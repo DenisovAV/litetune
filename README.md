@@ -41,35 +41,40 @@ would be reported as noise. Both sides answered the same 640 prompts; treating
 them as independent samples throws away exactly the information that settles the
 question.
 
-### What two runs of the same thing disagree about
+### What three runs of the same thing disagree about
 
-The same recipe sweep, run twice, differing only in a bundle flag that the
-text-parsing consumer cannot observe:
+The same recipe sweep, run three times on the same data with the same code. B
+and C are the identical shipping configuration; A differs only in the bundle's
+declared model type, which the text-parsing measurement cannot observe:
 
-| | run A | run B |
-|---|---|---|
-| Base, float | 0.7266 | 0.7266 |
-| Fine-tuned, float | 0.9094 | 0.9172 |
-| `dynamic_wi8_afp32` | 0.8906 — cost **resolved** | 0.9016 — cost *unresolved* |
-| `weight_only_wi8_afp32` | 0.9141 — cost *unresolved* | 0.9047 — cost **resolved** |
-| Gap between recipes | 0.0235 | 0.0031 |
+| | run A | run B | run C |
+|---|---|---|---|
+| Base, float | 0.7266 | 0.7266 | 0.7266 |
+| Fine-tuned, float | 0.9094 | 0.9172 | 0.9062 |
+| `dynamic_wi8_afp32` | 0.8906 — **resolved** | 0.9016 — *unresolved* | 0.8969 — *unresolved* |
+| `weight_only_wi8_afp32` | 0.9141 — *unresolved* | 0.9047 — **resolved** | 0.9000 — *unresolved* |
+| Gap between recipes | 0.0235 | 0.0031 | 0.0031 |
 
-**The recipes swap places, and so does which cost is resolved.** An earlier
+**The recipes swap places, and which cost resolves moves with them.** An earlier
 draft of this file read "the two recipes differ by 0.0234 on the same weights at
-the same bit width" and drew a conclusion from it. One more run of the same
-configuration reduced that gap to 0.0031. The gap was noise, and a single run
-had presented it as a finding.
+the same bit width" and drew a conclusion from it. Two further runs put that gap
+at 0.0031 and 0.0031. The gap was noise, and a single run had presented it as a
+finding.
 
-So what is actually established here is narrower than one run suggests, and
-worth separating:
+Across all three, the conversion cost resolves in **2 of 6** recipe-runs -- and
+B and C, which are the same configuration end to end, still disagree about
+`weight_only`.
 
-- **The base figure is 0.7266**, reproduced to four decimal places across a
-  rebuilt container image, a `transformers` major version change, new batching
-  code and a rewritten parser.
-- **Fine-tuning gains about +0.19**, resolved in every run, on 135-136
-  discordant pairs. This is far larger than the run-to-run spread.
-- **Conversion costs something small** — between 0.012 and 0.019 across runs —
-  and whether 640 examples *resolve* it depends on the run. At this effect size
+So what is actually established is narrower than one run suggests, and worth
+separating:
+
+- **The base figure is 0.7266**, identical to four decimal places in all three,
+  and reproduced across a rebuilt container image, a `transformers` major version
+  change, new batching code and a rewritten parser.
+- **Fine-tuning gains about +0.18**, resolved in every run, on 132-136 discordant
+  pairs. The spread across runs is 0.0109 — an order below the effect.
+- **Conversion costs something small** — 0.0063 to 0.0187 across runs — and
+  whether 640 examples *resolve* it is close to a coin flip. At this effect size
   the method is at its limit, and one run's verdict should not be quoted as the
   answer.
 
