@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the current release. The floor is declared in
+        # pyproject.toml and was previously untested, which made it a claim
+        # rather than a fact.
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+      - run: mypy
+      # The whole suite runs on fakes: no subprocess, no network, no GPU.
+      - run: pytest -q
+
+  # An editable install is not the artifact anyone receives. `src/` layout plus
+  # a dynamic hatch version plus `license-files` is exactly the surface where
+  # `pip install -e .` passes and a wheel does not.
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - name: install the wheel into a clean environment
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install dist/*.whl
+          /tmp/fresh/bin/litetune --help
+          /tmp/fresh/bin/python -c "import litetune, pathlib; \
+            assert litetune.__version__, 'no version'; \
+            assert (pathlib.Path(litetune.__file__).parent / 'py.typed').is_file(), 'no py.typed'"

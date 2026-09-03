@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+runs/
+.envs/
+
+# Working notes, not shipped
+openspec/
+.claude/
+.venv/

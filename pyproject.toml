@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "litetune"
+dynamic = ["version"]
+description = "Fine-tune, convert and verify small models for on-device. Know what the conversion cost you."
+readme = "README.md"
+# No upper bound, deliberately, and this was tried the other way first.
+#
+# The stage environments are built from the interpreter that runs litetune, and
+# their pinned `numpy==2.0.2` publishes no wheel above cp312 -- so `convert` and
+# `verify` cannot provision on 3.13+. But `prepare`, `tune` and `bundle` all
+# work there, and the whole test suite passes on 3.14. Declaring `<3.13` made
+# pip refuse to install a package whose majority still runs.
+#
+# So the ceiling is enforced where it actually bites: `StageEnv.provision`
+# refuses with a message naming the interpreter, the range and the reason,
+# instead of letting pip spend minutes failing to build numpy from source.
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Sasha Denisov", email = "denisov.shureg@gmail.com" }]
+keywords = ["lora", "fine-tuning", "on-device", "litertlm", "quantization", "evaluation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Deliberately thin. The heavy toolchains -- torch/transformers for training,
+# litert-torch/litert-lm for conversion -- are mutually incompatible and cannot
+# share one environment. They are installed into per-stage environments at
+# runtime instead. See litetune/envs.py.
+# Compatible-release, not an exact pin, and the distinction is not a
+# compromise. `envs._is_pinned` refuses `>=` for the *stage environments*
+# because litetune owns those end to end and an unpinned rebuild silently
+# changed one (`AttributeError: pad_token`, 2026-08-30). An installed library's
+# requirements are a different contract: `==` here makes litetune uninstallable
+# beside anything wanting another pyyaml, which is a cost paid by users to
+# solve a problem they do not have.
+dependencies = [
+    "pyyaml~=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/DenisovAV/litetune"
+Repository = "https://github.com/DenisovAV/litetune"
+Issues = "https://github.com/DenisovAV/litetune/issues"
+
+[project.optional-dependencies]
+# Exact, unlike the runtime dependency above, because these are a different
+# contract. `pyyaml` is an *install requirement*: `==` there would make litetune
+# uninstallable beside anything wanting another version. `ruff` and `mypy` are
+# *gates*: their job is to give the same answer on the same code, and an
+# unpinned formatter means the format check passes or fails on whatever pip
+# resolved that morning.
+#
+# Measured, not assumed: relaxing these to `~=` resolved ruff 0.8.4 to 0.16.5
+# -- `~=0.8` means `>=0.8, <1.0`, not `<0.9` -- and four files that passed
+# `format --check` in one environment failed it in another, on identical
+# source.
+dev = ["pytest==8.3.4", "ruff==0.8.4", "mypy==1.14.0", "types-PyYAML==6.0.12.20241230"]
+
+[project.scripts]
+litetune = "litetune.cli:main"
+
+[tool.hatch.version]
+# One source of truth. Two places to bump is one place to forget, and the
+# forgotten one would be recorded in every manifest as a confident wrong answer.
+path = "src/litetune/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/litetune"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "I", "UP", "BLE"]
+
+[tool.mypy]
+python_version = "3.10"
+# The tests too. `conftest.py` argues that a typed fake beats a mock because
+# "a mock would accept a typo in a method name and this will not" -- which is
+# only true if something checks it.
+files = ["src/litetune", "tests"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+# `check_untyped_defs` is deliberately off: turning it on surfaces ~50 findings
+# in test bodies, almost all `assert x is not None` narrowings the tests know
+# and mypy does not. Worth doing, not worth doing badly in a hurry. So the
+# fakes' *declarations* are checked -- which is what makes `_CONFORMS` in
+# conftest catch a renamed Protocol method -- and their call sites are not.
+
+# `tomllib` ships no stubs and is 3.11+; the packaging test imports it behind a
+# `ModuleNotFoundError` guard so it also runs on the declared 3.10 floor. An
+# inline ignore is either unused or missing depending on the interpreter, which
+# `warn_unused_ignores` then reports -- so the exemption is stated once here.
+[[tool.mypy.overrides]]
+module = "tomllib"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
