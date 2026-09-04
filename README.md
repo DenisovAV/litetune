@@ -48,37 +48,45 @@ prompt above are rendered in *declaration order*, which is what the reference
 consumer (`flutter_gemma`) emits. The jinja template inside the `.litertlm` we
 ship renders them with `dictsort` — measured, eight occurrences, including on
 declaration properties. On this dataset the two orders disagree for **100% of
-rows**, and one bundle therefore presents two different prompts depending on
-which path a consumer takes.
+rows**, so one bundle presents two different prompts depending on which path a
+consumer takes.
 
-Which one the base model's weights learned was argued rather than measured until
-it was measured. Same checkpoint, same greedy decode, same parser, one variable —
-twice, on disjoint samples with different batching:
+Which order the weights prefer was argued rather than measured until it was
+measured. Same greedy decode, same parser, one variable:
 
-| | n | declaration order | `dictsort` | paired difference |
-|---|---|---|---|---|
-| held-out split | 640 | 0.7266 ±0.0345 | **0.7625** ±0.0330 | −0.0359 ±0.0219 |
-| disjoint sample | 1280 | 0.7602 ±0.0234 | **0.7789** ±0.0227 | −0.0187 ±0.0099 |
+| | n | declaration order | `dictsort` | paired difference | discordant pairs |
+|---|---|---|---|---|---|
+| Base, held-out | 640 | 0.7266 | **0.7625** | −0.0359 ±0.0219 | 51 |
+| Base, disjoint sample | 1280 | 0.7602 | **0.7789** | −0.0187 ±0.0099 | 42 |
+| **Fine-tuned**, held-out | 640 | 0.9109 | 0.9141 | −0.0031 ±0.0087 *(unresolved)* | **8** |
 
-Both resolve, both in the same direction, and the intervals overlap at
-[−0.0286, −0.0140]. The discordant pairs split 37:14 and 33:9 — three to one in
-`dictsort`'s favour each time. **The weights prefer the template's order.**
+**The base cares and the fine-tuned model does not.** For the base both runs
+resolve, both favour `dictsort`, the intervals overlap at [−0.0286, −0.0140],
+and the discordant pairs run three to one. After fine-tuning the same comparison
+collapses: 51 discordant pairs become 8, and the difference is 0.0031 against an
+interval of ±0.0087 — unresolved not for want of data but for want of an effect.
 
-Not a parsing artifact: argument dicts compare without regard to key order, so a
-reordered call scores the same. What changes is *which arguments the model
-extracts* — given a declaration in the wrong order it returns `email` where the
-target wanted `phone_number`. The model learned "the Nth property is X", and
-moving the properties moves the answer.
+The mechanism is visible in the failures. It is not a parsing artifact — argument
+dicts compare without regard to key order, so a reordered call scores the same.
+What moves is *which argument the model extracts*: given a declaration in the
+order it did not learn, the base returns `email` where the target wanted
+`phone_number`. It had learned "the Nth property is X". Fine-tuning teaches it to
+read the name instead, and the position stops mattering.
 
-The first run is the one the base column above was measured with, so that column
-is understated, and the fine-tuning gain absorbs the difference: part of what
-reads as "learned the task" is "learned our rendering". Against a correctly
-rendered base the gain is roughly **+0.155**, not +0.19. Still large, still
-resolved.
+Two consequences for the numbers above:
 
-The fix is to render declarations the way the weights expect and re-measure. It
-is not done — what is done is that `contract.json` now records which convention
-a bundle was built under, so a consumer is no longer guessing.
+- **The base column is understated**, because it was measured in declaration
+  order. Under the order the weights prefer it is 0.7625.
+- **The fine-tuning gain depends on which base you compare against**, and both
+  are now measured rather than inferred: **+0.1843** entirely in declaration
+  order, **+0.1516** entirely in `dictsort`. The published +0.19 sits above both
+  because it pairs a tuned model measured at its best against a base measured at
+  its worst.
+
+`contract.json` records which convention a bundle was built under, so a consumer
+is not guessing. On the evidence above that matters for a base or lightly-tuned
+checkpoint and is close to free for a fully fine-tuned one — but "close to free"
+is a measurement on one model and one dataset, not a property of the method.
 
 ### What three runs of the same thing disagree about
 
@@ -362,11 +370,13 @@ extra tool calls firing on the device, not as a lower score.
 
 **One bundle, two prompt renderings.** The plugin renders declaration properties
 in declaration order; the jinja template inside the same `.litertlm` renders them
-with `dictsort`. They disagree for 100% of `mobile-actions` rows, and there is
-resolved evidence the weights prefer the template's order — see *The base figure
-is measured under a rendering the base did not learn*. litetune does not yet let
-you choose, record which was used, or refuse to compare two points rendered
-differently, which is what `contract.json` should carry and does not.
+with `dictsort`, and they disagree for 100% of `mobile-actions` rows. On the base
+checkpoint the wrong order costs a resolved 0.019–0.036; after fine-tuning the
+difference is unresolved and near zero, so this is a hazard for base and
+lightly-tuned models rather than a defect in a shipped one. `contract.json`
+records the convention, but litetune does not render declarations itself, cannot
+choose the order for you, and `verify` does not yet refuse to compare two points
+rendered differently.
 
 **The SentencePiece tokenizer is restored by hand, and that is load-bearing.**
 `transformers` 5.x `save_pretrained` no longer writes `tokenizer.model`, and the
