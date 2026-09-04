@@ -111,7 +111,10 @@ single `run` would hide which one you are in.
 
 ```bash
 # 1. Split, and reject rows that cannot be scored. Seconds.
-litetune prepare --data raw.jsonl --output-dir data --context-length 1024
+#    Without --tokenizer it cannot measure token lengths, so it splits the file
+#    and exits 4 — "could not check" — rather than implying the rows all fit.
+litetune prepare --data raw.jsonl --output-dir data --context-length 1024 \
+                 --tokenizer google/functiongemma-270m-it
 
 # 2. Fine-tune. On CPU, so size your expectations accordingly.
 litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
