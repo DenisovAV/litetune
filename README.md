@@ -157,7 +157,7 @@ Wiring `|| exit 1` on anything non-zero throws all of this away.
 
 | | |
 |---|---|
-| **Linux or macOS** | On Linux, `litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, so `libvulkan1` is required — without it every invocation, `--help` included, dies in under a second. macOS needs no such package: `litert-torch` and `litert-lm` both install and run there, verified end to end on Apple silicon — export produced a 435 MB `.litertlm` and the runtime answered a tool-calling prompt with the correct call. Windows is untried. |
+| **Linux or macOS** | On Linux, `litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, so `libvulkan1` is required — without it every invocation, `--help` included, dies in under a second. macOS needs no such package. Verified on Apple silicon: `litetune convert` provisioned its own environment and produced a 455,759,152-byte `.litertlm` — the same byte count as the Linux runs — and `litert-lm` answered a real tool-calling prompt with the correct call. Windows is untried. |
 | **Python 3.10–3.13** | Stage environments are built from the interpreter running litetune, so each has its own ceiling: `numpy==2.0.2` (3.12) for `convert` and `verify`, `torch==2.5.1` (3.13) for `tune` and `prepare --tokenizer`. `bundle` provisions nothing. Past a ceiling the command refuses and names the pin that set it. |
 | **CPU only** | All five stages. `convert` sets `CUDA_VISIBLE_DEVICES=""` so an export cannot depend on an accelerator. Workable for a 270M model; above that it is the first thing to fix. |
 | **Disk** | Several GB for the provisioned environments, cached between runs. |
