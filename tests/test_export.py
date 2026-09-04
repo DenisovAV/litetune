@@ -10,6 +10,7 @@ under test is built to record.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -580,3 +581,62 @@ def test_a_zero_byte_artifact_is_not_compared(toolchain, request_for):
 
     assert isinstance(result.comparison, Uncompared)
     assert "zero-byte" in result.comparison.reason
+
+
+def test_a_tokenizer_path_from_another_machine_is_repaired(tmp_path):
+    """`tune` writes an absolute `vocab_file`; the checkpoint then moves.
+
+    `export_lib.export_tokenizer` reads `tokenizer.vocab_file` and opens it
+    verbatim, with no resolution against the model directory. So a checkpoint
+    trained on one machine and converted on another dies with
+    `FileNotFoundError: /tmp/merged/tokenizer.model` -- a path that never
+    existed here -- after the model has finished loading.
+
+    Reproduced exactly that way: a checkpoint built on a Linux worker, exported
+    from a laptop. The path is a property of where the checkpoint is now, which
+    is knowable here and was not knowable there.
+    """
+    from litetune.export import repair_vocab_file
+
+    model = tmp_path / "merged"
+    model.mkdir()
+    (model / "tokenizer.model").write_bytes(b"sp")
+    config = model / "tokenizer_config.json"
+    config.write_text(
+        json.dumps({"vocab_file": "/tmp/merged/tokenizer.model", "model_max_length": 8192}),
+        encoding="utf-8",
+    )
+
+    note = repair_vocab_file(model)
+
+    assert note and "/tmp/merged/tokenizer.model" in note
+    written = json.loads(config.read_text(encoding="utf-8"))
+    assert written["vocab_file"] == str((model / "tokenizer.model").resolve())
+    assert written["model_max_length"] == 8192, "the rest of the config must survive"
+
+
+def test_a_vocab_file_that_resolves_is_left_alone(tmp_path):
+    from litetune.export import repair_vocab_file
+
+    model = tmp_path / "merged"
+    model.mkdir()
+    real = model / "tokenizer.model"
+    real.write_bytes(b"sp")
+    config = model / "tokenizer_config.json"
+    config.write_text(json.dumps({"vocab_file": str(real)}), encoding="utf-8")
+
+    assert repair_vocab_file(model) is None
+    assert json.loads(config.read_text(encoding="utf-8"))["vocab_file"] == str(real)
+
+
+def test_a_bpe_checkpoint_needs_no_repair_and_is_not_an_error(tmp_path):
+    """Qwen's tokenizer is BPE: there is no `tokenizer.model` to point at."""
+    from litetune.export import repair_vocab_file
+
+    model = tmp_path / "merged"
+    model.mkdir()
+    (model / "tokenizer_config.json").write_text(
+        json.dumps({"vocab_file": "/tmp/gone/tokenizer.model"}), encoding="utf-8"
+    )
+
+    assert repair_vocab_file(model) is None

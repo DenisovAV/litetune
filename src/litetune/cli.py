@@ -263,9 +263,11 @@ def _add_verify(sub) -> None:
         "--max-tokens",
         type=_positive,
         help=(
-            "generation limit for the reference side (default 256). The pinned runtime CLI "
-            "takes no decoding flags, so this bounds the reference only; the manifest names "
-            "that asymmetry and counts how many runtime generations end without a terminator"
+            "generation limit for the reference side (default 256). litetune passes no "
+            "decoding flags to the device side, so this bounds the reference only; the "
+            "manifest names that asymmetry and counts how many runtime generations end "
+            "without a terminator. The pinned litert-lm does accept --top-k, --top-p, "
+            "--temperature and --seed; wiring them through would close the gap"
         ),
     )
     verify.add_argument("--json", action="store_true", help="write the manifest to stdout")
