@@ -450,6 +450,23 @@ def test_export_does_not_ask_for_an_accelerator(toolchain, request_for):
     assert "--backend=gpu" not in call.argv
 
 
+class _AnyTemplate:
+    """Matches the template flag whatever absolute path it carries."""
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, str)
+            and other.startswith("--jinja_chat_template_override=")
+            and other.endswith("templates/functiongemma.jinja")
+        )
+
+    def __repr__(self) -> str:
+        return "--jinja_chat_template_override=<packaged functiongemma.jinja>"
+
+
+_ANY_TEMPLATE = _AnyTemplate()
+
+
 def test_argv_is_the_documented_command(request_for):
     request = request_for(MEASURED_RECIPES)
     assert request.argv("weight_only_wi8_afp32") == [
@@ -463,6 +480,12 @@ def test_argv_is_the_documented_command(request_for):
         # and without the override the bundle is typed `generic_model` and the
         # runtime creates no tool-call channel.
         "--litert_lm_model_type_override=function_gemma",
+        # The template the checkpoint ships with uses `macro` and `dictsort`,
+        # which LiteRT-LM's MiniJinja does not support: a bundle carrying it
+        # exports cleanly and then fails the native tool path. Compared by
+        # suffix because the value is an absolute path into the installed
+        # package, which differs per machine.
+        _ANY_TEMPLATE,
         # Appended by `ExportRequest` itself, because the caller said nothing
         # about it and the default is on. Every measured artifact carries it,
         # and an export without it is a different shape -- 286 MB against

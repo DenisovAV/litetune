@@ -1,0 +1,149 @@
+{#-
+  FunctionGemma prompt template for LiteRT-LM.
+
+  NOT WRITTEN HERE. This is the template Google ships inside its own published
+  FunctionGemma bundle, `litert-community/functiongemma-270m-ft-mobile-actions`,
+  extracted with `litertlm_peek`. It is covered by the Gemma Terms of Use, not by
+  this package's Apache-2.0 licence:
+  https://ai.google.dev/gemma/terms
+
+  Why it is here at all. The template the model ships with on the Hub uses
+  `{% macro %}` and eight `dictsort` calls; LiteRT-LM renders with MiniJinja,
+  which supports neither. A bundle carrying it fails the native tool path with
+  `INTERNAL: Failed to apply template` -- surfacing to a caller as an opaque
+  `litert_lm_conversation_send_message_stream failed`, because the Python
+  wrapper drops the message and keeps only the return code. The text path, which
+  is what `flutter_gemma` uses and what every number in this repository was
+  measured through, never reads the template and so never saw the fault.
+
+  A rewrite was attempted first and abandoned. It converged on this file one
+  missing branch at a time -- the tool shape the runtime actually passes, then
+  tool responses, then re-rendering an assistant's previous `tool_calls` so the
+  model stops at `<start_function_response>` instead of repeating itself -- each
+  discovered by a run that degenerated. The result would have been this template
+  with different whitespace and less testing, while remaining just as derivative.
+  Taking it whole and saying so is the more honest of the two.
+
+  Keep in sync with the upstream bundle rather than editing in place: a
+  divergence here is a prompt the model was not trained against, and that is
+  invisible in every check this package runs.
+-#}
+{{ bos_token }}
+{%- set ns = namespace(prev_message_type=None) -%}
+{%- set loop_messages = messages -%}
+{%- if tools or messages[0]['role'] == 'system' -%}
+    {{- '<start_of_turn>developer\n' -}}
+    {#- System Instructions (before tools) -#}
+    {%- if messages[0]['role'] == 'system' -%}
+        {%- if messages[0]['content'] is string -%}
+            {{- messages[0]['content'] | trim -}}
+        {%- elif messages[0]['content'] is iterable and messages[0]['content'] | length > 0 -%}
+            {%- if messages[0]['content'][0]['type'] == 'text' -%}
+                {{- messages[0]['content'][0]['text'] | trim -}}
+            {%- endif -%}
+        {%- endif -%}
+        {%- set loop_messages = messages[1:] -%}
+        {%- if tools -%}
+            {{- '\n\n' -}}
+        {%- endif -%}
+    {%- endif -%}
+    {#- Tool Declarations -#}
+    {%- for tool in tools %}
+        {{- '<start_function_declaration>' -}}
+        {{- tool | trim }}
+        {{- '<end_function_declaration>' -}}
+    {%- endfor %}
+    {#- System Instructions (after tools) -#}
+    {%- if messages[0]['role'] == 'system' and messages[0]['content'] is iterable and messages[0]['content'] | length > 1 -%}
+        {%- for item in messages[0]['content'][1:] -%}
+            {%- if item['type'] == 'text' -%}
+                {{- item['text'] | trim -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- '<end_of_turn>\n'}}
+{%- endif %}
+{#- Loop through messages. -#}
+{%- for message in loop_messages -%}
+    {%- if (message['role'] == 'assistant') -%}
+        {#- Rename "assistant" to "model". -#}
+        {%- set role = "model" -%}
+    {%- else -%}
+        {%- set role = message['role'] -%}
+    {%- endif -%}
+    {%- if role != 'tool' -%}
+        {%- if ns.prev_message_type == 'tool_call' -%}
+            {{ raise_exception("Tool call must be followed by a tool response.") }}
+        {%- endif -%}
+        {%- if ns.prev_message_type != 'tool_response' -%}
+            {{- '<start_of_turn>' + role + '\n'}}
+        {%- endif -%}
+        {%- set ns.prev_message_type = None -%}
+        {%- if 'content' in message -%}
+            {%- if message['content'] is string -%}
+                {{ message['content'] | trim }}
+            {%- elif message['content'] is iterable -%}
+                {%- for item in message['content'] -%}
+                    {%- if item['type'] == 'text' -%}
+                        {{ item['text'] | trim }}
+                    {%- endif -%}
+                {%- endfor -%}
+            {%- else -%}
+                {{ raise_exception("Invalid content type") }}
+            {%- endif -%}
+            {%- set ns.prev_message_type = 'content' -%}
+        {%- endif -%}
+        {%- if 'tool_calls' in message and message['tool_calls'] and message['tool_calls'] is iterable -%}
+            {#- Tool Calls -#}
+            {%- for tool_call in message['tool_calls'] -%}
+                {%- if 'function' in tool_call -%}
+                    {%- set tool_call = tool_call['function'] -%}
+                {%- endif -%}
+                {{-  '<start_function_call>call:' + tool_call['name'] + '{' -}}
+                {%- if 'arguments' in tool_call -%}
+                    {%- for key in tool_call['arguments'] -%}
+                        {{- key + ':' + tool_call['arguments'][key] -}}
+                        {% if not loop.last %}
+                            {{- ',' -}}
+                        {% endif %}
+                    {%- endfor %}
+                {%- endif -%}
+                {{- '}' + '<end_function_call>' -}}
+            {%- endfor -%}
+            {%- if loop.last -%}
+                {{ '<start_function_response>' }}
+            {%- endif -%}
+            {%- set ns.prev_message_type = 'tool_call' -%}
+        {%- endif -%}
+    {%- else -%}
+        {#- Tool Responses -#}
+        {%- if 'content' in message -%}
+            {%- if message['content'] is string -%}
+                {{- '<start_function_response>response:' -}}
+                {{ message['content'] | trim }}
+                {{- '<end_function_response>' -}}
+            {%- elif message['content'] is iterable -%}
+                {%- for item in message['content'] -%}
+                    {%- if item['type'] == 'text' -%}
+                        {{ '<start_function_response>response:' + item['text'] + '<end_function_response>' }}
+                    {%- else -%}
+                        {{ raise_exception("Invalid content type for tool response.") }}
+                    {%- endif -%}
+                {%- endfor -%}
+            {%- else -%}
+                {{ raise_exception("Invalid content type") }}
+            {%- endif -%}
+        {%- endif -%}
+        {%- set ns.prev_message_type = 'tool_response' -%}
+    {%- endif -%}
+    {%- if ns.prev_message_type not in ['tool_call', 'tool_response'] -%}
+        {{ '<end_of_turn>\n' }}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {%- if ns.prev_message_type == 'tool_call' -%}
+        {{- '<start_function_response>' -}}
+    {%- elif ns.prev_message_type != 'tool_response' -%}
+        {{- '<start_of_turn>model\n' -}}
+    {%- endif -%}
+{%- endif -%}

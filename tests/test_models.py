@@ -517,3 +517,59 @@ def test_functiongemma_declares_the_terminator_training_cannot_reveal():
 
     assert stop_tokens_for("google/gemma-3-270m-it") == ((), "")
     assert stop_tokens_for("some/unknown-model") == ((), "")
+
+
+def test_functiongemma_carries_a_template_the_runtime_can_execute():
+    """The checkpoint's own template cannot run on-device.
+
+    It uses `macro` and `dictsort`; LiteRT-LM renders with MiniJinja, which
+    supports neither. A bundle built from it exports cleanly, is the right size,
+    passes every liveness check and answers the text path `flutter_gemma` uses —
+    and fails the native tool path with an opaque
+    `litert_lm_conversation_send_message_stream failed`, because the wrapper
+    keeps the return code and drops the message under it.
+
+    Measured, on the same checkpoint: with the override the runtime answers
+    `[tool_call] set_alarm{hour:7}`; without it, `INTERNAL: Failed to apply
+    template`.
+    """
+    import pathlib
+
+    from litetune.models import functiongemma_template, plan_export
+
+    template = pathlib.Path(functiongemma_template())
+    assert template.is_file(), "the template must ship with the package"
+    text = template.read_text(encoding="utf-8")
+
+    # The header names both constructs while explaining their absence, so the
+    # body is what gets checked. A test that matched the explanation instead of
+    # the code would pass on a file that had neither.
+    body = text.split("-#}", 1)[1]
+    assert "{% macro" not in body
+    assert "dictsort" not in body
+    # And the attribution, which is the whole reason this file may sit in an
+    # Apache-2.0 package at all.
+    assert "NOT WRITTEN HERE" in text
+    assert "Gemma Terms of Use" in text
+
+    plan = plan_export("google/functiongemma-270m-it", (), ("dynamic_wi8_afp32",))
+    override = [f for f in plan.flags if f.startswith("--jinja_chat_template_override=")]
+    assert len(override) == 1
+    assert override[0].endswith("templates/functiongemma.jinja")
+    assert any(
+        "--jinja_chat_template_override" in f for f in plan.added
+    ), "litetune added this, and the report has to say so"
+
+
+def test_a_caller_who_names_their_own_template_keeps_it():
+    """Their value wins: litetune knows the flag is needed, not which template
+    a differently-trained checkpoint wants."""
+    from litetune.models import plan_export
+
+    plan = plan_export(
+        "google/functiongemma-270m-it",
+        ("--jinja_chat_template_override=/my/own.jinja",),
+        ("dynamic_wi8_afp32",),
+    )
+    overrides = [f for f in plan.flags if f.startswith("--jinja_chat_template_override=")]
+    assert overrides == ["--jinja_chat_template_override=/my/own.jinja"]

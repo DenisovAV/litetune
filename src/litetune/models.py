@@ -42,6 +42,7 @@ import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -330,6 +331,33 @@ def _gemma4(family: str, patterns: tuple[str, ...], override_repo: str | None) -
 #
 # The value cannot be derived from `model_type`, because the two families share
 # one. It has to come from the model's identity, which is what these rules are.
+def functiongemma_template() -> str:
+    """Path to the prompt template a FunctionGemma bundle must carry.
+
+    Not the one the checkpoint ships with. That template uses `{% macro %}` and
+    `dictsort`, which the MiniJinja engine inside LiteRT-LM does not support, so
+    a bundle built from it fails the native tool path -- the caller sees
+    `litert_lm_conversation_send_message_stream failed` and nothing else,
+    because the wrapper drops the message under it.
+
+    Shipped as a file rather than fetched from a repository the way Gemma 4's
+    override is. That one points at `litert-community`, which Google publishes
+    and maintains under Apache-2.0; pointing at anything else would make an
+    export depend on a mutable ref and a network round trip, which is the same
+    objection this package raises to `--base-model-revision main`.
+    """
+    return str(files("litetune") / "templates" / "functiongemma.jinja")
+
+
+_FUNCTION_TEMPLATE_REASON = (
+    "FunctionGemma's own chat template uses `macro` and `dictsort`, and LiteRT-LM renders "
+    "with MiniJinja, which supports neither. A bundle carrying it exports cleanly, passes "
+    "every liveness check, answers the text path that flutter_gemma uses -- and fails the "
+    "native tool path with an opaque `send_message_stream failed`. Measured: with this "
+    "override the same checkpoint answers `[tool_call] set_alarm{hour:7}`; without it, "
+    "`INTERNAL: Failed to apply template`"
+)
+
 _FUNCTION_RESPONSE_REASON = (
     "a FunctionGemma turn does not end at the call: after `<end_function_call>` the "
     "application has to execute the tool and send the result back, and the model must stop "
@@ -370,6 +398,11 @@ RULES: tuple[ModelRules, ...] = (
                 name="--litert_lm_model_type_override",
                 value="function_gemma",
                 reason=_MODEL_TYPE_REASON,
+            ),
+            RequiredFlag(
+                name="--jinja_chat_template_override",
+                value=functiongemma_template(),
+                reason=_FUNCTION_TEMPLATE_REASON,
             ),
         ),
         extra_stop_tokens=("<start_function_response>",),

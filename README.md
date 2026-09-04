@@ -221,6 +221,16 @@ that parses the response text sees nothing wrong; an app that passes tools
 natively receives no calls. The export succeeds, the file is the right size,
 every liveness check is green.
 
+**The prompt template has to be one the device can execute.** FunctionGemma's
+own template uses `macro` and `dictsort`; LiteRT-LM renders with MiniJinja,
+which supports neither. A bundle carrying it exports cleanly, is the right size,
+passes every liveness check, and answers the text path `flutter_gemma` uses —
+then fails the native tool path with `litert_lm_conversation_send_message_stream
+failed`, which is the whole error the caller gets. litetune ships a template the
+runtime can run and passes it on export. Measured on the same checkpoint: with
+the override the runtime answers `[tool_call] set_alarm{hour:7}`; without it,
+`INTERNAL: Failed to apply template`.
+
 **The terminator comes from the chat template, not from `eos_token_id`.** They
 are not always the same token, and a model trained to emit the wrong one never
 closes its turn — on a device it emits call after call, and a consumer that
@@ -275,11 +285,6 @@ withdrawn after re-measurement.
 
 **Known to be broken**
 
-- **Passing tools natively fails.** Handing the runtime a tool list — `litert-lm
-  --preset`, or the Kotlin `ConversationConfig.tools` — raises
-  `litert_lm_conversation_send_message_stream failed` on a bundle built here.
-  The cause is not known. Only the prompt-rendered path, which is what
-  `flutter_gemma` uses, is supported and measured.
 - **Peak memory is not bounded.** Training this model on 8,693 examples was
   OOM-killed at 32 GiB more than once. There is no preflight check; a death with
   no Python traceback is probably this.
