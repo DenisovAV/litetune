@@ -24,6 +24,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Imported, not scraped. A regex for the first double-quoted string in
+      # the file matched the module docstring -- which contains `"never raises"`
+      # -- and reported that as the package version. The guard failed safe, by
+      # refusing to publish, but for the wrong reason. `_version.py` is a leaf
+      # module with no imports of its own, so importing it costs nothing.
+      #
       # The tag is the version. A release built from a tree whose
       # `_version.py` says something else would publish an artifact whose
       # recorded version does not lead back to the code that made it -- and
@@ -33,7 +39,7 @@ jobs:
         run: |
           set -o pipefail
           tag="${GITHUB_REF_NAME#v}"
-          pkg=$(python -c "import re,pathlib; print(re.search(r'\"([^\"]+)\"', pathlib.Path('src/litetune/_version.py').read_text()).group(1))")
+          pkg=$(PYTHONPATH=src python -c "from litetune._version import __version__; print(__version__)")
           echo "tag=$tag package=$pkg"
           test "$tag" = "$pkg" || { echo "::error::tag $tag does not match _version.py $pkg"; exit 1; }
 
