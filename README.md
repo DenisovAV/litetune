@@ -1,7 +1,7 @@
 # litetune
 
-**Fine-tune a small model for tool-calling, convert it to run on a phone, and
-know what the conversion cost you.**
+**Fine-tune a small model, convert it to run on a phone, and know what the
+conversion cost you.**
 
 Getting from a Hugging Face checkpoint to a model that works inside your app is
 a long road — LoRA, merge, export to `.litertlm`, bundle metadata — and a
@@ -10,9 +10,14 @@ and is broken while every check stays green. litetune walks that road and knows
 the traps on it.
 
 The output is a `.litertlm` bundle: what LiteRT-LM loads, and what the
-`flutter_gemma` plugin runs on Android and iOS. The scope is **function
-calling** — your data is prompts and the tool calls they should produce, and
-"correct" means the tool name and every argument value.
+`flutter_gemma` plugin runs on Android and iOS.
+
+Any task shaped as prompt → completion works. What "correct" means is the one
+thing you choose: `--scorer tool-call` for function calling, where the operation
+name and every argument value must match, or `--scorer exact-text` where there
+is one right string. Everything after scoring — the paired comparison, the
+intervals, whether a difference resolves, the exit code — reads only whether
+each example was right, so it does not know or care which task you brought.
 
 - **prepare** — split the data, and reject rows that cannot be scored
 - **tune** — LoRA or full fine-tuning, with the wiring the export needs
@@ -24,7 +29,9 @@ Everything runs on CPU, which is workable at 270M and the first thing you will
 want to change above about 1B. Bring your own checkpoint and skip the first two
 steps, or bring a `.litertlm` and its float checkpoint and run only `verify`.
 
-> **Alpha.** Measured end to end on `google/functiongemma-270m-it` only. Gemma 3,
+> **Alpha.** Measured end to end on `google/functiongemma-270m-it` and function
+> calling only. The other scorer is tested but no task has been measured through
+> it end to end. Gemma 3,
 > Gemma 4 and Qwen3.5 export — litetune carries their required flags — but no
 > quality number has been established for them. Try it on yours and open an issue.
 
@@ -65,11 +72,25 @@ First run of `tune`, `convert` or `verify` builds that environment and pulls
 ## Your data
 
 One JSON object per line. Scoring rows need a `prompt` and a `target`; training
-rows add the `completion` text the model should produce:
+rows add the `completion` text the model should produce, or let `prepare` derive
+it from the target.
+
+**The shape of the target is how you declare the task.** An object with a `name`
+is a tool call:
 
 ```json
 {"prompt": "set an alarm for 7", "target": {"name": "set_alarm", "args": {"hour": "7"}}}
 ```
+
+A bare string is the answer itself:
+
+```json
+{"prompt": "classify the sentiment: it was fine", "target": "neutral"}
+```
+
+Two shapes rather than a target plus a `--target-kind`, because those two could
+disagree and a shape cannot disagree with itself. Match it with `--scorer` when
+you get to `verify`.
 
 `prepare` splits one raw file into `train.jsonl` and `heldout.jsonl` and rejects
 what it cannot score: malformed JSON, and rows with no `prompt`. Given
@@ -153,6 +174,7 @@ litetune knows four, and has measured two:
 | `--prompt-mode` | No default. `prerendered` means your app renders the tool declarations into the prompt and the runtime must not template again; `runtime_rendered` is the opposite. Must be the **same** value in `tune` and `bundle` — the wrong one produces a fluent wrong answer, not an error. |
 | `--adapter` | For a LoRA run, pass `<tune output>/adapter`, from outside `--output-dir`. Without it the bundle carries only the merged weights. |
 | `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused: they resolve to different weights on different days while the bundle reads identically. |
+| `--scorer` | What counts as correct, on `verify`. `tool-call` (default) or `exact-text`. It has to match the shape of your targets; nothing else in the pipeline changes. The manifest records which one ran, because two manifests scored differently are not comparable. |
 | `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. See [MEASUREMENTS.md](MEASUREMENTS.md). |
 
 ---

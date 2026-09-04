@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 # 95% two-sided normal quantile.
 Z95 = 1.959963985
@@ -81,7 +81,10 @@ class ToolCall:
         if obj is None:
             return None
         if not isinstance(obj, dict) or "name" not in obj:
-            raise ValueError(f"target must be an object with a 'name' field, got {obj!r}")
+            raise ValueError(
+                "target must be an object with a 'name' field (a tool call) or a string "
+                f"(the answer itself), got {obj!r}"
+            )
         args = obj.get("args") or {}
         if not isinstance(args, dict):
             raise ValueError(f"target 'args' must be an object, got {args!r}")
@@ -89,6 +92,24 @@ class ToolCall:
 
     def as_dict(self) -> dict:
         return {"name": self.name, "args": dict(self.args)}
+
+
+def read_target(obj: Any) -> ToolCall | str | None:
+    """A held-out label, in either shape the shipped scorers understand.
+
+    An object with a `name` is a tool call and is scored by `tool-call`; a bare
+    string is the answer itself and is scored by `exact-text`. `None` is an
+    unlabelled example, which is a documented state and not an error.
+
+    Two shapes rather than a schema, because the shape *is* the declaration of
+    what the task is, and asking for both a target and a `--target-kind` would
+    let them disagree.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        return obj
+    return ToolCall.from_target(obj)
 
 
 def parse_call(text: str) -> ToolCall | None:
@@ -300,16 +321,22 @@ def paired_difference(a: Sequence[bool], b: Sequence[bool]) -> Difference:
 class QualityMetrics:
     """Scores for one measurement point.
 
-    `exact_match` factorises: it is `name_accuracy * argument_accuracy`, because
-    argument accuracy is conditioned on the operation having been selected
-    correctly. Reporting them this way is what makes "the recipe cost 0.024"
-    attributable -- 0.995 of the operations survived conversion and the loss
-    lived entirely in the arguments.
+    `exact_match` is the one field every scorer produces: the proportion of
+    examples answered correctly, and the only one the statistics downstream
+    consume. Everything else here is a *decomposition*, and a scorer that has
+    none says so rather than inventing one.
+
+    For tool calls the decomposition is `name_accuracy * argument_accuracy`,
+    because argument accuracy is conditioned on the operation having been
+    selected correctly. Reporting it that way is what makes "the recipe cost
+    0.024" attributable -- 0.995 of the operations survived conversion and the
+    loss lived entirely in the arguments. A task with no such split -- one right
+    string, and you either produced it or did not -- leaves both `Unavailable`.
     """
 
     n: int
     parse_rate: Proportion
-    name_accuracy: Proportion
+    name_accuracy: Proportion | Unavailable
     argument_accuracy: Proportion | Unavailable
     exact_match: Proportion
     # Per-example exact-match outcome, in split order. Kept because the two
@@ -329,6 +356,41 @@ class QualityMetrics:
         }
 
 
+class Scorer(Protocol):
+    """Turns generated text and held-out labels into `QualityMetrics`.
+
+    The seam that makes the rest of this package task-agnostic. Everything
+    downstream -- the paired comparison, the intervals, whether a difference
+    resolves, the exit code -- consumes `QualityMetrics.correct`, a tuple of
+    booleans. Only the way a boolean is arrived at is specific to a task, so
+    that is the only thing worth replacing.
+
+    Implementations raise rather than returning a degenerate score when the
+    inputs cannot be scored at all: callers run them inside `checks.guard`, so
+    the result is `could not check` rather than a fabricated number.
+    """
+
+    @property
+    def name(self) -> str:
+        """How this scorer is named in the manifest and on the command line."""
+        ...
+
+    @property
+    def describes(self) -> str:
+        """What "correct" means here, in one line, for the report to carry."""
+        ...
+
+    def __call__(self, targets: Sequence[Any], outputs: Sequence[str]) -> QualityMetrics: ...
+
+
+def _require_alignment(targets: Sequence[Any], outputs: Sequence[str]) -> int:
+    if len(targets) != len(outputs):
+        raise ValueError(f"{len(targets)} targets against {len(outputs)} outputs")
+    if not targets:
+        raise ValueError("cannot score an empty split")
+    return len(targets)
+
+
 def score(targets: Sequence[ToolCall], outputs: Sequence[str]) -> QualityMetrics:
     """Score generated text against held-out labels.
 
@@ -336,12 +398,7 @@ def score(targets: Sequence[ToolCall], outputs: Sequence[str]) -> QualityMetrics
     scored at all; callers run this inside `checks.guard`, so the result is
     `could not check` rather than a fabricated number.
     """
-    if len(targets) != len(outputs):
-        raise ValueError(f"{len(targets)} targets against {len(outputs)} outputs")
-    n = len(targets)
-    if n == 0:
-        raise ValueError("cannot score an empty split")
-
+    n = _require_alignment(targets, outputs)
     parsed = [parse_call(text) for text in outputs]
     n_parsed = sum(p is not None for p in parsed)
     name_hits = [p is not None and p.name == t.name for p, t in zip(parsed, targets, strict=True)]
@@ -368,6 +425,75 @@ def score(targets: Sequence[ToolCall], outputs: Sequence[str]) -> QualityMetrics
         exact_match=Proportion.of(n_exact, n),
         correct=tuple(correct),
     )
+
+
+def score_exact_text(targets: Sequence[Any], outputs: Sequence[str]) -> QualityMetrics:
+    """Correct means the generation equals the target text, once normalised.
+
+    For every task where there is one right answer and no structure inside it:
+    a label, an extracted field, a rewritten sentence. Whitespace is collapsed
+    and the ends stripped, because a trailing newline is not a wrong answer;
+    nothing else is forgiven, since deciding that "almost" counts is a judgement
+    about your task that this package has no way to make.
+
+    `name_accuracy` and `argument_accuracy` are unavailable rather than zero.
+    There is nothing here to decompose, and a zero would read as a measurement.
+    """
+    n = _require_alignment(targets, outputs)
+    want = [" ".join(str(t).split()) for t in targets]
+    got = [" ".join(text.split()) for text in outputs]
+    correct = [w == g for w, g in zip(want, got, strict=True)]
+    no_split = Unavailable(
+        "exact-text scoring has no operation/argument split: the answer is one "
+        "string, and it either matches or does not"
+    )
+    return QualityMetrics(
+        n=n,
+        # Every generation is "parsed": the text is the answer.
+        parse_rate=Proportion.of(n, n),
+        name_accuracy=no_split,
+        argument_accuracy=no_split,
+        exact_match=Proportion.of(sum(correct), n),
+        correct=tuple(correct),
+    )
+
+
+@dataclass(frozen=True)
+class NamedScorer:
+    """A scoring function with the two things a report needs to say about it."""
+
+    name: str
+    describes: str
+    fn: Callable[[Sequence[Any], Sequence[str]], QualityMetrics]
+
+    def __call__(self, targets: Sequence[Any], outputs: Sequence[str]) -> QualityMetrics:
+        return self.fn(targets, outputs)
+
+
+SCORERS: dict[str, NamedScorer] = {
+    "tool-call": NamedScorer(
+        name="tool-call",
+        describes=(
+            "correct means the parsed call's operation name and every argument value match "
+            "the target"
+        ),
+        fn=score,
+    ),
+    "exact-text": NamedScorer(
+        name="exact-text",
+        describes=(
+            "correct means the generation equals the target text after collapsing whitespace"
+        ),
+        fn=score_exact_text,
+    ),
+}
+"""The scorers that ship. `verify` names the one it used in the manifest.
+
+Two, not one, because `tune` and `convert` were never specific to tool calls --
+only the measurement was. Two, not a plugin system, because which metrics people
+actually want is not yet known, and inventing an extension point for it would be
+guessing in public.
+"""
 
 
 def comparable_form(text: str) -> tuple:

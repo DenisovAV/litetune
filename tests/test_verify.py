@@ -448,3 +448,33 @@ def test_a_decoding_parameter_only_one_side_received_is_named(write_split):
         ),
     )
     assert any("token limit is unverified" in note for note in result.manifest["limitations"])
+
+
+def test_an_unknown_scorer_is_refused_before_anything_runs():
+    """The scorer decides what "correct" means; litetune will not guess it.
+
+    Refused in `__post_init__` rather than at the scoring call, which happens
+    after both sides have generated — several minutes and a provisioned
+    environment later, for a typo.
+    """
+    from litetune.evaluate import DataError
+    from litetune.verify import VerifyRequest
+
+    with pytest.raises(DataError, match="unknown scorer 'bleu'"):
+        VerifyRequest(
+            model=Path("m.litertlm"),
+            reference="checkpoint",
+            data=Path("held.jsonl"),
+            scorer="bleu",
+        )
+
+
+def test_the_default_scorer_is_named_not_assumed():
+    from litetune.verify import VerifyRequest
+
+    request = VerifyRequest(
+        model=Path("m.litertlm"),
+        reference="checkpoint",
+        data=Path("held.jsonl"),
+    )
+    assert request.scorer == "tool-call"

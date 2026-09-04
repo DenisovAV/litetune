@@ -603,3 +603,55 @@ def test_a_bad_request_is_refused_before_anything_is_read(tmp_path):
             context_length=64,
             heldout_fraction=1.0,
         )
+
+
+def test_a_string_target_is_a_task_declaration_not_a_malformed_call(tmp_path):
+    """The shape of the target says what the task is.
+
+    An object with a `name` is a tool call, scored by `tool-call`; a bare string
+    is the answer itself, scored by `exact-text`. Two shapes rather than a
+    target plus a `--target-kind`, because those two could disagree and the
+    shape cannot disagree with itself.
+    """
+    from litetune.metrics import ToolCall, read_target
+
+    assert read_target(None) is None
+    assert read_target("a cat sat") == "a cat sat"
+    assert read_target({"name": "set_alarm", "args": {"hour": "7"}}) == ToolCall(
+        name="set_alarm", args={"hour": "7"}
+    )
+
+    with pytest.raises(ValueError, match="a tool call.*or a string"):
+        read_target(42)
+
+
+def test_prepare_splits_a_text_task_and_says_the_profile_does_not_apply(tmp_path):
+    """A string-target split is scoreable; it just has no arguments to profile.
+
+    "No argument profile" has two causes and they are not the same news: string
+    targets are a task with no arguments, absent targets are a split nobody can
+    score at all. The check now distinguishes them, because the second is a
+    reason to stop and the first is not.
+    """
+    data = tmp_path / "raw.jsonl"
+    data.write_text(
+        "\n".join(
+            json.dumps({"prompt": f"classify: item {i}", "target": "red" if i % 2 else "blue"})
+            for i in range(40)
+        ),
+        encoding="utf-8",
+    )
+
+    result = prepare(PrepareRequest(data=data, output_dir=tmp_path / "out", context_length=512))
+
+    assert (tmp_path / "out" / "train.jsonl").exists()
+    assert (tmp_path / "out" / "heldout.jsonl").exists()
+
+    profile = [c for c in result.checks.checks if c.name == SCOREABILITY_CHECK][0]
+    assert "every target is a string" in (profile.detail or "")
+    assert profile.observed["labelled"] == 40
+
+    # And the completion was rendered from the string, not from a wire format.
+    first = json.loads((tmp_path / "out" / "train.jsonl").read_text().splitlines()[0])
+    assert first["completion"] in {"red", "blue"}
+    assert first["target"] == first["completion"]

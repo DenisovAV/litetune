@@ -55,6 +55,7 @@ from litetune.export import (
     run_export,
 )
 from litetune.manifest import RunStatus
+from litetune.metrics import SCORERS
 from litetune.prepare import (
     HuggingFaceTokenCounter,
     LengthStats,
@@ -234,6 +235,18 @@ def _add_verify(sub) -> None:
         "--limit",
         type=_positive,
         help="use only the first N examples",
+    )
+    verify.add_argument(
+        "--scorer",
+        choices=sorted(SCORERS),
+        default="tool-call",
+        help=(
+            "what counts as correct. tool-call (default): the parsed call's operation name "
+            "and every argument value match the target. exact-text: the generation equals "
+            "the target text once whitespace is collapsed — for any task with one right "
+            "answer and no structure inside it. Everything after scoring is task-agnostic, "
+            "so this is the only flag a different task has to change"
+        ),
     )
     verify.add_argument(
         "--max-conversion-cost",
@@ -608,6 +621,7 @@ def _verify(args: argparse.Namespace) -> int:
         data=args.data,
         limit=args.limit,
         reference_role=ReferenceRole(args.reference_role),
+        scorer=args.scorer,
         max_conversion_cost=args.max_conversion_cost,
         prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
         contract=args.contract,
