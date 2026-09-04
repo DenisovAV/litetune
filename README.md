@@ -25,6 +25,9 @@ each example was right, so it does not know or care which task you brought.
 - **verify** — measure what the conversion cost, before you ship
 - **bundle** — package the artifact with what was measured about it
 
+`litetune env` shows the environments the stages cached, and `--clean` removes
+them.
+
 Everything runs on CPU, which is workable at 270M and the first thing you will
 want to change above about 1B. Bring your own checkpoint and skip the first two
 steps, or bring a `.litertlm` and its float checkpoint and run only `verify`.
@@ -64,8 +67,24 @@ each stage builds its own environment from the interpreter you launched, and
 `numpy==2.0.2` — pinned by the export toolchain — stops publishing wheels after
 3.12. Past a ceiling the command refuses and names the pin that set it.
 
-First run of `tune`, `convert` or `verify` builds that environment and pulls
-`torch`: several gigabytes and a few minutes, cached afterwards.
+Each of `tune`, `convert` and `verify` builds its environment on first use and
+caches it. Measured on macOS:
+
+| stage | pulls | size |
+|---|---|---|
+| `verify` | both of the below | **~740 MB** |
+| `tune` | `torch`, `transformers`, `peft` | 588 MB |
+| `convert` | the `litert-torch` export toolchain | **1.6 GB** |
+| `bundle`, `prepare` | nothing | — |
+
+On Linux the training environment is larger: the `torch` wheel pulls its CUDA
+dependencies, several hundred megabytes each.
+
+`litetune env` shows what is on disk and `litetune env --clean` removes it; the
+next stage that needs one rebuilds it. Worth knowing because a provision that
+died halfway leaves a directory that looks like a working one from the outside,
+and because the cache key includes the interpreter — running litetune under two
+Pythons builds two sets.
 
 ---
 
