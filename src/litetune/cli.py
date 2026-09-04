@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from litetune import envs, models
+from litetune._version import __version__
 from litetune.bundle import (
     BundleError,
     BundleRequest,
@@ -171,6 +172,17 @@ def build_parser() -> argparse.ArgumentParser:
         prog="litetune",
         description="Fine-tune, convert and verify small models for on-device.",
     )
+    # A real `--version`, because argparse's prefix matching gave it away.
+    # `litetune --version` matched `--verbose` as an abbreviation, so a user
+    # checking which version they had silently turned on debug logging and was
+    # then told they had not named a command. Declaring the flag both answers
+    # the question and removes the collision.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"litetune {__version__}",
+        help="print the version and exit",
+    )
     parser.add_argument(
         "-v",
         "--verbose",
@@ -251,9 +263,11 @@ def _add_verify(sub) -> None:
         "--max-tokens",
         type=_positive,
         help=(
-            "generation limit for the reference side (default 256). The pinned runtime CLI "
-            "takes no decoding flags, so this bounds the reference only; the manifest names "
-            "that asymmetry and counts how many runtime generations end without a terminator"
+            "generation limit for the reference side (default 256). litetune passes no "
+            "decoding flags to the device side, so this bounds the reference only; the "
+            "manifest names that asymmetry and counts how many runtime generations end "
+            "without a terminator. The pinned litert-lm does accept --top-k, --top-p, "
+            "--temperature and --seed; wiring them through would close the gap"
         ),
     )
     verify.add_argument("--json", action="store_true", help="write the manifest to stdout")

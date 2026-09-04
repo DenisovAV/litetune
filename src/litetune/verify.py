@@ -519,8 +519,8 @@ def run_verify(
     # most needs it.
     if candidate.decode_enforced != reference.decode_enforced:
         # Both sides declare the same decoding, but only one of them was handed
-        # it: the pinned runtime CLI takes no decoding flags, so it runs on its
-        # own defaults. They are greedy on both sides, which is what makes the
+        # it: litetune passes none to the runtime, so it runs on its own
+        # defaults. They are greedy on both sides, which is what makes the
         # comparison admissible at all -- but a differing token limit would show
         # as truncation on one side only, so it is named rather than assumed
         # away.

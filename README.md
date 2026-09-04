@@ -21,14 +21,15 @@ the conversion succeeded. This tells you what it cost.
 pip install git+https://github.com/DenisovAV/litetune
 ```
 
-Linux, Python 3.10–3.12, and the `libvulkan1` system package:
+Python 3.10–3.12. On Linux you also need the `libvulkan1` system package:
 
 ```bash
 sudo apt-get install -y libvulkan1     # Debian/Ubuntu
 ```
 
-Colab works out of the box. See [Requirements](#requirements) for why Vulkan is
-needed even on CPU, and what runs on 3.13.
+macOS needs nothing extra. Colab works out of the box. See
+[Requirements](#requirements) for why Vulkan is needed even on CPU, and what
+runs on 3.13.
 
 ---
 
@@ -156,7 +157,7 @@ Wiring `|| exit 1` on anything non-zero throws all of this away.
 
 | | |
 |---|---|
-| **Linux** | `litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, so `libvulkan1` is required — without it every invocation, `--help` included, dies in under a second. The export and runtime toolchains are published for Linux only; **macOS is not supported** for `convert` and `verify`. |
+| **Linux or macOS** | On Linux, `litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, so `libvulkan1` is required — without it every invocation, `--help` included, dies in under a second. macOS needs no such package. Verified on Apple silicon: `litetune convert` provisioned its own environment and produced a 455,759,152-byte `.litertlm` — the same byte count as the Linux runs — and `litert-lm` answered a real tool-calling prompt with the correct call. Windows is untried. |
 | **Python 3.10–3.13** | Stage environments are built from the interpreter running litetune, so each has its own ceiling: `numpy==2.0.2` (3.12) for `convert` and `verify`, `torch==2.5.1` (3.13) for `tune` and `prepare --tokenizer`. `bundle` provisions nothing. Past a ceiling the command refuses and names the pin that set it. |
 | **CPU only** | All five stages. `convert` sets `CUDA_VISIBLE_DEVICES=""` so an export cannot depend on an accelerator. Workable for a 270M model; above that it is the first thing to fix. |
 | **Disk** | Several GB for the provisioned environments, cached between runs. |
@@ -204,10 +205,19 @@ which published claims were withdrawn after re-measurement.
   disagree for every declaration with more than one property. Costly on a base
   checkpoint, near-free after fine-tuning; `contract.json` records which you
   used. See [MEASUREMENTS.md](MEASUREMENTS.md).
-- **Decoding parameters reach only one side.** The pinned `litert-lm` CLI takes
-  no decoding flags, so the reference side is held to an explicit token limit
-  while the device side runs to the runtime's own. The manifest says so and
-  counts unterminated generations.
+- **Decoding parameters reach only one side.** litetune passes none to the
+  device side, so the reference is held to an explicit token limit while the
+  device runs to the runtime's own. The manifest says so and counts unterminated
+  generations. This is now litetune's gap rather than the toolchain's: the pinned
+  `litert-lm` does accept `--top-k`, `--top-p`, `--temperature` and `--seed`, and
+  they are not yet wired through.
+- **Passing tools natively is not supported.** litetune measures the path where
+  the application renders declarations into the prompt and parses calls out of
+  the response — what `flutter_gemma` does, and what every number here was
+  produced with. Handing the runtime a tool list instead (`litert-lm --preset`,
+  or the Kotlin `ConversationConfig.tools`) fails on a bundle built here with
+  `litert_lm_conversation_send_message_stream failed`. Reproduced on macOS; the
+  cause is not yet known, and no number in this README depends on that path.
 - **Evaluation is slower than it needs to be** — one subprocess per prompt. A
   persistent `litert-lm serve` client is worth roughly thirtyfold and is not
   implemented.

@@ -23,6 +23,7 @@ Liveness lives in `litetune.liveness`, quality in `litetune.verify`.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -486,6 +487,63 @@ def check_name(recipe: str) -> str:
     return f"export {recipe}"
 
 
+def repair_vocab_file(model_dir: Path) -> tuple[bool, str | None]:
+    """Point `vocab_file` at where the tokenizer actually is. Returns (ok, what happened).
+
+    `ok` is False only when a repair was needed and could not be made -- which
+    matters, because the export that follows will then die with the very error
+    this exists to prevent. Returning one string for both "here is what I did"
+    and "here is what went wrong" left the caller unable to tell them apart.
+
+    `export_lib.export_tokenizer` reads `tokenizer.vocab_file` and opens it
+    verbatim -- no resolution against the model directory. That field comes from
+    `tokenizer_config.json`, and `tune` writes an absolute path into it so the
+    exporter's SentencePiece branch fires at all: transformers 5.x stopped
+    writing `tokenizer.model` and the tokenizer classes stopped exposing
+    `vocab_file`, so without it every bundle silently gets an HF tokenizer
+    section and loses FST-constrained decoding.
+
+    An absolute path is correct exactly where it was written and wrong
+    everywhere else. Train on one machine and convert on another -- or in a
+    container with different mounts, or simply move the directory -- and the
+    export dies with `FileNotFoundError: /tmp/merged/tokenizer.model`, naming a
+    path that never existed here. Reproduced by exporting a checkpoint built on
+    a Linux worker from a laptop.
+
+    So the path is repaired at use, not trusted from write: where the checkpoint
+    *is* is knowable here and was not knowable there.
+    """
+    config = model_dir / "tokenizer_config.json"
+    beside = model_dir / "tokenizer.model"
+    if not config.exists():
+        return True, None
+    try:
+        data = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return False, f"could not read {config.name}: {exc}"
+    if not isinstance(data, dict):
+        return True, None
+
+    declared = data.get("vocab_file")
+    if declared and Path(declared).exists():
+        return True, None
+    if not beside.exists():
+        # Nothing to point at. Not an error: a BPE tokenizer has no such file,
+        # and a stale field with no file is left for the exporter to skip.
+        return True, None
+
+    data["vocab_file"] = str(beside.resolve())
+    try:
+        config.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as exc:
+        return False, f"could not rewrite {config.name}: {exc}"
+    return True, (
+        f"tokenizer_config.json in the checkpoint named a vocab_file that is not on this "
+        f"machine ({declared!r}); litetune rewrote it to point at {beside}. This modifies "
+        "the checkpoint directory, and the exporter reads that field verbatim"
+    )
+
+
 def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
     """Run one export. A non-zero exit is recorded, not raised."""
     name = check_name(recipe)
@@ -815,6 +873,23 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
         toolchain=Toolchain.unknown("not read yet", request.env.requirements),
     )
     result.limitations.append(NOT_VERIFIED)
+
+    # Before the toolchain is asked anything, and once for the sweep rather than
+    # once per recipe. A stale `vocab_file` fails the export outright, after the
+    # model has loaded, naming a path that never existed here.
+    #
+    # Reported and not merely logged: this writes to the *input* directory, and
+    # a tool that edits what you handed it must say so where you will see it.
+    model_path = Path(request.model)
+    if model_path.is_dir():
+        ok, note = repair_vocab_file(model_path)
+        if note:
+            events.note(note, model=request.model)
+            result.limitations.append(note)
+        if not ok:
+            result.limitations.append(
+                "the export below is likely to fail at `export_tokenizer` for the reason above"
+            )
     if request.unknown_recipes:
         result.limitations.append(
             f"recipes {list(request.unknown_recipes)} are not among the ones litetune has "

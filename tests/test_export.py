@@ -10,6 +10,7 @@ under test is built to record.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -580,3 +581,94 @@ def test_a_zero_byte_artifact_is_not_compared(toolchain, request_for):
 
     assert isinstance(result.comparison, Uncompared)
     assert "zero-byte" in result.comparison.reason
+
+
+def test_a_tokenizer_path_from_another_machine_is_repaired(tmp_path):
+    """`tune` writes an absolute `vocab_file`; the checkpoint then moves.
+
+    `export_lib.export_tokenizer` reads `tokenizer.vocab_file` and opens it
+    verbatim, with no resolution against the model directory. So a checkpoint
+    trained on one machine and converted on another dies with
+    `FileNotFoundError: /tmp/merged/tokenizer.model` -- a path that never
+    existed here -- after the model has finished loading.
+
+    Reproduced exactly that way: a checkpoint built on a Linux worker, exported
+    from a laptop. The path is a property of where the checkpoint is now, which
+    is knowable here and was not knowable there.
+    """
+    from litetune.export import repair_vocab_file
+
+    model = tmp_path / "merged"
+    model.mkdir()
+    (model / "tokenizer.model").write_bytes(b"sp")
+    config = model / "tokenizer_config.json"
+    config.write_text(
+        json.dumps({"vocab_file": "/tmp/merged/tokenizer.model", "model_max_length": 8192}),
+        encoding="utf-8",
+    )
+
+    ok, note = repair_vocab_file(model)
+
+    assert ok
+    assert note and "/tmp/merged/tokenizer.model" in note
+    written = json.loads(config.read_text(encoding="utf-8"))
+    assert written["vocab_file"] == str((model / "tokenizer.model").resolve())
+    assert written["model_max_length"] == 8192, "the rest of the config must survive"
+
+
+def test_a_vocab_file_that_resolves_is_left_alone(tmp_path):
+    from litetune.export import repair_vocab_file
+
+    model = tmp_path / "merged"
+    model.mkdir()
+    real = model / "tokenizer.model"
+    real.write_bytes(b"sp")
+    config = model / "tokenizer_config.json"
+    config.write_text(json.dumps({"vocab_file": str(real)}), encoding="utf-8")
+
+    assert repair_vocab_file(model) == (True, None)
+    assert json.loads(config.read_text(encoding="utf-8"))["vocab_file"] == str(real)
+
+
+def test_a_bpe_checkpoint_needs_no_repair_and_is_not_an_error(tmp_path):
+    """Qwen's tokenizer is BPE: there is no `tokenizer.model` to point at."""
+    from litetune.export import repair_vocab_file
+
+    model = tmp_path / "merged"
+    model.mkdir()
+    (model / "tokenizer_config.json").write_text(
+        json.dumps({"vocab_file": "/tmp/gone/tokenizer.model"}), encoding="utf-8"
+    )
+
+    assert repair_vocab_file(model) == (True, None)
+
+
+def test_run_export_repairs_the_path_and_says_so(toolchain, request_for, tmp_path, monkeypatch):
+    """The call site, not just the function.
+
+    Three tests can prove `repair_vocab_file` works and none of them notice if
+    nobody calls it -- and the call is what disappears in a refactor. This one
+    drives `run_export` and asserts both that the repair happened and that the
+    run said so: it edits the directory the caller handed in, and a tool that
+    modifies your input must report it where you will read it.
+    """
+    from litetune.export import run_export
+
+    model = tmp_path / "merged"
+    model.mkdir()
+    (model / "tokenizer.model").write_bytes(b"sp")
+    config = model / "tokenizer_config.json"
+    config.write_text(
+        json.dumps({"vocab_file": "/tmp/elsewhere/tokenizer.model"}), encoding="utf-8"
+    )
+
+    request = request_for(("weight_only_wi8_afp32",))
+    object.__setattr__(request, "model", str(model))
+    result = run_export(request)
+
+    assert json.loads(config.read_text(encoding="utf-8"))["vocab_file"] == str(
+        (model / "tokenizer.model").resolve()
+    )
+    repaired = [line for line in result.limitations if "vocab_file" in line]
+    assert repaired, "a rewrite of the caller's own directory must reach the report"
+    assert "/tmp/elsewhere/tokenizer.model" in repaired[0]

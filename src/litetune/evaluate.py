@@ -481,9 +481,11 @@ class LiteRtLmBackend:
     declared_prompt_mode: PromptMode | None = None
 
     name = "litert-lm"
-    # The pinned CLI takes no decoding flags, so `decode` is a declaration here
-    # and not an instruction. Stated as a value rather than left to a default,
-    # because the asymmetry is the thing `verify` reports as a limitation.
+    # litetune passes no decoding flags to this CLI, so `decode` is a
+    # declaration here and not an instruction. Stated as a value rather than
+    # left to a default, because the asymmetry is what `verify` reports as a
+    # limitation -- and it is litetune's gap, not the toolchain's: 0.16.1 does
+    # accept --top-k, --top-p, --temperature and --seed.
     decode_enforced = False
 
     @property
@@ -525,11 +527,12 @@ class LiteRtLmBackend:
             "prompt_mode": self.prompt_mode.value,
             "prompt_mode_declared": self.declared_prompt_mode is not None,
             "template_flag": None if self.uses_template else "--no-template",
-            # The pinned CLI takes no decoding flags, so `decode` is the
-            # *declared* configuration: greedy, to the runtime's own token
-            # limit. It is recorded because comparability depends on it, and
-            # any deviation must be passed through `extra_args` where it is
-            # visible in `argv_template` above.
+            # Nothing here is passed to the CLI, so `decode` is the *declared*
+            # configuration: greedy, to the runtime's own token limit. It is
+            # recorded because comparability depends on it, and any deviation
+            # must be passed through `extra_args` where it is visible in
+            # `argv_template` above -- which is also how the CLI's own
+            # --top-k/--top-p/--temperature/--seed would reach it today.
             "decode_declared": self.decode.as_dict(),
             "decode_passed_to_cli": self.decode_enforced,
         }
@@ -902,9 +905,9 @@ class MeasurementPoint:
     split_id: str
     engine: dict[str, Any]
     generations: tuple[Generation, ...] = ()
-    # Whether `decode` governed this measurement or merely describes it. The
-    # pinned litert-lm CLI takes no decoding flags, so a device point declares
-    # the same config the reference point enforces -- and comparing the two
+    # Whether `decode` governed this measurement or merely describes it.
+    # litetune hands the device side nothing, so a device point declares the
+    # same config the reference point enforces -- and comparing the two
     # fingerprints finds them equal, which is agreement about a declaration
     # rather than about what ran.
     # Required and keyword-only, with no default. `True` here is the optimistic
