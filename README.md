@@ -113,9 +113,14 @@ One JSON object per line:
 ```
 
 Training rows add a `completion` field with the text the model should produce.
-`prepare` builds both splits from a raw file and reports the token-length
-distribution, so a row too long for the sequence limit fails before you rent a
-GPU rather than after.
+
+`prepare` splits one raw file into `train.jsonl` and `heldout.jsonl`. The
+held-out half is never trained on — scoring a model on rows it was fitted to
+measures memorisation, not whether it answers new inputs, and on a small model
+the two can differ enormously. `prepare` splits by content hash rather than
+position, so re-running it puts the same rows on the same side, and it reports
+the token-length distribution so a row too long for the sequence limit fails
+before you rent a GPU rather than after.
 
 ---
 
@@ -160,7 +165,9 @@ Wiring `|| exit 1` on anything non-zero throws all of this away.
 
 ## Results
 
-`functiongemma-270m-it`, LoRA on `google/mobile-actions`, 640 held-out examples:
+`functiongemma-270m-it`, LoRA on `google/mobile-actions`, scored on **640
+examples the model never trained on** — the single-call rows of the dataset's
+`eval` split. Exact match means the tool name **and** every argument value.
 
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
 |---|---|---|---|
