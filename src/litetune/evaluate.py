@@ -38,7 +38,7 @@ from typing import Any, Protocol
 from litetune import envs
 from litetune.events import EventStream
 from litetune.exits import read_returncode
-from litetune.metrics import ToolCall
+from litetune.metrics import ToolCall, read_target
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +256,9 @@ class DataError(ValueError):
 class Example:
     index: int
     prompt: str
-    target: ToolCall | None  # None == unlabelled; contributes to liveness only
+    # A call for `tool-call` scoring, a string for `exact-text`, `None` for an
+    # unlabelled row -- which contributes to liveness only.
+    target: ToolCall | str | None
 
 
 @dataclass(frozen=True)
@@ -311,7 +313,7 @@ def load_split(path: Path, limit: int | None = None) -> Split:
         if not isinstance(obj, dict) or "prompt" not in obj:
             raise DataError(f"{path}:{lineno}: expected an object with a 'prompt' field")
         try:
-            target = ToolCall.from_target(obj.get("target"))
+            target = read_target(obj.get("target"))
         except ValueError as exc:
             raise DataError(f"{path}:{lineno}: {exc}") from exc
         examples.append(Example(index=len(examples), prompt=str(obj["prompt"]), target=target))
@@ -322,7 +324,10 @@ def load_split(path: Path, limit: int | None = None) -> Split:
 
     payload = json.dumps(
         [
-            {"prompt": e.prompt, "target": e.target.as_dict() if e.target else None}
+            {
+                "prompt": e.prompt,
+                "target": (e.target.as_dict() if isinstance(e.target, ToolCall) else e.target),
+            }
             for e in examples
         ],
         sort_keys=True,

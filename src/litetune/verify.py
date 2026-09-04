@@ -40,6 +40,7 @@ from litetune import models
 from litetune.checks import Check, Outcome, guard
 from litetune.evaluate import (
     GREEDY,
+    DataError,
     DecodeConfig,
     GenerationBackend,
     HuggingFaceBackend,
@@ -63,13 +64,13 @@ from litetune.liveness import (
     unterminated_count,
 )
 from litetune.metrics import (
+    SCORERS,
     Difference,
     Proportion,
     QualityMetrics,
     Unavailable,
     agreement,
     paired_difference,
-    score,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,19 @@ class VerifyRequest:
     reference_role: ReferenceRole = ReferenceRole.FLOAT_TWIN
     decode: DecodeConfig = GREEDY
     thresholds: LivenessThresholds = DEFAULT_THRESHOLDS
+    # What "correct" means. Everything after this point -- the paired
+    # comparison, the intervals, whether a difference resolves, the exit code --
+    # reads only the per-example booleans, so this is the single place a task
+    # other than tool calling has to change.
+    scorer: str = "tool-call"
+
+    def __post_init__(self) -> None:
+        if self.scorer not in SCORERS:
+            raise DataError(
+                f"unknown scorer {self.scorer!r}. Known: {sorted(SCORERS)}. "
+                "The scorer decides what 'correct' means; litetune will not guess it"
+            )
+
     max_conversion_cost: float | None = None
     # How the prompt reaching the model is built. Declared by the caller wins;
     # otherwise `contract` -- the bundle the artifact shipped with, which is
@@ -297,6 +311,12 @@ class _Run:
             "reference": {
                 "ref": self.request.reference,
                 "role": self.request.reference_role.value,
+            },
+            # What "correct" meant. Two manifests scored differently are not
+            # comparable, and nothing else in the file would say so.
+            "scorer": {
+                "name": self.request.scorer,
+                "means": SCORERS[self.request.scorer].describes,
             },
             "harness": {
                 "decode_requested": self.request.decode.as_dict(),
@@ -564,14 +584,16 @@ def run_verify(
     with guard("quality measured") as sink:
         indices = [e.index for e in labelled]
         targets = [e.target for e in labelled if e.target is not None]
-        candidate_metrics = score(targets, [candidate.generations[i].text for i in indices])
-        reference_metrics = score(targets, [reference.generations[i].text for i in indices])
+        scorer = SCORERS[request.scorer]
+        candidate_metrics = scorer(targets, [candidate.generations[i].text for i in indices])
+        reference_metrics = scorer(targets, [reference.generations[i].text for i in indices])
         agreed = agreement(candidate.texts, reference.texts)
         sink.append(
             Check.passed(
                 "quality measured",
-                f"scored {candidate_metrics.n} labelled examples on both sides",
-                observed={"n": candidate_metrics.n},
+                f"scored {candidate_metrics.n} labelled examples on both sides "
+                f"with the {scorer.name} scorer: {scorer.describes}",
+                observed={"n": candidate_metrics.n, "scorer": scorer.name},
             )
         )
     if not run.record(sink[0]).conclusive:

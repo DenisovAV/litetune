@@ -1,17 +1,39 @@
 # litetune
 
-**Fine-tune, convert and verify small models for on-device. Know what the
+**Fine-tune a small model, convert it to run on a phone, and know what the
 conversion cost you.**
 
-- **tune** — supervised fine-tuning, optional (bring your own checkpoint and skip it)
+Getting from a Hugging Face checkpoint to a model that works inside your app is
+a long road — LoRA, merge, export to `.litertlm`, bundle metadata — and a
+mistake at any step produces a file of the right size that loads without error
+and is broken while every check stays green. litetune walks that road and knows
+the traps on it.
+
+The output is a `.litertlm` bundle: what LiteRT-LM loads, and what the
+`flutter_gemma` plugin runs on Android and iOS.
+
+Any task shaped as prompt → completion works. What "correct" means is the one
+thing you choose: `--scorer tool-call` for function calling, where the operation
+name and every argument value must match, or `--scorer exact-text` where there
+is one right string. Everything after scoring — the paired comparison, the
+intervals, whether a difference resolves, the exit code — reads only whether
+each example was right, so it does not know or care which task you brought.
+
+- **prepare** — split the data, and reject rows that cannot be scored
+- **tune** — LoRA or full fine-tuning, with the wiring the export needs
 - **convert** — checkpoint to `.litertlm`, across quantization recipes
-- **verify** — measure what conversion cost, before you ship
+- **verify** — measure what the conversion cost, before you ship
+- **bundle** — package the artifact with what was measured about it
 
-Converting a model to run on a phone changes its answers. Most tooling tells you
-the conversion succeeded. This tells you what it cost.
+Everything runs on CPU, which is workable at 270M and the first thing you will
+want to change above about 1B. Bring your own checkpoint and skip the first two
+steps, or bring a `.litertlm` and its float checkpoint and run only `verify`.
 
-> **Alpha.** Tested end to end on `google/functiongemma-270m-it` only. Other
-> models are not claimed to work. Try it on yours and open an issue.
+> **Alpha.** Measured end to end on `google/functiongemma-270m-it` and function
+> calling only. The other scorer is tested but no task has been measured through
+> it end to end. Gemma 3,
+> Gemma 4 and Qwen3.5 export — litetune carries their required flags — but no
+> quality number has been established for them. Try it on yours and open an issue.
 
 ---
 
@@ -27,54 +49,71 @@ Or through Homebrew, which brings its own Python 3.12:
 brew install DenisovAV/tap/litetune
 ```
 
-Python 3.10–3.12. On Linux you also need the `libvulkan1` system package:
+**Linux or macOS**, Python 3.10–3.12. On Linux you also need `libvulkan1` —
+`litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, and
+without it every invocation, `--help` included, dies in under a second:
 
 ```bash
 sudo apt-get install -y libvulkan1     # Debian/Ubuntu
 ```
 
-macOS needs nothing extra. Colab works out of the box. See
-[Requirements](#requirements) for why Vulkan is needed even on CPU, and what
-runs on 3.13.
+macOS needs nothing extra; Colab works out of the box; Windows is untried.
+
+Python 3.13 runs `tune`, `prepare` and `bundle` but not `convert` or `verify`:
+each stage builds its own environment from the interpreter you launched, and
+`numpy==2.0.2` — pinned by the export toolchain — stops publishing wheels after
+3.12. Past a ceiling the command refuses and names the pin that set it.
+
+First run of `tune`, `convert` or `verify` builds that environment and pulls
+`torch`: several gigabytes and a few minutes, cached afterwards.
 
 ---
 
-## Quick start
+## Your data
 
-**If you already have a `.litertlm`**, this is the whole tool in one command.
-Nothing is retrained, no data leaves your machine:
+One JSON object per line. Scoring rows need a `prompt` and a `target`; training
+rows add the `completion` text the model should produce, or let `prepare` derive
+it from the target.
 
-```bash
-litetune verify --model ./your-model.litertlm \
-                --reference ./the-checkpoint-it-came-from \
-                --data held-out.jsonl
+**The shape of the target is how you declare the task.** An object with a `name`
+is a tool call:
+
+```json
+{"prompt": "set an alarm for 7", "target": {"name": "set_alarm", "args": {"hour": "7"}}}
 ```
 
-`--reference` is the **float twin** — the same weights before conversion. That is
-what makes the difference between them the conversion cost, rather than a
-mixture of that and whatever training did.
+A bare string is the answer itself:
 
-Pointing it at a different checkpoint (an untuned base, say) needs
-`--reference-role untuned_base`, and then both the training gain and the
-conversion cost are reported as unavailable: one number cannot separate two
-effects.
+```json
+{"prompt": "classify the sentiment: it was fine", "target": "neutral"}
+```
 
-First run provisions two environments and pulls `torch` — several gigabytes and
-a few minutes. Later runs reuse them.
+Two shapes rather than a target plus a `--target-kind`, because those two could
+disagree and a shape cannot disagree with itself. Match it with `--scorer` when
+you get to `verify`.
+
+`prepare` splits one raw file into `train.jsonl` and `heldout.jsonl` and rejects
+what it cannot score: malformed JSON, and rows with no `prompt`. Given
+`--tokenizer` it also reports the token-length distribution, so a row too long
+for the sequence limit fails before you rent a GPU rather than after.
+
+The held-out half is never trained on. Scoring a model on rows it was fitted to
+measures memorisation rather than whether it answers new inputs. The split is
+derived from the file's content hash, so re-running `prepare` puts the same rows
+on the same side.
 
 ---
 
-## The full pipeline
+## From your data to a shippable bundle
 
-Five commands, run in order. Each is a separate subcommand because each fails
-differently, and a single `run` would hide which one you are in.
+Five commands, in order. Each is separate because each fails differently, and a
+single `run` would hide which one you are in.
 
 ```bash
-# 1. Split the data, and refuse what cannot be measured. Seconds.
-litetune prepare --data raw.jsonl --output-dir data \
-                 --context-length 1024 --tokenizer google/functiongemma-270m-it
+# 1. Split, and reject rows that cannot be scored. Seconds.
+litetune prepare --data raw.jsonl --output-dir data --context-length 1024
 
-# 2. Fine-tune. Runs on CPU, so size your expectations accordingly.
+# 2. Fine-tune. On CPU, so size your expectations accordingly.
 litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
               --output-dir tuned --prompt-mode prerendered --method lora
 
@@ -83,6 +122,7 @@ litetune convert --model tuned/model --output-dir artifacts \
                  --recipe dynamic_wi8_afp32 --recipe weight_only_wi8_afp32
 
 # 4. Measure what the conversion cost, against the float twin.
+#    `convert` names the artifact; look the filename up rather than build it.
 litetune verify --model artifacts/weight_only_wi8_afp32/<name>.litertlm \
                 --reference tuned/model --data data/heldout.jsonl \
                 --json > manifest.json
@@ -98,36 +138,151 @@ litetune bundle --output-dir bundle \
                 --verify-manifest manifest.json
 ```
 
-`convert` names the artifact itself, one per recipe under `artifacts/<recipe>/`,
-so step 4 needs you to look the filename up rather than construct it.
+**Step 3 already gives you something shippable** — one `.litertlm` per recipe,
+under `artifacts/<recipe>/`. Steps 1–3 are also the part most tooling makes you
+assemble by hand; see [What it knows](#what-it-knows-that-a-shell-script-does-not)
+for what they do beyond calling the exporter yourself.
 
-### Flags worth knowing about
+**Steps 4 and 5 are what makes it trustworthy.** `--reference` is the **float
+twin**: the same weights before conversion. That is what makes the difference
+between the two the conversion cost rather than a mixture of that and whatever
+training did. Point it at a different checkpoint — an untuned base, say — and
+pass `--reference-role untuned_base`, and both the training gain and the
+conversion cost come back unavailable, because one number cannot separate two
+effects.
+
+If you already have a `.litertlm` and the checkpoint it came from, step 4 runs on
+its own.
+
+### Recipes
+
+litetune knows four, and has measured two:
+
+| recipe | |
+|---|---|
+| `dynamic_wi8_afp32` | the toolchain's default; its own docstring warns quality "may suffer" |
+| `weight_only_wi8_afp32` | dequantizes before compute, so slower by an unmeasured amount |
+| `dynamic_wi4_afp32` | 4-bit, unmeasured here |
+| `weight_only_wi4_afp32` | 4-bit, unmeasured here |
+
+`--recipe` has no default. A sweep of one is not a comparison.
+
+### Other flags that decide something
 
 | Flag | Why it matters |
 |---|---|
 | `--prompt-mode` | No default. `prerendered` means your app renders the tool declarations into the prompt and the runtime must not template again; `runtime_rendered` is the opposite. Must be the **same** value in `tune` and `bundle` — the wrong one produces a fluent wrong answer, not an error. |
-| `--recipe` | No default. A sweep of one is not a comparison, and picking a recipe without measuring the alternative is what this tool exists to stop. |
-| `--adapter` | For a LoRA run, pass `<tune output>/adapter`. `tune` merges the adapter into the checkpoint and a merged checkpoint cannot be un-merged, so this is the only form you can re-apply to a different base or ship separately. Point it outside `--output-dir`. |
-| `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused — they resolve to different weights on different days while the bundle reads identically. A tag is accepted and recorded as a weaker pin than it looks. |
+| `--adapter` | For a LoRA run, pass `<tune output>/adapter`, from outside `--output-dir`. Without it the bundle carries only the merged weights. |
+| `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused: they resolve to different weights on different days while the bundle reads identically. |
+| `--scorer` | What counts as correct, on `verify`. `tool-call` (default) or `exact-text`. It has to match the shape of your targets; nothing else in the pipeline changes. The manifest records which one ran, because two manifests scored differently are not comparable. |
 | `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. See [MEASUREMENTS.md](MEASUREMENTS.md). |
 
-### Your data file
+---
 
-One JSON object per line:
+## What it knows that a shell script does not
 
-```json
-{"prompt": "set an alarm for 7", "target": {"name": "set_alarm", "args": {"hour": "7"}}}
-```
+Each of these was paid for once, by an artifact that looked fine and was not.
 
-Training rows add a `completion` field with the text the model should produce.
+**Export flags keyed on model identity.** They are in no documentation, and
+`config.json` does not contain enough to derive them:
 
-`prepare` splits one raw file into `train.jsonl` and `heldout.jsonl`. The
-held-out half is never trained on — scoring a model on rows it was fitted to
-measures memorisation, not whether it answers new inputs, and on a small model
-the two can differ enormously. `prepare` splits by content hash rather than
-position, so re-running it puts the same rows on the same side, and it reports
-the token-length distribution so a row too long for the sequence limit fails
-before you rent a GPU rather than after.
+| family | flags litetune adds |
+|---|---|
+| `functiongemma` | `--litert_lm_model_type_override=function_gemma` |
+| `gemma-3-text` | `--litert_lm_model_type_override=gemma3` |
+| `gemma-4-e2b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm` |
+
+Without the first, FunctionGemma exports as a generic model — its `config.json`
+says `gemma3_text`, which the exporter does not recognise, so it falls through a
+silent catch-all. The runtime then builds no tool-call channel at all. An app
+that parses the response text sees nothing wrong; an app that passes tools
+natively receives no calls. The export succeeds, the file is the right size,
+every liveness check is green.
+
+**The terminator comes from the chat template, not from `eos_token_id`.** They
+are not always the same token, and a model trained to emit the wrong one never
+closes its turn — on a device it emits call after call, and a consumer that
+delimits the reply by the turn marker cannot find the end of one.
+
+**The adapter is saved before the merge.** A merged checkpoint cannot be
+un-merged, so the rank-16 delta is the only form you can re-apply to a different
+base, inspect, or ship on its own.
+
+**`tokenizer.model` is carried back.** `transformers` 5.x stopped writing it and
+the tokenizer classes stopped exposing `vocab_file`, so the exporter's
+SentencePiece branch never fires and the bundle silently gets an HF tokenizer
+section — losing FST-constrained decoding, which is SentencePiece-only. `tune`
+copies the file back and records in `metrics.json` whether it managed to.
+
+**Minimum `transformers` per family.** Gemma 4 and Qwen3.5 fail at tokenizer
+load on every 4.x release, and Gemma 4 needs 5.5.0 for `AutoConfig` to recognise
+the architecture. litetune refuses with the version rather than letting you find
+out from an `AttributeError`.
+
+**One environment per stage.** The training stack and the export toolchain pin
+incompatible dependencies and cannot share an interpreter.
+
+---
+
+## Results
+
+`functiongemma-270m-it`, LoRA on `google/mobile-actions`, scored on 640 examples
+the model never trained on:
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Base | 0.7266 | — | — |
+| Fine-tuned | 0.9172 | 0.9016 | 0.9047 |
+| Cost of conversion | — | +0.0156 *(within noise)* | +0.0125 |
+
+Your gain from fine-tuning depends on your data. What this table is here to show
+is the last row: conversion cost something, it was small, and one of the two
+figures is not distinguishable from zero at this sample size.
+
+The two artifacts are 0.04% apart in bytes. Nothing in file size, exit code or
+logs separates them — running both against held-out data is the only thing that
+does.
+
+**[MEASUREMENTS.md](MEASUREMENTS.md)** has the intervals, three runs of the same
+configuration and what they disagree about, and which published claims were
+withdrawn after re-measurement.
+
+---
+
+## Limitations
+
+**Known to be broken**
+
+- **Passing tools natively fails.** Handing the runtime a tool list — `litert-lm
+  --preset`, or the Kotlin `ConversationConfig.tools` — raises
+  `litert_lm_conversation_send_message_stream failed` on a bundle built here.
+  The cause is not known. Only the prompt-rendered path, which is what
+  `flutter_gemma` uses, is supported and measured.
+- **Peak memory is not bounded.** Training this model on 8,693 examples was
+  OOM-killed at 32 GiB more than once. There is no preflight check; a death with
+  no Python traceback is probably this.
+
+**Limits on the numbers**
+
+- **Measured on one model.** `functiongemma-270m-it`. Other families export but
+  have no quality figure.
+- **Measurement runs on CPU; your users run on a phone.** The GPU backend is
+  reported to score below CPU on identical artifacts, and litetune has not
+  measured that gap, so every number here is an optimistic estimate.
+- **Two prompt renderings are in the field** for the same model, and they
+  disagree for every declaration with more than one property. Costly on a base
+  checkpoint, near-free after fine-tuning; `contract.json` records which you
+  used. See [MEASUREMENTS.md](MEASUREMENTS.md).
+
+**Not built yet**
+
+- **Decoding parameters reach only one side.** litetune passes none to the
+  device, so the reference is held to an explicit token limit while the device
+  runs to the runtime's own. The manifest says so and counts unterminated
+  generations.
+- **Evaluation is slower than it needs to be** — one subprocess per prompt. A
+  persistent `litert-lm serve` client is worth roughly thirtyfold.
+- **`.litertlm` only**, no library API, and no single `run` command.
 
 ---
 
@@ -140,8 +295,8 @@ why there are five and not two.
 | | `verify` | `prepare` / `tune` / `convert` | `bundle` |
 |---|---|---|---|
 | **0** | passed | passed | passed |
-| **1** | failed a gate, or a label-free check | failed | failed |
-| **2** | inconclusive: the interval does not resolve the threshold | — | **the default** |
+| **1** | scored below the threshold you set | failed | failed |
+| **2** | inconclusive: the measurement cannot tell | — | **the default** |
 | **3** | nothing established: no labelled data, or a difference that cannot be attributed | — | carried in |
 | **4** | could not check — a harness fault, a bad command line, or a refused request | same | same |
 
@@ -156,79 +311,6 @@ measurement, and a typo should not produce one.
 re-measures nothing.
 
 Wiring `|| exit 1` on anything non-zero throws all of this away.
-
----
-
-## Requirements
-
-| | |
-|---|---|
-| **Linux or macOS** | On Linux, `litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, so `libvulkan1` is required — without it every invocation, `--help` included, dies in under a second. macOS needs no such package. Verified on Apple silicon: `litetune convert` provisioned its own environment and produced a 455,759,152-byte `.litertlm` — the same byte count as the Linux runs — and `litert-lm` answered a real tool-calling prompt with the correct call. Windows is untried. |
-| **Python 3.10–3.13** | Stage environments are built from the interpreter running litetune, so each has its own ceiling: `numpy==2.0.2` (3.12) for `convert` and `verify`, `torch==2.5.1` (3.13) for `tune` and `prepare --tokenizer`. `bundle` provisions nothing. Past a ceiling the command refuses and names the pin that set it. |
-| **CPU only** | All five stages. `convert` sets `CUDA_VISIBLE_DEVICES=""` so an export cannot depend on an accelerator. Workable for a 270M model; above that it is the first thing to fix. |
-| **Disk** | Several GB for the provisioned environments, cached between runs. |
-
----
-
-## Results
-
-`functiongemma-270m-it`, LoRA on `google/mobile-actions`, scored on **640
-examples the model never trained on** — the single-call rows of the dataset's
-`eval` split. Exact match means the tool name **and** every argument value.
-
-| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
-|---|---|---|---|
-| Base | 0.7266 | — | — |
-| Fine-tuned | **0.9172** | 0.9016 | 0.9047 |
-| Cost of conversion | — | +0.0156 *(unresolved)* | **+0.0125** |
-
-Fine-tuning gained **+0.19**; conversion cost between 0.006 and 0.019 depending
-on the run. Nothing in file size, exit code or logs separates the two artifacts —
-they are 0.04% apart in bytes. Running both against held-out data is the only
-thing that does.
-
-**[MEASUREMENTS.md](MEASUREMENTS.md)** has the full story: three runs of the same
-configuration and what they disagree about, why the intervals are paired, and
-which published claims were withdrawn after re-measurement.
-
----
-
-## Limitations
-
-- **Measured on one model.** `functiongemma-270m-it` only. The code is not
-  specific to it, but nothing else has been measured.
-- **Measurement runs on CPU; your users run on a phone.** Published reports put
-  the GPU backend materially below CPU on identical artifacts, so every number
-  here is an optimistic estimate.
-- **Peak memory is not bounded.** Training this model on 8,693 examples was
-  OOM-killed at 32 GiB more than once. There is no preflight check; a death with
-  no Python traceback is probably this.
-- **The SentencePiece tokenizer is restored by hand.** `transformers` 5.x stopped
-  writing `tokenizer.model`, and without it a bundle silently gets an HF
-  tokenizer section and loses FST-constrained decoding. `tune` copies it back and
-  records whether it managed to — check that field.
-- **Two prompt renderings are in the field** for the same model, and they
-  disagree for every declaration with more than one property. Costly on a base
-  checkpoint, near-free after fine-tuning; `contract.json` records which you
-  used. See [MEASUREMENTS.md](MEASUREMENTS.md).
-- **Decoding parameters reach only one side.** litetune passes none to the
-  device side, so the reference is held to an explicit token limit while the
-  device runs to the runtime's own. The manifest says so and counts unterminated
-  generations. This is now litetune's gap rather than the toolchain's: the pinned
-  `litert-lm` does accept `--top-k`, `--top-p`, `--temperature` and `--seed`, and
-  they are not yet wired through.
-- **Passing tools natively is not supported.** litetune measures the path where
-  the application renders declarations into the prompt and parses calls out of
-  the response — what `flutter_gemma` does, and what every number here was
-  produced with. Handing the runtime a tool list instead (`litert-lm --preset`,
-  or the Kotlin `ConversationConfig.tools`) fails on a bundle built here with
-  `litert_lm_conversation_send_message_stream failed`. Reproduced on macOS; the
-  cause is not yet known, and no number in this README depends on that path.
-- **Evaluation is slower than it needs to be** — one subprocess per prompt. A
-  persistent `litert-lm serve` client is worth roughly thirtyfold and is not
-  implemented.
-- **`.litertlm` only**, and there is no library API or single `run` command yet;
-  the config format that would drive one is implemented but not wired to the CLI.
 
 ---
 

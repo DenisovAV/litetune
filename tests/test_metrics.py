@@ -226,3 +226,70 @@ def test_agreement_ignores_formatting_differences():
     a = ["call:x{p:<escape>1<escape>}", "call:y{}"]
     b = ["call:x{ p : <escape>1<escape> }", "call:z{}"]
     assert agreement(a, b).value == 0.5
+
+
+def test_exact_text_scores_one_right_answer_and_claims_no_decomposition():
+    """A task with one right string has nothing to split into name and arguments.
+
+    Both are `Unavailable` rather than zero: a zero would read as a measurement
+    of something, and there is nothing there to measure.
+    """
+    from litetune.metrics import Unavailable, score_exact_text
+
+    metrics = score_exact_text(
+        ["red", "blue", "green"],
+        ["red\n", "  blue  ", "yellow"],
+    )
+
+    # Whitespace is forgiven; nothing else is.
+    assert metrics.correct == (True, True, False)
+    assert metrics.exact_match.value == pytest.approx(2 / 3)
+    assert metrics.parse_rate.value == 1.0
+    assert isinstance(metrics.name_accuracy, Unavailable)
+    assert isinstance(metrics.argument_accuracy, Unavailable)
+
+
+def test_a_scorer_refuses_rather_than_returning_a_degenerate_number():
+    from litetune.metrics import score_exact_text
+
+    with pytest.raises(ValueError, match="empty split"):
+        score_exact_text([], [])
+    with pytest.raises(ValueError, match="2 targets against 1 outputs"):
+        score_exact_text(["a", "b"], ["a"])
+
+
+def test_both_shipped_scorers_carry_their_own_name_and_meaning():
+    """The manifest records which one ran; two manifests scored differently are
+    not comparable, and nothing else in the file would say so."""
+    from litetune.metrics import SCORERS
+
+    assert set(SCORERS) == {"tool-call", "exact-text"}
+    for key, scorer in SCORERS.items():
+        assert scorer.name == key
+        assert scorer.describes.startswith("correct means")
+
+
+def test_the_statistics_below_a_scorer_do_not_know_the_task():
+    """The claim the whole design rests on, asserted rather than assumed.
+
+    `paired_difference` consumes the per-example booleans and nothing else, so
+    a tool-call run and an exact-text run with the same hit pattern must produce
+    the same difference, interval and verdict. If that ever stops being true,
+    swapping the scorer stops being safe.
+    """
+    from litetune.metrics import SCORERS, paired_difference, score_exact_text
+
+    # Same pattern of agreement, reached two different ways.
+    text_a = score_exact_text(["x"] * 8, ["x"] * 6 + ["no", "no"])
+    text_b = score_exact_text(["x"] * 8, ["x"] * 4 + ["no"] * 4)
+    assert text_a.correct == (True,) * 6 + (False, False)
+    assert text_b.correct == (True,) * 4 + (False,) * 4
+
+    difference = paired_difference(text_a.correct, text_b.correct)
+    assert difference.value == pytest.approx(2 / 8)
+    assert difference.discordant == 2
+    assert difference.method == "paired (McNemar)"
+    # It reports the interval and the verdict without ever asking what the task
+    # was -- which is the property that makes swapping the scorer safe.
+    assert "does not resolve" in difference.detail
+    assert SCORERS["tool-call"].name == "tool-call"

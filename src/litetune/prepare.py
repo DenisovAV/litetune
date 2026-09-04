@@ -53,7 +53,7 @@ from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.liveness import SkippedCheck
-from litetune.metrics import Proportion, ToolCall, Unavailable
+from litetune.metrics import Proportion, ToolCall, Unavailable, read_target
 from litetune.spec import DEFAULT_MIN_HELDOUT_EXAMPLES
 from litetune.storage import hash_file
 
@@ -138,17 +138,25 @@ class Row:
     lineno: int
     prompt: str
     completion: str
-    target: ToolCall | None
+    target: ToolCall | str | None
 
     @property
     def tool(self) -> str:
-        return self.target.name if self.target is not None else "<unlabelled>"
+        """The operation this row asks for, for the argument profile to group by.
+
+        A string target has no operation -- the answer is the whole thing -- so
+        the profile has nothing to group and says so rather than inventing a
+        bucket.
+        """
+        if isinstance(self.target, ToolCall):
+            return self.target.name
+        return "<unlabelled>"
 
     def as_record(self) -> dict[str, Any]:
         return {
             "prompt": self.prompt,
             "completion": self.completion,
-            "target": self.target.as_dict() if self.target is not None else None,
+            "target": (self.target.as_dict() if isinstance(self.target, ToolCall) else self.target),
             # Kept so that a row flagged downstream can be found in the file it
             # came from. A row identified only by its position in a shuffled
             # split is a row nobody can go and look at.
@@ -181,13 +189,15 @@ def read_rows(path: Path) -> list[Row]:
         if not isinstance(obj, dict) or "prompt" not in obj:
             raise PrepareError(f"{path}:{lineno}: expected an object with a 'prompt' field")
         try:
-            target = ToolCall.from_target(obj.get("target"))
+            target = read_target(obj.get("target"))
         except ValueError as exc:
             raise PrepareError(f"{path}:{lineno}: {exc}") from exc
 
         completion = obj.get("completion")
         if completion is None and target is not None:
-            completion = render_call(target)
+            # A string target is already the text to supervise; a call has to be
+            # rendered into the wire format the model is trained to emit.
+            completion = render_call(target) if isinstance(target, ToolCall) else target
         if not isinstance(completion, str) or not completion.strip():
             raise PrepareError(
                 f"{path}:{lineno}: no supervised span. A row needs a 'completion' string or a "
@@ -599,7 +609,10 @@ def profile_arguments(rows: Iterable[Row]) -> tuple[ArgumentProfile, ...]:
     """Cardinality and extractiveness for every (tool, argument) pair."""
     seen: dict[tuple[str, str], list[tuple[str, str]]] = {}
     for row in rows:
-        if row.target is None:
+        # A string target has no arguments to profile: the answer is the whole
+        # thing. Skipped rather than forced into a one-argument shape, which
+        # would report cardinality for a field that does not exist.
+        if not isinstance(row.target, ToolCall):
             continue
         for argument, value in row.target.args.items():
             seen.setdefault((row.target.name, argument), []).append((value, row.prompt))
@@ -938,11 +951,26 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     result.arguments = profile_arguments(rows)
     unscoreable = result.unscoreable
     if not result.arguments:
+        # Two reasons produce no argument profile, and they are not the same
+        # news. String targets are a task with no arguments -- there is nothing
+        # to warn about. Absent targets are a split nobody can score at all.
+        labelled = sum(1 for row in rows if row.target is not None)
+        if labelled:
+            detail = (
+                "every target is a string, so there are no arguments to profile. With "
+                "`--scorer exact-text` the whole answer is the unit and per-argument "
+                "cardinality does not apply; this check has nothing to say about such a "
+                "split, which is not the same as saying the split is fine"
+            )
+        else:
+            detail = (
+                "no row carries a 'target', so there are no arguments to profile and "
+                "nothing here can say whether exact match would measure anything"
+            )
         scoreability = Check.unchecked(
             SCOREABILITY_CHECK,
-            "no row carries a 'target', so there are no arguments to profile and nothing here "
-            "can say whether exact match would measure anything",
-            observed={"rows": len(rows)},
+            detail,
+            observed={"rows": len(rows), "labelled": labelled},
         )
     elif len(unscoreable) == len(result.arguments):
         # Every argument invented rather than quoted: exact match has nothing
