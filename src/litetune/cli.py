@@ -947,7 +947,17 @@ def _read_base_model(metrics: Path | None) -> str | None:
     if not isinstance(recorded, dict):
         raise DataError(f"{metrics} holds {type(recorded).__name__}, not training metrics")
     base = recorded.get("base_model")
-    return str(base) if base else None
+    if base is None:
+        # The caller typed --train-metrics; answering None sends them back to
+        # guessing from the path, and the refusal they would then get tells them
+        # to pass the flag they just passed.
+        raise DataError(
+            f"{metrics} records no 'base_model'. Runs from before litetune 0.1.3 did not "
+            "write one; pass --base-model <id> instead"
+        )
+    if not isinstance(base, str) or not base.strip():
+        raise DataError(f"{metrics} records a 'base_model' that is not a name: {base!r}")
+    return base
 
 
 def _convert(args: argparse.Namespace) -> int:

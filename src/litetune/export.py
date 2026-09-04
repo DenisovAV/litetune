@@ -358,7 +358,27 @@ class ExportRequest:
         # this family, and adds the ones it cannot export without. A plan whose
         # required flags could not be resolved is *kept*, not raised on: it is
         # `could not check`, and `run_export` refuses to attempt the sweep.
-        plan = models.plan_export(self.base_model or self.model, requested, self.recipes)
+        # A checkpoint that records what it came from is consulted even when
+        # the caller names something: `--base-model` beating the sidecar in
+        # silence is how a stale copy-pasted command line exports the wrong
+        # family with a passed check vouching for it.
+        # `hint_for` reads the sidecar itself when handed a directory, so the
+        # identity is just "the flag, or the path". The recorded value is read
+        # here only to notice that the two disagree.
+        recorded = models.recorded_identity(self.model)
+        identity = self.base_model or self.model
+        conflict = (
+            None
+            if not (self.base_model and recorded) or models.same_family(self.base_model, recorded)
+            else (
+                f"--base-model says {self.base_model!r} but the checkpoint records "
+                f"{recorded!r}, and they are different families. The recorded value came "
+                "from the run that produced these weights; the flag came from this command "
+                "line. litetune will not pick one"
+            )
+        )
+        object.__setattr__(self, "_identity_conflict", conflict)
+        plan = models.plan_export(identity, requested, self.recipes)
         flags = list(plan.flags)
         source = "caller"
         if self.externalize_embedder is None:
@@ -372,6 +392,11 @@ class ExportRequest:
         object.__setattr__(self, "extra_flags", tuple(flags))
         object.__setattr__(self, "_externalize_source", source)
         object.__setattr__(self, "_plan", plan)
+
+    @property
+    def identity_conflict(self) -> str | None:
+        """Why `--base-model` and the checkpoint's own record cannot both be right."""
+        return self._identity_conflict  # type: ignore[attr-defined]
 
     @property
     def externalize_source(self) -> str:
@@ -886,12 +911,41 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
     )
     result.limitations.append(NOT_VERIFIED)
 
+    # Two answers to "what is this", and no way to choose. Refused before any
+    # work: exporting under either one produces a bundle whose family flags may
+    # be wrong, and the check would say `passed` about it.
+    if request.identity_conflict:
+        result.checks.add(
+            Check.unchecked(
+                "model identity",
+                request.identity_conflict,
+                observed={
+                    "base_model_flag": request.base_model,
+                    "recorded": models.recorded_identity(request.model),
+                },
+            )
+        )
+        result.not_attempted = tuple(request.recipes)
+        events.stage_finished(result.outcome.value, attempted=0)
+        return result
+
     # Before the toolchain is asked anything, and once for the sweep rather than
     # once per recipe. A stale `vocab_file` fails the export outright, after the
     # model has loaded, naming a path that never existed here.
     #
     # Reported and not merely logged: this writes to the *input* directory, and
     # a tool that edits what you handed it must say so where you will see it.
+    # A sidecar that exists and cannot be read is a fault, not an absence: the
+    # family was then guessed from the path, which is what the sidecar exists to
+    # stop. Said where it will be read, not only recorded in the hint.
+    broken_record = models.provenance_error(request.model)
+    if broken_record:
+        result.limitations.append(
+            f"{broken_record}. The family was determined without it, so the export flags "
+            "below may be the wrong ones; rewrite the file or pass --base-model"
+        )
+        events.note(broken_record, model=request.model)
+
     model_path = Path(request.model)
     if model_path.is_dir():
         ok, note = repair_vocab_file(model_path)

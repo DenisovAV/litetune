@@ -170,8 +170,22 @@ class ModelRules:
     extra_stop_tokens: tuple[str, ...] = ()
     stop_token_reason: str = ""
 
+    # Whether this rule's patterns may be satisfied by the *path*. `hint_for`
+    # merges the model string and the config values into one text, so by default
+    # a directory named after a base model matches as if the config had said so.
+    # For a rule that exists to refuse an ambiguous config that is exactly wrong:
+    # `runs/gemma-3-270m-tools/model` holding a FunctionGemma checkpoint would be
+    # claimed by the wrong family and exported with the wrong flags, green.
+    config_only: bool = False
+
     def matches(self, text: str) -> bool:
         return any(re.search(pattern, text) for pattern in self.patterns)
+
+    def matches_hint(self, hint: ModelHint) -> bool:
+        if not self.config_only:
+            return self.matches(hint.text)
+        # The path is precisely the evidence this rule declares worthless.
+        return any(self.matches(_normalise(value)) for value in hint.from_config)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -464,7 +478,8 @@ RULES: tuple[ModelRules, ...] = (
         # `hint_for` folds `model_type` into the match text as `gemma3-text`.
         # Ordered last in RULES, so `functiongemma` and `gemma-3-270m` claim a
         # checkpoint that names itself and only an unnamed one reaches here.
-        patterns=(r"gemma3-text",),
+        patterns=(r"^gemma3-text$",),
+        config_only=True,
         required_flags=(
             RequiredFlag(
                 name="--litert_lm_model_type_override",
@@ -505,6 +520,14 @@ class ModelHint:
     text: str
     from_config: tuple[str, ...] = ()
     config_error: str | None = None
+    # True when `tune` recorded what this checkpoint came from. Without it, a
+    # match can only have come from the path or the architecture -- and a folder
+    # name is what the user called a directory, not what is inside it.
+    recorded: bool = False
+    # Why the sidecar could not be used, when there was one. Distinct from
+    # `recorded=False` with no error: one is a fault to fix, the other is just a
+    # checkpoint from before this existed.
+    provenance_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -512,6 +535,8 @@ class ModelHint:
             "matched_against": self.text,
             "from_config": list(self.from_config),
             "config_error": self.config_error,
+            "identity_recorded": self.recorded,
+            "provenance_error": self.provenance_error,
         }
 
 
@@ -532,18 +557,63 @@ load path on the next load anyway.
 """
 
 
-def _provenance(path: Path) -> str | None:
-    """The base model `tune` recorded beside this checkpoint, if it did."""
+def _provenance(path: Path) -> tuple[str | None, str | None]:
+    """The base model `tune` recorded beside this checkpoint. Returns (id, error).
+
+    An unreadable sidecar is not the same as an absent one, and returning `None`
+    for both was the one place in this module that failed to say which. A file
+    truncated by a full disk or half-copied by an interrupted `rsync` would then
+    look like a checkpoint that never recorded anything -- and be guessed at from
+    the path, which is the fault this sidecar exists to remove.
+    """
     sidecar = path / PROVENANCE_NAME
     if not sidecar.is_file():
-        return None
+        return None, None
     try:
         data = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        logger.warning("could not read %s: %s", sidecar, exc)
-        return None
-    base = data.get("base_model") if isinstance(data, dict) else None
-    return str(base) if base else None
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
+        return None, f"{sidecar} could not be read: {type(exc).__name__}: {exc}"
+    if not isinstance(data, dict):
+        return None, f"{sidecar} does not contain a JSON object"
+    base = data.get("base_model")
+    if base is None:
+        return None, f"{sidecar} records no 'base_model'"
+    if not isinstance(base, str) or not base.strip():
+        # A list or a dict here would `str()` into something that matches a
+        # family regex by accident, which is a confident answer from nonsense.
+        return None, f"{sidecar} records a non-string 'base_model': {base!r}"
+    return base, None
+
+
+def recorded_identity(model: str) -> str | None:
+    """What the checkpoint at `model` says it came from, if it says anything."""
+    path = Path(model)
+    return _provenance(path)[0] if path.is_dir() else None
+
+
+def provenance_error(model: str) -> str | None:
+    """Why the checkpoint's own record could not be used, if there was one.
+
+    Read from the path rather than from a plan's hint: when `--base-model` names
+    an id, the plan is built from that string and never opens the directory --
+    which is exactly when a broken record most needs saying out loud.
+    """
+    path = Path(model)
+    return _provenance(path)[1] if path.is_dir() else None
+
+
+def same_family(a: str | None, b: str | None) -> bool:
+    """Whether two identities resolve to the same rules. Unknown counts as same.
+
+    Two names litetune has no rules for cannot disagree about which rules apply,
+    so a conflict between them is not worth refusing over.
+    """
+    if not a or not b:
+        return True
+    left, right = identify(a), identify(b)
+    if left is None and right is None:
+        return True
+    return left is not None and right is not None and left.family == right.family
 
 
 def hint_for(model: str) -> ModelHint:
@@ -558,9 +628,9 @@ def hint_for(model: str) -> ModelHint:
     # config.json only knows what architecture it is -- which is not enough,
     # since FunctionGemma and Gemma 3 declare the same `model_type` and need
     # different overrides.
-    recorded = _provenance(path)
-    if recorded:
-        normalised = _normalise(recorded)
+    recorded_base, provenance_error = _provenance(path)
+    if recorded_base:
+        normalised = _normalise(recorded_base)
 
     try:
         data = json.loads(config.read_text(encoding="utf-8"))
@@ -572,12 +642,16 @@ def hint_for(model: str) -> ModelHint:
             model=model,
             text=normalised,
             config_error=f"{type(exc).__name__}: {exc}",
+            recorded=bool(recorded_base),
+            provenance_error=provenance_error,
         )
     if not isinstance(data, dict):
         return ModelHint(
             model=model,
             text=normalised,
             config_error=f"{config} does not contain a JSON object",
+            recorded=bool(recorded_base),
+            provenance_error=provenance_error,
         )
 
     values: list[str] = []
@@ -589,7 +663,13 @@ def hint_for(model: str) -> ModelHint:
             values.extend(str(item) for item in value)
     extra = tuple(values)
     text = "-".join([normalised, *(_normalise(v) for v in extra)])
-    return ModelHint(model=model, text=text, from_config=extra)
+    return ModelHint(
+        model=model,
+        text=text,
+        from_config=extra,
+        recorded=bool(recorded_base),
+        provenance_error=provenance_error,
+    )
 
 
 def identify(model: str) -> ModelRules | None:
@@ -603,8 +683,20 @@ def identify(model: str) -> ModelRules | None:
 
 
 def rules_for_hint(hint: ModelHint) -> ModelRules | None:
+    # An ambiguous config outranks a match from the path. `config.json` saying
+    # `gemma3_text` is a fact about the weights; `runs/gemma-3-270m-tools/model`
+    # is what somebody called a folder, and a FunctionGemma checkpoint sitting in
+    # one would otherwise be claimed by the wrong family and exported with the
+    # wrong flags -- successfully, and with a passed check vouching for it.
+    #
+    # Only when the identity was not recorded: a sidecar settles the question,
+    # and then the ordinary name rules apply as they should.
+    if not hint.recorded:
+        for rules in RULES:
+            if rules.config_only and rules.matches_hint(hint):
+                return rules
     for rules in RULES:
-        if rules.matches(hint.text):
+        if rules.matches_hint(hint):
             return rules
     return None
 

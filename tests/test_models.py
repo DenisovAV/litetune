@@ -651,3 +651,79 @@ def test_the_sidecar_beats_config_json(tmp_path):
 
     rules = rules_for_hint(hint_for(str(checkpoint)))
     assert rules is not None and rules.family == "functiongemma"
+
+
+def test_a_folder_named_after_the_base_model_does_not_decide_the_family(tmp_path):
+    """The path is what somebody called a directory, not what is inside it.
+
+    A FunctionGemma checkpoint in `runs/gemma-3-270m-tools/model` was claimed by
+    `gemma-3-text` on the path substring, exported with `=gemma3` and no template
+    override, and reported passed — the exact artifact this refusal exists to
+    stop, produced by the most natural naming convention there is.
+    """
+    from litetune.models import plan_export
+
+    checkpoint = tmp_path / "runs" / "gemma-3-270m-tools" / "model"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "gemma3_text"}), encoding="utf-8"
+    )
+
+    plan = plan_export(str(checkpoint), (), ("dynamic_wi8_afp32",))
+    assert plan.rules is not None and plan.rules.family == "gemma3-text-unidentified"
+    assert not plan.usable
+
+    # And a recorded identity settles it, so the ordinary rules apply again.
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": "google/functiongemma-270m-it"}), encoding="utf-8"
+    )
+    settled = plan_export(str(checkpoint), (), ("dynamic_wi8_afp32",))
+    assert settled.rules is not None and settled.rules.family == "functiongemma"
+    assert settled.usable
+
+
+def test_a_name_that_merely_contains_gemma3_text_is_not_refused():
+    """The refusal is about `config.json`, and its message says so.
+
+    Matching the merged hint text meant `myorg/gemma3_text_lora` — a Hub id with
+    no config anywhere — was refused with a message asserting what a file that
+    was never opened declares.
+    """
+    from litetune.models import plan_export
+
+    for name in ("myorg/gemma3_text_lora", "unsloth/gemma3-text-it"):
+        plan = plan_export(name, (), ("dynamic_wi8_afp32",))
+        assert plan.rules is None, name
+        assert plan.usable, name
+
+
+def test_an_unreadable_sidecar_is_a_fault_not_an_absence(tmp_path):
+    """Returning None for both let a truncated file look like an older run.
+
+    A `litetune.json` cut short by a full disk or a half-finished copy would
+    then be guessed past, from the path — which is the fault the sidecar exists
+    to remove.
+    """
+    from litetune.models import hint_for
+
+    counter = iter(range(100))
+
+    def hint_with(content: str):
+        d = tmp_path / f"case{next(counter)}" / "model"
+        d.mkdir(parents=True)
+        (d / "config.json").write_text(json.dumps({"model_type": "gemma3_text"}), encoding="utf-8")
+        (d / "litetune.json").write_text(content, encoding="utf-8")
+        return hint_for(str(d))
+
+    assert "could not be read" in (hint_with('{"base_model": "goo').provenance_error or "")
+    assert "does not contain a JSON object" in (hint_with("[1, 2]").provenance_error or "")
+    assert "records no 'base_model'" in (hint_with('{"prompt_mode": "x"}').provenance_error or "")
+    assert "not a name" in (hint_with('{"base_model": ["a"]}').provenance_error or "").replace(
+        "non-string 'base_model'", "not a name"
+    )
+
+    # A checkpoint that never had one is not a fault.
+    plain = tmp_path / "plain" / "model"
+    plain.mkdir(parents=True)
+    (plain / "config.json").write_text(json.dumps({"model_type": "llama"}), encoding="utf-8")
+    assert hint_for(str(plain)).provenance_error is None
