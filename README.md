@@ -83,31 +83,30 @@ on the same side.
 
 ---
 
-## Quick start
+## From your data to a shippable bundle
+
+Five commands, in order. Each is separate because each fails differently, and a
+single `run` would hide which one you are in.
 
 ```bash
+# 1. Split, and reject rows that cannot be scored. Seconds.
 litetune prepare --data raw.jsonl --output-dir data --context-length 1024
 
+# 2. Fine-tune. On CPU, so size your expectations accordingly.
 litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
               --output-dir tuned --prompt-mode prerendered --method lora
 
+# 3. Convert, sweeping recipes rather than trusting a default.
 litetune convert --model tuned/model --output-dir artifacts \
                  --recipe dynamic_wi8_afp32 --recipe weight_only_wi8_afp32
-```
 
-That is a shippable `.litertlm` per recipe, under `artifacts/<recipe>/`. It is
-also the part most tooling makes you assemble by hand — see
-[What it knows](#what-it-knows-that-a-shell-script-does-not) for what those
-three commands do that calling the exporter yourself does not.
-
-Two more steps measure the result and package it:
-
-```bash
-# convert names the artifact; look it up rather than construct it
+# 4. Measure what the conversion cost, against the float twin.
+#    `convert` names the artifact; look the filename up rather than build it.
 litetune verify --model artifacts/weight_only_wi8_afp32/<name>.litertlm \
                 --reference tuned/model --data data/heldout.jsonl \
                 --json > manifest.json
 
+# 5. Package the artifact with what was measured about it.
 litetune bundle --output-dir bundle \
                 --model artifacts/weight_only_wi8_afp32/<name>.litertlm \
                 --declarations tools.json --prompt-mode prerendered \
@@ -118,12 +117,21 @@ litetune bundle --output-dir bundle \
                 --verify-manifest manifest.json
 ```
 
-`--reference` is the **float twin**: the same weights before conversion. That is
-what makes the difference between the two the conversion cost rather than a
-mixture of that and whatever training did. Point it at a different checkpoint —
-an untuned base, say — and pass `--reference-role untuned_base`, and both the
-training gain and the conversion cost come back unavailable, because one number
-cannot separate two effects.
+**Step 3 already gives you something shippable** — one `.litertlm` per recipe,
+under `artifacts/<recipe>/`. Steps 1–3 are also the part most tooling makes you
+assemble by hand; see [What it knows](#what-it-knows-that-a-shell-script-does-not)
+for what they do beyond calling the exporter yourself.
+
+**Steps 4 and 5 are what makes it trustworthy.** `--reference` is the **float
+twin**: the same weights before conversion. That is what makes the difference
+between the two the conversion cost rather than a mixture of that and whatever
+training did. Point it at a different checkpoint — an untuned base, say — and
+pass `--reference-role untuned_base`, and both the training gain and the
+conversion cost come back unavailable, because one number cannot separate two
+effects.
+
+If you already have a `.litertlm` and the checkpoint it came from, step 4 runs on
+its own.
 
 ### Recipes
 
