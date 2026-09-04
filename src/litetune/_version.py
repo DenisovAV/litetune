@@ -10,4 +10,4 @@ exactly what an incomplete commit produces -- turned a function documented as
 `pyproject.toml` reads this file, so the number lives in one place.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
