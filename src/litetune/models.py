@@ -368,6 +368,16 @@ _FUNCTION_RESPONSE_REASON = (
     "only the terminator the run observed"
 )
 
+_GEMMA3_TEXT_AMBIGUOUS = (
+    "config.json declares model_type 'gemma3_text', which is FunctionGemma and also Gemma 3 "
+    "270M/1B -- they need different override values and different prompt templates, and "
+    "nothing in the config distinguishes them. transformers 5.x deletes `_name_or_path` on "
+    "save, so a trained checkpoint carries no name either. Say which it is: `--base-model "
+    "<id>`, or `--train-metrics` from the run that produced it. litetune refuses rather than "
+    "guessing, because guessing wrong exports a bundle with no tool-call channel that passes "
+    "every check"
+)
+
 _MODEL_TYPE_REASON = (
     "config.json declares model_type 'gemma3_text', which the exporter does not "
     "recognise, so the bundle is typed generic_model and the runtime creates no "
@@ -437,6 +447,32 @@ RULES: tuple[ModelRules, ...] = (
         min_transformers="5.0.0",
         min_transformers_reason=_TRANSFORMERS_5_REASON,
     ),
+    ModelRules(
+        family="gemma3-text-unidentified",
+        # Last, so a checkpoint that names its family is matched by name first.
+        # This is the fallback for one that does not: `config.json` establishes
+        # with certainty that an override is *required*, and cannot establish
+        # what it should be. FunctionGemma and Gemma 3 270M/1B all declare
+        # `gemma3_text` and need different values -- and different templates.
+        #
+        # So the plan is unusable and the export refuses, rather than producing
+        # a bundle typed `generic_model` with no tool-call channel while every
+        # check stays green. Any other architecture -- llama, phi3, mistral --
+        # matches nothing here and is a note and exit 0, by path or by id alike:
+        # about those litetune knows nothing, which is not the same as knowing
+        # the artifact will be wrong.
+        # `hint_for` folds `model_type` into the match text as `gemma3-text`.
+        # Ordered last in RULES, so `functiongemma` and `gemma-3-270m` claim a
+        # checkpoint that names itself and only an unnamed one reaches here.
+        patterns=(r"gemma3-text",),
+        required_flags=(
+            RequiredFlag(
+                name="--litert_lm_model_type_override",
+                reason=_MODEL_TYPE_REASON,
+                value_unknown=_GEMMA3_TEXT_AMBIGUOUS,
+            ),
+        ),
+    ),
 )
 
 
@@ -479,13 +515,52 @@ class ModelHint:
         }
 
 
+PROVENANCE_NAME = "litetune.json"
+"""What `tune` leaves beside a checkpoint so `convert` knows what it is.
+
+`config.json` was meant to carry this: `ModelHint` was written around
+`_name_or_path`, which `from_pretrained` sets to the id you loaded. transformers
+5.x deletes that key on save -- `to_diff_dict` drops it before serialising -- so
+a checkpoint this package produces names nothing, matches no family rule, and
+exports without the flags its family requires. Silently: the file is the right
+size and every check is green.
+
+The same shape as `tokenizer.model`, which `carry_back_sentencepiece` restores
+for the same reason. A sidecar rather than writing `_name_or_path` back, because
+that is a vendor-format file and `from_pretrained` overwrites the field with the
+load path on the next load anyway.
+"""
+
+
+def _provenance(path: Path) -> str | None:
+    """The base model `tune` recorded beside this checkpoint, if it did."""
+    sidecar = path / PROVENANCE_NAME
+    if not sidecar.is_file():
+        return None
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logger.warning("could not read %s: %s", sidecar, exc)
+        return None
+    base = data.get("base_model") if isinstance(data, dict) else None
+    return str(base) if base else None
+
+
 def hint_for(model: str) -> ModelHint:
-    """The text `identify` matches against: the model id, plus a local config.json."""
+    """The text `identify` matches against: the model id, plus a local checkpoint."""
     path = Path(model)
     normalised = _normalise(model)
     config = path / CONFIG_NAME
     if not (path.is_dir() and config.is_file()):
         return ModelHint(model=model, text=normalised)
+
+    # Before config.json: what produced the checkpoint knows what it was, and
+    # config.json only knows what architecture it is -- which is not enough,
+    # since FunctionGemma and Gemma 3 declare the same `model_type` and need
+    # different overrides.
+    recorded = _provenance(path)
+    if recorded:
+        normalised = _normalise(recorded)
 
     try:
         data = json.loads(config.read_text(encoding="utf-8"))

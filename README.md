@@ -221,6 +221,18 @@ that parses the response text sees nothing wrong; an app that passes tools
 natively receives no calls. The export succeeds, the file is the right size,
 every liveness check is green.
 
+**A trained checkpoint is told what it came from.** `tune` writes
+`litetune.json` beside the model, and `convert` reads it. This is not
+bookkeeping: the per-family export flags key on the model's *name*, a directory
+has none, and `transformers` 5.x deletes `_name_or_path` from `config.json` on
+save — so without it a checkpoint this tool produced would export with none of
+the flags its family requires, successfully and silently. `config.json` cannot
+stand in: FunctionGemma and Gemma 3 270M/1B all declare `model_type:
+gemma3_text` and need different values. A checkpoint from elsewhere says so with
+`--base-model` or `--train-metrics`; one that says nothing is refused rather than
+guessed at, because guessing wrong ships a bundle with no tool-call channel that
+passes every check.
+
 **The prompt template has to be one the device can execute.** FunctionGemma's
 own template uses `macro` and `dictsort`; LiteRT-LM renders with MiniJinja,
 which supports neither. A bundle carrying it exports cleanly, is the right size,

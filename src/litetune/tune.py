@@ -453,9 +453,37 @@ def main() -> int:
     tok.save_pretrained(str(model_dir))
     sentencepiece = carry_back_sentencepiece(tok, model_dir, spec["model"], spec.get("revision"))
 
+    # Beside the checkpoint, because a directory names nothing. `convert` keys
+    # the per-family export flags on the model's name, and `config.json` no
+    # longer carries one: transformers 5.x deletes `_name_or_path` on save. A
+    # checkpoint that cannot say what it came from is exported without the flags
+    # its family requires -- and the export succeeds, so nothing says otherwise.
+    (Path(model_dir) / "litetune.json").write_text(
+        json.dumps(
+            {
+                "base_model": spec["model"],
+                "base_model_revision": spec.get("revision"),
+                "prompt_mode": spec["prompt_mode"],
+                "turn_terminator": terminator,
+                "sentencepiece": sentencepiece,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
     Path(spec["metrics_out"]).write_text(
         json.dumps(
             {
+                # What this was trained from. Recorded because the checkpoint
+                # this run produces is a directory, and a directory carries no
+                # identity: `convert` keys its per-family export flags on the
+                # model's name, and without this it has nothing to key on --
+                # `config.json` cannot serve, since FunctionGemma and plain
+                # Gemma 3 declare the same `model_type` and need different
+                # overrides.
+                "base_model": spec["model"],
+                "base_model_revision": spec.get("revision"),
                 "method": spec["method"],
                 "learning_rate": spec["learning_rate"],
                 "dtype": spec["dtype"],

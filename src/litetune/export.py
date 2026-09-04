@@ -307,6 +307,17 @@ class ExportRequest:
     # printed. The default itself lives here and nowhere else: `cli` and `spec`
     # both used to carry their own, and the same job written two ways produced
     # artifacts differing by 171 MB that could not be compared on size at all.
+    # What the per-family export rules key on, when `model` cannot serve.
+    # After training, `model` is a directory, and a directory carries no
+    # identity: `plan_export` matches on the model's *name*, so a local path
+    # matches nothing and the family's required flags are silently not applied.
+    # That is how a FunctionGemma checkpoint becomes a bundle typed
+    # `generic_model`, with no tool-call channel and a template the runtime
+    # cannot execute -- while the export succeeds and every check stays green.
+    #
+    # `config.json` cannot stand in for this: FunctionGemma and plain Gemma 3
+    # both declare `model_type: gemma3_text` and need different overrides.
+    base_model: str | None = None
     externalize_embedder: bool | None = None
     # Additional exporter flags, verbatim. Whatever `litetune.models` says this
     # family requires is merged in here by `__post_init__`, so no code path --
@@ -347,7 +358,7 @@ class ExportRequest:
         # this family, and adds the ones it cannot export without. A plan whose
         # required flags could not be resolved is *kept*, not raised on: it is
         # `could not check`, and `run_export` refuses to attempt the sweep.
-        plan = models.plan_export(self.model, requested, self.recipes)
+        plan = models.plan_export(self.base_model or self.model, requested, self.recipes)
         flags = list(plan.flags)
         source = "caller"
         if self.externalize_embedder is None:
@@ -394,6 +405,7 @@ class ExportRequest:
     def as_dict(self) -> dict[str, Any]:
         return {
             "model": self.model,
+            "base_model": self.base_model,
             "output_dir": str(self.output_dir),
             "recipes": list(self.recipes),
             "externalize_embedder": EXTERNALIZE_FLAG in self.extra_flags,
