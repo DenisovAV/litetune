@@ -160,6 +160,14 @@ class ModelRules:
     recommended_recipes: tuple[str, ...] = ()
     recipe_reason: str = ""
     limitations: tuple[str, ...] = ()
+    # Terminators the serving convention requires that a training run cannot
+    # reveal. `tune` records the terminator it supervised, which is the one the
+    # completions end with -- and for a function-calling family that is only
+    # half the answer: the model must also stop where the application has to
+    # take over. Not derivable from `config.json` either, which is what this
+    # module is for.
+    extra_stop_tokens: tuple[str, ...] = ()
+    stop_token_reason: str = ""
 
     def matches(self, text: str) -> bool:
         return any(re.search(pattern, text) for pattern in self.patterns)
@@ -174,6 +182,8 @@ class ModelRules:
             "recommended_recipes": list(self.recommended_recipes),
             "recipe_reason": self.recipe_reason,
             "limitations": list(self.limitations),
+            "extra_stop_tokens": list(self.extra_stop_tokens),
+            "stop_token_reason": self.stop_token_reason,
         }
 
 
@@ -320,6 +330,15 @@ def _gemma4(family: str, patterns: tuple[str, ...], override_repo: str | None) -
 #
 # The value cannot be derived from `model_type`, because the two families share
 # one. It has to come from the model's identity, which is what these rules are.
+_FUNCTION_RESPONSE_REASON = (
+    "a FunctionGemma turn does not end at the call: after `<end_function_call>` the "
+    "application has to execute the tool and send the result back, and the model must stop "
+    "and wait for it. Training cannot reveal this terminator -- the completions end at "
+    "`<end_of_turn>`, so a run records that one and nothing else. Google's published bundle "
+    "for this model declares both, read with litertlm_peek; ours declared seventeen "
+    "auto-derived punctuation variants of `<end_of_turn>\\n` and not this"
+)
+
 _MODEL_TYPE_REASON = (
     "config.json declares model_type 'gemma3_text', which the exporter does not "
     "recognise, so the bundle is typed generic_model and the runtime creates no "
@@ -352,6 +371,8 @@ RULES: tuple[ModelRules, ...] = (
                 reason=_MODEL_TYPE_REASON,
             ),
         ),
+        extra_stop_tokens=("<start_function_response>",),
+        stop_token_reason=_FUNCTION_RESPONSE_REASON,
     ),
     ModelRules(
         family="gemma-3-text",
@@ -506,6 +527,21 @@ def limitations_for(model: str) -> list[str]:
     """Recorded limitations for this model. Empty when litetune knows of none."""
     rules = identify(model)
     return list(rules.limitations) if rules is not None else []
+
+
+def stop_tokens_for(model: str) -> tuple[tuple[str, ...], str]:
+    """Terminators this family needs beyond the one training recorded, and why.
+
+    Measured against Google's own published bundle for this model, read with
+    `litertlm_peek`: it declares `<end_of_turn>` *and*
+    `<start_function_response>`. Ours declared neither of those two -- an
+    auto-derived list of seventeen punctuation-plus-terminator variants, none of
+    which stops the model where the application must inject a tool result.
+    """
+    rules = identify(model)
+    if rules is None:
+        return (), ""
+    return rules.extra_stop_tokens, rules.stop_token_reason
 
 
 # ---------------------------------------------------------------------------

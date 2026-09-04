@@ -488,3 +488,26 @@ def test_verify_refuses_a_reference_whose_environment_cannot_load_it(write_split
     assert result.exit_code == 4
     version = next(c for c in result.manifest["checks"] if c["name"] == TRANSFORMERS_CHECK)
     assert version["outcome"] == "failed"
+
+
+def test_functiongemma_declares_the_terminator_training_cannot_reveal():
+    """A FunctionGemma turn does not end at the call.
+
+    After `<end_function_call>` the application executes the tool and sends the
+    result back, so the model must stop and wait. Training cannot reveal that
+    terminator: the completions end at `<end_of_turn>`, so a run records that
+    one and nothing else. Google's published bundle for this model declares
+    both -- read with `litertlm_peek` -- while ours declared seventeen
+    auto-derived punctuation variants of `<end_of_turn>\\n` and not this one.
+
+    Keyed on model identity because it is not in `config.json`: plain Gemma 3
+    shares the architecture and has no function-response channel at all.
+    """
+    from litetune.models import stop_tokens_for
+
+    tokens, reason = stop_tokens_for("google/functiongemma-270m-it")
+    assert tokens == ("<start_function_response>",)
+    assert "application has to execute the tool" in reason
+
+    assert stop_tokens_for("google/gemma-3-270m-it") == ((), "")
+    assert stop_tokens_for("some/unknown-model") == ((), "")

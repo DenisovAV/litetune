@@ -41,6 +41,40 @@ would be reported as noise. Both sides answered the same 640 prompts; treating
 them as independent samples throws away exactly the information that settles the
 question.
 
+### The base figure is measured under a rendering the base did not learn
+
+**Read the base column with this in mind.** The declaration properties in every
+prompt above are rendered in *declaration order*, which is what the reference
+consumer (`flutter_gemma`) emits. The jinja template inside the `.litertlm` we
+ship renders them with `dictsort` — measured, eight occurrences, including on
+declaration properties. On this dataset the two orders disagree for **100% of
+rows**, and one bundle therefore presents two different prompts depending on
+which path a consumer takes.
+
+Which one the base model's weights learned was argued rather than measured until
+it was measured. Same checkpoint, same 640 examples, same greedy decode, same
+parser, one variable:
+
+| | exact match |
+|---|---|
+| declaration order (as published above) | 0.7266 ±0.0345 |
+| `dictsort`, the template's order | **0.7625** ±0.0330 |
+
+Paired: **−0.0359 ±0.0219**, resolved, on 51 discordant pairs split 37 to 14.
+Not a parsing artifact — argument dicts compare without regard to key order, so
+what changes is *which arguments the model extracts*: given a declaration in the
+wrong order it returns `email` where the target wanted `phone_number`.
+
+So the base is understated by about 0.036, and the fine-tuning gain above
+absorbs that difference: part of what reads as "learned the task" is "learned
+our rendering". Against a correctly rendered base the gain is roughly
+**+0.155**, not +0.19. Still large, still resolved.
+
+This is **one run**, and a replication on a disjoint sample is not yet in. It is
+recorded here rather than after that run because the numbers above are already
+published and the evidence against them already resolves. The fix is to render
+declarations the way the weights expect and re-measure; it is not done.
+
 ### What three runs of the same thing disagree about
 
 The same recipe sweep, run three times on the same data with the same code. B
@@ -320,6 +354,22 @@ terminator while the runtime waits for another does not stop — which shows up 
 extra tool calls firing on the device, not as a lower score.
 
 ## Known limitations
+
+**One bundle, two prompt renderings.** The plugin renders declaration properties
+in declaration order; the jinja template inside the same `.litertlm` renders them
+with `dictsort`. They disagree for 100% of `mobile-actions` rows, and there is
+resolved evidence the weights prefer the template's order — see *The base figure
+is measured under a rendering the base did not learn*. litetune does not yet let
+you choose, record which was used, or refuse to compare two points rendered
+differently, which is what `contract.json` should carry and does not.
+
+**The bundle's stop tokens are not the ones Google ships.** Read with
+`litertlm_peek`, Google's published FunctionGemma bundle declares
+`<end_of_turn>` and `<start_function_response>`; an export from this toolchain
+declares seventeen auto-derived punctuation variants of `<end_of_turn>\n` and
+neither of those. `bundle` now records both in `contract.json` — the trained
+terminator from the run, the family's from `models.py` — but the metadata inside
+the `.litertlm` is written by the exporter and is still the auto-derived list.
 
 **The SentencePiece tokenizer is restored by hand, and that is load-bearing.**
 `transformers` 5.x `save_pretrained` no longer writes `tokenizer.model`, and the

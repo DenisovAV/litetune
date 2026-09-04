@@ -1224,3 +1224,62 @@ def test_a_usage_error_does_not_borrow_a_verdict_code():
         [_sys.executable, "-m", "litetune.cli", "--help"], capture_output=True, timeout=60
     )
     assert helped.returncode == 0
+
+
+def _stop_token_argv(tmp_path, *extra):
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"artifact")
+    declarations = tmp_path / "tools.json"
+    declarations.write_text("[]", encoding="utf-8")
+    return [
+        "bundle",
+        "--output-dir",
+        str(tmp_path / "bundle"),
+        "--model",
+        str(model),
+        "--declarations",
+        str(declarations),
+        "--prompt-mode",
+        "prerendered",
+        "--base-model",
+        "google/functiongemma-270m-it",
+        "--base-model-revision",
+        "1234567890abcdef1234567890abcdef12345678",
+        *extra,
+    ]
+
+
+def _stop_token_contract(tmp_path):
+    return json.loads((tmp_path / "bundle" / "contract.json").read_text(encoding="utf-8"))
+
+
+def test_the_family_stop_token_supplements_the_recorded_one(tmp_path):
+    """Both, in that order: what the model emits, then where the app takes over."""
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text(
+        json.dumps({"turn_terminator": {"text": "<end_of_turn>", "source": "chat template"}}),
+        encoding="utf-8",
+    )
+    main(_stop_token_argv(tmp_path, "--train-metrics", str(metrics)))
+
+    contract = _stop_token_contract(tmp_path)
+    assert contract["stop_tokens"] == ["<end_of_turn>", "<start_function_response>"]
+    notes = " ".join(contract["notes"])
+    assert "litetune added the stop token(s) <start_function_response>" in notes
+    assert "recorded terminator" in notes, "the trained one must stay attributed to the run"
+
+
+def test_a_family_stop_token_alone_says_the_trained_one_is_unrecorded(tmp_path):
+    """Supplementing is not substituting.
+
+    With no run and no `--stop-token`, the family's terminator would be the only
+    one declared -- a bundle that tells the runtime where the application takes
+    over but not where the turn ends. That is worse than declaring nothing,
+    because it looks specified, so it is said out loud.
+    """
+    main(_stop_token_argv(tmp_path))
+
+    contract = _stop_token_contract(tmp_path)
+    assert contract["stop_tokens"] == ["<start_function_response>"]
+    notes = " ".join(contract["notes"])
+    assert "the terminator the model was actually trained to emit is unrecorded" in notes

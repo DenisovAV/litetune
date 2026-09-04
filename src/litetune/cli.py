@@ -978,6 +978,36 @@ def _bundle(args: argparse.Namespace) -> int:
                 f"({(recorded.get('turn_terminator') or {}).get('source')})"
             )
 
+    # Terminators the family needs that the training run could not record. Added
+    # after the recorded one and never instead of it: the run observed what the
+    # model was trained to emit, and this observes what the serving convention
+    # additionally requires it to stop at. Both are named in the notes, because
+    # "the bundle declares two stop tokens" and "litetune added one of them" are
+    # different claims and the report is where a reader tells them apart.
+    family_stops, stop_reason = models.stop_tokens_for(args.base_model)
+    added_stops = tuple(t for t in family_stops if t not in stop_tokens)
+    unrecorded_primary = added_stops and not stop_tokens
+    if added_stops:
+        stop_tokens = stop_tokens + added_stops
+        terminator_notes = tuple(n for n in (terminator_note,) if n) + (
+            f"litetune added the stop token(s) {', '.join(added_stops)} for "
+            f"{args.base_model}: {stop_reason}",
+        )
+        if unrecorded_primary:
+            # The family token supplements the trained terminator; it must not
+            # stand in for it. A bundle declaring only "stop where the app takes
+            # over" and not "stop at the end of the turn" is worse than one
+            # declaring nothing, because it looks specified.
+            terminator_notes += (
+                "the stop token(s) above are the only ones declared: no training run was "
+                "supplied (--train-metrics) and none was named (--stop-token), so the "
+                "terminator the model was actually trained to emit is unrecorded. Declaring "
+                "only the family's token tells the runtime where the application takes over "
+                "and not where the turn ends",
+            )
+    else:
+        terminator_notes = tuple(n for n in (terminator_note,) if n)
+
     contract = Contract(
         prompt_mode=PromptMode(args.prompt_mode),
         # The runtime's pins, because which prompt a runtime renders is a
@@ -989,7 +1019,7 @@ def _bundle(args: argparse.Namespace) -> int:
         base_model_revision=args.base_model_revision,
         context_length=args.context_length,
         stop_tokens=stop_tokens,
-        notes=tuple(args.note) + ((terminator_note,) if terminator_note else ()),
+        notes=tuple(args.note) + terminator_notes,
     )
     request = BundleRequest(
         output_dir=args.output_dir,
