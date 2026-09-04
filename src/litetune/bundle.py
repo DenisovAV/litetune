@@ -39,6 +39,7 @@ import os
 import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +127,33 @@ def versions_from(*stage_envs: envs.StageEnv) -> dict[str, str]:
     return versions
 
 
+class WireConvention(str, Enum):
+    """The order a tool declaration's properties are rendered in.
+
+    Two conventions are in the field for the same model. `flutter_gemma` renders
+    them in declaration order; the jinja template inside the `.litertlm` renders
+    them with `dictsort`. They disagree for 100% of `google/mobile-actions` rows,
+    so one bundle presents two different prompts depending on which path a
+    consumer takes.
+
+    It is not a stylistic choice. Measured on the base checkpoint twice, on
+    disjoint samples with different batching: declaration order scores 0.7266
+    against dictsort's 0.7625 (n=640, paired -0.0359 +/-0.0219) and 0.7602
+    against 0.7789 (n=1280, paired -0.0187 +/-0.0099). Both resolve, both favour
+    dictsort, and the failure is not a reordered call -- argument dicts compare
+    without regard to key order -- but a *wrong argument*: given a declaration in
+    the order it did not learn, the model returns `email` where the target
+    wanted `phone_number`.
+
+    `declarations_sha256` cannot carry this. The same declarations rendered two
+    ways hash identically, so without this field a bundle has no way to say
+    which one it was trained under, and a consumer no way to match it.
+    """
+
+    DECLARATION_ORDER = "declaration_order"
+    TEMPLATE_DICTSORT = "template_dictsort"
+
+
 @dataclass(frozen=True)
 class Contract:
     """How this model must be called. Not optional, and not inferable at runtime.
@@ -143,6 +171,9 @@ class Contract:
     declarations_sha256: str | None = None
     context_length: int | None = None
     stop_tokens: Sequence[str] = ()
+    # `None` means unrecorded, not "the usual one". A default here would be a
+    # guess costing a measured, resolved 0.019-0.036 exact match when wrong.
+    wire_convention: WireConvention | None = None
     notes: Sequence[str] = ()
 
     def __post_init__(self) -> None:
@@ -199,6 +230,22 @@ class Contract:
             "declarations_sha256": self.declarations_sha256,
             "context_length": self.context_length,
             "stop_tokens": list(self.stop_tokens),
+            "wire_convention": (
+                self.wire_convention.value if self.wire_convention is not None else None
+            ),
+            "wire_convention_meaning": (
+                {
+                    WireConvention.DECLARATION_ORDER: "declaration properties are rendered in the "
+                    "order they were declared, as flutter_gemma renders them",
+                    WireConvention.TEMPLATE_DICTSORT: "declaration properties are rendered "
+                    "case-insensitively sorted by name, as the model's jinja template renders "
+                    "them",
+                }[self.wire_convention]
+                if self.wire_convention is not None
+                else "unrecorded: this bundle does not say which property order it was built "
+                "under, and the two in the field disagree for every declaration with more than "
+                "one property"
+            ),
             "notes": list(self.notes),
         }
 
@@ -232,6 +279,9 @@ class Contract:
             declarations_sha256=data.get("declarations_sha256"),
             context_length=data.get("context_length"),
             stop_tokens=data.get("stop_tokens") or (),
+            wire_convention=(
+                WireConvention(data["wire_convention"]) if data.get("wire_convention") else None
+            ),
             notes=data.get("notes") or (),
         )
 

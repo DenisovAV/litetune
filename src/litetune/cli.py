@@ -37,6 +37,7 @@ from litetune.bundle import (
     BundleRequest,
     BundleResult,
     Contract,
+    WireConvention,
     build_bundle,
     versions_from,
 )
@@ -447,6 +448,19 @@ def _add_bundle(sub) -> None:
         "--base-model-revision",
         required=True,
         help="its revision; a bundle whose starting weights are unrecorded cannot be reproduced",
+    )
+    bundle.add_argument(
+        "--wire-convention",
+        choices=[w.value for w in WireConvention],
+        help=(
+            "the order this model's tool declarations were rendered in. Two conventions are in "
+            "the field for the same model -- flutter_gemma renders properties in declaration "
+            "order, the jinja template inside the .litertlm sorts them -- and they disagree for "
+            "every declaration with more than one property. Measured twice on the base "
+            "checkpoint, choosing wrong costs a resolved 0.019-0.036 exact match, and the "
+            "failure is a wrong argument value rather than a reordered one. Left unset the "
+            "bundle records that it does not know, which is the honest answer and not a default"
+        ),
     )
     bundle.add_argument("--context-length", type=int)
     bundle.add_argument(
@@ -1010,6 +1024,7 @@ def _bundle(args: argparse.Namespace) -> int:
 
     contract = Contract(
         prompt_mode=PromptMode(args.prompt_mode),
+        wire_convention=(WireConvention(args.wire_convention) if args.wire_convention else None),
         # The runtime's pins, because which prompt a runtime renders is a
         # property of that runtime's release. `export.resolve_toolchain` reads
         # the resolved closure and is better; a run that produced one should
@@ -1032,6 +1047,20 @@ def _bundle(args: argparse.Namespace) -> int:
         attribution=manifest.get("attribution") or {},
         limitations=tuple(manifest.get("limitations") or ())
         + tuple(models.limitations_for(args.base_model))
+        # Only when there are declarations to order. A model called without
+        # tools cannot be affected by this, and a limitation that does not
+        # apply teaches readers to skim them.
+        + (
+            (
+                "--wire-convention was not given, so this bundle does not record which property "
+                "order its declarations were rendered in. The two conventions in the field "
+                "disagree for every declaration with more than one property, and on the base "
+                "checkpoint the wrong one costs a resolved 0.019-0.036 exact match -- as a wrong "
+                "argument value, not a reordered one. A consumer has to guess.",
+            )
+            if args.wire_convention is None
+            else ()
+        )
         # A tag can be moved. Recorded rather than refused: it still pins
         # something, and the bundle is where a reader finds out how much.
         + tuple(weak_revision_limitations(args.base_model_revision, "--base-model-revision")),

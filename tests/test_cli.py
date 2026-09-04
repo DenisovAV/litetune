@@ -1283,3 +1283,20 @@ def test_a_family_stop_token_alone_says_the_trained_one_is_unrecorded(tmp_path):
     assert contract["stop_tokens"] == ["<start_function_response>"]
     notes = " ".join(contract["notes"])
     assert "the terminator the model was actually trained to emit is unrecorded" in notes
+
+
+def test_an_unrecorded_wire_convention_is_a_named_limitation(tmp_path):
+    """A consumer that has to guess is told it has to guess."""
+    main(_stop_token_argv(tmp_path))
+    report = json.loads((tmp_path / "bundle" / "report.json").read_text(encoding="utf-8"))
+    limitation = [line for line in report["limitations"] if "--wire-convention" in line]
+    assert limitation, "an unrecorded convention must be reported, not silently omitted"
+    assert "0.019-0.036" in limitation[0], "the cost of guessing wrong belongs in the text"
+
+
+def test_a_recorded_wire_convention_raises_no_limitation(tmp_path):
+    main(_stop_token_argv(tmp_path, "--wire-convention", "template_dictsort"))
+    contract = _stop_token_contract(tmp_path)
+    report = json.loads((tmp_path / "bundle" / "report.json").read_text(encoding="utf-8"))
+    assert contract["wire_convention"] == "template_dictsort"
+    assert not [line for line in report["limitations"] if "--wire-convention" in line]

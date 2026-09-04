@@ -52,28 +52,33 @@ rows**, and one bundle therefore presents two different prompts depending on
 which path a consumer takes.
 
 Which one the base model's weights learned was argued rather than measured until
-it was measured. Same checkpoint, same 640 examples, same greedy decode, same
-parser, one variable:
+it was measured. Same checkpoint, same greedy decode, same parser, one variable —
+twice, on disjoint samples with different batching:
 
-| | exact match |
-|---|---|
-| declaration order (as published above) | 0.7266 ±0.0345 |
-| `dictsort`, the template's order | **0.7625** ±0.0330 |
+| | n | declaration order | `dictsort` | paired difference |
+|---|---|---|---|---|
+| held-out split | 640 | 0.7266 ±0.0345 | **0.7625** ±0.0330 | −0.0359 ±0.0219 |
+| disjoint sample | 1280 | 0.7602 ±0.0234 | **0.7789** ±0.0227 | −0.0187 ±0.0099 |
 
-Paired: **−0.0359 ±0.0219**, resolved, on 51 discordant pairs split 37 to 14.
-Not a parsing artifact — argument dicts compare without regard to key order, so
-what changes is *which arguments the model extracts*: given a declaration in the
-wrong order it returns `email` where the target wanted `phone_number`.
+Both resolve, both in the same direction, and the intervals overlap at
+[−0.0286, −0.0140]. The discordant pairs split 37:14 and 33:9 — three to one in
+`dictsort`'s favour each time. **The weights prefer the template's order.**
 
-So the base is understated by about 0.036, and the fine-tuning gain above
-absorbs that difference: part of what reads as "learned the task" is "learned
-our rendering". Against a correctly rendered base the gain is roughly
-**+0.155**, not +0.19. Still large, still resolved.
+Not a parsing artifact: argument dicts compare without regard to key order, so a
+reordered call scores the same. What changes is *which arguments the model
+extracts* — given a declaration in the wrong order it returns `email` where the
+target wanted `phone_number`. The model learned "the Nth property is X", and
+moving the properties moves the answer.
 
-This is **one run**, and a replication on a disjoint sample is not yet in. It is
-recorded here rather than after that run because the numbers above are already
-published and the evidence against them already resolves. The fix is to render
-declarations the way the weights expect and re-measure; it is not done.
+The first run is the one the base column above was measured with, so that column
+is understated, and the fine-tuning gain absorbs the difference: part of what
+reads as "learned the task" is "learned our rendering". Against a correctly
+rendered base the gain is roughly **+0.155**, not +0.19. Still large, still
+resolved.
+
+The fix is to render declarations the way the weights expect and re-measure. It
+is not done — what is done is that `contract.json` now records which convention
+a bundle was built under, so a consumer is no longer guessing.
 
 ### What three runs of the same thing disagree about
 

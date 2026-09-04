@@ -864,3 +864,38 @@ def test_an_adapter_outside_the_output_directory_is_copied_and_left_intact(tmp_p
     assert check is not None and check.outcome.value == "passed"
     assert (out / "adapter" / "adapter_model.safetensors").read_bytes() == b"weights"
     assert (source / "adapter_model.safetensors").exists(), "the source must not be consumed"
+
+
+def test_the_wire_convention_is_recorded_or_declared_unknown():
+    """`declarations_sha256` cannot carry this, which is why the field exists.
+
+    The same declarations rendered in declaration order and in dictsort hash
+    identically, so without this a bundle has no way to say which one it was
+    built under. Measured on the base checkpoint twice, on disjoint samples:
+    choosing wrong costs a resolved 0.019-0.036 exact match, and it fails as a
+    *wrong argument value* -- argument dicts compare without regard to key
+    order, so a merely reordered call would score the same.
+    """
+    from litetune.bundle import Contract, PromptMode, WireConvention
+
+    versions = {"litert-lm": "0.16.1"}
+    common = dict(
+        prompt_mode=PromptMode.PRERENDERED,
+        established_against=versions,
+        base_model="google/functiongemma-270m-it",
+        base_model_revision="a" * 40,
+    )
+
+    recorded = Contract(wire_convention=WireConvention.TEMPLATE_DICTSORT, **common).as_dict()
+    assert recorded["wire_convention"] == "template_dictsort"
+    assert "sorted by name" in recorded["wire_convention_meaning"]
+
+    # Unset is "unrecorded", never a quiet default: a default here is a guess
+    # with a measured, resolved cost.
+    unknown = Contract(**common).as_dict()
+    assert unknown["wire_convention"] is None
+    assert "unrecorded" in unknown["wire_convention_meaning"]
+
+    # And it survives the round trip, so a manifest can carry it forward.
+    assert Contract.read(recorded).wire_convention is WireConvention.TEMPLATE_DICTSORT
+    assert Contract.read(unknown).wire_convention is None
