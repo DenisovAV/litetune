@@ -18,7 +18,7 @@ the conversion succeeded. This tells you what it cost.
 ## Install
 
 ```bash
-pip install git+https://github.com/DenisovAV/litetune
+pip install litetune
 ```
 
 Python 3.10–3.12. On Linux you also need the `libvulkan1` system package:
