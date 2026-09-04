@@ -43,6 +43,7 @@ from litetune.bundle import (
     versions_from,
 )
 from litetune.checks import Outcome
+from litetune.envs import cached_environments, env_cache_root, remove_cached
 from litetune.evaluate import GREEDY, DataError, PromptMode
 from litetune.events import EventStream, TerminalRenderer
 from litetune.export import (
@@ -202,6 +203,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_tune(sub)
     _add_convert(sub)
     _add_bundle(sub)
+
+    env = sub.add_parser(
+        "env",
+        help="show or clear the environments the stages provisioned",
+        description=(
+            "Stage environments are cached under a path nothing else prints, and their "
+            "sizes differ by an order of magnitude: the export toolchain is over a "
+            "gigabyte, the runtime a tenth of that. A failed provision also leaves a "
+            "directory that looks like a working one from the outside."
+        ),
+    )
+    env.add_argument(
+        "--clean",
+        action="store_true",
+        help="remove every cached environment. The next stage that needs one rebuilds it",
+    )
     return parser
 
 
@@ -846,6 +863,49 @@ def summarise_tune(result: TuneResult) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# env
+# ---------------------------------------------------------------------------
+
+
+def _human(size: int) -> str:
+    scaled = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if scaled < 1024 or unit == "GB":
+            return f"{scaled:.0f} {unit}" if unit == "B" else f"{scaled:.1f} {unit}"
+        scaled /= 1024.0
+    return f"{scaled:.1f} GB"
+
+
+def _env(args: argparse.Namespace) -> int:
+    entries = cached_environments()
+    if not entries:
+        print(f"no cached environments under {env_cache_root()}")
+        return EXIT_CODES[Status.PASSED]
+
+    total = sum(e.bytes for e in entries)
+    if not args.clean:
+        print(f"{env_cache_root()}  —  {_human(total)} in {len(entries)} environment(s)")
+        for entry in entries:
+            # "Not for this interpreter" rather than "unused": the identity is a
+            # hash of the pins *and* the running Python, so an environment built
+            # by another version looks foreign from here and is not junk. Saying
+            # "unclaimed" would invite deleting the ones that work.
+            belongs = (
+                entry.stage or f"not for python{sys.version_info.major}.{sys.version_info.minor}"
+            )
+            state = "ready" if entry.ready else "incomplete"
+            print(f"  {_human(entry.bytes):>9}  {state:<10} {belongs:<28} {entry.path.name}")
+        print("\nRe-run with --clean to remove them; the next stage that needs one rebuilds it.")
+        return EXIT_CODES[Status.PASSED]
+
+    freed, failures = remove_cached(entries)
+    print(f"removed {len(entries) - len(failures)} environment(s), freed {_human(freed)}")
+    for failure in failures:
+        print(f"  could not remove {failure}")
+    return EXIT_CODES[Status.PASSED] if not failures else EXIT_CODES[Status.ERROR]
+
+
+# ---------------------------------------------------------------------------
 # convert
 # ---------------------------------------------------------------------------
 
@@ -1136,6 +1196,7 @@ HANDLERS = {
     "tune": _tune,
     "convert": _convert,
     "bundle": _bundle,
+    "env": _env,
 }
 
 

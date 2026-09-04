@@ -260,3 +260,68 @@ def test_a_provisioned_environment_can_run_its_console_scripts(monkeypatch, tmp_
     )
     assert done.returncode == 0, done.stderr
     assert "pip" in done.stdout
+
+
+def test_the_cache_is_inventoried_with_sizes_and_readiness(monkeypatch, tmp_path):
+    """There is no other way to find out what the stages left on disk.
+
+    The path is in no documentation, the sizes differ by an order of magnitude
+    between stages, and a provision that died halfway leaves a directory that
+    looks exactly like a working one from the outside.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+
+    big = tmp_path / "export-deadbeef"
+    (big / "lib").mkdir(parents=True)
+    (big / "lib" / "payload").write_bytes(b"x" * 5000)
+    (big / ".litetune-ready").write_text("deadbeef", encoding="utf-8")
+
+    half = tmp_path / "runtime-cafe"
+    half.mkdir()
+    (half / "payload").write_bytes(b"x" * 10)
+
+    entries = envs.cached_environments()
+
+    # Largest first: the reason to look is usually to find what to delete.
+    assert [e.path.name for e in entries] == ["export-deadbeef", "runtime-cafe"]
+    assert entries[0].bytes > 5000 and entries[0].ready
+    assert entries[1].bytes == 10 and not entries[1].ready
+
+
+def test_an_environment_for_another_interpreter_is_not_reported_as_junk():
+    """`identity` hashes the running Python along with the pins.
+
+    So an environment built by 3.12 looks foreign from 3.14 -- and it is not
+    junk, it is the one that works over there. Reporting it as "unused" would
+    invite deleting exactly the caches worth keeping.
+    """
+    from litetune.envs import EXPORT, RUNTIME, TRAIN
+
+    identities = {env.path.name for env in (RUNTIME, TRAIN, EXPORT)}
+    assert len(identities) == 3, "each stage owns a distinct directory"
+    for env in (RUNTIME, TRAIN, EXPORT):
+        assert env.identity in env.path.name
+        # The interpreter is in the hash, which is why the CLI says "not for
+        # pythonX.Y" rather than "unclaimed".
+        assert env.identity != _identity_ignoring_interpreter(env)
+
+
+def _identity_ignoring_interpreter(env) -> str:
+    import hashlib
+
+    return hashlib.sha256("\n".join(sorted(env.requirements)).encode()).hexdigest()[:12]
+
+
+def test_removing_the_cache_reports_what_would_not_go(monkeypatch, tmp_path):
+    """Four of five removed, and which one resisted, beats stopping at the first."""
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    for name in ("export-aaa", "runtime-bbb"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "f").write_bytes(b"x" * 100)
+
+    entries = envs.cached_environments()
+    freed, failures = envs.remove_cached(entries)
+
+    assert freed == 200
+    assert failures == []
+    assert envs.cached_environments() == []

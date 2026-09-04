@@ -28,12 +28,22 @@ import subprocess
 import sys
 import time
 import venv
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
 class UnpinnedRequirement(ValueError):
     """Raised when an environment definition would float."""
+
+
+def env_cache_root() -> Path:
+    """Where provisioned environments live. Public because `litetune env` shows it.
+
+    A path a user is told to inspect or clear should have a name in the API, not
+    only a shape in a docstring.
+    """
+    return _cache_root()
 
 
 def _cache_root() -> Path:
@@ -165,6 +175,79 @@ def _provision_lock(path: Path, timeout: float = PROVISION_TIMEOUT_S):
                 )
             time.sleep(0.5)
         yield
+
+
+@dataclass(frozen=True)
+class CachedEnv:
+    """One directory in the environment cache, and what is known about it."""
+
+    path: Path
+    bytes: int
+    ready: bool
+    # The stage it belongs to, when the name still matches one this version
+    # defines. A directory whose identity no longer matches any stage is not
+    # junk -- it is what an older litetune, or a different interpreter, built --
+    # so it is reported as unclaimed rather than as an error.
+    stage: str | None
+
+    @property
+    def claimed(self) -> bool:
+        return self.stage is not None
+
+
+def _tree_bytes(path: Path) -> int:
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file() and not child.is_symlink():
+                total += child.stat().st_size
+        except OSError:
+            # A file that vanished mid-walk is not a reason to refuse a total;
+            # it is a reason for the total to be approximate, which it always is.
+            continue
+    return total
+
+
+def cached_environments() -> list[CachedEnv]:
+    """Everything in the cache, largest first.
+
+    There is no other way to find out. The path is not in the documentation, the
+    sizes differ by an order of magnitude between stages, and a failed provision
+    leaves a directory behind that looks exactly like a working one from the
+    outside.
+    """
+    root = _cache_root()
+    if not root.is_dir():
+        return []
+    claimed = {env.path.name: env.name for env in (RUNTIME, TRAIN, EXPORT)}
+    out = [
+        CachedEnv(
+            path=child,
+            bytes=_tree_bytes(child),
+            ready=(child / ".litetune-ready").exists(),
+            stage=claimed.get(child.name),
+        )
+        for child in sorted(root.iterdir())
+        if child.is_dir()
+    ]
+    return sorted(out, key=lambda e: e.bytes, reverse=True)
+
+
+def remove_cached(entries: Sequence[CachedEnv]) -> tuple[int, list[str]]:
+    """Delete these directories. Returns the bytes freed and what would not go.
+
+    Failures are collected rather than raised: removing four of five caches and
+    saying which one resisted is more useful than stopping at the first.
+    """
+    freed = 0
+    failures: list[str] = []
+    for entry in entries:
+        try:
+            shutil.rmtree(entry.path)
+            freed += entry.bytes
+        except OSError as exc:
+            failures.append(f"{entry.path}: {exc}")
+    return freed, failures
 
 
 @dataclass(frozen=True)
