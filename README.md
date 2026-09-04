@@ -21,6 +21,12 @@ the conversion succeeded. This tells you what it cost.
 pip install litetune
 ```
 
+Or through Homebrew, which brings its own Python 3.12:
+
+```bash
+brew install DenisovAV/tap/litetune
+```
+
 Python 3.10–3.12. On Linux you also need the `libvulkan1` system package:
 
 ```bash
