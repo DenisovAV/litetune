@@ -368,14 +368,6 @@ is measured under a rendering the base did not learn*. litetune does not yet let
 you choose, record which was used, or refuse to compare two points rendered
 differently, which is what `contract.json` should carry and does not.
 
-**The bundle's stop tokens are not the ones Google ships.** Read with
-`litertlm_peek`, Google's published FunctionGemma bundle declares
-`<end_of_turn>` and `<start_function_response>`; an export from this toolchain
-declares seventeen auto-derived punctuation variants of `<end_of_turn>\n` and
-neither of those. `bundle` now records both in `contract.json` — the trained
-terminator from the run, the family's from `models.py` — but the metadata inside
-the `.litertlm` is written by the exporter and is still the auto-derived list.
-
 **The SentencePiece tokenizer is restored by hand, and that is load-bearing.**
 `transformers` 5.x `save_pretrained` no longer writes `tokenizer.model`, and the
 tokenizer classes no longer expose `vocab_file`. The exporter's SentencePiece

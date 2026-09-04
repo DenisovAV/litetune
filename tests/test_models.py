@@ -500,6 +500,11 @@ def test_functiongemma_declares_the_terminator_training_cannot_reveal():
     both -- read with `litertlm_peek` -- while ours declared seventeen
     auto-derived punctuation variants of `<end_of_turn>\\n` and not this one.
 
+    The `.litertlm` does carry it -- as token id 50, out of
+    `generation_config.eos_token_id`. This is about `contract.json`, which a
+    consumer reads without a protobuf parser and which otherwise names only the
+    terminator the run observed.
+
     Keyed on model identity because it is not in `config.json`: plain Gemma 3
     shares the architecture and has no function-response channel at all.
     """
@@ -508,6 +513,7 @@ def test_functiongemma_declares_the_terminator_training_cannot_reveal():
     tokens, reason = stop_tokens_for("google/functiongemma-270m-it")
     assert tokens == ("<start_function_response>",)
     assert "application has to execute the tool" in reason
+    assert "token id 50" in reason, "the reason must not claim the bundle lacks it"
 
     assert stop_tokens_for("google/gemma-3-270m-it") == ((), "")
     assert stop_tokens_for("some/unknown-model") == ((), "")

@@ -334,9 +334,10 @@ _FUNCTION_RESPONSE_REASON = (
     "a FunctionGemma turn does not end at the call: after `<end_function_call>` the "
     "application has to execute the tool and send the result back, and the model must stop "
     "and wait for it. Training cannot reveal this terminator -- the completions end at "
-    "`<end_of_turn>`, so a run records that one and nothing else. Google's published bundle "
-    "for this model declares both, read with litertlm_peek; ours declared seventeen "
-    "auto-derived punctuation variants of `<end_of_turn>\\n` and not this"
+    "`<end_of_turn>`, so a run records that one and nothing else. The .litertlm itself does "
+    "carry it, as token id 50 out of generation_config.eos_token_id; this is about the "
+    "contract, which a consumer reads without a protobuf parser and which otherwise names "
+    "only the terminator the run observed"
 )
 
 _MODEL_TYPE_REASON = (
@@ -532,11 +533,18 @@ def limitations_for(model: str) -> list[str]:
 def stop_tokens_for(model: str) -> tuple[tuple[str, ...], str]:
     """Terminators this family needs beyond the one training recorded, and why.
 
-    Measured against Google's own published bundle for this model, read with
-    `litertlm_peek`: it declares `<end_of_turn>` *and*
-    `<start_function_response>`. Ours declared neither of those two -- an
-    auto-derived list of seventeen punctuation-plus-terminator variants, none of
-    which stops the model where the application must inject a tool result.
+    Read with `litertlm_peek`, Google's bundle names `<end_of_turn>` and
+    `<start_function_response>` as strings; ours names the same two as token ids
+    106 and 50, taken from `generation_config.eos_token_id`, plus `<eos>` and a
+    set of punctuation-prefixed string variants the exporter adds deliberately
+    to catch SentencePiece merging `.` and the terminator into one token. The
+    two bundles agree; a first reading of the peek grepped for `token_str` and
+    reported a difference that was an encoding.
+
+    What did differ is the contract. `bundle` named only the terminator the
+    training run observed, so a consumer reading `contract.json` -- rather than
+    parsing the bundle's protobuf -- was not told where the application has to
+    take over.
     """
     rules = identify(model)
     if rules is None:

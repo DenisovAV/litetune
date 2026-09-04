@@ -998,6 +998,10 @@ def _bundle(args: argparse.Namespace) -> int:
     # additionally requires it to stop at. Both are named in the notes, because
     # "the bundle declares two stop tokens" and "litetune added one of them" are
     # different claims and the report is where a reader tells them apart.
+    #
+    # This completes the *contract*, not the artifact: the `.litertlm` already
+    # carries the same terminator as a token id. A consumer reading contract.json
+    # instead of parsing the bundle's protobuf was the one being short-changed.
     family_stops, stop_reason = models.stop_tokens_for(args.base_model)
     added_stops = tuple(t for t in family_stops if t not in stop_tokens)
     unrecorded_primary = added_stops and not stop_tokens
