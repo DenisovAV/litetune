@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from litetune import envs, models
+from litetune._version import __version__
 from litetune.bundle import (
     BundleError,
     BundleRequest,
@@ -170,6 +171,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="litetune",
         description="Fine-tune, convert and verify small models for on-device.",
+    )
+    # A real `--version`, because argparse's prefix matching gave it away.
+    # `litetune --version` matched `--verbose` as an abbreviation, so a user
+    # checking which version they had silently turned on debug logging and was
+    # then told they had not named a command. Declaring the flag both answers
+    # the question and removes the collision.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"litetune {__version__}",
+        help="print the version and exit",
     )
     parser.add_argument(
         "-v",

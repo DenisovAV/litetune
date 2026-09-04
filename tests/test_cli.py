@@ -1300,3 +1300,25 @@ def test_a_recorded_wire_convention_raises_no_limitation(tmp_path):
     report = json.loads((tmp_path / "bundle" / "report.json").read_text(encoding="utf-8"))
     assert contract["wire_convention"] == "template_dictsort"
     assert not [line for line in report["limitations"] if "--wire-convention" in line]
+
+
+def test_version_is_a_flag_and_not_an_abbreviation_of_verbose(capsys):
+    """`litetune --version` is the first thing a new user types.
+
+    It used to match `--verbose` through argparse's prefix abbreviation: the
+    flag silently switched on debug logging and the user was then told they had
+    not named a command. Declaring `--version` answers the question and removes
+    the collision.
+    """
+    from litetune._version import __version__
+
+    # `main` converts argparse's SystemExit into a return code -- the same path
+    # that keeps `litetune --help | head` from exiting 120 on a closed pipe.
+    assert main(["--version"]) == 0
+    assert capsys.readouterr().out.strip() == f"litetune {__version__}"
+
+
+def test_verbose_still_needs_a_command(capsys):
+    """`--verbose` modifies a run; it does not constitute one."""
+    assert main(["--verbose"]) == 4
+    assert "required: command" in capsys.readouterr().err
