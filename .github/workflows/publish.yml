@@ -1,0 +1,46 @@
+# Publishes to PyPI when a GitHub Release is published.
+#
+# No API token anywhere. PyPI trusts this exact workflow in this exact
+# repository through OIDC, so there is no secret to leak, rotate, or paste into
+# a chat window. `id-token: write` is what mints the short-lived credential;
+# without it the publish step has nothing to authenticate with.
+name: publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # The whole authentication story. Everything else stays read-only.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The tag is the version. A release built from a tree whose
+      # `_version.py` says something else would publish an artifact whose
+      # recorded version does not lead back to the code that made it -- and
+      # `manifest.py` writes that version into every artifact litetune
+      # produces, so the mismatch would propagate to the user's bundles.
+      - name: The tag and the package must agree
+        run: |
+          set -o pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(python -c "import re,pathlib; print(re.search(r'\"([^\"]+)\"', pathlib.Path('src/litetune/_version.py').read_text()).group(1))")
+          echo "tag=$tag package=$pkg"
+          test "$tag" = "$pkg" || { echo "::error::tag $tag does not match _version.py $pkg"; exit 1; }
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
