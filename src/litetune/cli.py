@@ -170,7 +170,10 @@ class _Parser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="litetune",
-        description="Fine-tune, convert and verify small models for on-device.",
+        description=(
+            "Fine-tune a small model, convert it to run on a phone, and know what the "
+            "conversion cost you."
+        ),
     )
     # A real `--version`, because argparse's prefix matching gave it away.
     # `litetune --version` matched `--verbose` as an abbreviation, so a user

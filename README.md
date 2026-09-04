@@ -1,14 +1,22 @@
 # litetune
 
-**Fine-tune, convert and verify small models for on-device. Know what the
+**Fine-tune a small model, convert it to run on a phone, and know what the
 conversion cost you.**
 
-- **tune** — supervised fine-tuning, optional (bring your own checkpoint and skip it)
-- **convert** — checkpoint to `.litertlm`, across quantization recipes
-- **verify** — measure what conversion cost, before you ship
+Getting from a Hugging Face checkpoint to a model that works inside your app is
+a long road — LoRA, merge, export to `.litertlm`, bundle metadata — and a
+mistake at any step produces a file of the right size that loads without error
+and works worse than it should. litetune walks that road and knows the traps on
+it.
 
-Converting a model to run on a phone changes its answers. Most tooling tells you
-the conversion succeeded. This tells you what it cost.
+- **prepare** — split the data, and refuse what cannot be measured
+- **tune** — supervised fine-tuning, loss masked to the completion
+- **convert** — checkpoint to `.litertlm`, across quantization recipes
+- **verify** — measure what the conversion cost, before you ship
+- **bundle** — package the artifact with what was measured about it
+
+Bring your own checkpoint and skip the first two, or bring your own `.litertlm`
+and run only `verify`.
 
 > **Alpha.** Tested end to end on `google/functiongemma-270m-it` only. Other
 > models are not claimed to work. Try it on yours and open an issue.
@@ -41,8 +49,24 @@ runs on 3.13.
 
 ## Quick start
 
-**If you already have a `.litertlm`**, this is the whole tool in one command.
-Nothing is retrained, no data leaves your machine:
+Fine-tune a model and get a `.litertlm` you can ship:
+
+```bash
+litetune prepare --data raw.jsonl --output-dir data --context-length 1024
+
+litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
+              --output-dir tuned --prompt-mode prerendered --method lora
+
+litetune convert --model tuned/model --output-dir artifacts \
+                 --recipe dynamic_wi8_afp32 --recipe weight_only_wi8_afp32
+```
+
+That is the part most tooling makes you assemble by hand. See
+[The full pipeline](#the-full-pipeline) for `verify` and `bundle`, and for what
+each flag decides.
+
+**Already have a `.litertlm`?** Then one command is the whole tool. Nothing is
+retrained and no data leaves your machine:
 
 ```bash
 litetune verify --model ./your-model.litertlm \
@@ -52,15 +76,13 @@ litetune verify --model ./your-model.litertlm \
 
 `--reference` is the **float twin** — the same weights before conversion. That is
 what makes the difference between them the conversion cost, rather than a
-mixture of that and whatever training did.
+mixture of that and whatever training did. Pointing it at a different checkpoint
+(an untuned base, say) needs `--reference-role untuned_base`, and then both the
+training gain and the conversion cost are reported as unavailable: one number
+cannot separate two effects.
 
-Pointing it at a different checkpoint (an untuned base, say) needs
-`--reference-role untuned_base`, and then both the training gain and the
-conversion cost are reported as unavailable: one number cannot separate two
-effects.
-
-First run provisions two environments and pulls `torch` — several gigabytes and
-a few minutes. Later runs reuse them.
+First run of `tune`, `convert` or `verify` provisions its own environment and
+pulls `torch` — several gigabytes and a few minutes. Later runs reuse it.
 
 ---
 
@@ -128,6 +150,56 @@ the two can differ enormously. `prepare` splits by content hash rather than
 position, so re-running it puts the same rows on the same side, and it reports
 the token-length distribution so a row too long for the sequence limit fails
 before you rent a GPU rather than after.
+
+---
+
+## What it knows that a shell script does not
+
+Each of these was paid for once, by an artifact that looked fine and was not.
+
+**Export flags keyed on model identity.** They are not in any documentation, and
+`config.json` does not contain enough to derive them:
+
+| family | flags litetune adds |
+|---|---|
+| `functiongemma` | `--litert_lm_model_type_override=function_gemma` |
+| `gemma-3-text` | `--litert_lm_model_type_override=gemma3` |
+| `gemma-4-e2b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm` |
+
+Without the first, FunctionGemma exports as `generic_model` — its `config.json`
+says `gemma3_text`, which the exporter's list does not have, so it falls through
+a silent catch-all. The runtime then builds no tool-call channel and
+`CreateConstraint` returns `Unimplemented`, which `conversation.cc` **swallows**.
+An app that parses the response text sees nothing wrong; an app that passes tools
+natively receives no calls at all. The export succeeds, the file is the right
+size, every liveness check is green.
+
+**The terminator comes from the chat template, not from `eos_token_id`.** They
+are not always the same token, and a model trained to emit the wrong one never
+closes its turn: on a device it emits call after call, and the consumer's
+`<start_of_turn>model…<end_of_turn>` regex cannot delimit output that never ends.
+Measured: 34 of 40 sampled generations emitted more than one call before this was
+fixed, and the accuracy score did not move — the repeats were identical, so the
+cost was device behaviour, not the metric.
+
+**The adapter is saved before the merge.** A merged checkpoint cannot be
+un-merged, and the rank-16 delta is the only form you can re-apply to a different
+base, inspect, or ship on its own.
+
+**`tokenizer.model` is carried back.** `transformers` 5.x stopped writing it and
+the tokenizer classes stopped exposing `vocab_file`, so the exporter's
+SentencePiece branch never fires and the bundle silently gets an HF tokenizer
+section — losing FST-constrained decoding, which is SentencePiece-only. `tune`
+copies the file back and records whether it managed to.
+
+**Minimum `transformers` per family.** Gemma 4 and Qwen3.5 fail at tokenizer load
+on every 4.x release, and Gemma 4 additionally needs 5.5.0 for `AutoConfig` to
+recognise the architecture. litetune refuses with the version rather than letting
+you find out from an `AttributeError`.
+
+**One environment per stage.** The training stack and the export toolchain pin
+incompatible dependencies and cannot share an interpreter. litetune provisions
+them separately so you never have to discover that.
 
 ---
 

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "litetune"
 dynamic = ["version"]
-description = "Fine-tune, convert and verify small models for on-device. Know what the conversion cost you."
+description = "Fine-tune a small model, convert it to run on a phone, and know what the conversion cost you."
 readme = "README.md"
 # No upper bound, deliberately, and this was tried the other way first.
 #
