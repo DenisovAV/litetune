@@ -450,6 +450,23 @@ def test_export_does_not_ask_for_an_accelerator(toolchain, request_for):
     assert "--backend=gpu" not in call.argv
 
 
+class _AnyTemplate:
+    """Matches the template flag whatever absolute path it carries."""
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, str)
+            and other.startswith("--jinja_chat_template_override=")
+            and other.endswith("templates/functiongemma.jinja")
+        )
+
+    def __repr__(self) -> str:
+        return "--jinja_chat_template_override=<packaged functiongemma.jinja>"
+
+
+_ANY_TEMPLATE = _AnyTemplate()
+
+
 def test_argv_is_the_documented_command(request_for):
     request = request_for(MEASURED_RECIPES)
     assert request.argv("weight_only_wi8_afp32") == [
@@ -463,6 +480,12 @@ def test_argv_is_the_documented_command(request_for):
         # and without the override the bundle is typed `generic_model` and the
         # runtime creates no tool-call channel.
         "--litert_lm_model_type_override=function_gemma",
+        # The template the checkpoint ships with uses `macro` and `dictsort`,
+        # which LiteRT-LM's MiniJinja does not support: a bundle carrying it
+        # exports cleanly and then fails the native tool path. Compared by
+        # suffix because the value is an absolute path into the installed
+        # package, which differs per machine.
+        _ANY_TEMPLATE,
         # Appended by `ExportRequest` itself, because the caller said nothing
         # about it and the default is on. Every measured artifact carries it,
         # and an export without it is a different shape -- 286 MB against
@@ -672,3 +695,90 @@ def test_run_export_repairs_the_path_and_says_so(toolchain, request_for, tmp_pat
     repaired = [line for line in result.limitations if "vocab_file" in line]
     assert repaired, "a rewrite of the caller's own directory must reach the report"
     assert "/tmp/elsewhere/tokenizer.model" in repaired[0]
+
+
+def _checkpoint(tmp_path, *, model_type="gemma3_text", recorded=None):
+    d = tmp_path / "model"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text(json.dumps({"model_type": model_type}), encoding="utf-8")
+    if recorded is not None:
+        (d / "litetune.json").write_text(json.dumps({"base_model": recorded}), encoding="utf-8")
+    return d
+
+
+def test_a_flag_that_contradicts_the_checkpoint_refuses_before_any_work(tmp_path):
+    """`--base-model` used to win in silence, and the check said passed.
+
+    One stale copy-pasted command line then exported the wrong family with a
+    report actively vouching for it. The recorded value came from the run that
+    produced the weights; the flag came from a shell. Neither is discarded.
+    """
+    from litetune.export import ExportRequest, run_export
+
+    checkpoint = _checkpoint(tmp_path, recorded="google/functiongemma-270m-it")
+    request = ExportRequest(
+        model=str(checkpoint),
+        base_model="google/gemma-3-270m-it",
+        output_dir=tmp_path / "out",
+        recipes=("dynamic_wi8_afp32",),
+    )
+
+    assert request.identity_conflict and "different families" in request.identity_conflict
+    result = run_export(request)
+    assert result.outcome is Outcome.UNCHECKED
+    assert result.not_attempted == ("dynamic_wi8_afp32",)
+    assert not result.exports, "nothing may be built under two answers"
+
+
+def test_a_flag_that_agrees_with_the_checkpoint_is_not_a_conflict(tmp_path):
+    from litetune.export import ExportRequest
+
+    checkpoint = _checkpoint(tmp_path, recorded="google/functiongemma-270m-it")
+    request = ExportRequest(
+        model=str(checkpoint),
+        base_model="google/functiongemma-270m-it",
+        output_dir=tmp_path / "out",
+        recipes=("dynamic_wi8_afp32",),
+    )
+    assert request.identity_conflict is None
+    assert request.plan.rules is not None
+    assert request.plan.rules.family == "functiongemma"
+
+
+def test_the_plan_is_keyed_on_the_identity_while_argv_still_names_the_path(tmp_path):
+    """Two values that are easy to swap and would swap silently.
+
+    `plan_export` must see the identity; `litert-torch` must see the directory.
+    Exchanging them produces either a plan with no rules or an export of a model
+    that is not on disk, and nothing else would notice.
+    """
+    from litetune.export import ExportRequest
+
+    checkpoint = _checkpoint(tmp_path, recorded="google/functiongemma-270m-it")
+    request = ExportRequest(
+        model=str(checkpoint),
+        output_dir=tmp_path / "out",
+        recipes=("dynamic_wi8_afp32",),
+    )
+
+    assert request.plan.rules is not None
+    assert request.plan.rules.family == "functiongemma"
+    assert f"--model={checkpoint}" in request.argv("dynamic_wi8_afp32")
+
+
+def test_an_unreadable_sidecar_reaches_the_report(tmp_path):
+    """Recorded in the hint is not enough: nobody reads a hint."""
+    from litetune.export import ExportRequest, run_export
+
+    checkpoint = _checkpoint(tmp_path)
+    (checkpoint / "litetune.json").write_text('{"base_model": "goo', encoding="utf-8")
+
+    result = run_export(
+        ExportRequest(
+            model=str(checkpoint),
+            base_model="google/functiongemma-270m-it",
+            output_dir=tmp_path / "out",
+            recipes=("dynamic_wi8_afp32",),
+        )
+    )
+    assert any("could not be read" in line for line in result.limitations)

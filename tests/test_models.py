@@ -85,12 +85,24 @@ def test_a_family_with_no_rules_is_reported_as_unknown_not_as_fine(model):
     assert "no per-model rules" in record["reason"]
 
 
-def test_a_local_checkpoint_is_identified_from_its_config(tmp_path):
-    # A merged checkpoint in `runs/out/model` carries no family in its path.
+def test_a_local_checkpoint_is_identified_from_what_tune_recorded(tmp_path):
+    """A merged checkpoint in `runs/out/model` carries no family in its path.
+
+    It used to carry one in `config.json`: `from_pretrained` sets
+    `_name_or_path` to the id you loaded, and this test hand-wrote that key.
+    transformers 5.x deletes it on save -- `to_diff_dict` drops it before
+    serialising -- so no checkpoint `tune` produces has ever had it, and the
+    test was verifying a contract upstream had already broken.
+
+    The identity now travels in a sidecar `tune` writes. The `config.json` here
+    is what transformers 5.x actually emits, so this fails if the sidecar stops
+    being read.
+    """
     checkpoint = tmp_path / "model"
     checkpoint.mkdir()
-    (checkpoint / "config.json").write_text(
-        json.dumps({"model_type": "gemma4", "_name_or_path": GEMMA4_E2B}), encoding="utf-8"
+    (checkpoint / "config.json").write_text(json.dumps({"model_type": "gemma4"}), encoding="utf-8")
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": GEMMA4_E2B}), encoding="utf-8"
     )
     rules = identify(str(checkpoint))
     assert rules is not None
@@ -517,3 +529,201 @@ def test_functiongemma_declares_the_terminator_training_cannot_reveal():
 
     assert stop_tokens_for("google/gemma-3-270m-it") == ((), "")
     assert stop_tokens_for("some/unknown-model") == ((), "")
+
+
+def test_functiongemma_carries_a_template_the_runtime_can_execute():
+    """The checkpoint's own template cannot run on-device.
+
+    It uses `macro` and `dictsort`; LiteRT-LM renders with MiniJinja, which
+    supports neither. A bundle built from it exports cleanly, is the right size,
+    passes every liveness check and answers the text path `flutter_gemma` uses —
+    and fails the native tool path with an opaque
+    `litert_lm_conversation_send_message_stream failed`, because the wrapper
+    keeps the return code and drops the message under it.
+
+    Measured, on the same checkpoint: with the override the runtime answers
+    `[tool_call] set_alarm{hour:7}`; without it, `INTERNAL: Failed to apply
+    template`.
+    """
+    import pathlib
+
+    from litetune.models import functiongemma_template, plan_export
+
+    template = pathlib.Path(functiongemma_template())
+    assert template.is_file(), "the template must ship with the package"
+    text = template.read_text(encoding="utf-8")
+
+    # The header names both constructs while explaining their absence, so the
+    # body is what gets checked. A test that matched the explanation instead of
+    # the code would pass on a file that had neither.
+    body = text.split("-#}", 1)[1]
+    assert "{% macro" not in body
+    assert "dictsort" not in body
+    # And the attribution, which is the whole reason this file may sit in an
+    # Apache-2.0 package at all.
+    assert "NOT WRITTEN HERE" in text
+    assert "Gemma Terms of Use" in text
+
+    plan = plan_export("google/functiongemma-270m-it", (), ("dynamic_wi8_afp32",))
+    override = [f for f in plan.flags if f.startswith("--jinja_chat_template_override=")]
+    assert len(override) == 1
+    assert override[0].endswith("templates/functiongemma.jinja")
+    assert any(
+        "--jinja_chat_template_override" in f for f in plan.added
+    ), "litetune added this, and the report has to say so"
+
+
+def test_a_caller_who_names_their_own_template_keeps_it():
+    """Their value wins: litetune knows the flag is needed, not which template
+    a differently-trained checkpoint wants."""
+    from litetune.models import plan_export
+
+    plan = plan_export(
+        "google/functiongemma-270m-it",
+        ("--jinja_chat_template_override=/my/own.jinja",),
+        ("dynamic_wi8_afp32",),
+    )
+    overrides = [f for f in plan.flags if f.startswith("--jinja_chat_template_override=")]
+    assert overrides == ["--jinja_chat_template_override=/my/own.jinja"]
+
+
+def test_an_unnamed_gemma3_text_checkpoint_refuses_rather_than_guessing(tmp_path):
+    """`config.json` proves a flag is needed and cannot say what it should be.
+
+    FunctionGemma and Gemma 3 270M/1B all declare `model_type: gemma3_text` and
+    need different override values and different templates. Guessing wrong
+    exports a bundle typed `generic_model` with no tool-call channel — which
+    passes every check this package runs, because the text path never notices.
+
+    So the plan is unusable and the export refuses. This is the same shape
+    Gemma 4 already had for its template variant, not a new kind of verdict.
+    """
+    from litetune.models import plan_export
+
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "gemma3_text"}), encoding="utf-8"
+    )
+
+    plan = plan_export(str(checkpoint), (), ("dynamic_wi8_afp32",))
+
+    assert plan.rules is not None and plan.rules.family == "gemma3-text-unidentified"
+    assert not plan.usable, "an export that would be mis-typed must not proceed"
+    unresolved = [c for c in plan.checks if c.outcome is not Outcome.PASSED]
+    assert unresolved, "the refusal has to reach the report"
+    detail = " ".join(c.detail or "" for c in plan.checks)
+    assert (
+        "--base-model" in detail and "--train-metrics" in detail
+    ), "a refusal must name the way out of it"
+
+
+def test_an_architecture_with_no_rules_is_a_note_not_a_refusal(tmp_path):
+    """Llama, Phi, Mistral: litetune knows nothing, which is not knowing they
+    are wrong. Same answer by path and by Hub id — the verdict is about the
+    model, not about how `--model` was typed."""
+    from litetune.models import plan_export
+
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps({"model_type": "llama"}), encoding="utf-8")
+
+    by_path = plan_export(str(checkpoint), (), ("dynamic_wi8_afp32",))
+    by_id = plan_export("meta-llama/Llama-3.2-1B", (), ("dynamic_wi8_afp32",))
+
+    assert by_path.rules is None and by_id.rules is None
+    assert by_path.usable and by_id.usable
+
+
+def test_the_sidecar_beats_config_json(tmp_path):
+    """What produced the checkpoint knows what it was; `config.json` knows only
+    the architecture, and for this family that is not enough."""
+    from litetune.models import hint_for, rules_for_hint
+
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "gemma3_text"}), encoding="utf-8"
+    )
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": "google/functiongemma-270m-it"}), encoding="utf-8"
+    )
+
+    rules = rules_for_hint(hint_for(str(checkpoint)))
+    assert rules is not None and rules.family == "functiongemma"
+
+
+def test_a_folder_named_after_the_base_model_does_not_decide_the_family(tmp_path):
+    """The path is what somebody called a directory, not what is inside it.
+
+    A FunctionGemma checkpoint in `runs/gemma-3-270m-tools/model` was claimed by
+    `gemma-3-text` on the path substring, exported with `=gemma3` and no template
+    override, and reported passed — the exact artifact this refusal exists to
+    stop, produced by the most natural naming convention there is.
+    """
+    from litetune.models import plan_export
+
+    checkpoint = tmp_path / "runs" / "gemma-3-270m-tools" / "model"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "gemma3_text"}), encoding="utf-8"
+    )
+
+    plan = plan_export(str(checkpoint), (), ("dynamic_wi8_afp32",))
+    assert plan.rules is not None and plan.rules.family == "gemma3-text-unidentified"
+    assert not plan.usable
+
+    # And a recorded identity settles it, so the ordinary rules apply again.
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": "google/functiongemma-270m-it"}), encoding="utf-8"
+    )
+    settled = plan_export(str(checkpoint), (), ("dynamic_wi8_afp32",))
+    assert settled.rules is not None and settled.rules.family == "functiongemma"
+    assert settled.usable
+
+
+def test_a_name_that_merely_contains_gemma3_text_is_not_refused():
+    """The refusal is about `config.json`, and its message says so.
+
+    Matching the merged hint text meant `myorg/gemma3_text_lora` — a Hub id with
+    no config anywhere — was refused with a message asserting what a file that
+    was never opened declares.
+    """
+    from litetune.models import plan_export
+
+    for name in ("myorg/gemma3_text_lora", "unsloth/gemma3-text-it"):
+        plan = plan_export(name, (), ("dynamic_wi8_afp32",))
+        assert plan.rules is None, name
+        assert plan.usable, name
+
+
+def test_an_unreadable_sidecar_is_a_fault_not_an_absence(tmp_path):
+    """Returning None for both let a truncated file look like an older run.
+
+    A `litetune.json` cut short by a full disk or a half-finished copy would
+    then be guessed past, from the path — which is the fault the sidecar exists
+    to remove.
+    """
+    from litetune.models import hint_for
+
+    counter = iter(range(100))
+
+    def hint_with(content: str):
+        d = tmp_path / f"case{next(counter)}" / "model"
+        d.mkdir(parents=True)
+        (d / "config.json").write_text(json.dumps({"model_type": "gemma3_text"}), encoding="utf-8")
+        (d / "litetune.json").write_text(content, encoding="utf-8")
+        return hint_for(str(d))
+
+    assert "could not be read" in (hint_with('{"base_model": "goo').provenance_error or "")
+    assert "does not contain a JSON object" in (hint_with("[1, 2]").provenance_error or "")
+    assert "records no 'base_model'" in (hint_with('{"prompt_mode": "x"}').provenance_error or "")
+    assert "not a name" in (hint_with('{"base_model": ["a"]}').provenance_error or "").replace(
+        "non-string 'base_model'", "not a name"
+    )
+
+    # A checkpoint that never had one is not a fault.
+    plain = tmp_path / "plain" / "model"
+    plain.mkdir(parents=True)
+    (plain / "config.json").write_text(json.dumps({"model_type": "llama"}), encoding="utf-8")
+    assert hint_for(str(plain)).provenance_error is None

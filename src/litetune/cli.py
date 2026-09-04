@@ -417,6 +417,24 @@ def _add_convert(sub) -> None:
     convert.add_argument("--model", required=True, help="HF id or path of the checkpoint")
     convert.add_argument("--output-dir", required=True, type=Path, help="one directory per recipe")
     convert.add_argument(
+        "--train-metrics",
+        type=Path,
+        help=(
+            "the `metrics.json` a `tune` run wrote. `--model` is a directory after training, "
+            "and a directory carries no identity — so without this the per-family export "
+            "flags have nothing to key on and are silently not applied, which is how a "
+            "FunctionGemma bundle ends up typed generic_model with no tool-call channel. "
+            "Pass `--base-model` instead if you did not train here"
+        ),
+    )
+    convert.add_argument(
+        "--base-model",
+        help=(
+            "what this checkpoint was fine-tuned from, when `--model` is a local directory "
+            "and there is no `--train-metrics` to read it out of"
+        ),
+    )
+    convert.add_argument(
         "--recipe",
         action="append",
         metavar="NAME",
@@ -910,10 +928,46 @@ def _env(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _read_base_model(metrics: Path | None) -> str | None:
+    """The model a `tune` run started from, out of the file it wrote.
+
+    `convert` needs the name because a trained checkpoint is a directory, and
+    the per-family export flags key on the name. Reading it from the run that
+    produced the checkpoint beats asking the caller to retype it, which is how
+    the two come to disagree.
+    """
+    if metrics is None:
+        return None
+    try:
+        recorded = json.loads(metrics.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise DataError(f"{metrics} is not valid JSON: {exc}") from None
+    except OSError as exc:
+        raise DataError(f"could not read {metrics}: {exc}") from None
+    if not isinstance(recorded, dict):
+        raise DataError(f"{metrics} holds {type(recorded).__name__}, not training metrics")
+    base = recorded.get("base_model")
+    if base is None:
+        # The caller typed --train-metrics; answering None sends them back to
+        # guessing from the path, and the refusal they would then get tells them
+        # to pass the flag they just passed.
+        raise DataError(
+            f"{metrics} records no 'base_model'. Runs from before litetune 0.1.3 did not "
+            "write one; pass --base-model <id> instead"
+        )
+    if not isinstance(base, str) or not base.strip():
+        raise DataError(f"{metrics} records a 'base_model' that is not a name: {base!r}")
+    return base
+
+
 def _convert(args: argparse.Namespace) -> int:
     events = _stream()
+    # Explicit beats recorded: a caller who names the base model has a reason,
+    # and the recorded one is only ever a convenience for the common case.
+    base_model = args.base_model or _read_base_model(args.train_metrics)
     request = ExportRequest(
         model=args.model,
+        base_model=base_model,
         output_dir=args.output_dir,
         # Not defaulted here either: `ExportRequest` refuses an empty sweep with
         # the measurement that makes the refusal worth reading.
