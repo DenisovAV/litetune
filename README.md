@@ -333,12 +333,16 @@ withdrawn after re-measurement.
 
 **Not built yet**
 
-- **Nothing here configures the app that loads the bundle.** On Android 12+ it
-  needs `<uses-native-library>` for `libOpenCL.so` (and `-car`, `-pixel`,
-  `libvndksupport.so`) or the runtime reports "Can not find OpenCL library on
-  this device" — about the app's permissions, not the device; `maxNumTokens`
-  no lower than the bundle's baked 1024, or GPU prompts take 53 s instead of
-  6; and an `EngineConfig.cacheDir`. `flutter_gemma` sets all three.
+- **Nothing here configures the app that loads the bundle.** An app targeting
+  API 31+ must declare `<uses-native-library android:name="libOpenCL.so"
+  android:required="false"/>` (plus the `-pixel`/`-car` names the loader also
+  tries) or the runtime reports "Can not find OpenCL library on this device":
+  in that case it is the missing declaration, not the device — though the
+  same string covers devices with no public OpenCL at all. Set an output cap
+  and a `maxNumTokens`: the bundle's KV cache is 4096 and a run that does not
+  stop fills it (13 of 20 GPU rows ran to 3,500 `<pad>` tokens and 53 s each
+  before the fp32 fix; capping at 1024 cut that to 6 s by cutting the garbage,
+  not by fixing it). And give `EngineConfig.cacheDir` a writable directory.
 - **Decoding parameters reach only one side.** litetune passes none to the
   device, so the reference is held to an explicit token limit while the device
   runs to the runtime's own. The manifest says so and counts unterminated

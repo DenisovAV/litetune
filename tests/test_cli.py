@@ -364,10 +364,12 @@ class FakeToolchain:
         self.calls.append(list(args))
         if args[0] == "pip":
             return subprocess.CompletedProcess(args, 0, self.pip_stdout, "")
-        if args[0] in ("litert-lm-builder", "litert-lm-peek"):
-            # This fake has no bundle builder: the repack reports that and the
-            # export stays a passed, CPU-only one.
-            return subprocess.CompletedProcess(args, 127, "", f"{args[0]}: not found")
+        if args[0] == "python" and str(args[1]).endswith("repack.py"):
+            # This fake has no export environment to run the repack script in:
+            # the repack reports that and the export stays a passed, CPU-only one.
+            return subprocess.CompletedProcess(
+                args, 1, "", "ModuleNotFoundError: No module named 'litert_lm_builder'"
+            )
         flags = dict(a.removeprefix("--").split("=", 1) for a in args[2:] if "=" in a)
         out_dir = Path(flags["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1346,8 +1348,8 @@ def test_convert_names_the_gpu_state_of_every_artifact(toolchain, tmp_path, caps
     captured = capsys.readouterr()
     assert code == 0
     assert "CPU-only (GPU activations not set)" in captured.out
+    assert "No module named 'litert_lm_builder'" in captured.out, "the reason reaches the console"
     assert "prefer_activation_type could not be written" in captured.out
-    assert "<pad>" in captured.out
 
 
 def test_convert_json_records_gpu_activation(toolchain, tmp_path, capsys):

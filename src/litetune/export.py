@@ -679,6 +679,7 @@ Reads JSON {artifact, work, key, value} from argv[1]. Writes JSON to argv[2]:
 `declared` is the value the section carries after this script (or before it,
 if it was left alone); `written` says whether the file was replaced.
 """
+import copy
 import json
 import os
 import sys
@@ -720,7 +721,7 @@ def comparable(doc):
     """The document with the two regenerated system keys removed and paths by name."""
     sm = doc.get("system_metadata", {})
     entries = [e for e in sm.get("entries", []) if e.get("key") not in VOLATILE]
-    sections = json.loads(json.dumps(doc.get("section", [])))
+    sections = copy.deepcopy(doc.get("section", []))
     for s in sections:
         if "data_path" in s:
             s["data_path"] = os.path.basename(s["data_path"])
@@ -732,18 +733,45 @@ def toml_value(v):
         return "true" if v else "false"
     if isinstance(v, (int, float)):
         return str(v)
-    return json.dumps(str(v))  # a valid TOML basic string
+    return toml_string(str(v))
+
+
+def toml_string(text):
+    """A TOML basic string. Not json.dumps: that writes a character outside the
+    BMP as a UTF-16 surrogate pair (`\\ud83d\\ude80`), which TOML forbids and
+    tomllib rejects, so one emoji in any metadata value would sink the pack."""
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif o < 0x20 or o == 0x7F:
+            out.append(f"\\u{o:04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def entry_line(e):
+    """One element of an `entries` / `additional_metadata` array. Both arrays
+    carry the same {key, value_type, value} shape, so both are written here."""
+    return (
+        f"  {{ key = {toml_value(e['key'])}, "
+        f"value_type = {toml_value(e['value_type'])}, "
+        f"value = {toml_value(e['value'])} }},"
+    )
 
 
 def write_toml(doc, path):
     """Emit TOML for the builder to read back. Only the shapes `unpack` writes."""
     lines = ["[system_metadata]", "entries = ["]
-    for e in doc.get("system_metadata", {}).get("entries", []):
-        lines.append(
-            f"  {{ key = {toml_value(e['key'])}, "
-            f"value_type = {toml_value(e['value_type'])}, "
-            f"value = {toml_value(e['value'])} }},"
-        )
+    lines += [entry_line(e) for e in doc.get("system_metadata", {}).get("entries", [])]
     lines += ["]", ""]
     for sec in doc.get("section", []):
         lines.append("[[section]]")
@@ -754,47 +782,41 @@ def write_toml(doc, path):
         meta = sec.get("additional_metadata") or []
         if meta:
             lines.append("additional_metadata = [")
-            for e in meta:
-                lines.append(
-                    f"  {{ key = {toml_value(e['key'])}, "
-            f"value_type = {toml_value(e['value_type'])}, "
-                    f"value = {toml_value(e['value'])} }},"
-                )
+            lines += [entry_line(e) for e in meta]
             lines.append("]")
         lines.append("")
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
-def main():
-    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    out = Path(sys.argv[2])
+def report(declared=None, written=False, reason=None):
+    """This script's whole result. The exit status says only whether the script
+    itself ran; every outcome the parent tells apart is in here."""
+    return {"declared": declared, "written": written, "reason": reason}
+
+
+def main(spec):
     artifact, work = spec["artifact"], Path(spec["work"])
     key, value = spec["key"], spec["value"]
-
-    def done(declared=None, written=False, reason=None):
-        out.write_text(json.dumps({"declared": declared, "written": written, "reason": reason}))
-        return 0
+    entry = {"key": key, "value_type": "String", "value": value}
 
     before_dir = work / "before"
     lb.unpack(artifact, str(before_dir))
     before = load(before_dir / "model.toml")
     targets = prefill_sections(before)
     if len(targets) != 1:
-        return done(
+        return report(
             reason=f"found {len(targets)} prefill_decode sections where exactly one was expected"
         )
     existing = declared_in(targets[0], key)
     if existing is not None:
         shown = existing or "(empty)"
         reason = f"the bundle already declares {key} = {shown}; left as written"
-        return done(declared=existing, reason=reason)
+        return report(declared=existing, reason=reason)
 
     # Patch the structure, not the text.
-    patched = json.loads(json.dumps(before))
+    patched = copy.deepcopy(before)
     sec = prefill_sections(patched)[0]
-    sec["additional_metadata"] = list(sec.get("additional_metadata") or []) + [
-        {"key": key, "value_type": "String", "value": value}
-    ]
+    sec["additional_metadata"] = list(sec.get("additional_metadata") or []) + [entry]
     for s in patched["section"]:
         s["data_path"] = str(before_dir / os.path.basename(s["data_path"]))
     patched_toml = work / "patched.toml"
@@ -803,25 +825,23 @@ def main():
     lb.pack(str(patched_toml), str(rebuilt))
 
     # Verify by round-tripping through the same unpack: the parsed document
-    # must be the original plus exactly the one entry.
+    # must be the original plus exactly the one entry -- which is what
+    # `patched` already is, so it is the expectation.
     after_dir = work / "after"
     lb.unpack(str(rebuilt), str(after_dir))
     after = load(after_dir / "model.toml")
-    expect = comparable(before)
-    prefill_sections(expect)[0]["additional_metadata"] = list(
-        prefill_sections(before)[0].get("additional_metadata") or []
-    ) + [{"key": key, "value_type": "String", "value": value}]
-    if comparable(after) != expect:
-        return done(reason="the rebuild changed the bundle beyond the one key")
+    if comparable(after) != comparable(patched):
+        return report(reason="the rebuild changed the bundle beyond the one key")
     read_back = declared_in(prefill_sections(after)[0], key)
     if read_back != value:
-        return done(reason=f"the rebuild wrote {key} = {read_back!r}; {value!r} was asked")
+        return report(reason=f"the rebuild wrote {key} = {read_back!r}; {value!r} was asked")
     os.replace(rebuilt, artifact)
-    return done(declared=read_back, written=True)
+    return report(declared=read_back, written=True)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    Path(sys.argv[2]).write_text(json.dumps(main(spec)))
 '''
 
 
@@ -852,12 +872,11 @@ def set_gpu_activation(
     The exporter offers no flag for this value, and the one flag it does offer
     (`--experimental_use_mixed_precision`) changes the graph as well.
     """
-    work: Path | None = None
-    leaked: list[str] = []
     if artifact.stat().st_size == 0:
         # Nothing to repack, and the sweep's size comparison downstream is
         # what reports a zero-byte export; this must not turn it into 8 bytes.
         return None, "the artifact is empty; nothing to repack"
+    work: Path | None = None
     try:
         # A fresh private directory, never a deterministic name: a stale or
         # planted `.foo-repack` symlink would otherwise have its *target*
@@ -897,6 +916,9 @@ def set_gpu_activation(
         reason = report.get("reason")
         if declared is None:
             return None, f"{reason}; the original was kept"
+        if report.get("written") and reason is not None:
+            # The script's contract: a replaced file has no reason to give.
+            return None, f"the repack reported both a rebuild and a reason ({reason}); refused"
         return str(declared), reason
     except subprocess.TimeoutExpired:
         return None, f"the repack did not finish within {timeout}s; the original was kept"
@@ -912,6 +934,7 @@ def set_gpu_activation(
         if work is not None:
             # A scratch dir the size of two bundles; a leak has to be said,
             # not hidden behind ignore_errors.
+            leaked: list[str] = []
             shutil.rmtree(work, onerror=lambda _fn, path, _exc: leaked.append(str(path)))
             if leaked:
                 logger.warning(
@@ -1468,26 +1491,21 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
     # Said at the top level, not only in the per-recipe record: a bundle left
     # at F16 runs on CPU and floods `<pad>` on GPU, and the two look the same
     # from every check this stage has.
-    other = [
-        f"{e.recipe} = {e.gpu_activation}"
-        for e in result.succeeded
-        if e.gpu_state is GpuActivationState.DECLARED_UPSTREAM
-    ]
+    upstream = GpuActivationState.DECLARED_UPSTREAM
+    other = [e for e in result.succeeded if e.gpu_state is upstream]
     if other:
+        named = ", ".join(f"{e.recipe} = {e.gpu_activation}" for e in other)
         result.limitations.append(
-            f"{GPU_ACTIVATION_KEY} was already declared and left as found: {', '.join(other)}. "
+            f"{GPU_ACTIVATION_KEY} was already declared and left as found: {named}. "
             "`fp16` reproduces the `<pad>` fault on GPU; `fp32_fp16` is what "
             "--experimental_use_mixed_precision writes and it also changes the graph, so the "
             "bundle is no longer the one the CPU figures describe"
         )
-    unset = [
-        f"{e.recipe} ({e.gpu_activation_note})"
-        for e in result.succeeded
-        if e.gpu_state is GpuActivationState.UNSET
-    ]
+    unset = [e for e in result.succeeded if e.gpu_state is GpuActivationState.UNSET]
     if unset:
+        named = ", ".join(f"{e.recipe} ({e.gpu_activation_note})" for e in unset)
         result.limitations.append(
-            f"{GPU_ACTIVATION_KEY} could not be written into {', '.join(unset)}. On the GPU "
+            f"{GPU_ACTIVATION_KEY} could not be written into {named}. On the GPU "
             "backend the runtime will compute activations in F16, which measured as `<pad>` "
             "floods and wrong tool names on a Snapdragon Galaxy S24 (3/20 vs 20/20 on CPU, "
             "n=20). These bundles are CPU-only until repacked"

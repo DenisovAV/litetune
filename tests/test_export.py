@@ -149,16 +149,24 @@ class FakeToolchain:
         )
 
 
-# A stand-in for the real `litert_lm_builder.litertlm_builder`. A fake bundle
-# is opaque bytes of the caller's size; the TOML that describes it lives in a
-# sidecar `<bundle>.toml` (a real bundle stores it in a header, which is why
-# the size does not grow with one key). `unpack` writes that TOML plus empty
-# section files; `pack` reads a TOML, writes a bundle of the original's size
-# and the sidecar beside it. Knobs are formatted in as Python literals;
-# braces that belong to the module are doubled for `str.format`.
+# A stand-in for the real `litert_lm_builder.litertlm_builder`, faithful in
+# the three places a mutation test showed the old fake let production-breaking
+# regressions through green:
+#   - the bundle is self-describing: its TOML lives *inside* the bytes after the
+#     `LITERTLM` magic, so the only way a test can read the new key back is if
+#     the rebuilt file really replaced the original (os.replace is load-bearing);
+#   - `pack` resolves each `data_path` the way the real `_resolve_path` does
+#     (absolute as-is, relative against the TOML's directory) and *opens* it,
+#     so a path the script forgot to absolutize raises FileNotFoundError;
+#   - `pack` regenerates the system `uuid` and `creation_timestamp`, so the
+#     script's exclusion of those two keys is what makes the round-trip equal.
+# Knobs are formatted in as Python literals; braces that belong to the module
+# are doubled for `str.format`.
 FAKE_BUILDER_MODULE = """
 import os
 import re
+import uuid as _uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_TOML = {default_toml!r}
@@ -166,15 +174,14 @@ UNPACK_FAILS = {unpack_fails}
 PACK_FAILS = {pack_fails}
 PACK_DRIFTS = {pack_drifts}
 PACK_MISPLACES = {pack_misplaces}
-
-
-def _sidecar(bundle_path):
-    return Path(str(bundle_path) + ".toml")
+MAGIC = b"LITERTLM"
 
 
 def _toml_of(bundle_path):
-    side = _sidecar(bundle_path)
-    return side.read_text(encoding="utf-8") if side.exists() else DEFAULT_TOML
+    raw = Path(bundle_path).read_bytes()
+    if not raw.startswith(MAGIC):
+        return DEFAULT_TOML  # a pristine artifact from the export fake
+    return raw[len(MAGIC):].rstrip(b"\\0").decode("utf-8")
 
 
 def unpack(litertlm_path, output_dir, jinja_prompt_template_path=None):
@@ -189,16 +196,31 @@ def unpack(litertlm_path, output_dir, jinja_prompt_template_path=None):
     return str(out / "model.toml")
 
 
+def _regenerate_system(toml):
+    stamp = datetime.now(timezone.utc).isoformat()
+    fresh = (
+        '  {{ key = "uuid", value_type = "String", value = "%s" }},\\n'
+        '  {{ key = "creation_timestamp", value_type = "String", value = "%s" }},\\n'
+    ) % (_uuid.uuid4(), stamp)
+    toml = re.sub(r'\\s*\\{{ key = "(uuid|creation_timestamp)"[^}}]*}},?\\n?', "", toml)
+    return re.sub(r"(\\[system_metadata\\]\\nentries = \\[\\n?)", r"\\1" + fresh, toml, count=1)
+
+
 def pack(toml_path, output_path, jinja_prompt_template_path=None):
     if PACK_FAILS:
         raise RuntimeError("pack: boom")
-    toml = Path(toml_path).read_text(encoding="utf-8")
-    # Paths were made absolute for the build; store them by name, as unpack does.
-    toml = re.sub(
-        r'(data_path\\s*=\\s*")([^"]+)(")',
-        lambda m: m.group(1) + os.path.basename(m.group(2)) + m.group(3),
-        toml,
-    )
+    toml_path = Path(toml_path)
+    toml = toml_path.read_text(encoding="utf-8")
+    # Resolve and open every data_path as the real builder does; a relative
+    # path the caller forgot to absolutize fails here, not silently.
+    def resolve(m):
+        raw = m.group(2)
+        path = Path(raw) if os.path.isabs(raw) else toml_path.parent / raw
+        with open(path, "rb"):
+            pass
+        return m.group(1) + os.path.basename(raw) + m.group(3)
+    toml = re.sub(r'(data_path\\s*=\\s*")([^"]+)(")', resolve, toml)
+    toml = _regenerate_system(toml)
     if PACK_DRIFTS:
         toml = toml.replace("[[section]]\\n", '[[section]]\\nextra = "drift"\\n', 1)
     if PACK_MISPLACES:
@@ -209,13 +231,11 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
             idx = max(i for i, l in enumerate(lines) if 'model_type = "embedder"' in l)
             lines[idx:idx + 1] = [lines[idx], "additional_metadata = [", act[0], "]"]
             toml = "\\n".join(lines)
+    body = MAGIC + toml.encode("utf-8")
     target = Path(output_path)
     original = target.parent.parent / target.name
-    size = original.stat().st_size if original.exists() else 4096
-    target.write_bytes(b"LITERTLM" + b"\\0" * max(0, size - 8))
-    _sidecar(target).write_text(toml, encoding="utf-8")
-    if original.exists():
-        _sidecar(original).write_text(toml, encoding="utf-8")
+    size = original.stat().st_size if original.exists() else len(body)
+    target.write_bytes(body + b"\\0" * max(0, size - len(body)))
     return str(target)
 """
 
@@ -940,15 +960,30 @@ def _fake_env(toolchain, tmp_path):
     return envs.StageEnv(name="export", python_ceiling=(3, 12), requirements=())
 
 
-def _artifact(tmp_path, size=4096) -> Path:
+def _artifact(tmp_path, size=16384) -> Path:
     path = tmp_path / "model.litertlm"
     path.write_bytes(b"\0" * size)
     return path
 
 
 def _toml_in(artifact: Path) -> str:
-    """What the fake builder recorded for this bundle (see FAKE_BUILDER_MODULE)."""
-    return Path(str(artifact) + ".toml").read_text(encoding="utf-8")
+    """The TOML inside the fake bundle (see FAKE_BUILDER_MODULE). Readable only
+    from a file the fake `pack` wrote -- so only after the original was replaced."""
+    raw = artifact.read_bytes()
+    assert raw.startswith(b"LITERTLM"), "not a repacked fake bundle: was the original replaced?"
+    return raw[len(b"LITERTLM") :].rstrip(b"\0").decode("utf-8")
+
+
+def _toml_loads(text: str):
+    """tomllib on 3.11+, tomli below -- the same fallback the repack script
+    uses, resolved by name so mypy's ignore codes do not differ per version."""
+    import importlib
+
+    try:
+        mod = importlib.import_module("tomllib")
+    except ModuleNotFoundError:
+        mod = importlib.import_module("tomli")
+    return mod.loads(text)
 
 
 def _sections(toml: str) -> list[str]:
@@ -968,6 +1003,7 @@ def test_the_activation_type_is_written_into_the_prefill_decode_section(toolchai
 
     assert (value, note) == (GPU_ACTIVATION, None)
     assert not [p for p in artifact.parent.iterdir() if p.name.startswith(".")], "work dir gone"
+    assert artifact.read_bytes()[:8] == b"LITERTLM", "the rebuilt file replaced the original"
     (prefill,) = [t for t in _sections(_toml_in(artifact)) if '"prefill_decode"' in t]
     (embedder,) = [t for t in _sections(_toml_in(artifact)) if '"embedder"' in t]
     assert 'key = "prefer_activation_type"' in prefill and f'value = "{GPU_ACTIVATION}"' in prefill
@@ -1301,3 +1337,129 @@ def test_an_empty_artifact_is_not_repacked(toolchain, tmp_path):
     assert note == "the artifact is empty; nothing to repack"
     assert artifact.stat().st_size == 0
     assert toolchain.repacks == [], "no script was run"
+
+
+def test_metadata_strings_survive_the_repack_whatever_they_contain(toolchain, tmp_path):
+    """An emoji in any metadata value sank the first version: `json.dumps`
+    writes a non-BMP character as a UTF-16 surrogate pair, TOML forbids
+    surrogates, and the builder's parser rejected the rebuilt TOML -- so the
+    bundle stayed CPU-only for a reason nothing named. The script runs here
+    with a real TOML parser, so this is a real round-trip. Found in review."""
+    from litetune.export import GPU_ACTIVATION, set_gpu_activation
+
+    nasty = 'rocket \U0001f680 quote \\" back \\\\ tab\\t triple \\"\\"\\" accent é cjk 中'
+    toolchain.repack_toml = FAKE_TOML.replace(
+        "[system_metadata]\nentries = []\n",
+        "[system_metadata]\nentries = [\n"
+        f'  {{ key = "description", value_type = "String", value = "{nasty}" }},\n]\n',
+    )
+    artifact = _artifact(tmp_path)
+
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert (value, note) == (GPU_ACTIVATION, None), note
+    doc = _toml_loads(_toml_in(artifact))
+    (desc,) = [e["value"] for e in doc["system_metadata"]["entries"] if e["key"] == "description"]
+    assert "\U0001f680" in desc and '"""' in desc and "\u00e9" in desc, "the value came back intact"
+
+
+def test_the_timeout_charges_elapsed_export_time(toolchain, request_for, monkeypatch):
+    """`remaining = timeout_s - seconds`: the repack gets what the export left,
+    floored at 1 so subprocess never sees timeout=0. Pinned by driving the
+    clock, not by hoping `min` alone is the arithmetic."""
+    import itertools
+
+    from litetune import export as export_module
+    from litetune.export import run_export
+
+    # perf_counter is read twice per recipe: start, then after the export.
+    ticks = itertools.chain([100.0, 103.0], itertools.repeat(103.0))
+    monkeypatch.setattr(export_module.time, "perf_counter", lambda: next(ticks))
+
+    run_export(request_for(("dynamic_wi8_afp32",), timeout_s=7))
+
+    (repack,) = toolchain.repacks
+    assert repack.timeout == 4, "7 s budget minus 3 s of export"
+
+
+def test_an_export_that_used_its_whole_budget_still_gets_one_second(
+    toolchain, request_for, monkeypatch
+):
+    import itertools
+
+    from litetune import export as export_module
+    from litetune.export import run_export
+
+    ticks = itertools.chain([100.0, 120.0], itertools.repeat(120.0))
+    monkeypatch.setattr(export_module.time, "perf_counter", lambda: next(ticks))
+
+    run_export(request_for(("dynamic_wi8_afp32",), timeout_s=7))
+
+    (repack,) = toolchain.repacks
+    assert repack.timeout == 1
+
+
+def test_a_weights_section_with_the_same_model_type_is_not_a_prefill_section(toolchain, tmp_path):
+    """Real `peek` writes `model_type` on TFLiteWeights sections too; a bundle
+    with external weights carries two `prefill_decode`-typed sections, and the
+    `section_type == "TFLiteModel"` filter is what keeps the count at one."""
+    from litetune.export import GPU_ACTIVATION, set_gpu_activation
+
+    toolchain.repack_toml = FAKE_TOML + (
+        '\n[[section]]\nmodel_type = "prefill_decode"\nsection_type = "TFLiteWeights"\n'
+        'data_path = "weights.bin"\n'
+    )
+    artifact = _artifact(tmp_path)
+
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert (value, note) == (GPU_ACTIVATION, None), note
+    tables = _sections(_toml_in(artifact))
+    (weights,) = [t for t in tables if '"TFLiteWeights"' in t]
+    assert "prefer_activation_type" not in weights
+
+
+@pytest.mark.parametrize("shape", ["bare", "additional_metadata"])
+def test_an_upstream_empty_declaration_in_either_toml_shape(toolchain, tmp_path, shape):
+    """Real `peek` writes a null entry as `""` inside `additional_metadata`;
+    a hand-written TOML may carry a bare key. Both read back as empty, not unset."""
+    from litetune.export import set_gpu_activation
+
+    if shape == "bare":
+        extra = 'prefer_activation_type = ""\n'
+    else:
+        extra = (
+            "additional_metadata = [\n"
+            '  { key = "prefer_activation_type", value_type = "String", value = "" },\n]\n'
+        )
+    toolchain.repack_toml = FAKE_TOML.replace(
+        'model_type = "prefill_decode"\n', 'model_type = "prefill_decode"\n' + extra
+    )
+    artifact = _artifact(tmp_path)
+
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert value == ""
+    assert note and "= (empty);" in note
+
+
+def test_non_string_metadata_values_survive_the_rebuild(toolchain, tmp_path):
+    """The real format carries Int32/Bool values; `toml_value` must re-emit
+    them as TOML numbers and booleans, not as quoted strings."""
+    from litetune.export import GPU_ACTIVATION, set_gpu_activation
+
+    toolchain.repack_toml = FAKE_TOML.replace(
+        "[system_metadata]\nentries = []\n",
+        "[system_metadata]\nentries = [\n"
+        '  { key = "layers", value_type = "Int32", value = 18 },\n'
+        '  { key = "quantized", value_type = "Bool", value = true },\n]\n',
+    )
+    artifact = _artifact(tmp_path)
+
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert (value, note) == (GPU_ACTIVATION, None), note
+    entries = {
+        e["key"]: e["value"] for e in _toml_loads(_toml_in(artifact))["system_metadata"]["entries"]
+    }
+    assert entries["layers"] == 18 and entries["quantized"] is True
