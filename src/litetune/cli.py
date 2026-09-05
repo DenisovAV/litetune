@@ -411,6 +411,12 @@ def _add_convert(sub) -> None:
         description=(
             "Sweep quantization recipes and report what each one produced. A produced file is "
             "not a verified model: run `litetune verify` on each artifact against held-out data. "
+            "Each bundle is then repacked with prefer_activation_type=fp32 on its prefill/decode "
+            "section: without it the Android GPU backend computes in F16 and floods <pad> while "
+            "reporting success (measured on one Snapdragon Galaxy S24, 3/20 vs 20/20 tool names "
+            "on 20 rows). The repack changes one metadata string and no bytes of the model; a "
+            "bundle that could not be repacked is kept, named in the report, and is CPU-only. "
+            "--json records what each bundle carries as exports[].gpu_activation. "
             f"{STAGE_EXIT_CODE_HELP}"
         ),
     )
@@ -469,7 +475,10 @@ def _add_convert(sub) -> None:
         help=(
             "an extra flag passed to the exporter verbatim; repeat it. Write it attached, "
             "--flag=--some_exporter_flag=value, so argparse does not read it as one of ours. "
-            "Flags this model family requires are added automatically and named in the report"
+            "Flags this model family requires are added automatically and named in the report. "
+            "--flag=--experimental_use_mixed_precision pre-empts the fp32 repack: it writes "
+            "prefer_activation_type=fp32_fp16 and also runs a graph pass, so the bundle is no "
+            "longer the one the CPU figures describe; the report records it as fp32_fp16"
         ),
     )
     convert.add_argument("--timeout-s", type=int, default=ExportRequest.timeout_s)

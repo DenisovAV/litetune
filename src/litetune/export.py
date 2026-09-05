@@ -69,21 +69,24 @@ KNOWN_RECIPES = (
 MEASURED_RECIPES = ("dynamic_wi8_afp32", "weight_only_wi8_afp32")
 
 # What the GPU text executor computes activations in, unless the bundle says
-# otherwise. Measured 2026-09-05 on a Galaxy S24 (Adreno) with the tuned
-# FunctionGemma bundle, native tool path, 20 rows:
+# otherwise. Measured 2026-09-05 on one Snapdragon Galaxy S24 (SC-51E) with the
+# tuned FunctionGemma bundle, native tool path, 20 rows, greedy:
 #
-#     activation      <pad> floods   tool name   exact   ms/prompt
-#     (unset -> F16)      14/20         3/20      2/20     16763
-#     fp32                 0/20        20/20     15/20      1375
-#     fp32_fp16            0/20        20/20     15/20      1406
-#     CPU, same file       0/20        20/20     14/20      2477
+#     activation            <pad> floods   tool name   exact   ms/prompt
+#     (unset -> F16), GPU       14/20         3/20      2/20     16763
+#     fp32, GPU                  0/20        20/20     15/20      1375
+#     fp32_fp16, GPU             0/20        20/20     15/20      1406
+#     fp32, CPU (repacked file)  0/20        20/20     14/20      2477
+#
+# The CPU row is the repacked file: the key changes nothing there.
 #
 # The engine reports success either way: it loads, every call returns, no
 # exception. Only the content betrays it. Google's own Mobile Actions bundle
 # does the same (20/20 `<pad>` on GPU) and the Gallery pins it to
 # `"accelerators": "cpu"`. LiteRT-LM's `engine_settings.cc` names the default
 # -- "Text executor defaults to F16" -- and the override is a string in the
-# prefill/decode section's metadata that neither `export_hf` nor Google sets.
+# prefill/decode section's metadata. Google's bundle does not carry it, and
+# `export_hf` can only write `fp32_fp16` (via --experimental_use_mixed_precision).
 #
 # `fp32` rather than `fp32_fp16`: the two measured the same, and `fp32` changes
 # one metadata string while `--experimental_use_mixed_precision` also runs a
@@ -625,12 +628,17 @@ _ACTIVATION_VALUE_RE = re.compile(
 
 def set_gpu_activation(
     artifact: Path, env: envs.StageEnv, *, activation: str = GPU_ACTIVATION, timeout: int = 600
-) -> tuple[bool, str | None]:
+) -> tuple[str | None, str | None]:
     """Write `prefer_activation_type` into the bundle's prefill/decode section.
 
-    Returns (ok, what happened). `ok` is False when the artifact is left as the
-    toolchain wrote it, which is a working CPU bundle and a broken GPU one -- so
-    the caller records the reason rather than failing the export.
+    Returns (what the bundle now declares, what happened). The first is None
+    when the artifact is left as the toolchain wrote it with no declaration --
+    a working CPU bundle and a broken GPU one -- so the caller records the
+    reason rather than failing the export. It is the bundle's *own* value, not
+    the requested one: a bundle that already declared something is left alone
+    and reported as carrying that, because `--flag=--experimental_use_mixed_precision`
+    produces `fp32_fp16` and an explicit `fp16` reproduces the fault, and
+    labelling either as `fp32` would be the false pass this key exists to end.
 
     Done by unpacking with `litert-lm-builder`, adding one key to `model.toml`,
     and rebuilding: the weights, tokenizer, template and model type are carried
@@ -649,14 +657,14 @@ def set_gpu_activation(
             timeout=timeout,
         )
         if proc.returncode != 0:
-            return False, f"litert-lm-builder unpack exited {proc.returncode}: {_tail(proc.stderr)}"
+            return None, f"litert-lm-builder unpack exited {proc.returncode}: {_tail(proc.stderr)}"
         toml_path = work / "model.toml"
         if not toml_path.exists():
-            return False, f"litert-lm-builder unpack wrote no model.toml into {work}"
+            return None, f"litert-lm-builder unpack wrote no model.toml into {work}"
         text = toml_path.read_text(encoding="utf-8")
         tables = [m for m in _TOML_TABLE_RE.finditer(text) if _PREFILL_RE.search(m.group(0))]
         if len(tables) != 1:
-            return False, (
+            return None, (
                 f"found {len(tables)} prefill_decode sections in model.toml where exactly one "
                 "was expected, so the GPU activation type was not set"
             )
@@ -664,7 +672,7 @@ def set_gpu_activation(
         present = _ACTIVATION_VALUE_RE.search(table.group(0))
         if present:
             value = present.group(1) or present.group(2)
-            return True, (
+            return value, (
                 f"the bundle already declares {GPU_ACTIVATION_KEY} = {value!r}; left as written"
             )
         # Key order inside a TOML table is free, so the key goes straight after
@@ -686,26 +694,26 @@ def set_gpu_activation(
             timeout=timeout,
         )
         if proc.returncode != 0 or not rebuilt.exists():
-            return False, (
+            return None, (
                 f"litert-lm-builder rebuild exited {proc.returncode}: {_tail(proc.stderr)}"
             )
         proc = env.run(["litert-lm-peek", "--litertlm_file", str(rebuilt)], timeout=timeout)
         peek = (proc.stdout or "") + (proc.stderr or "")
         if proc.returncode != 0 or GPU_ACTIVATION_KEY not in peek or activation not in peek:
-            return False, (
+            return None, (
                 f"the rebuilt bundle does not read back with {GPU_ACTIVATION_KEY} = "
                 f"{activation!r}; the original was kept"
             )
         os.replace(rebuilt, artifact)
-        return True, None
+        return activation, None
     except subprocess.TimeoutExpired:
-        return False, f"litert-lm-builder did not finish within {timeout}s; the original was kept"
+        return None, f"litert-lm-builder did not finish within {timeout}s; the original was kept"
     except Exception as exc:  # noqa: BLE001 - a broken repack must not unmake a good export
         # Whatever went wrong here, the toolchain's artifact is intact and is a
         # working CPU bundle. Escaping would let `guard` record the whole
         # recipe as "could not check", which is a smaller truth than the one
         # available: exported, CPU-only, and here is why.
-        return False, f"{type(exc).__name__}: {exc}; the original was kept"
+        return None, f"{type(exc).__name__}: {exc}; the original was kept"
     finally:
         _remove_tree(work)
 
@@ -843,17 +851,19 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
     # Repacked before it is hashed or sized: the file that ships is the one
     # that is recorded. A repack that cannot be made is a limitation on a
     # passed check, not a failed one -- the CPU artifact is intact.
-    gpu_ok, gpu_note = set_gpu_activation(artifact, request.env)
-    gpu_activation = GPU_ACTIVATION if gpu_ok else None
+    gpu_activation, gpu_note = set_gpu_activation(artifact, request.env)
     artifact_bytes = artifact.stat().st_size
     companions = tuple(p.name for p in produced if p != artifact)
     shipped_bytes = sum(p.stat().st_size for p in produced)
     digest = _sha256(artifact) if request.hash_artifacts else None
-    gpu_text = (
-        f"GPU activations {gpu_activation}"
-        if gpu_ok
-        else "GPU activations left at the toolchain's F16 default"
-    )
+    if gpu_activation is None:
+        gpu_text = "GPU activations left at the toolchain's F16 default"
+    elif gpu_activation == GPU_ACTIVATION:
+        gpu_text = f"GPU activations {gpu_activation}"
+    else:
+        # Declared by something upstream and left as found. Named, because
+        # `fp16` is the fault and `fp32_fp16` is a different graph.
+        gpu_text = f"GPU activations {gpu_activation} (declared upstream, not {GPU_ACTIVATION})"
     return RecipeExport(
         **base,
         artifact=artifact,
@@ -1265,6 +1275,18 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
     # Said at the top level, not only in the per-recipe record: a bundle left
     # at F16 runs on CPU and floods `<pad>` on GPU, and the two look the same
     # from every check this stage has.
+    other = {
+        e.recipe: e.gpu_activation
+        for e in result.succeeded
+        if e.gpu_activation not in (None, GPU_ACTIVATION)
+    }
+    if other:
+        result.limitations.append(
+            f"{GPU_ACTIVATION_KEY} was already declared and left as found: {other}. "
+            f"`fp16` reproduces the `<pad>` fault on GPU; `fp32_fp16` is what "
+            f"--experimental_use_mixed_precision writes and it also changes the graph, so the "
+            f"bundle is no longer the one the CPU figures describe"
+        )
     unset = [e.recipe for e in result.succeeded if e.gpu_activation is None]
     if unset:
         result.limitations.append(

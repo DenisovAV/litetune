@@ -896,9 +896,9 @@ def test_the_activation_type_is_written_into_the_prefill_decode_section(toolchai
 
     artifact = _artifact(tmp_path)
 
-    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
 
-    assert (ok, note) == (True, None)
+    assert (value, note) == (GPU_ACTIVATION, None)
     build = next(c for c in toolchain.repacks if c.argv[1:2] == ["toml"])
     written = Path(build.argv[build.argv.index("--path") + 1])
     # The work dir is gone; what matters is what the rebuilt bundle reads back as.
@@ -933,9 +933,9 @@ def test_a_bundle_that_already_declares_an_activation_type_is_left_alone(toolcha
     artifact = _artifact(tmp_path)
     before = artifact.read_bytes()
 
-    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
 
-    assert ok
+    assert value == "fp32_fp16", "what the bundle carries, not what was asked for"
     assert note and "fp32_fp16" in note and "left as written" in note
     assert artifact.read_bytes() == before
     assert not any(c.argv[1:2] == ["toml"] for c in toolchain.repacks), "no rebuild"
@@ -959,9 +959,9 @@ def test_every_repack_failure_keeps_the_original_and_says_why(toolchain, tmp_pat
     artifact = _artifact(tmp_path)
     before = artifact.read_bytes()
 
-    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
 
-    assert not ok
+    assert value is None
     assert note and expect in note
     assert artifact.read_bytes() == before
     assert not (artifact.parent / ".model-repack").exists(), "work dir cleaned up"
@@ -974,9 +974,9 @@ def test_a_toml_without_a_prefill_section_is_not_guessed_at(toolchain, tmp_path)
     artifact = _artifact(tmp_path)
     before = artifact.read_bytes()
 
-    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
 
-    assert not ok
+    assert value is None
     assert note and "prefill_decode" in note
     assert artifact.read_bytes() == before
 
@@ -1058,9 +1058,9 @@ def test_a_key_the_builder_wrote_into_additional_metadata_is_recognised(toolchai
     artifact = _artifact(tmp_path)
     before = artifact.read_bytes()
 
-    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
 
-    assert ok
+    assert value == "fp32"
     assert note and "'fp32'" in note and "left as written" in note
     assert artifact.read_bytes() == before
 
@@ -1079,9 +1079,9 @@ def test_the_key_is_placed_by_section_not_by_line_order(toolchain, tmp_path):
     )
     artifact = _artifact(tmp_path)
 
-    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
 
-    assert (ok, note) == (True, None)
+    assert (value, note) == (GPU_ACTIVATION, None)
     body = artifact.read_bytes().removeprefix(b"LITERTLM").rstrip(b"\0").decode()
     tables = body.split("[[section]]")
     embedder, prefill = tables[1], tables[2]
@@ -1097,8 +1097,37 @@ def test_two_prefill_sections_are_ambiguous_rather_than_a_guess(toolchain, tmp_p
     artifact = _artifact(tmp_path)
     before = artifact.read_bytes()
 
-    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
 
-    assert not ok
+    assert value is None
     assert note and "found 2 prefill_decode sections" in note
     assert artifact.read_bytes() == before
+
+
+@pytest.mark.parametrize("declared", ["fp16", "fp32_fp16"])
+def test_an_upstream_declaration_is_recorded_as_itself_not_as_fp32(
+    toolchain, request_for, declared
+):
+    """`--flag=--experimental_use_mixed_precision` produces `fp32_fp16`; an
+    explicit `fp16` reproduces the fault. Both are left as found, and the
+    record must say what the bundle carries. The first version recorded the
+    constant `fp32` for any bundle that declared anything, which would have
+    labelled the broken default as fixed. Found by the spec-conformance
+    review, not by a test."""
+    from litetune.export import GPU_ACTIVATION, run_export
+
+    toolchain.repack_toml = FAKE_TOML.replace(
+        'model_type = "prefill_decode"\n',
+        f'model_type = "prefill_decode"\nprefer_activation_type = "{declared}"\n',
+    )
+
+    result = run_export(request_for(("dynamic_wi8_afp32",)))
+
+    (export,) = result.succeeded
+    assert export.ok
+    assert export.gpu_activation == declared
+    assert export.as_dict()["gpu_activation"] == declared
+    assert f"GPU activations {declared} (declared upstream, not {GPU_ACTIVATION})" in (
+        export.check.detail
+    )
+    assert any(declared in text and "left as found" in text for text in result.limitations)

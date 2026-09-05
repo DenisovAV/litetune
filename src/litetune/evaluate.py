@@ -466,11 +466,12 @@ class LiteRtLmBackend:
     surface and that has to be measured before it is trusted.
 
     Measurement here runs on CPU while users run on a phone. Measured
-    2026-09-05 on a Galaxy S24: the GPU backend matches CPU on the same bundle
-    when the bundle carries `prefer_activation_type = fp32`, and floods `<pad>`
-    when it does not -- see `export.GPU_ACTIVATION`. So a number from here
-    stands for the device only for a bundle that carries the key, and
-    `describe()` records which backend and engine produced it.
+    2026-09-05 on one Snapdragon Galaxy S24: the device's CPU scored within
+    ±0.026 of this backend on 640 rows, so a number from here does stand for
+    the phone's CPU. Its GPU is another matter -- 20/20 tool names on 20 rows
+    when the bundle carries `prefer_activation_type = fp32`, `<pad>` floods and
+    3/20 when it does not (see `export.GPU_ACTIVATION`) -- and `describe()`
+    records which backend and engine produced each figure.
     """
 
     model: Path
