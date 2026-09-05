@@ -9,8 +9,14 @@ mistake at any step produces a file of the right size that loads without error
 and is broken while every check stays green. litetune walks that road and knows
 the traps on it.
 
-The output is a `.litertlm` bundle: what LiteRT-LM loads, and what the
-`flutter_gemma` plugin runs on Android and iOS.
+The output is a `.litertlm` bundle: what LiteRT-LM loads — natively on
+Android, iOS, macOS, Linux and Windows, with GPU acceleration on each and
+NPU on Snapdragon and Intel. The `flutter_gemma` plugin runs it through the
+LiteRT-LM C API on all five;
+Google's [AI Edge Gallery](https://github.com/google-ai-edge/gallery) loads
+the file directly if you only want to try it on a device. Web exists as a
+text-only preview that supports neither function calling nor LoRA, so a
+tuned tool-calling model is native-only for now.
 
 Any task shaped as prompt → completion works. What "correct" means is the one
 thing you choose: `--scorer tool-call` for function calling, where the operation
@@ -236,12 +242,15 @@ passes every check.
 **The prompt template has to be one the device can execute.** FunctionGemma's
 own template uses `macro` and `dictsort`; LiteRT-LM renders with MiniJinja,
 which supports neither. A bundle carrying it exports cleanly, is the right size,
-passes every liveness check, and answers the text path `flutter_gemma` uses —
-then fails the native tool path with `litert_lm_conversation_send_message_stream
-failed`, which is the whole error the caller gets. litetune ships a template the
-runtime can run and passes it on export. Measured on the same checkpoint: with
-the override the runtime answers `[tool_call] set_alarm{hour:7}`; without it,
-`INTERNAL: Failed to apply template`.
+passes every liveness check, and still answers a plain text prompt — then
+fails the native tool-call path, where LiteRT-LM routes the call through the
+chat template, with `litert_lm_conversation_send_message_stream failed`, which
+is the whole error the caller gets. The split is in the runtime, so every
+consumer sees it: the `flutter_gemma` plugin, the AI Edge Gallery, or the SDK
+used directly. litetune ships a template the runtime can run and passes it on
+export. Measured on the same checkpoint: with the override the runtime answers
+`[tool_call] set_alarm{hour:7}`; without it, `INTERNAL: Failed to apply
+template`.
 
 **The terminator comes from the chat template, not from `eos_token_id`.** They
 are not always the same token, and a model trained to emit the wrong one never
