@@ -10,6 +10,7 @@ under test is built to record.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -68,18 +69,35 @@ class Call:
 
 @dataclass
 class FakeToolchain:
-    """Stands in for `envs.StageEnv.run`."""
+    """Stands in for `envs.StageEnv.run`.
+
+    Also plays `litert-lm-builder` and `litert-lm-peek` for the GPU-activation
+    repack: `unpack` writes a `model.toml` with a `prefill_decode` section,
+    `toml ... output` writes the rebuilt file, and `peek` echoes the toml back
+    so the read-back check sees whatever was written. Each step can be made to
+    fail through the `repack_*` knobs.
+    """
 
     runs: dict[str, RecipeRun] = field(default_factory=dict)
     default: RecipeRun = field(default_factory=RecipeRun)
     pip_stdout: str = PIP_FREEZE
     pip_returncode: int = 0
     calls: list[Call] = field(default_factory=list)
+    # The repack's failure knobs.
+    repack_unpack_returncode: int = 0
+    repack_toml: str | None = None  # None -> the standard two-section toml
+    repack_build_returncode: int = 0
+    repack_peek_returncode: int = 0
+    repack_peek_lies: bool = False  # peek reports no activation key
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(Call(argv=list(args), timeout=timeout, kwargs=dict(kwargs)))
         if args[0] == "pip":
             return subprocess.CompletedProcess(args, self.pip_returncode, self.pip_stdout, "")
+        if args[0] == "litert-lm-builder":
+            return self._builder(args)
+        if args[0] == "litert-lm-peek":
+            return self._peek(args)
         assert args[:2] == ["litert-torch", "export_hf"], args
         flags = dict(a.removeprefix("--").split("=", 1) for a in args[2:] if "=" in a)
         run = self.runs.get(flags["quantization_recipe"], self.default)
@@ -94,6 +112,73 @@ class FakeToolchain:
     @property
     def exports(self) -> list[Call]:
         return [c for c in self.calls if c.argv[0] == "litert-torch"]
+
+    @property
+    def repacks(self) -> list[Call]:
+        return [c for c in self.calls if c.argv[0] in ("litert-lm-builder", "litert-lm-peek")]
+
+    def _builder(self, args) -> subprocess.CompletedProcess:
+        if args[1] == "unpack":
+            if self.repack_unpack_returncode:
+                return subprocess.CompletedProcess(
+                    args, self.repack_unpack_returncode, "", "unpack: boom"
+                )
+            source = Path(args[args.index("--input") + 1])
+            if source.stat().st_size == 0:
+                # The real builder cannot parse an empty file either; refusing
+                # here keeps a zero-byte artifact zero bytes downstream.
+                return subprocess.CompletedProcess(args, 1, "", "unpack: not a LiteRT-LM file")
+            out = Path(args[args.index("--output") + 1])
+            out.mkdir(parents=True, exist_ok=True)
+            toml = self.repack_toml if self.repack_toml is not None else FAKE_TOML
+            (out / "model.toml").write_text(toml, encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[1] == "toml":
+            if self.repack_build_returncode:
+                return subprocess.CompletedProcess(
+                    args, self.repack_build_returncode, "", "toml: boom"
+                )
+            toml_path = Path(args[args.index("--path") + 1])
+            rebuilt = Path(args[args.index("output") + 2])
+            # The rebuilt file carries the toml so peek can read it back, padded
+            # to the original's size: the real repack changes one metadata
+            # string and leaves the byte count alone, and sizes are asserted
+            # downstream.
+            original = rebuilt.parent.parent / rebuilt.name
+            size = original.stat().st_size if original.exists() else 0
+            body = b"LITERTLM" + toml_path.read_bytes()
+            rebuilt.write_bytes(body + b"\0" * max(0, size - len(body)))
+            return subprocess.CompletedProcess(args, 0, "", "")
+        raise AssertionError(args)
+
+    def _peek(self, args) -> subprocess.CompletedProcess:
+        if self.repack_peek_returncode:
+            return subprocess.CompletedProcess(args, self.repack_peek_returncode, "", "peek: boom")
+        path = Path(args[args.index("--litertlm_file") + 1])
+        raw = path.read_bytes()
+        body = raw.removeprefix(b"LITERTLM").rstrip(b"\0").decode("utf-8", "replace")
+        if self.repack_peek_lies:
+            body = body.replace("prefer_activation_type", "nothing_here")
+        return subprocess.CompletedProcess(args, 0, body, "")
+
+
+FAKE_TOML = """[system_metadata]
+entries = []
+
+[[section]]
+section_type = "SP_Tokenizer"
+data_path = "tok.spiece"
+
+[[section]]
+model_type = "prefill_decode"
+section_type = "TFLiteModel"
+data_path = "prefill_decode.tflite"
+
+[[section]]
+model_type = "embedder"
+section_type = "TFLiteModel"
+data_path = "embedder.tflite"
+"""
 
 
 @pytest.fixture
@@ -782,3 +867,238 @@ def test_an_unreadable_sidecar_reaches_the_report(tmp_path):
         )
     )
     assert any("could not be read" in line for line in result.limitations)
+
+
+# ---------------------------------------------------------------------------
+# GPU activation type
+# ---------------------------------------------------------------------------
+
+
+def _fake_env(toolchain, tmp_path):
+    """A StageEnv whose `run` is the fake; the repack only needs `run`."""
+    from litetune import envs
+
+    return envs.StageEnv(name="export", python_ceiling=(3, 12), requirements=())
+
+
+def _artifact(tmp_path, size=4096) -> Path:
+    path = tmp_path / "model.litertlm"
+    path.write_bytes(b"\0" * size)
+    return path
+
+
+def test_the_activation_type_is_written_into_the_prefill_decode_section(toolchain, tmp_path):
+    """Measured 2026-09-05: without this key a Galaxy S24 floods `<pad>` on GPU
+    (14/20) and gets 3/20 tool names; with it, 0/20 and 20/20. The engine
+    reports success either way, so the artifact has to carry the fix.
+    """
+    from litetune.export import GPU_ACTIVATION, set_gpu_activation
+
+    artifact = _artifact(tmp_path)
+
+    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert (ok, note) == (True, None)
+    build = next(c for c in toolchain.repacks if c.argv[1:2] == ["toml"])
+    written = Path(build.argv[build.argv.index("--path") + 1])
+    # The work dir is gone; what matters is what the rebuilt bundle reads back as.
+    assert not written.exists()
+    peek = next(c for c in toolchain.repacks if c.argv[0] == "litert-lm-peek")
+    assert peek.argv[-1].endswith("model.litertlm")
+    body = artifact.read_bytes().removeprefix(b"LITERTLM").rstrip(b"\0").decode()
+    tables = body.split("[[section]]")[1:]
+    (prefill,) = [t for t in tables if 'model_type = "prefill_decode"' in t]
+    (embedder,) = [t for t in tables if 'model_type = "embedder"' in t]
+    assert f'prefer_activation_type = "{GPU_ACTIVATION}"' in prefill
+    assert "prefer_activation_type" not in embedder, "the key belongs to prefill_decode only"
+
+
+def test_the_repack_keeps_the_artifact_size(toolchain, tmp_path):
+    """One metadata string; the real repack measured 455,759,152 bytes before
+    and after. A size change here would put every recorded figure in doubt."""
+    from litetune.export import set_gpu_activation
+
+    artifact = _artifact(tmp_path, size=9000)
+    set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+    assert artifact.stat().st_size == 9000
+
+
+def test_a_bundle_that_already_declares_an_activation_type_is_left_alone(toolchain, tmp_path):
+    from litetune.export import set_gpu_activation
+
+    toolchain.repack_toml = FAKE_TOML.replace(
+        'model_type = "prefill_decode"\n',
+        'model_type = "prefill_decode"\nprefer_activation_type = "fp32_fp16"\n',
+    )
+    artifact = _artifact(tmp_path)
+    before = artifact.read_bytes()
+
+    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert ok
+    assert note and "fp32_fp16" in note and "left as written" in note
+    assert artifact.read_bytes() == before
+    assert not any(c.argv[1:2] == ["toml"] for c in toolchain.repacks), "no rebuild"
+
+
+@pytest.mark.parametrize(
+    "knob, expect",
+    [
+        ("repack_unpack_returncode", "unpack exited 1"),
+        ("repack_build_returncode", "rebuild exited 1"),
+        ("repack_peek_returncode", "does not read back"),
+        ("repack_peek_lies", "does not read back"),
+    ],
+)
+def test_every_repack_failure_keeps_the_original_and_says_why(toolchain, tmp_path, knob, expect):
+    """The original is a working CPU bundle. Losing it to a failed repack would
+    turn a GPU limitation into no artifact at all."""
+    from litetune.export import set_gpu_activation
+
+    setattr(toolchain, knob, 1 if knob.endswith("returncode") else True)
+    artifact = _artifact(tmp_path)
+    before = artifact.read_bytes()
+
+    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert not ok
+    assert note and expect in note
+    assert artifact.read_bytes() == before
+    assert not (artifact.parent / ".model-repack").exists(), "work dir cleaned up"
+
+
+def test_a_toml_without_a_prefill_section_is_not_guessed_at(toolchain, tmp_path):
+    from litetune.export import set_gpu_activation
+
+    toolchain.repack_toml = FAKE_TOML.replace('model_type = "prefill_decode"', 'model_type = "aux"')
+    artifact = _artifact(tmp_path)
+    before = artifact.read_bytes()
+
+    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert not ok
+    assert note and "prefill_decode" in note
+    assert artifact.read_bytes() == before
+
+
+def test_run_export_repacks_every_artifact_and_records_it(toolchain, request_for):
+    """The call site: the recorded hash and size are of the file that ships."""
+    from litetune.export import GPU_ACTIVATION, run_export
+
+    result = run_export(request_for(MEASURED_RECIPES))
+
+    assert [e.gpu_activation for e in result.succeeded] == [GPU_ACTIVATION, GPU_ACTIVATION]
+    for export in result.succeeded:
+        assert export.check.observed["gpu_activation"] == GPU_ACTIVATION
+        assert f"GPU activations {GPU_ACTIVATION}" in export.check.detail
+        assert export.as_dict()["gpu_activation"] == GPU_ACTIVATION
+        assert export.sha256 == hashlib.sha256(export.artifact.read_bytes()).hexdigest()
+    assert not any("could not be written" in text for text in result.limitations)
+
+
+def test_a_failed_repack_is_a_limitation_on_a_passed_export(toolchain, request_for):
+    """CPU-only is a smaller thing than not exported. The check stays passed; the
+    report says the GPU backend will flood `<pad>`, and names the recipe."""
+    from litetune.export import run_export
+
+    toolchain.repack_unpack_returncode = 1
+
+    result = run_export(request_for(("dynamic_wi8_afp32",)))
+
+    (export,) = result.succeeded
+    assert export.ok
+    assert export.gpu_activation is None
+    assert "F16 default" in export.check.detail
+    assert "unpack exited 1" in export.check.observed["gpu_activation_note"]
+    assert any(
+        "dynamic_wi8_afp32" in text and "<pad>" in text and "CPU-only" in text
+        for text in result.limitations
+    )
+
+
+def test_an_exception_inside_the_repack_cannot_unmake_the_export(
+    toolchain, request_for, monkeypatch
+):
+    """`guard` turns an escaping exception into "could not check". A repack that
+    raises would then bury a perfectly good CPU export under that verdict, so
+    nothing may escape it. Found by two other test suites whose fakes did not
+    know the builder and raised KeyError."""
+    from litetune import envs
+    from litetune.export import run_export
+
+    def explode(self, args, timeout=3600, **kwargs):
+        if args[0] == "litert-lm-builder":
+            raise KeyError("quantization_recipe")
+        return toolchain(args, timeout, **kwargs)
+
+    monkeypatch.setattr(envs.StageEnv, "run", explode)
+
+    result = run_export(request_for(("dynamic_wi8_afp32",)))
+
+    (export,) = result.exports
+    assert export.ok, export.check.detail
+    assert export.gpu_activation is None
+    assert "KeyError" in export.check.observed["gpu_activation_note"]
+
+
+def test_a_key_the_builder_wrote_into_additional_metadata_is_recognised(toolchain, tmp_path):
+    """Real `litert-lm-builder unpack` does not round-trip the key as a bare
+    `prefer_activation_type = ...` line. It comes back as one entry of the
+    section's `additional_metadata` array, before `model_type`. The first
+    version of this code saw the substring, failed to read the value, and
+    reported `'?'`. Found by running the real builder, not the fake."""
+    from litetune.export import set_gpu_activation
+
+    toolchain.repack_toml = FAKE_TOML.replace(
+        '[[section]]\nmodel_type = "prefill_decode"\n',
+        "[[section]]\nadditional_metadata = [\n"
+        '  { key = "prefer_activation_type", value_type = "String", value = "fp32" },\n'
+        ']\nmodel_type = "prefill_decode"\n',
+    )
+    artifact = _artifact(tmp_path)
+    before = artifact.read_bytes()
+
+    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert ok
+    assert note and "'fp32'" in note and "left as written" in note
+    assert artifact.read_bytes() == before
+
+
+def test_the_key_is_placed_by_section_not_by_line_order(toolchain, tmp_path):
+    """Key order in a TOML table is free; the code must not depend on
+    `model_type` being the first line, or on the section being first."""
+    from litetune.export import GPU_ACTIVATION, set_gpu_activation
+
+    toolchain.repack_toml = (
+        '[[section]]\nmodel_type = "embedder"\nsection_type = "TFLiteModel"\n'
+        'data_path = "embedder.tflite"\n\n'
+        '[[section]]\ndata_path = "prefill_decode.tflite"\nsection_type = "TFLiteModel"\n'
+        'additional_metadata = [\n  { key = "License", value_type = "String", value = "x" },\n]\n'
+        'model_type = "prefill_decode"\n'
+    )
+    artifact = _artifact(tmp_path)
+
+    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert (ok, note) == (True, None)
+    body = artifact.read_bytes().removeprefix(b"LITERTLM").rstrip(b"\0").decode()
+    tables = body.split("[[section]]")
+    embedder, prefill = tables[1], tables[2]
+    assert GPU_ACTIVATION not in embedder
+    assert f'prefer_activation_type = "{GPU_ACTIVATION}"' in prefill
+    assert 'key = "License"' in prefill, "existing metadata survives"
+
+
+def test_two_prefill_sections_are_ambiguous_rather_than_a_guess(toolchain, tmp_path):
+    from litetune.export import set_gpu_activation
+
+    toolchain.repack_toml = FAKE_TOML + '\n[[section]]\nmodel_type = "prefill_decode"\n'
+    artifact = _artifact(tmp_path)
+    before = artifact.read_bytes()
+
+    ok, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert not ok
+    assert note and "found 2 prefill_decode sections" in note
+    assert artifact.read_bytes() == before

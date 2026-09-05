@@ -68,6 +68,30 @@ KNOWN_RECIPES = (
 # these; it is offered, never applied by default -- see `ExportRequest.recipes`.
 MEASURED_RECIPES = ("dynamic_wi8_afp32", "weight_only_wi8_afp32")
 
+# What the GPU text executor computes activations in, unless the bundle says
+# otherwise. Measured 2026-09-05 on a Galaxy S24 (Adreno) with the tuned
+# FunctionGemma bundle, native tool path, 20 rows:
+#
+#     activation      <pad> floods   tool name   exact   ms/prompt
+#     (unset -> F16)      14/20         3/20      2/20     16763
+#     fp32                 0/20        20/20     15/20      1375
+#     fp32_fp16            0/20        20/20     15/20      1406
+#     CPU, same file       0/20        20/20     14/20      2477
+#
+# The engine reports success either way: it loads, every call returns, no
+# exception. Only the content betrays it. Google's own Mobile Actions bundle
+# does the same (20/20 `<pad>` on GPU) and the Gallery pins it to
+# `"accelerators": "cpu"`. LiteRT-LM's `engine_settings.cc` names the default
+# -- "Text executor defaults to F16" -- and the override is a string in the
+# prefill/decode section's metadata that neither `export_hf` nor Google sets.
+#
+# `fp32` rather than `fp32_fp16`: the two measured the same, and `fp32` changes
+# one metadata string while `--experimental_use_mixed_precision` also runs a
+# graph pass. The artifact that leaves here is then byte-for-byte the one the
+# CPU numbers were taken on, plus one key.
+GPU_ACTIVATION = "fp32"
+GPU_ACTIVATION_KEY = "prefer_activation_type"
+
 # Measured: a 285,577,392-byte artifact in 122 s on CPU for a 270M checkpoint.
 # The ceiling is an order of magnitude above that so a larger checkpoint is not
 # cut off mid-write, and low enough that a hung export is recorded as a
@@ -476,6 +500,10 @@ class RecipeExport:
     sha256: str | None = None
     seconds: float | None = None
     returncode: int | None = None
+    # What the bundle tells the GPU text executor to compute activations in, or
+    # None when the repack could not be made and the toolchain's F16 default
+    # stands. See GPU_ACTIVATION.
+    gpu_activation: str | None = None
     # Full, not a tail. A nightly-specific failure has to be diagnosable months
     # later from the record alone, and the interesting line is as often the
     # first traceback frame as the last.
@@ -513,6 +541,7 @@ class RecipeExport:
             "artifact_bytes": self.artifact_bytes,
             "shipped_bytes": self.shipped_bytes,
             "sha256": self.sha256,
+            "gpu_activation": self.gpu_activation,
             "seconds": round(self.seconds, 3) if self.seconds is not None else None,
             "returncode": self.returncode,
             "stderr": self.stderr,
@@ -579,6 +608,118 @@ def repair_vocab_file(model_dir: Path) -> tuple[bool, str | None]:
         f"machine ({declared!r}); litetune rewrote it to point at {beside}. This modifies "
         "the checkpoint directory, and the exporter reads that field verbatim"
     )
+
+
+# One `[[section]]` table, from its header to the next header or end of file.
+_TOML_TABLE_RE = re.compile(r"\[\[section\]\][^\[]*(?:\[(?!\[section\])[^\[]*)*", re.S)
+_PREFILL_RE = re.compile(r'model_type\s*=\s*"prefill_decode"')
+# Both shapes the builder round-trips the key in. Written by hand it is a bare
+# key; read back by `unpack` it is one entry of the section's `additional_metadata`
+# array, which is also what the file actually stores.
+_ACTIVATION_VALUE_RE = re.compile(
+    r'(?:^\s*prefer_activation_type\s*=\s*"([^"]*)"'
+    r'|key\s*=\s*"prefer_activation_type"[^}]*?value\s*=\s*"([^"]*)")',
+    re.M,
+)
+
+
+def set_gpu_activation(
+    artifact: Path, env: envs.StageEnv, *, activation: str = GPU_ACTIVATION, timeout: int = 600
+) -> tuple[bool, str | None]:
+    """Write `prefer_activation_type` into the bundle's prefill/decode section.
+
+    Returns (ok, what happened). `ok` is False when the artifact is left as the
+    toolchain wrote it, which is a working CPU bundle and a broken GPU one -- so
+    the caller records the reason rather than failing the export.
+
+    Done by unpacking with `litert-lm-builder`, adding one key to `model.toml`,
+    and rebuilding: the weights, tokenizer, template and model type are carried
+    through untouched, which is checked by reading the result back with
+    `litert-lm-peek`. The original is replaced only after that check passes.
+    The exporter offers no flag for this value, and the one flag it does offer
+    (`--experimental_use_mixed_precision`) changes the graph as well.
+    """
+    work = artifact.parent / f".{artifact.stem}-repack"
+    if work.exists():
+        _remove_tree(work)
+    work.mkdir(parents=True)
+    try:
+        proc = env.run(
+            ["litert-lm-builder", "unpack", "--input", str(artifact), "--output", str(work)],
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            return False, f"litert-lm-builder unpack exited {proc.returncode}: {_tail(proc.stderr)}"
+        toml_path = work / "model.toml"
+        if not toml_path.exists():
+            return False, f"litert-lm-builder unpack wrote no model.toml into {work}"
+        text = toml_path.read_text(encoding="utf-8")
+        tables = [m for m in _TOML_TABLE_RE.finditer(text) if _PREFILL_RE.search(m.group(0))]
+        if len(tables) != 1:
+            return False, (
+                f"found {len(tables)} prefill_decode sections in model.toml where exactly one "
+                "was expected, so the GPU activation type was not set"
+            )
+        table = tables[0]
+        present = _ACTIVATION_VALUE_RE.search(table.group(0))
+        if present:
+            value = present.group(1) or present.group(2)
+            return True, (
+                f"the bundle already declares {GPU_ACTIVATION_KEY} = {value!r}; left as written"
+            )
+        # Key order inside a TOML table is free, so the key goes straight after
+        # the header rather than after any particular line.
+        header_end = table.start() + len("[[section]]")
+        patched = text[:header_end] + f'\n{GPU_ACTIVATION_KEY} = "{activation}"' + text[header_end:]
+        toml_path.write_text(patched, encoding="utf-8")
+        rebuilt = work / artifact.name
+        proc = env.run(
+            [
+                "litert-lm-builder",
+                "toml",
+                "--path",
+                str(toml_path),
+                "output",
+                "--path",
+                str(rebuilt),
+            ],
+            timeout=timeout,
+        )
+        if proc.returncode != 0 or not rebuilt.exists():
+            return False, (
+                f"litert-lm-builder rebuild exited {proc.returncode}: {_tail(proc.stderr)}"
+            )
+        proc = env.run(["litert-lm-peek", "--litertlm_file", str(rebuilt)], timeout=timeout)
+        peek = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode != 0 or GPU_ACTIVATION_KEY not in peek or activation not in peek:
+            return False, (
+                f"the rebuilt bundle does not read back with {GPU_ACTIVATION_KEY} = "
+                f"{activation!r}; the original was kept"
+            )
+        os.replace(rebuilt, artifact)
+        return True, None
+    except subprocess.TimeoutExpired:
+        return False, f"litert-lm-builder did not finish within {timeout}s; the original was kept"
+    except Exception as exc:  # noqa: BLE001 - a broken repack must not unmake a good export
+        # Whatever went wrong here, the toolchain's artifact is intact and is a
+        # working CPU bundle. Escaping would let `guard` record the whole
+        # recipe as "could not check", which is a smaller truth than the one
+        # available: exported, CPU-only, and here is why.
+        return False, f"{type(exc).__name__}: {exc}; the original was kept"
+    finally:
+        _remove_tree(work)
+
+
+def _remove_tree(path: Path) -> None:
+    for child in sorted(path.rglob("*"), reverse=True):
+        try:
+            child.rmdir() if child.is_dir() else child.unlink()
+        except OSError:
+            pass
+    try:
+        path.rmdir()
+    except OSError:
+        pass
 
 
 def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
@@ -699,10 +840,20 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
         )
 
     artifact = artifacts[0]
+    # Repacked before it is hashed or sized: the file that ships is the one
+    # that is recorded. A repack that cannot be made is a limitation on a
+    # passed check, not a failed one -- the CPU artifact is intact.
+    gpu_ok, gpu_note = set_gpu_activation(artifact, request.env)
+    gpu_activation = GPU_ACTIVATION if gpu_ok else None
     artifact_bytes = artifact.stat().st_size
     companions = tuple(p.name for p in produced if p != artifact)
     shipped_bytes = sum(p.stat().st_size for p in produced)
     digest = _sha256(artifact) if request.hash_artifacts else None
+    gpu_text = (
+        f"GPU activations {gpu_activation}"
+        if gpu_ok
+        else "GPU activations left at the toolchain's F16 default"
+    )
     return RecipeExport(
         **base,
         artifact=artifact,
@@ -710,16 +861,19 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
         artifact_bytes=artifact_bytes,
         shipped_bytes=shipped_bytes,
         sha256=digest,
+        gpu_activation=gpu_activation,
         check=Check.passed(
             name,
-            f"{artifact.name}: {artifact_bytes:,} bytes in {seconds:.1f}s on cpu — produced, "
-            "not verified",
+            f"{artifact.name}: {artifact_bytes:,} bytes in {seconds:.1f}s on cpu, {gpu_text} — "
+            "produced, not verified",
             observed=observed
             | {
                 "artifact": str(artifact),
                 "artifact_bytes": artifact_bytes,
                 "shipped_bytes": shipped_bytes,
                 "sha256": digest,
+                "gpu_activation": gpu_activation,
+                "gpu_activation_note": gpu_note,
                 "verified": False,
             },
         ),
@@ -1107,6 +1261,18 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
     result.comparison = compare_sizes(list(request.recipes), result.exports)
     if isinstance(result.comparison, Uncompared):
         result.limitations.append(result.comparison.reason)
+
+    # Said at the top level, not only in the per-recipe record: a bundle left
+    # at F16 runs on CPU and floods `<pad>` on GPU, and the two look the same
+    # from every check this stage has.
+    unset = [e.recipe for e in result.succeeded if e.gpu_activation is None]
+    if unset:
+        result.limitations.append(
+            f"{GPU_ACTIVATION_KEY} could not be written into {unset}: on the GPU backend "
+            f"the runtime will compute activations in F16, which measured as `<pad>` floods "
+            f"and wrong tool names on Adreno (3/20 vs 20/20 on CPU). These bundles are "
+            f"CPU-only until repacked; see the per-recipe gpu_activation_note"
+        )
 
     events.stage_finished(
         result.outcome.value,

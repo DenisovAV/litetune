@@ -329,6 +329,10 @@ class FakeToolchain:
         self.calls.append(list(args))
         if args[0] == "pip":
             return subprocess.CompletedProcess(args, 0, self.pip_stdout, "")
+        if args[0] in ("litert-lm-builder", "litert-lm-peek"):
+            # This fake has no bundle builder: the repack reports that and the
+            # export stays a passed, CPU-only one.
+            return subprocess.CompletedProcess(args, 127, "", f"{args[0]}: not found")
         flags = dict(a.removeprefix("--").split("=", 1) for a in args[2:] if "=" in a)
         out_dir = Path(flags["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)

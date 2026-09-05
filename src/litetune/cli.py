@@ -1001,9 +1001,16 @@ def _artifact_line(export: RecipeExport) -> str:
     """
     beside = (export.shipped_bytes or 0) - (export.artifact_bytes or 0)
     companions = f" (+{beside:,} bytes beside it)" if beside > 0 else ""
+    # Named on the line, not only in the JSON: a bundle without it is CPU-only
+    # and looks identical to one with it from every other field here.
+    gpu = (
+        f", GPU activations {export.gpu_activation}"
+        if export.gpu_activation
+        else ", CPU-only (GPU activations not set)"
+    )
     return (
         f"  {export.recipe}: {export.artifact_bytes:,} bytes{companions} "
-        f"in {export.seconds:.1f}s — {export.artifact}"
+        f"in {export.seconds:.1f}s{gpu} — {export.artifact}"
     )
 
 

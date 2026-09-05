@@ -465,10 +465,12 @@ class LiteRtLmBackend:
     implemented yet, because the serve path changes the prompt-construction
     surface and that has to be measured before it is trusted.
 
-    Measurement here runs on CPU while users run on a phone; published reports
-    put the GPU backend materially below CPU on identical artifacts, so every
-    number from this backend is an optimistic estimate and `describe()` records
-    which backend and engine produced it.
+    Measurement here runs on CPU while users run on a phone. Measured
+    2026-09-05 on a Galaxy S24: the GPU backend matches CPU on the same bundle
+    when the bundle carries `prefer_activation_type = fp32`, and floods `<pad>`
+    when it does not -- see `export.GPU_ACTIVATION`. So a number from here
+    stands for the device only for a bundle that carries the key, and
+    `describe()` records which backend and engine produced it.
     """
 
     model: Path

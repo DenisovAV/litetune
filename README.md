@@ -305,9 +305,17 @@ withdrawn after re-measurement.
 
 - **Measured on one model.** `functiongemma-270m-it`. Other families export but
   have no quality figure.
-- **Measurement runs on CPU; your users run on a phone.** The GPU backend is
-  reported to score below CPU on identical artifacts, and litetune has not
-  measured that gap, so every number here is an optimistic estimate.
+- **Measurement runs on CPU; your users run on a phone.** Measured on a Galaxy
+  S24, the GPU backend gives the same tool-call accuracy as CPU on the same
+  bundle (20/20 names, 15/20 vs 14/20 exact on 20 rows) and is 1.8× faster --
+  *if* the bundle declares `prefer_activation_type = fp32` for its prefill/decode
+  section. Without it the GPU text executor computes in F16 and the output is
+  `<pad>` floods and invented tool names (3/20 names), while the engine reports
+  success throughout. `convert` writes that key into every bundle it produces
+  and `manifest.json` records it as `gpu_activation`; a bundle that could not be
+  repacked is named in the limitations and is CPU-only. litetune's own numbers
+  are still CPU numbers: a phone GPU cannot be driven from a laptop, so a
+  device measurement is a separate run.
 - **Two prompt renderings are in the field** for the same model, and they
   disagree for every declaration with more than one property. Costly on a base
   checkpoint, near-free after fine-tuning; `contract.json` records which you
