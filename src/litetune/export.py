@@ -682,8 +682,12 @@ if it was left alone); `written` says whether the file was replaced.
 import json
 import os
 import sys
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11: the builder itself depends on tomli
+    import tomli as tomllib
 
 from litert_lm_builder import litertlm_builder as lb
 

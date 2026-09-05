@@ -62,7 +62,15 @@ Issues = "https://github.com/DenisovAV/litetune/issues"
 # -- `~=0.8` means `>=0.8, <1.0`, not `<0.9` -- and four files that passed
 # `format --check` in one environment failed it in another, on identical
 # source.
-dev = ["pytest==8.3.4", "ruff==0.8.4", "mypy==1.14.0", "types-PyYAML==6.0.12.20241230"]
+dev = [
+    "pytest==8.3.4",
+    "ruff==0.8.4",
+    "mypy==1.14.0",
+    "types-PyYAML==6.0.12.20241230",
+    # The repack script runs inside the export env, which has tomli via
+    # litert-lm-builder; the tests run that script with the host interpreter.
+    "tomli==2.4.1; python_version < '3.11'",
+]
 
 [project.scripts]
 litetune = "litetune.cli:main"

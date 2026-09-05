@@ -12,3 +12,4 @@ runs/
 openspec/
 .claude/
 .venv/
+.venv310/
