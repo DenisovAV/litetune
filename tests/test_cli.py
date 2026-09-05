@@ -1366,9 +1366,9 @@ def test_convert_json_records_gpu_activation(toolchain, tmp_path, capsys):
     assert code == 0
     manifest = json.loads(capsys.readouterr().out)
     (export,) = manifest["exports"]
-    assert "gpu_activation" in export
     assert export["gpu_activation"] is None
-    assert "gpu_activation_note" in export["check"]["observed"]
+    assert export["gpu_activation_state"] == "unset"
+    assert export["gpu_activation_note"]
 
 
 @pytest.mark.parametrize(

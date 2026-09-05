@@ -44,6 +44,7 @@ from litetune.export import (
 PIP_FREEZE = """absl-py==2.1.0
 flatbuffers==24.3.25
 litert-lm==0.16.1
+litert-lm-builder==0.16.1
 litert-torch-nightly==0.10.0.dev20260826
 numpy==2.0.2
 """
@@ -172,13 +173,17 @@ class FakeToolchain:
             # reads back as the standard two-section bundle.
             toml = self.repack_toml if self.repack_toml is not None else FAKE_TOML
         stamp = hashlib.sha1(raw).hexdigest()[:8]
+        # The real tool prints the system block *before* any `Section N:`
+        # header, so those keys carry no section number.
         out = [
-            "Section 0:",
-            "  Items:",
-            f"    Key: uuid, Value (String): {stamp}-uuid",
-            f"    Key: creation_timestamp, Value (String): 2026-09-05T{stamp}",
+            "LiteRT-LM Version: 1.6.0",
+            "",
+            "  Key: Authors, Value (String): ODML",
+            f"  Key: uuid, Value (String): {stamp}-uuid",
+            f"  Key: creation_timestamp, Value (String): 2026-09-05T{stamp}",
+            "",
         ]
-        for i, table in enumerate(toml.split("[[section]]")[1:], start=1):
+        for i, table in enumerate(_section_tables(toml), start=0):
             out += [f"Section {i}:", "  Items:"]
             mt = re.search(r'model_type\s*=\s*"([^"]*)"', table)
             if mt:
@@ -189,6 +194,8 @@ class FakeToolchain:
                 out.append(f"    Key: {m.group(1)}, Value (String): {m.group(2)}")
             for m in re.finditer(r'key\s*=\s*"([^"]*)"[^}]*?value\s*=\s*"([^"]*)"', table):
                 out.append(f"    Key: {m.group(1)}, Value (String): {m.group(2)}")
+            # Offsets, as the real tool prints them; the check must ignore them.
+            out += [f"  Begin Offset: {16384 * (i + 1)}", f"  End Offset:   {16384 * (i + 2)}"]
         body = "\n".join(out) + "\n"
         if self.repack_peek_lies:
             body = body.replace("prefer_activation_type", "nothing_here")
@@ -198,9 +205,24 @@ class FakeToolchain:
             keyed = [line for line in out if "prefer_activation_type" in line]
             if keyed:
                 out.remove(keyed[0])
-                out.append(keyed[0])  # lands in the last section: the embedder's
+                # Into the last section, before its offsets: the embedder's.
+                out.insert(len(out) - 2, keyed[0])
                 body = "\n".join(out) + "\n"
         return subprocess.CompletedProcess(args, 0, body, "")
+
+
+def _section_tables(toml: str) -> list[str]:
+    """Each `[[section]]` table up to the next table header of any kind.
+
+    Mirrors what real `unpack` output looks like: a single-bracket table can
+    follow the last section, and it is not part of that section.
+    """
+    out: list[str] = []
+    for chunk in toml.split("[[section]]")[1:]:
+        # Stop at the next single-bracket header on its own line.
+        body = re.split(r"^\[(?!\[)", chunk, maxsplit=1, flags=re.M)[0]
+        out.append(body)
+    return out
 
 
 FAKE_TOML = """[system_metadata]
@@ -664,6 +686,7 @@ def test_parse_pip_freeze_records_the_whole_resolved_set():
         "absl-py": "2.1.0",
         "flatbuffers": "24.3.25",
         "litert-lm": "0.16.1",
+        "litert-lm-builder": "0.16.1",
         "litert-torch-nightly": "0.10.0.dev20260826",
         "numpy": "2.0.2",
     }
@@ -977,9 +1000,9 @@ def test_a_bundle_that_already_declares_an_activation_type_is_left_alone(toolcha
     "knob, expect",
     [
         ("repack_unpack_returncode", "unpack exited 1"),
-        ("repack_build_returncode", "rebuild exited 1"),
-        ("repack_peek_returncode", "could not be read back"),
-        ("repack_peek_lies", "where exactly one"),
+        ("repack_build_returncode", "litert-lm-builder toml exited 1"),
+        ("repack_peek_returncode", "printed no section listing"),
+        ("repack_peek_lies", "left 0 prefer_activation_type keys"),
         ("repack_peek_misplaces", "landed outside the prefill/decode section"),
     ],
 )
@@ -1024,6 +1047,8 @@ def test_run_export_repacks_every_artifact_and_records_it(toolchain, request_for
     for export in result.succeeded:
         assert export.check.observed["gpu_activation"] == GPU_ACTIVATION
         assert f"GPU activations {GPU_ACTIVATION}" in export.check.detail
+        assert export.gpu_activation_note is None
+        assert export.as_dict()["gpu_activation_state"] == "set"
         assert export.as_dict()["gpu_activation"] == GPU_ACTIVATION
         assert export.sha256 == hashlib.sha256(export.artifact.read_bytes()).hexdigest()
     assert not any("could not be written" in text for text in result.limitations)
@@ -1041,8 +1066,10 @@ def test_a_failed_repack_is_a_limitation_on_a_passed_export(toolchain, request_f
     (export,) = result.succeeded
     assert export.ok
     assert export.gpu_activation is None
-    assert "F16 default" in export.check.detail
+    assert "CPU-only (GPU activations not set)" in export.check.detail
+    assert export.gpu_activation_note and "unpack exited 1" in export.gpu_activation_note
     assert "unpack exited 1" in export.check.observed["gpu_activation_note"]
+    assert export.as_dict()["gpu_activation_state"] == "unset"
     assert any(
         "dynamic_wi8_afp32" in text and "<pad>" in text and "CPU-only" in text
         for text in result.limitations
@@ -1071,7 +1098,7 @@ def test_an_exception_inside_the_repack_cannot_unmake_the_export(
     (export,) = result.exports
     assert export.ok, export.check.detail
     assert export.gpu_activation is None
-    assert "KeyError" in export.check.observed["gpu_activation_note"]
+    assert export.gpu_activation_note and "KeyError" in export.gpu_activation_note
 
 
 def test_a_key_the_builder_wrote_into_additional_metadata_is_recognised(toolchain, tmp_path):
@@ -1094,7 +1121,7 @@ def test_a_key_the_builder_wrote_into_additional_metadata_is_recognised(toolchai
     value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
 
     assert value == "fp32"
-    assert note and "'fp32'" in note and "left as written" in note
+    assert note and "= fp32;" in note and "left as written" in note
     assert artifact.read_bytes() == before
 
 
@@ -1163,6 +1190,7 @@ def test_an_upstream_declaration_is_recorded_as_itself_not_as_fp32(
     assert f"GPU activations {declared} (declared upstream, not {GPU_ACTIVATION})" in (
         export.check.detail
     )
+    assert export.as_dict()["gpu_activation_state"] == "declared_upstream"
     assert any(declared in text and "left as found" in text for text in result.limitations)
 
 
@@ -1187,7 +1215,7 @@ def test_a_work_dir_that_cannot_be_created_is_a_note_not_an_unchecked_export(
     (export,) = result.exports
     assert export.ok, export.check.detail
     assert export.gpu_activation is None
-    assert "PermissionError" in export.check.observed["gpu_activation_note"]
+    assert export.gpu_activation_note and "PermissionError" in export.gpu_activation_note
 
 
 def test_a_rebuild_that_changes_more_than_the_key_is_refused(toolchain, tmp_path):
@@ -1198,9 +1226,6 @@ def test_a_rebuild_that_changes_more_than_the_key_is_refused(toolchain, tmp_path
 
     # The rebuilt toml will carry the key; make the *original* read back with
     # an extra section so the two listings differ by more than the key.
-    class Drift(type(toolchain)):
-        pass
-
     calls = {"n": 0}
     real_peek = toolchain._peek
 
@@ -1224,5 +1249,106 @@ def test_a_rebuild_that_changes_more_than_the_key_is_refused(toolchain, tmp_path
     value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
 
     assert value is None
-    assert note and "dropped" in note
+    assert note and "beyond the one key" in note
     assert artifact.read_bytes() == before
+
+
+def test_the_read_back_demands_the_exact_value_not_a_prefix(toolchain, tmp_path):
+    """`fp32` is a substring of `fp32_fp16`. The check's whole purpose is to
+    measure what the rebuild wrote, so a prefix match would let the wrong
+    value through. Found in type-design review."""
+    from litetune.export import _rebuild_changed_only_the_key
+
+    before = (
+        "  Key: uuid, Value (String): a\n"
+        "Section 3:\n  Items:\n    Key: model_type, Value (String): tf_lite_prefill_decode\n"
+        "  Begin Offset: 16384\n"
+    )
+    after = (
+        "  Key: uuid, Value (String): b\n"
+        "Section 3:\n  Items:\n    Key: model_type, Value (String): tf_lite_prefill_decode\n"
+        "    Key: prefer_activation_type, Value (String): fp32_fp16\n"
+        "  Begin Offset: 32768\n"
+    )
+
+    verdict = _rebuild_changed_only_the_key(before, after)
+
+    assert verdict == (
+        None,
+        "the rebuild wrote prefer_activation_type = 'fp32_fp16'; 'fp32' was asked",
+    )
+
+
+def test_a_trailing_system_table_is_not_folded_into_the_last_section(toolchain, tmp_path):
+    """`unpack` may write `[system_metadata]` after the last `[[section]]`. A
+    table regex that stopped only at `[[section]]` folded it into that
+    section, so a system-level key of the same name read as the prefill
+    section's declaration. Found in review, twice."""
+    from litetune.export import GPU_ACTIVATION, set_gpu_activation
+
+    toolchain.repack_toml = (
+        '[[section]]\nmodel_type = "prefill_decode"\nsection_type = "TFLiteModel"\n'
+        'data_path = "p.tflite"\n\n[system_metadata]\nentries = [\n'
+        '  { key = "prefer_activation_type", value_type = "String", value = "fp16" },\n]\n'
+    )
+    artifact = _artifact(tmp_path)
+
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert (value, note) == (GPU_ACTIVATION, None), "the section had no key; it must be written"
+
+
+def test_an_empty_upstream_declaration_is_reported_as_empty_not_as_unset(toolchain, tmp_path):
+    """`group(1) or group(2)` turned `""` into None, which the caller then
+    reported as "could not be written". Found in review."""
+    from litetune.export import set_gpu_activation
+
+    toolchain.repack_toml = FAKE_TOML.replace(
+        'model_type = "prefill_decode"\n',
+        'model_type = "prefill_decode"\nprefer_activation_type = ""\n',
+    )
+    artifact = _artifact(tmp_path)
+
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert value == ""
+    assert note and "= (empty);" in note and "left as written" in note
+
+
+def test_the_read_back_is_checked_against_a_real_peek_listing():
+    """A captured pair of real `litert-lm-peek` listings (LiteRT-LM 1.6.0,
+    builder 0.16.1) of the measured bundle before and after the repack that
+    scored 0/20 `<pad>` on the phone. The fake renders a synthetic listing;
+    this pins the parser to the tool's actual shape -- the system block
+    printed *before* `Section 0:`, and offsets that the check must ignore.
+    The first positional version rejected this exact pair because it looked
+    for the system keys under section 0."""
+    from litetune.export import _rebuild_changed_only_the_key
+
+    before = (
+        "LiteRT-LM Version: 1.6.0\n\n"
+        "+---+\n|  System Metadata  |\n+---+\n"
+        "  Key: Authors, Value (String): ODML\n"
+        "  Key: uuid, Value (String): d2dc0fc7-5d05-4f51-89e2-4466d17aae90\n"
+        "  Key: creation_timestamp, Value (String): 2026-09-04T22:21:57.913205+00:00\n\n"
+        "Section 0:\n  Items:\n  Begin Offset: 16384\n  End Offset:   24505\n"
+        "  Data Type:    LlmMetadata\n\n"
+        "Section 2:\n  Items:\n  Begin Offset: 49152\n  End Offset:   4738296\n"
+        "  Data Type:    SP_Tokenizer\n\n"
+        "Section 3:\n  Items:\n"
+        "    Key: model_type, Value (String): tf_lite_prefill_decode\n"
+        "  Begin Offset: 4751360\n  End Offset:   281689696\n  Data Type:    TFLiteModel\n\n"
+        "Section 4:\n  Items:\n"
+        "    Key: model_type, Value (String): tf_lite_embedder\n"
+        "  Begin Offset: 281690112\n  End Offset:   455759152\n  Data Type:    TFLiteModel\n"
+    )
+    after = before.replace(
+        "d2dc0fc7-5d05-4f51-89e2-4466d17aae90", "880192fc-d1f6-49e2-b83e-32f64dcec107"
+    ).replace("2026-09-04T22:21:57.913205+00:00", "2026-09-05T12:45:46.649912+00:00")
+    after = after.replace(
+        "    Key: model_type, Value (String): tf_lite_prefill_decode\n",
+        "    Key: model_type, Value (String): tf_lite_prefill_decode\n"
+        "    Key: prefer_activation_type, Value (String): fp32\n",
+    )
+
+    assert _rebuild_changed_only_the_key(before, after) == ("fp32", None)

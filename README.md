@@ -297,6 +297,11 @@ withdrawn after re-measurement.
 
 **Known to be broken**
 
+- **The model does not always stop on the device.** 8 of 640 responses ran to
+  the token limit — two carried 350 and 351 identical calls — and 13.4% carried
+  more than one call, against 5% on the cloud CPU. The bundle names
+  `<end_of_turn>` and `<start_function_response>` as stop tokens, so whatever
+  stops the float path is not stopping this one. Not diagnosed.
 - **Peak memory is not bounded.** Training this model on 8,693 examples was
   OOM-killed at 32 GiB more than once. There is no preflight check; a death with
   no Python traceback is probably this.
@@ -306,34 +311,21 @@ withdrawn after re-measurement.
 - **Measured on one model.** `functiongemma-270m-it`. Other families export but
   have no quality figure.
 - **Measurement runs on CPU; your users run on a phone.** On one Snapdragon
-  Galaxy S24 (`SC-51E`), the tuned bundle on the device's CPU scored
-  0.8703 ±0.026 on the 640 held-out rows against 0.8906 on the cloud CPU that
-  produced it (run A in [MEASUREMENTS.md](MEASUREMENTS.md); the other two runs
-  of the same recipe scored 0.9016 and 0.8969, and against those the device
-  figure sits at the edge of its interval) -- so the laptop number predicted the
-  phone to within about ±0.03. The GPU backend on the same device gave 20/20 tool names
-  and 15/20 exact on 20 rows (CPU: 20/20, 14/20) at 1.8× the CPU speed -- *if*
-  the bundle declares `prefer_activation_type = fp32` for its prefill/decode
-  section. Without it the GPU text executor computes in F16 and the output is
-  `<pad>` floods and invented tool names (3/20 names), while the engine reports
-  success throughout. `convert` writes that key into every bundle it produces;
-  `convert --json` records what each bundle carries under
-  `exports[].gpu_activation`, and a bundle that could not be repacked is named
-  in the limitations and is CPU-only. One device, one recipe; litetune cannot
+  Galaxy S24 (`SC-51E`), the `dynamic_wi8_afp32` bundle on the device's CPU
+  scored 0.8703 ±0.026 on the 640 held-out rows against 0.8906 for the cloud
+  CPU run that produced it (run A in [MEASUREMENTS.md](MEASUREMENTS.md); runs
+  B and C scored 0.9016 and 0.8969, both just outside that interval). So the
+  reference number predicted the phone to within about 0.03. One device, one
+  recipe.
+- **The GPU number is 20 rows.** Same device, same bundle, GPU backend: 20/20
+  tool names and 15/20 exact (CPU: 20/20, 14/20) at 1.8× the CPU speed — with
+  `prefer_activation_type = fp32` in the bundle. Without it the GPU text
+  executor computes in F16 and returns `<pad>` floods and invented tool names
+  (3/20), while the engine reports success. `convert` writes that key into
+  every bundle it produces that does not already declare one; `--json` records
+  what each carries as `exports[].gpu_activation`, and a bundle that could not
+  be repacked is named in the limitations and is CPU-only. litetune cannot
   drive a phone GPU from a laptop, so a device run is a separate job.
-- **A native app on Android 12+ needs three things this README cannot supply.**
-  `<uses-native-library>` declarations for `libOpenCL.so` (and the `-car`,
-  `-pixel`, `libvndksupport.so` variants) in its manifest -- without them the
-  runtime reports "Can not find OpenCL library on this device", which is a
-  statement about the app's permissions, not the device; `maxNumTokens` no
-  lower than the bundle's baked 1024, or every GPU prompt takes 53 s instead
-  of 6; and an `EngineConfig.cacheDir`. `flutter_gemma` ships all three.
-- **The model does not always stop.** On the device, 8 of 640 responses ran to
-  the token limit -- two carried 350 and 351 identical calls -- and 13.4% carried
-  more than one call, against 5% on the cloud CPU after the terminator fix.
-  The bundle names `<end_of_turn>` and `<start_function_response>` as stop
-  tokens, so whatever stops the float path is not stopping this one. Not
-  diagnosed.
 - **Two prompt renderings are in the field** for the same model, and they
   disagree for every declaration with more than one property. Costly on a base
   checkpoint, near-free after fine-tuning; `contract.json` records which you
@@ -341,6 +333,12 @@ withdrawn after re-measurement.
 
 **Not built yet**
 
+- **Nothing here configures the app that loads the bundle.** On Android 12+ it
+  needs `<uses-native-library>` for `libOpenCL.so` (and `-car`, `-pixel`,
+  `libvndksupport.so`) or the runtime reports "Can not find OpenCL library on
+  this device" — about the app's permissions, not the device; `maxNumTokens`
+  no lower than the bundle's baked 1024, or GPU prompts take 53 s instead of
+  6; and an `EngineConfig.cacheDir`. `flutter_gemma` sets all three.
 - **Decoding parameters reach only one side.** litetune passes none to the
   device, so the reference is held to an explicit token limit while the device
   runs to the runtime's own. The manifest says so and counts unterminated

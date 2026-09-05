@@ -477,6 +477,12 @@ EXPORT = StageEnv(
     requirements=(
         "litert-torch-nightly==0.10.0.dev20260826",
         "litert-lm==0.16.1",
+        # Provides `litert-lm-builder` and `litert-lm-peek`, which `export`
+        # runs to write the GPU activation type into each bundle and to read
+        # the result back. Pinned by name: `litert-lm` happens to require
+        # this exact version today and `litert-torch` accepts any, so without
+        # this line the builder floats the moment the other two pins move.
+        "litert-lm-builder==0.16.1",
         "numpy==2.0.2",  # last of the 2.0 line; `<2.1` is a bound, not a pin
     ),
     system_requirements=("libvulkan1",),
