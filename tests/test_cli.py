@@ -1326,3 +1326,46 @@ def test_verbose_still_needs_a_command(capsys):
     """`--verbose` modifies a run; it does not constitute one."""
     assert main(["--verbose"]) == 4
     assert "required: command" in capsys.readouterr().err
+
+
+def test_convert_names_the_gpu_state_of_every_artifact(toolchain, tmp_path, capsys):
+    """This suite's fake has no bundle builder, so the repack cannot be made:
+    the export still passes, the line says CPU-only, and the note says why. A
+    bundle without the key and one with it are otherwise indistinguishable."""
+    code = main(
+        [
+            "convert",
+            "--model",
+            "google/functiongemma-270m-it",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--recipe",
+            "dynamic_wi8_afp32",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "CPU-only (GPU activations not set)" in captured.out
+    assert "prefer_activation_type could not be written" in captured.out
+    assert "<pad>" in captured.out
+
+
+def test_convert_json_records_gpu_activation(toolchain, tmp_path, capsys):
+    code = main(
+        [
+            "convert",
+            "--model",
+            "google/functiongemma-270m-it",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--recipe",
+            "dynamic_wi8_afp32",
+            "--json",
+        ]
+    )
+    assert code == 0
+    manifest = json.loads(capsys.readouterr().out)
+    (export,) = manifest["exports"]
+    assert "gpu_activation" in export
+    assert export["gpu_activation"] is None
+    assert "gpu_activation_note" in export["check"]["observed"]
