@@ -1,0 +1,46 @@
+{
+  "hosting": {
+    "target": "litetune",
+    "public": "build/jaspr",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      ".dart_tool/**",
+      ".build.manifest",
+      "packages/**"
+    ],
+    "cleanUrls": true,
+    "trailingSlash": false,
+    "headers": [
+      {
+        "comment": "Static assets are safe to cache forever. .js is excluded on purpose: Jaspr's client bundles are not content-hashed, so immutable caching pins a stale bundle on returning visitors.",
+        "source": "**/*.@(css|jpg|jpeg|gif|png|svg|webp|ico|woff2)",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=31536000, immutable"
+          }
+        ]
+      },
+      {
+        "source": "**/*.@(js|html)",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=0, must-revalidate"
+          }
+        ]
+      },
+      {
+        "comment": "The root document. `**/*.html` does not match `/` under cleanUrls, which left index.html on Firebase's default max-age=3600.",
+        "source": "/",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=0, must-revalidate"
+          }
+        ]
+      }
+    ]
+  }
+}

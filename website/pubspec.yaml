@@ -1,0 +1,23 @@
+name: litetune_website
+description: Marketing website for the litetune command-line tool.
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  jaspr: ^0.23.1
+
+dev_dependencies:
+  build_runner: ^2.10.0
+  build_web_compilers: ^4.8.0
+  jaspr_builder: ^0.23.1
+  lints: ^5.0.0
+
+# Static site generation: `jaspr build` pre-renders to plain HTML/CSS with no
+# client-side Dart needed for this page. Deliberately no `jaspr_content` —
+# there are no markdown docs yet; adding it later is a dependency + a
+# `ContentApp.custom` swap in main.server.dart, not a restructure.
+jaspr:
+  mode: static
