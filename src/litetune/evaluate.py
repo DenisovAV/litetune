@@ -634,6 +634,12 @@ import sys
 from pathlib import Path
 
 
+def generation_device(torch):
+    """CUDA when there is one, the CPU otherwise -- the same rule training uses,
+    so the float reference is not the one stage of a GPU run left on the CPU."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def main() -> int:
     spec = json.loads(Path(sys.argv[1]).read_text())
 
@@ -653,6 +659,9 @@ def main() -> int:
         attn_implementation=spec["attn_implementation"],
     )
     model.eval()
+    device = generation_device(torch)
+    model.to(device)
+    print(f"reference generation on {device}", file=sys.stderr, flush=True)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
     with Path(spec["out"]).open("w", encoding="utf-8") as sink:
@@ -664,7 +673,7 @@ def main() -> int:
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-            enc = tok(text, return_tensors="pt")
+            enc = tok(text, return_tensors="pt").to(device)
             with torch.no_grad():
                 ids = model.generate(
                     **enc,

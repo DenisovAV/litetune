@@ -73,6 +73,7 @@ class FakeTrainer:
     write_adapter: bool = True
     write_metrics: bool = True
     drop_fraction: bool = False
+    device: str | None = None
     raises: BaseException | None = None
     calls: list[Call] = field(default_factory=list)
     configs: list[dict] = field(default_factory=list)
@@ -115,6 +116,8 @@ class FakeTrainer:
                 "model_dir": config["model_dir"],
                 "adapter_dir": config.get("adapter_dir"),
             }
+            if self.device is not None:
+                payload["device"] = self.device
             if self.drop_fraction:
                 payload.pop("supervised_token_fraction")
             Path(config["metrics_out"]).write_text(json.dumps(payload), encoding="utf-8")
@@ -741,8 +744,23 @@ def manual_seed(seed):
     return seed
 
 
+class _Tensor(list):
+    # A list that answers `.to(device)` the way a tensor does: with itself.
+    def to(self, device):
+        return self
+
+
 def tensor(values, dtype=None):
-    return values
+    return _Tensor(values)
+
+
+class _Cuda:
+    @staticmethod
+    def is_available():
+        return False
+
+
+cuda = _Cuda()
 
 
 class _AdamW:
@@ -837,6 +855,10 @@ class _Model:
         return [_Parameter(1000)]
 
     def train(self):
+        return self
+
+    def to(self, device):
+        _log({"event": "to", "device": device})
         return self
 
     def __call__(self, input_ids=None, attention_mask=None, labels=None):
@@ -950,6 +972,17 @@ def test_the_real_script_saves_the_adapter_before_merging(request_for, stub_env)
     assert (request.adapter_dir / "adapter.json").is_file()
     assert (request.model_dir / "merged.json").is_file()
     assert (request.model_dir / "tokenizer.json").is_file()
+
+
+def test_the_real_script_puts_the_model_on_a_device_and_records_it(request_for, stub_env):
+    from litetune.tune import read_metrics
+
+    request = request_for()
+    assert run_real_script(request, stub_env).returncode == 0
+
+    moved = [e for e in stub_log(stub_env) if e["event"] == "to"]
+    assert [m["device"] for m in moved] == ["cpu"]
+    assert read_metrics(request.output_dir / "metrics.json").device == "cpu"
 
 
 def test_the_real_script_refuses_an_over_length_row(request_for, stub_env, tmp_path):
@@ -1149,3 +1182,67 @@ def test_a_model_without_a_sentencepiece_tokenizer_is_reported_not_failed(
 
     assert not (out / "tokenizer.model").exists()
     assert outcome.startswith("unavailable:"), outcome
+
+
+# ---------------------------------------------------------------------------
+# Where the run happens, and that it says so
+# ---------------------------------------------------------------------------
+
+
+class _Cuda:
+    def __init__(self, available: bool):
+        self._available = available
+
+    def is_available(self) -> bool:
+        return self._available
+
+
+class _FakeTorch:
+    def __init__(self, cuda: bool):
+        self.cuda = _Cuda(cuda)
+
+
+def test_the_script_trains_on_cuda_when_there_is_one(script_namespace):
+    """A GPU box that trains on the CPU is the shape this was found in: the
+    script never chose a device, so `litetune tune` on a CUDA machine ran
+    exactly as it does on a laptop."""
+    training_device = script_namespace["training_device"]
+    assert training_device(_FakeTorch(cuda=True)) == "cuda"
+    assert training_device(_FakeTorch(cuda=False)) == "cpu"
+
+
+def test_the_device_is_recorded_in_the_metrics():
+    from litetune.tune import TrainingMetrics
+
+    payload = {
+        "n_examples": 1,
+        "supervised_tokens": 1,
+        "total_tokens": 2,
+        "masked_tokens": 1,
+        "supervised_token_fraction": 0.5,
+        "epochs": [],
+        "device": "cuda",
+    }
+    assert TrainingMetrics.from_dict(payload).device == "cuda"
+    assert TrainingMetrics.from_dict(payload).as_dict()["device"] == "cuda"
+    # Older metrics files have no such field; absent is absent, not "cpu".
+    del payload["device"]
+    assert TrainingMetrics.from_dict(payload).device is None
+
+
+def test_bfloat16_on_the_cpu_is_named_as_a_limitation(trainer, request_for):
+    """bfloat16 is the default because it matches export and evaluation. On a
+    CPU it is also, on the one machine measured, a single-threaded matmul: a
+    300-step LoRA run sat on one core for 52 minutes without finishing, and
+    the same run in float32 took 307 s on ten threads. The default stands --
+    the dtype match is the more expensive thing to get wrong -- but a CPU run
+    is told what it is paying and which flag buys it back."""
+    trainer.device = "cpu"
+    result = run_tune(request_for(dtype="bfloat16"))
+    assert any("--dtype float32" in text for text in result.limitations)
+
+
+def test_a_cuda_run_carries_no_dtype_warning(trainer, request_for):
+    trainer.device = "cuda"
+    result = run_tune(request_for(dtype="bfloat16"))
+    assert not any("--dtype float32" in text for text in result.limitations)
