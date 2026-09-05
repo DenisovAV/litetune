@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,6 +90,7 @@ class FakeToolchain:
     repack_build_returncode: int = 0
     repack_peek_returncode: int = 0
     repack_peek_lies: bool = False  # peek reports no activation key
+    repack_peek_misplaces: bool = False  # peek shows the key under the embedder
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(Call(argv=list(args), timeout=timeout, kwargs=dict(kwargs)))
@@ -152,13 +154,52 @@ class FakeToolchain:
         raise AssertionError(args)
 
     def _peek(self, args) -> subprocess.CompletedProcess:
+        """Render what real `litert-lm-peek` prints, from the toml the file carries.
+
+        The real listing is per-section blocks of `Key: k, Value (String): v`
+        lines, with a system block whose `uuid` and `creation_timestamp` the
+        builder regenerates on every rebuild. The read-back check diffs two of
+        these, so the fake has to produce the same shape or the check would
+        have nothing real to run against.
+        """
         if self.repack_peek_returncode:
             return subprocess.CompletedProcess(args, self.repack_peek_returncode, "", "peek: boom")
         path = Path(args[args.index("--litertlm_file") + 1])
         raw = path.read_bytes()
-        body = raw.removeprefix(b"LITERTLM").rstrip(b"\0").decode("utf-8", "replace")
+        toml = raw.removeprefix(b"LITERTLM").rstrip(b"\0").decode("utf-8", "replace")
+        if not toml.startswith("["):
+            # A pristine artifact from the export fake carries no toml; it
+            # reads back as the standard two-section bundle.
+            toml = self.repack_toml if self.repack_toml is not None else FAKE_TOML
+        stamp = hashlib.sha1(raw).hexdigest()[:8]
+        out = [
+            "Section 0:",
+            "  Items:",
+            f"    Key: uuid, Value (String): {stamp}-uuid",
+            f"    Key: creation_timestamp, Value (String): 2026-09-05T{stamp}",
+        ]
+        for i, table in enumerate(toml.split("[[section]]")[1:], start=1):
+            out += [f"Section {i}:", "  Items:"]
+            mt = re.search(r'model_type\s*=\s*"([^"]*)"', table)
+            if mt:
+                out.append(f"    Key: model_type, Value (String): tf_lite_{mt.group(1)}")
+            for m in re.finditer(r'^\s*(\w+)\s*=\s*"([^"]*)"', table, re.M):
+                if m.group(1) in ("model_type", "section_type", "data_path"):
+                    continue
+                out.append(f"    Key: {m.group(1)}, Value (String): {m.group(2)}")
+            for m in re.finditer(r'key\s*=\s*"([^"]*)"[^}]*?value\s*=\s*"([^"]*)"', table):
+                out.append(f"    Key: {m.group(1)}, Value (String): {m.group(2)}")
+        body = "\n".join(out) + "\n"
         if self.repack_peek_lies:
             body = body.replace("prefer_activation_type", "nothing_here")
+        if self.repack_peek_misplaces:
+            # Only the rebuilt file carries the key; the original's listing is
+            # left as it is so the diff sees exactly one added, misplaced line.
+            keyed = [line for line in out if "prefer_activation_type" in line]
+            if keyed:
+                out.remove(keyed[0])
+                out.append(keyed[0])  # lands in the last section: the embedder's
+                body = "\n".join(out) + "\n"
         return subprocess.CompletedProcess(args, 0, body, "")
 
 
@@ -903,6 +944,7 @@ def test_the_activation_type_is_written_into_the_prefill_decode_section(toolchai
     written = Path(build.argv[build.argv.index("--path") + 1])
     # The work dir is gone; what matters is what the rebuilt bundle reads back as.
     assert not written.exists()
+    assert list(artifact.parent.iterdir()) == [artifact]
     peek = next(c for c in toolchain.repacks if c.argv[0] == "litert-lm-peek")
     assert peek.argv[-1].endswith("model.litertlm")
     body = artifact.read_bytes().removeprefix(b"LITERTLM").rstrip(b"\0").decode()
@@ -911,16 +953,6 @@ def test_the_activation_type_is_written_into_the_prefill_decode_section(toolchai
     (embedder,) = [t for t in tables if 'model_type = "embedder"' in t]
     assert f'prefer_activation_type = "{GPU_ACTIVATION}"' in prefill
     assert "prefer_activation_type" not in embedder, "the key belongs to prefill_decode only"
-
-
-def test_the_repack_keeps_the_artifact_size(toolchain, tmp_path):
-    """One metadata string; the real repack measured 455,759,152 bytes before
-    and after. A size change here would put every recorded figure in doubt."""
-    from litetune.export import set_gpu_activation
-
-    artifact = _artifact(tmp_path, size=9000)
-    set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
-    assert artifact.stat().st_size == 9000
 
 
 def test_a_bundle_that_already_declares_an_activation_type_is_left_alone(toolchain, tmp_path):
@@ -946,8 +978,9 @@ def test_a_bundle_that_already_declares_an_activation_type_is_left_alone(toolcha
     [
         ("repack_unpack_returncode", "unpack exited 1"),
         ("repack_build_returncode", "rebuild exited 1"),
-        ("repack_peek_returncode", "does not read back"),
-        ("repack_peek_lies", "does not read back"),
+        ("repack_peek_returncode", "could not be read back"),
+        ("repack_peek_lies", "where exactly one"),
+        ("repack_peek_misplaces", "landed outside the prefill/decode section"),
     ],
 )
 def test_every_repack_failure_keeps_the_original_and_says_why(toolchain, tmp_path, knob, expect):
@@ -964,7 +997,7 @@ def test_every_repack_failure_keeps_the_original_and_says_why(toolchain, tmp_pat
     assert value is None
     assert note and expect in note
     assert artifact.read_bytes() == before
-    assert not (artifact.parent / ".model-repack").exists(), "work dir cleaned up"
+    assert list(artifact.parent.iterdir()) == [artifact], "work dir cleaned up"
 
 
 def test_a_toml_without_a_prefill_section_is_not_guessed_at(toolchain, tmp_path):
@@ -1131,3 +1164,65 @@ def test_an_upstream_declaration_is_recorded_as_itself_not_as_fp32(
         export.check.detail
     )
     assert any(declared in text and "left as found" in text for text in result.limitations)
+
+
+def test_a_work_dir_that_cannot_be_created_is_a_note_not_an_unchecked_export(
+    toolchain, request_for, monkeypatch
+):
+    """The first version created the work dir *before* the try, so a stale
+    file of that name (or a permission error) escaped to `guard` and recorded
+    the recipe as could-not-check with a good artifact on disk. Found in
+    review; the temp dir is now made inside the try."""
+    import tempfile
+
+    from litetune.export import run_export
+
+    def refuse(*args, **kwargs):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", refuse)
+
+    result = run_export(request_for(("dynamic_wi8_afp32",)))
+
+    (export,) = result.exports
+    assert export.ok, export.check.detail
+    assert export.gpu_activation is None
+    assert "PermissionError" in export.check.observed["gpu_activation_note"]
+
+
+def test_a_rebuild_that_changes_more_than_the_key_is_refused(toolchain, tmp_path):
+    """The read-back is a diff of two peek listings, not a substring test: a
+    rebuild that dropped a section, or added a second key, or renamed a model
+    type would all have passed `"fp32" in peek`. Found in review."""
+    from litetune.export import set_gpu_activation
+
+    # The rebuilt toml will carry the key; make the *original* read back with
+    # an extra section so the two listings differ by more than the key.
+    class Drift(type(toolchain)):
+        pass
+
+    calls = {"n": 0}
+    real_peek = toolchain._peek
+
+    def peek_with_drift(args):
+        calls["n"] += 1
+        proc = real_peek(args)
+        if calls["n"] == 1:  # the original
+            proc = subprocess.CompletedProcess(
+                args,
+                0,
+                proc.stdout
+                + "Section 9:\n  Items:\n    Key: model_type, Value (String): tf_lite_aux\n",
+                "",
+            )
+        return proc
+
+    toolchain._peek = peek_with_drift
+    artifact = _artifact(tmp_path)
+    before = artifact.read_bytes()
+
+    value, note = set_gpu_activation(artifact, _fake_env(toolchain, tmp_path))
+
+    assert value is None
+    assert note and "dropped" in note
+    assert artifact.read_bytes() == before

@@ -27,7 +27,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -90,10 +92,15 @@ MEASURED_RECIPES = ("dynamic_wi8_afp32", "weight_only_wi8_afp32")
 #
 # `fp32` rather than `fp32_fp16`: the two measured the same, and `fp32` changes
 # one metadata string while `--experimental_use_mixed_precision` also runs a
-# graph pass. The artifact that leaves here is then byte-for-byte the one the
-# CPU numbers were taken on, plus one key.
+# graph pass. The model and tokenizer bytes that leave here are the ones the
+# CPU numbers were taken on; the builder regenerates the bundle uuid and
+# timestamp, and the size holds only because section padding absorbs the key.
 GPU_ACTIVATION = "fp32"
 GPU_ACTIVATION_KEY = "prefer_activation_type"
+# Per builder/peek step. Unpacking and rebuilding a 455 MB bundle measured
+# 1.3 s end to end on a laptop; this is a ceiling for a stalled tool, not a
+# budget, and four steps at the ceiling is still under one export timeout.
+REPACK_STEP_TIMEOUT_S = 300
 
 # Measured: a 285,577,392-byte artifact in 122 s on CPU for a 270M checkpoint.
 # The ceiling is an order of magnitude above that so a larger checkpoint is not
@@ -614,7 +621,7 @@ def repair_vocab_file(model_dir: Path) -> tuple[bool, str | None]:
 
 
 # One `[[section]]` table, from its header to the next header or end of file.
-_TOML_TABLE_RE = re.compile(r"\[\[section\]\][^\[]*(?:\[(?!\[section\])[^\[]*)*", re.S)
+_TOML_TABLE_RE = re.compile(r"\[\[section\]\][^\[]*(?:\[(?!\[section\])[^\[]*)*")
 _PREFILL_RE = re.compile(r'model_type\s*=\s*"prefill_decode"')
 # Both shapes the builder round-trips the key in. Written by hand it is a bare
 # key; read back by `unpack` it is one entry of the section's `additional_metadata`
@@ -627,7 +634,11 @@ _ACTIVATION_VALUE_RE = re.compile(
 
 
 def set_gpu_activation(
-    artifact: Path, env: envs.StageEnv, *, activation: str = GPU_ACTIVATION, timeout: int = 600
+    artifact: Path,
+    env: envs.StageEnv,
+    *,
+    activation: str = GPU_ACTIVATION,
+    timeout: int = REPACK_STEP_TIMEOUT_S,
 ) -> tuple[str | None, str | None]:
     """Write `prefer_activation_type` into the bundle's prefill/decode section.
 
@@ -641,17 +652,27 @@ def set_gpu_activation(
     labelling either as `fp32` would be the false pass this key exists to end.
 
     Done by unpacking with `litert-lm-builder`, adding one key to `model.toml`,
-    and rebuilding: the weights, tokenizer, template and model type are carried
-    through untouched, which is checked by reading the result back with
-    `litert-lm-peek`. The original is replaced only after that check passes.
+    and rebuilding. What the rebuild changed is then *measured*, not assumed:
+    `litert-lm-peek` is run on the original and on the rebuilt file and the
+    two listings must differ by exactly three lines -- the builder regenerates
+    the system `uuid` and `creation_timestamp`, and the new key must appear
+    once, inside the section whose `model_type` is `tf_lite_prefill_decode`.
+    Any other difference is a rebuild that did more than asked, and the
+    original is kept. Byte count is unchanged in practice because section
+    offsets are 16 KiB-aligned and the padding absorbs one key; the model and
+    tokenizer bytes are carried through, the uuid is not.
+
     The exporter offers no flag for this value, and the one flag it does offer
     (`--experimental_use_mixed_precision`) changes the graph as well.
     """
-    work = artifact.parent / f".{artifact.stem}-repack"
-    if work.exists():
-        _remove_tree(work)
-    work.mkdir(parents=True)
+    work: Path | None = None
     try:
+        # A fresh private directory, never a deterministic name: a stale or
+        # planted `.foo-repack` symlink would otherwise have its *target*
+        # emptied by cleanup, and two runs on one output dir would delete each
+        # other's unpack mid-flight. Same filesystem as the artifact so the
+        # final `os.replace` is one rename.
+        work = Path(tempfile.mkdtemp(prefix=f".{artifact.stem}-repack-", dir=artifact.parent))
         proc = env.run(
             ["litert-lm-builder", "unpack", "--input", str(artifact), "--output", str(work)],
             timeout=timeout,
@@ -697,37 +718,67 @@ def set_gpu_activation(
             return None, (
                 f"litert-lm-builder rebuild exited {proc.returncode}: {_tail(proc.stderr)}"
             )
-        proc = env.run(["litert-lm-peek", "--litertlm_file", str(rebuilt)], timeout=timeout)
-        peek = (proc.stdout or "") + (proc.stderr or "")
-        if proc.returncode != 0 or GPU_ACTIVATION_KEY not in peek or activation not in peek:
+        before = env.run(["litert-lm-peek", "--litertlm_file", str(artifact)], timeout=timeout)
+        after = env.run(["litert-lm-peek", "--litertlm_file", str(rebuilt)], timeout=timeout)
+        if before.returncode != 0 or after.returncode != 0:
             return None, (
-                f"the rebuilt bundle does not read back with {GPU_ACTIVATION_KEY} = "
-                f"{activation!r}; the original was kept"
+                f"litert-lm-peek exited {before.returncode}/{after.returncode}; the rebuild "
+                "could not be read back, so the original was kept"
             )
+        verdict = _rebuild_changed_only_the_key(before.stdout or "", after.stdout or "", activation)
+        if verdict is not None:
+            return None, f"{verdict}; the original was kept"
         os.replace(rebuilt, artifact)
         return activation, None
-    except subprocess.TimeoutExpired:
-        return None, f"litert-lm-builder did not finish within {timeout}s; the original was kept"
+    except subprocess.TimeoutExpired as exc:
+        return None, (
+            f"{Path(str(exc.cmd[0])).name} did not finish within {timeout}s; the original was kept"
+        )
     except Exception as exc:  # noqa: BLE001 - a broken repack must not unmake a good export
         # Whatever went wrong here, the toolchain's artifact is intact and is a
         # working CPU bundle. Escaping would let `guard` record the whole
         # recipe as "could not check", which is a smaller truth than the one
-        # available: exported, CPU-only, and here is why.
+        # available: exported, CPU-only, and here is why. The frame is kept in
+        # the log; the note is what the user reads.
+        logger.exception("GPU activation repack of %s failed", artifact)
         return None, f"{type(exc).__name__}: {exc}; the original was kept"
     finally:
-        _remove_tree(work)
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
 
 
-def _remove_tree(path: Path) -> None:
-    for child in sorted(path.rglob("*"), reverse=True):
-        try:
-            child.rmdir() if child.is_dir() else child.unlink()
-        except OSError:
-            pass
-    try:
-        path.rmdir()
-    except OSError:
-        pass
+_PEEK_VOLATILE = ("Key: uuid,", "Key: creation_timestamp,")
+_PEEK_SECTION_RE = re.compile(r"^Section \d+:", re.M)
+
+
+def _rebuild_changed_only_the_key(before: str, after: str, activation: str) -> str | None:
+    """None when the rebuild did exactly what was asked; otherwise, what else it did.
+
+    Measured against the real `litert-lm-peek` on the real bundle: the only
+    lines the builder regenerates are the system uuid and creation timestamp.
+    Everything else -- every section, every metadata key, every model type --
+    must read back identical, and the one added line must sit in the
+    prefill/decode section, not the embedder's.
+    """
+    keep = lambda line: not any(v in line for v in _PEEK_VOLATILE)  # noqa: E731
+    old = [line for line in before.splitlines() if keep(line)]
+    new = [line for line in after.splitlines() if keep(line)]
+    added = [line for line in new if line not in old]
+    removed = [line for line in old if line not in new]
+    wanted = f"Key: {GPU_ACTIVATION_KEY}, Value (String): {activation}"
+    if removed:
+        return f"the rebuild dropped {len(removed)} line(s) from the bundle listing: {removed[0]!r}"
+    if len(added) != 1 or wanted not in added[0]:
+        return f"the rebuild added {added!r} where exactly one {wanted!r} was expected"
+    # The key must be in the prefill/decode section: find which section block
+    # it landed in and check that block's model_type.
+    blocks = _PEEK_SECTION_RE.split(after)
+    home = next((b for b in blocks if wanted in b), "")
+    if "tf_lite_prefill_decode" not in home:
+        return f"{GPU_ACTIVATION_KEY} landed outside the prefill/decode section"
+    if len(old) != len(new) - 1:
+        return "the rebuild changed the listing in a way this check cannot describe"
+    return None
 
 
 def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
@@ -1287,12 +1338,13 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
             f"--experimental_use_mixed_precision writes and it also changes the graph, so the "
             f"bundle is no longer the one the CPU figures describe"
         )
-    unset = [e.recipe for e in result.succeeded if e.gpu_activation is None]
+    unset = ", ".join(e.recipe for e in result.succeeded if e.gpu_activation is None)
     if unset:
         result.limitations.append(
             f"{GPU_ACTIVATION_KEY} could not be written into {unset}: on the GPU backend "
             f"the runtime will compute activations in F16, which measured as `<pad>` floods "
-            f"and wrong tool names on Adreno (3/20 vs 20/20 on CPU). These bundles are "
+            f"and wrong tool names on a Snapdragon Galaxy S24 (3/20 vs 20/20 on CPU, n=20). "
+            f"These bundles are "
             f"CPU-only until repacked; see the per-recipe gpu_activation_note"
         )
 

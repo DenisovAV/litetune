@@ -47,6 +47,7 @@ from litetune.envs import cached_environments, env_cache_root, remove_cached
 from litetune.evaluate import GREEDY, DataError, PromptMode
 from litetune.events import EventStream, TerminalRenderer
 from litetune.export import (
+    GPU_ACTIVATION,
     MEASURED_RECIPES,
     ExportRequest,
     ExportResult,
@@ -1012,11 +1013,14 @@ def _artifact_line(export: RecipeExport) -> str:
     companions = f" (+{beside:,} bytes beside it)" if beside > 0 else ""
     # Named on the line, not only in the JSON: a bundle without it is CPU-only
     # and looks identical to one with it from every other field here.
-    gpu = (
-        f", GPU activations {export.gpu_activation}"
-        if export.gpu_activation
-        else ", CPU-only (GPU activations not set)"
-    )
+    if export.gpu_activation is None:
+        gpu = ", CPU-only (GPU activations not set)"
+    elif export.gpu_activation == GPU_ACTIVATION:
+        gpu = f", GPU activations {export.gpu_activation}"
+    else:
+        # An upstream declaration reads the same shape as the good case unless
+        # it is marked: `fp16` is the fault itself.
+        gpu = f", GPU activations {export.gpu_activation} (declared upstream, not {GPU_ACTIVATION})"
     return (
         f"  {export.recipe}: {export.artifact_bytes:,} bytes{companions} "
         f"in {export.seconds:.1f}s{gpu} — {export.artifact}"

@@ -1369,3 +1369,33 @@ def test_convert_json_records_gpu_activation(toolchain, tmp_path, capsys):
     assert "gpu_activation" in export
     assert export["gpu_activation"] is None
     assert "gpu_activation_note" in export["check"]["observed"]
+
+
+@pytest.mark.parametrize(
+    "declared, expect",
+    [
+        ("fp32", "GPU activations fp32 —"),
+        ("fp16", "GPU activations fp16 (declared upstream, not fp32)"),
+        ("fp32_fp16", "GPU activations fp32_fp16 (declared upstream, not fp32)"),
+        (None, "CPU-only (GPU activations not set)"),
+    ],
+)
+def test_the_convert_line_marks_an_upstream_declaration(declared, expect, tmp_path):
+    """The console line is what a person reads. `fp16` is the fault itself and
+    must not read the same as the good case. This suite's toolchain fake has no
+    builder, so the line is tested directly rather than through `convert`."""
+    from litetune.checks import Check
+    from litetune.cli import _artifact_line
+    from litetune.export import RecipeExport
+
+    export = RecipeExport(
+        recipe="dynamic_wi8_afp32",
+        check=Check.passed("export dynamic_wi8_afp32", "x"),
+        artifact=tmp_path / "model.litertlm",
+        artifact_bytes=4096,
+        shipped_bytes=4096,
+        seconds=1.0,
+        gpu_activation=declared,
+    )
+
+    assert expect in _artifact_line(export)
