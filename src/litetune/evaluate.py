@@ -465,10 +465,15 @@ class LiteRtLmBackend:
     implemented yet, because the serve path changes the prompt-construction
     surface and that has to be measured before it is trusted.
 
-    Measurement here runs on CPU while users run on a phone; published reports
-    put the GPU backend materially below CPU on identical artifacts, so every
-    number from this backend is an optimistic estimate and `describe()` records
-    which backend and engine produced it.
+    Measurement here runs on CPU while users run on a phone. Measured
+    2026-09-05 on one Snapdragon Galaxy S24, one recipe: the device's CPU
+    scored 0.8703 ±0.026 on 640 rows against 0.8906, 0.9016 and 0.8969 for
+    the three reference runs of that recipe -- within about 0.03, with two of
+    the three just outside the device interval. Its GPU is another matter --
+    20/20 tool names on 20 rows when the bundle carries
+    `prefer_activation_type = fp32`, `<pad>` floods and 3/20 when it does not
+    (see `export.GPU_ACTIVATION`) -- and `describe()` records which backend
+    and engine produced each figure.
     """
 
     model: Path

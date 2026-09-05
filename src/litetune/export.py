@@ -27,10 +27,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +70,73 @@ KNOWN_RECIPES = (
 # of the accuracy result. A caller that wants a defensible minimum sweep wants
 # these; it is offered, never applied by default -- see `ExportRequest.recipes`.
 MEASURED_RECIPES = ("dynamic_wi8_afp32", "weight_only_wi8_afp32")
+
+# What the GPU text executor computes activations in, unless the bundle says
+# otherwise. Measured 2026-09-05 on one Snapdragon Galaxy S24 (SC-51E) with the
+# tuned FunctionGemma bundle, native tool path, 20 rows, greedy:
+#
+#     activation            <pad> floods   tool name   exact   ms/prompt
+#     (unset -> F16), GPU       14/20         3/20      2/20     16763
+#     fp32, GPU                  0/20        20/20     15/20      1375
+#     fp32_fp16, GPU             0/20        20/20     15/20      1406
+#     fp32, CPU (repacked file)  0/20        20/20     14/20      2477
+#
+# The CPU row is the repacked file; the key is read only by the GPU executor.
+# CPU on the unrepacked file scored the same 14/20 in every earlier run.
+#
+# The engine reports success either way: it loads, every call returns, no
+# exception. Only the content betrays it. Google's own Mobile Actions bundle
+# does the same (20/20 `<pad>` on GPU) and the Gallery pins it to
+# `"accelerators": "cpu"`. LiteRT-LM's `engine_settings.cc` names the default
+# -- "Text executor defaults to F16" -- and the override is a string in the
+# prefill/decode section's metadata. Google's bundle does not carry it, and
+# `export_hf` can only write `fp32_fp16` (via --experimental_use_mixed_precision).
+#
+# `fp32` rather than `fp32_fp16`: the two gave the same exact-match count
+# (15/20) and latency within 2%, and `fp32` changes one metadata string while
+# `--experimental_use_mixed_precision` also runs a graph pass. The model
+# sections are not re-exported by the repack; the builder regenerates the
+# bundle uuid and timestamp, and the size held because section padding
+# absorbed the key.
+GPU_ACTIVATION = "fp32"
+GPU_ACTIVATION_KEY = "prefer_activation_type"
+
+
+class GpuActivationState(str, Enum):
+    """What a bundle's `prefer_activation_type` means for the GPU backend.
+
+    Three states, one place. The value itself stays a free string because it
+    is read back out of the bundle; what is closed is how litetune reads it.
+    """
+
+    UNSET = "unset"  # no declaration: the runtime's F16 default, CPU-only in practice
+    SET = "set"  # carries GPU_ACTIVATION, written by litetune or found upstream
+    DECLARED_UPSTREAM = "declared_upstream"  # carries something else, left as found
+
+    @classmethod
+    def of(cls, value: str | None) -> GpuActivationState:
+        if value is None:
+            return cls.UNSET
+        if value == GPU_ACTIVATION:
+            return cls.SET
+        return cls.DECLARED_UPSTREAM
+
+
+def describe_gpu_activation(value: str | None) -> str:
+    """The one sentence both the check detail and the console line print."""
+    state = GpuActivationState.of(value)
+    if state is GpuActivationState.UNSET:
+        return "CPU-only (GPU activations not set)"
+    if state is GpuActivationState.SET:
+        return f"GPU activations {value}"
+    return f"GPU activations {value} (declared upstream, not {GPU_ACTIVATION})"
+
+
+# For the whole repack (unpack, patch, pack, unpack again): a ceiling for a
+# stalled tool, not a budget. A real repack of a 455 MB bundle finishes in
+# seconds. Charged against the recipe's export timeout at the call site so a
+# `--timeout-s` bound holds for export and repack together.
+REPACK_TIMEOUT_S = 300
 
 # Measured: a 285,577,392-byte artifact in 122 s on CPU for a 270M checkpoint.
 # The ceiling is an order of magnitude above that so a larger checkpoint is not
@@ -476,6 +546,13 @@ class RecipeExport:
     sha256: str | None = None
     seconds: float | None = None
     returncode: int | None = None
+    # What the bundle tells the GPU text executor to compute activations in --
+    # the bundle's own value, whether litetune wrote it or found it -- or None
+    # when it carries no declaration and the toolchain's F16 default stands.
+    # `gpu_activation_note` says why that is, when there is something to say.
+    # See GPU_ACTIVATION and GpuActivationState.
+    gpu_activation: str | None = None
+    gpu_activation_note: str | None = None
     # Full, not a tail. A nightly-specific failure has to be diagnosable months
     # later from the record alone, and the interesting line is as often the
     # first traceback frame as the last.
@@ -489,6 +566,10 @@ class RecipeExport:
     @property
     def attempted(self) -> bool:
         return self.returncode is not None
+
+    @property
+    def gpu_state(self) -> GpuActivationState:
+        return GpuActivationState.of(self.gpu_activation)
 
     @property
     def verified(self) -> bool:
@@ -513,6 +594,9 @@ class RecipeExport:
             "artifact_bytes": self.artifact_bytes,
             "shipped_bytes": self.shipped_bytes,
             "sha256": self.sha256,
+            "gpu_activation": self.gpu_activation,
+            "gpu_activation_state": self.gpu_state.value,
+            "gpu_activation_note": self.gpu_activation_note,
             "seconds": round(self.seconds, 3) if self.seconds is not None else None,
             "returncode": self.returncode,
             "stderr": self.stderr,
@@ -579,6 +663,285 @@ def repair_vocab_file(model_dir: Path) -> tuple[bool, str | None]:
         f"machine ({declared!r}); litetune rewrote it to point at {beside}. This modifies "
         "the checkpoint directory, and the exporter reads that field verbatim"
     )
+
+
+# Runs inside envs.EXPORT, where `litert_lm_builder` and `tomllib` live. The
+# bundle format is the builder's to define, so every fact about it -- how a
+# section is laid out, which keys the rebuild regenerates, what a declaration
+# looks like -- is read through the builder's own `unpack`/`pack` and parsed
+# with a real TOML parser. A regex over the text would read `[[section]]`
+# inside a string value as a section; this cannot.
+_REPACK_SCRIPT = r'''
+"""Set one metadata key on a bundle's prefill/decode section; verify by round-trip.
+
+Reads JSON {artifact, work, key, value} from argv[1]. Writes JSON to argv[2]:
+  {"declared": <str|null>, "written": <bool>, "reason": <str|null>}
+`declared` is the value the section carries after this script (or before it,
+if it was left alone); `written` says whether the file was replaced.
+"""
+import copy
+import json
+import os
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11: the builder itself depends on tomli
+    import tomli as tomllib
+
+from litert_lm_builder import litertlm_builder as lb
+
+VOLATILE = {"uuid", "creation_timestamp"}
+
+
+def load(path):
+    return tomllib.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def prefill_sections(doc):
+    return [
+        s
+        for s in doc.get("section", [])
+        if s.get("section_type") == "TFLiteModel"
+        and str(s.get("model_type", "")).lower() == "prefill_decode"
+    ]
+
+
+def declared_in(section, key):
+    for entry in section.get("additional_metadata", []) or []:
+        if entry.get("key") == key:
+            return str(entry.get("value", ""))
+    if key in section:
+        return str(section[key])
+    return None
+
+
+def comparable(doc):
+    """The document with the two regenerated system keys removed and paths by name."""
+    sm = doc.get("system_metadata", {})
+    entries = [e for e in sm.get("entries", []) if e.get("key") not in VOLATILE]
+    sections = copy.deepcopy(doc.get("section", []))
+    for s in sections:
+        if "data_path" in s:
+            s["data_path"] = os.path.basename(s["data_path"])
+    return {"system_metadata": {"entries": entries}, "section": sections}
+
+
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return toml_string(str(v))
+
+
+def toml_string(text):
+    """A TOML basic string. Not json.dumps: that writes a character outside the
+    BMP as a UTF-16 surrogate pair (`\\ud83d\\ude80`), which TOML forbids and
+    tomllib rejects, so one emoji in any metadata value would sink the pack."""
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif o < 0x20 or o == 0x7F:
+            out.append(f"\\u{o:04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def entry_line(e):
+    """One element of an `entries` / `additional_metadata` array. Both arrays
+    carry the same {key, value_type, value} shape, so both are written here."""
+    return (
+        f"  {{ key = {toml_value(e['key'])}, "
+        f"value_type = {toml_value(e['value_type'])}, "
+        f"value = {toml_value(e['value'])} }},"
+    )
+
+
+def write_toml(doc, path):
+    """Emit TOML for the builder to read back. Only the shapes `unpack` writes."""
+    lines = ["[system_metadata]", "entries = ["]
+    lines += [entry_line(e) for e in doc.get("system_metadata", {}).get("entries", [])]
+    lines += ["]", ""]
+    for sec in doc.get("section", []):
+        lines.append("[[section]]")
+        for k, v in sec.items():
+            if k == "additional_metadata":
+                continue
+            lines.append(f"{k} = {toml_value(v)}")
+        meta = sec.get("additional_metadata") or []
+        if meta:
+            lines.append("additional_metadata = [")
+            lines += [entry_line(e) for e in meta]
+            lines.append("]")
+        lines.append("")
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
+def report(declared=None, written=False, reason=None):
+    """This script's whole result. The exit status says only whether the script
+    itself ran; every outcome the parent tells apart is in here."""
+    return {"declared": declared, "written": written, "reason": reason}
+
+
+def main(spec):
+    artifact, work = spec["artifact"], Path(spec["work"])
+    key, value = spec["key"], spec["value"]
+    entry = {"key": key, "value_type": "String", "value": value}
+
+    before_dir = work / "before"
+    lb.unpack(artifact, str(before_dir))
+    before = load(before_dir / "model.toml")
+    targets = prefill_sections(before)
+    if len(targets) != 1:
+        return report(
+            reason=f"found {len(targets)} prefill_decode sections where exactly one was expected"
+        )
+    existing = declared_in(targets[0], key)
+    if existing is not None:
+        shown = existing or "(empty)"
+        reason = f"the bundle already declares {key} = {shown}; left as written"
+        return report(declared=existing, reason=reason)
+
+    # Patch the structure, not the text.
+    patched = copy.deepcopy(before)
+    sec = prefill_sections(patched)[0]
+    sec["additional_metadata"] = list(sec.get("additional_metadata") or []) + [entry]
+    for s in patched["section"]:
+        s["data_path"] = str(before_dir / os.path.basename(s["data_path"]))
+    patched_toml = work / "patched.toml"
+    write_toml(patched, patched_toml)
+    rebuilt = work / Path(artifact).name
+    lb.pack(str(patched_toml), str(rebuilt))
+
+    # Verify by round-tripping through the same unpack: the parsed document
+    # must be the original plus exactly the one entry -- which is what
+    # `patched` already is, so it is the expectation.
+    after_dir = work / "after"
+    lb.unpack(str(rebuilt), str(after_dir))
+    after = load(after_dir / "model.toml")
+    if comparable(after) != comparable(patched):
+        return report(reason="the rebuild changed the bundle beyond the one key")
+    read_back = declared_in(prefill_sections(after)[0], key)
+    if read_back != value:
+        return report(reason=f"the rebuild wrote {key} = {read_back!r}; {value!r} was asked")
+    os.replace(rebuilt, artifact)
+    return report(declared=read_back, written=True)
+
+
+if __name__ == "__main__":
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    Path(sys.argv[2]).write_text(json.dumps(main(spec)))
+'''
+
+
+def set_gpu_activation(
+    artifact: Path, env: envs.StageEnv, *, timeout: int = REPACK_TIMEOUT_S
+) -> tuple[str | None, str | None]:
+    """Write `prefer_activation_type` into the bundle's prefill/decode section.
+
+    Returns (what the bundle now declares, what happened). The first is None
+    when the artifact is left as the toolchain wrote it with no declaration --
+    a working CPU bundle and a broken GPU one -- so the caller records the
+    reason rather than failing the export. It is the bundle's *own* value as
+    the builder reads it back, never the requested one: a bundle that already
+    declared something is left alone and reported as carrying that, because
+    `--flag=--experimental_use_mixed_precision` produces `fp32_fp16` and an
+    explicit `fp16` reproduces the fault, and labelling either as `fp32` would
+    be the false pass this key exists to end.
+
+    The work is done by `_REPACK_SCRIPT` inside the export environment: the
+    builder's own `unpack`, a real TOML parse, one entry appended to the
+    section's `additional_metadata`, the builder's own `pack`, and a second
+    `unpack` whose parsed document must equal the first plus that one entry
+    (the system `uuid` and `creation_timestamp` the builder regenerates are
+    excluded). Section bytes are not compared; on the one bundle measured the
+    size was unchanged (455,759,152 bytes) because section offsets are
+    16 KiB-aligned. The original is replaced only after that comparison.
+
+    The exporter offers no flag for this value, and the one flag it does offer
+    (`--experimental_use_mixed_precision`) changes the graph as well.
+    """
+    if artifact.stat().st_size == 0:
+        # Nothing to repack, and the sweep's size comparison downstream is
+        # what reports a zero-byte export; this must not turn it into 8 bytes.
+        return None, "the artifact is empty; nothing to repack"
+    work: Path | None = None
+    try:
+        # A fresh private directory, never a deterministic name: a stale or
+        # planted `.foo-repack` symlink would otherwise have its *target*
+        # emptied by cleanup, and two runs on one output dir would delete each
+        # other's unpack mid-flight. Same filesystem as the artifact so the
+        # script's final `os.replace` is one rename.
+        work = Path(tempfile.mkdtemp(prefix=f".{artifact.stem}-repack-", dir=artifact.parent))
+        script = work / "repack.py"
+        script.write_text(_REPACK_SCRIPT, encoding="utf-8")
+        spec = work / "spec.json"
+        result = work / "result.json"
+        spec.write_text(
+            json.dumps(
+                {
+                    "artifact": str(artifact),
+                    "work": str(work),
+                    "key": GPU_ACTIVATION_KEY,
+                    "value": GPU_ACTIVATION,
+                }
+            ),
+            encoding="utf-8",
+        )
+        proc = env.run(["python", str(script), str(spec), str(result)], timeout=timeout)
+        if proc.returncode != 0 or not result.is_file():
+            # The script does not catch its own errors, so a builder failure
+            # arrives as a traceback. The last line is the reason; the rest
+            # goes to the log where a frame is worth having.
+            stderr = proc.stderr or ""
+            last = next((ln for ln in reversed(stderr.splitlines()) if ln.strip()), "no stderr")
+            logger.warning("GPU activation repack of %s failed:\n%s", artifact, _tail(stderr, 2000))
+            return (
+                None,
+                f"the repack script exited {proc.returncode}: {last}; the original was kept",
+            )
+        report = json.loads(result.read_text(encoding="utf-8"))
+        declared = report.get("declared")
+        reason = report.get("reason")
+        if declared is None:
+            return None, f"{reason}; the original was kept"
+        if report.get("written") and reason is not None:
+            # The script's contract: a replaced file has no reason to give.
+            return None, f"the repack reported both a rebuild and a reason ({reason}); refused"
+        return str(declared), reason
+    except subprocess.TimeoutExpired:
+        return None, f"the repack did not finish within {timeout}s; the original was kept"
+    except Exception as exc:  # noqa: BLE001 - a broken repack must not unmake a good export
+        # Whatever went wrong here, the toolchain's artifact is intact and is a
+        # working CPU bundle. Escaping would let `guard` record the whole
+        # recipe as "could not check", which is a smaller truth than the one
+        # available: exported, CPU-only, and here is why. The frame is kept in
+        # the log; the note is what the user reads.
+        logger.exception("GPU activation repack of %s failed", artifact)
+        return None, f"{type(exc).__name__}: {exc}; the original was kept"
+    finally:
+        if work is not None:
+            # A scratch dir the size of two bundles; a leak has to be said,
+            # not hidden behind ignore_errors.
+            leaked: list[str] = []
+            shutil.rmtree(work, onerror=lambda _fn, path, _exc: leaked.append(str(path)))
+            if leaked:
+                logger.warning(
+                    "%d scratch file(s) left under %s after the repack; delete by hand",
+                    len(leaked),
+                    work,
+                )
 
 
 def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
@@ -699,10 +1062,22 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
         )
 
     artifact = artifacts[0]
+    # Repacked before it is hashed or sized: the file that ships is the one
+    # that is recorded. A repack that cannot be made is a limitation on a
+    # passed check, not a failed one -- the CPU artifact is intact.
+    remaining = max(1, int(request.timeout_s - seconds))
+    gpu_activation, gpu_note = set_gpu_activation(
+        artifact, request.env, timeout=min(REPACK_TIMEOUT_S, remaining)
+    )
+    if gpu_activation is None:
+        logger.warning("recipe %s: GPU activation not set: %s", recipe, gpu_note)
     artifact_bytes = artifact.stat().st_size
     companions = tuple(p.name for p in produced if p != artifact)
     shipped_bytes = sum(p.stat().st_size for p in produced)
     digest = _sha256(artifact) if request.hash_artifacts else None
+    gpu_text = describe_gpu_activation(gpu_activation)
+    if gpu_activation is None and gpu_note:
+        gpu_text = f"{gpu_text}: {gpu_note}"
     return RecipeExport(
         **base,
         artifact=artifact,
@@ -710,16 +1085,20 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
         artifact_bytes=artifact_bytes,
         shipped_bytes=shipped_bytes,
         sha256=digest,
+        gpu_activation=gpu_activation,
+        gpu_activation_note=gpu_note,
         check=Check.passed(
             name,
-            f"{artifact.name}: {artifact_bytes:,} bytes in {seconds:.1f}s on cpu — produced, "
-            "not verified",
+            f"{artifact.name}: {artifact_bytes:,} bytes in {seconds:.1f}s exported on cpu; "
+            f"{gpu_text} — produced, not verified",
             observed=observed
             | {
                 "artifact": str(artifact),
                 "artifact_bytes": artifact_bytes,
                 "shipped_bytes": shipped_bytes,
                 "sha256": digest,
+                "gpu_activation": gpu_activation,
+                "gpu_activation_note": gpu_note,
                 "verified": False,
             },
         ),
@@ -1100,6 +1479,7 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
                 recipe=recipe,
                 bytes=export.artifact_bytes,
                 sha256=export.sha256,
+                gpu_activation=export.gpu_activation,
                 verified=False,
             )
             events.metric(f"{recipe} bytes", export.artifact_bytes, recipe=recipe)
@@ -1107,6 +1487,29 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
     result.comparison = compare_sizes(list(request.recipes), result.exports)
     if isinstance(result.comparison, Uncompared):
         result.limitations.append(result.comparison.reason)
+
+    # Said at the top level, not only in the per-recipe record: a bundle left
+    # at F16 runs on CPU and floods `<pad>` on GPU, and the two look the same
+    # from every check this stage has.
+    upstream = GpuActivationState.DECLARED_UPSTREAM
+    other = [e for e in result.succeeded if e.gpu_state is upstream]
+    if other:
+        named = ", ".join(f"{e.recipe} = {e.gpu_activation}" for e in other)
+        result.limitations.append(
+            f"{GPU_ACTIVATION_KEY} was already declared and left as found: {named}. "
+            "`fp16` reproduces the `<pad>` fault on GPU; `fp32_fp16` is what "
+            "--experimental_use_mixed_precision writes and it also changes the graph, so the "
+            "bundle is no longer the one the CPU figures describe"
+        )
+    unset = [e for e in result.succeeded if e.gpu_state is GpuActivationState.UNSET]
+    if unset:
+        named = ", ".join(f"{e.recipe} ({e.gpu_activation_note})" for e in unset)
+        result.limitations.append(
+            f"{GPU_ACTIVATION_KEY} could not be written into {named}. On the GPU "
+            "backend the runtime will compute activations in F16, which measured as `<pad>` "
+            "floods and wrong tool names on a Snapdragon Galaxy S24 (3/20 vs 20/20 on CPU, "
+            "n=20). These bundles are CPU-only until repacked"
+        )
 
     events.stage_finished(
         result.outcome.value,

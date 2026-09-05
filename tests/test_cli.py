@@ -364,6 +364,12 @@ class FakeToolchain:
         self.calls.append(list(args))
         if args[0] == "pip":
             return subprocess.CompletedProcess(args, 0, self.pip_stdout, "")
+        if args[0] == "python" and str(args[1]).endswith("repack.py"):
+            # This fake has no export environment to run the repack script in:
+            # the repack reports that and the export stays a passed, CPU-only one.
+            return subprocess.CompletedProcess(
+                args, 1, "", "ModuleNotFoundError: No module named 'litert_lm_builder'"
+            )
         flags = dict(a.removeprefix("--").split("=", 1) for a in args[2:] if "=" in a)
         out_dir = Path(flags["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1322,3 +1328,76 @@ def test_verbose_still_needs_a_command(capsys):
     """`--verbose` modifies a run; it does not constitute one."""
     assert main(["--verbose"]) == 4
     assert "required: command" in capsys.readouterr().err
+
+
+def test_convert_names_the_gpu_state_of_every_artifact(toolchain, tmp_path, capsys):
+    """This suite's fake has no bundle builder, so the repack cannot be made:
+    the export still passes, the line says CPU-only, and the note says why. A
+    bundle without the key and one with it are otherwise indistinguishable."""
+    code = main(
+        [
+            "convert",
+            "--model",
+            "google/functiongemma-270m-it",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--recipe",
+            "dynamic_wi8_afp32",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "CPU-only (GPU activations not set)" in captured.out
+    assert "No module named 'litert_lm_builder'" in captured.out, "the reason reaches the console"
+    assert "prefer_activation_type could not be written" in captured.out
+
+
+def test_convert_json_records_gpu_activation(toolchain, tmp_path, capsys):
+    code = main(
+        [
+            "convert",
+            "--model",
+            "google/functiongemma-270m-it",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--recipe",
+            "dynamic_wi8_afp32",
+            "--json",
+        ]
+    )
+    assert code == 0
+    manifest = json.loads(capsys.readouterr().out)
+    (export,) = manifest["exports"]
+    assert export["gpu_activation"] is None
+    assert export["gpu_activation_state"] == "unset"
+    assert export["gpu_activation_note"]
+
+
+@pytest.mark.parametrize(
+    "declared, expect",
+    [
+        ("fp32", "GPU activations fp32 —"),
+        ("fp16", "GPU activations fp16 (declared upstream, not fp32)"),
+        ("fp32_fp16", "GPU activations fp32_fp16 (declared upstream, not fp32)"),
+        (None, "CPU-only (GPU activations not set)"),
+    ],
+)
+def test_the_convert_line_marks_an_upstream_declaration(declared, expect, tmp_path):
+    """The console line is what a person reads. `fp16` is the fault itself and
+    must not read the same as the good case. This suite's toolchain fake has no
+    builder, so the line is tested directly rather than through `convert`."""
+    from litetune.checks import Check
+    from litetune.cli import _artifact_line
+    from litetune.export import RecipeExport
+
+    export = RecipeExport(
+        recipe="dynamic_wi8_afp32",
+        check=Check.passed("export dynamic_wi8_afp32", "x"),
+        artifact=tmp_path / "model.litertlm",
+        artifact_bytes=4096,
+        shipped_bytes=4096,
+        seconds=1.0,
+        gpu_activation=declared,
+    )
+
+    assert expect in _artifact_line(export)

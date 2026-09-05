@@ -329,6 +329,12 @@ class FakeToolchain:
         self.calls.append(list(args))
         if args[0] == "pip":
             return subprocess.CompletedProcess(args, 0, self.pip_stdout, "")
+        if args[0] == "python" and str(args[1]).endswith("repack.py"):
+            # This fake has no export environment to run the repack script in:
+            # the repack reports that and the export stays a passed, CPU-only one.
+            return subprocess.CompletedProcess(
+                args, 1, "", "ModuleNotFoundError: No module named 'litert_lm_builder'"
+            )
         flags = dict(a.removeprefix("--").split("=", 1) for a in args[2:] if "=" in a)
         out_dir = Path(flags["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)

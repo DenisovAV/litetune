@@ -87,6 +87,23 @@ declared model type, which the text-parsing measurement cannot observe:
 | `weight_only_wi8_afp32` | 0.9141 — *unresolved* | 0.9047 — **resolved** | 0.9000 — *unresolved* |
 | Gap between recipes | 0.0235 | 0.0031 | 0.0031 |
 
+**On a phone.** The run-A `dynamic_wi8_afp32` bundle, repacked with
+`prefer_activation_type = fp32` (see README, Limitations), on one Snapdragon
+Galaxy S24 (`SC-51E`, Android 16), native tool path, greedy, 640 rows:
+
+| | device CPU | reference (run A) |
+|---|---|---|
+| exact match | **0.8703 ±0.0260** | 0.8906 |
+| tool name | 0.9812 | — |
+| produced a call | 634/640 | — |
+| per prompt, median | 3.3 s (2.3 s cold, 3.2 s warm: the phone throttles) | — |
+
+Difference −0.020 against run A, inside the device interval; −0.031 and −0.027
+against runs B and C, just outside it. The same bundle on the device's GPU,
+20 rows: 20/20 tool names and 15/20 exact with the key, 3/20 and 2/20 without
+it (`<pad>` floods; the engine reports success either way). GPU per prompt
+1.4 s with the key against 2.5 s on the device CPU for the same file.
+
 **The recipes swap places, and which cost resolves moves with them.** An earlier
 draft of this file read "the two recipes differ by 0.0234 on the same weights at
 the same bit width" and drew a conclusion from it. Two further runs put that gap
