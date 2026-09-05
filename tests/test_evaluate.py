@@ -341,3 +341,26 @@ def test_a_failed_batch_is_counted_where_something_reads_it():
 
     assert point.batch_failures == 2
     assert point.as_dict()["generations"]["from_a_failed_batch"] == 2
+
+
+def test_the_reference_script_generates_on_cuda_when_there_is_one():
+    """The float reference used to stay on the CPU whatever the machine had --
+    the one stage of a GPU run left behind. Same rule as training."""
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+
+    namespace: dict = {"__name__": "litetune_hf_script_under_test"}
+    exec(compile(_HF_GENERATE_SCRIPT, "hf_generate.py", "exec"), namespace)
+
+    class Cuda:
+        def __init__(self, available):
+            self.available = available
+
+        def is_available(self):
+            return self.available
+
+    class Torch:
+        def __init__(self, available):
+            self.cuda = Cuda(available)
+
+    assert namespace["generation_device"](Torch(True)) == "cuda"
+    assert namespace["generation_device"](Torch(False)) == "cpu"

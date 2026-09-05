@@ -221,6 +221,17 @@ def turn_terminator(tok, runtime_rendered):
     return [], "none"
 
 
+def training_device(torch):
+    """Where the run happens: CUDA when there is one, the CPU otherwise.
+
+    Chosen here rather than left to torch's default, which is the CPU
+    regardless of what the machine has: a GPU box that trains on the CPU ran
+    exactly as a laptop does, and nothing in the report said so. Recorded in
+    the metrics for the same reason.
+    """
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def build_examples(tok, rows, max_seq_length, runtime_rendered):
     """One (input_ids, labels) pair per row, with the prompt masked out."""
     examples = []
@@ -385,6 +396,8 @@ def main() -> int:
         **from_kwargs
     )
     model.config.use_cache = False
+    device = training_device(torch)
+    model.to(device)
 
     trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if spec["method"] == "lora":
@@ -423,7 +436,11 @@ def main() -> int:
             # The mask is applied here and nowhere else: transformers computes a
             # shifted cross-entropy that skips every IGNORE_INDEX position, so
             # the prompt contributes no gradient.
-            out = model(input_ids=input_ids, attention_mask=attention, labels=labels)
+            out = model(
+                input_ids=input_ids.to(device),
+                attention_mask=attention.to(device),
+                labels=labels.to(device),
+            )
             out.loss.backward()
             optimiser.step()
             optimiser.zero_grad(set_to_none=True)
@@ -488,6 +505,10 @@ def main() -> int:
                 "learning_rate": spec["learning_rate"],
                 "dtype": spec["dtype"],
                 "attn_implementation": spec["attn_implementation"],
+                # Where it ran. A CUDA box and a laptop produce the same
+                # checkpoint; they do not take the same time, and a report
+                # that cannot say which it was cannot explain the difference.
+                "device": device,
                 # Whether the SentencePiece model made it back beside the
                 # checkpoint. Recorded, not assumed: the difference between
                 # `SP_Tokenizer` and an HF section is invisible in every
@@ -700,6 +721,8 @@ class TrainingMetrics:
     epochs: tuple[EpochMetrics, ...]
     trainable_parameters: int | None = None
     base_parameters: int | None = None
+    # `None` when the script predates the field. Absent is absent, not "cpu".
+    device: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -728,6 +751,7 @@ class TrainingMetrics:
             epochs=epochs,
             trainable_parameters=data.get("trainable_parameters"),
             base_parameters=data.get("base_parameters"),
+            device=data.get("device"),
             raw=dict(data),
         )
 
@@ -741,6 +765,7 @@ class TrainingMetrics:
             "expected_supervised_token_fraction": EXPECTED_SUPERVISED_FRACTION,
             "trainable_parameters": self.trainable_parameters,
             "base_parameters": self.base_parameters,
+            "device": self.device,
             "epochs": [e.as_dict() for e in self.epochs],
             "final_loss": self.final_loss,
         }
@@ -1157,6 +1182,24 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         result.limitation(
             "the loss was not masked to the completion; this checkpoint is expected to be worse "
             "than the model it started from, and its training loss will not show it"
+        )
+
+    # -- where did it run? --------------------------------------------------
+    device = result.metrics.device if result.metrics is not None else None
+    if device is not None:
+        events.note(f"trained on {device}", device=device)
+    if device == "cpu" and request.dtype == "bfloat16":
+        # The default dtype is kept: matching export and evaluation is the
+        # more expensive thing to get wrong. But on the one CPU measured
+        # (Apple M-series, torch 2.5.1) bfloat16 matmuls ran on a single core
+        # -- a 300-step LoRA run sat there for 52 minutes without finishing,
+        # and the same run in float32 took 307 s on ten threads. A CPU run is
+        # told what it is paying and which flag buys it back.
+        result.limitation(
+            "this run trained bfloat16 on the CPU. On the CPU measured, bfloat16 matmuls were "
+            "single-threaded and roughly an order of magnitude slower than float32; if the run "
+            "is slow, --dtype float32 trains on every core, at the cost of the dtype mismatch "
+            "with export and evaluation that the report then records"
         )
 
     # -- the adapter, and the merge ----------------------------------------
