@@ -449,8 +449,8 @@ Wiring `|| exit 1` on anything non-zero throws all of this away.
 
 ## Contributing
 
-Issues and pull requests welcome, particularly measurements on models other than
-the one above — that is the gap this alpha most needs closed.
+Issues and pull requests welcome, particularly measurements on models other
+than the two above — that is the gap this alpha most needs closed.
 
 Run the checks with `pytest`, `ruff check`, `ruff format --check` and `mypy src`.
 
