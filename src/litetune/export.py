@@ -132,9 +132,11 @@ def describe_gpu_activation(value: str | None) -> str:
     return f"GPU activations {value} (declared upstream, not {GPU_ACTIVATION})"
 
 
-# Per builder/peek step: a ceiling for a stalled tool, not a budget. A real
-# repack of a 455 MB bundle finishes in seconds.
-REPACK_STEP_TIMEOUT_S = 300
+# For the whole repack (unpack, patch, pack, unpack again): a ceiling for a
+# stalled tool, not a budget. A real repack of a 455 MB bundle finishes in
+# seconds. Charged against the recipe's export timeout at the call site so a
+# `--timeout-s` bound holds for export and repack together.
+REPACK_TIMEOUT_S = 300
 
 # Measured: a 285,577,392-byte artifact in 122 s on CPU for a 270M checkpoint.
 # The ceiling is an order of magnitude above that so a larger checkpoint is not
@@ -169,33 +171,6 @@ _RECIPE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 _STDOUT_TAIL = 4000
 _DETAIL_TAIL = 400
-
-# --- GPU activation repack ---------------------------------------------------
-# One `[[section]]` table of the builder's model.toml: from its header up to the
-# next table header of any kind (`[[section]]` or a single-bracket table) or end
-# of file. Bounding at any header matters: `unpack` may emit `[system_metadata]`
-# after the last section, and a table regex that stops only at `[[section]]`
-# would fold it into that section.
-_TOML_TABLE_RE = re.compile(r"^\[\[section\]\]\n(?:(?!^\[)[^\n]*\n?)*", re.M)
-_PREFILL_RE = re.compile(r'^\s*model_type\s*=\s*"prefill_decode"', re.M)
-# Both shapes the builder round-trips the key in. Written by hand it is a bare
-# key; read back by `unpack` it is one entry of the section's
-# `additional_metadata` array, which is also what the file actually stores.
-_ACTIVATION_VALUE_RE = re.compile(
-    r'(?:^\s*prefer_activation_type\s*=\s*"([^"]*)"'
-    r'|key\s*=\s*"prefer_activation_type"[^}]*?value\s*=\s*"([^"]*)")',
-    re.M,
-)
-# What `litert-lm-peek` prints: a "System Metadata" block *before* any
-# `Section N:` header, then one block per section, each with `Key: k, Value
-# (String): v` items plus Begin/End Offset lines. The two system keys the
-# builder regenerates on every rebuild are excluded from the comparison; the
-# offsets are not compared at all, because 16 KiB section alignment means a
-# one-key metadata change can legitimately shift every offset after it.
-_PEEK_SECTION_RE = re.compile(r"^Section (\d+):", re.M)
-_PEEK_KEY_RE = re.compile(r"^\s*Key: ([^,]+), Value \(String\):(?: (.*?))?\s*$", re.M)
-_PEEK_SYSTEM = -1  # the section number given to keys printed before Section 0
-_PEEK_VOLATILE = ("uuid", "creation_timestamp")
 
 
 class NoRecipesRequested(ValueError):
@@ -690,8 +665,164 @@ def repair_vocab_file(model_dir: Path) -> tuple[bool, str | None]:
     )
 
 
+# Runs inside envs.EXPORT, where `litert_lm_builder` and `tomllib` live. The
+# bundle format is the builder's to define, so every fact about it -- how a
+# section is laid out, which keys the rebuild regenerates, what a declaration
+# looks like -- is read through the builder's own `unpack`/`pack` and parsed
+# with a real TOML parser. A regex over the text would read `[[section]]`
+# inside a string value as a section; this cannot.
+_REPACK_SCRIPT = r'''
+"""Set one metadata key on a bundle's prefill/decode section; verify by round-trip.
+
+Reads JSON {artifact, work, key, value} from argv[1]. Writes JSON to argv[2]:
+  {"declared": <str|null>, "written": <bool>, "reason": <str|null>}
+`declared` is the value the section carries after this script (or before it,
+if it was left alone); `written` says whether the file was replaced.
+"""
+import json
+import os
+import sys
+import tomllib
+from pathlib import Path
+
+from litert_lm_builder import litertlm_builder as lb
+
+VOLATILE = {"uuid", "creation_timestamp"}
+
+
+def load(path):
+    return tomllib.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def prefill_sections(doc):
+    return [
+        s
+        for s in doc.get("section", [])
+        if s.get("section_type") == "TFLiteModel"
+        and str(s.get("model_type", "")).lower() == "prefill_decode"
+    ]
+
+
+def declared_in(section, key):
+    for entry in section.get("additional_metadata", []) or []:
+        if entry.get("key") == key:
+            return str(entry.get("value", ""))
+    if key in section:
+        return str(section[key])
+    return None
+
+
+def comparable(doc):
+    """The document with the two regenerated system keys removed and paths by name."""
+    sm = doc.get("system_metadata", {})
+    entries = [e for e in sm.get("entries", []) if e.get("key") not in VOLATILE]
+    sections = json.loads(json.dumps(doc.get("section", [])))
+    for s in sections:
+        if "data_path" in s:
+            s["data_path"] = os.path.basename(s["data_path"])
+    return {"system_metadata": {"entries": entries}, "section": sections}
+
+
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return json.dumps(str(v))  # a valid TOML basic string
+
+
+def write_toml(doc, path):
+    """Emit TOML for the builder to read back. Only the shapes `unpack` writes."""
+    lines = ["[system_metadata]", "entries = ["]
+    for e in doc.get("system_metadata", {}).get("entries", []):
+        lines.append(
+            f"  {{ key = {toml_value(e['key'])}, "
+            f"value_type = {toml_value(e['value_type'])}, "
+            f"value = {toml_value(e['value'])} }},"
+        )
+    lines += ["]", ""]
+    for sec in doc.get("section", []):
+        lines.append("[[section]]")
+        for k, v in sec.items():
+            if k == "additional_metadata":
+                continue
+            lines.append(f"{k} = {toml_value(v)}")
+        meta = sec.get("additional_metadata") or []
+        if meta:
+            lines.append("additional_metadata = [")
+            for e in meta:
+                lines.append(
+                    f"  {{ key = {toml_value(e['key'])}, "
+            f"value_type = {toml_value(e['value_type'])}, "
+                    f"value = {toml_value(e['value'])} }},"
+                )
+            lines.append("]")
+        lines.append("")
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
+def main():
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    out = Path(sys.argv[2])
+    artifact, work = spec["artifact"], Path(spec["work"])
+    key, value = spec["key"], spec["value"]
+
+    def done(declared=None, written=False, reason=None):
+        out.write_text(json.dumps({"declared": declared, "written": written, "reason": reason}))
+        return 0
+
+    before_dir = work / "before"
+    lb.unpack(artifact, str(before_dir))
+    before = load(before_dir / "model.toml")
+    targets = prefill_sections(before)
+    if len(targets) != 1:
+        return done(
+            reason=f"found {len(targets)} prefill_decode sections where exactly one was expected"
+        )
+    existing = declared_in(targets[0], key)
+    if existing is not None:
+        shown = existing or "(empty)"
+        reason = f"the bundle already declares {key} = {shown}; left as written"
+        return done(declared=existing, reason=reason)
+
+    # Patch the structure, not the text.
+    patched = json.loads(json.dumps(before))
+    sec = prefill_sections(patched)[0]
+    sec["additional_metadata"] = list(sec.get("additional_metadata") or []) + [
+        {"key": key, "value_type": "String", "value": value}
+    ]
+    for s in patched["section"]:
+        s["data_path"] = str(before_dir / os.path.basename(s["data_path"]))
+    patched_toml = work / "patched.toml"
+    write_toml(patched, patched_toml)
+    rebuilt = work / Path(artifact).name
+    lb.pack(str(patched_toml), str(rebuilt))
+
+    # Verify by round-tripping through the same unpack: the parsed document
+    # must be the original plus exactly the one entry.
+    after_dir = work / "after"
+    lb.unpack(str(rebuilt), str(after_dir))
+    after = load(after_dir / "model.toml")
+    expect = comparable(before)
+    prefill_sections(expect)[0]["additional_metadata"] = list(
+        prefill_sections(before)[0].get("additional_metadata") or []
+    ) + [{"key": key, "value_type": "String", "value": value}]
+    if comparable(after) != expect:
+        return done(reason="the rebuild changed the bundle beyond the one key")
+    read_back = declared_in(prefill_sections(after)[0], key)
+    if read_back != value:
+        return done(reason=f"the rebuild wrote {key} = {read_back!r}; {value!r} was asked")
+    os.replace(rebuilt, artifact)
+    return done(declared=read_back, written=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
 def set_gpu_activation(
-    artifact: Path, env: envs.StageEnv, *, timeout: int = REPACK_STEP_TIMEOUT_S
+    artifact: Path, env: envs.StageEnv, *, timeout: int = REPACK_TIMEOUT_S
 ) -> tuple[str | None, str | None]:
     """Write `prefer_activation_type` into the bundle's prefill/decode section.
 
@@ -699,114 +830,72 @@ def set_gpu_activation(
     when the artifact is left as the toolchain wrote it with no declaration --
     a working CPU bundle and a broken GPU one -- so the caller records the
     reason rather than failing the export. It is the bundle's *own* value as
-    `litert-lm-peek` reads it back, never the requested one: a bundle that
-    already declared something is left alone and reported as carrying that,
-    because `--flag=--experimental_use_mixed_precision` produces `fp32_fp16`
-    and an explicit `fp16` reproduces the fault, and labelling either as
-    `fp32` would be the false pass this key exists to end.
+    the builder reads it back, never the requested one: a bundle that already
+    declared something is left alone and reported as carrying that, because
+    `--flag=--experimental_use_mixed_precision` produces `fp32_fp16` and an
+    explicit `fp16` reproduces the fault, and labelling either as `fp32` would
+    be the false pass this key exists to end.
 
-    Done by unpacking with `litert-lm-builder`, adding one key to `model.toml`,
-    and rebuilding. What the rebuild changed is then checked against
-    `litert-lm-peek` run on both files: ignoring the system `uuid` and
-    `creation_timestamp` the builder regenerates, the rebuilt listing must be
-    the original listing with exactly one line inserted, and that line must
-    sit in the section peek lists as `tf_lite_prefill_decode` (`prefill_decode`
-    in the TOML). Anything else is a rebuild that did more than asked, and the
-    original is kept. The listing is metadata only: section bytes are not
-    compared. On the one bundle measured the size was unchanged
-    (455,759,152 bytes) because section offsets are 16 KiB-aligned; the uuid
-    is not carried through.
+    The work is done by `_REPACK_SCRIPT` inside the export environment: the
+    builder's own `unpack`, a real TOML parse, one entry appended to the
+    section's `additional_metadata`, the builder's own `pack`, and a second
+    `unpack` whose parsed document must equal the first plus that one entry
+    (the system `uuid` and `creation_timestamp` the builder regenerates are
+    excluded). Section bytes are not compared; on the one bundle measured the
+    size was unchanged (455,759,152 bytes) because section offsets are
+    16 KiB-aligned. The original is replaced only after that comparison.
 
     The exporter offers no flag for this value, and the one flag it does offer
     (`--experimental_use_mixed_precision`) changes the graph as well.
     """
     work: Path | None = None
-    step = "litert-lm-builder unpack"
     leaked: list[str] = []
+    if artifact.stat().st_size == 0:
+        # Nothing to repack, and the sweep's size comparison downstream is
+        # what reports a zero-byte export; this must not turn it into 8 bytes.
+        return None, "the artifact is empty; nothing to repack"
     try:
         # A fresh private directory, never a deterministic name: a stale or
         # planted `.foo-repack` symlink would otherwise have its *target*
         # emptied by cleanup, and two runs on one output dir would delete each
         # other's unpack mid-flight. Same filesystem as the artifact so the
-        # final `os.replace` is one rename.
+        # script's final `os.replace` is one rename.
         work = Path(tempfile.mkdtemp(prefix=f".{artifact.stem}-repack-", dir=artifact.parent))
-        proc = env.run(
-            ["litert-lm-builder", "unpack", "--input", str(artifact), "--output", str(work)],
-            timeout=timeout,
+        script = work / "repack.py"
+        script.write_text(_REPACK_SCRIPT, encoding="utf-8")
+        spec = work / "spec.json"
+        result = work / "result.json"
+        spec.write_text(
+            json.dumps(
+                {
+                    "artifact": str(artifact),
+                    "work": str(work),
+                    "key": GPU_ACTIVATION_KEY,
+                    "value": GPU_ACTIVATION,
+                }
+            ),
+            encoding="utf-8",
         )
-        if proc.returncode != 0:
-            return None, f"{step} exited {proc.returncode}: {_tail(proc.stderr) or 'no stderr'}"
-        toml_path = work / "model.toml"
-        if not toml_path.exists():
-            return None, f"{step} wrote no model.toml into {work}"
-        text = toml_path.read_text(encoding="utf-8")
-        tables = [m for m in _TOML_TABLE_RE.finditer(text) if _PREFILL_RE.search(m.group(0))]
-        if len(tables) != 1:
-            return None, (
-                f"found {len(tables)} prefill_decode sections in model.toml where exactly one "
-                "was expected, so the GPU activation type was not set"
-            )
-        table = tables[0]
-        present = _ACTIVATION_VALUE_RE.search(table.group(0))
-        if present:
-            # Declared upstream. The TOML says so; the bundle is what counts,
-            # so the value is read back from peek like every other return.
-            step = "litert-lm-peek"
-            listing = env.run(["litert-lm-peek", "--litertlm_file", str(artifact)], timeout=timeout)
-            found = _declared_in_prefill(listing.stdout or "")
-            if listing.returncode != 0 or found is None:
-                return None, (
-                    f"model.toml declares {GPU_ACTIVATION_KEY} but litert-lm-peek does not show "
-                    f"it in the prefill/decode section (exit {listing.returncode}, stderr: "
-                    f"{_tail(listing.stderr) or 'none'}); left as written"
-                )
-            shown = found if found else "(empty)"
+        proc = env.run(["python", str(script), str(spec), str(result)], timeout=timeout)
+        if proc.returncode != 0 or not result.is_file():
+            # The script does not catch its own errors, so a builder failure
+            # arrives as a traceback. The last line is the reason; the rest
+            # goes to the log where a frame is worth having.
+            stderr = proc.stderr or ""
+            last = next((ln for ln in reversed(stderr.splitlines()) if ln.strip()), "no stderr")
+            logger.warning("GPU activation repack of %s failed:\n%s", artifact, _tail(stderr, 2000))
             return (
-                found,
-                f"the bundle already declares {GPU_ACTIVATION_KEY} = {shown}; left as written",
+                None,
+                f"the repack script exited {proc.returncode}: {last}; the original was kept",
             )
-        # Key order inside a TOML table is free, so the key goes straight after
-        # the header rather than after any particular line.
-        header_end = table.start() + len("[[section]]")
-        patched = (
-            text[:header_end] + f'\n{GPU_ACTIVATION_KEY} = "{GPU_ACTIVATION}"' + text[header_end:]
-        )
-        toml_path.write_text(patched, encoding="utf-8")
-        rebuilt = work / artifact.name
-        step = "litert-lm-builder toml"
-        proc = env.run(
-            [
-                "litert-lm-builder",
-                "toml",
-                "--path",
-                str(toml_path),
-                "output",
-                "--path",
-                str(rebuilt),
-            ],
-            timeout=timeout,
-        )
-        if proc.returncode != 0:
-            return None, f"{step} exited {proc.returncode}: {_tail(proc.stderr) or 'no stderr'}"
-        if not rebuilt.exists():
-            return None, f"{step} exited 0 but wrote no {artifact.name}"
-        step = "litert-lm-peek"
-        before = env.run(["litert-lm-peek", "--litertlm_file", str(artifact)], timeout=timeout)
-        after = env.run(["litert-lm-peek", "--litertlm_file", str(rebuilt)], timeout=timeout)
-        for label, run in (("original", before), ("rebuilt", after)):
-            if run.returncode != 0 or not _PEEK_SECTION_RE.search(run.stdout or ""):
-                return None, (
-                    f"litert-lm-peek exited {run.returncode} on the {label} file but printed "
-                    f"no section listing (stderr: {_tail(run.stderr) or 'none'}); the original "
-                    "was kept"
-                )
-        read_back, verdict = _rebuild_changed_only_the_key(before.stdout or "", after.stdout or "")
-        if verdict is not None:
-            return None, f"{verdict}; the original was kept"
-        os.replace(rebuilt, artifact)
-        return read_back, None
+        report = json.loads(result.read_text(encoding="utf-8"))
+        declared = report.get("declared")
+        reason = report.get("reason")
+        if declared is None:
+            return None, f"{reason}; the original was kept"
+        return str(declared), reason
     except subprocess.TimeoutExpired:
-        return None, f"{step} did not finish within {timeout}s; the original was kept"
+        return None, f"the repack did not finish within {timeout}s; the original was kept"
     except Exception as exc:  # noqa: BLE001 - a broken repack must not unmake a good export
         # Whatever went wrong here, the toolchain's artifact is intact and is a
         # working CPU bundle. Escaping would let `guard` record the whole
@@ -826,72 +915,6 @@ def set_gpu_activation(
                     len(leaked),
                     work,
                 )
-
-
-def _peek_lines(listing: str) -> list[tuple[int, str, str]]:
-    """(section, key, value) for every metadata key in a peek listing.
-
-    Keys printed before the first `Section N:` header belong to the system
-    block and get `_PEEK_SYSTEM`.
-    """
-    out: list[tuple[int, str, str]] = []
-    section = _PEEK_SYSTEM
-    for line in listing.splitlines():
-        header = _PEEK_SECTION_RE.match(line)
-        if header:
-            section = int(header.group(1))
-            continue
-        m = _PEEK_KEY_RE.match(line)
-        if m:
-            out.append((section, m.group(1), m.group(2) or ""))
-    return out
-
-
-def _declared_in_prefill(listing: str) -> str | None:
-    """The `prefer_activation_type` value in the prefill/decode section, if any."""
-    entries = _peek_lines(listing)
-    types = {sec: value for sec, key, value in entries if key == "model_type"}
-    for sec, key, value in entries:
-        if key == GPU_ACTIVATION_KEY and types.get(sec) == "tf_lite_prefill_decode":
-            return value
-    return None
-
-
-def _rebuild_changed_only_the_key(before: str, after: str) -> tuple[str | None, str | None]:
-    """(value read back, None) when the rebuild did exactly what was asked;
-    (None, what else it did) otherwise.
-
-    Positional, not membership: with the system `uuid` and `creation_timestamp`
-    dropped from both, the rebuilt key list must equal the original with
-    exactly one entry inserted. A moved key, a reordered section, or a
-    duplicated key are all differences here. Section offsets are not part of
-    the comparison (see `_PEEK_VOLATILE`).
-    """
-
-    def keep(entry: tuple[int, str, str]) -> bool:
-        section, key, _ = entry
-        return not (section == _PEEK_SYSTEM and key in _PEEK_VOLATILE)
-
-    old = [e for e in _peek_lines(before) if keep(e)]
-    new = [e for e in _peek_lines(after) if keep(e)]
-    hits = [i for i, (_, key, _) in enumerate(new) if key == GPU_ACTIVATION_KEY]
-    if len(hits) != 1:
-        return (
-            None,
-            f"the rebuild left {len(hits)} {GPU_ACTIVATION_KEY} keys where one was expected",
-        )
-    i = hits[0]
-    if old != new[:i] + new[i + 1 :]:
-        return None, "the rebuild changed the bundle listing beyond the one key"
-    section, _, value = new[i]
-    if value != GPU_ACTIVATION:
-        return None, (
-            f"the rebuild wrote {GPU_ACTIVATION_KEY} = {value!r}; {GPU_ACTIVATION!r} was asked"
-        )
-    types = {sec: val for sec, key, val in new if key == "model_type"}
-    if types.get(section) != "tf_lite_prefill_decode":
-        return None, f"{GPU_ACTIVATION_KEY} landed outside the prefill/decode section"
-    return value, None
 
 
 def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
@@ -1015,7 +1038,10 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
     # Repacked before it is hashed or sized: the file that ships is the one
     # that is recorded. A repack that cannot be made is a limitation on a
     # passed check, not a failed one -- the CPU artifact is intact.
-    gpu_activation, gpu_note = set_gpu_activation(artifact, request.env)
+    remaining = max(1, int(request.timeout_s - seconds))
+    gpu_activation, gpu_note = set_gpu_activation(
+        artifact, request.env, timeout=min(REPACK_TIMEOUT_S, remaining)
+    )
     if gpu_activation is None:
         logger.warning("recipe %s: GPU activation not set: %s", recipe, gpu_note)
     artifact_bytes = artifact.stat().st_size
