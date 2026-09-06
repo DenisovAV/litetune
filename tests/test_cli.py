@@ -993,7 +993,7 @@ def test_the_help_advertises_only_codes_the_command_can_return():
         assert "3 nothing" not in help_for(stage)
 
 
-def test_the_scorer_help_and_the_manifest_agree():
+def test_the_scorer_help_and_the_manifest_agree(tmp_path, capsys, write_split, fake_backends):
     """`--scorer`'s help text and `SCORERS[name].describes` are the same claim,
     written by hand in two places with nothing holding them together -- they
     drifted out of step once already. Assert the predicate itself is shared,
@@ -1002,6 +1002,11 @@ def test_the_scorer_help_and_the_manifest_agree():
     Whitespace is normalised before comparing: argparse rewraps the help
     string to the terminal width, which turns the single spaces in `describes`
     into newlines at different points than the source has them.
+
+    Named for the manifest, this test used to never read one: the two checks
+    above compare `--help`'s text to `SCORERS` directly, so `scorer.means`
+    could be emptied in the manifest itself and neither would notice. The
+    block below runs `verify` for real and reads the manifest it writes.
     """
     import contextlib
     import io
@@ -1024,6 +1029,25 @@ def test_the_scorer_help_and_the_manifest_agree():
         SCORERS["exact-text"].describes.removeprefix("correct means the generation ")
     )
     assert exact_text_clause in help_text
+
+    rows = labelled_rows(8)
+    fake_backends(correct_texts(rows), correct_texts(rows))
+    main(
+        [
+            "verify",
+            "--model",
+            str(tmp_path / "model.litertlm"),
+            "--reference",
+            "org/reference",
+            "--data",
+            str(write_split(rows)),
+            "--scorer",
+            "tool-call",
+            "--json",
+        ]
+    )
+    manifest = json.loads(capsys.readouterr().out)
+    assert manifest["scorer"] == {"name": "tool-call", "means": SCORERS["tool-call"].describes}
 
 
 def test_main_is_reusable_in_one_process(tmp_path):
@@ -1091,6 +1115,27 @@ def test_every_status_a_bundle_can_carry_has_an_exit_code():
 
     for status in RunStatus:
         assert EXIT_CODES[Status(status.value)] in {0, 1, 2, 3, 4}
+
+
+def test_the_exit_code_table_matches_the_published_one():
+    """Pins README's Exit codes table whole, not by membership.
+
+    `{0,1,2,3,4}` membership above lets any status swap exit codes with any
+    other -- `FAILED_SMOKE` at 2 and `INCONCLUSIVE` at 1 both still pass it --
+    and README documents which status gets which code, not merely that five
+    codes exist.
+    """
+    from litetune.verify import EXIT_CODES, Status
+
+    assert EXIT_CODES == {
+        Status.PASSED: 0,
+        Status.FAILED_SMOKE: 1,
+        Status.FAILED_GATE: 1,
+        Status.INCONCLUSIVE: 2,
+        Status.UNMEASURED: 3,
+        Status.FAILED_HARNESS: 4,
+        Status.ERROR: 4,
+    }
 
 
 def test_every_outcome_a_stage_can_report_has_an_exit_code():

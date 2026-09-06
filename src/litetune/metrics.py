@@ -432,11 +432,13 @@ def _reproduces_target(target: str, output: str) -> bool:
 
     The two conditions that function describes, named: the answers agree once
     whitespace is collapsed, and every marker the target ends with also
-    appears among the generation's markers, counting multiplicity -- order
-    does not matter, only how many of each. A target with no markers of its
-    own satisfies the second vacuously -- which is how a plain label forgives
-    a decoder's `<eos>`. A target ending `<eos>` is satisfied by a generation
-    ending `<end_of_turn>\n<eos>`: the chat template's close sits in front of
+    appears among the generation's markers, as a subsequence -- counting
+    multiplicity, and in the same order. `<eos></s>` and `</s><eos>` are
+    different endings under this rule; a set or a `Counter` would call them
+    the same. A target with no markers of its own satisfies the second
+    vacuously -- which is how a plain label forgives a decoder's `<eos>`. A
+    target ending `<eos>` is satisfied by a generation ending
+    `<end_of_turn>\n<eos>`: the chat template's close sits in front of
     the target's own marker, not in place of it. That shape is constructed --
     both supported families stop at their close and emit one marker -- but a
     family whose eos set excludes its close produces it, and the rule has to
@@ -612,13 +614,13 @@ def terminators_trimmed(text: str) -> int:
     Reported, never gated. On the transformers reference the count reflects
     how the chat template and the tokenizer relate: one marker when the
     template's close is itself a stop token, two when it is not and generation
-    runs past it into the eos -- `<end_of_turn>` then `<eos>`, a shape neither
-    supported family produces: measured, gemma-3-270m-it and
-    functiongemma-270m-it both carry their close in `eos_token_id`. The case this
-    tool measured, and a healthy gemma-3 run, the run this branch exists for,
-    reports 2. The count is not a threshold and no single number means
-    "defect". On a litert-lm candidate it is zero whenever the runtime strips
-    its own stop token before this tool ever sees the text.
+    runs past it into the eos -- `<end_of_turn>` then `<eos>`. Measured, neither
+    supported family produces that shape: gemma-3-270m-it and
+    functiongemma-270m-it both carry their template's close in `eos_token_id`,
+    so generation halts there and a healthy run reports 1. The count is not a
+    threshold and no single number means "defect". On a litert-lm candidate it
+    is zero whenever the runtime strips its own stop token before this tool
+    ever sees the text.
     """
     return len(_strip_terminators(text)[1])
 

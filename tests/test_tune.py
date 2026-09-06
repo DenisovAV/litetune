@@ -968,6 +968,61 @@ def test_the_real_script_refuses_an_over_length_row(request_for, stub_env, tmp_p
     assert not (request.output_dir / "metrics.json").exists()
 
 
+def test_the_recorded_terminator_reaches_bundles_stop_tokens(request_for, stub_env, tmp_path):
+    """The path README publishes: "`tune` records it at `turn_terminator.text`
+    in `metrics.json`, and `bundle` carries it into `contract.json`'s
+    `stop_tokens`". Every other test of either end feeds a hand-written
+    `metrics.json` fixture, so the two ends have only ever been shown to
+    agree with each other, not with what `tune` actually writes. This test
+    joins the hops: the real training script (via `run_real_script`, not
+    `FakeTrainer`'s canned payload) writes the real `metrics.json`, and that
+    exact file is handed to `bundle` through `--train-metrics`.
+    """
+    from litetune.cli import main
+
+    request = request_for()
+    proc = run_real_script(request, stub_env)
+    assert proc.returncode == 0, proc.stderr
+
+    metrics_path = request.output_dir / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    terminator_text = metrics["turn_terminator"]["text"]
+    # A real, computed decode -- not a placeholder a mutant renaming the key
+    # could still satisfy by accident.
+    assert terminator_text == "<99>"
+
+    model_file = tmp_path / "m.litertlm"
+    model_file.write_text("{}", encoding="utf-8")
+    declarations = tmp_path / "d.json"
+    declarations.write_text("[]", encoding="utf-8")
+    bundle_dir = tmp_path / "bundle"
+
+    main(
+        [
+            "bundle",
+            "--output-dir",
+            str(bundle_dir),
+            "--model",
+            str(model_file),
+            "--declarations",
+            str(declarations),
+            "--prompt-mode",
+            "prerendered",
+            # A family with no extra stop tokens of its own, so the assertion
+            # below is exactly the recorded terminator and nothing added.
+            "--base-model",
+            "google/gemma-3-270m-it",
+            "--base-model-revision",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--train-metrics",
+            str(metrics_path),
+        ]
+    )
+
+    contract = json.loads((bundle_dir / "contract.json").read_text(encoding="utf-8"))
+    assert contract["stop_tokens"] == [terminator_text]
+
+
 # ---------------------------------------------------------------------------
 # The three stages compose
 # ---------------------------------------------------------------------------

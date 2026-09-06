@@ -128,6 +128,22 @@ def test_one_flake_among_many_does_not_condemn_the_run():
     assert liveness_tier(make_point(texts)).outcome is Outcome.PASSED
 
 
+def test_the_shipped_failure_ratio_still_trips_the_degenerate_share_gate():
+    """`max_degenerate_share` survives being set to 0.99: nothing else here
+    sits between the 0.05 default and 0.99, only far below it (1/100) or far
+    above (100%). The published base-model run failed liveness at
+    571/600 = 0.9517 degenerate; at 0.99 that run would have been scored
+    instead of refused, which is the whole point of this gate.
+    """
+    looping = "open the app open the app open the app open the app open the app"
+    correct = "call:open{app:<escape>maps<escape>}"
+    texts = [looping] * 571 + [correct] * 29
+    result = liveness_tier(make_point(texts))
+    assert result.outcome is Outcome.FAILED
+    assert result.checks.first_failure.name == "no degenerate repetition"
+    assert "0.50" in result.checks.first_failure.detail
+
+
 def test_a_model_identical_to_its_baseline_fails_divergence():
     point = make_point(ALIVE)
     check = divergence_check(point, list(ALIVE), "the untuned base", LivenessThresholds())

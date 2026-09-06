@@ -789,6 +789,35 @@ def test_a_reference_that_sometimes_runs_to_the_token_bound_is_still_scored(writ
     ]
 
 
+def test_a_reference_just_over_the_unterminated_share_threshold_is_refused(write_split):
+    """`max_unterminated_share` survives being set to 0.99: every fixture for
+    this check elsewhere sits at an extreme -- about 1% (still scored, see
+    the test above) or effectively 100% (refused). 15 of 100 is just over the
+    documented 0.10 default, and nothing else here proves that boundary.
+    """
+    from litetune.liveness import DEFAULT_THRESHOLDS
+
+    assert DEFAULT_THRESHOLDS.max_unterminated_share == 0.10
+
+    rows = text_rows(100)
+    reference_texts = [r["target"] + "<|assistant_end|>" for r in rows[:15]]
+    reference_texts += [r["target"] + "<eos>" for r in rows[15:]]
+    result = verify(
+        write_split,
+        rows,
+        candidate=FakeBackend(texts=[r["target"] for r in rows]),
+        reference=TransformersLikeBackend(model="org/reference", texts=reference_texts),
+        scorer="exact-text",
+    )
+    assert result.status is Status.FAILED_HARNESS
+    check = next(
+        c for c in result.manifest["checks"] if c["name"] == "reference terminator recognised"
+    )
+    assert check["outcome"] == "could_not_check"
+    assert check["observed"]["unterminated"] == 15
+    assert check["observed"]["unterminated_share"] == pytest.approx(0.15)
+
+
 def test_a_healthy_gemma_reference_is_not_refused(write_split):
     """The guard against the refusal firing on a healthy reference.
 
@@ -1103,3 +1132,67 @@ def test_a_genuinely_bad_conversion_is_still_gated_when_the_reference_is_healthy
     cost = result.manifest["attribution"]["conversion_cost"]
     assert cost["available"] is True
     assert cost["value"] == pytest.approx(1.0)
+
+
+# -- NEAR_ZERO's boundary is pinned, not merely present -----------------------
+
+
+def _quality_at(value: float, correct: tuple[bool, ...]):
+    from litetune.metrics import Proportion, QualityMetrics, Unavailable
+
+    no_split = Unavailable("exact-text has no operation/argument split")
+    return QualityMetrics(
+        n=len(correct),
+        parse_rate=Proportion(value=1.0, n=len(correct), ci95=0.0),
+        name_accuracy=no_split,
+        argument_accuracy=no_split,
+        # `n` and `ci95` are not what `_attribute`'s guard reads; only
+        # `.value` and `.correct` are, so those are fixed and the rest filled
+        # in rather than derived.
+        exact_match=Proportion(value=value, n=len(correct), ci95=0.01),
+        correct=correct,
+    )
+
+
+def test_near_zero_is_pinned_at_point_zero_five():
+    """`NEAR_ZERO` is free in both directions unless its value itself is
+    pinned: 0.0 disables the near-zero attribution guard entirely, and 0.80
+    would read the shipped gemma-3 reference (0.6933, MEASUREMENTS.md) as
+    unavailable. The two tests below pin the boundary this constant draws;
+    this one pins the constant itself.
+    """
+    from litetune.verify import NEAR_ZERO
+
+    assert NEAR_ZERO == 0.05
+
+
+def test_attribute_floors_a_float_twin_reference_exactly_at_near_zero():
+    from litetune.metrics import Unavailable
+    from litetune.verify import NEAR_ZERO, _attribute
+
+    request = VerifyRequest(
+        model=Path("m.litertlm"), reference="org/reference", data=Path("d.jsonl")
+    )
+    reference = _quality_at(NEAR_ZERO, correct=(False,) * 100)
+    candidate = _quality_at(0.6, correct=(True,) * 60 + (False,) * 40)
+
+    cost, gain = _attribute(request, candidate, reference)
+
+    assert isinstance(cost, Unavailable)
+    assert isinstance(gain, Unavailable)
+
+
+def test_attribute_resolves_a_float_twin_reference_one_cent_above_near_zero():
+    from litetune.metrics import Difference
+    from litetune.verify import NEAR_ZERO, _attribute
+
+    request = VerifyRequest(
+        model=Path("m.litertlm"), reference="org/reference", data=Path("d.jsonl")
+    )
+    just_above = NEAR_ZERO + 0.01
+    reference = _quality_at(just_above, correct=(True,) * 6 + (False,) * 94)
+    candidate = _quality_at(0.6, correct=(True,) * 60 + (False,) * 40)
+
+    cost, gain = _attribute(request, candidate, reference)
+
+    assert isinstance(cost, Difference)
