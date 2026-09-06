@@ -39,10 +39,10 @@ want to change above about 1B. Bring your own checkpoint and skip the first two
 steps, or bring a `.litertlm` and its float checkpoint and run only `verify`.
 
 > **Alpha.** Measured end to end on `google/functiongemma-270m-it` and function
-> calling only. The other scorer is tested but no task has been measured through
-> it end to end. Gemma 3,
-> Gemma 4 and Qwen3.5 export — litetune carries their required flags — but no
-> quality number has been established for them. Try it on yours and open an issue.
+> calling, and on `google/gemma-3-270m-it` and `exact-text` classification —
+> see [MEASUREMENTS.md](MEASUREMENTS.md) for the banking77 numbers. Gemma 4
+> and Qwen3.5 export — litetune carries their required flags — but no quality
+> number has been established for them. Try it on yours and open an issue.
 
 ---
 
@@ -317,8 +317,10 @@ withdrawn after re-measurement.
 
 **Limits on the numbers**
 
-- **Measured on one model.** `functiongemma-270m-it`. Other families export but
-  have no quality figure.
+- **Measured on two models.** `functiongemma-270m-it` on tool-call function
+  calling, and `gemma-3-270m-it` on `exact-text` classification (banking77) —
+  the gemma-3 run the static-vocabulary bullet below refers to. Other families
+  export but have no quality figure.
 - **Measurement runs on CPU; your users run on a phone.** On one Snapdragon
   Galaxy S24 (`SC-51E`), the `dynamic_wi8_afp32` bundle on the device's CPU
   scored 0.8703 ±0.026 on the 640 held-out rows against 0.8906 for the cloud
@@ -339,6 +341,16 @@ withdrawn after re-measurement.
   disagree for every declaration with more than one property. Costly on a base
   checkpoint, near-free after fine-tuning; `contract.json` records which you
   used. See [MEASUREMENTS.md](MEASUREMENTS.md).
+- **The turn-terminator vocabulary is a static list.** `exact-text` scoring
+  and the liveness checks both trim against a fixed set of strings, recorded
+  verbatim at `harness.terminators` in every verify manifest. A model family
+  whose chat template closes a turn with a marker not in that list scores its
+  own float reference at zero under `exact-text` — the same defect the
+  gemma-3 run exposed — until the vocabulary is resolved from the bundle
+  contract instead of hardcoded, which is planned as a follow-up. To find your
+  own model's marker before then: `tune` records it at `turn_terminator.text`
+  in `metrics.json`, and `bundle` carries it into `contract.json`'s
+  `stop_tokens`.
 
 **Not built yet**
 

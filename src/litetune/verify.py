@@ -36,7 +36,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from litetune import models
+from litetune import metrics, models
 from litetune.checks import Check, Outcome, guard
 from litetune.evaluate import (
     GREEDY,
@@ -45,6 +45,7 @@ from litetune.evaluate import (
     GenerationBackend,
     HuggingFaceBackend,
     LiteRtLmBackend,
+    MeasurementPoint,
     PromptMode,
     PromptModeDecision,
     Split,
@@ -60,17 +61,20 @@ from litetune.liveness import (
     LivenessThresholds,
     SkippedCheck,
     divergence_check,
+    ends_with_terminator,
     liveness_tier,
     unterminated_count,
 )
 from litetune.metrics import (
     SCORERS,
+    TERMINATORS,
     Difference,
     Proportion,
     QualityMetrics,
     Unavailable,
     agreement,
     paired_difference,
+    terminators_trimmed,
 )
 
 logger = logging.getLogger(__name__)
@@ -318,9 +322,15 @@ class _Run:
                 "name": self.request.scorer,
                 "means": SCORERS[self.request.scorer].describes,
             },
+            # Recorded here, before any check runs, for the reason the thresholds
+            # are: the vocabulary decides verdicts. Every liveness check after the
+            # first trims against it before judging, so a `failed_smoke` manifest
+            # has to carry the list that produced its own verdict. The same list
+            # governs exact-text scoring later; one field serves both.
             "harness": {
                 "decode_requested": self.request.decode.as_dict(),
                 "liveness_thresholds": self.request.thresholds.as_dict(),
+                "terminators": list(TERMINATORS),
             },
             "checks": [],
             "measurements": {},
@@ -376,6 +386,21 @@ def run_verify(
             "unresolved unless the interval says otherwise"
         )
 
+    # Observable from the targets alone, before any generation, so it asserts no
+    # cause and cannot fire where the condition is absent: it is a fact about
+    # the held-out data, not about either model.
+    if request.scorer == "exact-text":
+        marked = sum(1 for e in split.labelled if metrics._strip_terminators(str(e.target))[1])
+        if marked:
+            run.limitation(
+                f"{marked} of {len(split.labelled)} held-out targets end in a turn marker this "
+                "tool lists at `harness.terminators`, so `exact-text` requires the generation to "
+                "reproduce it. If those markers are your dataset's copy of the model's stop token "
+                "rather than part of the answer, a runtime that consumes its stop token before "
+                "returning text cannot reproduce them, and the difference between the two sides "
+                "is a decoding artefact rather than a conversion cost."
+            )
+
     # -- which calling convention is this measurement taken in? ------------
     # Resolved before the backends are built, so both sides are configured from
     # one decision and neither falls back to a default nobody made.
@@ -415,6 +440,26 @@ def run_verify(
         run.record(sink[0])
         return run.finish(Status.FAILED_HARNESS)
     run.manifest["measurements"]["candidate"] = candidate.as_dict()
+    # The terminator vocabulary is `metrics.TERMINATORS`, recorded at
+    # harness.terminators. A count here moves only for a marker the vocabulary
+    # lists but the runtime did not consume. On a litert-lm candidate it has
+    # been observed at zero -- but `strip_runtime_noise` (evaluate.py) removes
+    # only log banners and stats lines, nothing that looks like a stop token, so
+    # that is what was seen, not what the code guarantees. A candidate count
+    # above zero is the model emitting its terminator as text and continuing,
+    # the defect README describes as "trained to emit the wrong one never
+    # closes its turn".
+    candidate_trimmed = _trimmed_record(candidate)
+    run.manifest["measurements"]["candidate"]["terminators_trimmed"] = candidate_trimmed
+    if candidate_trimmed["generations_trimmed"]:
+        run.limitation(
+            f"{candidate_trimmed['generations_trimmed']} of "
+            f"{candidate_trimmed['over_generations_that_ran']} candidate generations end in a "
+            "marker from `harness.terminators` that the runtime did not consume, one of them "
+            f"carrying {candidate_trimmed['most_trimmed_from_one_generation']}. On a litert-lm "
+            "run the runtime consumes its own stop token before returning text, so this is the "
+            "model emitting a terminator as text and continuing"
+        )
     if candidate.prompt_mode is not decision.mode:
         # Only reachable when the caller supplied their own backends:
         # `build_backends` configures both sides from the decision. The
@@ -487,6 +532,13 @@ def run_verify(
         run.record(sink[0])
         return run.finish(Status.FAILED_HARNESS)
     run.manifest["measurements"]["reference"] = reference.as_dict()
+    # Same vocabulary, opposite baseline: `generate` on the transformers side
+    # halts at the first eos, so at least one terminator is trimmed per
+    # generation that ran -- but not exactly one: a family whose eos set does
+    # not include its own template close runs past it into `<end_of_turn>`
+    # then `<eos>`, two markers on a healthy run, so this count has
+    # no single fixed value to compare against.
+    run.manifest["measurements"]["reference"]["terminators_trimmed"] = _trimmed_record(reference)
 
     # The reference is one side of the comparison; if it did not generate, the
     # comparison is unavailable rather than the candidate being at fault.
@@ -508,6 +560,55 @@ def run_verify(
             )
         )
         return run.finish(Status.FAILED_HARNESS)
+
+    # The reference-terminator invariant. `HuggingFaceBackend` is configured
+    # with `skip_special_tokens=False` and `generate` halts at eos, so every
+    # generation it returns should end in a marker `TERMINATORS` lists. Zero
+    # A share, not an all-or-nothing test: one generation that happens to end
+    # in a marker the vocabulary does know cannot vouch for the rest. Checked
+    # per generation and compared against a threshold recorded beside the
+    # others, because a generation that ran to the token bound is indis-
+    # tinguishable in the text from one that closed with an unknown marker. Checked only on the
+    # `transformers` engine: a fake or a future backend that already decodes
+    # with special tokens stripped would trip this for a reason that has
+    # nothing to do with the vocabulary.
+    # Every generation here has run: the tier above refuses the comparison on the
+    # first failed one. The filter is kept so this count and `terminators_trimmed`
+    # describe the same population rather than agreeing by accident.
+    reference_ran = [g for g in reference.generations if g.ok]
+    if pair.reference.describe().get("engine") == "transformers" and reference_ran:
+        unterminated = unterminated_count(reference)
+        share = unterminated / len(reference_ran)
+        if share > request.thresholds.max_unterminated_share:
+            unrecognised = next(
+                (g.text for g in reference_ran if not ends_with_terminator(g.text)), ""
+            )
+            detail = (
+                "the reference decoder is asked to keep special tokens, so a generation that "
+                f"stopped on its own ends in one -- {unterminated} of {len(reference_ran)} did "
+                f"not ({share:.4f}, threshold {request.thresholds.max_unterminated_share:.2f}). "
+                "Either this model's turn terminator is absent from `harness.terminators`, or "
+                "that many generations ran to the token limit without closing their turn. "
+                "Either way a comparison against them comes down to a marker rather than an "
+                "answer."
+            )
+            run.record(
+                Check.unchecked(
+                    "reference terminator recognised",
+                    detail,
+                    observed={
+                        "generations_ran": len(reference_ran),
+                        "unterminated": unterminated,
+                        "unterminated_share": round(share, 6),
+                        "threshold": request.thresholds.max_unterminated_share,
+                        "terminators": list(TERMINATORS),
+                        "first_unrecognised_tail": unrecognised[-24:],
+                    },
+                )
+            )
+            run.manifest["quality"] = Unavailable(detail).as_dict()
+            run.manifest["attribution"] = _unattributable(detail)
+            return run.finish(Status.FAILED_HARNESS)
 
     # -- were both sides measured the same way? ---------------------------
     mismatch = harness_mismatch(candidate, reference)
@@ -606,7 +707,11 @@ def run_verify(
         "agreement_with_reference": agreed.as_dict(),
         "note": (
             "agreement is label-free and is not a quality claim on its own; it is reported "
-            "only because both sides passed the liveness tier first"
+            "only because both sides passed the liveness tier first. It is also not normalised "
+            "the same way as exact_match: agreement_with_reference (comparable_form) trims every "
+            "trailing marker off both sides before comparing, while exact_match "
+            "(score_exact_text) holds the generation only to the markers the target itself ends "
+            "with -- so the two can read differently even when scored over the same generations"
         ),
     }
     _emit_metrics(events, candidate_metrics, reference_metrics)
@@ -630,6 +735,27 @@ def run_verify(
             run.limitation(cost.detail)
 
     return run.finish(_gate(run, request, cost))
+
+
+def _trimmed_record(point: MeasurementPoint) -> dict[str, int]:
+    """What `metrics.TERMINATORS` had to remove from this point's generations.
+
+    How many carried a marker at all, and the most any one of them carried,
+    counted over the generations that ran (`g.ok`) -- the same population
+    `liveness.unterminated_count` filters for the same point, so the two
+    counts stay comparable. `n` is deliberately not the key for that
+    denominator: `MeasurementPoint.as_dict()` already writes
+    `generations.n` for every generation the point holds, including ones
+    that never ran, and a second, differently-scoped `n` two keys below it
+    would read as the same quantity.
+    """
+    ran = [g for g in point.generations if g.ok]
+    counts = [terminators_trimmed(g.text) for g in ran]
+    return {
+        "generations_trimmed": sum(1 for count in counts if count),
+        "most_trimmed_from_one_generation": max(counts, default=0),
+        "over_generations_that_ran": len(ran),
+    }
 
 
 def _skip_divergence(live: LivenessResult) -> None:
@@ -662,6 +788,23 @@ def _attribute(
     the mistake this returns `Unavailable` to avoid.
     """
     if request.reference_role is ReferenceRole.FLOAT_TWIN:
+        if reference.exact_match.value <= NEAR_ZERO:
+            # A conversion cost is how far the converted model fell below its own
+            # float twin, and nothing falls below a baseline already on the floor.
+            # The difference is then bounded by the candidate's own score instead:
+            # a candidate right on 60% of rows against a reference at zero reports
+            # a *resolved* cost of -0.6000, which a threshold reads as comfortably
+            # within any bar. This says nothing about why the reference is there --
+            # a turn terminator the vocabulary does not list, the wrong prompt
+            # mode, targets in a format it was never trained for all land here --
+            # only that until it is off the floor the difference is not a cost.
+            floored = (
+                f"the float twin scores {reference.exact_match.value:.4f}, at or near zero: a "
+                "conversion cost measures how far the converted model fell below it, and there "
+                "is no room below a baseline already at the floor. The difference against it is "
+                "bounded by the candidate's own score rather than by anything conversion did"
+            )
+            return Unavailable(floored), Unavailable(floored)
         # Paired, because both sides answered the same prompts: see
         # metrics.paired_difference for why the unpaired interval is too blunt
         # to resolve a conversion cost of the size this tool reports.
@@ -683,9 +826,9 @@ def _attribute(
 def _emit_metrics(
     events: EventStream, candidate: QualityMetrics, reference: QualityMetrics
 ) -> None:
-    for label, metrics in (("candidate", candidate), ("reference", reference)):
+    for label, point_metrics in (("candidate", candidate), ("reference", reference)):
         for name in ("exact_match", "name_accuracy", "argument_accuracy", "parse_rate"):
-            value = getattr(metrics, name)
+            value = getattr(point_metrics, name)
             if isinstance(value, Proportion):
                 events.metric(f"{label}.{name}", value.value, ci95=value.ci95, n=value.n)
             else:

@@ -7,16 +7,20 @@ deterministic". So there is a test asserting that no comparison is computed
 before the generations are known to have succeeded.
 """
 
+import pytest
+
 from litetune.checks import Outcome
 from litetune.evaluate import GREEDY, Generation, MeasurementPoint, PromptMode
 from litetune.liveness import (
     LivenessThresholds,
     divergence_check,
+    ends_with_terminator,
     leaked_tokens,
     liveness_tier,
     repetition_ratio,
-    trim_terminator,
+    unterminated_count,
 )
+from litetune.metrics import TERMINATORS, trim_terminator
 
 
 def make_point(texts, returncode: int = 0, harness_error: str | None = None) -> MeasurementPoint:
@@ -154,3 +158,33 @@ def test_a_skipped_divergence_check_is_recorded_not_assumed():
 
 def test_no_generations_means_nothing_was_established():
     assert liveness_tier(make_point([])).outcome is Outcome.UNCHECKED
+
+
+@pytest.mark.parametrize("marker", TERMINATORS)
+def test_every_marker_in_the_shared_vocabulary_counts_as_termination(marker):
+    """This branch widened `ends_with_terminator` from a hand-rolled five-marker
+    tuple to `metrics.TERMINATORS`'s nine, so that liveness and scoring share
+    one vocabulary. Mutating `endswith(TERMINATORS)` to `endswith(TERMINATORS[:1])`
+    still passes if nothing here exercises a generation ending in any of the
+    other eight -- `<|eot_id|>`, `<|end|>`, `<|im_end|>` and
+    `<start_function_response>` among them, the last being FunctionGemma's own
+    declared stop token, the family this tool is measured on.
+    """
+    assert ends_with_terminator(f"answer{marker}")
+
+
+def test_unterminated_count_recognises_the_markers_the_vocabulary_gained():
+    """A point whose generations end in the newer markers -- not just `<eos>`,
+    which every other fixture in this file uses -- must still count as fully
+    terminated. `<start_function_response>` is FunctionGemma's declared stop
+    token per `models.RULES`.
+    """
+    point = make_point(
+        [
+            "call:a{}<|eot_id|>",
+            "call:b{}<|end|>",
+            "call:c{}<|im_end|>",
+            "call:d{}<start_function_response>",
+        ]
+    )
+    assert unterminated_count(point) == 0

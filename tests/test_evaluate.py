@@ -28,6 +28,7 @@ from litetune.evaluate import (
     load_split,
     strip_runtime_noise,
 )
+from litetune.metrics import score_exact_text, trim_terminator
 
 # -- the split --------------------------------------------------------------
 
@@ -212,6 +213,20 @@ def test_a_generation_script_that_dies_reports_unperformed(monkeypatch):
     assert not gens[0].ran
 
 
+def test_a_reference_generation_reaches_scoring_with_its_terminator_intact(tmp_path):
+    """The HF script keeps the terminator on purpose; nothing between the
+    results file and the scorer may strip it, or liveness goes blind to
+    leakage. A transport mutation stripping `<eos>` in `_read_results`
+    survived the whole suite before this test existed.
+    """
+    results = tmp_path / "r.jsonl"
+    results.write_text('{"index": 0, "text": "label_3<end_of_turn>\\n<eos>"}\n', encoding="utf-8")
+    texts = HuggingFaceBackend(model="org/m", auto_provision=False)._read_results(results)
+    assert texts[0] == "label_3<end_of_turn>\n<eos>"
+    assert trim_terminator(texts[0]) == "label_3"
+    assert score_exact_text(["label_3"], [texts[0]]).exact_match.value == 1.0
+
+
 def test_turning_on_the_chat_template_changes_the_measured_mode():
     plain = HuggingFaceBackend(model="m", auto_provision=False)
     templated = HuggingFaceBackend(model="m", auto_provision=False, runtime_rendered=True)
@@ -341,3 +356,20 @@ def test_a_failed_batch_is_counted_where_something_reads_it():
 
     assert point.batch_failures == 2
     assert point.as_dict()["generations"]["from_a_failed_batch"] == 2
+
+
+def test_the_reference_decoder_keeps_the_terminator_scoring_trims():
+    """The premise the whole normalisation rests on, pinned in the module that
+    makes it. `skip_special_tokens=False` is deliberate -- the liveness tier
+    needs to see leakage -- and it is why every reference generation carries a
+    marker scoring has to remove. Flip it and the leakage check goes blind
+    while the trimming becomes dead code, with nothing else noticing: the whole
+    suite stayed green through exactly that mutation.
+    """
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+
+    # The call, not the word. An earlier version of this test searched for the
+    # bare string and passed against a flipped call, because the comment above
+    # it explaining the choice contains the same text.
+    assert "skip_special_tokens=False)" in _HF_GENERATE_SCRIPT
+    assert "skip_special_tokens=True" not in _HF_GENERATE_SCRIPT
