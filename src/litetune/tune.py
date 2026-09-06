@@ -909,17 +909,24 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     result = TuneResult(request=request, checks=CheckSet(name=f"train:{request.model}"))
     result.limitation(NOT_VERIFIED)
     if request.dtype == DEFAULT_DTYPE:
-        # Named because it is a real cost of matching the serving dtype: the
+        # Named because it is a real cost of the bfloat16 default: the
         # parameters are bfloat16, so AdamW's moments are bfloat16 too. A
         # mixed-precision setup would keep an fp32 master copy and update more
-        # precisely. The dtype is chosen to match export and evaluation, because
-        # a mismatch there produces fluent garbage that no label-free check
-        # catches, and that failure is worse than a coarser optimiser step.
+        # precisely. bfloat16 is the training default, but it is not matched
+        # downstream: export.py sets no dtype at all, and evaluate.py's float
+        # reference loads with `torch_dtype=torch.float32` regardless of what
+        # trained the checkpoint under test. So a run at the default dtype
+        # still carries a dtype difference against the reference it is scored
+        # on -- whatever originally decided the default, matching export and
+        # evaluation was not it.
         result.limitation(
             "training runs with bfloat16 parameters, so the optimiser's moments are bfloat16 as "
-            "well; updates are coarser than a mixed-precision run with an fp32 master copy. The "
-            "dtype matches what export and evaluation load, which is the constraint that "
-            "decided it"
+            "well; updates are coarser than a mixed-precision run with an fp32 master copy. "
+            "bfloat16 is the training default, but the export and evaluation paths do not load "
+            "in it -- evaluation's float reference loads at float32 regardless of the training "
+            "dtype -- so a run at the default dtype still carries a dtype difference against the "
+            "reference it is scored on. What originally decided the bfloat16 default is not "
+            "established here"
         )
     if (request.dtype, request.attn_implementation) != (
         DEFAULT_DTYPE,

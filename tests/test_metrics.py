@@ -482,6 +482,32 @@ def test_the_order_of_the_markers_a_target_ends_with_is_part_of_the_answer():
     assert not _reproduces_target("x<eos><eos>", "x<eos>")
 
 
+@pytest.mark.parametrize("trailing_markers", ["", "<eos>", "<end_of_turn>\n<eos>"])
+def test_a_bare_target_scores_the_same_as_the_rule_it_replaced(trailing_markers):
+    """MEASUREMENTS.md's equivalence claim: the shipped rule leaves banking77's
+    figures unchanged "because these targets are bare labels carrying no
+    marker, the case in which the two rules are the same function".
+
+    For a target with no marker of its own, `_reproduces_target`'s marker
+    condition (`all(... for wanted in target_markers)`) is vacuously true no
+    matter what the generation carries, so the whole function reduces to
+    `same_answer` -- exactly what `comparable_form` (the trim-both-sides rule
+    `agreement`/`divergence` actually ship with) gives, since trimming a
+    target that has no marker changes nothing. This compares two independent,
+    already-shipped functions rather than one against a copy of itself, at 0,
+    1 and 2 trailing markers on the generation -- the counts the two rules
+    could in principle disagree over.
+    """
+    from litetune.metrics import comparable_form
+
+    target = "label_3"
+    output = target + trailing_markers
+
+    old_rule_agrees = comparable_form(target) == comparable_form(output)
+    assert _reproduces_target(target, output) is True
+    assert _reproduces_target(target, output) == old_rule_agrees
+
+
 def test_the_vocabulary_cannot_contain_an_empty_or_nested_marker():
     """Two invariants `_strip_terminators` depends on and nothing enforces.
 

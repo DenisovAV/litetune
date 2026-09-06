@@ -609,6 +609,22 @@ def run_verify(
             run.manifest["quality"] = Unavailable(detail).as_dict()
             run.manifest["attribution"] = _unattributable(detail)
             return run.finish(Status.FAILED_HARNESS)
+        if unterminated:
+            # Under the threshold the run is measured, but not silently. Every
+            # generation the vocabulary did not recognise is scored on its
+            # marker rather than on its answer, and only ever downward -- so
+            # the residue flatters the conversion, reporting the candidate as
+            # having improved on its own float twin. Reported at any count
+            # rather than above a second threshold: one number that decides a
+            # verdict is enough, and this one decides nothing.
+            run.limitation(
+                f"{unterminated} of {len(reference_ran)} reference generations "
+                f"({share:.4f}) end without a marker `harness.terminators` lists, below the "
+                f"{request.thresholds.max_unterminated_share:.2f} share that refuses the "
+                "comparison. Those rows are scored on their ending rather than on their "
+                "answer, which can only lower the reference -- so any conversion cost here "
+                "is flattered by up to that share"
+            )
 
     # -- were both sides measured the same way? ---------------------------
     mismatch = harness_mismatch(candidate, reference)
@@ -753,6 +769,12 @@ def _trimmed_record(point: MeasurementPoint) -> dict[str, int]:
     counts = [terminators_trimmed(g.text) for g in ran]
     return {
         "generations_trimmed": sum(1 for count in counts if count),
+        # The complement, because it is the half that carries risk and the other
+        # half hides it: a run whose vocabulary misses a marker reports a *large*
+        # `generations_trimmed` for the rows it did recognise, and says nothing
+        # about the rest. A reader checking whether the vocabulary covered this
+        # model needs the number that is not there, not the one that is.
+        "generations_not_trimmed": sum(1 for count in counts if not count),
         "most_trimmed_from_one_generation": max(counts, default=0),
         "over_generations_that_ran": len(ran),
     }
