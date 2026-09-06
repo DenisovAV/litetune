@@ -38,11 +38,12 @@ Everything runs on CPU, which is workable at 270M and the first thing you will
 want to change above about 1B. Bring your own checkpoint and skip the first two
 steps, or bring a `.litertlm` and its float checkpoint and run only `verify`.
 
-> **Alpha.** Measured end to end on `google/functiongemma-270m-it` and function
-> calling, and on `google/gemma-3-270m-it` and `exact-text` classification —
-> see [MEASUREMENTS.md](MEASUREMENTS.md) for the banking77 numbers. Gemma 4
-> and Qwen3.5 export — litetune carries their required flags — but no quality
-> number has been established for them. Try it on yours and open an issue.
+> **Alpha.** Measured end to end on two models: `google/functiongemma-270m-it`
+> with the tool-call scorer, and `google/gemma-3-270m-it` with `exact-text` on a
+> 77-way intent task — both on CPU, both in [MEASUREMENTS.md](MEASUREMENTS.md).
+> Gemma 4 and Qwen3.5 export — litetune carries their required flags — but no
+> quality number has been established for them. Try it on yours and open an
+> issue.
 
 ---
 
@@ -296,6 +297,22 @@ The two artifacts are 0.04% apart in bytes. Nothing in file size, exit code or
 logs separates them — running both against held-out data is the only thing that
 does.
 
+`gemma-3-270m-it`, LoRA on `mteb/banking77` (77-way intent, `--scorer
+exact-text`), scored on 600 examples the model never trained on:
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Base model | *refused* | — | — |
+| Fine-tuned | 0.6933 | 0.6767 | 0.6917 |
+| Cost of conversion | — | +0.0167 *(within noise)* | +0.0017 *(within noise)* |
+
+A different family, a different scorer, the same last row. The base row says
+*refused* because it was: asked for one intent label, the untuned model repeats
+itself on 571 of 600 prompts, and `verify` stops at the liveness tier rather
+than scoring a model that never answered. This run is also what found the
+`exact-text` terminator bug fixed in 0.1.5 — see
+[MEASUREMENTS.md](MEASUREMENTS.md).
+
 **[MEASUREMENTS.md](MEASUREMENTS.md)** has the intervals, three runs of the same
 configuration and what they disagree about, and which published claims were
 withdrawn after re-measurement.
@@ -317,10 +334,26 @@ withdrawn after re-measurement.
 
 **Limits on the numbers**
 
-- **Measured on two models.** `functiongemma-270m-it` on tool-call function
-  calling, and `gemma-3-270m-it` on `exact-text` classification (banking77) —
-  the gemma-3 run the static-vocabulary bullet below refers to. Other families
+- **Measured on two models.** `functiongemma-270m-it` end to end with the
+  tool-call scorer, and `gemma-3-270m-it` with `exact-text`. Gemma 4 and Qwen 3.5
   export but have no quality figure.
+- **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
+  the liveness checks both trim against a fixed set of strings, recorded
+  verbatim at `harness.terminators` in every verify manifest. A family whose
+  chat template closes a turn with a marker outside that list has its reference
+  scored at zero, which is a fact about the vocabulary rather than the model —
+  so `verify` refuses the comparison rather than reporting the difference as a
+  conversion cost. That is the safe direction, not a fix: the run still cannot
+  be measured until the vocabulary knows the marker. Resolving it from the
+  bundle contract instead of hardcoding is a follow-up. To find your own
+  model's marker before then, `tune` records it at `turn_terminator.text` in
+  `metrics.json` and `bundle` carries it into `contract.json`'s `stop_tokens`.
+
+- **bfloat16 on a CPU may train on one core.** The default dtype matches export
+  and evaluation. On the one CPU measured (Apple M-series, torch 2.5.1) it ran a
+  300-step LoRA on a single core for 52 minutes without finishing; the same run
+  with `--dtype float32` took 307 s on ten threads. `tune` says so when it sees
+  a CPU run at bfloat16, and records the dtype mismatch if you switch.
 - **Measurement runs on CPU; your users run on a phone.** On one Snapdragon
   Galaxy S24 (`SC-51E`), the `dynamic_wi8_afp32` bundle on the device's CPU
   scored 0.8703 ±0.026 on the 640 held-out rows against 0.8906 for the cloud
@@ -341,16 +374,6 @@ withdrawn after re-measurement.
   disagree for every declaration with more than one property. Costly on a base
   checkpoint, near-free after fine-tuning; `contract.json` records which you
   used. See [MEASUREMENTS.md](MEASUREMENTS.md).
-- **The turn-terminator vocabulary is a static list.** `exact-text` scoring
-  and the liveness checks both trim against a fixed set of strings, recorded
-  verbatim at `harness.terminators` in every verify manifest. A model family
-  whose chat template closes a turn with a marker not in that list scores its
-  own float reference at zero under `exact-text` — the same defect the
-  gemma-3 run exposed — until the vocabulary is resolved from the bundle
-  contract instead of hardcoded, which is planned as a follow-up. To find your
-  own model's marker before then: `tune` records it at `turn_terminator.text`
-  in `metrics.json`, and `bundle` carries it into `contract.json`'s
-  `stop_tokens`.
 
 **Not built yet**
 
