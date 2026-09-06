@@ -993,6 +993,39 @@ def test_the_help_advertises_only_codes_the_command_can_return():
         assert "3 nothing" not in help_for(stage)
 
 
+def test_the_scorer_help_and_the_manifest_agree():
+    """`--scorer`'s help text and `SCORERS[name].describes` are the same claim,
+    written by hand in two places with nothing holding them together -- they
+    drifted out of step once already. Assert the predicate itself is shared,
+    not merely that both mention the scorer's name.
+
+    Whitespace is normalised before comparing: argparse rewraps the help
+    string to the terminal width, which turns the single spaces in `describes`
+    into newlines at different points than the source has them.
+    """
+    import contextlib
+    import io
+    import re
+
+    from litetune.metrics import SCORERS
+
+    def squeeze(text: str) -> str:
+        return re.sub(r"\s+", " ", text)
+
+    buffer = io.StringIO()
+    with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buffer):
+        build_parser().parse_args(["verify", "--help"])
+    help_text = squeeze(buffer.getvalue())
+
+    tool_call_clause = squeeze(SCORERS["tool-call"].describes.removeprefix("correct means "))
+    assert tool_call_clause in help_text
+
+    exact_text_clause = squeeze(
+        SCORERS["exact-text"].describes.removeprefix("correct means the generation ")
+    )
+    assert exact_text_clause in help_text
+
+
 def test_main_is_reusable_in_one_process(tmp_path):
     """A sticky module flag made the second call redirect the caller's stdout.
 

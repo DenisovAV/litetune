@@ -427,22 +427,62 @@ def score(targets: Sequence[ToolCall], outputs: Sequence[str]) -> QualityMetrics
     )
 
 
+def _reproduces_target(target: str, output: str) -> bool:
+    """One row of `score_exact_text`: did this generation reproduce this target?
+
+    The two conditions that function describes, named: the answers agree once
+    whitespace is collapsed, and every marker the target ends with also
+    appears among the generation's markers, counting multiplicity -- order
+    does not matter, only how many of each. A target with no markers of its
+    own satisfies the second vacuously -- which is how a plain label forgives
+    a decoder's `<eos>`. A target ending `<eos>` is satisfied by a generation
+    ending `<end_of_turn>\n<eos>`: the chat template's close sits in front of
+    the target's own marker, not in place of it. That shape is constructed --
+    both supported families stop at their close and emit one marker -- but a
+    family whose eos set excludes its close produces it, and the rule has to
+    hold there too.
+    """
+    target_core, target_markers = _strip_terminators(target)
+    output_core, output_markers = _strip_terminators(output)
+    same_answer = " ".join(target_core.split()) == " ".join(output_core.split())
+    # A subsequence, not a bag: order carries meaning here. `<eos></s>` and
+    # `</s><eos>` are different endings, and a set or a `Counter` would call
+    # them the same. A subsequence still forgives what the decoder inserts
+    # around the target's own markers, which is the whole point -- a target
+    # ending `<eos>` is satisfied by `<end_of_turn>\n<eos>`, where the chat
+    # template's close sits in front of the target's marker rather than in
+    # place of it.
+    remaining = iter(output_markers)
+    emitted_target_markers = all(
+        any(emitted == wanted for emitted in remaining) for wanted in target_markers
+    )
+    return same_answer and emitted_target_markers
+
+
 def score_exact_text(targets: Sequence[Any], outputs: Sequence[str]) -> QualityMetrics:
-    """Correct means the generation equals the target text, once normalised.
+    """Correct means the generation reproduces the target text, once normalised.
 
     For every task where there is one right answer and no structure inside it:
     a label, an extracted field, a rewritten sentence. Whitespace is collapsed
-    and the ends stripped, because a trailing newline is not a wrong answer;
-    nothing else is forgiven, since deciding that "almost" counts is a judgement
-    about your task that this package has no way to make.
+    and the ends stripped on both sides -- the first thing this scorer
+    forgives. Trailing turn terminators come off the generation too: the
+    target was never decoded, so every marker it ends with must still appear
+    among the generation's own, the same number of times, wherever it sits --
+    but any terminator beyond that count is the decoder's convention, not part
+    of the answer, and is ignored. That is the second thing this scorer
+    forgives; deciding that "almost" counts any other way is a judgement about
+    your task that this package has no way to make.
+
+    Scored raw -- neither side trimmed at all -- a reference that scores 0.6933
+    measured 0.0000 because every generation ended in `<eos>`.
 
     `name_accuracy` and `argument_accuracy` are unavailable rather than zero.
     There is nothing here to decompose, and a zero would read as a measurement.
     """
     n = _require_alignment(targets, outputs)
-    want = [" ".join(str(t).split()) for t in targets]
-    got = [" ".join(text.split()) for text in outputs]
-    correct = [w == g for w, g in zip(want, got, strict=True)]
+    correct = [
+        _reproduces_target(str(target), text) for target, text in zip(targets, outputs, strict=True)
+    ]
     no_split = Unavailable(
         "exact-text scoring has no operation/argument split: the answer is one "
         "string, and it either matches or does not"
@@ -482,7 +522,9 @@ SCORERS: dict[str, NamedScorer] = {
     "exact-text": NamedScorer(
         name="exact-text",
         describes=(
-            "correct means the generation equals the target text after collapsing whitespace"
+            "correct means the generation matches the target text once whitespace is collapsed; "
+            "the generation must still contain every terminator the target ends with, counting "
+            "repeats, and any terminator beyond that is ignored"
         ),
         fn=score_exact_text,
     ),
@@ -496,11 +538,112 @@ guessing in public.
 """
 
 
+# Every marker a supported family closes a turn with, plus markers for families
+# this tool has no rules for at all: `models.identify` returns None for those,
+# which is a note and exit 0, so they reach `verify` regardless.
+# `<start_function_response>` is here because `models.RULES` declares it
+# FunctionGemma's stop token -- and `test_metrics.py` asserts that
+# correspondence, so a family added there cannot silently omit its marker here.
+#
+# This lives in `metrics` rather than in `liveness` because it decides what two
+# generations must look like to count as the same answer, and that is what this
+# module is for. While it lived in `liveness`, the scoring path could not see
+# it, and a reference that scores 0.6933 measured 0.0000 because every
+# generation ended in `<eos>`.
+TERMINATORS = (
+    "<eos>",
+    "<end_of_turn>",
+    "</s>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|eot_id|>",
+    "<|end_of_text|>",
+    "<|end|>",
+    "<start_function_response>",
+)
+
+
+def _strip_terminators(text: str) -> tuple[str, tuple[str, ...]]:
+    """The text with its trailing markers gone, and which markers came off.
+
+    `core` is `text` with every trailing marker from `TERMINATORS` removed,
+    repeatedly, with whitespace stripped between removals. Measured, both
+    supported families stop *at* their template's close -- gemma-3-270m-it and
+    functiongemma-270m-it both carry `<end_of_turn>` in `eos_token_id`, so a
+    real generation ends there and carries one marker, not a stack. The
+    whitespace between removals is for the family whose eos set does not
+    include its own close: generation runs past it into `<end_of_turn>\\n<eos>`,
+    and without the strip the newline hides the second marker. `markers` is
+    the sequence of
+    removed markers in text order, innermost first: `"a</s><eos>"` strips
+    `<eos>` off the end before `</s>`, but `</s>` sat closer to the answer, so
+    it is reported first -- `("a", ("</s>", "<eos>"))`.
+
+    One loop rather than two copies of it, because `trim_terminator` and
+    `terminators_trimmed` have to agree about where the answer ends, and two
+    hand-written copies of this loop agree only until someone edits one of
+    them.
+    """
+    out = text.strip()
+    removed: list[str] = []
+    changed = True
+    while changed:
+        changed = False
+        for token in TERMINATORS:
+            if out.endswith(token):
+                out = out[: -len(token)].strip()
+                removed.append(token)
+                changed = True
+    return out, tuple(reversed(removed))
+
+
+def trim_terminator(text: str) -> str:
+    """Drop trailing end-of-sequence markers, however many were emitted.
+
+    Trailing only: a marker in the middle of a generation is content, and a
+    model that put one there did something worth scoring as wrong.
+    """
+    return _strip_terminators(text)[0]
+
+
+def terminators_trimmed(text: str) -> int:
+    """How many markers came off the end of one generation.
+
+    Reported, never gated. On the transformers reference the count reflects
+    how the chat template and the tokenizer relate: one marker when the
+    template's close is itself a stop token, two when it is not and generation
+    runs past it into the eos -- `<end_of_turn>` then `<eos>`, a shape neither
+    supported family produces: measured, gemma-3-270m-it and
+    functiongemma-270m-it both carry their close in `eos_token_id`. The case this
+    tool measured, and a healthy gemma-3 run, the run this branch exists for,
+    reports 2. The count is not a threshold and no single number means
+    "defect". On a litert-lm candidate it is zero whenever the runtime strips
+    its own stop token before this tool ever sees the text.
+    """
+    return len(_strip_terminators(text)[1])
+
+
 def comparable_form(text: str) -> tuple:
-    """Normalise one output for equality against another model's output."""
+    """Normalise one output for equality against another model's output.
+
+    Used for decoder-vs-decoder comparisons -- `agreement`, `divergence` --
+    where both sides were decoded and every terminator comes off before the
+    comparison. `score_exact_text` is a different, honest operation:
+    decoder-vs-target, where the target was never decoded, so it trims the
+    generation only down to what the target itself ends with. The two share
+    one vocabulary, `TERMINATORS`, not one rule for how much of it to remove.
+
+    The terminator comes off here, once, so every decoder-vs-decoder
+    comparison in the package inherits one definition of "the same output"
+    instead of each call site remembering separately. The float reference
+    decodes with `skip_special_tokens=False` so the liveness tier can see
+    leakage, which means its generations carry a marker the runtime's do not;
+    comparing the two raw makes every pair differ for a reason about decoders,
+    not models.
+    """
     call = parse_call(text)
     if call is None:
-        return ("raw", text.strip())
+        return ("raw", " ".join(trim_terminator(text).split()))
     return ("call", call.name, tuple(sorted(call.args.items())))
 
 

@@ -260,10 +260,11 @@ def _add_verify(sub) -> None:
         default="tool-call",
         help=(
             "what counts as correct. tool-call (default): the parsed call's operation name "
-            "and every argument value match the target. exact-text: the generation equals "
-            "the target text once whitespace is collapsed — for any task with one right "
-            "answer and no structure inside it. Everything after scoring is task-agnostic, "
-            "so this is the only flag a different task has to change"
+            "and every argument value match the target. exact-text: matches the target text "
+            "once whitespace is collapsed; the generation must still contain every terminator "
+            "the target ends with, counting repeats, and any terminator beyond that is ignored "
+            "— for any task with one right answer and no structure inside it. Everything after "
+            "scoring is task-agnostic, so this is the only flag a different task has to change"
         ),
     )
     verify.add_argument(

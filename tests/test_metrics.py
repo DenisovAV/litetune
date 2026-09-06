@@ -10,10 +10,12 @@ import math
 import pytest
 
 from litetune.metrics import (
+    TERMINATORS,
     Proportion,
     QualityMetrics,
     ToolCall,
     Unavailable,
+    _reproduces_target,
     agreement,
     difference,
     paired_difference,
@@ -293,3 +295,207 @@ def test_the_statistics_below_a_scorer_do_not_know_the_task():
     # was -- which is the property that makes swapping the scorer safe.
     assert "does not resolve" in difference.detail
     assert SCORERS["tool-call"].name == "tool-call"
+
+
+# -- the terminator vocabulary ----------------------------------------------
+
+
+def test_every_stop_token_a_family_declares_is_a_terminator_here():
+    """`models.RULES` establishes a family's stop token from evidence;
+    `TERMINATORS` is where scoring learns to ignore it. Nothing linked them, so
+    a family added there with a marker missing here silently reproduced the
+    0.0000 defect -- which is what FunctionGemma's `<start_function_response>`
+    did until this was written down.
+    """
+    from litetune import models
+
+    declared = {token for rules in models.RULES for token in rules.extra_stop_tokens}
+    assert declared, "no family declares a stop token; this test has stopped testing anything"
+    assert declared <= set(TERMINATORS), sorted(declared - set(TERMINATORS))
+
+
+def test_the_vocabulary_lists_every_marker_a_supported_family_uses():
+    """Spelled out rather than parametrised over `TERMINATORS`, because a test
+    that iterates the thing under test cannot notice a deletion: removing an
+    entry removes its own case and the suite stays green. Each string here is a
+    family that would silently go back to scoring 0.0000 without it.
+    """
+    for marker, family in [
+        ("<eos>", "Gemma, and the tokenizer default for most others"),
+        ("<end_of_turn>", "Gemma chat templates"),
+        ("</s>", "Mistral and Llama-2"),
+        ("<|im_end|>", "ChatML: Qwen and everything that copied it"),
+        ("<|endoftext|>", "GPT-2 lineage"),
+        ("<|eot_id|>", "Llama-3"),
+        ("<|end_of_text|>", "Llama-3 raw completions"),
+        ("<|end|>", "Phi-3 and Phi-4"),
+        ("<start_function_response>", "FunctionGemma, per models.RULES"),
+    ]:
+        assert marker in TERMINATORS, f"{marker} ({family}) is no longer trimmed"
+    # `test_a_reference_whose_terminator_is_unknown_is_not_a_conversion_cost`
+    # (test_verify.py) depends on this marker staying unrecognised.
+    assert "<|assistant_end|>" not in TERMINATORS
+
+
+@pytest.mark.parametrize("terminator", TERMINATORS)
+def test_each_terminator_comes_off_the_end_and_only_the_end(terminator):
+    """Every entry in the vocabulary comes off the end, comes off however many
+    times it repeats, and is left alone anywhere else -- a marker in the
+    middle of a generation is content, not termination.
+    """
+    from litetune.metrics import trim_terminator
+
+    assert trim_terminator(f"answer{terminator}") == "answer"
+    assert trim_terminator(f"answer{terminator}{terminator}") == "answer"
+    assert (
+        trim_terminator(f"say {terminator} then stop{terminator}") == f"say {terminator} then stop"
+    )
+
+
+def test_strip_terminators_reports_markers_in_text_order():
+    """`markers` lists innermost first -- the order the markers appear in the
+    text, not the order stripping removes them (which is outermost first).
+    """
+    from litetune.metrics import _strip_terminators
+
+    assert _strip_terminators("a</s><eos>") == ("a", ("</s>", "<eos>"))
+    assert _strip_terminators("label_3<end_of_turn>\n<eos>") == (
+        "label_3",
+        ("<end_of_turn>", "<eos>"),
+    )
+    assert _strip_terminators("a") == ("a", ())
+    assert _strip_terminators("<eos>") == ("", ("<eos>",))
+
+
+def test_stacked_terminators_separated_by_whitespace_all_come_off():
+    """A chat-template close and the tokenizer's own EOS, separated by a newline.
+
+    Constructed, not observed: measured against the real checkpoints, both
+    supported families carry their template close in `eos_token_id`, so
+    generation stops there and returns one marker. The stack belongs to a
+    family whose eos set excludes its own close, where generation runs past it
+    -- and this tool is used on models it has no rules for. A mutation
+    dropping the inner `.strip()` between removals survived the whole suite;
+    this pins the newline coming off too.
+    """
+    from litetune.metrics import terminators_trimmed, trim_terminator
+
+    text = "label_3<end_of_turn>\n<eos>"
+    assert trim_terminator(text) == "label_3"
+    assert terminators_trimmed(text) == 2
+
+
+def test_a_terminator_followed_by_trailing_whitespace_still_comes_off():
+    """The outer twin of `test_stacked_terminators_separated_by_whitespace_all_come_off`:
+    that test pins the `.strip()` *between* removals; this one pins the first
+    `.strip()`, before any marker has come off at all. Mutating
+    `out = text.strip()` to `out = text` passes the whole suite unnoticed,
+    because every existing fixture puts its marker at the very end of the
+    string with nothing trailing it. `trim_terminator("<eos>\\n")` would then
+    return `"<eos>\\n"` instead of `""`, so a model that emits nothing but its
+    terminator plus a trailing newline stops being caught by
+    `liveness.non_empty_check` (`max_empty_share = 0.0`), and any generation
+    ending `<eos>\\n` scores 0 on every row under `exact-text` -- the exact
+    0.0000 defect this branch exists to fix, one newline away.
+    """
+    from litetune.metrics import terminators_trimmed, trim_terminator
+
+    assert trim_terminator("label_3<end_of_turn>\n<eos>\n") == "label_3"
+    assert terminators_trimmed("answer<eos>  \n") == 1
+    assert _reproduces_target("positive", "positive<eos>\n")
+
+
+def test_exact_text_holds_a_target_to_its_own_markers_and_forgives_the_decoders():
+    """One assertion per branch of the contract: a target's own trailing
+    markers are part of the answer and must be reproduced; anything a
+    generation carries beyond them is a decoder's convention and is ignored.
+    """
+    from litetune.metrics import score_exact_text
+
+    def hit(target: str, output: str) -> bool:
+        return score_exact_text([target], [output]).correct[0]
+
+    assert hit("positive", "positive<eos>")  # plain target: decoder EOS is forgiven
+    assert hit("<b>x</s>", "<b>x</s><eos>")  # target's marker kept, decoder EOS beyond it forgiven
+    assert hit("<b>x</s>", "<b>x</s>")  # target's own marker reproduced exactly
+    assert not hit("<b>x</s>", "<b>x")  # target's own marker dropped: wrong
+    assert not hit("<b>x</s>", "<b>x<eos>")  # decoder EOS is not the target's own marker
+    assert not hit("</s>", "")  # empty output cannot reproduce a marker-only target
+    assert not hit("</s>", "<eos>")  # a different marker is not the target's marker
+    assert hit("a b", "a  b<eos>")  # whitespace collapsed, decoder EOS forgiven
+    # The template's close (<end_of_turn>) sits in front of the target's own
+    # marker rather than in place of it, so the target's <eos> is still among
+    # the generation's markers. Constructed: measured, both supported families
+    # stop at their close and never reach the eos.
+    assert hit("x<eos>", "x<end_of_turn>\n<eos>")
+    assert not hit("x<eos><eos>", "x<eos>")  # multiplicity: target needs two, generation has one
+    assert hit("x<eos>", "x<eos><eos>")  # target needs one; a second beyond it is forgiven
+
+
+def test_agreement_and_exact_text_share_one_whitespace_rule():
+    """Label-free `agreement` and labelled `score_exact_text` must collapse
+    whitespace the same way, or the two could disagree about what counts as
+    the same answer on the very same pair of outputs.
+    """
+    from litetune.metrics import score_exact_text
+
+    assert agreement(["a b"], ["a  b"]).value == 1.0
+    assert score_exact_text(["a b"], ["a  b"]).exact_match.value == 1.0
+
+
+def test_whitespace_is_collapsed_on_the_targets_side_too():
+    """The test above only ever puts the extra whitespace on the output side,
+    and every fixture target elsewhere in this file is single-spaced, so
+    weakening `same_answer` from `" ".join(target_core.split()) == ...` to
+    `target_core == ...` passes the whole suite. A held-out target with an
+    internal double space would then score 0 forever, contradicting the
+    scorer's own docstring, which claims whitespace is "collapsed... on both
+    sides".
+    """
+    from litetune.metrics import score_exact_text
+
+    assert score_exact_text(["a  b"], ["a b<eos>"]).exact_match.value == 1.0
+
+
+def test_terminators_trimmed_counts_what_trimming_hides():
+    from litetune.metrics import terminators_trimmed
+
+    assert terminators_trimmed("answer") == 0
+    assert terminators_trimmed("answer<eos>") == 1
+    assert terminators_trimmed("answer" + "<eos>" * 7) == 7
+
+
+def test_the_order_of_the_markers_a_target_ends_with_is_part_of_the_answer():
+    """`<eos></s>` and `</s><eos>` are different endings.
+
+    The generation's markers have to contain the target's *as a subsequence*,
+    not as a bag. A `Counter` or a set would call these two equal, which would
+    let a model that closed its turn in the wrong order score correct -- while
+    a subsequence still forgives what the decoder inserts around the target's
+    own markers, which is the reason any of this is forgiven at all.
+    """
+    assert _reproduces_target("x<eos></s>", "x<eos></s>")
+    assert not _reproduces_target("x<eos></s>", "x</s><eos>")
+    # The forgiveness the subsequence keeps: the chat template's close sits in
+    # front of the target's own marker rather than in place of it.
+    assert _reproduces_target("x<eos>", "x<end_of_turn>\n<eos>")
+    assert not _reproduces_target("x<eos><eos>", "x<eos>")
+
+
+def test_the_vocabulary_cannot_contain_an_empty_or_nested_marker():
+    """Two invariants `_strip_terminators` depends on and nothing enforces.
+
+    An empty entry would make the stripper loop forever: `out[:-0]` is `""`,
+    so `out.endswith("")` is always true and the removal never terminates. A
+    marker that is a suffix of another (say `"eos>"` alongside `"<eos>"`) would
+    make the reported core -- and therefore `_reproduces_target` -- depend on
+    which one `TERMINATORS` happens to try first, since the shorter one would
+    strip first and leave the rest of the longer one behind as content.
+    Neither is triggered here; both are just true of every entry, always.
+    """
+    assert all(marker for marker in TERMINATORS), "an empty entry would hang _strip_terminators"
+    for marker in TERMINATORS:
+        others = [other for other in TERMINATORS if other != marker]
+        assert not any(
+            marker.endswith(other) for other in others
+        ), f"{marker!r} is a suffix of another entry: order-dependent stripping"

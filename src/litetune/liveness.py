@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.evaluate import MeasurementPoint
 from litetune.events import EventStream
-from litetune.metrics import comparable_form
+from litetune.metrics import TERMINATORS, comparable_form, trim_terminator
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,14 @@ class LivenessThresholds:
     repetition_min_tokens: int = 12
     repetition_ngram: int = 4
     min_divergence_share: float = 0.10
+    # A decoder asked to keep special tokens ends every generation that stopped
+    # on its own with one. A generation without one either ran to the token
+    # bound or closed its turn with a marker this tool's vocabulary does not
+    # list -- and the second is indistinguishable from the first in the text
+    # alone, which is why this is a share and not a per-row verdict. The
+    # observed rate of hitting the bound on a healthy run is about 1% (8 of
+    # 640, README); this leaves an order of magnitude above it.
+    max_unterminated_share: float = 0.10
 
     def as_dict(self) -> dict:
         return {
@@ -65,6 +73,7 @@ class LivenessThresholds:
             "repetition_min_tokens": self.repetition_min_tokens,
             "repetition_ngram": self.repetition_ngram,
             "min_divergence_share": self.min_divergence_share,
+            "max_unterminated_share": self.max_unterminated_share,
         }
 
 
@@ -77,25 +86,6 @@ _SPECIAL_TOKEN_RE = re.compile(
     r"<(pad|unk|bos|s|/s|\|endoftext\|)>|<unused\d+>|<start_of_turn>|<0x[0-9A-Fa-f]{2}>"
 )
 
-# One of these at the end of a generation is normal termination, not leakage.
-# The reference backend decodes with skip_special_tokens=False on purpose --
-# otherwise the leakage check has nothing to look at -- so the terminator has to
-# be trimmed here instead.
-_TERMINATORS = ("<eos>", "<end_of_turn>", "</s>", "<|im_end|>", "<|endoftext|>")
-
-
-def trim_terminator(text: str) -> str:
-    """Drop trailing end-of-sequence markers, however many were emitted."""
-    out = text.strip()
-    changed = True
-    while changed:
-        changed = False
-        for token in _TERMINATORS:
-            if out.endswith(token):
-                out = out[: -len(token)].strip()
-                changed = True
-    return out
-
 
 def ends_with_terminator(text: str) -> bool:
     """Did this generation stop on its own?
@@ -104,7 +94,7 @@ def ends_with_terminator(text: str) -> bool:
     cannot have been cut by a token bound, whichever side's bound it was --
     which is what lets two points with different bounds still be compared.
     """
-    return text.strip() != "" and text.strip().endswith(_TERMINATORS)
+    return text.strip() != "" and text.strip().endswith(TERMINATORS)
 
 
 def unterminated_count(point: MeasurementPoint) -> int:
@@ -120,6 +110,10 @@ def unterminated_count(point: MeasurementPoint) -> int:
     terminator out of generated text is interpretation, which is what this
     module is for, and putting it on the record of what happened made
     `evaluate` and `liveness` import each other.
+
+    The vocabulary checked against is `metrics.TERMINATORS`, recorded verbatim
+    at `harness.terminators` in the manifest; two runs' counts are comparable
+    only when that field agrees between them.
     """
     return sum(1 for g in point.generations if g.ok and not ends_with_terminator(g.text))
 

@@ -1,8 +1,9 @@
 # What was measured, and what it established
 
-Numbers for `litetune`. Everything here is `functiongemma-270m-it` LoRA-tuned on
-`google/mobile-actions`, scored on 640 held-out single-call examples; exact match
-means the tool name **and** every argument value.
+Numbers for `litetune`. Most of what follows is `functiongemma-270m-it` LoRA-tuned
+on `google/mobile-actions`, scored on 640 held-out single-call examples; exact
+match means the tool name **and** every argument value. The last section is a
+second family and the second scorer.
 
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
@@ -156,3 +157,70 @@ the two points it has — deriving it is the mistake the third point exists to
 prevent. Composing the three into a single command is the first thing on the
 list after this alpha; the README's *Limitations* records what is not wired.
 
+## A second family, and the second scorer
+
+`google/gemma-3-270m-it` @ `ac82b4e8`, LoRA r16/α32, lr 2e-4, one epoch over
+2,400 rows of `mteb/banking77` — 77-way intent classification, target is
+`label_text` — scored on 600 held-out rows with `--scorer exact-text`, prompt
+mode `prerendered`, litert-lm 0.16.1 CPU backend on an M-series Mac.
+
+| | float twin | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| exact match | 0.6933 ±0.0369 | 0.6767 ±0.0374 | 0.6917 ±0.0370 |
+| Cost of conversion | — | +0.0167 ±0.0201 *(unresolved, 38 discordant)* | +0.0017 ±0.0127 *(unresolved, 15 discordant)* |
+
+**Both costs are unresolved, and that is the finding.** At n=600 the intervals
+straddle zero, so this run establishes that neither quantisation moved accuracy
+by more than about two points — not that either is free. The functiongemma table
+above resolves a cost of +0.0125 at n=640 because its discordant count is 136;
+here it is 38 and 15. Discordant pairs, not sample size, are what buys
+resolution, and a task the two artifacts almost never disagree on cannot settle
+a small difference no matter how many rows it has.
+
+**What it established beyond the numbers.** The family rule resolved
+`model_type: gemma3_text` to Gemma 3 rather than FunctionGemma on a real export
+— the two share that string, and until this run the disambiguation had only ever
+run in a unit test.
+
+**What it cost to get.** The first run scored the float reference **0.0000**.
+The transformers reference decodes with `skip_special_tokens=False`, deliberately,
+so the liveness tier can see special-token leakage; every generation it returned
+ended in `<eos>`; and `exact-text` forgave whitespace and nothing else. `verify`
+reported a *resolved* conversion cost of −0.6767 across 406 discordant pairs — a
+confident number about a difference between two decoders. The `tool-call` scorer
+had hidden this on every earlier run, because its parser stops at the closing
+brace and never sees a trailing marker. The figures above are from the fixed
+scorer; the defect is why `harness.terminators` is now recorded on every
+manifest.
+
+**What the terminator actually is, measured rather than assumed.** Two different
+markers are in play here, and an earlier draft of this branch confused them.
+
+The **base** checkpoint stops on its chat template's own close: run on 20 of
+these held-out prompts at `max_new_tokens=64`, all 20 closed their turn and all
+20 ended in `<end_of_turn>` alone, for an unterminated share of 0.000.
+`generation_config.eos_token_id` is `[1, 106]` — `<eos>` and `<end_of_turn>` —
+so generation halts at the close and never reaches the tokenizer's eos.
+`functiongemma-270m-it` has the same shape, with `<start_function_response>`
+added to the set.
+
+The **tuned** model, and therefore the float twin this table compares against,
+ends on `<eos>` instead. These prompts are `prerendered`, so `tune` does not
+probe the chat template at all and takes the tokenizer's eos: `tune.metrics.json`
+records `turn_terminator: {ids: [1], source: "tokenizer_eos", text: "<eos>"}`,
+training appended exactly that to every completion, and `contract.json` carries
+`stop_tokens: ["<eos>"]`. Both markers are in the scorer's vocabulary, which is
+why neither run was mis-scored — but they are not the same marker, and which one
+a given artifact emits depends on how it was trained, not on its family.
+
+An earlier draft asserted instead that Gemma emits `<end_of_turn>\n<eos>` — two
+markers, newline between — in its docstrings, its tests and its commit message.
+It does not, for either supported family. The stacked shape belongs to a family whose
+eos set excludes its own template close, which is why the trimmer strips
+whitespace between removals; that case is constructed in the tests and labelled
+as such.
+
+**What it did not establish.** No untuned-base run, so training gain is
+unattributed and the prepare stage's headroom slices are empty. CPU only — no
+GPU or NPU figure for this family. Trained in float32 rather than the bfloat16
+default because bfloat16 on this CPU runs on a single core.
