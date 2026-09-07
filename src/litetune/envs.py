@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -31,6 +32,9 @@ import venv
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+from litetune.exits import read_returncode
 
 
 class UnpinnedRequirement(ValueError):
@@ -434,6 +438,18 @@ class StageEnv:
         Returns the completed process rather than raising on non-zero: callers
         decide whether a non-zero exit is a failed check or an unperformed one,
         and that distinction is the whole point of litetune.checks.
+
+        `errors="replace"` on the decode: `text=True` decodes stdout/stderr
+        eagerly, and a stray non-UTF-8 byte -- a CUDA or driver banner ahead of
+        a probe's own JSON line, in the same class of weird environment the
+        last-non-empty-line rule in `resolve_device` exists to survive --
+        raised `UnicodeDecodeError` there uncaught, which is a `ValueError`,
+        not the `OSError` every caller of this method was written to expect.
+        That escaped `resolve_device` and both of its callers and ended a
+        `tune` or `verify` run with a traceback instead of an unanswered
+        probe. Replacing the byte keeps the rest of the line readable, which
+        is what a caller that only reads the last line needs; this is shared
+        by every stage, so the fix protects all of them, not only the probe.
         """
         bindir = "Scripts" if os.name == "nt" else "bin"
         exe = self.path / bindir / args[0]
@@ -442,10 +458,187 @@ class StageEnv:
             argv,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             stdin=subprocess.DEVNULL,
             **kwargs,
         )
+
+
+# Where a stage's subprocess will run is decided here, once, in the parent,
+# before the subprocess starts rather than inside it. Both generated scripts
+# (`tune._TRAIN_SCRIPT`, `evaluate._HF_GENERATE_SCRIPT`) still carry a
+# `torch.cuda.is_available()` fallback, and it is reached only when this could
+# not answer or was never asked -- see `training_device` and
+# `generation_device`, which take the parent's answer when there is one.
+# Asking here is what lets the parent say something about a slow combination
+# before a six-hour run instead of reading the device out of a metrics file
+# afterwards.
+DEVICE_PROBE_TIMEOUT_S = 30
+
+# Sub-second: import torch, ask it three questions, print one JSON line.
+# Nothing else this package runs inside a stage environment is this cheap,
+# which is what makes asking it *before* the real, expensive subprocess
+# worthwhile.
+#
+# `is_available()` alone cannot tell "this machine has no GPU" from "this
+# torch cannot reach the one it has": a CPU-only wheel, a container started
+# without `--gpus` and a driver too old for the runtime all answer False. So
+# the build's CUDA version and the device count come back too, and
+# `DeviceProbe` says which of the two it saw.
+_DEVICE_PROBE_CODE = (
+    "import json, torch; "
+    "print(json.dumps({"
+    "'device': 'cuda' if torch.cuda.is_available() else 'cpu', "
+    "'cuda_build': torch.version.cuda, "
+    "'device_count': torch.cuda.device_count()}))"
+)
+
+
+@dataclass(frozen=True)
+class DeviceProbe:
+    """What one environment's own torch answered about its accelerator.
+
+    `device` is the part a caller acts on: `"cuda"`, `"cpu"`, or `None`. `None`
+    is not a device and must not be read as one -- `tune.TrainingMetrics.device`
+    defaults to `None` for the same reason ("absent is absent, not 'cpu'").
+    `detail` says which `None` it is, because they are different facts: the
+    probe was never asked, it could not be started, it was killed, it timed
+    out, it exited non-zero, or it answered something unusable.
+    """
+
+    device: str | None
+    detail: str
+    # `torch.version.cuda`: the CUDA version this wheel was built against, or
+    # `None` for a CPU-only wheel. Reported so that "cpu" from a CUDA build --
+    # torch is there and cannot reach a device -- is distinguishable from "cpu"
+    # from a CPU-only build, which is the machine having none.
+    cuda_build: str | None = None
+    device_count: int | None = None
+
+    @property
+    def answered(self) -> bool:
+        return self.device is not None
+
+    @property
+    def cuda_build_without_a_device(self) -> bool:
+        """A CUDA build that reports no usable device: torch cannot reach one."""
+        return self.device == "cpu" and bool(self.cuda_build)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "device": self.device,
+            "detail": self.detail,
+            "cuda_build": self.cuda_build,
+            "device_count": self.device_count,
+        }
+
+
+# What a caller gets when it never ran a probe at all. Distinct from every
+# unanswered probe below, because "nobody asked" and "it was asked and could
+# not say" are different facts about a run and the report has to carry which.
+NOT_PROBED = DeviceProbe(device=None, detail="no device probe was run")
+
+
+def _unanswered(env: StageEnv, reason: str, events=None) -> DeviceProbe:
+    detail = f"the device probe on environment {env.name!r} could not answer: {reason}"
+    logger.warning("%s", detail)
+    if events is not None:
+        events.note(detail, environment=env.name)
+    return DeviceProbe(device=None, detail=detail)
+
+
+def resolve_device(
+    env: StageEnv, timeout: int = DEVICE_PROBE_TIMEOUT_S, events=None
+) -> DeviceProbe:
+    """Ask this environment's own torch whether it has CUDA.
+
+    Not a guess and not a default: if the probe cannot be started, is killed,
+    times out, exits non-zero, or answers with anything other than exactly
+    "cuda" or "cpu", `DeviceProbe.device` is `None` rather than a quiet "cpu",
+    and `DeviceProbe.detail` carries which of those happened. A caller that
+    gets `None` back still has to run something; the training and generation
+    scripts fall back to asking `torch.cuda.is_available()` themselves in that
+    case, which is the one situation left where they decide for themselves
+    rather than being told.
+
+    `events`, when given, is where an unanswered probe is reported. `logging`
+    alone reaches nothing the report can carry, and a `None` device that is
+    never explained is indistinguishable from a device nobody asked about.
+    """
+    try:
+        proc = env.run(["python", "-c", _DEVICE_PROBE_CODE], timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        # Distinguished from the start-failure wording below: a hang read as
+        # "did not run" looks identical to a process that never started at
+        # all, and a reader debugging a wedged environment needs to know this
+        # one ran for the full `timeout` seconds before anything gave up on it.
+        return _unanswered(
+            env, f"it timed out after {timeout}s ({type(exc).__name__}: {exc})", events
+        )
+    except (OSError, ValueError) as exc:
+        # `ValueError` alongside `OSError`: `env.run`'s `text=True` decode
+        # raises `UnicodeDecodeError` -- a `ValueError`, not an `OSError` -- on
+        # a stray non-UTF-8 byte ahead of the probe's own line, which is
+        # exactly the "banner before the answer" case the last-non-empty-line
+        # rule below exists to survive. `env.run` now passes `errors="replace"`
+        # so that byte no longer raises there, but this catch is what stops
+        # this function's contract -- it never raises -- from depending on
+        # every caller of `env.run` getting that right.
+        return _unanswered(env, f"it could not be started ({type(exc).__name__}: {exc})", events)
+
+    reading = read_returncode(proc.returncode)
+    if not reading.conclusive:
+        # A killed probe never chose an exit status, so `exited -9` would be a
+        # sentence about something that did not happen. See `litetune.exits`.
+        return _unanswered(env, reading.describe("this environment"), events)
+    if proc.returncode != 0:
+        return _unanswered(
+            env,
+            f"it exited {proc.returncode} ({(proc.stderr or '').strip()[-200:] or 'no stderr'})",
+            events,
+        )
+
+    # The last non-empty line, not the whole of stdout: a stage environment is
+    # free to print a banner, a deprecation warning or a loader message ahead
+    # of the answer, and the answer is the last thing the probe writes. Reading
+    # all of stdout threw away a good answer because something else spoke
+    # first.
+    lines = [line for line in (proc.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return _unanswered(env, "it printed nothing on stdout", events)
+    try:
+        answer = json.loads(lines[-1])
+        device = answer["device"]
+        cuda_build = answer["cuda_build"]
+        device_count = answer["device_count"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return _unanswered(
+            env, f"its last stdout line is not an answer ({exc}): {lines[-1][:200]!r}", events
+        )
+    if device not in ("cuda", "cpu"):
+        return _unanswered(env, f"it answered {device!r}, which is neither device", events)
+
+    probe = DeviceProbe(
+        device=device,
+        detail=f"this environment's torch reports {device}",
+        cuda_build=cuda_build if isinstance(cuda_build, str) else None,
+        device_count=device_count if isinstance(device_count, int) else None,
+    )
+    if probe.cuda_build_without_a_device:
+        probe = DeviceProbe(
+            device=device,
+            detail=(
+                f"this environment's torch is a CUDA {probe.cuda_build} build reporting "
+                f"{probe.device_count} devices, so it will run on the CPU: torch cannot reach a "
+                "GPU here, which is not the same observation as this machine having none"
+            ),
+            cuda_build=probe.cuda_build,
+            device_count=probe.device_count,
+        )
+        if events is not None:
+            events.note(probe.detail, environment=env.name, device=device)
+    return probe
 
 
 # ---------------------------------------------------------------------------

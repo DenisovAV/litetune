@@ -34,9 +34,16 @@ each example was right, so it does not know or care which task you brought.
 `litetune env` shows the environments the stages cached, and `--clean` removes
 them.
 
-Everything runs on CPU, which is workable at 270M and the first thing you will
-want to change above about 1B. Bring your own checkpoint and skip the first two
-steps, or bring a `.litertlm` and its float checkpoint and run only `verify`.
+`tune` and `verify`'s float reference resolve the device once per run and use
+CUDA if `torch.cuda.is_available()` reports one, CPU otherwise; `convert`
+always runs on CPU, deliberately — export is a pure format conversion, and
+pinning it keeps the measured export time reproducible on a runner with no
+GPU at all. There is no `--device` flag; to force CPU on `tune` or `verify`
+regardless of what the box has, set `CUDA_VISIBLE_DEVICES=""` in the shell
+you launch it from — the stage subprocess inherits the environment. CPU alone
+is workable at 270M and the first thing you will want to change above about
+1B. Bring your own checkpoint and skip the first two steps, or bring a
+`.litertlm` and its float checkpoint and run only `verify`.
 
 > **Alpha.** Measured end to end on `google/functiongemma-270m-it` and function
 > calling, and on `google/gemma-3-270m-it` and `exact-text` classification —
@@ -141,7 +148,8 @@ single `run` would hide which one you are in.
 litetune prepare --data raw.jsonl --output-dir data --context-length 1024 \
                  --tokenizer google/functiongemma-270m-it
 
-# 2. Fine-tune. On CPU, so size your expectations accordingly.
+# 2. Fine-tune. Runs on CUDA if the box has one, otherwise CPU; size your
+#    expectations accordingly either way.
 litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
               --output-dir tuned --prompt-mode prerendered --method lora
 
@@ -201,6 +209,7 @@ litetune knows four, and has measured two:
 |---|---|
 | `--prompt-mode` | No default. `prerendered` means your app renders the tool declarations into the prompt and the runtime must not template again; `runtime_rendered` is the opposite. Must be the **same** value in `tune` and `bundle` — the wrong one produces a fluent wrong answer, not an error. |
 | `--adapter` | For a LoRA run, pass `<tune output>/adapter`, from outside `--output-dir`. Without it the bundle carries only the merged weights. |
+| `--dtype` | Training precision for `tune`. Default `bfloat16`. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records exactly one run's dtype — the second-family banking77 run, trained in float32 for this reason — and says nothing about the headline table's, so the report records yours. |
 | `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused: they resolve to different weights on different days while the bundle reads identically. |
 | `--scorer` | What counts as correct, on `verify`. `tool-call` (default) or `exact-text`. It has to match the shape of your targets; nothing else in the pipeline changes. The manifest records which one ran, because two manifests scored differently are not comparable. |
 | `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. See [MEASUREMENTS.md](MEASUREMENTS.md). |
@@ -267,6 +276,12 @@ SentencePiece branch never fires and the bundle silently gets an HF tokenizer
 section — losing FST-constrained decoding, which is SentencePiece-only. `tune`
 copies the file back and records in `metrics.json` whether it managed to.
 
+**`metrics.json` records which device trained the checkpoint.** `tune`
+resolves the device once, before training starts, and writes it to `device` as
+`"cuda"` or `"cpu"` — the field is absent only in a `metrics.json` written by a
+version of litetune that predates it, never a guessed value. It is the durable
+answer to where a given checkpoint was trained.
+
 **Minimum `transformers` per family.** Gemma 4 and Qwen3.5 fail at tokenizer
 load on every 4.x release, and Gemma 4 needs 5.5.0 for `AutoConfig` to recognise
 the architecture. litetune refuses with the version rather than letting you find
@@ -321,13 +336,23 @@ withdrawn after re-measurement.
   calling, and `gemma-3-270m-it` on `exact-text` classification (banking77) —
   the gemma-3 run the static-vocabulary bullet below refers to. Other families
   export but have no quality figure.
-- **Measurement runs on CPU; your users run on a phone.** On one Snapdragon
+- **The candidate is pinned to CPU; the reference is not, and your users run
+  on a phone.** On one Snapdragon
   Galaxy S24 (`SC-51E`), the `dynamic_wi8_afp32` bundle on the device's CPU
   scored 0.8703 ±0.026 on the 640 held-out rows against 0.8906 for the cloud
   CPU run that produced it (run A in [MEASUREMENTS.md](MEASUREMENTS.md); runs
   B and C scored 0.9016 and 0.8969, both just outside that interval). So the
   reference number predicted the phone to within about 0.03. One device, one
   recipe.
+- **On a GPU box, the reference and the candidate can run on different
+  hardware, and it is recorded rather than refused.** `build_backends` pins
+  the candidate to `litert-lm`'s CPU backend and lets the reference resolve
+  its own device; where the reference lands on `cuda`, the two sides differ
+  in hardware as well as in conversion. `harness.device_mismatch` in the
+  manifest names both devices and both engines, and the same text is carried
+  into the run's limitations, so the conversion-cost number does not silently
+  carry a hardware difference too. Refusing the comparison instead would
+  leave such a machine unable to verify at all.
 - **The GPU number is 20 rows.** Same device, same bundle, GPU backend: 20/20
   tool names and 15/20 exact (CPU: 20/20, 14/20) at 1.8× the CPU speed — with
   `prefer_activation_type = fp32` in the bundle. Without it the GPU text

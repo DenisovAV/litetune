@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
@@ -48,7 +49,7 @@ from litetune import envs, models
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.evaluate import PromptMode
 from litetune.events import EventStream
-from litetune.exits import read_returncode
+from litetune.exits import SIGKILL, read_returncode
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +104,78 @@ DEFAULT_LORA_TARGETS = (
 
 # A 270M checkpoint over a few thousand examples. High enough that a slow CPU
 # run is not cut off mid-epoch, low enough that a wedged run is a non-result the
-# same day rather than an occupied runner overnight.
+# same day rather than an occupied runner overnight. This ceiling is exactly
+# the run BFLOAT16_CPU_HINT describes: on the one CPU measured, bfloat16 was
+# an order of magnitude slower than float32, and a run that crawls that way is
+# a realistic way to spend most of the six hours below.
 DEFAULT_TIMEOUT_S = 6 * 3600
+
+# The default dtype stands, but a CPU run is told what it is paying and which
+# flag buys it back -- before the wait when the device is known early enough,
+# in the run's own detail text when it is not, and as a limitation for the
+# record either way. See `envs.resolve_device`.
+#
+# What the flag costs is deliberately not asserted here. It is not the dtype
+# mismatch with export and evaluation an earlier draft named: evaluate.py's
+# float reference loads at an unconditional float32 and export.py passes no
+# dtype at all, so float32 has nothing to mismatch. Nor is it comparability
+# with the published numbers -- MEASUREMENTS.md records exactly one run's
+# dtype, and that run trained in float32 for this reason. So the hint states
+# the departure and leaves the cost to the limitation `run_tune` already
+# records, which says the same thing at more length.
+BFLOAT16_CPU_HINT = (
+    "bfloat16 matmuls were single-threaded and roughly an order of magnitude slower than "
+    "float32 on the one CPU measured; --dtype float32 trains on every core instead of one, and "
+    "the report records the departure from the default dtype either way"
+)
+
+# Training stderr that names the accelerator rather than the method or the
+# data. A `torch.OutOfMemoryError` exits 1 like any other uncaught exception,
+# and `Check.failed` on that exit is a verdict about the recipe drawn from a
+# fact about the machine -- the reading `litetune.exits` exists to forbid,
+# reachable here only since the run stopped being pinned to the CPU. It is
+# routed to `unchecked` the same way `evaluate.py` routes `_HOST_FAILURE_RE`.
+#
+# An enumeration, deliberately, and not the `CUDA error:` prefix. That prefix
+# would be shorter and is wrong: `CUDA error: device-side assert triggered` is
+# the GPU face of an out-of-range index -- a token id past the embedding table,
+# a label past the vocabulary -- and on the CPU the identical defect raises
+# `IndexError: index out of range in self` and is recorded, correctly, as a
+# failed training run. Matching the prefix would make one bug in the data
+# produce a verdict on a laptop and a shrug on a GPU box, with the words "says
+# nothing about the method or the data" attached to the one case where it says
+# exactly that. `CUDA error: an illegal memory access was encountered` is the
+# same story. So each entry below is a fact about the machine on its own,
+# whatever wrapper text arrives around it.
+#
+# `OutOfMemoryError` is the class name `torch.cuda.OutOfMemoryError` binds, so
+# it matches whichever alias a traceback prints. The rest cover an allocation
+# that could not be served, a device that was gone or never there when the run
+# reached for it, a binary with no kernel for this architecture, a driver too
+# old for the runtime, and -- since CPU training is a first-class destination
+# here, not an edge case -- the host running out of RAM to give torch's
+# CPU allocator. Consulted only on a non-zero exit, and only against stderr:
+# nothing here can change what a clean run reports.
+#
+# `DefaultCPUAllocator: not enough memory`, `CUBLAS_STATUS_ALLOC_FAILED` and
+# `CUDNN_STATUS_ALLOC_FAILED` are the exact wording each raises, not a broader
+# prefix: the same reasoning that keeps `CUDA error: device-side assert
+# triggered` off this list applies here too, and a bare `not enough memory`
+# risks matching a message this list was never meant to speak for.
+_GPU_FAILURE_RE = re.compile(
+    r"(OutOfMemoryError"
+    r"|CUDA out of memory"
+    r"|HIP out of memory"
+    r"|CUDA error: out of memory"
+    r"|CUDA driver version is insufficient"
+    r"|no kernel image is available for execution"
+    r"|no CUDA-capable device is detected"
+    r"|invalid device ordinal"
+    r"|DefaultCPUAllocator: not enough memory"
+    r"|CUBLAS_STATUS_ALLOC_FAILED"
+    r"|CUDNN_STATUS_ALLOC_FAILED)",
+    re.IGNORECASE,
+)
 
 TRAINING_CHECK = "training run"
 MASKING_CHECK = "loss is masked to the completion"
@@ -228,6 +299,24 @@ def turn_terminator(tok, runtime_rendered):
     if tok.eos_token_id is not None:
         return [tok.eos_token_id], "tokenizer_eos"
     return [], "none"
+
+
+def training_device(torch, given=None):
+    """Where the run happens: what the parent already resolved, or CUDA-if-any.
+
+    `given` is `envs.resolve_device`'s answer, asked once by the parent process
+    before this script was even started, and taken here rather than decided
+    again -- so the parent knows the device while it can still act on it,
+    instead of reading it back out of the metrics file this run writes at the
+    end. Falls back to asking `torch` directly only when the parent could not
+    answer or never asked (`given is None`): a probe that could not run must
+    not stop a training run that otherwise would. Recorded in the metrics
+    either way, so a GPU box that trained on the CPU says so rather than
+    looking exactly like a laptop.
+    """
+    if given is not None:
+        return given
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def build_examples(tok, rows, max_seq_length, runtime_rendered):
@@ -394,6 +483,8 @@ def main() -> int:
         **from_kwargs
     )
     model.config.use_cache = False
+    device = training_device(torch, spec.get("device"))
+    model.to(device)
 
     trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if spec["method"] == "lora":
@@ -432,7 +523,11 @@ def main() -> int:
             # The mask is applied here and nowhere else: transformers computes a
             # shifted cross-entropy that skips every IGNORE_INDEX position, so
             # the prompt contributes no gradient.
-            out = model(input_ids=input_ids, attention_mask=attention, labels=labels)
+            out = model(
+                input_ids=input_ids.to(device),
+                attention_mask=attention.to(device),
+                labels=labels.to(device),
+            )
             out.loss.backward()
             optimiser.step()
             optimiser.zero_grad(set_to_none=True)
@@ -497,6 +592,10 @@ def main() -> int:
                 "learning_rate": spec["learning_rate"],
                 "dtype": spec["dtype"],
                 "attn_implementation": spec["attn_implementation"],
+                # Where it ran. A CUDA box and a laptop produce the same
+                # checkpoint; they do not take the same time, and a report
+                # that cannot say which it was cannot explain the difference.
+                "device": device,
                 # Whether the SentencePiece model made it back beside the
                 # checkpoint. Recorded, not assumed: the difference between
                 # `SP_Tokenizer` and an HF section is invisible in every
@@ -550,11 +649,13 @@ class TuneRequest:
     passes every check that does not involve held-out labels. `dtype` has no
     such pair to default to -- `evaluate.py`'s float reference loads at an
     unconditional `float32` regardless of the training dtype, and
-    `export.py` passes no dtype to the exporter at all -- so `dtype`
-    defaults instead to the one value every published number in this repo
-    was actually measured against. Both are recorded on every run for the
-    same underlying reason: a mismatch here produces output that looks fine
-    and is not.
+    `export.py` passes no dtype to the exporter at all -- so the `bfloat16`
+    default matches nothing downstream and is not derived from anything here.
+    It is stated, and `run_tune` records it as a limitation whether a run
+    takes it or departs from it, because this repo establishes no winner
+    between `bfloat16` and `float32`. Both fields are recorded on every run
+    for the same underlying reason: a mismatch here produces output that
+    looks fine and is not.
     """
 
     model: str
@@ -638,8 +739,17 @@ class TuneRequest:
         """Where the adapter is kept. An artifact, not scratch -- see the script."""
         return self.output_dir / "adapter" if self.method == "lora" else None
 
-    def config(self, metrics_out: Path) -> dict[str, Any]:
-        """Everything the generated script needs. Also what the report records."""
+    def config(self, metrics_out: Path, device: str | None = None) -> dict[str, Any]:
+        """Everything the generated script needs. Also what the report records.
+
+        `device` is what `envs.resolve_device` found before this config was
+        written, asked once in the parent rather than left for the script to
+        decide on its own -- see `tune.training_device`. `None` covers both
+        "the probe was asked and could not answer" and "no probe was run", and
+        the script falls back to asking itself in either case. Which of the two
+        it was is in `envs.DeviceProbe.detail`, and reaches the report as a
+        limitation rather than as a device.
+        """
         return {
             "model": self.model,
             "revision": self.revision,
@@ -660,10 +770,11 @@ class TuneRequest:
             "model_dir": str(self.model_dir),
             "adapter_dir": str(self.adapter_dir) if self.adapter_dir else None,
             "metrics_out": str(metrics_out),
+            "device": device,
         }
 
-    def as_dict(self) -> dict[str, Any]:
-        record = self.config(self.output_dir / "metrics.json")
+    def as_dict(self, device: str | None = None) -> dict[str, Any]:
+        record = self.config(self.output_dir / "metrics.json", device=device)
         record["learning_rate_source"] = (
             f"default for method {self.method!r}" if self.rate_is_default else "declared"
         )
@@ -716,6 +827,8 @@ class TrainingMetrics:
     epochs: tuple[EpochMetrics, ...]
     trainable_parameters: int | None = None
     base_parameters: int | None = None
+    # `None` when the script predates the field. Absent is absent, not "cpu".
+    device: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -744,6 +857,7 @@ class TrainingMetrics:
             epochs=epochs,
             trainable_parameters=data.get("trainable_parameters"),
             base_parameters=data.get("base_parameters"),
+            device=data.get("device"),
             raw=dict(data),
         )
 
@@ -757,6 +871,7 @@ class TrainingMetrics:
             "expected_supervised_token_fraction": EXPECTED_SUPERVISED_FRACTION,
             "trainable_parameters": self.trainable_parameters,
             "base_parameters": self.base_parameters,
+            "device": self.device,
             "epochs": [e.as_dict() for e in self.epochs],
             "final_loss": self.final_loss,
         }
@@ -827,6 +942,13 @@ class TuneResult:
     stderr: str = ""
     stdout_tail: str = ""
     limitations: list[str] = field(default_factory=list)
+    # What `envs.resolve_device` answered, asked once before the run started --
+    # not what `metrics.device` reports after one. The two agree whenever the
+    # run used what it was told; `None` means no device was established before
+    # the run, whether because the probe could not answer or because none ran,
+    # and is never "cpu" (see `TrainingMetrics.device`, "absent is absent").
+    # Which of the two it was is recorded as a limitation, not here.
+    device: str | None = None
 
     @property
     def outcome(self) -> Outcome:
@@ -870,7 +992,7 @@ class TuneResult:
             # contract is built from, and it must not be something a reader has
             # to go looking for.
             "prompt_mode": self.prompt_mode.value,
-            "request": self.request.as_dict(),
+            "request": self.request.as_dict(device=self.device),
             "metrics": self.metrics.as_dict() if self.metrics else None,
             "model_dir": str(self.model_dir) if self.model_dir else None,
             "adapter_dir": str(self.adapter_dir) if self.adapter_dir else None,
@@ -964,17 +1086,20 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     if request.dtype != DEFAULT_DTYPE:
         # Unlike attention, there is no pair here for a non-default dtype to
         # match or miss: evaluate.py's float reference always loads at
-        # float32, and export.py passes no dtype at all -- so a run trained
-        # at float32 is not "not the pair the export and evaluation paths
-        # use", it is the one dtype every published number in this repo was
-        # measured against.
+        # float32, and export.py passes no dtype at all. So this limitation
+        # states the departure and stops there. What it must not claim is
+        # which dtype the published numbers were taken at: MEASUREMENTS.md
+        # gives a dtype for exactly one of them -- the second-family
+        # banking77 run, trained in float32 "because bfloat16 on this CPU
+        # runs on a single core" -- and says nothing about the dtype of the
+        # headline table.
         result.limitation(
             f"this run trains with dtype {request.dtype!r}, not the {DEFAULT_DTYPE!r} default. "
             "evaluate.py's float reference loads at an unconditional float32 regardless of the "
             "training dtype, and export.py passes no dtype to the exporter at all, so there is "
             "no single dtype the export and evaluation paths are known to use for this run to "
-            "match or miss -- float32 is the dtype every published number in this repo was "
-            "measured against"
+            "match or miss. Which dtype a published number was taken at is recorded per run in "
+            "MEASUREMENTS.md and is not a property of this default"
         )
     if request.rate_is_default:
         events.note(
@@ -1055,6 +1180,53 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         events.stage_finished(result.outcome.value, attempted=False)
         return result
 
+    # -- where will this run? -----------------------------------------------
+    # Asked once, here, in the parent, before the training script starts,
+    # rather than left to the fallback inside it: that is what lets this run
+    # say where it is about to train while there is still something to do
+    # about it, instead of reading the device back out of a metrics file six
+    # hours later.
+    #
+    # Not gated on `auto_provision`. The probe provisions nothing, so
+    # readiness is its real precondition -- and the environment check above
+    # has already returned when the environment is not ready. Gating it on
+    # provisioning made `litetune tune --no-provision` (cli.py's flag) over an
+    # environment that was already there report no device at all for a run
+    # that had one.
+    probe = envs.resolve_device(request.env, events=events)
+    device = probe.device
+    result.device = device
+    if not probe.answered:
+        # `logging` alone reaches nothing the report carries, and a `None`
+        # device with nothing beside it is indistinguishable from a device
+        # nobody asked about.
+        result.limitation(
+            f"{probe.detail}, so this run's device was not established before it started. The "
+            "training script decided for itself and reports what it chose in its metrics"
+        )
+    elif probe.cuda_build_without_a_device:
+        result.limitation(probe.detail)
+    if request.dtype == DEFAULT_DTYPE and device != "cuda":
+        # Before the wait, not after it: DEFAULT_TIMEOUT_S is sized for
+        # exactly the run this combination produces, and the operator who set
+        # it running should not have to wait to hear why.
+        #
+        # `!= "cuda"` rather than `== "cpu"`: an unanswered probe is precisely
+        # the run that has nothing else to explain its six hours with, and the
+        # script's own fallback resolves to cpu on every machine without a
+        # reachable GPU. The wording says which of the two this is, because
+        # "will" and "may" are different claims.
+        where = (
+            "training will run bfloat16 on the CPU"
+            if device == "cpu"
+            else "training may run bfloat16 on the CPU: its device is not established yet"
+        )
+        events.note(
+            f"{where}: {BFLOAT16_CPU_HINT}",
+            device=device,
+            dtype=request.dtype,
+        )
+
     # -- run it ------------------------------------------------------------
     # The generated script and its config are written beside the checkpoint and
     # kept. They are the record of exactly what ran: a checkpoint whose training
@@ -1066,7 +1238,9 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     script.write_text(_TRAIN_SCRIPT, encoding="utf-8")
     metrics_out = workspace / "metrics.json"
     config_path = workspace / "train_config.json"
-    config_path.write_text(json.dumps(request.config(metrics_out), indent=2), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(request.config(metrics_out, device=device), indent=2), encoding="utf-8"
+    )
     # A previous attempt's metrics in place would be read as this attempt's, the
     # same way `export` refuses to inherit a stale artifact by mtime.
     metrics_out.unlink(missing_ok=True)
@@ -1085,10 +1259,29 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         logger.warning("training timed out after %ss", request.timeout_s)
         # From out here a hang is indistinguishable from a stalled machine, so
         # it is recorded as not performed rather than as a verdict.
+        timeout_detail = (
+            f"no result after {request.timeout_s}s (timeout): the run did not finish, which says "
+            "nothing about the method or the data"
+        )
+        if request.dtype == DEFAULT_DTYPE and device != "cuda":
+            # DEFAULT_TIMEOUT_S is sized for exactly this: the run whose
+            # ending the slowdown caused should be the one told it exists.
+            # Nothing here is read from the metrics: this ending returns
+            # before any metrics file is opened, so the pre-run probe is the
+            # only thing that knows anything about the device -- and an
+            # unanswered probe must not swallow the one hint that explains a
+            # six-hour non-result. It also must not turn into an assertion
+            # about a CPU nobody observed, so the lead-in says which it is.
+            lead = (
+                "it was running bfloat16 on the CPU"
+                if device == "cpu"
+                else "its device was never established, and bfloat16 on a CPU is one way to "
+                "spend this timeout"
+            )
+            timeout_detail = f"{timeout_detail}. {lead}: {BFLOAT16_CPU_HINT}"
         timed_out = Check.unchecked(
             TRAINING_CHECK,
-            f"no result after {request.timeout_s}s (timeout): the run did not finish, which says "
-            "nothing about the method or the data",
+            timeout_detail,
             observed={"timeout_s": request.timeout_s},
         )
         result.seconds = seconds
@@ -1128,6 +1321,30 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     if result.metrics is not None:
         _emit_epochs(events, result.metrics)
 
+    # -- where did it actually run? ------------------------------------------
+    # From `result.metrics`, not the pre-run probe above: this is what the
+    # script itself reported after using -- or falling back from -- what it
+    # was given, and it needs only `result.metrics`, which is parsed by now.
+    #
+    # Placed ahead of the killed early return below rather than at the bottom
+    # of the function. Two of the five endings this moves, not one: the killed
+    # return right below, and the accelerator-failure return further down,
+    # which was added in this same change and sits after this block for the
+    # same reason. The timeout returns further up without ever opening a
+    # metrics file, and the other two -- the blocked-start return and the
+    # bottom of the function -- were already downstream of this block. The
+    # window it buys the killed and accelerator-failure endings is narrow,
+    # too -- `metrics.json` is the last thing the training script
+    # writes, after the checkpoint and the tokenizer, so a process killed
+    # mid-run has most likely written none. Narrow is not nothing: a run
+    # killed just after that write is exactly the run whose device is worth
+    # knowing, and there is no cost to reading a file that is already parsed.
+    metrics_device = result.metrics.device if result.metrics is not None else None
+    if metrics_device is not None:
+        events.note(f"trained on {metrics_device}", device=metrics_device)
+    if metrics_device == "cpu" and request.dtype == DEFAULT_DTYPE:
+        result.limitation(f"this run trained bfloat16 on the CPU: {BFLOAT16_CPU_HINT}")
+
     reading = read_returncode(proc.returncode)
     if not reading.conclusive:
         # Killed, not failed. A training run is the longest-lived and hungriest
@@ -1135,10 +1352,47 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         # out-of-memory killer; reading `-9` as a training failure would blame
         # the method or the data for a fact about the machine. See
         # `litetune.exits`.
+        killed_detail = (
+            f"training was {reading.describe('the method or the data')}. "
+            f"stderr: {_tail(result.stderr) or 'none'}"
+        )
+        observed_device = metrics_device or device
+        # Withheld on a SIGKILL: `reading.describe` above has already named
+        # the near-certain cause -- the machine's out-of-memory killer -- and
+        # a speed hint stacked next to it reads as a second, contradictory
+        # story. A box killed while loading the checkpoint, seconds in, never
+        # ran a single matmul, slow or otherwise; the hint belongs to the
+        # signals that leave that door open, not to the one whose own text
+        # already says the run died for lack of memory.
+        if (
+            request.dtype == DEFAULT_DTYPE
+            and observed_device != "cuda"
+            and reading.signal != SIGKILL
+        ):
+            # What the script reported wins over what the probe predicted, and
+            # an unanswered probe does not silence the hint: see the note
+            # before the run. As there, the wording distinguishes a device
+            # that was *observed* -- `metrics_device`, written by the script
+            # itself -- from one that was only ever *predicted* by the
+            # pre-run probe: a killed run that never wrote metrics has
+            # nothing confirming it ran anywhere, and "it ran" would claim a
+            # past tense nothing established.
+            if metrics_device == "cpu":
+                lead = "it ran bfloat16 on the CPU"
+            elif observed_device == "cpu":
+                lead = (
+                    "the pre-run probe predicted the CPU, but the run was killed before its "
+                    "own device was confirmed"
+                )
+            else:
+                lead = (
+                    "its device was never established, and bfloat16 on a CPU is one way to "
+                    "reach this ending"
+                )
+            killed_detail = f"{killed_detail} {lead}: {BFLOAT16_CPU_HINT}."
         killed = Check.unchecked(
             TRAINING_CHECK,
-            f"training was {reading.describe('the method or the data')}. "
-            f"stderr: {_tail(result.stderr) or 'none'}",
+            killed_detail,
             observed=reading.as_dict() | {"seconds": round(result.seconds, 3)},
         )
         result.checks.add(killed)
@@ -1149,8 +1403,48 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         events.stage_finished(result.outcome.value, attempted=True)
         return result
 
+    gpu_failure = _GPU_FAILURE_RE.search(result.stderr or "") if proc.returncode != 0 else None
+    if gpu_failure is not None:
+        # The machine, not the run. An out-of-memory allocation on the GPU or
+        # the host, a device that disappeared between the probe and the run, a
+        # driver too old for the binary: each of them exits 1, and each of
+        # them says nothing at all about whether this method on this data
+        # would have worked. Same judgement as the killed branch above,
+        # arriving through stderr rather than through a signal.
+        accelerator = Check.unchecked(
+            TRAINING_CHECK,
+            f"training exited {proc.returncode} on a machine failure "
+            f"({gpu_failure.group(0)}), which says nothing about the method or the data: "
+            f"{_tail(result.stderr) or 'no stderr'}",
+            observed={
+                "returncode": proc.returncode,
+                "seconds": round(result.seconds, 3),
+                "matched": gpu_failure.group(0),
+                "device": metrics_device or device,
+                "stderr_tail": _tail(result.stderr, 2000),
+            },
+        )
+        result.checks.add(accelerator)
+        events.check(accelerator)
+        # Returns here, exactly as the killed branch above does, and for the
+        # same reason: nothing downstream of this point has an observation to
+        # make. Falling through would run `_merge_check`, which on a LoRA run
+        # would record a *failed* merge -- "no adapter was retained, the
+        # learned delta is unrecoverable" -- for a run that never got far
+        # enough to have one, while a full fine-tune's merge check returns
+        # `passed` unconditionally (there is no adapter to merge for that
+        # method, so it has nothing to fail on). A false *passed* is worse
+        # than the silence an early return leaves: it reports a merge that did
+        # not happen as though it had. One machine event, two wrong reports,
+        # chosen by `--method`.
+        result.checks.add(
+            masking_check(result.metrics, "the accelerator failed, so no mask was observed")
+        )
+        events.stage_finished(result.outcome.value, attempted=True)
+        return result
+
     if proc.returncode != 0:
-        failed = Check.failed(
+        training = Check.failed(
             TRAINING_CHECK,
             f"training exited {proc.returncode}: {_tail(result.stderr) or 'no stderr'}",
             observed={
@@ -1162,14 +1456,14 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     elif not _directory_is_populated(request.model_dir):
         # Exit zero and no checkpoint is the documented shape of this toolchain's
         # failures, and it is the reason `export` measures the same thing.
-        failed = Check.failed(
+        training = Check.failed(
             TRAINING_CHECK,
             f"training exited zero but wrote no checkpoint into {request.model_dir}",
             observed={"returncode": 0, "model_dir": str(request.model_dir)},
         )
     else:
         result.model_dir = request.model_dir
-        failed = Check.passed(
+        training = Check.passed(
             TRAINING_CHECK,
             f"{request.method} fine-tune finished in {result.seconds:.1f}s at learning rate "
             f"{request.rate:g} — trained, not verified",
@@ -1182,8 +1476,8 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
                 "verified": False,
             },
         )
-    result.checks.add(failed)
-    events.check(failed)
+    result.checks.add(training)
+    events.check(training)
     if result.model_dir is not None:
         events.artifact(str(result.model_dir), name="model", verified=False)
 

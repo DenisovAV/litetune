@@ -17,6 +17,7 @@ import pytest
 
 from litetune.evaluate import (
     GREEDY,
+    UNKNOWN_BACKEND,
     DecodeConfig,
     Generation,
     GenerationBackend,
@@ -52,7 +53,12 @@ class FakeBackend:
         return self.model
 
     def describe(self) -> dict:
-        return {"engine": "fake", "backend": "none"}
+        # `UNKNOWN_BACKEND`, not a third word for it. This double runs on no
+        # hardware, which is the state that constant names -- and
+        # `evaluate.device_mismatch` reads this key, so a double inventing its
+        # own vocabulary here would manufacture a hardware difference between
+        # two fakes that never touched hardware.
+        return {"engine": "fake", "backend": UNKNOWN_BACKEND}
 
     def generate(self, prompts: Sequence[str], events=None) -> list[Generation]:
         self.prompts_seen.append(list(prompts))
@@ -68,6 +74,23 @@ class FakeBackend:
             )
             for i, prompt in enumerate(prompts)
         ]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_env_cache(monkeypatch, tmp_path):
+    """Point the stage-environment cache at this test's own directory.
+
+    `StageEnv.ready` reads a marker file under `LITETUNE_ENV_DIR`, and code now
+    branches on it: `HuggingFaceBackend._ensure_env` runs the device probe only
+    against a ready environment. Without this, whether a given test probes
+    depends on whether the developer running it happens to have a matching
+    environment provisioned in `~/.cache/litetune/envs` -- which is not a
+    property of the code under test, and on a machine that has one would send a
+    real `python -c "import torch"` into a test that faked everything else.
+    Tests that want a ready environment write the marker themselves; this only
+    guarantees they start from a machine with none.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "litetune-envs"))
 
 
 @pytest.fixture
@@ -95,6 +118,37 @@ def labelled_rows(n: int) -> list[dict]:
 
 def correct_texts(rows: Sequence[dict]) -> list[str]:
     return [call_text(r["target"]["name"], **r["target"]["args"]) for r in rows]
+
+
+@dataclass
+class _FakeCuda:
+    """`torch.cuda`, reduced to the one method `training_device`/`generation_device`
+    call."""
+
+    available: bool
+
+    def is_available(self) -> bool:
+        return self.available
+
+
+@dataclass
+class FakeTorch:
+    """`torch`, reduced to the one attribute either device function reads."""
+
+    cuda: _FakeCuda
+
+
+def fake_torch(cuda: bool = False) -> FakeTorch:
+    """A `torch` double whose `.cuda.is_available()` answers `cuda`.
+
+    One shape, shared by `test_tune.py` and `test_evaluate.py`, and the
+    parameter is the point of it. `training_device` and `generation_device`
+    both fall back to `torch.cuda.is_available()`, and a double that can only
+    say "no GPU" cannot tell that fallback from a hardcoded `"cpu"` -- every
+    mutant of it still answers "cpu" against such a double. Being able to say
+    "there is a GPU" is what makes those two lines testable at all.
+    """
+    return FakeTorch(cuda=_FakeCuda(cuda))
 
 
 # A conformance assertion, not a runtime one: this is what makes the claim above

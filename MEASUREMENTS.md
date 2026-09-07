@@ -223,4 +223,6 @@ as such.
 **What it did not establish.** No untuned-base run, so training gain is
 unattributed and the prepare stage's headroom slices are empty. CPU only — no
 GPU or NPU figure for this family. Trained in float32 rather than the bfloat16
-default because bfloat16 on this CPU runs on a single core.
+default because bfloat16 on this CPU runs on a single core: a 300-step LoRA
+run in bfloat16 sat on that one core for 52 minutes without finishing, and the
+same run in float32 finished in 307 s on ten threads.

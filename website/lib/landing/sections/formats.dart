@@ -6,16 +6,17 @@ import '../../theme/brand.dart';
 /// What comes out of the pipeline, and what it is compatible with.
 ///
 /// Two rows carry a qualifier in muted text rather than a claim: the hardware
-/// row says the measurement runs on CPU, and the models row says only one
-/// family has been measured end to end. Both are in the README's limitations
-/// section, and a compatibility table that quietly drops them would be the
-/// exact failure the tool was built to catch.
+/// row says which stages the measurement runs on CPU for, and the models row
+/// says only one family has been measured end to end. Both are in the
+/// README's limitations section, and a compatibility table that quietly
+/// drops them would be the exact failure the tool was built to catch.
 ///
 /// The hardware row names NPU because the runtime has one — Snapdragon on
 /// Android, Intel on Windows — while the qualifier keeps litetune's own claim
-/// narrow: it measures on CPU. Naming a capability of the runtime and claiming
-/// a measurement of it are different sentences; only the second would be
-/// unsupported.
+/// narrow: it measures on CPU, except training and the float reference, which
+/// use a GPU when the host has one and record which backend actually produced
+/// each result. Naming a capability of the runtime and claiming a measurement
+/// of it are different sentences; only the second would be unsupported.
 class Formats extends StatelessComponent {
   const Formats({super.key});
 
@@ -44,8 +45,9 @@ class Formats extends StatelessComponent {
           ),
           span(classes: 'qualifier', [
             Component.text(
-              ' — litetune measures on CPU, and every result records which '
-              'backend produced it',
+              ' — litetune measures on CPU, except training and the float '
+              'reference, which use a GPU when the host has one; every result '
+              'records which backend produced it, or records it as unknown',
             ),
           ]),
         ]),

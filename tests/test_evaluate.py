@@ -12,17 +12,20 @@ eight confident negatives during the measurement work, so each has its own test.
 import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
-from conftest import FakeBackend, call_text, labelled_rows
+from conftest import FakeBackend, call_text, fake_torch, labelled_rows
 
 from litetune import envs
 from litetune.evaluate import (
+    UNKNOWN_BACKEND,
     DataError,
     DecodeConfig,
     HuggingFaceBackend,
     LiteRtLmBackend,
     PromptMode,
+    device_mismatch,
     evaluate,
     harness_mismatch,
     load_split,
@@ -234,6 +237,355 @@ def test_turning_on_the_chat_template_changes_the_measured_mode():
     assert templated.prompt_mode is PromptMode.RUNTIME_RENDERED
 
 
+def test_hugging_face_backend_reports_an_unknown_device_before_it_has_run():
+    # Not "cpu": a manifest read before `generate()` ran must not claim a
+    # device nothing measured yet. "unknown" and not a second word for it --
+    # `verify.py` already prints `engine.get("backend", "unknown")` for the
+    # same state when the key is missing entirely.
+    described = HuggingFaceBackend(model="org/m", auto_provision=False).describe()
+    assert described["backend"] == UNKNOWN_BACKEND == "unknown"
+
+
+def test_the_two_backends_say_which_vocabulary_their_backend_field_is_in(tmp_path):
+    """One key, two answers to two different questions.
+
+    `backend` is a torch device on the reference side and the flag passed to
+    `litert-lm` on the candidate side. They overlap at exactly one string,
+    "cpu", where they mean different things -- so each `describe()` says which
+    question it answered.
+    """
+    reference = HuggingFaceBackend(model="org/m", auto_provision=False).describe()
+    candidate = _litertlm(tmp_path).describe()
+    assert reference["backend_vocabulary"] == "torch device"
+    assert candidate["backend_vocabulary"] == "litert-lm --backend flag"
+    assert reference["backend_vocabulary"] != candidate["backend_vocabulary"]
+
+
+def test_hugging_face_backend_reports_the_device_it_actually_used(monkeypatch):
+    """Used to hardcode "cpu" unconditionally, which made a laptop's manifest
+    and a GPU box's byte-identical in the one field meant to tell them apart.
+    """
+
+    def fake_provision(self, events=None, force=False):
+        # The marker file, not just the directory: `_ensure_env` gates the
+        # probe on `env.ready`, which is exactly this file's existence.
+        self.path.mkdir(parents=True, exist_ok=True)
+        (self.path / ".litetune-ready").write_text(self.identity)
+        return self.path
+
+    monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
+    monkeypatch.setattr(
+        envs,
+        "resolve_device",
+        lambda env, timeout=30, events=None: envs.DeviceProbe(device="cuda", detail="fake"),
+    )
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text())
+        Path(spec["out"]).write_text(
+            json.dumps({"index": 0, "text": call_text("a")}) + "\n", encoding="utf-8"
+        )
+        Path(spec["run_report"]).write_text(json.dumps({"device": "cuda"}), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+
+    backend = HuggingFaceBackend(model="org/model")
+    backend.generate(["a"])
+
+    assert backend.describe()["backend"] == "cuda"
+
+
+def _ready_env() -> None:
+    """Make `envs.TRAIN` look provisioned without provisioning anything.
+
+    `_ensure_env` gates the device probe on `env.ready`, which is the marker
+    file and nothing else.
+    """
+    envs.TRAIN.path.mkdir(parents=True, exist_ok=True)
+    (envs.TRAIN.path / ".litetune-ready").write_text(envs.TRAIN.identity)
+
+
+def _generating_env(monkeypatch, *, probe: str | None, script_device: str | None) -> list:
+    """A stage environment that answers the probe and then generates.
+
+    Returns the argv of every call, so a test can assert that the probe
+    happened -- or did not.
+    """
+    calls: list = []
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        calls.append(list(args))
+        if args[1] == "-c":
+            if probe is None:
+                return subprocess.CompletedProcess(args, 1, "", "no torch")
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                json.dumps({"device": probe, "cuda_build": None, "device_count": 0}),
+                "",
+            )
+        spec = json.loads(Path(args[2]).read_text())
+        Path(spec["out"]).write_text(
+            json.dumps({"index": 0, "text": call_text("a")}) + "\n", encoding="utf-8"
+        )
+        if script_device is not None:
+            Path(spec["run_report"]).write_text(
+                json.dumps({"device": script_device}), encoding="utf-8"
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    return calls
+
+
+def test_the_probe_runs_over_a_ready_environment_nobody_asked_to_provision(monkeypatch):
+    """The probe provisions nothing, so readiness is its real precondition.
+
+    Gated on `auto_provision` instead, a caller that manages the environment's
+    lifecycle itself -- a library caller, and every backend in this file --
+    reported `describe()["backend"] == "unknown"` for a run whose device was
+    perfectly knowable. No CLI path reaches that state: `verify` has no
+    `--no-provision` flag.
+    """
+    _ready_env()
+    calls = _generating_env(monkeypatch, probe="cuda", script_device="cuda")
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    assert [c[1] for c in calls][0] == "-c"
+    assert backend.describe()["backend"] == "cuda"
+
+
+def test_no_probe_against_an_environment_that_is_not_there(monkeypatch):
+    """An environment with no marker is one nothing can be asked of."""
+    calls = _generating_env(monkeypatch, probe="cuda", script_device=None)
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    assert all(c[1] != "-c" for c in calls)
+    assert backend.describe()["backend"] == UNKNOWN_BACKEND
+
+
+def test_the_script_reports_the_device_it_used_and_that_answer_wins(monkeypatch):
+    """The probe is a prediction; the run report is the observation.
+
+    They differ whenever the script took its own fallback. `tune.py` has had
+    the observation all along through `metrics.device`; the reference side
+    predicted "cpu" and published it as though it had watched.
+    """
+    _ready_env()
+    _generating_env(monkeypatch, probe="cpu", script_device="cuda")
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    assert backend.device == "cuda"
+    assert backend.describe()["backend"] == "cuda"
+    # Both, not only the winner. A manifest that records "cuda" and nothing
+    # else cannot show that the prediction was wrong, and the logger line that
+    # says so does not travel with the measurement.
+    assert backend.probed_device == "cpu"
+    assert backend.describe()["backend_probed"] == "cpu"
+
+
+def test_a_run_that_used_what_it_was_told_records_the_two_as_equal(monkeypatch):
+    _ready_env()
+    _generating_env(monkeypatch, probe="cuda", script_device="cuda")
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    described = backend.describe()
+    assert described["backend"] == described["backend_probed"] == "cuda"
+
+
+def test_a_script_that_wrote_no_report_leaves_the_prediction_standing(monkeypatch):
+    """A run that died before writing it, or an older script that never did.
+    The prediction is still the best thing known, and `None` would be worse."""
+    _ready_env()
+    _generating_env(monkeypatch, probe="cuda", script_device=None)
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    assert backend.device == "cuda"
+
+
+def test_a_run_report_that_is_not_valid_utf8_leaves_the_prediction_standing(tmp_path):
+    """Same family as the blocker: `_read_results` a few lines below already
+    catches `UnicodeDecodeError` on a damaged results file; `_read_run_report`
+    used to let it escape, which would have aborted verification after the
+    generations that report was only ever supposed to annotate had already
+    been produced."""
+    report = tmp_path / "run.json"
+    report.write_bytes(b"\xff\xfe{not json")
+    device = HuggingFaceBackend(model="org/m", auto_provision=False)._read_run_report(report)
+    assert device is None
+
+
+def test_a_failed_probe_does_not_erase_a_device_already_known(monkeypatch):
+    """Reuse. The previous run's answer is a better record than `None`, and
+    `None` would claim the device was never established when it was."""
+    _ready_env()
+    _generating_env(monkeypatch, probe=None, script_device=None)
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False, device="cuda")
+    backend.generate(["a"])
+
+    assert backend.device == "cuda"
+
+
+def test_a_timeout_clears_the_device_it_never_confirmed(monkeypatch):
+    """The probe answered, but the generation subprocess it precedes never
+    finished: nothing ran, so `describe()` must not report the probe's
+    prediction as though the run had confirmed it."""
+    _ready_env()
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        if args[1] == "-c":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"device": "cuda", "cuda_build": None, "device_count": 1}), ""
+            )
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    gens = backend.generate(["a"])
+
+    assert gens[0].harness_error is not None
+    assert backend.device is None
+    assert backend.describe()["backend"] == UNKNOWN_BACKEND
+
+
+def test_a_script_that_could_not_start_clears_the_device_it_never_confirmed(monkeypatch):
+    _ready_env()
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        if args[1] == "-c":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"device": "cuda", "cuda_build": None, "device_count": 1}), ""
+            )
+        raise FileNotFoundError("python")
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    gens = backend.generate(["a"])
+
+    assert gens[0].harness_error is not None
+    assert backend.device is None
+    assert backend.describe()["backend"] == UNKNOWN_BACKEND
+
+
+def test_a_failed_probe_does_not_force_a_stale_device_onto_the_child(monkeypatch):
+    """The do-not-erase rule above protects the *report*; it must not also
+    hand the *child* a directive its own probe could not vouch for. Before
+    this was fixed, `spec["device"]` read `self.device` -- the previous run's
+    "cuda" -- even though this call's probe could not answer, which would make
+    `model.to("cuda")` fail on a box where CUDA had since gone away."""
+    _ready_env()
+    specs: list[dict] = []
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        if args[1] == "-c":
+            # No torch: the probe cannot answer this call.
+            return subprocess.CompletedProcess(args, 1, "", "no torch")
+        specs.append(json.loads(Path(args[2]).read_text()))
+        Path(json.loads(Path(args[2]).read_text())["out"]).write_text(
+            json.dumps({"index": 0, "text": call_text("a")}) + "\n", encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False, device="cuda")
+    backend.generate(["a"])
+
+    assert backend.device == "cuda", "the report still remembers the previous answer"
+    assert len(specs) == 1
+    assert (
+        specs[0]["device"] is None
+    ), "a probe that could not answer must not be forced onto the child"
+
+
+def test_a_blocked_environment_clears_the_device(monkeypatch):
+    """Nothing ran, so nothing has a device. The opposite of the case above:
+    there is no result here for a stale answer to describe."""
+
+    def explode(self, events=None, force=False):
+        raise RuntimeError("no interpreter")
+
+    monkeypatch.setattr(envs.StageEnv, "provision", explode)
+
+    backend = HuggingFaceBackend(model="org/model", device="cuda")
+    gens = backend.generate(["a"])
+
+    assert backend.device is None
+    assert backend.describe()["backend"] == UNKNOWN_BACKEND
+    assert gens[0].harness_error is not None
+
+
+# -- comparing two points that ran on different hardware ---------------------
+
+
+def _point(label: str, backend: str, engine: str = "transformers"):
+    from litetune.evaluate import GREEDY, MeasurementPoint
+
+    return MeasurementPoint(
+        label=label,
+        model_ref="org/m",
+        backend=engine,
+        prompt_mode=PromptMode.PRERENDERED,
+        decode=GREEDY,
+        split_id="s",
+        engine={"engine": engine, "backend": backend},
+        decode_enforced=True,
+    )
+
+
+def test_two_points_on_different_hardware_are_annotated_not_refused():
+    """`build_backends` pins the candidate to litert-lm's CPU backend and lets
+    the reference resolve its own device, so on a GPU box the two differ and
+    the conversion cost carries a hardware difference. Refusing would leave
+    such a machine unable to verify at all; the number is kept and told what
+    is in it.
+    """
+    note = device_mismatch(
+        _point("candidate", "cpu", engine="litert-lm"), _point("reference", "cuda")
+    )
+    assert note is not None
+    assert "cpu" in note and "cuda" in note
+    assert "candidate" in note and "reference" in note
+    # Still comparable: this is a limitation, not a refusal.
+    assert (
+        harness_mismatch(
+            _point("candidate", "cpu", engine="litert-lm"), _point("reference", "cuda")
+        )
+        is None
+    )
+
+
+def test_two_points_on_the_same_device_are_not_annotated():
+    assert (
+        device_mismatch(_point("candidate", "cpu", engine="litert-lm"), _point("reference", "cpu"))
+        is None
+    )
+
+
+def test_an_unestablished_device_is_not_a_difference():
+    """Nothing was established to differ from, and `describe()` already says
+    so in the same field."""
+    assert (
+        device_mismatch(
+            _point("candidate", "cpu", engine="litert-lm"),
+            _point("reference", UNKNOWN_BACKEND),
+        )
+        is None
+    )
+
+
 # -- the evaluator ----------------------------------------------------------
 
 
@@ -375,6 +727,200 @@ def test_the_reference_decoder_keeps_the_terminator_scoring_trims():
     assert "skip_special_tokens=True" not in _HF_GENERATE_SCRIPT
 
 
+class _GenerationStopped(RuntimeError):
+    """Stands in for a reference run that dies once the model is placed.
+
+    The OOM killer is the realistic cause -- this project has been killed at
+    32 GiB more than once -- but any death after placement and before the last
+    completion has the same shape, and the script's run report exists to
+    survive it.
+    """
+
+
+def _run_hf_generate_script(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    dtype: str = "bfloat16",
+    cuda: bool = False,
+    given=None,
+    stop_generation: bool = False,
+) -> dict:
+    """Runs `_HF_GENERATE_SCRIPT`'s real `main()` against faked `torch` and
+    `transformers`, and returns what the fakes captured.
+
+    `torch` and `transformers` are faked at the import boundary -- the same
+    pattern `test_tune.py`'s `script_namespace` fixture uses to test the
+    training script's body without a real torch. `cuda` and `given` are the
+    two things that decide where the script places the model: `cuda` is what
+    the fake `torch.cuda.is_available()` answers, `given` is `spec["device"]`,
+    what the parent already resolved. `FakeInputIds` and `FakeEncoding` track
+    their own device and hand back a new object when `.to()` actually moves
+    them, the way a real tensor does -- a double that returns `self`
+    unconditionally cannot tell a dropped `.to()` call from one that ran.
+    """
+    import sys
+    import types
+
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+
+    captured: dict = {}
+
+    class FakeModel:
+        def eval(self) -> "FakeModel":
+            return self
+
+        def to(self, device: str) -> "FakeModel":
+            # The script places the model before generating. Recorded rather
+            # than ignored so a reader can see this double is standing in for
+            # a real move, not silently swallowing one.
+            captured["model_device"] = device
+            return self
+
+        def generate(self, **kwargs: object) -> list[list[int]]:
+            captured["generate_input_ids_device"] = getattr(kwargs["input_ids"], "device", None)
+            if stop_generation:
+                raise _GenerationStopped("the run stopped after the model was placed")
+            return [[0, 1, 2, 3]]
+
+    class FakeAutoModelForCausalLM:
+        @staticmethod
+        def from_pretrained(model: str, torch_dtype: object, attn_implementation: str) -> FakeModel:
+            captured["torch_dtype"] = torch_dtype
+            return FakeModel()
+
+    class FakeInputIds(list):
+        device: str = "cpu"
+
+        @property
+        def shape(self) -> tuple[int, int]:
+            return (1, len(self[0]))
+
+        def to(self, device: str) -> "FakeInputIds":
+            if device == self.device:
+                return self
+            moved = FakeInputIds(self)
+            moved.device = device
+            return moved
+
+    class FakeEncoding(dict):
+        """What the tokenizer hands back, which the script places on a device.
+
+        A plain dict has no `.to`, and the script calls it -- so a double that
+        is a bare dict makes this test fail for a reason that has nothing to do
+        with the dtype or device it exists to pin.
+        """
+
+        device: str = "cpu"
+
+        def to(self, device: str) -> "FakeEncoding":
+            if device == self.device:
+                return self
+            moved = FakeEncoding(
+                {k: (v.to(device) if hasattr(v, "to") else v) for k, v in self.items()}
+            )
+            moved.device = device
+            return moved
+
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def __call__(self, text: str, return_tensors: str = "pt") -> "FakeEncoding":
+            return FakeEncoding({"input_ids": FakeInputIds([[10, 11, 12]])})
+
+        def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
+            return "generated"
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(model: str) -> FakeTokenizer:
+            return FakeTokenizer()
+
+    # `Any`: a real module has none of these attributes declared, and this
+    # double exists to be assigned onto dynamically -- same as the untyped
+    # test bodies elsewhere in this suite that `check_untyped_defs = false`
+    # leaves unchecked, made explicit here because this function is typed.
+    fake_torch_module: Any = types.ModuleType("torch")
+    fake_torch_module.float32 = "sentinel:float32"
+    fake_torch_module.bfloat16 = "sentinel:bfloat16"
+    fake_torch_module.no_grad = __import__("contextlib").nullcontext
+    # `fake_torch` from `conftest.py`: the one shape a fake `torch.cuda` takes
+    # in this suite, reused rather than a fourth hand-rolled `is_available`.
+    fake_torch_module.cuda = fake_torch(cuda=cuda).cuda
+
+    fake_transformers: Any = types.ModuleType("transformers")
+    fake_transformers.AutoModelForCausalLM = FakeAutoModelForCausalLM
+    fake_transformers.AutoTokenizer = FakeAutoTokenizer
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch_module)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    spec_path = tmp_path / "spec.json"
+    out_path = tmp_path / "out.jsonl"
+    report_path = tmp_path / "run.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "model": "org/m",
+                "prompts": ["hi"],
+                "max_tokens": 8,
+                "runtime_rendered": False,
+                "attn_implementation": "eager",
+                "dtype": dtype,
+                "device": given,
+                "out": str(out_path),
+                "run_report": str(report_path),
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "argv", ["generate.py", str(spec_path)])
+
+    # `exec` on this module's own `_HF_GENERATE_SCRIPT` constant, not on
+    # external input.
+    namespace: dict = {"__name__": "litetune_generate_script_under_test"}
+    exec(compile(_HF_GENERATE_SCRIPT, "generate_script.py", "exec"), namespace)
+    if stop_generation:
+        with pytest.raises(_GenerationStopped):
+            namespace["main"]()
+    else:
+        namespace["main"]()
+    # The run report is the script's structured answer about its own device,
+    # and it is what the backend reads back -- so the fixture returns it
+    # beside what the torch doubles captured. Whether it exists at all is
+    # reported separately, because a run that stopped early is exactly the
+    # case where the answer is worth having and the file might be missing.
+    captured["run_report_written"] = report_path.exists()
+    if report_path.exists():
+        captured["run_report"] = json.loads(report_path.read_text(encoding="utf-8"))
+    return captured
+
+
+def test_the_run_report_is_written_before_any_generation_runs(tmp_path, monkeypatch):
+    """Pins the *ordering*, which the comment beside the write claims and no
+    other test enforces.
+
+    Moving that write to after the generation loop -- present, otherwise
+    identical -- passes every other test in this suite, because they all read
+    the report from a run that finished. Deleting the write is caught; writing
+    it late is not. The difference only shows on a run that stops part-way,
+    and that is the run whose device is hardest to recover afterwards: the
+    parent falls back to its own prediction, or to `unknown`, for a reference
+    that had demonstrably reached a device and started work.
+
+    So the model is placed, the first `generate` raises, and the report must
+    already be on disk with the right answer in it.
+    """
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, cuda=True, stop_generation=True)
+
+    assert captured["model_device"] == "cuda"
+    assert captured["run_report_written"], (
+        "the run report must exist once the model is placed, not only once "
+        "generation has finished"
+    )
+    assert captured["run_report"]["device"] == "cuda"
+
+
 def test_the_float_reference_loads_at_float32_regardless_of_spec_dtype(tmp_path, monkeypatch):
     """S7: pins the *fact*, not the string. `tune.py`'s comments and
     limitations quote the prose "evaluate.py's float reference loads at an
@@ -387,87 +933,50 @@ def test_the_float_reference_loads_at_float32_regardless_of_spec_dtype(tmp_path,
 
     This runs the script's actual `main()` against a spec that carries a
     "dtype" key anyway (the backend does not have to write one for this to
-    matter -- only the script's own indifference to it does), with `torch`
-    and `transformers` faked at the import boundary, and asserts the dtype
-    the fake model loader actually received.
+    matter -- only the script's own indifference to it does), and asserts the
+    dtype the fake model loader actually received. No GPU and no `given`
+    keeps this test about the dtype: the device choice is the tests below's
+    to make.
     """
-    import json
-    import sys
-    import types
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, dtype="bfloat16")
+    assert captured["torch_dtype"] == "sentinel:float32"
 
+
+def test_the_reference_script_generates_on_cuda_when_there_is_one():
+    """Falls back to asking torch only when the parent could not answer."""
     from litetune.evaluate import _HF_GENERATE_SCRIPT
 
-    captured: dict = {}
+    namespace: dict = {"__name__": "litetune_hf_script_under_test"}
+    exec(compile(_HF_GENERATE_SCRIPT, "hf_generate.py", "exec"), namespace)
 
-    class FakeModel:
-        def eval(self) -> "FakeModel":
-            return self
+    assert namespace["generation_device"](fake_torch(cuda=True)) == "cuda"
+    assert namespace["generation_device"](fake_torch(cuda=False)) == "cpu"
 
-        def generate(self, **kwargs: object) -> list[list[int]]:
-            return [[0, 1, 2, 3]]
 
-    class FakeAutoModelForCausalLM:
-        @staticmethod
-        def from_pretrained(model: str, torch_dtype: object, attn_implementation: str) -> FakeModel:
-            captured["torch_dtype"] = torch_dtype
-            return FakeModel()
+def test_the_reference_script_moves_everything_to_the_device_it_resolves(tmp_path, monkeypatch):
+    """Kills three mutants at once, all invisible against a cuda-less fixture:
+    `device = generation_device(...)` hardcoded to `"cpu"`, `model.to(device)`
+    dropped or aimed at `"meta"`, and `.to(device)` dropped off the encoding
+    before `model.generate(**enc)`. Each leaves the model and its inputs on
+    different devices, which only shows up once the fake `torch` can say
+    there is a GPU.
+    """
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, cuda=True)
+    assert captured["model_device"] == "cuda"
+    assert captured["generate_input_ids_device"] == "cuda"
 
-    class FakeInputIds(list):
-        @property
-        def shape(self) -> tuple[int, int]:
-            return (1, len(self[0]))
 
-    class FakeTokenizer:
-        pad_token_id = 0
-        eos_token_id = 1
+def test_the_reference_script_writes_its_device_where_the_parent_can_read_it(tmp_path, monkeypatch):
+    """Structured, not only printed to stderr -- `_assemble` discards stderr
+    on a clean exit, which is the path that matters."""
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, cuda=True)
+    assert captured["run_report"] == {"device": "cuda"}
 
-        def __call__(self, text: str, return_tensors: str = "pt") -> dict:
-            return {"input_ids": FakeInputIds([[10, 11, 12]])}
 
-        def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
-            return "generated"
-
-    class FakeAutoTokenizer:
-        @staticmethod
-        def from_pretrained(model: str) -> FakeTokenizer:
-            return FakeTokenizer()
-
-    fake_torch = types.ModuleType("torch")
-    fake_torch.float32 = "sentinel:float32"
-    fake_torch.bfloat16 = "sentinel:bfloat16"
-    fake_torch.no_grad = __import__("contextlib").nullcontext
-
-    fake_transformers = types.ModuleType("transformers")
-    fake_transformers.AutoModelForCausalLM = FakeAutoModelForCausalLM
-    fake_transformers.AutoTokenizer = FakeAutoTokenizer
-
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-
-    spec_path = tmp_path / "spec.json"
-    out_path = tmp_path / "out.jsonl"
-    spec_path.write_text(
-        json.dumps(
-            {
-                "model": "org/m",
-                "prompts": ["hi"],
-                "max_tokens": 8,
-                "runtime_rendered": False,
-                "attn_implementation": "eager",
-                # The fact under test: a checkpoint trained at bfloat16 must
-                # not move the reference off float32.
-                "dtype": "bfloat16",
-                "out": str(out_path),
-            }
-        )
-    )
-    monkeypatch.setattr(sys, "argv", ["generate.py", str(spec_path)])
-
-    # `exec` on this module's own `_HF_GENERATE_SCRIPT` constant, not on
-    # external input -- the same pattern `test_tune.py`'s `script_namespace`
-    # fixture uses to test the training script's body without a real torch.
-    namespace: dict = {"__name__": "litetune_generate_script_under_test"}
-    exec(compile(_HF_GENERATE_SCRIPT, "generate_script.py", "exec"), namespace)
-    namespace["main"]()
-
-    assert captured["torch_dtype"] == "sentinel:float32"
+def test_the_reference_script_prefers_what_the_parent_already_resolved(tmp_path, monkeypatch):
+    """`given` (`spec["device"]`, what `HuggingFaceBackend` asked
+    `envs.resolve_device` before this script started) wins over asking torch
+    -- not a second, possibly-disagreeing guess made inside the subprocess.
+    """
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, cuda=False, given="cuda")
+    assert captured["model_device"] == "cuda"
