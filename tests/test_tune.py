@@ -431,6 +431,22 @@ def test_which_terminator_was_used_is_recorded(script_namespace):
     assert terminator["text"]
 
 
+def test_which_terminator_was_used_is_recorded_from_the_chat_template(script_namespace):
+    """Distinct from the test above on purpose: that one drives the fallback
+    path, where `terminator_source` genuinely is "tokenizer_eos" -- a
+    `build_examples` that hardcoded that string into the metrics dict instead
+    of using the value `turn_terminator` returned would still pass it. This
+    drives the chat-template path, where the two values differ, so the
+    metrics dict has to be carrying the real one.
+    """
+    build_examples = script_namespace["build_examples"]
+    rows = [{"prompt": "a", "completion": "x", "source_line": 1}]
+
+    _, _, _, terminator = build_examples(FakeTemplateTokenizer(), rows, 64, True)
+
+    assert terminator["source"] == "chat_template"
+
+
 def test_the_script_masks_every_prompt_token(script_namespace):
     build_examples = script_namespace["build_examples"]
     rows = [{"prompt": "a b c d e", "completion": "x y", "source_line": 1}]
@@ -671,10 +687,78 @@ def test_the_dtype_and_attention_the_export_path_uses_are_passed_through(trainer
 
 
 def test_a_different_dtype_is_allowed_and_named_as_a_limitation(trainer, request_for):
+    """`--dtype float32` -- what every published number in this repo was
+    actually measured under -- must not be told it is "not the pair the
+    export and evaluation paths use": evaluate.py's float reference always
+    loads at float32 regardless of training dtype, so this is the one value
+    that already matches it. Attention still defaults to eager here, so its
+    own, separate limitation must not fire.
+    """
     result = run_tune(request_for(dtype="float32"))
 
     assert trainer.configs[0]["dtype"] == "float32"
+    assert any(
+        "trains with dtype 'float32'" in text and "published number" in text
+        for text in result.limitations
+    ), result.limitations
+    assert not any("fluent, wrong" in text for text in result.limitations)
+
+
+def test_a_different_attention_implementation_is_named_as_a_limitation(trainer, request_for):
+    result = run_tune(request_for(attn_implementation="sdpa"))
+
+    assert trainer.configs[0]["attn_implementation"] == "sdpa"
     assert any("fluent, wrong" in text for text in result.limitations)
+
+
+def test_training_at_the_default_dtype_states_what_is_and_is_not_established(trainer, request_for):
+    """The two corrections to the limitation this branch shipped: the reason
+    bfloat16 beats float16 *is* in the repo (spec.py's overflow, cli.py's
+    NaN), so "not established" must be scoped to bfloat16 versus float32
+    only; and export.py passing no dtype is not the same claim as export not
+    loading in bfloat16, which nothing here establishes.
+    """
+    result = run_tune(request_for())
+
+    text = next(t for t in result.limitations if "optimiser's moments are bfloat16" in t)
+    assert "float16 overflows" in text
+    assert "NaN in float16" in text
+    assert "bfloat16 versus float32" in text
+    assert "export passes no dtype" in text
+    assert "the export and evaluation paths do not load in it" not in text
+
+
+def test_the_default_dtype_comment_does_not_claim_export_loads_in_bfloat16():
+    """A pure comment, not a runtime value -- pinned by reading the module's
+    own source, the way `test_manifest.py` pins `pyproject.toml`'s text.
+    `DEFAULT_DTYPE`'s comment used to claim the export and evaluation paths
+    use bfloat16 the same way they use eager attention; only the attention
+    half is true (evaluate.py:653 passes it through; evaluate.py:652 is an
+    unconditional `torch_dtype=torch.float32`).
+    """
+    import inspect
+
+    import litetune.tune as tune_module
+
+    source = inspect.getsource(tune_module)
+    assert "bfloat16 and eager attention, because the export and evaluation paths use" not in source
+    assert "Eager attention, because the export and evaluation paths use it too" in source
+
+
+def test_the_tune_request_docstring_does_not_claim_dtype_has_a_pair():
+    """R6's sixth copy of the claim: `help(TuneRequest)` used to say `dtype`
+    and `attn_implementation` "default to the pair the export and evaluation
+    paths use". Only `attn_implementation` has a pair to match -- evaluate.py
+    loads the float reference at an unconditional `float32` regardless of
+    training dtype, and export.py passes no dtype to the exporter at all.
+    """
+    import inspect
+
+    from litetune.tune import TuneRequest
+
+    doc = inspect.getdoc(TuneRequest) or ""
+    assert "default to the pair the export and evaluation paths use" not in doc
+    assert "such pair to default to" in doc
 
 
 def test_a_completed_run_is_never_reported_as_verified(trainer, request_for):
@@ -966,6 +1050,61 @@ def test_the_real_script_refuses_an_over_length_row(request_for, stub_env, tmp_p
     assert proc.returncode != 0
     assert "source line 9" in proc.stderr
     assert not (request.output_dir / "metrics.json").exists()
+
+
+def test_the_recorded_terminator_reaches_bundles_stop_tokens(request_for, stub_env, tmp_path):
+    """The path README publishes: "`tune` records it at `turn_terminator.text`
+    in `metrics.json`, and `bundle` carries it into `contract.json`'s
+    `stop_tokens`". Every other test of either end feeds a hand-written
+    `metrics.json` fixture, so the two ends have only ever been shown to
+    agree with each other, not with what `tune` actually writes. This test
+    joins the hops: the real training script (via `run_real_script`, not
+    `FakeTrainer`'s canned payload) writes the real `metrics.json`, and that
+    exact file is handed to `bundle` through `--train-metrics`.
+    """
+    from litetune.cli import main
+
+    request = request_for()
+    proc = run_real_script(request, stub_env)
+    assert proc.returncode == 0, proc.stderr
+
+    metrics_path = request.output_dir / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    terminator_text = metrics["turn_terminator"]["text"]
+    # A real, computed decode -- not a placeholder a mutant renaming the key
+    # could still satisfy by accident.
+    assert terminator_text == "<99>"
+
+    model_file = tmp_path / "m.litertlm"
+    model_file.write_text("{}", encoding="utf-8")
+    declarations = tmp_path / "d.json"
+    declarations.write_text("[]", encoding="utf-8")
+    bundle_dir = tmp_path / "bundle"
+
+    main(
+        [
+            "bundle",
+            "--output-dir",
+            str(bundle_dir),
+            "--model",
+            str(model_file),
+            "--declarations",
+            str(declarations),
+            "--prompt-mode",
+            "prerendered",
+            # A family with no extra stop tokens of its own, so the assertion
+            # below is exactly the recorded terminator and nothing added.
+            "--base-model",
+            "google/gemma-3-270m-it",
+            "--base-model-revision",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--train-metrics",
+            str(metrics_path),
+        ]
+    )
+
+    contract = json.loads((bundle_dir / "contract.json").read_text(encoding="utf-8"))
+    assert contract["stop_tokens"] == [terminator_text]
 
 
 # ---------------------------------------------------------------------------

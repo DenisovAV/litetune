@@ -54,6 +54,17 @@ class LivenessThresholds:
     # would fail every correct output.
     repetition_min_tokens: int = 12
     repetition_ngram: int = 4
+    # Numerically equal to `max_unterminated_share` below, and not for a load-
+    # bearing reason: the two are independent thresholds on unrelated checks,
+    # and the coincidence carries no meaning -- do not read one as a bound on
+    # the other. This is *not* because a difference confined to markers cannot
+    # clear this bar: divergence is computed over `comparable_form`
+    # (metrics.py), which strips only the members of `TERMINATORS`, and a
+    # residue of markers the vocabulary does not recognise -- by definition
+    # outside that set -- survives it. A candidate byte-identical to the
+    # baseline except for an unrecognised marker on 10% of rows clears this
+    # check at its default threshold (test_liveness.py pins the mechanism and
+    # the gap it opens). Known gap, not denied.
     min_divergence_share: float = 0.10
     # A decoder asked to keep special tokens ends every generation that stopped
     # on its own with one. A generation without one either ran to the token
