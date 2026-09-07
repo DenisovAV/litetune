@@ -5,13 +5,36 @@ import '../../theme/brand.dart';
 
 /// What comes out of the pipeline, and what it is compatible with.
 ///
-/// Two rows carry a qualifier in muted text rather than a claim: the hardware
-/// row says which stages the measurement runs on CPU for, and the models row
-/// says only one family has been measured end to end. Both are in the
-/// README's limitations section, and a compatibility table that quietly
-/// drops them would be the exact failure the tool was built to catch.
+/// Three rows carry a qualifier in muted text rather than a claim: the
+/// platforms row says web is a text-only preview, the acceleration row says
+/// which stages the measurement runs on CPU for, and the models row says what
+/// has been measured end to end, which is less than what exports. The last
+/// two are in the README's limitations section and the first is in its
+/// opening; a compatibility table that quietly drops any of them would be the
+/// exact failure the tool was built to catch.
 ///
-/// The hardware row names NPU because the runtime has one — Snapdragon on
+/// The models row is cut to what was actually run, where cutting is what it
+/// takes. The
+/// qualifier says "Gemma 3 270M" and not "Gemma 3" because `models.py` scopes
+/// `gemma-3-text` to the 270M and the 1B and only the 270M was measured, and
+/// the list says "Gemma 3 (text)" for the same reason one level up: that
+/// family rule covers those two sizes and no others. 4B and larger match no
+/// rule at all. They are `Gemma3ForConditionalGeneration` with a vision
+/// tower and a `model_type` of plain `gemma3`, which the exporter already
+/// recognises — so the override the rule would add is unnecessary for them,
+/// and it would assert a reason ("config.json says gemma3_text, which the
+/// exporter does not recognise") that is untrue of them and would ship in the
+/// manifest saying so. A family rule is a claim to have checked, and nobody
+/// here has. They export
+/// under the unknown-family note instead, so the row must not promise them.
+///
+/// FunctionGemma is written bare because one size is all this repository has
+/// ever named — `functiongemma-270m-it`, everywhere it appears. That is not
+/// something `models.py` encodes: its rule matches the family generically,
+/// unlike the Gemma 3 one, which enumerates. So if a second size ships, no
+/// check here will notice, and this line needs a size too.
+///
+/// The acceleration row names NPU because the runtime has one — Snapdragon on
 /// Android, Intel on Windows — while the qualifier keeps litetune's own claim
 /// narrow: it measures on CPU, except training and the float reference, which
 /// use a GPU when the host has one and record which backend actually produced
@@ -52,9 +75,11 @@ class Formats extends StatelessComponent {
           ]),
         ]),
         _row('Models', [
-          Component.text('Gemma 3, Gemma 4, Qwen 3.5, FunctionGemma'),
+          Component.text('Gemma 3 (text), Gemma 4, Qwen3.5, FunctionGemma'),
           span(classes: 'qualifier', [
-            Component.text(' — measured end to end on FunctionGemma so far'),
+            Component.text(
+              ' — measured end to end on FunctionGemma and Gemma 3 270M so far',
+            ),
           ]),
         ]),
       ]),
