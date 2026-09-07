@@ -388,7 +388,7 @@ def _add_tune(sub) -> None:
     tune.add_argument("--lora-rank", type=int, default=16)
     tune.add_argument("--lora-alpha", type=int, default=32)
     tune.add_argument("--lora-dropout", type=float, default=0.05)
-    # `choices`, not just a default: spec.py:87 removed float16 from `DTYPES`
+    # `choices`, not just a default: spec.py's `DTYPES` excludes float16
     # because a 270M model's loss goes to NaN in it while bfloat16 holds. The
     # spec file was closed and this line was not, so the path everyone actually
     # uses stayed open to the one value the design refuses.

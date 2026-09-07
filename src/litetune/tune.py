@@ -72,10 +72,19 @@ EXPECTED_SUPERVISED_FRACTION = 0.07
 # `labels` were never masked. This is the 0.0625-against-0.5625 signature.
 MASKING_NOT_APPLIED_ABOVE = 0.95
 
-# bfloat16 and eager attention, because the export and evaluation paths use
-# them: a checkpoint trained under a different attention implementation or
-# accumulation dtype than it is served with produces fluent garbage that every
-# label-free check passes. Gemma-family models are documented as requiring eager.
+# Eager attention, because the export and evaluation paths use it too:
+# evaluate.py's `_HF_GENERATE_SCRIPT` passes the training attention
+# implementation through unconditionally, and a checkpoint served under a
+# different implementation than it was trained with produces fluent garbage
+# that every label-free check passes. Gemma-family models are documented as
+# requiring eager.
+#
+# bfloat16 is the training default for a different reason -- see the two
+# limitations below, at the point a run actually trains in it or departs from
+# it. Unlike attention, there is no pair here for it to match: evaluate.py's
+# `_HF_GENERATE_SCRIPT` loads the float reference at an unconditional float32
+# regardless of the training dtype, and export.py passes no dtype to the
+# exporter at all.
 DEFAULT_DTYPE = "bfloat16"
 DEFAULT_ATTN_IMPLEMENTATION = "eager"
 
@@ -534,11 +543,18 @@ if __name__ == "__main__":
 class TuneRequest:
     """One training run.
 
-    `dtype` and `attn_implementation` default to the pair the export and
-    evaluation paths use. They are recorded rather than assumed because a
-    checkpoint trained under one attention implementation and served under
-    another produces output that is fluent, wrong, and passes every check that
-    does not involve held-out labels.
+    `attn_implementation` defaults to the implementation the export and
+    evaluation paths use too: `evaluate.py` passes the training attention
+    implementation through unconditionally, so a checkpoint trained under one
+    and served under another produces output that is fluent, wrong, and
+    passes every check that does not involve held-out labels. `dtype` has no
+    such pair to default to -- `evaluate.py`'s float reference loads at an
+    unconditional `float32` regardless of the training dtype, and
+    `export.py` passes no dtype to the exporter at all -- so `dtype`
+    defaults instead to the one value every published number in this repo
+    was actually measured against. Both are recorded on every run for the
+    same underlying reason: a mismatch here produces output that looks fine
+    and is not.
     """
 
     model: str
@@ -909,29 +925,56 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     result = TuneResult(request=request, checks=CheckSet(name=f"train:{request.model}"))
     result.limitation(NOT_VERIFIED)
     if request.dtype == DEFAULT_DTYPE:
-        # Named because it is a real cost of matching the serving dtype: the
+        # Named because it is a real cost of the bfloat16 default: the
         # parameters are bfloat16, so AdamW's moments are bfloat16 too. A
         # mixed-precision setup would keep an fp32 master copy and update more
-        # precisely. The dtype is chosen to match export and evaluation, because
-        # a mismatch there produces fluent garbage that no label-free check
-        # catches, and that failure is worse than a coarser optimiser step.
+        # precisely. bfloat16 over float16 *is* decided, in this repo:
+        # spec.py's `DTYPES` excludes float16 because a fine-tune in it
+        # overflows where bfloat16 does not, and cli.py's `--dtype` argument
+        # (`choices=sorted(DTYPES)`) pins the same choice to a 270M model
+        # whose loss goes to NaN in float16 while bfloat16 holds.
+        # bfloat16 versus float32, the other member of `DTYPES`, is not
+        # decided the same way -- what is established is that neither
+        # downstream path is known to match this default: evaluate.py's
+        # float reference loads with `torch_dtype=torch.float32` regardless
+        # of what trained the checkpoint under test, and export.py passes no
+        # dtype to the exporter at all, so what dtype the exported
+        # checkpoint actually loads in is not established here either.
         result.limitation(
             "training runs with bfloat16 parameters, so the optimiser's moments are bfloat16 as "
-            "well; updates are coarser than a mixed-precision run with an fp32 master copy. The "
-            "dtype matches what export and evaluation load, which is the constraint that "
-            "decided it"
+            "well; updates are coarser than a mixed-precision run with an fp32 master copy. "
+            "bfloat16 over float16 is decided, not a guess: a fine-tune in float16 overflows "
+            "where bfloat16 does not, and a 270M model's loss goes to NaN in float16 while "
+            "bfloat16 holds. bfloat16 versus float32, the other dtype this tool supports, is not "
+            "established the same way: evaluation's float reference loads at an unconditional "
+            "float32 regardless of the training dtype, so a run at the default dtype still "
+            "carries a dtype difference against the reference it is scored on; export passes no "
+            "dtype to the exporter at all, so what dtype the exported checkpoint actually loads "
+            "in is not established here either"
         )
-    if (request.dtype, request.attn_implementation) != (
-        DEFAULT_DTYPE,
-        DEFAULT_ATTN_IMPLEMENTATION,
-    ):
+    if request.attn_implementation != DEFAULT_ATTN_IMPLEMENTATION:
         result.limitation(
-            f"this run trains with dtype {request.dtype!r} and attention "
-            f"{request.attn_implementation!r}, not the {DEFAULT_DTYPE}/"
-            f"{DEFAULT_ATTN_IMPLEMENTATION} pair the export and evaluation paths use. A "
-            "checkpoint served under a different attention implementation than it was trained "
-            "with produces output that is fluent, wrong, and passes every check that does not "
+            f"this run trains with attention {request.attn_implementation!r}, not "
+            f"{DEFAULT_ATTN_IMPLEMENTATION!r}: evaluate.py passes the training attention "
+            "implementation through unconditionally (evaluate.py's `_HF_GENERATE_SCRIPT`), so a "
+            "checkpoint served under a different implementation than it was trained with "
+            "produces output that is fluent, wrong, and passes every check that does not "
             "involve held-out labels"
+        )
+    if request.dtype != DEFAULT_DTYPE:
+        # Unlike attention, there is no pair here for a non-default dtype to
+        # match or miss: evaluate.py's float reference always loads at
+        # float32, and export.py passes no dtype at all -- so a run trained
+        # at float32 is not "not the pair the export and evaluation paths
+        # use", it is the one dtype every published number in this repo was
+        # measured against.
+        result.limitation(
+            f"this run trains with dtype {request.dtype!r}, not the {DEFAULT_DTYPE!r} default. "
+            "evaluate.py's float reference loads at an unconditional float32 regardless of the "
+            "training dtype, and export.py passes no dtype to the exporter at all, so there is "
+            "no single dtype the export and evaluation paths are known to use for this run to "
+            "match or miss -- float32 is the dtype every published number in this repo was "
+            "measured against"
         )
     if request.rate_is_default:
         events.note(

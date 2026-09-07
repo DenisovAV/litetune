@@ -7,13 +7,17 @@ deterministic". So there is a test asserting that no comparison is computed
 before the generations are known to have succeeded.
 """
 
+import dataclasses
+
 import pytest
 
 from litetune.checks import Outcome
 from litetune.evaluate import GREEDY, Generation, MeasurementPoint, PromptMode
 from litetune.liveness import (
+    DEFAULT_THRESHOLDS,
     LivenessThresholds,
     divergence_check,
+    divergence_share,
     ends_with_terminator,
     leaked_tokens,
     liveness_tier,
@@ -128,6 +132,121 @@ def test_one_flake_among_many_does_not_condemn_the_run():
     assert liveness_tier(make_point(texts)).outcome is Outcome.PASSED
 
 
+def test_the_shipped_failure_ratio_still_trips_the_degenerate_share_gate():
+    """This fixture's own construction, not a figure this repo publishes
+    anywhere: 571 looping generations against 29 correct ones, chosen so the
+    degenerate share (571/600 = 0.9517) sits far above the 0.05 default with
+    room in both directions -- `max_degenerate_share` survives being set to
+    0.99 in a way nothing else in this file proves, since every other
+    fixture here sits at an extreme (about 1% or effectively 100%).
+
+    Asserted on `observed`, not on `.2f`-formatted text: a `"0.50" in detail`
+    assertion pins `repetition_ratio` (also 0.5 by default), not
+    `max_degenerate_share`, the constant this test is named for -- and it
+    would not notice a 0.05 -> 0.50 mutation of that constant, since 0.9517
+    clears either threshold. `test_default_liveness_thresholds_are_pinned`
+    below pins the value itself.
+    """
+    looping = "open the app open the app open the app open the app open the app"
+    correct = "call:open{app:<escape>maps<escape>}"
+    texts = [looping] * 571 + [correct] * 29
+    result = liveness_tier(make_point(texts))
+    assert result.outcome is Outcome.FAILED
+    check = result.checks.first_failure
+    assert check.name == "no degenerate repetition"
+    assert check.observed["share"] == pytest.approx(571 / 600)
+    assert check.observed["degenerate"] == 571
+    assert check.observed["n"] == 600
+
+
+def test_degenerate_share_exactly_at_the_default_threshold_still_passes():
+    """`>` not `>=`: a share landing exactly on `max_degenerate_share`'s
+    default must not fail the check.
+    """
+    looping = "open the app open the app open the app open the app open the app"
+    correct = "call:open{app:<escape>maps<escape>}"
+    texts = [looping] * 5 + [correct] * 95
+    result = liveness_tier(make_point(texts))
+    assert result.outcome is Outcome.PASSED
+
+
+def test_repetition_ratio_exactly_at_the_default_threshold_still_passes():
+    """`>` not `>=`: a per-generation ratio landing exactly on
+    `repetition_ratio`'s default must not fail `no degenerate repetition`.
+    Distinct from `max_degenerate_share`'s boundary above, which is a
+    share-of-generations bar computed *over* this per-generation ratio, not
+    the ratio itself -- a fixture sitting at an extreme for one says nothing
+    about the other.
+    """
+    text = "a a a a a a a a a b a a a"
+    assert repetition_ratio(text) == 0.5
+    result = liveness_tier(make_point([text]))
+    assert result.outcome is Outcome.PASSED
+
+
+def test_default_liveness_thresholds_are_pinned():
+    """Each of these is free to drift silently unless the value itself is
+    pinned, the way `verify.NEAR_ZERO` is pinned in `test_verify.py`: a
+    fixture that only ever sits at an extreme -- 1% or 100%, 0.09 or 0.995 --
+    cannot tell 0.05 from 0.50, or 4 from 2.
+
+    `max_empty_share` and `max_leak_share` are pinned at `0.0` here, not as
+    shares with room to slide, but as switches: zero tolerance means a single
+    empty or leaking generation is enough to fail its check, and the
+    behavioural tests below prove that at the smallest share above zero a
+    fixture's construction can produce.
+    """
+    assert DEFAULT_THRESHOLDS.max_empty_share == 0.0
+    assert DEFAULT_THRESHOLDS.max_leak_share == 0.0
+    assert DEFAULT_THRESHOLDS.max_degenerate_share == 0.05
+    assert DEFAULT_THRESHOLDS.repetition_ratio == 0.5
+    assert DEFAULT_THRESHOLDS.repetition_min_tokens == 12
+    assert DEFAULT_THRESHOLDS.repetition_ngram == 4
+    assert DEFAULT_THRESHOLDS.min_divergence_share == 0.10
+    assert DEFAULT_THRESHOLDS.max_unterminated_share == 0.10
+
+
+def test_one_empty_generation_among_many_fails_at_the_zero_tolerance_default():
+    """`max_empty_share` is `0.0`: any share above it -- not just a run that
+    is entirely empty -- must fail. One empty row out of many is the smallest
+    non-zero share a fixture here can produce, and it is also the point that
+    a share free to drift to 0.40 would still pass in silence.
+    """
+    texts = ["call:a{}"] * 99 + [""]
+    result = liveness_tier(make_point(texts))
+    assert result.outcome is Outcome.FAILED
+    assert result.checks.first_failure.name == "non-empty output"
+
+
+def test_one_leaking_generation_among_many_fails_at_the_zero_tolerance_default():
+    """`max_leak_share` is `0.0`: the same one-row argument as the empty-share
+    test above, for the other zero-tolerance switch.
+    """
+    texts = ["call:a{}"] * 99 + ["call:b{}<pad>"]
+    result = liveness_tier(make_point(texts))
+    assert result.outcome is Outcome.FAILED
+    assert result.checks.first_failure.name == "no special-token leakage"
+
+
+def test_liveness_thresholds_as_dict_carries_every_field():
+    """`harness.liveness_thresholds` is what a reader checks to see which
+    threshold decided a verdict; a field silently dropped from `as_dict`
+    would leave a manifest missing the number that caused a refusal, and a
+    field carried at the wrong value would leave a manifest lying about which
+    number decided it. Pinned against the dataclass's own field set *and* its
+    own field values, the way `test_cli.py` pins `EXIT_CODES` whole rather
+    than by membership, so neither a field added, renamed or dropped, nor a
+    default changed without `as_dict` following it, can pass unnoticed.
+    Compared against `DEFAULT_THRESHOLDS`'s own attributes rather than a
+    hand-written literal, so this test cannot itself go stale the way a
+    literal `{"max_empty_share": 0.0, ...}` would the day a default changes.
+    """
+    fields = {f.name for f in dataclasses.fields(LivenessThresholds)}
+    as_dict = DEFAULT_THRESHOLDS.as_dict()
+    assert set(as_dict) == fields
+    assert as_dict == {name: getattr(DEFAULT_THRESHOLDS, name) for name in fields}
+
+
 def test_a_model_identical_to_its_baseline_fails_divergence():
     point = make_point(ALIVE)
     check = divergence_check(point, list(ALIVE), "the untuned base", LivenessThresholds())
@@ -139,6 +258,49 @@ def test_a_model_that_says_something_else_diverges():
     point = make_point(ALIVE)
     check = divergence_check(point, ["call:zzz{}", "call:yyy{}"], "base", LivenessThresholds())
     assert check.outcome is Outcome.PASSED
+
+
+def test_divergence_share_exactly_at_the_default_threshold_still_passes():
+    """`<` not `<=`: a divergence share landing exactly on
+    `min_divergence_share`'s default must not fail the check.
+    """
+    baseline = [f"answer {i}" for i in range(100)]
+    candidate = list(baseline)
+    for i in range(10):
+        candidate[i] = f"different {i}"
+    check = divergence_check(
+        make_point(candidate), baseline, "the untuned base", LivenessThresholds()
+    )
+    assert check.observed["divergence_share"] == pytest.approx(0.10)
+    assert check.outcome is Outcome.PASSED
+
+
+def test_the_stripped_terminator_mechanism_the_old_comment_rested_on():
+    """The mechanism `min_divergence_share`'s comment used to lean on: two
+    answers differing only in which *recognised* terminator they close with
+    compare equal, because `comparable_form` strips every member of
+    `TERMINATORS` before comparing. That much is true; see the next test for
+    what it does not cover.
+    """
+    assert divergence_share(["x<eos>"] * 100, ["x<end_of_turn>"] * 100) == 0.0
+
+
+def test_an_unrecognised_marker_can_supply_the_divergence_this_check_requires():
+    """The comment's false half, made concrete. `comparable_form` strips only
+    `TERMINATORS` members, and a residue of unrecognised markers is by
+    definition not among them: a candidate byte-identical to the baseline
+    except for one on 10% of rows clears this check's own default threshold.
+    The candidate could be the baseline.
+    """
+    baseline = [f"label_{i}" for i in range(100)]
+    candidate = list(baseline)
+    for i in range(10):
+        candidate[i] = baseline[i] + "<|assistant_end|>"
+    check = divergence_check(
+        make_point(candidate), baseline, "the untuned base", LivenessThresholds()
+    )
+    assert check.outcome is Outcome.PASSED
+    assert check.observed["divergence_share"] == pytest.approx(0.10)
 
 
 def test_divergence_over_mismatched_prompts_cannot_be_checked():

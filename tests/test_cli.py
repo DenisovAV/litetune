@@ -993,7 +993,7 @@ def test_the_help_advertises_only_codes_the_command_can_return():
         assert "3 nothing" not in help_for(stage)
 
 
-def test_the_scorer_help_and_the_manifest_agree():
+def test_the_scorer_help_text_matches_scorers_describes():
     """`--scorer`'s help text and `SCORERS[name].describes` are the same claim,
     written by hand in two places with nothing holding them together -- they
     drifted out of step once already. Assert the predicate itself is shared,
@@ -1024,6 +1024,44 @@ def test_the_scorer_help_and_the_manifest_agree():
         SCORERS["exact-text"].describes.removeprefix("correct means the generation ")
     )
     assert exact_text_clause in help_text
+
+
+@pytest.mark.parametrize("scorer_name", ["tool-call", "exact-text"])
+def test_the_manifest_records_the_scorer_it_was_run_with(
+    tmp_path, capsys, write_split, fake_backends, scorer_name
+):
+    """Named for the manifest, this used to never read one: the help-text
+    checks above compare `--help`'s text to `SCORERS` directly, so
+    `scorer.means` could be emptied in the manifest itself and neither would
+    notice. This runs `verify` for real and reads the manifest it writes --
+    parametrised, since hardcoding `tool-call` here left `exact-text`'s
+    manifest entry, or its `describes` string, unchecked by anything.
+    """
+    from litetune.metrics import SCORERS
+
+    if scorer_name == "tool-call":
+        rows = labelled_rows(8)
+        texts = correct_texts(rows)
+    else:
+        rows = [{"prompt": f"classify {i}", "target": f"label_{i}"} for i in range(8)]
+        texts = [row["target"] for row in rows]
+    fake_backends(texts, texts)
+    main(
+        [
+            "verify",
+            "--model",
+            str(tmp_path / "model.litertlm"),
+            "--reference",
+            "org/reference",
+            "--data",
+            str(write_split(rows)),
+            "--scorer",
+            scorer_name,
+            "--json",
+        ]
+    )
+    manifest = json.loads(capsys.readouterr().out)
+    assert manifest["scorer"] == {"name": scorer_name, "means": SCORERS[scorer_name].describes}
 
 
 def test_main_is_reusable_in_one_process(tmp_path):
@@ -1091,6 +1129,29 @@ def test_every_status_a_bundle_can_carry_has_an_exit_code():
 
     for status in RunStatus:
         assert EXIT_CODES[Status(status.value)] in {0, 1, 2, 3, 4}
+
+
+def test_the_exit_code_table_matches_the_published_one():
+    """Pins `EXIT_CODES` whole, not by membership.
+
+    `{0,1,2,3,4}` membership above lets any status swap exit codes with any
+    other -- `FAILED_SMOKE` at 2 and `INCONCLUSIVE` at 1 both still pass it --
+    so this pins the exact mapping instead. It pins the dict this module
+    holds, not the prose in README's Exit codes table: nothing in the suite
+    reads `README.md`, so that table can drift out of step with this dict
+    without any test here noticing.
+    """
+    from litetune.verify import EXIT_CODES, Status
+
+    assert EXIT_CODES == {
+        Status.PASSED: 0,
+        Status.FAILED_SMOKE: 1,
+        Status.FAILED_GATE: 1,
+        Status.INCONCLUSIVE: 2,
+        Status.UNMEASURED: 3,
+        Status.FAILED_HARNESS: 4,
+        Status.ERROR: 4,
+    }
 
 
 def test_every_outcome_a_stage_can_report_has_an_exit_code():

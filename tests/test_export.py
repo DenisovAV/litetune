@@ -662,6 +662,20 @@ def test_argv_is_the_documented_command(request_for):
     assert "--externalize_embedder" in externalised.argv("dynamic_wi8_afp32")
 
 
+def test_the_export_argv_carries_no_dtype_flag(request_for):
+    """`tune.py`'s limitation strings say "export.py passes no dtype to the
+    exporter at all" -- pins the fact, not the prose, the same way
+    `test_the_float_reference_loads_at_float32_regardless_of_spec_dtype`
+    closes the matching gap on the evaluation side. `test_argv_is_the_
+    documented_command` above would incidentally catch a dtype flag added to
+    that one recipe's argv too, since it asserts the whole list, but nothing
+    states the claim directly, and nothing covers the other measured recipe.
+    """
+    request = request_for(MEASURED_RECIPES)
+    for recipe in MEASURED_RECIPES:
+        assert not any("dtype" in flag for flag in request.argv(recipe))
+
+
 def test_export_uses_the_export_environment(toolchain, request_for):
     request = request_for(("weight_only_wi8_afp32",))
     assert request.env is envs.EXPORT

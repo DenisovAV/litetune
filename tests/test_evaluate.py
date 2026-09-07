@@ -373,3 +373,101 @@ def test_the_reference_decoder_keeps_the_terminator_scoring_trims():
     # it explaining the choice contains the same text.
     assert "skip_special_tokens=False)" in _HF_GENERATE_SCRIPT
     assert "skip_special_tokens=True" not in _HF_GENERATE_SCRIPT
+
+
+def test_the_float_reference_loads_at_float32_regardless_of_spec_dtype(tmp_path, monkeypatch):
+    """S7: pins the *fact*, not the string. `tune.py`'s comments and
+    limitations quote the prose "evaluate.py's float reference loads at an
+    unconditional float32 regardless of the training dtype" -- three tests
+    assert that prose, and all three survive changing the hardcoded
+    `torch_dtype=torch.float32` to `torch_dtype=getattr(torch,
+    spec.get("dtype", "float32"))`, because nothing writes a "dtype" key into
+    the spec `HuggingFaceBackend` builds, so the mutation is inert against
+    every fixture that goes through the backend.
+
+    This runs the script's actual `main()` against a spec that carries a
+    "dtype" key anyway (the backend does not have to write one for this to
+    matter -- only the script's own indifference to it does), with `torch`
+    and `transformers` faked at the import boundary, and asserts the dtype
+    the fake model loader actually received.
+    """
+    import json
+    import sys
+    import types
+
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+
+    captured: dict = {}
+
+    class FakeModel:
+        def eval(self) -> "FakeModel":
+            return self
+
+        def generate(self, **kwargs: object) -> list[list[int]]:
+            return [[0, 1, 2, 3]]
+
+    class FakeAutoModelForCausalLM:
+        @staticmethod
+        def from_pretrained(model: str, torch_dtype: object, attn_implementation: str) -> FakeModel:
+            captured["torch_dtype"] = torch_dtype
+            return FakeModel()
+
+    class FakeInputIds(list):
+        @property
+        def shape(self) -> tuple[int, int]:
+            return (1, len(self[0]))
+
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def __call__(self, text: str, return_tensors: str = "pt") -> dict:
+            return {"input_ids": FakeInputIds([[10, 11, 12]])}
+
+        def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
+            return "generated"
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(model: str) -> FakeTokenizer:
+            return FakeTokenizer()
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.float32 = "sentinel:float32"
+    fake_torch.bfloat16 = "sentinel:bfloat16"
+    fake_torch.no_grad = __import__("contextlib").nullcontext
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoModelForCausalLM = FakeAutoModelForCausalLM
+    fake_transformers.AutoTokenizer = FakeAutoTokenizer
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    spec_path = tmp_path / "spec.json"
+    out_path = tmp_path / "out.jsonl"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "model": "org/m",
+                "prompts": ["hi"],
+                "max_tokens": 8,
+                "runtime_rendered": False,
+                "attn_implementation": "eager",
+                # The fact under test: a checkpoint trained at bfloat16 must
+                # not move the reference off float32.
+                "dtype": "bfloat16",
+                "out": str(out_path),
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "argv", ["generate.py", str(spec_path)])
+
+    # `exec` on this module's own `_HF_GENERATE_SCRIPT` constant, not on
+    # external input -- the same pattern `test_tune.py`'s `script_namespace`
+    # fixture uses to test the training script's body without a real torch.
+    namespace: dict = {"__name__": "litetune_generate_script_under_test"}
+    exec(compile(_HF_GENERATE_SCRIPT, "generate_script.py", "exec"), namespace)
+    namespace["main"]()
+
+    assert captured["torch_dtype"] == "sentinel:float32"

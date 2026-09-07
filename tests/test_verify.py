@@ -404,6 +404,23 @@ def test_a_near_zero_reference_is_flagged_as_unremarkable(write_split):
     assert any("at or near zero" in note for note in result.manifest["limitations"])
 
 
+def test_a_reference_exactly_at_near_zero_is_still_flagged(write_split):
+    """`<=` not `<`: `verify.py`'s own near-zero limitation (distinct from
+    `_attribute`'s guard, pinned separately below) must fire when the
+    reference sits exactly on `NEAR_ZERO`, not only strictly under it.
+    """
+    rows = labelled_rows(400)
+    result = verify(
+        write_split,
+        rows,
+        candidate=FakeBackend(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=wrong_texts(rows, 380)),
+    )
+    quality = result.manifest["quality"]
+    assert quality["reference"]["exact_match"]["value"] == pytest.approx(0.05)
+    assert any("at or near zero" in note for note in result.manifest["limitations"])
+
+
 def test_every_run_reports_which_backend_measured_it(write_split):
     rows = labelled_rows(4)
     result = verify(
@@ -467,6 +484,43 @@ def test_a_decoding_parameter_only_one_side_received_is_named(write_split):
         ),
     )
     assert any("token limit is unverified" in note for note in result.manifest["limitations"])
+
+
+def test_the_decoding_parameter_limitation_counts_unterminated_candidate_generations(write_split):
+    """README's *Decoding parameters reach only one side* bullet says the
+    manifest states this "and counts unterminated generations" -- the count
+    is `loose = unterminated_count(candidate)` in the same limitation the
+    test above pins a different clause of. Nothing pinned the count itself:
+    `loose` forced to `0` or to `candidate.n` still reads as a well-formed
+    sentence and survives the test above, which only asserts "token limit is
+    unverified" is present. 3 of 8 candidate generations lack a terminator
+    here; the other 5 carry one.
+    """
+
+    class RuntimeLikeBackend(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "fake-runtime", "backend": "cpu"}
+
+    class LibraryLikeBackend(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "fake-library", "backend": "cpu"}
+
+    rows = labelled_rows(8)
+    candidate_texts = correct_texts(rows)
+    for i in range(3, 8):
+        candidate_texts[i] += "<eos>"
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=RuntimeLikeBackend(texts=candidate_texts, decode_enforced=False),
+        reference=LibraryLikeBackend(
+            model="org/reference", texts=correct_texts(rows), decode_enforced=True
+        ),
+    )
+    assert any("3 of 8" in note for note in result.manifest["limitations"]), result.manifest[
+        "limitations"
+    ]
 
 
 def test_an_unknown_scorer_is_refused_before_anything_runs():
@@ -770,6 +824,13 @@ def test_a_reference_that_sometimes_runs_to_the_token_bound_is_still_scored(writ
     named threshold recorded beside the other liveness numbers rather than a
     per-row verdict. README's own run had 8 of 640 reach the bound; two of two
     hundred here must not cost the measurement.
+
+    Under the threshold, nothing about this run is reported beyond the ordinary
+    limitations -- no check and no extra note naming the 2 unterminated rows.
+    The limitation count is asserted, not the absence of one wording: a
+    withdrawn version of this file once reported such a note, and a test that
+    only checks a given phrase is gone stays green if the same note comes back
+    under different wording.
     """
     rows = text_rows(200)
     reference_texts = [r["target"] + "<end_of_turn>\n<eos>" for r in rows[:-2]]
@@ -787,6 +848,67 @@ def test_a_reference_that_sometimes_runs_to_the_token_bound_is_still_scored(writ
         for check in result.manifest["checks"]
         if check["name"] == "reference terminator recognised"
     ]
+    # 4 limitations: the inferred prompt mode, the candidate backend's
+    # supplied-vs-resolved mode mismatch, the CPU-vs-GPU note, and the
+    # unresolved-difference note from the paired comparison. Any fifth --
+    # regardless of wording -- would be a sub-threshold terminator note that
+    # must not exist.
+    assert len(result.manifest["limitations"]) == 4, result.manifest["limitations"]
+
+
+def test_a_reference_just_over_the_unterminated_share_threshold_is_refused(write_split):
+    """`max_unterminated_share` survives being set to 0.99: every fixture for
+    this check elsewhere sits at an extreme -- about 1% (still scored, see
+    the test above) or effectively 100% (refused). 15 of 100 is just over the
+    shipped 0.10 default (`LivenessThresholds.max_unterminated_share`,
+    asserted below), and nothing else here proves that boundary.
+    """
+    from litetune.liveness import DEFAULT_THRESHOLDS
+
+    assert DEFAULT_THRESHOLDS.max_unterminated_share == 0.10
+
+    rows = text_rows(100)
+    reference_texts = [r["target"] + "<|assistant_end|>" for r in rows[:15]]
+    reference_texts += [r["target"] + "<eos>" for r in rows[15:]]
+    result = verify(
+        write_split,
+        rows,
+        candidate=FakeBackend(texts=[r["target"] for r in rows]),
+        reference=TransformersLikeBackend(model="org/reference", texts=reference_texts),
+        scorer="exact-text",
+    )
+    assert result.status is Status.FAILED_HARNESS
+    check = next(
+        c for c in result.manifest["checks"] if c["name"] == "reference terminator recognised"
+    )
+    assert check["outcome"] == "could_not_check"
+    assert check["observed"]["unterminated"] == 15
+    assert check["observed"]["unterminated_share"] == pytest.approx(0.15)
+
+
+def test_a_reference_exactly_at_the_unterminated_share_threshold_is_scored_not_refused(
+    write_split,
+):
+    """`>` not `>=`: a share landing exactly on `max_unterminated_share`'s
+    default must not trip the refusal. 10 of 100 sits exactly on the shipped
+    0.10 default; the sibling above proves 15 of 100 refuses, and nothing
+    else here proves this side of the same boundary.
+    """
+    from litetune.liveness import DEFAULT_THRESHOLDS
+
+    assert DEFAULT_THRESHOLDS.max_unterminated_share == 0.10
+
+    rows = text_rows(100)
+    reference_texts = [r["target"] + "<|assistant_end|>" for r in rows[:10]]
+    reference_texts += [r["target"] + "<eos>" for r in rows[10:]]
+    result = verify(
+        write_split,
+        rows,
+        candidate=FakeBackend(texts=[r["target"] for r in rows]),
+        reference=TransformersLikeBackend(model="org/reference", texts=reference_texts),
+        scorer="exact-text",
+    )
+    assert result.status is Status.PASSED
 
 
 def test_a_healthy_gemma_reference_is_not_refused(write_split):
@@ -989,6 +1111,21 @@ def test_the_terminator_vocabulary_reaches_the_manifest_even_on_a_dead_run(write
     assert "terminators" in result.manifest["harness"]
 
 
+def test_the_reference_generate_comment_does_not_claim_a_universal_minimum():
+    """A pure comment, not a runtime value -- pinned by reading `verify.py`'s
+    own source. It used to claim "at least one terminator is trimmed per
+    generation that ran", contradicted by the code a few lines below it,
+    which tolerates a share of generations ending with none.
+    """
+    import inspect
+
+    import litetune.verify as verify_module
+
+    source = inspect.getsource(verify_module)
+    assert "at least one terminator is trimmed per" not in source
+    assert "a generation that stopped on its own carries" in source
+
+
 # -- a reference already at the floor cannot baseline a conversion cost -----
 
 
@@ -1103,3 +1240,75 @@ def test_a_genuinely_bad_conversion_is_still_gated_when_the_reference_is_healthy
     cost = result.manifest["attribution"]["conversion_cost"]
     assert cost["available"] is True
     assert cost["value"] == pytest.approx(1.0)
+
+
+# -- NEAR_ZERO's boundary is pinned, not merely present -----------------------
+
+
+def _quality_at(value: float, correct: tuple[bool, ...]):
+    from litetune.metrics import Proportion, QualityMetrics, Unavailable
+
+    no_split = Unavailable("exact-text has no operation/argument split")
+    return QualityMetrics(
+        n=len(correct),
+        parse_rate=Proportion(value=1.0, n=len(correct), ci95=0.0),
+        name_accuracy=no_split,
+        argument_accuracy=no_split,
+        # `n` and `ci95` are not what `_attribute`'s guard reads; only
+        # `.value` and `.correct` are, so those are fixed and the rest filled
+        # in rather than derived.
+        exact_match=Proportion(value=value, n=len(correct), ci95=0.01),
+        correct=correct,
+    )
+
+
+def test_near_zero_is_pinned_at_point_zero_five():
+    """`NEAR_ZERO` is free in both directions unless its value itself is
+    pinned: 0.0 disables the near-zero attribution guard entirely, and 0.80
+    would read the shipped gemma-3 reference (0.6933, MEASUREMENTS.md) as
+    unavailable. The two tests below pin the boundary this constant draws;
+    this one pins the constant itself.
+    """
+    from litetune.verify import NEAR_ZERO
+
+    assert NEAR_ZERO == 0.05
+
+
+def test_attribute_floors_a_float_twin_reference_exactly_at_near_zero():
+    from litetune.metrics import Unavailable
+    from litetune.verify import NEAR_ZERO, _attribute
+
+    request = VerifyRequest(
+        model=Path("m.litertlm"), reference="org/reference", data=Path("d.jsonl")
+    )
+    reference = _quality_at(NEAR_ZERO, correct=(False,) * 100)
+    candidate = _quality_at(0.6, correct=(True,) * 60 + (False,) * 40)
+
+    cost, gain = _attribute(request, candidate, reference)
+
+    assert isinstance(cost, Unavailable)
+    assert isinstance(gain, Unavailable)
+
+
+def test_attribute_resolves_a_float_twin_reference_one_cent_above_near_zero():
+    from litetune.metrics import Difference
+    from litetune.verify import NEAR_ZERO, _attribute
+
+    request = VerifyRequest(
+        model=Path("m.litertlm"), reference="org/reference", data=Path("d.jsonl")
+    )
+    just_above = NEAR_ZERO + 0.01
+    reference = _quality_at(just_above, correct=(True,) * 6 + (False,) * 94)
+    candidate = _quality_at(0.6, correct=(True,) * 60 + (False,) * 40)
+
+    cost, gain = _attribute(request, candidate, reference)
+
+    # Paired over the aligned booleans above: candidate is right on 0-59 and
+    # wrong on 60-99; reference is right on 0-5 and wrong on 6-99. The only
+    # discordant rows are 6-59, where candidate is right and reference is
+    # not -- 54 of 100 -- so `paired_difference`'s `(a_only - b_only) / n`
+    # is `(0 - 54) / 100`. A negated value would read as the candidate
+    # scoring *below* a reference it in fact outscores by 54 points.
+    assert isinstance(cost, Difference)
+    assert cost.value == pytest.approx(-0.54)
+    assert cost.resolved

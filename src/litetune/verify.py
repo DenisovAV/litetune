@@ -533,11 +533,15 @@ def run_verify(
         return run.finish(Status.FAILED_HARNESS)
     run.manifest["measurements"]["reference"] = reference.as_dict()
     # Same vocabulary, opposite baseline: `generate` on the transformers side
-    # halts at the first eos, so at least one terminator is trimmed per
-    # generation that ran -- but not exactly one: a family whose eos set does
-    # not include its own template close runs past it into `<end_of_turn>`
-    # then `<eos>`, two markers on a healthy run, so this count has
-    # no single fixed value to compare against.
+    # halts at the first eos, so a generation that stopped on its own carries
+    # at least one terminator -- but not every generation is guaranteed to
+    # stop on its own: the share checked below tolerates some ending without
+    # one, for a marker the vocabulary does not list or one that ran to the
+    # token bound instead. Nor is one the fixed count even for a generation
+    # that did stop cleanly: a family whose eos set does not include its own
+    # template close runs past it into `<end_of_turn>` then `<eos>`, two
+    # markers on a healthy run, so this count has no single fixed value to
+    # compare against either way.
     run.manifest["measurements"]["reference"]["terminators_trimmed"] = _trimmed_record(reference)
 
     # The reference is one side of the comparison; if it did not generate, the
@@ -575,6 +579,15 @@ def run_verify(
     # Every generation here has run: the tier above refuses the comparison on the
     # first failed one. The filter is kept so this count and `terminators_trimmed`
     # describe the same population rather than agreeing by accident.
+    #
+    # Below the threshold nothing here says how much of the tolerated share
+    # was scored, or which of its two causes produced any one row of it: a
+    # marker the vocabulary does not recognise and a generation cut at the
+    # token bound read identically in the text, and the two move a scored
+    # comparison in opposite ways. Telling them apart needs a fact this text
+    # does not carry -- what `generate` actually halted on, recorded per
+    # generation at the point it happens rather than inferred afterwards from
+    # a vocabulary.
     reference_ran = [g for g in reference.generations if g.ok]
     if pair.reference.describe().get("engine") == "transformers" and reference_ran:
         unterminated = unterminated_count(reference)
@@ -893,6 +906,22 @@ def _gate(run: _Run, request: VerifyRequest, cost: Difference | Unavailable) -> 
         )
         status = Status.FAILED_GATE
     elif high <= threshold:
+        # A reference generation that ends without a marker `harness.
+        # terminators` recognises -- see the "reference terminator recognised"
+        # check above -- can bias this comparison below its own refusal
+        # threshold -- and, the same way, pull a genuinely failing model out of
+        # `FAILED_GATE` into the straddle branch below, so `INCONCLUSIVE` carries
+        # the same unmarked risk -- and that bias is not accounted for here. An
+        # earlier version of this branch added the unterminated share back onto
+        # the point estimate as a flat offset, treating a share as a fixed
+        # penalty rather than widening the interval -- "between the *interval*
+        # and the threshold", this function's own earlier comment above -- and
+        # every fixture exercising it happened to be fully labelled, so the
+        # share over the population a conversion cost is actually measured over
+        # was never the value doing the work. That downgrade has been removed
+        # rather than patched: a verdict here does not account for this bias at
+        # all. Redoing it -- correctly, as an interval adjustment rather than a
+        # flat offset -- is its own change.
         check = Check.passed(
             name,
             f"conversion cost {cost.value:+.4f} ±{cost.ci95:.4f} is within {threshold:.4f}",

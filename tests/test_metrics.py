@@ -465,6 +465,37 @@ def test_terminators_trimmed_counts_what_trimming_hides():
     assert terminators_trimmed("answer" + "<eos>" * 7) == 7
 
 
+def test_the_terminators_trimmed_docstring_reports_the_measured_count():
+    """A pure comment, not a runtime value -- pinned by reading `metrics.py`'s
+    own source, the same way `test_verify.py` pins the reference-generate
+    comment and `test_tune.py` pins `DEFAULT_DTYPE`'s. The docstring used to
+    claim "a healthy gemma-3 run reports 2"; measured, gemma-3-270m-it and
+    functiongemma-270m-it both carry their template's close in
+    `eos_token_id`, so generation halts there and a healthy run reports 1
+    (`test_a_healthy_gemma_reference_is_not_refused` pins the mechanism;
+    MEASUREMENTS.md's 20 base generations all end in `<end_of_turn>` alone).
+    """
+    import inspect
+
+    import litetune.metrics as metrics_module
+
+    source = inspect.getsource(metrics_module)
+    assert "a healthy gemma-3 run reports 2" not in source
+    assert "a healthy run reports 1" in source
+
+
+def test_score_exact_texts_docstring_states_that_order_matters():
+    """The rule is a subsequence, not a bag -- `<eos></s>` and `</s><eos>` are
+    different endings -- so a docstring reading "wherever it sits" is wrong,
+    the same defect `_reproduces_target`'s own docstring was already free of.
+    """
+    from litetune.metrics import score_exact_text
+
+    doc = score_exact_text.__doc__ or ""
+    assert "wherever it sits" not in doc
+    assert "in the same order" in doc
+
+
 def test_the_order_of_the_markers_a_target_ends_with_is_part_of_the_answer():
     """`<eos></s>` and `</s><eos>` are different endings.
 
@@ -480,6 +511,57 @@ def test_the_order_of_the_markers_a_target_ends_with_is_part_of_the_answer():
     # front of the target's own marker rather than in place of it.
     assert _reproduces_target("x<eos>", "x<end_of_turn>\n<eos>")
     assert not _reproduces_target("x<eos><eos>", "x<eos>")
+
+
+@pytest.mark.parametrize("trailing_markers", ["", "<eos>", "<end_of_turn>\n<eos>"])
+def test_a_bare_target_scores_the_same_as_the_rule_it_replaced(trailing_markers):
+    """MEASUREMENTS.md's equivalence claim: the shipped rule leaves banking77's
+    figures unchanged "because these targets are bare labels carrying no
+    marker, the case in which the two rules are the same function".
+
+    For a target with no marker of its own, `_reproduces_target`'s marker
+    condition (`all(... for wanted in target_markers)`) is vacuously true no
+    matter what the generation carries, so the whole function reduces to
+    `same_answer` -- exactly what `comparable_form` (the trim-both-sides rule
+    `agreement`/`divergence` actually ship with) gives, since trimming a
+    target that has no marker changes nothing. This compares two independent,
+    already-shipped functions rather than one against a copy of itself, at 0,
+    1 and 2 trailing markers on the generation -- the counts the two rules
+    could in principle disagree over.
+    """
+    from litetune.metrics import comparable_form
+
+    target = "label_3"
+    output = target + trailing_markers
+
+    old_rule_agrees = comparable_form(target) == comparable_form(output)
+    assert _reproduces_target(target, output) is True
+    assert _reproduces_target(target, output) == old_rule_agrees
+
+
+def test_a_marked_target_is_where_the_two_rules_can_disagree():
+    """The equivalence above is tautological on its own: for a bare target,
+    `comparable_form` strips every trailing marker off both sides before
+    comparing, so `old_rule_agrees` is `True` for all three parametrisations
+    regardless of what `_reproduces_target` does, and the test could not fail
+    if `_reproduces_target` always returned `True`.
+
+    Give the target its own marker and drop that marker from the generation
+    entirely -- not merely reorder it -- and the two rules split:
+    `comparable_form` still strips it from both sides and calls this the same
+    answer, while `_reproduces_target` requires the target's own marker to be
+    reproduced and does not. This is the case the test above never has an
+    opportunity to exercise, and it is what makes that one non-tautological
+    by comparison: an implementation that always agreed with `comparable_form`
+    would fail here.
+    """
+    from litetune.metrics import comparable_form
+
+    target = "label_3<eos>"
+    output = "label_3"
+
+    assert comparable_form(target) == comparable_form(output)
+    assert _reproduces_target(target, output) is False
 
 
 def test_the_vocabulary_cannot_contain_an_empty_or_nested_marker():
