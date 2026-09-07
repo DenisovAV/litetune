@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from conftest import fake_torch
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -73,12 +74,61 @@ class FakeTrainer:
     write_adapter: bool = True
     write_metrics: bool = True
     drop_fraction: bool = False
+    device: str | None = None
     raises: BaseException | None = None
     calls: list[Call] = field(default_factory=list)
     configs: list[dict] = field(default_factory=list)
 
+    # -- the device probe ---------------------------------------------------
+    # `run_tune` makes two calls into the environment, and they are different
+    # commands with different contracts: `python -c <source>` for
+    # `envs.resolve_device`, then `python <script> <config>` for the training
+    # run. The fake has to answer both. Until it did, every probe here fell
+    # into the training branch, tried to read the probe's *source code* as a
+    # config path, raised `FileNotFoundError`, and `resolve_device` swallowed
+    # that into "could not answer" -- so every test in this file ran against a
+    # failed probe and could not tell one from a working one.
+    #
+    # `probe_device`/`probe_cuda_build`/`probe_device_count` compose the JSON
+    # line a real probe prints. `probe_stdout` overrides them verbatim, which
+    # is how a banner, an empty answer or an unparseable one are expressed;
+    # `probe_returncode`, `probe_stderr` and `probe_raises` cover the ways a
+    # probe fails to produce one at all.
+    probe_device: str | None = "cpu"
+    probe_cuda_build: str | None = None
+    probe_device_count: int = 0
+    probe_stdout: str | None = None
+    probe_returncode: int = 0
+    probe_stderr: str = ""
+    probe_raises: BaseException | None = None
+
+    @staticmethod
+    def is_probe(args) -> bool:
+        return len(args) >= 2 and args[1] == "-c"
+
+    def probe_result(self, args) -> subprocess.CompletedProcess:
+        if self.probe_raises is not None:
+            raise self.probe_raises
+        stdout = self.probe_stdout
+        if stdout is None:
+            stdout = (
+                json.dumps(
+                    {
+                        "device": self.probe_device,
+                        "cuda_build": self.probe_cuda_build,
+                        "device_count": self.probe_device_count,
+                    }
+                )
+                + "\n"
+            )
+        return subprocess.CompletedProcess(args, self.probe_returncode, stdout, self.probe_stderr)
+
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(Call(argv=list(args), timeout=timeout))
+        if self.is_probe(args):
+            # Ahead of `raises`, which describes the training run: a test that
+            # makes training time out is not also asking the probe to.
+            return self.probe_result(args)
         if self.raises is not None:
             raise self.raises
         config = json.loads(Path(args[2]).read_text(encoding="utf-8"))
@@ -115,6 +165,8 @@ class FakeTrainer:
                 "model_dir": config["model_dir"],
                 "adapter_dir": config.get("adapter_dir"),
             }
+            if self.device is not None:
+                payload["device"] = self.device
             if self.drop_fraction:
                 payload.pop("supervised_token_fraction")
             Path(config["metrics_out"]).write_text(json.dumps(payload), encoding="utf-8")
@@ -195,14 +247,25 @@ def test_the_parent_process_imports_neither_torch_nor_transformers(trainer, requ
 
 
 def test_the_run_happens_inside_the_train_environment(trainer, request_for):
+    """Two calls now, both in the same environment, in this order.
+
+    The device probe goes first and deliberately: it is what lets the run say
+    where it is about to train before the training happens, rather than after.
+    It runs in the train environment because that is the torch whose answer
+    matters -- asking any other interpreter would answer about a machine this
+    run is not using.
+    """
     request = request_for()
     run_tune(request)
 
-    assert len(trainer.calls) == 1
-    argv = trainer.calls[0].argv
-    assert argv[0] == "python"
-    assert Path(argv[1]).name == "train_script.py"
-    assert trainer.calls[0].timeout == request.timeout_s
+    assert len(trainer.calls) == 2
+    probe, training = trainer.calls
+    assert probe.argv[:2] == ["python", "-c"]
+    assert "cuda.is_available" in probe.argv[2]
+    assert probe.timeout < training.timeout
+    assert training.argv[0] == "python"
+    assert Path(training.argv[1]).name == "train_script.py"
+    assert training.timeout == request.timeout_s
     assert request.env is envs.TRAIN
 
 
@@ -594,16 +657,174 @@ def test_a_full_fine_tune_has_no_adapter_and_says_so(trainer, request_for):
 
 def test_a_non_zero_exit_is_recorded_not_raised(trainer, request_for):
     trainer.returncode = 1
-    trainer.stderr = "CUDA out of memory"
+    trainer.stderr = "ValueError: the training split is empty"
     trainer.write_model = False
 
     result = run_tune(request_for())
 
     check = check_named(result, TRAINING_CHECK)
     assert check.outcome is Outcome.FAILED
-    assert "exited 1" in check.detail and "CUDA out of memory" in check.detail
+    assert "exited 1" in check.detail and "the training split is empty" in check.detail
     assert result.returncode == 1
     assert result.model_dir is None
+
+
+# ---------------------------------------------------------------------------
+# ... but an accelerator or host-capacity failure is not a verdict about the run
+# ---------------------------------------------------------------------------
+#
+# This stderr used to be the fixture for the test above, and the outcome it
+# pinned was `failed`: "training exited 1: torch.OutOfMemoryError: CUDA out of
+# memory" recorded as a statement about the method and the data. `-9` was
+# already handled -- the killed branch reads it through `litetune.exits` -- but
+# an allocation that fails inside torch raises, and an uncaught exception exits
+# 1 like any other. Unreachable while the run was pinned to the CPU; reachable
+# now that it is not.
+#
+# CPU training is a first-class destination here, not an edge case, and the
+# host's own allocator raises the identical shape of exception -- `RuntimeError:
+# DefaultCPUAllocator: not enough memory` -- for the identical reason. Judging
+# it as a failed run while a GPU allocation failure on the same box gets a
+# shrug was an asymmetry this list creates, not the toolchain.
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB",
+        "torch.cuda.OutOfMemoryError: CUDA out of memory",
+        # Each alternative in `_GPU_FAILURE_RE` on its own, so that deleting
+        # one is a failing test rather than a case another alternative happens
+        # to catch: the exception class without the message, and the message
+        # without the class.
+        "torch.OutOfMemoryError: out of memory",
+        "RuntimeError: CUDA out of memory. Tried to allocate 20.00 MiB",
+        "RuntimeError: CUDA error: no kernel image is available for execution on the device",
+        "RuntimeError: CUDA error: invalid device ordinal",
+        "RuntimeError: CUDA error: no CUDA-capable device is detected",
+        "RuntimeError: CUDA error: out of memory",
+        "RuntimeError: CUDA driver version is insufficient for the CUDA runtime version",
+        "RuntimeError: HIP out of memory. Tried to allocate 2.00 GiB",
+        # The host allocator, not the device: exact wording, not a bare "not
+        # enough memory" that would also match a message this list was never
+        # meant to speak for.
+        "RuntimeError: DefaultCPUAllocator: not enough memory: you tried to allocate "
+        "402653184 bytes.",
+        "RuntimeError: CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling "
+        "`cublasCreate(handle)`",
+        "RuntimeError: cuDNN error: CUDNN_STATUS_ALLOC_FAILED",
+    ],
+)
+def test_an_accelerator_failure_is_could_not_check_not_a_failed_method(
+    trainer, request_for, stderr
+):
+    trainer.returncode = 1
+    trainer.stderr = stderr
+    trainer.write_model = False
+
+    result = run_tune(request_for())
+
+    check = check_named(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED, check.detail
+    # The verdict is withheld *and* the reason travels: a `could_not_check`
+    # with no stderr in it is unactionable, and the matched shape is what
+    # says which of these it was.
+    assert "says nothing about the method or the data" in check.detail
+    assert stderr[-40:] in check.detail
+    assert check.observed["matched"] in stderr
+    assert result.outcome is Outcome.UNCHECKED
+    assert result.model_dir is None
+
+
+def test_an_accelerator_failure_records_which_device_failed(trainer, request_for):
+    """The device in `observed` is read by a human deciding what to do next,
+    and until this test nothing pinned it: replacing it with `None` passed
+    every other test in the suite.
+
+    It matters because the advice differs. An accelerator failure on a box the
+    probe resolved to `cuda` means the GPU could not carry this run -- fewer
+    tokens, a smaller batch, or more VRAM. The same message with no device
+    behind it means something else happened, and a reader who cannot tell them
+    apart cannot act on either.
+    """
+    trainer.probe_device = "cuda"
+    trainer.returncode = 1
+    trainer.stderr = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB"
+    trainer.write_model = False
+
+    result = run_tune(request_for())
+
+    check = check_named(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED, check.detail
+    assert check.observed["device"] == "cuda"
+
+
+@pytest.mark.parametrize("method", ["full", "lora"])
+def test_an_accelerator_failure_produces_the_same_report_for_either_method(
+    trainer, request_for, method, tmp_path
+):
+    """It returns where the killed branch returns, and for the same reason.
+
+    Falling through instead reaches `_merge_check`, which on a LoRA run with
+    no adapter records a *failed* merge -- "the learned delta is
+    unrecoverable" -- while a full fine-tune's merge check short-circuits to
+    passed. One machine event, two different reports, chosen by `--method`.
+    """
+    trainer.returncode = 1
+    trainer.stderr = "torch.OutOfMemoryError: CUDA out of memory"
+    trainer.write_model = False
+    trainer.write_adapter = False
+
+    result = run_tune(request_for(method=method, output_dir=tmp_path / method))
+
+    assert [c.name for c in result.checks.checks] == [ENV_CHECK, TRAINING_CHECK, MASKING_CHECK]
+    assert not [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert result.outcome is Outcome.UNCHECKED
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "RuntimeError: expected scalar type Float but found BFloat16",
+        # The one that decides the shape of `_GPU_FAILURE_RE`. A device-side
+        # assert is the GPU face of an out-of-range index -- a token id past
+        # the embedding table -- and the identical defect on the CPU raises
+        # `IndexError` and is a failed run. Matching the `CUDA error:` prefix
+        # would make the same data bug a verdict on a laptop and a shrug on a
+        # GPU box, with "says nothing about the method or the data" attached
+        # to the one case where it says exactly that.
+        "RuntimeError: CUDA error: device-side assert triggered",
+        "RuntimeError: CUDA error: an illegal memory access was encountered",
+    ],
+)
+def test_an_ordinary_failure_is_still_a_failure(trainer, request_for, stderr):
+    """The other side of the branch. `_GPU_FAILURE_RE` widened to match
+    everything would make every training failure unreportable, which is the
+    opposite error and just as bad.
+    """
+    trainer.returncode = 1
+    trainer.stderr = stderr
+    trainer.write_model = False
+
+    result = run_tune(request_for())
+
+    assert check_named(result, TRAINING_CHECK).outcome is Outcome.FAILED
+    assert result.outcome is Outcome.FAILED
+
+
+def test_an_accelerator_message_on_a_clean_exit_changes_nothing(trainer, request_for):
+    """Consulted only on a non-zero exit. A run that recovered from an OOM,
+    retried at a smaller batch and exited zero with the message still in its
+    stderr is a run that finished -- reading stderr first would turn it into
+    a non-result.
+    """
+    trainer.returncode = 0
+    trainer.stderr = "torch.OutOfMemoryError: CUDA out of memory (caught, retried)"
+
+    result = run_tune(request_for())
+
+    assert check_named(result, TRAINING_CHECK).outcome is Outcome.PASSED
+    assert result.model_dir is not None
 
 
 def test_exit_zero_with_no_checkpoint_is_a_failure(trainer, request_for):
@@ -687,20 +908,24 @@ def test_the_dtype_and_attention_the_export_path_uses_are_passed_through(trainer
 
 
 def test_a_different_dtype_is_allowed_and_named_as_a_limitation(trainer, request_for):
-    """`--dtype float32` -- what every published number in this repo was
-    actually measured under -- must not be told it is "not the pair the
-    export and evaluation paths use": evaluate.py's float reference always
-    loads at float32 regardless of training dtype, so this is the one value
-    that already matches it. Attention still defaults to eager here, so its
-    own, separate limitation must not fire.
+    """A departure from the default is recorded -- and nothing more.
+
+    `--dtype float32` must not be told it is "not the pair the export and
+    evaluation paths use": evaluate.py's float reference always loads at
+    float32 regardless of training dtype, so it is the one value that already
+    matches it. It must not be told which dtype the published numbers were
+    taken at either, in either direction: MEASUREMENTS.md gives a dtype for
+    exactly one run -- the second-family banking77 one, trained in float32 --
+    and says nothing about the headline table's. Attention still defaults to
+    eager here, so its own, separate limitation must not fire.
     """
     result = run_tune(request_for(dtype="float32"))
 
     assert trainer.configs[0]["dtype"] == "float32"
-    assert any(
-        "trains with dtype 'float32'" in text and "published number" in text
-        for text in result.limitations
-    ), result.limitations
+    departure = [text for text in result.limitations if "trains with dtype 'float32'" in text]
+    assert len(departure) == 1, result.limitations
+    assert "MEASUREMENTS.md" in departure[0]
+    assert "every published number" not in departure[0]
     assert not any("fluent, wrong" in text for text in result.limitations)
 
 
@@ -816,17 +1041,55 @@ def test_a_report_is_written_for_a_failed_run(trainer, request_for):
 # handful of calls it makes.
 
 _STUB_TORCH = """
+import json
+import os
+
 bfloat16 = "bfloat16"
 float32 = "float32"
 long = "long"
+
+
+def _log(record):
+    path = os.environ["LITETUNE_STUB_LOG"]
+    with open(path, "a", encoding="utf-8") as sink:
+        sink.write(json.dumps(record) + "\\n")
 
 
 def manual_seed(seed):
     return seed
 
 
+class _Tensor(list):
+    # A list that tracks its own device and answers `.to(device)` the way a
+    # tensor does: with itself when the device is unchanged, with a new
+    # object when it is not. Returning `self` unconditionally made a dropped
+    # `.to()` call in the training script indistinguishable from one that ran.
+    def __init__(self, values, device="cpu"):
+        super().__init__(values)
+        self.device = device
+
+    def to(self, device):
+        if device == self.device:
+            return self
+        return _Tensor(list(self), device=device)
+
+
 def tensor(values, dtype=None):
-    return values
+    return _Tensor(values)
+
+
+class _Cuda:
+    @staticmethod
+    def is_available():
+        # A flag read from the environment, not a hardcoded `False`: this
+        # stub runs in its own subprocess and cannot share `conftest.py`'s
+        # `fake_torch`, but it answers the same question the same way -- a
+        # boolean that can say "there is a GPU", which `run_real_script`'s
+        # `cuda` parameter sets before the subprocess starts.
+        return os.environ.get("LITETUNE_STUB_CUDA") == "1"
+
+
+cuda = _Cuda()
 
 
 class _AdamW:
@@ -834,6 +1097,10 @@ class _AdamW:
         self.params = list(params)
         self.lr = lr
         self.steps = 0
+        # Logged so a test can assert the model moved to its device *before*
+        # this ran: parameters an optimiser is built against, then moved
+        # afterwards, silently end up split across two devices.
+        _log({"event": "optimiser_init", "n_params": len(self.params)})
 
     def step(self):
         self.steps += 1
@@ -923,8 +1190,23 @@ class _Model:
     def train(self):
         return self
 
+    def to(self, device):
+        _log({"event": "to", "device": device})
+        return self
+
     def __call__(self, input_ids=None, attention_mask=None, labels=None):
-        _log({"event": "forward", "rows": len(labels), "width": len(labels[0])})
+        _log({
+            "event": "forward",
+            "rows": len(labels),
+            "width": len(labels[0]),
+            # Where each of the three actually arrived, not just that `.to()`
+            # was called on it -- the doubles hand back a new object only
+            # when the device changed, so a dropped `.to()` call shows up
+            # here as "cpu" while the model sits on something else.
+            "input_ids_device": getattr(input_ids, "device", None),
+            "attention_mask_device": getattr(attention_mask, "device", None),
+            "labels_device": getattr(labels, "device", None),
+        })
         return _Output(_Loss(1.45))
 
     def save_pretrained(self, path):
@@ -969,7 +1251,16 @@ def stub_env(tmp_path):
     return stubs, log
 
 
-def run_real_script(request: TuneRequest, stub_env) -> subprocess.CompletedProcess:
+def run_real_script(
+    request: TuneRequest, stub_env, cuda: bool = False
+) -> subprocess.CompletedProcess:
+    """Runs `_TRAIN_SCRIPT` for real, against the stub modules `stub_env` wrote.
+
+    `cuda` sets the one flag the stub `torch.cuda.is_available()` reads. The
+    stub lives in its own subprocess and cannot share `conftest.py`'s
+    `fake_torch`, but this is the same shape: a boolean parameter, not a
+    hardcoded `False` unable to express "there is a GPU".
+    """
     stubs, log = stub_env
     request.output_dir.mkdir(parents=True, exist_ok=True)
     script = request.output_dir / "train_script.py"
@@ -982,7 +1273,12 @@ def run_real_script(request: TuneRequest, stub_env) -> subprocess.CompletedProce
         [sys.executable, str(script), str(config)],
         capture_output=True,
         text=True,
-        env={"PATH": "", "PYTHONPATH": str(stubs), "LITETUNE_STUB_LOG": str(log)},
+        env={
+            "PATH": "",
+            "PYTHONPATH": str(stubs),
+            "LITETUNE_STUB_LOG": str(log),
+            "LITETUNE_STUB_CUDA": "1" if cuda else "0",
+        },
     )
 
 
@@ -1034,6 +1330,57 @@ def test_the_real_script_saves_the_adapter_before_merging(request_for, stub_env)
     assert (request.adapter_dir / "adapter.json").is_file()
     assert (request.model_dir / "merged.json").is_file()
     assert (request.model_dir / "tokenizer.json").is_file()
+
+
+def test_the_real_script_puts_the_model_on_a_device_and_records_it(request_for, stub_env):
+    from litetune.tune import read_metrics
+
+    request = request_for()
+    assert run_real_script(request, stub_env).returncode == 0
+
+    moved = [e for e in stub_log(stub_env) if e["event"] == "to"]
+    assert [m["device"] for m in moved] == ["cpu"]
+    assert read_metrics(request.output_dir / "metrics.json").device == "cpu"
+
+
+def test_the_real_script_trains_on_cuda_when_the_stub_says_there_is_one(request_for, stub_env):
+    """Kills four mutants at once, all invisible against the cuda-less stub
+    above: the hardcoded `"cpu"` `training_device` could fall back to,
+    `model.to(device)` dropped or aimed at `"meta"`, `.to(device)` dropped off
+    `input_ids`, `attention_mask` or `labels` before the forward pass, and the
+    metrics payload's `"device"` key replaced with a literal `"cpu"`. Every
+    one of them happens to still say "cpu" against a cuda-less fixture --
+    only one that can say "there is a GPU" tells them apart.
+    """
+    from litetune.tune import read_metrics
+
+    request = request_for()
+    assert run_real_script(request, stub_env, cuda=True).returncode == 0
+
+    log = stub_log(stub_env)
+    moved = [e for e in log if e["event"] == "to"]
+    assert [m["device"] for m in moved] == ["cuda"]
+
+    forward = next(e for e in log if e["event"] == "forward")
+    assert forward["input_ids_device"] == "cuda"
+    assert forward["attention_mask_device"] == "cuda"
+    assert forward["labels_device"] == "cuda"
+
+    assert read_metrics(request.output_dir / "metrics.json").device == "cuda"
+
+
+def test_the_real_script_moves_the_model_before_building_the_optimiser(request_for, stub_env):
+    """An optimiser built before the model is moved is constructed against
+    parameters that then move out from under it -- silently, since nothing
+    about the run fails. `test_..._puts_the_model_on_a_device...` already
+    kills a move that is dropped outright; this is the one mutant that
+    survives even then, by moving the model back to front.
+    """
+    request = request_for()
+    assert run_real_script(request, stub_env).returncode == 0
+
+    events = [e["event"] for e in stub_log(stub_env)]
+    assert events.index("to") < events.index("optimiser_init")
 
 
 def test_the_real_script_refuses_an_over_length_row(request_for, stub_env, tmp_path):
@@ -1288,3 +1635,533 @@ def test_a_model_without_a_sentencepiece_tokenizer_is_reported_not_failed(
 
     assert not (out / "tokenizer.model").exists()
     assert outcome.startswith("unavailable:"), outcome
+
+
+# ---------------------------------------------------------------------------
+# Where the run happens, and that it says so
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# What the probe answered, and where the answer goes
+# ---------------------------------------------------------------------------
+#
+# Three destinations, all from one call: the config the training script is
+# handed, the report the run writes, and the pre-run note. Each of them used to
+# be unpinned -- `device = None` in `run_tune`, a literal `"device": "cpu"` in
+# `TuneRequest.config`, and deleting the probe outright all survived the whole
+# suite, because the fake could not answer the probe at all and every test ran
+# against a failure.
+
+
+def notes(seen) -> list[str]:
+    return [e.data.get("message", "") for e in seen if e.kind == "note"]
+
+
+def run_with_events(request):
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+    return run_tune(request, events=events), seen
+
+
+def test_the_probes_answer_reaches_the_script_and_the_report(trainer, request_for, tmp_path):
+    """`cuda`, so that every hardcoded `"cpu"` on the way is visible.
+
+    The script is *told* the device rather than left to decide: that is the
+    whole point of asking before the run instead of reading `metrics.device`
+    after it.
+    """
+    trainer.probe_device = "cuda"
+    request = request_for()
+
+    result = run_tune(request)
+
+    assert result.device == "cuda"
+    assert trainer.configs[0]["device"] == "cuda"
+    assert result.as_dict()["request"]["device"] == "cuda"
+    written = json.loads((request.output_dir / "train_config.json").read_text(encoding="utf-8"))
+    assert written["device"] == "cuda"
+
+
+def test_a_cpu_answer_reaches_the_script_too(trainer, request_for):
+    """The other value, so that `"device": "cuda"` hardcoded anywhere on the
+    path is as visible as `"cpu"` is."""
+    trainer.probe_device = "cpu"
+    run_tune(request_for())
+    assert trainer.configs[0]["device"] == "cpu"
+
+
+def test_a_probe_that_cannot_answer_is_a_limitation_not_a_device(trainer, request_for):
+    """`None` is not "cpu", and it must not be silent either. `logging` alone
+    reaches nothing the report carries, so a run whose device was never
+    established says so where the rest of the run's caveats are."""
+    trainer.probe_returncode = 1
+    trainer.probe_stderr = "ModuleNotFoundError: No module named 'torch'"
+
+    result = run_tune(request_for())
+
+    assert result.device is None
+    assert trainer.configs[0]["device"] is None
+    assert any(
+        "device probe" in text and "was not established" in text for text in result.limitations
+    ), result.limitations
+    assert any("No module named" in text for text in result.limitations), result.limitations
+
+
+def test_a_killed_probe_is_not_reported_as_an_exit_status(trainer, request_for):
+    """`-9` is a signal, not a status the probe chose. See `litetune.exits`."""
+    trainer.probe_returncode = -9
+
+    result = run_tune(request_for())
+
+    assert result.device is None
+    limitation = next(text for text in result.limitations if "device probe" in text)
+    assert "exited -9" not in limitation
+    assert "SIGKILL" in limitation
+
+
+def test_a_probe_that_times_out_is_not_a_device(trainer, request_for):
+    trainer.probe_raises = subprocess.TimeoutExpired(cmd="python", timeout=30)
+
+    result = run_tune(request_for())
+
+    assert result.device is None
+    assert any("TimeoutExpired" in text for text in result.limitations), result.limitations
+
+
+def test_a_banner_before_the_answer_does_not_destroy_it(trainer, request_for):
+    """A stage environment is free to print on startup. The answer is the last
+    line the probe writes, and reading the whole of stdout threw away a good
+    answer because something else spoke first."""
+    trainer.probe_stdout = (
+        "warning: overriding a pinned dependency\n"
+        '{"device": "cuda", "cuda_build": "12.4", "device_count": 1}\n'
+    )
+
+    result = run_tune(request_for())
+
+    assert result.device == "cuda"
+    assert not any("device probe" in text for text in result.limitations)
+
+
+def test_a_torch_that_cannot_reach_its_gpu_is_not_the_same_as_no_gpu(trainer, request_for):
+    """`is_available()` answers False for a CPU-only wheel, a container with no
+    `--gpus`, and a driver too old -- all of which are "torch cannot reach a
+    GPU here", not "this machine has none". The run still happens on the CPU;
+    what changes is that the report says which observation it was.
+    """
+    trainer.probe_device = "cpu"
+    trainer.probe_cuda_build = "12.4"
+    trainer.probe_device_count = 0
+
+    result = run_tune(request_for())
+
+    assert result.device == "cpu"
+    assert any(
+        "CUDA 12.4 build" in text and "not the same observation" in text
+        for text in result.limitations
+    ), result.limitations
+
+
+def test_a_cpu_only_wheel_reporting_cpu_carries_no_such_limitation(trainer, request_for):
+    """The other half: a wheel built without CUDA answering "cpu" is an
+    ordinary CPU machine and has nothing to explain."""
+    trainer.probe_device = "cpu"
+    trainer.probe_cuda_build = None
+
+    result = run_tune(request_for())
+
+    assert not any("not the same observation" in text for text in result.limitations)
+
+
+def test_the_probe_runs_even_without_provisioning(trainer, request_for, tmp_path):
+    """`litetune tune --no-provision` over an environment that is already there
+    is a run whose device is knowable. The probe provisions nothing -- gating it
+    on `auto_provision` made such a run report no device at all.
+    """
+    envs.TRAIN.path.mkdir(parents=True, exist_ok=True)
+    (envs.TRAIN.path / ".litetune-ready").write_text(envs.TRAIN.identity)
+    trainer.probe_device = "cuda"
+
+    result = run_tune(request_for(auto_provision=False))
+
+    assert result.device == "cuda"
+    assert check_named(result, TRAINING_CHECK).outcome is Outcome.PASSED
+
+
+# ---------------------------------------------------------------------------
+# The pre-run note, and the two details that quote the same hint
+# ---------------------------------------------------------------------------
+
+
+def test_a_cpu_probe_warns_before_the_wait_not_after_it(trainer, request_for):
+    trainer.probe_device = "cpu"
+
+    _, seen = run_with_events(request_for(dtype="bfloat16"))
+
+    warnings = [m for m in notes(seen) if "bfloat16 on the CPU" in m]
+    assert len(warnings) == 1
+    assert warnings[0].startswith("training will run bfloat16 on the CPU")
+    assert "--dtype float32" in warnings[0]
+
+
+def test_an_unanswered_probe_still_warns_and_says_it_is_a_maybe(trainer, request_for):
+    """The case this gate used to lose. `None` is not "cuda", and the script's
+    own fallback resolves to cpu on every machine without a reachable GPU --
+    so the run most likely to spend six hours is the one that was told
+    nothing. "may", not "will": the device is genuinely not established.
+    """
+    trainer.probe_raises = OSError("no interpreter")
+
+    _, seen = run_with_events(request_for(dtype="bfloat16"))
+
+    warnings = [m for m in notes(seen) if "bfloat16 on the CPU" in m]
+    assert len(warnings) == 1
+    assert warnings[0].startswith("training may run bfloat16 on the CPU")
+    assert "not established yet" in warnings[0]
+
+
+def test_a_cuda_probe_warns_about_nothing(trainer, request_for):
+    trainer.probe_device = "cuda"
+
+    _, seen = run_with_events(request_for(dtype="bfloat16"))
+
+    assert not [m for m in notes(seen) if "bfloat16 on the CPU" in m]
+
+
+def test_a_float32_run_is_not_told_to_take_the_advice_it_already_took(trainer, request_for):
+    trainer.probe_device = "cpu"
+
+    _, seen = run_with_events(request_for(dtype="float32"))
+
+    assert not [m for m in notes(seen) if "bfloat16 on the CPU" in m]
+
+
+def test_a_timeout_carries_the_hint_even_when_the_probe_said_nothing(trainer, request_for):
+    """This ending returns before any metrics file is opened, so the pre-run
+    probe is the only thing that knows anything about the device -- and a
+    six-hour non-result is exactly the ending that needs the hint."""
+    trainer.probe_raises = OSError("no interpreter")
+    trainer.raises = subprocess.TimeoutExpired(cmd="python", timeout=10)
+
+    result = run_tune(request_for(dtype="bfloat16"))
+
+    check = check_named(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED
+    assert "--dtype float32" in check.detail
+    # And it must not turn into a claim about a CPU nobody observed.
+    assert "its device was never established" in check.detail
+    assert "it was running bfloat16 on the CPU" not in check.detail
+
+
+def test_a_timeout_on_an_observed_cpu_says_so_plainly(trainer, request_for):
+    trainer.probe_device = "cpu"
+    trainer.raises = subprocess.TimeoutExpired(cmd="python", timeout=10)
+
+    detail = check_named(run_tune(request_for(dtype="bfloat16")), TRAINING_CHECK).detail
+
+    assert "it was running bfloat16 on the CPU" in detail
+    assert "never established" not in detail
+
+
+def test_a_timeout_on_cuda_carries_no_dtype_hint(trainer, request_for):
+    trainer.probe_device = "cuda"
+    trainer.raises = subprocess.TimeoutExpired(cmd="python", timeout=10)
+
+    result = run_tune(request_for(dtype="bfloat16"))
+
+    assert "--dtype float32" not in check_named(result, TRAINING_CHECK).detail
+
+
+def test_a_killed_run_prefers_what_the_script_reported_over_the_prediction(trainer, request_for):
+    """The probe said cuda; the script fell back and reported cpu. What ran is
+    what the detail is about.
+
+    `-15` (SIGTERM), not `-9`: SIGKILL carries its own hint -- see
+    `test_a_sigkill_does_not_carry_the_speed_hint_too` -- and this test is
+    about the confirmed-over-predicted wording, not about that one.
+    """
+    trainer.probe_device = "cuda"
+    trainer.device = "cpu"
+    trainer.returncode = -15
+
+    result = run_tune(request_for(dtype="bfloat16"))
+
+    check = check_named(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED
+    assert "--dtype float32" in check.detail
+    assert "it ran bfloat16 on the CPU" in check.detail
+
+
+def test_a_killed_run_that_established_no_device_says_that_instead(trainer, request_for):
+    trainer.probe_raises = OSError("no interpreter")
+    trainer.write_metrics = False
+    trainer.returncode = -15
+
+    detail = check_named(run_tune(request_for(dtype="bfloat16")), TRAINING_CHECK).detail
+
+    assert "--dtype float32" in detail
+    assert "its device was never established" in detail
+    assert "it ran bfloat16 on the CPU" not in detail
+
+
+def test_a_killed_run_with_only_a_prediction_does_not_claim_it_ran(trainer, request_for):
+    """The probe predicted the CPU; the run was killed before `metrics.json`
+    -- and so `metrics.device` -- ever existed to confirm it. "it ran" is a
+    past tense nothing here established; the wording says a prediction, not
+    an observation.
+    """
+    trainer.probe_device = "cpu"
+    trainer.write_metrics = False
+    trainer.returncode = -15
+
+    detail = check_named(run_tune(request_for(dtype="bfloat16")), TRAINING_CHECK).detail
+
+    assert "--dtype float32" in detail
+    assert "it ran bfloat16 on the CPU" not in detail
+    assert "predicted the CPU" in detail
+    assert "killed before its own device was confirmed" in detail
+
+
+def test_a_sigkill_does_not_carry_the_speed_hint_too(trainer, request_for):
+    """`reading.describe` already named the near-certain cause of a SIGKILL --
+    the machine's out-of-memory killer -- and a speed hint stacked next to it
+    reads as a second, contradictory story: a box killed while loading the
+    checkpoint, seconds in, never ran a single matmul, slow or otherwise. Same
+    device shape as the confirmed-cpu test above, `-9` instead of `-15`.
+    """
+    trainer.probe_device = "cuda"
+    trainer.device = "cpu"
+    trainer.returncode = -9
+
+    detail = check_named(run_tune(request_for(dtype="bfloat16")), TRAINING_CHECK).detail
+
+    assert "out-of-memory killer" in detail
+    assert "--dtype float32" not in detail
+    assert "it ran bfloat16 on the CPU" not in detail
+
+
+def test_a_killed_run_on_cuda_carries_no_dtype_hint(trainer, request_for):
+    trainer.probe_device = "cuda"
+    trainer.device = "cuda"
+    trainer.returncode = -9
+
+    result = run_tune(request_for(dtype="bfloat16"))
+
+    assert "--dtype float32" not in check_named(result, TRAINING_CHECK).detail
+
+
+def test_the_script_trains_on_cuda_when_there_is_one(script_namespace):
+    """The fallback, reached when the parent has no answer to give: a probe
+    that could not run, or an environment nobody probed. Without it a GPU box
+    would train on the CPU because a sub-second probe failed."""
+    training_device = script_namespace["training_device"]
+    assert training_device(fake_torch(cuda=True)) == "cuda"
+    assert training_device(fake_torch(cuda=False)) == "cpu"
+
+
+def test_the_script_takes_the_parents_answer_over_its_own(script_namespace):
+    """`given` wins, and the fake torch is set to disagree so that it has to.
+
+    Against a torch that says "no GPU", `if given is not None` reduced to `if
+    False` still answers "cpu" and nothing notices -- which is how the trust
+    branch stayed unpinned on this side while `evaluate.py`'s had a test.
+    """
+    training_device = script_namespace["training_device"]
+    assert training_device(fake_torch(cuda=False), given="cuda") == "cuda"
+    assert training_device(fake_torch(cuda=True), given="cpu") == "cpu"
+
+
+def test_the_device_is_recorded_in_the_metrics():
+    from litetune.tune import TrainingMetrics
+
+    payload = {
+        "n_examples": 1,
+        "supervised_tokens": 1,
+        "total_tokens": 2,
+        "masked_tokens": 1,
+        "supervised_token_fraction": 0.5,
+        "epochs": [],
+        "device": "cuda",
+    }
+    assert TrainingMetrics.from_dict(payload).device == "cuda"
+    assert TrainingMetrics.from_dict(payload).as_dict()["device"] == "cuda"
+    # Older metrics files have no such field; absent is absent, not "cpu".
+    del payload["device"]
+    assert TrainingMetrics.from_dict(payload).device is None
+
+
+def test_bfloat16_on_the_cpu_is_named_as_a_limitation(trainer, request_for):
+    """bfloat16 is the default because a fine-tune in float16 overflows where
+    bfloat16 does not, and a 270M model's loss goes to NaN in float16 while
+    bfloat16 holds -- not because it matches export or evaluation, which
+    `TuneRequest`'s own docstring and `BFLOAT16_CPU_HINT`'s comment both
+    disclaim. On a CPU it is also, on the one machine measured, a
+    single-threaded matmul: a 300-step LoRA run sat on one core for 52
+    minutes without finishing, and the same run in float32 took 307 s on ten
+    threads. The default stands regardless, but a CPU run is told what it is
+    paying and which flag buys it back."""
+    trainer.device = "cpu"
+    result = run_tune(request_for(dtype="bfloat16"))
+    assert any("--dtype float32" in text for text in result.limitations)
+
+
+def test_a_cuda_run_carries_no_dtype_warning(trainer, request_for):
+    trainer.device = "cuda"
+    result = run_tune(request_for(dtype="bfloat16"))
+    assert not any("--dtype float32" in text for text in result.limitations)
+
+
+def test_a_cpu_run_at_float32_carries_no_dtype_warning(trainer, request_for):
+    """The other half of the condition: `device == "cpu"` alone is not enough
+    to fire the hint. A run that already took the advice -- `--dtype
+    float32` on the CPU -- must not be told to take it again."""
+    trainer.device = "cpu"
+    result = run_tune(request_for(dtype="float32"))
+    assert not any("trained bfloat16 on the CPU" in text for text in result.limitations)
+
+
+# ---------------------------------------------------------------------------
+# Five endings, and whether each still tells the device story
+# ---------------------------------------------------------------------------
+#
+# The note and the limitation both read `result.metrics.device`, and used to
+# sit at the very end of `run_tune`, after the killed early return -- so on
+# that one ending they never ran. Two of the five endings moved, not one: the
+# killed return, and the accelerator-failure return added alongside it, which
+# sits after this block too. The timeout and the blocked-start returns both
+# return before a metrics file is ever opened, and the fifth ending, the
+# bottom of the function, was already downstream. The fixture below makes a
+# killed run that wrote metrics, which is a narrow case in production -- the
+# real script writes `metrics.json` last, after the checkpoint -- but it is
+# the case the placement exists for, and the other four are here so that a
+# regression in any of them is a failing test rather than a silence.
+
+
+def test_the_device_story_appears_on_a_clean_run(trainer, request_for):
+    trainer.device = "cpu"
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    result = run_tune(request_for(), events=events)
+
+    assert check_named(result, TRAINING_CHECK).outcome is Outcome.PASSED
+    assert result.metrics is not None and result.metrics.device == "cpu"
+    device_notes = [
+        e for e in seen if e.kind == "note" and e.data.get("message", "").startswith("trained on")
+    ]
+    assert len(device_notes) == 1
+    # The message and the typed `device` field both have to carry the real
+    # answer: a note that prints "trained on cpu" while `device=None` (or the
+    # reverse) is still wrong, just wrong in a way string-matching the
+    # message alone would miss.
+    assert device_notes[0].data["message"] == "trained on cpu"
+    assert device_notes[0].data["device"] == "cpu"
+    assert any("trained bfloat16 on the CPU" in text for text in result.limitations)
+
+
+def test_the_device_story_appears_when_training_is_killed(trainer, request_for):
+    """`-9` returns before the bottom of `run_tune` -- but the metrics file a
+    killed process wrote (if it got that far) was already on disk, and the
+    story about it must not be skipped along with the verdict."""
+    trainer.returncode = -9
+    trainer.device = "cpu"
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    result = run_tune(request_for(), events=events)
+
+    assert check_named(result, TRAINING_CHECK).outcome is Outcome.UNCHECKED
+    assert result.metrics is not None and result.metrics.device == "cpu"
+    device_notes = [
+        e for e in seen if e.kind == "note" and e.data.get("message", "").startswith("trained on")
+    ]
+    assert len(device_notes) == 1
+    # The message and the typed `device` field both have to carry the real
+    # answer: a note that prints "trained on cpu" while `device=None` (or the
+    # reverse) is still wrong, just wrong in a way string-matching the
+    # message alone would miss.
+    assert device_notes[0].data["message"] == "trained on cpu"
+    assert device_notes[0].data["device"] == "cpu"
+    assert any("trained bfloat16 on the CPU" in text for text in result.limitations)
+
+
+def test_the_device_story_appears_on_an_accelerator_failure(trainer, request_for):
+    """The other ending that moved alongside the killed one: `_GPU_FAILURE_RE`
+    also returns before the bottom of `run_tune`, and it sits after the
+    device-story block for the same reason the killed branch does."""
+    trainer.returncode = 1
+    trainer.stderr = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB"
+    trainer.write_model = False
+    trainer.device = "cpu"
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    result = run_tune(request_for(), events=events)
+
+    assert check_named(result, TRAINING_CHECK).outcome is Outcome.UNCHECKED
+    assert result.metrics is not None and result.metrics.device == "cpu"
+    device_notes = [
+        e for e in seen if e.kind == "note" and e.data.get("message", "").startswith("trained on")
+    ]
+    assert len(device_notes) == 1
+    assert device_notes[0].data["message"] == "trained on cpu"
+    assert device_notes[0].data["device"] == "cpu"
+    assert any("trained bfloat16 on the CPU" in text for text in result.limitations)
+
+
+def test_the_device_story_appears_when_training_exits_nonzero(trainer, request_for):
+    trainer.returncode = 1
+    trainer.device = "cpu"
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    result = run_tune(request_for(), events=events)
+
+    assert check_named(result, TRAINING_CHECK).outcome is Outcome.FAILED
+    assert result.metrics is not None and result.metrics.device == "cpu"
+    device_notes = [
+        e for e in seen if e.kind == "note" and e.data.get("message", "").startswith("trained on")
+    ]
+    assert len(device_notes) == 1
+    # The message and the typed `device` field both have to carry the real
+    # answer: a note that prints "trained on cpu" while `device=None` (or the
+    # reverse) is still wrong, just wrong in a way string-matching the
+    # message alone would miss.
+    assert device_notes[0].data["message"] == "trained on cpu"
+    assert device_notes[0].data["device"] == "cpu"
+    assert any("trained bfloat16 on the CPU" in text for text in result.limitations)
+
+
+def test_the_device_story_is_silent_with_no_metrics_file(trainer, request_for):
+    trainer.write_metrics = False
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    result = run_tune(request_for(), events=events)
+
+    assert result.metrics is None
+    assert not any(e.kind == "note" and "trained on" in e.data.get("message", "") for e in seen)
+    assert not any("trained bfloat16 on the CPU" in text for text in result.limitations)
+
+
+def test_the_device_story_is_silent_when_metrics_predate_the_field(trainer, request_for):
+    """`trainer.device` is left at its default `None`: the payload
+    `FakeTrainer` writes then carries no "device" key at all -- indistinguishable
+    from a real `metrics.json` written before the field existed."""
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    result = run_tune(request_for(), events=events)
+
+    assert result.metrics is not None
+    assert result.metrics.device is None
+    assert not any(e.kind == "note" and "trained on" in e.data.get("message", "") for e in seen)
+    assert not any("trained bfloat16 on the CPU" in text for text in result.limitations)

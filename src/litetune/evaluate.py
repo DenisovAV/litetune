@@ -93,6 +93,12 @@ class PromptMode(str, Enum):
 # to this.
 UNDECLARED_PROMPT_MODE = PromptMode.PRERENDERED
 
+# What `describe()["backend"]` says when a measurement's device was never
+# established. The word matters: `verify.py` prints
+# `engine.get("backend", "unknown")` when the key is missing entirely, so this
+# is the same word for what is, to a reader of the manifest, the same state.
+UNKNOWN_BACKEND = "unknown"
+
 # Control tokens that only appear in a prompt somebody already rendered. Bare
 # user text does not contain them.
 TURN_MARKERS = (
@@ -531,6 +537,10 @@ class LiteRtLmBackend:
         return {
             "engine": "litert-lm",
             "backend": self.backend_flag,
+            # The flag as passed, not a device torch chose: see
+            # `HuggingFaceBackend.describe`, where the same key carries the
+            # other vocabulary.
+            "backend_vocabulary": "litert-lm --backend flag",
             "requirements": list(self.env.requirements),
             "system_requirements": list(self.env.system_requirements),
             "argv_template": self.argv("<prompt>"),
@@ -634,6 +644,26 @@ import sys
 from pathlib import Path
 
 
+def generation_device(torch, given=None):
+    """Where generation happens: what the parent already resolved, or CUDA-if-any.
+
+    `given` is `envs.resolve_device`'s answer, asked once by `HuggingFaceBackend`
+    before this script started and taken here rather than decided again, so
+    the parent knows the device of the run it is about to start. `tune.py`'s
+    training script carries the same two lines for the same reason; they are
+    duplicated rather than shared because neither script may import litetune --
+    each runs inside a stage environment that has only torch in it.
+
+    The fallback is not dead code. It is what runs whenever the parent has no
+    answer to give: a probe that could not run, and an environment that was
+    never probed. Without it the float reference would sit on the CPU of a GPU
+    box because a sub-second probe failed.
+    """
+    if given is not None:
+        return given
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def main() -> int:
     spec = json.loads(Path(sys.argv[1]).read_text())
 
@@ -653,6 +683,15 @@ def main() -> int:
         attn_implementation=spec["attn_implementation"],
     )
     model.eval()
+    device = generation_device(torch, spec.get("device"))
+    model.to(device)
+    # Structured, not only printed. The stderr line below is for a human
+    # watching a run; `_assemble` discards stderr on a clean exit, so on the
+    # path that matters it reaches nobody. This file is what the parent reads
+    # back, and it is written before generation starts so that a run killed
+    # part-way still says where it was running.
+    Path(spec["run_report"]).write_text(json.dumps({"device": device}), encoding="utf-8")
+    print(f"reference generation on {device}", file=sys.stderr, flush=True)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
     with Path(spec["out"]).open("w", encoding="utf-8") as sink:
@@ -664,7 +703,7 @@ def main() -> int:
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-            enc = tok(text, return_tensors="pt")
+            enc = tok(text, return_tensors="pt").to(device)
             with torch.no_grad():
                 ids = model.generate(
                     **enc,
@@ -710,6 +749,36 @@ class HuggingFaceBackend:
     # always had; both are reported so a measurement never hides which one
     # decided it.
     declared_prompt_mode: PromptMode | None = None
+    # Where the reference actually generated. Set twice: to what
+    # `envs.resolve_device` found, before the run, and then to what the script
+    # itself reported after it -- see `generate()`. `None` until `generate()`
+    # has run, and after one whose probe could not answer and whose script
+    # wrote no report; never silently "cpu", the same rule
+    # `tune.TrainingMetrics.device` applies on the training side. `describe()`
+    # reports this rather than a hardcoded constant, because a laptop's
+    # manifest and a GPU box's must not be able to read identically in the one
+    # field that says which produced the numbers.
+    device: str | None = None
+    # What the probe predicted, kept beside what the run reported rather than
+    # replaced by it. They disagree whenever the script took its own fallback,
+    # and a disagreement is a fact about the measurement -- `tune` keeps both
+    # for the same reason (`TuneResult.device` against `metrics.device`). A
+    # logger warning does not travel with a manifest.
+    probed_device: str | None = None
+    # This call's own probe, in full, overwritten every time `_ensure_env`
+    # runs -- unlike `device` and `probed_device` above, which a failed probe
+    # deliberately leaves alone so a reused backend keeps reporting its last
+    # known answer. That do-not-erase rule protects the *report*; it must not
+    # also protect a directive handed to the *child* process, which is what
+    # reading `self.device` for `spec["device"]` used to do: a stale "cuda"
+    # from a previous call, forced onto a run whose own probe could not vouch
+    # for it, made `model.to("cuda")` fail on a box where CUDA had since gone
+    # away. `generate()` reads this, not `self.device`, when it builds the
+    # spec. `None` before `_ensure_env` has run, and after a call whose probe
+    # was never asked or could not answer -- see `verify.py`, which also reads
+    # `detail` and `cuda_build_without_a_device` off it to record the same
+    # limitation `tune.py` records for its own probe.
+    last_probe: envs.DeviceProbe | None = None
 
     name = "transformers"
     # `generate()` receives max_new_tokens and the stop condition, so here the
@@ -736,7 +805,30 @@ class HuggingFaceBackend:
     def describe(self) -> dict[str, Any]:
         return {
             "engine": "transformers",
-            "backend": "cpu",
+            # Resolved by `generate()`, not hardcoded: this used to say "cpu"
+            # unconditionally, which made a laptop's manifest and a GPU box's
+            # byte-identical in the one field meant to distinguish them.
+            # "unknown" before `generate()` has run, and after one whose device
+            # was never established -- not "cpu", for the same reason
+            # `TrainingMetrics.device` defaults to `None` rather than guessing.
+            # "unknown" and not "unresolved": `verify.py` already prints
+            # `engine.get("backend", "unknown")` into its limitation text, so a
+            # second word for the same state would have put two names for one
+            # thing in one manifest.
+            "backend": self.device if self.device is not None else UNKNOWN_BACKEND,
+            # What was predicted before the run, so a reader can see the two
+            # disagree rather than only the winner. `None` when nothing was
+            # asked; equal to `backend` on every run that used what it was
+            # told, which is the ordinary case.
+            "backend_probed": self.probed_device,
+            # `backend` is a torch device here and a `litert-lm --backend` flag
+            # on `LiteRtLmBackend`: two vocabularies under one key, overlapping
+            # only at the string "cpu", which means "torch placed the model on
+            # the CPU" on this side and "the runtime was asked for its CPU
+            # backend" on the other. Named so a reader comparing a candidate's
+            # `backend` with a reference's is not comparing two different
+            # questions.
+            "backend_vocabulary": "torch device",
             "requirements": list(self.env.requirements),
             "decode_declared": self.decode.as_dict(),
             "decode_passed_to_cli": self.decode_enforced,
@@ -752,11 +844,21 @@ class HuggingFaceBackend:
         if blocked is not None:
             return [Generation(i, p, harness_error=blocked) for i, p in enumerate(prompts)]
 
+        # This call's own probe only, not `self.device`: the do-not-erase rule
+        # in `_ensure_env` deliberately lets `self.device` keep a stale answer
+        # across calls for *reporting*, and that answer must not also become a
+        # directive forced onto this child's device placement -- a probe that
+        # could not vouch for it this run has no business deciding it. `None`
+        # is exactly what `generation_device`'s own fallback inside the script
+        # is for.
+        device_for_run = self.last_probe.device if self.last_probe is not None else None
+
         with tempfile.TemporaryDirectory(prefix="litetune-hf-") as tmp:
             work = Path(tmp)
             script = work / "generate.py"
             script.write_text(_HF_GENERATE_SCRIPT, encoding="utf-8")
             results = work / "generations.jsonl"
+            report = work / "run.json"
             spec = work / "spec.json"
             spec.write_text(
                 json.dumps(
@@ -766,7 +868,9 @@ class HuggingFaceBackend:
                         "max_tokens": self.decode.max_tokens,
                         "runtime_rendered": self.uses_template,
                         "attn_implementation": self.attn_implementation,
+                        "device": device_for_run,
                         "out": str(results),
+                        "run_report": str(report),
                     }
                 ),
                 encoding="utf-8",
@@ -782,25 +886,95 @@ class HuggingFaceBackend:
             except subprocess.TimeoutExpired:
                 logger.warning("transformers generation timed out after %ss", self.timeout_s)
                 reason = f"no result after {self.timeout_s}s (timeout)"
+                # Nothing ran, so nothing has a confirmed device: a prediction
+                # left standing here would be reported by `describe()` as the
+                # backend for a run that produced zero generations.
+                self.device = None
                 return [Generation(i, p, harness_error=reason) for i, p in enumerate(prompts)]
             except OSError as exc:
                 logger.exception("could not start the generation script")
                 reason = f"{type(exc).__name__}: {exc}"
+                self.device = None
                 return [Generation(i, p, harness_error=reason) for i, p in enumerate(prompts)]
 
             texts = self._read_results(results)
+            # The script's own answer wins over the probe's prediction. The
+            # temp directory goes away at the end of this block, so it is read
+            # here rather than anywhere later.
+            observed = self._read_run_report(report)
 
+        if observed is not None:
+            if self.device is not None and observed != self.device:
+                logger.warning(
+                    "the probe resolved %r but the generation script used %r; recording %r",
+                    self.device,
+                    observed,
+                    observed,
+                )
+            self.device = observed
         return self._assemble(prompts, texts, proc)
 
     def _ensure_env(self, events: EventStream | None) -> str | None:
-        if not self.auto_provision:
-            return None
-        try:
-            self.env.provision(events=events)
-        except (RuntimeError, OSError) as exc:
-            logger.exception("could not provision environment %r", self.env.name)
-            return f"environment {self.env.name!r} unavailable: {exc}"
+        """Provision the environment when asked to, then ask it its device.
+
+        The probe is sub-second next to the generation run it precedes, and it
+        is asked here -- once, in the parent -- rather than left to
+        `generation_device`'s own fallback inside the subprocess.
+
+        Gated on `env.ready`, not on `auto_provision`. The probe provisions
+        nothing; a ready environment is its only precondition, and it is about
+        to be used for the generation run regardless. Under the old gate a
+        caller that constructs this backend with `auto_provision=False` over an
+        environment that is already there -- a library caller managing the
+        lifecycle itself, and every test in this suite that does the same --
+        got `describe()["backend"] == "unknown"` for a run whose device was
+        perfectly knowable. (No CLI path reaches that state: `verify` has no
+        `--no-provision` flag and never sets this field.)
+
+        A probe that cannot answer leaves `device` alone rather than
+        overwriting it: on a reused backend the previous run's answer is a
+        better record than `None`, and `None` here would claim the device was
+        never established when it was. A blocked environment does clear it,
+        because then no run happened at all.
+        """
+        self.last_probe = None
+        if self.auto_provision:
+            try:
+                self.env.provision(events=events)
+            except (RuntimeError, OSError) as exc:
+                logger.exception("could not provision environment %r", self.env.name)
+                self.device = None
+                self.probed_device = None
+                return f"environment {self.env.name!r} unavailable: {exc}"
+        if self.env.ready:
+            probe = envs.resolve_device(self.env, events=events)
+            self.last_probe = probe
+            if probe.answered:
+                self.probed_device = probe.device
+                self.device = probe.device
         return None
+
+    def _read_run_report(self, report: Path) -> str | None:
+        """The device the generation script itself says it used, or `None`.
+
+        The probe before the run is a prediction; this is the observation.
+        They differ whenever the script took its own fallback -- an unanswered
+        probe, an environment nobody probed -- and whenever the device changed
+        underneath the two. `tune.py`'s training script already writes a
+        metrics file for its own reasons, so recovering this observation from
+        it costs nothing there; the reference side had no such file lying
+        around and needed this purpose-built report to get the same fact.
+        """
+        try:
+            device = json.loads(report.read_text(encoding="utf-8"))["device"]
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            # A script that died before writing this, an older one that never
+            # wrote it, or one whose write was cut short mid-byte -- the same
+            # decode failure `_read_results` below already accounts for. Not
+            # an error: the prediction stands and says so.
+            logger.warning("generation script wrote no usable run report: %s", exc)
+            return None
+        return device if isinstance(device, str) else None
 
     def _read_results(self, results: Path) -> dict[int, str]:
         if not results.exists():
@@ -1007,6 +1181,39 @@ def evaluate(
         split_id=split.id,
         engine=backend.describe(),
         generations=tuple(generations),
+    )
+
+
+def device_mismatch(a: MeasurementPoint, b: MeasurementPoint) -> str | None:
+    """The two points ran on different hardware, said in full, or None.
+
+    A limitation, not a refusal, and the difference from `harness_mismatch` is
+    the decision rather than an oversight. `build_backends` gives the candidate
+    `LiteRtLmBackend`'s default `backend_flag="cpu"` and never overrides it, so
+    on a machine where the reference now resolves to cuda the two sides differ
+    in hardware as well as in conversion, and the "cost of conversion" carries
+    both. Refusing that comparison would leave a GPU box unable to verify at
+    all, which is worse than a number that says what else is in it.
+
+    Read from `engine["backend"]`, which each backend fills with the device or
+    the flag it actually used. The two vocabularies do not overlap except at
+    the string "cpu" -- see `backend_vocabulary` in either `describe()` -- so
+    this reports both values and names neither as the right one. A value that
+    is missing or `UNKNOWN_BACKEND` is not a difference: nothing was
+    established to differ from, and `describe()` already says so.
+    """
+    left = a.engine.get("backend")
+    right = b.engine.get("backend")
+    if not isinstance(left, str) or not isinstance(right, str):
+        return None
+    if UNKNOWN_BACKEND in (left, right) or left == right:
+        return None
+    return (
+        f"{a.label} was measured on {left} ({a.engine.get('engine', 'unknown')}) and {b.label} on "
+        f"{right} ({b.engine.get('engine', 'unknown')}), so the difference between them carries a "
+        "hardware difference as well as a conversion one. The comparison is reported rather than "
+        "refused: pinning both sides to one device is not something litetune can do for the "
+        "runtime side, and a refusal would leave such a machine unable to verify at all"
     )
 
 

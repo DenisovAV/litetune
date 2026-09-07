@@ -8,6 +8,8 @@ silently.
 
 import os
 import pathlib
+import subprocess
+import sys
 import types
 
 import pytest
@@ -325,3 +327,270 @@ def test_removing_the_cache_reports_what_would_not_go(monkeypatch, tmp_path):
     assert freed == 200
     assert failures == []
     assert envs.cached_environments() == []
+
+
+# ---------------------------------------------------------------------------
+# The device probe
+# ---------------------------------------------------------------------------
+#
+# `resolve_device` had no direct test at all: everything about it was reached
+# through `run_tune`, where the fake could not answer it, so every one of its
+# branches ran only in the "could not answer" direction. Each of them is a
+# different fact about a run and the report has to carry which.
+
+
+@pytest.fixture
+def probe_env(monkeypatch, tmp_path) -> StageEnv:
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    return StageEnv(name="probe", requirements=("torch==2.5.1",))
+
+
+def _answers(monkeypatch, *, stdout="", returncode=0, stderr="", raises=None):
+    def fake_run(self, args, timeout=3600, **kwargs):
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+    monkeypatch.setattr(StageEnv, "run", fake_run)
+
+
+def _json_answer(device="cpu", cuda_build=None, device_count=0) -> str:
+    import json
+
+    return json.dumps({"device": device, "cuda_build": cuda_build, "device_count": device_count})
+
+
+def test_the_probe_asks_this_environments_own_torch(probe_env, monkeypatch):
+    """The question has to be asked inside the environment that will run the
+    job. Any other interpreter answers about a machine this run is not using.
+    """
+    seen: list = []
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        seen.append((self.name, list(args), timeout))
+        return subprocess.CompletedProcess(args, 0, _json_answer("cuda"), "")
+
+    monkeypatch.setattr(StageEnv, "run", fake_run)
+
+    assert envs.resolve_device(probe_env).device == "cuda"
+    name, argv, timeout = seen[0]
+    assert name == "probe"
+    assert argv[:2] == ["python", "-c"]
+    assert "cuda.is_available" in argv[2]
+    assert timeout == envs.DEVICE_PROBE_TIMEOUT_S
+
+
+def test_a_cpu_answer_is_a_cpu_answer(probe_env, monkeypatch):
+    _answers(monkeypatch, stdout=_json_answer("cpu"))
+    probe = envs.resolve_device(probe_env)
+    assert probe.device == "cpu"
+    assert probe.answered
+
+
+def test_a_banner_before_the_answer_does_not_destroy_it(probe_env, monkeypatch):
+    """Any line a stage environment prints on startup lands on stdout ahead of
+    the answer. The answer is the last thing written, and reading all of stdout
+    turned a perfectly good "cuda" into "could not answer"."""
+    _answers(
+        monkeypatch,
+        stdout=f"WARNING: pip is out of date\n\n{_json_answer('cuda', '12.4', 1)}\n",
+    )
+    assert envs.resolve_device(probe_env).device == "cuda"
+
+
+def test_an_answer_that_is_neither_device_is_not_a_device(probe_env, monkeypatch):
+    _answers(monkeypatch, stdout=_json_answer("mps"))
+    probe = envs.resolve_device(probe_env)
+    assert probe.device is None
+    assert "'mps'" in probe.detail
+
+
+def test_unparseable_stdout_is_not_a_device(probe_env, monkeypatch):
+    _answers(monkeypatch, stdout="cuda\n")
+    probe = envs.resolve_device(probe_env)
+    assert probe.device is None
+    assert "not an answer" in probe.detail
+
+
+def test_silence_is_not_a_device(probe_env, monkeypatch):
+    _answers(monkeypatch, stdout="   \n\n")
+    probe = envs.resolve_device(probe_env)
+    assert probe.device is None
+    assert "printed nothing" in probe.detail
+
+
+def test_a_non_zero_exit_is_not_a_device(probe_env, monkeypatch):
+    _answers(monkeypatch, returncode=1, stderr="ModuleNotFoundError: No module named 'torch'")
+    probe = envs.resolve_device(probe_env)
+    assert probe.device is None
+    assert "exited 1" in probe.detail
+    assert "No module named" in probe.detail
+
+
+def test_a_killed_probe_is_read_as_a_signal_not_a_status(probe_env, monkeypatch):
+    """`-9` is not an exit status the probe chose. See `litetune.exits`; the
+    same reading that turned a memory ceiling into a verdict about a model."""
+    _answers(monkeypatch, returncode=-9)
+    probe = envs.resolve_device(probe_env)
+    assert probe.device is None
+    assert "SIGKILL" in probe.detail
+    assert "exited -9" not in probe.detail
+
+
+def test_a_timeout_is_not_a_device(probe_env, monkeypatch):
+    _answers(monkeypatch, raises=subprocess.TimeoutExpired(cmd="python", timeout=30))
+    probe = envs.resolve_device(probe_env)
+    assert probe.device is None
+    assert "TimeoutExpired" in probe.detail
+
+
+def test_a_probe_that_cannot_start_is_not_a_device(probe_env, monkeypatch):
+    _answers(monkeypatch, raises=FileNotFoundError("python"))
+    probe = envs.resolve_device(probe_env)
+    assert probe.device is None
+    assert "FileNotFoundError" in probe.detail
+
+
+def test_an_invalid_byte_ahead_of_the_answer_does_not_crash_the_run(probe_env):
+    """A garbled byte on the probe's stdout used to end the whole run.
+
+    `StageEnv.run` calls `subprocess.run(..., text=True)`, which decodes
+    stdout eagerly, and a stray non-UTF-8 byte -- a CUDA, driver or vendor
+    banner ahead of the probe's own line, the same class of weird environment
+    the last-non-empty-line rule exists to survive -- raised
+    `UnicodeDecodeError`. That is a `ValueError`, not the `OSError` this
+    function used to catch, so it escaped `resolve_device` entirely and ended
+    a `tune` or `verify` run with a traceback instead of an unanswered probe.
+
+    No mock of `StageEnv.run`: the fake "python" below is a real executable at
+    the real path `run` looks for, so this exercises the actual
+    `subprocess.run(..., errors="replace")` call the fix lives in, not a
+    stand-in that hands back an already-decoded string and could not have
+    caught the regression.
+    """
+    probe_env.path.mkdir(parents=True, exist_ok=True)
+    bindir = probe_env.python.parent
+    bindir.mkdir(parents=True, exist_ok=True)
+    fake_python = bindir / "python"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "sys.stdout.buffer.write(b'\\xff\\n')\n"
+        'sys.stdout.buffer.write(b\'{"device": "cuda", "cuda_build": null, '
+        '"device_count": 0}\\n\')\n'
+    )
+    fake_python.chmod(0o755)
+
+    probe = envs.resolve_device(probe_env, timeout=5)
+
+    assert probe.device == "cuda"
+    assert probe.answered
+
+
+def test_a_decode_error_out_of_env_run_does_not_escape_resolve_device(probe_env, monkeypatch):
+    """The other half of the same fix, pinned independently of `errors="replace"`.
+
+    `env.run` no longer raises `UnicodeDecodeError` for this, but
+    `resolve_device`'s own contract -- it never raises -- must not depend on
+    every caller of `env.run` getting that right, so it catches `ValueError`
+    too. Reproduces the exact shape from the field: `UnicodeDecodeError` out
+    of `StageEnv.run`, uncaught by `except (TimeoutExpired, OSError)` because
+    it is a `ValueError`, not an `OSError`.
+    """
+    _answers(
+        monkeypatch,
+        raises=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    )
+    probe = envs.resolve_device(probe_env)
+    assert probe.device is None
+    assert not probe.answered
+    assert "UnicodeDecodeError" in probe.detail
+
+
+def test_a_cuda_build_that_sees_no_device_says_so(probe_env, monkeypatch):
+    """`is_available()` answers False for a CPU-only wheel, a container started
+    without `--gpus`, and a driver too old for the runtime. The first is "this
+    machine has no GPU"; the others are "torch cannot reach the one it has".
+    Both used to become a confident, identical "cpu".
+    """
+    _answers(monkeypatch, stdout=_json_answer("cpu", cuda_build="12.4", device_count=0))
+    probe = envs.resolve_device(probe_env)
+    assert probe.device == "cpu"
+    assert probe.cuda_build_without_a_device
+    assert "CUDA 12.4 build" in probe.detail
+    assert "0 devices" in probe.detail
+
+
+def test_a_cpu_only_wheel_reporting_cpu_is_an_ordinary_cpu_machine(probe_env, monkeypatch):
+    _answers(monkeypatch, stdout=_json_answer("cpu", cuda_build=None))
+    probe = envs.resolve_device(probe_env)
+    assert probe.device == "cpu"
+    assert not probe.cuda_build_without_a_device
+
+
+def test_an_unanswered_probe_reaches_the_event_stream(probe_env, monkeypatch):
+    """`logging` alone reaches nothing a report can carry."""
+    from litetune.events import EventStream
+
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+    _answers(monkeypatch, returncode=1, stderr="boom")
+
+    envs.resolve_device(probe_env, events=events)
+
+    assert [e for e in seen if e.kind == "note" and "could not answer" in e.data["message"]]
+
+
+def test_the_probe_source_reports_the_build_and_the_count(monkeypatch, capsys):
+    """`_DEVICE_PROBE_CODE` is a string of source that runs in another
+    interpreter, so the only way to pin what it prints is to run it here
+    against a fake torch. `torch.version.cuda` and `device_count()` are the
+    two facts that separate "this machine has no GPU" from "this torch cannot
+    reach the one it has" -- dropping either leaves `is_available()` alone,
+    which answers False for both.
+    """
+    import json
+    import sys
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.version = types.SimpleNamespace(cuda="12.4")
+    fake.cuda = types.SimpleNamespace(is_available=lambda: False, device_count=lambda: 0)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+
+    # `exec` on this package's own constant, not on external input.
+    exec(compile(envs._DEVICE_PROBE_CODE, "device_probe.py", "exec"), {})
+
+    assert json.loads(capsys.readouterr().out.strip()) == {
+        "device": "cpu",
+        "cuda_build": "12.4",
+        "device_count": 0,
+    }
+
+
+def test_the_probe_source_says_cuda_when_torch_can_reach_one(monkeypatch, capsys):
+    import json
+    import sys
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.version = types.SimpleNamespace(cuda="12.4")
+    fake.cuda = types.SimpleNamespace(is_available=lambda: True, device_count=lambda: 2)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+
+    exec(compile(envs._DEVICE_PROBE_CODE, "device_probe.py", "exec"), {})
+
+    assert json.loads(capsys.readouterr().out.strip()) == {
+        "device": "cuda",
+        "cuda_build": "12.4",
+        "device_count": 2,
+    }
+
+
+def test_no_probe_at_all_is_a_distinct_state():
+    """ "Nobody asked" and "it was asked and could not say" are different facts
+    about a run, and `None` alone cannot tell them apart."""
+    assert envs.NOT_PROBED.device is None
+    assert not envs.NOT_PROBED.answered
+    assert "no device probe was run" in envs.NOT_PROBED.detail

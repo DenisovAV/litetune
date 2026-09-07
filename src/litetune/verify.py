@@ -49,6 +49,7 @@ from litetune.evaluate import (
     PromptMode,
     PromptModeDecision,
     Split,
+    device_mismatch,
     evaluate,
     harness_mismatch,
     load_split,
@@ -532,6 +533,26 @@ def run_verify(
         run.record(sink[0])
         return run.finish(Status.FAILED_HARNESS)
     run.manifest["measurements"]["reference"] = reference.as_dict()
+    # `tune.py` records a limitation when the training side's own device probe
+    # could not answer, and another when a CUDA build sees no device -- see
+    # `run_tune`. The reference side asks the identical question through the
+    # identical `envs.resolve_device` and used to drop both answers on the
+    # floor: an unanswered probe reached only `events.note`, which `--json`
+    # does not capture, and `device_mismatch` below excludes the unknown
+    # sentinel from producing a limitation by design, so neither case reached
+    # the manifest. `isinstance` rather than a wider `getattr`: only
+    # `HuggingFaceBackend` runs this probe at all, and this is the reason a
+    # `LiteRtLmBackend` candidate is not expected to have one.
+    if isinstance(pair.reference, HuggingFaceBackend) and pair.reference.last_probe is not None:
+        probe = pair.reference.last_probe
+        if not probe.answered:
+            run.limitation(
+                f"{probe.detail}, so the reference run's device was not established before it "
+                "started. The generation script decided for itself and reports what it chose in "
+                "its own run report"
+            )
+        elif probe.cuda_build_without_a_device:
+            run.limitation(probe.detail)
     # Same vocabulary, opposite baseline: `generate` on the transformers side
     # halts at the first eos, so a generation that stopped on its own carries
     # at least one terminator -- but not every generation is guaranteed to
@@ -638,6 +659,14 @@ def run_verify(
             f"{candidate.decode.fingerprint}",
         )
     )
+    # Not a refusal. `harness_mismatch` above refuses the differences that
+    # make the two numbers answer different questions; a device difference
+    # makes them answer the same question on different hardware, which is
+    # reported and kept. See `evaluate.device_mismatch`.
+    devices = device_mismatch(candidate, reference)
+    if devices is not None:
+        run.limitation(devices)
+        run.manifest["harness"]["device_mismatch"] = devices
     for point in (candidate, reference):
         if point.batch_failures:
             run.limitation(

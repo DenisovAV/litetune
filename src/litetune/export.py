@@ -148,10 +148,17 @@ DEFAULT_TIMEOUT_S = 1800
 # a minute the environment is broken in a way the export itself will surface.
 TOOLCHAIN_TIMEOUT_S = 60
 
-# Export must not require an accelerator: the measurement above is CPU, and the
-# artifact has to be reproducible on a runner that has no GPU. Hiding the
-# devices makes that true by construction rather than by trusting the
-# exporter's default device selection.
+# Export must not require an accelerator: it is a pure format conversion, so
+# it has to run on a runner that has no GPU. Unlike training and the float
+# reference, which run wherever `envs.resolve_device` finds a device, export's
+# own device does not vary with the machine -- every export in this module
+# reports `"backend": "cpu"` because every export is given this environment.
+# Hiding the devices makes that true by construction rather than by trusting
+# the exporter's default device selection -- which is also why the 122 s
+# above is a CPU number: `export_recipe` has exactly one call site for the
+# export subprocess, this dict is passed there unconditionally, and
+# `--backend=gpu` never appears in `argv`, so nothing this module has ever
+# exported ran anywhere else.
 CPU_ONLY_ENV = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": ""}
 
 NOT_VERIFIED = (

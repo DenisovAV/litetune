@@ -6,12 +6,15 @@ a model that merely runs is never reported as verified, and a comparison whose
 two sides were not measured the same way is refused rather than annotated.
 """
 
+import json
+import subprocess
 from pathlib import Path
 
 import pytest
 from conftest import FakeBackend, call_text, correct_texts, labelled_rows
 
-from litetune.evaluate import Generation, PromptMode
+from litetune import envs
+from litetune.evaluate import Generation, HuggingFaceBackend, PromptMode
 from litetune.verify import (
     BackendPair,
     ReferenceRole,
@@ -671,6 +674,15 @@ def test_two_sides_that_genuinely_differ_are_scored_not_refused(write_split):
     assert result.status is not Status.FAILED_HARNESS
 
 
+class CpuCandidateBackend(FakeBackend):
+    """A candidate that names a device, the way `LiteRtLmBackend` does with its
+    `--backend` flag. `FakeBackend` itself reports `UNKNOWN_BACKEND`, which is
+    not a device and so cannot differ from one."""
+
+    def describe(self) -> dict:
+        return {"engine": "litert-lm", "backend": "cpu"}
+
+
 class TransformersLikeBackend(FakeBackend):
     """A reference that describes itself the way `HuggingFaceBackend` does.
 
@@ -681,6 +693,131 @@ class TransformersLikeBackend(FakeBackend):
 
     def describe(self) -> dict:
         return {"engine": "transformers", "backend": "cpu"}
+
+
+class CudaReferenceBackend(TransformersLikeBackend):
+    """A reference that resolved to cuda, as `HuggingFaceBackend` now can."""
+
+    def describe(self) -> dict:
+        return {"engine": "transformers", "backend": "cuda"}
+
+
+def test_a_cross_device_comparison_is_annotated_and_still_measured(write_split):
+    """`build_backends` pins the candidate to litert-lm's CPU backend and lets
+    the reference resolve its own device, so on a GPU box the "cost of
+    conversion" carries a hardware difference too. Recorded, not refused:
+    refusing would leave a GPU box unable to verify at all, which is worse
+    than a number that says what else is in it.
+    """
+    rows = text_rows(200)
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=CudaReferenceBackend(
+            model="org/reference", texts=[r["target"] + "<end_of_turn>\n<eos>" for r in rows]
+        ),
+        scorer="exact-text",
+    )
+
+    assert result.status is Status.PASSED
+    note = result.manifest["harness"]["device_mismatch"]
+    assert "cpu" in note and "cuda" in note
+    assert note in result.manifest["limitations"]
+    assert result.manifest["harness"]["equivalent"] is True
+
+
+def test_two_points_on_the_same_device_carry_no_such_note(write_split):
+    rows = text_rows(200)
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=TransformersLikeBackend(
+            model="org/reference", texts=[r["target"] + "<end_of_turn>\n<eos>" for r in rows]
+        ),
+        scorer="exact-text",
+    )
+
+    assert result.status is Status.PASSED
+    assert "device_mismatch" not in result.manifest["harness"]
+
+
+def _fake_reference_run(rows, *, probe_stdout: str, probe_returncode: int = 0):
+    """A `StageEnv.run` double answering both calls a real `HuggingFaceBackend`
+    makes: the device probe (`-c`), then the generation script."""
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        if args[1] == "-c":
+            return subprocess.CompletedProcess(args, probe_returncode, probe_stdout, "")
+        spec = json.loads(Path(args[2]).read_text())
+        Path(spec["out"]).write_text(
+            "\n".join(
+                json.dumps({"index": i, "text": rows[i]["target"] + "<end_of_turn>\n<eos>"})
+                for i in range(len(rows))
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    return fake_run
+
+
+def _ready_train_env(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    envs.TRAIN.path.mkdir(parents=True, exist_ok=True)
+    (envs.TRAIN.path / ".litetune-ready").write_text(envs.TRAIN.identity)
+
+
+def test_an_unanswered_reference_probe_reaches_the_manifest(write_split, monkeypatch, tmp_path):
+    """`tune.py` records a limitation when its own device probe cannot answer
+    (see `run_tune`); the reference side asks the identical question through
+    the identical `envs.resolve_device` and used to drop the answer after
+    `events.note`, which `--json` never captures."""
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout="", probe_returncode=1)
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert any(
+        "could not answer" in text and "reference run's device was not established" in text
+        for text in result.manifest["limitations"]
+    )
+
+
+def test_a_reference_cuda_build_with_no_device_reaches_the_manifest(
+    write_split, monkeypatch, tmp_path
+):
+    """The other half of the same asymmetry: `tune.py` also records a
+    limitation when a CUDA build answers "cpu" because it cannot reach the
+    device it was built against, and the reference side used to say nothing
+    at all -- an ordinary `cpu` backend in the manifest, indistinguishable
+    from a laptop with no GPU."""
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    probe_answer = json.dumps({"device": "cpu", "cuda_build": "12.4", "device_count": 0})
+    monkeypatch.setattr(envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer))
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert any(
+        "CUDA 12.4 build" in text and "0 devices" in text for text in result.manifest["limitations"]
+    )
 
 
 def test_a_reference_whose_terminator_is_unknown_is_not_a_conversion_cost(write_split):
