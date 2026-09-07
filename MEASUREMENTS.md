@@ -1,9 +1,10 @@
 # What was measured, and what it established
 
-Numbers for `litetune`. Most of what follows is `functiongemma-270m-it` LoRA-tuned
-on `google/mobile-actions`, scored on 640 held-out single-call examples; exact
-match means the tool name **and** every argument value. The last section is a
-second family and the second scorer.
+Numbers for `litetune`. Everything up to the last section is
+`functiongemma-270m-it` LoRA-tuned on `google/mobile-actions`, scored on 640
+held-out single-call examples; exact match means the tool name **and** every
+argument value. The last section is the first run of a second family and the
+second scorer.
 
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
@@ -159,39 +160,60 @@ list after this alpha; the README's *Limitations* records what is not wired.
 
 ## A second family, and the second scorer
 
-`google/gemma-3-270m-it` @ `ac82b4e8`, LoRA r16/α32, lr 2e-4, one epoch over
-2,400 rows of `mteb/banking77` — 77-way intent classification, target is
-`label_text` — scored on 600 held-out rows with `--scorer exact-text`, prompt
-mode `prerendered`, litert-lm 0.16.1 CPU backend on an M-series Mac.
+Everything above is one model and one scorer. This section is the first run of
+anything else: `google/gemma-3-270m-it` @ `ac82b4e8`, LoRA r16/α32, lr 2e-4,
+one epoch over 2,400 rows of `mteb/banking77` — 77-way intent classification,
+target is `label_text` — scored on 600 held-out rows with `--scorer
+exact-text` and a 256-token limit, prompt mode `prerendered`, litert-lm 0.16.1
+CPU backend on an M-series Mac. The training environment is the pinned one:
+`torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0`. Everything not named
+here was left at its default.
 
-| | float twin | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
 |---|---|---|---|
-| exact match | 0.6933 ±0.0369 | 0.6767 ±0.0374 | 0.6917 ±0.0370 |
+| Base model | *refused* | — | — |
+| Fine-tuned | **0.6933** ±0.0369 | 0.6767 ±0.0374 | 0.6917 ±0.0370 |
 | Cost of conversion | — | +0.0167 ±0.0201 *(unresolved, 38 discordant)* | +0.0017 ±0.0127 *(unresolved, 15 discordant)* |
 
-**Both costs are unresolved, and that is the finding.** At n=600 the intervals
-straddle zero, so this run establishes that neither quantisation moved accuracy
-by more than about two points — not that either is free. The functiongemma table
-above resolves a cost of +0.0125 at n=640 because its discordant count is 136;
-here it is 38 and 15. Discordant pairs, not sample size, are what buys
-resolution, and a task the two artifacts almost never disagree on cannot settle
-a small difference no matter how many rows it has.
+**Both costs are unresolved, and that is the finding.** At n=600 each interval
+contains zero, so this run establishes only that neither quantisation moved
+accuracy far — the dynamic estimate's own interval reaches +0.0368, so "far"
+here is up to about four points, not that either recipe is free. What resolves
+a paired difference is neither the row count nor the number of disagreements
+but the imbalance between the two directions of disagreement, set against the
+square root of how many there are: more disagreement widens the interval as
+well as feeding the estimate. The FunctionGemma conversion cost above clears
+its own interval at n=640 on 16 discordant pairs, and by a hair — +0.0125
+against ±0.0123. Here there are 38 and 15, and neither imbalance is large
+enough for the interval it has to buy.
 
-**What it established beyond the numbers.** The family rule resolved
-`model_type: gemma3_text` to Gemma 3 rather than FunctionGemma on a real export
-— the two share that string, and until this run the disambiguation had only ever
-run in a unit test.
+### What the run established that the table does not show
 
-**What it cost to get.** The first run scored the float reference **0.0000**.
-The transformers reference decodes with `skip_special_tokens=False`, deliberately,
-so the liveness tier can see special-token leakage; every generation it returned
-ended in `<eos>`; and `exact-text` forgave whitespace and nothing else. `verify`
-reported a *resolved* conversion cost of −0.6767 across 406 discordant pairs — a
-confident number about a difference between two decoders. The `tool-call` scorer
-had hidden this on every earlier run, because its parser stops at the closing
-brace and never sees a trailing marker. The figures above are from the fixed
-scorer; the defect is why `harness.terminators` is now recorded on every
-manifest.
+**The family rule was tested on the case it exists for.** `gemma-3-270m-it` and
+`functiongemma-270m-it` both declare `model_type: gemma3_text`; the export
+needs different overrides for each. `convert` resolved this checkpoint to
+`gemma-3-text` and added `--litert_lm_model_type_override=gemma3` — the first
+time that disambiguation ran on a real export rather than in a unit test.
+
+**The exact-text scorer was wrong before this run, and the run is what found
+it.** The transformers reference backend decodes with `skip_special_tokens=False`
+so the liveness tier can see leakage, and every generation it returns ends in
+`<eos>`. Under `exact-text` — whitespace forgiven, nothing else — that scored
+the fine-tuned float reference at **0.0000** on all 600 rows while the runtime
+side scored 0.6767, and `verify` reported a *resolved* "conversion cost" of
+−0.6767 across 406 discordant pairs — the imbalance the section above
+describes, at its limit. It did
+flag the reference-at-zero as not being evidence; the number was still wrong,
+and `tool-call` had hidden the asymmetry on every earlier run because its
+parser ignores trailing markers. Fixed in 0.1.5, though not the way the first
+attempt tried: trimming both sides scored a model that dropped a closing tag on
+every row at 1.0000, so the rule became "the generation must still contain
+every terminator the target ends with, counting repeats and in that order, and
+any terminator beyond that is ignored". The table above is from the fixed
+scorer, and the
+numbers are unchanged by the rule that replaced it — these targets are bare
+labels carrying no marker, the case in which the two rules are the same
+function.
 
 **What the terminator actually is, measured rather than assumed.** Two different
 markers are in play here, and an earlier draft of this branch confused them.
@@ -206,10 +228,11 @@ added to the set.
 
 The **tuned** model, and therefore the float twin this table compares against,
 ends on `<eos>` instead. These prompts are `prerendered`, so `tune` does not
-probe the chat template at all and takes the tokenizer's eos: `tune.metrics.json`
+probe the chat template at all and takes the tokenizer's eos: `metrics.json`
 records `turn_terminator: {ids: [1], source: "tokenizer_eos", text: "<eos>"}`,
 training appended exactly that to every completion, and `contract.json` carries
-`stop_tokens: ["<eos>"]`. Both markers are in the scorer's vocabulary, which is
+`stop_tokens: ["<eos>"]`. Both markers are in the scorer's vocabulary, recorded
+verbatim at `harness.terminators` in every verify manifest, which is
 why neither run was mis-scored — but they are not the same marker, and which one
 a given artifact emits depends on how it was trained, not on its family.
 
@@ -220,9 +243,54 @@ eos set excludes its own template close, which is why the trimmer strips
 whitespace between removals; that case is constructed in the tests and labelled
 as such.
 
-**What it did not establish.** No untuned-base run, so training gain is
-unattributed and the prepare stage's headroom slices are empty. CPU only — no
-GPU or NPU figure for this family. Trained in float32 rather than the bfloat16
+**What it did not establish.** No untuned-base score, and not for want of
+running it: the last section below says what happened. So training gain is
+unattributed, and `prepare` could not identify slices where the base already
+scores at ceiling. CPU only — no GPU or NPU figure for this family. Trained in float32 rather than the bfloat16
 default because bfloat16 on this CPU runs on a single core: a 300-step LoRA
 run in bfloat16 sat on that one core for 52 minutes without finishing, and the
-same run in float32 finished in 307 s on ten threads.
+same run in float32 finished in 307 s on ten threads, at a peak of 6.35 GB.
+
+### Limitations carried by these manifests
+
+Two, verbatim from the manifests:
+
+- Measured on litert-lm's CPU backend; the GPU backend is reported to score
+  below CPU on identical artifacts, so this is an optimistic estimate of
+  on-device behaviour. That report is about bundles without the GPU activation
+  key. The one GPU run this repository has measured, on a repacked bundle at
+  `prefer_activation_type = fp32`, scored 15/20 against CPU's 14/20 at 1.8× the
+  speed — see the table in `export.py`. `convert` now writes that key into every
+  bundle it produces, so the limitation's premise no longer holds for artifacts
+  this tool makes, and the string that states it is due a correction.
+- Decoding parameters were passed to transformers but not to litert-lm, which
+  used the pinned runtime's defaults; both are greedy, and the token limit is
+  unverified on the runtime side. That limit is what the base model ran into:
+  see the last section.
+
+And one fact about this run, which fired no limitation because the run was not
+at the default dtype:
+
+- Training ran in float32, for the reason above. Export passes no dtype and
+  the float reference loads at float32, so that is not a mismatch with either.
+
+### The base model could not be scored at all
+
+The untuned `gemma-3-270m-it` was converted and run over the same 600 prompts.
+`verify` refused to score it: 571 of 600 generations repeat themselves above the
+0.50 threshold, the worst at 0.9995. Asked to answer with one intent label, the
+base does not emit a label and stop — it runs on until the token limit, saying
+the same thing over and over. The run ends at `failed_smoke` and exit 1, before
+the quality tier.
+
+That refusal is the point. An exact-match score against those generations would
+have been a number — near zero — and it would have read as "the base is bad at
+this task". What actually happened is that the base never answered the question
+in the shape the task requires, which is a different claim, and the one that
+explains why fine-tuning moved so much. A liveness tier that scored it anyway
+would have turned "this model does not do the task" into "this model does the
+task badly".
+
+It also means the training gain here is unattributable in principle, not just
+unmeasured: there is no base figure to subtract, and manufacturing one from a
+degenerate run would be the mistake `attribution` exists to refuse.
