@@ -82,6 +82,15 @@ logger = logging.getLogger(__name__)
 
 MANIFEST_SCHEMA = "litetune.verify/1"
 
+
+# The one measurement that answers the caveat below: litert-lm's own GPU
+# backend. Not any accelerator -- an NPU is a third executor and predicts the
+# GPU no better than the CPU does -- and deliberately not a torch `cuda` device
+# either. `evaluate.py` warns that `backend` holds two vocabularies under one
+# key, a torch device and a litert-lm flag, overlapping only at `cpu`; a
+# transformers run on cuda has told you least of all about litert-lm's on-device
+# text executor, which is what the caveat below is about.
+GPU_MEASURED = ("litert-lm", "gpu")
 # Below this the interval swamps what the tool exists to measure: at n=200 the
 # Wald half-width on a 0.91 proportion is ±0.0398, against a measured recipe
 # effect of 0.024. At n=64 it is ±0.0703, which is where three conclusions were
@@ -472,12 +481,36 @@ def run_verify(
             "the caller and did not take the resolved mode. The mode recorded against the "
             "measurement is the one the numbers were produced in"
         )
-    run.limitation(
-        f"measured on the {candidate.engine.get('backend', 'unknown')} backend of "
-        f"{candidate.engine.get('engine', 'unknown')}; published reports put the GPU backend "
-        "materially below CPU on identical artifacts, so this is an optimistic estimate of "
-        "on-device behaviour"
-    )
+    # This limitation carries no measurement, deliberately. "an optimistic
+    # estimate" was the previous wording and was half wrong -- `export.GPU_ACTIVATION`'s
+    # table supports it for bundles with no activation key and not for keyed ones
+    # -- but every attempt to state that here needed the numbers, and the numbers
+    # are one phone, one recipe, one model, none of them the run holding this
+    # manifest. A per-run limitation quoting another run's figures is the
+    # borrowing this whole correction exists to undo, and it rots: every review
+    # finding against the old wording but the first was about the borrowed half.
+    # What is true of every run is the sentence below, and it points at the
+    # README section where the figures live with the conditions that make them
+    # readable.
+    #
+    # Silenced only for a litert-lm run on its GPU backend: there, and only
+    # there, the sentence would name the executor the run already used. An NPU,
+    # a torch cuda device and an unestablished backend all keep it.
+    # `or` rather than a default: a third-party backend may put the key there
+    # with a null value, which `.get`'s default does not cover, and this module
+    # promises never to raise.
+    backend = str(candidate.engine.get("backend") or "unknown")
+    engine = str(candidate.engine.get("engine") or "unknown")
+    measured_on = f"measured on the {backend} backend of {engine}"
+    if (engine.lower(), backend.lower()) != GPU_MEASURED:
+        run.limitation(
+            f"{measured_on}. litert-lm's GPU backend is a different executor and this "
+            "number does not predict it; README.md's limitations section carries what one "
+            "bundle measured on each, and what has to be in a bundle for the comparison to "
+            "mean anything"
+        )
+    else:
+        run.limitation(measured_on)
 
     # Check 5 (divergence) is deferred: the caller decides whether it applies,
     # and generating the reference before the candidate is known alive would pay

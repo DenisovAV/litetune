@@ -28,6 +28,12 @@ import '../../theme/brand.dart';
 /// here has. They export
 /// under the unknown-family note instead, so the row must not promise them.
 ///
+/// Gemma 4 carries its variants for the same reason: `plan_export` returns an
+/// unusable plan for a bare `gemma-4`, because the chat template override it
+/// needs is per-variant and guessing one would ship a wrong template. E2B and
+/// E4B pass, and so does a bare `gemma-4` whose caller supplies the override
+/// itself — the refusal names that flag.
+///
 /// FunctionGemma is written bare because one size is all this repository has
 /// ever named — `functiongemma-270m-it`, everywhere it appears. That is not
 /// something `models.py` encodes: its rule matches the family generically,
@@ -75,7 +81,7 @@ class Formats extends StatelessComponent {
           ]),
         ]),
         _row('Models', [
-          Component.text('Gemma 3 (text), Gemma 4, Qwen3.5, FunctionGemma'),
+          Component.text('Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3.5, FunctionGemma'),
           span(classes: 'qualifier', [
             Component.text(
               ' — measured end to end on FunctionGemma and Gemma 3 270M so far',

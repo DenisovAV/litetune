@@ -240,7 +240,7 @@ def test_turning_on_the_chat_template_changes_the_measured_mode():
 def test_hugging_face_backend_reports_an_unknown_device_before_it_has_run():
     # Not "cpu": a manifest read before `generate()` ran must not claim a
     # device nothing measured yet. "unknown" and not a second word for it --
-    # `verify.py` already prints `engine.get("backend", "unknown")` for the
+    # `verify.py` already prints the `unknown` fallback for the
     # same state when the key is missing entirely.
     described = HuggingFaceBackend(model="org/m", auto_provision=False).describe()
     assert described["backend"] == UNKNOWN_BACKEND == "unknown"

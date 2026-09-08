@@ -48,9 +48,12 @@ is workable at 270M and the first thing you will want to change above about
 > **Alpha.** Measured end to end on two models: `google/functiongemma-270m-it`
 > with the tool-call scorer, and `google/gemma-3-270m-it` with `exact-text` on a
 > 77-way intent task — both on CPU, both in [MEASUREMENTS.md](MEASUREMENTS.md).
-> Gemma 4 and Qwen3.5 export — litetune carries their required flags — but no
-> quality number has been established for them. Try it on yours and open an
-> issue.
+> Qwen3.5 exports and needs no flags from litetune, only a `transformers`
+> floor. Gemma 4 exports once you name the variant — `E2B` or `E4B` — because
+> the chat template override is per-variant; a bare `gemma-4` is refused
+> rather than guessed at, and the refusal names the flag to pass if you want
+> to choose the template yourself. No quality number has been established for
+> either. Try it on yours and open an issue.
 
 ---
 
@@ -226,9 +229,10 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 
 | family | flags litetune adds |
 |---|---|
-| `functiongemma` | `--litert_lm_model_type_override=function_gemma` |
+| `functiongemma` | `--litert_lm_model_type_override=function_gemma`, `--jinja_chat_template_override=<litetune's own template>` |
 | `gemma-3-text` | `--litert_lm_model_type_override=gemma3` |
 | `gemma-4-e2b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm` |
+| `gemma-4-e4b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E4B-it-litert-lm` |
 
 Without the first, FunctionGemma exports as a generic model — its `config.json`
 says `gemma3_text`, which the exporter does not recognise, so it falls through a
@@ -351,8 +355,9 @@ withdrawn after re-measurement.
 **Limits on the numbers**
 
 - **Measured on two models.** `functiongemma-270m-it` end to end with the
-  tool-call scorer, and `gemma-3-270m-it` with `exact-text`. Gemma 4 and Qwen3.5
-  export but have no quality figure.
+  tool-call scorer, and `gemma-3-270m-it` with `exact-text`. Qwen3.5 and the
+  named Gemma 4 variants export but have no quality figure; a Gemma 4 without
+  its variant is refused unless you supply the template override yourself.
 - **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
   the liveness checks both trim against a fixed set of strings, recorded
   verbatim at `harness.terminators` in every verify manifest. A family whose
