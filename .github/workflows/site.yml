@@ -1,0 +1,126 @@
+# Check the website on every pull request, and deploy it on merge to main.
+#
+# Two gaps this closes. Nothing in CI touched `website/` at all, so a Dart
+# change reached `main` on whatever the author happened to run locally. And the
+# deploy was `website/deploy.sh` from somebody's laptop, which made the live
+# site whatever that working tree held, with no record of what produced it.
+# The script stays for local previews.
+#
+# The site is a Jaspr static build: pure Dart, no Flutter, no runtime
+# JavaScript. It goes to the `litetune` hosting target of the same Firebase
+# project that serves fluttergemma.dev.
+name: site
+
+# Declared rather than inherited. The repository default is read today, but a
+# job that holds a deploy credential should not depend on a setting that can be
+# changed for an unrelated reason -- `publish.yml` pins its own for the same
+# reason. Nothing here writes to the repository.
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - 'website/**'
+      - '.github/workflows/site.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - '.github/workflows/site.yml'
+  # A deploy with no site change: a rolled-back hosting release, or a first
+  # run once the deploy secret exists.
+  workflow_dispatch:
+
+# Two deploys racing to one hosting target would make the live site the one
+# that finished last rather than the one merged last.
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      # Pinned exactly, like the ruff and mypy pins in pyproject.toml and for
+      # the same reason: a build tool resolved fresh each morning is a build
+      # that can differ from the one that was reviewed. `jaspr_cli` 0.23.2 is
+      # known to fail with "Failed to start build daemon, port file is
+      # missing"; this matches the `jaspr: ^0.23.1` pin in website/pubspec.yaml.
+      - name: Install the Jaspr CLI
+        run: dart pub global activate jaspr_cli 0.23.1
+
+      - name: Analyse
+        working-directory: website
+        run: |
+          dart pub get
+          dart analyze lib
+
+      - name: Build
+        working-directory: website
+        run: |
+          export PATH="$HOME/.pub-cache/bin:$PATH"
+          # A reused incremental cache has been observed to snapshot the page
+          # before the route table registered, producing a near-empty
+          # index.html that then shipped. `deploy.sh` removes these for the
+          # same reason; a clean build is cheap next to a blank home page.
+          rm -rf build/jaspr .dart_tool/build
+          jaspr build --sitemap-domain "https://litetune.dev"
+
+      # A build that produced nothing still exits zero, and a deploy would then
+      # publish an empty directory over a working site. Check what every page
+      # needs before anything is handed to Firebase.
+      - name: Refuse an empty build
+        working-directory: website
+        run: |
+          test -s build/jaspr/index.html \
+            || { echo "::error::index.html is missing or empty"; exit 1; }
+          grep -q "litetune" build/jaspr/index.html \
+            || { echo "::error::index.html rendered without the page content"; exit 1; }
+
+      - name: Keep the build for the deploy job
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: website/build/jaspr
+          retention-days: 1
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The bytes the build job checked, not a second build that could differ.
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: website/build/jaspr
+
+      # Pinned to a commit, not to `@v0`. Every other action here is
+      # tag-pinned like the rest of the repository's workflows, and that is
+      # fine because none of them is handed a credential. This one is: a
+      # floating major-version tag means the maintainer can move it to new
+      # code, and the next push to `main` would run that code with a
+      # long-lived service-account key in hand. `publish.yml` avoids the
+      # problem differently, by having no static secret at all -- it
+      # authenticates to PyPI over OIDC. Firebase Hosting has no equivalent
+      # wired up here, so the pin is what stands in for it.
+      - name: Deploy to Firebase Hosting
+        # v0.11.0
+        uses: FirebaseExtended/action-hosting-deploy@500ac625ca2dd40cbd15f7659af953801858032a
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_AICHAT_C0C27 }}
+          channelId: live
+          projectId: aichat-c0c27
+          entryPoint: website
+          target: litetune
