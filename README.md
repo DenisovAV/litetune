@@ -379,13 +379,13 @@ withdrawn after re-measurement.
   declarations plus request, and about 250 for the reply.
 - **A Qualcomm NPU bundle loads only in an app whose QAIRT is at least as new
   as the compiler's.** The public `ai-edge-litert-sdk-qualcomm` 2.2.0 writes
-  QAIRT 2.47 context binaries. An app that ships 2.44 QNN libraries (the
-  `flutter_gemma` example app as checked out on 2026-09-07 carried QAIRT
-  2.44.0.260225) fails with `Failed to create engine`; the logcat line is
-  `Context binary (2.47.0) is newer than the current SDK (2.44.0)`. The
-  `native-v0.16.0` runtime tarball from the same project carries 2.47 and
-  loads both Google's 2.44 bundles and ours; it is the runtime behind every
-  NPU number here. The Maven `litertlm-android` 0.16.1 AAR cannot reach the
+  QAIRT 2.47 context binaries. An app whose QNN libraries are QAIRT 2.44
+  (what the `flutter_gemma` example app loaded on 2026-09-07) fails with
+  `Failed to create engine`; the logcat line is `Context binary (2.47.0) is
+  newer than the current SDK (2.44.0)`. The `native-v0.16.0` runtime tarball
+  from the same project carries 2.47 and loads Google's 2.44-built bundles as
+  well as ours; it is the runtime behind the S25 numbers in this file. The
+  Maven `litertlm-android` 0.16.1 AAR cannot reach the
   Qualcomm NPU with any public dispatch library
   ([LiteRT#6889](https://github.com/google-ai-edge/LiteRT/issues/6889)).
 - **An Intel NPU keeps only the first prefill chunk, and not for the Qualcomm
@@ -403,8 +403,9 @@ withdrawn after re-measurement.
   before the graph, and a bundle built on transformers 5.13.1 loads on the
   Snapdragon 8 Elite and returns garbage: Google's published Qualcomm Gemma 4
   bundle carries a per-layer-embedder layout the public exporter does not
-  produce, and the runtime's NPU path expects that layout. The CPU and GPU
-  export of Gemma 4 is unaffected.
+  produce, and the runtime's NPU path expects that layout. The regular
+  CPU/GPU export of Gemma 4 completes on the same pin; it has no quality
+  figure.
 
 **Limits on the numbers**
 
@@ -459,9 +460,10 @@ withdrawn after re-measurement.
   parseable call on 13/20 rows, the right tool name on 12/20 and an exact
   match on 3/20, at a median 441 ms per prompt including that prefill. The
   same static-int8 graph on the CPU interpreter scored 20/20, 18/20 and 12/20,
-  so the nine exact rows the NPU loses are its own decode: two to syntax the
+  so the nine exact rows the NPU loses are its own decode: one to syntax the
   runtime's parser rejects (a stray `}`), one to a prose reply instead of a
-  call, six to a wrong or missing argument in an otherwise well-formed call.
+  call, one to the wrong tool named first of two calls, six to a wrong or
+  missing argument in an otherwise well-formed call.
   Not diagnosed beyond that; not yet measured on the fine-tuned weights. The
   full table across prompt sets is in [MEASUREMENTS.md](MEASUREMENTS.md).
 - **Two prompt renderings are in the field** for the same model, and they
@@ -494,10 +496,11 @@ withdrawn after re-measurement.
   `npu_quantize`, `npu_compile` — with the compile on Linux x86_64 through
   `ai-edge-litert-sdk-qualcomm` 2.2.0, one compile per SoC, `cache_length`
   896. The device outputs came from a C-API harness that is not in this
-  repository and were scored with litetune's own parser; `verify` has no
-  device mode. litert-torch's documented one-step
-  `export-hf --aot_backend=qualcomm` is not this path: its float bundle loads
-  on the HTP and is garbage on every row, single-chunk included. Until the
+  repository and were scored outside `verify` (litetune's call parser plus a
+  short comparison script); `verify` has no device mode. litert-torch's
+  documented one-step `export-hf --aot_backend=qualcomm` is not this path: its
+  float bundle of `gemma-3-270m-it` loads on the HTP and is garbage on every
+  row, single-chunk included. Until the
   stages are in `convert` and the fine-tuned figure exists, "NPU" here means
   the four NPU bullets under *Known to be broken*, not a flag.
 - **`.litertlm` only**, no library API, and no single `run` command.
