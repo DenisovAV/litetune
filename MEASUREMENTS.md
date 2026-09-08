@@ -158,6 +158,37 @@ the two points it has — deriving it is the mistake the third point exists to
 prevent. Composing the three into a single command is the first thing on the
 list after this alpha; the README's *Limitations* records what is not wired.
 
+### The same model on an NPU
+
+`functiongemma-270m-it` with its *base* weights (the fine-tuned checkpoint has
+not been through this yet), through litert-torch's `npu_export` stages — the
+`dynamic_wi8_afp32` export, calibration on 64 tool prompts disjoint from the
+20 scored, static int8, Qualcomm compile with `ai-edge-litert-sdk-qualcomm`
+2.2.0 (QAIRT 2.47), litert-torch-nightly 0.10.0.dev20260826 — for `SM8750`,
+run on a Galaxy S25 (Android 16) through the LiteRT-LM C API of the
+`native-v0.16.0` runtime tarball (a LiteRT-LM v0.16.1 tree) on the NPU,
+greedy, 20 rows per set, 2026-09-08. Each median is the upper of the two
+middle values at n=20.
+
+| prompt set | tokens | prefill chunks | `cache_length` 1024 (earlier builds, similar sets) | `cache_length` 896 |
+|---|---|---|---|---|
+| plain question | 17–73 | 1 | coherent | 20/20 coherent, median 389 ms |
+| filler, question last | 208–250 | 2 | garbage | 20/20 address it, median 465 ms |
+| tools + request | 579–635 | 5 | 0/20 parsed | parsed 13/20, tool name 12/20, exact 3/20, median 441 ms |
+
+Same 20 tool prompts, CPU interpreter: the `dynamic_wi8_afp32` stage-1 graph
+20/20 parsed, 19/20 name, 12/20 exact; the static-int8 stage-3 graph 20/20,
+18/20, 12/20. So at 20 rows quantization shows no cost beyond one tool-name
+row, and the nine exact rows the NPU loses are its own decode: one to syntax
+the runtime's parser rejects (a stray `}`), one to a prose reply instead of a
+call, one to the wrong tool named first of two calls, six to a wrong or
+missing argument in an otherwise well-formed call. On
+SM8750 the 1024→896 difference tracks the compiled prefill graph's attention
+mask crossing ~1.0 MiB (litert-torch#1184; the rule is stated under Known to
+be broken in the README); LiteRT-LM#3508 has the full table across two SoCs,
+Google's bundles included, and one published bundle that works above the
+line. One SoC, base weights, 20 rows: a status, not a figure.
+
 ## A second family, and the second scorer
 
 Everything above is one model and one scorer. This section is the first run of
