@@ -106,6 +106,26 @@ against runs B and C, just outside it. The same bundle on the device's GPU,
 it (`<pad>` floods; the engine reports success either way). GPU per prompt
 1.4 s with the key against 2.5 s on the device CPU for the same file.
 
+**On the NPU.** `functiongemma-270m-it` with its *base* weights (the
+fine-tuned checkpoint has not been through this yet), exported by
+litert-torch's public `npu_export` stages — float export, calibration on 64
+tool prompts, static int8, Qualcomm compile — for `SM8750`, run on a Galaxy
+S25 through the LiteRT-LM C API on the NPU, greedy, 20 rows per set:
+
+| prompt set | tokens | prefill chunks | `cache_length` 1024 | `cache_length` 896 |
+|---|---|---|---|---|
+| plain question | 17–73 | 1 | coherent | 20/20 coherent, median 389 ms |
+| filler, question last | 208–250 | 2 | the question is ignored | 20/20 answer it, median 465 ms |
+| tools + request | 579–635 | 5 | no parseable call | parsed 13/20, tool name 12/20, exact 3/20, median 441 ms |
+
+Same 20 tool prompts, same graphs, CPU interpreter: float 20/20 parsed, 19/20
+name, 12/20 exact; static int8 20/20, 18/20, 12/20. So quantization costs
+nothing measurable and the NPU's own decode loses nine exact rows to syntax
+slips the runtime's parser rejects. The 1024→896 difference is the compiled
+prefill graph's attention mask crossing ~1.0 MiB (litert-torch#1184;
+LiteRT-LM#3508 has the full table across two SoCs, Google's bundles included).
+One SoC, base weights, 20 rows: a status, not a figure.
+
 **The recipes swap places, and which cost resolves moves with them.** An earlier
 draft of this file read "the two recipes differ by 0.0234 on the same weights at
 the same bit width" and drew a conclusion from it. Two further runs put that gap
