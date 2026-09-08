@@ -15,10 +15,9 @@ Android, iOS, macOS, Linux and Windows, with GPU acceleration on each. The
 Google's [AI Edge Gallery](https://github.com/google-ai-edge/gallery) loads
 the file directly if you only want to try it on a device. Web exists as a
 text-only preview that supports neither function calling nor LoRA, so a
-tuned tool-calling model is native-only for now. The same export also runs
-on a Snapdragon 8 Elite NPU — compiled by hand through litert-torch's
-`npu_export` stages at the `cache_length` this project established while
-isolating
+tuned tool-calling model is native-only for now. The same model also runs on
+a Snapdragon 8 Elite NPU — hand-compiled through litert-torch's `npu_export`
+stages at the `cache_length` this project measured while isolating
 [LiteRT-LM#3508](https://github.com/google-ai-edge/LiteRT-LM/issues/3508) —
 and, for single-chunk prompts, on an Intel Lunar Lake NPU. The recipe, the
 numbers and the conditions are under [Limitations](#limitations); the compile
@@ -357,8 +356,9 @@ withdrawn after re-measurement.
 - **Peak memory is not bounded.** Training this model on 8,693 examples was
   OOM-killed at 32 GiB more than once. There is no preflight check; a death with
   no Python traceback is probably this.
-- **A Qualcomm NPU bundle needs `cache_length` ≤ 896 at `prefill_128`; above
-  that the NPU keeps only the first prefill chunk.** Google's published 270M
+- **A Gemma 3 270M NPU bundle needs `cache_length` ≤ 896 at `prefill_128` on
+  SM8750 and SM8850; above that it keeps only the first prefill chunk.**
+  Google's published 270M
   and 1B `sm8750` bundles on a Galaxy S25, its 270M `sm8850` bundle on a
   Galaxy S26 and every litetune build at `cache_length` 1024 lose everything
   after the first 128-token chunk: a 245-token prompt with the question at the
@@ -371,9 +371,10 @@ withdrawn after re-measurement.
   [litert-torch#1184](https://github.com/google-ai-edge/litert-torch/issues/1184).
   Every bundle that failed in the issue is above that line; the one published
   bundle that works on SM8850 (1B, 1.375 MiB) is above it too, so the rule is
-  a measured boundary on SM8750, not yet a traced cause. At 896 the mask is
-  exactly 1.0 MiB and all five chunks of a tool prompt survive; 768 keeps the
-  two-chunk context too. So the FunctionGemma NPU bundle is
+  a measured boundary for the 270M graphs on both SoCs, not yet a traced
+  cause. At 896 the mask is exactly 1.0 MiB and all five chunks of a tool
+  prompt survive; 768, further below the line, keeps the context too (checked
+  on two-chunk prompts). So the FunctionGemma NPU bundle is
   `prefill_lengths = [128]`, `cache_length` 896: about 640 tokens of
   declarations plus request, and about 250 for the reply.
 - **A Qualcomm NPU bundle loads only in an app whose QAIRT is at least as new
@@ -388,14 +389,14 @@ withdrawn after re-measurement.
   Qualcomm NPU with any public dispatch library
   ([LiteRT#6889](https://github.com/google-ai-edge/LiteRT/issues/6889)).
 - **An Intel NPU keeps only the first prefill chunk, and not for the Qualcomm
-  reason.** The stage-1 graph of the same export (the OpenVINO compiler
-  rejects the static-int8 stage), compiled for Lunar Lake with
-  `ai-edge-litert-sdk-intel` 2.2.0 and run on a Core Ultra 7 258V through the
-  LiteRT-LM C API, answers single-chunk prompts 20/20 and loses every
-  multi-chunk prompt regardless of `cache_length` — byte-identical output at
-  896 and 1024 — so the mask-size rule above is Qualcomm's and Intel's cause
-  is not found. There was no Google Gemma 3 Intel bundle to compare against as
-  of 2026-09-08.
+  reason.** The `dynamic_wi8_afp32` graph of the same export (the OpenVINO
+  compiler rejects the static-int8 stage that follows it), compiled for Lunar
+  Lake with `ai-edge-litert-sdk-intel` 2.2.0 and run on a Core Ultra 7 258V
+  through the LiteRT-LM C API, answers single-chunk prompts 20/20 and loses
+  every multi-chunk prompt regardless of `cache_length` — byte-identical
+  output at 896 and 1024. So the mask-size rule is Qualcomm's alone; Intel's
+  cause is not found. As of 2026-09-08 there was no Google Gemma 3 Intel
+  bundle to compare against.
 - **Gemma 4 cannot be built for an NPU with the public exporter.** On the
   transformers this tool pins (5.16.1; ≥ 5.14 removes `global_head_dim`) the
   split-cache NPU export in litert-torch-nightly 0.10.0.dev20260826 fails
@@ -450,7 +451,7 @@ withdrawn after re-measurement.
   what each carries as `exports[].gpu_activation`, and a bundle that could not
   be repacked is named in the limitations and is CPU-only. litetune cannot
   drive a phone GPU from a laptop, so a device run is a separate job.
-- **The NPU number is 20 rows on one SoC, with base weights.** The same
+- **The NPU number is 20 rows on one SoC.** The same
   `functiongemma-270m-it` (base weights, not the fine-tune) through
   litert-torch's `npu_export` stages for a Snapdragon 8 Elite (`SM8750`,
   Galaxy S25), on the phone's NPU through the LiteRT-LM C API, greedy,
@@ -486,8 +487,8 @@ withdrawn after re-measurement.
   generations.
 - **Evaluation is slower than it needs to be** — one subprocess per prompt. A
   persistent `litert-lm serve` client is worth roughly thirtyfold.
-- **`convert` does not compile for an NPU.** The NPU bundle in Limitations was
-  built by hand: the four functions in litert-torch's
+- **`convert` does not compile for an NPU.** The NPU bundle described under
+  *Known to be broken* was built by hand: the four functions in litert-torch's
   `generative/export_hf/experimental/npu_export/stages.py` — `npu_export`,
   `npu_calibrate` on 64 tool prompts disjoint from the scored set,
   `npu_quantize`, `npu_compile` — with the compile on Linux x86_64 through
@@ -498,7 +499,7 @@ withdrawn after re-measurement.
   `export-hf --aot_backend=qualcomm` is not this path: its float bundle loads
   on the HTP and is garbage on every row, single-chunk included. Until the
   stages are in `convert` and the fine-tuned figure exists, "NPU" here means
-  the NPU bullets under Limitations, not a flag.
+  the four NPU bullets under *Known to be broken*, not a flag.
 - **`.litertlm` only**, no library API, and no single `run` command.
 
 ---
