@@ -95,7 +95,7 @@ UNDECLARED_PROMPT_MODE = PromptMode.PRERENDERED
 
 # What `describe()["backend"]` says when a measurement's device was never
 # established. The word matters: `verify.py` prints
-# `engine.get("backend", "unknown")` when the key is missing entirely, so this
+# `unknown` when the key is missing or null, so this
 # is the same word for what is, to a reader of the manifest, the same state.
 UNKNOWN_BACKEND = "unknown"
 
@@ -812,7 +812,7 @@ class HuggingFaceBackend:
             # was never established -- not "cpu", for the same reason
             # `TrainingMetrics.device` defaults to `None` rather than guessing.
             # "unknown" and not "unresolved": `verify.py` already prints
-            # `engine.get("backend", "unknown")` into its limitation text, so a
+            # `unknown` into its limitation text for a missing or null value, so a
             # second word for the same state would have put two names for one
             # thing in one manifest.
             "backend": self.device if self.device is not None else UNKNOWN_BACKEND,

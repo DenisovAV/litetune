@@ -7,6 +7,7 @@ two sides were not measured the same way is refused rather than annotated.
 """
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -429,10 +430,205 @@ def test_every_run_reports_which_backend_measured_it(write_split):
     result = verify(
         write_split,
         rows,
+        candidate=FakeBackend(texts=correct_texts(rows), backend="npu"),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+    # The backend that produced the numbers, not the GPU sentence around it.
+    # That sentence has been wrong twice, and a test pinning its wording stays
+    # green for as long as the wording is wrong -- it only breaks when someone
+    # fixes it, which is the wrong way round. Four words of prose are matched
+    # here, and they are the four that carry the interpolation.
+    #
+    # The candidate says `npu` deliberately. Against the double's default this
+    # assertion could not fail, because that default is the same word the
+    # production `.get(..., "unknown")` falls back to -- so code that ignored
+    # the manifest and hardcoded the fallback would have passed.
+    backend = result.manifest["measurements"]["candidate"]["engine"]["backend"]
+    assert backend == "npu"
+    assert any(
+        f"measured on the {backend} backend" in note for note in result.manifest["limitations"]
+    )
+
+
+def test_a_cpu_measurement_is_warned_that_the_gpu_is_a_different_executor(write_split):
+    """The positive half, and the reason this test exists.
+
+    Before this pair, the only assertion about this limitation was that it
+    contained the words "optimistic estimate". Replacing that with a check on
+    the backend it names left nothing asserting the warning is emitted at all,
+    so a gate keyed on the wrong value silenced it on every real run and passed
+    the whole suite. A negative test alone cannot see that: it is satisfied by
+    a warning that never appears.
+    """
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=FakeBackend(texts=correct_texts(rows), backend="cpu"),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    notes = result.manifest["limitations"]
+    gpu_note = next(note for note in notes if "different executor" in note)
+    # And it carries no figure, in any notation. Every review finding against
+    # the old wording but the first was about a measurement borrowed from
+    # another model, task and device that this run has no claim on. `N/M` was
+    # how it was written; this file writes counts as "N of M", so pinning the
+    # slash alone would wave the same borrowing through in the house style.
+    # No digit belongs in the clause at all.
+    # `partition`, not `split`: if the separator ever changes this should
+    # fail on the assertion with the note printed, not on an IndexError.
+    caveat = gpu_note.partition(". ")[2]
+    assert not re.search(r"\d", caveat), caveat
+
+
+def test_an_npu_measurement_still_keeps_the_gpu_warning(write_split):
+    """An NPU is a third executor, not the one the caveat is about.
+
+    The condition was written as "already ran on an accelerator" and silenced
+    the warning here, which is wrong for the same reason it would be wrong on
+    the CPU: the GPU is as different from an NPU as from a CPU, and an NPU
+    number predicts GPU behaviour no better. The criterion is whether the run
+    was on the GPU itself, not whether it was on something fast.
+    """
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=FakeBackend(texts=correct_texts(rows), backend="npu"),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    assert any("different executor" in note for note in result.manifest["limitations"])
+
+
+def test_a_backend_nobody_established_keeps_the_warning(write_split):
+    """`unknown` is not an accelerator, and the caveat is exactly for it.
+
+    A run whose device was never established has not measured what the GPU
+    does. Silencing the warning there would read as "this ran somewhere that
+    makes the question moot", which is the one thing not known.
+    """
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
         candidate=FakeBackend(texts=correct_texts(rows)),
         reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
     )
-    assert any("optimistic estimate" in note for note in result.manifest["limitations"])
+
+    assert any("different executor" in note for note in result.manifest["limitations"])
+
+
+def test_a_litertlm_run_on_its_own_gpu_backend_is_told_nothing_about_it(write_split):
+    """The one measurement that answers the caveat, and the only one silenced.
+
+    The sentence is about litert-lm's on-device text executor. A litert-lm run
+    on that executor has measured it, so repeating "the GPU backend is a
+    different executor" directly after naming the gpu backend it used would be
+    worse than noise. Every other case keeps the caveat, including a torch
+    `cuda` run: `backend` holds two vocabularies under one key, and a
+    transformers measurement on cuda says least of all about litert-lm's GPU.
+
+    No litetune command reaches this branch: `build_backends` never passes
+    `backend_flag`, and litetune cannot drive a phone's GPU from a laptop. It
+    is reachable by a library caller assembling its own `BackendPair`, which is
+    the case the limitation above this one exists for.
+    """
+
+    class LiteRtLmOnGpu(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "litert-lm", "backend": "gpu"}
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=LiteRtLmOnGpu(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    notes = result.manifest["limitations"]
+    assert any("measured on the gpu backend of litert-lm" in note for note in notes)
+    assert not any("different executor" in note for note in notes)
+
+
+def test_a_backend_that_reports_a_null_device_does_not_crash_the_run(write_split):
+    """`verify` promises never to raise, and `.get(key, default)` does not help.
+
+    A default covers an absent key, not a key present with a null value.
+    `GenerationBackend.describe()` is a Protocol returning `dict[str, Any]`, so
+    a third-party backend may well put `None` there -- the first-party ones map
+    it to the unknown sentinel precisely because it happens. Before this was
+    guarded the value went into an f-string and read "the None backend"; once
+    the gate started calling `.lower()` on it, it became an AttributeError out
+    of `run_verify`, outside any guard.
+    """
+
+    class NullDevice(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "custom", "backend": None}
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=NullDevice(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    assert any("measured on the unknown backend" in n for n in result.manifest["limitations"])
+
+
+def test_some_other_engine_on_a_gpu_keeps_the_warning(write_split):
+    """The engine half of the pair, which nothing else varies.
+
+    Three tests vary the backend and hold the engine at something that is not
+    litert-lm, so a gate that dropped the engine check entirely and asked only
+    `backend != "gpu"` passed all of them. Both reviewers found that by
+    mutation. This is the case that separates the two: a backend named `gpu`
+    under an engine that is not litert-lm has not measured litert-lm's text
+    executor, so the caveat stands.
+    """
+
+    class SomeoneElsesGpu(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "vllm", "backend": "gpu"}
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=SomeoneElsesGpu(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    notes = result.manifest["limitations"]
+    assert any("measured on the gpu backend of vllm" in note for note in notes)
+    assert any("different executor" in note for note in notes)
+
+
+def test_a_torch_cuda_run_keeps_the_warning_about_litertlms_gpu(write_split):
+    """cuda is a torch device, not litert-lm's `--backend=gpu`.
+
+    They are two vocabularies under one manifest key, overlapping only at
+    `cpu`. Treating them as the same word would silence the caveat for the
+    measurement that establishes least about the executor it describes.
+    """
+
+    class TransformersOnCuda(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "transformers", "backend": "cuda"}
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=TransformersOnCuda(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    assert any("different executor" in note for note in result.manifest["limitations"])
 
 
 def test_missing_held_out_file_is_an_error_not_a_verdict(tmp_path):

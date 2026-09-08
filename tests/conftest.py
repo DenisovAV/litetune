@@ -46,6 +46,11 @@ class FakeBackend:
     # measurement as enforcing decode parameters it never received.
     decode_enforced: bool = True
     name: str = "fake"
+    # Settable, because a double that can only say `UNKNOWN_BACKEND` says the
+    # same word the production code falls back to, and a test
+    # asserting the recorded backend then passes against code that never reads
+    # the manifest at all.
+    backend: str = UNKNOWN_BACKEND
     prompts_seen: list[list[str]] = field(default_factory=list)
 
     @property
@@ -53,12 +58,17 @@ class FakeBackend:
         return self.model
 
     def describe(self) -> dict:
-        # `UNKNOWN_BACKEND`, not a third word for it. This double runs on no
-        # hardware, which is the state that constant names -- and
-        # `evaluate.device_mismatch` reads this key, so a double inventing its
-        # own vocabulary here would manufacture a hardware difference between
-        # two fakes that never touched hardware.
-        return {"engine": "fake", "backend": UNKNOWN_BACKEND}
+        # Defaults to `UNKNOWN_BACKEND`, not to a third word for it: this double
+        # runs on no hardware, which is the state that constant names.
+        # `evaluate.device_mismatch` reads this key and suppresses on
+        # `UNKNOWN_BACKEND`, so two doubles given *different* real-looking
+        # backends would manufacture a hardware difference between two fakes
+        # that never touched hardware. The same value on both is harmless.
+        #
+        # Several subclasses override `describe()` with a literal dict, some of
+        # them nested inside test functions where a module-level search misses
+        # them. On those, setting `backend=` is silently a no-op.
+        return {"engine": "fake", "backend": self.backend}
 
     def generate(self, prompts: Sequence[str], events=None) -> list[Generation]:
         self.prompts_seen.append(list(prompts))

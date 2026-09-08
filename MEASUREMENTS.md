@@ -253,16 +253,24 @@ same run in float32 finished in 307 s on ten threads, at a peak of 6.35 GB.
 
 ### Limitations carried by these manifests
 
-Two, verbatim from the manifests:
+Two, paraphrased — the second drops a measured clause and both carry a note:
 
-- Measured on litert-lm's CPU backend; the GPU backend is reported to score
-  below CPU on identical artifacts, so this is an optimistic estimate of
-  on-device behaviour. That report is about bundles without the GPU activation
-  key. The one GPU run this repository has measured, on a repacked bundle at
-  `prefer_activation_type = fp32`, scored 15/20 against CPU's 14/20 at 1.8× the
-  speed — see the table in `export.py`. `convert` now writes that key into every
-  bundle it produces, so the limitation's premise no longer holds for artifacts
-  this tool makes, and the string that states it is due a correction.
+- Measured on litert-lm's CPU backend. The manifests from this run carry the
+  older wording, which said published reports put the GPU backend materially
+  below CPU on identical artifacts, so the number was an optimistic estimate of
+  on-device behaviour. That was true of bundles without the GPU activation key
+  and not of bundles with it: on the one
+  device measured, a repacked bundle at `prefer_activation_type = fp32` scored
+  15/20 against the CPU's 14/20 at 1.8× the speed, which at n=20 is not a
+  resolved difference — see the table in `export.py`. `convert` attempts that
+  repack on every bundle, and names the ones where it could not, or where a
+  different value was already declared; one already declaring `fp32` needs no
+  warning and gets none. The limitation was corrected after this run, and cut
+  back: a manifest produced today says only that litert-lm's GPU backend is a
+  different executor and the CPU number does not predict it, and points at
+  README's limitations section. Figures belong in the documents, where the
+  conditions that make them readable sit beside them, and not in a per-run
+  limitation that would carry another run's numbers into every manifest.
 - Decoding parameters were passed to transformers but not to litert-lm, which
   used the pinned runtime's defaults; both are greedy, and the token limit is
   unverified on the runtime side. That limit is what the base model ran into:
