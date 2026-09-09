@@ -926,9 +926,17 @@ def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch, request):
     # when the process dies, zombie or not.
     lockfile = tmp_path / "grandchild.lock"
     pidfile = tmp_path / "grandchild.pid"
+    held = tmp_path / "grandchild.held"
     grandchild_code = (
-        f"import fcntl, time; h = open({str(lockfile)!r}, 'w');"
-        "fcntl.flock(h, fcntl.LOCK_EX); time.sleep(30)"
+        # Deaf to the polite signal on purpose: a grandchild that dies on the
+        # SIGTERM would let this pass without the SIGKILL sweep ever running,
+        # and the sweep is the thing the docstring claims.
+        "import fcntl, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        f"h = open({str(lockfile)!r}, 'w'); fcntl.flock(h, fcntl.LOCK_EX);"
+        # Announced, because a lock that was never taken is indistinguishable
+        # from one that was released -- and the poll below would then report
+        # success having observed nothing at all.
+        f"open({str(held)!r}, 'w').write('1'); time.sleep(30)"
     )
     child = (
         "import subprocess, sys, time;"
@@ -941,9 +949,10 @@ def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch, request):
         env.run(["python", "-c", child], timeout=3)
 
     grandchild = int(pidfile.read_text())
-    # Best effort, so a failure of this test does not leave a process behind
-    # for the next half minute.
+    # Registered before the assertion below: a failure there must not leak the
+    # process for the next half minute.
     request.addfinalizer(lambda: _reap(grandchild))
+    assert held.exists(), "the grandchild never took the lock; this test proved nothing"
 
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -1071,3 +1080,230 @@ def test_a_platform_without_sigkill_still_kills(monkeypatch):
     proc = NoSignals()
     assert envs._kill_tree(proc, grace=0.01) is envs.Reach.CHILD_ONLY
     assert proc.hard_killed, "the hard kill must go through Popen.kill where there is no SIGKILL"
+
+
+def test_the_stage_is_given_its_grace(monkeypatch):
+    """Deleting the wait entirely leaves SIGTERM immediately followed by
+    SIGKILL, which is behaviourally the SIGKILL-only shape the grace exists to
+    replace -- and every signal-order assertion here would still pass."""
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: None)
+    waited = []
+    monkeypatch.setattr(envs, "_wait_without_reaping", lambda proc, grace: waited.append(grace))
+
+    envs._kill_tree(_FakeProc(), grace=0.25)
+    assert waited == [0.25], "the child must be given time between SIGTERM and SIGKILL"
+
+
+def test_the_group_is_killed_even_when_the_child_went_quietly(monkeypatch):
+    """Its own exit does not cover what it spawned.
+
+    A trainer that obeys SIGTERM and leaves its DataLoader workers running is
+    the case the unconditional second signal exists for.
+    """
+    sent = []
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: sent.append(sig))
+
+    proc = _FakeProc()
+
+    def exits_during_the_grace(target, grace):
+        target.returncode = -15
+
+    monkeypatch.setattr(envs, "_wait_without_reaping", exits_during_the_grace)
+    envs._kill_tree(proc, grace=0.01)
+    assert sent == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_a_stage_that_cannot_be_signalled_at_all_says_so(monkeypatch):
+    """The difference between the two halves of the leaked-process warning.
+
+    `NOTHING` is the state where the child itself is still there and could not
+    be touched -- EPERM in a sandbox -- and the message must not then blame a
+    grandchild that never left the group.
+    """
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: (_ for _ in ()).throw(PermissionError))
+
+    class Untouchable(_FakeProc):
+        def send_signal(self, sig):
+            raise PermissionError("operation not permitted")
+
+    assert envs._kill_tree(Untouchable(), grace=0.01) is envs.Reach.NOTHING
+
+
+def test_the_partial_output_of_a_wedged_stage_is_kept(monkeypatch):
+    """The stderr of a timed-out stage is the one artifact that explains it.
+
+    This is the path where a grandchild left the group and still holds the
+    pipes: the drain gives up, and what the stage managed to say before that
+    must survive rather than being replaced by two empty strings.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, grace=None: envs.Reach.GROUP)
+
+    class Wedged(_FakeProc):
+        args = ["python", "-c", "..."]
+        stdout = None
+        stderr = None
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired("python", timeout, output=b"partial", stderr=b"boom")
+
+    out, err = envs._kill_and_drain(Wedged())
+    assert out == "partial" and err == "boom"
+
+
+def test_bytes_from_a_text_mode_pipe_are_decoded():
+    """`_check_timeout` attaches the raw chunks without decoding, even in text
+    mode, so the decode has to happen on the way out."""
+    assert envs._as_text(None) == ""
+    assert envs._as_text("already text") == "already text"
+    assert envs._as_text(b"a \xff byte") == "a � byte"
+
+
+def test_every_variable_the_comment_argues_for_is_actually_dropped():
+    """The parametrised test above generates its cases *from* the tuple, so
+    deleting an entry removes a case rather than failing one.
+
+    The injection pair is the one the module comment argues hardest about, and
+    it is the one a later reader is most likely to take back out.
+    """
+    for name in ("PYTHONPATH", "PYTHONEXECUTABLE", "PIP_TARGET", "PIP_PREFIX", "PIP_ROOT"):
+        assert name in envs._HOST_OVERRIDES
+    assert {"LD_PRELOAD", "DYLD_INSERT_LIBRARIES"} <= set(envs._HOST_OVERRIDES)
+    # And the ones the comment says are deliberately absent.
+    for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "PIP_INDEX_URL", "PIP_CONFIG_FILE"):
+        assert name not in envs._HOST_OVERRIDES
+
+
+def test_the_interpreter_is_where_venv_actually_puts_it(monkeypatch):
+    """Anchored to literals on both platforms, because the test fake now builds
+    through this same function -- so nothing else can catch it drifting."""
+    # Built before the monkeypatch: `os.name` is one global, and `pathlib`
+    # reads it to decide which flavour of path to construct.
+    root = pathlib.Path("/x")
+    posix = pathlib.Path("/x/bin/python")
+    windows = pathlib.Path("/x/Scripts/python.exe")
+
+    assert envs._interpreter_in(root) == posix
+    assert envs._console_script_in(root, "pip") is None  # nothing there to find
+
+    monkeypatch.setattr(envs.os, "name", "nt")
+    assert envs._interpreter_in(root) == windows
+
+
+def test_a_windows_console_script_is_found_by_its_exe(tmp_path, monkeypatch):
+    """Entry points there are `.exe` wrappers. Looking only for the bare name
+    finds nothing and silently takes the `python -m` path, which works for
+    `pip` and not for `litert-torch`."""
+    monkeypatch.setattr(envs.os, "name", "nt")
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    (scripts / "litert-torch.exe").touch()
+
+    assert envs._console_script_in(tmp_path, "litert-torch") == scripts / "litert-torch.exe"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGTERM dispositions are POSIX")
+def test_a_terminated_litetune_takes_the_stage_with_it(tmp_path, request):
+    """`kill <litetune>` must not leave a six-hour torch run holding its memory.
+
+    Every other test of the guard calls the context manager directly, so none
+    of them notices if `run` stops entering it -- measured: replacing it with
+    `nullcontext()` left the whole suite green. The only way to cover that is
+    to deliver a real signal to a real litetune process, so this starts one of
+    its own rather than signalling pytest.
+    """
+    lockfile = tmp_path / "stage.lock"
+    held = tmp_path / "stage.held"
+    stage_code = (
+        f"import fcntl, time; h = open({str(lockfile)!r}, 'w'); fcntl.flock(h, fcntl.LOCK_EX);"
+        f"open({str(held)!r}, 'w').write('1'); time.sleep(60)"
+    )
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(pathlib.Path(envs.__file__).parents[2])!r})\n"
+        f"os.environ['LITETUNE_ENV_DIR'] = {str(tmp_path)!r}\n"
+        "from litetune.envs import StageEnv\n"
+        "env = StageEnv(name='terminated', requirements=('pyyaml==6.0.2',))\n"
+        "env.python.parent.mkdir(parents=True, exist_ok=True)\n"
+        "env.python.symlink_to(sys.executable)\n"
+        f"env.run(['python', '-c', {stage_code!r}], timeout=120)\n",
+        encoding="utf-8",
+    )
+
+    litetune = subprocess.Popen([sys.executable, str(runner)])
+    request.addfinalizer(lambda: _reap(litetune.pid))
+
+    # Signalling before the stage holds the lock would test nothing, and a
+    # fixed sleep would either flake or be slow.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not held.exists():
+        time.sleep(0.05)
+    assert held.exists(), "the stage never started; nothing was under test"
+
+    os.kill(litetune.pid, signal.SIGTERM)
+    assert litetune.wait(timeout=30) == -signal.SIGTERM, "litetune must still die as it would have"
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        with open(lockfile, "a") as handle:
+            taken = envs._try_lock(handle)
+        if taken is None:
+            pytest.skip("no advisory locking on this filesystem")
+        if taken is True:
+            return
+        time.sleep(0.05)
+    pytest.fail("the stage outlived the litetune process that was told to exit")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGINT delivery to a process group is POSIX")
+def test_an_interrupted_litetune_takes_the_stage_with_it(tmp_path, request):
+    """The `except BaseException` arm of `run`, which nothing else reaches.
+
+    Measured: narrowing it to `except SystemExit` left the suite green. It is
+    the replacement for the SIGINT that used to reach the child through the
+    shared terminal, so a Ctrl-C during a six-hour `tune` not landing here
+    means the whole torch tree keeps running.
+    """
+    lockfile = tmp_path / "stage.lock"
+    held = tmp_path / "stage.held"
+    stage_code = (
+        f"import fcntl, time; h = open({str(lockfile)!r}, 'w'); fcntl.flock(h, fcntl.LOCK_EX);"
+        f"open({str(held)!r}, 'w').write('1'); time.sleep(60)"
+    )
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(pathlib.Path(envs.__file__).parents[2])!r})\n"
+        f"os.environ['LITETUNE_ENV_DIR'] = {str(tmp_path)!r}\n"
+        "from litetune.envs import StageEnv\n"
+        "env = StageEnv(name='interrupted', requirements=('pyyaml==6.0.2',))\n"
+        "env.python.parent.mkdir(parents=True, exist_ok=True)\n"
+        "env.python.symlink_to(sys.executable)\n"
+        f"env.run(['python', '-c', {stage_code!r}], timeout=120)\n",
+        encoding="utf-8",
+    )
+
+    litetune = subprocess.Popen([sys.executable, str(runner)])
+    request.addfinalizer(lambda: _reap(litetune.pid))
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not held.exists():
+        time.sleep(0.05)
+    assert held.exists(), "the stage never started; nothing was under test"
+
+    os.kill(litetune.pid, signal.SIGINT)
+    assert litetune.wait(timeout=30) != 0, "an interrupted run must not report success"
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        with open(lockfile, "a") as handle:
+            taken = envs._try_lock(handle)
+        if taken is None:
+            pytest.skip("no advisory locking on this filesystem")
+        if taken is True:
+            return
+        time.sleep(0.05)
+    pytest.fail("the stage outlived the interrupted litetune process")
