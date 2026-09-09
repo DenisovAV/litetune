@@ -119,8 +119,12 @@ jobs:
         uses: FirebaseExtended/action-hosting-deploy@500ac625ca2dd40cbd15f7659af953801858032a
         with:
           repoToken: ${{ secrets.GITHUB_TOKEN }}
-          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_AICHAT_C0C27 }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           channelId: live
-          projectId: aichat-c0c27
+          # A secret rather than a repository variable, and not a literal: the
+          # project id is an infrastructure identifier, and workflow logs on a
+          # public repository are public. As a secret it is masked there; as a
+          # `vars.` entry or a literal it would be printed.
+          projectId: ${{ secrets.FIREBASE_PROJECT_ID }}
           entryPoint: website
           target: litetune
