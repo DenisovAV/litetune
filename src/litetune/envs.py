@@ -80,32 +80,234 @@ PROVISION_TIMEOUT_S = 1800
 # earlier: they redirect the install out of the venv while `.litetune-ready` is
 # still written over it.
 #
+# The line is drawn at *silent structural corruption*, not at everything that
+# could change a result, and two cases decided where it falls.
+#
+# `PIP_INDEX_URL` and its relatives are not here, though they are the sharper
+# hole on paper: measured 2026-09-09, pip reports `:env:.index-url` and fetches
+# `pyyaml==6.0.2` from whatever host is named, so an environment whose identity
+# hashes `numpy==2.0.2` could hold another index's idea of that name. They stay
+# because a corporate mirror or an air-gapped installer is exactly how they are
+# normally set, and dropping them would break machines that install correctly
+# today in order to close a hole that requires an attacker already inside the
+# user's environment. `PIP_CONFIG_FILE` settles it: unsetting it does not close
+# the channel, it falls back to `/etc/pip.conf` and the user's own config,
+# which can set `index-url` just as well. What actually answers this is the
+# record, not the strip -- `export.resolve_toolchain` reads the resolved
+# closure back with `pip freeze --all`, so what was installed is stated rather
+# than assumed.
+#
+# `PIP_TARGET`, `PIP_PREFIX` and `PIP_ROOT` are a different case and do belong
+# here: they do not change what is fetched, they put it somewhere else while
+# pip still exits 0 and `.litetune-ready` is still written over a venv that
+# now holds nothing. That is the failure this file exists to make impossible.
+#
+# `PYTHONEXECUTABLE` is here for the workers rather than the stage: it
+# overrides `sys.executable`, which `multiprocessing`'s spawn start method --
+# the default on macOS, and what a torch `DataLoader` uses -- relaunches
+# workers with. The stage would hold its pins while the processes doing the
+# work booted off another interpreter.
+#
+# `LD_PRELOAD` and `DYLD_INSERT_LIBRARIES` inject code under a correctly
+# pinned package, which is the same false provenance one layer down.
+# `LD_LIBRARY_PATH` and `DYLD_LIBRARY_PATH` are deliberately *not* here: they
+# are the same shape, but unlike the rest they have ordinary legitimate uses --
+# CUDA and MKL on clusters are routinely reached that way -- so stripping them
+# would break working machines to close a hole nobody has been bitten by. The
+# line is drawn at injection, not at search paths.
+#
 # Dropped rather than emptied. `PYTHONPATH=""` is not the same as unset on
 # every platform, and an empty entry has meant "the current directory" often
 # enough to be worth not relying on.
 _HOST_OVERRIDES = (
     "PYTHONPATH",
     "PYTHONHOME",
-    "PYTHONSTARTUP",
+    "PYTHONEXECUTABLE",
     "PIP_TARGET",
     "PIP_PREFIX",
+    "PIP_ROOT",
+    "LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES",
 )
 
+# How long to wait for the pipes after killing a process group. A grandchild
+# that called `setsid()` itself escapes the group, and if it still holds the
+# inherited stdout it can keep an unbounded `communicate()` open forever --
+# which would put back the unbounded wait this whole change exists to remove,
+# one level out from where the original bug was.
+_DRAIN_AFTER_KILL_S = 10
 
-def _kill_tree(proc: subprocess.Popen) -> None:
+
+def _interpreter_in(root: Path) -> Path:
+    """Where `venv` puts the interpreter inside `root`.
+
+    One function because there were two spellings: `provision` built
+    `Scripts/python.exe` on Windows while `StageEnv.python` looked for
+    `Scripts/python`, which `venv` never creates there. That cost nothing
+    while `ready` read only the marker file; once `ready` also checks the
+    interpreter, the mismatch would make every Windows environment read as
+    unprovisioned forever -- reinstalling torch on every invocation while
+    `litetune env` called each working environment `incomplete`.
+    """
+    if os.name == "nt":
+        return root / "Scripts" / "python.exe"
+    return root / "bin" / "python"
+
+
+def _console_script_in(root: Path, name: str) -> Path | None:
+    """The console script `name` inside `root`, or None to fall back to `-m`.
+
+    Windows entry points are `.exe` wrappers, so looking only for the bare name
+    there finds nothing and every stage silently takes the `python -m` path --
+    which works for `pip` and not for `litert-torch`, whose module is not
+    executable that way.
+    """
+    bindir = root / ("Scripts" if os.name == "nt" else "bin")
+    candidates = [bindir / f"{name}.exe", bindir / name] if os.name == "nt" else [bindir / name]
+    return next((c for c in candidates if c.exists()), None)
+
+
+def _kill_tree(proc: subprocess.Popen) -> bool:
     """Kill the whole process group, falling back to the child alone.
 
-    `ProcessLookupError` is the ordinary case, not an error: the process
-    finished between the timeout firing and this call.
+    Returns whether a signal was delivered, so a caller can say "and it could
+    not be killed" rather than leaving a leaked process to be diagnosed later
+    as somebody else's out-of-memory kill. `ProcessLookupError` counts as
+    delivered: the process finished between the timeout firing and this call,
+    which is the ordinary case and not a failure.
+
+    `PermissionError` is a subclass of `OSError` and is named only to say that
+    it is expected here -- a setuid child cannot be signalled by its parent.
     """
+    # `Popen.send_signal` makes this check for the same reason, and the reason
+    # is severe: once the child has been reaped its pid is free for the kernel
+    # to hand out again, and `killpg` on a recycled pid SIGKILLs a stranger's
+    # process group. The timeout path cannot reach that state, but the
+    # `BaseException` path can -- a KeyboardInterrupt landing inside
+    # `communicate`'s trailing `wait()` arrives after the reap.
+    if proc.returncode is not None:
+        return True
     if os.name != "nt" and hasattr(os, "killpg"):
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            return
-        except (ProcessLookupError, PermissionError, OSError):
+            pgid = os.getpgid(proc.pid)
+            # `start_new_session=True` guarantees the child leads its own
+            # group, so this can only match ours if a caller reached past that
+            # with `process_group=`. Killing our own group would take the
+            # user's shell with it, so refuse rather than trust the invariant.
+            if pgid != os.getpgid(0):
+                os.killpg(pgid, signal.SIGKILL)
+                return True
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError):
             pass
-    with contextlib.suppress(ProcessLookupError, OSError):
+    try:
         proc.kill()
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen):
+    """Take the child down with us on SIGTERM or SIGHUP.
+
+    `start_new_session=True` is what lets a timeout kill everything the stage
+    spawned, but it also took the child out of the terminal's process group --
+    and a hangup on that group, an SSH session dropping or a window closing, is
+    how an interactive run used to be cleaned up. Python turns only SIGINT into
+    an exception, so the `except BaseException` in `run` cannot stand in for
+    these two: without this, `kill <litetune>` or a dropped connection leaves a
+    six-hour torch run holding its memory, which is the very thing the process
+    group was introduced to prevent.
+
+    The previous disposition is restored before the signal is re-raised, so the
+    process still dies the way it would have. Signals can only be installed on
+    the main thread; elsewhere this is a no-op rather than an error, because a
+    library that refused to run off the main thread would be worse than one
+    that cleans up in fewer cases.
+    """
+    installed: dict[int, Any] = {}
+
+    def take_the_child_with_us(signum, _frame):
+        _kill_tree(proc)
+        # `None` means the handler in place was installed from C and cannot be
+        # restored from Python -- `signal.signal(sig, None)` is a `TypeError`.
+        # Falling back to the default is what "die the way we would have" means
+        # when the previous disposition is not expressible here.
+        signal.signal(signum, installed.get(signum) or signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+        # Reached only if that disposition was `SIG_IGN`, or a Python handler
+        # that returns -- litetune embedded in a larger application. Returning
+        # here would resume `communicate()` over a child we just SIGKILLed and
+        # hand the caller a `-9`, which `exits` reports as the out-of-memory
+        # killer: our own kill, blamed on the machine. Raising keeps the run's
+        # own account of itself honest.
+        raise KeyboardInterrupt(f"signal {signum} arrived while a stage subprocess was running")
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            installed[sig] = signal.signal(sig, take_the_child_with_us)
+        except (ValueError, OSError):
+            # Not the main thread, or the platform has no such signal.
+            pass
+    try:
+        yield
+    finally:
+        for sig, previous in installed.items():
+            if previous is None:
+                # Same `TypeError` as above, and here it would fire inside a
+                # `finally` and mask whatever was already propagating.
+                continue
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(sig, previous)
+
+
+def _kill_and_drain(proc: subprocess.Popen) -> tuple[str, str]:
+    """Kill the group, then collect what it wrote -- without waiting forever.
+
+    The drain is bounded because the kill is not guaranteed to have reached
+    everything: a grandchild that called `setsid()` is outside the group and
+    can hold the inherited stdout open. Giving up on the output is the right
+    trade here, since the caller is already on its way to reporting a timeout
+    or re-raising; hanging instead would reinstate the unbounded wait.
+    """
+    killed = _kill_tree(proc)
+    try:
+        return proc.communicate(timeout=_DRAIN_AFTER_KILL_S)
+    except subprocess.TimeoutExpired as expired:
+        # Said out loud, because a leaked process is otherwise diagnosed hours
+        # later as somebody else's out-of-memory kill.
+        logger.warning(
+            "output pipes stayed open after %s the process group for %s; something it "
+            "spawned has left the group and is still running",
+            "killing" if killed else "failing to kill",
+            _describe(proc),
+        )
+        # Whatever was read before giving up. The stage's stderr is the single
+        # most useful artifact in a timeout report, so it is worth carrying the
+        # partial one rather than returning two empty strings.
+        return _as_text(expired.output), _as_text(expired.stderr)
+
+
+def _as_text(chunk: str | bytes | None) -> str:
+    """`TimeoutExpired` carries bytes from a text-mode pipe on some paths."""
+    if chunk is None:
+        return ""
+    return chunk if isinstance(chunk, str) else chunk.decode("utf-8", "replace")
+
+
+def _describe(proc: subprocess.Popen) -> str:
+    """The first word of a subprocess's command line, for a log message."""
+    args = proc.args
+    if isinstance(args, str | bytes | os.PathLike):
+        return os.fsdecode(args)
+    return os.fsdecode(next(iter(args), "the stage subprocess"))
 
 
 def _child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -116,6 +318,20 @@ def _child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
     deliberately -- `export`'s repack does not, but the shape leaves the door
     open for one that must, rather than making every caller rebuild this.
     """
+    dropped = [k for k in _HOST_OVERRIDES if k in os.environ]
+    if dropped:
+        # Said out loud rather than done quietly. A user who set `PYTHONPATH`
+        # following a workaround in an issue thread would otherwise get numbers
+        # the workaround does not predict, with nothing anywhere recording that
+        # the variable existed. `PYTHONSTARTUP` is excluded from the message
+        # because it does nothing to a non-interactive child either way.
+        named = [k for k in dropped if k != "PYTHONSTARTUP"]
+        if named:
+            logger.warning(
+                "not passing %s to the stage subprocess: it would outrank the "
+                "environment's own pins, which every measurement is recorded against",
+                ", ".join(named),
+            )
     env = {k: v for k, v in os.environ.items() if k not in _HOST_OVERRIDES}
     if overrides:
         env.update(overrides)
@@ -286,8 +502,7 @@ def cached_environments() -> list[CachedEnv]:
             # and the stage cannot disagree about the same directory. Reading
             # only the marker made `litetune env` print `ready` for one holding
             # nothing else, which is where this was first seen.
-            ready=(child / ".litetune-ready").exists()
-            and (child / ("Scripts" if os.name == "nt" else "bin") / "python").exists(),
+            ready=(child / ".litetune-ready").exists() and _interpreter_in(child).exists(),
             stage=claimed.get(child.name),
         )
         for child in sorted(root.iterdir())
@@ -350,8 +565,7 @@ class StageEnv:
 
     @property
     def python(self) -> Path:
-        bindir = "Scripts" if os.name == "nt" else "bin"
-        return self.path / bindir / "python"
+        return _interpreter_in(self.path)
 
     @property
     def ready(self) -> bool:
@@ -442,9 +656,10 @@ class StageEnv:
                         "budget building the virtualenv; nothing was installed, and any "
                         "existing environment is untouched"
                     )
-                bindir = "Scripts" if os.name == "nt" else "bin"
-                python = self.path / bindir / ("python.exe" if os.name == "nt" else "python")
-                cmd = [str(python), "-m", "pip", "install", "--quiet", *self.requirements]
+                # The same spelling `ready` and `run` use, from one function:
+                # two of them disagreeing on Windows is what made this worth
+                # naming at all.
+                cmd = [str(self.python), "-m", "pip", "install", "--quiet", *self.requirements]
                 try:
                     proc = subprocess.run(
                         cmd,
@@ -513,7 +728,6 @@ class StageEnv:
         args: list[str],
         timeout: int = 3600,
         env: Mapping[str, str] | None = None,
-        **kwargs,
     ) -> subprocess.CompletedProcess[str]:
         """Run a console script or module inside this environment.
 
@@ -544,9 +758,8 @@ class StageEnv:
         the next stage is then SIGKILLed and `exits` reads that as the OOM
         killer, blaming the machine for litetune's own orphan.
         """
-        bindir = "Scripts" if os.name == "nt" else "bin"
-        exe = self.path / bindir / args[0]
-        argv = [str(exe), *args[1:]] if exe.exists() else [str(self.python), "-m", *args]
+        exe = _console_script_in(self.path, args[0])
+        argv = [str(exe), *args[1:]] if exe is not None else [str(self.python), "-m", *args]
         proc = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
@@ -556,25 +769,27 @@ class StageEnv:
             stdin=subprocess.DEVNULL,
             env=_child_env(env),
             # POSIX only; accepted and ignored on Windows, where `_kill_tree`
-            # falls back to killing the child alone.
+            # falls back to killing the child alone. Not overridable: a caller
+            # reaching past it with `process_group=` would put the child in
+            # *our* group, and `_kill_tree` would then aim SIGKILL at the
+            # session that is running litetune. There was a `**kwargs`
+            # passthrough here with no user in the package; it is gone.
             start_new_session=True,
-            **kwargs,
         )
         try:
-            out, err = proc.communicate(timeout=timeout)
+            with _kill_child_if_we_are_told_to_exit(proc):
+                out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             # Kill first, then drain: `communicate()` with no timeout would
             # otherwise wait on a pipe the process group is still holding open.
-            _kill_tree(proc)
-            out, err = proc.communicate()
+            out, err = _kill_and_drain(proc)
             raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from None
         except BaseException:
             # Ctrl-C reaches the group through the terminal only while the
             # child shares it, and `start_new_session=True` is what stopped it
             # doing so. This is that signal's replacement, and it covers every
             # other way out of the `try` as well.
-            _kill_tree(proc)
-            proc.communicate()
+            _kill_and_drain(proc)
             raise
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 

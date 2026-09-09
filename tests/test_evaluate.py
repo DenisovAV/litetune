@@ -267,8 +267,8 @@ def test_hugging_face_backend_reports_the_device_it_actually_used(monkeypatch):
     """
 
     def fake_provision(self, events=None, force=False):
-        # The marker file, not just the directory: `_ensure_env` gates the
-        # probe on `env.ready`, which is exactly this file's existence.
+        # Marker and interpreter both: `_ensure_env` gates the probe on
+        # `env.ready`, and a directory with only the marker is not ready.
         mark_provisioned(self)
         return self.path
 
@@ -299,7 +299,7 @@ def _ready_env() -> None:
     """Make `envs.TRAIN` look provisioned without provisioning anything.
 
     `_ensure_env` gates the device probe on `env.ready`, which is the marker
-    file and nothing else.
+    file and the interpreter beside it.
     """
     mark_provisioned(envs.TRAIN)
 

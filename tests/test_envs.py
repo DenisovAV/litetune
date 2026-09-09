@@ -6,10 +6,14 @@ unpinned. The constructor refuses that shape so the failure cannot recur
 silently.
 """
 
+import contextlib
+import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
+import time
 import types
 
 import pytest
@@ -473,7 +477,7 @@ def test_a_probe_that_cannot_start_is_not_a_device(probe_env, monkeypatch):
 def test_an_invalid_byte_ahead_of_the_answer_does_not_crash_the_run(probe_env):
     """A garbled byte on the probe's stdout used to end the whole run.
 
-    `StageEnv.run` calls `subprocess.run(..., text=True)`, which decodes
+    `StageEnv.run` decodes with `text=True`, which reads
     stdout eagerly, and a stray non-UTF-8 byte -- a CUDA, driver or vendor
     banner ahead of the probe's own line, the same class of weird environment
     the last-non-empty-line rule exists to survive -- raised
@@ -483,7 +487,7 @@ def test_an_invalid_byte_ahead_of_the_answer_does_not_crash_the_run(probe_env):
 
     No mock of `StageEnv.run`: the fake "python" below is a real executable at
     the real path `run` looks for, so this exercises the actual
-    `subprocess.run(..., errors="replace")` call the fix lives in, not a
+    `errors="replace"` decode the fix lives in, not a
     stand-in that hands back an already-decoded string and could not have
     caught the regression.
     """
@@ -633,31 +637,60 @@ def test_the_host_cannot_reach_past_the_pins(name, monkeypatch):
     assert name not in envs._child_env()
 
 
-def test_the_child_process_really_does_not_see_it(tmp_path, monkeypatch):
+def _symlinked_env(tmp_path, monkeypatch, name: str) -> StageEnv:
+    """A stage environment whose interpreter is the one running the tests.
+
+    Enough for `run` to start a real process without provisioning anything,
+    which is what the tests below are about: they ask the child what it got.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    env = StageEnv(name=name, requirements=("pyyaml==6.0.2",))
+    env.python.parent.mkdir(parents=True, exist_ok=True)
+    env.python.symlink_to(sys.executable)
+    return env
+
+
+def test_the_child_process_gets_the_host_environment_minus_the_reach(tmp_path, monkeypatch):
     """The helper being right is not the claim; the subprocess is.
 
     Every other test here calls `_child_env` directly, so all of them would
-    still pass if `run` stopped calling it. This one starts a real process
-    through `StageEnv.run` and asks it what it inherited.
+    still pass if `run` stopped calling it. This one starts a real process and
+    reads its whole environment back.
+
+    Asserting the absences alone is not enough either: `env=dict(env or {})`
+    passes a test that only checks `PYTHONPATH` is gone, and it launches every
+    stage with no `PATH`, no `HOME` and no Hugging Face cache. Sanitation is
+    the claim, not isolation, so what survives is asserted too.
     """
-    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
     monkeypatch.setenv("PYTHONPATH", "/planted")
-    env = StageEnv(name="realchild", requirements=("pyyaml==6.0.2",))
-    env.python.parent.mkdir(parents=True, exist_ok=True)
-    env.python.symlink_to(sys.executable)
+    monkeypatch.setenv("LITETUNE_CANARY", "kept")
+    env = _symlinked_env(tmp_path, monkeypatch, "realchild")
 
-    seen = env.run(
-        ["python", "-c", "import os; print(os.environ.get('PYTHONPATH', '<unset>'))"], timeout=60
-    )
-    assert seen.stdout.strip() == "<unset>"
-
-    # And a caller's own override still reaches it, through the same path.
-    override = env.run(
-        ["python", "-c", "import os; print(os.environ.get('CUDA_VISIBLE_DEVICES', '<none>'))"],
+    proc = env.run(
+        ["python", "-c", "import json, os; print(json.dumps(dict(os.environ)))"],
         timeout=60,
         env={"CUDA_VISIBLE_DEVICES": ""},
     )
-    assert override.stdout.strip() == ""
+    seen = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert "PYTHONPATH" not in seen
+    assert seen["CUDA_VISIBLE_DEVICES"] == "", "a caller's override still reaches the child"
+    assert seen["LITETUNE_CANARY"] == "kept", "the rest of the host environment is not isolation"
+    assert seen["PATH"] == os.environ["PATH"], "the base is the host's, not an empty dict"
+
+
+def test_the_child_gets_a_session_of_its_own(tmp_path, monkeypatch):
+    """`_kill_tree` SIGKILLs the child's process group.
+
+    If the child ever shared ours, that group is the test runner's -- so a
+    regression here would not fail a test, it would kill pytest with signal 9,
+    which this project's own `read_returncode` then reads as the OOM killer.
+    `_kill_tree` refuses to signal its own group for that reason; this pins the
+    other half, that the child is genuinely somewhere else.
+    """
+    env = _symlinked_env(tmp_path, monkeypatch, "ownsession")
+    proc = env.run(["python", "-c", "import os; print(os.getsid(0))"], timeout=30)
+    assert int(proc.stdout.strip()) != os.getsid(0)
 
 
 def test_a_signal_still_reads_as_a_signal_through_the_new_run(tmp_path, monkeypatch):
@@ -668,16 +701,81 @@ def test_a_signal_still_reads_as_a_signal_through_the_new_run(tmp_path, monkeypa
     rather than `failed`. A rewrite of `run` that returned an unsigned status
     would collapse the two silently.
     """
-    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    env = StageEnv(name="signalled", requirements=("pyyaml==6.0.2",))
-    env.python.parent.mkdir(parents=True, exist_ok=True)
-    env.python.symlink_to(sys.executable)
-
+    env = _symlinked_env(tmp_path, monkeypatch, "signalled")
     proc = env.run(
         ["python", "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"], timeout=60
     )
     assert proc.returncode == -9
     assert not envs.read_returncode(proc.returncode).conclusive
+
+
+def test_a_timeout_carries_what_the_child_managed_to_say(tmp_path, monkeypatch):
+    """And pins the order: kill first, then drain.
+
+    Draining before the kill is the shape that hangs, and it is an easy thing
+    to reorder while tidying. The output is the only artifact that would
+    explain a six-hour non-result, so it is worth having in hand even though
+    no caller reads it today.
+    """
+    env = _symlinked_env(tmp_path, monkeypatch, "talkative")
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        env.run(
+            ["python", "-c", "import time; print('partial', flush=True); time.sleep(30)"],
+            timeout=1,
+        )
+    assert "partial" in (caught.value.output or "")
+    assert caught.value.timeout == 1
+
+
+def test_a_group_that_cannot_be_killed_falls_back_to_the_child(monkeypatch):
+    """`killpg` returns EPERM in some sandboxes and containers.
+
+    That is exactly where an orphaned trainer would come back, so the fallback
+    is not decoration. It never runs in this suite otherwise.
+    """
+
+    def refuse(*_args):
+        raise PermissionError("operation not permitted")
+
+    # A real pid is not needed and would be a different test; what matters is
+    # that the group exists, is not ours, and refuses the signal.
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    monkeypatch.setattr(envs.os, "killpg", refuse)
+
+    killed = []
+    stub = types.SimpleNamespace(pid=4242, returncode=None, kill=lambda: killed.append(True))
+    assert envs._kill_tree(stub) is True
+    assert killed == [True], "the child alone is killed when its group refuses"
+
+
+def test_a_process_that_already_left_counts_as_killed(monkeypatch):
+    """Finishing between the timeout firing and the kill is the ordinary case."""
+
+    def gone(*_args):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(envs.os, "killpg", gone)
+    assert envs._kill_tree(types.SimpleNamespace(pid=4243, returncode=None)) is True
+
+
+def test_the_stage_refuses_to_kill_its_own_process_group(monkeypatch):
+    """Otherwise a caller reaching past `start_new_session` takes the shell out.
+
+    `os.getpgid(proc.pid)` returning our own group can only happen if someone
+    passes `process_group=` through `**kwargs`, which nothing does today -- but
+    the cost of the invariant being wrong once is the user's terminal.
+    """
+    signalled = []
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: signalled.append(pgid))
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 999)
+
+    killed = []
+    envs._kill_tree(
+        types.SimpleNamespace(pid=4244, returncode=None, kill=lambda: killed.append(True))
+    )
+
+    assert signalled == [], "our own process group must never be signalled"
+    assert killed == [True], "and the child alone is killed instead"
 
 
 def test_the_rest_of_the_host_environment_survives(monkeypatch):
@@ -763,7 +861,7 @@ def test_an_interpreter_with_no_marker_is_not_ready_either(tmp_path, monkeypatch
 
 
 @pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX")
-def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch):
+def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch, request):
     """`subprocess.run(timeout=)` kills the direct child and nothing below it.
 
     `tune` waits six hours; when that fires it records an honest "not checked"
@@ -771,23 +869,43 @@ def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch):
     The next stage is SIGKILLed and `exits` reads that as the OOM killer --
     blaming the machine for litetune's own orphan.
     """
-    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    env = StageEnv(name="grandchild", requirements=("pyyaml==6.0.2",))
-    env.python.parent.mkdir(parents=True)
-    env.python.symlink_to(sys.executable)
+    env = _symlinked_env(tmp_path, monkeypatch, "grandchild")
 
+    # Liveness is a held lock, not a pid. `kill(pid, 0)` succeeds against a
+    # zombie, and after the group dies the grandchild is reparented to init and
+    # reaped whenever init gets round to it -- which, in a container whose PID 1
+    # is a shell that never reaps, is never. A lock is released by the kernel
+    # when the process dies, zombie or not.
+    lockfile = tmp_path / "grandchild.lock"
     pidfile = tmp_path / "grandchild.pid"
+    grandchild_code = (
+        f"import fcntl, time; h = open({str(lockfile)!r}, 'w');"
+        "fcntl.flock(h, fcntl.LOCK_EX); time.sleep(30)"
+    )
     child = (
         "import subprocess, sys, time;"
-        f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
+        f"p = subprocess.Popen([sys.executable, '-c', {grandchild_code!r}]);"
         f"open({str(pidfile)!r}, 'w').write(str(p.pid));"
-        "time.sleep(60)"
+        "time.sleep(30)"
     )
 
     with pytest.raises(subprocess.TimeoutExpired):
         env.run(["python", "-c", child], timeout=3)
 
     grandchild = int(pidfile.read_text())
-    # Signal 0 asks "is it there" without sending anything.
-    with pytest.raises(ProcessLookupError):
-        os.kill(grandchild, 0)
+    # Best effort, so a failure of this test does not leave a process behind
+    # for the next half minute.
+    request.addfinalizer(lambda: _reap(grandchild))
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with open(lockfile, "w") as handle:
+            if envs._try_lock(handle) is not False:
+                return
+        time.sleep(0.05)
+    pytest.fail(f"grandchild {grandchild} still holds its lock 10s after the group was killed")
+
+
+def _reap(pid: int) -> None:
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)

@@ -177,9 +177,9 @@ def mark_provisioned(env) -> Path:
     short-circuited on it, `run` reached a python that did not exist, and the
     error named the toolchain instead of the empty directory.
 
-    Eleven places across seven test files used to write the marker alone, which
-    is the old and wrong definition of ready taught eleven times. One helper so
-    that the next change to what "provisioned" means has one place to land.
+    Nine places across seven test files used to write the marker alone, which is
+    the old and wrong definition of ready taught nine times. One helper so that
+    the next change to what "provisioned" means has one place to land.
     """
     env.python.parent.mkdir(parents=True, exist_ok=True)
     env.python.touch()
