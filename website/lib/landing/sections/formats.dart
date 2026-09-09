@@ -46,6 +46,19 @@ import '../../theme/brand.dart';
 /// use a GPU when the host has one and record which backend actually produced
 /// each result. Naming a capability of the runtime and claiming a measurement
 /// of it are different sentences; only the second would be unsupported.
+///
+/// That row stays by decision, and this paragraph is here so it is not
+/// re-opened as an oversight — it has been raised three times. Since it was
+/// written both NPUs were measured, and neither reads as well as the row
+/// sounds: `convert` compiles for no NPU at all, a Snapdragon bundle has to be
+/// built by hand and scores worse there than on the CPU, and an Intel one
+/// keeps only the first prefill chunk. The row names what the runtime does and
+/// what `convert` is meant to reach; the README's limitations carry the
+/// distance between that and today, and they are the page to correct first
+/// when any of it changes. The line to hold: this row may run ahead of
+/// `convert` by the compile step, and by nothing else. If a reader could take
+/// it as a measurement of the bundle litetune hands them, it has crossed that
+/// line and should be cut.
 class Formats extends StatelessComponent {
   const Formats({super.key});
 
