@@ -946,12 +946,26 @@ class HuggingFaceBackend:
                 self.device = None
                 self.probed_device = None
                 return f"environment {self.env.name!r} unavailable: {exc}"
-        if self.env.ready:
-            probe = envs.resolve_device(self.env, events=events)
-            self.last_probe = probe
-            if probe.answered:
-                self.probed_device = probe.device
-                self.device = probe.device
+        if not self.env.ready:
+            # A third state, and it used to be reported as the first: "nobody
+            # asked", "it was asked and could not say", and "there was nothing
+            # to ask". Leaving `last_probe` at `None` made the manifest
+            # byte-identical to a run where no probe was wanted.
+            #
+            # Recorded, not blocking. Whether an unprovisioned environment can
+            # still generate is the caller's to decide -- a library caller that
+            # manages the lifecycle itself, or a test that supplies its own
+            # `run`, legitimately gets here and proceeds. What must not happen
+            # is the run finishing with no trace of why its device is unknown.
+            self.last_probe = envs._unanswered(
+                self.env, f"it is not provisioned at {self.env.path}", events
+            )
+            return None
+        probe = envs.resolve_device(self.env, events=events)
+        self.last_probe = probe
+        if probe.answered:
+            self.probed_device = probe.device
+            self.device = probe.device
         return None
 
     def _read_run_report(self, report: Path) -> str | None:

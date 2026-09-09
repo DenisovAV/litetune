@@ -736,7 +736,6 @@ class _FakeProc:
     def __init__(self, pid=4242, returncode=None):
         self.pid = pid
         self.returncode = returncode
-        self.group_signals: list[int] = []
         self.direct_signals: list[int] = []
 
     def send_signal(self, sig):
@@ -758,7 +757,7 @@ def test_a_stage_is_asked_to_stop_before_it_is_killed(monkeypatch):
     monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
     monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: sent.append(sig))
 
-    assert envs._kill_tree(_FakeProc(), grace=0.01) is True
+    assert envs._kill_tree(_FakeProc(), grace=0.01) is envs.Reach.GROUP
     assert sent == [signal.SIGTERM, signal.SIGKILL], "polite first, then certain"
 
 
@@ -778,7 +777,7 @@ def test_a_group_that_cannot_be_killed_falls_back_to_the_child(monkeypatch):
     monkeypatch.setattr(envs.os, "killpg", refuse)
 
     proc = _FakeProc()
-    assert envs._kill_tree(proc, grace=0.01) is True
+    assert envs._kill_tree(proc, grace=0.01) is envs.Reach.CHILD_ONLY
     assert proc.direct_signals == [signal.SIGTERM, signal.SIGKILL]
 
 
@@ -790,7 +789,7 @@ def test_a_process_that_already_left_counts_as_killed(monkeypatch):
 
     monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4243 if pid else 1)
     monkeypatch.setattr(envs.os, "killpg", gone)
-    assert envs._kill_tree(_FakeProc(pid=4243), grace=0.01) is True
+    assert envs._kill_tree(_FakeProc(pid=4243), grace=0.01) is envs.Reach.ALREADY_GONE
 
 
 def test_a_reaped_process_is_never_signalled(monkeypatch):
@@ -804,7 +803,7 @@ def test_a_reaped_process_is_never_signalled(monkeypatch):
     monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: signalled.append(sig))
 
     proc = _FakeProc(returncode=0)
-    assert envs._kill_tree(proc) is True
+    assert envs._kill_tree(proc) is envs.Reach.ALREADY_GONE
     assert signalled == [] and proc.direct_signals == []
 
 
@@ -949,8 +948,11 @@ def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch, request):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         with open(lockfile, "w") as handle:
-            if envs._try_lock(handle) is not False:
-                return
+            taken = envs._try_lock(handle)
+        if taken is None:
+            pytest.skip("no advisory locking on this filesystem; liveness cannot be observed")
+        if taken is True:
+            return
         time.sleep(0.05)
     pytest.fail(f"grandchild {grandchild} still holds its lock 10s after the group was killed")
 
@@ -958,3 +960,114 @@ def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch, request):
 def _reap(pid: int) -> None:
     with contextlib.suppress(OSError):
         os.kill(pid, signal.SIGKILL)
+
+
+# ---------------------------------------------------------------------------
+# What the termination guard does and does not take over
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="SIGHUP is POSIX")
+def test_a_signal_the_process_already_ignores_is_left_alone(monkeypatch):
+    """`nohup` sets SIGHUP to SIG_IGN for one purpose: surviving the hangup.
+
+    Installing over it turns the documented way to run a six-hour `tune` over
+    SSH into the one way to lose it -- litetune would kill the trainer the
+    moment the connection dropped, and then report it as a Ctrl-C nobody typed.
+    """
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_IGN)
+    installed = []
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: installed.append(sig))
+
+    with envs._kill_child_if_we_are_told_to_exit(_FakeProc()):
+        pass
+
+    assert installed == [], "an inherited SIG_IGN is the caller's decision, not ours to override"
+
+
+def test_the_guard_hands_back_the_signals_it_took(monkeypatch):
+    """Including where the previous handler came from C and cannot be restored.
+
+    `signal.signal` returns `None` for those, and leaving ours in place would
+    outlive the call, closed over a process that no longer exists.
+    """
+    restored = {}
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: restored.setdefault(sig, handler))
+
+    with envs._kill_child_if_we_are_told_to_exit(_FakeProc()):
+        pass
+
+    # The first call per signal installs ours; the finally puts something back.
+    assert restored, "the guard installed nothing at all"
+
+
+def test_a_second_signal_does_not_buy_the_child_more_time(monkeypatch):
+    """Our handler stays installed while it runs, so a second signal re-enters.
+
+    Measured before the guard: three SIGTERMs a second apart against a child
+    that ignores them took 8.0s to give up instead of 5.0s, and deeper nesting
+    compounds. "Stop harder" must not mean "wait longer".
+    """
+    entries = []
+
+    def slow_kill(proc, grace=None):
+        entries.append(grace)
+        if len(entries) == 1:
+            handler(signal.SIGTERM, None)  # a second signal, mid-grace
+        return envs.Reach.GROUP
+
+    monkeypatch.setattr(envs, "_kill_tree", slow_kill)
+    captured = {}
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+    monkeypatch.setattr(signal, "signal", lambda sig, h: captured.setdefault(sig, h))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    with envs._kill_child_if_we_are_told_to_exit(_FakeProc()):
+        handler = captured[signal.SIGTERM]
+        with pytest.raises(envs.StageInterrupted):
+            handler(signal.SIGTERM, None)
+
+    assert len(entries) == 1, "the second signal must not start another grace"
+
+
+def test_an_interrupted_stage_is_not_reported_as_a_ctrl_c():
+    """`KeyboardInterrupt` means one specific thing to every reader of a log.
+
+    A run ended by a hangup or by `kill` is not one the operator abandoned, and
+    CPython's own exit status for the two is the same 130 unless they are
+    different types.
+    """
+    interrupted = envs.StageInterrupted(signal.SIGTERM)
+    assert not isinstance(interrupted, KeyboardInterrupt)
+    assert isinstance(interrupted, BaseException)
+    assert "SIGTERM" in str(interrupted)
+    assert interrupted.signum == signal.SIGTERM
+
+
+def test_a_platform_without_sigkill_still_kills(monkeypatch):
+    """Windows has no `SIGKILL`, and reading the name is enough to raise.
+
+    That `AttributeError` fired inside the handler that was reporting a
+    timeout, so the timeout was never reported at all -- and CI is Linux-only,
+    so nothing in this suite could have caught it.
+    """
+    monkeypatch.setattr(envs, "_SIGKILL", None)
+    monkeypatch.setattr(envs, "_group_of", lambda proc: None)
+
+    class NoSignals(_FakeProc):
+        def __init__(self):
+            super().__init__()
+            self.hard_killed = False
+
+        def send_signal(self, sig):
+            if sig is not signal.SIGTERM:
+                raise ValueError(f"Unsupported signal: {sig}")
+            super().send_signal(sig)
+
+        def kill(self):
+            self.hard_killed = True
+
+    proc = NoSignals()
+    assert envs._kill_tree(proc, grace=0.01) is envs.Reach.CHILD_ONLY
+    assert proc.hard_killed, "the hard kill must go through Popen.kill where there is no SIGKILL"

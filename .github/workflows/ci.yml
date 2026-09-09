@@ -29,8 +29,8 @@ jobs:
       - run: ruff format --check src tests
       - run: mypy
       # Almost all of it runs on fakes. A handful of tests in test_envs.py
-        # start a real interpreter -- to read a child's environment back, and
-        # to check a killed process group -- but nothing reaches the network.
+      # start a real interpreter -- to read a child's environment back, and to
+      # check a killed process group -- but nothing reaches the network.
       - run: pytest -q
 
   # An editable install is not the artifact anyone receives. `src/` layout plus

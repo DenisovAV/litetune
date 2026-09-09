@@ -38,11 +38,13 @@ logger = logging.getLogger(__name__)
 SIGKILL = 9
 
 OOM_HINT = (
-    "nothing in litetune sends SIGKILL, so on Linux this is almost always the out-of-memory "
-    "killer: the process asked for more memory than the machine would give it. A Gemma 4 export "
-    "died exactly this way at a 32 GiB ceiling and read as a failed conversion; on a larger "
-    "machine the same command produced a specific, actionable error instead. Re-run it with more "
-    "memory before concluding anything about the model"
+    "litetune sends SIGKILL only to a stage's own process group, after that stage's timeout "
+    "expired, and it reports that as a timeout rather than as this -- so on Linux a -9 arriving "
+    "here is almost always the out-of-memory killer: the process asked for more memory than the "
+    "machine would give it. A Gemma 4 export died exactly this way at a 32 GiB ceiling and read "
+    "as a failed conversion; on a larger machine the same command produced a specific, "
+    "actionable error instead. Re-run it with more memory before concluding anything about the "
+    "model"
 )
 
 
