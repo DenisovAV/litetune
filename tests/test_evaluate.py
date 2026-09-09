@@ -978,3 +978,27 @@ def test_the_reference_script_prefers_what_the_parent_already_resolved(tmp_path,
     """
     captured = _run_hf_generate_script(tmp_path, monkeypatch, cuda=False, given="cuda")
     assert captured["model_device"] == "cuda"
+
+
+def test_an_unprovisioned_environment_is_a_third_state(monkeypatch, tmp_path):
+    """ "Nobody asked", "it was asked and could not say", and "there was nothing
+    to ask" are three different facts, and the third used to be filed as the
+    first: `last_probe` stayed `None`, so the manifest was byte-identical to a
+    run where no probe was wanted.
+
+    It must also not block. Whether an unprovisioned environment can still
+    generate is the caller's decision -- a library caller managing the lifecycle
+    itself, or a test supplying its own `run`, legitimately gets here.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+
+    blocked = backend._ensure_env(events=None)
+
+    assert blocked is None, "recording is not blocking"
+    assert backend.last_probe is not None, "the third state must leave a record"
+    assert "not provisioned" in backend.last_probe.detail
+    assert (
+        "could not answer" not in backend.last_probe.detail
+    ), "no probe was attempted, so it cannot be reported as one that failed to answer"
+    assert backend.last_probe.device is None

@@ -55,6 +55,8 @@ class StageInterrupted(BaseException):
 
     def __init__(self, signum: int):
         self.signum = signum
+        # `set(...)` rather than `signum in signal.Signals`: the direct form is
+        # a TypeError before 3.12, and this package supports 3.10.
         name = signal.Signals(signum).name if signum in set(signal.Signals) else str(signum)
         super().__init__(f"{name} arrived while a stage subprocess was running")
 
@@ -171,9 +173,22 @@ _TERM_GRACE_S = 5
 # `Popen.kill`", which is what `subprocess` does on that platform anyway.
 _SIGKILL = getattr(signal, "SIGKILL", None)
 
-# Names already named in a warning. Module-level because the point is to say it
-# once per process, not once per subprocess.
+# Names already named in a warning during the current run. `run` is called once
+# per prompt during evaluation and Colab sets `PYTHONPATH` by default, so a
+# per-call warning is hundreds of identical lines through a progress report --
+# but "once per process" is the wrong grain for a library, where a notebook or a
+# service is one process spanning many independent runs. `forget_reported_drops`
+# is what a run boundary calls to get its own record.
 _REPORTED_DROPS: set[str] = set()
+
+
+def forget_reported_drops() -> None:
+    """Start a fresh record of which host variables have been reported dropped.
+
+    Called at the top of a run so the second run in one process says what the
+    first one did, rather than inheriting its silence.
+    """
+    _REPORTED_DROPS.clear()
 
 
 def _interpreter_in(root: Path) -> Path:
@@ -222,19 +237,32 @@ def _group_of(proc: subprocess.Popen) -> int | None:
     return None if pgid == os.getpgid(0) else pgid
 
 
-class Reach(str, Enum):
+class Reach(Enum):
     """How far a kill got. A bool had room for two of these four.
 
     The distinction is `checks.Outcome`'s, one layer down: "the group is gone"
     and "nothing could be signalled" are both *not* "killed", and only one of
     them means something is still running. A caller that logs the difference
     can say what it knows instead of guessing at a rogue grandchild.
+
+    Ordered worst-to-best so `max()` can take the best reach achieved rather
+    than the last one attempted -- a SIGTERM that reached the whole group must
+    not be reported as "nothing could be signalled" because the SIGKILL after
+    it was refused.
+
+    A plain `Enum`, not `str, Enum`: the values are never read, and the mixin
+    makes `f"{Reach.GROUP}"` render as `group` on 3.10 and `Reach.GROUP` on
+    3.11+, which is a difference waiting for the first person to log one
+    directly.
     """
 
-    GROUP = "group"  # the whole process group was signalled
-    CHILD_ONLY = "child"  # only the direct child; descendants are not covered
-    ALREADY_GONE = "gone"  # nothing to signal, and nothing left running
-    NOTHING = "nothing"  # every attempt was refused; it is still out there
+    NOTHING = 0  # every attempt was refused; it is still out there
+    ALREADY_GONE = 1  # nothing to signal, and nothing left running
+    CHILD_ONLY = 2  # only the direct child; descendants are not covered
+    GROUP = 3  # the whole process group was signalled
+
+    def __lt__(self, other: Reach) -> bool:
+        return self.value < other.value
 
 
 def _signal_tree(proc: subprocess.Popen, pgid: int | None, sig: int | None) -> Reach:
@@ -269,17 +297,22 @@ def _signal_tree(proc: subprocess.Popen, pgid: int | None, sig: int | None) -> R
     except (OSError, ValueError):
         # `ValueError` is Windows' answer to a signal it does not support.
         return Reach.NOTHING
-    # `send_signal` returns silently for a child already reaped, so this says
-    # "asked", not "arrived" -- which is why the reaped case is caught above.
+    # `Popen.send_signal` polls first and returns silently for a child that has
+    # already been reaped, and it swallows `ProcessLookupError` from `os.kill`
+    # besides -- so the arm above cannot fire on this path, and without this
+    # re-check a child that obeyed the SIGTERM would be reported as one we
+    # killed. Asking is not arriving.
+    if proc.poll() is not None:
+        return Reach.ALREADY_GONE
     return Reach.CHILD_ONLY
 
 
 def _kill_tree(proc: subprocess.Popen, grace: float = _TERM_GRACE_S) -> Reach:
     """End the child and everything it spawned: SIGTERM, then SIGKILL.
 
-    Returns how far it got, so a caller can say "and it could not be killed"
-    rather than leaving a leaked process to be diagnosed later as somebody
-    else's out-of-memory kill.
+    Returns the best reach achieved, so a caller can say "and it could not be
+    killed" rather than leaving a leaked process to be diagnosed later as
+    somebody else's out-of-memory kill.
 
     SIGTERM first because this replaced something gentler. Before the child had
     a session of its own, Ctrl-C reached it as SIGINT through the terminal and
@@ -292,50 +325,74 @@ def _kill_tree(proc: subprocess.Popen, grace: float = _TERM_GRACE_S) -> Reach:
     # `Popen.send_signal` makes this check for the same reason, and the reason
     # is severe: once the child has been reaped its pid is free for the kernel
     # to hand out again, and `killpg` on a recycled pid signals a stranger's
-    # process group. The timeout path cannot reach that state, but the
-    # `BaseException` path can -- a KeyboardInterrupt landing inside
-    # `communicate`'s trailing `wait()` arrives after the reap.
-    if proc.returncode is not None:
+    # process group. `poll()` as well as the recorded returncode, because a
+    # host that ignores SIGCHLD has the kernel reap for it -- `Popen` then never
+    # learns, and the pid is free while `returncode` is still None.
+    if proc.returncode is not None or proc.poll() is not None:
         return Reach.ALREADY_GONE
     pgid = _group_of(proc)
     reached = _signal_tree(proc, pgid, signal.SIGTERM)
     if reached in (Reach.GROUP, Reach.CHILD_ONLY) and grace > 0:
-        _wait_without_reaping(proc, grace)
+        _wait_without_reaping(proc, pgid, grace)
     # Unconditionally, even where the child exited on the SIGTERM: what it
     # spawned is not covered by its own exit, and this is the signal that
     # collects them. Measured 2026-09-09: a group whose leader has exited but
     # is not yet reaped still exists and still takes a signal, which is what
     # makes this safe -- and why the wait above must not reap.
-    final = _signal_tree(proc, pgid, _SIGKILL)
-    return final if final is not Reach.ALREADY_GONE else reached
+    return max(reached, _signal_tree(proc, pgid, _SIGKILL))
 
 
-def _wait_without_reaping(proc: subprocess.Popen, grace: float) -> None:
+def _wait_without_reaping(proc: subprocess.Popen, pgid: int | None, grace: float) -> None:
     """Wait for the child to exit, leaving it reapable.
 
     `proc.wait()` would be the obvious call and is the wrong one: it reaps, and
     a process group id *is* the leader's pid, so reaping frees the number this
     function's caller is about to send SIGKILL to. Measured 2026-09-09: with
     the leader reaped and no other member, `killpg` answers `ESRCH` and the id
-    is free for reuse; unreaped, the group is still there. `waitid` with
-    `WNOWAIT` reports the exit and leaves the child for `communicate` to reap.
+    is free for reuse; unreaped, the group is still there.
 
-    Where `waitid` is unavailable the grace is simply slept out. That is slower
-    in the case where the child obeys the SIGTERM at once, and it is never
-    wrong.
+    Two ways to watch without reaping, because neither covers every host.
+    `waitid` with `WNOWAIT` reports the exit and leaves the child reapable, but
+    it does not exist on macOS -- measured, on the Python this project is
+    developed against, where the guard has to stay on `waitid` itself because
+    `os.P_PID` and `os.WNOWAIT` are both present there anyway. Failing that,
+    signalling the group with 0 asks whether anything in it is still there,
+    which is the question this wait is really about: it ends early when the
+    whole group is gone, and that is also how a *second* termination signal
+    cuts this wait short, since its own hard kill empties the group.
+
+    With neither, the grace is slept out. Slower when the child obeys at once,
+    never wrong.
     """
     deadline = time.monotonic() + grace
     waitid = getattr(os, "waitid", None)
-    while time.monotonic() < deadline:
-        if waitid is None:
-            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-            continue
-        try:
-            if waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
-                return
-        except (ChildProcessError, OSError):
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return
-        time.sleep(0.05)
+        if waitid is not None:
+            try:
+                if waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                    return
+            except ChildProcessError:
+                # The child is gone and is no longer ours to wait for -- a host
+                # that ignores SIGCHLD had the kernel reap it.
+                return
+            except OSError as exc:
+                # We could not observe, which is not the same as "it exited".
+                # Sleeping out the rest of the grace is what this function
+                # promises; returning here would silently make the grace zero.
+                logger.debug("cannot watch pid %d without reaping it: %s", proc.pid, exc)
+                waitid = None
+        elif pgid is not None:
+            try:
+                os.killpg(pgid, 0)
+            except OSError:
+                # ESRCH: nothing left in the group. EPERM: on macOS, a group
+                # whose only member is an unreaped zombie. Either way there is
+                # nothing further to wait for.
+                return
+        time.sleep(min(0.05, remaining))
 
 
 @contextlib.contextmanager
@@ -369,12 +426,21 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen):
     def take_the_child_with_us(signum, _frame):
         nonlocal handling
         # Our handler stays installed while it runs, so a second signal
-        # re-enters here and nests another full grace. Measured: three SIGTERMs
-        # a second apart against a child that ignores them took 8.0s to give up
-        # instead of 5.0s, and deeper nesting compounds it. The second signal
-        # means "stop harder", so it must not mean "wait longer".
+        # re-enters here. Measured: three SIGTERMs a second apart against a
+        # child that ignores them took 8.0s to give up instead of 5.0s, because
+        # each nested call started its own grace.
+        #
+        # The second signal means "stop harder", so it skips the grace and
+        # kills outright -- and then *returns*, rather than raising. Raising
+        # through the first invocation was the earlier attempt and it was
+        # worse: the first frame never reached its restore or its re-delivery,
+        # so the process died of an uncaught exception instead of the signal,
+        # and `run`'s handler then started a fresh grace of its own. Returning
+        # leaves the first invocation to finish, and it finishes at once,
+        # because emptying the group is exactly what its wait is watching for.
         if handling:
-            raise StageInterrupted(signum)
+            _kill_tree(proc, grace=0)
+            return
         handling = True
         _kill_tree(proc)
         # `None` means the handler in place was installed from C and cannot be
@@ -402,14 +468,17 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen):
             if signal.getsignal(sig) == signal.SIG_IGN:
                 continue
             installed[sig] = signal.signal(sig, take_the_child_with_us)
-        except (ValueError, OSError):
-            # Not the main thread, or the platform has no such signal. Said out
-            # loud at debug level: the consequence is a torch process outliving
-            # a SIGTERM, and "why" should not need a code read.
-            logger.debug(
-                "no %s guard for %s: signals can only be installed on the main thread",
+        except (ValueError, OSError) as exc:
+            # Off the main thread, or a platform without this signal -- the
+            # message must not pick one. `warning`, not `debug`: the
+            # consequence is a six-hour torch run outliving the SIGTERM that
+            # was meant to end it, and `cli` leaves the level at WARNING unless
+            # asked for more.
+            logger.warning(
+                "no %s guard for %s (%s): a termination signal will not reach it",
                 name,
                 _describe(proc),
+                exc,
             )
 
     try:
@@ -446,10 +515,22 @@ def _kill_and_drain(proc: subprocess.Popen) -> tuple[str, str]:
             "output pipes for %s stayed open after %s, so something is still holding them",
             _describe(proc),
             {
-                Reach.GROUP: "the process group was killed; a descendant has left the group",
-                Reach.CHILD_ONLY: "the child was killed, which does not cover what it spawned",
+                # Not "a descendant left the group": `killpg` returning 0 says
+                # the signal was accepted, not that anything died. A member
+                # wedged in an uninterruptible ioctl is unkillable and still
+                # holds the pipe, so naming one cause would send the reader
+                # hunting for the wrong process.
+                Reach.GROUP: (
+                    "the group was signalled, so either something outside it holds them or "
+                    "something in it has not died"
+                ),
+                Reach.CHILD_ONLY: (
+                    "only the child was signalled, which does not cover what it spawned"
+                ),
                 Reach.NOTHING: "nothing could be signalled at all",
-                Reach.ALREADY_GONE: "the child had already exited",
+                Reach.ALREADY_GONE: (
+                    "the child had already exited, so something it spawned holds them"
+                ),
             }[reached],
         )
         # Whatever was read before giving up. The stage's stderr is the single
@@ -949,21 +1030,29 @@ class StageEnv:
             # passthrough here with no user in the package; it is gone.
             start_new_session=True,
         )
-        try:
-            with _kill_child_if_we_are_told_to_exit(proc):
+        # The guard wraps the cleanup as well as the wait, and that is the
+        # whole point of where it sits. With the `try` outside it, the context
+        # manager restored the default dispositions *before* either handler ran
+        # -- and `_kill_and_drain` is a grace plus a drain, so for up to fifteen
+        # seconds of every timeout and every interrupt litetune was unprotected.
+        # Reproduced: a third signal arriving in that window killed litetune
+        # mid-kill and the stage outlived its parent, which is precisely what
+        # the guard exists to prevent.
+        with _kill_child_if_we_are_told_to_exit(proc):
+            try:
                 out, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Kill first, then drain: `communicate()` with no timeout would
-            # otherwise wait on a pipe the process group is still holding open.
-            out, err = _kill_and_drain(proc)
-            raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from None
-        except BaseException:
-            # Ctrl-C reaches the group through the terminal only while the
-            # child shares it, and `start_new_session=True` is what stopped it
-            # doing so. This is that signal's replacement, and it covers every
-            # other way out of the `try` as well.
-            _kill_and_drain(proc)
-            raise
+            except subprocess.TimeoutExpired:
+                # Kill first, then drain: `communicate()` with no timeout would
+                # otherwise wait on a pipe the group is still holding open.
+                out, err = _kill_and_drain(proc)
+                raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from None
+            except BaseException:
+                # Ctrl-C reaches the group through the terminal only while the
+                # child shares it, and `start_new_session=True` is what stopped
+                # it doing so. This is that signal's replacement, and it covers
+                # every other way out of the `try` as well.
+                _kill_and_drain(proc)
+                raise
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 

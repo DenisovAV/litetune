@@ -774,8 +774,10 @@ class HuggingFaceBackend:
     # from a previous call, forced onto a run whose own probe could not vouch
     # for it, made `model.to("cuda")` fail on a box where CUDA had since gone
     # away. `generate()` reads this, not `self.device`, when it builds the
-    # spec. `None` before `_ensure_env` has run, and after a call whose probe
-    # was never asked or could not answer -- see `verify.py`, which also reads
+    # spec. `None` only before `_ensure_env` has run: after it, a probe that
+    # could not answer and an environment there was nothing to probe both leave
+    # a `DeviceProbe` carrying which of the two it was -- see `verify.py`, which
+    # also reads
     # `detail` and `cuda_build_without_a_device` off it to record the same
     # limitation `tune.py` records for its own probe.
     last_probe: envs.DeviceProbe | None = None
@@ -957,9 +959,20 @@ class HuggingFaceBackend:
             # manages the lifecycle itself, or a test that supplies its own
             # `run`, legitimately gets here and proceeds. What must not happen
             # is the run finishing with no trace of why its device is unknown.
-            self.last_probe = envs._unanswered(
-                self.env, f"it is not provisioned at {self.env.path}", events
+            detail = (
+                f"no device probe was attempted: environment {self.env.name!r} is not "
+                f"provisioned at {self.env.path}"
             )
+            # Its own sentence, not `envs._unanswered`'s. That one says a probe
+            # "could not answer", which is the second of the three states the
+            # comment above names, and this is the third. It is also the only
+            # cross-module reach into an `envs` private in the package, so the
+            # moment a probe-specific side effect is added there this call site
+            # would start lying.
+            logger.warning("%s", detail)
+            if events is not None:
+                events.note(detail, environment=self.env.name)
+            self.last_probe = envs.DeviceProbe(device=None, detail=detail)
             return None
         probe = envs.resolve_device(self.env, events=events)
         self.last_probe = probe

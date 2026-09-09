@@ -36,7 +36,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from litetune import metrics, models
+from litetune import envs, metrics, models
 from litetune.checks import Check, Outcome, guard
 from litetune.evaluate import (
     GREEDY,
@@ -372,6 +372,10 @@ def run_verify(
 ) -> VerifyResult:
     """Verify one converted artifact. Returns a status and a manifest; never raises."""
     events = events or EventStream(echo_json=False)
+    # A run's own record of which host variables it dropped. Without this the
+    # second `verify` in one process -- a notebook, a service -- inherits the
+    # first one's "already said that" and reports nothing.
+    envs.forget_reported_drops()
     events.stage_started("verify", model=str(request.model), reference=request.reference)
     run = _Run(request=request, events=events)
 

@@ -731,7 +731,12 @@ def test_a_timeout_carries_what_the_child_managed_to_say(tmp_path, monkeypatch):
 
 
 class _FakeProc:
-    """A `Popen` stand-in that records what was signalled, and never dies."""
+    """A `Popen` stand-in that records what was signalled, and never dies.
+
+    `poll` answers from `returncode` the way the real one does, because
+    `_kill_tree` and `_signal_tree` both ask it: a host that ignores SIGCHLD
+    has the kernel reap for us, and `Popen` only learns through `poll`.
+    """
 
     def __init__(self, pid=4242, returncode=None):
         self.pid = pid
@@ -740,6 +745,9 @@ class _FakeProc:
 
     def send_signal(self, sig):
         self.direct_signals.append(sig)
+
+    def poll(self):
+        return self.returncode
 
     def wait(self, timeout=None):
         raise subprocess.TimeoutExpired("fake", timeout)
@@ -755,7 +763,9 @@ def test_a_stage_is_asked_to_stop_before_it_is_killed(monkeypatch):
     """
     sent = []
     monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
-    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: sent.append(sig))
+    # Signal 0 is the liveness probe the grace uses, not a kill; recording it
+    # would make this test about the wait rather than about the order.
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: sig and sent.append(sig))
 
     assert envs._kill_tree(_FakeProc(), grace=0.01) is envs.Reach.GROUP
     assert sent == [signal.SIGTERM, signal.SIGKILL], "polite first, then certain"
@@ -967,8 +977,23 @@ def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch, request):
 
 
 def _reap(pid: int) -> None:
+    """Best effort, for a pid we never had a `Popen` for -- a grandchild."""
     with contextlib.suppress(OSError):
         os.kill(pid, signal.SIGKILL)
+
+
+def _reap_proc(proc: subprocess.Popen) -> None:
+    """The same, through the object, for a process we started ourselves.
+
+    `os.kill` on the bare pid is the recycling hazard the production code goes
+    to lengths to avoid, and these finalisers run *after* `wait()` has reaped
+    the process -- so the number may already belong to somebody else. `Popen`
+    knows it was reaped and does nothing.
+    """
+    with contextlib.suppress(OSError):
+        proc.kill()
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        proc.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -1000,15 +1025,28 @@ def test_the_guard_hands_back_the_signals_it_took(monkeypatch):
     `signal.signal` returns `None` for those, and leaving ours in place would
     outlive the call, closed over a process that no longer exists.
     """
-    restored = {}
+    # Every call recorded in order, not just the first: `setdefault` kept only
+    # the install and discarded the restore, so replacing the whole `finally`
+    # body with `pass` left this green.
+    calls: list[tuple[int, object]] = []
+
+    # `None` is what `signal.signal` returns when the handler it displaced came
+    # from C -- the case the docstring is entirely about, and one a `SIG_DFL`
+    # stub never reaches.
     monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
-    monkeypatch.setattr(signal, "signal", lambda sig, handler: restored.setdefault(sig, handler))
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: calls.append((sig, handler)))
 
     with envs._kill_child_if_we_are_told_to_exit(_FakeProc()):
-        pass
+        installed = dict(calls)
+        assert installed, "the guard installed nothing at all"
+        assert all(callable(h) for h in installed.values())
 
-    # The first call per signal installs ours; the finally puts something back.
-    assert restored, "the guard installed nothing at all"
+    handed_back = dict(calls[len(installed) :])
+    assert set(handed_back) == set(installed), "every signal taken must be handed back"
+    assert all(h is signal.SIG_DFL for h in handed_back.values()), (
+        "a C handler cannot be restored from Python, so the default is what goes back -- "
+        "leaving ours would outlive this call over a process that no longer exists"
+    )
 
 
 def test_a_second_signal_does_not_buy_the_child_more_time(monkeypatch):
@@ -1017,16 +1055,22 @@ def test_a_second_signal_does_not_buy_the_child_more_time(monkeypatch):
     Measured before the guard: three SIGTERMs a second apart against a child
     that ignores them took 8.0s to give up instead of 5.0s, and deeper nesting
     compounds. "Stop harder" must not mean "wait longer".
+
+    The second signal kills with no grace and returns, rather than raising
+    through the first invocation. Raising was the earlier attempt: it left the
+    first frame without its restore or its re-delivery, so the process died of
+    an uncaught exception instead of the signal.
     """
+    _TERM_GRACE_SENTINEL = object()
     entries = []
 
-    def slow_kill(proc, grace=None):
+    def kill_and_signal_again(proc, grace=_TERM_GRACE_SENTINEL):
         entries.append(grace)
         if len(entries) == 1:
             handler(signal.SIGTERM, None)  # a second signal, mid-grace
         return envs.Reach.GROUP
 
-    monkeypatch.setattr(envs, "_kill_tree", slow_kill)
+    monkeypatch.setattr(envs, "_kill_tree", kill_and_signal_again)
     captured = {}
     monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
     monkeypatch.setattr(signal, "signal", lambda sig, h: captured.setdefault(sig, h))
@@ -1034,10 +1078,16 @@ def test_a_second_signal_does_not_buy_the_child_more_time(monkeypatch):
 
     with envs._kill_child_if_we_are_told_to_exit(_FakeProc()):
         handler = captured[signal.SIGTERM]
+        # `os.kill` is a no-op here, so the re-delivery returns and the first
+        # invocation reaches its "the host handler carried on" raise -- which is
+        # the correct end for that path, and not what the second signal did.
         with pytest.raises(envs.StageInterrupted):
             handler(signal.SIGTERM, None)
 
-    assert len(entries) == 1, "the second signal must not start another grace"
+    assert entries == [
+        _TERM_GRACE_SENTINEL,
+        0,
+    ], "the second signal must kill outright rather than start another grace"
 
 
 def test_an_interrupted_stage_is_not_reported_as_a_ctrl_c():
@@ -1089,7 +1139,9 @@ def test_the_stage_is_given_its_grace(monkeypatch):
     monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
     monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: None)
     waited = []
-    monkeypatch.setattr(envs, "_wait_without_reaping", lambda proc, grace: waited.append(grace))
+    monkeypatch.setattr(
+        envs, "_wait_without_reaping", lambda proc, pgid, grace: waited.append(grace)
+    )
 
     envs._kill_tree(_FakeProc(), grace=0.25)
     assert waited == [0.25], "the child must be given time between SIGTERM and SIGKILL"
@@ -1107,7 +1159,7 @@ def test_the_group_is_killed_even_when_the_child_went_quietly(monkeypatch):
 
     proc = _FakeProc()
 
-    def exits_during_the_grace(target, grace):
+    def exits_during_the_grace(target, pgid, grace):
         target.returncode = -15
 
     monkeypatch.setattr(envs, "_wait_without_reaping", exits_during_the_grace)
@@ -1168,10 +1220,21 @@ def test_every_variable_the_comment_argues_for_is_actually_dropped():
     The injection pair is the one the module comment argues hardest about, and
     it is the one a later reader is most likely to take back out.
     """
-    for name in ("PYTHONPATH", "PYTHONEXECUTABLE", "PIP_TARGET", "PIP_PREFIX", "PIP_ROOT"):
-        assert name in envs._HOST_OVERRIDES
-    assert {"LD_PRELOAD", "DYLD_INSERT_LIBRARIES"} <= set(envs._HOST_OVERRIDES)
-    # And the ones the comment says are deliberately absent.
+    # Set equality, not membership: the parametrised test above generates its
+    # cases *from* this tuple, so deleting an entry removed a case rather than
+    # failing one -- measured, with `PYTHONHOME` gone and the suite green.
+    # Both directions now need a deliberate edit here.
+    assert set(envs._HOST_OVERRIDES) == {
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONEXECUTABLE",
+        "PIP_TARGET",
+        "PIP_PREFIX",
+        "PIP_ROOT",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+    }
+    # And the ones the module comment argues are deliberately absent.
     for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "PIP_INDEX_URL", "PIP_CONFIG_FILE"):
         assert name not in envs._HOST_OVERRIDES
 
@@ -1223,7 +1286,7 @@ def test_a_terminated_litetune_takes_the_stage_with_it(tmp_path, request):
     runner = tmp_path / "runner.py"
     runner.write_text(
         "import os, sys\n"
-        f"sys.path.insert(0, {str(pathlib.Path(envs.__file__).parents[2])!r})\n"
+        f"sys.path.insert(0, {str(pathlib.Path(envs.__file__).parents[1])!r})\n"
         f"os.environ['LITETUNE_ENV_DIR'] = {str(tmp_path)!r}\n"
         "from litetune.envs import StageEnv\n"
         "env = StageEnv(name='terminated', requirements=('pyyaml==6.0.2',))\n"
@@ -1234,12 +1297,14 @@ def test_a_terminated_litetune_takes_the_stage_with_it(tmp_path, request):
     )
 
     litetune = subprocess.Popen([sys.executable, str(runner)])
-    request.addfinalizer(lambda: _reap(litetune.pid))
+    request.addfinalizer(lambda: _reap_proc(litetune))
 
     # Signalling before the stage holds the lock would test nothing, and a
     # fixed sleep would either flake or be slow.
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline and not held.exists():
+        if litetune.poll() is not None:
+            pytest.fail(f"the runner died before the stage started (exit {litetune.returncode})")
         time.sleep(0.05)
     assert held.exists(), "the stage never started; nothing was under test"
 
@@ -1275,9 +1340,14 @@ def test_an_interrupted_litetune_takes_the_stage_with_it(tmp_path, request):
     )
     runner = tmp_path / "runner.py"
     runner.write_text(
-        "import os, sys\n"
-        f"sys.path.insert(0, {str(pathlib.Path(envs.__file__).parents[2])!r})\n"
+        "import os, signal, sys\n"
+        f"sys.path.insert(0, {str(pathlib.Path(envs.__file__).parents[1])!r})\n"
         f"os.environ['LITETUNE_ENV_DIR'] = {str(tmp_path)!r}\n"
+        # A backgrounded pytest hands its children SIGINT=SIG_IGN, and
+        # CPython keeps an inherited SIG_IGN for SIGINT rather than
+        # installing its own. Without this the signal is dropped, the test
+        # times out, and a mutation run reads that as a killed mutant.
+        "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
         "from litetune.envs import StageEnv\n"
         "env = StageEnv(name='interrupted', requirements=('pyyaml==6.0.2',))\n"
         "env.python.parent.mkdir(parents=True, exist_ok=True)\n"
@@ -1287,15 +1357,19 @@ def test_an_interrupted_litetune_takes_the_stage_with_it(tmp_path, request):
     )
 
     litetune = subprocess.Popen([sys.executable, str(runner)])
-    request.addfinalizer(lambda: _reap(litetune.pid))
+    request.addfinalizer(lambda: _reap_proc(litetune))
 
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline and not held.exists():
+        if litetune.poll() is not None:
+            pytest.fail(f"the runner died before the stage started (exit {litetune.returncode})")
         time.sleep(0.05)
     assert held.exists(), "the stage never started; nothing was under test"
 
     os.kill(litetune.pid, signal.SIGINT)
-    assert litetune.wait(timeout=30) != 0, "an interrupted run must not report success"
+    assert (
+        litetune.wait(timeout=30) == -signal.SIGINT
+    ), "a real Ctrl-C must stay a KeyboardInterrupt and end the process on the signal"
 
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -1307,3 +1381,100 @@ def test_an_interrupted_litetune_takes_the_stage_with_it(tmp_path, request):
             return
         time.sleep(0.05)
     pytest.fail("the stage outlived the interrupted litetune process")
+
+
+def test_both_termination_signals_are_guarded(monkeypatch):
+    """Dropping SIGHUP from the loop left the whole suite green.
+
+    SIGHUP is the case the guard is chiefly for: a dropped SSH session is how a
+    six-hour `tune` ends in practice, and SIGTERM alone does not cover it.
+    """
+    taken = []
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: taken.append(sig))
+
+    with envs._kill_child_if_we_are_told_to_exit(_FakeProc()):
+        installed = set(taken)
+
+    assert {signal.SIGTERM, signal.SIGHUP} <= installed
+
+
+def test_the_drain_says_only_what_the_kill_established(monkeypatch, caplog):
+    """The four sentences are the reason `Reach` exists; swapping them was green.
+
+    `killpg` returning 0 says the signal was accepted, not that anything died,
+    so the group case must not name a departed grandchild as the cause.
+    """
+
+    class Wedged(_FakeProc):
+        args = ["python"]
+        stdout = None
+        stderr = None
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired("python", timeout, output=b"", stderr=b"")
+
+    for reach, expected in (
+        (envs.Reach.GROUP, "the group was signalled"),
+        (envs.Reach.CHILD_ONLY, "only the child was signalled"),
+        (envs.Reach.NOTHING, "nothing could be signalled at all"),
+        (envs.Reach.ALREADY_GONE, "the child had already exited"),
+    ):
+        monkeypatch.setattr(envs, "_kill_tree", lambda proc, grace=None, r=reach: r)
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            envs._kill_and_drain(Wedged())
+        assert expected in caplog.text, f"{reach} must not be described as something else"
+
+
+def test_the_wait_ends_when_the_group_does(tmp_path):
+    """Nothing exercised this directly, and both obvious wrong versions passed.
+
+    A version that never waits, and one that uses `proc.wait()` -- which reaps,
+    freeing the pid that *is* the group id the next SIGKILL targets -- were both
+    green. This one watches a real process and checks the child is left
+    reapable, which is what makes the group id safe to reuse afterwards.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.3)"], start_new_session=True
+    )
+    started = time.monotonic()
+    envs._wait_without_reaping(proc, os.getpgid(proc.pid), 10.0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5, f"the wait sat out {elapsed:.1f}s of a 10s grace after the child exited"
+    assert proc.returncode is None, "the child must be left unreaped, or its group id is freed"
+    proc.communicate()
+
+
+def test_a_dropped_variable_is_said_once_per_run(monkeypatch, caplog):
+    """Once per subprocess was hundreds of lines through a progress report.
+
+    Once per *process* was the other extreme: a notebook or a service is one
+    process spanning many runs, and the second run had no record at all.
+    """
+    monkeypatch.setenv("PYTHONPATH", "/planted")
+    envs.forget_reported_drops()
+
+    with caplog.at_level("WARNING"):
+        envs._child_env()
+        envs._child_env()
+    assert caplog.text.count("not passing PYTHONPATH") == 1, "said twice in one run"
+
+    caplog.clear()
+    envs.forget_reported_drops()
+    with caplog.at_level("WARNING"):
+        envs._child_env()
+    assert "not passing PYTHONPATH" in caplog.text, "a second run inherited the first one's silence"
+
+
+def test_a_variable_the_caller_asked_for_is_not_reported_as_dropped(monkeypatch, caplog):
+    """Overrides are applied after the strip, so naming one is the opposite of true."""
+    monkeypatch.setenv("PYTHONPATH", "/planted")
+    envs.forget_reported_drops()
+
+    with caplog.at_level("WARNING"):
+        env = envs._child_env({"PYTHONPATH": "/deliberate"})
+
+    assert env["PYTHONPATH"] == "/deliberate"
+    assert "not passing PYTHONPATH" not in caplog.text
