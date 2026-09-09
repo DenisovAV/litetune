@@ -633,6 +633,53 @@ def test_the_host_cannot_reach_past_the_pins(name, monkeypatch):
     assert name not in envs._child_env()
 
 
+def test_the_child_process_really_does_not_see_it(tmp_path, monkeypatch):
+    """The helper being right is not the claim; the subprocess is.
+
+    Every other test here calls `_child_env` directly, so all of them would
+    still pass if `run` stopped calling it. This one starts a real process
+    through `StageEnv.run` and asks it what it inherited.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv("PYTHONPATH", "/planted")
+    env = StageEnv(name="realchild", requirements=("pyyaml==6.0.2",))
+    env.python.parent.mkdir(parents=True, exist_ok=True)
+    env.python.symlink_to(sys.executable)
+
+    seen = env.run(
+        ["python", "-c", "import os; print(os.environ.get('PYTHONPATH', '<unset>'))"], timeout=60
+    )
+    assert seen.stdout.strip() == "<unset>"
+
+    # And a caller's own override still reaches it, through the same path.
+    override = env.run(
+        ["python", "-c", "import os; print(os.environ.get('CUDA_VISIBLE_DEVICES', '<none>'))"],
+        timeout=60,
+        env={"CUDA_VISIBLE_DEVICES": ""},
+    )
+    assert override.stdout.strip() == ""
+
+
+def test_a_signal_still_reads_as_a_signal_through_the_new_run(tmp_path, monkeypatch):
+    """`Popen` replaced `subprocess.run`, and the whole check model rides on this.
+
+    `exits.read_returncode` tells "killed" from "exited non-zero" by the sign of
+    the return code, and that is what keeps a SIGKILLed stage `unchecked`
+    rather than `failed`. A rewrite of `run` that returned an unsigned status
+    would collapse the two silently.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    env = StageEnv(name="signalled", requirements=("pyyaml==6.0.2",))
+    env.python.parent.mkdir(parents=True, exist_ok=True)
+    env.python.symlink_to(sys.executable)
+
+    proc = env.run(
+        ["python", "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"], timeout=60
+    )
+    assert proc.returncode == -9
+    assert not envs.read_returncode(proc.returncode).conclusive
+
+
 def test_the_rest_of_the_host_environment_survives(monkeypatch):
     """Sanitation, not isolation: a stage still needs HOME, PATH and the rest."""
     monkeypatch.setenv("LITETUNE_CANARY", "kept")
