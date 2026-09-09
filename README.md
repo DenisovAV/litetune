@@ -201,7 +201,11 @@ its own.
 
 ### Recipes
 
-litetune knows four, and has measured two:
+The recipes are
+[AI Edge Quantizer](https://github.com/google-ai-edge/ai-edge-quantizer)'s,
+applied by `litert-torch export_hf` during `convert`; litetune adds none of its
+own and measures what each one costs on your task. It knows four, and has
+measured two:
 
 | recipe | |
 |---|---|
