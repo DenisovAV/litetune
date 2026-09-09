@@ -28,11 +28,14 @@ def _fake_venv(self, path):
     A bare `mkdir` was enough while `ready` read only the marker file. It is
     not a virtualenv, and a fake that is missing the one thing `ready` now
     looks for would assert the opposite of the invariant under test.
+
+    Built through `envs._interpreter_in` rather than by spelling the filename
+    here: writing an extensionless `python` on Windows is what would hide the
+    very asymmetry that made `ready` unsatisfiable there.
     """
-    root = pathlib.Path(path)
-    bindir = root / ("Scripts" if os.name == "nt" else "bin")
-    bindir.mkdir(parents=True, exist_ok=True)
-    (bindir / "python").touch()
+    interpreter = envs._interpreter_in(pathlib.Path(path))
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    interpreter.touch()
 
 
 def test_unpinned_requirement_is_refused():
@@ -727,6 +730,38 @@ def test_a_timeout_carries_what_the_child_managed_to_say(tmp_path, monkeypatch):
     assert caught.value.timeout == 1
 
 
+class _FakeProc:
+    """A `Popen` stand-in that records what was signalled, and never dies."""
+
+    def __init__(self, pid=4242, returncode=None):
+        self.pid = pid
+        self.returncode = returncode
+        self.group_signals: list[int] = []
+        self.direct_signals: list[int] = []
+
+    def send_signal(self, sig):
+        self.direct_signals.append(sig)
+
+    def wait(self, timeout=None):
+        raise subprocess.TimeoutExpired("fake", timeout)
+
+
+def test_a_stage_is_asked_to_stop_before_it_is_killed(monkeypatch):
+    """SIGKILL alone would be a quiet downgrade of what this replaced.
+
+    Ctrl-C used to reach the child as SIGINT through the shared terminal group,
+    so torch ran its own handlers -- for `tune` that is a checkpoint written
+    rather than a file truncated mid-save. The grace keeps that; SIGKILL still
+    follows, so a wedged process cannot outlast its own timeout.
+    """
+    sent = []
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: sent.append(sig))
+
+    assert envs._kill_tree(_FakeProc(), grace=0.01) is True
+    assert sent == [signal.SIGTERM, signal.SIGKILL], "polite first, then certain"
+
+
 def test_a_group_that_cannot_be_killed_falls_back_to_the_child(monkeypatch):
     """`killpg` returns EPERM in some sandboxes and containers.
 
@@ -742,10 +777,9 @@ def test_a_group_that_cannot_be_killed_falls_back_to_the_child(monkeypatch):
     monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
     monkeypatch.setattr(envs.os, "killpg", refuse)
 
-    killed = []
-    stub = types.SimpleNamespace(pid=4242, returncode=None, kill=lambda: killed.append(True))
-    assert envs._kill_tree(stub) is True
-    assert killed == [True], "the child alone is killed when its group refuses"
+    proc = _FakeProc()
+    assert envs._kill_tree(proc, grace=0.01) is True
+    assert proc.direct_signals == [signal.SIGTERM, signal.SIGKILL]
 
 
 def test_a_process_that_already_left_counts_as_killed(monkeypatch):
@@ -754,28 +788,43 @@ def test_a_process_that_already_left_counts_as_killed(monkeypatch):
     def gone(*_args):
         raise ProcessLookupError
 
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4243 if pid else 1)
     monkeypatch.setattr(envs.os, "killpg", gone)
-    assert envs._kill_tree(types.SimpleNamespace(pid=4243, returncode=None)) is True
+    assert envs._kill_tree(_FakeProc(pid=4243), grace=0.01) is True
+
+
+def test_a_reaped_process_is_never_signalled(monkeypatch):
+    """Its pid is free for the kernel to hand to somebody else.
+
+    `killpg` on a recycled pid would take out a stranger's process group, and
+    the interrupt path can reach this state: a KeyboardInterrupt landing inside
+    `communicate`'s trailing `wait()` arrives after the child was reaped.
+    """
+    signalled = []
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: signalled.append(sig))
+
+    proc = _FakeProc(returncode=0)
+    assert envs._kill_tree(proc) is True
+    assert signalled == [] and proc.direct_signals == []
 
 
 def test_the_stage_refuses_to_kill_its_own_process_group(monkeypatch):
     """Otherwise a caller reaching past `start_new_session` takes the shell out.
 
     `os.getpgid(proc.pid)` returning our own group can only happen if someone
-    passes `process_group=` through `**kwargs`, which nothing does today -- but
-    the cost of the invariant being wrong once is the user's terminal.
+    reaches past `start_new_session=True`, which nothing can now that the
+    `**kwargs` passthrough is gone -- but the cost of the invariant being wrong
+    once is the user's terminal.
     """
     signalled = []
     monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: signalled.append(pgid))
     monkeypatch.setattr(envs.os, "getpgid", lambda pid: 999)
 
-    killed = []
-    envs._kill_tree(
-        types.SimpleNamespace(pid=4244, returncode=None, kill=lambda: killed.append(True))
-    )
+    proc = _FakeProc(pid=4244)
+    envs._kill_tree(proc, grace=0.01)
 
     assert signalled == [], "our own process group must never be signalled"
-    assert killed == [True], "and the child alone is killed instead"
+    assert proc.direct_signals == [signal.SIGTERM, signal.SIGKILL]
 
 
 def test_the_rest_of_the_host_environment_survives(monkeypatch):

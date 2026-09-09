@@ -137,6 +137,11 @@ _HOST_OVERRIDES = (
 # one level out from where the original bug was.
 _DRAIN_AFTER_KILL_S = 10
 
+# How long a stage gets between SIGTERM and SIGKILL. Long enough for torch to
+# finish a `save_pretrained` it had started, short enough that a wedged process
+# cannot meaningfully extend the timeout it already blew through.
+_TERM_GRACE_S = 5
+
 
 def _interpreter_in(root: Path) -> Path:
     """Where `venv` puts the interpreter inside `root`.
@@ -167,47 +172,84 @@ def _console_script_in(root: Path, name: str) -> Path | None:
     return next((c for c in candidates if c.exists()), None)
 
 
-def _kill_tree(proc: subprocess.Popen) -> bool:
-    """Kill the whole process group, falling back to the child alone.
+def _group_of(proc: subprocess.Popen) -> int | None:
+    """The child's process group, when signalling it is safe and meaningful.
 
-    Returns whether a signal was delivered, so a caller can say "and it could
-    not be killed" rather than leaving a leaked process to be diagnosed later
-    as somebody else's out-of-memory kill. `ProcessLookupError` counts as
-    delivered: the process finished between the timeout firing and this call,
-    which is the ordinary case and not a failure.
-
-    `PermissionError` is a subclass of `OSError` and is named only to say that
-    it is expected here -- a setuid child cannot be signalled by its parent.
+    `None` where there is no `killpg`, where the lookup is refused, or where
+    the group turns out to be our own -- `start_new_session=True` means it
+    cannot be, but a wrong answer here SIGKILLs the session running litetune,
+    so the invariant is checked rather than trusted.
     """
-    # `Popen.send_signal` makes this check for the same reason, and the reason
-    # is severe: once the child has been reaped its pid is free for the kernel
-    # to hand out again, and `killpg` on a recycled pid SIGKILLs a stranger's
-    # process group. The timeout path cannot reach that state, but the
-    # `BaseException` path can -- a KeyboardInterrupt landing inside
-    # `communicate`'s trailing `wait()` arrives after the reap.
-    if proc.returncode is not None:
-        return True
-    if os.name != "nt" and hasattr(os, "killpg"):
+    if os.name == "nt" or not hasattr(os, "killpg"):
+        return None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        return None
+    return None if pgid == os.getpgid(0) else pgid
+
+
+def _signal_tree(proc: subprocess.Popen, pgid: int | None, sig: int) -> bool:
+    """Deliver `sig` to the group if there is one, else to the child alone.
+
+    A process that has already gone counts as delivered: between a timeout
+    firing and this call is exactly where a process finishes on its own, and
+    that is the ordinary case rather than a failure.
+    """
+    if pgid is not None:
         try:
-            pgid = os.getpgid(proc.pid)
-            # `start_new_session=True` guarantees the child leads its own
-            # group, so this can only match ours if a caller reached past that
-            # with `process_group=`. Killing our own group would take the
-            # user's shell with it, so refuse rather than trust the invariant.
-            if pgid != os.getpgid(0):
-                os.killpg(pgid, signal.SIGKILL)
-                return True
+            os.killpg(pgid, sig)
+            return True
         except ProcessLookupError:
             return True
-        except (PermissionError, OSError):
+        except OSError:
+            # `PermissionError` among them: a setuid child cannot be signalled
+            # by its parent. Fall through and try the child directly.
             pass
     try:
-        proc.kill()
+        proc.send_signal(sig)
     except ProcessLookupError:
         return True
     except OSError:
         return False
     return True
+
+
+def _kill_tree(proc: subprocess.Popen, grace: float = _TERM_GRACE_S) -> bool:
+    """End the child and everything it spawned: SIGTERM, then SIGKILL.
+
+    Returns whether a signal was delivered, so a caller can say "and it could
+    not be killed" rather than leaving a leaked process to be diagnosed later
+    as somebody else's out-of-memory kill.
+
+    SIGTERM first because this replaced something gentler. Before the child had
+    a session of its own, Ctrl-C reached it as SIGINT through the terminal and
+    torch got to run its own handlers -- which for `tune` is the difference
+    between a checkpoint written and a file truncated mid-`save_pretrained`.
+    Going straight to SIGKILL would have been a quiet downgrade of that, so the
+    grace is the part that keeps the replacement honest; SIGKILL still follows,
+    because a wedged process must not be able to outlast its own timeout.
+    """
+    # `Popen.send_signal` makes this check for the same reason, and the reason
+    # is severe: once the child has been reaped its pid is free for the kernel
+    # to hand out again, and `killpg` on a recycled pid signals a stranger's
+    # process group. The timeout path cannot reach that state, but the
+    # `BaseException` path can -- a KeyboardInterrupt landing inside
+    # `communicate`'s trailing `wait()` arrives after the reap.
+    if proc.returncode is not None:
+        return True
+    # Read once, while the child is certainly unreaped: after the wait below it
+    # may be gone, and `getpgid` on its pid would then answer about whoever
+    # inherited the number.
+    pgid = _group_of(proc)
+    delivered = _signal_tree(proc, pgid, signal.SIGTERM)
+    if delivered and grace > 0:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=grace)
+    # Unconditionally, even where the child exited on the SIGTERM: what it
+    # spawned is not covered by its own exit, and this is the signal that
+    # collects them.
+    return _signal_tree(proc, pgid, signal.SIGKILL) or delivered
 
 
 @contextlib.contextmanager
