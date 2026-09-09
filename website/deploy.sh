@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # Build + deploy the litetune website to Firebase Hosting.
 #
-# Deploys to the `litetune` hosting site in the same Firebase project that
-# serves fluttergemma.dev. The target mapping lives in .firebaserc.
+# The project id is deliberately not in this repository: it is an
+# infrastructure identifier, it is not otherwise public (the site is static,
+# with no client Firebase SDK to carry it), and naming it here would point at
+# every other resource in the same project. Pass it in the environment:
+#
+#   LITETUNE_FIREBASE_PROJECT=<project-id> ./deploy.sh
+#
+# `firebase target:apply` writes the mapping into a local .firebaserc, which
+# is git-ignored; .firebaserc.example shows its shape.
 set -euo pipefail
 
 WEBSITE_DIR="$(cd "$(dirname "$0")" && pwd)"
 DOMAIN="https://litetune.dev"
-PROJECT="aichat-c0c27"
-TARGET="litetune"
+PROJECT="${LITETUNE_FIREBASE_PROJECT:?set LITETUNE_FIREBASE_PROJECT to the Firebase project id}"
+TARGET="${LITETUNE_FIREBASE_SITE:-litetune}"
 
 cd "$WEBSITE_DIR"
 
@@ -25,6 +32,8 @@ rm -rf build/jaspr .dart_tool/build
 jaspr build --sitemap-domain "$DOMAIN"
 
 echo "==> Deploying to Firebase Hosting ($TARGET)…"
+# Idempotent, and the reason a checkout with no .firebaserc can still deploy.
+firebase target:apply hosting "$TARGET" "$TARGET" --project "$PROJECT"
 firebase deploy --only "hosting:$TARGET" --project "$PROJECT"
 
 echo "==> Done."

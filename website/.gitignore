@@ -2,3 +2,5 @@
 build/
 .build.manifest
 .firebase/
+# Carries the Firebase project id. See .firebaserc.example and deploy.sh.
+.firebaserc
