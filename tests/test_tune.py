@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import fake_torch
+from conftest import fake_torch, mark_provisioned
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -178,8 +178,7 @@ def trainer(monkeypatch, tmp_path) -> FakeTrainer:
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
 
     def fake_provision(self, events=None, force: bool = False) -> Path:
-        self.path.mkdir(parents=True, exist_ok=True)
-        (self.path / ".litetune-ready").write_text(self.identity)
+        mark_provisioned(self)
         return self.path
 
     fake = FakeTrainer()
@@ -1780,8 +1779,7 @@ def test_the_probe_runs_even_without_provisioning(trainer, request_for, tmp_path
     is a run whose device is knowable. The probe provisions nothing -- gating it
     on `auto_provision` made such a run report no device at all.
     """
-    envs.TRAIN.path.mkdir(parents=True, exist_ok=True)
-    (envs.TRAIN.path / ".litetune-ready").write_text(envs.TRAIN.identity)
+    mark_provisioned(envs.TRAIN)
     trainer.probe_device = "cuda"
 
     result = run_tune(request_for(auto_provision=False))

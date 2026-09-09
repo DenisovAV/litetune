@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FakeBackend, call_text, fake_torch, labelled_rows
+from conftest import FakeBackend, call_text, fake_torch, labelled_rows, mark_provisioned
 
 from litetune import envs
 from litetune.evaluate import (
@@ -269,8 +269,7 @@ def test_hugging_face_backend_reports_the_device_it_actually_used(monkeypatch):
     def fake_provision(self, events=None, force=False):
         # The marker file, not just the directory: `_ensure_env` gates the
         # probe on `env.ready`, which is exactly this file's existence.
-        self.path.mkdir(parents=True, exist_ok=True)
-        (self.path / ".litetune-ready").write_text(self.identity)
+        mark_provisioned(self)
         return self.path
 
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
@@ -302,8 +301,7 @@ def _ready_env() -> None:
     `_ensure_env` gates the device probe on `env.ready`, which is the marker
     file and nothing else.
     """
-    envs.TRAIN.path.mkdir(parents=True, exist_ok=True)
-    (envs.TRAIN.path / ".litetune-ready").write_text(envs.TRAIN.identity)
+    mark_provisioned(envs.TRAIN)
 
 
 def _generating_env(monkeypatch, *, probe: str | None, script_device: str | None) -> list:

@@ -18,6 +18,19 @@ from litetune import envs
 from litetune.envs import EXPORT, RUNTIME, TRAIN, StageEnv, UnpinnedRequirement
 
 
+def _fake_venv(self, path):
+    """Stand in for `EnvBuilder.create` -- including the interpreter.
+
+    A bare `mkdir` was enough while `ready` read only the marker file. It is
+    not a virtualenv, and a fake that is missing the one thing `ready` now
+    looks for would assert the opposite of the invariant under test.
+    """
+    root = pathlib.Path(path)
+    bindir = root / ("Scripts" if os.name == "nt" else "bin")
+    bindir.mkdir(parents=True, exist_ok=True)
+    (bindir / "python").touch()
+
+
 def test_unpinned_requirement_is_refused():
     with pytest.raises(UnpinnedRequirement) as e:
         StageEnv(name="bad", requirements=("litert-lm",))
@@ -186,11 +199,7 @@ def test_an_unsupported_interpreter_is_refused_before_pip_runs(monkeypatch, tmp_
         python_ceiling=(3, 13),
         ceiling_pin="torch==2.5.1",
     )
-    monkeypatch.setattr(
-        venv.EnvBuilder,
-        "create",
-        lambda self, path: pathlib.Path(path).mkdir(parents=True, exist_ok=True),
-    )
+    monkeypatch.setattr(venv.EnvBuilder, "create", _fake_venv)
     monkeypatch.setattr(
         subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr="")
     )
@@ -276,18 +285,28 @@ def test_the_cache_is_inventoried_with_sizes_and_readiness(monkeypatch, tmp_path
     big = tmp_path / "export-deadbeef"
     (big / "lib").mkdir(parents=True)
     (big / "lib" / "payload").write_bytes(b"x" * 5000)
+    (big / "bin").mkdir()
+    (big / "bin" / "python").touch()
     (big / ".litetune-ready").write_text("deadbeef", encoding="utf-8")
 
     half = tmp_path / "runtime-cafe"
     half.mkdir()
     (half / "payload").write_bytes(b"x" * 10)
 
+    # The marker over nothing. This shape was found in a real cache and the
+    # listing called it `ready`, which is the one word that would stop a reader
+    # from suspecting it -- and `provision` short-circuits on the same test.
+    hollow = tmp_path / "train-hollow"
+    hollow.mkdir()
+    (hollow / ".litetune-ready").write_text("hollow", encoding="utf-8")
+
     entries = envs.cached_environments()
 
     # Largest first: the reason to look is usually to find what to delete.
-    assert [e.path.name for e in entries] == ["export-deadbeef", "runtime-cafe"]
+    assert [e.path.name for e in entries] == ["export-deadbeef", "runtime-cafe", "train-hollow"]
     assert entries[0].bytes > 5000 and entries[0].ready
     assert entries[1].bytes == 10 and not entries[1].ready
+    assert not entries[2].ready, "a marker over an empty directory is not a ready environment"
 
 
 def test_an_environment_for_another_interpreter_is_not_reported_as_junk():
@@ -594,3 +613,134 @@ def test_no_probe_at_all_is_a_distinct_state():
     assert envs.NOT_PROBED.device is None
     assert not envs.NOT_PROBED.answered
     assert "no device probe was run" in envs.NOT_PROBED.detail
+
+
+# ---------------------------------------------------------------------------
+# What the host can reach into a stage with
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", sorted(envs._HOST_OVERRIDES))
+def test_the_host_cannot_reach_past_the_pins(name, monkeypatch):
+    """A pinned environment that imports something else is the ledger's case.
+
+    `PYTHONPATH` is prepended ahead of the venv's own `site-packages`, so a
+    directory holding `numpy.py` outranks `numpy==2.0.2`. The run does not
+    crash; it records a measurement under a provenance it did not have, and the
+    cache then replays it under the pinned identity.
+    """
+    monkeypatch.setenv(name, "/somewhere/of/the/hosts/own")
+    assert name not in envs._child_env()
+
+
+def test_the_rest_of_the_host_environment_survives(monkeypatch):
+    """Sanitation, not isolation: a stage still needs HOME, PATH and the rest."""
+    monkeypatch.setenv("LITETUNE_CANARY", "kept")
+    assert envs._child_env()["LITETUNE_CANARY"] == "kept"
+
+
+def test_a_caller_override_is_applied_after_the_sanitation(monkeypatch):
+    """`export` passes `CUDA_VISIBLE_DEVICES=""` and must still win."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    assert envs._child_env({"CUDA_VISIBLE_DEVICES": ""})["CUDA_VISIBLE_DEVICES"] == ""
+
+
+def test_the_cpu_only_override_is_overrides_and_not_an_environment(monkeypatch):
+    """It returned `dict(os.environ) | ...`, which handed PYTHONPATH back.
+
+    The base is `StageEnv.run`'s to build. A caller that starts from
+    `os.environ` re-adds exactly what the sanitation just removed, and this is
+    the one caller that passes `env=` at all.
+    """
+    from litetune.export import _cpu_only_environ
+
+    monkeypatch.setenv("PYTHONPATH", "/host")
+    assert "PYTHONPATH" not in _cpu_only_environ()
+
+
+def test_the_install_does_not_inherit_a_redirected_pip(tmp_path, monkeypatch):
+    """`PIP_TARGET` installs elsewhere while `.litetune-ready` is written here.
+
+    The result is an environment that reports ready and holds nothing, which is
+    the same false pass from one step earlier in the pipeline.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv("PIP_TARGET", "/somewhere/else")
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
+
+    seen = {}
+
+    def capture(cmd, **kwargs):
+        seen.update(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(envs.subprocess, "run", capture)
+    StageEnv(name="pipenv", requirements=("pyyaml==6.0.2",)).provision()
+    assert "PIP_TARGET" not in seen
+
+
+# ---------------------------------------------------------------------------
+# What "ready" is evidence of
+# ---------------------------------------------------------------------------
+
+
+def test_a_marker_over_an_empty_directory_is_not_ready(tmp_path, monkeypatch):
+    """Found in a real cache: 12 bytes, the marker alone, no `bin/`.
+
+    `provision` short-circuits on `ready` and builds nothing, and `run` then
+    reaches an interpreter that does not exist and reports "it could not be
+    started" -- which sends the reader to look at their toolchain instead of at
+    an empty directory.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    env = StageEnv(name="hollow", requirements=("pyyaml==6.0.2",))
+    env.path.mkdir(parents=True)
+    (env.path / ".litetune-ready").write_text("whatever", encoding="utf-8")
+
+    assert not env.ready
+
+
+def test_an_interpreter_with_no_marker_is_not_ready_either(tmp_path, monkeypatch):
+    """The marker still means "the install finished"; it did not lose its job."""
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    env = StageEnv(name="half", requirements=("pyyaml==6.0.2",))
+    env.python.parent.mkdir(parents=True)
+    env.python.touch()
+
+    assert not env.ready
+
+
+# ---------------------------------------------------------------------------
+# What a timeout takes with it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX")
+def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch):
+    """`subprocess.run(timeout=)` kills the direct child and nothing below it.
+
+    `tune` waits six hours; when that fires it records an honest "not checked"
+    and the run *continues*, so an abandoned torch process keeps its memory.
+    The next stage is SIGKILLed and `exits` reads that as the OOM killer --
+    blaming the machine for litetune's own orphan.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    env = StageEnv(name="grandchild", requirements=("pyyaml==6.0.2",))
+    env.python.parent.mkdir(parents=True)
+    env.python.symlink_to(sys.executable)
+
+    pidfile = tmp_path / "grandchild.pid"
+    child = (
+        "import subprocess, sys, time;"
+        f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid));"
+        "time.sleep(60)"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        env.run(["python", "-c", child], timeout=3)
+
+    grandchild = int(pidfile.read_text())
+    # Signal 0 asks "is it there" without sending anything.
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild, 0)

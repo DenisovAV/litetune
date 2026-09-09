@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from conftest import mark_provisioned
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -265,8 +266,7 @@ def toolchain(monkeypatch, tmp_path) -> FakeToolchain:
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
 
     def fake_provision(self, events=None, force: bool = False) -> Path:
-        self.path.mkdir(parents=True, exist_ok=True)
-        (self.path / ".litetune-ready").write_text(self.identity)
+        mark_provisioned(self)
         return self.path
 
     fake = FakeToolchain()

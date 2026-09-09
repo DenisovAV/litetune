@@ -25,7 +25,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -198,7 +197,13 @@ def _sha256(path: Path) -> str:
 
 
 def _cpu_only_environ() -> dict[str, str]:
-    return dict(os.environ) | CPU_ONLY_ENV
+    """The overrides, not a whole environment.
+
+    `StageEnv.run` builds the base -- the host's minus the variables that let
+    it reach past the pins. Returning `dict(os.environ) | ...` from here, as
+    this once did, handed `PYTHONPATH` straight back.
+    """
+    return dict(CPU_ONLY_ENV)
 
 
 def _produced_files(directory: Path, since: float) -> list[Path]:

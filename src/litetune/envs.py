@@ -25,11 +25,12 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
 import venv
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,59 @@ def _is_pinned(requirement: str) -> bool:
 logger = logging.getLogger(__name__)
 
 PROVISION_TIMEOUT_S = 1800
+
+# Variables that let the host reach inside a stage environment and outrank its
+# pins. `PYTHONPATH` is prepended ahead of the venv's own `site-packages`, so a
+# directory holding `numpy.py` wins over the `numpy==2.0.2` this module went to
+# such lengths to fix: measured 2026-09-09, the same interpreter reporting
+# `2.0.2` with the variable unset and a planted module with it set. That is not
+# a crash. It is a run recorded under a provenance it did not have -- the
+# manifest still names the pin -- and the cache then replays it under the
+# pinned identity. `PIP_TARGET` and `PIP_PREFIX` are the same shape one step
+# earlier: they redirect the install out of the venv while `.litetune-ready` is
+# still written over it.
+#
+# Dropped rather than emptied. `PYTHONPATH=""` is not the same as unset on
+# every platform, and an empty entry has meant "the current directory" often
+# enough to be worth not relying on.
+_HOST_OVERRIDES = (
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PIP_TARGET",
+    "PIP_PREFIX",
+)
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the whole process group, falling back to the child alone.
+
+    `ProcessLookupError` is the ordinary case, not an error: the process
+    finished between the timeout firing and this call.
+    """
+    if os.name != "nt" and hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    with contextlib.suppress(ProcessLookupError, OSError):
+        proc.kill()
+
+
+def _child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment a stage subprocess runs in: the host's, minus the reach.
+
+    Callers that need their own variables pass them in `overrides`; they are
+    applied after the sanitation, so a caller can still set `PYTHONPATH`
+    deliberately -- `export`'s repack does not, but the shape leaves the door
+    open for one that must, rather than making every caller rebuild this.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in _HOST_OVERRIDES}
+    if overrides:
+        env.update(overrides)
+    return env
+
 
 # The stage environments are built from the *host* interpreter, so its version
 # is theirs -- and each has its own ceiling, set by whichever of its pins stops
@@ -228,7 +282,12 @@ def cached_environments() -> list[CachedEnv]:
         CachedEnv(
             path=child,
             bytes=_tree_bytes(child),
-            ready=(child / ".litetune-ready").exists(),
+            # The same two-part test `StageEnv.ready` applies, so the listing
+            # and the stage cannot disagree about the same directory. Reading
+            # only the marker made `litetune env` print `ready` for one holding
+            # nothing else, which is where this was first seen.
+            ready=(child / ".litetune-ready").exists()
+            and (child / ("Scripts" if os.name == "nt" else "bin") / "python").exists(),
             stage=claimed.get(child.name),
         )
         for child in sorted(root.iterdir())
@@ -296,7 +355,20 @@ class StageEnv:
 
     @property
     def ready(self) -> bool:
-        return (self.path / ".litetune-ready").exists()
+        """The install finished *and* the tree it finished into is still here.
+
+        The marker alone is not enough. A directory holding nothing but
+        `.litetune-ready` was found in a real cache (12 bytes, no `bin/`):
+        `provision` short-circuits on it and builds nothing, and `run` then
+        reaches a python that does not exist and reports "it could not be
+        started" -- which names the wrong cause and sends the reader looking at
+        their toolchain instead of at an empty directory.
+
+        Checking `python` rather than the marker's contents is deliberate: the
+        path already carries the identity hash, so a marker here cannot belong
+        to a different build. What is missing is the tree, not the identity.
+        """
+        return (self.path / ".litetune-ready").exists() and self.python.exists()
 
     def provision(
         self, events=None, force: bool = False, timeout: int = PROVISION_TIMEOUT_S
@@ -382,6 +454,10 @@ class StageEnv:
                         # The timeout message names a prompt as a cause; this is
                         # what stops one from being waited on at all.
                         stdin=subprocess.DEVNULL,
+                        # `PIP_TARGET`/`PIP_PREFIX` in the host environment
+                        # would install somewhere other than this venv, and
+                        # `.litetune-ready` would still be written over it.
+                        env=_child_env(),
                     )
                 except subprocess.TimeoutExpired:
                     raise RuntimeError(
@@ -432,7 +508,13 @@ class StageEnv:
             events.note(f"environment {self.name!r} ready at {self.path}")
         return self.path
 
-    def run(self, args: list[str], timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
+    def run(
+        self,
+        args: list[str],
+        timeout: int = 3600,
+        env: Mapping[str, str] | None = None,
+        **kwargs,
+    ) -> subprocess.CompletedProcess[str]:
         """Run a console script or module inside this environment.
 
         Returns the completed process rather than raising on non-zero: callers
@@ -450,19 +532,51 @@ class StageEnv:
         probe. Replacing the byte keeps the rest of the line readable, which
         is what a caller that only reads the last line needs; this is shared
         by every stage, so the fix protects all of them, not only the probe.
+
+        `env` is *overrides*, not a whole environment: the base is the host's
+        minus `_HOST_OVERRIDES`, so a caller cannot accidentally hand the pins
+        back to `PYTHONPATH` by starting from `os.environ`.
+
+        The process is started in its own session so that a timeout can kill
+        what it spawned. `subprocess.run` kills only the direct child, which
+        for `tune` means a six-hour timeout records an honest "not checked",
+        the run continues, and an abandoned torch process keeps its memory --
+        the next stage is then SIGKILLed and `exits` reads that as the OOM
+        killer, blaming the machine for litetune's own orphan.
         """
         bindir = "Scripts" if os.name == "nt" else "bin"
         exe = self.path / bindir / args[0]
         argv = [str(exe), *args[1:]] if exe.exists() else [str(self.python), "-m", *args]
-        return subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             errors="replace",
-            timeout=timeout,
             stdin=subprocess.DEVNULL,
+            env=_child_env(env),
+            # POSIX only; accepted and ignored on Windows, where `_kill_tree`
+            # falls back to killing the child alone.
+            start_new_session=True,
             **kwargs,
         )
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill first, then drain: `communicate()` with no timeout would
+            # otherwise wait on a pipe the process group is still holding open.
+            _kill_tree(proc)
+            out, err = proc.communicate()
+            raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from None
+        except BaseException:
+            # Ctrl-C reaches the group through the terminal only while the
+            # child shares it, and `start_new_session=True` is what stopped it
+            # doing so. This is that signal's replacement, and it covers every
+            # other way out of the `try` as well.
+            _kill_tree(proc)
+            proc.communicate()
+            raise
+        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 # Where a stage's subprocess will run is decided here, once, in the parent,
