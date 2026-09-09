@@ -1064,7 +1064,7 @@ def test_a_second_signal_does_not_buy_the_child_more_time(monkeypatch):
     _TERM_GRACE_SENTINEL = object()
     entries = []
 
-    def kill_and_signal_again(proc, grace=_TERM_GRACE_SENTINEL):
+    def kill_and_signal_again(proc, grace=_TERM_GRACE_SENTINEL, stop=None):
         entries.append(grace)
         if len(entries) == 1:
             handler(signal.SIGTERM, None)  # a second signal, mid-grace
@@ -1140,7 +1140,11 @@ def test_the_stage_is_given_its_grace(monkeypatch):
     monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: None)
     waited = []
     monkeypatch.setattr(
-        envs, "_wait_without_reaping", lambda proc, pgid, grace: waited.append(grace)
+        envs,
+        "_wait_without_reaping",
+        # Returns True: "the group is still ours to signal", which is what the
+        # real one says unless the child was reaped out from under it.
+        lambda proc, pgid, grace, stop=None: waited.append(grace) or True,
     )
 
     envs._kill_tree(_FakeProc(), grace=0.25)
@@ -1159,8 +1163,11 @@ def test_the_group_is_killed_even_when_the_child_went_quietly(monkeypatch):
 
     proc = _FakeProc()
 
-    def exits_during_the_grace(target, pgid, grace):
-        target.returncode = -15
+    def exits_during_the_grace(target, pgid, grace, stop=None):
+        # Exited, not reaped: `_wait_without_reaping` is named for what it does
+        # not do, so `returncode` stays None and the group id stays pinned. A
+        # stub that set it was modelling something the real one cannot do.
+        return True
 
     monkeypatch.setattr(envs, "_wait_without_reaping", exits_during_the_grace)
     envs._kill_tree(proc, grace=0.01)
@@ -1548,7 +1555,11 @@ def test_the_grace_is_given_even_where_only_the_child_could_be_signalled(monkeyp
     waited = []
     monkeypatch.setattr(envs, "_group_of", lambda proc: None)  # no group: child only
     monkeypatch.setattr(
-        envs, "_wait_without_reaping", lambda proc, pgid, grace: waited.append(grace)
+        envs,
+        "_wait_without_reaping",
+        # Returns True: "the group is still ours to signal", which is what the
+        # real one says unless the child was reaped out from under it.
+        lambda proc, pgid, grace, stop=None: waited.append(grace) or True,
     )
 
     assert envs._kill_tree(_FakeProc(), grace=0.25) is envs.Reach.CHILD_ONLY
@@ -1582,21 +1593,64 @@ def test_a_delivered_sigterm_is_not_erased_by_a_refused_sigkill(monkeypatch):
     assert sent == [signal.SIGTERM]
 
 
-def test_a_child_reaped_behind_our_back_is_never_signalled(monkeypatch):
-    """A host that ignores SIGCHLD has the kernel reap for us.
+def test_a_host_that_reaps_for_us_gets_no_group_signal(monkeypatch):
+    """A host that ignores SIGCHLD has the kernel reap children as they exit.
 
-    `Popen` never learns, so `returncode` stays `None` while the pid is already
-    free for reuse -- and `killpg` on it would signal a stranger's group. This
-    is why the guard asks `poll()` and not only the recorded code.
+    `Popen` never learns, so `returncode` stays `None` while the pid -- which
+    *is* the group id -- is already free for reuse. No observation closes that
+    window, because any answer is stale by the time the signal goes out, so the
+    group is not addressed there at all.
+
+    An earlier attempt asked `poll()` before reading the group. That reaps, and
+    reaping the leader both frees the id and makes `getpgid` answer ESRCH, so
+    it skipped the sweep in the one case the module is written for -- the child
+    exited and a grandchild still holds the pipe. It leaked.
     """
-    signalled = []
-    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: signalled.append(sig))
+    if not hasattr(signal, "SIGCHLD"):
+        pytest.skip("SIGCHLD is POSIX")
+    group_signals = []
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: group_signals.append(sig))
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_IGN)
 
-    class ReapedElsewhere(_FakeProc):
-        def poll(self):
-            self.returncode = 0  # what `Popen.poll` does on ECHILD
-            return self.returncode
+    proc = _FakeProc()
+    assert envs._kill_tree(proc, grace=0.01) is envs.Reach.CHILD_ONLY
+    assert group_signals == [], "the group id is not ours to signal where the kernel reaps"
+    assert proc.direct_signals == [signal.SIGTERM, signal.SIGKILL]
 
-    proc = ReapedElsewhere()
-    assert envs._kill_tree(proc) is envs.Reach.ALREADY_GONE
-    assert signalled == [] and proc.direct_signals == []
+
+@pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX")
+def test_a_grandchild_is_collected_after_its_parent_has_exited(tmp_path, monkeypatch):
+    """The case the whole module exists for, and it leaked.
+
+    The child exits and a descendant keeps running, holding the inherited
+    pipes. Two separate things broke this: a `poll()` guard that reaped the
+    leader and then skipped the group kill, and -- on macOS -- `getpgid`
+    answering ESRCH for a zombie leader, which made the group unreachable
+    exactly when it still had a live member.
+    """
+    child = (
+        "import subprocess, sys;"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']);"
+        "sys.exit(0)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    pgid = os.getpgid(proc.pid)
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and proc.poll() is None:
+        time.sleep(0.02)
+    # `poll` above reaped the leader, which is what the production path must
+    # never do -- so put the state back the way `run` would see it and let
+    # `_kill_tree` read the group for itself.
+    proc.returncode = None
+
+    assert envs._kill_tree(proc, grace=0.2) is envs.Reach.GROUP
+    time.sleep(0.3)
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pgid, 0)

@@ -1293,6 +1293,10 @@ class ExportResult:
 
 def run_export(request: ExportRequest, events: EventStream | None = None) -> ExportResult:
     """Sweep the requested recipes. Returns a result; failures are recorded, not raised."""
+    # This run's own record of which host variables it dropped, so a second
+    # run in one process -- a notebook, a service -- says what the first
+    # one did instead of inheriting its silence.
+    envs.forget_reported_drops()
     events = events or EventStream(echo_json=False)
     events.stage_started("export", model=request.model, recipes=list(request.recipes))
     result = ExportResult(

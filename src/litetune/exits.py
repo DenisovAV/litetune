@@ -6,9 +6,10 @@ is not "the program ran and failed with 9", it is "the program was shot".
 
 This is not a hypothetical. A Gemma 4 export returned `-9`, the result was read
 as "ran and failed", and the model was struck from the catalogue for a reason
-that had nothing to do with the model: `-9` is SIGKILL, and on Linux, with
-nothing else sending it, SIGKILL is the out-of-memory killer. The export had hit
-a 32 GiB memory ceiling. Run on a larger machine, the same command produced a
+that had nothing to do with the model: `-9` is SIGKILL, and on that machine it
+came from the out-of-memory killer. The export had hit a 32 GiB memory ceiling.
+A supervisor cancelling a job sends the same signal, which is why `OOM_HINT`
+below names both and says which to check first. Run on a larger machine, the same command produced a
 specific, actionable error instead -- which is to say the "failure" was a fact
 about the machine and the real answer was still unknown.
 
@@ -32,10 +33,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# The one signal worth naming in prose. litetune does send it -- to a stage's
-# own process group, from `envs._kill_tree` -- but never in a way that
-# returns a code to this function: those paths all raise instead. So a -9
-# read here still came from outside.
+# The one signal worth naming in prose. litetune does send it: to a stage's
+# process group and to the stage's own child from `envs._kill_tree`, and to
+# pip from `provision`'s own `subprocess.run`. None of those returns a code to
+# this function -- every one ends in a raise -- so a -9 read here still came
+# from outside. That is a whole-program invariant with nothing enforcing it,
+# which is worth knowing if `StageEnv.run` is ever restructured again.
 SIGKILL = 9
 
 OOM_HINT = (

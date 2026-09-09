@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 import venv
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -230,8 +230,31 @@ def _group_of(proc: subprocess.Popen) -> int | None:
     """
     if os.name == "nt" or not hasattr(os, "killpg"):
         return None
+    # A host that ignores SIGCHLD has the kernel reap children the moment they
+    # exit, and `Popen` never learns: `returncode` stays None while the pid --
+    # which *is* the group id -- is already free to be handed out again. No
+    # check closes that window, because any observation is stale by the time
+    # the signal goes out. So the group is not used there at all, and the
+    # direct child is what can be reached safely. Losing the sweep on such a
+    # host is the price of not signalling a stranger's group on every other.
+    sigchld = getattr(signal, "SIGCHLD", None)
+    if sigchld is not None and signal.getsignal(sigchld) == signal.SIG_IGN:
+        logger.debug("SIGCHLD is ignored, so a stage's descendants cannot be collected safely")
+        return None
     try:
         pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        # macOS answers ESRCH for a *zombie* leader where Linux still reports
+        # its group -- so the group became unreachable exactly when the child
+        # had exited and a descendant was still holding the pipe, which is the
+        # case the sweep exists for. Measured as a leak on this platform.
+        #
+        # The pid is safe to use as the group id here for two reasons that hold
+        # together: `run` starts every stage with `start_new_session=True`, so
+        # the child leads a group whose id is its own pid; and we only reach
+        # this line with `returncode is None` and SIGCHLD not ignored, so the
+        # child is unreaped and its pid cannot have been handed to anyone else.
+        pgid = proc.pid
     except OSError:
         return None
     return None if pgid == os.getpgid(0) else pgid
@@ -297,17 +320,21 @@ def _signal_tree(proc: subprocess.Popen, pgid: int | None, sig: int | None) -> R
     except (OSError, ValueError):
         # `ValueError` is Windows' answer to a signal it does not support.
         return Reach.NOTHING
-    # `Popen.send_signal` polls first and returns silently for a child that has
-    # already been reaped, and it swallows `ProcessLookupError` from `os.kill`
-    # besides -- so the arm above cannot fire on this path, and without this
-    # re-check a child that obeyed the SIGTERM would be reported as one we
-    # killed. Asking is not arriving.
-    if proc.poll() is not None:
+    # `Popen.send_signal` polls first and returns silently for a child already
+    # reaped, and it swallows `ProcessLookupError` from `os.kill` besides -- so
+    # the arm above cannot fire on this path. Read what that poll learned
+    # rather than polling again: a second poll of our own would reap on the
+    # EPERM fallback, freeing the group id the caller is still holding.
+    if proc.returncode is not None:
         return Reach.ALREADY_GONE
     return Reach.CHILD_ONLY
 
 
-def _kill_tree(proc: subprocess.Popen, grace: float = _TERM_GRACE_S) -> Reach:
+def _kill_tree(
+    proc: subprocess.Popen,
+    grace: float = _TERM_GRACE_S,
+    stop: Callable[[], bool] | None = None,
+) -> Reach:
     """End the child and everything it spawned: SIGTERM, then SIGKILL.
 
     Returns the best reach achieved, so a caller can say "and it could not be
@@ -322,18 +349,25 @@ def _kill_tree(proc: subprocess.Popen, grace: float = _TERM_GRACE_S) -> Reach:
     grace is the part that keeps the replacement honest; SIGKILL still follows,
     because a wedged process must not be able to outlast its own timeout.
     """
-    # `Popen.send_signal` makes this check for the same reason, and the reason
-    # is severe: once the child has been reaped its pid is free for the kernel
-    # to hand out again, and `killpg` on a recycled pid signals a stranger's
-    # process group. `poll()` as well as the recorded returncode, because a
-    # host that ignores SIGCHLD has the kernel reap for it -- `Popen` then never
-    # learns, and the pid is free while `returncode` is still None.
-    if proc.returncode is not None or proc.poll() is not None:
+    if proc.returncode is not None:
         return Reach.ALREADY_GONE
+    # Read before anything can poll, and `poll()` is deliberately not called
+    # here. It reaps, and reaping the leader does two bad things at once: it
+    # frees the pid that *is* the group id, and it makes `getpgid` answer
+    # ESRCH so the id cannot be recovered. A guard that polled first therefore
+    # skipped the group kill in exactly the state this module is written for --
+    # the child exited, a grandchild still holds the pipe -- and the descendant
+    # survived. Measured as a leak. The auto-reaping hazard that guard was
+    # aiming at is handled where it can be handled without reaping, in
+    # `_group_of`.
     pgid = _group_of(proc)
     reached = _signal_tree(proc, pgid, signal.SIGTERM)
     if reached in (Reach.GROUP, Reach.CHILD_ONLY) and grace > 0:
-        _wait_without_reaping(proc, pgid, grace)
+        if not _wait_without_reaping(proc, pgid, grace, stop):
+            # Reaped out from under us during the grace, so the number below is
+            # no longer ours to signal. Nothing left that can be collected
+            # safely, and saying so beats aiming at whoever holds it now.
+            return reached
     # Unconditionally, even where the child exited on the SIGTERM: what it
     # spawned is not covered by its own exit, and this is the signal that
     # collects them. Measured 2026-09-09: a group whose leader has exited but
@@ -342,7 +376,12 @@ def _kill_tree(proc: subprocess.Popen, grace: float = _TERM_GRACE_S) -> Reach:
     return max(reached, _signal_tree(proc, pgid, _SIGKILL))
 
 
-def _wait_without_reaping(proc: subprocess.Popen, pgid: int | None, grace: float) -> None:
+def _wait_without_reaping(
+    proc: subprocess.Popen,
+    pgid: int | None,
+    grace: float,
+    stop: Callable[[], bool] | None = None,
+) -> bool:
     """Wait for the child to exit, leaving it reapable.
 
     `proc.wait()` would be the obvious call and is the wrong one: it reaps, and
@@ -367,17 +406,24 @@ def _wait_without_reaping(proc: subprocess.Popen, pgid: int | None, grace: float
     deadline = time.monotonic() + grace
     waitid = getattr(os, "waitid", None)
     while True:
+        if stop is not None and stop():
+            # A second termination signal has already killed outright, so there
+            # is nothing left for this wait to give.
+            return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return
+            return True
         if waitid is not None:
             try:
                 if waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
-                    return
+                    # Exited, and still reapable: the pid stays pinned, so the
+                    # caller's group id is still its own.
+                    return True
             except ChildProcessError:
-                # The child is gone and is no longer ours to wait for -- a host
-                # that ignores SIGCHLD had the kernel reap it.
-                return
+                # Somebody else reaped it: the pid, and so the group id, is
+                # free *now*. Reported rather than swallowed, because the
+                # caller's next act is a `killpg` on that number.
+                return False
             except OSError as exc:
                 # We could not observe, which is not the same as "it exited".
                 # Sleeping out the rest of the grace is what this function
@@ -388,10 +434,19 @@ def _wait_without_reaping(proc: subprocess.Popen, pgid: int | None, grace: float
             try:
                 os.killpg(pgid, 0)
             except OSError:
-                # ESRCH: nothing left in the group. EPERM: on macOS, a group
-                # whose only member is an unreaped zombie. Either way there is
-                # nothing further to wait for.
-                return
+                # ESRCH is unambiguous: the group is empty. `EPERM` is not, and
+                # cannot be made so without reaping -- measured on macOS, a
+                # group whose only member is an unreaped zombie answers EPERM,
+                # and so does a group we are genuinely not allowed to signal.
+                #
+                # Read as "nothing live left", deliberately, and the cost is
+                # named rather than hidden: a stage that execs a setuid helper
+                # during its shutdown loses the rest of its grace. Against that,
+                # the other reading costs the full grace on every kill on the
+                # platform this is developed on, because `os.waitid` is missing
+                # from CPython there before 3.13. A rare stage shape pays a
+                # little; every ordinary one would pay five seconds.
+                return True
         time.sleep(min(0.05, remaining))
 
 
@@ -422,9 +477,14 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen):
     """
     installed: dict[int, Any] = {}
     handling = False
+    # Set by a second termination signal and read by the first invocation's
+    # grace. Needed because SIGKILL does not empty a group -- the leader stays
+    # an unreaped zombie -- so "the wait notices on its own" holds only where
+    # there is a group to watch, and not on the child-only fallback.
+    escalated = False
 
     def take_the_child_with_us(signum, _frame):
-        nonlocal handling
+        nonlocal handling, escalated
         # Our handler stays installed while it runs, so a second signal
         # re-enters here. Measured: three SIGTERMs a second apart against a
         # child that ignores them took 8.0s to give up instead of 5.0s, because
@@ -439,10 +499,19 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen):
         # leaves the first invocation to finish, and it finishes at once,
         # because emptying the group is exactly what its wait is watching for.
         if handling:
+            escalated = True
             _kill_tree(proc, grace=0)
             return
         handling = True
-        _kill_tree(proc)
+        try:
+            _kill_tree(proc, stop=lambda: escalated)
+        finally:
+            # Reset before the re-delivery below, and before `run`'s cleanup
+            # runs under this same guard. Leaving it set swallowed every signal
+            # after the first for the whole grace-plus-drain window -- up to
+            # fifteen seconds in which litetune could not be terminated at all,
+            # which is a worse trade than the one it was made for.
+            handling = False
         # `None` means the handler in place was installed from C and cannot be
         # restored from Python -- `signal.signal(sig, None)` is a `TypeError`.
         # Falling back to the default is what "die the way we would have" means

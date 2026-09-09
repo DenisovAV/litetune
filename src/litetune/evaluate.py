@@ -774,10 +774,11 @@ class HuggingFaceBackend:
     # from a previous call, forced onto a run whose own probe could not vouch
     # for it, made `model.to("cuda")` fail on a box where CUDA had since gone
     # away. `generate()` reads this, not `self.device`, when it builds the
-    # spec. `None` only before `_ensure_env` has run: after it, a probe that
-    # could not answer and an environment there was nothing to probe both leave
-    # a `DeviceProbe` carrying which of the two it was -- see `verify.py`, which
-    # also reads
+    # spec. `None` before `_ensure_env` has run, and after a call in which
+    # provisioning itself raised -- that path returns its own blocking reason
+    # and never gets as far as a probe. Where the environment merely could not
+    # answer, or where there was nothing to ask, a `DeviceProbe` is left
+    # carrying which of the two it was -- see `verify.py`, which also reads
     # `detail` and `cuda_build_without_a_device` off it to record the same
     # limitation `tune.py` records for its own probe.
     last_probe: envs.DeviceProbe | None = None
