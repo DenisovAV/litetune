@@ -1436,13 +1436,17 @@ def test_the_wait_ends_when_the_group_does(tmp_path):
     reapable, which is what makes the group id safe to reuse afterwards.
     """
     proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(0.3)"], start_new_session=True
+        [sys.executable, "-c", "import time; time.sleep(0.5)"], start_new_session=True
     )
     started = time.monotonic()
     envs._wait_without_reaping(proc, os.getpgid(proc.pid), 10.0)
     elapsed = time.monotonic() - started
 
-    assert elapsed < 5, f"the wait sat out {elapsed:.1f}s of a 10s grace after the child exited"
+    # Both bounds, because each alone is satisfied by a wrong version: a body
+    # replaced by `return` is fast and reaps nothing, and one that sleeps the
+    # whole grace waits long enough.
+    assert elapsed >= 0.4, f"returned after {elapsed:.2f}s without waiting for the child"
+    assert elapsed < 5, f"sat out {elapsed:.1f}s of a 10s grace after the child had exited"
     assert proc.returncode is None, "the child must be left unreaped, or its group id is freed"
     proc.communicate()
 
@@ -1478,3 +1482,121 @@ def test_a_variable_the_caller_asked_for_is_not_reported_as_dropped(monkeypatch,
 
     assert env["PYTHONPATH"] == "/deliberate"
     assert "not passing PYTHONPATH" not in caplog.text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGTERM dispositions are POSIX")
+def test_the_grace_lets_a_stage_finish_what_it_started(tmp_path, monkeypatch):
+    """The grace is only worth having if it has an effect, and nothing saw one.
+
+    Every other test passes a grace explicitly or stubs the wait, so setting
+    `_TERM_GRACE_S` to zero -- switching the grace off for the whole package --
+    left the suite green. This one runs a stage that catches SIGTERM and writes
+    a file on its way out, which is `save_pretrained` in miniature: with no
+    grace, SIGKILL follows immediately and the file never appears.
+    """
+    env = _symlinked_env(tmp_path, monkeypatch, "graceful")
+    marker = tmp_path / "shut-down-cleanly"
+    ready = tmp_path / "handler-installed"
+    # A real source file, not a one-liner: the shutdown needs a `def`, and it
+    # needs to take long enough that the scheduler cannot slip it in between an
+    # immediate SIGTERM and SIGKILL. Without that this passes with the grace
+    # switched off whenever the child happens to win the race, which is luck
+    # rather than the property under test. A real `save_pretrained` is slower
+    # than this by orders of magnitude.
+    stage = "\n".join(
+        (
+            "import signal, sys, time",
+            "def bye(*_a):",
+            "    time.sleep(0.75)",
+            f"    open({str(marker)!r}, 'w').write('1')",
+            "    sys.exit(0)",
+            "signal.signal(signal.SIGTERM, bye)",
+            # Announced after the handler is in place: signalling before that
+            # is answered by the default disposition, and the test would fail
+            # for a reason that has nothing to do with the grace.
+            f"open({str(ready)!r}, 'w').write('1')",
+            "time.sleep(60)",
+        )
+    )
+
+    proc = subprocess.Popen(
+        [str(env.python), "-c", stage],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not ready.exists():
+        if proc.poll() is not None:
+            pytest.fail(f"the stage died before it was ready (exit {proc.returncode})")
+        time.sleep(0.02)
+    assert ready.exists(), "the stage never installed its handler; nothing was under test"
+
+    envs._kill_tree(proc)
+    proc.communicate()
+
+    assert marker.exists(), "the stage was killed before it could finish shutting down"
+
+
+def test_the_grace_is_given_even_where_only_the_child_could_be_signalled(monkeypatch):
+    """Narrowing the guard to the group path drops it on the fallback silently.
+
+    That fallback is the sandbox and setuid case -- exactly where an orphaned
+    trainer comes back -- so it is the last place the grace should quietly go.
+    """
+    waited = []
+    monkeypatch.setattr(envs, "_group_of", lambda proc: None)  # no group: child only
+    monkeypatch.setattr(
+        envs, "_wait_without_reaping", lambda proc, pgid, grace: waited.append(grace)
+    )
+
+    assert envs._kill_tree(_FakeProc(), grace=0.25) is envs.Reach.CHILD_ONLY
+    assert waited == [0.25]
+
+
+def test_a_delivered_sigterm_is_not_erased_by_a_refused_sigkill(monkeypatch):
+    """`Reach` must carry the best reach, not the last attempt.
+
+    A stage that execs a setuid helper mid-flight takes the SIGTERM and refuses
+    the SIGKILL. Reporting that as "nothing could be signalled at all" sends the
+    reader looking for a permissions problem that did not affect the first
+    signal.
+    """
+    sent = []
+
+    def group(pgid, sig):
+        if sig == signal.SIGTERM:
+            sent.append(sig)
+            return
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    monkeypatch.setattr(envs.os, "killpg", group)
+
+    class Untouchable(_FakeProc):
+        def send_signal(self, sig):
+            raise PermissionError("operation not permitted")
+
+    assert envs._kill_tree(Untouchable(), grace=0.01) is envs.Reach.GROUP
+    assert sent == [signal.SIGTERM]
+
+
+def test_a_child_reaped_behind_our_back_is_never_signalled(monkeypatch):
+    """A host that ignores SIGCHLD has the kernel reap for us.
+
+    `Popen` never learns, so `returncode` stays `None` while the pid is already
+    free for reuse -- and `killpg` on it would signal a stranger's group. This
+    is why the guard asks `poll()` and not only the recorded code.
+    """
+    signalled = []
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: signalled.append(sig))
+
+    class ReapedElsewhere(_FakeProc):
+        def poll(self):
+            self.returncode = 0  # what `Popen.poll` does on ECHILD
+            return self.returncode
+
+    proc = ReapedElsewhere()
+    assert envs._kill_tree(proc) is envs.Reach.ALREADY_GONE
+    assert signalled == [] and proc.direct_signals == []
