@@ -546,6 +546,14 @@ than the two above — that is the gap this alpha most needs closed.
 
 Run the checks with `pytest`, `ruff check`, `ruff format --check` and `mypy src`.
 
+`scripts/ci-local.sh` runs what CI runs, on the platform CI runs it on: the
+three interpreters in Linux containers, then the wheel job. It needs podman or
+`ENGINE=docker`, and writes nothing to your working tree. Worth the minute
+before sending anything that touches processes, signals or paths — a green
+suite on macOS and a red CI run happened on the same commit twice, because
+`os.waitid` is absent from CPython there before 3.13 and the same test took a
+different branch on each.
+
 ## License
 
 Apache 2.0.
