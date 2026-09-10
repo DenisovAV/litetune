@@ -8,8 +8,13 @@ built with [Jaspr](https://jaspr.site) in static mode and modelled on the
 dart pub get
 jaspr serve          # http://localhost:8080, hot reload
 jaspr build          # static output in build/jaspr
-./deploy.sh          # build + deploy to Firebase Hosting
+./check-build.sh     # refuse a render that has a head and no page body
+./deploy.sh          # build + check + deploy to Firebase Hosting
 ```
+
+`check-build.sh` is the one copy of that check: `deploy.sh` runs it before it
+uploads anything, and the CI workflow runs it twice — once on the build it
+produced, once on the artifact it is about to publish.
 
 ## Layout
 
