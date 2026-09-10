@@ -31,6 +31,16 @@ else in the codebase hardcodes a hex value.
 
 ## Before the first deploy
 
-`deploy.sh` and `firebase.json` carry a placeholder Firebase project and
-hosting target. Fill both in, or replace them with whatever host ends up
-serving `litetune.dev`.
+The Firebase project id is not in this repository — it is an infrastructure
+identifier, and the static site does not otherwise carry it. `deploy.sh` reads
+it from the environment and fails immediately if it is unset:
+
+```bash
+LITETUNE_FIREBASE_PROJECT=<project-id> ./deploy.sh
+```
+
+The hosting site defaults to `litetune`; `LITETUNE_FIREBASE_SITE` overrides it,
+and `firebase.json` names the same target. `deploy.sh` applies the target
+mapping on each run, so a fresh checkout needs no `.firebaserc`; the one it
+writes is git-ignored, and `.firebaserc.example` shows the shape if you would
+rather commit a mapping of your own.

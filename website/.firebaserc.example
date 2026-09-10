@@ -1,9 +1,9 @@
 {
   "projects": {
-    "default": "aichat-c0c27"
+    "default": "your-firebase-project-id"
   },
   "targets": {
-    "aichat-c0c27": {
+    "your-firebase-project-id": {
       "hosting": {
         "litetune": [
           "litetune"
