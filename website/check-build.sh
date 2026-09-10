@@ -32,19 +32,34 @@ fail() { echo "check-build: $*" >&2; exit 1; }
 # document consisting only of `<head>pip install litetune</head>` passes a
 # plain grep for the marker while having no body at all.
 #
-# What this proves is that the body is not empty, not that the page is whole:
+# This is a text range and not a parse, and the difference is worth naming
+# rather than glossing: a `<body` occurring inside a script string or an
+# attribute in the head would open the range early, and the marker after it
+# would then pass. Neither can come out of jaspr, which emits one lowercase
+# `<body` on the boundary line -- the character class is only so that a
+# hand-written uppercase `<BODY>` is not rejected for nothing.
+#
+# What it proves is that the body is not empty, not that the page is whole:
 # a render that produced the hero and stopped passes. That is the failure mode
 # on record -- the route table not yet registered, so nothing renders -- and a
 # check that tried to assert every section would go stale on the next edit.
-sed -n '/<body/,$p' "$BUILD_DIR/index.html" | grep -q "pip install litetune" \
+sed -n '/<[Bb][Oo][Dd][Yy]/,$p' "$BUILD_DIR/index.html" \
+  | grep -q "pip install litetune" \
   || fail "index.html rendered a head with no page body"
 
 # The other files a deploy publishes. index.html references the first two from
 # its head, and an index pointing at an asset the build did not write goes out
-# as a page with no icon or no client bundle. sitemap.xml comes from
-# --sitemap-domain and is the file nothing on the page would reveal missing.
-for artefact in main.client.dart.js favicon.svg sitemap.xml; do
+# as a page with no icon or no client bundle.
+for artefact in main.client.dart.js favicon.svg; do
   [ -s "$BUILD_DIR/$artefact" ] || fail "$artefact is missing or empty"
 done
+
+# The sitemap is the one output nothing on the page would reveal missing, and
+# it is conditional: `build_command.dart:366` writes it only when
+# --sitemap-domain was passed. Both callers pass it, so its absence means the
+# build was made some other way and is not the one that should be deployed --
+# but say that, because the cause is a missing flag and not a broken render.
+[ -s "$BUILD_DIR/sitemap.xml" ] \
+  || fail "sitemap.xml is missing or empty -- was this built without --sitemap-domain?"
 
 echo "check-build: $BUILD_DIR looks like a full render"

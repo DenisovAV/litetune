@@ -41,13 +41,22 @@ cd "$WEBSITE_DIR"
 #
 # Refusing to continue matters as much as not killing. Observed with lsof:
 # with a foreign listener on 127.0.0.1:8080, jaspr's renderer still binds
-# *:8080 (it passes `shared: true`), the build connects to 127.0.0.1:8080,
-# reaches the more specific listener, prints `Generating route "/"` and never
-# returns. A 5567 collision at least fails loudly with "Address already in
+# *:8080 (it passes `shared: true`), the build then fetches
+# `http://localhost:$serverPort` (`build_command.dart:301`) -- which resolved
+# to the more specific listener, not to jaspr's -- prints
+# `Generating route "/"` and never returns. A 5567 collision at least fails loudly with "Address already in
 # use"; 8080 is the silent one, and it cost 14 minutes before anyone looked.
 blocked=0
 for p in 8080 5567; do
-  for pid in $(lsof -ti ":$p" 2>/dev/null); do
+  # Listeners only. `lsof -ti :8080` also answers for anything with an open
+  # connection *to* someone's port 8080 -- a browser tab, an IDE, a lingering
+  # CLOSE_WAIT -- and none of those can stop jaspr binding the port. Measured:
+  # with a listener and one client both present, `lsof -ti :8080` returned
+  # both pids and `-sTCP:LISTEN` returned only the listener. Without this the
+  # loop refused builds nothing was blocking, and before that killed clients
+  # that were merely talking to something else. `-nP` also skips the reverse
+  # DNS and port-name lookups, which stall on a remote peer.
+  for pid in $(lsof -nP -tiTCP:"$p" -sTCP:LISTEN 2>/dev/null); do
     cmd="$(ps -o args= -p "$pid" 2>/dev/null || true)"
     case "$cmd" in
       "") ;;

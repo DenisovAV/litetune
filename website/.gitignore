@@ -6,3 +6,13 @@ build/
 # project is passed on the command line -- but the CLI writes one anyway, and
 # what it writes carries the project id.
 .firebaserc
+
+# Same reason. `deploy.sh` runs the CLI here rather than in a temp directory,
+# and firebase-tools writes this log unconditionally into the working
+# directory; it keeps it when the exit code is 2 or more, or whenever DEBUG is
+# set. Its second line is the whole command, `--project <id>` included. Useful
+# locally, which is why it is ignored rather than redirected -- but it is one
+# `git add -A` from the repository, and the id is the one thing that must not
+# land there.
+firebase-debug.log
+firebase-debug.*.log

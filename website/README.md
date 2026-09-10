@@ -7,7 +7,7 @@ built with [Jaspr](https://jaspr.site) in static mode and modelled on the
 ```bash
 dart pub get
 jaspr serve          # http://localhost:8080, hot reload
-jaspr build          # static output in build/jaspr
+jaspr build --sitemap-domain "https://litetune.dev"   # static output in build/jaspr
 ./check-build.sh     # refuse a render that has a head and no page body
 ./deploy.sh          # build + check + deploy to Firebase Hosting
 ```
@@ -15,6 +15,11 @@ jaspr build          # static output in build/jaspr
 `check-build.sh` is the one copy of that check: `deploy.sh` runs it before it
 uploads anything, and the CI workflow runs it twice — once on the build it
 produced, once on the artifact it is about to publish.
+
+The `--sitemap-domain` above is not decoration. `jaspr build` writes
+`sitemap.xml` only when it is given, `deploy.sh` and CI both pass it, and
+`check-build.sh` requires the file — so a bare `jaspr build` produces a tree
+the check will reject.
 
 ## Layout
 

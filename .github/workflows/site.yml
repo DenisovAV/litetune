@@ -175,12 +175,19 @@ jobs:
       # exactly what is described above.
       # Installed in a step of its own, with no secret anywhere in its
       # environment, because installing is when the most code runs: 673
-      # packages, whose lifecycle scripts execute as themselves. Only the top
-      # -level version is pinned -- the published tarball carries no lockfile
-      # and its 70 dependencies are caret ranges -- so what arrives here is
-      # not fixed, and the answer is to give it nothing rather than to trust
-      # it. The deploy step below then runs the installed binary directly and
-      # invokes no package manager at all.
+      # packages, whose lifecycle scripts execute as themselves. Only the
+      # top-level version is pinned -- the published tarball carries no
+      # lockfile and 66 of its 70 dependencies are caret ranges -- so what
+      # arrives here is not fixed, and the answer is to give it nothing
+      # rather than to trust it. The deploy step below then runs the
+      # installed binary directly and invokes no package manager at all.
+      # Node itself is whatever the runner image ships, unlike every other
+      # tool in this file. The rule the others are pinned under is about the
+      # build differing from the one that was reviewed, and Node is not in
+      # that path: the bytes were built and checked in the job above, and
+      # this only uploads them. firebase-tools 15.30.0 asks for
+      # `>=20.0.0 || >=22.0.0 || >=24.0.0`, which every current runner image
+      # satisfies.
       - name: Install the Firebase CLI
         run: npm install --no-save --prefix "$RUNNER_TEMP/firebase-cli" firebase-tools@15.30.0
 
@@ -195,8 +202,15 @@ jobs:
         run: |
           # One private directory for both files firebase-tools needs from us,
           # emptied on the way out however the step ends.
+          #
+          # `dotglob` because the plain glob does not match a leading dot:
+          # reproduced, a `.hidden` file survives `rm -f "$work"/*`, `rmdir`
+          # then fails, and `|| true` swallows it, so the directory and its
+          # contents outlive the step. Nothing writes one there today -- the
+          # key is named by this script and the log by FIREBASE_DEBUG_PATH --
+          # which is a reason the mechanism should not depend on it.
           work="$(mktemp -d)"
-          trap 'rm -f "$work"/*; rmdir "$work" 2>/dev/null || true' EXIT
+          trap 'shopt -s dotglob; rm -f "$work"/*; rmdir "$work" 2>/dev/null || true' EXIT
           key="$work/key.json"
           # The enclosing directory is already 0700; this is so the key is
           # not the one file that would still be readable if it were ever
@@ -221,7 +235,11 @@ jobs:
               key = json.load(open(sys.argv[1]))
           except Exception as exc:
               sys.exit(f"::error::FIREBASE_SERVICE_ACCOUNT is not JSON ({type(exc).__name__})")
-          if key.get("type") != "service_account":
+          # `isinstance` before `.get`: valid JSON that is not an object --
+          # `[]`, `"x"`, `null`, a number -- reached `.get` and raised an
+          # AttributeError with a traceback instead of the message below.
+          # It failed closed either way; it just failed unreadably.
+          if not isinstance(key, dict) or key.get("type") != "service_account":
               sys.exit("::error::FIREBASE_SERVICE_ACCOUNT is JSON but not a service-account key")
           PY
           # The other secret, which nothing else here would notice: unset or
@@ -230,21 +248,24 @@ jobs:
           [ -n "$FIREBASE_PROJECT" ] \
             || { echo "::error::FIREBASE_PROJECT_ID is empty or unset"; exit 1; }
           # FIREBASE_DEBUG_PATH, because the debug log is not optional.
-          # `lib/bin/cli.js:53` calls `useFileLogger()` before it looks at any
-          # flag, and that transport is at level "debug" -- the same level as
-          # the request URLs and response bodies this step avoids putting on
-          # the console. It writes to `process.cwd()`, which here is
-          # `website/`, and its first line is the full command, `--project`
-          # and its value included. Masking applies to the log GitHub renders,
-          # not to a file in the workspace.
+          # `lib/bin/cli.js:53` calls `useFileLogger()` unconditionally --
+          # `--debug` decides the console transport (`:49-51`), never this
+          # one -- and it is at level "debug", the same level as the request
+          # URLs and response bodies this step avoids putting on the console.
+          # It writes to `process.cwd()`, which here is `website/`, and its
+          # second line is the whole command, `--project` and its value
+          # included. Masking applies to the log GitHub renders, not to a
+          # file in the workspace.
           #
           # firebase-tools deletes it on exit when the exit code is below 2
           # (`cli.js:73-75`) -- observed: a credential failure exits 1 and the
-          # file goes. What is left is the rest: `errorOut.js:19` uses 2 for
-          # anything that is not a FirebaseError, and a cancelled job never
-          # runs the exit handler at all. Pointing it into $work means the
-          # trap covers every one of those, and that nothing lands in the
-          # checkout for a later step to pick up.
+          # file goes. What is left is the rest. `errorOut.js:12-15` wraps
+          # anything that is not a FirebaseError with `exit: 2`, and `:18` is
+          # `process.exitCode = fbError.exit || 2`, so a FirebaseError that
+          # names no exit code lands on 2 as well; either way the file stays.
+          # A cancelled job runs no exit handler at all. Pointing it into
+          # $work means the trap covers every one of those, and that nothing
+          # lands in the checkout for a later step to pick up.
           GOOGLE_APPLICATION_CREDENTIALS="$key" \
           FIREBASE_DEBUG_PATH="$work/firebase-debug.log" \
             "$RUNNER_TEMP/firebase-cli/node_modules/.bin/firebase" deploy \
