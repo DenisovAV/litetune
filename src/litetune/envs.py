@@ -243,19 +243,16 @@ def _group_of(proc: subprocess.Popen) -> int | None:
         return None
     try:
         pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        # macOS answers ESRCH for a *zombie* leader where Linux still reports
-        # its group -- so the group became unreachable exactly when the child
-        # had exited and a descendant was still holding the pipe, which is the
-        # case the sweep exists for. Measured as a leak on this platform.
-        #
-        # The pid is safe to use as the group id here for two reasons that hold
-        # together: `run` starts every stage with `start_new_session=True`, so
-        # the child leads a group whose id is its own pid; and we only reach
-        # this line with `returncode is None` and SIGCHLD not ignored, so the
-        # child is unreaped and its pid cannot have been handed to anyone else.
-        pgid = proc.pid
     except OSError:
+        # Not recovered from `proc.pid`. That fallback was added because macOS
+        # answers ESRCH for a zombie leader where Linux still reports its
+        # group, and it was justified by "we only get here with the child
+        # unreaped". `SA_NOCLDWAIT`, set through `sigaction`, breaks that: the
+        # kernel reaps, `getsignal` cannot see the flag, `returncode` stays
+        # None, and the pid is free -- so the fallback could aim a SIGKILL at
+        # whoever holds that number now. The zombie case is solved instead by
+        # reading the group at spawn, where the child is certainly alive; see
+        # `StageEnv.run`.
         return None
     return None if pgid == os.getpgid(0) else pgid
 
@@ -334,6 +331,7 @@ def _kill_tree(
     proc: subprocess.Popen,
     grace: float = _TERM_GRACE_S,
     stop: Callable[[], bool] | None = None,
+    pgid: int | None = None,
 ) -> Reach:
     """End the child and everything it spawned: SIGTERM, then SIGKILL.
 
@@ -360,7 +358,9 @@ def _kill_tree(
     # survived. Measured as a leak. The auto-reaping hazard that guard was
     # aiming at is handled where it can be handled without reaping, in
     # `_group_of`.
-    pgid = _group_of(proc)
+    # A group read at spawn beats one looked up now: by the time a kill runs,
+    # the leader may be a zombie whose group macOS will not report.
+    pgid = pgid if pgid is not None else _group_of(proc)
     reached = _signal_tree(proc, pgid, signal.SIGTERM)
     if reached in (Reach.GROUP, Reach.CHILD_ONLY) and grace > 0:
         if not _wait_without_reaping(proc, pgid, grace, stop):
@@ -433,25 +433,33 @@ def _wait_without_reaping(
         elif pgid is not None:
             try:
                 os.killpg(pgid, 0)
-            except OSError:
-                # ESRCH is unambiguous: the group is empty. `EPERM` is not, and
-                # cannot be made so without reaping -- measured on macOS, a
-                # group whose only member is an unreaped zombie answers EPERM,
-                # and so does a group we are genuinely not allowed to signal.
-                #
-                # Read as "nothing live left", deliberately, and the cost is
-                # named rather than hidden: a stage that execs a setuid helper
-                # during its shutdown loses the rest of its grace. Against that,
-                # the other reading costs the full grace on every kill on the
-                # platform this is developed on, because `os.waitid` is missing
-                # from CPython there before 3.13. A rare stage shape pays a
-                # little; every ordinary one would pay five seconds.
+            except ProcessLookupError:
+                # Unambiguous: the group is empty.
                 return True
+            except PermissionError:
+                # Ambiguous, and only on one platform. macOS answers EPERM for
+                # a group whose sole member is an unreaped zombie -- measured
+                # -- so reading it as "nothing live left" is what keeps the
+                # grace from being slept out in full there, which matters
+                # because `os.waitid` is missing from CPython on macOS before
+                # 3.13. On Linux EPERM has only the ordinary meaning: a live
+                # group we may not signal, which is a stage that execed a
+                # setuid helper -- and returning there would take away the
+                # grace from exactly the shutdown it exists to protect.
+                if sys.platform == "darwin":
+                    return True
+                logger.debug("cannot probe process group %d, so waiting out the grace", pgid)
+                # Stop probing, not stop waiting: the grace is what the setuid
+                # descendant needs, and it is the one thing we can still give.
+                pgid = None
+            except OSError as exc:
+                logger.debug("cannot probe process group %d: %s", pgid, exc)
+                pgid = None
         time.sleep(min(0.05, remaining))
 
 
 @contextlib.contextmanager
-def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen):
+def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen, pgid: int | None = None):
     """Take the child down with us on SIGTERM or SIGHUP.
 
     `start_new_session=True` is what lets a timeout kill everything the stage
@@ -500,11 +508,11 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen):
         # because emptying the group is exactly what its wait is watching for.
         if handling:
             escalated = True
-            _kill_tree(proc, grace=0)
+            _kill_tree(proc, grace=0, pgid=pgid)
             return
         handling = True
         try:
-            _kill_tree(proc, stop=lambda: escalated)
+            _kill_tree(proc, stop=lambda: escalated, pgid=pgid)
         finally:
             # Reset before the re-delivery below, and before `run`'s cleanup
             # runs under this same guard. Leaving it set swallowed every signal
@@ -562,7 +570,7 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen):
                 signal.signal(sig, signal.SIG_DFL if previous is None else previous)
 
 
-def _kill_and_drain(proc: subprocess.Popen) -> tuple[str, str]:
+def _kill_and_drain(proc: subprocess.Popen, pgid: int | None = None) -> tuple[str, str]:
     """Kill the group, then collect what it wrote -- without waiting forever.
 
     The drain is bounded because the kill is not guaranteed to have reached
@@ -571,7 +579,7 @@ def _kill_and_drain(proc: subprocess.Popen) -> tuple[str, str]:
     trade here, since the caller is already on its way to reporting a timeout
     or re-raising; hanging instead would reinstate the unbounded wait.
     """
-    reached = _kill_tree(proc)
+    reached = _kill_tree(proc, pgid=pgid)
     try:
         return proc.communicate(timeout=_DRAIN_AFTER_KILL_S)
     except subprocess.TimeoutExpired as expired:
@@ -1107,20 +1115,28 @@ class StageEnv:
         # Reproduced: a third signal arriving in that window killed litetune
         # mid-kill and the stage outlived its parent, which is precisely what
         # the guard exists to prevent.
-        with _kill_child_if_we_are_told_to_exit(proc):
+        # Read here, once, while the child is certainly alive. By the time a
+        # kill runs the leader may be a zombie, and macOS will not report the
+        # group of one -- which made the group unreachable in exactly the case
+        # the sweep exists for. Recovering it from `proc.pid` later was the
+        # other way, and it is unsafe: a host using `SA_NOCLDWAIT` has the
+        # kernel reap without `Popen` or `getsignal` ever knowing, and the
+        # number is then free for somebody else.
+        pgid = _group_of(proc)
+        with _kill_child_if_we_are_told_to_exit(proc, pgid):
             try:
                 out, err = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 # Kill first, then drain: `communicate()` with no timeout would
                 # otherwise wait on a pipe the group is still holding open.
-                out, err = _kill_and_drain(proc)
+                out, err = _kill_and_drain(proc, pgid)
                 raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from None
             except BaseException:
                 # Ctrl-C reaches the group through the terminal only while the
                 # child shares it, and `start_new_session=True` is what stopped
                 # it doing so. This is that signal's replacement, and it covers
                 # every other way out of the `try` as well.
-                _kill_and_drain(proc)
+                _kill_and_drain(proc, pgid)
                 raise
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
@@ -1169,6 +1185,13 @@ class DeviceProbe:
 
     device: str | None
     detail: str
+    # Whether a probe was run at all. Three states share `device is None` and
+    # they are different facts: nobody asked, it was asked and could not
+    # answer, and there was nothing to ask. Only the middle one implies a
+    # generation script will start and write a run report, and a consumer that
+    # has to tell them apart should read this rather than the wording of
+    # `detail` -- a sentence built somewhere else is not a protocol.
+    attempted: bool = True
     # `torch.version.cuda`: the CUDA version this wheel was built against, or
     # `None` for a CPU-only wheel. Reported so that "cpu" from a CUDA build --
     # torch is there and cannot reach a device -- is distinguishable from "cpu"

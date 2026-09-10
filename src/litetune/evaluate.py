@@ -973,7 +973,7 @@ class HuggingFaceBackend:
             logger.warning("%s", detail)
             if events is not None:
                 events.note(detail, environment=self.env.name)
-            self.last_probe = envs.DeviceProbe(device=None, detail=detail)
+            self.last_probe = envs.DeviceProbe(device=None, detail=detail, attempted=False)
             return None
         probe = envs.resolve_device(self.env, events=events)
         self.last_probe = probe

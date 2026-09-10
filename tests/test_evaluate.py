@@ -1002,3 +1002,17 @@ def test_an_unprovisioned_environment_is_a_third_state(monkeypatch, tmp_path):
         "could not answer" not in backend.last_probe.detail
     ), "no probe was attempted, so it cannot be reported as one that failed to answer"
     assert backend.last_probe.device is None
+
+
+def test_the_unprovisioned_state_is_a_field_not_a_phrase(monkeypatch, tmp_path):
+    """`verify` used to tell the two apart by looking for "not provisioned" in
+    the sentence, which is a protocol made of prose: the first rewording takes
+    the branch out silently, and a caller that supplies its own runnable `run`
+    over an unready environment makes the sentence wrong anyway."""
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+
+    backend._ensure_env(events=None)
+
+    assert backend.last_probe is not None
+    assert backend.last_probe.attempted is False, "no probe was run, and that is a fact not a word"

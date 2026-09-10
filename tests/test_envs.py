@@ -1064,7 +1064,7 @@ def test_a_second_signal_does_not_buy_the_child_more_time(monkeypatch):
     _TERM_GRACE_SENTINEL = object()
     entries = []
 
-    def kill_and_signal_again(proc, grace=_TERM_GRACE_SENTINEL, stop=None):
+    def kill_and_signal_again(proc, grace=_TERM_GRACE_SENTINEL, stop=None, pgid=None):
         entries.append(grace)
         if len(entries) == 1:
             handler(signal.SIGTERM, None)  # a second signal, mid-grace
@@ -1198,7 +1198,7 @@ def test_the_partial_output_of_a_wedged_stage_is_kept(monkeypatch):
     pipes: the drain gives up, and what the stage managed to say before that
     must survive rather than being replaced by two empty strings.
     """
-    monkeypatch.setattr(envs, "_kill_tree", lambda proc, grace=None: envs.Reach.GROUP)
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, grace=None, pgid=None: envs.Reach.GROUP)
 
     class Wedged(_FakeProc):
         args = ["python", "-c", "..."]
@@ -1427,7 +1427,7 @@ def test_the_drain_says_only_what_the_kill_established(monkeypatch, caplog):
         (envs.Reach.NOTHING, "nothing could be signalled at all"),
         (envs.Reach.ALREADY_GONE, "the child had already exited"),
     ):
-        monkeypatch.setattr(envs, "_kill_tree", lambda proc, grace=None, r=reach: r)
+        monkeypatch.setattr(envs, "_kill_tree", lambda proc, grace=None, pgid=None, r=reach: r)
         caplog.clear()
         with caplog.at_level("WARNING"):
             envs._kill_and_drain(Wedged())
@@ -1646,11 +1646,13 @@ def test_a_grandchild_is_collected_after_its_parent_has_exited(tmp_path, monkeyp
     while time.monotonic() < deadline and proc.poll() is None:
         time.sleep(0.02)
     # `poll` above reaped the leader, which is what the production path must
-    # never do -- so put the state back the way `run` would see it and let
-    # `_kill_tree` read the group for itself.
+    # never do -- so put the state back the way `run` sees it.
     proc.returncode = None
 
-    assert envs._kill_tree(proc, grace=0.2) is envs.Reach.GROUP
+    # The group as `run` captured it: at spawn, while the child was alive.
+    # Looking it up now would fail on macOS, which does not report the group
+    # of a zombie -- and that is the whole reason `run` reads it early.
+    assert envs._kill_tree(proc, grace=0.2, pgid=pgid) is envs.Reach.GROUP
     time.sleep(0.3)
     with pytest.raises(ProcessLookupError):
         os.killpg(pgid, 0)
