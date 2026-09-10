@@ -133,46 +133,6 @@ jobs:
         working-directory: website
         run: ./check-build.sh
 
-      # `firebase-tools` is called directly rather than through
-      # `FirebaseExtended/action-hosting-deploy`. Both reasons are about what
-      # that action does on the way to the same command -- it ends up running
-      # this tool with this same `GOOGLE_APPLICATION_CREDENTIALS`.
-      #
-      # At the commit this workflow pinned, `src/deploy.ts:112-128` catches any
-      # deploy failure and re-runs it with `--debug`, unconditionally. At debug
-      # level firebase-tools logs the request URL of every call
-      # (`lib/apiv2.js:438` in 15.30.0) and the response body of every call
-      # that does not opt out with `skipLog.resBody` (`:461-464`). Nothing
-      # under `lib/hosting/` or `lib/deploy/hosting/` opts out. GitHub masks
-      # the exact
-      # `FIREBASE_PROJECT_ID` string wherever it appears, so the project id in
-      # a URL is covered -- but a Hosting response body is site config,
-      # release records and resource names, and none of that is the secret's
-      # text. The first failed deploy would have written it into a public log,
-      # so would every one after it, and `if (!debug)` at `src/deploy.ts:116`
-      # has no input behind it: the retry cannot be turned off.
-      #
-      # It also runs `npx firebase-tools@${firebaseToolsVersion}`, defaulting
-      # to `latest` (`src/deploy.ts:85`, `action.yml:48`). That one is
-      # closeable with an input -- but with the debug retry not closeable, one
-      # `npx` line here is less machinery than an action wrapping it.
-      #
-      # Version pinned exactly, for the reason the `jaspr_cli` pin above gives.
-      #
-      # The rule the action was pinned under still holds for whatever comes
-      # next. The key file does not outlive this step any more -- the trap
-      # below removes it, where the action's `tmp.fileSync` left it on the
-      # runner for the rest of the job -- but any step given the secret in
-      # its own `env:` has it, and steps in one job share a runner with no
-      # isolation. A third-party action added here needs a commit pin, not a
-      # `@v0` tag the maintainer can move to new code. `publish.yml` avoids
-      # the question entirely by having no static secret -- it authenticates
-      # to PyPI over OIDC. Firebase Hosting has no equivalent wired up here.
-      #
-      # One env name in particular: firebase-tools turns the debug console
-      # logger on for any `DEBUG` in the environment (`lib/logger.js:181`),
-      # not just for `--debug`. A `DEBUG:` added to this job would reopen
-      # exactly what is described above.
       # Installed in a step of its own, with no secret anywhere in its
       # environment, because installing is when the most code runs: 673
       # packages, whose lifecycle scripts execute as themselves. Only the
@@ -181,16 +141,56 @@ jobs:
       # arrives here is not fixed, and the answer is to give it nothing
       # rather than to trust it. The deploy step below then runs the
       # installed binary directly and invokes no package manager at all.
-      # Node itself is whatever the runner image ships, unlike every other
-      # tool in this file. The rule the others are pinned under is about the
-      # build differing from the one that was reviewed, and Node is not in
-      # that path: the bytes were built and checked in the job above, and
-      # this only uploads them. firebase-tools 15.30.0 asks for
+      #
+      # The version is pinned exactly, for the reason the `jaspr_cli` pin
+      # above gives. Node itself is not, unlike every other tool in this
+      # file: the rule the others are pinned under is about a build differing
+      # from the one that was reviewed, and Node is not in that path -- the
+      # bytes were built and checked in the job above, and this only uploads
+      # them. firebase-tools 15.30.0 asks for
       # `>=20.0.0 || >=22.0.0 || >=24.0.0`, which every current runner image
       # satisfies.
       - name: Install the Firebase CLI
         run: npm install --no-save --prefix "$RUNNER_TEMP/firebase-cli" firebase-tools@15.30.0
 
+      # `firebase-tools` is called directly rather than through
+      # `FirebaseExtended/action-hosting-deploy`. Both reasons are about what
+      # that action does on the way to the same command -- it ends up running
+      # this tool with this same `GOOGLE_APPLICATION_CREDENTIALS`.
+      #
+      # At the commit this workflow pinned, `src/deploy.ts:112-128` catches
+      # any deploy failure and re-runs it with `--debug`, unconditionally. At
+      # debug level firebase-tools logs the request URL of every call
+      # (`lib/apiv2.js:438` in 15.30.0) and the response body of every call
+      # that does not opt out with `skipLog.resBody` (`:461-464`). Nothing
+      # under `lib/hosting/` or `lib/deploy/hosting/` opts out. GitHub masks
+      # the exact `FIREBASE_PROJECT_ID` string wherever it appears, so the
+      # project id in a URL is covered -- but a Hosting response body is site
+      # config, release records and resource names, and none of that is the
+      # secret's text. The first failed deploy would have written it into a
+      # public log, so would every one after it, and `if (!debug)` at
+      # `src/deploy.ts:116` has no input behind it: the retry cannot be
+      # turned off.
+      #
+      # It also runs `npx firebase-tools@${firebaseToolsVersion}`, defaulting
+      # to `latest` (`src/deploy.ts:85`, `action.yml:48`). That one is
+      # closeable with an input -- but with the debug retry not closeable,
+      # calling the binary here is less machinery than an action wrapping it.
+      #
+      # The rule the action was pinned under still holds for whatever comes
+      # next. The key file does not outlive this step -- the trap below
+      # removes it, where the action's `tmp.fileSync` left it on the runner
+      # for the rest of the job -- but any step given the secret in its own
+      # `env:` has it, and steps in one job share a runner with no isolation.
+      # A third-party action added here needs a commit pin, not a `@v0` tag
+      # the maintainer can move to new code. `publish.yml` avoids the
+      # question entirely by having no static secret -- it authenticates to
+      # PyPI over OIDC. Firebase Hosting has no equivalent wired up here.
+      #
+      # One env name in particular: firebase-tools turns the debug console
+      # logger on for any `DEBUG` in the environment (`lib/logger.js:181`),
+      # not just for `--debug`. A `DEBUG:` added to this job would reopen
+      # exactly what is described above.
       - name: Deploy to Firebase Hosting
         working-directory: website
         env:
