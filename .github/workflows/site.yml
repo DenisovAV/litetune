@@ -7,9 +7,10 @@
 # The script stays for local previews.
 #
 # The site is a Jaspr static build: pure Dart, no Flutter, no runtime
-# JavaScript. It goes to the `litetune` hosting target; which project holds
-# that target is a secret, for the same reason the project id below is one --
-# naming it here would point at every other resource beside it.
+# JavaScript. It goes to the `litetune` hosting site named in
+# website/firebase.json; which project holds that site is a secret, for the
+# same reason the project id below is one -- naming it here would point at
+# every other resource beside it.
 name: site
 
 # Declared rather than inherited. The repository default is read today, but a
@@ -106,9 +107,12 @@ jobs:
           name: site
           path: website/build/jaspr
 
-      # Pinned to a commit, not to `@v0`. Every other action here is
-      # tag-pinned like the rest of the repository's workflows, and that is
-      # fine because none of them is handed a credential. This one is: a
+      # Pinned to a commit, not to `@v0`. The other actions in this job are
+      # tag-pinned, and the reason that is acceptable is that they are
+      # first-party `actions/*` -- not that they are handed no credential.
+      # Steps in one job share a runner and GitHub gives them no isolation
+      # from each other, so anything added to this job sees what this step
+      # is given. A third-party action added here later needs the same pin. A
       # floating major-version tag means the maintainer can move it to new
       # code, and the next push to `main` would run that code with a
       # long-lived service-account key in hand. `publish.yml` avoids the
@@ -119,7 +123,11 @@ jobs:
         # v0.11.0
         uses: FirebaseExtended/action-hosting-deploy@500ac625ca2dd40cbd15f7659af953801858032a
         with:
-          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          # No `repoToken`. The action wants one to post preview-channel URLs
+          # back to a pull request, and this is a push-to-main deploy to the
+          # live channel with no pull request to comment on. Handing a token
+          # to a third party for a job it does not have is the kind of thing
+          # that is only ever noticed after it matters.
           firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           channelId: live
           # A secret rather than a repository variable, and not a literal: the
@@ -128,4 +136,9 @@ jobs:
           # `vars.` entry or a literal it would be printed.
           projectId: ${{ secrets.FIREBASE_PROJECT_ID }}
           entryPoint: website
-          target: litetune
+          # No `target`. A target is a name resolved through `.firebaserc`,
+          # and that file is git-ignored now because it carried the project
+          # id -- so a fresh checkout has no mapping and the deploy would fail
+          # on a lookup rather than on anything real. `firebase.json` names
+          # the site directly instead, which needs no mapping and makes the
+          # local script and this workflow agree by construction.

@@ -1,6 +1,6 @@
 {
   "hosting": {
-    "target": "litetune",
+    "site": "litetune",
     "public": "build/jaspr",
     "ignore": [
       "firebase.json",

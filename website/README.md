@@ -39,8 +39,7 @@ it from the environment and fails immediately if it is unset:
 LITETUNE_FIREBASE_PROJECT=<project-id> ./deploy.sh
 ```
 
-The hosting site defaults to `litetune`; `LITETUNE_FIREBASE_SITE` overrides it,
-and `firebase.json` names the same target. `deploy.sh` applies the target
-mapping on each run, so a fresh checkout needs no `.firebaserc`; the one it
-writes is git-ignored, and `.firebaserc.example` shows the shape if you would
-rather commit a mapping of your own.
+The hosting site is named in `firebase.json`, so nothing has to resolve a
+target and a fresh checkout needs no `.firebaserc` at all. The CI workflow
+deploys the same way, from the same file, which is what keeps the two from
+drifting.

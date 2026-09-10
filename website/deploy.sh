@@ -8,14 +8,14 @@
 #
 #   LITETUNE_FIREBASE_PROJECT=<project-id> ./deploy.sh
 #
-# `firebase target:apply` writes the mapping into a local .firebaserc, which
-# is git-ignored; .firebaserc.example shows its shape.
+# The hosting site is named in firebase.json, so no `.firebaserc` and no
+# target mapping is needed -- which is what lets this script and the CI
+# workflow deploy the same place without either of them carrying the project.
 set -euo pipefail
 
 WEBSITE_DIR="$(cd "$(dirname "$0")" && pwd)"
 DOMAIN="https://litetune.dev"
 PROJECT="${LITETUNE_FIREBASE_PROJECT:?set LITETUNE_FIREBASE_PROJECT to the Firebase project id}"
-TARGET="${LITETUNE_FIREBASE_SITE:-litetune}"
 
 cd "$WEBSITE_DIR"
 
@@ -31,9 +31,7 @@ echo "==> Building Jaspr site (static)…"
 rm -rf build/jaspr .dart_tool/build
 jaspr build --sitemap-domain "$DOMAIN"
 
-echo "==> Deploying to Firebase Hosting ($TARGET)…"
-# Idempotent, and the reason a checkout with no .firebaserc can still deploy.
-firebase target:apply hosting "$TARGET" "$TARGET" --project "$PROJECT"
-firebase deploy --only "hosting:$TARGET" --project "$PROJECT"
+echo "==> Deploying to Firebase Hosting…"
+firebase deploy --only hosting --project "$PROJECT"
 
 echo "==> Done."

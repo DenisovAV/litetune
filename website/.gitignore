@@ -2,5 +2,7 @@
 build/
 .build.manifest
 .firebase/
-# Carries the Firebase project id. See .firebaserc.example and deploy.sh.
+# Nothing needs this now -- the hosting site is named in firebase.json and the
+# project is passed on the command line -- but the CLI writes one anyway, and
+# what it writes carries the project id.
 .firebaserc
