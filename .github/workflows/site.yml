@@ -1,0 +1,274 @@
+# Check the website on every pull request, and deploy it on merge to main.
+#
+# Two gaps this closes. Nothing in CI touched `website/` at all, so a Dart
+# change reached `main` on whatever the author happened to run locally. And the
+# deploy was `website/deploy.sh` from somebody's laptop, which made the live
+# site whatever that working tree held, with no record of what produced it.
+# The script stays for local previews.
+#
+# The site is a Jaspr static build: pure Dart, no Flutter. Every page is
+# pre-rendered; the build still emits `main.client.dart.js`, which mounts a
+# client app with no components in it. It goes to the `litetune` site named in
+# website/firebase.json; which project holds that site is a secret, for the
+# same reason the project id below is one -- naming it here would point at
+# every other resource beside it.
+name: site
+
+# Declared rather than inherited. The repository default is read today, but a
+# job that holds a deploy credential should not depend on a setting that can be
+# changed for an unrelated reason -- `publish.yml` pins its own for the same
+# reason. Nothing here writes to the repository.
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - 'website/**'
+      - '.github/workflows/site.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - '.github/workflows/site.yml'
+  # A deploy with no site change: a rolled-back hosting release, or a first
+  # run once the deploy secret exists.
+  workflow_dispatch:
+
+# Two deploys racing to one hosting target would make the live site the one
+# that finished last rather than the one merged last.
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than `stable`, which is whatever Dart released this
+      # morning. 3.13.3 is the SDK this site is built with locally and the one
+      # that produced the builds on this pull request; it satisfies both the
+      # `sdk: ^3.10.0` constraint in pubspec.yaml and the narrower
+      # `>=3.13.0-107.0.dev <3.14.0-z` the lock file resolved under.
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.13.3
+
+      # Pinned exactly, like the ruff and mypy pins in pyproject.toml and for
+      # the same reason: a build tool resolved fresh each morning is a build
+      # that can differ from the one that was reviewed. The CLI needs its own
+      # pin because it is a global activation and pubspec.lock does not cover
+      # it -- the lock pins the library (`jaspr` and `jaspr_builder` resolve to
+      # 0.23.4) and says nothing about the tool that drives it. 0.23.1 is the
+      # version `dart pub global list` reports on the machine the live site has
+      # been deployed from, so this is the pairing the site is known to build
+      # under.
+      - name: Install the Jaspr CLI
+        run: dart pub global activate jaspr_cli 0.23.1
+
+      - name: Analyse
+        working-directory: website
+        run: |
+          dart pub get
+          dart analyze lib
+
+      - name: Build
+        working-directory: website
+        run: |
+          export PATH="$HOME/.pub-cache/bin:$PATH"
+          # A reused incremental cache has been observed to snapshot the page
+          # before the route table registered, producing a near-empty
+          # index.html that then shipped. `deploy.sh` removes these for the
+          # same reason; a clean build is cheap next to a blank home page.
+          rm -rf build/jaspr .dart_tool/build
+          jaspr build --sitemap-domain "https://litetune.dev"
+
+      # A build that produced nothing still exits zero. What the check looks
+      # at is in website/check-build.sh, which `deploy.sh` runs too.
+      - name: Refuse an empty build
+        working-directory: website
+        run: ./check-build.sh
+
+      - name: Keep the build for the deploy job
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: website/build/jaspr
+          retention-days: 1
+
+  deploy:
+    needs: build
+    # `main` explicitly, not merely "not a pull request". `workflow_dispatch`
+    # accepts any ref, so the looser gate let anyone with write access publish
+    # a feature branch to the live site by dispatching on it.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Redundant today and kept anyway. The workflow-level group is keyed on
+    # `github.ref`, and with the gate above restricting this job to `main`,
+    # a push and a dispatch both resolve to `refs/heads/main` and already
+    # share it. This group holds if that gate is ever widened, which is the
+    # change that would otherwise let two deploys reach Hosting together.
+    concurrency:
+      group: site-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # The bytes the build job checked, not a second build that could differ.
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: website/build/jaspr
+
+      # Again on this side of the artifact, not only in the build job. It
+      # is not a byte-for-byte check of what was uploaded -- it reads four
+      # files -- and `download-artifact@v4` does not give one either: on a
+      # digest mismatch it calls `core.warning` and carries on
+      # (`src/download-artifact.ts:193-197`). So this is the only thing
+      # standing between a truncated download and Hosting.
+      - name: Refuse an empty build
+        working-directory: website
+        run: ./check-build.sh
+
+      # Installed in a step of its own, with no secret anywhere in its
+      # environment, because installing is when the most code runs: 673
+      # packages, whose lifecycle scripts execute as themselves. Only the
+      # top-level version is pinned -- the published tarball carries no
+      # lockfile and 66 of its 70 dependencies are caret ranges -- so what
+      # arrives here is not fixed, and the answer is to give it nothing
+      # rather than to trust it. The deploy step below then runs the
+      # installed binary directly and invokes no package manager at all.
+      #
+      # The version is pinned exactly, for the reason the `jaspr_cli` pin
+      # above gives. Node itself is not, unlike every other tool in this
+      # file: the rule the others are pinned under is about a build differing
+      # from the one that was reviewed, and Node is not in that path -- the
+      # bytes were built and checked in the job above, and this only uploads
+      # them. firebase-tools 15.30.0 asks for
+      # `>=20.0.0 || >=22.0.0 || >=24.0.0`, which every current runner image
+      # satisfies.
+      - name: Install the Firebase CLI
+        run: npm install --no-save --prefix "$RUNNER_TEMP/firebase-cli" firebase-tools@15.30.0
+
+      # `firebase-tools` is called directly rather than through
+      # `FirebaseExtended/action-hosting-deploy`. Both reasons are about what
+      # that action does on the way to the same command -- it ends up running
+      # this tool with this same `GOOGLE_APPLICATION_CREDENTIALS`.
+      #
+      # At the commit this workflow pinned, `src/deploy.ts:112-128` catches
+      # any deploy failure and re-runs it with `--debug`, unconditionally. At
+      # debug level firebase-tools logs the request URL of every call
+      # (`lib/apiv2.js:438` in 15.30.0) and the response body of every call
+      # that does not opt out with `skipLog.resBody` (`:461-464`). Nothing
+      # under `lib/hosting/` or `lib/deploy/hosting/` opts out. GitHub masks
+      # the exact `FIREBASE_PROJECT_ID` string wherever it appears, so the
+      # project id in a URL is covered -- but a Hosting response body is site
+      # config, release records and resource names, and none of that is the
+      # secret's text. The first failed deploy would have written it into a
+      # public log, so would every one after it, and `if (!debug)` at
+      # `src/deploy.ts:116` has no input behind it: the retry cannot be
+      # turned off.
+      #
+      # It also runs `npx firebase-tools@${firebaseToolsVersion}`, defaulting
+      # to `latest` (`src/deploy.ts:85`, `action.yml:48`). That one is
+      # closeable with an input -- but with the debug retry not closeable,
+      # calling the binary here is less machinery than an action wrapping it.
+      #
+      # The rule the action was pinned under still holds for whatever comes
+      # next. The key file does not outlive this step -- the trap below
+      # removes it, where the action's `tmp.fileSync` left it on the runner
+      # for the rest of the job -- but any step given the secret in its own
+      # `env:` has it, and steps in one job share a runner with no isolation.
+      # A third-party action added here needs a commit pin, not a `@v0` tag
+      # the maintainer can move to new code. `publish.yml` avoids the
+      # question entirely by having no static secret -- it authenticates to
+      # PyPI over OIDC. Firebase Hosting has no equivalent wired up here.
+      #
+      # One env name in particular: firebase-tools turns the debug console
+      # logger on for any `DEBUG` in the environment (`lib/logger.js:181`),
+      # not just for `--debug`. A `DEBUG:` added to this job would reopen
+      # exactly what is described above.
+      - name: Deploy to Firebase Hosting
+        working-directory: website
+        env:
+          # `--project` on the command line rather than baked into a config:
+          # the id is an infrastructure identifier, and workflow logs on a
+          # public repository are public. As a secret it is masked.
+          FIREBASE_PROJECT: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          # One private directory for both files firebase-tools needs from us,
+          # emptied on the way out however the step ends.
+          #
+          # `dotglob` because the plain glob does not match a leading dot:
+          # reproduced, a `.hidden` file survives `rm -f "$work"/*`, `rmdir`
+          # then fails, and `|| true` swallows it, so the directory and its
+          # contents outlive the step. Nothing writes one there today -- the
+          # key is named by this script and the log by FIREBASE_DEBUG_PATH --
+          # which is a reason the mechanism should not depend on it.
+          work="$(mktemp -d)"
+          trap 'shopt -s dotglob; rm -f "$work"/*; rmdir "$work" 2>/dev/null || true' EXIT
+          key="$work/key.json"
+          # The enclosing directory is already 0700; this is so the key is
+          # not the one file that would still be readable if it were ever
+          # copied somewhere less private.
+          (umask 077 && printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > "$key")
+          # The key goes to firebase-tools as a path, so it should not also
+          # go as a value. Left set, it would be in the environment of node
+          # and of every dependency firebase-tools loads at run time, none of
+          # which needs it. The install is already out of reach -- it happened
+          # in the step above, where this variable does not exist.
+          unset FIREBASE_SERVICE_ACCOUNT
+          # Written verbatim, which is what the action did too
+          # (`src/createGACFile.ts` -- no decoding step), so a key stored
+          # base64-encoded or with the wrong file pasted in reaches
+          # google-auth-library as-is and comes back as a generic "could not
+          # load default credentials". Nothing here has ever run, so say which
+          # of the two secrets is wrong instead. The check prints its verdict
+          # and never any part of the file.
+          python3 - "$key" <<'PY' || exit 1
+          import json, sys
+          try:
+              key = json.load(open(sys.argv[1]))
+          except Exception as exc:
+              sys.exit(f"::error::FIREBASE_SERVICE_ACCOUNT is not JSON ({type(exc).__name__})")
+          # `isinstance` before `.get`: valid JSON that is not an object --
+          # `[]`, `"x"`, `null`, a number -- reached `.get` and raised an
+          # AttributeError with a traceback instead of the message below.
+          # It failed closed either way; it just failed unreadably.
+          if not isinstance(key, dict) or key.get("type") != "service_account":
+              sys.exit("::error::FIREBASE_SERVICE_ACCOUNT is JSON but not a service-account key")
+          PY
+          # The other secret, which nothing else here would notice: unset or
+          # empty, `--project ""` reaches firebase-tools as no project at all
+          # and comes back as a generic error about project selection.
+          [ -n "$FIREBASE_PROJECT" ] \
+            || { echo "::error::FIREBASE_PROJECT_ID is empty or unset"; exit 1; }
+          # FIREBASE_DEBUG_PATH, because the debug log is not optional.
+          # `lib/bin/cli.js:53` calls `useFileLogger()` unconditionally --
+          # `--debug` decides the console transport (`:49-51`), never this
+          # one -- and it is at level "debug", the same level as the request
+          # URLs and response bodies this step avoids putting on the console.
+          # It writes to `process.cwd()`, which here is `website/`, and its
+          # second line is the whole command, `--project` and its value
+          # included. Masking applies to the log GitHub renders, not to a
+          # file in the workspace.
+          #
+          # firebase-tools deletes it on exit when the exit code is below 2
+          # (`cli.js:73-75`) -- observed: a credential failure exits 1 and the
+          # file goes. What is left is the rest. `errorOut.js:12-15` wraps
+          # anything that is not a FirebaseError with `exit: 2`, and `:18` is
+          # `process.exitCode = fbError.exit || 2`, so a FirebaseError that
+          # names no exit code lands on 2 as well; either way the file stays.
+          # A cancelled job runs no exit handler at all. Pointing it into
+          # $work means the trap covers every one of those, and that nothing
+          # lands in the checkout for a later step to pick up.
+          GOOGLE_APPLICATION_CREDENTIALS="$key" \
+          FIREBASE_DEBUG_PATH="$work/firebase-debug.log" \
+            "$RUNNER_TEMP/firebase-cli/node_modules/.bin/firebase" deploy \
+              --only hosting \
+              --project "$FIREBASE_PROJECT" \
+              --non-interactive

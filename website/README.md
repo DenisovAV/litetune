@@ -7,9 +7,19 @@ built with [Jaspr](https://jaspr.site) in static mode and modelled on the
 ```bash
 dart pub get
 jaspr serve          # http://localhost:8080, hot reload
-jaspr build          # static output in build/jaspr
-./deploy.sh          # build + deploy to Firebase Hosting
+jaspr build --sitemap-domain "https://litetune.dev"   # static output in build/jaspr
+./check-build.sh     # refuse a render that has a head and no page body
+./deploy.sh          # build + check + deploy to Firebase Hosting
 ```
+
+`check-build.sh` is the one copy of that check: `deploy.sh` runs it before it
+uploads anything, and the CI workflow runs it twice — once on the build it
+produced, once on the artifact it is about to publish.
+
+The `--sitemap-domain` above is not decoration. `jaspr build` writes
+`sitemap.xml` only when it is given, `deploy.sh` and CI both pass it, and
+`check-build.sh` requires the file — so a bare `jaspr build` produces a tree
+the check will reject.
 
 ## Layout
 
@@ -39,8 +49,7 @@ it from the environment and fails immediately if it is unset:
 LITETUNE_FIREBASE_PROJECT=<project-id> ./deploy.sh
 ```
 
-The hosting site defaults to `litetune`; `LITETUNE_FIREBASE_SITE` overrides it,
-and `firebase.json` names the same target. `deploy.sh` applies the target
-mapping on each run, so a fresh checkout needs no `.firebaserc`; the one it
-writes is git-ignored, and `.firebaserc.example` shows the shape if you would
-rather commit a mapping of your own.
+The hosting site is named in `firebase.json`, so nothing has to resolve a
+target and a fresh checkout needs no `.firebaserc` at all. The CI workflow
+deploys the same way, from the same file, which is what keeps the two from
+drifting.
