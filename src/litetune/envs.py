@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+import selectors
 import shutil
 import signal
 import subprocess
@@ -34,7 +35,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, cast
 
 from litetune.exits import read_returncode
 
@@ -157,10 +158,31 @@ _HOST_OVERRIDES = (
 
 # How long to wait for the pipes after killing a process group. A grandchild
 # that called `setsid()` itself escapes the group, and if it still holds the
-# inherited stdout it can keep an unbounded `communicate()` open forever --
-# which would put back the unbounded wait this whole change exists to remove,
-# one level out from where the original bug was.
+# inherited stdout it can keep an unbounded read open forever -- which would
+# put back the unbounded wait this whole change exists to remove, one level
+# out from where the original bug was.
 _DRAIN_AFTER_KILL_S = 10
+
+# How long to wait for the child to become reapable once it has been SIGKILLed
+# and its pipes are done. Short because by this point the only thing that can
+# still delay it is an uninterruptible sleep, which no wait would survive
+# either; the alternative is leaving a zombie for the life of the run.
+_REAP_AFTER_KILL_S = 5
+
+# One read. The size is CPython's own in `Popen._communicate`, and it is
+# copied rather than chosen: nothing here measured a better one, and matching
+# the code this stands in for is the cheapest way to be sure the difference
+# between them is not the read size. Chunking is not observable in the output
+# -- both paths join before decoding -- so this is about syscall count alone.
+_READ_CHUNK = 32768
+
+# How many times in a row a read may answer EINTR, per pipe, before that pipe
+# is given up on. PEP 475 has `os.read` retry a signal itself unless a Python
+# handler raised, so even one is unusual and a run of them means something
+# else is wrong. The bound is what stops the drain spinning: measured with a
+# read that always raises, 34,862 attempts in 30 ms, because the descriptor
+# stays ready and `select` hands it straight back.
+_MAX_INTERRUPTED_READS = 8
 
 # How long a stage gets between SIGTERM and SIGKILL. Long enough for torch to
 # finish a `save_pretrained` it had started, short enough that a wedged process
@@ -332,6 +354,7 @@ def _kill_tree(
     grace: float = _TERM_GRACE_S,
     stop: Callable[[], bool] | None = None,
     pgid: int | None = None,
+    pump: Callable[[float], None] | None = None,
 ) -> Reach:
     """End the child and everything it spawned: SIGTERM, then SIGKILL.
 
@@ -370,7 +393,43 @@ def _kill_tree(
         # is a zombie answers EPERM, which looks exactly like the setuid case.
         return reached
     if reached is not Reach.NOTHING and grace > 0:
-        still_ours = _wait_without_reaping(proc, pgid, grace, stop)
+        try:
+            still_ours = _wait_without_reaping(proc, pgid, grace, stop, pump)
+        except BaseException:
+            # The grace is the one part of this function that can be
+            # interrupted -- a Ctrl-C during it raises straight through --
+            # and every exception there used to take the SIGKILL with it.
+            # Measured on a real tree: SIGTERM sent, SIGKILL not, the leader
+            # unreaped and the group still alive. That is the leak this
+            # module exists to prevent, produced by the keystroke that was
+            # asking for the stage to stop sooner rather than to outlive us.
+            # Guarded the way the ordinary path at the top of this function
+            # is: once the leader has been reaped the group id is no longer
+            # ours, and a second termination signal can have reaped it while
+            # this grace was being interrupted. Signalling anyway aims
+            # SIGKILL at whatever now owns that number.
+            #
+            # It does skip the `still_ours` check below, and that is the
+            # trade rather than an oversight: that check is what the grace
+            # returns, and the grace is what just raised.
+            #
+            # `returncode` is the same evidence the ordinary path at the top
+            # of this function uses -- no better, and no worse. It is not
+            # proof: `_group_of` spells out that a host using `SA_NOCLDWAIT`
+            # has the kernel reap with `returncode` still None and the pid
+            # already free, and that neither `Popen` nor `getsignal` can see
+            # it. That hole is open on both paths and is not closed here;
+            # what this check does close is the ordinary case, where a
+            # second termination signal reaped the leader through
+            # `send_signal` while this grace was being interrupted.
+            #
+            # `returncode`, not `poll()`. Polling reaps, and reaping the
+            # leader here is the very hazard the top of this function is
+            # arranged around -- it would free the number and then aim the
+            # SIGKILL at it.
+            if proc.returncode is None:
+                _signal_tree(proc, pgid, _SIGKILL)
+            raise
         # Withheld only where there is a group to mis-target. With no group the
         # final signal goes through `Popen`, which polls first and cannot reach
         # a stranger -- and on Linux `waitid` answers ECHILD for any pid that
@@ -392,6 +451,7 @@ def _wait_without_reaping(
     pgid: int | None,
     grace: float,
     stop: Callable[[], bool] | None = None,
+    pump: Callable[[float], None] | None = None,
 ) -> bool:
     """Wait for the child to exit, leaving it reapable.
 
@@ -413,6 +473,11 @@ def _wait_without_reaping(
 
     With neither, the grace is slept out. Slower when the child obeys at once,
     never wrong.
+
+    `pump` is given the waiting interval instead of `time.sleep`, so the
+    pipes are emptied while the child shuts down. Without it a stage that
+    writes more than a pipe buffer on its way out blocks in `write` and
+    spends the whole grace blocked -- see `_PipeDrain`.
     """
     deadline = time.monotonic() + grace
     waitid = getattr(os, "waitid", None)
@@ -466,7 +531,11 @@ def _wait_without_reaping(
             except OSError as exc:
                 logger.debug("cannot probe process group %d: %s", pgid, exc)
                 pgid = None
-        time.sleep(min(0.05, remaining))
+        interval = min(0.05, remaining)
+        if pump is not None:
+            pump(interval)
+        else:
+            time.sleep(interval)
 
 
 @contextlib.contextmanager
@@ -522,14 +591,47 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen, pgid: int | None 
             _kill_tree(proc, grace=0, pgid=pgid)
             return
         handling = True
+        # The same drain the timeout path uses, for the same reason: without
+        # something emptying the pipes, a stage that writes more than a pipe
+        # buffer while shutting down blocks in `write` and is SIGKILLed part
+        # way through its `save_pretrained`. Measured with a stage writing
+        # 200,000 bytes on SIGTERM: it never reached the end of its handler.
+        # This is the path that matters most for that, because it is the one
+        # `kill <litetune>` and a dropped SSH session take.
+        #
+        # What it reads is dropped. The process is on its way out and no
+        # caller reads a stage's output on this path; the point is to unblock
+        # the child, not to keep what it says.
+        drain = _PipeDrain(proc, seed=False)
         try:
-            _kill_tree(proc, stop=lambda: escalated, pgid=pgid)
+            _kill_tree(proc, stop=lambda: escalated, pgid=pgid, pump=drain.pump)
         finally:
+            drain.close()
             # Reset before the re-delivery below, and before `run`'s cleanup
-            # runs under this same guard. Leaving it set swallowed every signal
-            # after the first for the whole grace-plus-drain window -- up to
-            # fifteen seconds in which litetune could not be terminated at all,
-            # which is a worse trade than the one it was made for.
+            # runs under this same guard, so a later TERM or HUP re-enters
+            # this handler rather than being swallowed.
+            #
+            # An earlier version never reset it, and a `finally` rather than a
+            # plain assignment after the `try` is what this has to be. The
+            # grace just above is not the damage either way -- `handling` is
+            # set during it in every version, and a second signal there takes
+            # the escalation branch at the top of this handler on purpose.
+            #
+            # The two routes out of the `try` differ in what is left pointing
+            # here. When the grace returns, the signal being handled is put
+            # back on its previous disposition below, and only the other of
+            # TERM and HUP can still reach this handler. When the grace is
+            # interrupted -- a Ctrl-C while it waits -- the restore below never
+            # runs, and both of them can. A plain reset would be skipped on
+            # exactly that second route, which is why it is a `finally`.
+            #
+            # With `handling` left set, whichever of them arrived took the
+            # escalation branch and returned instead of ending litetune, for
+            # the whole of `run`'s cleanup -- a grace, the drain and the reap,
+            # `_TERM_GRACE_S` plus `_DRAIN_AFTER_KILL_S` plus
+            # `_REAP_AFTER_KILL_S`, up to 5 + 10 + 5 = 20 seconds on either
+            # route. (SIGKILL always got through, and SIGINT was never this
+            # guard's to swallow -- it installs only TERM and HUP.)
             handling = False
         # `None` means the handler in place was installed from C and cannot be
         # restored from Python -- `signal.signal(sig, None)` is a `TypeError`.
@@ -581,52 +683,718 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen, pgid: int | None 
                 signal.signal(sig, signal.SIG_DFL if previous is None else previous)
 
 
-def _kill_and_drain(proc: subprocess.Popen, pgid: int | None = None) -> tuple[str, str]:
-    """Kill the group, then collect what it wrote -- without waiting forever.
+class _PipeDrain:
+    """Read a child's pipes without reaping it, and keep what was read.
 
-    The drain is bounded because the kill is not guaranteed to have reached
-    everything: a grandchild that called `setsid()` is outside the group and
-    can hold the inherited stdout open. Giving up on the output is the right
-    trade here, since the caller is already on its way to reporting a timeout
-    or re-raising; hanging instead would reinstate the unbounded wait.
+    `communicate()` is the obvious call and cannot do this job, for two
+    reasons the module has measured.
+
+    It reaps. A process group id *is* the leader's pid, so a reap before the
+    SIGKILL frees the number the kill is aimed at -- the same hazard
+    `_wait_without_reaping` exists for, one function further out.
+
+    And it can only run *after* the kill, which left nothing emptying the
+    pipes during the grace. A pipe holds 65,536 bytes -- measured on the
+    machine this was written on, by writing to one until EAGAIN; a stage that writes
+    more than that on its way out -- a torch traceback, a progress bar
+    flushing its last frames, `save_pretrained` logging each shard -- blocks
+    in `write`, never reaches the end of its shutdown, and is SIGKILLed at the
+    end of a grace it spent blocked. The grace helped a quiet stage and not a
+    talkative one, which is the wrong way round: the talkative one is the one
+    with something to say.
+
+    Reads are raw `os.read` on the file descriptors, the way CPython's own
+    `Popen._communicate` does it, and the decode happens once at the end. A
+    text-mode pipe is a `TextIOWrapper`; reading one incrementally either
+    blocks waiting to complete a multi-byte character or raises when the
+    descriptor is non-blocking.
     """
-    reached = _kill_tree(proc, pgid=pgid)
-    try:
-        return proc.communicate(timeout=_DRAIN_AFTER_KILL_S)
-    except subprocess.TimeoutExpired as expired:
-        # Said out loud, because a leaked process is otherwise diagnosed hours
-        # later as somebody else's out-of-memory kill. The sentence says only
-        # what `reached` supports: blaming a stray grandchild when in fact
-        # nothing could be signalled would send the reader hunting for the
-        # wrong process.
-        logger.warning(
-            "output pipes for %s stayed open after %s, so something is still holding them",
-            _describe(proc),
-            {
-                # Not "a descendant left the group": `killpg` returning 0 says
-                # the signal was accepted, not that anything died. A member
-                # wedged in an uninterruptible ioctl is unkillable and still
-                # holds the pipe, so naming one cause would send the reader
-                # hunting for the wrong process.
-                Reach.GROUP: (
-                    "the group was signalled, so either something outside it holds them or "
-                    "something in it has not died"
-                ),
-                Reach.CHILD_ONLY: (
-                    "only the child was signalled, which does not cover what it spawned"
-                ),
-                Reach.NOTHING: "nothing could be signalled at all",
-                Reach.ALREADY_GONE: (
-                    "the child had already exited, so something it spawned holds them"
-                ),
-            }[reached],
+
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        already: tuple[str | bytes | None, str | bytes | None] = (None, None),
+        *,
+        seed: bool = True,
+    ) -> None:
+        self._out: list[bytes] = []
+        self._err: list[bytes] = []
+        self._encoding = _encoding_of(proc.stdout)
+        self._err_encoding = _encoding_of(proc.stderr)
+        # Whatever a `communicate` before us already took off the pipes. Those
+        # bytes are gone from the descriptors and this is the only place left
+        # that has them, so without picking them up the salvaged output starts
+        # at the moment of the timeout and drops everything before it -- which
+        # on a stage that died early is all of it.
+        #
+        # `seed=False` skips it for a caller that says it will throw the text
+        # away. This is a `b"".join` over everything the stage has said -- a
+        # second full copy of the transcript -- and the callers that do not
+        # want it are a signal handler, which builds its drain before its own
+        # SIGTERM goes out, and `run`'s interrupt cleanup, which runs after a
+        # handler has already signalled on the route that raises
+        # `StageInterrupted`. A `MemoryError` there would also escape a
+        # constructor that promises not to raise.
+        carried_in = (
+            (
+                (proc.stdout, already[0], self._out, self._encoding),
+                (proc.stderr, already[1], self._err, self._err_encoding),
+            )
+            if seed
+            else ()
         )
-        # Whatever was read before giving up. The stage's stderr is the single
-        # most useful artifact in a timeout report, so it is worth carrying the
-        # partial one rather than returning two empty strings.
-        stream = proc.stdout or proc.stderr
-        encoding = getattr(stream, "encoding", None) or "utf-8"
-        return _as_text(expired.output, encoding), _as_text(expired.stderr, encoding)
+        for stream, carried, sink, encoding in carried_in:
+            recovered = _buffered_by_communicate(proc, stream)
+            if recovered is None:
+                # No `communicate` ran, or this CPython keeps its partial
+                # reads somewhere else. The caller's exception is then the
+                # only account of them there is.
+                recovered = (
+                    carried.encode(encoding, "replace") if isinstance(carried, str) else carried
+                )
+            if recovered:
+                sink.append(recovered)
+        self._selector: selectors.BaseSelector | None = None
+        # Whether this host can watch pipes at all, which is a different
+        # question from whether any are left to watch. Conflating them sent
+        # the one case the seeding exists for -- `communicate`'s trailing
+        # `wait()`, which only raises after both pipes hit EOF and were
+        # closed -- down the fallback branch, where the seed is not used.
+        self._can_watch = False
+        self._open = 0
+        # Per descriptor, not one shared count: with a single counter,
+        # interruptions alternating between the two pipes close one of them
+        # early, and a steady stream of data on one resets the count for the
+        # other so the bound is never reached at all.
+        self._interrupted: dict[int, int] = {}
+        # Nothing here may raise. This runs while a timeout or an interrupt is
+        # already being handled, and an exception would replace the reason the
+        # caller is here with a reason about reading pipes. A drain that
+        # cannot watch anything still keeps the bytes it was seeded with, and
+        # `pump` still spends the grace -- which is what happened before this
+        # class existed.
+        try:
+            selector = selectors.DefaultSelector()
+        except OSError as exc:  # pragma: no cover - needs a descriptor to spare
+            # `epoll`/`kqueue` each need a descriptor of their own, and the
+            # host is out of them.
+            logger.debug("no usable selector, so the stage goes unheard: %s", exc)
+            return
+        refused = 0
+        for stream, sink in ((proc.stdout, self._out), (proc.stderr, self._err)):
+            if stream is None or stream.closed:
+                # Nothing to watch is not the same as being unable to watch.
+                # A pipe already at EOF and closed is the ordinary state after
+                # `communicate` gave up, and the seed is the account of it;
+                # treating that as "this host cannot watch" sent it to the
+                # fallback, which has no seed to return.
+                continue
+            try:
+                selector.register(stream, selectors.EVENT_READ, sink)
+            except (ValueError, OSError) as exc:
+                # A refusal, which is the other thing entirely: `epoll_ctl`
+                # out of room, or a descriptor this selector will not take.
+                # Measured against the version that set the flag before this
+                # loop: with both registrations refused the fallback was
+                # skipped and a stage that had a traceback to give returned
+                # two empty strings.
+                logger.debug("cannot watch a pipe of pid %d: %s", proc.pid, exc)
+                refused += 1
+                continue
+            self._open += 1
+        # All or nothing -- for a drain whose text will be read. A drain that
+        # watches one pipe and not the other reads the one, and is then
+        # overridden by a fallback that replaces its result rather than
+        # merging, so what it read is discarded. Measured with stdout
+        # registered and stderr refused: `out == ''` for a stage that had
+        # spoken on both. Giving up on both instead lets `communicate` read
+        # both.
+        #
+        # That rule costs the grace, and for a drain whose text is thrown away
+        # it buys nothing that the fallback does not still provide: the leak
+        # warning comes from the fallback reading both streams, and a partial
+        # drain reaches the fallback just the same. With nothing watched, nothing empties the pipes
+        # while the stage shuts down, and a stage that writes more than a
+        # buffer on its way out blocks and is SIGKILLed -- measured: 5.0 s,
+        # exit -9, its handler never finished, where a partial watch let it
+        # finish in 0.1 s. `seed=False` is exactly the two callers that
+        # discard: the signal handler and `run`'s own interrupt cleanup, and
+        # the first of those is the `kill <litetune>` path. So they keep
+        # whatever did register, and the rule applies only where the output
+        # is the point.
+        self._can_watch = refused == 0
+        if self._open and (self._can_watch or not seed):
+            self._selector = selector
+        else:
+            # Kept truthful rather than load-bearing: with the selector gone
+            # nothing reads, whatever this says, but `draining` should not
+            # claim a pipe nobody is watching.
+            self._open = 0
+            selector.close()
+
+    @property
+    def encoding(self) -> str:
+        """The encoding stdout was opened with."""
+        return self._encoding
+
+    @property
+    def err_encoding(self) -> str:
+        """The encoding stderr was opened with."""
+        return self._err_encoding
+
+    @property
+    def draining(self) -> bool:
+        """Whether a pipe this drain is watching has not reached its end.
+
+        Only about the pipes it watches. A pipe it could not register, or one
+        it stopped watching when `select` refused, contributes nothing here --
+        not "held" and not "closed", because nothing was read from it. A
+        drain in that state is not `watching`, and `_kill_and_drain` then asks
+        the fallback instead, which reads both streams.
+
+        A pipe can also be closed without the drain giving up watching, and
+        then this reports it done while a writer may still hold it: when a
+        read fails -- any `OSError` other than an interruption, or
+        `_MAX_INTERRUPTED_READS` interruptions in a row. Both are treated as
+        the end of that pipe because reading it again cannot succeed and
+        leaving it registered spins the loop. Neither has been seen outside a
+        test; PEP 475 has `os.read` retry EINTR itself unless a Python
+        handler raised.
+        """
+        return self._open > 0
+
+    @property
+    def watching(self) -> bool:
+        """Whether this drain's result can be trusted as the whole account.
+
+        Not "is it reading": a discarding drain that registered one pipe of
+        two reads that one while this is False. What False means is that some
+        pipe went unwatched -- a registration refused, or `select` refusing
+        on a host where it takes sockets only -- so a caller that wants the
+        output, or wants to know whether a stray process still holds the
+        pipes, has to ask the fallback, which reads both. (`close()` makes it
+        False as well, on a drain that watched everything; nothing asks after
+        that.)
+
+        Not "is anything left to read" either: a drain whose pipes both
+        reached EOF is still watching, and its seed is still the account of
+        what the stage said. That distinction is the whole of the
+        trailing-`wait()` case.
+
+        Answered only after a read has been attempted, never before one.
+        `SelectSelector.register` checks the event mask, the descriptor and
+        whether it is registered already -- and not whether `select` on this
+        host can do anything with it. Measured: it accepts a pipe and keeps
+        the descriptor, so where `select` takes sockets only both pipes
+        register happily and the refusal arrives on the first `select`.
+        """
+        return self._can_watch
+
+    def pump(self, budget: float) -> None:
+        """Read whatever is ready, spending exactly `budget` seconds.
+
+        Shaped to drop into a wait loop in place of its `time.sleep`: it
+        consumes the whole budget, so the cadence of the loop it replaces
+        does not change with how talkative the stage is.
+
+        "Consumes" and not "sleeps through": with a child writing steadily it
+        reads for the whole budget without yielding, which is the point --
+        the alternative is letting the pipe refill and blocking the child
+        again. It sleeps only when there is nothing to read.
+        """
+        self._read_for(budget, until_eof=False)
+
+    def finish(self, budget: float) -> None:
+        """Read to the end of both pipes, or until `budget` runs out.
+
+        Returns as soon as the pipes close, which `pump` deliberately does
+        not: measured, spending the whole ten seconds here added ten seconds
+        to every timeout the moment the drain started working.
+        """
+        self._read_for(budget, until_eof=True)
+
+    def _read_for(self, budget: float, until_eof: bool) -> None:
+        deadline = time.monotonic() + budget
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self._selector is None or not self._open:
+                if until_eof:
+                    return
+                time.sleep(remaining)
+                return
+            try:
+                ready = self._selector.select(remaining)
+            except OSError as exc:
+                # Nothing may escape this. It runs between the SIGTERM and
+                # the SIGKILL, and an exception here leaves the group
+                # unsignalled, the child unreaped, and the caller holding an
+                # errno where its own timeout should be.
+                #
+                # This is the Windows shape and the reason `watching` cannot
+                # be answered before a read: `select` there takes sockets
+                # only, so both pipes register and the first `select` refuses
+                # them. Giving up on watching leaves the caller free to fall
+                # back to `communicate`, which does work there.
+                logger.debug("cannot watch the stage's pipes: %s", exc)
+                self._unwatch()
+                continue
+            for key, _ in ready:
+                self._read(key)
+
+    def _unwatch(self) -> None:
+        """Give up on watching, without touching what has already been read."""
+        if self._selector is not None:
+            self._selector.close()
+            self._selector = None
+        self._can_watch = False
+        self._open = 0
+
+    def _read(self, key: selectors.SelectorKey) -> None:
+        try:
+            chunk = os.read(key.fd, _READ_CHUNK)
+        except InterruptedError:
+            # A signal arrived mid-read. PEP 475 has `os.read` retry this
+            # itself unless a Python handler raised, so it is close to
+            # unreachable -- but the cost of getting it wrong is not
+            # proportionate: the branch below closes the pipe, so one EINTR
+            # would drop everything the stage says from then on. Verified by
+            # planting one: the read end closed and the next write to the
+            # pipe raised `BrokenPipeError`.
+            self._interrupted[key.fd] = self._interrupted.get(key.fd, 0) + 1
+            if self._interrupted[key.fd] > _MAX_INTERRUPTED_READS:
+                logger.debug("giving up on a pipe that answers only EINTR")
+                self._close(cast("IO[Any]", key.fileobj))
+            return
+        except OSError as exc:
+            # Treated as end of stream. The descriptor is unreadable, so no
+            # amount of further selecting will produce anything, and leaving
+            # it registered would spin this loop for the rest of the budget.
+            logger.debug("cannot read a pipe of the stage: %s", exc)
+            chunk = b""
+        self._interrupted.pop(key.fd, None)
+        if chunk:
+            key.data.append(chunk)
+            return
+        # Narrowed here because here is where it is known: `SelectorKey`
+        # types this as `int | HasFileno`, and the register loop above is
+        # what establishes that only the two pipe objects are ever in it.
+        self._close(cast("IO[Any]", key.fileobj))
+
+    def _close(self, stream: IO[Any]) -> None:
+        # `unregister` is not guarded, and that is the invariant rather than
+        # an oversight: it is only ever reached with a key `select` has just
+        # handed back, so the registration exists. `_fileobj_lookup` falls
+        # back to an identity scan for a stream whose `fileno()` now raises,
+        # and the kqueue and epoll implementations swallow `OSError` for a
+        # stale descriptor, so only `KeyError` could escape and only for a
+        # key that was never registered.
+        if self._selector is not None:
+            self._selector.unregister(stream)
+        self._open -= 1
+        with contextlib.suppress(OSError):
+            stream.close()
+
+    def close(self) -> None:
+        self._unwatch()
+
+    def text(self) -> tuple[str, str]:
+        r"""What was read, decoded and newline-translated like `communicate`.
+
+        The translation matters because both paths describe the same child:
+        `Popen._translate_newlines` turns `\r\n` and a lone `\r` into `\n`,
+        so without it the same stage's output changed shape depending on
+        whether it finished or was killed -- a `\r`-heavy progress bar
+        rendering as overwrites inside an error report rather than as lines.
+        """
+        return (
+            _translate_newlines(b"".join(self._out), self._encoding),
+            _translate_newlines(b"".join(self._err), self._err_encoding),
+        )
+
+
+def _buffered_by_communicate(proc: subprocess.Popen, stream: IO[Any] | None) -> bytes | None:
+    """What `communicate` read off `stream` before it gave up, or `None`.
+
+    `Popen.communicate` accumulates into `_fileobj2output` and only assembles
+    the result at the end, so a timeout raised from its trailing `wait()`
+    carries no output at all while every byte sits in that dict -- and a
+    timeout raised from the pipe read carries exactly what is in there. One
+    source covers both, which is why this is preferred over the exception.
+
+    It is a private attribute, so this asks for it rather than assuming it:
+    a CPython that renames or drops it leaves the caller on the exception,
+    which is where this module was before.
+    """
+    buffered = getattr(proc, "_fileobj2output", None)
+    if not isinstance(buffered, dict) or stream is None:
+        return None
+    chunks = buffered.get(stream)
+    if chunks is None:
+        return None
+    try:
+        return b"".join(chunks)
+    except TypeError:
+        # Text-mode chunks on some other implementation. Not ours to join.
+        return None
+
+
+def _encoding_of(stream: object) -> str:
+    """The encoding a pipe was opened with, or UTF-8 if it will not say.
+
+    Asked once, while the stream is certainly open: a closed `TextIOWrapper`
+    still answers, but a stream this module replaced with `None` does not.
+    """
+    return getattr(stream, "encoding", None) or "utf-8"
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    """Collect the exit status, so a killed stage does not stay a zombie.
+
+    Bounded, and only ever called after `_kill_tree` has returned -- which is
+    not the same as after a SIGKILL, since that returns early both when the
+    child had already gone and when the group stopped being ours to signal.
+    Either way nothing else is going to collect it: `communicate` used to do
+    this as a side effect, and dropping it in favour of reading the pipes
+    directly would otherwise leave one zombie per timed-out stage for the life
+    of the run.
+    """
+    try:
+        proc.wait(timeout=_REAP_AFTER_KILL_S)
+    except subprocess.TimeoutExpired:
+        logger.debug("%s did not become reapable after being killed", _describe(proc))
+
+
+def _kill_and_drain(
+    proc: subprocess.Popen,
+    pgid: int | None = None,
+    already: tuple[str | bytes | None, str | bytes | None] = (None, None),
+    *,
+    seed: bool = True,
+) -> tuple[str, str]:
+    """Kill the group and collect what it wrote -- reading throughout.
+
+    The drain runs *during* the grace as well as after the kill, which is the
+    difference between a grace a talkative stage can use and one it spends
+    blocked on a full pipe. `_PipeDrain` says why that could not be
+    `communicate`.
+
+    `already` is what the caller's own read took off the pipes before it gave
+    up; it is carried rather than re-read, because those bytes are gone from
+    the descriptors. `_PipeDrain` prefers the `Popen`'s own buffer to it and
+    says why.
+
+    Both phases are bounded, because the kill is not guaranteed to have
+    reached everything: a grandchild that called `setsid()` is outside the
+    group and can hold the inherited stdout open. Giving up on the output is
+    the right trade, since the caller is already on its way to reporting a
+    timeout or re-raising; hanging instead would reinstate the unbounded wait.
+    """
+    drain = _PipeDrain(proc, already, seed=seed)
+    try:
+        reached = _kill_tree(proc, pgid=pgid, pump=drain.pump)
+        # `finish` before the decision, not after it. `_kill_tree` returns
+        # without pumping on several paths -- an already-exited leader is the
+        # one that matters, because a grandchild holding the pipes is exactly
+        # what this function is for -- so on those the first read of the whole
+        # run happens here, and asking `watching` any earlier asks it before
+        # anything has tried.
+        #
+        # But only for a drain that is still watching. A drain that was
+        # partial from its constructor already knows it will hand over to the
+        # fallback, and letting it `finish` first made it wait the budget
+        # twice when something held its pipe -- measured, 21.4 s where the
+        # other shapes took 11.3 s -- for bytes the fallback's own read then
+        # replaced. The shape the reorder above exists for still gets here:
+        # where `select` takes sockets only, both pipes register, `watching`
+        # stays true until the first `select`, and that happens in here.
+        if drain.watching:
+            drain.finish(_DRAIN_AFTER_KILL_S)
+        if drain.watching:
+            out, err, still_held = (*drain.text(), drain.draining)
+        else:
+            # Nothing on this host can be watched: `select` on Windows takes
+            # sockets and not pipes, and a POSIX host can run out of the
+            # descriptor `epoll` needs. Fall back to the read this replaced.
+            # It is safe *here* and was not before, because `communicate`
+            # reaps and a reap ahead of the kill frees the group id the kill
+            # is aimed at. `_kill_tree` has returned by this line, which is
+            # not always the same as "the SIGKILL was sent" -- it returns
+            # early when the child had already gone, or when the group
+            # stopped being ours -- but on exactly those paths there is no
+            # further signal for a reap to spoil.
+            #
+            # Taken by discarding callers as well, and that is deliberate. An
+            # earlier revision skipped it for them, on the argument that the
+            # read costs up to `_DRAIN_AFTER_KILL_S` for text nobody reads.
+            # The read is not where that time goes. `communicate(timeout=...)`
+            # returns once both pipes reach EOF and the child is reapable, and
+            # after a SIGKILL those normally come together, so it spends the
+            # whole budget in two cases. One is something still holding a pipe
+            # -- exactly the case the warning below exists for, and a drain
+            # that watched every pipe spends one budget in `finish` then too.
+            # The other is a child that does not become reapable: nothing could
+            # be signalled and it kept running, or the killed leader is in the
+            # uninterruptible sleep `_REAP_AFTER_KILL_S` names. The skip did
+            # save that budget without silencing anything, on a stop that had
+            # already failed. At most one budget either way: a drain that goes
+            # to the fallback does not spend one in `finish` as well.
+            #
+            # What the skip bought in the first case was silence. On Windows,
+            # with no process group and a `select` that refuses pipes, an
+            # interrupt that finds the child alive and its pipes still held
+            # reaches only the child, and "only the child was signalled" --
+            # true, and the only clue that its descendants are loose -- stopped
+            # being printed.
+            #
+            # One cost comes back with it: `communicate` assembles the whole
+            # transcript, so a discarding caller on this path makes the copy
+            # `seed=False` spares it in the constructor. That is a host that
+            # could not watch its pipes, being interrupted.
+            out, err, still_held = _drain_by_communicate(proc, drain)
+        if still_held:
+            # Said out loud, because a leaked process is otherwise diagnosed
+            # hours later as somebody else's out-of-memory kill. The sentence
+            # says only what `reached` supports: blaming a stray grandchild
+            # when in fact nothing could be signalled would send the reader
+            # hunting for the wrong process.
+            logger.warning(
+                "output pipes for %s are still open: %s",
+                _describe(proc),
+                {
+                    # Not "a descendant left the group": `killpg` returning 0
+                    # says the signal was accepted, not that anything died. A
+                    # member wedged in an uninterruptible ioctl is unkillable
+                    # and still holds the pipe, so naming one cause would send
+                    # the reader hunting for the wrong process.
+                    Reach.GROUP: (
+                        "the group was signalled, so either something outside it is holding "
+                        "them or something in it has not died"
+                    ),
+                    Reach.CHILD_ONLY: (
+                        "only the child was signalled, which does not cover what it spawned"
+                    ),
+                    Reach.NOTHING: (
+                        "nothing could be signalled at all, so the child itself may be "
+                        "holding them"
+                    ),
+                    Reach.ALREADY_GONE: (
+                        "the child had already exited, so something it spawned holds them"
+                    ),
+                }[reached],
+            )
+        # Whatever was read, however far it got. The stage's stderr is the
+        # single most useful artifact in a timeout report, so it is worth
+        # carrying the partial one rather than returning two empty strings.
+        return out, err
+    finally:
+        # The selector goes back first. `_reap` waits, and a wait is
+        # interruptible: with the two the other way round, a signal arriving
+        # during the reap skipped the close entirely and leaked a kqueue or
+        # epoll descriptor per interrupted stage. Before the reap moved in
+        # here, `drain.close()` was the whole `finally` and could not be
+        # skipped -- which is the property to keep.
+        try:
+            drain.close()
+        finally:
+            # In a `finally` of its own because the kill above can be
+            # interrupted, and a child that was killed and never collected
+            # is a zombie for the life of the run. Bounded, so an interrupt
+            # is not answered by hanging.
+            _reap(proc)
+
+
+def _pipes_open(proc: subprocess.Popen) -> bool:
+    """Whether either read end is still open on our side.
+
+    Used only where a read has just timed out, which is what makes it
+    evidence: `communicate` closes each stream as it reaches EOF, so a
+    timeout with one still open means the end never came and something is
+    still holding the write end. On its own the answer would be weaker than
+    that -- an unclosed wrapper says only that nobody closed it.
+
+    This is the fallback's counterpart to `_PipeDrain.draining`, which
+    answers the same question on the watched path from what the drain saw.
+    They answer over different sets: this asks both streams, while
+    `draining` speaks only for the pipes the drain watched. `_kill_and_drain`
+    uses `draining` only when the drain watched every pipe, which is when the
+    two sets are the same.
+    """
+    return any(stream is not None and not stream.closed for stream in (proc.stdout, proc.stderr))
+
+
+def _drain_by_communicate(proc: subprocess.Popen, drain: _PipeDrain) -> tuple[str, str, bool]:
+    """Read the pipes the old way, for a host where they cannot be watched.
+
+    Kept because the alternative on such a host is not "a slower drain" but
+    "no output at all": a stage would time out and say nothing about why.
+    What `communicate` returns already includes everything *it* read earlier,
+    so it replaces the drain's seed rather than being added to it. It does
+    not include what the drain itself took off a pipe with `os.read` -- a
+    discarding drain that watched one pipe during the grace -- and that is
+    dropped here; it is dropped only on a path whose caller throws the text
+    away.
+
+    Returns the third value the caller needs from the drain it is standing in
+    for: whether the pipes are still held by something.
+    """
+    try:
+        out, err = proc.communicate(timeout=_DRAIN_AFTER_KILL_S)
+    except subprocess.TimeoutExpired as expired:
+        out, err = expired.output, expired.stderr
+        still_held = _pipes_open(proc)
+    except (OSError, ValueError) as exc:
+        # No warning from here. The read failed, so nothing was established
+        # about who holds what -- our own wrappers being unclosed says only
+        # that we did not close them, not that a writer is alive. A warning
+        # that fires when nothing is known is the warning that gets ignored
+        # when something is.
+        logger.debug("could not read the pipes of %s: %s", _describe(proc), exc)
+        return (*drain.text(), False)
+    else:
+        still_held = False
+    if out is None and err is None:
+        # The trailing `wait()` raised, so this call assembled nothing -- but
+        # it did read, and into the same `_fileobj2output` the drain was
+        # seeded from. The seed was taken in the drain's constructor, before
+        # this read ran, so returning it dropped whatever the read found:
+        # measured, `part1` returned while the buffer held `part1` and
+        # `part2`. Asking the buffer again is what picks that up; the seed is
+        # the account only where there is no buffer to ask.
+        out = _buffered_by_communicate(proc, proc.stdout)
+        err = _buffered_by_communicate(proc, proc.stderr)
+        if out is None and err is None:
+            return (*drain.text(), still_held)
+    # In the encoding each pipe was opened with, not the default: a stage on a
+    # non-UTF-8 host would otherwise have its salvaged stderr come back as
+    # mojibake, which is the one artifact this exists to preserve. And
+    # newline-translated, for the same reason `_PipeDrain.text` is: on the
+    # `TimeoutExpired` exit these are raw, untranslated bytes straight off
+    # the pipe. `_translate_newlines` passes an already-translated `str`
+    # through unchanged, so the successful exit is unaffected.
+    #
+    # Not a Windows claim, though this is the path that exists for Windows:
+    # `communicate` there reads on threads and its `TimeoutExpired` carries
+    # no output at all, so the bytes-on-timeout shape is a POSIX one -- a
+    # host that lost its selector, not a host that never had one.
+    return (
+        _translate_newlines(out, drain.encoding),
+        _translate_newlines(err, drain.err_encoding),
+        still_held,
+    )
+
+
+def _run_guarded(
+    argv: Sequence[str],
+    timeout: float,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess so that whatever ends litetune ends it too.
+
+    Shared by `StageEnv.run` and `StageEnv.provision`, which have the same
+    problem and used to have two different answers. `run` grew a session, a
+    termination guard and a group kill; `provision` stayed on `subprocess.run`,
+    whose only cleanup is `Popen.kill` on its direct child and only on paths
+    that raise. A SIGTERM to litetune raises nothing, so a half-hour
+    `pip install torch` and every compiler it had spawned carried on against a
+    directory nobody was going to keep.
+
+    The session is what makes the group killable, and the group is what makes
+    the kill worth anything: killing only the direct child means a six-hour
+    `tune` timeout records an honest "not checked", the run continues, and an
+    abandoned torch process keeps its memory -- the next stage is then
+    SIGKILLed and `exits` reads that as the OOM killer, blaming the machine
+    for litetune's own orphan.
+
+    Returns the completed process rather than raising on non-zero: callers
+    decide whether a non-zero exit is a failed check or an unperformed one,
+    and that distinction is the whole point of litetune.checks.
+
+    `errors="replace"` on the decode: `text=True` decodes stdout/stderr
+    eagerly, and a stray non-UTF-8 byte -- a CUDA or driver banner ahead of a
+    probe's own JSON line, in the same class of weird environment the
+    last-non-empty-line rule in `resolve_device` exists to survive -- raised
+    `UnicodeDecodeError` there uncaught, which is a `ValueError`, not the
+    `OSError` every caller was written to expect. That escaped
+    `resolve_device` and both of its callers and ended a `tune` or `verify`
+    run with a traceback instead of an unanswered probe.
+
+    `env` is *overrides*, not a whole environment: the base is the host's
+    minus `_HOST_OVERRIDES`, so a caller cannot accidentally hand the pins
+    back through `PYTHONPATH`, and `PIP_TARGET` cannot redirect an install out
+    of the venv it is supposed to fill.
+    """
+    proc = subprocess.Popen(
+        list(argv),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        # The timeout message names a prompt as a cause; this is what stops
+        # one from being waited on at all.
+        stdin=subprocess.DEVNULL,
+        env=_child_env(env),
+        # POSIX only; accepted and ignored on Windows, where `_kill_tree`
+        # falls back to killing the child alone. Not overridable: a caller
+        # reaching past it with `process_group=` would put the child in *our*
+        # group, and `_kill_tree` would then aim SIGKILL at the session that
+        # is running litetune. There was a `**kwargs` passthrough here with no
+        # user in the package; it is gone.
+        start_new_session=True,
+    )
+    # The guard wraps the cleanup as well as the wait, and that is the whole
+    # point of where it sits. With the `try` outside it, the context manager
+    # restored the default dispositions *before* either handler ran -- and
+    # `_kill_and_drain` is a grace, a drain and a reap, so for up to twenty
+    # seconds of every timeout and every interrupt litetune was unprotected.
+    # Reproduced: a third signal arriving in that window killed litetune
+    # mid-kill and the stage outlived its parent, which is precisely what the
+    # guard exists to prevent.
+    #
+    # The group is read here, once, while the child is certainly alive. By the
+    # time a kill runs the leader may be a zombie, and macOS will not report
+    # the group of one -- which made the group unreachable in exactly the case
+    # the sweep exists for. Recovering it from `proc.pid` later was the other
+    # way, and it is unsafe: a host using `SA_NOCLDWAIT` has the kernel reap
+    # without `Popen` or `getsignal` ever knowing, and the number is then free
+    # for somebody else.
+    pgid = _group_of(proc)
+    with _kill_child_if_we_are_told_to_exit(proc, pgid):
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as expired:
+            # Kill first, then drain: reading first would wait on a pipe the
+            # group is still holding open. What `communicate` already read is
+            # handed over rather than re-read -- those bytes are off the
+            # descriptors now, and `_PipeDrain` says where they are found.
+            out, err = _kill_and_drain(proc, pgid, (expired.output, expired.stderr))
+            raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from None
+        except BaseException:
+            # Ctrl-C reaches the group through the terminal only while the
+            # child shares it, and `start_new_session=True` is what stopped it
+            # doing so. This is that signal's replacement, and it covers every
+            # other way out of the `try` as well.
+            #
+            # `seed=False` for the same reason the handler uses it: this
+            # result is discarded -- the exception is on its way out and no
+            # caller reads a stage's output on this path -- and seeding means
+            # a `b"".join` over the whole transcript, which is the one thing
+            # in the drain's constructor that can raise.
+            _kill_and_drain(proc, pgid, seed=False)
+            raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def _translate_newlines(chunk: str | bytes | None, encoding: str) -> str:
+    """Decode, and end lines the way a completed `communicate` would.
+
+    Spelled out rather than borrowed: `Popen._translate_newlines` is private,
+    and reaching into it would tie this to a name CPython owes nobody. It is
+    two statements there and two operations here, and the pair is checked
+    against it by test rather than by assertion.
+    """
+    return _as_text(chunk, encoding).replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _as_text(chunk: str | bytes | None, encoding: str = "utf-8") -> str:
@@ -844,7 +1612,7 @@ def cached_environments() -> list[CachedEnv]:
             # and the stage cannot disagree about the same directory. Reading
             # only the marker made `litetune env` print `ready` for one holding
             # nothing else, which is where this was first seen.
-            ready=(child / ".litetune-ready").exists() and _interpreter_in(child).exists(),
+            ready=(child / ".litetune-ready").is_file() and _interpreter_in(child).exists(),
             stage=claimed.get(child.name),
         )
         for child in sorted(root.iterdir())
@@ -923,8 +1691,13 @@ class StageEnv:
         Checking `python` rather than the marker's contents is deliberate: the
         path already carries the identity hash, so a marker here cannot belong
         to a different build. What is missing is the tree, not the identity.
+
+        A file, not merely something by that name. `provision` only ever
+        writes it with `write_text`, so a directory there was put there by
+        something else -- and `.exists()` answered yes for it, which let an
+        environment nobody finished read as ready.
         """
-        return (self.path / ".litetune-ready").exists() and self.python.exists()
+        return (self.path / ".litetune-ready").is_file() and self.python.exists()
 
     def provision(
         self, events=None, force: bool = False, timeout: int = PROVISION_TIMEOUT_S
@@ -1003,19 +1776,19 @@ class StageEnv:
                 # naming at all.
                 cmd = [str(self.python), "-m", "pip", "install", "--quiet", *self.requirements]
                 try:
-                    proc = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=remaining,
-                        # The timeout message names a prompt as a cause; this is
-                        # what stops one from being waited on at all.
-                        stdin=subprocess.DEVNULL,
-                        # `PIP_TARGET`/`PIP_PREFIX` in the host environment
-                        # would install somewhere other than this venv, and
-                        # `.litetune-ready` would still be written over it.
-                        env=_child_env(),
-                    )
+                    # Through the same guard the stages use, and for the same
+                    # reason. `subprocess.run` kills its direct child, and
+                    # only from an `except`: a SIGTERM to litetune raises
+                    # nothing at all, and a timeout reaches pip and not the
+                    # compilers pip spawned. Half an hour of `pip install
+                    # torch` therefore carried on writing into a directory the
+                    # restore below had already decided to throw away.
+                    #
+                    # `_run_guarded` also puts `PIP_TARGET` and `PIP_PREFIX`
+                    # out of reach, which would otherwise install somewhere
+                    # other than this venv while `.litetune-ready` was written
+                    # over it regardless.
+                    proc = _run_guarded(cmd, remaining)
                 except subprocess.TimeoutExpired:
                     raise RuntimeError(
                         f"provisioning environment {self.name!r} exceeded its {timeout}s budget "
@@ -1073,83 +1846,23 @@ class StageEnv:
     ) -> subprocess.CompletedProcess[str]:
         """Run a console script or module inside this environment.
 
-        Returns the completed process rather than raising on non-zero: callers
-        decide whether a non-zero exit is a failed check or an unperformed one,
-        and that distinction is the whole point of litetune.checks.
+        A console script is preferred over `python -m` wherever the file is
+        present, because that is what `convert` and `verify` invoke
+        `litert-torch` and `litert-lm` as.
 
-        `errors="replace"` on the decode: `text=True` decodes stdout/stderr
-        eagerly, and a stray non-UTF-8 byte -- a CUDA or driver banner ahead of
-        a probe's own JSON line, in the same class of weird environment the
-        last-non-empty-line rule in `resolve_device` exists to survive --
-        raised `UnicodeDecodeError` there uncaught, which is a `ValueError`,
-        not the `OSError` every caller of this method was written to expect.
-        That escaped `resolve_device` and both of its callers and ended a
-        `tune` or `verify` run with a traceback instead of an unanswered
-        probe. Replacing the byte keeps the rest of the line readable, which
-        is what a caller that only reads the last line needs; this is shared
-        by every stage, so the fix protects all of them, not only the probe.
+        Everything about how the process is started, killed and read is in
+        `_run_guarded`, which `provision` shares -- including why the child
+        gets a session of its own, what `env` may and may not reach, and why
+        the decode replaces bad bytes rather than raising.
 
-        `env` is *overrides*, not a whole environment: the base is the host's
-        minus `_HOST_OVERRIDES`, so a caller cannot accidentally hand the pins
-        back to `PYTHONPATH` by starting from `os.environ`.
-
-        The process is started in its own session so that a timeout can kill
-        what it spawned. `subprocess.run` kills only the direct child, which
-        for `tune` means a six-hour timeout records an honest "not checked",
-        the run continues, and an abandoned torch process keeps its memory --
-        the next stage is then SIGKILLed and `exits` reads that as the OOM
-        killer, blaming the machine for litetune's own orphan.
+        Returns the completed process rather than raising on non-zero:
+        callers decide whether a non-zero exit is a failed check or an
+        unperformed one, and that distinction is the whole point of
+        litetune.checks.
         """
         exe = _console_script_in(self.path, args[0])
         argv = [str(exe), *args[1:]] if exe is not None else [str(self.python), "-m", *args]
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            stdin=subprocess.DEVNULL,
-            env=_child_env(env),
-            # POSIX only; accepted and ignored on Windows, where `_kill_tree`
-            # falls back to killing the child alone. Not overridable: a caller
-            # reaching past it with `process_group=` would put the child in
-            # *our* group, and `_kill_tree` would then aim SIGKILL at the
-            # session that is running litetune. There was a `**kwargs`
-            # passthrough here with no user in the package; it is gone.
-            start_new_session=True,
-        )
-        # The guard wraps the cleanup as well as the wait, and that is the
-        # whole point of where it sits. With the `try` outside it, the context
-        # manager restored the default dispositions *before* either handler ran
-        # -- and `_kill_and_drain` is a grace plus a drain, so for up to fifteen
-        # seconds of every timeout and every interrupt litetune was unprotected.
-        # Reproduced: a third signal arriving in that window killed litetune
-        # mid-kill and the stage outlived its parent, which is precisely what
-        # the guard exists to prevent.
-        # Read here, once, while the child is certainly alive. By the time a
-        # kill runs the leader may be a zombie, and macOS will not report the
-        # group of one -- which made the group unreachable in exactly the case
-        # the sweep exists for. Recovering it from `proc.pid` later was the
-        # other way, and it is unsafe: a host using `SA_NOCLDWAIT` has the
-        # kernel reap without `Popen` or `getsignal` ever knowing, and the
-        # number is then free for somebody else.
-        pgid = _group_of(proc)
-        with _kill_child_if_we_are_told_to_exit(proc, pgid):
-            try:
-                out, err = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                # Kill first, then drain: `communicate()` with no timeout would
-                # otherwise wait on a pipe the group is still holding open.
-                out, err = _kill_and_drain(proc, pgid)
-                raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from None
-            except BaseException:
-                # Ctrl-C reaches the group through the terminal only while the
-                # child shares it, and `start_new_session=True` is what stopped
-                # it doing so. This is that signal's replacement, and it covers
-                # every other way out of the `try` as well.
-                _kill_and_drain(proc, pgid)
-                raise
-        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+        return _run_guarded(argv, timeout, env)
 
 
 # Where a stage's subprocess will run is decided here, once, in the parent,

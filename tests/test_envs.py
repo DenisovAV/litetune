@@ -180,7 +180,6 @@ def test_an_unsupported_interpreter_is_refused_before_pip_runs(monkeypatch, tmp_
     and blamed numpy for it, which sends the reader to fix a pin that is not
     there. So the message must name the pin that actually set the limit.
     """
-    import subprocess
     import venv
 
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
@@ -192,7 +191,10 @@ def test_an_unsupported_interpreter_is_refused_before_pip_runs(monkeypatch, tmp_
     )
 
     started = []
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: started.append(a))
+    # `_run_guarded`, not `subprocess.run`: the install moved onto the same
+    # guarded path the stages use, and a tripwire left on the old function
+    # would report "the refusal came before pip" whatever pip did.
+    monkeypatch.setattr(envs, "_run_guarded", lambda *a, **k: started.append(a))
     monkeypatch.setattr(envs.sys, "version_info", (3, 13, 0, "final", 0))
 
     with pytest.raises(RuntimeError, match=r"pins numpy==2\.0\.2.*up to python3\.12"):
@@ -208,7 +210,7 @@ def test_an_unsupported_interpreter_is_refused_before_pip_runs(monkeypatch, tmp_
     )
     monkeypatch.setattr(venv.EnvBuilder, "create", _fake_venv)
     monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
     )
     reaches_further.provision()
     assert reaches_further.ready, "3.13 is inside torch's range and must be allowed"
@@ -239,18 +241,17 @@ def test_a_provisioned_environment_can_run_its_console_scripts(monkeypatch, tmp_
     env = StageEnv(name="relocatable", requirements=("pyyaml==6.0.2",))
 
     installs = []
-    real_run = real_subprocess.run
 
-    def skip_only_our_install(cmd, **kwargs):
-        # `EnvBuilder.create` shells out to `ensurepip` through this same
-        # function, and that call is the one installing the script under test.
-        # Stubbing indiscriminately removes the evidence.
-        if isinstance(cmd, list | tuple) and "install" in cmd:
-            installs.append(list(cmd))
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-        return real_run(cmd, **kwargs)
+    def skip_our_install(cmd, *args, **kwargs):
+        installs.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(envs.subprocess, "run", skip_only_our_install)
+    # Only litetune's own install is stubbed. `EnvBuilder.create` shells out
+    # to `ensurepip` through `subprocess.run`, and that call is the one
+    # installing the console script under test -- it has to really run. The
+    # two used to share a function and the stub had to tell them apart by
+    # looking for "install" in the command line; they no longer do.
+    monkeypatch.setattr(envs, "_run_guarded", skip_our_install)
     path = env.provision(timeout=300)
     monkeypatch.undo()
 
@@ -730,6 +731,84 @@ def test_a_timeout_carries_what_the_child_managed_to_say(tmp_path, monkeypatch):
     assert caught.value.timeout == 1
 
 
+class _WedgedProc:
+    """A child that never exits, with real pipes that never close.
+
+    Real descriptors, because the drain reads them with `os.read`: a stub
+    `communicate` would only prove the stub was called, and it is exactly the
+    call the drain stopped making. The write ends stay open until `close`, so
+    the pipes never reach EOF -- the state the "are still open" warning is
+    about, and the one a grandchild outside the killed group produces.
+    """
+
+    args = ["python"]
+    returncode = None
+
+    def __init__(self, on_stdout=b"", on_stderr=b"", pid=4242, encoding="utf-8", err_encoding=None):
+        self.pid = pid
+        self.direct_signals: list[int] = []
+        self._writers: list[int] = []
+        self.stdout = self._pipe(on_stdout, encoding)
+        self.stderr = self._pipe(on_stderr, err_encoding or encoding)
+
+    def _pipe(self, payload, encoding="utf-8"):
+        read_fd, write_fd = os.pipe()
+        if payload:
+            os.write(write_fd, payload)
+        self._writers.append(write_fd)
+        return open(read_fd, encoding=encoding, errors="replace")
+
+    def send_signal(self, sig):
+        self.direct_signals.append(sig)
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        raise subprocess.TimeoutExpired("fake", timeout)
+
+    def close(self):
+        for fd in self._writers:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    def as_communicate_left_it(self):
+        """The state a completed `_communicate` leaves: both pipes at EOF and
+        both stream objects closed. It only returns when every descriptor has
+        reached EOF, so a timeout raised by the `wait()` after it can only
+        ever be seen in this state -- which is what makes it the shape the
+        seeding has to be tested against."""
+        self.close()
+        for stream in (self.stdout, self.stderr):
+            with contextlib.suppress(OSError):
+                stream.close()
+        return self
+
+
+class _FakePopen:
+    """A child that starts, says nothing and exits zero.
+
+    Enough for `_run_guarded` to get through: it reads the group, installs the
+    guard, and calls `communicate`. Used where the test is about what was
+    handed to `Popen` rather than about anything the child does.
+    """
+
+    args = ["python"]
+    pid = 4242
+    returncode = 0
+    stdout = None
+    stderr = None
+
+    def communicate(self, timeout=None):
+        return "", ""
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
 class _FakeProc:
     """A `Popen` stand-in that records what was signalled, and never dies.
 
@@ -737,6 +816,12 @@ class _FakeProc:
     `_kill_tree` and `_signal_tree` both ask it: a host that ignores SIGCHLD
     has the kernel reap for us, and `Popen` only learns through `poll`.
     """
+
+    # A real `Popen` always has these, whether or not it was given pipes, and
+    # the termination guard now builds a drain around them.
+    args = ["python"]
+    stdout = None
+    stderr = None
 
     def __init__(self, pid=4242, returncode=None):
         self.pid = pid
@@ -883,18 +968,39 @@ def test_the_install_does_not_inherit_a_redirected_pip(tmp_path, monkeypatch):
 
     seen = {}
 
-    def capture(cmd, **kwargs):
+    # At `Popen`, which is where the environment is actually handed over.
+    # Capturing at a wrapper only proves the wrapper was called.
+    def capture(argv, **kwargs):
         seen.update(kwargs.get("env") or {})
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+        return _FakePopen()
 
-    monkeypatch.setattr(envs.subprocess, "run", capture)
+    monkeypatch.setattr(envs.subprocess, "Popen", capture)
     StageEnv(name="pipenv", requirements=("pyyaml==6.0.2",)).provision()
+    assert seen, "the install must have started a process"
     assert "PIP_TARGET" not in seen
 
 
 # ---------------------------------------------------------------------------
 # What "ready" is evidence of
 # ---------------------------------------------------------------------------
+
+
+def test_a_directory_named_like_the_marker_is_not_ready(tmp_path, monkeypatch):
+    """The marker is a file `provision` writes; nothing else is evidence.
+
+    `.exists()` answered yes for a directory of the same name, so an
+    environment nobody finished read as ready, `provision` short-circuited on
+    it, and the cache listing agreed.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    env = StageEnv(name="counterfeit", requirements=("pyyaml==6.0.2",))
+    env.python.parent.mkdir(parents=True, exist_ok=True)
+    env.python.symlink_to(sys.executable)
+    (env.path / ".litetune-ready").mkdir()
+
+    assert not env.ready
+    listed = [entry for entry in envs.cached_environments() if entry.path == env.path]
+    assert listed and not listed[0].ready, "and the cache listing must agree"
 
 
 def test_a_marker_over_an_empty_directory_is_not_ready(tmp_path, monkeypatch):
@@ -1074,7 +1180,7 @@ def test_a_second_signal_does_not_buy_the_child_more_time(monkeypatch):
     _TERM_GRACE_SENTINEL = object()
     entries = []
 
-    def kill_and_signal_again(proc, grace=_TERM_GRACE_SENTINEL, stop=None, pgid=None):
+    def kill_and_signal_again(proc, grace=_TERM_GRACE_SENTINEL, stop=None, pgid=None, pump=None):
         entries.append(grace)
         if len(entries) == 1:
             handler(signal.SIGTERM, None)  # a second signal, mid-grace
@@ -1098,6 +1204,115 @@ def test_a_second_signal_does_not_buy_the_child_more_time(monkeypatch):
         _TERM_GRACE_SENTINEL,
         0,
     ], "the second signal must kill outright rather than start another grace"
+
+
+def test_a_second_signal_cuts_the_first_grace_short(monkeypatch):
+    """Killing outright is half of it; the first grace must also stop waiting.
+
+    The grace `_kill_tree` gives the first signal ends early when its `stop`
+    answers yes, and the handler's escalation is what makes it answer yes.
+    Without that, the second signal's SIGKILL goes out and the first frame
+    still sits out the rest of its `_TERM_GRACE_S` before it can end
+    litetune.
+    """
+    asked: list = []
+
+    def kill(proc, grace=None, stop=None, pgid=None, pump=None):
+        if grace == 0:
+            return envs.Reach.GROUP
+        asked.append(stop is not None and stop())
+        handler(signal.SIGHUP, None)  # a second signal, mid-grace
+        asked.append(stop is not None and stop())
+        return envs.Reach.GROUP
+
+    monkeypatch.setattr(envs, "_kill_tree", kill)
+    captured: dict = {}
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+    monkeypatch.setattr(signal, "signal", lambda sig, h: captured.setdefault(sig, h))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    with envs._kill_child_if_we_are_told_to_exit(_FakeProc()):
+        handler = captured[signal.SIGTERM]
+        with pytest.raises(envs.StageInterrupted):
+            handler(signal.SIGTERM, None)
+
+    assert asked == [False, True], "the grace was not told that a second signal arrived"
+
+
+def test_a_handler_whose_grace_was_interrupted_can_still_be_signalled(monkeypatch):
+    """The route the `finally` around the handler's grace exists for.
+
+    A Ctrl-C during the grace raises out of `_kill_tree`, so the disposition
+    restore and the re-delivery after it never run, and both TERM and HUP
+    still point at this handler during `run`'s cleanup. If the handler were
+    still marked as running, whichever arrived next would take the
+    escalation branch -- a zero grace, and a return instead of ending
+    litetune -- for up to twenty seconds of that cleanup.
+    """
+    graces: list = []
+    default = object()
+
+    def kill(proc, grace=default, stop=None, pgid=None, pump=None):
+        graces.append(grace)
+        if len(graces) == 1:
+            raise KeyboardInterrupt
+        return envs.Reach.GROUP
+
+    monkeypatch.setattr(envs, "_kill_tree", kill)
+    captured: dict = {}
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+    monkeypatch.setattr(signal, "signal", lambda sig, h: captured.setdefault(sig, h))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    with envs._kill_child_if_we_are_told_to_exit(_FakeProc()):
+        with pytest.raises(KeyboardInterrupt):
+            captured[signal.SIGTERM](signal.SIGTERM, None)
+        # `os.kill` is a no-op here, so a handler that is not stuck ends in
+        # the raise it uses when the process survives its own re-delivery.
+        with pytest.raises(envs.StageInterrupted):
+            captured[signal.SIGHUP](signal.SIGHUP, None)
+
+    assert graces == [default, default], "the next signal was treated as a second one"
+
+
+@pytest.mark.parametrize("interrupted", [False, True], ids=["returned", "interrupted"])
+def test_the_handler_gives_its_selector_back(monkeypatch, interrupted):
+    """The handler's drain holds a selector over the stage's pipes.
+
+    Its grace can end two ways -- by returning, or by an interrupt raised out
+    of it -- and neither may keep that descriptor open for the rest of the
+    run: `run`'s own cleanup builds another drain over the same pipes next.
+    """
+    drains: list = []
+    real_drain = envs._PipeDrain
+
+    def note(proc_, already=(None, None), *, seed=True):
+        drains.append(real_drain(proc_, already, seed=seed))
+        return drains[-1]
+
+    def kill(proc, **kwargs):
+        assert drains[-1]._selector is not None, "nothing to give back; the test proves nothing"
+        if interrupted:
+            raise KeyboardInterrupt
+        return envs.Reach.GROUP
+
+    monkeypatch.setattr(envs, "_PipeDrain", note)
+    monkeypatch.setattr(envs, "_kill_tree", kill)
+    captured: dict = {}
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+    monkeypatch.setattr(signal, "signal", lambda sig, h: captured.setdefault(sig, h))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    proc = _WedgedProc()
+    try:
+        with envs._kill_child_if_we_are_told_to_exit(proc):
+            with pytest.raises(KeyboardInterrupt if interrupted else envs.StageInterrupted):
+                captured[signal.SIGTERM](signal.SIGTERM, None)
+    finally:
+        proc.close()
+
+    assert len(drains) == 1
+    assert drains[0]._selector is None, "the handler's selector outlived its grace"
 
 
 def test_an_interrupted_stage_is_not_reported_as_a_ctrl_c():
@@ -1154,7 +1369,7 @@ def test_the_stage_is_given_its_grace(monkeypatch):
         "_wait_without_reaping",
         # Returns True: "the group is still ours to signal", which is what the
         # real one says unless the child was reaped out from under it.
-        lambda proc, pgid, grace, stop=None: waited.append(grace) or True,
+        lambda proc, pgid, grace, stop=None, pump=None: waited.append(grace) or True,
     )
 
     envs._kill_tree(_FakeProc(), grace=0.25)
@@ -1173,7 +1388,7 @@ def test_the_group_is_killed_even_when_the_child_went_quietly(monkeypatch):
 
     proc = _FakeProc()
 
-    def exits_during_the_grace(target, pgid, grace, stop=None):
+    def exits_during_the_grace(target, pgid, grace, stop=None, pump=None):
         # Exited, not reaped: `_wait_without_reaping` is named for what it does
         # not do, so `returncode` stays None and the group id stays pinned. A
         # stub that set it was modelling something the real one cannot do.
@@ -1201,6 +1416,197 @@ def test_a_stage_that_cannot_be_signalled_at_all_says_so(monkeypatch):
     assert envs._kill_tree(Untouchable(), grace=0.01) is envs.Reach.NOTHING
 
 
+def test_the_grace_is_usable_by_a_stage_that_has_something_to_say(tmp_path, monkeypatch):
+    """The grace was only ever usable by a quiet stage, which is backwards.
+
+    Nothing emptied the pipes between SIGTERM and SIGKILL. A pipe here holds
+    65,536 bytes, measured by writing to one until EAGAIN;
+    a stage that writes more than that on the way out -- a torch traceback, the
+    last frames of a progress bar, `save_pretrained` logging each shard --
+    blocks in `write` partway through, never reaches the end of its shutdown,
+    and is SIGKILLed at the end of a grace it spent blocked. The stage with the
+    most to say lost the most of it.
+
+    Measured against the code this replaced, same child, same timeout: 65,536
+    bytes arrived -- exactly one pipe buffer -- and the whole five-second grace
+    was spent blocked. Both halves matter, so both are asserted: a version that
+    drained only after the kill would still truncate, and one that drained
+    without letting the child finish would still take the full grace.
+    """
+    env = _symlinked_env(tmp_path, monkeypatch, "chatty")
+    said = 200_000  # a little over three 65,536-byte buffers
+    child = (
+        "import signal, sys, time\n"
+        "def bye(signum, frame):\n"
+        f"    sys.stderr.write('X' * {said})\n"
+        "    sys.stderr.flush()\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, bye)\n"
+        "sys.stdout.write('running\\n'); sys.stdout.flush()\n"
+        "time.sleep(60)\n"
+    )
+
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        env.run(["python", "-c", child], timeout=1)
+    elapsed = time.monotonic() - started
+
+    assert len(caught.value.stderr or "") == said, (
+        "the stage was cut off mid-sentence: the pipes were not being read while "
+        "it shut down, so it blocked on a full one"
+    )
+    assert "running" in (caught.value.output or ""), "stdout was drained too"
+    assert elapsed < 1 + envs._TERM_GRACE_S, (
+        "the child finished inside the grace and the wait must end with it; "
+        "spending the whole grace means it was blocked for it"
+    )
+
+
+def test_a_drain_that_reached_the_end_does_not_sit_out_its_budget(monkeypatch):
+    """`finish` returns at EOF and `pump` does not, and the difference is ten
+    seconds on every single timeout.
+
+    `pump` stands in for the sleep inside the grace, so it must spend what it
+    is given whatever the pipes do. The drain after the kill must not: when
+    that one was shaped the same way, the fix for the defect above worked and
+    added `_DRAIN_AFTER_KILL_S` to the wall-clock of every timed-out stage.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    proc = _WedgedProc(on_stdout=b"done")
+    proc.close()  # both pipes are at EOF before the drain starts
+
+    drain = envs._PipeDrain(proc)
+    started = time.monotonic()
+    drain.finish(5)
+    assert time.monotonic() - started < 1, "finish must return once the pipes are done"
+
+    started = time.monotonic()
+    drain.pump(0.3)
+    assert time.monotonic() - started >= 0.25, "pump must spend its budget, EOF or not"
+
+
+def test_the_install_is_killed_with_litetune(tmp_path, monkeypatch):
+    """`provision` was the last unguarded subprocess in the package.
+
+    `subprocess.run` kills its direct child, and only on a path that raises. A
+    SIGTERM to litetune raises nothing, and a timeout reaches pip and not the
+    compilers pip spawned -- so half an hour of `pip install torch` carried on
+    writing into a directory the restore path had already decided to discard.
+    Its own session is what makes the group killable, and the guard is what
+    kills it.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
+
+    started = {}
+    guarded = []
+    real_guard = envs._kill_child_if_we_are_told_to_exit
+
+    @contextlib.contextmanager
+    def note_the_guard(proc, pgid=None):
+        guarded.append(proc)
+        with real_guard(proc, pgid):
+            yield
+
+    def capture(argv, **kwargs):
+        started.update(kwargs)
+        return _FakePopen()
+
+    monkeypatch.setattr(envs.subprocess, "Popen", capture)
+    monkeypatch.setattr(envs, "_kill_child_if_we_are_told_to_exit", note_the_guard)
+    StageEnv(name="guarded", requirements=("pyyaml==6.0.2",)).provision()
+
+    assert started.get("start_new_session") is True, (
+        "without a session of its own the install shares litetune's process "
+        "group, and there is no group left to kill that is only pip's"
+    )
+    assert guarded, "the install must run inside the termination guard"
+
+
+def test_a_selector_that_accepts_and_then_refuses_does_not_escape(monkeypatch):
+    """`SelectSelector.register` checks the event mask, the descriptor and
+    duplicate registration -- and not whether `select` on this host can do
+    anything with what it is handed. Measured: it accepts a pipe and keeps
+    the descriptor. So where `select` takes sockets only, both pipes register
+    and the refusal arrives on the first `select`, which runs inside
+    `_kill_tree` between the SIGTERM and the SIGKILL.
+
+    Letting it out of there costs three things at once: the group is never
+    SIGKILLed, the child is never reaped, and the caller gets an errno where
+    its own `TimeoutExpired` should be -- so `provision`'s `except
+    TimeoutExpired` stops matching and a pip timeout surfaces as a socket
+    error. Deciding the fallback from registration alone could not catch this,
+    because registration succeeded.
+    """
+    killed: list[str] = []
+
+    class RefusesOnSelect(envs.selectors.SelectSelector):
+        def select(self, timeout=None):
+            raise OSError(10038, "not a socket")
+
+    monkeypatch.setattr(envs.selectors, "DefaultSelector", RefusesOnSelect)
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.2)
+    monkeypatch.setattr(
+        envs, "_kill_tree", lambda proc, pump=None, **kwargs: (pump(0.05), killed.append("yes"))[1]
+    )
+
+    class Talkative(_WedgedProc):
+        def communicate(self, timeout=None):
+            return "everything it said", "and why"
+
+    proc = Talkative()
+    try:
+        out, err = envs._kill_and_drain(proc)
+    finally:
+        proc.close()
+
+    assert killed, "the kill must have run to completion"
+    assert (out, err) == (
+        "everything it said",
+        "and why",
+    ), "the drain gave up on watching, so the fallback had to take over"
+
+
+def test_a_host_that_cannot_watch_its_pipes_still_gets_the_output(monkeypatch):
+    """Windows `select` handles sockets, not pipes, and a POSIX host can run
+    out of the descriptor `epoll` needs.
+
+    Without a fallback the new drain would register nothing there and read
+    nothing, so a timed-out stage would say nothing at all about why -- worse
+    than the code this replaced, which used `communicate` and did read. The
+    fallback is only safe after the kill, and that is where it is called from.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(
+        envs.selectors,
+        "DefaultSelector",
+        lambda: (_ for _ in ()).throw(OSError("no descriptors to spare")),
+    )
+
+    class Talkative(_FakePopen):
+        def communicate(self, timeout=None):
+            return "everything it said", "and why"
+
+    out, err = envs._kill_and_drain(Talkative())
+    assert (out, err) == ("everything it said", "and why")
+
+
+def test_the_fallback_keeps_the_seed_when_communicate_assembles_nothing(monkeypatch):
+    """Its trailing `wait()` can raise after the pipes are done, and then the
+    call returns nothing while the earlier read is all there is."""
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(
+        envs.selectors, "DefaultSelector", lambda: (_ for _ in ()).throw(OSError("none"))
+    )
+
+    class Wedged(_FakePopen):
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired("python", timeout)
+
+    out, err = envs._kill_and_drain(Wedged(), already=(b"said before", None))
+    assert out == "said before" and err == ""
+
+
 def test_the_partial_output_of_a_wedged_stage_is_kept(monkeypatch):
     """The stderr of a timed-out stage is the one artifact that explains it.
 
@@ -1208,18 +1614,63 @@ def test_the_partial_output_of_a_wedged_stage_is_kept(monkeypatch):
     pipes: the drain gives up, and what the stage managed to say before that
     must survive rather than being replaced by two empty strings.
     """
-    monkeypatch.setattr(envs, "_kill_tree", lambda proc, grace=None, pgid=None: envs.Reach.GROUP)
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.2)
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
 
-    class Wedged(_FakeProc):
-        args = ["python", "-c", "..."]
-        stdout = None
-        stderr = None
-
-        def communicate(self, timeout=None):
-            raise subprocess.TimeoutExpired("python", timeout, output=b"partial", stderr=b"boom")
-
-    out, err = envs._kill_and_drain(Wedged())
+    proc = _WedgedProc(on_stdout=b"partial", on_stderr=b"boom")
+    try:
+        out, err = envs._kill_and_drain(proc)
+    finally:
+        proc.close()
     assert out == "partial" and err == "boom"
+
+
+def test_what_the_earlier_read_took_off_the_pipes_is_not_lost(monkeypatch):
+    """The narrow case, and the reason the drain does not trust the exception.
+
+    `communicate` assembles its result at the very end, so a timeout raised
+    from its trailing `wait()` -- pipes at EOF, process still alive -- carries
+    no output at all while every byte sits in the `Popen`. Those bytes are off
+    the descriptors, so no amount of reading gets them back; taking the
+    exception's word for it returned two empty strings for a stage that had
+    said plenty.
+    """
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.2)
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+
+    proc = _WedgedProc()
+    proc._fileobj2output = {proc.stdout: [b"said"], proc.stderr: [b"complained"]}
+    # In the state `_communicate` actually leaves: EOF on both, both closed.
+    # With the pipes left open instead, this test passed while exercising a
+    # different branch entirely -- the drain still had something to watch, so
+    # it never showed that a closed-pipe drain keeps its seed.
+    proc.as_communicate_left_it()
+    try:
+        # As `_run_guarded` calls it on that path: an exception carrying None.
+        out, err = envs._kill_and_drain(proc, already=(None, None))
+    finally:
+        proc.close()
+    assert out == "said" and err == "complained"
+
+
+def test_the_exception_is_used_when_the_popen_kept_nothing(monkeypatch):
+    """`_fileobj2output` is a CPython private, so it is asked for, not assumed.
+
+    An implementation that keeps its partial reads elsewhere leaves the
+    caller's exception as the only account of them, which is where this module
+    was before -- so that path has to keep working rather than silently
+    returning nothing.
+    """
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.2)
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+
+    proc = _WedgedProc()
+    assert not hasattr(proc, "_fileobj2output")
+    try:
+        out, err = envs._kill_and_drain(proc, already=(b"from the exception", None))
+    finally:
+        proc.close()
+    assert out == "from the exception" and err == ""
 
 
 def test_bytes_from_a_text_mode_pipe_are_decoded():
@@ -1285,6 +1736,65 @@ def test_a_windows_console_script_is_found_by_its_exe(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="SIGTERM dispositions are POSIX")
+def test_a_terminated_litetune_lets_the_stage_finish_its_sentence(tmp_path, request):
+    """The grace is only worth having on the path `kill <litetune>` takes.
+
+    The timeout path was pumped first and the signal path was not, which left
+    the fix on the wrong side: a timeout is a report, while a SIGTERM during a
+    six-hour `tune` is the case where the grace exists so torch can finish the
+    `save_pretrained` it had started. Measured with the pump missing, a stage
+    writing 200,000 bytes in its SIGTERM handler before writing its marker:
+    litetune exited in 5.00s and the marker was never written -- the stage
+    spent the whole grace blocked on a full pipe and was SIGKILLed.
+
+    A quiet stage cannot see this. `test_a_terminated_litetune_takes_the_stage
+    _with_it` above holds a lock and sleeps, so it passes either way.
+    """
+    started = tmp_path / "stage.started"
+    finished = tmp_path / "stage.finished"
+    stage_code = (
+        "import signal, sys, time\n"
+        "def bye(signum, frame):\n"
+        "    sys.stderr.write('X' * 200_000)\n"
+        "    sys.stderr.flush()\n"
+        f"    open({str(finished)!r}, 'w').write('1')\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, bye)\n"
+        f"open({str(started)!r}, 'w').write('1')\n"
+        "time.sleep(60)\n"
+    )
+    runner = tmp_path / "chatty_runner.py"
+    runner.write_text(
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(pathlib.Path(envs.__file__).parents[1])!r})\n"
+        f"os.environ['LITETUNE_ENV_DIR'] = {str(tmp_path)!r}\n"
+        "from litetune.envs import StageEnv\n"
+        "env = StageEnv(name='chattykill', requirements=('pyyaml==6.0.2',))\n"
+        "env.python.parent.mkdir(parents=True, exist_ok=True)\n"
+        "env.python.symlink_to(sys.executable)\n"
+        f"env.run(['python', '-c', {stage_code!r}], timeout=120)\n",
+        encoding="utf-8",
+    )
+
+    litetune = subprocess.Popen([sys.executable, str(runner)])
+    request.addfinalizer(lambda: _reap_proc(litetune))
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not started.exists():
+        if litetune.poll() is not None:
+            pytest.fail(f"the runner died before the stage started (exit {litetune.returncode})")
+        time.sleep(0.05)
+    assert started.exists(), "the stage never started; nothing was under test"
+
+    os.kill(litetune.pid, signal.SIGTERM)
+    assert litetune.wait(timeout=30) == -signal.SIGTERM, "litetune must still die as it would have"
+
+    assert finished.exists(), (
+        "the stage was SIGKILLed part way through its shutdown: nothing emptied "
+        "the pipes during the grace, so it blocked after one buffer"
+    )
+
+
 def test_a_terminated_litetune_takes_the_stage_with_it(tmp_path, request):
     """`kill <litetune>` must not leave a six-hour torch run holding its memory.
 
@@ -1422,14 +1932,7 @@ def test_the_drain_says_only_what_the_kill_established(monkeypatch, caplog):
     `killpg` returning 0 says the signal was accepted, not that anything died,
     so the group case must not name a departed grandchild as the cause.
     """
-
-    class Wedged(_FakeProc):
-        args = ["python"]
-        stdout = None
-        stderr = None
-
-        def communicate(self, timeout=None):
-            raise subprocess.TimeoutExpired("python", timeout, output=b"", stderr=b"")
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.05)
 
     for reach, expected in (
         (envs.Reach.GROUP, "the group was signalled"),
@@ -1437,11 +1940,36 @@ def test_the_drain_says_only_what_the_kill_established(monkeypatch, caplog):
         (envs.Reach.NOTHING, "nothing could be signalled at all"),
         (envs.Reach.ALREADY_GONE, "the child had already exited"),
     ):
-        monkeypatch.setattr(envs, "_kill_tree", lambda proc, grace=None, pgid=None, r=reach: r)
+        monkeypatch.setattr(envs, "_kill_tree", lambda proc, r=reach, **kwargs: r)
+        proc = _WedgedProc()
         caplog.clear()
-        with caplog.at_level("WARNING"):
-            envs._kill_and_drain(Wedged())
+        try:
+            with caplog.at_level("WARNING"):
+                envs._kill_and_drain(proc)
+        finally:
+            proc.close()
         assert expected in caplog.text, f"{reach} must not be described as something else"
+
+
+def test_nothing_is_said_when_the_pipes_did_close(monkeypatch, caplog):
+    """The warning is about pipes still held, and it is the thing that sends a
+    reader hunting for a leaked process. A drain that reached the end of both
+    pipes has nothing to report, and saying so anyway would make the warning
+    worthless by making it constant."""
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.2)
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+
+    proc = _WedgedProc(on_stdout=b"all of it")
+    proc.close()  # both write ends gone: the pipes end where the data ends
+    with caplog.at_level("WARNING"):
+        out, _ = envs._kill_and_drain(proc)
+    assert out == "all of it"
+    # Asserted against the words the warning actually uses. This line read
+    # "still holding them" -- the old wording -- for four review rounds after
+    # the warning was rewritten, so it could not fail: that phrase is no
+    # longer anywhere in the output, and a drain that warned on every closed
+    # pipe passed.
+    assert "are still open" not in caplog.text
 
 
 def test_the_wait_ends_when_the_group_does(tmp_path):
@@ -1569,7 +2097,7 @@ def test_the_grace_is_given_even_where_only_the_child_could_be_signalled(monkeyp
         "_wait_without_reaping",
         # Returns True: "the group is still ours to signal", which is what the
         # real one says unless the child was reaped out from under it.
-        lambda proc, pgid, grace, stop=None: waited.append(grace) or True,
+        lambda proc, pgid, grace, stop=None, pump=None: waited.append(grace) or True,
     )
 
     assert envs._kill_tree(_FakeProc(), grace=0.25) is envs.Reach.CHILD_ONLY
@@ -1629,6 +2157,1235 @@ def test_a_host_that_reaps_for_us_gets_no_group_signal(monkeypatch):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX")
+def test_a_stage_reads_the_same_whether_it_finished_or_was_killed(tmp_path, monkeypatch):
+    r"""Two paths describing one child must not disagree about what it said.
+
+    `communicate` runs `_translate_newlines` and the raw read does not, so a
+    `\r`-heavy stage -- any torch progress bar -- came back as lines when it
+    finished and as terminal overwrites when it timed out, inside the error
+    report that exists to explain the timeout.
+    """
+    env = _symlinked_env(tmp_path, monkeypatch, "crlf")
+    emit = r"import sys; sys.stdout.write('a\r\nb\rc\n'); sys.stdout.flush()"
+
+    finished = env.run(["python", "-c", emit], timeout=30)
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        env.run(["python", "-c", emit + "; import time; time.sleep(30)"], timeout=1)
+
+    assert finished.stdout == "a\nb\nc\n"
+    assert caught.value.output == finished.stdout
+
+
+def test_an_interrupted_read_does_not_end_the_stream(monkeypatch):
+    """A single EINTR must not cost every byte after it.
+
+    The read's `except OSError` closes the pipe, and `InterruptedError` is an
+    `OSError` -- so one interrupted read was indistinguishable from end of
+    stream and dropped the descriptor for good. Verified before the fix by
+    planting one: the read end closed, and the next write to the pipe raised
+    `BrokenPipeError`. PEP 475 makes `os.read` retry EINTR itself unless a
+    Python handler raised, so this is close to unreachable -- and the cost of
+    it being reachable is out of all proportion to the two lines.
+    """
+    proc = _WedgedProc(on_stdout=b"before")
+    drain = envs._PipeDrain(proc)
+    real_read = envs.os.read
+    reads = {"n": 0}
+
+    def interrupted_once(fd, size):
+        reads["n"] += 1
+        if reads["n"] == 1:
+            raise InterruptedError(4, "Interrupted system call")
+        return real_read(fd, size)
+
+    try:
+        monkeypatch.setattr(envs.os, "read", interrupted_once)
+        drain.pump(0.1)
+        monkeypatch.undo()
+        os.write(proc._writers[0], b" and after")
+        drain.pump(0.1)
+    finally:
+        drain.close()
+        proc.close()
+
+    assert drain.text()[0] == "before and after", (
+        "the pipe was closed on an interrupted read, so everything the stage "
+        "said after it was lost"
+    )
+
+
+def test_an_interrupted_reap_still_gives_the_selector_back(monkeypatch):
+    """The reap waits, and a wait can be interrupted.
+
+    With the reap ahead of the close in the same `finally`, a signal landing
+    in `proc.wait` skipped the close and leaked a kqueue or epoll descriptor
+    for every interrupted stage. Before the reap moved into that `finally`,
+    the close was the whole of it and could not be skipped; that is the
+    property, and nothing was watching it.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.05)
+    monkeypatch.setattr(envs, "_reap", lambda proc: (_ for _ in ()).throw(KeyboardInterrupt))
+
+    opened: list[int] = []
+    real_drain = envs._PipeDrain
+
+    def remember(proc_, already=(None, None), *, seed=True):
+        drain = real_drain(proc_, already, seed=seed)
+        if drain._selector is not None:
+            opened.append(drain._selector.fileno())
+        return drain
+
+    monkeypatch.setattr(envs, "_PipeDrain", remember)
+
+    proc = _WedgedProc(on_stdout=b"x")
+    proc.close()
+    with pytest.raises(KeyboardInterrupt):
+        envs._kill_and_drain(proc)
+
+    assert opened, "no selector was opened, so there is nothing under test"
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+def test_the_handlers_grace_is_pumped_with_the_one_that_sleeps(monkeypatch):
+    """The same choice as on the timeout path, at the other call site.
+
+    `finish` returns the moment there is nothing left to read, so handing it
+    to a wait loop turns the loop into a busy one for the rest of the grace
+    -- here, inside a signal handler, on every `kill <litetune>`. The timeout
+    path's call site is covered; this one was not, and the mutation survived.
+    """
+    handed: list = []
+    monkeypatch.setattr(
+        envs,
+        "_kill_tree",
+        lambda proc, pump=None, **kwargs: (handed.append(pump), envs.Reach.GROUP)[1],
+    )
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+    captured: dict = {}
+    monkeypatch.setattr(signal, "signal", lambda sig, h: captured.setdefault(sig, h))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    with envs._kill_child_if_we_are_told_to_exit(_FakeProc(), pgid=4242):
+        with pytest.raises(envs.StageInterrupted):
+            captured[signal.SIGTERM](signal.SIGTERM, None)
+
+    assert handed and handed[0] is not None, "the handler's grace must pump"
+    started = time.monotonic()
+    handed[0](0.3)
+    assert (
+        time.monotonic() - started >= 0.25
+    ), "the handler was handed a pump that returns early, so its grace spins"
+
+
+def test_a_pipe_open_on_either_side_is_reported(monkeypatch, caplog):
+    """`_pipes_open` has to ask about both, and an asymmetric pair is the
+    ordinary state rather than an edge case: a leader that closed its stdout
+    while a grandchild kept stderr, or the other way round.
+
+    With both pipes always in the same state, `any`, `all`, and either one of
+    them alone are indistinguishable -- three mutations that survived.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(
+        envs.selectors, "DefaultSelector", lambda: (_ for _ in ()).throw(OSError("none"))
+    )
+
+    def timed_out(timeout=None):
+        raise subprocess.TimeoutExpired("python", timeout, output=b"", stderr=b"")
+
+    for closed, label in (("stdout", "only stderr held"), ("stderr", "only stdout held")):
+        proc = _WedgedProc(on_stdout=b"o", on_stderr=b"e")
+        getattr(proc, closed).close()
+        proc.communicate = timed_out
+        caplog.clear()
+        try:
+            with caplog.at_level("WARNING"):
+                envs._kill_and_drain(proc)
+        finally:
+            proc.close()
+        assert "are still open" in caplog.text, label
+
+
+def test_the_drain_gives_its_selector_descriptor_back():
+    """`kqueue` and `epoll` each cost a descriptor of their own.
+
+    One per timed-out stage, held for the life of the run, is a leak that
+    surfaces much later as an unrelated `OSError` about too many open files.
+    Asserted on the selector's own descriptor rather than by counting the
+    process's: everything else in reach here is a pipe belonging to the fake.
+    """
+    proc = _WedgedProc(on_stdout=b"x")
+    drain = envs._PipeDrain(proc)
+    try:
+        assert drain.watching, "nothing to assert about if it never opened one"
+        fd = drain._selector.fileno()
+        assert fd >= 0 and os.fstat(fd), "the selector should be holding a descriptor"
+        drain.close()
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    finally:
+        proc.close()
+
+
+def test_the_fallback_reads_like_the_stage_wrote(monkeypatch, caplog):
+    """The `communicate` fallback, with a real pipe and a real encoding.
+
+    Both existing tests of this branch hand it a fake whose pipes are `None`,
+    so the encoding is always the UTF-8 default and the stub returns ASCII
+    `str` -- nothing is ever decoded, and nothing is ever translated. Four
+    separate mutations survived the suite behind that: decoding in the
+    default encoding instead of the pipe's, stderr decoded in stdout's, and
+    both hard-coded answers to "are the pipes still held".
+
+    It matters most exactly here. This branch exists for hosts whose `select`
+    cannot take a pipe -- Windows -- which is where a non-UTF-8 console
+    encoding and `\r\n` are the ordinary case, not the exotic one.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(
+        envs.selectors, "DefaultSelector", lambda: (_ for _ in ()).throw(OSError("none"))
+    )
+
+    said = "RuntimeError: n\u2019a pas pu charger le mod\u00e8le"
+    printed = (
+        "\u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0430 \u043c\u043e\u0434\u0435\u043b\u0438"  # noqa: RUF001
+    )
+    # Two encodings, not one: with both pipes the same, a stderr decoded in
+    # stdout's encoding is indistinguishable from a correct one.
+    proc = _WedgedProc(encoding="cp1251", err_encoding="cp1252")
+
+    def timed_out(timeout=None):
+        raise subprocess.TimeoutExpired(
+            "python",
+            timeout,
+            output=printed.encode("cp1251") + b"\r\nb\rc\n",
+            stderr=said.encode("cp1252") + b"\r\n",
+        )
+
+    proc.communicate = timed_out
+    try:
+        with caplog.at_level("WARNING"):
+            out, err = envs._kill_and_drain(proc)
+    finally:
+        proc.close()
+
+    assert err == said + "\n", "stderr must be decoded in the encoding its pipe was opened with"
+    assert out == printed + "\nb\nc\n", (
+        "stdout too: with an ASCII stdout, decoding it in the wrong encoding "
+        "is invisible and the stderr assertion carries the whole test"
+    )
+    assert "are still open" in caplog.text, (
+        "the pipes were open, so the leak warning has to fire -- it is the "
+        "only thing that names a stray process at the time it happens"
+    )
+
+
+def test_the_fallback_reports_pipes_that_really_are_held(monkeypatch, caplog):
+    """The other half of the same claim.
+
+    A test that only checks the warning stays quiet is satisfied by a
+    `still_held` hard-coded to `False`, which is how the previous version of
+    this pair let that mutation through. This is the case where the pipes are
+    open -- a grandchild outside the killed group -- and the warning is the
+    only thing that names a stray process while it is still findable.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(
+        envs.selectors, "DefaultSelector", lambda: (_ for _ in ()).throw(OSError("none"))
+    )
+
+    # Only stderr is held, so an `all` in place of the `any` reports nothing
+    # for a grandchild that inherited one pipe and not the other.
+    proc = _WedgedProc(on_stdout=b"said")
+    proc.stdout.close()
+
+    def timed_out(timeout=None):
+        raise subprocess.TimeoutExpired("python", timeout, output=b"said", stderr=b"")
+
+    proc.communicate = timed_out
+    try:
+        with caplog.at_level("WARNING"):
+            envs._kill_and_drain(proc)
+    finally:
+        proc.close()
+    assert "are still open" in caplog.text
+
+
+def test_the_interrupt_bound_counts_only_a_run_of_them(monkeypatch):
+    """The bound is on *consecutive* interruptions, and the reset is what
+    makes that word true.
+
+    Without it the count only ever grows, so a pipe that is interrupted now
+    and then -- which is the case the retry exists for -- is eventually
+    closed anyway, and the data after it is lost.
+
+    Asserted on the text that came through, not on `watching`. `watching`
+    describes the host, and giving one pipe up does not change it -- so the
+    previous version's assertion could not fail for the reason it named, and
+    the mutation it was meant to catch was caught by accident, when the
+    test's own next write hit a closed pipe.
+    """
+    proc = _WedgedProc()
+    drain = envs._PipeDrain(proc)
+    real_read = envs.os.read
+    flips = {"n": 0}
+
+    def every_other_one(fd, size):
+        flips["n"] += 1
+        if flips["n"] % 2:
+            raise InterruptedError(4, "Interrupted system call")
+        return real_read(fd, size)
+
+    written = []
+    try:
+        monkeypatch.setattr(envs.os, "read", every_other_one)
+        # A fixed count, not one derived from the bound: tied to the
+        # constant, a bound of 100,000 turned this into half an hour.
+        for i in range(24):
+            chunk = f"<{i}>".encode()
+            written.append(chunk)
+            os.write(proc._writers[0], chunk)
+            drain.pump(0.02)
+    finally:
+        monkeypatch.undo()
+        text = drain.text()[0]
+        drain.close()
+        proc.close()
+
+    assert text == b"".join(written).decode(), (
+        "scattered interruptions closed the pipe part way through: the count "
+        "is not being reset by the reads between them"
+    )
+
+
+def test_the_rescue_kill_does_not_signal_a_group_that_is_no_longer_ours(monkeypatch):
+    """The rescue SIGKILL has to obey the same guard as the ordinary one.
+
+    Once the leader has been reaped the group id is the leader's freed pid,
+    and a second termination signal can reap it while this grace is being
+    interrupted. Signalling anyway aims SIGKILL at whatever now owns that
+    number -- which is the accident the whole module is arranged to avoid,
+    arriving through the rescue added to prevent a different one.
+    """
+    sent: list[int] = []
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: sent.append(sig))
+
+    proc = _FakeProc()
+
+    def reaped_by_somebody_else(*args, **kwargs):
+        proc.returncode = 0  # as `Popen.send_signal`'s own poll would leave it
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(envs, "_wait_without_reaping", reaped_by_somebody_else)
+
+    with pytest.raises(KeyboardInterrupt):
+        envs._kill_tree(proc, grace=0.25)
+
+    assert sent == [signal.SIGTERM], (
+        "the leader was reaped during the grace, so the group id is no longer "
+        "ours and the rescue must not use it"
+    )
+
+
+def test_the_discarded_drain_is_not_seeded_either(monkeypatch):
+    """`run`'s own cleanup discards its drain, exactly as the handler does.
+
+    Seeding it means a `b"".join` over everything the stage has said, on the
+    way out of an interrupt, and the result is thrown away -- the same cost
+    and the same `MemoryError` exposure that `seed=False` removed one frame
+    in.
+    """
+    seen: dict = {}
+    real = envs._kill_and_drain
+
+    def note(proc, pgid=None, already=(None, None), *, seed=True):
+        seen["seed"] = seed
+        return real(proc, pgid, already, seed=seed)
+
+    monkeypatch.setattr(envs, "_kill_and_drain", note)
+
+    class Interrupted(_FakePopen):
+        def communicate(self, timeout=None):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(envs.subprocess, "Popen", lambda *a, **k: Interrupted())
+    with pytest.raises(KeyboardInterrupt):
+        envs._run_guarded(["python", "-c", "pass"], timeout=5)
+    assert seen.get("seed") is False, "the discarded drain must not pay for a seed"
+
+
+def test_the_rescue_asks_returncode_and_does_not_poll(monkeypatch):
+    """`returncode`, not `poll()`, and the difference is the whole hazard.
+
+    Every fake in this file has a `poll()` with no side effect, so the two
+    were indistinguishable and swapping them passed. A real `poll()` reaps.
+    For a leader that has exited but not been collected, that frees the pid
+    which *is* the group id -- and the rescue then either skips the SIGKILL
+    that would have collected its grandchildren, or aims it at a number that
+    is no longer ours. `returncode` reads without reaping.
+    """
+    sent: list[int] = []
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: sent.append(sig))
+
+    class ExitedButUncollected(_FakeProc):
+        """The leader is a zombie: gone, but its pid still pinned."""
+
+        def poll(self):
+            self.returncode = 0  # as `Popen.poll` does: it collects, and says so
+            return self.returncode
+
+    proc = ExitedButUncollected()
+    monkeypatch.setattr(
+        envs, "_wait_without_reaping", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt)
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        envs._kill_tree(proc, grace=0.25)
+
+    assert proc.returncode is None, "the rescue reaped the leader, freeing its group id"
+    assert sent == [signal.SIGTERM, signal.SIGKILL], (
+        "an uncollected leader still pins its group, so the SIGKILL that "
+        "collects its descendants must go out"
+    )
+
+
+def test_the_fallback_keeps_what_its_own_read_found(monkeypatch):
+    """The trailing `wait()` of the fallback's `communicate` can raise too.
+
+    When it does the call assembles nothing, and the code returned the
+    drain's seed -- taken in the drain's constructor, before this read ran.
+    Everything the fallback's read found was dropped. Measured against a real
+    `Popen`: `part1` came back while `_fileobj2output` held `part1` and
+    `part2`. This is the wedged-in-exit case, a stage that wrote its last
+    traceback during the grace and then could not be reaped.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(
+        envs.selectors, "DefaultSelector", lambda: (_ for _ in ()).throw(OSError("none"))
+    )
+
+    proc = _WedgedProc()
+    proc._fileobj2output = {proc.stdout: [b"part1\n"], proc.stderr: [b"err1\n"]}
+
+    def reads_more_then_the_wait_raises(timeout=None):
+        proc._fileobj2output[proc.stdout].append(b"part2\n")
+        proc._fileobj2output[proc.stderr].append(b"err2\n")
+        raise subprocess.TimeoutExpired("python", timeout)  # carries no output
+
+    proc.communicate = reads_more_then_the_wait_raises
+    try:
+        out, err = envs._kill_and_drain(proc)
+    finally:
+        proc.close()
+    assert out == "part1\npart2\n", "the fallback's own read must not be dropped"
+    assert err == "err1\nerr2\n", "stderr especially: it is where the traceback is"
+
+
+def test_a_read_failure_makes_no_claim_and_keeps_the_seed(monkeypatch, caplog):
+    """The exit where nothing at all was established.
+
+    A read that failed says nothing about who holds the pipes -- our own
+    wrappers being unclosed says only that we did not close them -- so this
+    exit warns about nothing. What it must still do is hand back the seed:
+    the account of the stage is all that is left, and returning two empty
+    strings instead was not caught by anything.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(
+        envs.selectors, "DefaultSelector", lambda: (_ for _ in ()).throw(OSError("none"))
+    )
+
+    proc = _WedgedProc()
+    proc._fileobj2output = {proc.stdout: [b"everything it said"], proc.stderr: []}
+
+    def refuses(timeout=None):
+        raise ValueError("I/O operation on closed file")
+
+    proc.communicate = refuses
+    try:
+        with caplog.at_level("WARNING"):
+            out, _ = envs._kill_and_drain(proc)
+    finally:
+        proc.close()
+    assert out == "everything it said", "the seed is the only account left; it must survive"
+    assert "are still open" not in caplog.text
+
+
+def test_one_pipe_refused_gives_up_on_both(monkeypatch):
+    """Watching one pipe and not the other is worse than watching neither.
+
+    The drain reads the one it got, and is then overridden by a fallback that
+    replaces its result rather than merging -- so the half it read is thrown
+    away and only the other half survives. Measured before the fix, with
+    stdout registered and stderr refused: stdout came back empty for a stage
+    that had written to both. Giving up on both leaves `communicate` able to
+    read both.
+
+    That is more than a half-drain returns *when nothing is written during
+    the grace* -- which is this test's setup, writers closed first -- and it
+    is not free: nothing is emptied while the stage shuts down. Which is why
+    the rule is scoped to drains whose text is read; see the next test.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.05)
+
+    proc = _WedgedProc(on_stdout=b"OUT\n", on_stderr=b"ERR\n")
+    proc.close()  # both at EOF, so `communicate` can read them to the end
+
+    class RefusesStderr(envs.selectors.SelectSelector):
+        def register(self, fileobj, events, data=None):
+            if fileobj is proc.stderr:
+                raise OSError(1, "not permitted")
+            return super().register(fileobj, events, data)
+
+    monkeypatch.setattr(envs.selectors, "DefaultSelector", RefusesStderr)
+
+    def reads_what_is_left(timeout=None):
+        return (
+            "" if proc.stdout.closed else proc.stdout.read(),
+            "" if proc.stderr.closed else proc.stderr.read(),
+        )
+
+    proc.communicate = reads_what_is_left
+    out, err = envs._kill_and_drain(proc)
+    assert (out, err) == (
+        "OUT\n",
+        "ERR\n",
+    ), "the drain must not consume a pipe it is about to be overridden for"
+
+
+def test_interruptions_on_two_pipes_are_counted_apart(monkeypatch):
+    """The other half of "per pipe", and the half nothing exercised.
+
+    With one counter shared between the descriptors, interruptions that
+    alternate between them add up: five on each makes ten against a bound of
+    eight, and a pipe that never saw more than five in a row is given up on.
+    Measured: the per-pipe code returns both streams' data; a shared counter
+    returns two empty strings.
+    """
+    proc = _WedgedProc()
+    drain = envs._PipeDrain(proc)
+    out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
+    real_read = envs.os.read
+    left = {out_fd: 5, err_fd: 5}
+
+    def five_each_then_real(fd, size):
+        if left.get(fd, 0) > 0:
+            left[fd] -= 1
+            raise InterruptedError(4, "Interrupted system call")
+        return real_read(fd, size)
+
+    os.write(proc._writers[0], b"OUT")
+    os.write(proc._writers[1], b"ERR")
+    try:
+        monkeypatch.setattr(envs.os, "read", five_each_then_real)
+        drain.pump(0.3)
+    finally:
+        monkeypatch.undo()
+        text = drain.text()
+        drain.close()
+        proc.close()
+
+    assert text == (
+        "OUT",
+        "ERR",
+    ), "five interruptions on each pipe were counted together and both pipes were given up on"
+
+
+def test_the_interrupt_bound_is_per_pipe_and_consecutive(monkeypatch):
+    """One counter for two descriptors was wrong in both directions.
+
+    Interruptions alternating between the pipes closed one of them after
+    fewer than its own bound; and a steady stream of data on one reset the
+    count for the other, so a pipe interrupted forever was never let go.
+
+    "Steady" is the part that has to be tested. A first version wrote one
+    byte to stderr, so a shared reset fired at most once and hid inside the
+    slack of the bound. Measured with stderr fed on every stdout
+    interruption: the fixed code lets stdout go after nine attempts; the
+    shared reset made 125,267 in 0.2 s and never let it go.
+
+    And giving up on stdout must leave stderr alone. That is checked by
+    writing to stderr *after* stdout was dropped and seeing it arrive --
+    an earlier assertion that stderr "was read throughout" was satisfied by
+    what arrived before the bound was reached, so a drain that abandoned both
+    pipes at once passed.
+    """
+    proc = _WedgedProc()
+    drain = envs._PipeDrain(proc)
+    out_fd = proc.stdout.fileno()
+    os.write(proc._writers[0], b"x")
+
+    real_read = envs.os.read
+    attempts = {"out": 0}
+
+    def stdout_interrupted_while_stderr_talks(fd, size):
+        if fd == out_fd:
+            attempts["out"] += 1
+            os.write(proc._writers[1], b"y")  # stderr always has more to say
+            raise InterruptedError(4, "Interrupted system call")
+        return real_read(fd, size)
+
+    try:
+        monkeypatch.setattr(envs.os, "read", stdout_interrupted_while_stderr_talks)
+        drain.pump(0.2)
+        monkeypatch.undo()
+        let_go_after = attempts["out"]
+        before = drain.text()[1]
+        os.write(proc._writers[1], b"AFTER")
+        drain.pump(0.1)
+        after = drain.text()[1]
+    finally:
+        monkeypatch.undo()
+        drain.close()
+        proc.close()
+
+    assert let_go_after <= 50, (
+        f"stdout was interrupted {let_go_after} times in a row and never let "
+        "go: data arriving on stderr is resetting a bound that belongs to stdout"
+    )
+    assert after == before + "AFTER", (
+        "stderr stopped being read when stdout was given up on; the bound "
+        "belongs to one pipe and must not close the other"
+    )
+
+
+def test_a_drain_whose_text_is_discarded_keeps_what_did_register(monkeypatch):
+    """All-or-nothing is for drains whose output is read.
+
+    Applied everywhere, it cost the grace on the two paths that throw the text
+    away -- the signal handler and `run`'s interrupt cleanup -- and bought
+    them nothing, since nothing there reads what the fallback would recover.
+    Measured with stderr refused and a child writing 200 KB to stdout on
+    SIGTERM: 5.0 s, exit -9, handler unfinished, where watching stdout let it
+    finish in 0.1 s. The handler is the `kill <litetune>` path.
+    """
+    proc = _WedgedProc()
+
+    class RefusesStderr(envs.selectors.SelectSelector):
+        def register(self, fileobj, events, data=None):
+            if fileobj is proc.stderr:
+                raise OSError(1, "not permitted")
+            return super().register(fileobj, events, data)
+
+    monkeypatch.setattr(envs.selectors, "DefaultSelector", RefusesStderr)
+    try:
+        kept = envs._PipeDrain(proc, seed=False)
+        read = envs._PipeDrain(proc)
+        # Written before each pump, and `read` first: one write shared between
+        # them let whichever pumped first empty the pipe, so the second's
+        # assertion held whatever it did.
+        os.write(proc._writers[0], b"x" * 1000)
+        read.pump(0.05)
+        os.write(proc._writers[0], b"y" * 1000)
+        kept.pump(0.05)
+        kept_got, read_got = kept.text()[0], read.text()[0]
+        kept.close()
+        read.close()
+    finally:
+        proc.close()
+
+    assert kept_got, "a discarding drain must keep emptying the pipe it could register"
+    assert not read_got, "a drain whose text is read must still give up on both"
+
+
+def test_a_discarding_drain_still_gives_a_half_registered_stage_its_grace(tmp_path, monkeypatch):
+    """The measurement the scoped all-or-nothing rule rests on, kept in the tree.
+
+    With one pipe refused, a drain that gives up on both empties nothing while
+    the stage shuts down, and a stage writing more than a pipe buffer on its
+    way out blocks and is SIGKILLed. Measured before the rule was scoped, with
+    exactly this child: 5.0 s, exit -9, and the SIGTERM handler never
+    finished; after, 0.1 s, exit 0, finished. Asserted on the handler's own
+    marker and on the exit, not on timing.
+    """
+    finished = tmp_path / "handler.finished"
+    child = (
+        "import signal, sys, time\n"
+        "def bye(signum, frame):\n"
+        "    sys.stdout.write('X' * 200_000)\n"
+        "    sys.stdout.flush()\n"
+        f"    open({str(finished)!r}, 'w').write('1')\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, bye)\n"
+        "print('up', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    pgid = os.getpgid(proc.pid)
+    try:
+        assert proc.stdout.readline() == "up\n"
+
+        class RefusesStderr(envs.selectors.SelectSelector):
+            def register(self, fileobj, events, data=None):
+                if fileobj is proc.stderr:
+                    raise OSError(1, "not permitted")
+                return super().register(fileobj, events, data)
+
+        monkeypatch.setattr(envs.selectors, "DefaultSelector", RefusesStderr)
+        envs._kill_and_drain(proc, pgid, seed=False)
+
+        assert finished.exists(), (
+            "the stage was SIGKILLed before its SIGTERM handler finished: with "
+            "one pipe refused, nothing emptied the other during the grace"
+        )
+        assert proc.returncode == 0
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
+
+
+def test_a_drain_that_gave_up_watching_hands_the_question_on(monkeypatch, caplog):
+    """After `select` refuses, the drain knows nothing about the pipes.
+
+    It must say so rather than keep a count from before -- `draining` stays
+    truthful -- and whoever wants the answer then gets it from the fallback,
+    which reads both streams. Here nothing holds them, so the warning must
+    stay quiet -- on the evidence of the fallback's read reaching the end,
+    which the test checks was actually asked for.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.05)
+
+    class RefusesOnSelect(envs.selectors.SelectSelector):
+        def select(self, timeout=None):
+            raise OSError(10038, "not a socket")
+
+    monkeypatch.setattr(envs.selectors, "DefaultSelector", RefusesOnSelect)
+
+    proc = _WedgedProc()
+    drain = envs._PipeDrain(proc, seed=False)
+    try:
+        assert drain._open == 2, "both pipes register; the refusal comes later"
+        drain.pump(0.05)
+        assert not drain.watching
+        assert not drain.draining, "a drain that gave up must not report pipes it stopped watching"
+    finally:
+        drain.close()
+
+    # EOF with the read ends still open, so the drain inside `_kill_and_drain`
+    # registers both pipes and meets the refusal. Closing the streams
+    # instead -- as an earlier version did -- left nothing to register, kept
+    # the drain watching, and reached neither `_unwatch` nor the fallback.
+    proc.close()
+    asked = []
+    proc.communicate = lambda timeout=None: asked.append(timeout) or ("", "")
+    with caplog.at_level("WARNING"):
+        envs._kill_and_drain(proc, seed=False)
+    assert asked, "the refusal must hand the question to the fallback"
+    assert "are still open" not in caplog.text
+
+
+def test_a_partial_discarding_drain_warns_for_the_pipe_it_could_not_watch(monkeypatch, caplog):
+    """The refused pipe is exactly the one a half-registered drain cannot see.
+
+    With stdout registered and stderr refused, a stray process holding only
+    stderr is invisible to `draining`. The drain is not `watching`, so the
+    fallback is asked, and its read of both streams is what finds the pipe
+    still held.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.05)
+
+    proc = _WedgedProc(on_stdout=b"done")
+
+    class RefusesStderr(envs.selectors.SelectSelector):
+        def register(self, fileobj, events, data=None):
+            if fileobj is proc.stderr:
+                raise OSError(1, "not permitted")
+            return super().register(fileobj, events, data)
+
+    monkeypatch.setattr(envs.selectors, "DefaultSelector", RefusesStderr)
+    os.close(proc._writers[0])  # stdout reaches EOF; stderr's writer stays held
+    proc._writers[0] = -1
+
+    def stderr_still_held(timeout=None):
+        raise subprocess.TimeoutExpired("python", timeout, output=b"", stderr=b"")
+
+    proc.communicate = stderr_still_held
+    try:
+        with caplog.at_level("WARNING"):
+            envs._kill_and_drain(proc, seed=False)
+    finally:
+        proc.close()
+    assert "are still open" in caplog.text
+
+
+def test_a_drain_that_hands_over_does_not_wait_first(monkeypatch):
+    """A drain partial from its constructor goes straight to the fallback.
+
+    It used to `finish` first, and a watched pipe that something still held
+    made that wait its whole budget before the fallback waited again --
+    measured, 21.4 s where the other shapes took 11.3 s. The fallback's own
+    read replaces whatever `finish` would have gathered, so the first wait
+    bought nothing.
+
+    Asserted directly -- `finish` is not asked for any time at all -- rather
+    than by timing. A bound of half a 0.6 s budget failed on correct code
+    whenever the process was descheduled for 300 ms, and passed for any
+    change that merely made the drain stop watching early.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.6)
+
+    proc = _WedgedProc()  # both writers held: `finish` on stdout would wait it out
+
+    class RefusesStderr(envs.selectors.SelectSelector):
+        def register(self, fileobj, events, data=None):
+            if fileobj is proc.stderr:
+                raise OSError(1, "not permitted")
+            return super().register(fileobj, events, data)
+
+    monkeypatch.setattr(envs.selectors, "DefaultSelector", RefusesStderr)
+
+    asked_to_finish: list[float] = []
+    real_finish = envs._PipeDrain.finish
+    monkeypatch.setattr(
+        envs._PipeDrain,
+        "finish",
+        lambda self, budget: (asked_to_finish.append(budget), real_finish(self, budget))[1],
+    )
+    fallback_asked: list = []
+    proc.communicate = lambda timeout=None: fallback_asked.append(timeout) or ("", "")
+    try:
+        envs._kill_and_drain(proc, seed=False)
+    finally:
+        proc.close()
+
+    assert not asked_to_finish, "a drain that was never going to be believed waited first"
+    assert fallback_asked, "and it still has to hand over to the fallback"
+
+
+def test_a_pipe_that_fails_to_read_is_let_go(monkeypatch, caplog):
+    """An `os.read` that fails for good must end that pipe, not repeat.
+
+    The descriptor stays ready, so leaving it registered hands it straight
+    back to the next `select`: measured with a read that raised EIO, 1,048,105
+    attempts in one second, and then a warning that the pipes were still held
+    -- by nothing but the drain's own refusal to stop asking.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.3)
+
+    proc = _WedgedProc()
+    out_fd = proc.stdout.fileno()
+    # Both writers closed, so both pipes are readable. Readiness is what makes
+    # `select` hand stdout to `_read` at all -- a first version left stdout's
+    # writer open with nothing written, the descriptor was never ready, the
+    # failing read was never attempted, and the test failed on correct code
+    # for a reason that had nothing to do with it.
+    proc.close()
+    real_read = envs.os.read
+    attempts = {"n": 0}
+
+    def eio_on_stdout(fd, size):
+        if fd == out_fd:
+            attempts["n"] += 1
+            raise OSError(5, "Input/output error")
+        return real_read(fd, size)
+
+    monkeypatch.setattr(envs.os, "read", eio_on_stdout)
+    try:
+        with caplog.at_level("WARNING"):
+            envs._kill_and_drain(proc)
+    finally:
+        monkeypatch.undo()
+        proc.close()
+
+    # Exactly one: none would mean the failing read was never reached, which
+    # is how this test's first version passed on nothing.
+    assert attempts["n"] == 1, f"{attempts['n']} reads of a descriptor that fails every time"
+    assert "are still open" not in caplog.text
+
+
+def test_a_discarding_caller_still_hears_about_an_unwatched_pipe(monkeypatch, caplog):
+    """A discarding caller asks the fallback too, for the warning's sake.
+
+    An earlier revision skipped the fallback for callers that throw the text
+    away, to save the read. But with the child killed and reapable,
+    `communicate` only runs to its timeout when something still holds the
+    pipes -- which is the one case the leak warning is for -- so there the
+    skip saved time only by silencing it. The shape
+    here is the Windows one: `select` refuses both pipes, the drain watches
+    nothing, and an interrupt that finds the child alive and its pipes still
+    held reaches only the child. "Only the child was signalled" is then true,
+    and it was never printed.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.CHILD_ONLY)
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.05)
+
+    class RefusesOnSelect(envs.selectors.SelectSelector):
+        def select(self, timeout=None):
+            raise OSError(10038, "not a socket")
+
+    monkeypatch.setattr(envs.selectors, "DefaultSelector", RefusesOnSelect)
+
+    proc = _WedgedProc()  # a stray process still holds both write ends
+
+    def still_held(timeout=None):
+        raise subprocess.TimeoutExpired("python", timeout, output=b"", stderr=b"")
+
+    proc.communicate = still_held
+    try:
+        with caplog.at_level("WARNING"):
+            envs._kill_and_drain(proc, seed=False)
+    finally:
+        proc.close()
+    assert "only the child was signalled" in caplog.text, (
+        "the pipes were held and only the child had been signalled; a "
+        "discarding caller has to say so as loudly as any other"
+    )
+
+
+def test_a_selector_that_refuses_every_pipe_falls_back(monkeypatch):
+    """Registration refused is not the same as nothing to register.
+
+    Both leave no pipe watched, and only one of them means this host cannot
+    watch pipes at all. Deciding from the count alone sent a drain whose
+    pipes were merely already closed -- the ordinary state after a
+    `communicate` gave up -- to a fallback with no seed to return; deciding
+    before the loop sent a host that refused both registrations to the
+    watched path, where it read nothing and reported nothing.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.05)
+
+    class RefusesRegistration(envs.selectors.SelectSelector):
+        def register(self, fileobj, events, data=None):
+            raise OSError(1, "not permitted")
+
+    monkeypatch.setattr(envs.selectors, "DefaultSelector", RefusesRegistration)
+
+    proc = _WedgedProc()
+
+    def spoke(timeout=None):
+        return "the traceback that explains the timeout\n", ""
+
+    proc.communicate = spoke
+    try:
+        out, _ = envs._kill_and_drain(proc)
+    finally:
+        proc.close()
+    assert out == "the traceback that explains the timeout\n", (
+        "both registrations were refused, so the drain cannot read and the " "fallback has to run"
+    )
+
+
+def test_a_refusal_first_seen_after_the_kill_still_falls_back(monkeypatch):
+    """`_kill_tree` returns without pumping on three of its four exits.
+
+    An already-exited leader is the one that matters, because a grandchild
+    holding the pipes is the case this whole function exists for -- and on
+    that exit the first read of the entire run happens in `finish`. Sampling
+    `watching` before it therefore asked the question before anything had
+    tried, and a host that cannot watch silently returned two empty strings
+    with no warning: a visible crash traded for invisible loss.
+    """
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.05)
+    # Returns without ever calling the pump, as the ALREADY_GONE exit does.
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, pump=None, **kwargs: envs.Reach.GROUP)
+
+    class RefusesOnSelect(envs.selectors.SelectSelector):
+        def select(self, timeout=None):
+            raise OSError(10038, "not a socket")
+
+    monkeypatch.setattr(envs.selectors, "DefaultSelector", RefusesOnSelect)
+
+    proc = _WedgedProc()
+
+    def spoke(timeout=None):
+        return "what the stage said before it stopped\n", ""
+
+    proc.communicate = spoke
+    try:
+        out, _ = envs._kill_and_drain(proc)
+    finally:
+        proc.close()
+    assert (
+        out == "what the stage said before it stopped\n"
+    ), "the refusal arrived inside finish, and the fallback must still run"
+
+
+def test_the_fallback_does_not_claim_pipes_it_cannot_see(monkeypatch, caplog):
+    """The warning must not assert what the code cannot check.
+
+    Both failure exits used to hard-code "still held". The likeliest way to
+    reach the second is a read on an already-closed file, where the claim is
+    exactly backwards.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(
+        envs.selectors, "DefaultSelector", lambda: (_ for _ in ()).throw(OSError("none"))
+    )
+
+    proc = _WedgedProc(on_stdout=b"said")
+    proc.as_communicate_left_it()  # both pipes closed, as after a completed read
+
+    def refuses(timeout=None):
+        raise ValueError("I/O operation on closed file")
+
+    proc.communicate = refuses
+    with caplog.at_level("WARNING"):
+        envs._kill_and_drain(proc)
+    assert "are still open" not in caplog.text, (
+        "the pipes are closed; saying they are held sends the reader after a "
+        "process that does not exist"
+    )
+
+
+def test_the_handler_does_not_copy_what_it_is_about_to_discard(monkeypatch):
+    """The signal handler's drain is built to unblock the child, not to keep
+    its words -- its own comment says so.
+
+    Seeding it means a `b"".join` over everything the stage has said so far,
+    inside a signal handler, before the first SIGTERM goes out -- a second
+    full copy of the transcript. What this asserts is the behaviour: that
+    the seed is skipped, and that the handler is the caller asking for it.
+    The copy is also the one operation in that constructor that can raise
+    where the constructor promises not to, so a `MemoryError` there would
+    replace the kill entirely.
+    """
+    proc = _WedgedProc()
+    proc._fileobj2output = {proc.stdout: [b"expensive"], proc.stderr: [b"also expensive"]}
+    try:
+        assert envs._PipeDrain(proc, seed=False).text() == ("", "")
+        assert envs._PipeDrain(proc).text() == ("expensive", "also expensive")
+    finally:
+        proc.close()
+
+    handed: dict = {}
+    real_drain = envs._PipeDrain
+
+    def note(proc_, already=(None, None), *, seed=True):
+        handed["seed"] = seed
+        return real_drain(proc_, already, seed=seed)
+
+    monkeypatch.setattr(envs, "_PipeDrain", note)
+    monkeypatch.setattr(envs, "_kill_tree", lambda *a, **k: envs.Reach.GROUP)
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+    captured: dict = {}
+    monkeypatch.setattr(signal, "signal", lambda sig, h: captured.setdefault(sig, h))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    victim = _FakeProc()
+    with envs._kill_child_if_we_are_told_to_exit(victim, pgid=4242):
+        # The re-delivery is stubbed out, so the handler falls through to the
+        # raise it uses when the process is expected to survive the signal.
+        with pytest.raises(envs.StageInterrupted):
+            captured[signal.SIGTERM](signal.SIGTERM, None)
+    assert handed.get("seed") is False, "the handler must not pay for a seed it discards"
+
+
+def test_the_grace_is_pumped_with_the_one_that_sleeps(monkeypatch):
+    """Which of the two the grace is given is not interchangeable.
+
+    `pump` spends its budget; `finish` returns the moment the pipes are done.
+    Handing `finish` to the wait turns a loop that sleeps in 50 ms steps into
+    one that spins at full speed for the whole grace as soon as the stage has
+    stopped writing -- a stage that closes its output early and then takes its
+    time shutting down is exactly that case. Asserting the contract at the
+    call site rather than the identity of the method, so a differently-named
+    replacement still has to sleep.
+    """
+    handed: list = []
+    monkeypatch.setattr(
+        envs,
+        "_kill_tree",
+        lambda proc, pump=None, **kwargs: (handed.append(pump), envs.Reach.GROUP)[1],
+    )
+    monkeypatch.setattr(envs, "_DRAIN_AFTER_KILL_S", 0.05)
+
+    proc = _WedgedProc()
+    proc.as_communicate_left_it()  # nothing left to read, as after a long stage
+    try:
+        envs._kill_and_drain(proc)
+    finally:
+        proc.close()
+
+    assert handed and handed[0] is not None, "the grace must be given something to pump"
+    started = time.monotonic()
+    handed[0](0.3)
+    assert (
+        time.monotonic() - started >= 0.25
+    ), "the grace was handed a pump that returns early, so the wait loop spins"
+
+
+def test_the_drain_kills_the_group_and_reaps_the_leader(tmp_path):
+    """`_kill_and_drain` end to end on a real process tree, not a fake.
+
+    Every other test of this function stubs `_kill_tree` and hands it a fake
+    whose `wait` always raises, so nothing observes the kill or the reap. A
+    `proc.poll()` inserted before the kill survived the whole suite because
+    of that -- and it is the exact thing the module is built to avoid, since
+    polling reaps the leader and frees the pid that *is* the group id, after
+    which the group kill is aimed at nothing and the grandchild is left
+    running.
+
+    The reap is asserted with `os.waitpid(..., WNOHANG)` and not with
+    `proc.returncode`. `returncode` is set by any poll from any direction --
+    including `Popen.send_signal`'s own -- so asserting on it passed six
+    times in eight whether or not anything reaped, which is a test that
+    reports the weather. `ECHILD` from `waitpid` means the leader was
+    collected by us and by nobody else.
+
+    The reap half of this only bites on Linux, and that is not a flaw to be
+    tidied away on a Mac. Here a group whose only member is a zombie answers
+    EPERM, so the SIGKILL falls to the direct-child leg, `send_signal` polls
+    on its way through and collects the leader before `_reap` is reached --
+    measured. On Linux `killpg` reaches that group, nothing polls, and
+    deleting `_reap` fails this test: verified in the 3.13 container.
+    """
+    gone = tmp_path / "leader.gone"
+    child = (
+        "import subprocess, sys;"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']);"
+        f"open({str(gone)!r}, 'w').write('1');"
+        "sys.exit(0)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    pgid = os.getpgid(proc.pid)
+    pid = proc.pid
+    try:
+        # Waited for through a file the leader writes on its way out, never
+        # with `poll`. Polling reaps, and a leader the *test* collected makes
+        # `waitpid` answer ECHILD whether or not the code under test ever
+        # reaped anything -- which is how the first version of this test
+        # passed with `_reap` deleted.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not gone.exists():
+            time.sleep(0.02)
+        assert gone.exists(), "the leader never got as far as exiting"
+        time.sleep(0.2)
+
+        envs._kill_and_drain(proc, pgid)
+
+        time.sleep(0.3)
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pgid, 0)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+
+
+def test_the_fallback_stays_quiet_when_a_timeout_left_nothing_open(monkeypatch, caplog):
+    """The `TimeoutExpired` exit had "still held" written into it too.
+
+    Its sibling test covers pipes that are held; without this one, hard-coding
+    the answer the other way round passes both. The warning is the only thing
+    that names a stray process while it is still findable, and a warning that
+    fires either way names nothing.
+
+    The shape is synthetic and has to be: CPython cannot produce a
+    `TimeoutExpired` carrying output with both pipes already closed, because
+    once both are closed `_communicate` registers nothing and the only
+    timeout left is the trailing `wait()`'s, which carries none. It is built
+    by hand because the predicate has to be exercised in both directions and
+    this is the only way to reach one of them -- not because it is a state
+    the code will meet.
+    """
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    monkeypatch.setattr(
+        envs.selectors, "DefaultSelector", lambda: (_ for _ in ()).throw(OSError("none"))
+    )
+
+    proc = _WedgedProc(on_stdout=b"said")
+    proc.as_communicate_left_it()
+
+    def timed_out(timeout=None):
+        raise subprocess.TimeoutExpired("python", timeout, output=b"said", stderr=b"")
+
+    proc.communicate = timed_out
+    with caplog.at_level("WARNING"):
+        out, _ = envs._kill_and_drain(proc)
+    assert out == "said"
+    assert "are still open" not in caplog.text
+
+
+def test_a_pipe_that_only_ever_answers_eintr_is_let_go(monkeypatch):
+    """Retrying an interrupted read is right; retrying it forever is not.
+
+    The descriptor stays ready, so `select` hands it straight back and the
+    drain reads at full speed for the rest of its budget. Measured before the
+    bound: 372,988 attempts in 0.3 s. The sibling test covers one interruption
+    followed by data, which a version with no bound at all also passes.
+
+    What is pinned here is that a bound exists and is under fifty, not that
+    it is eight. The number is a judgement rather than a measurement, so
+    asserting it exactly would only detect that somebody changed it.
+    Consecutive-only and per-pipe are separate properties with tests of
+    their own.
+    """
+    proc = _WedgedProc(on_stdout=b"unreachable")
+    drain = envs._PipeDrain(proc)
+    attempts = {"n": 0}
+
+    def always_interrupted(fd, size):
+        attempts["n"] += 1
+        raise InterruptedError(4, "Interrupted system call")
+
+    try:
+        monkeypatch.setattr(envs.os, "read", always_interrupted)
+        drain.pump(0.2)
+    finally:
+        monkeypatch.undo()
+        drain.close()
+        proc.close()
+
+    # A literal ceiling, not one derived from the bound. Compared with the
+    # constant itself, any value passed -- a bound of 1000 did.
+    assert attempts["n"] <= 50, (
+        f"{attempts['n']} attempts in 0.2s: the pipe is never let go, so the "
+        "drain spins for the rest of its budget"
+    )
+
+
+def test_an_interrupted_grace_still_kills_the_group(monkeypatch):
+    """The grace is the one interruptible part of the kill.
+
+    A second Ctrl-C during cleanup used to take the SIGKILL with it, leaving
+    the process group alive -- from the keystroke that was asking for the
+    stage to stop sooner. Measured on a real tree before the fix: SIGTERM
+    sent, SIGKILL not, the leader unreaped and the group still there.
+    """
+    sent: list[int] = []
+    # 4242 for the child and something else for our own group: `_group_of`
+    # refuses to signal a group that is also ours, and a stub answering the
+    # same id to both makes it refuse.
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: sent.append(sig))
+    monkeypatch.setattr(
+        envs,
+        "_wait_without_reaping",
+        lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        envs._kill_tree(_FakeProc(), grace=0.25)
+
+    assert sent == [
+        signal.SIGTERM,
+        signal.SIGKILL,
+    ], "the interrupt escaped before the SIGKILL, so the group outlives us"
+
+
 def test_a_grandchild_is_collected_after_its_parent_has_exited(tmp_path, monkeypatch):
     """The case the whole module exists for, and it leaked.
 
