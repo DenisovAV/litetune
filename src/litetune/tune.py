@@ -49,7 +49,7 @@ from litetune import envs, models
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.evaluate import PromptMode
 from litetune.events import EventStream
-from litetune.exits import SIGKILL, read_returncode
+from litetune.exits import read_returncode
 
 logger = logging.getLogger(__name__)
 
@@ -1037,6 +1037,10 @@ def _directory_is_populated(path: Path) -> bool:
 
 def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneResult:
     """Fine-tune inside `envs.TRAIN`. A non-zero exit is recorded, never raised."""
+    # This run's own record of which host variables it dropped, so a second
+    # run in one process -- a notebook, a service -- says what the first
+    # one did instead of inheriting its silence.
+    envs.forget_reported_drops()
     events = events or EventStream(echo_json=False)
     events.stage_started(
         "train",
@@ -1357,18 +1361,15 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             f"stderr: {_tail(result.stderr) or 'none'}"
         )
         observed_device = metrics_device or device
-        # Withheld on a SIGKILL: `reading.describe` above has already named
-        # the near-certain cause -- the machine's out-of-memory killer -- and
-        # a speed hint stacked next to it reads as a second, contradictory
-        # story. A box killed while loading the checkpoint, seconds in, never
-        # ran a single matmul, slow or otherwise; the hint belongs to the
-        # signals that leave that door open, not to the one whose own text
-        # already says the run died for lack of memory.
-        if (
-            request.dtype == DEFAULT_DTYPE
-            and observed_device != "cuda"
-            and reading.signal != SIGKILL
-        ):
+        # No longer withheld on a SIGKILL. It used to be, on the argument that
+        # `reading.describe` had already named the near-certain cause -- the
+        # out-of-memory killer -- so a speed hint beside it read as a second,
+        # contradictory story. That text no longer says "near-certain": it
+        # offers a cancelled job as an equal possibility and tells the reader
+        # to check for one first. So a CI runner cancelling a bf16-on-CPU
+        # training run would be told to find more memory while the one fact
+        # this run did establish stayed unsaid.
+        if request.dtype == DEFAULT_DTYPE and observed_device != "cuda":
             # What the script reported wins over what the probe predicted, and
             # an unanswered probe does not silence the hint: see the note
             # before the run. As there, the wording distinguishes a device

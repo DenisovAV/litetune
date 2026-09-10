@@ -6,9 +6,10 @@ is not "the program ran and failed with 9", it is "the program was shot".
 
 This is not a hypothetical. A Gemma 4 export returned `-9`, the result was read
 as "ran and failed", and the model was struck from the catalogue for a reason
-that had nothing to do with the model: `-9` is SIGKILL, and on Linux, with
-nothing else sending it, SIGKILL is the out-of-memory killer. The export had hit
-a 32 GiB memory ceiling. Run on a larger machine, the same command produced a
+that had nothing to do with the model: `-9` is SIGKILL, and on that machine it
+came from the out-of-memory killer. The export had hit a 32 GiB memory ceiling.
+A supervisor cancelling a job sends the same signal, which is why `OOM_HINT`
+below names both and says which to check first. Run on a larger machine, the same command produced a
 specific, actionable error instead -- which is to say the "failure" was a fact
 about the machine and the real answer was still unknown.
 
@@ -32,17 +33,23 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# The one signal worth naming in prose: nothing in litetune sends it, so a
-# process that dies of it on a build machine was almost always killed for
-# memory.
+# The one signal worth naming in prose. litetune does send it: to a stage's
+# process group and to the stage's own child from `envs._kill_tree`, and to
+# pip from `provision`'s own `subprocess.run`. None of those returns a code to
+# this function -- every one ends in a raise -- so a -9 read here still came
+# from outside. That is a whole-program invariant with nothing enforcing it,
+# which is worth knowing if `StageEnv.run` is ever restructured again.
 SIGKILL = 9
 
 OOM_HINT = (
-    "nothing in litetune sends SIGKILL, so on Linux this is almost always the out-of-memory "
-    "killer: the process asked for more memory than the machine would give it. A Gemma 4 export "
-    "died exactly this way at a 32 GiB ceiling and read as a failed conversion; on a larger "
-    "machine the same command produced a specific, actionable error instead. Re-run it with more "
-    "memory before concluding anything about the model"
+    "every SIGKILL litetune sends ends in a raised exception rather than a return code, so a -9 "
+    "arriving here did not come from litetune. On Linux that leaves the out-of-memory killer -- "
+    "the process asked for more memory than the machine would give it -- or a supervisor that "
+    "cancelled the job: a CI runner, `docker stop` past its grace, a cgroup limit, Slurm. A "
+    "Gemma 4 export died of memory exactly this way at a 32 GiB ceiling and read as a failed "
+    "conversion; on a larger machine the same command produced a specific, actionable error "
+    "instead. Check for a cancellation, then re-run with more memory, before concluding anything "
+    "about the model"
 )
 
 

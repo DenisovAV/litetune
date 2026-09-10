@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from conftest import mark_provisioned
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -81,8 +82,7 @@ def killing_toolchain(monkeypatch, tmp_path):
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
 
     def fake_provision(self, events=None, force: bool = False) -> Path:
-        self.path.mkdir(parents=True, exist_ok=True)
-        (self.path / ".litetune-ready").write_text(self.identity)
+        mark_provisioned(self)
         return self.path
 
     def fake_run(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:

@@ -25,12 +25,14 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
 import venv
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,24 @@ from litetune.exits import read_returncode
 
 class UnpinnedRequirement(ValueError):
     """Raised when an environment definition would float."""
+
+
+class StageInterrupted(BaseException):
+    """A termination signal arrived while a stage subprocess was running.
+
+    `BaseException` rather than `Exception` so it unwinds like the interrupt it
+    is instead of being caught as a stage failure -- but not `KeyboardInterrupt`,
+    which already means "a person pressed Ctrl-C" to every reader of a log and
+    to CPython's own exit status. A run ended by a hangup or by `kill` must not
+    be reported as one the operator abandoned.
+    """
+
+    def __init__(self, signum: int):
+        self.signum = signum
+        # `set(...)` rather than `signum in signal.Signals`: the direct form is
+        # a TypeError before 3.12, and this package supports 3.10.
+        name = signal.Signals(signum).name if signum in set(signal.Signals) else str(signum)
+        super().__init__(f"{name} arrived while a stage subprocess was running")
 
 
 def env_cache_root() -> Path:
@@ -67,6 +87,598 @@ def _is_pinned(requirement: str) -> bool:
 logger = logging.getLogger(__name__)
 
 PROVISION_TIMEOUT_S = 1800
+
+# Variables that let the host reach inside a stage environment and outrank its
+# pins. `PYTHONPATH` is prepended ahead of the venv's own `site-packages`, so a
+# directory holding `numpy.py` wins over the `numpy==2.0.2` this module went to
+# such lengths to fix: measured 2026-09-09, the same interpreter reporting
+# `2.0.2` with the variable unset and a planted module with it set. That is not
+# a crash. It is a run recorded under a provenance it did not have -- the
+# manifest still names the pin -- and the cache then replays it under the
+# pinned identity. `PIP_TARGET` and `PIP_PREFIX` are the same shape one step
+# earlier: they redirect the install out of the venv while `.litetune-ready` is
+# still written over it.
+#
+# The line is drawn at *silent structural corruption*, not at everything that
+# could change a result, and two cases decided where it falls.
+#
+# `PIP_INDEX_URL` and its relatives are not here, though they are the sharper
+# hole on paper: measured 2026-09-09, pip reports `:env:.index-url` and fetches
+# `pyyaml==6.0.2` from whatever host is named, so an environment whose identity
+# hashes `numpy==2.0.2` could hold another index's idea of that name. They stay
+# because a corporate mirror or an air-gapped installer is exactly how they are
+# normally set, and dropping them would break machines that install correctly
+# today in order to close a hole that requires an attacker already inside the
+# user's environment. `PIP_CONFIG_FILE` settles it: unsetting it does not close
+# the channel, it falls back to `/etc/pip.conf` and the user's own config,
+# which can set `index-url` just as well. What actually answers this is the
+# record, not the strip -- `export.resolve_toolchain` reads the resolved
+# closure back with `pip freeze --all`, so what was installed is stated rather
+# than assumed.
+#
+# `PIP_TARGET`, `PIP_PREFIX` and `PIP_ROOT` are a different case and do belong
+# here: they do not change what is fetched, they put it somewhere else while
+# pip still exits 0 and `.litetune-ready` is still written over a venv that
+# now holds nothing. That is the failure this file exists to make impossible.
+#
+# `PYTHONEXECUTABLE` is here for the workers rather than the stage: it
+# overrides `sys.executable`, which `multiprocessing`'s spawn start method --
+# the default on macOS, and what a torch `DataLoader` uses -- relaunches
+# workers with. The stage would hold its pins while the processes doing the
+# work booted off another interpreter.
+#
+# `LD_PRELOAD` and `DYLD_INSERT_LIBRARIES` inject code under a correctly
+# pinned package, which is the same false provenance one layer down. They are
+# the least comfortable entries here, because preloading `libgomp` or an
+# allocator is a documented torch workaround and stripping one turns a working
+# machine into a crashing one. Kept anyway, and the reason is the direction of
+# the failure: a dropped preload fails loudly and the warning below names it,
+# while an honoured one produces a number nothing can tell apart from a real
+# one. This file exists for the second kind.
+# `LD_LIBRARY_PATH` and `DYLD_LIBRARY_PATH` are deliberately *not* here: they
+# are the same shape, but unlike the rest they have ordinary legitimate uses --
+# CUDA and MKL on clusters are routinely reached that way -- so stripping them
+# would break working machines to close a hole nobody has been bitten by. The
+# line is drawn at injection, not at search paths.
+#
+# Dropped rather than emptied. `PYTHONPATH=""` is not the same as unset on
+# every platform, and an empty entry has meant "the current directory" often
+# enough to be worth not relying on.
+_HOST_OVERRIDES = (
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONEXECUTABLE",
+    "PIP_TARGET",
+    "PIP_PREFIX",
+    "PIP_ROOT",
+    "LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES",
+)
+
+# How long to wait for the pipes after killing a process group. A grandchild
+# that called `setsid()` itself escapes the group, and if it still holds the
+# inherited stdout it can keep an unbounded `communicate()` open forever --
+# which would put back the unbounded wait this whole change exists to remove,
+# one level out from where the original bug was.
+_DRAIN_AFTER_KILL_S = 10
+
+# How long a stage gets between SIGTERM and SIGKILL. Long enough for torch to
+# finish a `save_pretrained` it had started, short enough that a wedged process
+# cannot meaningfully extend the timeout it already blew through.
+_TERM_GRACE_S = 5
+
+# Windows has no `SIGKILL`, and reading the attribute unconditionally is enough
+# to raise there -- inside the very handler that was reporting a timeout, so
+# the timeout would never be reported at all. `None` means "kill through
+# `Popen.kill`", which is what `subprocess` does on that platform anyway.
+_SIGKILL = getattr(signal, "SIGKILL", None)
+
+# Names already named in a warning during the current run. `run` is called once
+# per prompt during evaluation and Colab sets `PYTHONPATH` by default, so a
+# per-call warning is hundreds of identical lines through a progress report --
+# but "once per process" is the wrong grain for a library, where a notebook or a
+# service is one process spanning many independent runs. `forget_reported_drops`
+# is what a run boundary calls to get its own record.
+_REPORTED_DROPS: set[str] = set()
+
+
+def forget_reported_drops() -> None:
+    """Start a fresh record of which host variables have been reported dropped.
+
+    Called at the top of a run so the second run in one process says what the
+    first one did, rather than inheriting its silence.
+    """
+    _REPORTED_DROPS.clear()
+
+
+def _interpreter_in(root: Path) -> Path:
+    """Where `venv` puts the interpreter inside `root`.
+
+    One function because there were two spellings: `provision` built
+    `Scripts/python.exe` on Windows while `StageEnv.python` looked for
+    `Scripts/python`, which `venv` never creates there. That cost nothing
+    while `ready` read only the marker file; once `ready` also checks the
+    interpreter, the mismatch would make every Windows environment read as
+    unprovisioned forever -- reinstalling torch on every invocation while
+    `litetune env` called each working environment `incomplete`.
+    """
+    if os.name == "nt":
+        return root / "Scripts" / "python.exe"
+    return root / "bin" / "python"
+
+
+def _console_script_in(root: Path, name: str) -> Path | None:
+    """The console script `name` inside `root`, or None to fall back to `-m`.
+
+    Windows entry points are `.exe` wrappers, so looking only for the bare name
+    there finds nothing and every stage silently takes the `python -m` path --
+    which works for `pip` and not for `litert-torch`, whose module is not
+    executable that way.
+    """
+    bindir = root / ("Scripts" if os.name == "nt" else "bin")
+    candidates = [bindir / f"{name}.exe", bindir / name] if os.name == "nt" else [bindir / name]
+    return next((c for c in candidates if c.exists()), None)
+
+
+def _group_of(proc: subprocess.Popen) -> int | None:
+    """The child's process group, when signalling it is safe and meaningful.
+
+    `None` where there is no `killpg`, where the lookup is refused, or where
+    the group turns out to be our own -- `start_new_session=True` means it
+    cannot be, but a wrong answer here SIGKILLs the session running litetune,
+    so the invariant is checked rather than trusted.
+    """
+    if os.name == "nt" or not hasattr(os, "killpg"):
+        return None
+    # A host that ignores SIGCHLD has the kernel reap children the moment they
+    # exit, and `Popen` never learns: `returncode` stays None while the pid --
+    # which *is* the group id -- is already free to be handed out again. No
+    # check closes that window, because any observation is stale by the time
+    # the signal goes out. So the group is not used there at all, and the
+    # direct child is what can be reached safely. Losing the sweep on such a
+    # host is the price of not signalling a stranger's group on every other.
+    sigchld = getattr(signal, "SIGCHLD", None)
+    if sigchld is not None and signal.getsignal(sigchld) == signal.SIG_IGN:
+        logger.debug("SIGCHLD is ignored, so a stage's descendants cannot be collected safely")
+        return None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        # Not recovered from `proc.pid`. That fallback was added because macOS
+        # answers ESRCH for a zombie leader where Linux still reports its
+        # group, and it was justified by "we only get here with the child
+        # unreaped". `SA_NOCLDWAIT`, set through `sigaction`, breaks that: the
+        # kernel reaps, `getsignal` cannot see the flag, `returncode` stays
+        # None, and the pid is free -- so the fallback could aim a SIGKILL at
+        # whoever holds that number now. The zombie case is solved instead by
+        # reading the group at spawn, where the child is certainly alive; see
+        # `StageEnv.run`.
+        return None
+    return None if pgid == os.getpgid(0) else pgid
+
+
+class Reach(Enum):
+    """How far a kill got. A bool had room for two of these four.
+
+    The distinction is `checks.Outcome`'s, one layer down: "the group is gone"
+    and "nothing could be signalled" are both *not* "killed", and only one of
+    them means something is still running. A caller that logs the difference
+    can say what it knows instead of guessing at a rogue grandchild.
+
+    Ordered worst-to-best so `max()` can take the best reach achieved rather
+    than the last one attempted -- a SIGTERM that reached the whole group must
+    not be reported as "nothing could be signalled" because the SIGKILL after
+    it was refused.
+
+    A plain `Enum`, not `str, Enum`: the values are never read, and the mixin
+    makes `f"{Reach.GROUP}"` render as `group` on 3.10 and `Reach.GROUP` on
+    3.11+, which is a difference waiting for the first person to log one
+    directly.
+    """
+
+    NOTHING = 0  # every attempt was refused; it is still out there
+    ALREADY_GONE = 1  # nothing to signal, and nothing left running
+    CHILD_ONLY = 2  # only the direct child; descendants are not covered
+    GROUP = 3  # the whole process group was signalled
+
+    def __lt__(self, other: Reach) -> bool:
+        return self.value < other.value
+
+
+def _signal_tree(proc: subprocess.Popen, pgid: int | None, sig: int | None) -> Reach:
+    """Deliver `sig` to the group if there is one, else to the child alone.
+
+    `sig` is `None` where the platform has no such signal -- Windows has no
+    `SIGKILL` -- and the child is then killed through `Popen.kill`, which is
+    what `subprocess` itself does there.
+
+    A process that has already gone reports `ALREADY_GONE` rather than success:
+    between a timeout firing and this call is exactly where a process finishes
+    on its own, so it is the ordinary case and not a failure, but it is also
+    not evidence that anything was signalled.
+    """
+    if pgid is not None and sig is not None:
+        try:
+            os.killpg(pgid, sig)
+            return Reach.GROUP
+        except ProcessLookupError:
+            return Reach.ALREADY_GONE
+        except OSError:
+            # `PermissionError` among them: a setuid child cannot be signalled
+            # by its parent. Fall through and try the child directly.
+            pass
+    try:
+        if sig is None:
+            proc.kill()
+        else:
+            proc.send_signal(sig)
+    except ProcessLookupError:
+        return Reach.ALREADY_GONE
+    except (OSError, ValueError):
+        # `ValueError` is Windows' answer to a signal it does not support.
+        return Reach.NOTHING
+    # `Popen.send_signal` polls first and returns silently for a child already
+    # reaped, and it swallows `ProcessLookupError` from `os.kill` besides -- so
+    # the arm above cannot fire on this path. Read what that poll learned
+    # rather than polling again: a second poll of our own would reap on the
+    # EPERM fallback, freeing the group id the caller is still holding.
+    if proc.returncode is not None:
+        return Reach.ALREADY_GONE
+    return Reach.CHILD_ONLY
+
+
+def _kill_tree(
+    proc: subprocess.Popen,
+    grace: float = _TERM_GRACE_S,
+    stop: Callable[[], bool] | None = None,
+    pgid: int | None = None,
+) -> Reach:
+    """End the child and everything it spawned: SIGTERM, then SIGKILL.
+
+    Returns the best reach achieved, so a caller can say "and it could not be
+    killed" rather than leaving a leaked process to be diagnosed later as
+    somebody else's out-of-memory kill.
+
+    SIGTERM first because this replaced something gentler. Before the child had
+    a session of its own, Ctrl-C reached it as SIGINT through the terminal and
+    torch got to run its own handlers -- which for `tune` is the difference
+    between a checkpoint written and a file truncated mid-`save_pretrained`.
+    Going straight to SIGKILL would have been a quiet downgrade of that, so the
+    grace is the part that keeps the replacement honest; SIGKILL still follows,
+    because a wedged process must not be able to outlast its own timeout.
+    """
+    if proc.returncode is not None:
+        return Reach.ALREADY_GONE
+    # Read before anything can poll, and `poll()` is deliberately not called
+    # here. It reaps, and reaping the leader does two bad things at once: it
+    # frees the pid that *is* the group id, and it makes `getpgid` answer
+    # ESRCH so the id cannot be recovered. A guard that polled first therefore
+    # skipped the group kill in exactly the state this module is written for --
+    # the child exited, a grandchild still holds the pipe -- and the descendant
+    # survived. Measured as a leak. The auto-reaping hazard that guard was
+    # aiming at is handled where it can be handled without reaping, in
+    # `_group_of`.
+    # A group read at spawn beats one looked up now: by the time a kill runs,
+    # the leader may be a zombie whose group macOS will not report.
+    pgid = pgid if pgid is not None else _group_of(proc)
+    reached = _signal_tree(proc, pgid, signal.SIGTERM)
+    if reached is Reach.ALREADY_GONE or proc.returncode is not None:
+        # `Popen.send_signal` polls before it signals, so the direct-child leg
+        # -- reached whenever `killpg` was refused -- can reap the leader on
+        # its way through. Once that happens the group id is no longer ours,
+        # and on macOS this is the *ordinary* path: a group whose only member
+        # is a zombie answers EPERM, which looks exactly like the setuid case.
+        return reached
+    if reached is not Reach.NOTHING and grace > 0:
+        still_ours = _wait_without_reaping(proc, pgid, grace, stop)
+        # Withheld only where there is a group to mis-target. With no group the
+        # final signal goes through `Popen`, which polls first and cannot reach
+        # a stranger -- and on Linux `waitid` answers ECHILD for any pid that
+        # is not our child, so withholding it there stopped the SIGKILL
+        # unconditionally. CI caught that; this machine could not, because
+        # CPython has no `os.waitid` on macOS before 3.13.
+        if not still_ours and pgid is not None:
+            return reached
+    # Unconditionally, even where the child exited on the SIGTERM: what it
+    # spawned is not covered by its own exit, and this is the signal that
+    # collects them. Measured 2026-09-09: a group whose leader has exited but
+    # is not yet reaped still exists and still takes a signal, which is what
+    # makes this safe -- and why the wait above must not reap.
+    return max(reached, _signal_tree(proc, pgid, _SIGKILL))
+
+
+def _wait_without_reaping(
+    proc: subprocess.Popen,
+    pgid: int | None,
+    grace: float,
+    stop: Callable[[], bool] | None = None,
+) -> bool:
+    """Wait for the child to exit, leaving it reapable.
+
+    `proc.wait()` would be the obvious call and is the wrong one: it reaps, and
+    a process group id *is* the leader's pid, so reaping frees the number this
+    function's caller is about to send SIGKILL to. Measured 2026-09-09: with
+    the leader reaped and no other member, `killpg` answers `ESRCH` and the id
+    is free for reuse; unreaped, the group is still there.
+
+    Two ways to watch without reaping, because neither covers every host.
+    `waitid` with `WNOWAIT` reports the exit and leaves the child reapable, but
+    it does not exist on macOS -- measured, on the Python this project is
+    developed against, where the guard has to stay on `waitid` itself because
+    `os.P_PID` and `os.WNOWAIT` are both present there anyway. Failing that,
+    signalling the group with 0 asks whether anything in it is still there,
+    which is the question this wait is really about: it ends early when the
+    whole group is gone, and that is also how a *second* termination signal
+    cuts this wait short, since its own hard kill empties the group.
+
+    With neither, the grace is slept out. Slower when the child obeys at once,
+    never wrong.
+    """
+    deadline = time.monotonic() + grace
+    waitid = getattr(os, "waitid", None)
+    while True:
+        if stop is not None and stop():
+            # A second termination signal has already killed outright, so there
+            # is nothing left for this wait to give.
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        if waitid is not None:
+            try:
+                if waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                    # Exited, and still reapable: the pid stays pinned, so the
+                    # caller's group id is still its own.
+                    return True
+            except ChildProcessError:
+                # Somebody else reaped it: the pid, and so the group id, is
+                # free *now*. Reported rather than swallowed, because the
+                # caller's next act is a `killpg` on that number.
+                return False
+            except OSError as exc:
+                # We could not observe, which is not the same as "it exited".
+                # Sleeping out the rest of the grace is what this function
+                # promises; returning here would silently make the grace zero.
+                logger.debug("cannot watch pid %d without reaping it: %s", proc.pid, exc)
+                waitid = None
+        elif pgid is not None:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                # Unambiguous: the group is empty.
+                return True
+            except PermissionError:
+                # Ambiguous, and only on one platform. macOS answers EPERM for
+                # a group whose sole member is an unreaped zombie -- measured
+                # -- so reading it as "nothing live left" is what keeps the
+                # grace from being slept out in full there, which matters
+                # because `os.waitid` is missing from CPython on macOS before
+                # 3.13. On Linux EPERM has only the ordinary meaning: a live
+                # group we may not signal, which is a stage that execed a
+                # setuid helper -- and returning there would take away the
+                # grace from exactly the shutdown it exists to protect.
+                if sys.platform == "darwin":
+                    return True
+                logger.debug("cannot probe process group %d, so waiting out the grace", pgid)
+                # Stop probing, not stop waiting: the grace is what the setuid
+                # descendant needs, and it is the one thing we can still give.
+                pgid = None
+            except OSError as exc:
+                logger.debug("cannot probe process group %d: %s", pgid, exc)
+                pgid = None
+        time.sleep(min(0.05, remaining))
+
+
+@contextlib.contextmanager
+def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen, pgid: int | None = None):
+    """Take the child down with us on SIGTERM or SIGHUP.
+
+    `start_new_session=True` is what lets a timeout kill everything the stage
+    spawned, but it also took the child out of the terminal's process group --
+    and a hangup on that group, an SSH session dropping or a window closing, is
+    how an interactive run used to be cleaned up. Python turns only SIGINT into
+    an exception, so the `except BaseException` in `run` cannot stand in for
+    these two: without this, `kill <litetune>` or a dropped connection leaves a
+    six-hour torch run holding its memory, which is the very thing the process
+    group was introduced to prevent.
+
+    A signal the process was already ignoring is left alone. `nohup` sets
+    SIGHUP to `SIG_IGN` for exactly one purpose -- to survive the hangup that
+    ends the SSH session -- and installing over it would turn the documented
+    way to run a six-hour `tune` into the one way to lose it. The same holds
+    for a supervisor that ignores SIGTERM on purpose.
+
+    The previous disposition is restored before the signal is re-raised, so the
+    process still dies the way it would have. Signals can only be installed on
+    the main thread; elsewhere this is a no-op rather than an error, because a
+    library that refused to run off the main thread would be worse than one
+    that cleans up in fewer cases.
+    """
+    installed: dict[int, Any] = {}
+    handling = False
+    # Set by a second termination signal and read by the first invocation's
+    # grace. Needed because SIGKILL does not empty a group -- the leader stays
+    # an unreaped zombie -- so "the wait notices on its own" holds only where
+    # there is a group to watch, and not on the child-only fallback.
+    escalated = False
+
+    def take_the_child_with_us(signum, _frame):
+        nonlocal handling, escalated
+        # Our handler stays installed while it runs, so a second signal
+        # re-enters here. Measured: three SIGTERMs a second apart against a
+        # child that ignores them took 8.0s to give up instead of 5.0s, because
+        # each nested call started its own grace.
+        #
+        # The second signal means "stop harder", so it skips the grace and
+        # kills outright -- and then *returns*, rather than raising. Raising
+        # through the first invocation was the earlier attempt and it was
+        # worse: the first frame never reached its restore or its re-delivery,
+        # so the process died of an uncaught exception instead of the signal,
+        # and `run`'s handler then started a fresh grace of its own. Returning
+        # leaves the first invocation to finish, and it finishes at once,
+        # because emptying the group is exactly what its wait is watching for.
+        if handling:
+            escalated = True
+            _kill_tree(proc, grace=0, pgid=pgid)
+            return
+        handling = True
+        try:
+            _kill_tree(proc, stop=lambda: escalated, pgid=pgid)
+        finally:
+            # Reset before the re-delivery below, and before `run`'s cleanup
+            # runs under this same guard. Leaving it set swallowed every signal
+            # after the first for the whole grace-plus-drain window -- up to
+            # fifteen seconds in which litetune could not be terminated at all,
+            # which is a worse trade than the one it was made for.
+            handling = False
+        # `None` means the handler in place was installed from C and cannot be
+        # restored from Python -- `signal.signal(sig, None)` is a `TypeError`.
+        # Falling back to the default is what "die the way we would have" means
+        # when the previous disposition is not expressible here.
+        previous = installed.get(signum)
+        signal.signal(signum, signal.SIG_DFL if previous is None else previous)
+        os.kill(os.getpid(), signum)
+        # Reached only where that disposition returns instead of ending the
+        # process -- litetune embedded in a larger application whose own
+        # handler carries on. Returning here would resume `communicate()` over
+        # a child we just killed and hand the caller a `-9`, which `exits`
+        # reports as the out-of-memory killer: our own kill, blamed on the
+        # machine. This carries the signal number instead, because
+        # `KeyboardInterrupt` already means one specific thing to every reader
+        # and to CPython's exit status, and nobody typed Ctrl-C.
+        raise StageInterrupted(signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            if signal.getsignal(sig) == signal.SIG_IGN:
+                continue
+            installed[sig] = signal.signal(sig, take_the_child_with_us)
+        except (ValueError, OSError) as exc:
+            # Off the main thread, or a platform without this signal -- the
+            # message must not pick one. `warning`, not `debug`: the
+            # consequence is a six-hour torch run outliving the SIGTERM that
+            # was meant to end it, and `cli` leaves the level at WARNING unless
+            # asked for more.
+            logger.warning(
+                "no %s guard for %s (%s): a termination signal will not reach it",
+                name,
+                _describe(proc),
+                exc,
+            )
+
+    try:
+        yield
+    finally:
+        for sig, previous in installed.items():
+            # `None` is a handler installed from C, which Python cannot express
+            # and so cannot restore. Leaving ours in place is the worse of the
+            # two: it would outlive this call, closed over a process that no
+            # longer exists. The default is at least the platform's own answer.
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(sig, signal.SIG_DFL if previous is None else previous)
+
+
+def _kill_and_drain(proc: subprocess.Popen, pgid: int | None = None) -> tuple[str, str]:
+    """Kill the group, then collect what it wrote -- without waiting forever.
+
+    The drain is bounded because the kill is not guaranteed to have reached
+    everything: a grandchild that called `setsid()` is outside the group and
+    can hold the inherited stdout open. Giving up on the output is the right
+    trade here, since the caller is already on its way to reporting a timeout
+    or re-raising; hanging instead would reinstate the unbounded wait.
+    """
+    reached = _kill_tree(proc, pgid=pgid)
+    try:
+        return proc.communicate(timeout=_DRAIN_AFTER_KILL_S)
+    except subprocess.TimeoutExpired as expired:
+        # Said out loud, because a leaked process is otherwise diagnosed hours
+        # later as somebody else's out-of-memory kill. The sentence says only
+        # what `reached` supports: blaming a stray grandchild when in fact
+        # nothing could be signalled would send the reader hunting for the
+        # wrong process.
+        logger.warning(
+            "output pipes for %s stayed open after %s, so something is still holding them",
+            _describe(proc),
+            {
+                # Not "a descendant left the group": `killpg` returning 0 says
+                # the signal was accepted, not that anything died. A member
+                # wedged in an uninterruptible ioctl is unkillable and still
+                # holds the pipe, so naming one cause would send the reader
+                # hunting for the wrong process.
+                Reach.GROUP: (
+                    "the group was signalled, so either something outside it holds them or "
+                    "something in it has not died"
+                ),
+                Reach.CHILD_ONLY: (
+                    "only the child was signalled, which does not cover what it spawned"
+                ),
+                Reach.NOTHING: "nothing could be signalled at all",
+                Reach.ALREADY_GONE: (
+                    "the child had already exited, so something it spawned holds them"
+                ),
+            }[reached],
+        )
+        # Whatever was read before giving up. The stage's stderr is the single
+        # most useful artifact in a timeout report, so it is worth carrying the
+        # partial one rather than returning two empty strings.
+        stream = proc.stdout or proc.stderr
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        return _as_text(expired.output, encoding), _as_text(expired.stderr, encoding)
+
+
+def _as_text(chunk: str | bytes | None, encoding: str = "utf-8") -> str:
+    """`TimeoutExpired` carries bytes from a text-mode pipe on some paths.
+
+    `_check_timeout` attaches the raw chunks without decoding even when the
+    pipe was opened in text mode, so the decode has to happen here -- in the
+    encoding the pipe was actually opened with, or the salvaged stderr this
+    exists to preserve comes back as mojibake on a non-UTF-8 host.
+    """
+    if chunk is None:
+        return ""
+    return chunk if isinstance(chunk, str) else chunk.decode(encoding, "replace")
+
+
+def _describe(proc: subprocess.Popen) -> str:
+    """The first word of a subprocess's command line, for a log message."""
+    args = proc.args
+    if isinstance(args, str | bytes | os.PathLike):
+        return os.fsdecode(args)
+    return os.fsdecode(next(iter(args), "the stage subprocess"))
+
+
+def _child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment a stage subprocess runs in: the host's, minus the reach.
+
+    Callers that need their own variables pass them in `overrides`; they are
+    applied after the sanitation, so a caller can still set `PYTHONPATH`
+    deliberately -- `export`'s repack does not, but the shape leaves the door
+    open for one that must, rather than making every caller rebuild this.
+    """
+    # Only what is actually being taken away: a caller that passes one of these
+    # as an override gets it, so naming it as dropped would state the opposite
+    # of what happens.
+    dropped = [k for k in _HOST_OVERRIDES if k in os.environ and k not in (overrides or {})]
+    # Said out loud rather than done quietly -- but once. `run` is called per
+    # prompt during evaluation, and Colab sets `PYTHONPATH` by default, so a
+    # per-call warning is several hundred identical lines through the middle of
+    # a progress report on the platform this tool names as supported.
+    unreported = [k for k in dropped if k not in _REPORTED_DROPS]
+    if unreported:
+        _REPORTED_DROPS.update(unreported)
+        logger.warning(
+            "not passing %s to the stage subprocess: it would outrank the "
+            "environment's own pins, which every measurement is recorded against",
+            ", ".join(unreported),
+        )
+    env = {k: v for k, v in os.environ.items() if k not in _HOST_OVERRIDES}
+    if overrides:
+        env.update(overrides)
+    return env
+
 
 # The stage environments are built from the *host* interpreter, so its version
 # is theirs -- and each has its own ceiling, set by whichever of its pins stops
@@ -228,7 +840,11 @@ def cached_environments() -> list[CachedEnv]:
         CachedEnv(
             path=child,
             bytes=_tree_bytes(child),
-            ready=(child / ".litetune-ready").exists(),
+            # The same two-part test `StageEnv.ready` applies, so the listing
+            # and the stage cannot disagree about the same directory. Reading
+            # only the marker made `litetune env` print `ready` for one holding
+            # nothing else, which is where this was first seen.
+            ready=(child / ".litetune-ready").exists() and _interpreter_in(child).exists(),
             stage=claimed.get(child.name),
         )
         for child in sorted(root.iterdir())
@@ -291,12 +907,24 @@ class StageEnv:
 
     @property
     def python(self) -> Path:
-        bindir = "Scripts" if os.name == "nt" else "bin"
-        return self.path / bindir / "python"
+        return _interpreter_in(self.path)
 
     @property
     def ready(self) -> bool:
-        return (self.path / ".litetune-ready").exists()
+        """The install finished *and* the tree it finished into is still here.
+
+        The marker alone is not enough. A directory holding nothing but
+        `.litetune-ready` was found in a real cache (12 bytes, no `bin/`):
+        `provision` short-circuits on it and builds nothing, and `run` then
+        reaches a python that does not exist and reports "it could not be
+        started" -- which names the wrong cause and sends the reader looking at
+        their toolchain instead of at an empty directory.
+
+        Checking `python` rather than the marker's contents is deliberate: the
+        path already carries the identity hash, so a marker here cannot belong
+        to a different build. What is missing is the tree, not the identity.
+        """
+        return (self.path / ".litetune-ready").exists() and self.python.exists()
 
     def provision(
         self, events=None, force: bool = False, timeout: int = PROVISION_TIMEOUT_S
@@ -370,9 +998,10 @@ class StageEnv:
                         "budget building the virtualenv; nothing was installed, and any "
                         "existing environment is untouched"
                     )
-                bindir = "Scripts" if os.name == "nt" else "bin"
-                python = self.path / bindir / ("python.exe" if os.name == "nt" else "python")
-                cmd = [str(python), "-m", "pip", "install", "--quiet", *self.requirements]
+                # The same spelling `ready` and `run` use, from one function:
+                # two of them disagreeing on Windows is what made this worth
+                # naming at all.
+                cmd = [str(self.python), "-m", "pip", "install", "--quiet", *self.requirements]
                 try:
                     proc = subprocess.run(
                         cmd,
@@ -382,6 +1011,10 @@ class StageEnv:
                         # The timeout message names a prompt as a cause; this is
                         # what stops one from being waited on at all.
                         stdin=subprocess.DEVNULL,
+                        # `PIP_TARGET`/`PIP_PREFIX` in the host environment
+                        # would install somewhere other than this venv, and
+                        # `.litetune-ready` would still be written over it.
+                        env=_child_env(),
                     )
                 except subprocess.TimeoutExpired:
                     raise RuntimeError(
@@ -432,7 +1065,12 @@ class StageEnv:
             events.note(f"environment {self.name!r} ready at {self.path}")
         return self.path
 
-    def run(self, args: list[str], timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
+    def run(
+        self,
+        args: list[str],
+        timeout: int = 3600,
+        env: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         """Run a console script or module inside this environment.
 
         Returns the completed process rather than raising on non-zero: callers
@@ -450,19 +1088,68 @@ class StageEnv:
         probe. Replacing the byte keeps the rest of the line readable, which
         is what a caller that only reads the last line needs; this is shared
         by every stage, so the fix protects all of them, not only the probe.
+
+        `env` is *overrides*, not a whole environment: the base is the host's
+        minus `_HOST_OVERRIDES`, so a caller cannot accidentally hand the pins
+        back to `PYTHONPATH` by starting from `os.environ`.
+
+        The process is started in its own session so that a timeout can kill
+        what it spawned. `subprocess.run` kills only the direct child, which
+        for `tune` means a six-hour timeout records an honest "not checked",
+        the run continues, and an abandoned torch process keeps its memory --
+        the next stage is then SIGKILLed and `exits` reads that as the OOM
+        killer, blaming the machine for litetune's own orphan.
         """
-        bindir = "Scripts" if os.name == "nt" else "bin"
-        exe = self.path / bindir / args[0]
-        argv = [str(exe), *args[1:]] if exe.exists() else [str(self.python), "-m", *args]
-        return subprocess.run(
+        exe = _console_script_in(self.path, args[0])
+        argv = [str(exe), *args[1:]] if exe is not None else [str(self.python), "-m", *args]
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             errors="replace",
-            timeout=timeout,
             stdin=subprocess.DEVNULL,
-            **kwargs,
+            env=_child_env(env),
+            # POSIX only; accepted and ignored on Windows, where `_kill_tree`
+            # falls back to killing the child alone. Not overridable: a caller
+            # reaching past it with `process_group=` would put the child in
+            # *our* group, and `_kill_tree` would then aim SIGKILL at the
+            # session that is running litetune. There was a `**kwargs`
+            # passthrough here with no user in the package; it is gone.
+            start_new_session=True,
         )
+        # The guard wraps the cleanup as well as the wait, and that is the
+        # whole point of where it sits. With the `try` outside it, the context
+        # manager restored the default dispositions *before* either handler ran
+        # -- and `_kill_and_drain` is a grace plus a drain, so for up to fifteen
+        # seconds of every timeout and every interrupt litetune was unprotected.
+        # Reproduced: a third signal arriving in that window killed litetune
+        # mid-kill and the stage outlived its parent, which is precisely what
+        # the guard exists to prevent.
+        # Read here, once, while the child is certainly alive. By the time a
+        # kill runs the leader may be a zombie, and macOS will not report the
+        # group of one -- which made the group unreachable in exactly the case
+        # the sweep exists for. Recovering it from `proc.pid` later was the
+        # other way, and it is unsafe: a host using `SA_NOCLDWAIT` has the
+        # kernel reap without `Popen` or `getsignal` ever knowing, and the
+        # number is then free for somebody else.
+        pgid = _group_of(proc)
+        with _kill_child_if_we_are_told_to_exit(proc, pgid):
+            try:
+                out, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Kill first, then drain: `communicate()` with no timeout would
+                # otherwise wait on a pipe the group is still holding open.
+                out, err = _kill_and_drain(proc, pgid)
+                raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from None
+            except BaseException:
+                # Ctrl-C reaches the group through the terminal only while the
+                # child shares it, and `start_new_session=True` is what stopped
+                # it doing so. This is that signal's replacement, and it covers
+                # every other way out of the `try` as well.
+                _kill_and_drain(proc, pgid)
+                raise
+        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 # Where a stage's subprocess will run is decided here, once, in the parent,
@@ -509,6 +1196,13 @@ class DeviceProbe:
 
     device: str | None
     detail: str
+    # Whether a probe was run at all. Three states share `device is None` and
+    # they are different facts: nobody asked, it was asked and could not
+    # answer, and there was nothing to ask. Only the middle one implies a
+    # generation script will start and write a run report, and a consumer that
+    # has to tell them apart should read this rather than the wording of
+    # `detail` -- a sentence built somewhere else is not a protocol.
+    attempted: bool = True
     # `torch.version.cuda`: the CUDA version this wheel was built against, or
     # `None` for a CPU-only wheel. Reported so that "cpu" from a CUDA build --
     # torch is there and cannot reach a device -- is distinguishable from "cpu"

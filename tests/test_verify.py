@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import FakeBackend, call_text, correct_texts, labelled_rows
+from conftest import FakeBackend, call_text, correct_texts, labelled_rows, mark_provisioned
 
 from litetune import envs
 from litetune.evaluate import Generation, HuggingFaceBackend, PromptMode
@@ -961,8 +961,7 @@ def _fake_reference_run(rows, *, probe_stdout: str, probe_returncode: int = 0):
 
 def _ready_train_env(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
-    envs.TRAIN.path.mkdir(parents=True, exist_ok=True)
-    (envs.TRAIN.path / ".litetune-ready").write_text(envs.TRAIN.identity)
+    mark_provisioned(envs.TRAIN)
 
 
 def test_an_unanswered_reference_probe_reaches_the_manifest(write_split, monkeypatch, tmp_path):

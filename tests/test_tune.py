@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import fake_torch
+from conftest import fake_torch, mark_provisioned
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -178,8 +178,7 @@ def trainer(monkeypatch, tmp_path) -> FakeTrainer:
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
 
     def fake_provision(self, events=None, force: bool = False) -> Path:
-        self.path.mkdir(parents=True, exist_ok=True)
-        (self.path / ".litetune-ready").write_text(self.identity)
+        mark_provisioned(self)
         return self.path
 
     fake = FakeTrainer()
@@ -1780,8 +1779,7 @@ def test_the_probe_runs_even_without_provisioning(trainer, request_for, tmp_path
     is a run whose device is knowable. The probe provisions nothing -- gating it
     on `auto_provision` made such a run report no device at all.
     """
-    envs.TRAIN.path.mkdir(parents=True, exist_ok=True)
-    (envs.TRAIN.path / ".litetune-ready").write_text(envs.TRAIN.identity)
+    mark_provisioned(envs.TRAIN)
     trainer.probe_device = "cuda"
 
     result = run_tune(request_for(auto_provision=False))
@@ -1924,12 +1922,20 @@ def test_a_killed_run_with_only_a_prediction_does_not_claim_it_ran(trainer, requ
     assert "killed before its own device was confirmed" in detail
 
 
-def test_a_sigkill_does_not_carry_the_speed_hint_too(trainer, request_for):
-    """`reading.describe` already named the near-certain cause of a SIGKILL --
-    the machine's out-of-memory killer -- and a speed hint stacked next to it
-    reads as a second, contradictory story: a box killed while loading the
-    checkpoint, seconds in, never ran a single matmul, slow or otherwise. Same
-    device shape as the confirmed-cpu test above, `-9` instead of `-15`.
+def test_a_sigkill_still_carries_the_speed_hint(trainer, request_for):
+    """It used to be withheld, and the reason it was withheld is gone.
+
+    The argument was that `reading.describe` had already named the
+    out-of-memory killer as the near-certain cause, so a speed hint beside it
+    read as a second, contradictory story. That text no longer says
+    "near-certain": it offers a cancelled job as an equal possibility -- a CI
+    runner, `docker stop`, a cgroup limit, Slurm -- and tells the reader to
+    check for one first.
+
+    So the shape this covers is a cancelled bf16-on-CPU run, where the old
+    behaviour sent the user to find more memory while withholding the one fact
+    the run did establish. Same device shape as the confirmed-cpu test above,
+    `-9` instead of `-15`.
     """
     trainer.probe_device = "cuda"
     trainer.device = "cpu"
@@ -1938,8 +1944,7 @@ def test_a_sigkill_does_not_carry_the_speed_hint_too(trainer, request_for):
     detail = check_named(run_tune(request_for(dtype="bfloat16")), TRAINING_CHECK).detail
 
     assert "out-of-memory killer" in detail
-    assert "--dtype float32" not in detail
-    assert "it ran bfloat16 on the CPU" not in detail
+    assert "--dtype float32" in detail, "the one fact this run established must not be withheld"
 
 
 def test_a_killed_run_on_cuda_carries_no_dtype_hint(trainer, request_for):

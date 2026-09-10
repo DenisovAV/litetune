@@ -36,7 +36,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from litetune import metrics, models
+from litetune import envs, metrics, models
 from litetune.checks import Check, Outcome, guard
 from litetune.evaluate import (
     GREEDY,
@@ -370,8 +370,19 @@ def run_verify(
     events: EventStream | None = None,
     backends: BackendPair | None = None,
 ) -> VerifyResult:
-    """Verify one converted artifact. Returns a status and a manifest; never raises."""
+    """Verify one converted artifact. Returns a status and a manifest.
+
+    Raises nothing about the model: every failure becomes a check and a status,
+    which is the point. The one thing that does come through is
+    `envs.StageInterrupted` -- a termination signal reaching litetune while a
+    stage was running. That is not a verdict and must not be turned into one,
+    so it is deliberately allowed past.
+    """
     events = events or EventStream(echo_json=False)
+    # A run's own record of which host variables it dropped. Without this the
+    # second `verify` in one process -- a notebook, a service -- inherits the
+    # first one's "already said that" and reports nothing.
+    envs.forget_reported_drops()
     events.stage_started("verify", model=str(request.model), reference=request.reference)
     run = _Run(request=request, events=events)
 
@@ -579,11 +590,25 @@ def run_verify(
     if isinstance(pair.reference, HuggingFaceBackend) and pair.reference.last_probe is not None:
         probe = pair.reference.last_probe
         if not probe.answered:
-            run.limitation(
-                f"{probe.detail}, so the reference run's device was not established before it "
-                "started. The generation script decided for itself and reports what it chose in "
-                "its own run report"
+            # The tail depends on whether a probe was attempted, and that is
+            # a field rather than a phrase found in `detail`: a sentence built
+            # in another module is not a protocol, and the first rewording
+            # would have taken this branch out silently.
+            #
+            # Where the probe ran and could not answer, the generation script
+            # still starts and picks a device itself, so its run report is the
+            # place to look. Where there was nothing to probe, the environment
+            # is unusable and no script starts -- `env.run` reaches a missing
+            # interpreter -- so promising a run report points at an artifact
+            # that does not exist.
+            tail = (
+                "so the reference run's device was not established before it started. The "
+                "generation script decided for itself and reports what it chose in its own "
+                "run report"
+                if probe.attempted
+                else "so the reference run has no device on record"
             )
+            run.limitation(f"{probe.detail}, {tail}")
         elif probe.cuda_build_without_a_device:
             run.limitation(probe.detail)
     # Same vocabulary, opposite baseline: `generate` on the transformers side

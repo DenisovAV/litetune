@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FakeBackend, call_text, fake_torch, labelled_rows
+from conftest import FakeBackend, call_text, fake_torch, labelled_rows, mark_provisioned
 
 from litetune import envs
 from litetune.evaluate import (
@@ -267,10 +267,9 @@ def test_hugging_face_backend_reports_the_device_it_actually_used(monkeypatch):
     """
 
     def fake_provision(self, events=None, force=False):
-        # The marker file, not just the directory: `_ensure_env` gates the
-        # probe on `env.ready`, which is exactly this file's existence.
-        self.path.mkdir(parents=True, exist_ok=True)
-        (self.path / ".litetune-ready").write_text(self.identity)
+        # Marker and interpreter both: `_ensure_env` gates the probe on
+        # `env.ready`, and a directory with only the marker is not ready.
+        mark_provisioned(self)
         return self.path
 
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
@@ -300,10 +299,9 @@ def _ready_env() -> None:
     """Make `envs.TRAIN` look provisioned without provisioning anything.
 
     `_ensure_env` gates the device probe on `env.ready`, which is the marker
-    file and nothing else.
+    file and the interpreter beside it.
     """
-    envs.TRAIN.path.mkdir(parents=True, exist_ok=True)
-    (envs.TRAIN.path / ".litetune-ready").write_text(envs.TRAIN.identity)
+    mark_provisioned(envs.TRAIN)
 
 
 def _generating_env(monkeypatch, *, probe: str | None, script_device: str | None) -> list:
@@ -980,3 +978,41 @@ def test_the_reference_script_prefers_what_the_parent_already_resolved(tmp_path,
     """
     captured = _run_hf_generate_script(tmp_path, monkeypatch, cuda=False, given="cuda")
     assert captured["model_device"] == "cuda"
+
+
+def test_an_unprovisioned_environment_is_a_third_state(monkeypatch, tmp_path):
+    """ "Nobody asked", "it was asked and could not say", and "there was nothing
+    to ask" are three different facts, and the third used to be filed as the
+    first: `last_probe` stayed `None`, so the manifest was byte-identical to a
+    run where no probe was wanted.
+
+    It must also not block. Whether an unprovisioned environment can still
+    generate is the caller's decision -- a library caller managing the lifecycle
+    itself, or a test supplying its own `run`, legitimately gets here.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+
+    blocked = backend._ensure_env(events=None)
+
+    assert blocked is None, "recording is not blocking"
+    assert backend.last_probe is not None, "the third state must leave a record"
+    assert "not provisioned" in backend.last_probe.detail
+    assert (
+        "could not answer" not in backend.last_probe.detail
+    ), "no probe was attempted, so it cannot be reported as one that failed to answer"
+    assert backend.last_probe.device is None
+
+
+def test_the_unprovisioned_state_is_a_field_not_a_phrase(monkeypatch, tmp_path):
+    """`verify` used to tell the two apart by looking for "not provisioned" in
+    the sentence, which is a protocol made of prose: the first rewording takes
+    the branch out silently, and a caller that supplies its own runnable `run`
+    over an unready environment makes the sentence wrong anyway."""
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+
+    backend._ensure_env(events=None)
+
+    assert backend.last_probe is not None
+    assert backend.last_probe.attempted is False, "no probe was run, and that is a fact not a word"

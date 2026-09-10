@@ -1354,6 +1354,18 @@ def _dispatch(args: argparse.Namespace) -> int:
         _say(f"litetune {args.command} did not run: {exc}")
         _say("no claim is made about the model")
         return EXIT_CODES[Status.ERROR]
+    except envs.StageInterrupted as exc:
+        # A termination signal reached litetune while a stage was running. It
+        # is not an `Exception`, so it would otherwise pass this boundary
+        # untouched and end the process on an uncaught traceback -- which
+        # CPython exits 1 for, and 1 is this tool's code for a failed gate.
+        # Measured: an uncaught `StageInterrupted` gives 1 where the
+        # `KeyboardInterrupt` it replaced gave 130. The run is over either way;
+        # what must not happen is a signal being reported as a verdict.
+        logger.debug("litetune %s was interrupted by a signal", args.command, exc_info=True)
+        _say(f"litetune {args.command} was interrupted: {exc}")
+        _say("no claim is made about the model")
+        return EXIT_CODES[Status.ERROR]
     except Exception:  # noqa: BLE001 - top-level boundary: a crash must not read as a verdict
         logger.exception("litetune %s could not run", args.command)
         _say(

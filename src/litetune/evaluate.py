@@ -774,8 +774,11 @@ class HuggingFaceBackend:
     # from a previous call, forced onto a run whose own probe could not vouch
     # for it, made `model.to("cuda")` fail on a box where CUDA had since gone
     # away. `generate()` reads this, not `self.device`, when it builds the
-    # spec. `None` before `_ensure_env` has run, and after a call whose probe
-    # was never asked or could not answer -- see `verify.py`, which also reads
+    # spec. `None` before `_ensure_env` has run, and after a call in which
+    # provisioning itself raised -- that path returns its own blocking reason
+    # and never gets as far as a probe. Where the environment merely could not
+    # answer, or where there was nothing to ask, a `DeviceProbe` is left
+    # carrying which of the two it was -- see `verify.py`, which also reads
     # `detail` and `cuda_build_without_a_device` off it to record the same
     # limitation `tune.py` records for its own probe.
     last_probe: envs.DeviceProbe | None = None
@@ -946,12 +949,37 @@ class HuggingFaceBackend:
                 self.device = None
                 self.probed_device = None
                 return f"environment {self.env.name!r} unavailable: {exc}"
-        if self.env.ready:
-            probe = envs.resolve_device(self.env, events=events)
-            self.last_probe = probe
-            if probe.answered:
-                self.probed_device = probe.device
-                self.device = probe.device
+        if not self.env.ready:
+            # A third state, and it used to be reported as the first: "nobody
+            # asked", "it was asked and could not say", and "there was nothing
+            # to ask". Leaving `last_probe` at `None` made the manifest
+            # byte-identical to a run where no probe was wanted.
+            #
+            # Recorded, not blocking. Whether an unprovisioned environment can
+            # still generate is the caller's to decide -- a library caller that
+            # manages the lifecycle itself, or a test that supplies its own
+            # `run`, legitimately gets here and proceeds. What must not happen
+            # is the run finishing with no trace of why its device is unknown.
+            detail = (
+                f"no device probe was attempted: environment {self.env.name!r} is not "
+                f"provisioned at {self.env.path}"
+            )
+            # Its own sentence, not `envs._unanswered`'s. That one says a probe
+            # "could not answer", which is the second of the three states the
+            # comment above names, and this is the third. It is also the only
+            # cross-module reach into an `envs` private in the package, so the
+            # moment a probe-specific side effect is added there this call site
+            # would start lying.
+            logger.warning("%s", detail)
+            if events is not None:
+                events.note(detail, environment=self.env.name)
+            self.last_probe = envs.DeviceProbe(device=None, detail=detail, attempted=False)
+            return None
+        probe = envs.resolve_device(self.env, events=events)
+        self.last_probe = probe
+        if probe.answered:
+            self.probed_device = probe.device
+            self.device = probe.device
         return None
 
     def _read_run_report(self, report: Path) -> str | None:

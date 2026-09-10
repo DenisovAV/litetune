@@ -11,10 +11,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The floor and the current release. The floor is declared in
-        # pyproject.toml and was previously untested, which made it a claim
-        # rather than a fact.
-        python-version: ["3.10", "3.13"]
+        # The floor, the ceiling that matters, and the current release. The
+        # floor is declared in pyproject.toml and was previously untested,
+        # which made it a claim rather than a fact. 3.12 is here for the same
+        # reason: `RUNTIME` and `EXPORT` both cap at it, so it is the newest
+        # interpreter on which `convert` and `verify` can provision at all --
+        # the version most users doing this tool's headline job are on, and it
+        # was the one version in the supported range that nothing exercised.
+        python-version: ["3.10", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,7 +28,9 @@ jobs:
       - run: ruff check src tests
       - run: ruff format --check src tests
       - run: mypy
-      # The whole suite runs on fakes: no subprocess, no network, no GPU.
+      # Almost all of it runs on fakes. A handful of tests in test_envs.py
+      # start a real interpreter -- to read a child's environment back, and to
+      # check a killed process group -- but nothing reaches the network.
       - run: pytest -q
 
   # An editable install is not the artifact anyone receives. `src/` layout plus

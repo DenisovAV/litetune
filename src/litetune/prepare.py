@@ -874,6 +874,10 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     nothing can score -- is a recorded result, because those are facts about the
     data that a report has to carry rather than exceptions that lose them.
     """
+    # This run's own record of which host variables it dropped, so a second
+    # run in one process -- a notebook, a service -- says what the first
+    # one did instead of inheriting its silence.
+    envs.forget_reported_drops()
     events = events or EventStream(echo_json=False)
     events.stage_started("prepare", data=str(request.data), seed=request.seed)
 
