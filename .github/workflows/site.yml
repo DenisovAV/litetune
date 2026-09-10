@@ -7,8 +7,9 @@
 # The script stays for local previews.
 #
 # The site is a Jaspr static build: pure Dart, no Flutter, no runtime
-# JavaScript. It goes to the `litetune` hosting target of the same Firebase
-# project that serves fluttergemma.dev.
+# JavaScript. It goes to the `litetune` hosting target; which project holds
+# that target is a secret, for the same reason the project id below is one --
+# naming it here would point at every other resource beside it.
 name: site
 
 # Declared rather than inherited. The repository default is read today, but a
