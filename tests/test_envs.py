@@ -763,6 +763,11 @@ def test_a_stage_is_asked_to_stop_before_it_is_killed(monkeypatch):
     """
     sent = []
     monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    # The wait is not what these pin, and a fake pid is not anyone's child --
+    # `waitid` says ECHILD for it on Linux, which is right and which made the
+    # real wait decide the outcome here. Stubbed so the assertion is about the
+    # signals.
+    monkeypatch.setattr(envs, "_wait_without_reaping", lambda *a, **k: True)
     # Signal 0 is the liveness probe the grace uses, not a kill; recording it
     # would make this test about the wait rather than about the order.
     monkeypatch.setattr(envs.os, "killpg", lambda pgid, sig: sig and sent.append(sig))
@@ -784,6 +789,11 @@ def test_a_group_that_cannot_be_killed_falls_back_to_the_child(monkeypatch):
     # A real pid is not needed and would be a different test; what matters is
     # that the group exists, is not ours, and refuses the signal.
     monkeypatch.setattr(envs.os, "getpgid", lambda pid: 4242 if pid else 1)
+    # The wait is not what these pin, and a fake pid is not anyone's child --
+    # `waitid` says ECHILD for it on Linux, which is right and which made the
+    # real wait decide the outcome here. Stubbed so the assertion is about the
+    # signals.
+    monkeypatch.setattr(envs, "_wait_without_reaping", lambda *a, **k: True)
     monkeypatch.setattr(envs.os, "killpg", refuse)
 
     proc = _FakeProc()

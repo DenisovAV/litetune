@@ -362,11 +362,22 @@ def _kill_tree(
     # the leader may be a zombie whose group macOS will not report.
     pgid = pgid if pgid is not None else _group_of(proc)
     reached = _signal_tree(proc, pgid, signal.SIGTERM)
-    if reached in (Reach.GROUP, Reach.CHILD_ONLY) and grace > 0:
-        if not _wait_without_reaping(proc, pgid, grace, stop):
-            # Reaped out from under us during the grace, so the number below is
-            # no longer ours to signal. Nothing left that can be collected
-            # safely, and saying so beats aiming at whoever holds it now.
+    if reached is Reach.ALREADY_GONE or proc.returncode is not None:
+        # `Popen.send_signal` polls before it signals, so the direct-child leg
+        # -- reached whenever `killpg` was refused -- can reap the leader on
+        # its way through. Once that happens the group id is no longer ours,
+        # and on macOS this is the *ordinary* path: a group whose only member
+        # is a zombie answers EPERM, which looks exactly like the setuid case.
+        return reached
+    if reached is not Reach.NOTHING and grace > 0:
+        still_ours = _wait_without_reaping(proc, pgid, grace, stop)
+        # Withheld only where there is a group to mis-target. With no group the
+        # final signal goes through `Popen`, which polls first and cannot reach
+        # a stranger -- and on Linux `waitid` answers ECHILD for any pid that
+        # is not our child, so withholding it there stopped the SIGKILL
+        # unconditionally. CI caught that; this machine could not, because
+        # CPython has no `os.waitid` on macOS before 3.13.
+        if not still_ours and pgid is not None:
             return reached
     # Unconditionally, even where the child exited on the SIGTERM: what it
     # spawned is not covered by its own exit, and this is the signal that
