@@ -330,6 +330,8 @@ def test_the_vocabulary_lists_every_marker_a_supported_family_uses():
         ("<|end_of_text|>", "Llama-3 raw completions"),
         ("<|end|>", "Phi-3 and Phi-4"),
         ("<start_function_response>", "FunctionGemma, per models.RULES"),
+        ("<turn|>", "Gemma 4 chat templates, per models.RULES"),
+        ("<|tool_response>", "Gemma 4 after a tool call, per models.RULES"),
     ]:
         assert marker in TERMINATORS, f"{marker} ({family}) is no longer trimmed"
     # `test_a_reference_whose_terminator_is_unknown_is_not_a_conversion_cost`
