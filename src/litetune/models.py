@@ -388,14 +388,17 @@ _FUNCTION_RESPONSE_REASON = (
 # [1, 106, 50]; tokenizer.json names those `<eos>`, `<turn|>` and
 # `<|tool_response>`. Measured 2026-09-11 on an A100: all five reference
 # generations stopped on their own after 6-17 tokens, each ending `<turn|>`.
+# No generation stopping at `<|tool_response>` has been observed here, and the
+# reason below says so rather than describing a role taken from its name.
 _GEMMA4_STOP_REASON = (
     "Gemma 4 closes a turn with `<turn|>`, not `<end_of_turn>`: generation_config.json declares "
-    "eos_token_id [1, 106, 50], and tokenizer.json names 106 `<turn|>` and 50 `<|tool_response>` "
-    "-- the stop the model reaches once it has called a tool and the application has to answer. "
-    "Neither was in `metrics.TERMINATORS`, so every Gemma 4 generation ended in a marker scoring "
-    "did not recognise, and a 600-row `verify` refused the comparison outright: 600 of 600 "
-    "reference generations 'did not' end in a terminator it knew. Declaring them here is what "
-    "that vocabulary is checked against"
+    "eos_token_id [1, 106, 50] and tokenizer.json names 106 `<turn|>`. Measured, all five "
+    "reference generations stopped on their own and ended there. Neither marker was in "
+    "`metrics.TERMINATORS`, so every Gemma 4 generation ended in one scoring did not recognise "
+    "and a 600-row `verify` refused the comparison outright: 600 of 600 reference generations "
+    "did not end in a terminator it knew. 50 is `<|tool_response>`, which the chat template uses "
+    "to open a tool-response turn; it is declared because the model's own eos set names it, not "
+    "because a generation stopping there has been observed here"
 )
 
 _GEMMA3_TEXT_AMBIGUOUS = (
