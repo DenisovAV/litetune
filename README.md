@@ -408,15 +408,19 @@ withdrawn after re-measurement.
   Snapdragon 8 Elite and returns garbage: Google's published Qualcomm Gemma 4
   bundle carries a per-layer-embedder layout the public exporter does not
   produce, and the runtime's NPU path expects that layout. The regular
-  CPU/GPU export of Gemma 4 completes on the same pin; it has no quality
-  figure.
+  CPU/GPU export of Gemma 4 completes on the same pin, and a CPU one now has a
+  conversion-cost figure — see [MEASUREMENTS.md](MEASUREMENTS.md).
 
 **Limits on the numbers**
 
-- **Measured on two models.** `functiongemma-270m-it` end to end with the
-  tool-call scorer, and `gemma-3-270m-it` with `exact-text`. Qwen3.5 and the
-  named Gemma 4 variants export but have no quality figure; a Gemma 4 without
-  its variant is refused unless you supply the template override yourself.
+- **Measured on three models, two of them end to end.**
+  `functiongemma-270m-it` with the tool-call scorer and `gemma-3-270m-it` with
+  `exact-text` were fine-tuned here, so both a training gain and a conversion
+  cost are attributed. `gemma-4-E2B-it` was not: base weights, two conversions
+  of them compared against the float reference, so that run has a conversion
+  cost and no training gain. Qwen3.5 exports but has no quality figure, and a
+  Gemma 4 without its variant is still refused unless you supply the template
+  override yourself.
 - **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
   the liveness checks both trim against a fixed set of strings, recorded
   verbatim at `harness.terminators` in every verify manifest. A family whose
@@ -425,7 +429,9 @@ withdrawn after re-measurement.
   rather than the model — so `verify` stops before scoring either side and
   reports a harness failure instead of a conversion cost. That is the safe
   direction, not a fix: the run still cannot be measured until the vocabulary
-  knows the marker. Resolving it from the bundle contract instead of
+  knows the marker. Gemma 4 is the case that proved it — it closes a turn with
+  `<turn|>`, all 600 reference generations ended there, and the comparison was
+  refused until the vocabulary learned the marker. Resolving it from the bundle contract instead of
   hardcoding is a follow-up. To find your own
   model's marker before then, `tune` records it at `turn_terminator.text` in
   `metrics.json` and `bundle` carries it into `contract.json`'s `stop_tokens`.

@@ -282,6 +282,60 @@ default because bfloat16 on this CPU runs on a single core: a 300-step LoRA
 run in bfloat16 sat on that one core for 52 minutes without finishing, and the
 same run in float32 finished in 307 s on ten threads, at a peak of 6.35 GB.
 
+## A third family, and the marker the vocabulary did not know
+
+The two sections above measure models this project fine-tuned. This one
+measures neither: it compares two *conversions of the same base weights* --
+`google/gemma-4-E2B-it`, untouched -- because `models.py` records that a Google
+engineer recommends two recipes "to remain the model quality" and, in the same
+sentence, that litetune had measured neither.
+
+600 held-out rows of `mteb/banking77` with all 77 labels listed in the prompt,
+`--scorer exact-text`, 256-token limit, prompt mode `runtime_rendered`,
+reference role `float_twin`. The labels are in the prompt because these are base
+weights that never saw this task and cannot guess a snake_case label out of 77;
+without them the reference sits on the floor and nothing can be attributed. The
+reference is `google/gemma-4-E2B-it` at float32 on one A100-SXM4-40GB, greedy;
+both candidates run on litert-lm 0.16.1's CPU backend in the same container, 12
+vCPU. Export environment `transformers==5.17.0`, `numpy==2.0.2`.
+
+| | exact match | cost of conversion | discordant |
+|---|---|---|---|
+| float reference | **0.5983** | — | — |
+| Google's published `gemma-4-E2B-it.litertlm` | 0.5717 | +0.0267 ±0.0277 *(unresolved)* | 72 of 600 |
+| `dynamic_wi4b32_afp32`, exported here | 0.5483 | **+0.0500** ±0.0244 *(resolved)* | 56 of 600 |
+
+**What it establishes.** An export made here cost something measurable on this
+task. Google's published artifact's cost did not resolve at this sample size.
+
+**What it does not.** That either is worse than the other. Each was measured
+against the float reference and not against the other, and the intervals
+overlap: [-0.001, 0.054] against [0.026, 0.074]. Nor are the two the same kind
+of object -- Google's comes from a quantized-safetensors path litert-torch does
+not support, so `float_twin` is exact for the export here and looser for
+theirs. One run.
+
+**The resolved difference rests on fewer disagreements than the unresolved
+one** -- 56 against 72 -- which is the arithmetic the second family's section
+describes, seen from the other side.
+
+### What this run established that the table does not show
+
+**One of the two recommended recipes does not build at all.**
+`dynamic_wi4c_hr_afp32`, the first one named, fails inside the quantizer:
+`hadamard_rotation.py` calls `ndarray.reshape(..., copy=False)`, a keyword that
+arrives in NumPy 2.1, while the export environment pins `numpy==2.0.2` because
+the toolchain requires it. `convert` exits 1 and reports `export: failed`. The
+recipe is unreachable on this pin -- not measured and found wanting.
+
+**The static terminator vocabulary refused this family, exactly as README said
+it would.** Gemma 4 closes a turn with `<turn|>`; the vocabulary knew
+`<end_of_turn>`. All 600 reference generations ended in a marker scoring did not
+recognise, so `verify` stopped before scoring either side. That is the safe
+direction and it is also useless until the vocabulary learns the marker. It has
+since: `terminators_trimmed` then read 600 of 600, one marker each. The table
+above is from the re-run.
+
 ### Limitations carried by these manifests
 
 Two, paraphrased — the second drops a measured clause and both carry a note:
