@@ -49,6 +49,17 @@ it from the environment and fails immediately if it is unset:
 LITETUNE_FIREBASE_PROJECT=<project-id> ./deploy.sh
 ```
 
+It also refuses to publish what the CI deploy would not: a checkout that is
+not on `main` or has local changes to the site's inputs, and a version PyPI does
+not serve as an installable final release whose tag is on `main`. Those checks
+use `git`, `curl` and `jq`.
+
+One consequence of the same rule: while a version's release is tagged and PyPI
+never received it, no site change ships until PyPI serves that version. CI waits
+about ten minutes for the upload on every run and then fails; this script asks
+once and refuses. Removing the tag does not help -- that is the "not released
+yet" case, which skips the deploy just the same.
+
 The hosting site is named in `firebase.json`, so nothing has to resolve a
 target and a fresh checkout needs no `.firebaserc` at all. The CI workflow
 deploys the same way, from the same file, which is what keeps the two from

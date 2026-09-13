@@ -13,12 +13,15 @@ import 'sections/why_it_exists.dart';
 /// The whole site: one page, composed from sections that each live in their
 /// own file under `lib/landing/sections/`.
 class LandingPage extends StatelessComponent {
-  const LandingPage({super.key});
+  const LandingPage({required this.version, super.key});
+
+  /// The package version, passed down to the nav bar.
+  final String version;
 
   @override
   Component build(BuildContext context) {
     return div(classes: 'page', [
-      const NavBar(),
+      NavBar(version: version),
       main_(classes: 'content', [
         const Hero(),
         const WhyItExists(),
@@ -72,11 +75,20 @@ class LandingPage extends StatelessComponent {
     // Below the breakpoint the label stops being a gutter and becomes a
     // heading above its content — at phone width a fixed 11rem column would
     // leave the text a few characters wide.
+    //
+    // `stretch` there, not the `start` above. In a column, a start-aligned item
+    // is as wide as its content asks rather than as wide as the column, and
+    // two sections ask for more than a phone has: the 62ch paragraph and card
+    // grid in "Why it exists", and the two cards in "Where to run it". Both
+    // ran off the right edge in a 390px frame -- the first on the live site,
+    // the second in a build whose section code is the live one. `max-width`
+    // on the content still sets the measure on wider screens.
     StyleRule.media(
       query: MediaQuery.screen(maxWidth: 900.px),
       styles: [
         css('.row').styles(
           flexDirection: FlexDirection.column,
+          alignItems: AlignItems.stretch,
           gap: Gap.all(1.1.rem),
           padding: Padding.only(top: 3.rem),
         ),

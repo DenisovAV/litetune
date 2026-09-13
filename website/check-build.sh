@@ -43,8 +43,14 @@ fail() { echo "check-build: $*" >&2; exit 1; }
 # a render that produced the hero and stopped passes. That is the failure mode
 # on record -- the route table not yet registered, so nothing renders -- and a
 # check that tried to assert every section would go stale on the next edit.
+#
+# `grep -c`, not `grep -q`, in every pipeline here: `-q` exits at the first
+# match, the `sed` feeding it is then writing into a closed pipe, and under
+# `pipefail` its SIGPIPE fails the pipeline -- a false "no body" on a good build.
+# Reproduced with a 1.4 MB page: five runs of `sed | grep -q` all returned
+# status 141, `sed | grep -c` none. `-c` reads to the end.
 sed -n '/<[Bb][Oo][Dd][Yy]/,$p' "$BUILD_DIR/index.html" \
-  | grep -q "pip install litetune" \
+  | grep -c "pip install litetune" >/dev/null \
   || fail "index.html rendered a head with no page body"
 
 # The other files a deploy publishes. index.html references the first two from
@@ -62,4 +68,38 @@ done
 [ -s "$BUILD_DIR/sitemap.xml" ] \
   || fail "sitemap.xml is missing or empty -- was this built without --sitemap-domain?"
 
-echo "check-build: $BUILD_DIR looks like a full render"
+# The second page, and the one fact both pages state. The version is read from
+# the package the way `lib/project.dart` reads it -- the whole
+# `__version__ = "..."` line, since the module docstring above it holds quoted
+# text of its own -- and must appear in the nav bar and as a release heading in
+# the changelog.
+#
+# The heading is the check that has a cause behind it: the nav's version links
+# to `/changelog#v<version>`, so a version bumped without a changelog entry
+# builds cleanly and ships a link to nothing. That is also the release that
+# most needs its entry, because a release that makes an earlier result wrong
+# says so there.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[ "$(grep -c '^__version__ = ' "$REPO_ROOT/src/litetune/_version.py" || true)" = 1 ] \
+  || fail "$REPO_ROOT/src/litetune/_version.py does not have exactly one __version__ line"
+VERSION="$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' "$REPO_ROOT/src/litetune/_version.py")"
+[ -n "$VERSION" ] || fail "cannot read __version__ from $REPO_ROOT/src/litetune/_version.py"
+
+CHANGELOG_HTML="$BUILD_DIR/changelog/index.html"
+[ -s "$CHANGELOG_HTML" ] || fail "changelog/index.html is missing or empty"
+sed -n '/<[Bb][Oo][Dd][Yy]/,$p' "$CHANGELOG_HTML" | grep -c 'class="changelog-body"' >/dev/null \
+  || fail "changelog/index.html rendered a head with no page body"
+# The newest release heading in the rendered changelog body, id and text both:
+# the page renders the id from the text, so a match on both is a heading this
+# page produced, not the same characters somewhere else in the file. The newest
+# rather than any, as `tests/test_changelog.py` requires -- an entry for the
+# new version written under the old heading would otherwise pass.
+NEWEST="$(sed -n '/class="changelog-body"/,$p' "$CHANGELOG_HTML" | grep -o '<h2 id="v[^"]*">[^<]*' | awk 'NR == 1' || true)"
+case "$NEWEST" in
+  "<h2 id=\"v$VERSION\">$VERSION"*) ;;
+  *) fail "CHANGELOG.md does not open with an entry for $VERSION, and the nav links to one (newest: ${NEWEST:-none})" ;;
+esac
+sed -n '/<[Bb][Oo][Dd][Yy]/,$p' "$BUILD_DIR/index.html" | grep -cF ">v$VERSION<" >/dev/null \
+  || fail "index.html does not show version $VERSION"
+
+echo "check-build: $BUILD_DIR looks like a full render of $VERSION"

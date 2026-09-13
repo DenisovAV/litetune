@@ -24,6 +24,7 @@ class SiteFooter extends StatelessComponent {
         ]),
       ]),
       nav(classes: 'nav-links foot-links', [
+        a(href: '/changelog', [Component.text('Changelog')]),
         _link('https://github.com/DenisovAV/litetune', 'GitHub'),
         _link('https://pypi.org/project/litetune/', 'PyPI'),
         _link(

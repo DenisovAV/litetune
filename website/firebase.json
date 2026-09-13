@@ -13,6 +13,24 @@
     "trailingSlash": false,
     "headers": [
       {
+        "comment": "The changelog page is CHANGELOG.md rendered as HTML, markup included, so anything merged into that file would otherwise run on this origin. Scripts, images and everything else come from here -- the pages carry no data: URI, and allowing them would paint arbitrary content on this origin; the two font hosts are the page's only outside sources, and the inline styles are jaspr's own <style> block. object-src and form-action are closed because nothing uses them -- form-action does not fall back to default-src, so an injected form would post off-site without it; `base-uri 'self'` rather than none, since jaspr's pages carry `<base href=\"/\">` and blocking it changes how every relative URL resolves.",
+        "source": "**",
+        "headers": [
+          {
+            "key": "Content-Security-Policy",
+            "value": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self'; object-src 'none'; form-action 'self'; base-uri 'self'; frame-ancestors 'none'"
+          },
+          {
+            "key": "X-Content-Type-Options",
+            "value": "nosniff"
+          },
+          {
+            "key": "Referrer-Policy",
+            "value": "strict-origin-when-cross-origin"
+          }
+        ]
+      },
+      {
         "comment": "Static assets are safe to cache forever. .js is excluded on purpose: Jaspr's client bundles are not content-hashed, so immutable caching pins a stale bundle on returning visitors.",
         "source": "**/*.@(css|jpg|jpeg|gif|png|svg|webp|ico|woff2)",
         "headers": [
@@ -24,6 +42,16 @@
       },
       {
         "source": "**/*.@(js|html)",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=0, must-revalidate"
+          }
+        ]
+      },
+      {
+        "comment": "The changelog, for the same reason as `/` below: under cleanUrls it is requested as `/changelog`, which no extension rule matches. After a release the nav on `/` links to the new version's entry here, so a cached copy of this page is a link to nothing.",
+        "source": "/changelog",
         "headers": [
           {
             "key": "Cache-Control",
