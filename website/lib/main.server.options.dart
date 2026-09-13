@@ -5,6 +5,8 @@
 // Generated with jaspr_builder
 
 import 'package:jaspr/server.dart';
+import 'package:litetune_website/changelog/changelog_page.dart'
+    as _changelog_page;
 import 'package:litetune_website/landing/sections/formats.dart' as _formats;
 import 'package:litetune_website/landing/sections/hero.dart' as _hero;
 import 'package:litetune_website/landing/sections/nav_bar.dart' as _nav_bar;
@@ -38,6 +40,7 @@ import 'package:litetune_website/landing/landing_page.dart' as _landing_page;
 ServerOptions get defaultServerOptions => ServerOptions(
   clientId: 'main.client.dart.js',
   styles: () => [
+    ..._changelog_page.ChangelogPage.styles,
     ..._landing_page.LandingPage.styles,
     ..._formats.Formats.styles,
     ..._hero.Hero.styles,

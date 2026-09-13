@@ -1,4 +1,5 @@
-# Check the website on every pull request, and deploy it on merge to main.
+# Check the website on every pull request, and deploy it from `main` -- on a
+# merge once its version is released, and when a release is published.
 #
 # Two gaps this closes. Nothing in CI touched `website/` at all, so a Dart
 # change reached `main` on whatever the author happened to run locally. And the
@@ -22,21 +23,49 @@ permissions:
   contents: read
 
 on:
+  # The two files outside `website/` are read by the build: the nav shows the
+  # version from `_version.py`, and `/changelog` is `CHANGELOG.md` rendered.
   pull_request:
     paths:
       - 'website/**'
       - '.github/workflows/site.yml'
+      - 'CHANGELOG.md'
+      - 'src/litetune/_version.py'
   push:
     branches: [main]
     paths:
       - 'website/**'
       - '.github/workflows/site.yml'
+      - 'CHANGELOG.md'
+      - 'src/litetune/_version.py'
+  # The deploy that puts a new version on the site. A push to `main` cannot be
+  # that deploy: the version is bumped on `main` before the release exists, and
+  # a site naming a version `pip install` does not have yet is wrong for as long
+  # as that gap lasts -- for good, if the release never happens. So a push
+  # deploys only a version PyPI serves, waiting for the upload once its release
+  # is tagged (the build job decides; see its gate), and the release deploys
+  # what it publishes.
+  #
+  # A release builds `main`, not the tagged commit (see the checkout steps).
+  # Building the tag would publish the site as it was when the tag was cut, and
+  # a site change merged in between -- skipped by its own push run, because its
+  # version was not released yet -- would be overwritten or never deployed.
+  release:
+    types: [published]
   # A deploy with no site change: a rolled-back hosting release, or a first
   # run once the deploy secret exists.
   workflow_dispatch:
 
 # Two deploys racing to one hosting target would make the live site the one
-# that finished last rather than the one merged last.
+# that finished last rather than the one merged last. The deploy job's own group
+# serialises them, and the gate's freshness test makes the loser of that race
+# stand down rather than publish an older site.
+#
+# Keyed on the ref, so a release run gets a group of its own. Sharing `main`'s
+# meant a release run replaced whatever was waiting there -- GitHub cancels a
+# pending run when a newer one joins its group -- so a release run that deploys
+# nothing, a pre-release or one that fails its checks, took a queued site fix
+# down with it.
 concurrency:
   group: site-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -44,8 +73,27 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+      released: ${{ steps.released.outputs.released }}
     steps:
+      # `main` on a release, and the event's own commit otherwise -- an empty
+      # `ref` is checkout's default. Not `github.ref` for the others: an
+      # explicit ref makes checkout fetch that branch's tip when the job
+      # starts, which after a quick second merge is not the commit that
+      # triggered the run.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && 'main' || '' }}
+          # The gate below reads tags, and fetches `main` to compare against.
+          fetch-depth: 0
+
+      # Which commit was built, so the deploy job checks out that one and not
+      # whatever `main` is by the time it starts.
+      - name: Record the commit being built
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # Pinned rather than `stable`, which is whatever Dart released this
       # morning. 3.13.3 is the SDK this site is built with locally and the one
@@ -72,7 +120,14 @@ jobs:
         working-directory: website
         run: |
           dart pub get
-          dart analyze lib
+          dart analyze lib test
+
+      # What the changelog page refuses to render, and what it must go on
+      # rendering. Each refusal is a payload a review round got past an earlier
+      # version of that check.
+      - name: Test the changelog page
+        working-directory: website
+        run: dart test
 
       - name: Build
         working-directory: website
@@ -82,6 +137,11 @@ jobs:
           # before the route table registered, producing a near-empty
           # index.html that then shipped. `deploy.sh` removes these for the
           # same reason; a clean build is cheap next to a blank home page.
+          # The same near-empty shape has a second cause, reproduced during
+          # review on a clean copy: another server already on the port jaspr's
+          # generator fetches from, whose answer it snapshots instead. Nothing
+          # here can take that port, and `check-build.sh` refuses the result
+          # either way.
           rm -rf build/jaspr .dart_tool/build
           jaspr build --sitemap-domain "https://litetune.dev"
 
@@ -91,8 +151,228 @@ jobs:
         working-directory: website
         run: ./check-build.sh
 
-      - name: Keep the build for the deploy job
+      # Deploy a version only once `pip install litetune` gets it. In this job
+      # rather than the deploy one, so a run with nothing to deploy never
+      # reaches it: the deploy job's concurrency group holds one run and one
+      # waiting, and a run that was only going to stand down used to take that
+      # waiting place from a site fix.
+      #
+      # "What `pip install` gets" is asked of PyPI itself rather than inferred
+      # from a GitHub Release: a
+      # release is what starts `publish.yml`, not proof that its upload
+      # succeeded, and the two workflows run side by side with nothing joining
+      # them. A release whose upload was refused -- `publish.yml` refuses a tag
+      # that disagrees with the tagged commit's `_version.py` -- would
+      # otherwise have its version on the site.
+      #
+      # A version with no release tag yet is not a failure on a push or a
+      # dispatch: that is the window between merging a version bump and
+      # publishing its release, and the run skips with a notice. Once the tag
+      # exists, PyPI is expected to have the upload, and a run that waits out
+      # the deadline for it fails.
+      - name: Deploy only a version pip installs
+        id: released
         if: github.event_name != 'pull_request'
+        run: |
+          # `main` fetched here and read from `FETCH_HEAD`, not from
+          # `refs/remotes/origin/main`. On a push or a dispatch, checkout points
+          # that ref at the commit being built (`git-source-provider.ts`
+          # re-fetches `+<sha>:refs/remotes/origin/main`), so comparing against
+          # it compared the build with itself -- the freshness test below passed
+          # while `main` really had moved, reproduced with plain git.
+          #
+          # `refs/heads/main`, not `main`: a short name on the fetch side is
+          # matched against the remote's refs the same way, and a tag wins.
+          # Reproduced against a local remote holding both -- `git fetch origin
+          # main` brought back the tag, `git fetch origin refs/heads/main` the
+          # branch. `FETCH_HEAD` itself is a file in the git directory, which no
+          # tag can shadow.
+          git fetch --quiet origin refs/heads/main \
+            || { echo "::error::could not fetch main to compare this build with"; exit 1; }
+          origin_main="$(git rev-parse --verify FETCH_HEAD)" \
+            || { echo "::error::could not read the fetched main"; exit 1; }
+
+          # Read as `website/check-build.sh` and `lib/project.dart` read it: the
+          # whole `__version__ = "..."` line, since the module docstring above
+          # it holds quoted text of its own, and exactly one such line.
+          read_version() { # <file contents on stdin> -> version, or nothing
+            local source; source="$(cat)"
+            [ "$(grep -c '^__version__ = ' <<<"$source" || true)" = 1 ] || return 0
+            sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' <<<"$source"
+          }
+          version="$(read_version < src/litetune/_version.py)"
+          [ -n "$version" ] \
+            || { echo "::error::src/litetune/_version.py needs exactly one readable __version__ line"; exit 1; }
+
+          # A pre-release or development version is not deployed: `pip install
+          # --help` on `--pre` says "By default, pip only finds stable
+          # versions", so a site naming `0.2.0rc1` would name what a plain
+          # `pip install litetune` does not give. Final releases -- an optional
+          # epoch, a release segment, an optional `.postN` -- are what it gives.
+          if ! [[ "$version" =~ ^([0-9]+!)?[0-9]+(\.[0-9]+)*(\.post[0-9]+)?$ ]]; then
+            echo "::notice::$version is not a final release, and pip does not install one by default; the site keeps the last final one"
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The release's tagged commit: the event's own on a release run, the
+          # tag's on a push or dispatch. Either way it must name this version in
+          # its own `_version.py` -- `publish.yml` uploads that commit and
+          # refuses a tag it disagrees with -- and be on `main`, or the site
+          # would vouch for a package built from code `main` never merged. A
+          # push checks this too: `publish.yml` has no ancestry test, so a
+          # release cut on an unmerged commit still reaches PyPI, and the next
+          # push would otherwise deploy the version it uploaded. `v` optional,
+          # as `publish.yml` strips it.
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            # A pre-release cut from a branch while `main` holds a final version
+            # is a release this workflow has nothing to deploy for, not a
+            # mismatch to report.
+            if ! [[ "${GITHUB_REF_NAME#v}" =~ ^([0-9]+!)?[0-9]+(\.[0-9]+)*(\.post[0-9]+)?$ ]]; then
+              echo "::notice::$GITHUB_REF_NAME is not a final release; the site keeps the last final one"
+              echo "released=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ "${GITHUB_REF_NAME#v}" = "$version" ] \
+              || { echo "::error::release $GITHUB_REF_NAME does not match _version.py $version on main"; exit 1; }
+            # A release run executes this file as it is in the tagged commit,
+            # while it builds `main`. If `main`'s copy has changed since -- a
+            # fix to these very checks, or to the build's pins -- this run is
+            # the old workflow judging the new site, and the freshness test
+            # below cannot see it, since it compares `main` with `main`.
+            workflow_differs=0
+            git diff --quiet "$GITHUB_WORKFLOW_SHA" "$origin_main" -- .github/workflows/site.yml \
+              || workflow_differs=$?
+            case "$workflow_differs" in
+              0) ;;
+              1) echo "::error::this release runs site.yml from $GITHUB_REF_NAME, which differs from main's; run the site workflow on main to deploy $version"
+                 exit 1 ;;
+              *) echo "::error::could not compare this run's site.yml with main's (git diff exited $workflow_differs)"
+                 exit 1 ;;
+            esac
+            tagged_commit="$GITHUB_SHA"
+          else
+            # `show-ref --verify` takes the name exactly. `rev-parse` does not:
+            # asked for `refs/tags/v0.1.6` it also tries `refs/tags/<that>`, so
+            # a tag literally named `refs/tags/v0.1.6` on another commit
+            # answered for the real one -- reproduced in review.
+            tag_object="$(git show-ref --verify -s "refs/tags/v$version" 2>/dev/null \
+              || git show-ref --verify -s "refs/tags/$version" 2>/dev/null || true)"
+            if [ -n "$tag_object" ]; then
+              # A tag on something that is not a commit is a broken release,
+              # not an absent one.
+              tagged_commit="$(git rev-parse -q --verify "$tag_object^{commit}")" \
+                || { echo "::error::the tag for $version does not point at a commit"; exit 1; }
+            fi
+            if [ -z "$tagged_commit" ]; then
+              echo "::notice::no tag v$version or $version; the site deploys when that release is published"
+              echo "released=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          tagged="$(git show "$tagged_commit:src/litetune/_version.py" 2>/dev/null | read_version)"
+          [ "$tagged" = "$version" ] \
+            || { echo "::error::the tagged commit's own _version.py says ${tagged:-nothing readable}, not $version"; exit 1; }
+          # The ref is spelled in full: git resolves a short `origin/main` to
+          # `refs/tags/origin/main` before the remote branch, and every tag is on
+          # this runner, so a tag of that name pointing at an unmerged commit
+          # passed this test -- reproduced in review, and refused in full.
+          git merge-base --is-ancestor "$tagged_commit" "$origin_main" \
+            || { echo "::error::the commit tagged for $version is not on main"; exit 1; }
+
+          # PyPI's JSON for this version. Installable means all of: the version
+          # PyPI reports is the one asked for, spelled the same -- it looks
+          # versions up normalised, so `0.1.05` answers as `0.1.5`, which is a
+          # different string on the site; not yanked; and at least one file.
+          # 404 is a version PyPI does not have. Anything else, or a body that
+          # is not that JSON, is a failed request, not an answer.
+          #
+          # Every run that gets here has a release tag for this version, so an
+          # upload is due, and each waits for it -- about ten minutes, where
+          # each publish run so far finished within forty seconds -- then fails
+          # without deploying if it never appears. A push waits as well as a
+          # release run, because either may be the run that finds the upload
+          # first; asking once would leave a version published a moment later
+          # undeployed until the next trigger.
+          url="https://pypi.org/pypi/litetune/$version/json"
+          # A deadline, not a count: with each request allowed thirty seconds, a
+          # count of thirty attempts twenty seconds apart could run nearly
+          # twenty-five minutes against PyPI timing out.
+          body="$(mktemp)"
+          deadline=$((SECONDS + 600))
+          while :; do
+            # curl's own exit matters as well as the status: a 200 whose body
+            # stalled past `--max-time` reports 200 with the body cut short.
+            curl_exit=0
+            status="$(curl -s --connect-timeout 10 --max-time 30 -o "$body" -w '%{http_code}' "$url")" \
+              || curl_exit=$?
+            [ "$status" = 200 ] && [ "$curl_exit" = 0 ] && break
+            # Before the sleep, not after the request: waiting would start a
+            # request that could only answer past the deadline.
+            [ $((SECONDS + 20)) -ge "$deadline" ] && break
+            sleep 20
+          done
+          case "$status" in
+            200)
+              [ "$curl_exit" = 0 ] \
+                || { echo "::error::PyPI's answer for litetune $version was cut off (curl exited $curl_exit)"; exit 1; } ;;
+            404)
+              echo "::error::PyPI still has no litetune $version though v$version is tagged; check that its release was published and its publish run succeeded"
+              exit 1 ;;
+            000)
+              # curl's code for a request that got no response at all.
+              echo "::error::could not reach PyPI to ask about litetune $version"
+              exit 1 ;;
+            *)
+              echo "::error::could not ask PyPI about litetune $version (HTTP $status)"
+              exit 1 ;;
+          esac
+          verdict="$(jq -r --arg v "$version" '
+            if (.info.version | type) != "string" then "unreadable"
+            elif .info.version != $v then "respelled"
+            elif .info.yanked != false then "yanked"
+            elif ((.urls // []) | length) == 0 then "no files"
+            else "installable" end' "$body" 2>/dev/null || echo unreadable)"
+          case "$verdict" in
+            installable) ;;
+            respelled|yanked|"no files")
+              echo "::notice::litetune $version on PyPI is not installable as that version ($verdict); the site does not name it"
+              echo "released=false" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+            *)
+              echo "::error::PyPI's answer for litetune $version is not the JSON expected"
+              exit 1 ;;
+          esac
+
+          # Last, and only once PyPI has answered: is what was built still what
+          # `main` would build? A run can be old by the time it gets here -- a
+          # re-run of one that failed above, days later, checks out its own
+          # commit again -- and would put that site back over a newer one. So if
+          # anything the site is built from differs on `main`, this run stands
+          # down and leaves the deploy to one that built what `main` holds.
+          # Usually that is the push that moved it. Where the move was the next
+          # version bump, nothing deploys until that version is released: the
+          # site then lags `main` by a release rather than naming a version
+          # PyPI does not have.
+          # `git diff --quiet` exits 1 for a difference and 128 for a failure,
+          # such as an unresolvable ref; only the first is a reason to step
+          # aside, and the second must not pass for it.
+          differs=0
+          git diff --quiet HEAD "$origin_main" -- \
+              website CHANGELOG.md src/litetune/_version.py .github/workflows/site.yml \
+            || differs=$?
+          case "$differs" in
+            0) ;;
+            1) echo "::notice::main has a newer site than this run built; its own run deploys it"
+               echo "released=false" >> "$GITHUB_OUTPUT"
+               exit 0 ;;
+            *) echo "::error::could not compare this build with main (git diff exited $differs)"
+               exit 1 ;;
+          esac
+          echo "released=true" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the build for the deploy job
+        if: steps.released.outputs.released == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: site
@@ -103,22 +383,75 @@ jobs:
     needs: build
     # `main` explicitly, not merely "not a pull request". `workflow_dispatch`
     # accepts any ref, so the looser gate let anyone with write access publish
-    # a feature branch to the live site by dispatching on it.
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    # a feature branch to the live site by dispatching on it. A release is the
+    # one other way in; it builds `main` too, and the build job's gate refuses
+    # one whose tagged commit is not on `main` -- with an error, so this job
+    # does not run and the run is red.
+    if: >-
+      needs.build.outputs.released == 'true'
+      && (github.event_name == 'release'
+          || (github.event_name != 'pull_request' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
-    # Redundant today and kept anyway. The workflow-level group is keyed on
-    # `github.ref`, and with the gate above restricting this job to `main`,
-    # a push and a dispatch both resolve to `refs/heads/main` and already
-    # share it. This group holds if that gate is ever widened, which is the
-    # change that would otherwise let two deploys reach Hosting together.
+    # The deploy itself: 31 s for the whole job on the one deploy run so far,
+    # of which the Firebase CLI install was 19 s and the deploy 4 s. The wait
+    # for PyPI is the build job's. A precaution, not a cure for anything
+    # seen here -- the default is the six hours GitHub allows, and a job stuck
+    # that long would hold every later deploy behind it.
+    timeout-minutes: 30
+    # This is what keeps two deploys off Hosting at once: the workflow group
+    # above is per ref, so a release run and a push run are in different ones
+    # and can be in flight together. Two is the most there can be, and that is
+    # what makes this safe: pushes and dispatches share `main`'s workflow group,
+    # and two release runs cannot both pass the gate unless `main`'s version
+    # changed between them. With three, a newer run could be cancelled while
+    # waiting here and the last to arrive stand down, leaving the newest site
+    # unpublished with every run green. Only runs that will deploy get here -- the
+    # gate is in the build job -- and the step below stands the second one down
+    # unless `main` is still what it built. Where it is, that second deploy
+    # republishes an equivalent build of the same commit; not the same bytes,
+    # since `sitemap.xml` carries the time it was built.
     concurrency:
       group: site-deploy
       cancel-in-progress: false
     steps:
+      # The commit the build job built, so the version read below is the one
+      # the artifact renders. Full history so the freshness test below can
+      # compare it with `main`; the repository is small.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+
+      # Asked again here, holding the group, because the build job asked it
+      # before queueing: a run that built an older `main` can reach this job
+      # after a newer one has deployed -- arrival order at the group is not
+      # commit order -- and would publish the older site.
+      - name: Still what main holds
+        id: fresh
+        run: |
+          # Fetched by full ref name, as the build job's gate explains. This
+          # job checks out a bare commit, so nothing here repoints
+          # `refs/remotes/origin/main` -- but fetching is what makes this the
+          # state of `main` now, which is the point of asking again.
+          git fetch --quiet origin refs/heads/main \
+            || { echo "::error::could not fetch main to compare this build with"; exit 1; }
+          origin_main="$(git rev-parse --verify FETCH_HEAD)" \
+            || { echo "::error::could not read the fetched main"; exit 1; }
+          differs=0
+          git diff --quiet HEAD "$origin_main" -- \
+              website CHANGELOG.md src/litetune/_version.py .github/workflows/site.yml \
+            || differs=$?
+          case "$differs" in
+            0) echo "fresh=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "::notice::main moved on while this run waited; its own run deploys it"
+               echo "fresh=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::could not compare this build with main (git diff exited $differs)"
+               exit 1 ;;
+          esac
 
       # The bytes the build job checked, not a second build that could differ.
       - uses: actions/download-artifact@v4
+        if: steps.fresh.outputs.fresh == 'true'
         with:
           name: site
           path: website/build/jaspr
@@ -130,6 +463,7 @@ jobs:
       # (`src/download-artifact.ts:193-197`). So this is the only thing
       # standing between a truncated download and Hosting.
       - name: Refuse an empty build
+        if: steps.fresh.outputs.fresh == 'true'
         working-directory: website
         run: ./check-build.sh
 
@@ -151,6 +485,7 @@ jobs:
       # `>=20.0.0 || >=22.0.0 || >=24.0.0`, which every current runner image
       # satisfies.
       - name: Install the Firebase CLI
+        if: steps.fresh.outputs.fresh == 'true'
         run: npm install --no-save --prefix "$RUNNER_TEMP/firebase-cli" firebase-tools@15.30.0
 
       # `firebase-tools` is called directly rather than through
@@ -192,6 +527,7 @@ jobs:
       # not just for `--debug`. A `DEBUG:` added to this job would reopen
       # exactly what is described above.
       - name: Deploy to Firebase Hosting
+        if: steps.fresh.outputs.fresh == 'true'
         working-directory: website
         env:
           # `--project` on the command line rather than baked into a config:

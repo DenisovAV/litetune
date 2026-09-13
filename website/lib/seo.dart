@@ -41,11 +41,16 @@ List<Component> fontLinks() => [
   ),
 ];
 
-/// Builds the `<head>` tags for the landing page: canonical, robots,
-/// Open Graph, Twitter Card and JSON-LD.
+/// Builds the `<head>` tags for a page: canonical, robots, Open Graph,
+/// Twitter Card and JSON-LD.
+///
+/// [description] describes the page. The JSON-LD block describes the
+/// application instead, so a page about something narrower -- the changelog --
+/// passes [applicationDescription] and keeps the application's own there.
 List<Component> seoHead({
   required String title,
   required String description,
+  String? applicationDescription,
   String path = '/',
   String image = '/images/og-image.png',
 }) {
@@ -98,7 +103,7 @@ List<Component> seoHead({
             'name': 'litetune',
             'applicationCategory': 'DeveloperApplication',
             'operatingSystem': 'macOS, Linux',
-            'description': description,
+            'description': applicationDescription ?? description,
             'url': kSiteOrigin,
             'license': 'https://www.apache.org/licenses/LICENSE-2.0',
             'author': {'@type': 'Person', 'name': 'Sasha Denisov'},
