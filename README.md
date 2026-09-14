@@ -376,7 +376,15 @@ withdrawn after re-measurement.
   Every bundle that failed in the issue is above that line; the one published
   bundle that works on SM8850 (1B, 1.375 MiB) is above it too, so the rule is
   a measured boundary for the 270M graphs on both SoCs, not yet a traced
-  cause. At 896 the mask is exactly 1.0 MiB and all five chunks of a tool
+  cause. **The boundary is per model, not a number to carry across.** Reading
+  the SRQ graphs, the operand of the failing add is the int16 mask tiled over
+  the query heads inside the compiled prefill graph —
+  `2 B × num_attention_heads × prefill × (cache_length + prefill)` — which for
+  Gemma 3's four heads is the same number as the count above over the bundle's
+  two fp32 mask inputs, and for a sixteen-head model is not: Qwen3-0.6B is
+  4.0 MiB at `cache_length` 896, still above the line
+  ([LiteRT-LM#3508, 2026-09-11](https://github.com/google-ai-edge/LiteRT-LM/issues/3508)).
+  At 896 the mask is exactly 1.0 MiB and all five chunks of a tool
   prompt survive; 768, further below the line, keeps the context too (checked
   on two-chunk prompts). So the FunctionGemma NPU bundle is
   `prefill_lengths = [128]`, `cache_length` 896: about 640 tokens of
