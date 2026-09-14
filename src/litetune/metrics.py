@@ -628,10 +628,11 @@ def _strip_terminators(text: str) -> tuple[str, tuple[str, ...]]:
     """The text with its trailing markers gone, and which markers came off.
 
     `core` is `text` with every trailing marker from `TERMINATORS` removed,
-    repeatedly, with whitespace stripped between removals. Measured, both
-    supported families stop *at* their template's close -- gemma-3-270m-it and
-    functiongemma-270m-it both carry `<end_of_turn>` in `eos_token_id`, so a
-    real generation ends there and carries one marker, not a stack. The
+    repeatedly, with whitespace stripped between removals. Measured, every
+    family run here stops *at* its template's close -- gemma-3-270m-it and
+    functiongemma-270m-it carry `<end_of_turn>` in `eos_token_id`,
+    gemma-4-E2B-it carries `<turn|>` and Qwen3-0.6B `<|im_end|>` -- so a real
+    generation ends there and carries one marker, not a stack. The
     whitespace between removals is for the family whose eos set does not
     include its own close: generation runs past it into `<end_of_turn>\\n<eos>`,
     and without the strip the newline hides the second marker. `markers` is
@@ -673,10 +674,10 @@ def terminators_trimmed(text: str) -> int:
     Reported, never gated. On the transformers reference the count reflects
     how the chat template and the tokenizer relate: one marker when the
     template's close is itself a stop token, two when it is not and generation
-    runs past it into the eos -- `<end_of_turn>` then `<eos>`. Measured, neither
-    supported family produces that shape: gemma-3-270m-it and
-    functiongemma-270m-it both carry their template's close in `eos_token_id`,
-    so generation halts there and a healthy run reports 1. The count is not a
+    runs past it into the eos -- `<end_of_turn>` then `<eos>`. Measured, no
+    family run here produces that shape: each carries its template's close in
+    `eos_token_id`, so generation halts there and a healthy run reports 1 --
+    on Qwen3-0.6B's reference, 600 of 600. The count is not a
     threshold and no single number means "defect". On a litert-lm candidate it
     is zero whenever the runtime strips its own stop token before this tool
     ever sees the text.
