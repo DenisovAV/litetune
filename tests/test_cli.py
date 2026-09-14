@@ -1325,7 +1325,7 @@ def test_a_usage_error_does_not_borrow_a_verdict_code():
     assert helped.returncode == 0
 
 
-def _stop_token_argv(tmp_path, *extra):
+def _stop_token_argv(tmp_path, *extra, base_model="google/functiongemma-270m-it"):
     model = tmp_path / "model.litertlm"
     model.write_bytes(b"artifact")
     declarations = tmp_path / "tools.json"
@@ -1341,7 +1341,7 @@ def _stop_token_argv(tmp_path, *extra):
         "--prompt-mode",
         "prerendered",
         "--base-model",
-        "google/functiongemma-270m-it",
+        base_model,
         "--base-model-revision",
         "1234567890abcdef1234567890abcdef12345678",
         *extra,
@@ -1366,6 +1366,37 @@ def test_the_family_stop_token_supplements_the_recorded_one(tmp_path):
     notes = " ".join(contract["notes"])
     assert "litetune added the stop token(s) <start_function_response>" in notes
     assert "recorded terminator" in notes, "the trained one must stay attributed to the run"
+
+
+def test_gemma_4_bundles_declare_the_stop_tokens_the_family_carries(tmp_path):
+    """Declaring a family's stop tokens completes the contract, not the artifact.
+
+    `models.RULES` gained Gemma 4's `<turn|>` and `<|tool_response>` so that
+    scoring would trim them, and the same tuple reaches `contract.json` through
+    `stop_tokens_for`. That is shipped output -- a consumer reading the contract
+    rather than parsing the bundle is now told where the turn ends -- so it is
+    asserted here instead of riding along as a side effect of a scoring change.
+
+    The recorded terminator is one the family also declares, which is the case
+    the de-duplication in `cli` exists for: `<turn|>` is not added twice, and
+    only what litetune actually contributed is named in the notes.
+    """
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text(
+        json.dumps({"turn_terminator": {"text": "<turn|>", "source": "chat template"}}),
+        encoding="utf-8",
+    )
+    main(
+        _stop_token_argv(
+            tmp_path, "--train-metrics", str(metrics), base_model="google/gemma-4-E2B-it"
+        )
+    )
+
+    contract = _stop_token_contract(tmp_path)
+    assert contract["stop_tokens"] == ["<turn|>", "<|tool_response>"]
+    notes = " ".join(contract["notes"])
+    assert "litetune added the stop token(s) <|tool_response>" in notes
+    assert "<turn|>, <|tool_response>" not in notes, "the recorded one was not litetune's to add"
 
 
 def test_a_family_stop_token_alone_says_the_trained_one_is_unrecorded(tmp_path):

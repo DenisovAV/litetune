@@ -311,6 +311,8 @@ def _gemma4(family: str, patterns: tuple[str, ...], override_repo: str | None) -
         recommended_recipes=("dynamic_wi4c_hr_afp32", "dynamic_wi4b32_afp32"),
         recipe_reason=_GEMMA4_RECIPE_REASON,
         limitations=(_GEMMA4_NOT_GOOGLES_ARTIFACT,),
+        extra_stop_tokens=("<turn|>", "<|tool_response>"),
+        stop_token_reason=_GEMMA4_STOP_REASON,
     )
 
 
@@ -380,6 +382,23 @@ _FUNCTION_RESPONSE_REASON = (
     "carry it, as token id 50 out of generation_config.eos_token_id; this is about the "
     "contract, which a consumer reads without a protobuf parser and which otherwise names "
     "only the terminator the run observed"
+)
+
+# Sourced: generation_config.json on `google/gemma-4-E2B-it` declares eos_token_id
+# [1, 106, 50]; tokenizer.json names those `<eos>`, `<turn|>` and
+# `<|tool_response>`. Measured 2026-09-11 on an A100: all five reference
+# generations stopped on their own after 6-17 tokens, each ending `<turn|>`.
+# No generation stopping at `<|tool_response>` has been observed here, and the
+# reason below says so rather than describing a role taken from its name.
+_GEMMA4_STOP_REASON = (
+    "Gemma 4 closes a turn with `<turn|>`, not `<end_of_turn>`: generation_config.json declares "
+    "eos_token_id [1, 106, 50] and tokenizer.json names 106 `<turn|>`. Measured, all five "
+    "reference generations stopped on their own and ended there. Neither marker was in "
+    "`metrics.TERMINATORS`, so every Gemma 4 generation ended in one scoring did not recognise "
+    "and a 600-row `verify` refused the comparison outright: 600 of 600 reference generations "
+    "did not end in a terminator it knew. 50 is `<|tool_response>`, which the chat template uses "
+    "to open a tool-response turn; it is declared because the model's own eos set names it, not "
+    "because a generation stopping there has been observed here"
 )
 
 _GEMMA3_TEXT_AMBIGUOUS = (

@@ -109,6 +109,26 @@ def test_a_local_checkpoint_is_identified_from_what_tune_recorded(tmp_path):
     assert rules.family == "gemma-4-e2b"
 
 
+def test_gemma_4_declares_the_stop_tokens_its_generation_config_names():
+    """Gemma 4 closes a turn with `<turn|>`, not `<end_of_turn>`.
+
+    Until this was declared, `metrics.TERMINATORS` did not carry it, and a
+    600-row `verify` against `google/gemma-4-E2B-it` refused every comparison:
+    the reference generations ended in a marker scoring did not recognise, 600
+    of 600. `generation_config.json` names eos_token_id [1, 106, 50] and
+    `tokenizer.json` names 106 `<turn|>` and 50 `<|tool_response>`, the stop
+    reached once the model has called a tool.
+
+    Asserted per variant rather than once: `_gemma4` builds three, and a tuple
+    dropped from the factory would leave all three silent while every other
+    test stayed green.
+    """
+    for family in ("gemma-4-e2b", "gemma-4-e4b", "gemma-4"):
+        rules = next(r for r in models.RULES if r.family == family)
+        assert rules.extra_stop_tokens == ("<turn|>", "<|tool_response>"), family
+        assert rules.stop_token_reason, f"{family} declares stop tokens with no evidence"
+
+
 def test_a_config_that_cannot_be_read_says_so_rather_than_reporting_no_rules(tmp_path):
     checkpoint = tmp_path / "model"
     checkpoint.mkdir()

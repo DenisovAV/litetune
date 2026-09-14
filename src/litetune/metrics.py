@@ -564,6 +564,8 @@ TERMINATORS = (
     "<|end_of_text|>",
     "<|end|>",
     "<start_function_response>",
+    "<turn|>",
+    "<|tool_response>",
 )
 
 
