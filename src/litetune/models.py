@@ -481,6 +481,22 @@ RULES: tuple[ModelRules, ...] = (
         min_transformers_reason=_TRANSFORMERS_5_REASON,
     ),
     ModelRules(
+        family="qwen-3",
+        # Nothing to add, and that is what this entry records. `qwen3` is on the
+        # exporter's own type list (the model-type trap, above), so a config
+        # that says `model_type: "qwen3"` is typed correctly with no override.
+        # Measured 2026-09-14 on Qwen/Qwen3-0.6B: both int8 recipes exported
+        # with no flag from litetune, `litertlm_peek` on the artifact read
+        # `llm_model_type { qwen3 {} }`, and the conversion cost is in
+        # MEASUREMENTS.md.
+        #
+        # By size, not `qwen-?3`: that also claims the other sizes and the
+        # Qwen 3 models built on other architectures, none of which this
+        # project has run. No `min_transformers` either -- none was measured.
+        # Sizes are added here as they are.
+        patterns=(r"qwen-?3-0-6b",),
+    ),
+    ModelRules(
         family="gemma3-text-unidentified",
         # Last, so a checkpoint that names its family is matched by name first.
         # This is the fallback for one that does not: `config.json` establishes
