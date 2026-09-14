@@ -414,3 +414,100 @@ recognise, so `verify` stopped before scoring either side. That is the safe
 direction and it is also useless until the vocabulary learns the marker. It has
 since: `terminators_trimmed` then read 600 of 600, one marker each. The table
 above is from the re-run.
+
+## A fourth family, and the first that is not Gemma
+
+Every section above measures a Gemma: FunctionGemma and Gemma 3 fine-tuned
+here, Gemma 4 converted from its base weights. This one is `Qwen/Qwen3-0.6B`
+@ `c1899de2`, the first model measured here that litetune had no per-model
+rule for — `convert` said "no per-model rules for this checkpoint" on the
+tuned checkpoint and on the base.
+
+The task, the rows and the scorer are the second family's: LoRA r16/α32, lr
+2e-4, one epoch, batch 8, over the same 2,400 rows of `mteb/banking77`, scored
+on the same 600 held-out rows — both runs' verify manifests record split
+`0c7505b2b6f69ab1`, and their prepare reports the same `heldout.content_sha256`
+— with `--scorer exact-text`, a 256-token limit and prompt mode `prerendered`.
+What differs is recorded: `max_seq_length` 256 rather than 160, and bfloat16
+rather than float32, because training and the float reference ran on one
+A100-SXM4-40GB. Both candidates ran on litert-lm 0.16.1's CPU backend in the
+same container, 12 vCPU. litetune 0.1.6; training environment `torch==2.5.1`,
+`transformers==5.16.1`, `peft==0.20.0`; export environment
+`litert-torch-nightly==0.10.0.dev20260826`, `litert-lm==0.16.1`,
+`litert-lm-builder==0.16.1`, `numpy==2.0.2`.
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Base model | *not scored* | — | — |
+| Fine-tuned | **0.7450** ±0.0349 | 0.7367 ±0.0352 | 0.7383 ±0.0352 |
+| Cost of conversion | — | +0.0083 ±0.0150 *(unresolved, 21 discordant)* | +0.0067 ±0.0113 *(unresolved, 12 discordant)* |
+
+**Both costs are unresolved**, as both of the second family's were. Across the
+two runs, the manifests support two observations and no ranking. The
+fine-tuned Qwen3 scores higher on these rows than the fine-tuned Gemma 3 did,
+0.7450 against 0.6933. Its conversions disagree with its float model on fewer
+rows, 21 and 12 against 38 and 15. litetune computes no interval for a
+difference between two models, so neither is a resolved difference, and the
+conversion costs are not ranked: the intervals overlap, and this run's
+reference ran on a different device from its candidates, which the second
+family's did not.
+
+### What this run established that the table does not show
+
+**The family needs no rule, and now has one that says so.** Both recipes
+exported with no flag from litetune. `litertlm_peek` on a `dynamic_wi8_afp32`
+export of the base reads `llm_model_type { qwen3 {} }`, not `generic_model`,
+and the tuned checkpoint's `config.json` names the same `model_type`. That is
+the model-type trap `models.py` describes, seen from the other side: `qwen3` is
+on the exporter's own list, so the config's `model_type` selects the right type
+with no override. `models.py` records it as `qwen-3`, scoped to 0.6B, the one
+size run.
+
+**The terminator is the template's close, and it is also the tokenizer's
+eos.** `generation_config.eos_token_id` is `[151645, 151643]` — `<|im_end|>`
+and `<|endoftext|>` — and `<|im_end|>` closes a turn in the chat template.
+`tune` recorded `turn_terminator: {ids: [151645], source: "tokenizer_eos",
+text: "<|im_end|>"}`, and `contract.json` carries `stop_tokens:
+["<|im_end|>"]`. On the reference, `terminators_trimmed` read 600 of 600, one
+marker each. The second family's section describes Gemma 3, where the
+tokenizer's eos and the template's close are two markers; here they are one.
+
+**The runtime side returns no terminator.** On litert-lm `terminators_trimmed`
+read 0 of 600 and the manifest records "600 of 600 litert-lm generations end
+without a terminator", for both recipes, while liveness found no empty,
+leaking or degenerate generation among the 600 and every one exited zero. The
+generations stopped; the runtime hands back the text without its stop token.
+The unterminated-share check reads only the transformers reference, whose
+decoder is asked to keep special tokens.
+
+**Measuring the second recipe took several times as long.** The first time
+each bundle ran, litert-lm wrote an XNNPACK cache beside it: 601,946,856 bytes
+for `dynamic_wi8_afp32` and 2,385,932,008 for `weight_only_wi8_afp32`, three
+times that bundle's 771,404,928. On the same machine the 600-prompt verify,
+float reference included and a five-prompt verify run before it, took 27
+minutes for `dynamic_wi8_afp32` and 2 hours 10 minutes for
+`weight_only_wi8_afp32`. Nothing here measured whether the cache is the reason.
+
+**What it did not establish.** No untuned-base score. The base was converted,
+and a five-prompt `verify` was given 900 seconds before the full one would
+start; it did not finish, so the full one did not start. Separately, on a
+laptop, one of these prompts sent the way `verify` sends it made the untuned
+base alternate two labels that are not among the 77, repeating them for
+several minutes. So training gain is unattributed here too. One run.
+Conversions measured on CPU only — no GPU or NPU figure for this family.
+
+### Limitations carried by these manifests
+
+Four, the same on both recipes:
+
+- Measured on litert-lm's CPU backend; its GPU backend is a different executor
+  and this number does not predict it.
+- The candidate ran on CPU and the reference on CUDA, so the difference carries
+  a hardware difference as well as a conversion one. Reported rather than
+  refused: litetune cannot pin the runtime side to a device, and a refusal
+  would leave such a machine unable to verify at all.
+- Decoding was passed to transformers (`max_tokens` 256, greedy) but not to
+  litert-lm, which uses the pinned runtime's defaults; both are greedy, and the
+  token limit is unverified on the runtime side. 600 of 600 runtime generations
+  end without a terminator, which the subsection above accounts for.
+- The sample does not resolve either difference.
