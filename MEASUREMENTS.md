@@ -297,12 +297,69 @@ as such.
 **What it did not establish.** No untuned-base score, and not for want of
 running it: the base was converted and measured in this same mode, and refused
 at the liveness tier — asked for one intent label it returned nothing at all on
-53 of 600 prompts, so `verify` stopped before scoring either side. Training gain
-is therefore unattributed, and `prepare` could not identify slices where the
-base already scores at ceiling. The candidate ran on CPU only — no GPU or NPU
-figure for this family. Training ran in bfloat16 on the A100; the single-core
-bfloat16 behaviour that made an earlier run of this pair train in float32 is a
-property of that Mac's CPU and says nothing about this one.
+53 of 600 prompts, so `verify` stopped before scoring either side, as *The base
+model could not be scored at all* below describes. Training gain is therefore
+unattributed, and `prepare` could not identify slices where the base already
+scores at ceiling. The candidate ran on CPU only — no GPU or NPU figure for this
+family. Training ran in bfloat16 on the A100; the single-core bfloat16 behaviour
+that made an earlier run of this pair train in float32 is a property of that
+Mac's CPU and says nothing about this one.
+
+### Limitations carried by these manifests
+
+Two, paraphrased — the second drops a measured clause and both carry a note:
+
+- Measured on litert-lm's CPU backend. The manifests from this run carry the
+  older wording, which said published reports put the GPU backend materially
+  below CPU on identical artifacts, so the number was an optimistic estimate of
+  on-device behaviour. That was true of bundles without the GPU activation key
+  and not of bundles with it: on the one
+  device measured, a repacked bundle at `prefer_activation_type = fp32` scored
+  15/20 against the CPU's 14/20 at 1.8× the speed, which at n=20 is not a
+  resolved difference — see the table in `export.py`. `convert` attempts that
+  repack on every bundle, and names the ones where it could not, or where a
+  different value was already declared; one already declaring `fp32` needs no
+  warning and gets none. The limitation was corrected after this run, and cut
+  back: a manifest produced today says only that litert-lm's GPU backend is a
+  different executor and the CPU number does not predict it, and points at
+  README's limitations section. Figures belong in the documents, where the
+  conditions that make them readable sit beside them, and not in a per-run
+  limitation that would carry another run's numbers into every manifest.
+- Decoding parameters were passed to transformers but not to litert-lm, which
+  used the pinned runtime's defaults; both are greedy, and the token limit is
+  unverified on the runtime side. In the withdrawn `prerendered` run that limit
+  is what the base model ran into; in the re-measurement it returned nothing at
+  all instead — see the subsection after this one.
+
+And one fact about the re-measured run, which fired no limitation:
+
+- Training ran in bfloat16, the default, on the same A100 that held the float
+  reference. Export passes no dtype and the float reference loads at float32,
+  so that is not a mismatch with either.
+
+### The base model could not be scored at all
+
+The untuned `gemma-3-270m-it` was converted and run over the same 600 prompts in
+both prompt modes, and `verify` refused to score it both times — for different
+reasons, which is itself worth recording. `prerendered`: 571 of 600 generations
+repeat themselves above the 0.50 threshold, the worst at 0.9995, running on
+until the token limit. `runtime_rendered`, the re-measurement: 53 of 600
+generations are empty after decoding, a share of 0.0883 against a threshold of
+0.0000. Either way the run ends at `failed_smoke`, before the quality tier:
+asked to answer with one intent label, the base does not emit a label and
+stop.
+
+That refusal is the point. An exact-match score against those generations would
+have been a number — near zero — and it would have read as "the base is bad at
+this task". What actually happened is that the base never answered the question
+in the shape the task requires, which is a different claim, and the one that
+explains why fine-tuning moved so much. A liveness tier that scored it anyway
+would have turned "this model does not do the task" into "this model does the
+task badly".
+
+It also means the training gain here is unattributable in principle, not just
+unmeasured: there is no base figure to subtract, and manufacturing one from a
+degenerate run would be the mistake `attribution` exists to refuse.
 
 ## A third family, and the marker the vocabulary did not know
 
@@ -357,59 +414,3 @@ recognise, so `verify` stopped before scoring either side. That is the safe
 direction and it is also useless until the vocabulary learns the marker. It has
 since: `terminators_trimmed` then read 600 of 600, one marker each. The table
 above is from the re-run.
-
-### Limitations carried by these manifests
-
-Two, paraphrased — the second drops a measured clause and both carry a note:
-
-- Measured on litert-lm's CPU backend. The manifests from this run carry the
-  older wording, which said published reports put the GPU backend materially
-  below CPU on identical artifacts, so the number was an optimistic estimate of
-  on-device behaviour. That was true of bundles without the GPU activation key
-  and not of bundles with it: on the one
-  device measured, a repacked bundle at `prefer_activation_type = fp32` scored
-  15/20 against the CPU's 14/20 at 1.8× the speed, which at n=20 is not a
-  resolved difference — see the table in `export.py`. `convert` attempts that
-  repack on every bundle, and names the ones where it could not, or where a
-  different value was already declared; one already declaring `fp32` needs no
-  warning and gets none. The limitation was corrected after this run, and cut
-  back: a manifest produced today says only that litert-lm's GPU backend is a
-  different executor and the CPU number does not predict it, and points at
-  README's limitations section. Figures belong in the documents, where the
-  conditions that make them readable sit beside them, and not in a per-run
-  limitation that would carry another run's numbers into every manifest.
-- Decoding parameters were passed to transformers but not to litert-lm, which
-  used the pinned runtime's defaults; both are greedy, and the token limit is
-  unverified on the runtime side. In the withdrawn `prerendered` run that limit
-  is what the base model ran into; in the re-measurement it returned nothing at
-  all instead — see the last section.
-
-And one fact about the re-measured run, which fired no limitation:
-
-- Training ran in bfloat16, the default, on the same A100 that held the float
-  reference. Export passes no dtype and the float reference loads at float32,
-  so that is not a mismatch with either.
-
-### The base model could not be scored at all
-
-The untuned `gemma-3-270m-it` was converted and run over the same 600 prompts in
-both prompt modes, and `verify` refused to score it both times — for different
-reasons, which is itself worth recording. `prerendered`: 571 of 600 generations
-repeat themselves above the 0.50 threshold, the worst at 0.9995, running on
-until the token limit. `runtime_rendered`, the re-measurement: 53 of 600
-generations are empty after decoding, a share of 0.0883 against a threshold of
-0.0000. Either way the run ends at `failed_smoke`, before the quality tier:
-asked to answer with one intent label, the base does not emit a label and
-stop.
-
-That refusal is the point. An exact-match score against those generations would
-have been a number — near zero — and it would have read as "the base is bad at
-this task". What actually happened is that the base never answered the question
-in the shape the task requires, which is a different claim, and the one that
-explains why fine-tuning moved so much. A liveness tier that scored it anyway
-would have turned "this model does not do the task" into "this model does the
-task badly".
-
-It also means the training gain here is unattributable in principle, not just
-unmeasured: there is no base figure to subtract, and manufacturing one from a
-degenerate run would be the mistake `attribution` exists to refuse.
