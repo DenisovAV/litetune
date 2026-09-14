@@ -50,9 +50,10 @@ is workable at 270M and the first thing you will want to change above about
 1B. Bring your own checkpoint and skip the first two steps, or bring a
 `.litertlm` and its float checkpoint and run only `verify`.
 
-> **Alpha.** Measured end to end on two models: `google/functiongemma-270m-it`
-> with the tool-call scorer, and `google/gemma-3-270m-it` with `exact-text` on a
-> 77-way intent task — both on CPU, both in [MEASUREMENTS.md](MEASUREMENTS.md).
+> **Alpha.** Measured end to end on three models: `google/functiongemma-270m-it`
+> with the tool-call scorer, and `google/gemma-3-270m-it` and `Qwen/Qwen3-0.6B`
+> with `exact-text` on the same 77-way intent task — every conversion measured
+> on CPU, all in [MEASUREMENTS.md](MEASUREMENTS.md).
 > Qwen3.5 exports and needs no flags from litetune, only a `transformers`
 > floor. Gemma 4 exports once you name the variant — `E2B` or `E4B` — because
 > the chat template override is per-variant; a bare `gemma-4` is refused
@@ -356,6 +357,20 @@ tier rather than scoring a model that never answered. An earlier run of this
 same pair, measured in the other prompt mode, is what found the `exact-text`
 terminator bug fixed in 0.1.5 — see [MEASUREMENTS.md](MEASUREMENTS.md).
 
+`Qwen3-0.6B`, LoRA on the same 2,400 rows, scored on the same 600:
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Base model | *not scored* | — | — |
+| Fine-tuned | 0.7450 | 0.7367 | 0.7383 |
+| Cost of conversion | — | +0.0083 *(within noise)* | +0.0067 *(within noise)* |
+
+The first family measured here that litetune had no rule for. It exported with
+no flag from litetune, and the rule it has now records that none is needed.
+Neither conversion figure clears its interval. Training and the float reference
+ran on a GPU and the converted models on a CPU, so this cost carries a hardware
+difference the Gemma 3 one does not — see [MEASUREMENTS.md](MEASUREMENTS.md).
+
 **[MEASUREMENTS.md](MEASUREMENTS.md)** has the intervals, three runs of the same
 configuration and what they disagree about, and which published claims were
 withdrawn after re-measurement.
@@ -435,14 +450,15 @@ withdrawn after re-measurement.
 
 **Limits on the numbers**
 
-- **Measured on three models, two of them end to end.**
-  `functiongemma-270m-it` with the tool-call scorer and `gemma-3-270m-it` with
-  `exact-text` were fine-tuned here, so both a training gain and a conversion
-  cost are attributed. `gemma-4-E2B-it` was not: base weights, two conversions
-  of them compared against the float reference, so that run has a conversion
-  cost and no training gain. Qwen3.5 exports but has no quality figure, and a
-  Gemma 4 without its variant is still refused unless you supply the template
-  override yourself.
+- **Measured on four models, three of them end to end.**
+  `functiongemma-270m-it` with the tool-call scorer, and `gemma-3-270m-it` and
+  `Qwen3-0.6B` with `exact-text`, were fine-tuned here, so each has a conversion
+  cost. Only FunctionGemma also has a training gain: neither of the other two
+  untuned bases was scored. `gemma-4-E2B-it` was not fine-tuned: base weights,
+  two conversions of them compared against the float reference, so that run has
+  a conversion cost and no training gain. Qwen3.5 exports but has no quality
+  figure, and a Gemma 4 without its variant is still refused unless you supply
+  the template override yourself.
 - **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
   the liveness checks both trim against a fixed set of strings, recorded
   verbatim at `harness.terminators` in every verify manifest. A family whose
