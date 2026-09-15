@@ -817,6 +817,25 @@ def test_bundle_refuses_a_prompt_mode_the_record_contradicts(tmp_path, deliverab
     assert not (tmp_path / "bundle" / "contract.json").exists()
 
 
+def test_bundle_refuses_a_training_record_whose_prompt_mode_it_cannot_read(
+    tmp_path, deliverable, capsys
+):
+    from litetune import cli
+
+    model, declarations = deliverable
+    metrics = _train_metrics(tmp_path, prompt_mode="templated")
+    # `--prompt-mode prerendered` is passed as well: a record that cannot be read
+    # is refused, not replaced by the flag.
+    code = main(_bundle_argv(tmp_path, model, declarations, "--train-metrics", str(metrics)))
+
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_CODES[cli.Status.ERROR]
+    assert "train-metrics.json" in err
+    assert "records prompt_mode 'templated'" in err
+    assert "runtime_rendered" in err
+    assert not (tmp_path / "bundle" / "contract.json").exists()
+
+
 def test_bundle_without_a_mode_or_a_training_record_does_not_run(tmp_path, deliverable, capsys):
     from litetune import cli
 
