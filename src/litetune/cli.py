@@ -67,6 +67,7 @@ from litetune.prepare import (
     prepare,
 )
 from litetune.prompt_mode import PromptMode, parse_prompt_mode
+from litetune.recipes import DEFINED_RECIPES
 from litetune.spec import DTYPES, SpecError, mutable_ref_refusal, weak_revision_limitations
 from litetune.tune import METHODS, TuneError, TuneRequest, TuneResult, run_tune, write_report
 from litetune.verify import EXIT_CODES, ReferenceRole, Status, VerifyRequest, run_verify
@@ -461,7 +462,9 @@ def _add_convert(sub) -> None:
         metavar="NAME",
         help=(
             "a quantization recipe to sweep; repeat it. There is no default: the toolchain's own "
-            f"choice cost 0.024 exact match. A defensible minimum is {list(MEASURED_RECIPES)}"
+            f"choice cost 0.024 exact match. A defensible minimum is {list(MEASURED_RECIPES)}. "
+            "litetune also defines "
+            + "; ".join(f"{r.name} ({r.describes})" for r in DEFINED_RECIPES.values())
         ),
     )
     convert.add_argument(

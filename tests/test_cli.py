@@ -1697,3 +1697,9 @@ def test_the_tune_summary_says_when_the_mode_was_never_decided(monkeypatch, tmp_
     )
 
     assert "prompt mode not decided" in capsys.readouterr().out
+
+
+def test_convert_help_names_the_recipe_litetune_defines(capsys):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["convert", "--help"])
+    assert "dynamic_wi4b32_emb8_afp32" in capsys.readouterr().out

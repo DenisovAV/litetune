@@ -40,6 +40,13 @@ from litetune import envs, models
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.events import EventStream
 from litetune.exits import read_returncode
+from litetune.recipes import (
+    DEFINED_RECIPES,
+    RecipeDefinitionError,
+    definition_of,
+    source_of,
+    toolchain_argument,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -500,14 +507,14 @@ class ExportRequest:
             "export_hf",
             f"--model={self.model}",
             f"--output_dir={self.dir_for(recipe)}",
-            f"--quantization_recipe={recipe}",
+            f"--quantization_recipe={toolchain_argument(recipe)}",
             *self.extra_flags,
         ]
 
     @property
     def unknown_recipes(self) -> tuple[str, ...]:
-        """Requested recipes litetune has no measurement for. Not an error."""
-        return tuple(r for r in self.recipes if r not in KNOWN_RECIPES)
+        """Requested recipes litetune neither defines nor has measured. Not an error."""
+        return tuple(r for r in self.recipes if r not in KNOWN_RECIPES and r not in DEFINED_RECIPES)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -542,6 +549,9 @@ class RecipeExport:
     recipe: str
     check: Check
     argv: tuple[str, ...] = ()
+    # The rules of a recipe litetune defines, exactly as the toolchain received
+    # them; None for a toolchain preset, whose rules live in the toolchain.
+    recipe_definition: list[dict[str, Any]] | None = None
     artifact: Path | None = None
     # Everything the recipe produced besides the `.litertlm` itself. Measured,
     # this is normally empty: `--externalize_embedder` writes the embedding as
@@ -584,6 +594,11 @@ class RecipeExport:
         return GpuActivationState.of(self.gpu_activation)
 
     @property
+    def recipe_source(self) -> str:
+        """`litetune` for a recipe litetune defines, `toolchain` for a name passed as given."""
+        return source_of(self.recipe)
+
+    @property
     def verified(self) -> bool:
         """Always False. Not a field, so no code path can set it True.
 
@@ -596,6 +611,8 @@ class RecipeExport:
     def as_dict(self) -> dict[str, Any]:
         return {
             "recipe": self.recipe,
+            "recipe_source": self.recipe_source,
+            "recipe_definition": self.recipe_definition,
             "verified": False,
             "unverified_reason": NOT_VERIFIED,
             "outcome": self.check.outcome.value,
@@ -960,6 +977,20 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
     """Run one export. A non-zero exit is recorded, not raised."""
     name = check_name(recipe)
     argv = tuple(request.argv(recipe))
+    try:
+        definition = definition_of(recipe)
+    except RecipeDefinitionError as exc:
+        # A fact about this installation, not about the recipe: nothing ran,
+        # and no other recipe is exported in its place.
+        return RecipeExport(
+            recipe=recipe,
+            argv=argv,
+            check=Check.unchecked(
+                name,
+                f"{exc}; nothing was exported for {recipe}",
+                observed={"recipe": recipe},
+            ),
+        )
     out_dir = request.dir_for(recipe)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -976,6 +1007,7 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
         return RecipeExport(
             recipe=recipe,
             argv=argv,
+            recipe_definition=definition,
             seconds=seconds,
             check=Check.unchecked(
                 name,
@@ -989,6 +1021,7 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
         return RecipeExport(
             recipe=recipe,
             argv=argv,
+            recipe_definition=definition,
             seconds=time.perf_counter() - started,
             check=Check.unchecked(
                 name,
@@ -1012,6 +1045,7 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
     base: dict[str, Any] = {
         "recipe": recipe,
         "argv": argv,
+        "recipe_definition": definition,
         "seconds": seconds,
         "returncode": proc.returncode,
         "stderr": stderr,

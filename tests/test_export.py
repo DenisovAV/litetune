@@ -1477,3 +1477,92 @@ def test_non_string_metadata_values_survive_the_rebuild(toolchain, tmp_path):
         e["key"]: e["value"] for e in _toml_loads(_toml_in(artifact))["system_metadata"]["entries"]
     }
     assert entries["layers"] == 18 and entries["quantized"] is True
+
+
+# ---------------------------------------------------------------------------
+# Recipes litetune defines itself
+# ---------------------------------------------------------------------------
+
+OWNED = "dynamic_wi4b32_emb8_afp32"
+
+
+def test_an_owned_recipe_hands_the_toolchain_its_packaged_file(request_for):
+    request = request_for((OWNED,))
+    argv = request.argv(OWNED)
+
+    (flag,) = [a for a in argv if a.startswith("--quantization_recipe=")]
+    path = Path(flag.split("=", 1)[1])
+    assert path.name == f"{OWNED}.json"
+    assert path.is_file()
+    # The name, not the path, is what the caller sees on disk.
+    assert request.dir_for(OWNED).name == OWNED
+    assert f"--output_dir={request.dir_for(OWNED)}" in argv
+
+
+@pytest.mark.parametrize("recipe", ["weight_only_wi8_afp32", "dynamic_wi4b64_afp32"])
+def test_other_recipe_names_reach_the_toolchain_as_given(request_for, recipe):
+    assert f"--quantization_recipe={recipe}" in request_for((recipe,)).argv(recipe)
+
+
+def test_the_report_carries_the_owned_recipe_and_its_rules(toolchain, request_for):
+    result = run_export(request_for(("dynamic_wi8_afp32", OWNED)))
+
+    owned = next(e for e in result.exports if e.recipe == OWNED)
+    record = owned.as_dict()
+    assert owned.ok
+    assert record["recipe_source"] == "litetune"
+    assert sorted(rule["operation"] for rule in record["recipe_definition"]) == [
+        "EMBEDDING_LOOKUP",
+        "FULLY_CONNECTED",
+    ]
+    preset = next(e for e in result.exports if e.recipe == "dynamic_wi8_afp32").as_dict()
+    assert preset["recipe_source"] == "toolchain"
+    assert preset["recipe_definition"] is None
+    # What ran is the file, under the recipe's own directory.
+    (owned_call,) = [
+        c.argv for c in toolchain.exports if any(a.endswith(f"{OWNED}.json") for a in c.argv)
+    ]
+    assert any(a.endswith(f"/{OWNED}") for a in owned_call if a.startswith("--output_dir="))
+
+
+def test_an_owned_recipe_is_not_flagged_as_passed_through(toolchain, request_for):
+    result = run_export(request_for((OWNED, "dynamic_wi4b64_afp32")))
+
+    passed_through = [text for text in result.limitations if "passed through" in text]
+    assert len(passed_through) == 1
+    assert "dynamic_wi4b64_afp32" in passed_through[0]
+    assert OWNED not in passed_through[0]
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        (None, "missing"),
+        ("not json", "could not be read"),
+        ('{"operation": "FULLY_CONNECTED"}', "not a list of quantization rules"),
+    ],
+)
+def test_an_owned_recipe_that_cannot_be_read_is_not_exported_in_anothers_place(
+    toolchain, request_for, tmp_path, monkeypatch, content, reason
+):
+    from dataclasses import replace
+
+    from litetune.recipes import DEFINED_RECIPES
+
+    target = tmp_path / "recipes" / f"{OWNED}.json"
+    if content is not None:
+        target.parent.mkdir()
+        target.write_text(content, encoding="utf-8")
+    monkeypatch.setitem(DEFINED_RECIPES, OWNED, replace(DEFINED_RECIPES[OWNED], path=target))
+
+    result = run_export(request_for((OWNED, "dynamic_wi8_afp32")))
+
+    owned = next(e for e in result.exports if e.recipe == OWNED)
+    assert owned.check.outcome is Outcome.UNCHECKED
+    assert OWNED in owned.check.detail
+    assert reason in owned.check.detail
+    assert not owned.attempted
+    exported = [c.argv for c in toolchain.exports]
+    assert not any(f"--quantization_recipe={target}" in argv for argv in exported)
+    assert any("--quantization_recipe=dynamic_wi8_afp32" in argv for argv in exported)
+    assert next(e for e in result.exports if e.recipe == "dynamic_wi8_afp32").ok
