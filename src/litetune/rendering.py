@@ -11,7 +11,7 @@ tokens neither template shows.
 So the check compares token ids. For every prompt, a script in `envs.RUNTIME`
 renders it with `Conversation.render_message_to_string` -- in LiteRT-LM v0.16.1
 that returns `GetSingleTurnText`, the function `SendMessage` renders with --
-and tokenizes the result the way prefill does. A script in the reference's
+and turns the result into ids the way a first-turn prefill does. A script in the reference's
 environment produces the ids the reference generates from, through the same
 `evaluate.REFERENCE_PROMPT_SOURCE` the generation script uses. The lists must be
 equal. On the first few prompts the runtime also sends the message, and the
@@ -72,6 +72,22 @@ def prefill_ids(engine, text):
     return list(engine.tokenize(text))
 
 
+def runtime_ids(engine, rendered):
+    """What a first turn gives the model: the session's BOS, then the rendered text.
+
+    A session prepends the BOS string on its first turn, outside the rendered
+    text (runtime/core/session_utils.cc, ApplyPromptTemplates, v0.16.1), and
+    prefill turns that string into the BOS id. Measured on a gemma-3-270m export
+    on 2026-09-15: `render_message_to_string` gave 46 ids, the conversation
+    prefilled 47, and the transformers template renders 47 with one <bos>. A
+    rendering that carries its own BOS string gets a second one here, as it
+    would in the runtime. A model without a BOS gets nothing added.
+    """
+    bos = engine.bos_token_id
+    first_turn = [bos] if bos is not None and bos >= 0 and engine.detokenize([bos]) else []
+    return first_turn + prefill_ids(engine, rendered)
+
+
 def main():
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 
@@ -95,7 +111,7 @@ def main():
                     {
                         "index": index,
                         "rendered": rendered,
-                        "ids": prefill_ids(engine, rendered),
+                        "ids": runtime_ids(engine, rendered),
                         "prefill_tokens": None,
                     }
                 )

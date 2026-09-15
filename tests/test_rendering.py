@@ -159,6 +159,17 @@ def test_prefill_ids_leave_text_alone_for_a_model_without_a_bos():
     assert prefill_ids(FakeEngine(bos=None), "<bos>hi") == [ord(c) for c in "<bos>hi"]
 
 
+def test_a_first_turn_starts_with_the_bos_the_session_prepends():
+    runtime_ids = _exec(_RUNTIME_SCRIPT, "runtime_script")["runtime_ids"]
+
+    # gemma-3-270m: the rendering carries no <bos>; the session adds it.
+    assert runtime_ids(FakeEngine(bos=2), "hi") == [2, ord("h"), ord("i")]
+    # A rendering that brings its own gets two, as the runtime would give it.
+    assert runtime_ids(FakeEngine(bos=2), "<bos>hi") == [2, 2, ord("h"), ord("i")]
+    # Qwen3: no BOS at all, nothing added.
+    assert runtime_ids(FakeEngine(bos=None), "hi") == [ord("h"), ord("i")]
+
+
 def _fake_litert_lm(engine: FakeEngine) -> Any:
     module: Any = types.ModuleType("litert_lm")
 
@@ -175,7 +186,7 @@ def _fake_litert_lm(engine: FakeEngine) -> Any:
 
         def render_message_to_string(self, prompt: str) -> str:
             engine.rendered.append(prompt)
-            return f"<bos>[{prompt}]"
+            return f"[{prompt}]"
 
         def send_message(self, prompt: str) -> dict:
             engine.sent.append(prompt)
@@ -230,7 +241,7 @@ def test_the_runtime_script_renders_every_prompt_and_sends_only_the_sample(tmp_p
     assert engine.rendered == prompts
     assert engine.sent == ["a", "bb"]
     assert [row["prefill_tokens"] for row in written] == [3, 4, None]
-    assert written[1]["rendered"] == "<bos>[bb]"
+    assert written[1]["rendered"] == "[bb]"
     assert written[1]["ids"] == [2, ord("["), ord("b"), ord("b"), ord("]")]
 
 
