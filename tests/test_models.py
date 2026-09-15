@@ -476,7 +476,9 @@ def test_tune_refuses_a_model_the_training_environment_cannot_tokenize(
             model=GEMMA4_E2B,
             data=data,
             output_dir=tmp_path / "run",
-            prompt_mode=PromptMode.PRERENDERED,
+            # Bare text, which is what this mode trains; `tune` refuses
+            # `prerendered` on it before anything else is checked.
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
         )
     )
     assert result.outcome is Outcome.FAILED

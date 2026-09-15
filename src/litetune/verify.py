@@ -47,6 +47,7 @@ from litetune.evaluate import (
     LiteRtLmBackend,
     MeasurementPoint,
     PromptMode,
+    PromptModeConflict,
     PromptModeDecision,
     Split,
     device_mismatch,
@@ -67,6 +68,7 @@ from litetune.liveness import (
     unterminated_count,
 )
 from litetune.metrics import (
+    REASONING_BLOCKS,
     SCORERS,
     TERMINATORS,
     Difference,
@@ -74,9 +76,13 @@ from litetune.metrics import (
     QualityMetrics,
     Unavailable,
     agreement,
+    carries_reasoning,
     paired_difference,
+    reasoning_unclosed,
+    strip_reasoning,
     terminators_trimmed,
 )
+from litetune.rendering import RENDERING_CHECK, RenderingObserver, RenderingProbe
 
 logger = logging.getLogger(__name__)
 
@@ -171,10 +177,13 @@ class VerifyRequest:
             )
 
     max_conversion_cost: float | None = None
-    # How the prompt reaching the model is built. Declared by the caller wins;
-    # otherwise `contract` -- the bundle the artifact shipped with, which is
-    # where `tune`'s decision is written down -- and otherwise it is inferred
-    # from the split and reported as inferred. `run_verify` fills this in before
+    # How the prompt reaching the model is built. A reference checkpoint `tune`
+    # produced records the mode it trained under in `litetune.json`, and that
+    # record wins: a declared mode or a contract that disagrees with it is
+    # refused. Without a record, declared by the caller wins; otherwise
+    # `contract` -- the bundle the artifact shipped with, which is where
+    # `tune`'s decision is written down -- and otherwise it is inferred from the
+    # split and reported as inferred. `run_verify` fills this in before
     # `build_backends` is called, so a backend never has to fall back to a
     # default nobody chose.
     prompt_mode: PromptMode | None = None
@@ -185,6 +194,10 @@ class VerifyRequest:
 class BackendPair:
     candidate: GenerationBackend
     reference: GenerationBackend
+    # What proves the two sides render a `runtime_rendered` prompt identically.
+    # `build_backends` always supplies one; a caller passing their own backends
+    # may not, and the manifest then says the check was not run.
+    rendering: RenderingObserver | None = None
 
 
 def build_backends(request: VerifyRequest) -> BackendPair:
@@ -202,6 +215,7 @@ def build_backends(request: VerifyRequest) -> BackendPair:
         reference=HuggingFaceBackend(
             model=request.reference, decode=request.decode, declared_prompt_mode=request.prompt_mode
         ),
+        rendering=RenderingProbe(model=request.model, reference=request.reference),
     )
 
 
@@ -235,10 +249,42 @@ def contract_prompt_mode(path: Path) -> PromptMode:
     return Contract.read(payload).prompt_mode
 
 
+def recorded_prompt_mode(reference: str) -> PromptMode | None:
+    """The mode `tune` recorded beside a local reference checkpoint, if it recorded one.
+
+    `None` for a Hugging Face id, a directory with no `litetune.json`, or a
+    `litetune.json` that records no mode. A sidecar that exists and cannot be
+    read raises: falling back to the contract or the prompts would silently
+    replace a mode the checkpoint wrote down.
+    """
+    path = Path(reference)
+    sidecar = path / models.PROVENANCE_NAME
+    if not (path.is_dir() and sidecar.is_file()):
+        return None
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{sidecar} does not contain a JSON object")
+    raw = data.get("prompt_mode")
+    if raw is None:
+        return None
+    try:
+        return PromptMode(raw)
+    except ValueError:
+        raise ValueError(
+            f"{sidecar} records prompt_mode {raw!r}, which is not a known mode; expected one of "
+            f"{[mode.value for mode in PromptMode]}"
+        ) from None
+
+
 def _resolve_mode(request: VerifyRequest, split: Split) -> PromptModeDecision:
-    """Declared, then the contract, then the prompts. Never a silent default."""
+    """The training record, then declared, then the contract, then the prompts."""
     contract_mode = contract_prompt_mode(request.contract) if request.contract is not None else None
-    return resolve_prompt_mode(split.prompts, declared=request.prompt_mode, contract=contract_mode)
+    return resolve_prompt_mode(
+        split.prompts,
+        declared=request.prompt_mode,
+        contract=contract_mode,
+        recorded=recorded_prompt_mode(request.reference),
+    )
 
 
 def _model_rules(request: VerifyRequest) -> tuple[str, models.ModelRules | None]:
@@ -341,6 +387,10 @@ class _Run:
                 "decode_requested": self.request.decode.as_dict(),
                 "liveness_thresholds": self.request.thresholds.as_dict(),
                 "terminators": list(TERMINATORS),
+                # Reasoning through the last closing marker is removed from both
+                # sides before scoring. Recorded for the same reason: two runs
+                # that removed different markers scored different text.
+                "reasoning_blocks": [list(pair) for pair in REASONING_BLOCKS],
             },
             "checks": [],
             "measurements": {},
@@ -426,11 +476,16 @@ def run_verify(
     # Resolved before the backends are built, so both sides are configured from
     # one decision and neither falls back to a default nobody made.
     with guard(CONTRACT_CHECK) as sink:
-        decision = _resolve_mode(request, split)
+        try:
+            decision = _resolve_mode(request, split)
+        except PromptModeConflict as exc:
+            # Two sources name different modes and one of them is what the
+            # weights learned. No measurement either way can be attributed.
+            sink.append(Check.unchecked(CONTRACT_CHECK, str(exc)))
     if sink:
-        # A contract was named and could not be read. Falling back to inference
-        # here would be a silent substitution for a mode the caller had told us
-        # where to find.
+        # A contract or a training record could not be read, or disagreed with
+        # the record. Falling back to inference here would be a silent
+        # substitution for a mode the caller had told us where to find.
         run.record(sink[0])
         return run.finish(Status.FAILED_HARNESS)
 
@@ -452,6 +507,35 @@ def run_verify(
 
     pair = backends or build_backends(request)
 
+    # -- do both sides put the same prompt tokens in front of the model? ---
+    # Before any generation: a candidate and a reference that were shown
+    # different prompts produce a difference no score can attribute, and the
+    # generations are the expensive part of this run.
+    if decision.mode is PromptMode.RUNTIME_RENDERED:
+        if pair.rendering is None:
+            reason = (
+                "the backends were supplied by the caller without a rendering observer, so "
+                "nothing established that the runtime and the reference render these prompts into "
+                "the same token ids"
+            )
+            run.manifest["harness"]["rendering_check"] = {"applied": False, "reason": reason}
+            run.limitation(reason)
+        else:
+            with guard(RENDERING_CHECK) as sink:
+                comparison = pair.rendering.observe(split.prompts, events=events)
+                run.manifest["harness"]["rendering_check"] = comparison.as_dict()
+                sink.append(comparison.check())
+            if run.record(sink[0]).outcome is not Outcome.PASSED:
+                # Could not look, or looked and found the sides differ. Neither is
+                # a verdict about the model, and neither leaves anything to score.
+                return run.finish(Status.FAILED_HARNESS)
+    else:
+        run.manifest["harness"]["rendering_check"] = {
+            "applied": False,
+            "reason": "prerendered: neither side applies a chat template, so there is no "
+            "rendering to compare",
+        }
+
     # -- the candidate -----------------------------------------------------
     # An empty sink means the evaluator returned; anything in it is the reason
     # it did not, and that is `could not check`, not a verdict.
@@ -472,6 +556,7 @@ def run_verify(
     # closes its turn".
     candidate_trimmed = _trimmed_record(candidate)
     run.manifest["measurements"]["candidate"]["terminators_trimmed"] = candidate_trimmed
+    run.manifest["measurements"]["candidate"]["reasoning_removed"] = _reasoning_record(candidate)
     if candidate_trimmed["generations_trimmed"]:
         run.limitation(
             f"{candidate_trimmed['generations_trimmed']} of "
@@ -622,6 +707,7 @@ def run_verify(
     # markers on a healthy run, so this count has no single fixed value to
     # compare against either way.
     run.manifest["measurements"]["reference"]["terminators_trimmed"] = _trimmed_record(reference)
+    run.manifest["measurements"]["reference"]["reasoning_removed"] = _reasoning_record(reference)
 
     # The reference is one side of the comparison; if it did not generate, the
     # comparison is unavailable rather than the candidate being at fault.
@@ -786,9 +872,18 @@ def run_verify(
         indices = [e.index for e in labelled]
         targets = [e.target for e in labelled if e.target is not None]
         scorer = SCORERS[request.scorer]
-        candidate_metrics = scorer(targets, [candidate.generations[i].text for i in indices])
-        reference_metrics = scorer(targets, [reference.generations[i].text for i in indices])
-        agreed = agreement(candidate.texts, reference.texts)
+        # The same removal on both sides, whatever shape each side's reasoning
+        # takes, so an answer is compared with an answer and not with markup.
+        candidate_metrics = scorer(
+            targets, [strip_reasoning(candidate.generations[i].text) for i in indices]
+        )
+        reference_metrics = scorer(
+            targets, [strip_reasoning(reference.generations[i].text) for i in indices]
+        )
+        agreed = agreement(
+            [strip_reasoning(text) for text in candidate.texts],
+            [strip_reasoning(text) for text in reference.texts],
+        )
         sink.append(
             Check.passed(
                 "quality measured",
@@ -854,6 +949,25 @@ def _trimmed_record(point: MeasurementPoint) -> dict[str, int]:
     return {
         "generations_trimmed": sum(1 for count in counts if count),
         "most_trimmed_from_one_generation": max(counts, default=0),
+        "over_generations_that_ran": len(ran),
+    }
+
+
+def _reasoning_record(point: MeasurementPoint) -> dict[str, int]:
+    """How many of this point's generations carried reasoning, and how many never closed it.
+
+    Over the generations that ran, the population `_trimmed_record` counts, so
+    the two records beside each other describe the same generations. Reported
+    and never gated: removing the block is what lets the answer be scored, and
+    how often a model reasons is a property worth reading, not a failure.
+    """
+    ran = [g for g in point.generations if g.ok]
+    return {
+        "generations_with_reasoning": sum(1 for g in ran if carries_reasoning(g.text)),
+        # Scored unchanged, and wrong unless the answer happens to be in the
+        # reasoning: a count near the total means the token limit, not the
+        # model's answer, decided these rows.
+        "generations_with_unclosed_reasoning": sum(1 for g in ran if reasoning_unclosed(g.text)),
         "over_generations_that_ran": len(ran),
     }
 

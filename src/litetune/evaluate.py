@@ -82,10 +82,11 @@ class PromptMode(str, Enum):
 #     hand-rendered wire format with control tokens -> --no-template
 #     apply_chat_template / native runtime tools     -> no flag
 #
-# `tune` records that decision, `bundle.Contract.prompt_mode` carries it, and
-# `verify` reads it back. Only when there is no contract -- a foreign artifact,
-# which is this tool's primary entry point -- is it inferred, and then the
-# inference and its evidence are reported so a user can contradict them.
+# `tune` records that decision beside the checkpoint, `bundle.Contract.prompt_mode`
+# carries it, and `verify` reads it back from either. Only when there is neither
+# -- a foreign artifact, which is this tool's primary entry point -- is it
+# inferred, and then the inference and its evidence are reported so a user can
+# contradict them.
 
 # What a backend falls back to when nobody declared a mode. It is what this tool
 # has always done and not a considered answer, so every backend records whether
@@ -109,20 +110,26 @@ TURN_MARKERS = (
     "<start_of_image>",
 )
 
-# Above this share of prompts carrying a marker the split is pre-rendered;
-# below one minus it, it is bare. In between the split is inconsistent, which is
-# reported rather than smoothed over.
+# At or above this share of prompts carrying a marker the split is pre-rendered;
+# at or below `_MARKER_BARE_SHARE` it is bare. In between the split is
+# inconsistent, which is reported rather than smoothed over. Two constants rather
+# than `1.0 - _MARKER_CONFIDENT_SHARE`, which is 0.09999999999999998: a split with
+# exactly one rendered prompt in ten fell into the inconsistent band.
 _MARKER_CONFIDENT_SHARE = 0.9
+_MARKER_BARE_SHARE = 0.1
 
 
 @dataclass(frozen=True)
 class PromptModeDecision:
     """Which mode a measurement runs in, where that came from, and on what evidence.
 
-    `source` is `declared` (the caller said so), `contract` (the bundle that
-    shipped the model said so) or `inferred` (neither existed and the prompts
-    were inspected). Only the last one is a guess, and it says so in every
-    report it reaches.
+    `source` is `checkpoint` (`tune` recorded it beside the reference),
+    `declared` (the caller said so), `contract` (the bundle that shipped the
+    model said so) or `inferred` (none of those existed and the prompts were
+    inspected). Only the last one is a guess, and it says so in every
+    report it reaches. `tune` adds `overridden`: a declared mode its training
+    prompts contradict, kept on purpose. `markers` names the control tokens the
+    prompts carried.
     """
 
     mode: PromptMode
@@ -130,6 +137,7 @@ class PromptModeDecision:
     evidence: str
     marker_share: float | None = None
     ambiguous: bool = False
+    markers: tuple[str, ...] = ()
 
     @property
     def inferred(self) -> bool:
@@ -142,6 +150,7 @@ class PromptModeDecision:
             "evidence": self.evidence,
             "marker_share": self.marker_share,
             "ambiguous": self.ambiguous,
+            "markers": list(self.markers),
         }
 
 
@@ -159,18 +168,72 @@ def marker_share(prompts: Sequence[str]) -> tuple[float, tuple[str, ...]]:
     return hits / len(prompts), tuple(seen)
 
 
+@dataclass(frozen=True)
+class PromptEvidence:
+    """What a set of prompts says about how they were built, before anyone decides.
+
+    `mode` is `None` when the prompts disagree with each other. `verify` then
+    measures them verbatim and says so; `tune` refuses to train on them unless a
+    mode is declared.
+    """
+
+    share: float
+    markers: tuple[str, ...]
+    count: int
+
+    @property
+    def mode(self) -> PromptMode | None:
+        if self.share >= _MARKER_CONFIDENT_SHARE:
+            return PromptMode.PRERENDERED
+        if self.share <= _MARKER_BARE_SHARE:
+            return PromptMode.RUNTIME_RENDERED
+        return None
+
+
+def prompt_evidence(prompts: Sequence[str]) -> PromptEvidence:
+    """The one classification `verify` and `tune` both use, so they cannot drift apart."""
+    share, seen = marker_share(prompts)
+    return PromptEvidence(share=share, markers=seen, count=len(prompts))
+
+
+class PromptModeConflict(ValueError):
+    """A declared mode or a contract disagrees with the mode the checkpoint trained under."""
+
+
 def resolve_prompt_mode(
     prompts: Sequence[str],
     declared: PromptMode | None = None,
     contract: PromptMode | None = None,
+    recorded: PromptMode | None = None,
 ) -> PromptModeDecision:
-    """Decide the mode this measurement runs in. An explicit choice always wins.
+    """Decide the mode this measurement runs in. The training record always wins.
 
-    Precedence is declared, then the contract the artifact shipped with, then
-    the prompts themselves. The last is a heuristic and is labelled as one: a
-    prompt that already contains `<start_of_turn>` was rendered by whoever wrote
-    the split, and templating it again double-wraps it.
+    `recorded` is the mode `tune` wrote beside the reference checkpoint. It is
+    what the weights learned, so a declared mode or a contract that disagrees
+    with it raises `PromptModeConflict` rather than measure the checkpoint on a
+    prompt it never saw. Without a record, precedence is declared, then the
+    contract the artifact shipped with, then the prompts themselves. The last is
+    a heuristic and is labelled as one: a prompt that already contains
+    `<start_of_turn>` was rendered by whoever wrote the split, and templating it
+    again double-wraps it.
     """
+    if recorded is not None:
+        for name, other in (("the declared mode", declared), ("the bundle contract", contract)):
+            if other is not None and other is not recorded:
+                raise PromptModeConflict(
+                    f"{name} is {other.value}, but the reference checkpoint records that it was "
+                    f"trained {recorded.value}. Measuring it {other.value} scores it on a prompt "
+                    "it never learned; leave out the value that disagrees, or check that "
+                    "--reference and --contract belong to the same run"
+                )
+        return PromptModeDecision(
+            mode=recorded,
+            source="checkpoint",
+            evidence=(
+                "read from the litetune.json `tune` wrote beside the reference checkpoint, which "
+                "records the mode it trained under"
+            ),
+        )
     if declared is not None:
         return PromptModeDecision(
             mode=declared,
@@ -187,9 +250,10 @@ def resolve_prompt_mode(
             ),
         )
 
-    share, seen = marker_share(prompts)
+    evidence = prompt_evidence(prompts)
+    share, seen = evidence.share, evidence.markers
     found = ", ".join(seen) if seen else "none"
-    if share >= _MARKER_CONFIDENT_SHARE:
+    if evidence.mode is PromptMode.PRERENDERED:
         return PromptModeDecision(
             mode=PromptMode.PRERENDERED,
             source="inferred",
@@ -199,8 +263,9 @@ def resolve_prompt_mode(
                 "them would double-wrap them"
             ),
             marker_share=share,
+            markers=seen,
         )
-    if share <= 1.0 - _MARKER_CONFIDENT_SHARE:
+    if evidence.mode is PromptMode.RUNTIME_RENDERED:
         return PromptModeDecision(
             mode=PromptMode.RUNTIME_RENDERED,
             source="inferred",
@@ -209,6 +274,7 @@ def resolve_prompt_mode(
                 "text and the runtime has to render its own template around them"
             ),
             marker_share=share,
+            markers=seen,
         )
     # Neither shape. Something has to run, so the prompts are used as they are --
     # the option that transforms nothing and leaves the evidence in the record --
@@ -223,6 +289,7 @@ def resolve_prompt_mode(
         ),
         marker_share=share,
         ambiguous=True,
+        markers=seen,
     )
 
 
@@ -634,14 +701,42 @@ class LiteRtLmBackend:
         )
 
 
+# The one place the reference turns a prompt into what it tokenizes. Pasted into
+# the generation script below and into `rendering`'s reference-ids script,
+# because the rendering check compares the ids this produces with the runtime's:
+# two hand-written copies agree only until one of them is edited. The same shape
+# as `tune.render_prompt`, which training has always used.
+REFERENCE_PROMPT_SOURCE = r'''
+def reference_prompt(tok, prompt, runtime_rendered):
+    """The text the reference tokenizes, and whether the tokenizer may add special tokens.
+
+    In runtime_rendered the chat template has already emitted every special token
+    the turn needs, BOS included, so the tokenizer must not add them again:
+    transformers' chat-templating guide says to pass add_special_tokens=False
+    after apply_chat_template(tokenize=False). Without it google/gemma-3-270m-it
+    gave 15 ids with two leading <bos> where the template renders 14.
+    """
+    if not runtime_rendered:
+        return prompt, True
+    text = tok.apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
+    )
+    return text, False
+'''
+
+
 # Runs inside envs.TRAIN, which is the only environment with torch and
 # transformers in it. Written to a temp file rather than passed with `-c` so
 # that a traceback carries usable line numbers.
-_HF_GENERATE_SCRIPT = r'''
+_HF_GENERATE_SCRIPT = (
+    r'''
 """Greedy generation for one split. Writes JSONL: {"index": int, "text": str}."""
 import json
 import sys
 from pathlib import Path
+'''
+    + REFERENCE_PROMPT_SOURCE
+    + r'''
 
 
 def generation_device(torch, given=None):
@@ -696,14 +791,8 @@ def main() -> int:
 
     with Path(spec["out"]).open("w", encoding="utf-8") as sink:
         for i, prompt in enumerate(spec["prompts"]):
-            text = prompt
-            if spec["runtime_rendered"]:
-                text = tok.apply_chat_template(
-                    [{"role": "user", "content": prompt}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            enc = tok(text, return_tensors="pt").to(device)
+            text, add_special = reference_prompt(tok, prompt, spec["runtime_rendered"])
+            enc = tok(text, return_tensors="pt", add_special_tokens=add_special).to(device)
             with torch.no_grad():
                 ids = model.generate(
                     **enc,
@@ -724,6 +813,7 @@ def main() -> int:
 if __name__ == "__main__":
     sys.exit(main())
 '''
+)
 
 
 @dataclass

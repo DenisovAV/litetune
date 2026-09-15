@@ -1180,12 +1180,12 @@ def test_a_reference_that_sometimes_runs_to_the_token_bound_is_still_scored(writ
         for check in result.manifest["checks"]
         if check["name"] == "reference terminator recognised"
     ]
-    # 4 limitations: the inferred prompt mode, the candidate backend's
-    # supplied-vs-resolved mode mismatch, the CPU-vs-GPU note, and the
-    # unresolved-difference note from the paired comparison. Any fifth --
-    # regardless of wording -- would be a sub-threshold terminator note that
-    # must not exist.
-    assert len(result.manifest["limitations"]) == 4, result.manifest["limitations"]
+    # 5 limitations: the inferred prompt mode, the rendering check the supplied
+    # backends could not run, the candidate backend's supplied-vs-resolved mode
+    # mismatch, the CPU-vs-GPU note, and the unresolved-difference note from the
+    # paired comparison. Any sixth -- regardless of wording -- would be a
+    # sub-threshold terminator note that must not exist.
+    assert len(result.manifest["limitations"]) == 5, result.manifest["limitations"]
 
 
 def test_a_reference_just_over_the_unterminated_share_threshold_is_refused(write_split):
@@ -1644,3 +1644,126 @@ def test_attribute_resolves_a_float_twin_reference_one_cent_above_near_zero():
     assert isinstance(cost, Difference)
     assert cost.value == pytest.approx(-0.54)
     assert cost.resolved
+
+
+# -- reasoning ----------------------------------------------------------------
+
+
+def test_reasoning_is_removed_from_both_sides_before_scoring_and_counted(write_split):
+    rows = text_rows(40)
+    result = verify(
+        write_split,
+        rows,
+        candidate=FakeBackend(
+            texts=[f"[thought]\nthinking\n[/thought]\n{r['target']}" for r in rows[:30]]
+            + [r["target"] for r in rows[30:]]
+        ),
+        reference=FakeBackend(
+            model="org/reference",
+            texts=[f"<think>\nthinking\n</think>\n\n{r['target']}" for r in rows],
+        ),
+        scorer="exact-text",
+    )
+
+    quality = result.manifest["quality"]
+    assert quality["candidate"]["exact_match"]["value"] == 1.0
+    assert quality["reference"]["exact_match"]["value"] == 1.0
+    measurements = result.manifest["measurements"]
+    assert measurements["candidate"]["reasoning_removed"] == {
+        "generations_with_reasoning": 30,
+        "generations_with_unclosed_reasoning": 0,
+        "over_generations_that_ran": 40,
+    }
+    assert measurements["reference"]["reasoning_removed"] == {
+        "generations_with_reasoning": 40,
+        "generations_with_unclosed_reasoning": 0,
+        "over_generations_that_ran": 40,
+    }
+    assert result.manifest["harness"]["reasoning_blocks"] == [
+        ["[thought]", "[/thought]"],
+        ["<think>", "</think>"],
+    ]
+
+
+def test_reasoning_on_every_row_changes_no_verdict(write_split):
+    rows = text_rows(40)
+
+    def run(candidate_prefix, reference_prefix):
+        return verify(
+            write_split,
+            rows,
+            candidate=FakeBackend(
+                texts=[candidate_prefix + r["target"] for r in rows[:-4]]
+                + [candidate_prefix + "label_none"] * 4
+            ),
+            reference=FakeBackend(
+                model="org/reference", texts=[reference_prefix + r["target"] for r in rows]
+            ),
+            scorer="exact-text",
+            max_conversion_cost=0.05,
+        )
+
+    plain = run("", "")
+    reasoning = run("[thought]\nx\n[/thought]\n", "<think>\nx\n</think>\n\n")
+
+    assert reasoning.status is plain.status
+    assert (
+        reasoning.manifest["attribution"]["conversion_cost"]
+        == plain.manifest["attribution"]["conversion_cost"]
+    )
+    assert (
+        reasoning.manifest["measurements"]["candidate"]["reasoning_removed"][
+            "generations_with_reasoning"
+        ]
+        == 40
+    )
+
+
+def test_a_generation_that_failed_is_not_counted_as_reasoning(write_split):
+    """The same population as `terminators_trimmed`: generations that ran and exited cleanly."""
+    rows = text_rows(40)
+
+    class LastCandidateGenerationFailed(FakeBackend):
+        def generate(self, prompts, events=None):
+            generations = super().generate(prompts, events=events)
+            last = generations[-1]
+            return [
+                *generations[:-1],
+                Generation(
+                    index=last.index,
+                    prompt=last.prompt,
+                    text=f"[thought]\nx\n[/thought]\n{rows[-1]['target']}",
+                    returncode=1,
+                ),
+            ]
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=LastCandidateGenerationFailed(texts=[r["target"] for r in rows]),
+        reference=FakeBackend(model="org/reference", texts=[r["target"] for r in rows]),
+        scorer="exact-text",
+    )
+
+    assert result.manifest["measurements"]["candidate"]["reasoning_removed"] == {
+        "generations_with_reasoning": 0,
+        "generations_with_unclosed_reasoning": 0,
+        "over_generations_that_ran": 39,
+    }
+
+
+def test_reasoning_that_never_closed_is_scored_unchanged_and_counted(write_split):
+    rows = text_rows(40)
+    cut_off = [f"<think>\nstill going {r['target']}" for r in rows[:10]]
+    result = verify(
+        write_split,
+        rows,
+        candidate=FakeBackend(texts=cut_off + [r["target"] for r in rows[10:]]),
+        reference=FakeBackend(model="org/reference", texts=[r["target"] for r in rows]),
+        scorer="exact-text",
+    )
+
+    removed = result.manifest["measurements"]["candidate"]["reasoning_removed"]
+    assert removed["generations_with_reasoning"] == 0
+    assert removed["generations_with_unclosed_reasoning"] == 10
+    assert result.manifest["quality"]["candidate"]["exact_match"]["value"] == 0.75

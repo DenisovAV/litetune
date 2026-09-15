@@ -569,6 +569,61 @@ TERMINATORS = (
 )
 
 
+# The markers reasoning is enclosed in, in the two shapes observed on 2026-09-14:
+# `litert-lm run` prints the conversation's thought channel between `[thought]`
+# and `[/thought]` ahead of the answer, and the transformers reference, decoded
+# with special tokens kept, leaves Qwen3's `<think>`...`</think>` inline.
+# `verify` removes reasoning from both sides before scoring, so answers are
+# compared with answers, and reports how many generations carried it.
+REASONING_BLOCKS = (
+    ("[thought]", "[/thought]"),
+    ("<think>", "</think>"),
+)
+
+
+def _split_reasoning(text: str) -> tuple[str, str]:
+    """The answer, and whether the generation's reasoning was `closed`, `unclosed` or `none`.
+
+    Everything through the *last* closing marker is reasoning, whether or not the
+    opening marker is in the generation. That is how Qwen3's model card parses
+    its output (`rindex` of `</think>`) and what lm-evaluation-harness applies
+    (`split(think_end_token)[-1]`), and it is the only rule that works when the
+    chat template put the opening marker in the prompt: Qwen3-4B-Thinking-2507's
+    card says its output normally contains only `</think>`. With no closing
+    marker the text comes back unchanged, whitespace included, so a model that
+    does not reason scores exactly as it did before this existed. A generation
+    that opened reasoning and never closed it -- greedy decoding in thinking mode
+    is what Qwen3's card warns ends in repetition -- is scored unchanged too, and
+    reported as `unclosed`.
+    """
+    end, width = -1, 0
+    for _, closing in REASONING_BLOCKS:
+        at = text.rfind(closing)
+        if at > end:
+            end, width = at, len(closing)
+    if end >= 0:
+        return text[end + width :].lstrip(), "closed"
+    body = text.lstrip()
+    if any(body.startswith(opening) for opening, _ in REASONING_BLOCKS):
+        return text, "unclosed"
+    return text, "none"
+
+
+def strip_reasoning(text: str) -> str:
+    """The generation without its reasoning."""
+    return _split_reasoning(text)[0]
+
+
+def carries_reasoning(text: str) -> bool:
+    """Whether `strip_reasoning` removes anything from this generation."""
+    return _split_reasoning(text)[1] == "closed"
+
+
+def reasoning_unclosed(text: str) -> bool:
+    """Whether this generation opened reasoning and ended before closing it."""
+    return _split_reasoning(text)[1] == "unclosed"
+
+
 def _strip_terminators(text: str) -> tuple[str, tuple[str, ...]]:
     """The text with its trailing markers gone, and which markers came off.
 

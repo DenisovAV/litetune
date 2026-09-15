@@ -743,6 +743,7 @@ def _run_hf_generate_script(
     cuda: bool = False,
     given=None,
     stop_generation: bool = False,
+    runtime_rendered: bool = False,
 ) -> dict:
     """Runs `_HF_GENERATE_SCRIPT`'s real `main()` against faked `torch` and
     `transformers`, and returns what the fakes captured.
@@ -823,9 +824,26 @@ def _run_hf_generate_script(
     class FakeTokenizer:
         pad_token_id = 0
         eos_token_id = 1
+        bos_token_id = 2
 
-        def __call__(self, text: str, return_tensors: str = "pt") -> "FakeEncoding":
-            return FakeEncoding({"input_ids": FakeInputIds([[10, 11, 12]])})
+        def __call__(
+            self, text: str, return_tensors: str = "pt", add_special_tokens: bool = True
+        ) -> "FakeEncoding":
+            # One id per word, `<bos>` read as the BOS id, and the tokenizer's
+            # own BOS in front unless told not to -- Gemma 3's tokenizer does both.
+            ids = [
+                self.bos_token_id if word == "<bos>" else 10 + n
+                for n, word in enumerate(text.split())
+            ]
+            if add_special_tokens:
+                ids = [self.bos_token_id, *ids]
+            captured.setdefault("tokenized", []).append(ids)
+            return FakeEncoding({"input_ids": FakeInputIds([ids])})
+
+        def apply_chat_template(
+            self, messages: list, tokenize: bool = False, add_generation_prompt: bool = False
+        ) -> str:
+            return "<bos> user " + messages[0]["content"] + " model"
 
         def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
             return "generated"
@@ -863,7 +881,7 @@ def _run_hf_generate_script(
                 "model": "org/m",
                 "prompts": ["hi"],
                 "max_tokens": 8,
-                "runtime_rendered": False,
+                "runtime_rendered": runtime_rendered,
                 "attn_implementation": "eager",
                 "dtype": dtype,
                 "device": given,
@@ -1016,3 +1034,19 @@ def test_the_unprovisioned_state_is_a_field_not_a_phrase(monkeypatch, tmp_path):
 
     assert backend.last_probe is not None
     assert backend.last_probe.attempted is False, "no probe was run, and that is a fact not a word"
+
+
+def test_a_rendered_prompt_reaches_the_reference_with_one_bos(tmp_path, monkeypatch):
+    """The template already emits `<bos>`; the tokenizer must not add a second.
+
+    transformers' chat-templating guide: pass `add_special_tokens=False` when
+    tokenizing text `apply_chat_template(tokenize=False)` rendered. The cached
+    `google/gemma-3-270m-it` tokenizer gave two leading BOS without it.
+    """
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, runtime_rendered=True)
+    assert captured["tokenized"] == [[2, 11, 12, 13]]
+
+
+def test_a_prerendered_prompt_still_gets_the_tokenizers_bos(tmp_path, monkeypatch):
+    captured = _run_hf_generate_script(tmp_path, monkeypatch)
+    assert captured["tokenized"] == [[2, 10]]

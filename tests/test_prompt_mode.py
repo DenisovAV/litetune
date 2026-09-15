@@ -15,6 +15,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
 from conftest import FakeBackend, correct_texts, labelled_rows
 
 from litetune import envs
@@ -23,7 +24,9 @@ from litetune.evaluate import (
     HuggingFaceBackend,
     LiteRtLmBackend,
     PromptMode,
+    PromptModeConflict,
     marker_share,
+    prompt_evidence,
     resolve_prompt_mode,
 )
 from litetune.verify import BackendPair, Status, VerifyRequest, build_backends, run_verify
@@ -84,6 +87,31 @@ def test_marker_share_names_what_it_saw():
     share, seen = marker_share([RENDERED, BARE])
     assert share == 0.5
     assert seen == ("<start_of_turn>",)
+
+
+@pytest.mark.parametrize(
+    ("rendered", "bare", "mode"),
+    [
+        (0, 10, PromptMode.RUNTIME_RENDERED),
+        (1, 9, PromptMode.RUNTIME_RENDERED),
+        (5, 5, None),
+        (9, 1, PromptMode.PRERENDERED),
+        (10, 0, PromptMode.PRERENDERED),
+    ],
+)
+def test_both_bounds_belong_to_the_mode_they_name(rendered, bare, mode):
+    evidence = prompt_evidence([RENDERED] * rendered + [BARE] * bare)
+    assert evidence.mode is mode
+    assert evidence.count == 10
+
+
+def test_one_rendered_prompt_in_ten_is_bare_text_to_verify_too():
+    # `share <= 1.0 - 0.9` put this split in the mixed band: 1.0 - 0.9 is
+    # 0.09999999999999998, and 1/10 is not below it.
+    decision = resolve_prompt_mode([RENDERED] + [BARE] * 9)
+    assert decision.mode is PromptMode.RUNTIME_RENDERED
+    assert not decision.ambiguous
+    assert decision.markers == ("<start_of_turn>",)
 
 
 # ---------------------------------------------------------------------------
@@ -263,3 +291,136 @@ def test_a_supplied_backend_that_ignores_the_resolved_mode_is_recorded(tmp_path,
     assert result.manifest["harness"]["prompt_mode"] == "prerendered"
     assert result.manifest["harness"]["prompt_mode_decision"]["prompt_mode"] == "runtime_rendered"
     assert any("did not take the resolved mode" in text for text in result.manifest["limitations"])
+
+
+# ---------------------------------------------------------------------------
+# The record `tune` leaves beside the checkpoint
+# ---------------------------------------------------------------------------
+
+
+def test_the_training_record_wins_and_says_where_it_came_from():
+    decision = resolve_prompt_mode([BARE] * 10, recorded=PromptMode.PRERENDERED)
+    assert decision.mode is PromptMode.PRERENDERED
+    assert decision.source == "checkpoint"
+    assert "litetune.json" in decision.evidence
+
+
+def test_a_declared_mode_or_contract_that_agrees_with_the_record_is_the_record():
+    decision = resolve_prompt_mode(
+        [BARE] * 10,
+        declared=PromptMode.PRERENDERED,
+        contract=PromptMode.PRERENDERED,
+        recorded=PromptMode.PRERENDERED,
+    )
+    assert decision.source == "checkpoint"
+
+
+@pytest.mark.parametrize("which", ["declared", "contract"])
+def test_a_value_that_contradicts_the_record_raises_naming_both(which):
+    with pytest.raises(PromptModeConflict) as raised:
+        resolve_prompt_mode(
+            [BARE] * 10, recorded=PromptMode.PRERENDERED, **{which: PromptMode.RUNTIME_RENDERED}
+        )
+    assert "runtime_rendered" in str(raised.value)
+    assert "prerendered" in str(raised.value)
+
+
+def _checkpoint(tmp_path: Path, record: dict | str) -> str:
+    path = tmp_path / "tuned-model"
+    path.mkdir()
+    text = record if isinstance(record, str) else json.dumps(record)
+    (path / "litetune.json").write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def _verify(tmp_path, write_split, reference, **kwargs):
+    rows = labelled_rows(8)  # bare text: inference alone would say runtime_rendered
+    return run_verify(
+        VerifyRequest(
+            model=tmp_path / "m.litertlm", reference=reference, data=write_split(rows), **kwargs
+        ),
+        backends=_pair(rows),
+    )
+
+
+def test_verify_uses_the_mode_training_recorded_beside_the_reference(tmp_path, write_split):
+    reference = _checkpoint(
+        tmp_path,
+        {
+            "base_model": "org/base",
+            "prompt_mode": "prerendered",
+            "prompt_mode_decision": {"prompt_mode": "prerendered", "source": "overridden"},
+        },
+    )
+    result = _verify(tmp_path, write_split, reference)
+
+    decision = result.manifest["harness"]["prompt_mode_decision"]
+    assert decision["source"] == "checkpoint"
+    assert decision["prompt_mode"] == "prerendered"
+    assert not any("was not declared" in text for text in result.manifest["limitations"])
+
+
+def test_a_record_that_predates_the_decision_field_is_still_the_record(tmp_path, write_split):
+    # The keys `tune` wrote into litetune.json before it recorded how it decided.
+    reference = _checkpoint(
+        tmp_path,
+        {
+            "base_model": "org/base",
+            "base_model_revision": None,
+            "prompt_mode": "prerendered",
+            "turn_terminator": {"ids": [1], "source": "tokenizer_eos", "text": "<eos>"},
+            "sentencepiece": None,
+        },
+    )
+    result = _verify(tmp_path, write_split, reference)
+
+    assert result.manifest["harness"]["prompt_mode_decision"]["source"] == "checkpoint"
+
+
+def test_verify_refuses_a_declared_mode_the_training_record_contradicts(tmp_path, write_split):
+    reference = _checkpoint(tmp_path, {"base_model": "org/base", "prompt_mode": "prerendered"})
+    result = _verify(tmp_path, write_split, reference, prompt_mode=PromptMode.RUNTIME_RENDERED)
+
+    assert result.status is Status.FAILED_HARNESS
+    last = result.manifest["checks"][-1]
+    assert last["outcome"] == "could_not_check"
+    assert "the declared mode is runtime_rendered" in last["detail"]
+    assert "trained prerendered" in last["detail"]
+    assert "candidate" not in result.manifest["measurements"]
+
+
+def test_verify_refuses_a_contract_the_training_record_contradicts(tmp_path, write_split):
+    reference = _checkpoint(tmp_path, {"base_model": "org/base", "prompt_mode": "prerendered"})
+    result = _verify(
+        tmp_path,
+        write_split,
+        reference,
+        contract=_contract(tmp_path, PromptMode.RUNTIME_RENDERED),
+    )
+
+    assert result.status is Status.FAILED_HARNESS
+    assert "the bundle contract is runtime_rendered" in result.manifest["checks"][-1]["detail"]
+    assert "candidate" not in result.manifest["measurements"]
+
+
+def test_a_directory_without_a_record_keeps_the_contract_then_the_prompts(tmp_path, write_split):
+    plain = tmp_path / "foreign-model"
+    plain.mkdir()
+    inferred = _verify(tmp_path, write_split, str(plain))
+    assert inferred.manifest["harness"]["prompt_mode_decision"]["source"] == "inferred"
+
+
+def test_a_record_without_a_mode_keeps_the_contract(tmp_path, write_split):
+    reference = _checkpoint(tmp_path, {"base_model": "org/base"})
+    result = _verify(
+        tmp_path, write_split, reference, contract=_contract(tmp_path, PromptMode.PRERENDERED)
+    )
+    assert result.manifest["harness"]["prompt_mode_decision"]["source"] == "contract"
+
+
+@pytest.mark.parametrize("text", ['{"prompt_mode": ', "[1]", '{"prompt_mode": "templated"}'])
+def test_a_record_that_cannot_be_read_is_not_replaced_by_a_guess(tmp_path, write_split, text):
+    result = _verify(tmp_path, write_split, _checkpoint(tmp_path, text))
+
+    assert result.status is Status.FAILED_HARNESS
+    assert result.manifest["checks"][-1]["outcome"] == "could_not_check"

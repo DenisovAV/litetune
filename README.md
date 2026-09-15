@@ -122,7 +122,7 @@ it from the target.
 is a tool call:
 
 ```json
-{"prompt": "set an alarm for 7", "target": {"name": "set_alarm", "args": {"hour": "7"}}}
+{"prompt": "<start_of_turn>developer\nYou are a model that can do function calling with the following functions\n<start_function_declaration>declaration:set_alarm{description:<escape>Sets an alarm<escape>,parameters:{properties:{hour:{description:<escape>Hour of the alarm<escape>,type:<escape>STRING<escape>}},required:[<escape>hour<escape>],type:<escape>OBJECT<escape>}}<end_function_declaration>\n<end_of_turn>\n<start_of_turn>user\nset an alarm for 7\n<end_of_turn>\n<start_of_turn>model\n", "target": {"name": "set_alarm", "args": {"hour": "7"}}}
 ```
 
 A bare string is the answer itself:
@@ -134,6 +134,15 @@ A bare string is the answer itself:
 Two shapes rather than a target plus a `--target-kind`, because those two could
 disagree and a shape cannot disagree with itself. Match it with `--scorer` when
 you get to `verify`.
+
+**The prompt is exactly what your application will send the model.** The tool
+call above is FunctionGemma's: its application renders the tool declarations and
+every turn marker into the prompt itself — flutter_gemma does it in Dart — so the
+runtime must not template it again, and `tune` trains it `prerendered`. The
+sentiment row is bare text for a runtime that applies the model's own chat
+template, so it trains `runtime_rendered`. `tune` tells the two apart by the
+control tokens in the prompts, and refuses a file that mixes them unless you
+declare which one it is.
 
 `prepare` splits one raw file into `train.jsonl` and `heldout.jsonl` and rejects
 what it cannot score: malformed JSON, and rows with no `prompt`. Given
@@ -160,9 +169,11 @@ litetune prepare --data raw.jsonl --output-dir data --context-length 1024 \
                  --tokenizer google/functiongemma-270m-it
 
 # 2. Fine-tune. Runs on CUDA if the box has one, otherwise CPU; size your
-#    expectations accordingly either way.
+#    expectations accordingly either way. The prompt mode is read off the
+#    prompts (these carry FunctionGemma's control tokens, so prerendered) and
+#    recorded beside the checkpoint, where steps 4 and 5 take it from.
 litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
-              --output-dir tuned --prompt-mode prerendered --method lora
+              --output-dir tuned --method lora
 
 # 3. Convert, sweeping recipes rather than trusting a default.
 litetune convert --model tuned/model --output-dir artifacts \
@@ -177,7 +188,7 @@ litetune verify --model artifacts/weight_only_wi8_afp32/<name>.litertlm \
 # 5. Package the artifact with what was measured about it.
 litetune bundle --output-dir bundle \
                 --model artifacts/weight_only_wi8_afp32/<name>.litertlm \
-                --declarations tools.json --prompt-mode prerendered \
+                --declarations tools.json \
                 --base-model google/functiongemma-270m-it \
                 --base-model-revision <commit-sha> \
                 --adapter tuned/adapter \
@@ -222,7 +233,7 @@ measured two:
 
 | Flag | Why it matters |
 |---|---|
-| `--prompt-mode` | No default. `prerendered` means your app renders the tool declarations into the prompt and the runtime must not template again; `runtime_rendered` is the opposite. Must be the **same** value in `tune` and `bundle` — the wrong one produces a fluent wrong answer, not an error. |
+| `--prompt-mode` | Optional, never defaulted. `prerendered` means the prompt already carries its control tokens — your app renders the tool declarations into it — and the runtime must not template it again; `runtime_rendered` means the prompt is bare text and the runtime applies the model's chat template. Without the flag `tune` reads the mode off the training prompts (control tokens in at least 90% of them: `prerendered`; in at most 10%: `runtime_rendered`) and refuses a split in between. A declared mode the prompts contradict is refused unless you add `--force-prompt-mode`. `tune` records the mode beside the checkpoint; `verify` reads it through `--reference` and `bundle` through `--train-metrics`, and each refuses a different value — the wrong mode produces a fluent wrong answer, not an error. |
 | `--adapter` | For a LoRA run, pass `<tune output>/adapter`, from outside `--output-dir`. Without it the bundle carries only the merged weights. |
 | `--dtype` | Training precision for `tune`. Default `bfloat16`. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records exactly one run's dtype — the second-family banking77 run, trained in float32 for this reason — and says nothing about the headline table's, so the report records yours. |
 | `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused: they resolve to different weights on different days while the bundle reads identically. |
@@ -446,6 +457,19 @@ withdrawn after re-measurement.
   model's marker before then, `tune` records it at `turn_terminator.text` in
   `metrics.json` and `bundle` carries it into `contract.json`'s `stop_tokens`.
 
+- **In `runtime_rendered`, `verify` refuses to compare two sides that were shown
+  different prompts.** Before generating anything it renders every held-out
+  prompt through the runtime's own conversation path and through the
+  reference's chat template, and compares the token ids; on the first 8 it also
+  compares the prefill count the runtime reports when the prompt is actually
+  sent. Any difference is a harness failure (exit 4) with the prompt, both
+  counts and the first differing position at `harness.rendering_check`, not a
+  conversion cost. On the base `Qwen3-0.6B` export all 600 banking77 prompts
+  matched; an export whose template added an empty `<think></think>` was
+  refused on all 600. Reasoning is removed from both sides before scoring,
+  through the last `[/thought]` or `</think>`, and counted per side at
+  `measurements.<side>.reasoning_removed`, including generations that never
+  closed it.
 - **The candidate is pinned to CPU; the reference is not, and your users run
   on a phone.** On one Snapdragon
   Galaxy S24 (`SC-51E`), the `dynamic_wi8_afp32` bundle on the device's CPU

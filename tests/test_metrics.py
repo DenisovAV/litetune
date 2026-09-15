@@ -17,10 +17,13 @@ from litetune.metrics import (
     Unavailable,
     _reproduces_target,
     agreement,
+    carries_reasoning,
     difference,
     paired_difference,
     parse_call,
+    reasoning_unclosed,
     score,
+    strip_reasoning,
 )
 
 # -- the wire format --------------------------------------------------------
@@ -583,3 +586,54 @@ def test_the_vocabulary_cannot_contain_an_empty_or_nested_marker():
         assert not any(
             marker.endswith(other) for other in others
         ), f"{marker!r} is a suffix of another entry: order-dependent stripping"
+
+
+# ---------------------------------------------------------------------------
+# Reasoning, removed the same way on both sides
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "answer"),
+    [
+        # `litert-lm run` 0.16.1 on Qwen3-0.6B, spacing as it printed it: the
+        # thought channel ahead of the answer, a space inside each marker.
+        ("[thought] \nThe user wants a label.\n [/thought]\n\n\nlabel_3", "label_3"),
+        # The transformers reference, decoded with special tokens kept.
+        ("<think>\nThe user wants a label.\n</think>\n\nlabel_3", "label_3"),
+        # What Qwen3's chat template emits when thinking is disabled.
+        ("<think>\n\n</think>\n\nlabel_3", "label_3"),
+        # A template that opened the block in the prompt, as Qwen3-4B-Thinking-2507's does.
+        ("the user wants a label.\n</think>\n\nlabel_3", "label_3"),
+        # A closing marker at the very start: an empty reasoning block the template opened.
+        ("</think>\n\nlabel_3", "label_3"),
+        # Everything through the last close, which is where Qwen3's own parser cuts.
+        ("<think>a</think>\n<think>b</think>\nlabel_3", "label_3"),
+    ],
+)
+def test_a_leading_reasoning_block_comes_off(text, answer):
+    assert strip_reasoning(text) == answer
+    assert carries_reasoning(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "label_3",
+        "  label_3\n",
+        "<think>the generation ran out while still reasoning",
+        "[thought] \nthe runtime stopped at the token limit",
+    ],
+)
+def test_anything_else_is_scored_exactly_as_it_was(text):
+    assert strip_reasoning(text) == text
+    assert not carries_reasoning(text)
+
+
+def test_only_reasoning_that_opened_and_never_closed_counts_as_unclosed():
+    assert reasoning_unclosed("  <think>\nthe generation ran out")
+    assert reasoning_unclosed("[thought] \nthe runtime stopped")
+    assert not reasoning_unclosed("label_3")
+    # An opening marker after the answer did not open the generation's reasoning.
+    assert not reasoning_unclosed("label_3 <think>")
+    assert not reasoning_unclosed("<think>done</think>label_3")

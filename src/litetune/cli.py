@@ -26,7 +26,7 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, NoReturn
@@ -282,8 +282,9 @@ def _add_verify(sub) -> None:
             "how the prompt reaching the model is built. prerendered: the prompt already contains "
             "the declarations and every control token, and the runtime is told not to template it "
             "(--no-template). runtime_rendered: the runtime applies its own chat template. "
-            "Without this litetune reads --contract, and without that it infers the mode from the "
-            "prompts and says so"
+            "When --reference is a checkpoint tune trained, the mode tune recorded beside it "
+            "is used and a different value here is refused. Otherwise, without this litetune "
+            "reads --contract, and without that it infers the mode from the prompts and says so"
         ),
     )
     verify.add_argument(
@@ -291,7 +292,8 @@ def _add_verify(sub) -> None:
         type=Path,
         help=(
             "path to the bundle contract.json this model shipped with; its prompt_mode is the "
-            "mode the checkpoint was trained for"
+            "mode the checkpoint was trained for. Refused when it disagrees with the mode recorded "
+            "beside --reference"
         ),
     )
     verify.add_argument(
@@ -365,15 +367,25 @@ def _add_tune(sub) -> None:
     tune.add_argument("--revision", help="pin the base checkpoint's revision")
     tune.add_argument(
         "--prompt-mode",
-        required=True,
         choices=[mode.value for mode in PromptMode],
         help=(
             "how this run builds its prompts, which is the convention the checkpoint will expect "
             "for the rest of its life. prerendered: the prompt carries the declarations and every "
             "control token, and the serving runtime must not template it. runtime_rendered: the "
-            "prompt is bare text and the runtime applies its own chat template. Required, because "
-            "the two are mutually exclusive and calling a model in the wrong one produces a "
-            "fluent wrong answer rather than an error"
+            "prompt is bare text and the runtime applies its own chat template. Without it tune "
+            "reads the training prompts: control tokens in at least 90%% of them mean prerendered, "
+            "in at most 10%% runtime_rendered, and a split in between is refused. A declared mode "
+            "the prompts contradict is refused too, because calling a model in the wrong one "
+            "produces a fluent wrong answer rather than an error"
+        ),
+    )
+    tune.add_argument(
+        "--force-prompt-mode",
+        action="store_true",
+        help=(
+            "train in --prompt-mode even though the training prompts contradict it. The check "
+            "reads control tokens and cannot see how your application calls the model; the "
+            "report records that it was overridden"
         ),
     )
     tune.add_argument(
@@ -512,11 +524,12 @@ def _add_bundle(sub) -> None:
     bundle.add_argument("--declarations", required=True, type=Path, help="tool declarations JSON")
     bundle.add_argument(
         "--prompt-mode",
-        required=True,
         choices=[mode.value for mode in PromptMode],
         help=(
-            "how this model must be called. Required and never defaulted: a runtime cannot infer "
-            "it, both conventions are in the field, and the wrong one is a fluent wrong answer"
+            "how this model must be called. Taken from --train-metrics, which records the mode "
+            "training used, and a different value here is refused; needed only without a training "
+            "record. Never defaulted: a runtime cannot infer it, both conventions are in the "
+            "field, and the wrong one is a fluent wrong answer"
         ),
     )
     bundle.add_argument("--base-model", required=True, help="the checkpoint this started from")
@@ -755,6 +768,22 @@ def summarise(manifest: dict) -> list[str]:
             f"  prompt mode: {decision.get('prompt_mode', '?')} ({decision.get('source', '?')})"
         )
 
+    # Printed beside the score, never folded into it: a model that reasons on
+    # most rows is still scored on the answers that follow.
+    measurements = _mapping(manifest.get("measurements"))
+    reasoning = []
+    for side in ("candidate", "reference"):
+        removed = _mapping(_mapping(measurements.get(side)).get("reasoning_removed"))
+        if removed:
+            unclosed = removed.get("generations_with_unclosed_reasoning")
+            reasoning.append(
+                f"{side} {removed.get('generations_with_reasoning', '?')} of "
+                f"{removed.get('over_generations_that_ran', '?')}"
+                + (f" ({unclosed} never closed)" if unclosed else "")
+            )
+    if reasoning:
+        lines.append(f"  reasoning removed before scoring: {', '.join(reasoning)}")
+
     for limitation in manifest.get("limitations", []):
         lines.append(f"  note: {limitation}")
     if status != Status.PASSED.value:
@@ -844,7 +873,8 @@ def _tune(args: argparse.Namespace) -> int:
         lora_dropout=args.lora_dropout,
         dtype=args.dtype,
         attn_implementation=args.attn_implementation,
-        prompt_mode=PromptMode(args.prompt_mode),
+        prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
+        force_prompt_mode=args.force_prompt_mode,
         timeout_s=args.timeout_s,
         auto_provision=not args.no_provision,
     )
@@ -862,10 +892,18 @@ def _tune(args: argparse.Namespace) -> int:
 def summarise_tune(result: TuneResult) -> list[str]:
     request = result.request
     source = "default for the method" if request.rate_is_default else "declared"
+    decision = result.prompt_mode_decision
+    if decision is not None:
+        described = f"prompt mode {decision.mode.value} ({decision.source})"
+    elif request.prompt_mode is not None:
+        # Declared but never settled: the run stopped before the check, or was
+        # refused by it. Printing the bare mode read as though it had trained.
+        described = f"prompt mode {request.prompt_mode.value} declared, not decided"
+    else:
+        described = "prompt mode not decided"
     lines = [
         f"outcome: {result.outcome.value}",
-        f"  {request.method} fine-tune at learning rate {request.rate:g} ({source}), "
-        f"prompt mode {result.prompt_mode.value}",
+        f"  {request.method} fine-tune at learning rate {request.rate:g} ({source}), {described}",
     ]
     metrics = result.metrics
     if metrics is not None:
@@ -1088,6 +1126,49 @@ def measurements_from_verify(manifest: dict[str, Any]) -> dict[str, Any]:
     return points
 
 
+def _bundle_prompt_mode(
+    args: argparse.Namespace, recorded: Mapping[str, Any]
+) -> tuple[PromptMode, str]:
+    """The mode the contract declares, and a note saying where it came from.
+
+    The training record is what the weights learned, so it is the source and
+    `--prompt-mode` can only agree with it. Retyping it by hand was how a bundle
+    could tell an application to call a model in the mode it was not trained in.
+    """
+    raw = recorded.get("prompt_mode")
+    trained: PromptMode | None = None
+    if raw is not None:
+        try:
+            trained = PromptMode(raw)
+        except ValueError:
+            raise BundleInputError(
+                f"{args.train_metrics} records prompt_mode {raw!r}, which is not a known mode; "
+                f"expected one of {[mode.value for mode in PromptMode]}"
+            ) from None
+    declared = PromptMode(args.prompt_mode) if args.prompt_mode else None
+    if trained is not None and declared is not None and declared is not trained:
+        raise BundleInputError(
+            f"--prompt-mode is {declared.value}, but {args.train_metrics} records that the model "
+            f"was trained {trained.value}. A contract telling the application to call it "
+            f"{declared.value} produces a fluent wrong answer; leave out --prompt-mode, or pass "
+            "the metrics of the run that produced this model"
+        )
+    if trained is not None:
+        decision = recorded.get("prompt_mode_decision")
+        how = decision.get("source") if isinstance(decision, Mapping) else None
+        return trained, (
+            f"prompt mode {trained.value} taken from the training run's record"
+            + (f" ({how})" if how else "")
+        )
+    if declared is not None:
+        return declared, f"prompt mode {declared.value} declared with --prompt-mode"
+    raise BundleInputError(
+        "no prompt mode: pass --train-metrics from the tune run that produced this model, or "
+        "--prompt-mode. It is never defaulted: a runtime cannot infer it, and the wrong one is a "
+        "fluent wrong answer"
+    )
+
+
 def _bundle(args: argparse.Namespace) -> int:
     events = _stream()
 
@@ -1132,17 +1213,21 @@ def _bundle(args: argparse.Namespace) -> int:
     # the model was never trained to emit does not stop.
     stop_tokens = tuple(args.stop_token)
     terminator_note = None
-    if not stop_tokens and args.train_metrics is not None:
+    recorded: dict[str, Any] = {}
+    if args.train_metrics is not None:
         try:
-            recorded = json.loads(args.train_metrics.read_text(encoding="utf-8"))
+            loaded = json.loads(args.train_metrics.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise BundleInputError(f"{args.train_metrics} is not valid JSON: {exc}") from None
         except OSError as exc:
             raise BundleInputError(f"could not read {args.train_metrics}: {exc}") from None
-        if not isinstance(recorded, dict):
+        if not isinstance(loaded, dict):
             raise BundleInputError(
-                f"{args.train_metrics} holds {type(recorded).__name__}, not training metrics"
+                f"{args.train_metrics} holds {type(loaded).__name__}, not training metrics"
             )
+        recorded = loaded
+    prompt_mode, prompt_mode_note = _bundle_prompt_mode(args, recorded)
+    if not stop_tokens:
         term = (recorded.get("turn_terminator") or {}).get("text")
         if term:
             stop_tokens = (term,)
@@ -1186,7 +1271,7 @@ def _bundle(args: argparse.Namespace) -> int:
         terminator_notes = tuple(n for n in (terminator_note,) if n)
 
     contract = Contract(
-        prompt_mode=PromptMode(args.prompt_mode),
+        prompt_mode=prompt_mode,
         wire_convention=(WireConvention(args.wire_convention) if args.wire_convention else None),
         # The runtime's pins, because which prompt a runtime renders is a
         # property of that runtime's release. `export.resolve_toolchain` reads
@@ -1197,7 +1282,7 @@ def _bundle(args: argparse.Namespace) -> int:
         base_model_revision=args.base_model_revision,
         context_length=args.context_length,
         stop_tokens=stop_tokens,
-        notes=tuple(args.note) + terminator_notes,
+        notes=tuple(args.note) + terminator_notes + (prompt_mode_note,),
     )
     request = BundleRequest(
         output_dir=args.output_dir,
