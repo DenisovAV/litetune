@@ -32,7 +32,7 @@ tool declarations were hand-rendered into the prompt, and the same FunctionGemma
 trained through `apply_chat_template` would need the opposite. Same weights, same
 family, different answer. It is decided by `tune`, carried by
 `bundle.Contract.prompt_mode`, and resolved for a foreign artifact by
-`evaluate.resolve_prompt_mode` -- never inferred from a model id.
+`prompt_mode.resolve_prompt_mode` -- never inferred from a model id.
 """
 
 from __future__ import annotations

@@ -97,7 +97,7 @@ ATTN_IMPLEMENTATIONS = ("eager", "sdpa", "flash_attention_2")
 DATASET_FORMATS = ("jsonl",)
 TRAIN_MODES = ("full", "lora", "skip")
 SAMPLERS = ("greedy", "top_k", "top_p")
-PROMPT_MODES = ("prerendered", "runtime_rendered")  # mirrors evaluate.PromptMode
+PROMPT_MODES = ("prerendered", "runtime_rendered")  # mirrors prompt_mode.PromptMode
 
 # Which spec sections each stage's result depends on. This is the table that
 # keeps a gate threshold out of a measurement key.

@@ -13,8 +13,8 @@ renders it with `Conversation.render_message_to_string` -- in LiteRT-LM v0.16.1
 that returns `GetSingleTurnText`, the function `SendMessage` renders with --
 and turns the result into ids the way a first-turn prefill does. A script in the reference's
 environment produces the ids the reference generates from, through the same
-`evaluate.REFERENCE_PROMPT_SOURCE` the generation script uses. The lists must be
-equal. On the first few prompts the runtime also sends the message, and the
+`prompt_mode.RENDERING_SOURCE` training and the generation script use. The lists
+must be equal. On the first few prompts the runtime also sends the message, and the
 prefill count it reports must equal the reference's id count: that catches a
 wrong mirror of the prefill step, and tokens the runtime adds outside the
 rendered text.
@@ -32,9 +32,9 @@ from typing import Any, Protocol
 
 from litetune import envs
 from litetune.checks import Check
-from litetune.evaluate import REFERENCE_PROMPT_SOURCE
 from litetune.events import EventStream
 from litetune.exits import read_returncode
+from litetune.prompt_mode import RENDERING_SOURCE
 
 RENDERING_CHECK = "runtime and reference render the same prompt tokens"
 
@@ -136,7 +136,7 @@ import json
 import sys
 from pathlib import Path
 '''
-    + REFERENCE_PROMPT_SOURCE
+    + RENDERING_SOURCE
     + r"""
 
 def main():
@@ -147,7 +147,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(spec["model"])
     rows = []
     for index, prompt in enumerate(spec["prompts"]):
-        text, add_special = reference_prompt(tok, prompt, True)
+        text, add_special = render_prompt(tok, prompt, True)
         ids = tok(text, add_special_tokens=add_special)["input_ids"]
         rows.append({"index": index, "rendered": text, "ids": [int(i) for i in ids]})
     Path(spec["out"]).write_text(json.dumps(rows), encoding="utf-8")

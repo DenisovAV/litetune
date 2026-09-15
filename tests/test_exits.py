@@ -125,7 +125,7 @@ def test_a_killed_sweep_does_not_report_a_verdict(killing_toolchain, tmp_path):
 
 
 def test_a_killed_training_run_is_could_not_check(killing_toolchain, tmp_path):
-    from litetune.evaluate import PromptMode
+    from litetune.prompt_mode import PromptMode
     from litetune.tune import TuneRequest
 
     data = tmp_path / "train.jsonl"

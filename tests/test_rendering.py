@@ -19,7 +19,7 @@ import pytest
 from conftest import FakeBackend, correct_texts, labelled_rows
 
 from litetune import envs
-from litetune.evaluate import PromptMode
+from litetune.prompt_mode import PromptMode
 from litetune.rendering import (
     _REFERENCE_SCRIPT,
     _RUNTIME_SCRIPT,

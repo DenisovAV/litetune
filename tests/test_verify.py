@@ -15,7 +15,8 @@ import pytest
 from conftest import FakeBackend, call_text, correct_texts, labelled_rows, mark_provisioned
 
 from litetune import envs
-from litetune.evaluate import Generation, HuggingFaceBackend, PromptMode
+from litetune.evaluate import Generation, HuggingFaceBackend
+from litetune.prompt_mode import PromptMode
 from litetune.verify import (
     BackendPair,
     ReferenceRole,

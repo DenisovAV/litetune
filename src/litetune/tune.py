@@ -47,10 +47,10 @@ from typing import Any
 
 from litetune import envs, models
 from litetune.checks import Check, CheckSet, Outcome, guard
-from litetune.evaluate import PromptMode, PromptModeDecision, prompt_evidence
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.prepare import PrepareError, read_rows
+from litetune.prompt_mode import RENDERING_SOURCE, PromptMode, PromptModeDecision, prompt_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +228,8 @@ def _tail(text: str, limit: int = _DETAIL_TAIL) -> str:
 # to both methods, so a full-against-LoRA comparison is not confounded by it,
 # and every parameter that does vary is in the config file beside this script.
 
-_TRAIN_SCRIPT = r'''
+_TRAIN_SCRIPT = (
+    r'''
 """Supervised fine-tuning with the loss masked to the completion.
 
 Reads a config JSON, writes a metrics JSON. Prints nothing: the parent turns the
@@ -242,25 +243,9 @@ from pathlib import Path
 # torch's own ignore index. Positions set to this contribute no gradient, and
 # they are the whole mechanism by which the prompt is excluded from the loss.
 IGNORE_INDEX = -100
-
-
-def render_prompt(tok, prompt, runtime_rendered):
-    """The prompt as the *serving runtime* will present it.
-
-    Two mutually exclusive conventions, and the model learns whichever one it
-    was trained against. `evaluate.py`'s generation script makes the same choice
-    on the same flag; if the two disagree, every measurement is taken on a
-    prompt the model was never trained on.
-    """
-    if not runtime_rendered:
-        return prompt, True
-    templated = tok.apply_chat_template(
-        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
-    )
-    # The template already emits the model's BOS. Asking the tokenizer to add
-    # another produces two, which shifts every position by one and is invisible
-    # in the loss.
-    return templated, False
+'''
+    + RENDERING_SOURCE
+    + r'''
 
 
 def turn_terminator(tok, runtime_rendered):
@@ -642,6 +627,7 @@ def main() -> int:
 if __name__ == "__main__":
     sys.exit(main())
 '''
+)
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +757,7 @@ class TuneRequest:
     # declarations has learned a different input distribution from one trained
     # under the runtime's own chat template. From here it travels into
     # `bundle.Contract.prompt_mode` and back out through
-    # `evaluate.resolve_prompt_mode`, so nothing downstream has to guess.
+    # `prompt_mode.resolve_prompt_mode`, so nothing downstream has to guess.
     #
     # `--no-template` on the serving side is right for a hand-rendered wire
     # format and wrong for anything else, and it was carried everywhere by

@@ -44,7 +44,7 @@ from litetune.bundle import (
 )
 from litetune.checks import Outcome
 from litetune.envs import cached_environments, env_cache_root, remove_cached
-from litetune.evaluate import GREEDY, DataError, PromptMode
+from litetune.evaluate import GREEDY, DataError
 from litetune.events import EventStream, TerminalRenderer
 from litetune.export import (
     MEASURED_RECIPES,
@@ -66,6 +66,7 @@ from litetune.prepare import (
     PrepareResult,
     prepare,
 )
+from litetune.prompt_mode import PromptMode, parse_prompt_mode
 from litetune.spec import DTYPES, SpecError, mutable_ref_refusal, weak_revision_limitations
 from litetune.tune import METHODS, TuneError, TuneRequest, TuneResult, run_tune, write_report
 from litetune.verify import EXIT_CODES, ReferenceRole, Status, VerifyRequest, run_verify
@@ -1139,12 +1140,9 @@ def _bundle_prompt_mode(
     trained: PromptMode | None = None
     if raw is not None:
         try:
-            trained = PromptMode(raw)
-        except ValueError:
-            raise BundleInputError(
-                f"{args.train_metrics} records prompt_mode {raw!r}, which is not a known mode; "
-                f"expected one of {[mode.value for mode in PromptMode]}"
-            ) from None
+            trained = parse_prompt_mode(raw, str(args.train_metrics))
+        except ValueError as exc:
+            raise BundleInputError(str(exc)) from None
     declared = PromptMode(args.prompt_mode) if args.prompt_mode else None
     if trained is not None and declared is not None and declared is not trained:
         raise BundleInputError(

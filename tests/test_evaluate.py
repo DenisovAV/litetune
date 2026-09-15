@@ -24,7 +24,6 @@ from litetune.evaluate import (
     DecodeConfig,
     HuggingFaceBackend,
     LiteRtLmBackend,
-    PromptMode,
     device_mismatch,
     evaluate,
     harness_mismatch,
@@ -32,6 +31,7 @@ from litetune.evaluate import (
     strip_runtime_noise,
 )
 from litetune.metrics import score_exact_text, trim_terminator
+from litetune.prompt_mode import PromptMode
 
 # -- the split --------------------------------------------------------------
 

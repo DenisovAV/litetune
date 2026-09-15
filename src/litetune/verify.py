@@ -46,15 +46,11 @@ from litetune.evaluate import (
     HuggingFaceBackend,
     LiteRtLmBackend,
     MeasurementPoint,
-    PromptMode,
-    PromptModeConflict,
-    PromptModeDecision,
     Split,
     device_mismatch,
     evaluate,
     harness_mismatch,
     load_split,
-    resolve_prompt_mode,
 )
 from litetune.events import EventStream
 from litetune.liveness import (
@@ -81,6 +77,13 @@ from litetune.metrics import (
     reasoning_unclosed,
     strip_reasoning,
     terminators_trimmed,
+)
+from litetune.prompt_mode import (
+    PromptMode,
+    PromptModeConflict,
+    PromptModeDecision,
+    parse_prompt_mode,
+    resolve_prompt_mode,
 )
 from litetune.rendering import RENDERING_CHECK, RenderingObserver, RenderingProbe
 
@@ -265,15 +268,7 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
     if not isinstance(data, dict):
         raise ValueError(f"{sidecar} does not contain a JSON object")
     raw = data.get("prompt_mode")
-    if raw is None:
-        return None
-    try:
-        return PromptMode(raw)
-    except ValueError:
-        raise ValueError(
-            f"{sidecar} records prompt_mode {raw!r}, which is not a known mode; expected one of "
-            f"{[mode.value for mode in PromptMode]}"
-        ) from None
+    return None if raw is None else parse_prompt_mode(raw, str(sidecar))
 
 
 def _resolve_mode(request: VerifyRequest, split: Split) -> PromptModeDecision:

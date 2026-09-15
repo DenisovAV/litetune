@@ -18,7 +18,7 @@ from conftest import FakeBackend, correct_texts, labelled_rows, mark_provisioned
 from litetune import envs
 from litetune import verify as verify_module
 from litetune.cli import build_parser, main, measurements_from_verify, summarise
-from litetune.evaluate import PromptMode
+from litetune.prompt_mode import PromptMode
 from litetune.verify import BackendPair, Status
 
 

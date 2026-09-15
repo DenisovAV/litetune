@@ -18,7 +18,6 @@ from conftest import FakeBackend, correct_texts, labelled_rows, mark_provisioned
 
 from litetune import envs, models
 from litetune.checks import Outcome
-from litetune.evaluate import PromptMode
 from litetune.export import ExportRequest, run_export
 from litetune.models import (
     EXPORT_FLAGS_CHECK,
@@ -29,6 +28,7 @@ from litetune.models import (
     transformers_check,
     version_tuple,
 )
+from litetune.prompt_mode import PromptMode
 from litetune.tune import TuneRequest, run_tune
 from litetune.verify import BackendPair, Status, VerifyRequest, run_verify
 

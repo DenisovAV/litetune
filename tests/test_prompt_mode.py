@@ -20,12 +20,13 @@ from conftest import FakeBackend, correct_texts, labelled_rows
 
 from litetune import envs
 from litetune.bundle import Contract
-from litetune.evaluate import (
-    HuggingFaceBackend,
-    LiteRtLmBackend,
+from litetune.evaluate import HuggingFaceBackend, LiteRtLmBackend
+from litetune.prompt_mode import (
+    RENDERING_SOURCE,
     PromptMode,
     PromptModeConflict,
     marker_share,
+    parse_prompt_mode,
     prompt_evidence,
     resolve_prompt_mode,
 )
@@ -424,3 +425,36 @@ def test_a_record_that_cannot_be_read_is_not_replaced_by_a_guess(tmp_path, write
 
     assert result.status is Status.FAILED_HARNESS
     assert result.manifest["checks"][-1]["outcome"] == "could_not_check"
+
+
+# ---------------------------------------------------------------------------
+# One rendering, one parser
+# ---------------------------------------------------------------------------
+
+
+def test_training_the_reference_and_the_rendering_check_render_from_one_source():
+    # Training learns from this text and the rendering check compares the
+    # reference's ids with the runtime's: a copy in any one script renders a
+    # prompt the others may not.
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+    from litetune.rendering import _REFERENCE_SCRIPT
+    from litetune.tune import _TRAIN_SCRIPT
+
+    for script in (_TRAIN_SCRIPT, _HF_GENERATE_SCRIPT, _REFERENCE_SCRIPT):
+        assert script.count(RENDERING_SOURCE) == 1
+        assert script.count("def render_prompt(") == 1
+
+
+@pytest.mark.parametrize("raw", ["prerendered", PromptMode.RUNTIME_RENDERED])
+def test_a_recorded_mode_reads_back_as_itself(raw):
+    assert parse_prompt_mode(raw, "the record") is PromptMode(raw)
+
+
+@pytest.mark.parametrize("raw", ["templated", "", 1, None])
+def test_an_unknown_recorded_mode_is_refused_naming_the_record_and_the_modes(raw):
+    with pytest.raises(ValueError) as exc:
+        parse_prompt_mode(raw, "run/litetune.json")
+
+    message = str(exc.value)
+    assert message.startswith(f"run/litetune.json records prompt_mode {raw!r}")
+    assert all(mode.value in message for mode in PromptMode)

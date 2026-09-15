@@ -26,9 +26,9 @@ from conftest import fake_torch, mark_provisioned
 
 from litetune import envs
 from litetune.checks import Outcome
-from litetune.evaluate import PromptMode, PromptModeDecision
 from litetune.events import EventStream
 from litetune.prepare import read_rows
+from litetune.prompt_mode import PromptMode, PromptModeDecision
 from litetune.tune import (
     _TRAIN_SCRIPT,
     DEFAULT_ATTN_IMPLEMENTATION,

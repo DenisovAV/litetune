@@ -12,7 +12,7 @@ import dataclasses
 import pytest
 
 from litetune.checks import Outcome
-from litetune.evaluate import GREEDY, Generation, MeasurementPoint, PromptMode
+from litetune.evaluate import GREEDY, Generation, MeasurementPoint
 from litetune.liveness import (
     DEFAULT_THRESHOLDS,
     LivenessThresholds,
@@ -25,6 +25,7 @@ from litetune.liveness import (
     unterminated_count,
 )
 from litetune.metrics import TERMINATORS, trim_terminator
+from litetune.prompt_mode import PromptMode
 
 
 def make_point(texts, returncode: int = 0, harness_error: str | None = None) -> MeasurementPoint:
