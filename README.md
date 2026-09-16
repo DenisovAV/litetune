@@ -235,7 +235,7 @@ measured two:
 |---|---|
 | `--prompt-mode` | Optional, never defaulted. `prerendered` means the prompt already carries its control tokens — your app renders the tool declarations into it — and the runtime must not template it again; `runtime_rendered` means the prompt is bare text and the runtime applies the model's chat template. Without the flag `tune` reads the mode off the training prompts (control tokens in at least 90% of them: `prerendered`; in at most 10%: `runtime_rendered`) and refuses a split in between. A declared mode the prompts contradict is refused unless you add `--force-prompt-mode`. `tune` records the mode beside the checkpoint; `verify` reads it through `--reference` and `bundle` through `--train-metrics`, and each refuses a different value — the wrong mode produces a fluent wrong answer, not an error. |
 | `--adapter` | For a LoRA run, pass `<tune output>/adapter`, from outside `--output-dir`. Without it the bundle carries only the merged weights. |
-| `--dtype` | Training precision for `tune`. Default `bfloat16`. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records exactly one run's dtype — the second-family banking77 run, trained in float32 for this reason — and says nothing about the headline table's, so the report records yours. |
+| `--dtype` | Training precision for `tune`. Default `bfloat16`. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records the banking77 runs' dtype — bfloat16, trained on a GPU where this flag's reason does not apply — and says nothing about the headline table's, so the report records yours. |
 | `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused: they resolve to different weights on different days while the bundle reads identically. |
 | `--scorer` | What counts as correct, on `verify`. `tool-call` (default) or `exact-text`. It has to match the shape of your targets; nothing else in the pipeline changes. The manifest records which one ran, because two manifests scored differently are not comparable. |
 | `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. See [MEASUREMENTS.md](MEASUREMENTS.md). |
@@ -344,16 +344,17 @@ exact-text`), scored on 600 examples the model never trained on:
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
 |---|---|---|---|
 | Base model | *refused* | — | — |
-| Fine-tuned | 0.6933 | 0.6767 | 0.6917 |
-| Cost of conversion | — | +0.0167 *(within noise)* | +0.0017 *(within noise)* |
+| Fine-tuned | 0.6717 | 0.6717 | 0.6683 |
+| Cost of conversion | — | +0.0000 *(within noise)* | +0.0033 *(within noise)* |
 
-A different family, a different scorer, and this time neither conversion
-figure clears its interval. The base row says
-*refused* because it was: asked for one intent label, the untuned model repeats
-itself on 571 of 600 prompts, and `verify` stops at the liveness tier rather
-than scoring a model that never answered. This run is also what found the
-`exact-text` terminator bug fixed in 0.1.5 — see
-[MEASUREMENTS.md](MEASUREMENTS.md).
+A different family, a different scorer, and this time neither conversion figure
+clears its interval — the dynamic recipe lands on the same score as its float
+twin while still disagreeing with it on 34 of 600 prompts. The base row says
+*refused* because it was: asked for one intent label, the untuned model
+returned nothing at all on 53 of 600 prompts, and `verify` stops at the liveness
+tier rather than scoring a model that never answered. An earlier run of this
+same pair, measured in the other prompt mode, is what found the `exact-text`
+terminator bug fixed in 0.1.5 — see [MEASUREMENTS.md](MEASUREMENTS.md).
 
 **[MEASUREMENTS.md](MEASUREMENTS.md)** has the intervals, three runs of the same
 configuration and what they disagree about, and which published claims were

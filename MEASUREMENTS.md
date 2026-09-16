@@ -194,29 +194,44 @@ line. One SoC, base weights, 20 rows: a status, not a figure.
 Everything above is one model and one scorer. This section is the first run of
 anything else: `google/gemma-3-270m-it` @ `ac82b4e8`, LoRA r16/α32, lr 2e-4,
 one epoch over 2,400 rows of `mteb/banking77` — 77-way intent classification,
-target is `label_text` — scored on 600 held-out rows with `--scorer
-exact-text` and a 256-token limit, prompt mode `prerendered`, litert-lm 0.16.1
-CPU backend on an M-series Mac. The training environment is the pinned one:
-`torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0`. Everything not named
+target is `label_text` — scored on 600 held-out rows (split
+`0c7505b2b6f69ab1`) with `--scorer exact-text` and a 256-token limit, prompt
+mode `runtime_rendered`, litert-lm 0.16.1's CPU backend against a float twin on
+one A100-SXM4-40GB. Training ran in bfloat16 on that GPU. Everything not named
 here was left at its default.
+
+**The prompt mode is what changed.** An earlier version of this section measured
+the same checkpoint `prerendered` — the runtime told not to apply the model's
+chat template, to prompts that are bare user text — and reported 0.6933, 0.6767
+and 0.6917. Those numbers are withdrawn, not adjusted: they describe a model
+answering a prompt no caller sends. Here `tune` was given no `--prompt-mode`,
+inferred `runtime_rendered` because 0% of the 2,400 training prompts carry a
+control token, and recorded that beside the checkpoint; `verify` read the mode
+back from that record rather than inferring it again. Before generating
+anything it rendered all 600 held-out prompts through the runtime's own
+conversation path and through the reference's chat template: identical token
+ids on all 600, and the runtime's prefill count equal to the reference's on the
+eight it also sent.
 
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
 |---|---|---|---|
 | Base model | *refused* | — | — |
-| Fine-tuned | **0.6933** ±0.0369 | 0.6767 ±0.0374 | 0.6917 ±0.0370 |
-| Cost of conversion | — | +0.0167 ±0.0201 *(unresolved, 38 discordant)* | +0.0017 ±0.0127 *(unresolved, 15 discordant)* |
+| Fine-tuned | **0.6717** ±0.0376 | 0.6717 ±0.0376 | 0.6683 ±0.0377 |
+| Cost of conversion | — | +0.0000 ±0.0190 *(unresolved, 34 discordant)* | +0.0033 ±0.0131 *(unresolved, 16 discordant)* |
 
 **Both costs are unresolved, and that is the finding.** At n=600 each interval
 contains zero, so this run establishes only that neither quantisation moved
-accuracy far — the dynamic estimate's own interval reaches +0.0368, so "far"
-here is up to about four points, not that either recipe is free. What resolves
-a paired difference is neither the row count nor the number of disagreements
-but the imbalance between the two directions of disagreement, set against the
-square root of how many there are: more disagreement widens the interval as
-well as feeding the estimate. The FunctionGemma conversion cost above clears
-its own interval at n=640 on 16 discordant pairs, and by a hair — +0.0125
-against ±0.0123. Here there are 38 and 15, and neither imbalance is large
-enough for the interval it has to buy.
+accuracy far — the dynamic estimate's own interval reaches +0.0190, so "far"
+here is up to about two points, not that either recipe is free. That recipe
+also shows why a score is not an answer: it lands on the same 0.6717 as the
+float twin and still disagrees with it on 34 of 600 prompts, in both
+directions. What resolves a paired difference is neither the row count nor the
+number of disagreements but the imbalance between the two directions of
+disagreement, set against the square root of how many there are: more
+disagreement widens the interval as well as feeding the estimate. The
+FunctionGemma conversion cost above clears its own interval at n=640 on 16
+discordant pairs, and by a hair — +0.0125 against ±0.0123. Here there are 34
+and 16, and neither imbalance is large enough for the interval it has to buy.
 
 ### What the run established that the table does not show
 
@@ -226,23 +241,23 @@ needs different overrides for each. `convert` resolved this checkpoint to
 `gemma-3-text` and added `--litert_lm_model_type_override=gemma3` — the first
 time that disambiguation ran on a real export rather than in a unit test.
 
-**The exact-text scorer was wrong before this run, and the run is what found
-it.** The transformers reference backend decodes with `skip_special_tokens=False`
-so the liveness tier can see leakage, and every generation it returns ends in
-`<eos>`. Under `exact-text` — whitespace forgiven, nothing else — that scored
-the fine-tuned float reference at **0.0000** on all 600 rows while the runtime
-side scored 0.6767, and `verify` reported a *resolved* "conversion cost" of
-−0.6767 across 406 discordant pairs — the imbalance the section above
-describes, at its limit. It did
-flag the reference-at-zero as not being evidence; the number was still wrong,
-and `tool-call` had hidden the asymmetry on every earlier run because its
-parser ignores trailing markers. Fixed in 0.1.5, though not the way the first
-attempt tried: trimming both sides scored a model that dropped a closing tag on
-every row at 1.0000, so the rule became "the generation must still contain
-every terminator the target ends with, counting repeats and in that order, and
-any terminator beyond that is ignored". The table above is from the fixed
-scorer, and the
-numbers are unchanged by the rule that replaced it — these targets are bare
+**The exact-text scorer was wrong before this pair was first measured, and this
+pair is what found it.** The transformers reference backend decodes with
+`skip_special_tokens=False` so the liveness tier can see leakage, and every
+generation it returns ends in a terminator. Under `exact-text` — whitespace
+forgiven, nothing else — that scored the fine-tuned float reference at
+**0.0000** on all 600 rows while the runtime side scored 0.6767, and `verify`
+reported a *resolved* "conversion cost" of −0.6767 across 406 discordant
+pairs — the imbalance the section above describes, at its limit. It did flag
+the reference-at-zero as not being evidence; the number was still wrong, and
+`tool-call` had hidden the asymmetry on every earlier run because its parser
+ignores trailing markers. Fixed in 0.1.5, though not the way the first attempt
+tried: trimming both sides scored a model that dropped a closing tag on every
+row at 1.0000, so the rule became "the generation must still contain every
+terminator the target ends with, counting repeats and in that order, and any
+terminator beyond that is ignored". That 0.6767 belongs to the withdrawn
+`prerendered` run; the table above is from the re-measurement under the fixed
+scorer, and the rule that replaced it changes neither — these targets are bare
 labels carrying no marker, the case in which the two rules are the same
 function.
 
@@ -257,15 +272,20 @@ so generation halts at the close and never reaches the tokenizer's eos.
 `functiongemma-270m-it` has the same shape, with `<start_function_response>`
 added to the set.
 
-The **tuned** model, and therefore the float twin this table compares against,
-ends on `<eos>` instead. These prompts are `prerendered`, so `tune` does not
-probe the chat template at all and takes the tokenizer's eos: `metrics.json`
-records `turn_terminator: {ids: [1], source: "tokenizer_eos", text: "<eos>"}`,
-training appended exactly that to every completion, and `contract.json` carries
-`stop_tokens: ["<eos>"]`. Both markers are in the scorer's vocabulary, recorded
-verbatim at `harness.terminators` in every verify manifest, which is
-why neither run was mis-scored — but they are not the same marker, and which one
-a given artifact emits depends on how it was trained, not on its family.
+The **tuned** model ends on whichever marker the mode it trained under put
+there, and that is the second thing the re-measurement changed. In
+`runtime_rendered`, `tune` renders the chat template around every prompt and
+takes the terminator from that template: `metrics.json` records
+`turn_terminator: {ids: [106, 107], source: "chat_template", text:
+"<end_of_turn>\n"}`, training appended exactly that to every completion, and
+`contract.json` carries it into `stop_tokens`. The earlier `prerendered` run of
+the same checkpoint took the tokenizer's eos instead — `{ids: [1], source:
+"tokenizer_eos", text: "<eos>"}` — because a prerendered prompt is not
+templated, so there is no template close to read. Both markers are in the
+scorer's vocabulary, recorded verbatim at `harness.terminators` in every verify
+manifest, which is why neither run was mis-scored — but they are not the same
+marker, and which one a given artifact emits depends on how it was trained, not
+on its family.
 
 An earlier draft asserted instead that Gemma emits `<end_of_turn>\n<eos>` — two
 markers, newline between — in its docstrings, its tests and its commit message.
@@ -275,12 +295,14 @@ whitespace between removals; that case is constructed in the tests and labelled
 as such.
 
 **What it did not establish.** No untuned-base score, and not for want of
-running it: the last section below says what happened. So training gain is
-unattributed, and `prepare` could not identify slices where the base already
-scores at ceiling. CPU only — no GPU or NPU figure for this family. Trained in float32 rather than the bfloat16
-default because bfloat16 on this CPU runs on a single core: a 300-step LoRA
-run in bfloat16 sat on that one core for 52 minutes without finishing, and the
-same run in float32 finished in 307 s on ten threads, at a peak of 6.35 GB.
+running it: the base was converted and measured in this same mode, and refused
+at the liveness tier — asked for one intent label it returned nothing at all on
+53 of 600 prompts, so `verify` stopped before scoring either side. Training gain
+is therefore unattributed, and `prepare` could not identify slices where the
+base already scores at ceiling. The candidate ran on CPU only — no GPU or NPU
+figure for this family. Training ran in bfloat16 on the A100; the single-core
+bfloat16 behaviour that made an earlier run of this pair train in float32 is a
+property of that Mac's CPU and says nothing about this one.
 
 ## A third family, and the marker the vocabulary did not know
 
@@ -358,23 +380,27 @@ Two, paraphrased — the second drops a measured clause and both carry a note:
   limitation that would carry another run's numbers into every manifest.
 - Decoding parameters were passed to transformers but not to litert-lm, which
   used the pinned runtime's defaults; both are greedy, and the token limit is
-  unverified on the runtime side. That limit is what the base model ran into:
-  see the last section.
+  unverified on the runtime side. In the withdrawn `prerendered` run that limit
+  is what the base model ran into; in the re-measurement it returned nothing at
+  all instead — see the last section.
 
-And one fact about this run, which fired no limitation because the run was not
-at the default dtype:
+And one fact about the re-measured run, which fired no limitation:
 
-- Training ran in float32, for the reason above. Export passes no dtype and
-  the float reference loads at float32, so that is not a mismatch with either.
+- Training ran in bfloat16, the default, on the same A100 that held the float
+  reference. Export passes no dtype and the float reference loads at float32,
+  so that is not a mismatch with either.
 
 ### The base model could not be scored at all
 
-The untuned `gemma-3-270m-it` was converted and run over the same 600 prompts.
-`verify` refused to score it: 571 of 600 generations repeat themselves above the
-0.50 threshold, the worst at 0.9995. Asked to answer with one intent label, the
-base does not emit a label and stop — it runs on until the token limit, saying
-the same thing over and over. The run ends at `failed_smoke` and exit 1, before
-the quality tier.
+The untuned `gemma-3-270m-it` was converted and run over the same 600 prompts in
+both prompt modes, and `verify` refused to score it both times — for different
+reasons, which is itself worth recording. `prerendered`: 571 of 600 generations
+repeat themselves above the 0.50 threshold, the worst at 0.9995, running on
+until the token limit. `runtime_rendered`, the re-measurement: 53 of 600
+generations are empty after decoding, a share of 0.0883 against a threshold of
+0.0000. Either way the run ends at `failed_smoke`, before the quality tier:
+asked to answer with one intent label, the base does not emit a label and
+stop.
 
 That refusal is the point. An exact-match score against those generations would
 have been a number — near zero — and it would have read as "the base is bad at
