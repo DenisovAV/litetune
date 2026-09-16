@@ -471,7 +471,7 @@ def test_a_run_that_reported_no_prefill_count_is_not_a_pass():
         PROMPTS,
         rows([[1, 2, 3], [4, 5, 6]]),
         rows([[1, 2, 3], [4, 5, 6]]),
-        prefill_requested=2,
+        prefill_sent=2,
     )
 
     assert comparison.agrees
@@ -481,17 +481,54 @@ def test_a_run_that_reported_no_prefill_count_is_not_a_pass():
     assert check.observed["prompts_compared"] == 2
 
 
-def test_asking_for_no_prefill_sample_is_not_a_failed_check():
+def _answers_every_prompt_without_a_prefill_count(self, args, timeout=3600, **kwargs):
+    """A runtime that renders every prompt and reports no prefill count at all."""
+    spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+    written = rows([[1, 2, 3] for _ in spec["prompts"]])
+    Path(spec["out"]).write_text(json.dumps(written), encoding="utf-8")
+    return subprocess.CompletedProcess(args, 0, "", "")
+
+
+def test_the_count_in_the_message_is_the_prompts_the_runtime_was_sent(monkeypatch, tmp_path):
+    """The runtime script prefills `rows[: prefill_sample]`, so a split shorter
+    than the sample sends fewer prompts than the sample names. Reporting the
+    sample instead would put a number of sends that never happened into the
+    message and into the manifest -- the defect this check exists to catch,
+    committed by the check itself."""
+    comparison = _probe(
+        monkeypatch, tmp_path, _answers_every_prompt_without_a_prefill_count
+    ).observe(["hi"])
+
+    assert comparison.prefill_sent == 1
+    check = comparison.check()
+    assert check.outcome.value == "could_not_check"
+    assert "any of the 1 prompts it was sent" in check.detail
+    assert check.observed["prefill_sent"] == 1
+
+
+def test_asking_for_no_prefill_sample_is_not_a_failed_check(monkeypatch, tmp_path):
     """Zero is a caller's choice, not a runtime that went quiet.
 
     `RenderingProbe.prefill_sample` is public and slicing by 0 sends nothing,
     so treating that as an unanswered comparison would fail a run whose ids
     agree over every prompt.
     """
-    comparison = compare_renderings(
-        PROMPTS, rows([[1, 2, 3], [4, 5, 6]]), rows([[1, 2, 3], [4, 5, 6]])
-    )
+    probe = _probe(monkeypatch, tmp_path, _answers_every_prompt_without_a_prefill_count)
+    probe.prefill_sample = 0
 
-    check = comparison.check()
+    check = probe.observe(PROMPTS).check()
+
     assert check.outcome.value == "passed"
-    assert check.observed["prefill_requested"] == 0
+    assert check.observed["prefill_sent"] == 0
+
+
+def test_a_negative_prefill_sample_reports_what_the_slice_sent(monkeypatch, tmp_path):
+    """`prefill_sample` is public and unvalidated, and `rows[:-1]` sends every
+    prompt but the last. Following the slice rather than the number keeps the
+    recorded count from going negative or naming sends that did not happen."""
+    probe = _probe(monkeypatch, tmp_path, _answers_every_prompt_without_a_prefill_count)
+    probe.prefill_sample = -1
+
+    comparison = probe.observe(PROMPTS)
+
+    assert comparison.prefill_sent == 1

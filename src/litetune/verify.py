@@ -257,8 +257,9 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
 
     `None` for a Hugging Face id, a directory with no `litetune.json`, or a
     `litetune.json` that records no mode. A sidecar that exists and cannot be
-    read raises: falling back to the contract or the prompts would silently
-    replace a mode the checkpoint wrote down.
+    read raises, and so does a reference directory that is a broken link:
+    falling back to the contract or the prompts would silently replace a mode
+    the checkpoint wrote down.
     """
     sidecar = Path(reference) / models.PROVENANCE_NAME
     try:
@@ -267,8 +268,11 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
         # A dangling symlink raises this too, and it is not the same statement:
         # the link is an entry, so something recorded a mode here and the link
         # no longer reaches it. `is_symlink` reads the link itself rather than
-        # its target, so it is true exactly in that case.
-        if sidecar.is_symlink():
+        # its target, so it is true exactly in that case -- and the broken link
+        # can be the reference directory, where the sidecar's own `is_symlink`
+        # is false because what is missing is its parent. A Hugging Face id is
+        # not an entry on disk, so neither call is true for one.
+        if sidecar.is_symlink() or Path(reference).is_symlink():
             raise
         return None
     except NotADirectoryError:

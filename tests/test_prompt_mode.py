@@ -518,6 +518,23 @@ def test_a_sidecar_that_is_a_dangling_symlink_raises(tmp_path):
         recorded_prompt_mode(reference)
 
 
+def test_a_reference_directory_that_is_a_broken_link_raises(tmp_path):
+    """The broken link can be the directory rather than the sidecar.
+
+    Reading `<link>/litetune.json` raises `FileNotFoundError`, and the sidecar's
+    own `is_symlink` is false because what is missing is its parent -- so
+    nothing about the failure tells it apart from a checkpoint that never
+    recorded a mode, unless the reference itself is looked at.
+    """
+    from litetune.verify import recorded_prompt_mode
+
+    reference = tmp_path / "link-to-nowhere"
+    reference.symlink_to(tmp_path / "never-created")
+
+    with pytest.raises(OSError):
+        recorded_prompt_mode(str(reference))
+
+
 def test_a_reference_with_no_sidecar_is_still_no_record(tmp_path):
     from litetune.verify import recorded_prompt_mode
 

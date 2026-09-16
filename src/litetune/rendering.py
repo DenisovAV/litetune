@@ -213,9 +213,11 @@ class RenderingComparison:
 
     compared: int
     prefill: tuple[Mapping[str, int], ...] = ()
-    # How many prompts the runtime was asked to prefill. Zero is a caller that
-    # asked for none, which is not the same as a runtime that answered none.
-    prefill_requested: int = 0
+    # How many prompts the runtime was actually sent for prefill, which is not
+    # the sample a caller asked for: the runtime script slices that sample over
+    # the prompts it was given. Zero is a caller that asked for none, which is
+    # not the same as a runtime that answered none.
+    prefill_sent: int = 0
     mismatches: tuple[RenderingMismatch, ...] = field(default_factory=tuple)
 
     @property
@@ -224,7 +226,7 @@ class RenderingComparison:
 
     def check(self) -> Check:
         sampled = len(self.prefill)
-        if self.agrees and self.prefill_requested and not sampled:
+        if self.agrees and self.prefill_sent and not sampled:
             # Equal ids are half of this check. The other half -- the runtime's
             # own prefill count against the reference's id count -- is what
             # catches tokens added outside the rendered text, and it is how the
@@ -234,8 +236,8 @@ class RenderingComparison:
             return Check.unchecked(
                 RENDERING_CHECK,
                 f"identical token ids for all {self.compared} prompts, but the runtime reported no "
-                f"prefill count for any of the {self.prefill_requested} prompts it was sent, so "
-                "that half of the check did not run",
+                f"prefill count for any of the {self.prefill_sent} prompts it was sent, so that "
+                "half of the check did not run",
                 observed=self.as_dict(),
             )
         if self.agrees:
@@ -258,7 +260,7 @@ class RenderingComparison:
         return {
             "applied": True,
             "prompts_compared": self.compared,
-            "prefill_requested": self.prefill_requested,
+            "prefill_sent": self.prefill_sent,
             "prefill_sampled": [dict(row) for row in self.prefill],
             "mismatches": len(self.mismatches),
             # The first few, which is what a reader needs to find the cause; the
@@ -278,7 +280,7 @@ def compare_renderings(
     prompts: Sequence[str],
     runtime_rows: Sequence[Mapping[str, Any]],
     reference_rows: Sequence[Mapping[str, Any]],
-    prefill_requested: int = 0,
+    prefill_sent: int = 0,
 ) -> RenderingComparison:
     """Compare what the two scripts returned. Raises if either did not cover every prompt."""
     runtime = {int(row["index"]): row for row in runtime_rows}
@@ -327,7 +329,7 @@ def compare_renderings(
     return RenderingComparison(
         compared=len(prompts),
         prefill=tuple(prefill),
-        prefill_requested=prefill_requested,
+        prefill_sent=prefill_sent,
         mismatches=tuple(mismatches),
     )
 
@@ -372,7 +374,16 @@ class RenderingProbe:
             events,
         )
         return compare_renderings(
-            prompts, runtime_rows, reference_rows, prefill_requested=self.prefill_sample
+            prompts,
+            runtime_rows,
+            reference_rows,
+            # What the runtime script's own slice sends, not the sample asked
+            # for: it prefills `rows[: prefill_sample]` over one row per prompt,
+            # so slicing the prompts the same way answers it for every value the
+            # field can hold -- a sample larger than the split, zero, a negative
+            # one -- instead of restating the configured number as a fact about
+            # what the runtime was given.
+            prefill_sent=len(prompts[: self.prefill_sample]),
         )
 
     def _run(
