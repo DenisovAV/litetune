@@ -217,18 +217,24 @@ its own.
 
 The recipes are
 [AI Edge Quantizer](https://github.com/google-ai-edge/ai-edge-quantizer)'s,
-applied by `litert-torch export_hf` during `convert`; litetune adds none of its
-own and measures what each one costs on your task. It knows four, and has
-measured two:
+applied by `litert-torch export_hf` during `convert`, and `--recipe` passes a
+name litetune does not know straight through to it. litetune defines exactly one
+of its own, shipped as a quantizer recipe file inside the package; what it adds
+to the rest is a measurement of what each costs on your task:
 
 | recipe | |
 |---|---|
 | `dynamic_wi8_afp32` | the toolchain's default; its own docstring warns quality "may suffer" |
 | `weight_only_wi8_afp32` | dequantizes before compute, so slower by an unmeasured amount |
-| `dynamic_wi4_afp32` | 4-bit, unmeasured here |
-| `weight_only_wi4_afp32` | 4-bit, unmeasured here |
+| `dynamic_wi4_afp32` | 4-bit channelwise. Refused at the five-prompt gate on both models measured |
+| `weight_only_wi4_afp32` | the same, refused the same way: at four bits the damage is in the weights, not the kernels |
+| `dynamic_wi4b32_afp32` | 4-bit in blocks of 32. Passes the gate; cost +0.0350 on a tuned Qwen3-0.6B and +0.3483 on a tuned gemma-3-270m |
+| `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550 and +0.3200 on the same two |
 
-`--recipe` has no default. A sweep of one is not a comparison.
+`--recipe` has no default. A sweep of one is not a comparison. **At four bits,
+both models measured here lost accuracy the sample resolves** — see
+[MEASUREMENTS.md](MEASUREMENTS.md) for the intervals, the refusals and what
+those numbers do not establish.
 
 ### Other flags that decide something
 

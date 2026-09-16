@@ -525,3 +525,70 @@ Four, the same on both recipes:
   token limit is unverified on the runtime side. 600 of 600 runtime generations
   end without a terminator, which the subsection above accounts for.
 - The sample does not resolve either difference.
+
+## What four bits cost
+
+Everything above is 8-bit. This section converts two tuned checkpoints four more
+ways: the `gemma-3-270m-it` run of the second family, and `Qwen/Qwen3-0.6B` @
+`c1899de2` trained the same way — LoRA r16/α32, lr 2e-4, one epoch, bfloat16,
+over the same 2,400 banking77 rows. Both are scored on the same 600 held-out
+rows of split `0c7505b2b6f69ab1`, `--scorer exact-text`, 256-token limit, prompt
+mode `runtime_rendered`, litert-lm 0.16.1's CPU backend against each model's own
+float twin. Sizes are the `.litertlm` the export wrote.
+
+| Qwen3-0.6B | bytes | exact match | cost of conversion | discordant |
+|---|---|---|---|---|
+| float twin | — | **0.6983** ±0.0367 | — | — |
+| `dynamic_wi4_afp32` | 395,310,000 | *refused at the gate* | — | — |
+| `weight_only_wi4_afp32` | 395,621,504 | *refused at the gate* | — | — |
+| `dynamic_wi4b32_afp32` | 428,978,304 | 0.6633 ±0.0378 | **+0.0350** ±0.0247 *(resolved)* | 57 of 600 |
+| `dynamic_wi4b32_emb8_afp32` | 500,691,888 | 0.6433 ±0.0383 | **+0.0550** ±0.0267 *(resolved)* | 67 of 600 |
+
+| gemma-3-270m-it | bytes | exact match | cost of conversion | discordant |
+|---|---|---|---|---|
+| float twin | — | **0.6717** ±0.0376 | — | — |
+| `dynamic_wi4_afp32` | 237,851,952 | *refused at the gate* | — | — |
+| `weight_only_wi4_afp32` | 238,032,400 | *refused at the gate* | — | — |
+| `dynamic_wi4b32_afp32` | 252,925,440 | 0.3233 ±0.0374 | **+0.3483** ±0.0503 *(resolved)* | 237 of 600 |
+| `dynamic_wi4b32_emb8_afp32` | 332,617,008 | 0.3517 ±0.0382 | **+0.3200** ±0.0482 *(resolved)* | 218 of 600 |
+
+**Channelwise four bits never reached a score.** litetune gates a bundle on five
+prompts before spending an hour on 600, and both channelwise recipes failed that
+gate on both models: under `dynamic_wi4_afp32` Qwen3 repeated itself on one of
+five prompts at a ratio of 0.99 and gemma leaked `<bos>`; under
+`weight_only_wi4_afp32` Qwen3 did not finish one prompt within 300 s and gemma
+finished none of five within 900 s. The rendering check passed on all four
+bundles, so neither refusal is a prompt the two sides disagreed about.
+
+**The damage is in the weights, not in the integer kernels.**
+`weight_only_wi4_afp32` dequantizes before compute and fails exactly like
+`dynamic_wi4_afp32`, which leaves rounding the weights as the difference that
+matters. A five-prompt diagnostic through every bundle of each checkpoint says
+the same from the other side: at 8 bits both models emit the reference's label
+and stop, the terminator scoring at or above −0.001 in log-probability; at 4 bits
+channelwise, Qwen3 gets two of five labels and on one prompt emits the right
+label and then does not stop — its terminator scores −0.64 to −4.17 — while gemma
+produces no label at all, scoring the reference answer at −32 to −107 against
+−0.03 to −0.47 at 8 bits.
+
+**Blocks of 32 fix the breakage and still cost accuracy.** A scale per 32 weights
+instead of one per output channel passes the gate on both models and scores all
+600 rows. That costs the tuned Qwen3-0.6B 3.5 points of exact match and the tuned
+gemma-3-270m 34.8. Both intervals clear zero: these are differences this sample
+settles, not noise.
+
+**int8 embeddings do not rescue gemma-3-270m.** gemma holds 170M of its 270M
+parameters in embeddings, and `dynamic_wi4b32_afp32` rounds them to four bits
+along with everything else — the converter reports the embedder section
+compressing at a ratio of 0.14, against 0.26 when it stays 8-bit. litetune's own
+`dynamic_wi4b32_emb8_afp32` keeps embeddings at int8 with OCTAV clipping on the
+4-bit linear weights, which is the layout Google's quantization guide gives a
+decoder. gemma still loses 32.0 points.
+
+**What this does not establish.** That either block-wise recipe is better than
+the other. Each was paired against its float twin and never against the other,
+and the intervals overlap on both models — with int8 embeddings Qwen3 reads worse
+(+0.0550 against +0.0350) and gemma better (+0.3200 against +0.3483), and neither
+difference is one this design can settle. Nor does it say anything about models
+larger than these two, or about 4-bit weights produced some other way, such as by
+quantization-aware training. One run each, one runtime, CPU only.
