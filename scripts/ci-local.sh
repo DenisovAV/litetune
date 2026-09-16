@@ -71,7 +71,9 @@ wheel_job() {
     /tmp/fresh/bin/litetune --help >/dev/null
     /tmp/fresh/bin/python -c "import litetune, pathlib; \
       assert litetune.__version__, \"no version\"; \
-      assert (pathlib.Path(litetune.__file__).parent / \"py.typed\").is_file(), \"no py.typed\""
+      root = pathlib.Path(litetune.__file__).parent; \
+      assert (root / \"py.typed\").is_file(), \"no py.typed\"; \
+      assert (root / \"recipes\" / \"dynamic_wi4b32_emb8_afp32.json\").is_file(), \"no recipe json\""
   '
 }
 

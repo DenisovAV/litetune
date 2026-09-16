@@ -308,35 +308,34 @@ Mac's CPU and says nothing about this one.
 
 ### Limitations carried by these manifests
 
-Two, paraphrased — the second drops a measured clause and both carry a note:
+Four, paraphrased:
 
-- Measured on litert-lm's CPU backend. The manifests from this run carry the
-  older wording, which said published reports put the GPU backend materially
-  below CPU on identical artifacts, so the number was an optimistic estimate of
-  on-device behaviour. That was true of bundles without the GPU activation key
-  and not of bundles with it: on the one
-  device measured, a repacked bundle at `prefer_activation_type = fp32` scored
-  15/20 against the CPU's 14/20 at 1.8× the speed, which at n=20 is not a
-  resolved difference — see the table in `export.py`. `convert` attempts that
-  repack on every bundle, and names the ones where it could not, or where a
+- Measured on litert-lm's CPU backend. The wording these manifests carry is the
+  corrected one: litert-lm's GPU backend is a different executor and this number
+  does not predict it, pointing at README's limitations section rather than
+  quoting figures. The earlier wording, which this run predates, said published
+  reports put the GPU backend materially below CPU on identical artifacts. That
+  was true of bundles without the GPU activation key and not of bundles with it:
+  on the one device measured, a repacked bundle at `prefer_activation_type =
+  fp32` scored 15/20 against the CPU's 14/20 at 1.8× the speed, which at n=20 is
+  not a resolved difference — see the table in `export.py`. `convert` attempts
+  that repack on every bundle, and names the ones where it could not, or where a
   different value was already declared; one already declaring `fp32` needs no
-  warning and gets none. The limitation was corrected after this run, and cut
-  back: a manifest produced today says only that litert-lm's GPU backend is a
-  different executor and the CPU number does not predict it, and points at
-  README's limitations section. Figures belong in the documents, where the
-  conditions that make them readable sit beside them, and not in a per-run
-  limitation that would carry another run's numbers into every manifest.
+  warning and gets none. Figures belong in the documents, where the conditions
+  that make them readable sit beside them, and not in a per-run limitation that
+  would carry another run's numbers into every manifest.
+- The candidate ran on CPU and the reference on CUDA, so the difference carries
+  a hardware difference as well as a conversion one. Training ran in bfloat16 on
+  that same A100; export passes no dtype and the float reference loads at
+  float32, so the dtype mismatches neither side — the device does, and this is
+  the limitation that records it.
 - Decoding parameters were passed to transformers but not to litert-lm, which
   used the pinned runtime's defaults; both are greedy, and the token limit is
   unverified on the runtime side. In the withdrawn `prerendered` run that limit
   is what the base model ran into; in the re-measurement it returned nothing at
   all instead — see the subsection after this one.
-
-And one fact about the re-measured run, which fired no limitation:
-
-- Training ran in bfloat16, the default, on the same A100 that held the float
-  reference. Export passes no dtype and the float reference loads at float32,
-  so that is not a mismatch with either.
+- The sample does not resolve the difference: +0.0000 lies inside ±0.0190 at
+  n=600, on 34 of 600 discordant examples.
 
 ### The base model could not be scored at all
 
@@ -508,11 +507,14 @@ the base step: the guard ahead of it stopped the container and recorded
 earlier run met the same thing from the other side: a five-prompt `verify`
 given 900 seconds that did not finish. So training gain is unattributed here
 too. One run.
-Conversions measured on CPU only — no GPU or NPU figure for this family.
+Conversions measured on CPU in this run. The same artifacts were later run on a
+phone, on both its CPU and its GPU — see *What four bits cost*. No NPU figure
+for this family.
 
 ### Limitations carried by these manifests
 
-Four, the same on both recipes:
+Four on `dynamic_wi8_afp32`, three on `weight_only_wi8_afp32`: the last is
+absent there because that cost does resolve.
 
 - Measured on litert-lm's CPU backend; its GPU backend is a different executor
   and this number does not predict it.
@@ -524,11 +526,15 @@ Four, the same on both recipes:
   litert-lm, which uses the pinned runtime's defaults; both are greedy, and the
   token limit is unverified on the runtime side. 600 of 600 runtime generations
   end without a terminator, which the subsection above accounts for.
-- The sample does not resolve either difference.
+- On `dynamic_wi8_afp32` only: the sample does not resolve that difference.
+  `weight_only_wi8_afp32` carries no such line, and its table entry above says
+  why — +0.0167 ±0.0113, resolved on 12 discordant.
 
 ## What four bits cost
 
-Everything above is 8-bit. This section converts two tuned checkpoints four more
+Everything above is 8-bit, except the Gemma 4 table, whose `dynamic_wi4b32_afp32`
+row is a block-wise four-bit export of base weights rather than a tuned
+checkpoint. This section converts two tuned checkpoints four more
 ways: the `gemma-3-270m-it` run of the second family, and `Qwen/Qwen3-0.6B` @
 `c1899de2` trained the same way — LoRA r16/α32, lr 2e-4, one epoch, bfloat16,
 over the same 2,400 banking77 rows. Both are scored on the same 600 held-out

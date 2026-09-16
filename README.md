@@ -52,8 +52,9 @@ is workable at 270M and the first thing you will want to change above about
 
 > **Alpha.** Measured end to end on three models: `google/functiongemma-270m-it`
 > with the tool-call scorer, and `google/gemma-3-270m-it` and `Qwen/Qwen3-0.6B`
-> with `exact-text` on the same 77-way intent task — every conversion measured
-> on CPU, all in [MEASUREMENTS.md](MEASUREMENTS.md).
+> with `exact-text` on the same 77-way intent task — every conversion scored on
+> CPU, two of them also on a phone's CPU and GPU, all in
+> [MEASUREMENTS.md](MEASUREMENTS.md).
 > Qwen3.5 exports and needs no flags from litetune, only a `transformers`
 > floor. Gemma 4 exports once you name the variant — `E2B` or `E4B` — because
 > the chat template override is per-variant; a bare `gemma-4` is refused
@@ -226,9 +227,9 @@ to the rest is a measurement of what each costs on your task:
 |---|---|
 | `dynamic_wi8_afp32` | the toolchain's default; its own docstring warns quality "may suffer" |
 | `weight_only_wi8_afp32` | dequantizes before compute, so slower by an unmeasured amount |
-| `dynamic_wi4_afp32` | 4-bit channelwise. Refused at the five-prompt gate on both models measured |
-| `weight_only_wi4_afp32` | 4-bit channelwise, dequantised before compute. Refused too, on a different check: a prompt that never finished rather than a leaked token |
-| `dynamic_wi4b32_afp32` | 4-bit in blocks of 32. Passes the gate; cost +0.0350 on a tuned Qwen3-0.6B and +0.3483 on a tuned gemma-3-270m |
+| `dynamic_wi4_afp32` | 4-bit channelwise. Refused on both models measured — a leaked `<bos>` on gemma, degenerate repetition on Qwen3 — at the five-prompt gate the measurement harness runs; litetune has no gate of its own |
+| `weight_only_wi4_afp32` | 4-bit channelwise, dequantised before compute. Refused too, and differently: prompts that never finished |
+| `dynamic_wi4b32_afp32` | 4-bit in blocks of 32. Reached a score on both; cost +0.0350 on a tuned Qwen3-0.6B and +0.3483 on a tuned gemma-3-270m |
 | `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550 and +0.3200 on the same two |
 
 `--recipe` has no default. A sweep of one is not a comparison. **At four bits,
@@ -376,7 +377,8 @@ no flag from litetune, and the rule it has now records that none is needed. The
 weight-only figure clears its interval here where the dynamic one does not, and
 where neither of Gemma 3's did — on 12 disagreements out of 600. Training and
 the float reference ran on a GPU and the converted models on a CPU, so this cost
-carries a hardware difference the Gemma 3 one does not — see
+carries a hardware difference as well as a conversion one — as the Gemma 3 one
+does too; every manifest in both runs records it — see
 [MEASUREMENTS.md](MEASUREMENTS.md).
 
 **[MEASUREMENTS.md](MEASUREMENTS.md)** has the intervals, three runs of the same
@@ -461,9 +463,10 @@ withdrawn after re-measurement.
 - **Measured on four models, three of them fine-tuned here.**
   `functiongemma-270m-it` with the tool-call scorer, and `gemma-3-270m-it` and
   `Qwen3-0.6B` with `exact-text`, each with a conversion cost against its own
-  float twin. Only FunctionGemma also has a training gain: both banking77 runs
-  refused to score their untuned base, so there is no base figure to subtract
-  and the manifests record the gain as unavailable. `gemma-4-E2B-it` was not
+  float twin. Only FunctionGemma also has a training gain: neither banking77 run
+  has an untuned base figure to subtract — Gemma 3's base was run and refused to
+  score, Qwen3's never reached the base step at all — and both manifests record
+  the gain as unavailable. `gemma-4-E2B-it` was not
   fine-tuned at all: base weights, two conversions of them compared against the
   float reference, so that run has a conversion cost and no training gain.
   Qwen3.5 exports but has no quality figure, and a Gemma 4 without its variant
@@ -490,8 +493,8 @@ withdrawn after re-measurement.
   all of them if the split is shorter, it also compares the prefill count the
   runtime reports when the prompt is actually sent. Any difference is a harness failure (exit 4) with the prompt, both
   counts and the first differing position at `harness.rendering_check`, not a
-  conversion cost. On the tuned `Qwen3-0.6B` exports all 600 banking77 prompts
-  matched, and on the `gemma-3-270m-it` base export too; a rendering that adds
+  conversion cost. On every tuned export of both families all 600 banking77
+  prompts matched, and on the `gemma-3-270m-it` base export too; a rendering that adds
   an empty `<think></think>` is refused on every prompt, which is constructed
   in the tests rather than seen in a run. Reasoning is removed from both sides before scoring,
   through the last `[/thought]` or `</think>`, and counted per side at
@@ -609,7 +612,7 @@ Wiring `|| exit 1` on anything non-zero throws all of this away.
 ## Contributing
 
 Issues and pull requests welcome, particularly measurements on models other
-than the two above — that is the gap this alpha most needs closed.
+than the four above — that is the gap this alpha most needs closed.
 
 Run the checks with `pytest`, `ruff check`, `ruff format --check` and `mypy src`.
 

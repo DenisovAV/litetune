@@ -486,9 +486,10 @@ RULES: tuple[ModelRules, ...] = (
         # exporter's own type list (the model-type trap, above), so a config
         # that says `model_type: "qwen3"` is typed correctly with no override.
         # Measured 2026-09-14 on Qwen/Qwen3-0.6B: both int8 recipes exported
-        # with no flag from litetune, `litertlm_peek` on the artifact read
-        # `llm_model_type { qwen3 {} }`, and the conversion cost is in
-        # MEASUREMENTS.md.
+        # with no flag from litetune, and the conversion cost is in
+        # MEASUREMENTS.md. What the artifact's own `llm_model_type` reads is not
+        # recorded here: that observation appears in no manifest or log of any
+        # run, and was struck from the documents for the same reason.
         #
         # By size, not `qwen-?3`: that also claims the other sizes and the
         # Qwen 3 models built on other architectures, none of which this
