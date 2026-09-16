@@ -46,8 +46,7 @@ class DefinedRecipe:
 # OCTAV, embeddings int8. Never channelwise for a decoder"). On the banking77
 # checkpoints both channelwise 4-bit presets failed their gates, and the
 # block-wise preset, which keeps embeddings at 4 bits, cost gemma-3-270m
-# +0.3483 ±0.0503. The file was generated with the quantizer's own
-# RecipeManager and round-trips through it.
+# +0.3483 ±0.0503.
 DEFINED_RECIPES: dict[str, DefinedRecipe] = {
     recipe.name: recipe
     for recipe in (

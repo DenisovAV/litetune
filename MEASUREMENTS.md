@@ -552,24 +552,30 @@ float twin. Sizes are the `.litertlm` the export wrote.
 | `dynamic_wi4b32_afp32` | 252,925,440 | 0.3233 ±0.0374 | **+0.3483** ±0.0503 *(resolved)* | 237 of 600 |
 | `dynamic_wi4b32_emb8_afp32` | 332,617,008 | 0.3517 ±0.0382 | **+0.3200** ±0.0482 *(resolved)* | 218 of 600 |
 
-**Channelwise four bits never reached a score.** litetune gates a bundle on five
-prompts before spending an hour on 600, and both channelwise recipes failed that
-gate on both models: under `dynamic_wi4_afp32` Qwen3 repeated itself on one of
-five prompts at a ratio of 0.99 and gemma leaked `<bos>`; under
-`weight_only_wi4_afp32` Qwen3 did not finish one prompt within 300 s and gemma
-finished none of five within 900 s. The rendering check passed on all four
+**Channelwise four bits never reached a score.** The measurement harness gates a
+bundle on five prompts before spending an hour on 600 — litetune has no gate of
+its own — and both channelwise recipes failed that gate on both models: under
+`dynamic_wi4_afp32` Qwen3 repeated itself on one of five prompts at a ratio of
+0.9937 and gemma leaked `<bos>`; under `weight_only_wi4_afp32` Qwen3 did not
+finish one prompt within 300 s, and gemma hit litetune's own 300 s per-prompt
+limit on each of the first two, after which the gate's 900 s budget expired. No
+manifest was written for that last one, so how many of the five it would have
+finished is not known. The rendering check passed on all four
 bundles, so neither refusal is a prompt the two sides disagreed about.
 
-**The damage is in the weights, not in the integer kernels.**
-`weight_only_wi4_afp32` dequantizes before compute and fails exactly like
-`dynamic_wi4_afp32`, which leaves rounding the weights as the difference that
-matters. A five-prompt diagnostic through every bundle of each checkpoint says
+**Both recipes collapse, which points at the weights rather than the integer
+kernels.** `weight_only_wi4_afp32` dequantises before compute and failed on the
+same checkpoints as `dynamic_wi4_afp32` — on a different check, but neither
+produced an answer — so integer activations are not what separates a working
+bundle from a broken one here. A five-prompt diagnostic through every bundle of each checkpoint says
 the same from the other side: at 8 bits both models emit the reference's label
 and stop, the terminator scoring at or above −0.001 in log-probability; at 4 bits
-channelwise, Qwen3 gets two of five labels and on one prompt emits the right
-label and then does not stop — its terminator scores −0.64 to −4.17 — while gemma
-produces no label at all, scoring the reference answer at −32 to −107 against
-−0.03 to −0.47 at 8 bits.
+channelwise, Qwen3 matches one of five labels exactly and on another emits the
+right label and then does not stop — its terminator scores −0.64 to −4.17 — while
+gemma produces no label at all, scoring the reference answer at −32 to −107
+against −0.03 to −0.47 at 8 bits. Those last figures are the diagnostic's
+`score_total` with the terminator token's own log-probability taken off, which is
+why they are not the raw totals in `*__diag-int4.json`.
 
 **Blocks of 32 fix the breakage and still cost accuracy.** A scale per 32 weights
 instead of one per output channel passes the gate on both models and scores all
@@ -577,10 +583,13 @@ instead of one per output channel passes the gate on both models and scores all
 gemma-3-270m 34.8. Both intervals clear zero: these are differences this sample
 settles, not noise.
 
-**int8 embeddings do not rescue gemma-3-270m.** gemma holds 170M of its 270M
-parameters in embeddings, and `dynamic_wi4b32_afp32` rounds them to four bits
-along with everything else — the converter reports the embedder section
-compressing at a ratio of 0.14, against 0.26 when it stays 8-bit. litetune's own
+**int8 embeddings do not rescue gemma-3-270m.** gemma holds 168M of its 268M
+parameters in embeddings — a 262,144-token vocabulary at a hidden size of 640,
+against the `base_parameters` its own tune metrics record — and
+`dynamic_wi4b32_afp32` rounds them to four bits with everything else: its
+embedder section compresses 640.01 MiB to 90.01 MiB, a ratio of 0.14 computed
+from the convert manifest, against the 0.26 the converter prints for the 8-bit
+run. litetune's own
 `dynamic_wi4b32_emb8_afp32` keeps embeddings at int8 with OCTAV clipping on the
 4-bit linear weights, which is the layout Google's quantization guide gives a
 decoder. gemma still loses 32.0 points.
@@ -591,4 +600,28 @@ and the intervals overlap on both models — with int8 embeddings Qwen3 reads wo
 (+0.0550 against +0.0350) and gemma better (+0.3200 against +0.3483), and neither
 difference is one this design can settle. Nor does it say anything about models
 larger than these two, or about 4-bit weights produced some other way, such as by
-quantization-aware training. One run each, one runtime, CPU only.
+quantization-aware training. One run each, one runtime.
+
+**On a phone, the backend changes the answer.** The Qwen3-0.6B artifacts above
+were run on a Galaxy S24 (`SC-51E`, SM8650, Android 36) through Firebase Test
+Lab, 600 rows per cell. The phone scores nothing: it records generations, and the
+host scores them with the same `exact-text` scorer and the same paired interval
+`verify` uses.
+
+| bundle | backend | exact match | cost against the float reference | discordant |
+|---|---|---|---|---|
+| `dynamic_wi8_afp32` | CPU | 0.6817 ±0.0373 | **+0.0167** ±0.0146 *(resolved)* | 20 of 600 |
+| `dynamic_wi8_afp32` | GPU | 0.6500 ±0.0382 | **+0.0483** ±0.0259 *(resolved)* | 63 of 600 |
+| `dynamic_wi4b32_emb8_afp32` | CPU | 0.6333 ±0.0386 | **+0.0650** ±0.0255 *(resolved)* | 61 of 600 |
+| `dynamic_wi4b32_emb8_afp32` | GPU | 0.6550 ±0.0380 | **+0.0433** ±0.0249 *(resolved)* | 58 of 600 |
+
+Paired over the same prompts, the GPU backend costs **+0.0317 ±0.0233** against
+the CPU one on the 8-bit bundle and **−0.0217 ±0.0142** on the mixed int4 bundle.
+Both resolve, and they point in opposite directions: which backend is better
+depends on the recipe. README's limitation — that litert-lm's GPU backend is a
+different executor and a CPU number does not predict it — has a size here.
+
+What the phone run does not establish: the difference between it and the cloud
+CPU number for the same file (0.6817 against 0.6917) is two numbers, not a paired
+test, because the cloud candidate's per-row generations were never shipped. One
+phone model, one run per cell, greedy decoding.

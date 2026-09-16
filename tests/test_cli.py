@@ -1702,4 +1702,10 @@ def test_the_tune_summary_says_when_the_mode_was_never_decided(monkeypatch, tmp_
 def test_convert_help_names_the_recipe_litetune_defines(capsys):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["convert", "--help"])
-    assert "dynamic_wi4b32_emb8_afp32" in capsys.readouterr().out
+    # Whitespace collapsed: argparse wraps help text, so a phrase that reaches
+    # the user still breaks across lines in the captured output.
+    out = " ".join(capsys.readouterr().out.split())
+    assert "dynamic_wi4b32_emb8_afp32" in out
+    # The catalogue's own one-line description reaches the user, the way the
+    # scorer help is held to `SCORERS`' `describes`.
+    assert "int4 weights in blocks of 32 with int8 embeddings" in out

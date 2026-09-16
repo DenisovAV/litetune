@@ -227,7 +227,7 @@ to the rest is a measurement of what each costs on your task:
 | `dynamic_wi8_afp32` | the toolchain's default; its own docstring warns quality "may suffer" |
 | `weight_only_wi8_afp32` | dequantizes before compute, so slower by an unmeasured amount |
 | `dynamic_wi4_afp32` | 4-bit channelwise. Refused at the five-prompt gate on both models measured |
-| `weight_only_wi4_afp32` | the same, refused the same way: at four bits the damage is in the weights, not the kernels |
+| `weight_only_wi4_afp32` | 4-bit channelwise, dequantised before compute. Refused too, on a different check: a prompt that never finished rather than a leaked token |
 | `dynamic_wi4b32_afp32` | 4-bit in blocks of 32. Passes the gate; cost +0.0350 on a tuned Qwen3-0.6B and +0.3483 on a tuned gemma-3-270m |
 | `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550 and +0.3200 on the same two |
 
@@ -458,15 +458,16 @@ withdrawn after re-measurement.
 
 **Limits on the numbers**
 
-- **Measured on four models, three of them end to end.**
+- **Measured on four models, three of them fine-tuned here.**
   `functiongemma-270m-it` with the tool-call scorer, and `gemma-3-270m-it` and
-  `Qwen3-0.6B` with `exact-text`, were fine-tuned here, so each has a conversion
-  cost. Only FunctionGemma also has a training gain: neither of the other two
-  untuned bases was scored. `gemma-4-E2B-it` was not fine-tuned: base weights,
-  two conversions of them compared against the float reference, so that run has
-  a conversion cost and no training gain. Qwen3.5 exports but has no quality
-  figure, and a Gemma 4 without its variant is still refused unless you supply
-  the template override yourself.
+  `Qwen3-0.6B` with `exact-text`, each with a conversion cost against its own
+  float twin. Only FunctionGemma also has a training gain: both banking77 runs
+  refused to score their untuned base, so there is no base figure to subtract
+  and the manifests record the gain as unavailable. `gemma-4-E2B-it` was not
+  fine-tuned at all: base weights, two conversions of them compared against the
+  float reference, so that run has a conversion cost and no training gain.
+  Qwen3.5 exports but has no quality figure, and a Gemma 4 without its variant
+  is still refused unless you supply the template override yourself.
 - **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
   the liveness checks both trim against a fixed set of strings, recorded
   verbatim at `harness.terminators` in every verify manifest. A family whose

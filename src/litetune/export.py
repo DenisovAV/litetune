@@ -70,6 +70,13 @@ KNOWN_RECIPES = (
     "weight_only_wi8_afp32",
     "dynamic_wi4_afp32",
     "weight_only_wi4_afp32",
+    # Block-wise 4-bit: both measured on two tuned checkpoints over 600 rows
+    # (MEASUREMENTS.md, "What four bits cost"), so neither is a name litetune
+    # merely passes through. Leaving them out told a caller their recipe was
+    # "not among the ones litetune has measured" while the README tabulated
+    # what it cost.
+    "dynamic_wi4b32_afp32",
+    "dynamic_wi4b32_emb8_afp32",
 )
 
 # The two the README's table was produced with: same bit width, opposite ends
@@ -1534,6 +1541,18 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
             )
             events.metric(f"{recipe} bytes", export.artifact_bytes, recipe=recipe)
 
+    # A recipe whose definition could not be read never ran, and `not_attempted`
+    # is where a reader looks for that. Without this it held only the recipes an
+    # early return skipped, so a sweep could carry a recipe that was not
+    # attempted and not listed as such.
+    result.not_attempted = tuple(e.recipe for e in result.exports if not e.attempted)
+    produced = [e.recipe for e in result.exports if e.ok]
+    if len(produced) < len(request.recipes):
+        missing = [r for r in request.recipes if r not in produced]
+        result.limitations.append(
+            f"{', '.join(missing)} produced no artifact, so any comparison below is over "
+            f"{len(produced)} of the {len(request.recipes)} recipes requested"
+        )
     result.comparison = compare_sizes(list(request.recipes), result.exports)
     if isinstance(result.comparison, Uncompared):
         result.limitations.append(result.comparison.reason)

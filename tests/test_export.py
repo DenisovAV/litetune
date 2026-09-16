@@ -409,7 +409,13 @@ def test_a_recipe_name_cannot_escape_the_output_directory(tmp_path):
 def test_unknown_recipe_is_passed_through_but_flagged(toolchain, request_for):
     result = run_export(request_for(("dynamic_wi8_afp32", "experimental_wi2")))
     assert result.outcome is Outcome.PASSED
-    assert any("experimental_wi2" in limit for limit in result.limitations)
+    (flagged,) = [limit for limit in result.limitations if "passed through" in limit]
+    named = flagged.split(" are not among")[0]
+    assert "experimental_wi2" in named
+    # The measured preset in the same sweep is not swept up with it. Asserted on
+    # the names the limitation flags, not on the whole sentence: it also lists
+    # the measured recipes for context, and `dynamic_wi8_afp32` is one of them.
+    assert "dynamic_wi8_afp32" not in named
     assert "experimental_wi2" not in KNOWN_RECIPES
 
 
@@ -1530,8 +1536,12 @@ def test_an_owned_recipe_is_not_flagged_as_passed_through(toolchain, request_for
 
     passed_through = [text for text in result.limitations if "passed through" in text]
     assert len(passed_through) == 1
-    assert "dynamic_wi4b64_afp32" in passed_through[0]
-    assert OWNED not in passed_through[0]
+    named = passed_through[0].split(" are not among")[0]
+    assert "dynamic_wi4b64_afp32" in named
+    assert OWNED not in named
+    # And it now appears on the other side of that sentence: among the recipes
+    # litetune has measured, which is what the README's table says of it.
+    assert OWNED in passed_through[0]
 
 
 @pytest.mark.parametrize(
@@ -1540,6 +1550,12 @@ def test_an_owned_recipe_is_not_flagged_as_passed_through(toolchain, request_for
         (None, "missing"),
         ("not json", "could not be read"),
         ('{"operation": "FULLY_CONNECTED"}', "not a list of quantization rules"),
+        # Each conjunct of the shape check earns its own case: an empty list and
+        # a rule with no operation both validated while only the isinstance was
+        # pinned, and either would hand the toolchain a file that quantizes
+        # nothing while the report vouched for the rules it did not apply.
+        ("[]", "not a list of quantization rules"),
+        ('[{"regex": ".*"}]', "not a list of quantization rules"),
     ],
 )
 def test_an_owned_recipe_that_cannot_be_read_is_not_exported_in_anothers_place(

@@ -464,7 +464,9 @@ def _add_convert(sub) -> None:
             "a quantization recipe to sweep; repeat it. There is no default: the toolchain's own "
             f"choice cost 0.024 exact match. A defensible minimum is {list(MEASURED_RECIPES)}. "
             "litetune also defines "
-            + "; ".join(f"{r.name} ({r.describes})" for r in DEFINED_RECIPES.values())
+            + "; ".join(
+                f"{r.name} ({r.describes})".replace("%", "%%") for r in DEFINED_RECIPES.values()
+            )
         ),
     )
     convert.add_argument(
