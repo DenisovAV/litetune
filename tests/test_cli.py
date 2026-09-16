@@ -1670,3 +1670,30 @@ def test_the_verify_summary_says_how_much_reasoning_never_closed():
         }
     )
     assert "  reasoning removed before scoring: candidate 3 of 40 (5 never closed)" in lines
+
+
+def test_the_tune_summary_says_when_the_mode_was_never_decided(monkeypatch, tmp_path, capsys):
+    # The line a user reads after a run that stopped before the decision. Both
+    # branches ran under existing tests; neither was asserted, so either could
+    # print the other's sentence.
+    from litetune import cli
+    from litetune.checks import CheckSet
+    from litetune.tune import TuneResult
+
+    def fake_run_tune(request, events=None):
+        return TuneResult(request=request, checks=CheckSet(name="train"))
+
+    monkeypatch.setattr(cli, "run_tune", fake_run_tune)
+    main(
+        [
+            "tune",
+            "--model",
+            "m",
+            "--data",
+            str(tmp_path / "d.jsonl"),
+            "--output-dir",
+            str(tmp_path / "run"),
+        ]
+    )
+
+    assert "prompt mode not decided" in capsys.readouterr().out

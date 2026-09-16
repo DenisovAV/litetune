@@ -460,3 +460,19 @@ def test_the_real_backends_carry_the_real_probe(tmp_path):
     assert isinstance(pair.rendering, RenderingProbe)
     assert pair.rendering.model == tmp_path / "m.litertlm"
     assert pair.rendering.reference == "org/reference"
+
+
+def test_a_run_that_reported_no_prefill_count_is_not_a_pass():
+    """Equal ids are half the check; the prefill count is the half that catches
+    tokens added outside the rendered text, which is how the session BOS was
+    found. If the runtime returned no count for any prompt it was sent, that
+    half did not run and the check must not vouch for it."""
+    comparison = compare_renderings(
+        PROMPTS, rows([[1, 2, 3], [4, 5, 6]]), rows([[1, 2, 3], [4, 5, 6]])
+    )
+
+    assert comparison.agrees
+    check = comparison.check()
+    assert check.outcome.value == "could_not_check"
+    assert "no prefill count" in check.detail
+    assert check.observed["prompts_compared"] == 2

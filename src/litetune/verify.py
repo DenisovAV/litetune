@@ -260,11 +260,17 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
     read raises: falling back to the contract or the prompts would silently
     replace a mode the checkpoint wrote down.
     """
-    path = Path(reference)
-    sidecar = path / models.PROVENANCE_NAME
-    if not (path.is_dir() and sidecar.is_file()):
+    sidecar = Path(reference) / models.PROVENANCE_NAME
+    try:
+        text = sidecar.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        # No record: a Hugging Face id, or a directory that never had one.
         return None
-    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    # Every other OSError propagates. `Path.is_file()` answers False for a
+    # sidecar that exists and cannot be stat'd -- a permission, a dangling
+    # symlink, a stale mount -- and falling through to the contract or to
+    # inference would silently replace a mode the checkpoint wrote down.
+    data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError(f"{sidecar} does not contain a JSON object")
     raw = data.get("prompt_mode")
@@ -516,6 +522,13 @@ def run_verify(
             run.manifest["harness"]["rendering_check"] = {"applied": False, "reason": reason}
             run.limitation(reason)
         else:
+            # Written before the attempt: if `observe` raises, the guard records
+            # the failure in the checks, and a manifest reader still finds this
+            # key rather than a KeyError on the one path where it matters.
+            run.manifest["harness"]["rendering_check"] = {
+                "applied": False,
+                "reason": "the rendering check did not finish",
+            }
             with guard(RENDERING_CHECK) as sink:
                 comparison = pair.rendering.observe(split.prompts, events=events)
                 run.manifest["harness"]["rendering_check"] = comparison.as_dict()

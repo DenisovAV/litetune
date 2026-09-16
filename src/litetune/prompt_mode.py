@@ -7,9 +7,7 @@ the model expected", and what it actually does is route the runtime to
 template, the `<|turn>model` anchor, tool handling and channel extraction. It
 is correct when the caller built the whole prompt including control tokens --
 the FunctionGemma case, where training used a hand-rendered wire format -- and
-wrong by default. A six-model probe run without it gave live structured output
-on Gemma 3 270M, Qwen3 0.6B and Qwen2.5 0.5B, all of which had previously been
-measured *with* it.
+wrong by default.
 
 The mode is not a property of the model. The same FunctionGemma trained
 through `apply_chat_template` would need the opposite flag, so it cannot be
@@ -26,7 +24,9 @@ inferred, and then the inference and its evidence are reported so a user can
 contradict them.
 
 This module holds what every stage shares; each stage keeps its own policy.
-`tune.decide_prompt_mode` refuses to guess for a training run, `verify` measures
+`tune.decide_prompt_mode` infers the mode from the training prompts and refuses
+only what it cannot read -- a split that mixes the two conventions, or a declared
+mode the prompts contradict without `--force-prompt-mode`. `verify` measures
 under `resolve_prompt_mode`, and `bundle` takes the mode the training run
 recorded. How a prompt becomes tokenizer input is `RENDERING_SOURCE`.
 """

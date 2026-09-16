@@ -23,6 +23,7 @@ from litetune.bundle import Contract
 from litetune.evaluate import HuggingFaceBackend, LiteRtLmBackend
 from litetune.prompt_mode import (
     RENDERING_SOURCE,
+    TURN_MARKERS,
     PromptMode,
     PromptModeConflict,
     marker_share,
@@ -458,3 +459,53 @@ def test_an_unknown_recorded_mode_is_refused_naming_the_record_and_the_modes(raw
     message = str(exc.value)
     assert message.startswith(f"run/litetune.json records prompt_mode {raw!r}")
     assert all(mode.value in message for mode in PromptMode)
+
+
+@pytest.mark.parametrize("marker", TURN_MARKERS)
+def test_every_control_token_the_list_carries_marks_a_prompt_as_rendered(marker):
+    """Each entry earns its place, or a family stops being recognised.
+
+    One literal covered this before, so dropping any other marker from the tuple
+    left the suite green while a Qwen split scored 0% rendered and trained
+    double-wrapped.
+    """
+    decision = resolve_prompt_mode([f"{marker}user\nhi"] * 10)
+
+    assert decision.mode is PromptMode.PRERENDERED
+    assert decision.markers == (marker,)
+
+
+def test_the_markers_reach_the_record_a_reader_contradicts_it_with():
+    # Asserted on the serialised form, not the attribute: the record is what
+    # `litetune.json`, the tune metrics and the verify manifest carry.
+    record = resolve_prompt_mode([RENDERED] * 10).as_dict()
+
+    assert record["markers"] == ["<start_of_turn>"]
+    assert record["source"] == "inferred"
+
+
+def test_a_sidecar_that_exists_and_cannot_be_read_raises(tmp_path):
+    """The docstring promises this, and `is_file()` quietly broke the promise.
+
+    A mode the checkpoint wrote down must not be replaced by one inferred from
+    the prompts because the file could not be looked at.
+    """
+    from litetune.verify import recorded_prompt_mode
+
+    reference = _checkpoint(tmp_path, {"prompt_mode": "prerendered"})
+    sidecar = Path(reference) / "litetune.json"
+    sidecar.unlink()
+    sidecar.mkdir()  # exists, and reading it is an OSError that is not "absent"
+
+    with pytest.raises(OSError):
+        recorded_prompt_mode(reference)
+
+
+def test_a_reference_with_no_sidecar_is_still_no_record(tmp_path):
+    from litetune.verify import recorded_prompt_mode
+
+    empty = tmp_path / "plain-checkpoint"
+    empty.mkdir()
+
+    assert recorded_prompt_mode(str(empty)) is None
+    assert recorded_prompt_mode("Qwen/Qwen3-0.6B") is None

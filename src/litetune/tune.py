@@ -463,7 +463,14 @@ def main() -> int:
     if pad_id is None:
         raise ValueError("the tokenizer has neither a pad token nor an eos token to pad with")
 
-    runtime_rendered = spec["prompt_mode"] == "runtime_rendered"
+    mode = spec["prompt_mode"]
+    if mode not in ("prerendered", "runtime_rendered"):
+        raise ValueError(
+            f"prompt_mode {mode!r} is not a mode this script can train. The parent decides it "
+            "and writes it here; a missing one is not a default, because prerendered and "
+            "runtime_rendered train different prompts."
+        )
+    runtime_rendered = mode == "runtime_rendered"
     examples, supervised, total, terminator = build_examples(
         tok, rows, spec["max_seq_length"], runtime_rendered
     )

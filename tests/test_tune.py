@@ -2388,3 +2388,17 @@ def test_the_real_script_records_the_decision_beside_the_checkpoint(request_for,
     for record in (metrics, sidecar):
         assert record["prompt_mode"] == "prerendered"
         assert record["prompt_mode_decision"] == decision.as_dict()
+
+
+def test_the_training_script_refuses_a_prompt_mode_it_was_not_given():
+    """`spec["prompt_mode"] == "runtime_rendered"` read a missing mode as
+    prerendered -- silently training the other convention, which is the failure
+    this whole module exists to prevent. The guard has to come before the flag
+    is derived, or it guards nothing."""
+    from litetune.tune import _TRAIN_SCRIPT
+
+    guard = _TRAIN_SCRIPT.index("is not a mode this script can train")
+    derived = _TRAIN_SCRIPT.index('runtime_rendered = mode == "runtime_rendered"')
+
+    assert guard < derived
+    assert 'if mode not in ("prerendered", "runtime_rendered"):' in _TRAIN_SCRIPT

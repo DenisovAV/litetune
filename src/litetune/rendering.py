@@ -221,6 +221,20 @@ class RenderingComparison:
 
     def check(self) -> Check:
         sampled = len(self.prefill)
+        if self.agrees and not sampled and self.compared:
+            # Equal ids are half of this check. The other half -- the runtime's
+            # own prefill count against the reference's id count -- is what
+            # catches tokens added outside the rendered text, and it is how the
+            # BOS a session prepends was found. If the runtime reported no count
+            # for any prompt it was sent, that half did not run, and passing here
+            # would vouch for a comparison nobody made.
+            return Check.unchecked(
+                RENDERING_CHECK,
+                f"identical token ids for all {self.compared} prompts, but the runtime reported "
+                "no prefill count for any prompt it was sent, so that half of the check did not "
+                "run",
+                observed=self.as_dict(),
+            )
         if self.agrees:
             return Check.passed(
                 RENDERING_CHECK,
