@@ -1,10 +1,10 @@
 # What was measured, and what it established
 
-Numbers for `litetune`. Everything up to the last section is
-`functiongemma-270m-it` LoRA-tuned on `google/mobile-actions`, scored on 640
-held-out single-call examples; exact match means the tool name **and** every
-argument value. The last section is the first run of a second family and the
-second scorer.
+Numbers for `litetune`. The first sections are `functiongemma-270m-it`
+LoRA-tuned on `google/mobile-actions`, scored on 640 held-out single-call
+examples; exact match means the tool name **and** every argument value. Each
+section after them is another family: `gemma-3-270m-it` with the second scorer,
+then `gemma-4-E2B-it` converted from its base weights.
 
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
