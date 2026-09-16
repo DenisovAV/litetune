@@ -213,6 +213,9 @@ class RenderingComparison:
 
     compared: int
     prefill: tuple[Mapping[str, int], ...] = ()
+    # How many prompts the runtime was asked to prefill. Zero is a caller that
+    # asked for none, which is not the same as a runtime that answered none.
+    prefill_requested: int = 0
     mismatches: tuple[RenderingMismatch, ...] = field(default_factory=tuple)
 
     @property
@@ -221,7 +224,7 @@ class RenderingComparison:
 
     def check(self) -> Check:
         sampled = len(self.prefill)
-        if self.agrees and not sampled and self.compared:
+        if self.agrees and self.prefill_requested and not sampled:
             # Equal ids are half of this check. The other half -- the runtime's
             # own prefill count against the reference's id count -- is what
             # catches tokens added outside the rendered text, and it is how the
@@ -230,9 +233,9 @@ class RenderingComparison:
             # would vouch for a comparison nobody made.
             return Check.unchecked(
                 RENDERING_CHECK,
-                f"identical token ids for all {self.compared} prompts, but the runtime reported "
-                "no prefill count for any prompt it was sent, so that half of the check did not "
-                "run",
+                f"identical token ids for all {self.compared} prompts, but the runtime reported no "
+                f"prefill count for any of the {self.prefill_requested} prompts it was sent, so "
+                "that half of the check did not run",
                 observed=self.as_dict(),
             )
         if self.agrees:
@@ -255,6 +258,7 @@ class RenderingComparison:
         return {
             "applied": True,
             "prompts_compared": self.compared,
+            "prefill_requested": self.prefill_requested,
             "prefill_sampled": [dict(row) for row in self.prefill],
             "mismatches": len(self.mismatches),
             # The first few, which is what a reader needs to find the cause; the
@@ -274,6 +278,7 @@ def compare_renderings(
     prompts: Sequence[str],
     runtime_rows: Sequence[Mapping[str, Any]],
     reference_rows: Sequence[Mapping[str, Any]],
+    prefill_requested: int = 0,
 ) -> RenderingComparison:
     """Compare what the two scripts returned. Raises if either did not cover every prompt."""
     runtime = {int(row["index"]): row for row in runtime_rows}
@@ -320,7 +325,10 @@ def compare_renderings(
                 )
             )
     return RenderingComparison(
-        compared=len(prompts), prefill=tuple(prefill), mismatches=tuple(mismatches)
+        compared=len(prompts),
+        prefill=tuple(prefill),
+        prefill_requested=prefill_requested,
+        mismatches=tuple(mismatches),
     )
 
 
@@ -363,7 +371,9 @@ class RenderingProbe:
             {"model": self.reference, "prompts": list(prompts)},
             events,
         )
-        return compare_renderings(prompts, runtime_rows, reference_rows)
+        return compare_renderings(
+            prompts, runtime_rows, reference_rows, prefill_requested=self.prefill_sample
+        )
 
     def _run(
         self,

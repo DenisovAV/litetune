@@ -263,13 +263,20 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
     sidecar = Path(reference) / models.PROVENANCE_NAME
     try:
         text = sidecar.read_text(encoding="utf-8")
-    except (FileNotFoundError, NotADirectoryError):
-        # No record: a Hugging Face id, or a directory that never had one.
+    except FileNotFoundError:
+        # A dangling symlink raises this too, and it is not the same statement:
+        # the link is an entry, so something recorded a mode here and the link
+        # no longer reaches it. `is_symlink` reads the link itself rather than
+        # its target, so it is true exactly in that case.
+        if sidecar.is_symlink():
+            raise
         return None
-    # Every other OSError propagates. `Path.is_file()` answers False for a
-    # sidecar that exists and cannot be stat'd -- a permission, a dangling
-    # symlink, a stale mount -- and falling through to the contract or to
-    # inference would silently replace a mode the checkpoint wrote down.
+    except NotADirectoryError:
+        # The reference is not a directory at all: a Hugging Face id, or a file.
+        return None
+    # Every other OSError propagates -- a permission, a stale mount -- because
+    # falling through to the contract or to inference would silently replace a
+    # mode the checkpoint wrote down.
     data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError(f"{sidecar} does not contain a JSON object")

@@ -468,7 +468,10 @@ def test_a_run_that_reported_no_prefill_count_is_not_a_pass():
     found. If the runtime returned no count for any prompt it was sent, that
     half did not run and the check must not vouch for it."""
     comparison = compare_renderings(
-        PROMPTS, rows([[1, 2, 3], [4, 5, 6]]), rows([[1, 2, 3], [4, 5, 6]])
+        PROMPTS,
+        rows([[1, 2, 3], [4, 5, 6]]),
+        rows([[1, 2, 3], [4, 5, 6]]),
+        prefill_requested=2,
     )
 
     assert comparison.agrees
@@ -476,3 +479,19 @@ def test_a_run_that_reported_no_prefill_count_is_not_a_pass():
     assert check.outcome.value == "could_not_check"
     assert "no prefill count" in check.detail
     assert check.observed["prompts_compared"] == 2
+
+
+def test_asking_for_no_prefill_sample_is_not_a_failed_check():
+    """Zero is a caller's choice, not a runtime that went quiet.
+
+    `RenderingProbe.prefill_sample` is public and slicing by 0 sends nothing,
+    so treating that as an unanswered comparison would fail a run whose ids
+    agree over every prompt.
+    """
+    comparison = compare_renderings(
+        PROMPTS, rows([[1, 2, 3], [4, 5, 6]]), rows([[1, 2, 3], [4, 5, 6]])
+    )
+
+    check = comparison.check()
+    assert check.outcome.value == "passed"
+    assert check.observed["prefill_requested"] == 0

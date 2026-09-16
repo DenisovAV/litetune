@@ -501,6 +501,23 @@ def test_a_sidecar_that_exists_and_cannot_be_read_raises(tmp_path):
         recorded_prompt_mode(reference)
 
 
+def test_a_sidecar_that_is_a_dangling_symlink_raises(tmp_path):
+    """A link is an entry: something recorded a mode here and the link stopped
+    reaching it. Reading it raises `FileNotFoundError`, the same exception a
+    sidecar that was never there raises, and the two are not the same
+    statement -- one is "no record", the other is a record that cannot be read.
+    """
+    from litetune.verify import recorded_prompt_mode
+
+    reference = _checkpoint(tmp_path, {"prompt_mode": "prerendered"})
+    sidecar = Path(reference) / "litetune.json"
+    sidecar.unlink()
+    sidecar.symlink_to(tmp_path / "never-written.json")
+
+    with pytest.raises(OSError):
+        recorded_prompt_mode(reference)
+
+
 def test_a_reference_with_no_sidecar_is_still_no_record(tmp_path):
     from litetune.verify import recorded_prompt_mode
 
