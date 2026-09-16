@@ -362,14 +362,16 @@ terminator bug fixed in 0.1.5 — see [MEASUREMENTS.md](MEASUREMENTS.md).
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
 |---|---|---|---|
 | Base model | *not scored* | — | — |
-| Fine-tuned | 0.7450 | 0.7367 | 0.7383 |
-| Cost of conversion | — | +0.0083 *(within noise)* | +0.0067 *(within noise)* |
+| Fine-tuned | 0.6983 | 0.6917 | 0.6817 |
+| Cost of conversion | — | +0.0067 *(within noise)* | +0.0167 |
 
 The first family measured here that litetune had no rule for. It exported with
-no flag from litetune, and the rule it has now records that none is needed.
-Neither conversion figure clears its interval. Training and the float reference
-ran on a GPU and the converted models on a CPU, so this cost carries a hardware
-difference the Gemma 3 one does not — see [MEASUREMENTS.md](MEASUREMENTS.md).
+no flag from litetune, and the rule it has now records that none is needed. The
+weight-only figure clears its interval here where the dynamic one does not, and
+where neither of Gemma 3's did — on 12 disagreements out of 600. Training and
+the float reference ran on a GPU and the converted models on a CPU, so this cost
+carries a hardware difference the Gemma 3 one does not — see
+[MEASUREMENTS.md](MEASUREMENTS.md).
 
 **[MEASUREMENTS.md](MEASUREMENTS.md)** has the intervals, three runs of the same
 configuration and what they disagree about, and which published claims were

@@ -427,11 +427,16 @@ The task, the rows and the scorer are the second family's: LoRA r16/α32, lr
 2e-4, one epoch, batch 8, over the same 2,400 rows of `mteb/banking77`, scored
 on the same 600 held-out rows — both runs' verify manifests record split
 `0c7505b2b6f69ab1`, and their prepare reports the same `heldout.content_sha256`
-— with `--scorer exact-text`, a 256-token limit and prompt mode `prerendered`.
-What differs is recorded: `max_seq_length` 256 rather than 160, and bfloat16
-rather than float32, because training and the float reference ran on one
-A100-SXM4-40GB. Both candidates ran on litert-lm 0.16.1's CPU backend in the
-same container, 12 vCPU. litetune 0.1.6; training environment `torch==2.5.1`,
+— with `--scorer exact-text`, a 256-token limit and prompt mode
+`runtime_rendered`. `tune` was given no `--prompt-mode` and inferred it: 0% of
+the 2,400 training prompts carry a control token, so they are bare text and
+training renders the model's own chat template around them the way the runtime
+will. `verify` read that record back from beside the checkpoint, and before
+generating anything it found the runtime and the reference rendering identical
+token ids on all 600 prompts. What differs from the second family is recorded:
+`max_seq_length` 256 rather than 160. Training and the float reference ran on
+one A100-SXM4-40GB in bfloat16, and both candidates on litert-lm 0.16.1's CPU
+backend in the same container, 12 vCPU. litetune 0.1.6; training environment `torch==2.5.1`,
 `transformers==5.16.1`, `peft==0.20.0`; export environment
 `litert-torch-nightly==0.10.0.dev20260826`, `litert-lm==0.16.1`,
 `litert-lm-builder==0.16.1`, `numpy==2.0.2`.
@@ -439,18 +444,24 @@ same container, 12 vCPU. litetune 0.1.6; training environment `torch==2.5.1`,
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
 |---|---|---|---|
 | Base model | *not scored* | — | — |
-| Fine-tuned | **0.7450** ±0.0349 | 0.7367 ±0.0352 | 0.7383 ±0.0352 |
-| Cost of conversion | — | +0.0083 ±0.0150 *(unresolved, 21 discordant)* | +0.0067 ±0.0113 *(unresolved, 12 discordant)* |
+| Fine-tuned | **0.6983** ±0.0367 | 0.6917 ±0.0370 | 0.6817 ±0.0373 |
+| Cost of conversion | — | +0.0067 ±0.0146 *(unresolved, 20 discordant)* | **+0.0167** ±0.0113 *(resolved, 12 discordant)* |
 
-**Both costs are unresolved**, as both of the second family's were. Across the
-two runs, the manifests support two observations and no ranking. The
-fine-tuned Qwen3 scores higher on these rows than the fine-tuned Gemma 3 did,
-0.7450 against 0.6933. Its conversions disagree with its float model on fewer
-rows, 21 and 12 against 38 and 15. litetune computes no interval for a
-difference between two models, so neither is a resolved difference, and the
-conversion costs are not ranked: the intervals overlap, and this run's
-reference ran on a different device from its candidates, which the second
-family's did not.
+**One cost is resolved and one is not**, where both of the second family's were
+unresolved — and the resolved one rests on fewer disagreements, not more.
+`weight_only_wi8_afp32` costs +0.0167 with an interval of ±0.0113 on 12
+disagreements out of 600, eleven of which fall the same way; `dynamic_wi8_afp32`
+costs +0.0067 inside ±0.0146 on 20, split twelve against eight. That is the
+arithmetic the headline section describes, seen once more: what buys an interval
+is the imbalance between the two directions, not the count.
+
+Across the two families the manifests support one observation and no ranking.
+The fine-tuned Qwen3 scores higher on these rows than the fine-tuned Gemma 3
+did, 0.6983 against 0.6717, and its conversions disagree with their float model
+on 20 and 12 rows against Gemma 3's 34 and 16. litetune computes no interval for
+a difference between two models, so that is not a resolved difference, and the
+conversion costs are not ranked across families: both runs' references ran on a
+different device from their candidates, so both carry that difference.
 
 ### What this run established that the table does not show
 
@@ -466,11 +477,13 @@ size run.
 **The terminator is the template's close, and it is also the tokenizer's
 eos.** `generation_config.eos_token_id` is `[151645, 151643]` — `<|im_end|>`
 and `<|endoftext|>` — and `<|im_end|>` closes a turn in the chat template.
-`tune` recorded `turn_terminator: {ids: [151645], source: "tokenizer_eos",
-text: "<|im_end|>"}`, and `contract.json` carries `stop_tokens:
-["<|im_end|>"]`. On the reference, `terminators_trimmed` read 600 of 600, one
-marker each. The second family's section describes Gemma 3, where the
-tokenizer's eos and the template's close are two markers; here they are one.
+Training in `runtime_rendered` takes the terminator from that template, so
+`tune` recorded `turn_terminator: {ids: [151645, 198], source: "chat_template",
+text: "<|im_end|>\n"}` — the marker and the newline the template writes after
+it — and `contract.json` carries that into `stop_tokens`. On the reference,
+`terminators_trimmed` read 600 of 600, one marker each. The second family's
+section describes Gemma 3, where the tokenizer's eos and the template's close
+are two different markers; here they are the same one.
 
 **The runtime side returns no terminator.** On litert-lm `terminators_trimmed`
 read 0 of 600 and the manifest records "600 of 600 litert-lm generations end
@@ -480,19 +493,21 @@ generations stopped; the runtime hands back the text without its stop token.
 The unterminated-share check reads only the transformers reference, whose
 decoder is asked to keep special tokens.
 
-**Measuring the second recipe took several times as long.** The first time
-each bundle ran, litert-lm wrote an XNNPACK cache beside it: 601,946,856 bytes
+**Measuring the second recipe took several times as long.** Timed in the
+earlier run of these same bundles and not re-timed here: the first time each
+bundle ran, litert-lm wrote an XNNPACK cache beside it, 601,946,856 bytes
 for `dynamic_wi8_afp32` and 2,385,932,008 for `weight_only_wi8_afp32`, three
 times that bundle's 771,404,928. On the same machine the 600-prompt verify,
 float reference included and a five-prompt verify run before it, took 27
 minutes for `dynamic_wi8_afp32` and 2 hours 10 minutes for
-`weight_only_wi8_afp32`. Nothing here measured whether the cache is the reason.
+`weight_only_wi8_afp32`. Nothing measured whether the cache is the reason.
 
-**What it did not establish.** No untuned-base score. The base was converted,
-and a five-prompt `verify` was given 900 seconds before the full one would
-start; it did not finish, so the full one did not start. Separately, on a
-laptop, one of these prompts sent the way `verify` sends it made the untuned
-base alternate two labels that are not among the 77, repeating them for
+**What it did not establish.** No untuned-base score. This run never reached
+the base step: the guard ahead of it stopped the container and recorded
+"untuned Qwen3-0.6B reasons without a token limit on the CLI candidate". The
+earlier run met the same thing from the other side — a five-prompt `verify`
+given 900 seconds that did not finish, and, on a laptop, one of these prompts
+making the untuned base alternate two labels that are not among the 77 for
 several minutes. So training gain is unattributed here too. One run.
 Conversions measured on CPU only — no GPU or NPU figure for this family.
 
