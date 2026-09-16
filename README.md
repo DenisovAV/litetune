@@ -483,9 +483,10 @@ withdrawn after re-measurement.
   all of them if the split is shorter, it also compares the prefill count the
   runtime reports when the prompt is actually sent. Any difference is a harness failure (exit 4) with the prompt, both
   counts and the first differing position at `harness.rendering_check`, not a
-  conversion cost. On the base `Qwen3-0.6B` export all 600 banking77 prompts
-  matched; an export whose template added an empty `<think></think>` was
-  refused on all 600. Reasoning is removed from both sides before scoring,
+  conversion cost. On the tuned `Qwen3-0.6B` exports all 600 banking77 prompts
+  matched, and on the `gemma-3-270m-it` base export too; a rendering that adds
+  an empty `<think></think>` is refused on every prompt, which is constructed
+  in the tests rather than seen in a run. Reasoning is removed from both sides before scoring,
   through the last `[/thought]` or `</think>`, and counted per side at
   `measurements.<side>.reasoning_removed`, including generations that never
   closed it.

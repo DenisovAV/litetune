@@ -4,7 +4,8 @@ Numbers for `litetune`. The first sections are `functiongemma-270m-it`
 LoRA-tuned on `google/mobile-actions`, scored on 640 held-out single-call
 examples; exact match means the tool name **and** every argument value. Each
 section after them is another family: `gemma-3-270m-it` with the second scorer,
-then `gemma-4-E2B-it` converted from its base weights.
+`gemma-4-E2B-it` converted from its base weights, and `Qwen3-0.6B`, the first
+that is not a Gemma.
 
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
@@ -466,9 +467,8 @@ different device from their candidates, so both carry that difference.
 ### What this run established that the table does not show
 
 **The family needs no rule, and now has one that says so.** Both recipes
-exported with no flag from litetune. `litertlm_peek` on a `dynamic_wi8_afp32`
-export of the base reads `llm_model_type { qwen3 {} }`, not `generic_model`,
-and the tuned checkpoint's `config.json` names the same `model_type`. That is
+exported with no flag from litetune, and the tuned checkpoint's `config.json`
+names `model_type: qwen3`. That is
 the model-type trap `models.py` describes, seen from the other side: `qwen3` is
 on the exporter's own list, so the config's `model_type` selects the right type
 with no override. `models.py` records it as `qwen-3`, scoped to 0.6B, the one
@@ -505,10 +505,9 @@ minutes for `dynamic_wi8_afp32` and 2 hours 10 minutes for
 **What it did not establish.** No untuned-base score. This run never reached
 the base step: the guard ahead of it stopped the container and recorded
 "untuned Qwen3-0.6B reasons without a token limit on the CLI candidate". The
-earlier run met the same thing from the other side — a five-prompt `verify`
-given 900 seconds that did not finish, and, on a laptop, one of these prompts
-making the untuned base alternate two labels that are not among the 77 for
-several minutes. So training gain is unattributed here too. One run.
+earlier run met the same thing from the other side: a five-prompt `verify`
+given 900 seconds that did not finish. So training gain is unattributed here
+too. One run.
 Conversions measured on CPU only — no GPU or NPU figure for this family.
 
 ### Limitations carried by these manifests
