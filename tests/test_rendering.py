@@ -53,7 +53,10 @@ def rows(ids_by_prompt, prefill=None, rendered="rendered"):
 
 def test_identical_ids_and_prefill_counts_agree():
     comparison = compare_renderings(
-        PROMPTS, rows([[1, 2, 3], [4, 5]], prefill=[3, None]), rows([[1, 2, 3], [4, 5]])
+        PROMPTS,
+        rows([[1, 2, 3], [4, 5]], prefill=[3, None]),
+        rows([[1, 2, 3], [4, 5]]),
+        prefill_sent=1,
     )
 
     assert comparison.agrees
@@ -71,6 +74,7 @@ def test_differing_ids_name_the_prompt_the_counts_and_where_they_split():
         PROMPTS,
         rows([[1, 2, 3], [4, 9, 5, 6]], rendered="...<|im_start|>assistant\n"),
         rows([[1, 2, 3], [4, 5, 6]], rendered="...<|im_start|>assistant\n<think>"),
+        prefill_sent=0,
     )
 
     assert not comparison.agrees
@@ -87,7 +91,9 @@ def test_differing_ids_name_the_prompt_the_counts_and_where_they_split():
 
 
 def test_ids_of_the_same_length_are_still_compared_id_by_id():
-    comparison = compare_renderings(PROMPTS[:1], rows([[4, 9, 6]]), rows([[4, 5, 6]]))
+    comparison = compare_renderings(
+        PROMPTS[:1], rows([[4, 9, 6]]), rows([[4, 5, 6]]), prefill_sent=0
+    )
     (mismatch,) = comparison.mismatches
     assert (mismatch.runtime_tokens, mismatch.reference_tokens) == (3, 3)
     assert mismatch.first_difference == 1
@@ -95,14 +101,18 @@ def test_ids_of_the_same_length_are_still_compared_id_by_id():
 
 def test_one_list_that_is_a_prefix_of_the_other_splits_where_the_shorter_ends():
     # The shape an extra BOS, or a missing generation prompt, takes.
-    comparison = compare_renderings(PROMPTS[:1], rows([[2, 2, 7]]), rows([[2, 2, 7, 8]]))
+    comparison = compare_renderings(
+        PROMPTS[:1], rows([[2, 2, 7]]), rows([[2, 2, 7, 8]]), prefill_sent=0
+    )
     assert comparison.mismatches[0].first_difference == 3
 
 
 def test_a_prefill_count_the_rendering_does_not_explain_is_a_mismatch():
     # The rendered ids agree, and the runtime still prefilled one more token when
     # it sent the prompt: a BOS the session prepends outside the rendered text.
-    comparison = compare_renderings(PROMPTS[:1], rows([[2, 7, 8]], prefill=[4]), rows([[2, 7, 8]]))
+    comparison = compare_renderings(
+        PROMPTS[:1], rows([[2, 7, 8]], prefill=[4]), rows([[2, 7, 8]]), prefill_sent=1
+    )
 
     (mismatch,) = comparison.mismatches
     assert mismatch.kind == "prefill"
@@ -115,7 +125,7 @@ def test_a_script_that_did_not_cover_every_prompt_is_not_a_comparison(side):
     full, short = rows([[1], [2]]), rows([[1]])
     runtime, reference = (short, full) if side == "runtime" else (full, short)
     with pytest.raises(RenderingProbeError, match=f"the {side} rendering script returned 1"):
-        compare_renderings(PROMPTS, runtime, reference)
+        compare_renderings(PROMPTS, runtime, reference, prefill_sent=0)
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +255,33 @@ def test_the_runtime_script_renders_every_prompt_and_sends_only_the_sample(tmp_p
     assert written[1]["ids"] == [2, ord("["), ord("b"), ord("b"), ord("]")]
 
 
+@pytest.mark.parametrize(
+    "sample, sent",
+    [(0, []), (2, ["a", "bb"]), (-1, ["a", "bb"]), (100, ["a", "bb", "ccc"])],
+)
+def test_the_script_sends_what_the_probe_counts_for_every_sample(
+    sample, sent, tmp_path, monkeypatch
+):
+    """`RenderingProbe.observe` records `len(prompts[: prefill_sample])` as the
+    number sent, and never sees the script's own `rows[: prefill_sample]`. The
+    two are the same expression over the same length only as long as this holds
+    for every value the public field can take -- a zero, a negative, and a
+    sample larger than the split."""
+    engine = FakeEngine(bos=2)
+    prompts = ["a", "bb", "ccc"]
+
+    _run_script(
+        _RUNTIME_SCRIPT,
+        tmp_path,
+        monkeypatch,
+        {"litert_lm": _fake_litert_lm(engine)},
+        {"model": "m.litertlm", "prompts": prompts, "prefill_sample": sample},
+    )
+
+    assert engine.sent == sent
+    assert len(engine.sent) == len(prompts[:sample])
+
+
 # ---------------------------------------------------------------------------
 # The reference's script, against a fake `transformers`
 # ---------------------------------------------------------------------------
@@ -358,7 +395,14 @@ class FakeObserver:
         prefill = [None] * len(prompts)
         if self.prefill is not None:
             prefill[0] = self.prefill
-        return compare_renderings(prompts, rows(runtime, prefill=prefill), rows(reference))
+        # This observer sends exactly the prompt it answers for, and none when
+        # it answers for none. Saying so is the point of the argument.
+        return compare_renderings(
+            prompts,
+            rows(runtime, prefill=prefill),
+            rows(reference),
+            prefill_sent=1 if self.prefill is not None else 0,
+        )
 
 
 def _verify(write_split, observer, prompt_mode=PromptMode.RUNTIME_RENDERED):
@@ -532,3 +576,43 @@ def test_a_negative_prefill_sample_reports_what_the_slice_sent(monkeypatch, tmp_
     comparison = probe.observe(PROMPTS)
 
     assert comparison.prefill_sent == 1
+    # The message is where a wrong number would be read, so pin it there too.
+    check = comparison.check()
+    assert check.outcome.value == "could_not_check"
+    assert "any of the 1 prompts it was sent" in check.detail
+
+
+def test_the_comparison_will_not_guess_what_the_runtime_was_sent():
+    """`prefill_sent` has no default, and that is a contract rather than a style.
+
+    A default of zero lets a caller that never established the number record
+    "none were sent" in the manifest, and zero also switches off the guard at
+    the top of `check()` -- so an observer whose runtime answered nothing would
+    read as passed, which is the one thing that guard exists to prevent. Nothing
+    else in the suite fails if the default comes back, because every call site
+    passes the argument; this test is what holds the signature.
+    """
+    with pytest.raises(TypeError, match="prefill_sent"):
+        compare_renderings(PROMPTS, rows([[1], [2]]), rows([[1], [2]]))
+
+
+def test_a_partly_answered_sample_does_not_call_the_answers_the_sends():
+    """Eight prompts sent, three answered: the passing message must not put the
+    word "sent" on the number that answered.
+
+    The five that were sent and said nothing are the half of the check that
+    catches tokens added outside the rendered text, and a reader comparing the
+    detail against `prefill_sent` in the same record would otherwise get two
+    different answers to how many the runtime got.
+    """
+    prompts = [f"prompt {i}" for i in range(10)]
+    ids = [[1, 2, 3] for _ in prompts]
+    answered = [3, 3, 3] + [None] * 7
+
+    comparison = compare_renderings(prompts, rows(ids, prefill=answered), rows(ids), prefill_sent=8)
+
+    check = comparison.check()
+    assert check.outcome.value == "passed"
+    assert "on 3 of the 8 prompts it was sent" in check.detail
+    assert check.observed["prefill_sent"] == 8
+    assert len(check.observed["prefill_sampled"]) == 3

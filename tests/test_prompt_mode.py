@@ -535,6 +535,25 @@ def test_a_reference_directory_that_is_a_broken_link_raises(tmp_path):
         recorded_prompt_mode(str(reference))
 
 
+def test_a_healthy_symlinked_reference_with_no_sidecar_is_no_record(tmp_path):
+    """The companion to the broken-link test, and the one that pins the
+    difference between them.
+
+    `models/current -> models/run-42` is an ordinary layout, and a checkpoint
+    that never recorded a mode is an ordinary checkpoint. Asking only whether
+    the reference is a link refuses both cases alike, and this run would end as
+    a harness failure instead of falling through to the contract or the prompts.
+    """
+    from litetune.verify import recorded_prompt_mode
+
+    real = tmp_path / "run-42"
+    real.mkdir()
+    link = tmp_path / "current"
+    link.symlink_to(real)
+
+    assert recorded_prompt_mode(str(link)) is None
+
+
 def test_a_reference_with_no_sidecar_is_still_no_record(tmp_path):
     from litetune.verify import recorded_prompt_mode
 

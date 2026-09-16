@@ -256,23 +256,34 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
     """The mode `tune` recorded beside a local reference checkpoint, if it recorded one.
 
     `None` for a Hugging Face id, a directory with no `litetune.json`, or a
-    `litetune.json` that records no mode. A sidecar that exists and cannot be
-    read raises, and so does a reference directory that is a broken link:
+    `litetune.json` that records no mode -- including when that directory is
+    reached through a symlink that resolves. A sidecar that exists and cannot
+    be read raises, and so does a reference that is a link going nowhere:
     falling back to the contract or the prompts would silently replace a mode
     the checkpoint wrote down.
+
+    A link going nowhere further up the path is not detected. Reading through
+    it raises the same `FileNotFoundError` as an absent directory, and the
+    reference is then not itself a link, so nothing here tells the two apart;
+    it reads as no record.
     """
     sidecar = Path(reference) / models.PROVENANCE_NAME
     try:
         text = sidecar.read_text(encoding="utf-8")
     except FileNotFoundError:
-        # A dangling symlink raises this too, and it is not the same statement:
-        # the link is an entry, so something recorded a mode here and the link
-        # no longer reaches it. `is_symlink` reads the link itself rather than
-        # its target, so it is true exactly in that case -- and the broken link
-        # can be the reference directory, where the sidecar's own `is_symlink`
-        # is false because what is missing is its parent. A Hugging Face id is
-        # not an entry on disk, so neither call is true for one.
-        if sidecar.is_symlink() or Path(reference).is_symlink():
+        # A link going nowhere raises this too, and it is not the same
+        # statement: the link is an entry, so something recorded a mode here
+        # and the link no longer reaches it.
+        #
+        # The two calls are not the same test. For the sidecar, `is_symlink`
+        # settles it: a link that resolved would have been read, so a link that
+        # is still an entry after `FileNotFoundError` is dangling. For the
+        # reference directory, the same exception is raised by the ordinary
+        # case of a checkpoint that simply has no sidecar, and the directory
+        # link being intact says nothing -- so that one has to be asked whether
+        # it resolves. `exists` follows the link; `is_symlink` does not.
+        reference_path = Path(reference)
+        if sidecar.is_symlink() or (reference_path.is_symlink() and not reference_path.exists()):
             raise
         return None
     except NotADirectoryError:

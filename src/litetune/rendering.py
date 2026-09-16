@@ -215,8 +215,10 @@ class RenderingComparison:
     prefill: tuple[Mapping[str, int], ...] = ()
     # How many prompts the runtime was actually sent for prefill, which is not
     # the sample a caller asked for: the runtime script slices that sample over
-    # the prompts it was given. Zero is a caller that asked for none, which is
-    # not the same as a runtime that answered none.
+    # the prompts it was given. Zero means none were sent -- a sample of zero,
+    # no prompts at all, or a negative sample at least as large as the split --
+    # which is not the same as a runtime that was sent prompts and answered for
+    # none of them.
     prefill_sent: int = 0
     mismatches: tuple[RenderingMismatch, ...] = field(default_factory=tuple)
 
@@ -241,10 +243,20 @@ class RenderingComparison:
                 observed=self.as_dict(),
             )
         if self.agrees:
+            # `sampled` counts the prompts that answered with a count, which is
+            # not the number that were sent: the runtime can leave
+            # `last_prefill_token_count` unset for some of them. Naming one
+            # number with the other's word is the mistake this whole check is
+            # about, so say both.
+            half = (
+                f"and the runtime's prefill count equal to the reference's on {sampled} of the "
+                f"{self.prefill_sent} prompts it was sent"
+                if self.prefill_sent
+                else "and no prefill count asked for"
+            )
             return Check.passed(
                 RENDERING_CHECK,
-                f"identical token ids for all {self.compared} prompts, and the runtime's prefill "
-                f"count equal to the reference's on the {sampled} sent",
+                f"identical token ids for all {self.compared} prompts, {half}",
                 observed=self.as_dict(),
             )
         first = self.mismatches[0]
@@ -280,9 +292,16 @@ def compare_renderings(
     prompts: Sequence[str],
     runtime_rows: Sequence[Mapping[str, Any]],
     reference_rows: Sequence[Mapping[str, Any]],
-    prefill_sent: int = 0,
+    prefill_sent: int,
 ) -> RenderingComparison:
-    """Compare what the two scripts returned. Raises if either did not cover every prompt."""
+    """Compare what the two scripts returned. Raises if either did not cover every prompt.
+
+    `prefill_sent` has no default on purpose. It is a statement about what the
+    runtime was given, which only the caller that ran it knows; defaulting it to
+    zero would let a caller that never established it record "none were sent",
+    and zero also switches off the guard that refuses to pass a prefill
+    comparison nobody made.
+    """
     runtime = {int(row["index"]): row for row in runtime_rows}
     reference = {int(row["index"]): row for row in reference_rows}
     expected = set(range(len(prompts)))

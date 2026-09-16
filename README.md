@@ -461,9 +461,9 @@ withdrawn after re-measurement.
 - **In `runtime_rendered`, `verify` refuses to compare two sides that were shown
   different prompts.** Before generating anything it renders every held-out
   prompt through the runtime's own conversation path and through the
-  reference's chat template, and compares the token ids; on the first 8 it also
-  compares the prefill count the runtime reports when the prompt is actually
-  sent. Any difference is a harness failure (exit 4) with the prompt, both
+  reference's chat template, and compares the token ids; on the first 8, or on
+  all of them if the split is shorter, it also compares the prefill count the
+  runtime reports when the prompt is actually sent. Any difference is a harness failure (exit 4) with the prompt, both
   counts and the first differing position at `harness.rendering_check`, not a
   conversion cost. On the base `Qwen3-0.6B` export all 600 banking77 prompts
   matched; an export whose template added an empty `<think></think>` was
