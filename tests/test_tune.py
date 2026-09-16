@@ -31,6 +31,7 @@ from litetune.prepare import read_rows
 from litetune.prompt_mode import PromptMode, PromptModeDecision
 from litetune.tune import (
     _TRAIN_SCRIPT,
+    DECLARATIONS_CHECK,
     DEFAULT_ATTN_IMPLEMENTATION,
     DEFAULT_DTYPE,
     ENV_CHECK,
@@ -1297,6 +1298,7 @@ def run_real_script(
     stub_env,
     cuda: bool = False,
     decision: PromptModeDecision | None = None,
+    declarations_sha256: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Runs `_TRAIN_SCRIPT` for real, against the stub modules `stub_env` wrote.
 
@@ -1311,7 +1313,13 @@ def run_real_script(
     script.write_text(_TRAIN_SCRIPT, encoding="utf-8")
     config = request.output_dir / "train_config.json"
     config.write_text(
-        json.dumps(request.config(request.output_dir / "metrics.json", decision=decision)),
+        json.dumps(
+            request.config(
+                request.output_dir / "metrics.json",
+                decision=decision,
+                declarations_sha256=declarations_sha256,
+            )
+        ),
         encoding="utf-8",
     )
     return subprocess.run(
@@ -1351,6 +1359,33 @@ def test_the_real_script_writes_metrics_this_module_can_read(request_for, stub_e
     assert metrics.supervised_token_fraction < 0.4
     assert [e.epoch for e in metrics.epochs] == [1, 2]
     assert metrics.final_loss == pytest.approx(1.45)
+
+
+def test_the_real_script_records_the_declarations_in_both_files(request_for, stub_env, tmp_path):
+    """Both files, and the digest a bundle's contract is compared against.
+
+    `verify` reads this back rather than being told which declarations a
+    checkpoint knows, and `bundle` compares the same string against its
+    contract. A digest computed a second way -- over the parsed value, or over
+    the text rather than the bytes -- would be a different string for the same
+    file, and would turn that comparison into a refusal of a matching set.
+    """
+    from litetune.storage import hash_file
+
+    decls = tmp_path / "declarations.json"
+    decls.write_text('[{"name": "send_email"}]', encoding="utf-8")
+    digest = hash_file(decls)
+
+    request = request_for(declarations=decls)
+    proc = run_real_script(request, stub_env, declarations_sha256=digest)
+    assert proc.returncode == 0, proc.stderr
+
+    sidecar = json.loads((request.model_dir / "litetune.json").read_text(encoding="utf-8"))
+    metrics = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert sidecar["declarations_sha256"] == digest
+    assert metrics["declarations_sha256"] == digest
+    # The prefix is part of it: `bundle` splits on it before comparing.
+    assert digest.startswith("sha256:")
 
 
 def test_the_real_script_loads_the_dtype_and_attention_it_was_given(request_for, stub_env):
@@ -1735,6 +1770,45 @@ def test_a_cpu_answer_reaches_the_script_too(trainer, request_for):
     trainer.probe_device = "cpu"
     run_tune(request_for())
     assert trainer.configs[0]["device"] == "cpu"
+
+
+def test_the_digest_is_the_results_and_the_file_is_the_requests(trainer, request_for, tmp_path):
+    """One report must not answer one question twice.
+
+    `TuneRequest.as_dict` builds its record from `config()`, and calls it without
+    the run's digest -- `config()` is also the script's spec, where the digest
+    arrives as an argument. Leaving it in that record would write `None` inside
+    `request` beside the real value at the top level. So the request records the
+    file the caller named, and the digest of what was in it belongs to the
+    result, which is the division `prompt_mode_decision` already follows.
+    """
+    from litetune.storage import hash_file
+
+    decls = tmp_path / "declarations.json"
+    decls.write_text('[{"name": "set_timer"}]', encoding="utf-8")
+
+    record = run_tune(request_for(declarations=decls)).as_dict()
+
+    assert record["declarations_sha256"] == hash_file(decls)
+    assert record["request"]["declarations"] == str(decls)
+    assert "declarations_sha256" not in record["request"]
+
+
+def test_declarations_that_do_not_parse_are_refused_before_the_environment(
+    trainer, request_for, tmp_path
+):
+    """The mode above is settled before anything is provisioned, and this is the
+    same kind of fact about the request. Finding it out after provisioning costs
+    a download and minutes to say what the file said all along."""
+    decls = tmp_path / "declarations.json"
+    decls.write_text("{not json", encoding="utf-8")
+
+    result = run_tune(request_for(declarations=decls))
+
+    assert result.outcome is Outcome.FAILED
+    refusal = next(c for c in result.checks.checks if c.name == DECLARATIONS_CHECK)
+    assert "not valid JSON" in refusal.detail
+    assert trainer.calls == []
 
 
 def test_a_probe_that_cannot_answer_is_a_limitation_not_a_device(trainer, request_for):

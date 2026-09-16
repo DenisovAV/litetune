@@ -47,6 +47,7 @@ from typing import Any
 
 from litetune import envs, models
 from litetune.checks import Check, CheckSet, Outcome, guard
+from litetune.declarations import DeclarationsError, entry_count, read_declarations
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.prepare import PrepareError, read_rows
@@ -60,6 +61,7 @@ TUNE_SCHEMA = "litetune.tune/1"
 # declared mode the training prompts contradict. Library messages name the flag
 # too: a refusal is read by whoever typed the command.
 PROMPT_MODE_CHECK = "prompt mode"
+DECLARATIONS_CHECK = "tool declarations"
 FORCE_PROMPT_MODE_FLAG = "--force-prompt-mode"
 
 METHODS = ("full", "lora")
@@ -568,6 +570,7 @@ def main() -> int:
                 "base_model_revision": spec.get("revision"),
                 "prompt_mode": spec["prompt_mode"],
                 "prompt_mode_decision": spec.get("prompt_mode_decision"),
+                "declarations_sha256": spec.get("declarations_sha256"),
                 "turn_terminator": terminator,
                 "sentencepiece": sentencepiece,
             },
@@ -608,6 +611,8 @@ def main() -> int:
                 # How that mode was decided, and on what evidence: declared,
                 # inferred from these prompts, or declared against them on purpose.
                 "prompt_mode_decision": spec.get("prompt_mode_decision"),
+                # Which tool declarations these calls were trained against.
+                "declarations_sha256": spec.get("declarations_sha256"),
                 "n_examples": len(examples),
                 "supervised_tokens": supervised,
                 "total_tokens": total,
@@ -779,6 +784,11 @@ class TuneRequest:
     # this field is only what the caller said.
     prompt_mode: PromptMode | None = field(default=None, kw_only=True)
     force_prompt_mode: bool = field(default=False, kw_only=True)
+    # The tool declarations the run trains against, in the shape `bundle` takes.
+    # Their digest is recorded beside the checkpoint, where `verify` reads it
+    # back rather than being told it. Absent trains exactly what it trained
+    # before.
+    declarations: Path | None = field(default=None, kw_only=True)
     timeout_s: int = DEFAULT_TIMEOUT_S
     env: envs.StageEnv = envs.TRAIN
     auto_provision: bool = True
@@ -833,6 +843,7 @@ class TuneRequest:
         metrics_out: Path,
         device: str | None = None,
         decision: PromptModeDecision | None = None,
+        declarations_sha256: str | None = None,
     ) -> dict[str, Any]:
         """Everything the generated script needs. Also what the report records.
 
@@ -846,6 +857,10 @@ class TuneRequest:
 
         `decision` is the mode `run_tune` settled on. Without one the declared
         mode is written, which is `None` when nothing was declared.
+
+        `declarations_sha256` is computed in this process, not in the script:
+        the training environment has no litetune to compute it with, and the
+        digest has to be the one `bundle` compares its contract against.
         """
         mode = decision.mode if decision is not None else self.prompt_mode
         return {
@@ -868,6 +883,10 @@ class TuneRequest:
             # How the mode was decided and on what evidence. The script writes it
             # beside the checkpoint, so the decision outlives this process.
             "prompt_mode_decision": decision.as_dict() if decision is not None else None,
+            # What the calls in this split were trained against. The script
+            # writes it beside the checkpoint, where `verify` reads it back
+            # instead of being told which declarations a checkpoint knows.
+            "declarations_sha256": declarations_sha256,
             "model_dir": str(self.model_dir),
             "adapter_dir": str(self.adapter_dir) if self.adapter_dir else None,
             "metrics_out": str(metrics_out),
@@ -879,6 +898,12 @@ class TuneRequest:
         # The request records what the caller said; the decision is the result's
         # and is reported at the top level of `TuneResult.as_dict`.
         record.pop("prompt_mode_decision")
+        # Same division: the request says which file the caller named, and the
+        # digest of what was in it belongs to the result. Leaving it here would
+        # write `None` into `request` on every report, beside the real digest at
+        # the top level -- two fields in one record disagreeing about one fact.
+        record.pop("declarations_sha256")
+        record["declarations"] = str(self.declarations) if self.declarations else None
         record["force_prompt_mode"] = self.force_prompt_mode
         record["learning_rate_source"] = (
             f"default for method {self.method!r}" if self.rate_is_default else "declared"
@@ -1057,6 +1082,10 @@ class TuneResult:
     # How the mode was settled, before the environment was touched. `None` only
     # when the run was refused before a mode could be decided.
     prompt_mode_decision: PromptModeDecision | None = None
+    # The digest of the declarations this run trained against, read before the
+    # environment was touched. `None` when none were supplied, which is every
+    # run that trains plain text.
+    declarations_sha256: str | None = None
 
     @property
     def outcome(self) -> Outcome:
@@ -1106,6 +1135,9 @@ class TuneResult:
             # to go looking for.
             "prompt_mode": mode.value if mode is not None else None,
             "prompt_mode_decision": decision.as_dict() if decision is not None else None,
+            # Top-level for the same reason as the mode: a bundle's contract is
+            # built from this, and a reader must not have to go looking for it.
+            "declarations_sha256": self.declarations_sha256,
             "request": self.request.as_dict(device=self.device),
             "metrics": self.metrics.as_dict() if self.metrics else None,
             "model_dir": str(self.model_dir) if self.model_dir else None,
@@ -1267,6 +1299,33 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     result.checks.add(decided)
     events.check(decided)
 
+    # Before the environment, like the mode above: a declarations file that
+    # cannot be read is a fact about the request, and finding it out after
+    # provisioning costs minutes and a download to say so.
+    if request.declarations is not None:
+        try:
+            parsed, digest = read_declarations(request.declarations)
+        except DeclarationsError as exc:
+            refused = Check.failed(
+                DECLARATIONS_CHECK,
+                str(exc),
+                observed={"declarations": str(request.declarations)},
+            )
+            result.checks.add(refused)
+            events.check(refused)
+            events.stage_finished(result.outcome.value, attempted=False)
+            return result
+        result.declarations_sha256 = digest
+        count = entry_count(parsed)
+        read = Check.passed(
+            DECLARATIONS_CHECK,
+            f"{count if count is not None else 'the'} declaration(s) from "
+            f"{request.declarations.name}, {digest[:23]}",
+            observed={"declarations": str(request.declarations), "sha256": digest},
+        )
+        result.checks.add(read)
+        events.check(read)
+
     # -- can this run at all? ---------------------------------------------
     with guard(ENV_CHECK) as sink:
         if request.auto_provision:
@@ -1386,7 +1445,12 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     config_path = workspace / "train_config.json"
     config_path.write_text(
         json.dumps(
-            request.config(metrics_out, device=device, decision=result.prompt_mode_decision),
+            request.config(
+                metrics_out,
+                device=device,
+                decision=result.prompt_mode_decision,
+                declarations_sha256=result.declarations_sha256,
+            ),
             indent=2,
         ),
         encoding="utf-8",

@@ -299,6 +299,16 @@ def _add_verify(sub) -> None:
         ),
     )
     verify.add_argument(
+        "--declarations",
+        type=Path,
+        help=(
+            "tool declarations JSON, the same file bundle takes. Refused when its digest "
+            "disagrees with the one recorded beside --reference, because a model measured "
+            "against a different tool list than it trained on is measured on another task. "
+            "Without it the run measures exactly what it measured before"
+        ),
+    )
+    verify.add_argument(
         "--max-tokens",
         type=_positive,
         help=(
@@ -349,6 +359,15 @@ def _add_prepare(sub) -> None:
         ),
     )
     prep.add_argument("--tokenizer-revision", help="revision of --tokenizer")
+    prep.add_argument(
+        "--declarations",
+        type=Path,
+        help=(
+            "tool declarations JSON, the same file bundle takes. A row whose target names a "
+            "tool the declarations do not offer is rejected, rather than teaching a call the "
+            "prompt never offers. Without it the split is built exactly as before"
+        ),
+    )
     prep.add_argument("--json", action="store_true", help="write the report to stdout")
 
 
@@ -388,6 +407,15 @@ def _add_tune(sub) -> None:
             "train in --prompt-mode even though the training prompts contradict it. The check "
             "reads control tokens and cannot see how your application calls the model; the "
             "report records that it was overridden"
+        ),
+    )
+    tune.add_argument(
+        "--declarations",
+        type=Path,
+        help=(
+            "tool declarations JSON, the same file bundle takes. Their digest is recorded "
+            "beside the checkpoint, so verify reads what this run trained against rather than "
+            "being told it. Without it the run trains exactly what it trained before"
         ),
     )
     tune.add_argument(
@@ -690,6 +718,7 @@ def _verify(args: argparse.Namespace) -> int:
         max_conversion_cost=args.max_conversion_cost,
         prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
         contract=args.contract,
+        declarations=args.declarations,
         # `is not None`, not truthiness: `--max-tokens 0` is a request this
         # cannot honour, and silently substituting the default would report a
         # limit the run did not use.
@@ -818,6 +847,7 @@ def _prepare(args: argparse.Namespace) -> int:
         heldout_size=args.heldout_size,
         min_heldout_examples=args.min_heldout_examples,
         tokens=counter,
+        declarations=args.declarations,
     )
     result = prepare(request, events=events)
     delivered = _report(result.as_dict(), lambda: summarise_prepare(result), args.json)
@@ -881,6 +911,7 @@ def _tune(args: argparse.Namespace) -> int:
         attn_implementation=args.attn_implementation,
         prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
         force_prompt_mode=args.force_prompt_mode,
+        declarations=args.declarations,
         timeout_s=args.timeout_s,
         auto_provision=not args.no_provision,
     )

@@ -38,6 +38,7 @@ from typing import Any
 
 from litetune import envs, metrics, models
 from litetune.checks import Check, Outcome, guard
+from litetune.declarations import read_declarations
 from litetune.evaluate import (
     GREEDY,
     DataError,
@@ -191,6 +192,11 @@ class VerifyRequest:
     # default nobody chose.
     prompt_mode: PromptMode | None = None
     contract: Path | None = None
+    # The tool declarations to measure against, in the shape `bundle` takes. A
+    # set whose digest disagrees with the one recorded beside the reference
+    # checkpoint is refused rather than measured. Absent measures exactly what
+    # it measured before.
+    declarations: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +229,7 @@ def build_backends(request: VerifyRequest) -> BackendPair:
 
 
 CONTRACT_CHECK = "prompt-rendering mode is known"
+DECLARATIONS_CHECK = "declarations match the checkpoint's record"
 
 INFERRED_PROMPT_MODE = (
     "the prompt-rendering mode was not declared and no bundle contract was supplied, so it was "
@@ -255,12 +262,53 @@ def contract_prompt_mode(path: Path) -> PromptMode:
 def recorded_prompt_mode(reference: str) -> PromptMode | None:
     """The mode `tune` recorded beside a local reference checkpoint, if it recorded one.
 
-    `None` for a Hugging Face id, a directory with no `litetune.json`, or a
-    `litetune.json` that records no mode -- including when that directory is
-    reached through a symlink that resolves. A sidecar that exists and cannot
-    be read raises, and so does a reference that is a link going nowhere:
-    falling back to the contract or the prompts would silently replace a mode
-    the checkpoint wrote down.
+    `None` when the checkpoint records no mode, and under every condition
+    `_recorded` returns `None` for. Those conditions are written down there
+    rather than here, because they are the same for every question asked of the
+    sidecar and two copies of them would drift. Falling back to the contract or
+    to the prompts when a record exists would silently replace a mode the
+    checkpoint wrote down, which is why an unreadable record raises instead of
+    reading as absent.
+    """
+    read = _recorded(reference)
+    if read is None:
+        return None
+    data, sidecar = read
+    raw = data.get("prompt_mode")
+    return None if raw is None else parse_prompt_mode(raw, str(sidecar))
+
+
+def recorded_declarations_sha256(reference: str) -> str | None:
+    """The declarations digest `tune` recorded beside a local reference checkpoint.
+
+    `None` under the same conditions `recorded_prompt_mode` returns `None`, and
+    additionally for a checkpoint that recorded no declarations -- every run
+    that trained plain text. Comparing against `None` is not a disagreement:
+    it is the absence of anything to disagree with.
+    """
+    read = _recorded(reference)
+    if read is None:
+        return None
+    raw = read[0].get("declarations_sha256")
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(f"{read[1]} records declarations_sha256 {raw!r}, which is not a string")
+    return raw
+
+
+def _recorded(reference: str) -> tuple[dict, Path] | None:
+    """The checkpoint's own record and where it was read from, or `None` for no record.
+
+    One reader for every question asked of `litetune.json`. The distinction
+    below is subtle enough that a second copy would drift from it, and the two
+    copies would then disagree about whether a checkpoint said anything.
+
+    `None` for a Hugging Face id, for a directory with no `litetune.json`, and
+    for a reference that is not a directory at all -- including a directory
+    reached through a symlink that resolves and simply has no sidecar. A
+    sidecar that exists and cannot be read raises, and so does a reference that
+    is a link going nowhere.
 
     A link going nowhere further up the path is not detected. Reading through
     it raises the same `FileNotFoundError` as an absent directory, and the
@@ -272,8 +320,8 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
         text = sidecar.read_text(encoding="utf-8")
     except FileNotFoundError:
         # A link going nowhere raises this too, and it is not the same
-        # statement: the link is an entry, so something recorded a mode here
-        # and the link no longer reaches it.
+        # statement: the link is an entry, so something recorded a checkpoint's
+        # own account here and the link no longer reaches it.
         #
         # The two calls are not the same test. For the sidecar, `is_symlink`
         # settles it: a link that resolved would have been read, so a link that
@@ -290,13 +338,12 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
         # The reference is not a directory at all: a Hugging Face id, or a file.
         return None
     # Every other OSError propagates -- a permission, a stale mount -- because
-    # falling through to the contract or to inference would silently replace a
-    # mode the checkpoint wrote down.
+    # falling through to the contract, to inference, or to "no declarations
+    # recorded" would silently replace what the checkpoint wrote down.
     data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError(f"{sidecar} does not contain a JSON object")
-    raw = data.get("prompt_mode")
-    return None if raw is None else parse_prompt_mode(raw, str(sidecar))
+    return data, sidecar
 
 
 def _resolve_mode(request: VerifyRequest, split: Split) -> PromptModeDecision:
@@ -521,6 +568,28 @@ def run_verify(
     if decision.inferred:
         run.limitation(INFERRED_PROMPT_MODE.format(evidence=decision.evidence))
     request = replace(request, prompt_mode=decision.mode)
+
+    # -- are these the declarations the checkpoint trained against? ---------
+    # Before the backends, for the same reason the mode is: a model measured
+    # against a different tool list than it learned is measured on another
+    # task, and the number that comes out looks like a conversion cost.
+    if request.declarations is not None:
+        with guard(DECLARATIONS_CHECK) as sink:
+            _, digest = read_declarations(request.declarations)
+            recorded = recorded_declarations_sha256(request.reference)
+            if recorded is not None and recorded != digest:
+                sink.append(
+                    Check.failed(
+                        DECLARATIONS_CHECK,
+                        f"{request.declarations} hashes {digest}, and the checkpoint at "
+                        f"{request.reference} records {recorded}. The model learned to call one "
+                        "tool list and would be measured against another",
+                    )
+                )
+        if sink:
+            run.record(sink[0])
+            return run.finish(Status.FAILED_HARNESS)
+        run.manifest["harness"]["declarations_sha256"] = digest
 
     # -- what does litetune know about this model family? ------------------
     rules_for, rules = _model_rules(request)

@@ -187,6 +187,100 @@ def test_without_the_flag_the_default_limit_is_unchanged():
     assert GREEDY.max_tokens == 256
 
 
+def _captured_request(monkeypatch, entry_point: str, argv: list[str]):
+    """Drive one stage's CLI function and return the request it was given.
+
+    Through the stage's own `_verify`/`_prepare` rather than around it: asserting
+    on the parsed namespace would pass while the flag never reached the request,
+    which is the whole thing these tests exist to catch.
+    """
+    import litetune.cli as cli
+
+    seen: dict[str, object] = {}
+
+    def capture(request, **kwargs):
+        seen["request"] = request
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli, entry_point, capture)
+    args = cli.build_parser().parse_args(argv)
+    with pytest.raises(SystemExit):
+        {"run_verify": cli._verify, "prepare": cli._prepare}[entry_point](args)
+    return seen["request"]
+
+
+_VERIFY_ARGV = ["verify", "--model", "m.litertlm", "--reference", "r", "--data", "d.jsonl"]
+_PREPARE_ARGV = ["prepare", "--data", "d.jsonl", "--output-dir", "out", "--context-length", "1024"]
+
+
+def test_verify_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
+    """The flag exists so `verify` can refuse a set the checkpoint did not train
+    on. It cannot refuse what never reached it."""
+    decls = tmp_path / "declarations.json"
+
+    request = _captured_request(
+        monkeypatch, "run_verify", [*_VERIFY_ARGV, "--declarations", str(decls)]
+    )
+
+    assert request.declarations == decls
+
+
+def test_prepare_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
+    decls = tmp_path / "declarations.json"
+
+    request = _captured_request(
+        monkeypatch, "prepare", [*_PREPARE_ARGV, "--declarations", str(decls)]
+    )
+
+    assert request.declarations == decls
+
+
+def test_tune_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
+    from litetune import cli
+    from litetune.checks import CheckSet
+    from litetune.tune import TuneResult
+
+    decls = tmp_path / "declarations.json"
+    seen = {}
+
+    def fake_run_tune(request, events=None):
+        seen["request"] = request
+        return TuneResult(request=request, checks=CheckSet(name="train"))
+
+    monkeypatch.setattr(cli, "run_tune", fake_run_tune)
+    main(
+        [
+            "tune",
+            "--model",
+            "m",
+            "--data",
+            str(tmp_path / "d.jsonl"),
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--declarations",
+            str(decls),
+        ]
+    )
+
+    assert seen["request"].declarations == decls
+
+
+@pytest.mark.parametrize(
+    "stage, argv",
+    [("verify", _VERIFY_ARGV), ("prepare", _PREPARE_ARGV), ("tune", ["tune", "--model", "m"])],
+)
+def test_a_run_without_declarations_is_the_run_it_was_before(stage, argv):
+    """Absent is not a default that stands in for something. Every stage here
+    behaved one way before declarations were an input, and a caller who does not
+    pass them gets exactly that -- which is what makes this change additive."""
+    from litetune.cli import build_parser
+
+    full = argv if stage != "tune" else [*argv, "--data", "d.jsonl", "--output-dir", "out"]
+    args = build_parser().parse_args(full)
+
+    assert args.declarations is None
+
+
 def test_verify_runs_standalone_and_prints_a_result(tmp_path, capsys, write_split, fake_backends):
     rows = labelled_rows(16)
     fake_backends(correct_texts(rows), correct_texts(rows))

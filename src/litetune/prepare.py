@@ -724,6 +724,10 @@ class PrepareRequest:
     min_heldout_examples: int = MIN_HELDOUT_EXAMPLES
     tokens: TokenCounter | None = None
     headroom: HeadroomProbe | None = None
+    # The tool declarations this split's calls are made against, in the shape
+    # `bundle` takes. Absent is the run every existing caller makes, and it
+    # behaves exactly as it did before declarations were an input here.
+    declarations: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", Path(self.data))

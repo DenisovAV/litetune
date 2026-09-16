@@ -31,7 +31,15 @@ from litetune.prompt_mode import (
     prompt_evidence,
     resolve_prompt_mode,
 )
-from litetune.verify import BackendPair, Status, VerifyRequest, build_backends, run_verify
+from litetune.verify import (
+    DECLARATIONS_CHECK,
+    EXIT_CODES,
+    BackendPair,
+    Status,
+    VerifyRequest,
+    build_backends,
+    run_verify,
+)
 
 RENDERED = "<start_of_turn>user\nset the background to red<end_of_turn>\n<start_of_turn>model\n"
 BARE = "set the background to red"
@@ -562,3 +570,82 @@ def test_a_reference_with_no_sidecar_is_still_no_record(tmp_path):
 
     assert recorded_prompt_mode(str(empty)) is None
     assert recorded_prompt_mode("Qwen/Qwen3-0.6B") is None
+
+
+def _verify_with(tmp_path, write_split, reference, declarations, rows=None):
+    """`run_verify` with backends this test keeps a handle on.
+
+    `_verify` above builds its pair inside, which is enough when the question is
+    what the manifest says. Here the question is whether anything ran at all, so
+    the fakes have to be visible to the assertions.
+    """
+    rows = rows if rows is not None else labelled_rows(8)
+    candidate = FakeBackend(texts=correct_texts(rows))
+    reference_backend = FakeBackend(model="org/reference", texts=correct_texts(rows))
+    result = run_verify(
+        VerifyRequest(
+            model=tmp_path / "m.litertlm",
+            reference=reference,
+            data=write_split(rows),
+            declarations=declarations,
+        ),
+        backends=BackendPair(candidate=candidate, reference=reference_backend),
+    )
+    return result, candidate, reference_backend
+
+
+def test_declarations_that_disagree_with_the_checkpoints_record_are_refused(tmp_path, write_split):
+    """A model measured against a different tool list than it learned is measured
+    on another task, and the number that comes out of that reads as a conversion
+    cost. The refusal names both digests, because "they differ" without saying
+    which is which leaves the reader to guess what to fix."""
+    from litetune.storage import hash_file
+
+    trained = tmp_path / "trained.json"
+    trained.write_text('[{"name": "send_email"}]', encoding="utf-8")
+    measured = tmp_path / "measured.json"
+    measured.write_text('[{"name": "set_timer"}]', encoding="utf-8")
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(trained)}
+    )
+
+    result, candidate, reference_backend = _verify_with(tmp_path, write_split, reference, measured)
+
+    assert result.status is Status.FAILED_HARNESS
+    assert EXIT_CODES[result.status] == 4
+    refusal = next(c for c in result.manifest["checks"] if c["name"] == DECLARATIONS_CHECK)
+    assert hash_file(measured) in refusal["detail"]
+    assert hash_file(trained) in refusal["detail"]
+    # Refused before either side was asked for anything.
+    assert candidate.prompts_seen == []
+    assert reference_backend.prompts_seen == []
+
+
+def test_declarations_that_match_the_record_are_measured_and_recorded(tmp_path, write_split):
+    from litetune.storage import hash_file
+
+    decls = tmp_path / "declarations.json"
+    decls.write_text('[{"name": "send_email"}]', encoding="utf-8")
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(decls)}
+    )
+
+    result, candidate, _ = _verify_with(tmp_path, write_split, reference, decls)
+
+    assert result.status is not Status.FAILED_HARNESS
+    assert result.manifest["harness"]["declarations_sha256"] == hash_file(decls)
+    assert candidate.prompts_seen != []
+
+
+def test_a_checkpoint_that_recorded_no_declarations_is_not_a_disagreement(tmp_path, write_split):
+    """`None` is the absence of something to disagree with, not a mismatch. Every
+    checkpoint trained before declarations were an input records nothing here,
+    and refusing those would refuse every run that predates this change."""
+    decls = tmp_path / "declarations.json"
+    decls.write_text('[{"name": "send_email"}]', encoding="utf-8")
+    reference = _checkpoint(tmp_path, {"prompt_mode": "prerendered"})
+
+    result, candidate, _ = _verify_with(tmp_path, write_split, reference, decls)
+
+    assert result.status is not Status.FAILED_HARNESS
+    assert candidate.prompts_seen != []
