@@ -47,13 +47,20 @@ from typing import Any
 
 from litetune import envs, models
 from litetune.checks import Check, CheckSet, Outcome, guard
-from litetune.evaluate import PromptMode
 from litetune.events import EventStream
 from litetune.exits import read_returncode
+from litetune.prepare import PrepareError, read_rows
+from litetune.prompt_mode import RENDERING_SOURCE, PromptMode, PromptModeDecision, prompt_evidence
 
 logger = logging.getLogger(__name__)
 
 TUNE_SCHEMA = "litetune.tune/1"
+
+# The check the prompt-mode decision is recorded under, and the flag that keeps a
+# declared mode the training prompts contradict. Library messages name the flag
+# too: a refusal is read by whoever typed the command.
+PROMPT_MODE_CHECK = "prompt mode"
+FORCE_PROMPT_MODE_FLAG = "--force-prompt-mode"
 
 METHODS = ("full", "lora")
 
@@ -221,7 +228,8 @@ def _tail(text: str, limit: int = _DETAIL_TAIL) -> str:
 # to both methods, so a full-against-LoRA comparison is not confounded by it,
 # and every parameter that does vary is in the config file beside this script.
 
-_TRAIN_SCRIPT = r'''
+_TRAIN_SCRIPT = (
+    r'''
 """Supervised fine-tuning with the loss masked to the completion.
 
 Reads a config JSON, writes a metrics JSON. Prints nothing: the parent turns the
@@ -235,25 +243,9 @@ from pathlib import Path
 # torch's own ignore index. Positions set to this contribute no gradient, and
 # they are the whole mechanism by which the prompt is excluded from the loss.
 IGNORE_INDEX = -100
-
-
-def render_prompt(tok, prompt, runtime_rendered):
-    """The prompt as the *serving runtime* will present it.
-
-    Two mutually exclusive conventions, and the model learns whichever one it
-    was trained against. `evaluate.py`'s generation script makes the same choice
-    on the same flag; if the two disagree, every measurement is taken on a
-    prompt the model was never trained on.
-    """
-    if not runtime_rendered:
-        return prompt, True
-    templated = tok.apply_chat_template(
-        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
-    )
-    # The template already emits the model's BOS. Asking the tokenizer to add
-    # another produces two, which shifts every position by one and is invisible
-    # in the loss.
-    return templated, False
+'''
+    + RENDERING_SOURCE
+    + r'''
 
 
 def turn_terminator(tok, runtime_rendered):
@@ -471,7 +463,14 @@ def main() -> int:
     if pad_id is None:
         raise ValueError("the tokenizer has neither a pad token nor an eos token to pad with")
 
-    runtime_rendered = spec["prompt_mode"] == "runtime_rendered"
+    mode = spec["prompt_mode"]
+    if mode not in ("prerendered", "runtime_rendered"):
+        raise ValueError(
+            f"prompt_mode {mode!r} is not a mode this script can train. The parent decides it "
+            "and writes it here; a missing one is not a default, because prerendered and "
+            "runtime_rendered train different prompts."
+        )
+    runtime_rendered = mode == "runtime_rendered"
     examples, supervised, total, terminator = build_examples(
         tok, rows, spec["max_seq_length"], runtime_rendered
     )
@@ -568,6 +567,7 @@ def main() -> int:
                 "base_model": spec["model"],
                 "base_model_revision": spec.get("revision"),
                 "prompt_mode": spec["prompt_mode"],
+                "prompt_mode_decision": spec.get("prompt_mode_decision"),
                 "turn_terminator": terminator,
                 "sentencepiece": sentencepiece,
             },
@@ -605,6 +605,9 @@ def main() -> int:
                 # contract has to state this, and this is where it is observed
                 # rather than asserted.
                 "prompt_mode": spec["prompt_mode"],
+                # How that mode was decided, and on what evidence: declared,
+                # inferred from these prompts, or declared against them on purpose.
+                "prompt_mode_decision": spec.get("prompt_mode_decision"),
                 "n_examples": len(examples),
                 "supervised_tokens": supervised,
                 "total_tokens": total,
@@ -631,11 +634,89 @@ def main() -> int:
 if __name__ == "__main__":
     sys.exit(main())
 '''
+)
 
 
 # ---------------------------------------------------------------------------
 # The request
 # ---------------------------------------------------------------------------
+
+
+def decide_prompt_mode(
+    prompts: Sequence[str], declared: PromptMode | None, force: bool = False
+) -> PromptModeDecision:
+    """Which convention this run trains under. Raises `TuneError` rather than guess.
+
+    `verify` measures a split whose prompts disagree with each other verbatim,
+    because something has to run and a measurement costs minutes. Here a wrong
+    guess costs a training run and leaves a checkpoint that expects a prompt no
+    caller sends, so an undeclared mixed split is refused, and so is a declared
+    mode the prompts contradict unless `force` says the contradiction is
+    deliberate. The check reads control tokens in the prompts; it cannot see how
+    an application will call the model, which is what `force` is for.
+    """
+    evidence = prompt_evidence(prompts)
+    found = ", ".join(evidence.markers) if evidence.markers else "none"
+    observed = (
+        f"{evidence.share:.0%} of {evidence.count} training prompts contain control tokens "
+        f"({found})"
+    )
+
+    def decided(mode: PromptMode, source: str, reason: str) -> PromptModeDecision:
+        return PromptModeDecision(
+            mode=mode,
+            source=source,
+            evidence=f"{observed}; {reason}",
+            marker_share=evidence.share,
+            markers=evidence.markers,
+        )
+
+    if evidence.count == 0:
+        if declared is None:
+            raise TuneError(
+                "the training split has no prompts to infer a prompt mode from; pass --prompt-mode"
+            )
+        return decided(declared, "declared", "there are no prompts to check it against")
+    if declared is None:
+        if evidence.mode is None:
+            raise TuneError(
+                f"{observed}: the split mixes rendered prompts and bare text, so no single prompt "
+                "mode fits it and litetune will not guess one for a training run. Render every "
+                "prompt the same way, or pass --prompt-mode to decide"
+            )
+        if evidence.mode is PromptMode.PRERENDERED:
+            reason = "they were rendered before training, so the runtime must not template them"
+        else:
+            reason = (
+                "they are bare text, so training renders the model's chat template around them "
+                "the way the runtime will"
+            )
+        return decided(evidence.mode, "inferred", f"{reason}. No mode was declared")
+    if evidence.mode is None:
+        return decided(
+            declared, "declared", "the split mixes both conventions, so the declared mode decides"
+        )
+    if evidence.mode is declared:
+        return decided(declared, "declared", "the prompts agree with the declared mode")
+    if declared is PromptMode.PRERENDERED:
+        conflict = (
+            "these prompts are bare text, and a runtime that applies its own chat template would "
+            "present them inside a turn this training never showed the model"
+        )
+    else:
+        conflict = (
+            "these prompts were already rendered, and training under the chat template would "
+            "wrap them a second time"
+        )
+    if not force:
+        raise TuneError(
+            f"{declared.value} was declared, but {observed}: {conflict}. Leave out --prompt-mode "
+            f"to train in the mode the prompts show, or pass {FORCE_PROMPT_MODE_FLAG} if the "
+            "application really calls the model this way"
+        )
+    return decided(
+        declared, "overridden", f"{conflict}; {FORCE_PROMPT_MODE_FLAG} kept the declared mode"
+    )
 
 
 @dataclass(frozen=True)
@@ -683,18 +764,21 @@ class TuneRequest:
     # declarations has learned a different input distribution from one trained
     # under the runtime's own chat template. From here it travels into
     # `bundle.Contract.prompt_mode` and back out through
-    # `evaluate.resolve_prompt_mode`, so nothing downstream has to guess.
+    # `prompt_mode.resolve_prompt_mode`, so nothing downstream has to guess.
     #
     # `--no-template` on the serving side is right for a hand-rendered wire
     # format and wrong for anything else, and it was carried everywhere by
     # habit once.
-    # Required and keyword-only. Which convention the prompt is built under is
-    # not something this code can guess, and guessing wrong trains the model on
-    # a prompt the runtime never sends -- silently, with a loss curve that looks
-    # fine. The CLI always required it; the library API said so in a comment and
-    # then supplied `PRERENDERED` anyway. Stating it as a field with no default
-    # makes the type non-optional, so nothing downstream carries a None case.
-    prompt_mode: PromptMode = field(kw_only=True)
+    # Keyword-only, and `None` means "not declared", never a default: `run_tune`
+    # then reads the training prompts and decides from their control tokens,
+    # refusing a split that mixes the two conventions (`decide_prompt_mode`). A
+    # declared mode the prompts contradict is refused too, unless
+    # `force_prompt_mode` says the contradiction is deliberate. Guessing wrong
+    # trains the model on a prompt the runtime never sends -- silently, with a
+    # loss curve that looks fine. The decided mode is `TuneResult.prompt_mode`;
+    # this field is only what the caller said.
+    prompt_mode: PromptMode | None = field(default=None, kw_only=True)
+    force_prompt_mode: bool = field(default=False, kw_only=True)
     timeout_s: int = DEFAULT_TIMEOUT_S
     env: envs.StageEnv = envs.TRAIN
     auto_provision: bool = True
@@ -702,11 +786,16 @@ class TuneRequest:
     def __post_init__(self) -> None:
         if self.method not in METHODS:
             raise TuneError(f"method must be one of {list(METHODS)}, got {self.method!r}")
-        if not isinstance(self.prompt_mode, PromptMode):
+        if self.prompt_mode is not None and not isinstance(self.prompt_mode, PromptMode):
             raise TuneError(
                 f"prompt_mode must be a PromptMode, got {self.prompt_mode!r}. The two conventions "
                 "are mutually exclusive and a model trained under one cannot be served under the "
                 f"other; known modes: {[m.value for m in PromptMode]}"
+            )
+        if self.force_prompt_mode and self.prompt_mode is None:
+            raise TuneError(
+                f"{FORCE_PROMPT_MODE_FLAG} keeps a declared prompt mode the training prompts "
+                "contradict, and no mode was declared; pass --prompt-mode with it"
             )
         if self.learning_rate is not None and self.learning_rate <= 0:
             raise TuneError(f"learning_rate must be positive, got {self.learning_rate}")
@@ -739,7 +828,12 @@ class TuneRequest:
         """Where the adapter is kept. An artifact, not scratch -- see the script."""
         return self.output_dir / "adapter" if self.method == "lora" else None
 
-    def config(self, metrics_out: Path, device: str | None = None) -> dict[str, Any]:
+    def config(
+        self,
+        metrics_out: Path,
+        device: str | None = None,
+        decision: PromptModeDecision | None = None,
+    ) -> dict[str, Any]:
         """Everything the generated script needs. Also what the report records.
 
         `device` is what `envs.resolve_device` found before this config was
@@ -749,7 +843,11 @@ class TuneRequest:
         the script falls back to asking itself in either case. Which of the two
         it was is in `envs.DeviceProbe.detail`, and reaches the report as a
         limitation rather than as a device.
+
+        `decision` is the mode `run_tune` settled on. Without one the declared
+        mode is written, which is `None` when nothing was declared.
         """
+        mode = decision.mode if decision is not None else self.prompt_mode
         return {
             "model": self.model,
             "revision": self.revision,
@@ -766,7 +864,10 @@ class TuneRequest:
             "lora_targets": list(self.lora_targets),
             "dtype": self.dtype,
             "attn_implementation": self.attn_implementation,
-            "prompt_mode": self.prompt_mode.value,
+            "prompt_mode": mode.value if mode is not None else None,
+            # How the mode was decided and on what evidence. The script writes it
+            # beside the checkpoint, so the decision outlives this process.
+            "prompt_mode_decision": decision.as_dict() if decision is not None else None,
             "model_dir": str(self.model_dir),
             "adapter_dir": str(self.adapter_dir) if self.adapter_dir else None,
             "metrics_out": str(metrics_out),
@@ -775,6 +876,10 @@ class TuneRequest:
 
     def as_dict(self, device: str | None = None) -> dict[str, Any]:
         record = self.config(self.output_dir / "metrics.json", device=device)
+        # The request records what the caller said; the decision is the result's
+        # and is reported at the top level of `TuneResult.as_dict`.
+        record.pop("prompt_mode_decision")
+        record["force_prompt_mode"] = self.force_prompt_mode
         record["learning_rate_source"] = (
             f"default for method {self.method!r}" if self.rate_is_default else "declared"
         )
@@ -949,6 +1054,9 @@ class TuneResult:
     # and is never "cpu" (see `TrainingMetrics.device`, "absent is absent").
     # Which of the two it was is recorded as a limitation, not here.
     device: str | None = None
+    # How the mode was settled, before the environment was touched. `None` only
+    # when the run was refused before a mode could be decided.
+    prompt_mode_decision: PromptModeDecision | None = None
 
     @property
     def outcome(self) -> Outcome:
@@ -969,13 +1077,16 @@ class TuneResult:
         return False
 
     @property
-    def prompt_mode(self) -> PromptMode:
+    def prompt_mode(self) -> PromptMode | None:
         """The convention this checkpoint now expects at serving time.
 
         Surfaced here because `bundle.Contract` requires it and refuses to
         default it: this is the stage that decided it, so this is where a bundle
-        should read it from rather than a human retyping it.
+        should read it from rather than a human retyping it. `None` only for a
+        run refused before a mode was decided.
         """
+        if self.prompt_mode_decision is not None:
+            return self.prompt_mode_decision.mode
         return self.request.prompt_mode
 
     def limitation(self, text: str) -> None:
@@ -983,6 +1094,8 @@ class TuneResult:
             self.limitations.append(text)
 
     def as_dict(self) -> dict[str, Any]:
+        mode = self.prompt_mode
+        decision = self.prompt_mode_decision
         return {
             "schema": TUNE_SCHEMA,
             "verified": False,
@@ -991,7 +1104,8 @@ class TuneResult:
             # Top-level as well as inside `request`: this is the field a bundle's
             # contract is built from, and it must not be something a reader has
             # to go looking for.
-            "prompt_mode": self.prompt_mode.value,
+            "prompt_mode": mode.value if mode is not None else None,
+            "prompt_mode_decision": decision.as_dict() if decision is not None else None,
             "request": self.request.as_dict(device=self.device),
             "metrics": self.metrics.as_dict() if self.metrics else None,
             "model_dir": str(self.model_dir) if self.model_dir else None,
@@ -1112,6 +1226,47 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             method=request.method,
         )
 
+    # -- is there a split, and which convention does it train? -------------
+    # Before the environment, so a refusal costs nothing: provisioning installs
+    # torch and transformers, and the device probe starts an interpreter in it.
+    if not request.data.is_file():
+        # A check, not an exception: "the split is not there" is an observation
+        # about this run, and the report has to carry it.
+        missing = Check.failed(
+            TRAINING_CHECK,
+            f"the training split {request.data} does not exist, so nothing was trained",
+            observed={"data": str(request.data)},
+        )
+        result.checks.add(missing)
+        events.check(missing)
+        events.stage_finished(result.outcome.value, attempted=False)
+        return result
+
+    try:
+        prompts = [row.prompt for row in read_rows(request.data)]
+        decision = decide_prompt_mode(prompts, request.prompt_mode, force=request.force_prompt_mode)
+    except (TuneError, PrepareError, OSError) as exc:
+        refused = Check.failed(
+            PROMPT_MODE_CHECK,
+            str(exc),
+            observed={
+                "declared": request.prompt_mode.value if request.prompt_mode is not None else None,
+                "force_prompt_mode": request.force_prompt_mode,
+            },
+        )
+        result.checks.add(refused)
+        events.check(refused)
+        events.stage_finished(result.outcome.value, attempted=False)
+        return result
+    result.prompt_mode_decision = decision
+    decided = Check.passed(
+        PROMPT_MODE_CHECK,
+        f"{decision.mode.value} ({decision.source}): {decision.evidence}",
+        observed=decision.as_dict(),
+    )
+    result.checks.add(decided)
+    events.check(decided)
+
     # -- can this run at all? ---------------------------------------------
     with guard(ENV_CHECK) as sink:
         if request.auto_provision:
@@ -1170,19 +1325,6 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             result.limitation(f"training was not attempted: {version_check.detail}")
             events.stage_finished(result.outcome.value, attempted=False)
             return result
-
-    if not request.data.is_file():
-        # A check, not an exception: "the split is not there" is an observation
-        # about this run, and the report has to carry it.
-        missing = Check.failed(
-            TRAINING_CHECK,
-            f"the training split {request.data} does not exist, so nothing was trained",
-            observed={"data": str(request.data)},
-        )
-        result.checks.add(missing)
-        events.check(missing)
-        events.stage_finished(result.outcome.value, attempted=False)
-        return result
 
     # -- where will this run? -----------------------------------------------
     # Asked once, here, in the parent, before the training script starts,
@@ -1243,7 +1385,11 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     metrics_out = workspace / "metrics.json"
     config_path = workspace / "train_config.json"
     config_path.write_text(
-        json.dumps(request.config(metrics_out, device=device), indent=2), encoding="utf-8"
+        json.dumps(
+            request.config(metrics_out, device=device, decision=result.prompt_mode_decision),
+            indent=2,
+        ),
+        encoding="utf-8",
     )
     # A previous attempt's metrics in place would be read as this attempt's, the
     # same way `export` refuses to inherit a stale artifact by mtime.

@@ -21,8 +21,8 @@ from litetune.evaluate import (
     DecodeConfig,
     Generation,
     GenerationBackend,
-    PromptMode,
 )
+from litetune.prompt_mode import PromptMode
 
 
 def call_text(name: str, **args: str) -> str:

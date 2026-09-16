@@ -18,7 +18,7 @@ from conftest import FakeBackend, correct_texts, labelled_rows, mark_provisioned
 from litetune import envs
 from litetune import verify as verify_module
 from litetune.cli import build_parser, main, measurements_from_verify, summarise
-from litetune.evaluate import PromptMode
+from litetune.prompt_mode import PromptMode
 from litetune.verify import BackendPair, Status
 
 
@@ -567,21 +567,57 @@ def test_tune_parses_and_dispatches(monkeypatch, tmp_path, capsys):
     assert "default for the method" in capsys.readouterr().out
 
 
-def test_tune_requires_the_prompt_mode_to_be_stated(tmp_path):
-    # There is no defensible default: the two conventions are mutually
-    # exclusive and the wrong one is a fluent wrong answer.
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(
-            [
-                "tune",
-                "--model",
-                "m",
-                "--data",
-                str(tmp_path / "d.jsonl"),
-                "--output-dir",
-                str(tmp_path),
-            ]
-        )
+def test_tune_leaves_an_undeclared_prompt_mode_to_the_training_prompts(monkeypatch, tmp_path):
+    # Not a default: `None` reaches `run_tune`, which reads the split and refuses
+    # one that mixes the two conventions.
+    from litetune import cli
+    from litetune.checks import CheckSet
+    from litetune.tune import TuneResult
+
+    seen = {}
+
+    def fake_run_tune(request, events=None):
+        seen["request"] = request
+        return TuneResult(request=request, checks=CheckSet(name="train"))
+
+    monkeypatch.setattr(cli, "run_tune", fake_run_tune)
+    main(
+        [
+            "tune",
+            "--model",
+            "m",
+            "--data",
+            str(tmp_path / "d.jsonl"),
+            "--output-dir",
+            str(tmp_path / "run"),
+        ]
+    )
+    assert seen["request"].prompt_mode is None
+    assert seen["request"].force_prompt_mode is False
+
+
+def test_tune_refuses_to_force_a_prompt_mode_nobody_declared(monkeypatch, tmp_path, capsys):
+    from litetune import cli
+
+    def never(request, events=None):
+        raise AssertionError("run_tune must not be reached")
+
+    monkeypatch.setattr(cli, "run_tune", never)
+    code = main(
+        [
+            "tune",
+            "--model",
+            "m",
+            "--data",
+            str(tmp_path / "d.jsonl"),
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--force-prompt-mode",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code != 0
+    assert "--prompt-mode" in captured.out + captured.err
 
 
 def test_tune_refuses_an_unknown_method(tmp_path):
@@ -729,24 +765,87 @@ def test_bundle_assembles_the_four_members(tmp_path, deliverable, capsys):
     assert "measurements not made" in out
 
 
-def test_bundle_requires_a_prompt_mode(tmp_path, deliverable):
+def _without_prompt_mode(argv):
+    at = argv.index("--prompt-mode")
+    return argv[:at] + argv[at + 2 :]
+
+
+def _train_metrics(tmp_path, **record):
+    path = tmp_path / "train-metrics.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return path
+
+
+def test_bundle_takes_the_prompt_mode_from_the_training_record(tmp_path, deliverable):
     model, declarations = deliverable
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(
-            [
-                "bundle",
-                "--output-dir",
-                str(tmp_path / "bundle"),
-                "--model",
-                str(model),
-                "--declarations",
-                str(declarations),
-                "--base-model",
-                "org/base",
-                "--base-model-revision",
-                "a" * 40,
-            ]
+    metrics = _train_metrics(
+        tmp_path,
+        prompt_mode="runtime_rendered",
+        prompt_mode_decision={"prompt_mode": "runtime_rendered", "source": "inferred"},
+    )
+    main(
+        _without_prompt_mode(
+            _bundle_argv(tmp_path, model, declarations, "--train-metrics", str(metrics))
         )
+    )
+
+    contract = json.loads((tmp_path / "bundle" / "contract.json").read_text(encoding="utf-8"))
+    assert contract["prompt_mode"] == "runtime_rendered"
+    assert any("training run's record (inferred)" in note for note in contract["notes"])
+
+
+def test_bundle_accepts_a_prompt_mode_that_agrees_with_the_record(tmp_path, deliverable):
+    model, declarations = deliverable
+    metrics = _train_metrics(tmp_path, prompt_mode="prerendered")
+    main(_bundle_argv(tmp_path, model, declarations, "--train-metrics", str(metrics)))
+
+    contract = json.loads((tmp_path / "bundle" / "contract.json").read_text(encoding="utf-8"))
+    assert contract["prompt_mode"] == "prerendered"
+
+
+def test_bundle_refuses_a_prompt_mode_the_record_contradicts(tmp_path, deliverable, capsys):
+    from litetune import cli
+
+    model, declarations = deliverable
+    metrics = _train_metrics(tmp_path, prompt_mode="runtime_rendered")
+    code = main(_bundle_argv(tmp_path, model, declarations, "--train-metrics", str(metrics)))
+
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_CODES[cli.Status.ERROR]
+    assert "--prompt-mode is prerendered" in err
+    assert "trained runtime_rendered" in err
+    assert not (tmp_path / "bundle" / "contract.json").exists()
+
+
+def test_bundle_refuses_a_training_record_whose_prompt_mode_it_cannot_read(
+    tmp_path, deliverable, capsys
+):
+    from litetune import cli
+
+    model, declarations = deliverable
+    metrics = _train_metrics(tmp_path, prompt_mode="templated")
+    # `--prompt-mode prerendered` is passed as well: a record that cannot be read
+    # is refused, not replaced by the flag.
+    code = main(_bundle_argv(tmp_path, model, declarations, "--train-metrics", str(metrics)))
+
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_CODES[cli.Status.ERROR]
+    assert "train-metrics.json" in err
+    assert "records prompt_mode 'templated'" in err
+    assert "runtime_rendered" in err
+    assert not (tmp_path / "bundle" / "contract.json").exists()
+
+
+def test_bundle_without_a_mode_or_a_training_record_does_not_run(tmp_path, deliverable, capsys):
+    from litetune import cli
+
+    model, declarations = deliverable
+    code = main(_without_prompt_mode(_bundle_argv(tmp_path, model, declarations)))
+
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_CODES[cli.Status.ERROR]
+    assert "no prompt mode" in err
+    assert not (tmp_path / "bundle" / "contract.json").exists()
 
 
 def test_bundle_carries_a_verify_manifest_into_the_report(tmp_path, deliverable, capsys):
@@ -848,6 +947,7 @@ def test_verify_prompt_mode_reaches_the_manifest(tmp_path, capsys, write_split, 
         "evidence": "the caller declared this mode; no inference was made",
         "marker_share": None,
         "ambiguous": False,
+        "markers": [],
     }
 
 
@@ -1525,3 +1625,87 @@ def test_the_convert_line_marks_an_upstream_declaration(declared, expect, tmp_pa
     )
 
     assert expect in _artifact_line(export)
+
+
+def test_the_verify_summary_prints_the_reasoning_count_for_each_side():
+    from litetune.cli import summarise
+
+    lines = summarise(
+        {
+            "status": "passed",
+            "measurements": {
+                "candidate": {
+                    "reasoning_removed": {
+                        "generations_with_reasoning": 3,
+                        "over_generations_that_ran": 40,
+                    }
+                },
+                "reference": {
+                    "reasoning_removed": {
+                        "generations_with_reasoning": 0,
+                        "over_generations_that_ran": 40,
+                    }
+                },
+            },
+        }
+    )
+    assert "  reasoning removed before scoring: candidate 3 of 40, reference 0 of 40" in lines
+
+
+def test_the_verify_summary_says_how_much_reasoning_never_closed():
+    from litetune.cli import summarise
+
+    lines = summarise(
+        {
+            "status": "passed",
+            "measurements": {
+                "candidate": {
+                    "reasoning_removed": {
+                        "generations_with_reasoning": 3,
+                        "generations_with_unclosed_reasoning": 5,
+                        "over_generations_that_ran": 40,
+                    }
+                }
+            },
+        }
+    )
+    assert "  reasoning removed before scoring: candidate 3 of 40 (5 never closed)" in lines
+
+
+def test_the_tune_summary_says_when_the_mode_was_never_decided(monkeypatch, tmp_path, capsys):
+    # The line a user reads after a run that stopped before the decision. Both
+    # branches ran under existing tests; neither was asserted, so either could
+    # print the other's sentence.
+    from litetune import cli
+    from litetune.checks import CheckSet
+    from litetune.tune import TuneResult
+
+    def fake_run_tune(request, events=None):
+        return TuneResult(request=request, checks=CheckSet(name="train"))
+
+    monkeypatch.setattr(cli, "run_tune", fake_run_tune)
+    main(
+        [
+            "tune",
+            "--model",
+            "m",
+            "--data",
+            str(tmp_path / "d.jsonl"),
+            "--output-dir",
+            str(tmp_path / "run"),
+        ]
+    )
+
+    assert "prompt mode not decided" in capsys.readouterr().out
+
+
+def test_convert_help_names_the_recipe_litetune_defines(capsys):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["convert", "--help"])
+    # Whitespace collapsed: argparse wraps help text, so a phrase that reaches
+    # the user still breaks across lines in the captured output.
+    out = " ".join(capsys.readouterr().out.split())
+    assert "dynamic_wi4b32_emb8_afp32" in out
+    # The catalogue's own one-line description reaches the user, the way the
+    # scorer help is held to `SCORERS`' `describes`.
+    assert "int4 weights in blocks of 32 with int8 embeddings" in out

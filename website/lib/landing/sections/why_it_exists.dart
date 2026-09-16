@@ -3,8 +3,8 @@ import 'package:jaspr/jaspr.dart';
 
 import '../../theme/brand.dart';
 
-/// The one paragraph that explains the tool's reason to exist, and the two
-/// runs where it was actually done.
+/// The one paragraph that explains the tool's reason to exist, and the runs
+/// where it was actually done.
 ///
 /// The paragraph carries no numbers, deliberately: the measured figures live
 /// in MEASUREMENTS.md, where a reader can see the intervals and the sample
@@ -13,7 +13,7 @@ import '../../theme/brand.dart';
 ///
 /// The cards below it hold to the same rule. The only quantity on them is a
 /// sample size, which is the thing a claim needs rather than a claim itself,
-/// and neither card carries a score or a verdict. That is not squeamishness:
+/// and no card carries a score or a verdict. That is not squeamishness:
 /// `MEASUREMENTS.md` records the FunctionGemma conversion cost resolving in
 /// 2 of 6 recipe-runs across three runs of the same configuration, calls
 /// whether 640 examples resolve it "close to a coin flip", and says in terms
@@ -22,10 +22,12 @@ import '../../theme/brand.dart';
 ///
 /// What each card carries instead is the fact that is unambiguous and belongs
 /// to that run alone. FunctionGemma was also run on a phone, on the same 640
-/// rows, which Gemma 3 270M has no counterpart to. Gemma 3 270M's untuned base
-/// could not be scored at all -- it repeated itself on 571 of 600 prompts and
-/// `verify` stopped before the quality tier -- which is why its training gain
-/// is unattributable in principle rather than merely unmeasured.
+/// rows, which neither of the others has a counterpart to. Gemma 3 270M's
+/// untuned base could not be scored at all -- it repeated itself on 571 of 600
+/// prompts and `verify` stopped before the quality tier -- which is why its
+/// training gain is unattributable in principle rather than merely unmeasured.
+/// Qwen3 0.6B is the one model here that exported with no per-model flag:
+/// `models.py` had no rule for it until that run established none was needed.
 ///
 /// The card says "verify refused" and not "the base could not be scored". The
 /// refusal is the tool doing its job, and the passive form hands the failure
@@ -35,7 +37,8 @@ import '../../theme/brand.dart';
 /// `MEASUREMENTS.md` uses the active verb for the same reason.
 ///
 /// The size is in the card name because `models.py` scopes the `gemma-3-text`
-/// family to the 270M and the 1B, and only the 270M was measured.
+/// family to the 270M and the 1B, and only the 270M was measured. Qwen3's card
+/// carries its size because its rule is scoped to the one size that was run.
 class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
@@ -68,11 +71,17 @@ class WhyItExists extends StatelessComponent {
               'exact-text scoring, 600 held-out rows',
               'verify refused to score the untuned base at all.',
             ),
+            _card(
+              'Qwen3 0.6B',
+              'exact-text scoring, the same 600 held-out rows',
+              'Exported with no per-model flag.',
+            ),
           ]),
           p(classes: 'measured-note', [
             Component.text(
-              'Both on CPU. Conversion cost came out small on both, and at '
-              'these sample sizes the method is near its limit. ',
+              'Every conversion measured on CPU. Conversion cost came out small '
+              'on all three, and at these sample sizes the method is near its '
+              'limit. ',
             ),
             a(
               href:

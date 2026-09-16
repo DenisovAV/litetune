@@ -15,15 +15,20 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
 from conftest import FakeBackend, correct_texts, labelled_rows
 
 from litetune import envs
 from litetune.bundle import Contract
-from litetune.evaluate import (
-    HuggingFaceBackend,
-    LiteRtLmBackend,
+from litetune.evaluate import HuggingFaceBackend, LiteRtLmBackend
+from litetune.prompt_mode import (
+    RENDERING_SOURCE,
+    TURN_MARKERS,
     PromptMode,
+    PromptModeConflict,
     marker_share,
+    parse_prompt_mode,
+    prompt_evidence,
     resolve_prompt_mode,
 )
 from litetune.verify import BackendPair, Status, VerifyRequest, build_backends, run_verify
@@ -84,6 +89,31 @@ def test_marker_share_names_what_it_saw():
     share, seen = marker_share([RENDERED, BARE])
     assert share == 0.5
     assert seen == ("<start_of_turn>",)
+
+
+@pytest.mark.parametrize(
+    ("rendered", "bare", "mode"),
+    [
+        (0, 10, PromptMode.RUNTIME_RENDERED),
+        (1, 9, PromptMode.RUNTIME_RENDERED),
+        (5, 5, None),
+        (9, 1, PromptMode.PRERENDERED),
+        (10, 0, PromptMode.PRERENDERED),
+    ],
+)
+def test_both_bounds_belong_to_the_mode_they_name(rendered, bare, mode):
+    evidence = prompt_evidence([RENDERED] * rendered + [BARE] * bare)
+    assert evidence.mode is mode
+    assert evidence.count == 10
+
+
+def test_one_rendered_prompt_in_ten_is_bare_text_to_verify_too():
+    # `share <= 1.0 - 0.9` put this split in the mixed band: 1.0 - 0.9 is
+    # 0.09999999999999998, and 1/10 is not below it.
+    decision = resolve_prompt_mode([RENDERED] + [BARE] * 9)
+    assert decision.mode is PromptMode.RUNTIME_RENDERED
+    assert not decision.ambiguous
+    assert decision.markers == ("<start_of_turn>",)
 
 
 # ---------------------------------------------------------------------------
@@ -263,3 +293,272 @@ def test_a_supplied_backend_that_ignores_the_resolved_mode_is_recorded(tmp_path,
     assert result.manifest["harness"]["prompt_mode"] == "prerendered"
     assert result.manifest["harness"]["prompt_mode_decision"]["prompt_mode"] == "runtime_rendered"
     assert any("did not take the resolved mode" in text for text in result.manifest["limitations"])
+
+
+# ---------------------------------------------------------------------------
+# The record `tune` leaves beside the checkpoint
+# ---------------------------------------------------------------------------
+
+
+def test_the_training_record_wins_and_says_where_it_came_from():
+    decision = resolve_prompt_mode([BARE] * 10, recorded=PromptMode.PRERENDERED)
+    assert decision.mode is PromptMode.PRERENDERED
+    assert decision.source == "checkpoint"
+    assert "litetune.json" in decision.evidence
+
+
+def test_a_declared_mode_or_contract_that_agrees_with_the_record_is_the_record():
+    decision = resolve_prompt_mode(
+        [BARE] * 10,
+        declared=PromptMode.PRERENDERED,
+        contract=PromptMode.PRERENDERED,
+        recorded=PromptMode.PRERENDERED,
+    )
+    assert decision.source == "checkpoint"
+
+
+@pytest.mark.parametrize("which", ["declared", "contract"])
+def test_a_value_that_contradicts_the_record_raises_naming_both(which):
+    with pytest.raises(PromptModeConflict) as raised:
+        resolve_prompt_mode(
+            [BARE] * 10, recorded=PromptMode.PRERENDERED, **{which: PromptMode.RUNTIME_RENDERED}
+        )
+    assert "runtime_rendered" in str(raised.value)
+    assert "prerendered" in str(raised.value)
+
+
+def _checkpoint(tmp_path: Path, record: dict | str) -> str:
+    path = tmp_path / "tuned-model"
+    path.mkdir()
+    text = record if isinstance(record, str) else json.dumps(record)
+    (path / "litetune.json").write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def _verify(tmp_path, write_split, reference, **kwargs):
+    rows = labelled_rows(8)  # bare text: inference alone would say runtime_rendered
+    return run_verify(
+        VerifyRequest(
+            model=tmp_path / "m.litertlm", reference=reference, data=write_split(rows), **kwargs
+        ),
+        backends=_pair(rows),
+    )
+
+
+def test_verify_uses_the_mode_training_recorded_beside_the_reference(tmp_path, write_split):
+    reference = _checkpoint(
+        tmp_path,
+        {
+            "base_model": "org/base",
+            "prompt_mode": "prerendered",
+            "prompt_mode_decision": {"prompt_mode": "prerendered", "source": "overridden"},
+        },
+    )
+    result = _verify(tmp_path, write_split, reference)
+
+    decision = result.manifest["harness"]["prompt_mode_decision"]
+    assert decision["source"] == "checkpoint"
+    assert decision["prompt_mode"] == "prerendered"
+    assert not any("was not declared" in text for text in result.manifest["limitations"])
+
+
+def test_a_record_that_predates_the_decision_field_is_still_the_record(tmp_path, write_split):
+    # The keys `tune` wrote into litetune.json before it recorded how it decided.
+    reference = _checkpoint(
+        tmp_path,
+        {
+            "base_model": "org/base",
+            "base_model_revision": None,
+            "prompt_mode": "prerendered",
+            "turn_terminator": {"ids": [1], "source": "tokenizer_eos", "text": "<eos>"},
+            "sentencepiece": None,
+        },
+    )
+    result = _verify(tmp_path, write_split, reference)
+
+    assert result.manifest["harness"]["prompt_mode_decision"]["source"] == "checkpoint"
+
+
+def test_verify_refuses_a_declared_mode_the_training_record_contradicts(tmp_path, write_split):
+    reference = _checkpoint(tmp_path, {"base_model": "org/base", "prompt_mode": "prerendered"})
+    result = _verify(tmp_path, write_split, reference, prompt_mode=PromptMode.RUNTIME_RENDERED)
+
+    assert result.status is Status.FAILED_HARNESS
+    last = result.manifest["checks"][-1]
+    assert last["outcome"] == "could_not_check"
+    assert "the declared mode is runtime_rendered" in last["detail"]
+    assert "trained prerendered" in last["detail"]
+    assert "candidate" not in result.manifest["measurements"]
+
+
+def test_verify_refuses_a_contract_the_training_record_contradicts(tmp_path, write_split):
+    reference = _checkpoint(tmp_path, {"base_model": "org/base", "prompt_mode": "prerendered"})
+    result = _verify(
+        tmp_path,
+        write_split,
+        reference,
+        contract=_contract(tmp_path, PromptMode.RUNTIME_RENDERED),
+    )
+
+    assert result.status is Status.FAILED_HARNESS
+    assert "the bundle contract is runtime_rendered" in result.manifest["checks"][-1]["detail"]
+    assert "candidate" not in result.manifest["measurements"]
+
+
+def test_a_directory_without_a_record_keeps_the_contract_then_the_prompts(tmp_path, write_split):
+    plain = tmp_path / "foreign-model"
+    plain.mkdir()
+    inferred = _verify(tmp_path, write_split, str(plain))
+    assert inferred.manifest["harness"]["prompt_mode_decision"]["source"] == "inferred"
+
+
+def test_a_record_without_a_mode_keeps_the_contract(tmp_path, write_split):
+    reference = _checkpoint(tmp_path, {"base_model": "org/base"})
+    result = _verify(
+        tmp_path, write_split, reference, contract=_contract(tmp_path, PromptMode.PRERENDERED)
+    )
+    assert result.manifest["harness"]["prompt_mode_decision"]["source"] == "contract"
+
+
+@pytest.mark.parametrize("text", ['{"prompt_mode": ', "[1]", '{"prompt_mode": "templated"}'])
+def test_a_record_that_cannot_be_read_is_not_replaced_by_a_guess(tmp_path, write_split, text):
+    result = _verify(tmp_path, write_split, _checkpoint(tmp_path, text))
+
+    assert result.status is Status.FAILED_HARNESS
+    assert result.manifest["checks"][-1]["outcome"] == "could_not_check"
+
+
+# ---------------------------------------------------------------------------
+# One rendering, one parser
+# ---------------------------------------------------------------------------
+
+
+def test_training_the_reference_and_the_rendering_check_render_from_one_source():
+    # Training learns from this text and the rendering check compares the
+    # reference's ids with the runtime's: a copy in any one script renders a
+    # prompt the others may not.
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+    from litetune.rendering import _REFERENCE_SCRIPT
+    from litetune.tune import _TRAIN_SCRIPT
+
+    for script in (_TRAIN_SCRIPT, _HF_GENERATE_SCRIPT, _REFERENCE_SCRIPT):
+        assert script.count(RENDERING_SOURCE) == 1
+        assert script.count("def render_prompt(") == 1
+
+
+@pytest.mark.parametrize("raw", ["prerendered", PromptMode.RUNTIME_RENDERED])
+def test_a_recorded_mode_reads_back_as_itself(raw):
+    assert parse_prompt_mode(raw, "the record") is PromptMode(raw)
+
+
+@pytest.mark.parametrize("raw", ["templated", "", 1, None])
+def test_an_unknown_recorded_mode_is_refused_naming_the_record_and_the_modes(raw):
+    with pytest.raises(ValueError) as exc:
+        parse_prompt_mode(raw, "run/litetune.json")
+
+    message = str(exc.value)
+    assert message.startswith(f"run/litetune.json records prompt_mode {raw!r}")
+    assert all(mode.value in message for mode in PromptMode)
+
+
+@pytest.mark.parametrize("marker", TURN_MARKERS)
+def test_every_control_token_the_list_carries_marks_a_prompt_as_rendered(marker):
+    """Each entry earns its place, or a family stops being recognised.
+
+    One literal covered this before, so dropping any other marker from the tuple
+    left the suite green while a Qwen split scored 0% rendered and trained
+    double-wrapped.
+    """
+    decision = resolve_prompt_mode([f"{marker}user\nhi"] * 10)
+
+    assert decision.mode is PromptMode.PRERENDERED
+    assert decision.markers == (marker,)
+
+
+def test_the_markers_reach_the_record_a_reader_contradicts_it_with():
+    # Asserted on the serialised form, not the attribute: the record is what
+    # `litetune.json`, the tune metrics and the verify manifest carry.
+    record = resolve_prompt_mode([RENDERED] * 10).as_dict()
+
+    assert record["markers"] == ["<start_of_turn>"]
+    assert record["source"] == "inferred"
+
+
+def test_a_sidecar_that_exists_and_cannot_be_read_raises(tmp_path):
+    """The docstring promises this, and `is_file()` quietly broke the promise.
+
+    A mode the checkpoint wrote down must not be replaced by one inferred from
+    the prompts because the file could not be looked at.
+    """
+    from litetune.verify import recorded_prompt_mode
+
+    reference = _checkpoint(tmp_path, {"prompt_mode": "prerendered"})
+    sidecar = Path(reference) / "litetune.json"
+    sidecar.unlink()
+    sidecar.mkdir()  # exists, and reading it is an OSError that is not "absent"
+
+    with pytest.raises(OSError):
+        recorded_prompt_mode(reference)
+
+
+def test_a_sidecar_that_is_a_dangling_symlink_raises(tmp_path):
+    """A link is an entry: something recorded a mode here and the link stopped
+    reaching it. Reading it raises `FileNotFoundError`, the same exception a
+    sidecar that was never there raises, and the two are not the same
+    statement -- one is "no record", the other is a record that cannot be read.
+    """
+    from litetune.verify import recorded_prompt_mode
+
+    reference = _checkpoint(tmp_path, {"prompt_mode": "prerendered"})
+    sidecar = Path(reference) / "litetune.json"
+    sidecar.unlink()
+    sidecar.symlink_to(tmp_path / "never-written.json")
+
+    with pytest.raises(OSError):
+        recorded_prompt_mode(reference)
+
+
+def test_a_reference_directory_that_is_a_broken_link_raises(tmp_path):
+    """The broken link can be the directory rather than the sidecar.
+
+    Reading `<link>/litetune.json` raises `FileNotFoundError`, and the sidecar's
+    own `is_symlink` is false because what is missing is its parent -- so
+    nothing about the failure tells it apart from a checkpoint that never
+    recorded a mode, unless the reference itself is looked at.
+    """
+    from litetune.verify import recorded_prompt_mode
+
+    reference = tmp_path / "link-to-nowhere"
+    reference.symlink_to(tmp_path / "never-created")
+
+    with pytest.raises(OSError):
+        recorded_prompt_mode(str(reference))
+
+
+def test_a_healthy_symlinked_reference_with_no_sidecar_is_no_record(tmp_path):
+    """The companion to the broken-link test, and the one that pins the
+    difference between them.
+
+    `models/current -> models/run-42` is an ordinary layout, and a checkpoint
+    that never recorded a mode is an ordinary checkpoint. Asking only whether
+    the reference is a link refuses both cases alike, and this run would end as
+    a harness failure instead of falling through to the contract or the prompts.
+    """
+    from litetune.verify import recorded_prompt_mode
+
+    real = tmp_path / "run-42"
+    real.mkdir()
+    link = tmp_path / "current"
+    link.symlink_to(real)
+
+    assert recorded_prompt_mode(str(link)) is None
+
+
+def test_a_reference_with_no_sidecar_is_still_no_record(tmp_path):
+    from litetune.verify import recorded_prompt_mode
+
+    empty = tmp_path / "plain-checkpoint"
+    empty.mkdir()
+
+    assert recorded_prompt_mode(str(empty)) is None
+    assert recorded_prompt_mode("Qwen/Qwen3-0.6B") is None

@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import pytest
@@ -26,21 +26,25 @@ from conftest import fake_torch, mark_provisioned
 
 from litetune import envs
 from litetune.checks import Outcome
-from litetune.evaluate import PromptMode
 from litetune.events import EventStream
+from litetune.prepare import read_rows
+from litetune.prompt_mode import PromptMode, PromptModeDecision
 from litetune.tune import (
     _TRAIN_SCRIPT,
     DEFAULT_ATTN_IMPLEMENTATION,
     DEFAULT_DTYPE,
     ENV_CHECK,
     EXPECTED_SUPERVISED_FRACTION,
+    FORCE_PROMPT_MODE_FLAG,
     LEARNING_RATES,
     MASKING_CHECK,
     MERGE_CHECK,
+    PROMPT_MODE_CHECK,
     TRAINING_CHECK,
     TrainingMetrics,
     TuneError,
     TuneRequest,
+    decide_prompt_mode,
     masking_check,
     run_tune,
     write_report,
@@ -151,6 +155,7 @@ class FakeTrainer:
                 "dtype": config["dtype"],
                 "attn_implementation": config["attn_implementation"],
                 "prompt_mode": config["prompt_mode"],
+                "prompt_mode_decision": config.get("prompt_mode_decision"),
                 "n_examples": 40,
                 "supervised_tokens": self.supervised_tokens,
                 "total_tokens": self.total_tokens,
@@ -187,14 +192,21 @@ def trainer(monkeypatch, tmp_path) -> FakeTrainer:
     return fake
 
 
+def _rendered(text: str) -> str:
+    """A prompt that is already a turn, the way FunctionGemma's application sends it."""
+    return f"<start_of_turn>user\n{text}<end_of_turn>\n<start_of_turn>model\n"
+
+
 @pytest.fixture
 def train_data(tmp_path) -> Path:
+    # Rendered, because the requests below declare `prerendered` for
+    # FunctionGemma and `tune` refuses that declaration on bare text.
     path = tmp_path / "train.jsonl"
     path.write_text(
         "".join(
             json.dumps(
                 {
-                    "prompt": f"set the background to colour swatch{i}",
+                    "prompt": _rendered(f"set the background to colour swatch{i}"),
                     "completion": (
                         f"call:change_background_color{{color:<escape>swatch{i}<escape>}}"
                     ),
@@ -216,13 +228,36 @@ def request_for(tmp_path, train_data):
             "model": "google/functiongemma-270m-it",
             "data": train_data,
             "output_dir": tmp_path / "tuned",
-            # Stated, not defaulted: `TuneRequest` refuses to guess it.
+            # Declared, and agreeing with `train_data`'s rendered prompts.
             "prompt_mode": PromptMode.PRERENDERED,
         }
         params.update(kwargs)
         return TuneRequest(**params)
 
     return _build
+
+
+@pytest.fixture
+def bare_train_data(tmp_path) -> Path:
+    """The same rows as bare text, the way a caller of the runtime's own template sends them."""
+    path = tmp_path / "bare.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "prompt": f"set the background to colour swatch{i}",
+                    "completion": (
+                        f"call:change_background_color{{color:<escape>swatch{i}<escape>}}"
+                    ),
+                    "source_line": i + 1,
+                }
+            )
+            + "\n"
+            for i in range(40)
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def check_named(result, name):
@@ -577,8 +612,10 @@ def test_runtime_rendered_training_applies_the_chat_template_once(script_namespa
     assert add_special is False
 
 
-def test_the_trained_prompt_mode_reaches_the_script_and_the_report(trainer, request_for):
-    result = run_tune(request_for(prompt_mode=PromptMode.RUNTIME_RENDERED))
+def test_the_trained_prompt_mode_reaches_the_script_and_the_report(
+    trainer, request_for, bare_train_data
+):
+    result = run_tune(request_for(prompt_mode=PromptMode.RUNTIME_RENDERED, data=bare_train_data))
 
     assert trainer.configs[0]["prompt_mode"] == "runtime_rendered"
     # This is the field `bundle.Contract` refuses to default, so the stage that
@@ -776,7 +813,12 @@ def test_an_accelerator_failure_produces_the_same_report_for_either_method(
 
     result = run_tune(request_for(method=method, output_dir=tmp_path / method))
 
-    assert [c.name for c in result.checks.checks] == [ENV_CHECK, TRAINING_CHECK, MASKING_CHECK]
+    assert [c.name for c in result.checks.checks] == [
+        PROMPT_MODE_CHECK,
+        ENV_CHECK,
+        TRAINING_CHECK,
+        MASKING_CHECK,
+    ]
     assert not [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
     assert result.outcome is Outcome.UNCHECKED
 
@@ -1251,7 +1293,10 @@ def stub_env(tmp_path):
 
 
 def run_real_script(
-    request: TuneRequest, stub_env, cuda: bool = False
+    request: TuneRequest,
+    stub_env,
+    cuda: bool = False,
+    decision: PromptModeDecision | None = None,
 ) -> subprocess.CompletedProcess:
     """Runs `_TRAIN_SCRIPT` for real, against the stub modules `stub_env` wrote.
 
@@ -1266,7 +1311,8 @@ def run_real_script(
     script.write_text(_TRAIN_SCRIPT, encoding="utf-8")
     config = request.output_dir / "train_config.json"
     config.write_text(
-        json.dumps(request.config(request.output_dir / "metrics.json")), encoding="utf-8"
+        json.dumps(request.config(request.output_dir / "metrics.json", decision=decision)),
+        encoding="utf-8",
     )
     return subprocess.run(
         [sys.executable, str(script), str(config)],
@@ -1301,7 +1347,7 @@ def test_the_real_script_writes_metrics_this_module_can_read(request_for, stub_e
     assert metrics.supervised_token_fraction == pytest.approx(
         metrics.supervised_tokens / metrics.total_tokens
     )
-    # Prompts are six words, completions one -- masked, and visibly so.
+    # Prompts are eight words as a rendered turn, completions one -- masked, and visibly so.
     assert metrics.supervised_token_fraction < 0.4
     assert [e.epoch for e in metrics.epochs] == [1, 2]
     assert metrics.final_loss == pytest.approx(1.45)
@@ -1469,7 +1515,7 @@ def test_prepare_feeds_tune_feeds_bundle(trainer, tmp_path):
         "".join(
             json.dumps(
                 {
-                    "prompt": f"set the background to colour swatch{i}",
+                    "prompt": _rendered(f"set the background to colour swatch{i}"),
                     "target": {
                         "name": "change_background_color",
                         "args": {"color": f"swatch{i}"},
@@ -1563,23 +1609,23 @@ def test_fractional_epochs_are_scheduled_rather_than_rounded_away(script_namespa
         epoch_schedule(0.0, 40, 8)
 
 
-def test_omitting_the_prompt_mode_is_refused(tmp_path, train_data):
-    """The property `field(kw_only=True)` exists to guarantee.
+def test_omitting_the_prompt_mode_leaves_it_to_the_prompts_not_to_a_default(
+    trainer, request_for, bare_train_data
+):
+    """`None` is "not declared". Reverting it to `= PromptMode.PRERENDERED` would
+    train these bare prompts prerendered; the run reads the split instead."""
+    result = run_tune(request_for(prompt_mode=None, data=bare_train_data))
 
-    Reverting it to `= PromptMode.PRERENDERED` used to pass the whole suite:
-    every call site already passed it by keyword, so nothing tested that
-    omitting it fails. Which convention the prompt was built under cannot be
-    guessed, and guessing wrong trains the model on a prompt the runtime never
-    sends.
-    """
-    with pytest.raises(TypeError, match="prompt_mode"):
-        TuneRequest(model="m", data=train_data, output_dir=tmp_path)
+    assert result.outcome is Outcome.PASSED
+    assert result.prompt_mode is PromptMode.RUNTIME_RENDERED
+    assert trainer.configs[0]["prompt_mode_decision"]["source"] == "inferred"
 
 
-def test_the_prompt_mode_is_keyword_only(tmp_path, train_data):
+def test_the_prompt_mode_is_keyword_only():
     """Positionally it would land where `timeout_s` reads in the class body."""
-    with pytest.raises(TypeError):
-        TuneRequest("m", train_data, tmp_path, PromptMode.PRERENDERED)
+    by_name = {f.name: f for f in fields(TuneRequest)}
+    assert by_name["prompt_mode"].kw_only
+    assert by_name["force_prompt_mode"].kw_only
 
 
 def test_the_sentencepiece_model_is_carried_back_beside_the_checkpoint(tmp_path, script_namespace):
@@ -2170,3 +2216,189 @@ def test_the_device_story_is_silent_when_metrics_predate_the_field(trainer, requ
     assert result.metrics.device is None
     assert not any(e.kind == "note" and "trained on" in e.data.get("message", "") for e in seen)
     assert not any("trained bfloat16 on the CPU" in text for text in result.limitations)
+
+
+# ---------------------------------------------------------------------------
+# Which convention a run trains under, decided before anything is installed
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mixed_train_data(tmp_path) -> Path:
+    path = tmp_path / "mixed.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "prompt": _rendered(f"colour {i}") if i % 2 else f"colour {i}",
+                    "completion": f"call:change_background_color{{color:<escape>{i}<escape>}}",
+                }
+            )
+            + "\n"
+            for i in range(40)
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _refuse_provisioning(monkeypatch):
+    def never(self, events=None, force: bool = False):
+        raise AssertionError("an environment was provisioned before the prompt mode was decided")
+
+    monkeypatch.setattr(envs.StageEnv, "provision", never)
+
+
+def test_bare_prompts_and_no_declared_mode_train_runtime_rendered(
+    trainer, request_for, bare_train_data
+):
+    result = run_tune(request_for(prompt_mode=None, data=bare_train_data))
+
+    decision = result.as_dict()["prompt_mode_decision"]
+    assert decision["prompt_mode"] == "runtime_rendered"
+    assert decision["source"] == "inferred"
+    assert decision["marker_share"] == 0.0
+    assert trainer.configs[0]["prompt_mode"] == "runtime_rendered"
+    assert check_named(result, PROMPT_MODE_CHECK).outcome is Outcome.PASSED
+
+
+def test_rendered_prompts_and_no_declared_mode_train_prerendered(trainer, request_for):
+    result = run_tune(request_for(prompt_mode=None))
+
+    assert result.prompt_mode is PromptMode.PRERENDERED
+    assert result.prompt_mode_decision is not None
+    assert result.prompt_mode_decision.source == "inferred"
+    assert result.prompt_mode_decision.markers == ("<start_of_turn>",)
+    assert trainer.configs[0]["prompt_mode"] == "prerendered"
+
+
+def test_a_mixed_split_with_no_declared_mode_is_refused_before_anything_runs(
+    trainer, request_for, mixed_train_data, monkeypatch
+):
+    _refuse_provisioning(monkeypatch)
+
+    result = run_tune(request_for(prompt_mode=None, data=mixed_train_data))
+
+    check = check_named(result, PROMPT_MODE_CHECK)
+    assert check.outcome is Outcome.FAILED
+    assert result.outcome is Outcome.FAILED
+    assert "50% of 40 training prompts" in check.detail
+    assert "--prompt-mode" in check.detail
+    assert trainer.calls == []
+    assert not result.request.output_dir.exists()
+    assert result.prompt_mode is None
+    assert result.as_dict()["prompt_mode"] is None
+
+
+def test_prerendered_declared_on_bare_prompts_is_refused_before_anything_runs(
+    trainer, request_for, bare_train_data, monkeypatch
+):
+    # The gemma-3-270m and Qwen3-0.6B banking77 runs were invoked this way.
+    _refuse_provisioning(monkeypatch)
+
+    result = run_tune(request_for(prompt_mode=PromptMode.PRERENDERED, data=bare_train_data))
+
+    check = check_named(result, PROMPT_MODE_CHECK)
+    assert check.outcome is Outcome.FAILED
+    assert "prerendered was declared" in check.detail
+    assert "bare text" in check.detail
+    assert FORCE_PROMPT_MODE_FLAG in check.detail
+    assert trainer.calls == []
+    assert not result.request.output_dir.exists()
+
+
+def test_runtime_rendered_declared_on_rendered_prompts_is_refused_before_anything_runs(
+    trainer, request_for, monkeypatch
+):
+    _refuse_provisioning(monkeypatch)
+
+    result = run_tune(request_for(prompt_mode=PromptMode.RUNTIME_RENDERED))
+
+    check = check_named(result, PROMPT_MODE_CHECK)
+    assert check.outcome is Outcome.FAILED
+    assert "runtime_rendered was declared" in check.detail
+    assert "a second time" in check.detail
+    assert trainer.calls == []
+    assert not result.request.output_dir.exists()
+
+
+def test_a_deliberate_contradiction_trains_and_says_it_was_overridden(
+    trainer, request_for, bare_train_data
+):
+    result = run_tune(
+        request_for(
+            prompt_mode=PromptMode.PRERENDERED, force_prompt_mode=True, data=bare_train_data
+        )
+    )
+
+    assert result.outcome is Outcome.PASSED
+    assert result.prompt_mode is PromptMode.PRERENDERED
+    assert trainer.configs[0]["prompt_mode"] == "prerendered"
+    assert trainer.configs[0]["prompt_mode_decision"]["source"] == "overridden"
+    assert result.as_dict()["request"]["force_prompt_mode"] is True
+
+
+def test_a_declared_mode_the_prompts_agree_with_is_recorded_as_declared(trainer, request_for):
+    result = run_tune(request_for())
+
+    recorded = trainer.configs[0]["prompt_mode_decision"]
+    assert recorded["source"] == "declared"
+    assert recorded["marker_share"] == 1.0
+    # The request keeps what the caller said; the decision lives on the result.
+    assert "prompt_mode_decision" not in result.as_dict()["request"]
+
+
+def test_a_mixed_split_trains_in_the_declared_mode(trainer, request_for, mixed_train_data):
+    result = run_tune(request_for(prompt_mode=PromptMode.PRERENDERED, data=mixed_train_data))
+
+    assert result.outcome is Outcome.PASSED
+    assert result.prompt_mode_decision is not None
+    assert result.prompt_mode_decision.source == "declared"
+
+
+def test_forcing_a_mode_nobody_declared_is_refused(tmp_path, train_data):
+    with pytest.raises(TuneError, match="--prompt-mode"):
+        TuneRequest(model="m", data=train_data, output_dir=tmp_path, force_prompt_mode=True)
+
+
+def test_training_rows_that_cannot_be_read_are_refused_before_anything_runs(
+    trainer, request_for, tmp_path, monkeypatch
+):
+    _refuse_provisioning(monkeypatch)
+    broken = tmp_path / "broken.jsonl"
+    broken.write_text("not json\n", encoding="utf-8")
+
+    result = run_tune(request_for(data=broken))
+
+    assert check_named(result, PROMPT_MODE_CHECK).outcome is Outcome.FAILED
+    assert trainer.calls == []
+
+
+def test_the_real_script_records_the_decision_beside_the_checkpoint(request_for, stub_env):
+    request = request_for()
+    decision = decide_prompt_mode(
+        [row.prompt for row in read_rows(request.data)], request.prompt_mode
+    )
+
+    proc = run_real_script(request, stub_env, decision=decision)
+    assert proc.returncode == 0, proc.stderr
+
+    metrics = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    sidecar = json.loads((request.model_dir / "litetune.json").read_text(encoding="utf-8"))
+    for record in (metrics, sidecar):
+        assert record["prompt_mode"] == "prerendered"
+        assert record["prompt_mode_decision"] == decision.as_dict()
+
+
+def test_the_training_script_refuses_a_prompt_mode_it_was_not_given():
+    """`spec["prompt_mode"] == "runtime_rendered"` read a missing mode as
+    prerendered -- silently training the other convention, which is the failure
+    this whole module exists to prevent. The guard has to come before the flag
+    is derived, or it guards nothing."""
+    from litetune.tune import _TRAIN_SCRIPT
+
+    guard = _TRAIN_SCRIPT.index("is not a mode this script can train")
+    derived = _TRAIN_SCRIPT.index('runtime_rendered = mode == "runtime_rendered"')
+
+    assert guard < derived
+    assert 'if mode not in ("prerendered", "runtime_rendered"):' in _TRAIN_SCRIPT

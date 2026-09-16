@@ -569,14 +569,70 @@ TERMINATORS = (
 )
 
 
+# The markers reasoning is enclosed in, in the two shapes observed on 2026-09-14:
+# `litert-lm run` prints the conversation's thought channel between `[thought]`
+# and `[/thought]` ahead of the answer, and the transformers reference, decoded
+# with special tokens kept, leaves Qwen3's `<think>`...`</think>` inline.
+# `verify` removes reasoning from both sides before scoring, so answers are
+# compared with answers, and reports how many generations carried it.
+REASONING_BLOCKS = (
+    ("[thought]", "[/thought]"),
+    ("<think>", "</think>"),
+)
+
+
+def _split_reasoning(text: str) -> tuple[str, str]:
+    """The answer, and whether the generation's reasoning was `closed`, `unclosed` or `none`.
+
+    Everything through the *last* closing marker is reasoning, whether or not the
+    opening marker is in the generation. That is how Qwen3's model card parses
+    its output (`rindex` of `</think>`) and what lm-evaluation-harness applies
+    (`split(think_end_token)[-1]`), and it is the only rule that works when the
+    chat template put the opening marker in the prompt: Qwen3-4B-Thinking-2507's
+    card says its output normally contains only `</think>`. With no closing
+    marker the text comes back unchanged, whitespace included, so a model that
+    does not reason scores exactly as it did before this existed. A generation
+    that opened reasoning and never closed it -- greedy decoding in thinking mode
+    is what Qwen3's card warns ends in repetition -- is scored unchanged too, and
+    reported as `unclosed`.
+    """
+    end, width = -1, 0
+    for _, closing in REASONING_BLOCKS:
+        at = text.rfind(closing)
+        if at > end:
+            end, width = at, len(closing)
+    if end >= 0:
+        return text[end + width :].lstrip(), "closed"
+    body = text.lstrip()
+    if any(body.startswith(opening) for opening, _ in REASONING_BLOCKS):
+        return text, "unclosed"
+    return text, "none"
+
+
+def strip_reasoning(text: str) -> str:
+    """The generation without its reasoning."""
+    return _split_reasoning(text)[0]
+
+
+def carries_reasoning(text: str) -> bool:
+    """Whether `strip_reasoning` removes anything from this generation."""
+    return _split_reasoning(text)[1] == "closed"
+
+
+def reasoning_unclosed(text: str) -> bool:
+    """Whether this generation opened reasoning and ended before closing it."""
+    return _split_reasoning(text)[1] == "unclosed"
+
+
 def _strip_terminators(text: str) -> tuple[str, tuple[str, ...]]:
     """The text with its trailing markers gone, and which markers came off.
 
     `core` is `text` with every trailing marker from `TERMINATORS` removed,
-    repeatedly, with whitespace stripped between removals. Measured, both
-    supported families stop *at* their template's close -- gemma-3-270m-it and
-    functiongemma-270m-it both carry `<end_of_turn>` in `eos_token_id`, so a
-    real generation ends there and carries one marker, not a stack. The
+    repeatedly, with whitespace stripped between removals. Measured, every
+    family run here stops *at* its template's close -- gemma-3-270m-it and
+    functiongemma-270m-it carry `<end_of_turn>` in `eos_token_id`,
+    gemma-4-E2B-it carries `<turn|>` and Qwen3-0.6B `<|im_end|>` -- so a real
+    generation ends there and carries one marker, not a stack. The
     whitespace between removals is for the family whose eos set does not
     include its own close: generation runs past it into `<end_of_turn>\\n<eos>`,
     and without the strip the newline hides the second marker. `markers` is
@@ -618,10 +674,10 @@ def terminators_trimmed(text: str) -> int:
     Reported, never gated. On the transformers reference the count reflects
     how the chat template and the tokenizer relate: one marker when the
     template's close is itself a stop token, two when it is not and generation
-    runs past it into the eos -- `<end_of_turn>` then `<eos>`. Measured, neither
-    supported family produces that shape: gemma-3-270m-it and
-    functiongemma-270m-it both carry their template's close in `eos_token_id`,
-    so generation halts there and a healthy run reports 1. The count is not a
+    runs past it into the eos -- `<end_of_turn>` then `<eos>`. Measured, no
+    family run here produces that shape: each carries its template's close in
+    `eos_token_id`, so generation halts there and a healthy run reports 1 --
+    on Qwen3-0.6B's reference, 600 of 600. The count is not a
     threshold and no single number means "defect". On a litert-lm candidate it
     is zero whenever the runtime strips its own stop token before this tool
     ever sees the text.

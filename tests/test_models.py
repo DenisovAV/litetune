@@ -18,7 +18,6 @@ from conftest import FakeBackend, correct_texts, labelled_rows, mark_provisioned
 
 from litetune import envs, models
 from litetune.checks import Outcome
-from litetune.evaluate import PromptMode
 from litetune.export import ExportRequest, run_export
 from litetune.models import (
     EXPORT_FLAGS_CHECK,
@@ -29,6 +28,7 @@ from litetune.models import (
     transformers_check,
     version_tuple,
 )
+from litetune.prompt_mode import PromptMode
 from litetune.tune import TuneRequest, run_tune
 from litetune.verify import BackendPair, Status, VerifyRequest, run_verify
 
@@ -54,6 +54,7 @@ E2B_TEMPLATE = "--jinja_chat_template_override=litert-community/gemma-4-E2B-it-l
         # is not, and that difference is the point.
         ("google/gemma-4-it", "gemma-4"),
         ("Qwen/Qwen3.5-4B-Instruct", "qwen-3.5"),
+        ("Qwen/Qwen3-0.6B", "qwen-3"),
     ],
 )
 def test_families_are_recognised(model, family):
@@ -68,8 +69,15 @@ def test_families_are_recognised(model, family):
         # FunctionGemma and Gemma 3 used to sit here. They have rules now: both
         # declare `model_type: gemma3_text`, which the exporter does not
         # recognise, so without an override both bundle as `generic_model`.
-        "Qwen/Qwen3-0.6B",
+        # Qwen3-0.6B sat here until its export and conversion cost were
+        # measured. Its rule adds nothing; the rest of Qwen 3 stays below.
         "Qwen/Qwen2.5-0.5B-Instruct",
+        # Claimed by size, and only the size that was measured. The TTS model is
+        # here because its name ends in 0.6B too.
+        "Qwen/Qwen3-1.7B",
+        "Qwen/Qwen3-30B-A3B",
+        "Qwen/Qwen3-VL-2B-Instruct",
+        "litert-community/Qwen3-TTS-12Hz-0.6B-Base",
         # A size suffix is not the generation number: matching these would
         # refuse an export for a family these rules say nothing about.
         "org/gemma-40m",
@@ -107,6 +115,26 @@ def test_a_local_checkpoint_is_identified_from_what_tune_recorded(tmp_path):
     rules = identify(str(checkpoint))
     assert rules is not None
     assert rules.family == "gemma-4-e2b"
+
+
+def test_a_qwen3_checkpoint_tune_wrote_is_claimed_through_its_sidecar(tmp_path):
+    """What `convert` was handed in the 2026-09-14 measurement: `runs/tuned/model`.
+
+    The config and sidecar below have the shape that run's `tune` wrote. Its
+    export printed "no per-model rules", because there were none.
+    """
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+        encoding="utf-8",
+    )
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": "Qwen/Qwen3-0.6B"}), encoding="utf-8"
+    )
+    rules = identify(str(checkpoint))
+    assert rules is not None
+    assert rules.family == "qwen-3"
 
 
 def test_gemma_4_declares_the_stop_tokens_its_generation_config_names():
@@ -217,11 +245,29 @@ def test_an_export_request_carries_the_required_flags_into_its_argv(tmp_path):
 
 
 def test_a_family_with_no_rules_has_its_flags_left_alone(tmp_path):
-    plan = plan_export("Qwen/Qwen3-0.6B", ("--some_flag=1",), ("dynamic_wi8_afp32",))
+    plan = plan_export("Qwen/Qwen2.5-0.5B-Instruct", ("--some_flag=1",), ("dynamic_wi8_afp32",))
     assert plan.flags == ("--some_flag=1",)
     assert plan.added == ()
     assert plan.usable
     assert "no per-model rules" in " ".join(plan.notes)
+
+
+def test_a_qwen3_export_carries_no_flags_and_no_longer_says_the_family_is_unknown():
+    """The rule records a check, not a workaround.
+
+    Measured 2026-09-14: both int8 recipes exported with no flag from litetune,
+    and the bundle declared `llm_model_type { qwen3 {} }`. So the plan adds
+    nothing, and the one thing the entry changes is that the unknown-family
+    note is gone.
+    """
+    plan = plan_export("Qwen/Qwen3-0.6B", ("--some_flag=1",), ("dynamic_wi8_afp32",))
+    assert plan.rules is not None
+    assert plan.rules.family == "qwen-3"
+    assert plan.flags == ("--some_flag=1",)
+    assert plan.added == ()
+    assert plan.checks == ()
+    assert plan.usable
+    assert models.UNKNOWN_FAMILY not in plan.notes
 
 
 def test_functiongemma_gets_the_model_type_its_runtime_needs():
@@ -476,7 +522,9 @@ def test_tune_refuses_a_model_the_training_environment_cannot_tokenize(
             model=GEMMA4_E2B,
             data=data,
             output_dir=tmp_path / "run",
-            prompt_mode=PromptMode.PRERENDERED,
+            # Bare text, which is what this mode trains; `tune` refuses
+            # `prerendered` on it before anything else is checked.
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
         )
     )
     assert result.outcome is Outcome.FAILED

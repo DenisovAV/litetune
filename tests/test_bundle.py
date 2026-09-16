@@ -27,9 +27,9 @@ from litetune.bundle import (
     versions_from,
 )
 from litetune.checks import Outcome
-from litetune.evaluate import PromptMode
 from litetune.events import EventStream
 from litetune.manifest import CacheOutcome, RunManifest, RunStatus, StageRecord
+from litetune.prompt_mode import PromptMode
 from litetune.storage import hash_file
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"

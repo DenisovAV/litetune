@@ -31,7 +31,6 @@ import subprocess
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -39,6 +38,7 @@ from litetune import envs
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.metrics import ToolCall, read_target
+from litetune.prompt_mode import RENDERING_SOURCE, PromptMode
 
 logger = logging.getLogger(__name__)
 
@@ -48,44 +48,6 @@ PROGRESS_EVERY = 25
 
 DEFAULT_MAX_TOKENS = 256
 
-
-class PromptMode(str, Enum):
-    """How the text that reached the model was constructed."""
-
-    # The prompt is used verbatim: the application rendered any declarations
-    # into it and the runtime's own template is disabled (`--no-template`).
-    PRERENDERED = "prerendered"
-    # The runtime applies its own chat template and renders declarations.
-    RUNTIME_RENDERED = "runtime_rendered"
-
-
-# ---------------------------------------------------------------------------
-# Which mode a measurement is taken in
-# ---------------------------------------------------------------------------
-#
-# `--no-template` is narrow, and it was carried around as though it were
-# general. Its own help says "the input should include all control tokens for
-# the model expected", and what it actually does is route the runtime to
-# `create_session()` instead of `create_conversation()`, bypassing the chat
-# template, the `<|turn>model` anchor, tool handling and channel extraction. It
-# is correct when the caller built the whole prompt including control tokens --
-# the FunctionGemma case, where training used a hand-rendered wire format -- and
-# wrong by default. A six-model probe run without it gave live structured output
-# on Gemma 3 270M, Qwen3 0.6B and Qwen2.5 0.5B, all of which had previously been
-# measured *with* it.
-#
-# The mode is not a property of the model. The same FunctionGemma trained
-# through `apply_chat_template` would need the opposite flag, so it cannot be
-# looked up by family (see `litetune.models`). It is decided by how the prompt
-# was built at training time:
-#
-#     hand-rendered wire format with control tokens -> --no-template
-#     apply_chat_template / native runtime tools     -> no flag
-#
-# `tune` records that decision, `bundle.Contract.prompt_mode` carries it, and
-# `verify` reads it back. Only when there is no contract -- a foreign artifact,
-# which is this tool's primary entry point -- is it inferred, and then the
-# inference and its evidence are reported so a user can contradict them.
 
 # What a backend falls back to when nobody declared a mode. It is what this tool
 # has always done and not a considered answer, so every backend records whether
@@ -98,132 +60,6 @@ UNDECLARED_PROMPT_MODE = PromptMode.PRERENDERED
 # `unknown` when the key is missing or null, so this
 # is the same word for what is, to a reader of the manifest, the same state.
 UNKNOWN_BACKEND = "unknown"
-
-# Control tokens that only appear in a prompt somebody already rendered. Bare
-# user text does not contain them.
-TURN_MARKERS = (
-    "<start_of_turn>",
-    "<|turn>",
-    "<|im_start|>",
-    "<|start_header_id|>",
-    "<start_of_image>",
-)
-
-# Above this share of prompts carrying a marker the split is pre-rendered;
-# below one minus it, it is bare. In between the split is inconsistent, which is
-# reported rather than smoothed over.
-_MARKER_CONFIDENT_SHARE = 0.9
-
-
-@dataclass(frozen=True)
-class PromptModeDecision:
-    """Which mode a measurement runs in, where that came from, and on what evidence.
-
-    `source` is `declared` (the caller said so), `contract` (the bundle that
-    shipped the model said so) or `inferred` (neither existed and the prompts
-    were inspected). Only the last one is a guess, and it says so in every
-    report it reaches.
-    """
-
-    mode: PromptMode
-    source: str
-    evidence: str
-    marker_share: float | None = None
-    ambiguous: bool = False
-
-    @property
-    def inferred(self) -> bool:
-        return self.source == "inferred"
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "prompt_mode": self.mode.value,
-            "source": self.source,
-            "evidence": self.evidence,
-            "marker_share": self.marker_share,
-            "ambiguous": self.ambiguous,
-        }
-
-
-def marker_share(prompts: Sequence[str]) -> tuple[float, tuple[str, ...]]:
-    """Share of prompts already carrying a control token, and which ones were seen."""
-    if not prompts:
-        return 0.0, ()
-    seen: list[str] = []
-    hits = 0
-    for prompt in prompts:
-        found = [marker for marker in TURN_MARKERS if marker in prompt]
-        if found:
-            hits += 1
-            seen.extend(m for m in found if m not in seen)
-    return hits / len(prompts), tuple(seen)
-
-
-def resolve_prompt_mode(
-    prompts: Sequence[str],
-    declared: PromptMode | None = None,
-    contract: PromptMode | None = None,
-) -> PromptModeDecision:
-    """Decide the mode this measurement runs in. An explicit choice always wins.
-
-    Precedence is declared, then the contract the artifact shipped with, then
-    the prompts themselves. The last is a heuristic and is labelled as one: a
-    prompt that already contains `<start_of_turn>` was rendered by whoever wrote
-    the split, and templating it again double-wraps it.
-    """
-    if declared is not None:
-        return PromptModeDecision(
-            mode=declared,
-            source="declared",
-            evidence="the caller declared this mode; no inference was made",
-        )
-    if contract is not None:
-        return PromptModeDecision(
-            mode=contract,
-            source="contract",
-            evidence=(
-                "read from the bundle contract that shipped with this model, which records the "
-                "convention the checkpoint was trained for"
-            ),
-        )
-
-    share, seen = marker_share(prompts)
-    found = ", ".join(seen) if seen else "none"
-    if share >= _MARKER_CONFIDENT_SHARE:
-        return PromptModeDecision(
-            mode=PromptMode.PRERENDERED,
-            source="inferred",
-            evidence=(
-                f"{share:.0%} of the held-out prompts already contain control tokens ({found}), so "
-                "they were rendered before they reached this tool; applying a chat template to "
-                "them would double-wrap them"
-            ),
-            marker_share=share,
-        )
-    if share <= 1.0 - _MARKER_CONFIDENT_SHARE:
-        return PromptModeDecision(
-            mode=PromptMode.RUNTIME_RENDERED,
-            source="inferred",
-            evidence=(
-                f"{share:.0%} of the held-out prompts contain control tokens, so they are bare "
-                "text and the runtime has to render its own template around them"
-            ),
-            marker_share=share,
-        )
-    # Neither shape. Something has to run, so the prompts are used as they are --
-    # the option that transforms nothing and leaves the evidence in the record --
-    # and the inconsistency is stated rather than hidden.
-    return PromptModeDecision(
-        mode=PromptMode.PRERENDERED,
-        source="inferred",
-        evidence=(
-            f"{share:.0%} of the held-out prompts contain control tokens ({found}) and the rest do "
-            "not: the split mixes the two conventions, so no single mode is right for all of it. "
-            "The prompts were used verbatim; declare the mode explicitly to remove the guess"
-        ),
-        marker_share=share,
-        ambiguous=True,
-    )
 
 
 @dataclass(frozen=True)
@@ -637,11 +473,15 @@ class LiteRtLmBackend:
 # Runs inside envs.TRAIN, which is the only environment with torch and
 # transformers in it. Written to a temp file rather than passed with `-c` so
 # that a traceback carries usable line numbers.
-_HF_GENERATE_SCRIPT = r'''
+_HF_GENERATE_SCRIPT = (
+    r'''
 """Greedy generation for one split. Writes JSONL: {"index": int, "text": str}."""
 import json
 import sys
 from pathlib import Path
+'''
+    + RENDERING_SOURCE
+    + r'''
 
 
 def generation_device(torch, given=None):
@@ -696,14 +536,8 @@ def main() -> int:
 
     with Path(spec["out"]).open("w", encoding="utf-8") as sink:
         for i, prompt in enumerate(spec["prompts"]):
-            text = prompt
-            if spec["runtime_rendered"]:
-                text = tok.apply_chat_template(
-                    [{"role": "user", "content": prompt}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            enc = tok(text, return_tensors="pt").to(device)
+            text, add_special = render_prompt(tok, prompt, spec["runtime_rendered"])
+            enc = tok(text, return_tensors="pt", add_special_tokens=add_special).to(device)
             with torch.no_grad():
                 ids = model.generate(
                     **enc,
@@ -724,6 +558,7 @@ def main() -> int:
 if __name__ == "__main__":
     sys.exit(main())
 '''
+)
 
 
 @dataclass

@@ -125,7 +125,7 @@ def test_a_killed_sweep_does_not_report_a_verdict(killing_toolchain, tmp_path):
 
 
 def test_a_killed_training_run_is_could_not_check(killing_toolchain, tmp_path):
-    from litetune.evaluate import PromptMode
+    from litetune.prompt_mode import PromptMode
     from litetune.tune import TuneRequest
 
     data = tmp_path / "train.jsonl"
@@ -135,7 +135,9 @@ def test_a_killed_training_run_is_could_not_check(killing_toolchain, tmp_path):
             model="google/functiongemma-270m-it",
             data=data,
             output_dir=tmp_path / "run",
-            prompt_mode=PromptMode.PRERENDERED,
+            # Bare text, which is what this mode trains; `tune` refuses
+            # `prerendered` on it before anything else is checked.
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
         )
     )
     training = next(c for c in result.checks.checks if c.name == TRAINING_CHECK)

@@ -32,7 +32,7 @@ tool declarations were hand-rendered into the prompt, and the same FunctionGemma
 trained through `apply_chat_template` would need the opposite. Same weights, same
 family, different answer. It is decided by `tune`, carried by
 `bundle.Contract.prompt_mode`, and resolved for a foreign artifact by
-`evaluate.resolve_prompt_mode` -- never inferred from a model id.
+`prompt_mode.resolve_prompt_mode` -- never inferred from a model id.
 """
 
 from __future__ import annotations
@@ -479,6 +479,23 @@ RULES: tuple[ModelRules, ...] = (
         patterns=(r"qwen-?3-5(?![\db])",),
         min_transformers="5.0.0",
         min_transformers_reason=_TRANSFORMERS_5_REASON,
+    ),
+    ModelRules(
+        family="qwen-3",
+        # Nothing to add, and that is what this entry records. `qwen3` is on the
+        # exporter's own type list (the model-type trap, above), so a config
+        # that says `model_type: "qwen3"` is typed correctly with no override.
+        # Measured 2026-09-14 on Qwen/Qwen3-0.6B: both int8 recipes exported
+        # with no flag from litetune, and the conversion cost is in
+        # MEASUREMENTS.md. What the artifact's own `llm_model_type` reads is not
+        # recorded here: that observation appears in no manifest or log of any
+        # run, and was struck from the documents for the same reason.
+        #
+        # By size, not `qwen-?3`: that also claims the other sizes and the
+        # Qwen 3 models built on other architectures, none of which this
+        # project has run. No `min_transformers` either -- none was measured.
+        # Sizes are added here as they are.
+        patterns=(r"qwen-?3-0-6b",),
     ),
     ModelRules(
         family="gemma3-text-unidentified",

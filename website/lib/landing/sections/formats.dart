@@ -40,6 +40,11 @@ import '../../theme/brand.dart';
 /// unlike the Gemma 3 one, which enumerates. So if a second size ships, no
 /// check here will notice, and this line needs a size too.
 ///
+/// Qwen3 carries its size for the Gemma 3 reason: `models.py` claims `qwen-3`
+/// by size, and 0.6B is the only one run. Its other sizes, and the Qwen 3
+/// models built on other architectures, match no rule and export under the
+/// unknown-family note.
+///
 /// The acceleration row names NPU because the runtime has one — Snapdragon on
 /// Android, Intel on Windows — while the qualifier keeps litetune's own claim
 /// narrow: it measures on CPU, except training and the float reference, which
@@ -94,10 +99,14 @@ class Formats extends StatelessComponent {
           ]),
         ]),
         _row('Models', [
-          Component.text('Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3.5, FunctionGemma'),
+          Component.text(
+            'Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3 0.6B, Qwen3.5, '
+            'FunctionGemma',
+          ),
           span(classes: 'qualifier', [
             Component.text(
-              ' — measured end to end on FunctionGemma and Gemma 3 270M so far',
+              ' — measured end to end on FunctionGemma, Gemma 3 270M and '
+              'Qwen3 0.6B so far',
             ),
           ]),
         ]),

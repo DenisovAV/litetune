@@ -45,10 +45,10 @@ from typing import Any
 
 from litetune import envs
 from litetune.checks import Check, CheckSet, Outcome
-from litetune.evaluate import PromptMode
 from litetune.events import EventStream
 from litetune.manifest import RunManifest, RunStatus
 from litetune.metrics import Unavailable
+from litetune.prompt_mode import PromptMode, parse_prompt_mode
 from litetune.storage import hash_file
 
 logger = logging.getLogger(__name__)
@@ -265,12 +265,9 @@ class Contract:
                 f"wrong choice is silent. Set it to one of {[m.value for m in PromptMode]}"
             )
         try:
-            mode = raw if isinstance(raw, PromptMode) else PromptMode(str(raw))
+            mode = parse_prompt_mode(raw, "contract")
         except ValueError as exc:
-            raise MissingRenderingMode(
-                f"contract.prompt_mode {raw!r} is not a known mode; expected one of "
-                f"{[m.value for m in PromptMode]}"
-            ) from exc
+            raise MissingRenderingMode(str(exc)) from exc
         return cls(
             prompt_mode=mode,
             established_against=data.get("established_against") or {},

@@ -50,9 +50,11 @@ is workable at 270M and the first thing you will want to change above about
 1B. Bring your own checkpoint and skip the first two steps, or bring a
 `.litertlm` and its float checkpoint and run only `verify`.
 
-> **Alpha.** Measured end to end on two models: `google/functiongemma-270m-it`
-> with the tool-call scorer, and `google/gemma-3-270m-it` with `exact-text` on a
-> 77-way intent task — both on CPU, both in [MEASUREMENTS.md](MEASUREMENTS.md).
+> **Alpha.** Measured end to end on three models: `google/functiongemma-270m-it`
+> with the tool-call scorer, and `google/gemma-3-270m-it` and `Qwen/Qwen3-0.6B`
+> with `exact-text` on the same 77-way intent task — every conversion scored on
+> CPU, two of them also on a phone's CPU and GPU, all in
+> [MEASUREMENTS.md](MEASUREMENTS.md).
 > Qwen3.5 exports and needs no flags from litetune, only a `transformers`
 > floor. Gemma 4 exports once you name the variant — `E2B` or `E4B` — because
 > the chat template override is per-variant; a bare `gemma-4` is refused
@@ -122,7 +124,7 @@ it from the target.
 is a tool call:
 
 ```json
-{"prompt": "set an alarm for 7", "target": {"name": "set_alarm", "args": {"hour": "7"}}}
+{"prompt": "<start_of_turn>developer\nYou are a model that can do function calling with the following functions\n<start_function_declaration>declaration:set_alarm{description:<escape>Sets an alarm<escape>,parameters:{properties:{hour:{description:<escape>Hour of the alarm<escape>,type:<escape>STRING<escape>}},required:[<escape>hour<escape>],type:<escape>OBJECT<escape>}}<end_function_declaration>\n<end_of_turn>\n<start_of_turn>user\nset an alarm for 7\n<end_of_turn>\n<start_of_turn>model\n", "target": {"name": "set_alarm", "args": {"hour": "7"}}}
 ```
 
 A bare string is the answer itself:
@@ -134,6 +136,15 @@ A bare string is the answer itself:
 Two shapes rather than a target plus a `--target-kind`, because those two could
 disagree and a shape cannot disagree with itself. Match it with `--scorer` when
 you get to `verify`.
+
+**The prompt is exactly what your application will send the model.** The tool
+call above is FunctionGemma's: its application renders the tool declarations and
+every turn marker into the prompt itself — flutter_gemma does it in Dart — so the
+runtime must not template it again, and `tune` trains it `prerendered`. The
+sentiment row is bare text for a runtime that applies the model's own chat
+template, so it trains `runtime_rendered`. `tune` tells the two apart by the
+control tokens in the prompts, and refuses a file that mixes them unless you
+declare which one it is.
 
 `prepare` splits one raw file into `train.jsonl` and `heldout.jsonl` and rejects
 what it cannot score: malformed JSON, and rows with no `prompt`. Given
@@ -160,9 +171,11 @@ litetune prepare --data raw.jsonl --output-dir data --context-length 1024 \
                  --tokenizer google/functiongemma-270m-it
 
 # 2. Fine-tune. Runs on CUDA if the box has one, otherwise CPU; size your
-#    expectations accordingly either way.
+#    expectations accordingly either way. The prompt mode is read off the
+#    prompts (these carry FunctionGemma's control tokens, so prerendered) and
+#    recorded beside the checkpoint, where steps 4 and 5 take it from.
 litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
-              --output-dir tuned --prompt-mode prerendered --method lora
+              --output-dir tuned --method lora
 
 # 3. Convert, sweeping recipes rather than trusting a default.
 litetune convert --model tuned/model --output-dir artifacts \
@@ -177,7 +190,7 @@ litetune verify --model artifacts/weight_only_wi8_afp32/<name>.litertlm \
 # 5. Package the artifact with what was measured about it.
 litetune bundle --output-dir bundle \
                 --model artifacts/weight_only_wi8_afp32/<name>.litertlm \
-                --declarations tools.json --prompt-mode prerendered \
+                --declarations tools.json \
                 --base-model google/functiongemma-270m-it \
                 --base-model-revision <commit-sha> \
                 --adapter tuned/adapter \
@@ -205,26 +218,32 @@ its own.
 
 The recipes are
 [AI Edge Quantizer](https://github.com/google-ai-edge/ai-edge-quantizer)'s,
-applied by `litert-torch export_hf` during `convert`; litetune adds none of its
-own and measures what each one costs on your task. It knows four, and has
-measured two:
+applied by `litert-torch export_hf` during `convert`, and `--recipe` passes a
+name litetune does not know straight through to it. litetune defines exactly one
+of its own, shipped as a quantizer recipe file inside the package; what it adds
+to the rest is a measurement of what each costs on your task:
 
 | recipe | |
 |---|---|
 | `dynamic_wi8_afp32` | the toolchain's default; its own docstring warns quality "may suffer" |
 | `weight_only_wi8_afp32` | dequantizes before compute, so slower by an unmeasured amount |
-| `dynamic_wi4_afp32` | 4-bit, unmeasured here |
-| `weight_only_wi4_afp32` | 4-bit, unmeasured here |
+| `dynamic_wi4_afp32` | 4-bit channelwise. Refused on both models measured — a leaked `<bos>` on gemma, degenerate repetition on Qwen3 — at the five-prompt gate the measurement harness runs; litetune has no gate of its own |
+| `weight_only_wi4_afp32` | 4-bit channelwise, dequantised before compute. Refused too, and differently: prompts that never finished |
+| `dynamic_wi4b32_afp32` | 4-bit in blocks of 32. Reached a score on both; cost +0.0350 on a tuned Qwen3-0.6B and +0.3483 on a tuned gemma-3-270m |
+| `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550 and +0.3200 on the same two |
 
-`--recipe` has no default. A sweep of one is not a comparison.
+`--recipe` has no default. A sweep of one is not a comparison. **At four bits,
+both models measured here lost accuracy the sample resolves** — see
+[MEASUREMENTS.md](MEASUREMENTS.md) for the intervals, the refusals and what
+those numbers do not establish.
 
 ### Other flags that decide something
 
 | Flag | Why it matters |
 |---|---|
-| `--prompt-mode` | No default. `prerendered` means your app renders the tool declarations into the prompt and the runtime must not template again; `runtime_rendered` is the opposite. Must be the **same** value in `tune` and `bundle` — the wrong one produces a fluent wrong answer, not an error. |
+| `--prompt-mode` | Optional, never defaulted. `prerendered` means the prompt already carries its control tokens — your app renders the tool declarations into it — and the runtime must not template it again; `runtime_rendered` means the prompt is bare text and the runtime applies the model's chat template. Without the flag `tune` reads the mode off the training prompts (control tokens in at least 90% of them: `prerendered`; in at most 10%: `runtime_rendered`) and refuses a split in between. A declared mode the prompts contradict is refused unless you add `--force-prompt-mode`. `tune` records the mode beside the checkpoint; `verify` reads it through `--reference` and `bundle` through `--train-metrics`, and each refuses a different value — the wrong mode produces a fluent wrong answer, not an error. |
 | `--adapter` | For a LoRA run, pass `<tune output>/adapter`, from outside `--output-dir`. Without it the bundle carries only the merged weights. |
-| `--dtype` | Training precision for `tune`. Default `bfloat16`. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records exactly one run's dtype — the second-family banking77 run, trained in float32 for this reason — and says nothing about the headline table's, so the report records yours. |
+| `--dtype` | Training precision for `tune`. Default `bfloat16`. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records the banking77 runs' dtype — bfloat16, trained on a GPU where this flag's reason does not apply — and says nothing about the headline table's, so the report records yours. |
 | `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused: they resolve to different weights on different days while the bundle reads identically. |
 | `--scorer` | What counts as correct, on `verify`. `tool-call` (default) or `exact-text`. It has to match the shape of your targets; nothing else in the pipeline changes. The manifest records which one ran, because two manifests scored differently are not comparable. |
 | `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. See [MEASUREMENTS.md](MEASUREMENTS.md). |
@@ -333,15 +352,33 @@ exact-text`), scored on 600 examples the model never trained on:
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
 |---|---|---|---|
 | Base model | *refused* | — | — |
-| Fine-tuned | 0.6933 | 0.6767 | 0.6917 |
-| Cost of conversion | — | +0.0167 *(within noise)* | +0.0017 *(within noise)* |
+| Fine-tuned | 0.6717 | 0.6717 | 0.6683 |
+| Cost of conversion | — | +0.0000 *(within noise)* | +0.0033 *(within noise)* |
 
-A different family, a different scorer, and this time neither conversion
-figure clears its interval. The base row says
-*refused* because it was: asked for one intent label, the untuned model repeats
-itself on 571 of 600 prompts, and `verify` stops at the liveness tier rather
-than scoring a model that never answered. This run is also what found the
-`exact-text` terminator bug fixed in 0.1.5 — see
+A different family, a different scorer, and this time neither conversion figure
+clears its interval — the dynamic recipe lands on the same score as its float
+twin while still disagreeing with it on 34 of 600 prompts. The base row says
+*refused* because it was: asked for one intent label, the untuned model
+returned nothing at all on 53 of 600 prompts, and `verify` stops at the liveness
+tier rather than scoring a model that never answered. An earlier run of this
+same pair, measured in the other prompt mode, is what found the `exact-text`
+terminator bug fixed in 0.1.5 — see [MEASUREMENTS.md](MEASUREMENTS.md).
+
+`Qwen3-0.6B`, LoRA on the same 2,400 rows, scored on the same 600:
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Base model | *not scored* | — | — |
+| Fine-tuned | 0.6983 | 0.6917 | 0.6817 |
+| Cost of conversion | — | +0.0067 *(within noise)* | +0.0167 |
+
+The first family measured here that litetune had no rule for. It exported with
+no flag from litetune, and the rule it has now records that none is needed. The
+weight-only figure clears its interval here where the dynamic one does not, and
+where neither of Gemma 3's did — on 12 disagreements out of 600. Training and
+the float reference ran on a GPU and the converted models on a CPU, so this cost
+carries a hardware difference as well as a conversion one — as the Gemma 3 one
+does too; every manifest in both runs records it — see
 [MEASUREMENTS.md](MEASUREMENTS.md).
 
 **[MEASUREMENTS.md](MEASUREMENTS.md)** has the intervals, three runs of the same
@@ -423,14 +460,17 @@ withdrawn after re-measurement.
 
 **Limits on the numbers**
 
-- **Measured on three models, two of them end to end.**
-  `functiongemma-270m-it` with the tool-call scorer and `gemma-3-270m-it` with
-  `exact-text` were fine-tuned here, so both a training gain and a conversion
-  cost are attributed. `gemma-4-E2B-it` was not: base weights, two conversions
-  of them compared against the float reference, so that run has a conversion
-  cost and no training gain. Qwen3.5 exports but has no quality figure, and a
-  Gemma 4 without its variant is still refused unless you supply the template
-  override yourself.
+- **Measured on four models, three of them fine-tuned here.**
+  `functiongemma-270m-it` with the tool-call scorer, and `gemma-3-270m-it` and
+  `Qwen3-0.6B` with `exact-text`, each with a conversion cost against its own
+  float twin. Only FunctionGemma also has a training gain: neither banking77 run
+  has an untuned base figure to subtract — Gemma 3's base was run and refused to
+  score, Qwen3's never reached the base step at all — and both manifests record
+  the gain as unavailable. `gemma-4-E2B-it` was not
+  fine-tuned at all: base weights, two conversions of them compared against the
+  float reference, so that run has a conversion cost and no training gain.
+  Qwen3.5 exports but has no quality figure, and a Gemma 4 without its variant
+  is still refused unless you supply the template override yourself.
 - **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
   the liveness checks both trim against a fixed set of strings, recorded
   verbatim at `harness.terminators` in every verify manifest. A family whose
@@ -446,6 +486,20 @@ withdrawn after re-measurement.
   model's marker before then, `tune` records it at `turn_terminator.text` in
   `metrics.json` and `bundle` carries it into `contract.json`'s `stop_tokens`.
 
+- **In `runtime_rendered`, `verify` refuses to compare two sides that were shown
+  different prompts.** Before generating anything it renders every held-out
+  prompt through the runtime's own conversation path and through the
+  reference's chat template, and compares the token ids; on the first 8, or on
+  all of them if the split is shorter, it also compares the prefill count the
+  runtime reports when the prompt is actually sent. Any difference is a harness failure (exit 4) with the prompt, both
+  counts and the first differing position at `harness.rendering_check`, not a
+  conversion cost. On every tuned export of both families all 600 banking77
+  prompts matched, and on the `gemma-3-270m-it` base export too; a rendering that adds
+  an empty `<think></think>` is refused on every prompt, which is constructed
+  in the tests rather than seen in a run. Reasoning is removed from both sides before scoring,
+  through the last `[/thought]` or `</think>`, and counted per side at
+  `measurements.<side>.reasoning_removed`, including generations that never
+  closed it.
 - **The candidate is pinned to CPU; the reference is not, and your users run
   on a phone.** On one Snapdragon
   Galaxy S24 (`SC-51E`), the `dynamic_wi8_afp32` bundle on the device's CPU
@@ -558,7 +612,7 @@ Wiring `|| exit 1` on anything non-zero throws all of this away.
 ## Contributing
 
 Issues and pull requests welcome, particularly measurements on models other
-than the two above — that is the gap this alpha most needs closed.
+than the four above — that is the gap this alpha most needs closed.
 
 Run the checks with `pytest`, `ruff check`, `ruff format --check` and `mypy src`.
 
