@@ -117,7 +117,9 @@ def _declarations(tmp_path: Path, *names: str) -> Path:
     """The OpenAI function objects the runtime requires, for `names`."""
     path = tmp_path / "declarations.json"
     path.write_text(
-        json.dumps([{"type": "function", "function": {"name": name}} for name in names]),
+        json.dumps(
+            [{"type": "function", "function": {"name": name, "description": "d"}} for name in names]
+        ),
         encoding="utf-8",
     )
     return path

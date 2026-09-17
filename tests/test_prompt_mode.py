@@ -503,7 +503,7 @@ def test_declarations_reach_the_prompt_the_model_is_trained_on():
     from. Without them the two sides agree on a prompt no serving caller sends.
     """
     tok = _RecordingTokenizer()
-    tools = [{"type": "function", "function": {"name": "open_app"}}]
+    tools = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]
 
     text, add_special = _render_prompt()(tok, "open maps", True, tools)
 
@@ -536,7 +536,7 @@ def test_a_prerendered_prompt_is_untouched_by_declarations():
     caller built the whole prompt, so there is nothing for declarations to be
     rendered into."""
     tok = _RecordingTokenizer()
-    tools = [{"type": "function", "function": {"name": "open_app"}}]
+    tools = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]
 
     text, add_special = _render_prompt()(tok, "already rendered", False, tools)
 
@@ -694,11 +694,13 @@ def test_declarations_that_disagree_with_the_checkpoints_record_are_refused(tmp_
 
     trained = tmp_path / "trained.json"
     trained.write_text(
-        '[{"type": "function", "function": {"name": "send_email"}}]', encoding="utf-8"
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
     )
     measured = tmp_path / "measured.json"
     measured.write_text(
-        '[{"type": "function", "function": {"name": "set_timer"}}]', encoding="utf-8"
+        '[{"type": "function", "function": {"name": "set_timer", "description": "d"}}]',
+        encoding="utf-8",
     )
     reference = _checkpoint(
         tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(trained)}
@@ -720,7 +722,10 @@ def test_declarations_that_match_the_record_are_measured_and_recorded(tmp_path, 
     from litetune.storage import hash_file
 
     decls = tmp_path / "declarations.json"
-    decls.write_text('[{"type": "function", "function": {"name": "send_email"}}]', encoding="utf-8")
+    decls.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
     reference = _checkpoint(
         tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(decls)}
     )
@@ -737,7 +742,10 @@ def test_a_checkpoint_that_recorded_no_declarations_is_not_a_disagreement(tmp_pa
     checkpoint trained before declarations were an input records nothing here,
     and refusing those would refuse every run that predates this change."""
     decls = tmp_path / "declarations.json"
-    decls.write_text('[{"type": "function", "function": {"name": "send_email"}}]', encoding="utf-8")
+    decls.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
     reference = _checkpoint(tmp_path, {"prompt_mode": "prerendered"})
 
     result, candidate, _ = _verify_with(tmp_path, write_split, reference, decls)

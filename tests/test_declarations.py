@@ -4,9 +4,13 @@ litetune does not invent a schema here. The runtime's Python API refuses a tool
 whose description has no `['function']['name']` before it renders anything, and
 the chat template a checkpoint carries reads the same two keys to build its
 declaration. So both renderers the measurement compares require the OpenAI
-function object, and these tests hold this module to exactly those rules --
-no stricter, because the declaration text is produced by the runtime's own
-formatter and nothing in this project establishes what else it accepts.
+function object, and these tests hold this module to those rules.
+
+Beyond them it holds the module to one more thing, measured rather than
+preferred: the two renderers disagree about key order and about four shapes, so
+the file is sorted and those shapes are refused. Each refusal below names the
+difference it prevents, and every one of them was reproduced against a real
+bundle and the published chat template on 2026-09-17.
 """
 
 from __future__ import annotations
@@ -32,12 +36,12 @@ WRAPPED = [
             "description": "Changes the app background colour",
             "parameters": {
                 "type": "object",
-                "properties": {"color": {"type": "string"}},
+                "properties": {"color": {"type": "string", "description": "The colour name"}},
                 "required": ["color"],
             },
         },
     },
-    {"type": "function", "function": {"name": "open_app"}},
+    {"type": "function", "function": {"name": "open_app", "description": "Opens an app"}},
 ]
 
 
@@ -118,3 +122,176 @@ def test_a_shape_with_no_entry_count_answers_none():
     refuses anyway, so this is about the helper, not about the file."""
     assert entry_count("a string") is None
     assert entry_count([]) == 0
+
+
+def test_every_mapping_is_ordered_before_either_renderer_sees_it(tmp_path):
+    """The runtime's formatter prints the key order it is given and the reference
+    template sorts, so the file is sorted once here. Measured on 2026-09-17: this
+    is the whole of the ordering difference -- seven shapes, agreement on all
+    seven, including two properties declared in reverse alphabetical order.
+    """
+    payload = [
+        {
+            "function": {
+                "parameters": {
+                    "required": ["zebra"],
+                    "properties": {
+                        "zebra": {"type": "string", "description": "z"},
+                        "alpha": {"type": "integer", "description": "a"},
+                    },
+                    "type": "object",
+                },
+                "name": "t",
+                "description": "d",
+            },
+            "type": "function",
+        }
+    ]
+
+    parsed, digest = read_declarations(_write(tmp_path, payload))
+
+    function = parsed[0]["function"]
+    assert list(parsed[0]) == ["function", "type"]
+    assert list(function) == ["description", "name", "parameters"]
+    assert list(function["parameters"]) == ["properties", "required", "type"]
+    assert list(function["parameters"]["properties"]) == ["alpha", "zebra"]
+    assert list(function["parameters"]["properties"]["alpha"]) == ["description", "type"]
+    # Sorting changes what is rendered, never what is recorded.
+    assert digest == hash_file(_write(tmp_path, payload))
+
+
+@pytest.mark.parametrize(
+    "parameters, expected",
+    [
+        (
+            {
+                "type": "object",
+                "properties": {"x": {"type": "string", "description": "d", "nullable": True}},
+            },
+            "carries ['nullable']",
+        ),
+        ({"type": "object", "properties": {"x": {"type": "string"}}}, "no description string"),
+        (
+            {"type": "object", "properties": {"type": {"type": "string", "description": "d"}}},
+            "named after one of the words the reference template reserves",
+        ),
+        (
+            {
+                "type": "object",
+                "description": "d",
+                "properties": {"x": {"type": "string", "description": "d"}},
+            },
+            "carries ['description']",
+        ),
+        ({"type": "object", "properties": {}}, "empty properties"),
+        (
+            {
+                "type": "object",
+                "properties": {"x": {"type": "string", "description": "d"}},
+                "required": [],
+            },
+            "empty required",
+        ),
+        ({}, "is empty"),
+        (
+            {
+                "type": "object",
+                "properties": {"n": {"type": "integer", "description": "d", "enum": [1, 2]}},
+            },
+            "carries ['enum']",
+        ),
+        (
+            {"type": "object", "properties": {"o": {"type": "object", "description": "d"}}},
+            "object with no properties",
+        ),
+        (
+            {"type": "object", "properties": {"x": {"type": "String", "description": "d"}}},
+            "has type 'String'",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"xs": {"type": "array", "description": "d", "items": "string"}},
+            },
+            "not a non-empty object",
+        ),
+    ],
+)
+def test_a_shape_the_two_renderers_render_differently_is_refused(tmp_path, parameters, expected):
+    """One measured difference per case; none of these is a schema preference.
+
+    The reference template emits, per property, `description`, then `enum` for a
+    string, `properties`/`required` for an object, `items` for an array, then
+    `type` -- and nothing else in any branch, while the runtime's formatter
+    prints every key it is handed. So each shape here renders two ways, and the
+    run is refused at the file rather than at a token position minutes later.
+    """
+    payload = [
+        {
+            "type": "function",
+            "function": {"name": "t", "description": "d", "parameters": parameters},
+        }
+    ]
+
+    with pytest.raises(DeclarationsError) as caught:
+        read_declarations(_write(tmp_path, payload))
+
+    assert expected in str(caught.value)
+
+
+def test_a_tool_with_no_description_is_refused(tmp_path):
+    """The template renders a tool's description unconditionally; the formatter
+    omits the key. So a tool without one is two different declarations."""
+    payload = [{"type": "function", "function": {"name": "t"}}]
+
+    with pytest.raises(DeclarationsError, match="no description string"):
+        read_declarations(_write(tmp_path, payload))
+
+
+def test_a_key_the_reference_template_never_reads_is_refused(tmp_path):
+    payload = [{"type": "function", "function": {"name": "t", "description": "d", "strict": True}}]
+
+    with pytest.raises(DeclarationsError, match=r"carries \['strict'\]"):
+        read_declarations(_write(tmp_path, payload))
+
+
+def test_the_subset_is_not_tighter_than_the_two_renderers_agree_on(tmp_path):
+    """The guard against reading the rules as "keep it simple": every shape the
+    two renderers do render identically has to pass, including the nested ones.
+    """
+    payload = [
+        {
+            "type": "function",
+            "function": {
+                "name": "t",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"type": "string", "description": "m", "enum": ["on", "off"]},
+                        "who": {
+                            "type": "object",
+                            "description": "w",
+                            "properties": {"first": {"type": "string", "description": "f"}},
+                            "required": ["first"],
+                        },
+                        "rows": {
+                            "type": "array",
+                            "description": "r",
+                            "items": {
+                                "type": "object",
+                                "properties": {"k": {"type": "string", "description": "k"}},
+                            },
+                        },
+                        "count": {"type": "integer", "description": "c"},
+                        "flag": {"type": "boolean", "description": "f"},
+                    },
+                    "required": ["mode"],
+                },
+            },
+        }
+    ]
+
+    parsed, _ = read_declarations(_write(tmp_path, payload))
+
+    assert tool_names(parsed) == frozenset({"t"})

@@ -1385,7 +1385,10 @@ def test_the_real_script_records_the_declarations_in_both_files(request_for, stu
     from litetune.storage import hash_file
 
     decls = tmp_path / "declarations.json"
-    decls.write_text('[{"type": "function", "function": {"name": "send_email"}}]', encoding="utf-8")
+    decls.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
     digest = hash_file(decls)
 
     request = request_for(declarations=decls)
@@ -1405,7 +1408,7 @@ def test_the_spec_carries_the_declarations_the_script_renders_with(request_for, 
     file is the declarations and this is what the template's `tools=` receives,
     and one report must not use one word for two things."""
     request = request_for(declarations=tmp_path / "declarations.json")
-    tools = [{"type": "function", "function": {"name": "open_app"}}]
+    tools = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]
 
     spec = request.config(tmp_path / "metrics.json", declarations=tools)
 
@@ -1423,7 +1426,7 @@ def test_the_real_script_trains_on_a_prompt_carrying_the_declarations(
     dropped the declarations on the way to `render_prompt` would have left the
     suite green while training the model on a prompt no serving caller sends.
     """
-    tools = [{"type": "function", "function": {"name": "open_app"}}]
+    tools = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]
     request = request_for(data=bare_train_data, prompt_mode=PromptMode.RUNTIME_RENDERED)
 
     proc = run_real_script(request, stub_env, declarations=tools)
@@ -1649,7 +1652,14 @@ def test_prepare_feeds_tune_feeds_bundle(trainer, tmp_path):
 
     declarations = tmp_path / "tools.json"
     declarations.write_text(
-        json.dumps([{"type": "function", "function": {"name": "change_background_color"}}]),
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "change_background_color", "description": "d"},
+                }
+            ]
+        ),
         encoding="utf-8",
     )
 
@@ -1841,7 +1851,10 @@ def test_the_digest_is_the_results_and_the_file_is_the_requests(trainer, request
     from litetune.storage import hash_file
 
     decls = tmp_path / "declarations.json"
-    decls.write_text('[{"type": "function", "function": {"name": "set_timer"}}]', encoding="utf-8")
+    decls.write_text(
+        '[{"type": "function", "function": {"name": "set_timer", "description": "d"}}]',
+        encoding="utf-8",
+    )
 
     record = run_tune(request_for(declarations=decls)).as_dict()
 

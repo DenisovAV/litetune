@@ -272,7 +272,7 @@ def test_the_runtime_script_renders_every_prompt_and_sends_only_the_sample(tmp_p
     assert written[1]["ids"] == [2, ord("["), ord("b"), ord("b"), ord("]")]
 
 
-TOOLS = [{"type": "function", "function": {"name": "open_app"}}]
+TOOLS = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]
 
 
 def test_the_runtime_script_declares_the_tools_it_was_given(tmp_path, monkeypatch):
@@ -425,7 +425,7 @@ def test_the_reference_script_renders_the_declarations_the_spec_carries(tmp_path
         {
             "model": "org/reference",
             "prompts": ["hi"],
-            "tools": [{"type": "function", "function": {"name": "open_app"}}],
+            "tools": [{"type": "function", "function": {"name": "open_app", "description": "d"}}],
         },
     )
 
