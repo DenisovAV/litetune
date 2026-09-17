@@ -45,6 +45,9 @@ class FakeBackend:
     # absent, and a `.get(..., True)` in the production code recorded every fake
     # measurement as enforcing decode parameters it never received.
     decode_enforced: bool = True
+    # Likewise part of the contract: a double that did not say this would be
+    # scored down whichever path the production code happens to check for.
+    scores_structurally: bool = False
     name: str = "fake"
     # Settable, because a double that can only say `UNKNOWN_BACKEND` says the
     # same word the production code falls back to, and a test

@@ -415,7 +415,7 @@ class Scorer(Protocol):
     def __call__(self, targets: Sequence[Any], outputs: Sequence[str]) -> QualityMetrics: ...
 
 
-def _require_alignment(targets: Sequence[Any], outputs: Sequence[str]) -> int:
+def _require_alignment(targets: Sequence[Any], outputs: Sequence[Any]) -> int:
     if len(targets) != len(outputs):
         raise ValueError(f"{len(targets)} targets against {len(outputs)} outputs")
     if not targets:
@@ -430,8 +430,29 @@ def score(targets: Sequence[ToolCall], outputs: Sequence[str]) -> QualityMetrics
     scored at all; callers run this inside `checks.guard`, so the result is
     `could not check` rather than a fabricated number.
     """
-    n = _require_alignment(targets, outputs)
-    parsed = [parse_call(text) for text in outputs]
+    _require_alignment(targets, outputs)
+    return score_parsed(targets, [parse_call(text) for text in outputs])
+
+
+def score_parsed(targets: Sequence[ToolCall], parsed: Sequence[ToolCall | None]) -> QualityMetrics:
+    """The same scoring rule, over calls somebody else parsed.
+
+    `score` reaches here after parsing text with `parse_call`; the tool path
+    reaches here with what the runtime's own parser returned. One rule, two
+    sources -- because a number produced by a second, subtly different notion of
+    "correct" cannot be compared with the numbers already published here, and
+    two copies of this arithmetic would drift the moment one of them is fixed.
+
+    A `None` is a generation that produced no call. On the text path that is
+    litetune's parser failing; on the tool path it is the model answering
+    without calling anything. Either way it is a wrong answer rather than a
+    missing one -- a row the runtime *refused* never reaches here at all, and is
+    counted separately, because "the model called the wrong tool" and "the model
+    wrote something the runtime could not read" are different failures and their
+    average is neither.
+    """
+    n = _require_alignment(targets, parsed)
+    parsed = list(parsed)
     n_parsed = sum(p is not None for p in parsed)
     name_hits = [p is not None and p.name == t.name for p, t in zip(parsed, targets, strict=True)]
     n_name = sum(name_hits)

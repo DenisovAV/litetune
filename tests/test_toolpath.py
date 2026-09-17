@@ -281,3 +281,211 @@ def test_a_script_that_writes_the_wrong_number_of_rows_is_a_harness_failure(tmp_
 def test_a_refused_row_says_so(tmp_path):
     assert ToolPathRow(0, error="boom").refused is True
     assert ToolPathRow(0, call={"name": "t", "arguments": {}}).refused is False
+
+
+# -- the backend, and how `verify` picks it ----------------------------------
+
+
+from conftest import FakeBackend, correct_texts, labelled_rows  # noqa: E402
+
+from litetune.prompt_mode import PromptMode  # noqa: E402
+from litetune.toolpath import ToolPathBackend  # noqa: E402
+from litetune.verify import (  # noqa: E402
+    BackendPair,
+    Status,
+    VerifyRequest,
+    build_backends,
+    run_verify,
+)
+
+FUNCTIONGEMMA = "google/functiongemma-270m-it"
+DECLS = [{"type": "function", "function": {"name": "change_background_color", "description": "d"}}]
+
+
+@dataclass
+class CannedEnv:
+    """A runtime environment that answers the script with canned rows per mode."""
+
+    by_mode: dict[str, list[dict]]
+    name: str = "runtime"
+    fail: str | None = None
+
+    def provision(self, events=None):
+        return None
+
+    def run(self, argv, timeout=None):
+        spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+        if self.fail is not None:
+            return types.SimpleNamespace(returncode=3, stderr=self.fail)
+        mode = "constrained" if spec["constrained"] else "unconstrained"
+        Path(spec["out"]).write_text(json.dumps(self.by_mode[mode]), encoding="utf-8")
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+
+def _rows(rows_, hits: int, refusals: int = 0) -> list[dict]:
+    """A row per example: `hits` correct calls, then `refusals` refusals, then misses."""
+    out = []
+    for i, row in enumerate(rows_):
+        target = row["target"]
+        if i < hits:
+            out.append(
+                {
+                    "index": i,
+                    "call": {"name": target["name"], "arguments": target["args"]},
+                    "text": "",
+                    "error": None,
+                }
+            )
+        elif i < hits + refusals:
+            out.append(
+                {
+                    "index": i,
+                    "call": None,
+                    "text": "",
+                    "error": "INVALID_ARGUMENT: Failed to parse tool calls from code block",
+                }
+            )
+        else:
+            out.append(
+                {
+                    "index": i,
+                    "call": {"name": target["name"], "arguments": {"color": "no"}},
+                    "text": "",
+                    "error": None,
+                }
+            )
+    return out
+
+
+def _verify(tmp_path, rows_, by_mode, **kwargs):
+    split = tmp_path / "heldout.jsonl"
+    split.write_text("\n".join(json.dumps(r) for r in rows_) + "\n", encoding="utf-8")
+    candidate = ToolPathBackend(
+        model=tmp_path / "m.litertlm",
+        declarations=DECLS,
+        env=CannedEnv(by_mode=by_mode, **kwargs),
+    )
+    request = VerifyRequest(
+        model=tmp_path / "m.litertlm",
+        reference="org/reference",
+        data=split,
+        prompt_mode=PromptMode.RUNTIME_RENDERED,
+    )
+    reference = FakeBackend(
+        model="org/reference",
+        texts=correct_texts(rows_),
+        prompt_mode=PromptMode.RUNTIME_RENDERED,
+    )
+    return run_verify(request, backends=BackendPair(candidate=candidate, reference=reference))
+
+
+def test_the_score_is_the_call_the_runtime_returned(tmp_path):
+    """Not text this re-parsed. The runtime's parser is the one being measured,
+    because it is the one an application depends on."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path, rows_, {"constrained": _rows(rows_, 6), "unconstrained": _rows(rows_, 6)}
+    )
+
+    assert result.status in (Status.PASSED, Status.FAILED_GATE, Status.INCONCLUSIVE)
+    assert result.manifest["quality"]["candidate"]["exact_match"]["value"] == pytest.approx(0.75)
+    assert result.manifest["tool_path"]["constrained"]["score"]["n"] == 8
+
+
+def test_both_decoding_modes_are_reported(tmp_path):
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path, rows_, {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 4)}
+    )
+
+    path = result.manifest["tool_path"]
+    assert path["constrained"]["score"]["exact_match"]["value"] == pytest.approx(1.0)
+    assert path["unconstrained"]["score"]["exact_match"]["value"] == pytest.approx(0.5)
+
+
+def test_modes_that_disagree_raise_a_limitation(tmp_path):
+    """The grammar can carry a model that never learned the format. A run that
+    reported only the constrained number would report such a model as working."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path, rows_, {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 4)}
+    )
+
+    assert any("did not agree" in limitation for limitation in result.manifest["limitations"])
+
+
+def test_modes_that_agree_raise_none(tmp_path):
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path, rows_, {"constrained": _rows(rows_, 6), "unconstrained": _rows(rows_, 6)}
+    )
+
+    assert not any("did not agree" in limitation for limitation in result.manifest["limitations"])
+
+
+def test_a_refusal_is_counted_and_kept_out_of_the_score(tmp_path):
+    """A model whose output the parser rejected failed differently from one that
+    called the wrong tool, and an average over both describes neither."""
+    rows_ = labelled_rows(8)
+    both = _rows(rows_, hits=6, refusals=2)
+    result = _verify(tmp_path, rows_, {"constrained": both, "unconstrained": both})
+
+    path = result.manifest["tool_path"]
+    assert path["constrained"]["refused_by_the_runtime"] == 2
+    # Six correct out of the six the runtime could read, not out of eight.
+    assert path["constrained"]["score"]["n"] == 6
+    assert path["constrained"]["score"]["exact_match"]["value"] == pytest.approx(1.0)
+    assert any("refused 2 of 8" in limitation for limitation in result.manifest["limitations"])
+
+
+def test_a_tool_path_that_cannot_run_is_a_harness_failure_naming_the_runtime(tmp_path):
+    """Not a verdict about the model. Nothing was measured, and reporting every
+    prompt as a wrong answer would be a claim no measurement supports."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path,
+        rows_,
+        {},
+        fail="could not create a conversation with declarations: RuntimeError: no tool support",
+    )
+
+    assert result.status is Status.FAILED_HARNESS
+    assert "no tool support" in json.dumps(result.manifest)
+
+
+def test_the_path_is_chosen_from_the_model_and_the_declarations(tmp_path):
+    """Never from a flag: a flag can disagree with the model, and the run would
+    then measure a path the artifact does not serve."""
+    request = VerifyRequest(
+        model=tmp_path / "m.litertlm",
+        reference=FUNCTIONGEMMA,
+        data=tmp_path / "heldout.jsonl",
+        prompt_mode=PromptMode.RUNTIME_RENDERED,
+    )
+
+    chosen = build_backends(request, declarations=DECLS)
+    assert isinstance(chosen.candidate, ToolPathBackend)
+
+    # Same request, no declarations: there is nothing to declare.
+    assert not isinstance(build_backends(request).candidate, ToolPathBackend)
+
+
+@pytest.mark.parametrize(
+    "reference, mode",
+    [
+        ("Qwen/Qwen3-0.6B", PromptMode.RUNTIME_RENDERED),
+        (FUNCTIONGEMMA, PromptMode.PRERENDERED),
+    ],
+)
+def test_a_family_or_a_mode_with_no_tool_path_stays_on_the_text_path(tmp_path, reference, mode):
+    """Two different reasons, and neither is a preference: litetune records no
+    tool channel for Qwen-3, and a pre-rendered prompt routes the runtime past
+    the conversation the tool path needs."""
+    request = VerifyRequest(
+        model=tmp_path / "m.litertlm",
+        reference=reference,
+        data=tmp_path / "heldout.jsonl",
+        prompt_mode=mode,
+    )
+
+    assert not isinstance(build_backends(request, declarations=DECLS).candidate, ToolPathBackend)

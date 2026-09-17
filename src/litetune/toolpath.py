@@ -45,8 +45,11 @@ from pathlib import Path
 from typing import Any
 
 from litetune import envs
+from litetune.evaluate import GREEDY, DecodeConfig, Generation
 from litetune.events import EventStream
 from litetune.exits import read_returncode
+from litetune.metrics import QualityMetrics, ToolCall, Unavailable, score_parsed
+from litetune.prompt_mode import PromptMode
 
 logger = logging.getLogger(__name__)
 
@@ -280,3 +283,156 @@ class ToolPathProbe:
                 f"for {len(prompts)} prompts"
             )
         return [ToolPathRow(**row) for row in rows]
+
+
+def as_tool_call(call: dict[str, Any] | None) -> ToolCall | None:
+    """The runtime's call as the scorer's shape, or `None` when there was none.
+
+    The arguments arrive typed -- `1234.0`, `True` -- and `ToolCall` keeps that
+    beside the flattened view the comparison uses. Nothing is re-rendered and
+    nothing is re-parsed on the way: the point of this path is that the
+    runtime's parser is the one being measured.
+    """
+    if call is None or not isinstance(call.get("name"), str):
+        return None
+    return ToolCall(name=call["name"], args=dict(call.get("arguments") or {}))
+
+
+def score_rows(
+    targets: Sequence[ToolCall], rows: Sequence[ToolPathRow]
+) -> tuple[QualityMetrics | Unavailable, int]:
+    """Score the rows the runtime could read, and count the ones it refused.
+
+    A refusal is the runtime rejecting the model's output, and it is kept out of
+    the score rather than counted as a wrong answer. Those are different
+    failures -- one model called the wrong tool, the other wrote something no
+    application could read -- and an average over both describes neither. The
+    count travels beside the score so nobody reads the number without it.
+    """
+    kept = [(t, r) for t, r in zip(targets, rows, strict=True) if not r.refused]
+    refused = len(rows) - len(kept)
+    if not kept:
+        return (
+            Unavailable(
+                f"the runtime refused all {refused} generations, so there was nothing to score"
+            ),
+            refused,
+        )
+    return (
+        score_parsed([t for t, _ in kept], [as_tool_call(r.call) for _, r in kept]),
+        refused,
+    )
+
+
+DISAGREEING_MODES = (
+    "the two decoding modes did not agree: {constrained:.4f} with the runtime's grammar on and "
+    "{unconstrained:.4f} with it off, over {n} scored rows. The constrained number is what an "
+    "application gets; the unconstrained one is the only evidence the model learned the format "
+    "rather than being held to it, and a gap between them is the model leaning on the grammar. "
+    "Neither number describes the other."
+)
+
+
+@dataclass
+class ToolPathBackend:
+    """The candidate, measured through the runtime's tool path in both modes.
+
+    A `GenerationBackend` because it is one -- one answer per prompt, in order,
+    never raising for a failed run. What it adds is on each `Generation`: the
+    structured call the runtime returned, and the runtime's refusal when its
+    parser rejected that generation.
+
+    `prompt_mode` is `RUNTIME_RENDERED` and cannot be anything else: the runtime
+    builds this prompt, declarations and all. A caller who resolved
+    `prerendered` and still reached here has a contradiction rather than a
+    choice, and `run_verify` refuses before building this.
+    """
+
+    model: Path
+    declarations: list
+    decode: DecodeConfig = GREEDY
+    env: envs.StageEnv = envs.RUNTIME
+    auto_provision: bool = True
+    timeout_s: int = TOOL_PATH_TIMEOUT_S
+    # Filled by `generate`: the rows from each mode, kept so the manifest can
+    # carry both numbers rather than only the one that was scored.
+    rows: dict[str, list[ToolPathRow]] = field(default_factory=dict, init=False)
+    harness_error: str | None = field(default=None, init=False)
+
+    name = "litert-lm tool path"
+
+    @property
+    def model_ref(self) -> str:
+        return str(self.model)
+
+    @property
+    def prompt_mode(self) -> PromptMode:
+        return PromptMode.RUNTIME_RENDERED
+
+    @property
+    def decode_enforced(self) -> bool:
+        # `max_output_tokens` and a greedy sampler are passed to the
+        # conversation, so the numbers in `decode` governed this run.
+        return True
+
+    @property
+    def scores_structurally(self) -> bool:
+        """This backend's answers are calls, not text, and are scored as calls.
+
+        On the Protocol rather than sniffed from the rows, for the reason
+        `decode_enforced` records: a run where the model answered in prose on
+        every prompt produces rows with no call and no refusal, which is
+        indistinguishable from the text path by inspection. A backend that
+        forgets to declare this must fail to type-check.
+        """
+        return True
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "backend": self.name,
+            "model": self.model_ref,
+            "env": self.env.name,
+            "declarations": len(self.declarations),
+            "automatic_tool_calling": False,
+            "modes": sorted(self.rows),
+        }
+
+    def generate(
+        self, prompts: Sequence[str], events: EventStream | None = None
+    ) -> list[Generation]:
+        """The constrained run's answers. Both runs happen; both are kept.
+
+        Constrained is what is returned, because it is what an application gets.
+        The unconstrained rows sit in `self.rows` for the manifest and for the
+        agreement check, and a caller that reported only one of the two would be
+        reporting the number that cannot fail.
+        """
+        probe = ToolPathProbe(
+            model=self.model,
+            declarations=self.declarations,
+            max_tokens=self.decode.max_tokens,
+            env=self.env,
+            auto_provision=self.auto_provision,
+            timeout_s=self.timeout_s,
+        )
+        for mode, constrained in (("constrained", True), ("unconstrained", False)):
+            try:
+                self.rows[mode] = probe.observe(prompts, constrained=constrained, events=events)
+            except ToolPathError as exc:
+                # Nothing was measured. Every prompt carries the same harness
+                # error, which is what keeps these rows out of the score
+                # entirely instead of counting as wrong answers.
+                self.harness_error = str(exc)
+                logger.warning("the tool path could not be measured: %s", exc)
+                return [Generation(i, p, harness_error=str(exc)) for i, p in enumerate(prompts)]
+        return [
+            Generation(
+                index=row.index,
+                prompt=prompts[row.index],
+                text=row.text,
+                returncode=0,
+                call=row.call,
+                refusal=row.error,
+            )
+            for row in self.rows["constrained"]
+        ]

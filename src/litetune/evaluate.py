@@ -211,6 +211,15 @@ class Generation:
     # `returncode=0` erased the fact entirely, and putting the real code here
     # would make `ok` false for output that exists and is scoreable.
     batch_returncode: int | None = None
+    # The structured call a tool-path run returned, and the runtime's own
+    # refusal of this generation when its parser rejected one. Both are `None`
+    # on the text path, which is every backend that reads stdout: there the
+    # call is whatever `metrics.parse_call` makes of `text`, and a refusal is
+    # not something the runtime is in a position to report. Carried here rather
+    # than in a parallel list so that a row cannot lose its pairing with the
+    # prompt it answers.
+    call: dict[str, Any] | None = None
+    refusal: str | None = None
 
     @property
     def ran(self) -> bool:
@@ -287,6 +296,17 @@ class GenerationBackend(Protocol):
         """
         ...
 
+    @property
+    def scores_structurally(self) -> bool:
+        """Whether this backend's answers are calls rather than text.
+
+        Here for the same reason as `decode_enforced`: a run whose model
+        answered in prose on every prompt is indistinguishable from a text run
+        by looking at the rows, so the backend declares it and a backend that
+        forgets fails to type-check rather than being scored the wrong way.
+        """
+        ...
+
     def describe(self) -> dict[str, Any]:
         """Engine identity: which backend and which pinned versions produced this."""
 
@@ -339,6 +359,8 @@ class LiteRtLmBackend:
     # limitation -- and it is litetune's gap, not the toolchain's: 0.16.1 does
     # accept --top-k, --top-p, --temperature and --seed.
     decode_enforced = False
+    # Text off stdout; a call is whatever `parse_call` makes of it.
+    scores_structurally = False
 
     @property
     def prompt_mode(self) -> PromptMode:
@@ -629,6 +651,8 @@ class HuggingFaceBackend:
     # `generate()` receives max_new_tokens and the stop condition, so here the
     # declared configuration is the applied one.
     decode_enforced = True
+    # Text off stdout; a call is whatever `parse_call` makes of it.
+    scores_structurally = False
 
     @property
     def model_ref(self) -> str:
