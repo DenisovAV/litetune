@@ -25,8 +25,10 @@ from litetune.models import (
     FlagRefused,
     identify,
     plan_export,
+    renders_declarations_for,
     transformers_check,
     version_tuple,
+    wire_format_for,
 )
 from litetune.prompt_mode import PromptMode
 from litetune.tune import TuneRequest, run_tune
@@ -689,6 +691,55 @@ def test_an_unnamed_gemma3_text_checkpoint_refuses_rather_than_guessing(tmp_path
     assert (
         "--base-model" in detail and "--train-metrics" in detail
     ), "a refusal must name the way out of it"
+
+
+def test_the_one_family_whose_tool_path_was_measured_carries_it():
+    """FunctionGemma is the only entry with a wire format, and it says why.
+
+    The reason has to name what was read rather than assert the format, because
+    a family rule is a claim to have checked: the declaration turn was measured
+    against a bundle and the call spelling comes from the runtime's own goldens.
+    """
+    fg = wire_format_for(FUNCTIONGEMMA)
+
+    assert fg.family == "functiongemma"
+    assert fg.name == "functiongemma"
+    assert fg.known
+    assert "<escape>" in fg.reason and "goldens" in fg.reason
+    assert renders_declarations_for(FUNCTIONGEMMA) == (True, fg.reason)
+
+
+@pytest.mark.parametrize("model", ["Qwen/Qwen3-0.6B", "google/gemma-3-270m-it"])
+def test_a_family_with_an_entry_and_no_measured_format_says_so(model):
+    """The live case D11 exists for.
+
+    Qwen-3 has an entry that deliberately records nothing about its calls. Under
+    a single "does litetune know this model" question it would read as fine, and
+    a structured target would be rendered in FunctionGemma's spelling for a
+    runtime that does not read it.
+    """
+    answer = wire_format_for(model)
+
+    assert answer.family is not None
+    assert answer.name is None
+    assert not answer.known
+    assert answer.family in answer.reason
+    assert "completion" in answer.reason
+    assert renders_declarations_for(model)[0] is False
+
+
+def test_a_model_with_no_entry_is_a_third_distinct_answer():
+    """Not the same as a family that records no format, and not the same message.
+
+    Knowing nothing about Llama is not knowing it is wrong, so this names the
+    two ways forward rather than the family -- there is no family to name.
+    """
+    answer = wire_format_for("meta-llama/Llama-3.2-1B")
+
+    assert answer.family is None
+    assert answer.name is None
+    assert "no entry for this model" in answer.reason
+    assert answer.reason != wire_format_for("Qwen/Qwen3-0.6B").reason
 
 
 def test_an_architecture_with_no_rules_is_a_note_not_a_refusal(tmp_path):

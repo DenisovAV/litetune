@@ -50,6 +50,8 @@ from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.declarations import DeclarationsError, entry_count, read_declarations
 from litetune.events import EventStream
 from litetune.exits import read_returncode
+from litetune.metrics import ToolCall
+from litetune.models import renders_declarations_for
 from litetune.prepare import PrepareError, read_rows
 from litetune.prompt_mode import RENDERING_SOURCE, PromptMode, PromptModeDecision, prompt_evidence
 
@@ -62,6 +64,36 @@ TUNE_SCHEMA = "litetune.tune/1"
 # too: a refusal is read by whoever typed the command.
 PROMPT_MODE_CHECK = "prompt mode"
 DECLARATIONS_CHECK = "tool declarations"
+
+
+def _refuse_calls_without_declarations(request: TuneRequest) -> Check | None:
+    """A structured target for a declaration-rendering family, with none supplied.
+
+    `prepare` refuses the same thing, and this is not a duplicate: a split
+    written by hand reaches `tune` without passing through that stage, and the
+    defect it prevents -- training an answer to a prompt 730 characters shorter
+    than the one the runtime sends -- is invisible in a loss curve.
+    """
+    renders, reason = renders_declarations_for(request.model)
+    if not renders:
+        return None
+    try:
+        rows = read_rows(request.data)
+    except (PrepareError, OSError):
+        # Not this check's business. The row reader's own refusal follows.
+        return None
+    if not any(isinstance(row.target, ToolCall) for row in rows):
+        return None
+    return Check.failed(
+        DECLARATIONS_CHECK,
+        f"this split trains tool calls for {request.model}, whose runtime renders the tool "
+        "declarations into the prompt, and no declarations were given. Pass --declarations with "
+        "the same JSON bundle takes; they cannot be derived from the targets, because the "
+        f"descriptions, types and required lists are the application's contract. {reason}",
+        observed={"model": request.model, "declarations": None},
+    )
+
+
 FORCE_PROMPT_MODE_FLAG = "--force-prompt-mode"
 
 METHODS = ("full", "lora")
@@ -1312,6 +1344,17 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     # Bound before the branch: the script's spec is built further down on every
     # path, including the one where no declarations were supplied.
     declarations: list | None = None
+    if request.declarations is None:
+        # A family whose runtime renders declarations trains a prompt that
+        # carries them. Refused here as well as in `prepare`, because a
+        # hand-written split reaches this stage without passing through that
+        # one, and by the time the loss curve is available it looks fine.
+        undeclared = _refuse_calls_without_declarations(request)
+        if undeclared is not None:
+            result.checks.add(undeclared)
+            events.check(undeclared)
+            events.stage_finished(result.outcome.value, attempted=False)
+            return result
     if request.declarations is not None:
         try:
             declarations, digest = read_declarations(request.declarations)

@@ -20,7 +20,9 @@ from stage_fakes import spec_mapping
 from litetune.checks import Outcome
 from litetune.events import EventStream
 from litetune.metrics import Proportion, ToolCall, Unavailable, parse_call
+from litetune.models import PROVENANCE_NAME
 from litetune.prepare import (
+    ASSUMED_WIRE_FORMAT,
     HIGH_CARDINALITY_SHARE,
     LENGTH_CHECK,
     MIN_HELDOUT_EXAMPLES,
@@ -40,6 +42,8 @@ from litetune.prepare import (
     split_seed,
 )
 from litetune.spec import Spec
+
+FUNCTIONGEMMA = "google/functiongemma-270m-it"
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -622,6 +626,140 @@ def test_each_type_is_rendered_the_way_the_runtime_writes_it():
     assert render_call(call) == (
         "call:set{who:<escape>ann<escape>,n:3,ratio:0.5,on:true,off:false,gone:null}"
     )
+
+
+CALL_ROWS = [
+    {"prompt": "make it red", "target": {"name": "set_colour", "args": {"colour": "red"}}},
+]
+
+
+def test_a_family_whose_calls_were_measured_is_rendered_in_its_own_format(
+    tmp_path, write_jsonl, request_for
+):
+    result = prepare(
+        request_for(
+            write_jsonl(CALL_ROWS * 40),
+            base_model=FUNCTIONGEMMA,
+            declarations=_declarations(tmp_path, "set_colour"),
+        )
+    )
+
+    assert result.identity is not None
+    assert result.identity["family"] == "functiongemma"
+    assert result.identity["wire_format"] == "functiongemma"
+    first = json.loads(result.train.path.read_text(encoding="utf-8").splitlines()[0])
+    assert first["completion"] == "call:set_colour{colour:<escape>red<escape>}"
+    assert ASSUMED_WIRE_FORMAT not in result.limitations
+
+
+def test_a_family_with_no_measured_call_format_is_refused_by_row(write_jsonl, request_for):
+    """Qwen-3 has an entry that deliberately records nothing about its calls.
+
+    Rendering FunctionGemma's spelling for it trains a format its runtime does
+    not read, and no check downstream can see that -- which is the defect this
+    gate exists to close.
+    """
+    with pytest.raises(PrepareError) as caught:
+        prepare(request_for(write_jsonl(CALL_ROWS * 40), base_model="Qwen/Qwen3-0.6B"))
+
+    assert "qwen-3" in str(caught.value)
+    assert "completion" in str(caught.value)
+
+
+def test_a_model_litetune_has_no_entry_for_says_that_instead(write_jsonl, request_for):
+    with pytest.raises(PrepareError) as caught:
+        prepare(request_for(write_jsonl(CALL_ROWS * 40), base_model="meta-llama/Llama-3.2-1B"))
+
+    assert "no entry for this model" in str(caught.value)
+
+
+def test_only_a_structured_target_reaches_the_refusal(write_jsonl, request_for):
+    """A row that brings its own completion is the caller saying what to train.
+
+    litetune does not parse it back to work out which family it is in, so the
+    gate never fires on it -- whatever the model is, and whether or not litetune
+    has an entry for it.
+    """
+    rows = [{"prompt": "make it red", "completion": "call:set_colour{colour:red}"}] * 40
+
+    for model in ("Qwen/Qwen3-0.6B", "meta-llama/Llama-3.2-1B", FUNCTIONGEMMA):
+        result = prepare(request_for(write_jsonl(rows), base_model=model))
+        first = json.loads(result.train.path.read_text(encoding="utf-8").splitlines()[0])
+        assert first["completion"] == "call:set_colour{colour:red}"
+
+
+def test_naming_no_model_keeps_today_s_behaviour_and_says_what_it_assumed(write_jsonl, request_for):
+    """Every caller that predates the flag. Refusing them would refuse splits
+    that work; saying nothing would leave the assumption invisible."""
+    result = prepare(request_for(write_jsonl(CALL_ROWS * 40)))
+
+    assert result.identity is None
+    assert ASSUMED_WIRE_FORMAT in result.limitations
+    first = json.loads(result.train.path.read_text(encoding="utf-8").splitlines()[0])
+    assert first["completion"] == "call:set_colour{colour:<escape>red<escape>}"
+
+
+def test_a_plain_text_split_never_mentions_a_wire_format(write_jsonl, request_for):
+    """4.7's guard at this level: nothing about declarations or formats applies."""
+    rows = [{"prompt": f"q{i}", "completion": "an answer"} for i in range(40)]
+
+    result = prepare(request_for(write_jsonl(rows)))
+
+    assert ASSUMED_WIRE_FORMAT not in result.limitations
+    assert result.identity is None
+
+
+def test_the_family_resolves_from_a_checkpoint_the_way_convert_resolves_it(
+    tmp_path, write_jsonl, request_for
+):
+    """Sidecar, then config, then the name -- the existing order, not a second one.
+
+    The folder is named after the wrong family on purpose: that is the case the
+    order exists for, and a path must not outrank what is inside.
+    """
+    checkpoint = tmp_path / "runs" / "qwen-ish" / "model"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "gemma3_text"}), encoding="utf-8"
+    )
+    (checkpoint / PROVENANCE_NAME).write_text(
+        json.dumps({"base_model": FUNCTIONGEMMA}), encoding="utf-8"
+    )
+
+    result = prepare(
+        request_for(
+            write_jsonl(CALL_ROWS * 40),
+            base_model=str(checkpoint),
+            declarations=_declarations(tmp_path, "set_colour"),
+        )
+    )
+
+    assert result.identity is not None
+    assert result.identity["family"] == "functiongemma"
+    assert result.identity["identity_recorded"] is True
+
+
+def test_a_declaration_rendering_family_refuses_to_train_calls_without_them(
+    write_jsonl, request_for
+):
+    """The runtime puts the declarations in the prompt before the model sees the
+    question -- 809 characters where a run without them trains 79. A split that
+    skips them teaches an answer to a prompt no application sends, and the loss
+    curve of such a run is indistinguishable from one that worked."""
+    with pytest.raises(PrepareError) as caught:
+        prepare(request_for(write_jsonl(CALL_ROWS * 40), base_model=FUNCTIONGEMMA))
+
+    message = str(caught.value)
+    assert "--declarations" in message
+    assert "cannot be derived from the targets" in message
+
+
+def test_that_refusal_does_not_fire_on_plain_text_for_the_same_family(write_jsonl, request_for):
+    rows_ = [{"prompt": f"q{i}", "completion": "an answer"} for i in range(40)]
+
+    result = prepare(request_for(write_jsonl(rows_), base_model=FUNCTIONGEMMA))
+
+    assert result.n_rows == 40
 
 
 def test_a_value_with_no_measured_shape_is_refused_by_row(write_jsonl, request_for):

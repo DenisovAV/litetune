@@ -55,6 +55,12 @@ from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.liveness import SkippedCheck
 from litetune.metrics import Proportion, ToolCall, Unavailable, read_target
+from litetune.models import (
+    WireFormat,
+    hint_for,
+    renders_declarations_for,
+    wire_format_for,
+)
 from litetune.spec import DEFAULT_MIN_HELDOUT_EXAMPLES
 from litetune.storage import hash_file
 
@@ -106,6 +112,26 @@ NO_HEADROOM_MEASUREMENT = (
     "ceiling -- and where a fine-tune therefore cannot show a gain -- were not identified. Pass a "
     "HeadroomProbe built from a measured base-model run to fill this in."
 )
+
+
+ASSUMED_WIRE_FORMAT = (
+    "structured targets were rendered in FunctionGemma's call format because no model was "
+    "named. That format is the only one this project has measured, and it is what this stage "
+    "has always assumed -- but a model of another family is trained to emit a spelling its own "
+    "runtime does not read, and nothing downstream can see it. Pass --base-model to have the "
+    "format read from the model instead of assumed."
+)
+
+
+def _identity(base_model: str | None, wire: WireFormat | None) -> dict[str, Any] | None:
+    """What the model was resolved to, and from where. `None` when none was named."""
+    if base_model is None or wire is None:
+        return None
+    return hint_for(base_model).as_dict() | {
+        "family": wire.family,
+        "wire_format": wire.name,
+        "wire_format_reason": wire.reason,
+    }
 
 
 class PrepareError(ValueError):
@@ -190,6 +216,36 @@ class Row:
         }
 
 
+def refuse_calls_without_declarations(rows: Sequence[Row], base_model: str) -> None:
+    """Refuse structured targets for a family whose runtime renders declarations.
+
+    Such a runtime puts the declarations into the prompt before the model ever
+    sees the question. A split trained without them teaches the model to answer
+    a prompt no application sends -- 79 characters where the runtime sends 809,
+    measured -- and nothing downstream can see it, because the training loss and
+    the scorer both work from the same short prompt.
+
+    Named rather than inferred: the declarations cannot be derived from the
+    targets. The tool names are there, but the descriptions, types, enums and
+    required lists are the application's contract, and a prompt built from
+    invented schemas trains the model on something no caller sends. So the
+    automatic behaviour is a refusal naming the flag, the treatment
+    `--prompt-mode` already gets.
+    """
+    renders, reason = renders_declarations_for(base_model)
+    if not renders:
+        return
+    for row in rows:
+        if isinstance(row.target, ToolCall):
+            raise PrepareError(
+                f"this split trains tool calls for {base_model}, whose runtime renders the tool "
+                "declarations into the prompt, and no declarations were given. Pass "
+                "--declarations with the same JSON bundle takes. They cannot be derived from the "
+                "targets: the names are there, but the descriptions, types and required lists are "
+                f"the application's contract. {reason}"
+            )
+
+
 def refuse_undeclared_tools(rows: Sequence[Row], data: Path, declarations: Path) -> None:
     """Refuse a row whose target calls a tool the declarations do not offer.
 
@@ -215,13 +271,33 @@ def refuse_undeclared_tools(rows: Sequence[Row], data: Path, declarations: Path)
             )
 
 
-def read_rows(path: Path) -> list[Row]:
+def _completion_for(target: ToolCall | str | None, wire_format: WireFormat | None) -> Any:
+    """The text to supervise for this target, or a refusal naming why there is none.
+
+    A row that brings its own completion never reaches here: that is the caller
+    saying what to train, and litetune does not parse it back to second-guess
+    the family. Only a structured target has to be rendered, and rendering it
+    means choosing a spelling -- which is the thing only the model knows.
+    """
+    if not isinstance(target, ToolCall):
+        return target
+    if wire_format is not None and not wire_format.known:
+        raise ValueError(wire_format.reason)
+    return render_call(target)
+
+
+def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
     """Read training JSONL. Raises `PrepareError` naming `path:lineno`.
 
     A row is `{"prompt": str}` plus either an explicit `"completion"` or a
     `"target"` this renders into one. A row with neither is an error rather than
     a skip: a training file that silently loses a tenth of its rows produces a
     model nobody can explain and a loss curve that looks normal.
+
+    `wire_format` is what the model's family records for its calls. `None` means
+    the caller named no model, which is every call that predates `--base-model`;
+    those keep today's behaviour and `prepare` records a limitation saying which
+    spelling was assumed, because breaking them would refuse splits that work.
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -249,7 +325,7 @@ def read_rows(path: Path) -> list[Row]:
             # A string target is already the text to supervise; a call has to be
             # rendered into the wire format the model is trained to emit.
             try:
-                completion = render_call(target) if isinstance(target, ToolCall) else target
+                completion = _completion_for(target, wire_format)
             except ValueError as exc:
                 raise PrepareError(f"{path}:{lineno}: {exc}") from exc
         if not isinstance(completion, str) or not completion.strip():
@@ -782,6 +858,14 @@ class PrepareRequest:
     # `bundle` takes. Absent is the run every existing caller makes, and it
     # behaves exactly as it did before declarations were an input here.
     declarations: Path | None = None
+    # What this split is for. A structured target has to be rendered in the
+    # spelling that model's runtime reads, and litetune records that per family
+    # rather than asking -- but it has to know which family, and this stage
+    # carried no model reference at all. `--base-model`, the flag `convert` and
+    # `bundle` already take, not `--tokenizer`: that one is declared as a
+    # tokenizer, and making the wire format depend on it would tie the trained
+    # format to whether the caller asked for length measurement.
+    base_model: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", Path(self.data))
@@ -806,6 +890,7 @@ class PrepareRequest:
             "min_heldout_examples": self.min_heldout_examples,
             "tokens": self.tokens.describe() if self.tokens is not None else None,
             "headroom_probe": type(self.headroom).__name__ if self.headroom else None,
+            "base_model": self.base_model,
         }
 
 
@@ -845,6 +930,11 @@ class PrepareResult:
     # Checks that were never in scope for this run, with the reason. Not a
     # fourth outcome: a reader must be able to tell that two checks ran rather
     # than assuming three did. Same construction as `liveness.LivenessResult`.
+    # What the model was resolved to and from where, when one was named. A
+    # reader has to be able to tell which spelling the completions are in
+    # without re-running the resolution, and `ModelHint` already records
+    # whether the answer came from the sidecar, the config or the name.
+    identity: dict[str, Any] | None = None
     skipped: list[SkippedCheck] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
     report_path: Path | None = None
@@ -907,6 +997,7 @@ class PrepareResult:
             "arguments": [a.as_dict() for a in self.arguments],
             "unscoreable_arguments": [f"{a.tool}.{a.argument}" for a in self.unscoreable],
             "slices": [s.as_dict() for s in self.slices],
+            "model": self.identity,
             "checks": self.checks.as_dict() | {"skipped": [s.as_dict() for s in self.skipped]},
             "limitations": list(self.limitations),
             "spec_fragment": self.spec_fragment(),
@@ -939,19 +1030,28 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     events = events or EventStream(echo_json=False)
     events.stage_started("prepare", data=str(request.data), seed=request.seed)
 
-    rows = read_rows(request.data)
+    # The family decides how a structured target is spelled, and it is read
+    # from the model rather than asked of the caller. A run that named no
+    # model gets `None`, which is today's behaviour plus a limitation.
+    wire = wire_format_for(request.base_model) if request.base_model else None
+    rows = read_rows(request.data, wire)
     # Before anything is profiled or split: a row calling a tool the prompt will
     # never offer is a row that cannot be trained, and saying so after a split
     # has been written means the caller re-runs the stage to learn it.
     if request.declarations is not None:
         refuse_undeclared_tools(rows, request.data, request.declarations)
+    elif request.base_model is not None:
+        refuse_calls_without_declarations(rows, request.base_model)
     content_sha256 = hash_file(request.data)
     result = PrepareResult(
         request=request,
         checks=CheckSet(name=f"prepare:{request.data.name}"),
         content_sha256=content_sha256,
         n_rows=len(rows),
+        identity=_identity(request.base_model, wire),
     )
+    if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
+        result.limitation(ASSUMED_WIRE_FORMAT)
     events.metric("rows", len(rows), source=str(request.data))
 
     # -- lengths -----------------------------------------------------------

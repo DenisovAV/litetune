@@ -368,6 +368,17 @@ def _add_prepare(sub) -> None:
             "prompt never offers. Without it the split is built exactly as before"
         ),
     )
+    prep.add_argument(
+        "--base-model",
+        help=(
+            "the model this split is for, resolved the way convert and bundle resolve it. It "
+            "decides how a structured target is spelled: litetune records that per family and "
+            "refuses a family whose calls it has never measured, rather than rendering "
+            "FunctionGemma's format for everyone. Not --tokenizer, which is declared as a "
+            "tokenizer. Without it the split is built exactly as before, with a limitation "
+            "saying which format was assumed"
+        ),
+    )
     prep.add_argument("--json", action="store_true", help="write the report to stdout")
 
 
@@ -848,6 +859,7 @@ def _prepare(args: argparse.Namespace) -> int:
         min_heldout_examples=args.min_heldout_examples,
         tokens=counter,
         declarations=args.declarations,
+        base_model=args.base_model,
     )
     result = prepare(request, events=events)
     delivered = _report(result.as_dict(), lambda: summarise_prepare(result), args.json)

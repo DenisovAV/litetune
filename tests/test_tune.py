@@ -26,6 +26,7 @@ from conftest import fake_torch, mark_provisioned
 
 from litetune import envs
 from litetune.checks import Outcome
+from litetune.cli import OUTCOME_EXIT_CODES
 from litetune.events import EventStream
 from litetune.prepare import read_rows
 from litetune.prompt_mode import PromptMode, PromptModeDecision
@@ -1628,28 +1629,6 @@ def test_prepare_feeds_tune_feeds_bundle(trainer, tmp_path):
         def count(self, texts):
             return [len(text.split()) for text in texts]
 
-    prepared = prepare(
-        PrepareRequest(
-            data=data,
-            output_dir=tmp_path / "prepared",
-            context_length=1024,
-            tokens=WordCounter(),
-        )
-    )
-    assert prepared.outcome is Outcome.PASSED
-
-    tuned = run_tune(
-        TuneRequest(
-            model="google/functiongemma-270m-it",
-            data=prepared.train.path,
-            output_dir=tmp_path / "tuned",
-            method="lora",
-            prompt_mode=PromptMode.PRERENDERED,
-        )
-    )
-    assert tuned.outcome is Outcome.PASSED
-    assert tuned.model_dir is not None
-
     declarations = tmp_path / "tools.json"
     declarations.write_text(
         json.dumps(
@@ -1662,6 +1641,31 @@ def test_prepare_feeds_tune_feeds_bundle(trainer, tmp_path):
         ),
         encoding="utf-8",
     )
+
+    prepared = prepare(
+        PrepareRequest(
+            data=data,
+            output_dir=tmp_path / "prepared",
+            context_length=1024,
+            tokens=WordCounter(),
+            declarations=declarations,
+            base_model="google/functiongemma-270m-it",
+        )
+    )
+    assert prepared.outcome is Outcome.PASSED
+
+    tuned = run_tune(
+        TuneRequest(
+            model="google/functiongemma-270m-it",
+            data=prepared.train.path,
+            output_dir=tmp_path / "tuned",
+            method="lora",
+            prompt_mode=PromptMode.PRERENDERED,
+            declarations=declarations,
+        )
+    )
+    assert tuned.outcome is Outcome.PASSED
+    assert tuned.model_dir is not None
 
     bundled = build_bundle(
         BundleRequest(
@@ -2545,3 +2549,58 @@ def test_the_training_script_refuses_a_prompt_mode_it_was_not_given():
 
     assert guard < derived
     assert 'if mode not in ("prerendered", "runtime_rendered"):' in _TRAIN_SCRIPT
+
+
+def test_a_declaration_rendering_family_refuses_to_train_calls_without_them(tmp_path, request_for):
+    """`prepare` refuses this too, and this is not a duplicate of that refusal.
+
+    A split written by hand reaches `tune` without passing through `prepare`,
+    and the defect -- training an answer to a prompt the runtime never sends --
+    is invisible in a loss curve.
+    """
+    data = tmp_path / "targets.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "prompt": f"set the background to swatch{i}",
+                    "target": {
+                        "name": "change_background_color",
+                        "args": {"color": f"swatch{i}"},
+                    },
+                }
+            )
+            + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+
+    # The prompts are bare, so the mode has to agree or that check refuses first
+    # and this one never runs.
+    result = run_tune(request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED))
+
+    assert result.outcome is Outcome.FAILED
+    assert OUTCOME_EXIT_CODES[result.outcome] != 0
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any("--declarations" in c.detail for c in failed)
+    # Nothing was provisioned: the refusal is about the request, not the run.
+    assert result.model_dir is None
+
+
+def test_that_refusal_does_not_fire_on_a_family_with_no_tool_channel(tmp_path, request_for):
+    data = tmp_path / "targets.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps({"prompt": f"q{i}", "target": {"name": "t", "args": {"a": "b"}}}) + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_tune(
+        request_for(model="Qwen/Qwen3-0.6B", data=data, prompt_mode=PromptMode.RUNTIME_RENDERED)
+    )
+
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert not any("--declarations" in c.detail for c in failed)
