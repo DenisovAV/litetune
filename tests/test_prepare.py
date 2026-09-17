@@ -624,7 +624,9 @@ def test_each_type_is_rendered_the_way_the_runtime_writes_it():
     )
 
     assert render_call(call) == (
+        "<start_function_call>"
         "call:set{who:<escape>ann<escape>,n:3,ratio:0.5,on:true,off:false,gone:null}"
+        "<end_function_call>"
     )
 
 
@@ -648,7 +650,9 @@ def test_a_family_whose_calls_were_measured_is_rendered_in_its_own_format(
     assert result.identity["family"] == "functiongemma"
     assert result.identity["wire_format"] == "functiongemma"
     first = json.loads(result.train.path.read_text(encoding="utf-8").splitlines()[0])
-    assert first["completion"] == "call:set_colour{colour:<escape>red<escape>}"
+    assert first["completion"] == (
+        "<start_function_call>call:set_colour{colour:<escape>red<escape>}<end_function_call>"
+    )
     assert ASSUMED_WIRE_FORMAT not in result.limitations
 
 
@@ -696,7 +700,9 @@ def test_naming_no_model_keeps_today_s_behaviour_and_says_what_it_assumed(write_
     assert result.identity is None
     assert ASSUMED_WIRE_FORMAT in result.limitations
     first = json.loads(result.train.path.read_text(encoding="utf-8").splitlines()[0])
-    assert first["completion"] == "call:set_colour{colour:<escape>red<escape>}"
+    assert first["completion"] == (
+        "<start_function_call>call:set_colour{colour:<escape>red<escape>}<end_function_call>"
+    )
 
 
 def test_a_plain_text_split_never_mentions_a_wire_format(write_jsonl, request_for):

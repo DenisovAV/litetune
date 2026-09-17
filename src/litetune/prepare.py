@@ -135,6 +135,11 @@ def _identity(base_model: str | None, wire: WireFormat | None) -> dict[str, Any]
     }
 
 
+# FunctionGemma's call markers, single tokens in its vocabulary (48 and 49).
+START_CALL = "<start_function_call>"
+END_CALL = "<end_function_call>"
+
+
 class PrepareError(ValueError):
     """The dataset could not be read as a dataset. The message names the row."""
 
@@ -163,9 +168,19 @@ def render_call(call: ToolCall) -> str:
     `temperature:20` sits next to `unit:<escape>C<escape>`. Escaping everything,
     which this did until the format was read, teaches the model to send a number
     as a string.
+
+    **A call is wrapped in its markers.** `<start_function_call>` and
+    `<end_function_call>` are what the runtime's parser looks for, and a call
+    without them is plain text to it: no call returned and nothing refused.
+    Measured 2026-09-17, on a checkpoint trained from this function before it
+    wrote them -- 0 of 5 prompts returned a call. The goldens carry them, both
+    FunctionGemma templates render them, and the spike encoder that trained the
+    bundle whose tool path did work wrote them. What follows the closing marker
+    is not written here: it depends on who reads the reply, and `tune` asks the
+    chat template for it.
     """
     body = ",".join(_render_argument(key, call.raw[key]) for key in call.args)
-    return f"call:{call.name}{{{body}}}"
+    return f"{START_CALL}call:{call.name}{{{body}}}{END_CALL}"
 
 
 def _render_argument(key: str, value: Any) -> str:

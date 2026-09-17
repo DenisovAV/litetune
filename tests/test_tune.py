@@ -2645,3 +2645,160 @@ def test_prerendered_calls_train_without_declarations_because_the_prompt_carries
 
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
     assert not any("--declarations" in c.detail for c in failed)
+
+
+# -- how a call ends ---------------------------------------------------------
+
+
+class WordTokenizer:
+    """One id per distinct whitespace word, so two different endings get
+    different ids -- `FakeTokenizer`'s ids are positional and would call
+    `<end_of_turn>` and `<start_function_response>` the same token."""
+
+    eos_token_id = 1
+    pad_token_id = 0
+
+    def __init__(self):
+        self.vocab: dict[str, int] = {}
+
+    def __call__(self, text: str, add_special_tokens: bool = True) -> dict:
+        spaced = text
+        for marker in (
+            "<start_function_call>",
+            "<end_function_call>",
+            "<start_function_response>",
+            "<end_of_turn>",
+        ):
+            spaced = spaced.replace(marker, f" {marker} ")
+        ids = [self.vocab.setdefault(w, 1000 + len(self.vocab)) for w in spaced.split()]
+        return {"input_ids": ([2] if add_special_tokens else []) + ids}
+
+    def decode(self, ids) -> str:
+        words = {v: k for k, v in self.vocab.items()}
+        return "".join(words.get(i, "") for i in ids)
+
+    def ids(self, text: str) -> list[int]:
+        return self(text, add_special_tokens=False)["input_ids"]
+
+
+class CallTemplateTokenizer(WordTokenizer):
+    """Renders a turn the way FunctionGemma's published template does: a text
+    answer closes with `<end_of_turn>`, a call is wrapped in its markers and
+    followed by `<start_function_response>` and nothing else."""
+
+    wrap_calls = True
+
+    def apply_chat_template(
+        self, messages, tokenize=False, add_generation_prompt=False, tools=None
+    ):
+        out = ""
+        for m in messages:
+            if m.get("tool_calls"):
+                for call in m["tool_calls"]:
+                    body = f"call:{call['function']['name']}{{}}"
+                    out += (
+                        f"<start_function_call>{body}<end_function_call>"
+                        if self.wrap_calls
+                        else body
+                    )
+                out += "<start_function_response>"
+            else:
+                out += f"<start>{m['role']}\n{m['content']}<end_of_turn>\n"
+        return out + ("<start>model\n" if add_generation_prompt else "")
+
+
+CALL_PROBE = {
+    "name": "litetune_probe",
+    "text": "<start_function_call>call:litetune_probe{}<end_function_call>",
+}
+
+
+def _call_row(prompt="set it"):
+    return {
+        "prompt": prompt,
+        "completion": "<start_function_call>call:set{a:<escape>b<escape>}<end_function_call>",
+        "target": {"name": "set", "args": {"a": "b"}},
+    }
+
+
+def test_a_call_ends_the_way_the_template_ends_a_call(script_namespace):
+    """Measured on 2026-09-17 against a real bundle: a model trained with every
+    completion closed by `<end_of_turn>` -- the text turn's ending -- and no call
+    markers returned no call from the runtime on 5 of 5 prompts, with nothing
+    refused. Both FunctionGemma templates end a call turn
+    `<end_function_call><start_function_response>`, and that is derived here the
+    same way `turn_terminator` derives a text turn's ending: from the template."""
+    build_examples = script_namespace["build_examples"]
+    tok = CallTemplateTokenizer()
+    text_row = {"prompt": "hi", "completion": "hello"}
+
+    examples, _, _, terminator = build_examples(
+        tok, [_call_row(), text_row], 256, True, None, CALL_PROBE
+    )
+
+    call_labels, text_labels = examples[0][1], examples[1][1]
+    call_end, text_end = tok.ids("<start_function_response>"), tok.ids("<end_of_turn>\n")
+    assert call_labels[-len(call_end) :] == call_end
+    assert text_labels[-len(text_end) :] == text_end
+    assert call_end != text_end
+    assert terminator["call"]["source"] == "chat_template_call"
+    assert terminator["call"]["text"] == "<start_function_response>"
+
+
+def test_a_template_that_renders_a_call_differently_refuses_to_train(script_namespace):
+    """If the template writes a call some other way than `prepare` did, the
+    completion teaches a call the runtime would not parse. Stopping is cheaper
+    than a training run that looks fine and returns nothing."""
+    build_examples = script_namespace["build_examples"]
+    tok = CallTemplateTokenizer()
+    tok.wrap_calls = False
+
+    with pytest.raises(ValueError, match="renders a tool call differently"):
+        build_examples(tok, [_call_row()], 256, True, None, CALL_PROBE)
+
+
+def test_a_prerendered_call_keeps_the_text_terminator(script_namespace):
+    """`prerendered` is the application's path -- flutter_gemma delimits a reply
+    by `<end_of_turn>` -- and the template is not consulted there at all."""
+    build_examples = script_namespace["build_examples"]
+    tok = CallTemplateTokenizer()
+
+    examples, _, _, terminator = build_examples(tok, [_call_row()], 256, False, None, CALL_PROBE)
+
+    assert examples[0][1][-1] == tok.eos_token_id
+    assert terminator["call"] is None
+
+
+def test_rows_without_a_structured_target_never_ask_about_calls(script_namespace):
+    """A split of text answers must not render a probe call at all -- the
+    templates of families with no tool channel cannot."""
+    build_examples = script_namespace["build_examples"]
+
+    _, _, _, terminator = build_examples(
+        FakeTemplateTokenizer(),
+        [{"prompt": "hi", "completion": "hello"}],
+        64,
+        True,
+        None,
+        CALL_PROBE,
+    )
+
+    assert terminator["call"] is None
+
+
+def test_the_script_is_handed_the_call_prepare_renders(tmp_path, request_for):
+    """The script asks the template how a call ends by rendering a probe call
+    and finding `prepare`'s text for it. That text has to be `render_call`'s
+    own -- a second rendering of it here could agree with the template while
+    the real completions do not."""
+    from litetune.metrics import ToolCall
+    from litetune.prepare import render_call
+    from litetune.tune import CALL_PROBE_NAME
+
+    spec = request_for().config(tmp_path / "metrics.json")
+
+    assert spec["call_probe"] == {
+        "name": CALL_PROBE_NAME,
+        "text": render_call(ToolCall(CALL_PROBE_NAME, {})),
+    }
+    assert spec["call_probe"]["text"].startswith("<start_function_call>")

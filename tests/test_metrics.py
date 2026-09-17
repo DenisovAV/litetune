@@ -113,6 +113,18 @@ def test_a_value_that_is_neither_escaped_nor_a_scalar_is_not_a_call():
     assert parse_call("call:set{colour:red}") is None
 
 
+def test_parses_a_call_in_its_markers_up_to_the_stop_token():
+    """What a correctly trained model emits on the tool path's text side, and
+    what the transformers reference now generates: the call in its markers,
+    followed by the token the model stops on."""
+    text = (
+        "<start_function_call>call:set_alarm{hour:<escape>7<escape>}"
+        "<end_function_call><start_function_response>"
+    )
+
+    assert parse_call(text) == ToolCall("set_alarm", {"hour": "7"})
+
+
 def test_parses_a_call_with_no_arguments():
     assert parse_call("call:refresh{}") == ToolCall("refresh", {})
 

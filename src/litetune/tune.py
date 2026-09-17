@@ -52,7 +52,7 @@ from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.metrics import ToolCall
 from litetune.models import renders_declarations_for
-from litetune.prepare import PrepareError, read_rows
+from litetune.prepare import PrepareError, read_rows, render_call
 from litetune.prompt_mode import RENDERING_SOURCE, PromptMode, PromptModeDecision, prompt_evidence
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,9 @@ TUNE_SCHEMA = "litetune.tune/1"
 # too: a refusal is read by whoever typed the command.
 PROMPT_MODE_CHECK = "prompt mode"
 DECLARATIONS_CHECK = "tool declarations"
+
+# A name no declaration could plausibly use, rendered only to ask the template how a call ends.
+CALL_PROBE_NAME = "litetune_probe"
 
 
 def _refuse_calls_without_declarations(request: TuneRequest, mode: PromptMode) -> Check | None:
@@ -353,17 +356,83 @@ def training_device(torch, given=None):
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def build_examples(tok, rows, max_seq_length, runtime_rendered, tools=None):
+def is_call_row(row):
+    """A row whose target is a tool call, as `prepare` writes one."""
+    target = row.get("target")
+    return isinstance(target, dict) and "name" in target
+
+
+def call_terminator(tok, runtime_rendered, probe):
+    """What the chat template puts after a tool call, or `None` where it is not asked.
+
+    A text answer and a call end differently. FunctionGemma's templates -- the
+    published one and the one bundled with LiteRT-LM -- close a text turn with
+    `<end_of_turn>` and a call turn with `<end_function_call>` followed by
+    `<start_function_response>`, where the model stops and the application
+    runs the tool. Measured 2026-09-17: a model trained with every completion
+    closed by the text ending, and no call markers, returned no call from the
+    runtime on 5 of 5 prompts and had nothing refused -- the runtime read plain
+    text.
+
+    So this asks the template, the way `turn_terminator` does for a text turn:
+    render an assistant turn carrying a probe call and take what follows it.
+    `probe` is the call `prepare` renders for the same probe, passed in by the
+    parent because this script cannot import litetune. If the template does not
+    render that exact text, the completions this run trains are not calls the
+    runtime would read, and training stops rather than proceeds.
+
+    Only in `runtime_rendered`: in `prerendered` the application builds the
+    prompt and reads the reply, and flutter_gemma delimits a reply by
+    `<end_of_turn>`, so the text ending stands.
+    """
+    if not runtime_rendered or not probe:
+        return None
+    try:
+        rendered = tok.apply_chat_template(
+            [{"role": "user", "content": "x"},
+             {"role": "assistant", "tool_calls": [
+                 {"type": "function", "function": {"name": probe["name"], "arguments": {}}}]}],
+            tokenize=False, add_generation_prompt=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, and training stops
+        raise ValueError(
+            "the chat template could not render a tool call, so there is no ending to train a "
+            f"call with: {type(exc).__name__}: {exc}"[:400]
+        ) from exc
+    if probe["text"] not in rendered:
+        raise ValueError(
+            "the chat template renders a tool call differently from the completions this run "
+            f"trains: prepare wrote {probe['text']!r}, and the template rendered "
+            f"{rendered[-200:]!r}. Training on the first teaches a call the runtime would not read"
+        )
+    tail = rendered.split(probe["text"])[-1]
+    ids = tok(tail, add_special_tokens=False)["input_ids"]
+    if not ids:
+        raise ValueError(
+            "the chat template puts nothing after a tool call, so a trained call would never stop"
+        )
+    return {"ids": list(ids), "source": "chat_template_call", "text": tok.decode(ids)}
+
+
+def build_examples(tok, rows, max_seq_length, runtime_rendered, tools=None, call_probe=None):
     """One (input_ids, labels) pair per row, with the prompt masked out."""
     examples = []
     supervised = 0
     total = 0
     terminator, terminator_source = turn_terminator(tok, runtime_rendered)
+    # Asked only when some row is a call: a family with no tool channel has a
+    # template that cannot render one, and a text split has no reason to try.
+    call = (
+        call_terminator(tok, runtime_rendered, call_probe)
+        if any(is_call_row(row) for row in rows)
+        else None
+    )
     for row in rows:
         prompt_text, add_special = render_prompt(tok, row["prompt"], runtime_rendered, tools)
         prompt_ids = tok(prompt_text, add_special_tokens=add_special)["input_ids"]
         completion_ids = tok(row["completion"], add_special_tokens=False)["input_ids"]
-        completion_ids = list(completion_ids) + list(terminator)
+        ending = call["ids"] if call is not None and is_call_row(row) else terminator
+        completion_ids = list(completion_ids) + list(ending)
         input_ids = list(prompt_ids) + list(completion_ids)
         if len(input_ids) > max_seq_length:
             # Never truncate. Cutting the sequence removes the end of the
@@ -382,6 +451,8 @@ def build_examples(tok, rows, max_seq_length, runtime_rendered, tools=None):
         "ids": list(terminator),
         "source": terminator_source,
         "text": tok.decode(terminator) if terminator else "",
+        # How a call row ended, when one was trained and the template was asked.
+        "call": call,
     }
 
 
@@ -514,7 +585,8 @@ def main() -> int:
         )
     runtime_rendered = mode == "runtime_rendered"
     examples, supervised, total, terminator = build_examples(
-        tok, rows, spec["max_seq_length"], runtime_rendered, spec.get("tools")
+        tok, rows, spec["max_seq_length"], runtime_rendered, spec.get("tools"),
+        spec.get("call_probe"),
     )
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -934,6 +1006,14 @@ class TuneRequest:
             # under the other name and a reader must not have to work out
             # which of two `declarations` a report means.
             "tools": declarations,
+            # The call `prepare` renders for a probe, so the script can ask the
+            # chat template what ends a call turn and check that the template
+            # writes a call the way the completions do. The script cannot import
+            # litetune, so the text travels in the spec.
+            "call_probe": {
+                "name": CALL_PROBE_NAME,
+                "text": render_call(ToolCall(CALL_PROBE_NAME, {})),
+            },
             "model_dir": str(self.model_dir),
             "adapter_dir": str(self.adapter_dir) if self.adapter_dir else None,
             "metrics_out": str(metrics_out),
