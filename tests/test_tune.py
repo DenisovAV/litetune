@@ -1175,6 +1175,16 @@ class _Tokenizer:
         ids = [1000 + i for i, _ in enumerate(text.split())]
         return {"input_ids": ([2] if add_special_tokens else []) + ids}
 
+    def apply_chat_template(
+        self, messages, tokenize=False, add_generation_prompt=False, tools=None
+    ):
+        # Logged, not just rendered: the question these tests answer is whether
+        # the declarations reached the template at all, and a rendered string
+        # cannot distinguish "none were passed" from "an empty list was".
+        _log({"event": "chat_template", "tools": tools})
+        declarations = "".join("decl:" + t["function"]["name"] + " " for t in (tools or []))
+        return declarations + "user " + messages[0]["content"]
+
     def decode(self, ids):
         return " ".join(f"<{i}>" for i in ids)
 
@@ -1299,6 +1309,7 @@ def run_real_script(
     cuda: bool = False,
     decision: PromptModeDecision | None = None,
     declarations_sha256: str | None = None,
+    declarations: list | None = None,
 ) -> subprocess.CompletedProcess:
     """Runs `_TRAIN_SCRIPT` for real, against the stub modules `stub_env` wrote.
 
@@ -1318,6 +1329,7 @@ def run_real_script(
                 request.output_dir / "metrics.json",
                 decision=decision,
                 declarations_sha256=declarations_sha256,
+                declarations=declarations,
             )
         ),
         encoding="utf-8",
@@ -1386,6 +1398,47 @@ def test_the_real_script_records_the_declarations_in_both_files(request_for, stu
     assert metrics["declarations_sha256"] == digest
     # The prefix is part of it: `bundle` splits on it before comparing.
     assert digest.startswith("sha256:")
+
+
+def test_the_spec_carries_the_declarations_the_script_renders_with(request_for, tmp_path):
+    """The boundary the training script reads. `tools`, not `declarations`: the
+    file is the declarations and this is what the template's `tools=` receives,
+    and one report must not use one word for two things."""
+    request = request_for(declarations=tmp_path / "declarations.json")
+    tools = [{"type": "function", "function": {"name": "open_app"}}]
+
+    spec = request.config(tmp_path / "metrics.json", declarations=tools)
+
+    assert spec["tools"] == tools
+    assert request.config(tmp_path / "metrics.json")["tools"] is None
+
+
+def test_the_real_script_trains_on_a_prompt_carrying_the_declarations(
+    request_for, bare_train_data, stub_env
+):
+    """The training prompt is the whole point of passing declarations at all.
+
+    Every other test of this script runs `prerendered`, where the prompt is used
+    verbatim and no template is called -- so until this one, a script that
+    dropped the declarations on the way to `render_prompt` would have left the
+    suite green while training the model on a prompt no serving caller sends.
+    """
+    tools = [{"type": "function", "function": {"name": "open_app"}}]
+    request = request_for(data=bare_train_data, prompt_mode=PromptMode.RUNTIME_RENDERED)
+
+    proc = run_real_script(request, stub_env, declarations=tools)
+    assert proc.returncode == 0, proc.stderr
+
+    rendered = [e for e in stub_log(stub_env) if e["event"] == "chat_template"]
+    assert rendered, "the template was never called: the run did not render a turn at all"
+    # The first render is `turn_terminator`, asking how a turn ends before any
+    # row is built. It passes no tools and should not: it is not a prompt. Every
+    # render after it is a prompt the model trains on, and those carry the
+    # declarations. Pinned in that order rather than as "some call had them", so
+    # a change in either the probe or the loop is visible here.
+    assert rendered[0]["tools"] is None
+    assert len(rendered) > 1
+    assert all(e["tools"] == tools for e in rendered[1:])
 
 
 def test_the_real_script_loads_the_dtype_and_attention_it_was_given(request_for, stub_env):

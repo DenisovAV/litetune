@@ -454,6 +454,97 @@ def test_training_the_reference_and_the_rendering_check_render_from_one_source()
         assert script.count("def render_prompt(") == 1
 
 
+def test_every_generated_script_is_valid_python():
+    """Counting copies of the source does not prove any of them parses.
+
+    A docstring edited into `RENDERING_SOURCE` at the wrong depth once produced
+    seven failures in tests about dtype and device -- every test that execs a
+    script -- and none of them said the script would not compile. This says it.
+    """
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+    from litetune.rendering import _REFERENCE_SCRIPT
+    from litetune.tune import _TRAIN_SCRIPT
+
+    for name, script in [
+        ("train", _TRAIN_SCRIPT),
+        ("generate", _HF_GENERATE_SCRIPT),
+        ("reference", _REFERENCE_SCRIPT),
+    ]:
+        compile(script, f"{name}_script.py", "exec")
+
+
+def _render_prompt():
+    """`render_prompt` out of the shared source, the way every script gets it."""
+    namespace: dict = {}
+    exec(compile(RENDERING_SOURCE, "rendering_source.py", "exec"), namespace)
+    return namespace["render_prompt"]
+
+
+class _RecordingTokenizer:
+    """A tokenizer double that records exactly how the template was called."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append(dict(kwargs))
+        tools = kwargs.get("tools")
+        declarations = "".join(
+            f"<start_function_declaration>declaration:{t['function']['name']}"
+            f"<end_function_declaration>"
+            for t in (tools or [])
+        )
+        return f"{declarations}<start_of_turn>user\n{messages[0]['content']}<end_of_turn>\n"
+
+
+def test_declarations_reach_the_prompt_the_model_is_trained_on():
+    """The runtime renders a developer turn carrying the declarations, and this
+    is the source both the training prompt and the reference's prompt come
+    from. Without them the two sides agree on a prompt no serving caller sends.
+    """
+    tok = _RecordingTokenizer()
+    tools = [{"type": "function", "function": {"name": "open_app"}}]
+
+    text, add_special = _render_prompt()(tok, "open maps", True, tools)
+
+    assert "declaration:open_app" in text
+    assert tok.calls[0]["tools"] == tools
+    assert add_special is False
+
+
+def test_without_declarations_the_template_is_not_even_asked_about_tools():
+    """Byte-identical is not "renders the same thing anyway".
+
+    Four tokenizer doubles in this suite declare `apply_chat_template` without a
+    `tools` parameter, and real templates branch on it. Passing `tools=None` to
+    find out whether it changes nothing is not the same as not passing it, so
+    the no-declarations path must not mention the keyword at all.
+    """
+    tok = _RecordingTokenizer()
+
+    with_none = _render_prompt()(tok, "open maps", True)
+    with_empty = _render_prompt()(tok, "open maps", True, [])
+
+    assert "tools" not in tok.calls[0]
+    assert "tools" not in tok.calls[1]
+    assert with_none == with_empty
+    assert "declaration:" not in with_none[0]
+
+
+def test_a_prerendered_prompt_is_untouched_by_declarations():
+    """The mode decides whether a template runs at all. `prerendered` means the
+    caller built the whole prompt, so there is nothing for declarations to be
+    rendered into."""
+    tok = _RecordingTokenizer()
+    tools = [{"type": "function", "function": {"name": "open_app"}}]
+
+    text, add_special = _render_prompt()(tok, "already rendered", False, tools)
+
+    assert text == "already rendered"
+    assert add_special is True
+    assert tok.calls == []
+
+
 @pytest.mark.parametrize("raw", ["prerendered", PromptMode.RUNTIME_RENDERED])
 def test_a_recorded_mode_reads_back_as_itself(raw):
     assert parse_prompt_mode(raw, "the record") is PromptMode(raw)

@@ -147,7 +147,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(spec["model"])
     rows = []
     for index, prompt in enumerate(spec["prompts"]):
-        text, add_special = render_prompt(tok, prompt, True)
+        text, add_special = render_prompt(tok, prompt, True, spec.get("tools"))
         ids = tok(text, add_special_tokens=add_special)["input_ids"]
         rows.append({"index": index, "rendered": text, "ids": [int(i) for i in ids]})
     Path(spec["out"]).write_text(json.dumps(rows), encoding="utf-8")
@@ -367,6 +367,11 @@ class RenderingProbe:
 
     model: Path
     reference: str
+    # The declarations both sides render, as parsed JSON: the scripts run in
+    # environments that cannot read the caller's file. The check is only
+    # meaningful when both sides are asked for the same thing, so one field
+    # feeds both scripts.
+    declarations: list | None = None
     prefill_sample: int = DEFAULT_PREFILL_SAMPLE
     runtime_env: envs.StageEnv = envs.RUNTIME
     reference_env: envs.StageEnv = envs.TRAIN
@@ -389,7 +394,11 @@ class RenderingProbe:
         reference_rows = self._run(
             self.reference_env,
             _REFERENCE_SCRIPT,
-            {"model": self.reference, "prompts": list(prompts)},
+            {
+                "model": self.reference,
+                "prompts": list(prompts),
+                "tools": self.declarations,
+            },
             events,
         )
         return compare_renderings(

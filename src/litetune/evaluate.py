@@ -536,7 +536,9 @@ def main() -> int:
 
     with Path(spec["out"]).open("w", encoding="utf-8") as sink:
         for i, prompt in enumerate(spec["prompts"]):
-            text, add_special = render_prompt(tok, prompt, spec["runtime_rendered"])
+            text, add_special = render_prompt(
+                tok, prompt, spec["runtime_rendered"], spec.get("tools")
+            )
             enc = tok(text, return_tensors="pt", add_special_tokens=add_special).to(device)
             with torch.no_grad():
                 ids = model.generate(
@@ -576,6 +578,11 @@ class HuggingFaceBackend:
     env: envs.StageEnv = envs.TRAIN
     auto_provision: bool = True
     runtime_rendered: bool = False
+    # The tool declarations the chat template renders into a developer turn, as
+    # parsed JSON rather than a path: this backend's script runs in another
+    # environment, which cannot read the caller's file. `None` renders the bare
+    # user turn this rendered before declarations were an input.
+    declarations: list | None = None
     # Must match training. `spec.BaseModel.attn_implementation` carries the
     # same default and exists to be threaded here.
     attn_implementation: str = "eager"
@@ -705,6 +712,7 @@ class HuggingFaceBackend:
                         "prompts": list(prompts),
                         "max_tokens": self.decode.max_tokens,
                         "runtime_rendered": self.uses_template,
+                        "tools": self.declarations,
                         "attn_implementation": self.attn_implementation,
                         "device": device_for_run,
                         "out": str(results),

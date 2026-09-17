@@ -24,10 +24,18 @@ from litetune.verify import BackendPair, Status
 
 @pytest.fixture
 def fake_backends(monkeypatch):
-    """Install canned backends behind the CLI's own construction path."""
+    """Install canned backends behind the CLI's own construction path.
+
+    The signature follows `build_backends`, including the declarations it is
+    handed: a double that takes fewer arguments than the function it replaces
+    fails at the call rather than at the behaviour, and says nothing about
+    either. These backends ignore the declarations deliberately -- the tests
+    using this fixture are about what the manifest records, and the rendering
+    they would feed is covered where the renderer itself is.
+    """
 
     def install(candidate_texts, reference_texts):
-        def build(request):
+        def build(request, declarations=None):
             return BackendPair(
                 candidate=FakeBackend(texts=candidate_texts),
                 reference=FakeBackend(model=request.reference, texts=reference_texts),

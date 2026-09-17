@@ -313,14 +313,14 @@ def training_device(torch, given=None):
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def build_examples(tok, rows, max_seq_length, runtime_rendered):
+def build_examples(tok, rows, max_seq_length, runtime_rendered, tools=None):
     """One (input_ids, labels) pair per row, with the prompt masked out."""
     examples = []
     supervised = 0
     total = 0
     terminator, terminator_source = turn_terminator(tok, runtime_rendered)
     for row in rows:
-        prompt_text, add_special = render_prompt(tok, row["prompt"], runtime_rendered)
+        prompt_text, add_special = render_prompt(tok, row["prompt"], runtime_rendered, tools)
         prompt_ids = tok(prompt_text, add_special_tokens=add_special)["input_ids"]
         completion_ids = tok(row["completion"], add_special_tokens=False)["input_ids"]
         completion_ids = list(completion_ids) + list(terminator)
@@ -474,7 +474,7 @@ def main() -> int:
         )
     runtime_rendered = mode == "runtime_rendered"
     examples, supervised, total, terminator = build_examples(
-        tok, rows, spec["max_seq_length"], runtime_rendered
+        tok, rows, spec["max_seq_length"], runtime_rendered, spec.get("tools")
     )
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -844,6 +844,7 @@ class TuneRequest:
         device: str | None = None,
         decision: PromptModeDecision | None = None,
         declarations_sha256: str | None = None,
+        declarations: list | None = None,
     ) -> dict[str, Any]:
         """Everything the generated script needs. Also what the report records.
 
@@ -887,6 +888,12 @@ class TuneRequest:
             # writes it beside the checkpoint, where `verify` reads it back
             # instead of being told which declarations a checkpoint knows.
             "declarations_sha256": declarations_sha256,
+            # `tools`, not `declarations`: the file is the declarations, and
+            # this is what the chat template's `tools=` receives. One key per
+            # meaning, because the request record already carries the path
+            # under the other name and a reader must not have to work out
+            # which of two `declarations` a report means.
+            "tools": declarations,
             "model_dir": str(self.model_dir),
             "adapter_dir": str(self.adapter_dir) if self.adapter_dir else None,
             "metrics_out": str(metrics_out),
@@ -1302,9 +1309,12 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     # Before the environment, like the mode above: a declarations file that
     # cannot be read is a fact about the request, and finding it out after
     # provisioning costs minutes and a download to say so.
+    # Bound before the branch: the script's spec is built further down on every
+    # path, including the one where no declarations were supplied.
+    declarations: list | None = None
     if request.declarations is not None:
         try:
-            parsed, digest = read_declarations(request.declarations)
+            declarations, digest = read_declarations(request.declarations)
         except DeclarationsError as exc:
             refused = Check.failed(
                 DECLARATIONS_CHECK,
@@ -1316,7 +1326,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             events.stage_finished(result.outcome.value, attempted=False)
             return result
         result.declarations_sha256 = digest
-        count = entry_count(parsed)
+        count = entry_count(declarations)
         read = Check.passed(
             DECLARATIONS_CHECK,
             f"{count if count is not None else 'the'} declaration(s) from "
@@ -1450,6 +1460,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
                 device=device,
                 decision=result.prompt_mode_decision,
                 declarations_sha256=result.declarations_sha256,
+                declarations=declarations,
             ),
             indent=2,
         ),

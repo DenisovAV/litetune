@@ -209,22 +209,34 @@ class BackendPair:
     rendering: RenderingObserver | None = None
 
 
-def build_backends(request: VerifyRequest) -> BackendPair:
+def build_backends(request: VerifyRequest, declarations: list | None = None) -> BackendPair:
     """The real backends. Tests pass their own pair to `run_verify` instead.
 
     `request.prompt_mode` has been resolved by the time this is called, so both
     sides are configured from one decision: the runtime gets `--no-template`
     only when the prompts are pre-rendered, and the reference applies its chat
     template only when they are not.
+
+    `declarations` arrive parsed rather than as the path on the request: the
+    scripts these backends run live in other environments, which cannot read
+    the caller's file, and `run_verify` has already read it to compare its
+    digest against the checkpoint's record. The candidate is not given them
+    here -- it is measured through `litert-lm run`, which has no tools argument
+    at all, and giving it one is the tool-path work, not this.
     """
     return BackendPair(
         candidate=LiteRtLmBackend(
             model=request.model, decode=request.decode, declared_prompt_mode=request.prompt_mode
         ),
         reference=HuggingFaceBackend(
-            model=request.reference, decode=request.decode, declared_prompt_mode=request.prompt_mode
+            model=request.reference,
+            decode=request.decode,
+            declared_prompt_mode=request.prompt_mode,
+            declarations=declarations,
         ),
-        rendering=RenderingProbe(model=request.model, reference=request.reference),
+        rendering=RenderingProbe(
+            model=request.model, reference=request.reference, declarations=declarations
+        ),
     )
 
 
@@ -573,9 +585,13 @@ def run_verify(
     # Before the backends, for the same reason the mode is: a model measured
     # against a different tool list than it learned is measured on another
     # task, and the number that comes out looks like a conversion cost.
+    # Initialised before the guard, not inside it: `guard` turns an exception
+    # into a recorded check rather than a raise, so an assignment made only in
+    # the body is not one the code below can rely on.
+    declarations: list | None = None
     if request.declarations is not None:
         with guard(DECLARATIONS_CHECK) as sink:
-            _, digest = read_declarations(request.declarations)
+            declarations, digest = read_declarations(request.declarations)
             recorded = recorded_declarations_sha256(request.reference)
             if recorded is not None and recorded != digest:
                 sink.append(
@@ -597,7 +613,7 @@ def run_verify(
     for text in rules.limitations if rules is not None else ():
         run.limitation(text)
 
-    pair = backends or build_backends(request)
+    pair = backends or build_backends(request, declarations)
 
     # -- do both sides put the same prompt tokens in front of the model? ---
     # Before any generation: a candidate and a reference that were shown

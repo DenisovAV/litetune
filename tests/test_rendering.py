@@ -295,8 +295,14 @@ def _fake_transformers() -> Any:
             ids = [2 if word == "<bos>" else 10 + n for n, word in enumerate(text.split())]
             return {"input_ids": [2, *ids] if add_special_tokens else ids}
 
-        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-            return "<bos> user " + messages[0]["content"] + " model"
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=False, tools=None
+        ):
+            # Without tools this renders exactly what it rendered before they
+            # were an input, word for word, so the test below still pins the
+            # same ids.
+            declarations = "".join(f"decl:{t['function']['name']} " for t in (tools or []))
+            return "<bos> " + declarations + "user " + messages[0]["content"] + " model"
 
     module: Any = types.ModuleType("transformers")
     module.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda model: Tokenizer())
@@ -315,6 +321,33 @@ def test_the_reference_script_gives_the_ids_the_reference_generates_from(tmp_pat
     # One BOS: the template's. The same ids the generation script is given --
     # `test_evaluate.py` pins that side with the same tokenizer shape.
     assert written == [{"index": 0, "rendered": "<bos> user hi model", "ids": [2, 11, 12, 13]}]
+
+
+def test_the_reference_script_renders_the_declarations_the_spec_carries(tmp_path, monkeypatch):
+    """The spec is how the declarations reach this side, and the shared source
+    renders them here exactly as it does in training.
+
+    Without this, a script that stopped passing them would leave both sides
+    agreeing on a prompt no serving caller sends, and every other test in this
+    suite would stay green: the others render `render_prompt` directly or supply
+    no tools at all.
+    """
+    written = _run_script(
+        _REFERENCE_SCRIPT,
+        tmp_path,
+        monkeypatch,
+        {"transformers": _fake_transformers()},
+        {
+            "model": "org/reference",
+            "prompts": ["hi"],
+            "tools": [{"type": "function", "function": {"name": "open_app"}}],
+        },
+    )
+
+    assert "decl:open_app" in written[0]["rendered"]
+    # The declaration is part of what the model is measured on, not a label
+    # beside it: one more rendered word is one more id.
+    assert written[0]["ids"] == [2, 11, 12, 13, 14]
 
 
 # ---------------------------------------------------------------------------
