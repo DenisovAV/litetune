@@ -602,9 +602,13 @@ def test_declarations_that_disagree_with_the_checkpoints_record_are_refused(tmp_
     from litetune.storage import hash_file
 
     trained = tmp_path / "trained.json"
-    trained.write_text('[{"name": "send_email"}]', encoding="utf-8")
+    trained.write_text(
+        '[{"type": "function", "function": {"name": "send_email"}}]', encoding="utf-8"
+    )
     measured = tmp_path / "measured.json"
-    measured.write_text('[{"name": "set_timer"}]', encoding="utf-8")
+    measured.write_text(
+        '[{"type": "function", "function": {"name": "set_timer"}}]', encoding="utf-8"
+    )
     reference = _checkpoint(
         tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(trained)}
     )
@@ -625,7 +629,7 @@ def test_declarations_that_match_the_record_are_measured_and_recorded(tmp_path, 
     from litetune.storage import hash_file
 
     decls = tmp_path / "declarations.json"
-    decls.write_text('[{"name": "send_email"}]', encoding="utf-8")
+    decls.write_text('[{"type": "function", "function": {"name": "send_email"}}]', encoding="utf-8")
     reference = _checkpoint(
         tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(decls)}
     )
@@ -642,7 +646,7 @@ def test_a_checkpoint_that_recorded_no_declarations_is_not_a_disagreement(tmp_pa
     checkpoint trained before declarations were an input records nothing here,
     and refusing those would refuse every run that predates this change."""
     decls = tmp_path / "declarations.json"
-    decls.write_text('[{"name": "send_email"}]', encoding="utf-8")
+    decls.write_text('[{"type": "function", "function": {"name": "send_email"}}]', encoding="utf-8")
     reference = _checkpoint(tmp_path, {"prompt_mode": "prerendered"})
 
     result, candidate, _ = _verify_with(tmp_path, write_split, reference, decls)

@@ -13,11 +13,22 @@ bytes -- would produce a different string for the same file and turn that
 comparison into a false refusal. So the digest is `storage.hash_file`, the
 function `bundle` already compares with, over the same bytes.
 
-**The shape is deliberately the loose one.** `bundle` accepts any JSON here and
-counts the entries when it is a list or a mapping. What a declaration may
-contain is the serving runtime's business, and a stricter schema in litetune
-would refuse files the runtime renders happily. This reads the file, insists it
-is JSON, and says how many entries it holds when that question has an answer.
+**The shape is the runtime's, and the rules here are its rules.** One entry is
+the OpenAI function-tool object: `{"type": "function", "function": {"name",
+"description", "parameters"}}`. That is not a preference. The runtime's Python
+API raises `interfaces.Tool description must contain ['function']['name']`
+before it forwards anything, and the Hub chat template a checkpoint carries
+reads `tool_data['function']['name']` to render its declaration -- so both of
+the renderers the measurement compares require it, and a file without it is
+refused by the runtime rather than rendered differently.
+
+So this enforces exactly the three rules the runtime enforces -- a list, each
+entry an object, `function.name` a string -- and nothing beyond them.
+`parameters` stays opaque: the declaration text is produced by the runtime's own
+C++ formatter, and nothing in this project establishes what that formatter
+accepts beyond those three. A stricter schema here would refuse files that
+render, which is the mistake the first version of this docstring made in the
+opposite direction.
 
 A leaf module on purpose: `prompt_mode.py` is the precedent, and the three
 stages that need declarations share almost no imports with each other. Anything
@@ -40,8 +51,8 @@ class DeclarationsError(Exception):
 def read_declarations(path: Path) -> tuple[Any, str]:
     """The parsed declarations and their digest, in the shape `bundle` accepts.
 
-    Raises `DeclarationsError` when the file cannot be read or is not JSON. It
-    does not raise on an unexpected JSON shape: see the module docstring.
+    Raises `DeclarationsError` when the file cannot be read, is not JSON, or
+    does not carry what the runtime requires: see the module docstring.
     """
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -56,9 +67,40 @@ def read_declarations(path: Path) -> tuple[Any, str]:
             f"the declarations at {path} are not valid JSON ({exc}); a runtime cannot render a "
             "tool list it cannot parse"
         ) from exc
+    _check(parsed, Path(path))
     # The digest is over the file's bytes, not over `text` or `parsed`: that is
     # what `bundle` compares its contract against.
     return parsed, hash_file(Path(path))
+
+
+def _check(parsed: Any, path: Path) -> None:
+    """The runtime's own three rules, refused here instead of at conversation time."""
+    if not isinstance(parsed, list):
+        raise DeclarationsError(
+            f"the declarations at {path} are a {type(parsed).__name__}, and the runtime takes a "
+            "list of tools"
+        )
+    for index, entry in enumerate(parsed):
+        where = f"{path}: tool {index}"
+        if not isinstance(entry, dict):
+            raise DeclarationsError(f"{where} is a {type(entry).__name__}, not an object")
+        function = entry.get("function")
+        if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+            raise DeclarationsError(
+                f"{where} has no ['function']['name'] string. A tool is the OpenAI function "
+                'object: {"type": "function", "function": {"name": ..., "parameters": ...}}. '
+                "The runtime refuses anything else before it renders a declaration, and the "
+                "reference chat template reads the same two keys"
+            )
+
+
+def tool_names(parsed: Any) -> frozenset[str]:
+    """Every tool the declarations offer, by the name a call must use.
+
+    Read after `read_declarations` has accepted the file, so the shape is the
+    one checked above; anything it would have refused never reaches here.
+    """
+    return frozenset(entry["function"]["name"] for entry in parsed)
 
 
 def entry_count(parsed: Any) -> int | None:

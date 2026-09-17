@@ -820,7 +820,10 @@ def deliverable(tmp_path):
     model = tmp_path / "model.litertlm"
     model.write_bytes(b"weights")
     declarations = tmp_path / "tools.json"
-    declarations.write_text(json.dumps([{"name": "change_background_color"}]), encoding="utf-8")
+    declarations.write_text(
+        json.dumps([{"type": "function", "function": {"name": "change_background_color"}}]),
+        encoding="utf-8",
+    )
     return model, declarations
 
 

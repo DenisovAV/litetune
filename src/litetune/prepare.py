@@ -50,6 +50,7 @@ from typing import Any, Protocol
 
 from litetune import envs
 from litetune.checks import Check, CheckSet, Outcome, guard
+from litetune.declarations import read_declarations, tool_names
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.liveness import SkippedCheck
@@ -162,6 +163,31 @@ class Row:
             # split is a row nobody can go and look at.
             "source_line": self.lineno,
         }
+
+
+def refuse_undeclared_tools(rows: Sequence[Row], data: Path, declarations: Path) -> None:
+    """Refuse a row whose target calls a tool the declarations do not offer.
+
+    Raised rather than recorded, which is this stage's exception to its own rule
+    that a fact about the data belongs in the report rather than in an
+    exception. A row teaching a call the prompt never offers is not a fact to
+    carry forward: it cannot be trained honestly, on the same ground `read_rows`
+    refuses a row with no supervised span. The model would learn to call
+    something no runtime will have declared to it, and the loss curve would look
+    exactly like a run that worked.
+
+    Only a structured target is checked. A row that supplies its own completion
+    text is the caller saying what to train, and litetune does not parse it back
+    to second-guess which tool it names.
+    """
+    offered = tool_names(read_declarations(declarations)[0])
+    for row in rows:
+        if isinstance(row.target, ToolCall) and row.target.name not in offered:
+            raise PrepareError(
+                f"{data}:{row.lineno}: the target calls {row.target.name!r}, which "
+                f"{declarations} does not declare. It offers "
+                f"{', '.join(sorted(offered)) if offered else 'no tools at all'}"
+            )
 
 
 def read_rows(path: Path) -> list[Row]:
@@ -886,6 +912,11 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     events.stage_started("prepare", data=str(request.data), seed=request.seed)
 
     rows = read_rows(request.data)
+    # Before anything is profiled or split: a row calling a tool the prompt will
+    # never offer is a row that cannot be trained, and saying so after a split
+    # has been written means the caller re-runs the stage to learn it.
+    if request.declarations is not None:
+        refuse_undeclared_tools(rows, request.data, request.declarations)
     content_sha256 = hash_file(request.data)
     result = PrepareResult(
         request=request,

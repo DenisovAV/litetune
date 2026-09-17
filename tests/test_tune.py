@@ -1373,7 +1373,7 @@ def test_the_real_script_records_the_declarations_in_both_files(request_for, stu
     from litetune.storage import hash_file
 
     decls = tmp_path / "declarations.json"
-    decls.write_text('[{"name": "send_email"}]', encoding="utf-8")
+    decls.write_text('[{"type": "function", "function": {"name": "send_email"}}]', encoding="utf-8")
     digest = hash_file(decls)
 
     request = request_for(declarations=decls)
@@ -1595,7 +1595,10 @@ def test_prepare_feeds_tune_feeds_bundle(trainer, tmp_path):
     assert tuned.model_dir is not None
 
     declarations = tmp_path / "tools.json"
-    declarations.write_text(json.dumps([{"name": "change_background_color"}]), encoding="utf-8")
+    declarations.write_text(
+        json.dumps([{"type": "function", "function": {"name": "change_background_color"}}]),
+        encoding="utf-8",
+    )
 
     bundled = build_bundle(
         BundleRequest(
@@ -1785,7 +1788,7 @@ def test_the_digest_is_the_results_and_the_file_is_the_requests(trainer, request
     from litetune.storage import hash_file
 
     decls = tmp_path / "declarations.json"
-    decls.write_text('[{"name": "set_timer"}]', encoding="utf-8")
+    decls.write_text('[{"type": "function", "function": {"name": "set_timer"}}]', encoding="utf-8")
 
     record = run_tune(request_for(declarations=decls)).as_dict()
 

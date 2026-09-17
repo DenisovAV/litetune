@@ -64,9 +64,34 @@ def declarations(tmp_path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
+            # The OpenAI function object the runtime requires: it refuses a tool
+            # whose description has no `['function']['name']` before it renders
+            # anything, and the reference chat template reads the same keys.
             [
-                {"name": "change_background_color", "parameters": {"color": "string"}},
-                {"name": "open_app", "parameters": {"app": "string"}},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "change_background_color",
+                        "description": "Changes the app background colour",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"color": {"type": "string"}},
+                            "required": ["color"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "open_app",
+                        "description": "Opens an app by name",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"app": {"type": "string"}},
+                            "required": ["app"],
+                        },
+                    },
+                },
             ]
         ),
         encoding="utf-8",

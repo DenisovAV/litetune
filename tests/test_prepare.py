@@ -113,6 +113,76 @@ def request_for(tmp_path):
     return _build
 
 
+def _declarations(tmp_path: Path, *names: str) -> Path:
+    """The OpenAI function objects the runtime requires, for `names`."""
+    path = tmp_path / "declarations.json"
+    path.write_text(
+        json.dumps([{"type": "function", "function": {"name": name}} for name in names]),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_row_calling_an_undeclared_tool_is_refused_by_name(tmp_path, write_jsonl, request_for):
+    """Training it would teach a call the prompt never offers.
+
+    The model would learn to ask for a tool no runtime declares to it, and
+    nothing downstream would say so: the loss curve of such a run looks exactly
+    like one that worked, and the failure only appears when an application gets
+    a call it has no handler for.
+    """
+    data = write_jsonl(rows(3, tool="open_app") + rows(1, tool="send_email", start=3))
+    declarations = _declarations(tmp_path, "open_app")
+
+    with pytest.raises(PrepareError) as caught:
+        prepare(request_for(data, declarations=declarations))
+
+    message = str(caught.value)
+    # The fourth record is the fourth line, and the row carries its line number
+    # precisely so it can be found in the file it came from.
+    assert f"{data}:4" in message
+    assert "'send_email'" in message
+    assert "It offers open_app" in message
+    assert not (tmp_path / "prepared" / "train.jsonl").exists()
+
+
+def test_a_split_whose_calls_are_all_declared_is_prepared(tmp_path, write_jsonl, request_for):
+    data = write_jsonl(rows(6, tool="open_app"))
+    declarations = _declarations(tmp_path, "open_app", "set_timer")
+
+    result = prepare(request_for(data, declarations=declarations))
+
+    assert result.n_rows == 6
+    assert result.train is not None
+
+
+def test_without_declarations_nothing_about_tools_is_checked(tmp_path, write_jsonl, request_for):
+    """The flag is additive: every split that prepared before declarations were
+    an input prepares the same way now."""
+    data = write_jsonl(rows(3, tool="open_app") + rows(1, tool="send_email", start=3))
+
+    result = prepare(request_for(data))
+
+    assert result.n_rows == 4
+
+
+def test_a_row_that_brings_its_own_completion_is_not_second_guessed(
+    tmp_path, write_jsonl, request_for
+):
+    """Only a structured target is checked. A caller who wrote the completion
+    text said what to train, and litetune does not parse it back to work out
+    which tool it names -- it would be guessing at a string it did not render.
+    """
+    data = write_jsonl(
+        [{"prompt": "call it", "completion": "call:send_email{to:<escape>x<escape>}"}] * 4
+    )
+    declarations = _declarations(tmp_path, "open_app")
+
+    result = prepare(request_for(data, declarations=declarations))
+
+    assert result.n_rows == 4
+
+
 def heldout_lines(result) -> set[int]:
     return {
         json.loads(line)["source_line"]
