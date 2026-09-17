@@ -625,7 +625,7 @@ def test_each_type_is_rendered_the_way_the_runtime_writes_it():
 
     assert render_call(call) == (
         "<start_function_call>"
-        "call:set{who:<escape>ann<escape>,n:3,ratio:0.5,on:true,off:false,gone:null}"
+        "call:set{gone:null,n:3,off:false,on:true,ratio:0.5,who:<escape>ann<escape>}"
         "<end_function_call>"
     )
 
@@ -934,3 +934,19 @@ def test_prerendered_calls_prepare_without_declarations_because_the_prompt_carri
     result = prepare(request_for(write_jsonl(rows_), base_model=FUNCTIONGEMMA))
 
     assert result.n_rows == 40
+
+
+def test_the_arguments_are_written_in_the_order_the_declarations_are_sorted_into():
+    """The runtime's grammar enforces the declared property order, and
+    `declarations.py` sorts the declarations. Measured 2026-09-17: a model
+    trained in the dataset's own argument order lost an argument on 112 of 640
+    rows under the grammar -- `send_email` came back as `subject, to`, never
+    with `body`, because `body` sorts first and the model wrote it last.
+    """
+    call = ToolCall(name="send_email", args={"to": "a@b.c", "subject": "hi", "body": "text"})
+
+    assert render_call(call) == (
+        "<start_function_call>call:send_email{"
+        "body:<escape>text<escape>,subject:<escape>hi<escape>,to:<escape>a@b.c<escape>"
+        "}<end_function_call>"
+    )

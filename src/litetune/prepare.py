@@ -178,8 +178,20 @@ def render_call(call: ToolCall) -> str:
     bundle whose tool path did work wrote them. What follows the closing marker
     is not written here: it depends on who reads the reply, and `tune` asks the
     chat template for it.
+
+    **The arguments are sorted, because the runtime's grammar enforces the order
+    the declarations list.** `declarations.py` sorts every mapping in the file,
+    so the declared property order is alphabetical; sorting here makes the order
+    the model is trained to write the same one. Measured 2026-09-17 on
+    FunctionGemma x mobile-actions, n=640: trained in the dataset's own argument
+    order, the model wrote `to, subject, body`, and with the runtime's grammar
+    on it emitted `subject, to` and never `body` -- an argument out of declared
+    order is not merely discouraged, it is illegal, and the call closes without
+    it. 112 of 640 rows lost an argument that way, 0.9172 falling to 0.7422. A
+    probe over 20 of them: declared `to, subject, body`, the grammar kept `body`
+    on 20 of 20; declared alphabetically, on 0 of 20.
     """
-    body = ",".join(_render_argument(key, call.raw[key]) for key in call.args)
+    body = ",".join(_render_argument(key, call.raw[key]) for key in sorted(call.args))
     return f"{START_CALL}call:{call.name}{{{body}}}{END_CALL}"
 
 
