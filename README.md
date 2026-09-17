@@ -151,7 +151,8 @@ what it cannot score: malformed JSON, and rows with no `prompt`. Given
 `--tokenizer` it also reports the token-length distribution, so a row too long
 for the sequence limit fails before you rent a GPU rather than after.
 
-The held-out half is never trained on. Scoring a model on rows it was fitted to
+The held-out rows — a fifth of the file by default, `--heldout-fraction` or
+`--heldout-size` to change it — are never trained on. Scoring a model on rows it was fitted to
 measures memorisation rather than whether it answers new inputs. The split is
 derived from the file's content hash, so re-running `prepare` puts the same rows
 on the same side.
@@ -170,12 +171,13 @@ single `run` would hide which one you are in.
 litetune prepare --data raw.jsonl --output-dir data --context-length 1024 \
                  --tokenizer google/functiongemma-270m-it
 
-# 2. Fine-tune. Runs on CUDA if the box has one, otherwise CPU; size your
-#    expectations accordingly either way. The prompt mode is read off the
-#    prompts (these carry FunctionGemma's control tokens, so prerendered) and
-#    recorded beside the checkpoint, where steps 4 and 5 take it from.
+# 2. Fine-tune. Runs on CUDA if the box has one, otherwise CPU. Declare the
+#    prompt mode rather than leave it to be read off the prompts: these carry
+#    FunctionGemma's control tokens, so prerendered. It is recorded beside the
+#    checkpoint, where steps 4 and 5 take it from. On a CPU add --dtype float32:
+#    bfloat16 runs single-threaded there (see the flag table below).
 litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
-              --output-dir tuned --method lora
+              --output-dir tuned --method lora --prompt-mode prerendered
 
 # 3. Convert, sweeping recipes rather than trusting a default.
 litetune convert --model tuned/model --output-dir artifacts \
@@ -183,6 +185,8 @@ litetune convert --model tuned/model --output-dir artifacts \
 
 # 4. Measure what the conversion cost, against the float twin.
 #    `convert` names the artifact; look the filename up rather than build it.
+#    The prompt mode is read from the record step 2 left beside tuned/model,
+#    and a --prompt-mode that disagrees with it is refused.
 litetune verify --model artifacts/weight_only_wi8_afp32/<name>.litertlm \
                 --reference tuned/model --data data/heldout.jsonl \
                 --json > manifest.json
@@ -246,7 +250,62 @@ those numbers do not establish.
 | `--dtype` | Training precision for `tune`. Default `bfloat16`. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records the banking77 runs' dtype — bfloat16, trained on a GPU where this flag's reason does not apply — and says nothing about the headline table's, so the report records yours. |
 | `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused: they resolve to different weights on different days while the bundle reads identically. |
 | `--scorer` | What counts as correct, on `verify`. `tool-call` (default) or `exact-text`. It has to match the shape of your targets; nothing else in the pipeline changes. The manifest records which one ran, because two manifests scored differently are not comparable. |
-| `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. See [MEASUREMENTS.md](MEASUREMENTS.md). |
+| `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. It applies to prompts your application renders. When the runtime renders the declarations, litetune settles the order itself — see [Tool calling through the runtime](#tool-calling-through-the-runtime). See [MEASUREMENTS.md](MEASUREMENTS.md). |
+
+### Tool calling through the runtime
+
+The walkthrough above renders the declarations into every prompt itself. The
+other way is to let the runtime do it: bare prompts, and the declarations passed
+as a file to `create_conversation(tools=...)`. Then they are an input to every
+stage, not only to `bundle`:
+
+```bash
+litetune prepare --data raw.jsonl --output-dir data --context-length 1024 \
+                 --tokenizer google/functiongemma-270m-it \
+                 --base-model google/functiongemma-270m-it --declarations tools.json
+
+litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
+              --output-dir tuned --method lora \
+              --prompt-mode runtime_rendered --declarations tools.json
+
+# convert as in step 3, then:
+litetune verify --model artifacts/<recipe>/<name>.litertlm \
+                --reference tuned/model --data data/heldout.jsonl \
+                --declarations tools.json --json > manifest.json
+```
+
+`tools.json` is a list of OpenAI function objects, the shape `bundle` takes.
+
+**The order of its keys is settled for you.** The runtime prints a declaration's
+keys in the order it is given; FunctionGemma's own chat template sorts them. So
+litetune sorts the file when it reads it, and the training prompt and the
+runtime then render the same tokens — the rendering check compares them on every
+`verify`. It refuses the shapes the two still render differently: `nullable`, a
+property with no `description`, a property named `description`, `type`,
+`properties`, `required` or `nullable`, an `enum` on a non-string, an empty
+collection, and a type outside the seven lowercase JSON Schema names. Two of
+those are capability you give up — `nullable` and a reserved property name; the
+rest you fix by writing the field. The disagreement is Google's:
+[LiteRT-LM#3638](https://github.com/google-ai-edge/LiteRT-LM/issues/3638).
+
+**A call is trained the way the runtime writes one**: strings between
+`<escape>` markers, numbers, booleans and null bare —
+`call:set_alarm{label:<escape>wake<escape>,hour:7}`.
+
+**`verify` picks the path from the model, not from a flag.** With declarations
+and a family whose runtime renders them, it asks the runtime for a structured
+call instead of reading text, twice: with the runtime's constrained decoding on,
+which is what an application gets, and off, which is the only evidence the model
+learned the format rather than being held to it. A gap between the two is
+reported. A generation the runtime's parser refuses is counted apart from wrong
+answers, and both sides are scored over the rows it could read.
+
+**What it refuses.** Structured targets in `runtime_rendered` without
+`--declarations`: their descriptions and types are your application's contract
+and cannot be read off the targets. And a structured target for a family whose
+call format litetune has not measured: supply each row's `completion` instead.
+`prepare` without `--base-model` still renders FunctionGemma's format, and the
+report says that it assumed it.
 
 ---
 

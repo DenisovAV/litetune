@@ -39,6 +39,14 @@ declaration properties. On this dataset the two orders disagree for **100% of
 rows**, so one bundle presents two different prompts depending on which path a
 consumer takes.
 
+**Which path this applies to.** Everything in this section is about prompts an
+application renders itself — `prerendered`, the path these runs took. Through
+the runtime's tool path the runtime renders the declarations from JSON before
+any template runs, so neither order in the table below is what it sends there.
+On that path litetune sorts the declarations file when it reads it, and the
+rendering check found the training prompt and the runtime's identical by token
+ids — three of three prompts, on a two-property tool.
+
 Which order the weights prefer was argued rather than measured until it was
 measured. Same greedy decode, same parser, one variable:
 
