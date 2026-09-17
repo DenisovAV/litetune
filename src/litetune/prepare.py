@@ -127,9 +127,34 @@ def render_call(call: ToolCall) -> str:
     The inverse of `metrics.parse_call`, and it has to stay one: the completion
     a model is trained to emit must be byte-identical to the string the scorer
     will parse, or training and measurement are working from different targets.
+
+    **Values are typed on the wire.** A string is delimited by `<escape>`; a
+    number, a boolean and a null are written bare. That is the runtime's own
+    shape, and its goldens say so directly: `function_gemma_data_processor_test`
+    carries `call:get_weather{location:<escape>Paris<escape>}` beside
+    `call:tool_name{x:1}`, and the same rule holds in a tool response, where
+    `temperature:20` sits next to `unit:<escape>C<escape>`. Escaping everything,
+    which this did until the format was read, teaches the model to send a number
+    as a string.
     """
-    body = ",".join(f"{key}:<escape>{value}<escape>" for key, value in call.args.items())
+    body = ",".join(_render_argument(key, call.raw[key]) for key in call.args)
     return f"call:{call.name}{{{body}}}"
+
+
+def _render_argument(key: str, value: Any) -> str:
+    """One `key:value` pair. Raises `ValueError` for a value with no known shape."""
+    if isinstance(value, str):
+        return f"{key}:<escape>{value}<escape>"
+    if value is None or isinstance(value, int | float):
+        # `json.dumps` spells all four the way the wire format does -- `3`,
+        # `0.5`, `true`, `null` -- where `str` would write `True` and `None`.
+        # A bool is an int, so it takes this branch too.
+        return f"{key}:{json.dumps(value)}"
+    raise ValueError(
+        f"the argument {key!r} is a {type(value).__name__}, and nothing in this project "
+        "establishes what the runtime's call parser accepts for a list or an object. Supply the "
+        "row's 'completion' text instead, which is taken as written"
+    )
 
 
 @dataclass(frozen=True)
@@ -223,7 +248,10 @@ def read_rows(path: Path) -> list[Row]:
         if completion is None and target is not None:
             # A string target is already the text to supervise; a call has to be
             # rendered into the wire format the model is trained to emit.
-            completion = render_call(target) if isinstance(target, ToolCall) else target
+            try:
+                completion = render_call(target) if isinstance(target, ToolCall) else target
+            except ValueError as exc:
+                raise PrepareError(f"{path}:{lineno}: {exc}") from exc
         if not isinstance(completion, str) or not completion.strip():
             raise PrepareError(
                 f"{path}:{lineno}: no supervised span. A row needs a 'completion' string or a "

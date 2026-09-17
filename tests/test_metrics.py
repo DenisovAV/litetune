@@ -34,10 +34,83 @@ def test_parses_a_single_call():
     assert call == ToolCall("change_background_color", {"color": "red"})
 
 
+def test_a_targets_types_survive_beside_the_flattened_arguments():
+    """The comparison is untyped and stays untyped; rendering is not.
+
+    `args` is what scoring reads and it is still strings. `raw` is what the
+    renderer reads, because the runtime's parser distinguishes a bare `3` from
+    an escaped one and a target flattened to `"3"` cannot say which it was.
+    """
+    call = ToolCall.from_target(
+        {"name": "set", "args": {"n": 3, "ratio": 0.5, "on": True, "who": "ann", "gone": None}}
+    )
+
+    assert call is not None
+    assert call.args == {"n": "3", "ratio": "0.5", "on": "true", "who": "ann", "gone": "null"}
+    assert call.raw == {"n": 3, "ratio": 0.5, "on": True, "who": "ann", "gone": None}
+
+
+def test_the_types_are_out_of_the_comparison():
+    """Every number this project has published was produced by comparing `args`.
+
+    A `raw` that took part in equality would silently re-score all of them, so
+    two calls that agree on the flattened arguments agree, whatever they carry
+    beside them.
+    """
+    typed = ToolCall("set", {"n": 3})
+    from_wire = ToolCall("set", {"n": "3"})
+
+    assert typed == from_wire
+    assert typed.raw != from_wire.raw
+    assert "raw" not in repr(typed)
+    assert typed.as_dict() == {"name": "set", "args": {"n": "3"}}
+
+
 def test_parses_multiple_arguments():
     call = parse_call("call:set{a:<escape>1<escape>,b:<escape>two<escape>}")
     assert call is not None
     assert call.args == {"a": "1", "b": "two"}
+
+
+def test_parses_a_bare_scalar_the_way_the_runtime_writes_it():
+    call = parse_call("call:set{n:3,ratio:0.5,on:true,off:false,gone:null}")
+
+    assert call is not None
+    # Scoring stays untyped: the flattened view is what it compares.
+    assert call.args == {"n": "3", "ratio": "0.5", "on": "true", "off": "false", "gone": "null"}
+    assert call.raw == {"n": 3, "ratio": 0.5, "on": True, "off": False, "gone": None}
+
+
+def test_parses_a_generation_mixing_both_forms():
+    """The untuned base writes bare and every checkpoint trained before the
+    format was measured writes escaped, so a comparison spans both -- sometimes
+    inside one call."""
+    call = parse_call("call:set{who:<escape>ann<escape>,n:3,label:<escape>7<escape>}")
+
+    assert call is not None
+    assert call.args == {"who": "ann", "n": "3", "label": "7"}
+    assert call.raw == {"who": "ann", "n": 3, "label": "7"}
+
+
+def test_an_escaped_number_still_parses_and_still_compares_equal():
+    """What an old checkpoint emits has to keep scoring against a typed target.
+
+    The comparison was untyped before this change and stays untyped, so a run
+    measured last month and one measured today are the same measurement.
+    """
+    old = parse_call("call:set{n:<escape>3<escape>}")
+    new = parse_call("call:set{n:3}")
+
+    assert old == new == ToolCall("set", {"n": 3})
+    assert old is not None and new is not None
+    assert old.raw == {"n": "3"}
+    assert new.raw == {"n": 3}
+
+
+def test_a_value_that_is_neither_escaped_nor_a_scalar_is_not_a_call():
+    """A bare word is not a shape either renderer produces, and reading it as
+    one would turn a malformed generation into a confident wrong answer."""
+    assert parse_call("call:set{colour:red}") is None
 
 
 def test_parses_a_call_with_no_arguments():

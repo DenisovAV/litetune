@@ -17,10 +17,11 @@ real when the interval covers it, and says so in words the report can print.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 # 95% two-sided normal quantile.
@@ -31,18 +32,25 @@ Z95 = 1.959963985
 # The wire format
 # ---------------------------------------------------------------------------
 #
-# FunctionGemma emits `call:NAME{key:<escape>value<escape>,...}`. Values are
-# delimited by a literal `<escape>` marker rather than quoted, so a value may
-# contain commas and braces; the parser below therefore scans argument pairs
-# instead of splitting the body on punctuation. `<escape>` is part of the
-# format, not a leaked special token -- see liveness.py, where flagging it would
-# fail every correct output.
+# FunctionGemma emits `call:NAME{key:value,...}`, and a value comes in two
+# shapes. A string is delimited by a literal `<escape>` marker rather than
+# quoted, so it may contain commas and braces; the parser below therefore scans
+# argument pairs instead of splitting the body on punctuation. `<escape>` is
+# part of the format, not a leaked special token -- see liveness.py, where
+# flagging it would fail every correct output. A number, a boolean and a null
+# are written bare, which is what the runtime returned when its tool path was
+# measured on 2026-09-16 (`1234.0` for a numeric argument, `"red"` for a string).
+#
+# Both are accepted, because the comparison has to span the change: every
+# checkpoint this project trained before the format was measured emits the
+# escaped form for everything, and the untuned base emits the bare one. A parser
+# that took only the new shape would fail to read both ends of the very
+# comparison it exists to make.
 
 _HEAD_RE = re.compile(r"call:\s*(?P<name>[A-Za-z_][A-Za-z0-9_.\-]*)\s*\{")
-_ARG_RE = re.compile(
-    r"\s*(?P<key>[A-Za-z_][A-Za-z0-9_.\-]*)\s*:\s*<escape>(?P<value>.*?)<escape>\s*",
-    re.DOTALL,
-)
+_KEY = r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]*)\s*:\s*"
+_ESCAPED_RE = re.compile(rf"\s*{_KEY}<escape>(?P<value>.*?)<escape>\s*", re.DOTALL)
+_BARE_RE = re.compile(rf"\s*{_KEY}(?P<value>true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*")
 _CLOSE_RE = re.compile(r"\s*\}")
 
 
@@ -64,16 +72,31 @@ def _stringify(value: Any) -> str:
 
 @dataclass(frozen=True)
 class ToolCall:
-    """One parsed call. `args` values are always strings; see `_stringify`."""
+    """One parsed call. `args` values are always strings; see `_stringify`.
+
+    `raw` carries the same arguments before `_stringify` flattened them, because
+    the wire format is typed where the comparison is not: the runtime's parser
+    reads a bare `3` as a number and an escaped one as a string, so rendering a
+    target back has to know which it was. Scoring never reads it -- it is out of
+    equality and out of `repr`, so every number this project has published stays
+    the number it was -- and nothing here makes the comparison type-aware. That
+    is deliberate and was paid for by earlier measurements.
+    """
 
     name: str
     args: dict[str, str]
+    raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         # Normalise on construction so that equality means "same answer"
         # regardless of which side of the comparison a value came from.
         object.__setattr__(self, "name", self.name.strip())
-        object.__setattr__(self, "args", {str(k): _stringify(v) for k, v in self.args.items()})
+        original = dict(self.args)
+        object.__setattr__(self, "args", {str(k): _stringify(v) for k, v in original.items()})
+        # A caller that knows the types states them; everyone else gets what
+        # they passed, which for a target read from JSON is already typed.
+        if not self.raw:
+            object.__setattr__(self, "raw", {str(k): v for k, v in original.items()})
 
     @classmethod
     def from_target(cls, obj: Any) -> ToolCall | None:
@@ -123,16 +146,25 @@ def parse_call(text: str) -> ToolCall | None:
     if head is None:
         return None
     pos = head.end()
-    args: dict[str, str] = {}
+    values: dict[str, Any] = {}
     while True:
         if _CLOSE_RE.match(text, pos) is not None:
-            return ToolCall(name=head.group("name"), args=args)
-        arg = _ARG_RE.match(text, pos)
-        if arg is None:
-            # A body that starts but never closes cleanly is not half a call.
-            return None
-        args[arg.group("key")] = arg.group("value")
-        pos = arg.end()
+            # `values` is typed; the constructor flattens it into `args`, which
+            # is what scoring compares, and keeps it as `raw`, which is what a
+            # renderer reads. So a rendered target and a parsed generation are
+            # the same round trip.
+            return ToolCall(name=head.group("name"), args=values)
+        escaped = _ESCAPED_RE.match(text, pos)
+        if escaped is not None:
+            values[escaped.group("key")] = escaped.group("value")
+            pos = escaped.end()
+        else:
+            bare = _BARE_RE.match(text, pos)
+            if bare is None:
+                # A body that starts but never closes cleanly is not half a call.
+                return None
+            values[bare.group("key")] = json.loads(bare.group("value"))
+            pos = bare.end()
         if text[pos : pos + 1] == ",":
             pos += 1
 

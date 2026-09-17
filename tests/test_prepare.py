@@ -34,6 +34,7 @@ from litetune.prepare import (
     is_extractive,
     prepare,
     profile_arguments,
+    read_rows,
     render_call,
     split_rows,
     split_seed,
@@ -604,6 +605,43 @@ def test_a_rendered_completion_parses_back_to_its_own_target():
     # Training must emit exactly what the scorer will parse, or the two are
     # working from different targets.
     assert parse_call(rendered) == call
+
+
+def test_each_type_is_rendered_the_way_the_runtime_writes_it():
+    """The exact trained completion, byte for byte.
+
+    A string is delimited by `<escape>`; a number, a boolean and a null are
+    bare. Measured through the runtime's own tool path on 2026-09-16, where a
+    numeric argument came back as `1234.0` and a string one as `"red"`.
+    """
+    call = ToolCall(
+        name="set",
+        args={"who": "ann", "n": 3, "ratio": 0.5, "on": True, "off": False, "gone": None},
+    )
+
+    assert render_call(call) == (
+        "call:set{who:<escape>ann<escape>,n:3,ratio:0.5,on:true,off:false,gone:null}"
+    )
+
+
+def test_a_value_with_no_measured_shape_is_refused_by_row(write_jsonl, request_for):
+    """A list or an object has no established spelling in a call.
+
+    Nothing in this project says what the runtime's parser accepts for one, and
+    guessing would teach the model a format nobody has seen the runtime read.
+    The row names the way through, which is the path `read_rows` already
+    prefers: supply the completion text.
+    """
+    data = write_jsonl(
+        [{"prompt": "tag it", "target": {"name": "tag", "args": {"labels": ["a", "b"]}}}]
+    )
+
+    with pytest.raises(PrepareError) as caught:
+        read_rows(data)
+
+    assert ":1:" in str(caught.value)
+    assert "'labels' is a list" in str(caught.value)
+    assert "'completion'" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
