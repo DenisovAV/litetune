@@ -123,9 +123,31 @@ def _check(parsed: Any, path: Path) -> None:
 
 
 # The seven names the runtime's formatter uppercases. It leaves anything else
-# alone while the reference template uppercases whatever it is given, so a type
-# outside this set -- or one already capitalised -- renders two different ways.
+# alone while the reference template uppercases whatever it is given. So a
+# lowercase name agrees -- the formatter uppercases it -- and so does the same
+# name already in capitals, which neither side changes; any other spelling,
+# `String` among them, renders two ways. Measured 2026-09-17, the capitals on
+# google/mobile-actions' own declarations, which write `OBJECT` and `STRING`. The
+# first version of this refused capitals too, and with them every tool in that
+# dataset that takes an argument.
 _TYPES = ("array", "boolean", "integer", "null", "number", "object", "string")
+
+# Said wherever a refusal tells the caller to remove something. This file is the
+# declarations the application sends, and a key dropped here and left in the
+# application reaches the runtime as it was.
+_ALSO_IN_THE_APP = (
+    "drop the key here and in the declarations your application sends, which should be this file"
+)
+
+
+def _type_name(kind: Any) -> str | None:
+    """The lowercase type name, or `None` for a spelling the two render differently."""
+    if not isinstance(kind, str):
+        return None
+    if kind in _TYPES or (kind.isupper() and kind.lower() in _TYPES):
+        return kind.lower()
+    return None
+
 
 # The five words the reference template treats as structural. A property named
 # one of them is skipped by its `standard_keys` guard and vanishes from the
@@ -167,14 +189,14 @@ def _check_parameters(parameters: Any, where: str) -> None:
     if not isinstance(parameters, dict) or not parameters:
         raise DeclarationsError(
             f"{where} is empty. The reference template omits an empty parameters object and the "
-            "runtime prints `parameters:{}`; drop the key instead"
+            f"runtime prints `parameters:{{}}`; {_ALSO_IN_THE_APP}"
         )
     _refuse_extra_keys(set(parameters), {"type", "properties", "required"}, where)
     for key in ("type", "properties", "required"):
         if key in parameters and not parameters[key]:
             raise DeclarationsError(
                 f"{where} has an empty {key}. The reference template omits it and the runtime "
-                "prints it empty; drop the key instead"
+                f"prints it empty; {_ALSO_IN_THE_APP}"
             )
     if "properties" in parameters:
         if not isinstance(parameters["properties"], dict):
@@ -199,15 +221,17 @@ def _check_properties(properties: dict[str, Any], where: str) -> None:
                 "property whether or not there is one, so it would write an empty "
                 "<escape><escape> where the runtime writes nothing"
             )
-        kind = prop.get("type")
-        if kind not in _TYPES:
+        written = prop.get("type")
+        kind = _type_name(written)
+        if kind is None:
             raise DeclarationsError(
-                f"{here} has type {kind!r}. The runtime's formatter uppercases only "
-                f"{', '.join(_TYPES)} and leaves anything else as written, while the reference "
-                "template uppercases whatever it is given"
+                f"{here} has type {written!r}. The runtime's formatter uppercases only the "
+                f"lowercase names {', '.join(_TYPES)} and leaves anything else as written, while "
+                "the reference template uppercases whatever it is given -- so a lowercase name, "
+                "or the same name in capitals, renders one way and any other spelling renders two"
             )
         _refuse_extra_keys(
-            set(prop), {"description", "type", *_RENDERABLE.get(kind, ())}, here, kind=kind
+            set(prop), {"description", "type", *_RENDERABLE.get(kind, ())}, here, kind=written
         )
         if kind == "object":
             # Not optional the way the others are: the template renders
@@ -223,7 +247,7 @@ def _check_properties(properties: dict[str, Any], where: str) -> None:
             if key in prop and not prop[key]:
                 raise DeclarationsError(
                     f"{here} has an empty {key}. The reference template omits it and the runtime "
-                    "prints it empty; drop the key instead"
+                    f"prints it empty; {_ALSO_IN_THE_APP}"
                 )
         if kind == "array" and "items" in prop:
             _check_items(prop["items"], f"{here}.items")
@@ -236,13 +260,15 @@ def _check_items(items: Any, where: str) -> None:
             "only when they are one, and the runtime renders whatever is there"
         )
     _refuse_extra_keys(set(items), {"type", "description", "properties", "required"}, where)
-    if "type" in items and items["type"] not in _TYPES:
+    if "type" in items and _type_name(items["type"]) is None:
         raise DeclarationsError(
-            f"{where} has type {items['type']!r}. The reference template uppercases a list of "
-            "types and escapes it as one; the runtime's formatter leaves a non-string type alone"
+            f"{where} has type {items['type']!r}. Only a lowercase type name or the same name in "
+            "capitals renders one way: the reference template uppercases whatever it is given, "
+            "including a list of types, and the runtime's formatter uppercases only the lowercase "
+            "names"
         )
     if "required" in items and not items["required"]:
-        raise DeclarationsError(f"{where} has an empty required; drop the key instead")
+        raise DeclarationsError(f"{where} has an empty required; {_ALSO_IN_THE_APP}")
     if "properties" in items:
         if not isinstance(items["properties"], dict) or not items["properties"]:
             raise DeclarationsError(f"{where}: properties is not a non-empty object")

@@ -295,3 +295,101 @@ def test_the_subset_is_not_tighter_than_the_two_renderers_agree_on(tmp_path):
     parsed, _ = read_declarations(_write(tmp_path, payload))
 
     assert tool_names(parsed) == frozenset({"t"})
+
+
+# google/mobile-actions, the one real dataset this project trains FunctionGemma
+# from, verbatim: its declarations write types in capitals and give a tool with
+# no arguments an empty `properties`.
+MOBILE_ACTIONS_CALENDAR = {
+    "function": {
+        "name": "create_calendar_event",
+        "description": "Creates a new calendar event.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "title": {"type": "STRING", "description": "The title of the event."},
+                "datetime": {
+                    "type": "STRING",
+                    "description": "The date and time of the event in the format "
+                    "YYYY-MM-DDTHH:MM:SS.",
+                },
+            },
+            "required": ["title", "datetime"],
+        },
+    }
+}
+
+
+def test_a_type_name_in_capitals_is_accepted(tmp_path):
+    """Neither renderer changes a capitalised name, so it renders one way.
+
+    Measured on this exact declaration against a bundle and the published
+    template: identical. The first version of the type rule refused it, and with
+    it every tool in mobile-actions that takes an argument.
+    """
+    payload = [
+        MOBILE_ACTIONS_CALENDAR,
+        {
+            "function": {
+                "name": "tag",
+                "description": "d",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "xs": {"type": "ARRAY", "description": "x", "items": {"type": "STRING"}}
+                    },
+                },
+            }
+        },
+    ]
+
+    parsed, _ = read_declarations(_write(tmp_path, payload))
+
+    assert tool_names(parsed) == frozenset({"create_calendar_event", "tag"})
+
+
+@pytest.mark.parametrize("spelling", ["String", "sTRING", "text"])
+def test_any_other_spelling_of_a_type_is_still_refused(tmp_path, spelling):
+    """The runtime uppercases only the lowercase names; the template uppercases
+    anything. So `String` becomes `STRING` on one side and stays `String` on the
+    other -- measured."""
+    payload = [
+        {
+            "function": {
+                "name": "t",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"x": {"type": spelling, "description": "d"}},
+                },
+            }
+        }
+    ]
+
+    with pytest.raises(DeclarationsError, match=f"has type '{spelling}'"):
+        read_declarations(_write(tmp_path, payload))
+
+
+def test_an_empty_properties_says_to_drop_it_in_the_application_too(tmp_path):
+    """mobile-actions writes `"properties": {}` for a tool with no arguments.
+
+    That one really does render two ways -- the runtime prints `properties:{}`
+    and the template omits it, measured -- and dropping the key makes them agree,
+    also measured. But the runtime at serving time renders whatever the
+    application sends, so a key dropped only in this file comes back.
+    """
+    no_args = {
+        "function": {
+            "name": "turn_off_flashlight",
+            "description": "Turns the flashlight off.",
+            "parameters": {"type": "OBJECT", "properties": {}},
+        }
+    }
+
+    with pytest.raises(DeclarationsError) as caught:
+        read_declarations(_write(tmp_path, [no_args]))
+    assert "declarations your application sends" in str(caught.value)
+
+    del no_args["function"]["parameters"]["properties"]
+    parsed, _ = read_declarations(_write(tmp_path, [no_args]))
+    assert tool_names(parsed) == frozenset({"turn_off_flashlight"})

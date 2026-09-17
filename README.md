@@ -283,9 +283,12 @@ runtime then render the same tokens — the rendering check compares them on eve
 `verify`. It refuses the shapes the two still render differently: `nullable`, a
 property with no `description`, a property named `description`, `type`,
 `properties`, `required` or `nullable`, an `enum` on a non-string, an empty
-collection, and a type outside the seven lowercase JSON Schema names. Two of
-those are capability you give up — `nullable` and a reserved property name; the
-rest you fix by writing the field. The disagreement is Google's:
+collection, and a type written other than as one of the seven JSON Schema names
+in lowercase or in capitals. Two of those are capability you give up — `nullable`
+and a reserved property name; the rest you fix by writing the file differently,
+and whatever you remove, remove from what your application sends too: the
+runtime renders what it is given. `google/mobile-actions` meets one of them
+itself — its tools with no arguments carry `"properties": {}`. The disagreement is Google's:
 [LiteRT-LM#3638](https://github.com/google-ai-edge/LiteRT-LM/issues/3638).
 
 **A call is trained the way the runtime writes one**: strings between
