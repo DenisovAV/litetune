@@ -233,6 +233,11 @@ TOOL_PATH_NOT_CHOSEN = {
 }
 
 
+SUPPLIED_BACKENDS = (
+    "the caller supplied its own backends, so the measurement path was not selected by this run"
+)
+
+
 def _tool_path_reason(request: VerifyRequest, declarations: list | None) -> tuple[bool, str]:
     """Whether to measure through the tool path, and the sentence the manifest carries.
 
@@ -793,6 +798,16 @@ def run_verify(
         run.limitation(text)
 
     pair = backends or build_backends(request, declarations)
+    # Which path the candidate is measured through, and why. From what actually
+    # runs rather than from the rule alone: a caller that supplies its own
+    # backends has chosen the path itself, and a manifest that named the rule's
+    # answer instead would describe a run that did not happen.
+    chosen, why = _tool_path_reason(request, declarations)
+    ran = pair.candidate.scores_structurally
+    run.manifest["harness"]["tool_path_selection"] = {
+        "tool_path": ran,
+        "why": why if ran == chosen else SUPPLIED_BACKENDS,
+    }
 
     # -- do both sides put the same prompt tokens in front of the model? ---
     # Before any generation: a candidate and a reference that were shown

@@ -489,3 +489,49 @@ def test_a_family_or_a_mode_with_no_tool_path_stays_on_the_text_path(tmp_path, r
     )
 
     assert not isinstance(build_backends(request, declarations=DECLS).candidate, ToolPathBackend)
+
+
+def test_the_manifest_says_which_path_ran_and_why(tmp_path):
+    """The spec's own words: `verify` records that it measured through the tool
+    path and why. An earlier version computed the reason and discarded it, while
+    the task record claimed the manifest carried it."""
+    rows_ = labelled_rows(8)
+    split = tmp_path / "heldout.jsonl"
+    split.write_text("\n".join(json.dumps(r) for r in rows_) + "\n", encoding="utf-8")
+    decls = tmp_path / "tools.json"
+    decls.write_text(json.dumps(DECLS), encoding="utf-8")
+    candidate = ToolPathBackend(
+        model=tmp_path / "m.litertlm",
+        declarations=DECLS,
+        env=CannedEnv(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)}),
+    )
+    request = VerifyRequest(
+        model=tmp_path / "m.litertlm",
+        reference=FUNCTIONGEMMA,
+        data=split,
+        prompt_mode=PromptMode.RUNTIME_RENDERED,
+        declarations=decls,
+    )
+    reference = FakeBackend(
+        model=FUNCTIONGEMMA, texts=correct_texts(rows_), prompt_mode=PromptMode.RUNTIME_RENDERED
+    )
+
+    result = run_verify(request, backends=BackendPair(candidate=candidate, reference=reference))
+
+    selection = result.manifest["harness"]["tool_path_selection"]
+    assert selection["tool_path"] is True
+    assert "functiongemma" in selection["why"] and "Nothing asked for it" in selection["why"]
+
+
+def test_supplied_backends_are_not_described_as_selected(tmp_path):
+    """A test or a caller that hands `run_verify` its own candidate chose the
+    path. Naming the rule's answer instead would describe a run that did not
+    happen: here the rule says text path, and a tool path ran."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path, rows_, {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)}
+    )
+
+    selection = result.manifest["harness"]["tool_path_selection"]
+    assert selection["tool_path"] is True
+    assert "supplied its own backends" in selection["why"]
