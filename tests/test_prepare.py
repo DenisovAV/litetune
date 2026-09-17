@@ -903,3 +903,28 @@ def test_prepare_splits_a_text_task_and_says_the_profile_does_not_apply(tmp_path
     first = json.loads((tmp_path / "out" / "train.jsonl").read_text().splitlines()[0])
     assert first["completion"] in {"red", "blue"}
     assert first["target"] == first["completion"]
+
+
+def test_prerendered_calls_prepare_without_declarations_because_the_prompt_carries_them(
+    write_jsonl, request_for
+):
+    """In `prerendered` the application rendered the declarations into the
+    prompt already, so there is nothing for `--declarations` to add. The first
+    version of this refusal asked only the family, which refused the README's
+    own walkthrough."""
+    decl = (
+        "<start_of_turn>developer\n<start_function_declaration>declaration:set_colour"
+        "{description:<escape>d<escape>}<end_function_declaration>\n<end_of_turn>\n"
+    )
+    rows_ = [
+        {
+            "prompt": f"{decl}<start_of_turn>user\nmake it red {i}<end_of_turn>\n"
+            "<start_of_turn>model\n",
+            "target": {"name": "set_colour", "args": {"colour": "red"}},
+        }
+        for i in range(40)
+    ]
+
+    result = prepare(request_for(write_jsonl(rows_), base_model=FUNCTIONGEMMA))
+
+    assert result.n_rows == 40

@@ -61,6 +61,7 @@ from litetune.models import (
     renders_declarations_for,
     wire_format_for,
 )
+from litetune.prompt_mode import PromptMode, prompt_evidence
 from litetune.spec import DEFAULT_MIN_HELDOUT_EXAMPLES
 from litetune.storage import hash_file
 
@@ -231,9 +232,19 @@ def refuse_calls_without_declarations(rows: Sequence[Row], base_model: str) -> N
     invented schemas trains the model on something no caller sends. So the
     automatic behaviour is a refusal naming the flag, the treatment
     `--prompt-mode` already gets.
+
+    Only for bare prompts. Prompts that already carry control tokens were
+    rendered by the application, declarations included -- flutter_gemma does
+    that for FunctionGemma -- so nothing is missing from them. This stage has no
+    mode of its own, so it asks `prompt_evidence`, the classification `tune` and
+    `verify` already share, rather than a heuristic of its own; a split whose
+    prompts disagree is left to `tune`, which refuses it unless a mode is
+    declared.
     """
     renders, reason = renders_declarations_for(base_model)
     if not renders:
+        return
+    if prompt_evidence([row.prompt for row in rows]).mode is not PromptMode.RUNTIME_RENDERED:
         return
     for row in rows:
         if isinstance(row.target, ToolCall):

@@ -1648,8 +1648,6 @@ def test_prepare_feeds_tune_feeds_bundle(trainer, tmp_path):
             output_dir=tmp_path / "prepared",
             context_length=1024,
             tokens=WordCounter(),
-            declarations=declarations,
-            base_model="google/functiongemma-270m-it",
         )
     )
     assert prepared.outcome is Outcome.PASSED
@@ -1661,9 +1659,12 @@ def test_prepare_feeds_tune_feeds_bundle(trainer, tmp_path):
             output_dir=tmp_path / "tuned",
             method="lora",
             prompt_mode=PromptMode.PRERENDERED,
-            declarations=declarations,
         )
     )
+    # No --declarations, as in the README: these prompts were rendered by the
+    # application and carry the declarations already. An earlier version of the
+    # declarations refusal failed here, and this test was briefly changed to pass
+    # them instead of the refusal being fixed.
     assert tuned.outcome is Outcome.PASSED
     assert tuned.model_dir is not None
 
@@ -2601,6 +2602,46 @@ def test_that_refusal_does_not_fire_on_a_family_with_no_tool_channel(tmp_path, r
     result = run_tune(
         request_for(model="Qwen/Qwen3-0.6B", data=data, prompt_mode=PromptMode.RUNTIME_RENDERED)
     )
+
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert not any("--declarations" in c.detail for c in failed)
+
+
+def test_prerendered_calls_train_without_declarations_because_the_prompt_carries_them(
+    tmp_path, request_for
+):
+    """The refusal is about the runtime rendering the declarations. In
+    `prerendered` the application has already rendered them into the prompt --
+    flutter_gemma does this for FunctionGemma in Dart -- so the prompt is the
+    declaration and `--declarations` has nothing to add. Refusing here refused
+    the README's own walkthrough, and the first version of this refusal did."""
+    decl = (
+        "<start_of_turn>developer\n<start_function_declaration>declaration:change_background_color"
+        "{description:<escape>d<escape>}<end_function_declaration>\n<end_of_turn>\n"
+    )
+    data = tmp_path / "prerendered.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "prompt": f"{decl}<start_of_turn>user\nswatch{i}<end_of_turn>\n"
+                    "<start_of_turn>model\n",
+                    "completion": (
+                        f"call:change_background_color{{color:<escape>swatch{i}<escape>}}"
+                    ),
+                    "target": {
+                        "name": "change_background_color",
+                        "args": {"color": f"swatch{i}"},
+                    },
+                }
+            )
+            + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_tune(request_for(data=data, prompt_mode=PromptMode.PRERENDERED))
 
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
     assert not any("--declarations" in c.detail for c in failed)

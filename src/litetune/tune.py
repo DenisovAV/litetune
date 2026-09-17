@@ -66,14 +66,22 @@ PROMPT_MODE_CHECK = "prompt mode"
 DECLARATIONS_CHECK = "tool declarations"
 
 
-def _refuse_calls_without_declarations(request: TuneRequest) -> Check | None:
+def _refuse_calls_without_declarations(request: TuneRequest, mode: PromptMode) -> Check | None:
     """A structured target for a declaration-rendering family, with none supplied.
 
     `prepare` refuses the same thing, and this is not a duplicate: a split
     written by hand reaches `tune` without passing through that stage, and the
     defect it prevents -- training an answer to a prompt 730 characters shorter
     than the one the runtime sends -- is invisible in a loss curve.
+
+    Only in `runtime_rendered`, because only there does the runtime render the
+    declarations. In `prerendered` the application has already put them into
+    the prompt -- flutter_gemma does that for FunctionGemma -- so the prompt is
+    the declaration and there is nothing missing. The first version of this
+    asked only the family, and refused the README's own walkthrough.
     """
+    if mode is not PromptMode.RUNTIME_RENDERED:
+        return None
     renders, reason = renders_declarations_for(request.model)
     if not renders:
         return None
@@ -1349,7 +1357,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         # carries them. Refused here as well as in `prepare`, because a
         # hand-written split reaches this stage without passing through that
         # one, and by the time the loss curve is available it looks fine.
-        undeclared = _refuse_calls_without_declarations(request)
+        undeclared = _refuse_calls_without_declarations(request, decision.mode)
         if undeclared is not None:
             result.checks.add(undeclared)
             events.check(undeclared)
