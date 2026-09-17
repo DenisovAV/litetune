@@ -389,7 +389,7 @@ def test_the_score_is_the_call_the_runtime_returned(tmp_path):
 
     assert result.status in (Status.PASSED, Status.FAILED_GATE, Status.INCONCLUSIVE)
     assert result.manifest["quality"]["candidate"]["exact_match"]["value"] == pytest.approx(0.75)
-    assert result.manifest["tool_path"]["constrained"]["score"]["n"] == 8
+    assert result.manifest["tool_path"]["modes"]["constrained"]["score"]["n"] == 8
 
 
 def test_both_decoding_modes_are_reported(tmp_path):
@@ -398,7 +398,7 @@ def test_both_decoding_modes_are_reported(tmp_path):
         tmp_path, rows_, {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 4)}
     )
 
-    path = result.manifest["tool_path"]
+    path = result.manifest["tool_path"]["modes"]
     assert path["constrained"]["score"]["exact_match"]["value"] == pytest.approx(1.0)
     assert path["unconstrained"]["score"]["exact_match"]["value"] == pytest.approx(0.5)
 
@@ -430,7 +430,7 @@ def test_a_refusal_is_counted_and_kept_out_of_the_score(tmp_path):
     both = _rows(rows_, hits=6, refusals=2)
     result = _verify(tmp_path, rows_, {"constrained": both, "unconstrained": both})
 
-    path = result.manifest["tool_path"]
+    path = result.manifest["tool_path"]["modes"]
     assert path["constrained"]["refused_by_the_runtime"] == 2
     # Six correct out of the six the runtime could read, not out of eight.
     assert path["constrained"]["score"]["n"] == 6
@@ -535,3 +535,77 @@ def test_supplied_backends_are_not_described_as_selected(tmp_path):
     selection = result.manifest["harness"]["tool_path_selection"]
     assert selection["tool_path"] is True
     assert "supplied its own backends" in selection["why"]
+
+
+def test_the_device_is_named_in_the_vocabulary_verify_reads(tmp_path):
+    """`verify` reads the candidate's device from `engine` and `backend`. The
+    script opens the engine on `Backend.CPU()`, and a real run's manifest has to
+    say so rather than naming the path where the device belongs."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path, rows_, {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)}
+    )
+
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert (engine["engine"], engine["backend"]) == ("litert-lm", "cpu")
+    assert any(
+        "measured on the cpu backend of litert-lm" in limitation
+        for limitation in result.manifest["limitations"]
+    )
+
+
+def test_the_conversion_cost_is_measured_with_the_grammar_off_like_the_reference(tmp_path):
+    """The attribution a real run got wrong.
+
+    FunctionGemma x mobile-actions at n=640: reference 0.9234, tool path with
+    the grammar off 0.9172, with it on 0.7422. Compared with the grammar-on
+    number, the manifest reported a resolved conversion cost of 0.1812 that was
+    almost entirely the grammar. The reference generates with no grammar, so
+    the conversion cost is measured against the grammar-off run, and what the
+    grammar does is its own paired difference.
+    """
+    rows_ = labelled_rows(40)
+    result = _verify(
+        tmp_path, rows_, {"constrained": _rows(rows_, 20), "unconstrained": _rows(rows_, 40)}
+    )
+
+    cost = result.manifest["attribution"]["conversion_cost"]
+    assert cost["value"] == pytest.approx(0.0)
+    path = result.manifest["tool_path"]
+    assert path["compared_with_reference"] == "unconstrained"
+    assert path["application_score"]["value"] == pytest.approx(0.5)
+    assert path["grammar_effect"]["value"] == pytest.approx(0.5)
+    assert path["grammar_effect"]["resolved"] is True
+
+
+def test_a_row_refused_in_either_mode_is_out_of_every_score(tmp_path):
+    """Keeping out different rows per mode would unpair the grammar's effect and
+    the comparison with the reference at once."""
+    rows_ = labelled_rows(8)
+    constrained = _rows(rows_, hits=6, refusals=2)
+    unconstrained = _rows(rows_, hits=8)
+
+    result = _verify(tmp_path, rows_, {"constrained": constrained, "unconstrained": unconstrained})
+
+    modes = result.manifest["tool_path"]["modes"]
+    assert modes["constrained"]["score"]["n"] == modes["unconstrained"]["score"]["n"] == 6
+    assert modes["constrained"]["refused_by_the_runtime"] == 2
+    assert modes["unconstrained"]["refused_by_the_runtime"] == 0
+    assert result.manifest["quality"]["reference"]["n"] == 6
+
+
+def test_a_row_refused_only_with_the_grammar_off_is_out_of_every_score_too(tmp_path):
+    """The mirror case. A mutant that kept out only the grammar-on refusals
+    passed the test above, because it refused only in that mode."""
+    rows_ = labelled_rows(8)
+
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"constrained": _rows(rows_, hits=8), "unconstrained": _rows(rows_, hits=6, refusals=2)},
+    )
+
+    modes = result.manifest["tool_path"]["modes"]
+    assert modes["constrained"]["score"]["n"] == modes["unconstrained"]["score"]["n"] == 6
+    assert modes["unconstrained"]["refused_by_the_runtime"] == 2
+    assert any("grammar off" in limitation for limitation in result.manifest["limitations"])

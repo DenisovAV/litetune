@@ -76,6 +76,7 @@ from litetune.metrics import (
     carries_reasoning,
     paired_difference,
     reasoning_unclosed,
+    score_parsed,
     strip_reasoning,
     terminators_trimmed,
 )
@@ -88,7 +89,7 @@ from litetune.prompt_mode import (
     resolve_prompt_mode,
 )
 from litetune.rendering import RENDERING_CHECK, RenderingObserver, RenderingProbe
-from litetune.toolpath import DISAGREEING_MODES, ToolPathBackend, score_rows
+from litetune.toolpath import DISAGREEING_MODES, ToolPathBackend, as_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -330,58 +331,86 @@ def _score_tool_path(
     indices: list[int],
     run: Any,
 ) -> tuple[QualityMetrics, dict[str, Any], list[int], list]:
-    """The candidate's score from the calls the runtime returned, and both modes.
+    """Both decoding modes, scored over the rows the runtime read in both.
 
-    The constrained run is what an application gets and is therefore the score.
-    The unconstrained run is the only evidence that the model learned the format
-    rather than being held to it by the grammar -- the colab-tuned demo model
-    answers cleanly with the grammar on and is refused with it off -- so it is
-    measured, reported, and raised as a limitation when the two disagree.
+    Three numbers come out of a tool-path run and they answer three questions,
+    so none of them stands in for another.
 
-    Neither number is derived from the other and neither stands in for it.
+    - **Compared with the reference: grammar off.** The float reference is
+      `transformers` generating greedily with no grammar, so the conversion cost
+      is measured against the tool path with the runtime's grammar off too.
+      Measured 2026-09-17 on FunctionGemma x mobile-actions at n=640: reference
+      0.9234, grammar off 0.9172, grammar on 0.7422. The first version compared
+      the reference with the grammar-on number and reported a *resolved*
+      conversion cost of 0.1812 that was almost entirely the grammar.
+    - **What an application gets: grammar on**, which is the runtime's default
+      whenever tools are passed. Reported as that, under its own name.
+    - **What the grammar does: the paired difference between the two**, over the
+      same rows. Its own quantity with its own interval, because one number
+      cannot separate two effects.
+
+    Rows the runtime refused in either mode are counted and kept out of every
+    score: a model whose output the parser rejected failed differently from one
+    that called the wrong tool. Keeping out the same rows everywhere is what
+    keeps all three comparisons paired.
     """
     assert isinstance(backend, ToolPathBackend)
-    reported: dict[str, Any] = {}
-    scores: dict[str, float] = {}
-    for mode, rows in backend.rows.items():
-        metrics_, refused = score_rows(targets, [rows[i] for i in indices])
-        reported[mode] = {"score": metrics_.as_dict(), "refused_by_the_runtime": refused}
-        if isinstance(metrics_, QualityMetrics):
-            scores[mode] = metrics_.exact_match.value
-        if mode == "constrained":
-            constrained = metrics_
-            constrained_refused = refused
-    if isinstance(constrained, Unavailable):
-        raise ValueError(constrained.reason)
-    # The rows the runtime could read, and their targets. The reference is
-    # scored over exactly these: the comparison is paired, and a candidate
-    # scored on six rows against a reference scored on eight is not a
-    # comparison at all.
-    constrained_rows = backend.rows["constrained"]
-    scored_over = len(indices)
+    rows = backend.rows
+    if set(rows) != {"constrained", "unconstrained"}:
+        raise ValueError(f"the tool path reported modes {sorted(rows)}, not both")
+    refused = {mode: sum(1 for i in indices if rows[mode][i].refused) for mode in rows}
     kept = [
         (i, target)
         for i, target in zip(indices, targets, strict=True)
-        if not constrained_rows[i].refused
+        if not rows["constrained"][i].refused and not rows["unconstrained"][i].refused
     ]
+    if not kept:
+        raise ValueError(
+            f"the runtime refused a generation on every one of the {len(indices)} rows in at "
+            "least one decoding mode, so there is nothing to score"
+        )
+    scored_over = len(indices)
     indices = [i for i, _ in kept]
     targets = [target for _, target in kept]
-    if constrained_refused:
-        run.limitation(
-            f"the runtime refused {constrained_refused} of {scored_over} generations with the "
-            "grammar on: those rows are counted here and kept out of the score, because a model "
-            "whose output the parser rejected failed differently from one that called the wrong "
-            "tool and an average over both describes neither"
-        )
-    if len(scores) == 2 and scores["constrained"] != scores["unconstrained"]:
+    scored = {
+        mode: score_parsed(targets, [as_tool_call(rows[mode][i].call) for i in indices])
+        for mode in rows
+    }
+    grammar = paired_difference(scored["unconstrained"].correct, scored["constrained"].correct)
+    reported: dict[str, Any] = {
+        "modes": {
+            mode: {"score": scored[mode].as_dict(), "refused_by_the_runtime": refused[mode]}
+            for mode in rows
+        },
+        "compared_with_reference": "unconstrained",
+        "compared_with_reference_because": (
+            "the reference generates with no grammar, so the conversion cost is measured against "
+            "the runtime with its grammar off as well"
+        ),
+        "application_score": scored["constrained"].exact_match.as_dict(),
+        "grammar_effect": grammar.as_dict()
+        | {"sign": "positive means the runtime's grammar lowers the score"},
+    }
+    for mode, count in refused.items():
+        if count:
+            state = "on" if mode == "constrained" else "off"
+            run.limitation(
+                f"the runtime refused {count} of {scored_over} generations with the grammar "
+                f"{state}: those rows are counted here and kept out of every score, because a "
+                "model whose output the parser rejected failed differently from one that called "
+                "the wrong tool and an average over both describes neither"
+            )
+    if scored["constrained"].exact_match.value != scored["unconstrained"].exact_match.value:
         run.limitation(
             DISAGREEING_MODES.format(
-                constrained=scores["constrained"],
-                unconstrained=scores["unconstrained"],
-                n=constrained.n,
+                constrained=scored["constrained"].exact_match.value,
+                unconstrained=scored["unconstrained"].exact_match.value,
+                n=len(indices),
             )
+            + f" The conversion cost here is measured with the grammar off; what the grammar "
+            f"does is reported apart, as {grammar.detail}."
         )
-    return constrained, reported, indices, targets
+    return scored["unconstrained"], reported, indices, targets
 
 
 def _candidate_backend(request: VerifyRequest, declarations: list | None) -> GenerationBackend:

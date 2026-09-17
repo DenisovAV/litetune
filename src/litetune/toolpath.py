@@ -48,7 +48,7 @@ from litetune import envs
 from litetune.evaluate import GREEDY, DecodeConfig, Generation
 from litetune.events import EventStream
 from litetune.exits import read_returncode
-from litetune.metrics import QualityMetrics, ToolCall, Unavailable, score_parsed
+from litetune.metrics import ToolCall
 from litetune.prompt_mode import PromptMode
 
 logger = logging.getLogger(__name__)
@@ -298,32 +298,6 @@ def as_tool_call(call: dict[str, Any] | None) -> ToolCall | None:
     return ToolCall(name=call["name"], args=dict(call.get("arguments") or {}))
 
 
-def score_rows(
-    targets: Sequence[ToolCall], rows: Sequence[ToolPathRow]
-) -> tuple[QualityMetrics | Unavailable, int]:
-    """Score the rows the runtime could read, and count the ones it refused.
-
-    A refusal is the runtime rejecting the model's output, and it is kept out of
-    the score rather than counted as a wrong answer. Those are different
-    failures -- one model called the wrong tool, the other wrote something no
-    application could read -- and an average over both describes neither. The
-    count travels beside the score so nobody reads the number without it.
-    """
-    kept = [(t, r) for t, r in zip(targets, rows, strict=True) if not r.refused]
-    refused = len(rows) - len(kept)
-    if not kept:
-        return (
-            Unavailable(
-                f"the runtime refused all {refused} generations, so there was nothing to score"
-            ),
-            refused,
-        )
-    return (
-        score_parsed([t for t, _ in kept], [as_tool_call(r.call) for _, r in kept]),
-        refused,
-    )
-
-
 DISAGREEING_MODES = (
     "the two decoding modes did not agree: {constrained:.4f} with the runtime's grammar on and "
     "{unconstrained:.4f} with it off, over {n} scored rows. The constrained number is what an "
@@ -389,7 +363,15 @@ class ToolPathBackend:
 
     def describe(self) -> dict[str, Any]:
         return {
-            "backend": self.name,
+            # The same keys and vocabulary `LiteRtLmBackend` uses, because
+            # `verify` reads the device from them: the first version put this
+            # backend's name under `backend`, and a real run's manifest then
+            # said the candidate was measured on "litert-lm tool path
+            # (unknown)" instead of on the CPU the script asks for.
+            "engine": "litert-lm",
+            "backend": "cpu",
+            "backend_vocabulary": "litert-lm Python API Backend",
+            "path": "tool path",
             "model": self.model_ref,
             "env": self.env.name,
             "declarations": len(self.declarations),
