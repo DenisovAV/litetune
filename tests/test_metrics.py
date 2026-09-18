@@ -285,8 +285,23 @@ START, END = "<start_function_call>", "<end_function_call>"
         (f"{START}call:f{{a:1}} and more{END}", None),
         (f"{START}not a call{END}call:f{{a:1}}", None),
         (f"{START}call:f{{a:1}}{END}{START}call:g{{a:}}{END}", None),  # one block fails all
-        (f"{START}call:f{{a:[1]}}{END}", None),  # an array: not read here
         (f"{START}call:true{{}}{END}", None),  # `true` is not a name
+        # Found in review: the grammar takes an array and an object as a value.
+        (f"{START}call:f{{a:[1,<escape>x<escape>]}}{END}", [ToolCall("f", {"a": [1, "x"]})]),
+        (
+            f"{START}call:f{{a:{{b:true,c:null}}}}{END}",
+            [ToolCall("f", {"a": {"b": True, "c": None}})],
+        ),
+        # And a character no lexer rule matches is skipped, not refused.
+        (f"{START}call:f{{a:1}};{END}", [ToolCall("f", {"a": 1})]),
+        (f"{START}call:f{{a:5.}}{END}", [ToolCall("f", {"a": 5})]),
+        (f"{START}call:(f){{}}{END}", [ToolCall("f", {})]),
+        (f"{START}call:f{{a:\x0b1}}{END}", [ToolCall("f", {"a": 1})]),
+        (f"{START}call:f{{a:1e400}}{END}", [ToolCall("f", {"a": None})]),  # json! of inf
+        (f"{START}call:f{{a:e5}}{END}", None),  # lexes, and Rust cannot parse it
+        (f"{START}call:f{{a:1.5e3}}{END}", None),  # fraction and exponent never together
+        (f"{START}call:f{{call:1}}{END}", None),  # `call` is not a key
+        (f"{START} {END}", None),  # a block that is not empty is a call or nothing
     ],
 )
 def test_a_reply_is_read_as_the_runtime_reads_it(text, calls):
@@ -295,6 +310,17 @@ def test_a_reply_is_read_as_the_runtime_reads_it(text, calls):
     tune's check read the first call anywhere, and five shapes that the
     runtime reads differently were scored or trained as the call."""
     assert runtime_calls(text) == calls
+
+
+def test_the_runtime_reads_every_number_as_a_double():
+    """`fc_parser.rs` parses a `NUMBER` with `text.parse::<f64>()`, so an integer
+    past 2**53 reaches an application as the nearest double -- and a target of
+    its exact digits is not what it is handed."""
+    (call,) = runtime_calls(f"{START}call:f{{n:9007199254740993,m:7}}{END}")
+
+    assert call.raw == {"n": 9007199254740992.0, "m": 7.0}
+    assert [type(v) for v in call.raw.values()] == [float, float]
+    assert call != ToolCall("f", {"n": 9007199254740993, "m": 7})
 
 
 def test_a_number_past_pythons_digit_limit_is_read_as_the_runtime_reads_it():

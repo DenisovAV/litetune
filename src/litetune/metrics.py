@@ -61,13 +61,14 @@ Z95 = 1.959963985
 #
 # Two readers are built on these tokens. `parse_call` is the scorer's on the
 # text path: it reads the first call anywhere in a generation and ignores what
-# follows, which is what every published text-path number was scored with.
-# `runtime_calls` is the runtime's reading of a reply, for everything held to
-# the tool path: only between the call markers, and each block one whole call.
-# Neither reads an array or an object as a value, which the runtime's grammar
-# accepts; `prepare` refuses to train one, so only a completion a split gives
-# can carry it. Inside a call, both refuse a character the lexer has no rule
-# for; what the runtime's lexer does with one is not established here.
+# follows, reads no array or object as a value, and refuses a character no rule
+# of the lexer matches -- which is what every published text-path number was
+# scored with. `runtime_calls` is the runtime's reading of a reply, for
+# everything held to the tool path: only between the call markers, each block
+# one whole call, by the lexer's own rules -- arrays and objects included, a
+# character no rule matches skipped as antlr4rust's lexer skips it, and every
+# number a double. A third comparison, `comparable_form`, is the text path's
+# for two decoders' outputs; see there.
 
 IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_.\-]*"
 # Words matching IDENTIFIER that the lexer reads as something else, because the
@@ -111,15 +112,18 @@ def _strip_escape_tokens(text: str) -> str:
 
 
 def _bare_value(text: str) -> Any:
-    """The value of a token `_BARE_RE` matched. Cannot raise: the regex is the grammar."""
+    """The value of a token `_BARE_RE` matched, for `parse_call`. Cannot raise.
+
+    An integer stays exact, as the text path always read it; `runtime_calls`
+    reads every number as the double the runtime hands over.
+    """
     if text in ("true", "false", "null"):
         return json.loads(text)
     if re.fullmatch(_INTEGER, text):
         try:
             return int(text)
         except ValueError:
-            # Past Python's limit on the digits `int` reads from text. The
-            # runtime reads it as a double, and so does this.
+            # Past Python's limit on the digits `int` reads from text.
             return float(text)
     return float(text)
 
@@ -348,26 +352,147 @@ def _read_arguments(text: str, pos: int) -> tuple[dict[str, Any], int] | None:
         pos = comma.end()
 
 
-# One block between the markers, whole: `start : functionCall EOF` with
-# `functionCall : CALL COLON ID object?`, whitespace skipped between tokens.
-_WHOLE_HEAD_RE = re.compile(rf"\s*call\s*:\s*(?P<name>{IDENTIFIER})\s*")
+# The runtime's lexer (`AntlrFcLexer.g4`), rule by rule in the order it declares
+# them. At each position the longest match wins and a tie goes to the rule
+# declared first; `WS` is skipped; and a character no rule matches is skipped
+# too, because antlr4rust's lexer reports it and recovers by consuming it. The
+# fragments: `INT : '0' | [1-9][0-9]*`, `FRAC : '.' [0-9]+`,
+# `EXP : [eE] [+-]? [0-9]+`, and `ESCAPED_STRING` ends at the first escape of
+# any spelling.
+_LEXER_RULES = (
+    ("{", re.compile(r"\{")),
+    ("}", re.compile(r"\}")),
+    ("[", re.compile(r"\[")),
+    ("]", re.compile(r"\]")),
+    (",", re.compile(",")),
+    (":", re.compile(":")),
+    ("ESCAPE", re.compile(_ESCAPE)),
+    ("BOOLEAN", re.compile("true|false")),
+    ("NULL", re.compile("null")),
+    (
+        "NUMBER",
+        re.compile(
+            r"-?(?:(?:0|[1-9][0-9]*)(?:\.[0-9]+|[eE][+-]?[0-9]+)?|\.[0-9]+|[eE][+-]?[0-9]+)"
+        ),
+    ),
+    ("STRING", re.compile(rf"{_ESCAPE}.*?{_ESCAPE}", re.DOTALL)),
+    ("CALL", re.compile("call")),
+    ("ID", re.compile(IDENTIFIER)),
+    ("WS", re.compile(r"[ \t\n\r]+")),
+)
+
+
+def _runtime_tokens(block: str) -> list[tuple[str, str]]:
+    """`block` as the runtime's lexer reads it: (rule, text), `WS` and unmatched characters gone."""
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    while pos < len(block):
+        best: tuple[str, str] | None = None
+        for rule, pattern in _LEXER_RULES:
+            match = pattern.match(block, pos)
+            if match is not None and match.end() > pos:
+                if best is None or len(match.group()) > len(best[1]):
+                    best = (rule, match.group())
+        if best is None:
+            pos += 1
+            continue
+        pos += len(best[1])
+        if best[0] != "WS":
+            tokens.append(best)
+    return tokens
+
+
+class _NotACall(Exception):
+    """The block is not `start : functionCall EOF`, or a value the runtime cannot read."""
+
+
+class _CallReader:
+    """`AntlrFcParser.g4` over `_runtime_tokens`, with `fc_parser.rs`'s values.
+
+    Bails on the first error, as the runtime's `BailErrorStrategy` does. A
+    string loses `<escape>` and `<|"|>` at its ends and keeps `<ctrl46>`; a
+    number is a double, `null` where it is not finite (`json!` of an infinite
+    `f64`), and a failure where Rust cannot parse it (`e5`); an object keeps
+    the first of two equal keys.
+    """
+
+    def __init__(self, tokens: list[tuple[str, str]]):
+        self.tokens = tokens
+        self.pos = 0
+
+    def take(self, rule: str) -> str:
+        if self.pos >= len(self.tokens) or self.tokens[self.pos][0] != rule:
+            raise _NotACall
+        self.pos += 1
+        return self.tokens[self.pos - 1][1]
+
+    def peek(self) -> str | None:
+        return self.tokens[self.pos][0] if self.pos < len(self.tokens) else None
+
+    def call(self) -> ToolCall:
+        self.take("CALL")
+        self.take(":")
+        name = self.take("ID")
+        arguments = self.object() if self.peek() == "{" else {}
+        if self.peek() is not None:
+            raise _NotACall
+        return ToolCall(name=name, args=arguments)
+
+    def object(self) -> dict[str, Any]:
+        self.take("{")
+        values: dict[str, Any] = {}
+        if self.peek() != "}":
+            while True:
+                key = self.take("ID")
+                self.take(":")
+                values.setdefault(key, self.value())
+                if self.peek() != ",":
+                    break
+                self.take(",")
+        self.take("}")
+        return values
+
+    def array(self) -> list[Any]:
+        self.take("[")
+        items: list[Any] = []
+        if self.peek() != "]":
+            while True:
+                items.append(self.value())
+                if self.peek() != ",":
+                    break
+                self.take(",")
+        self.take("]")
+        return items
+
+    def value(self) -> Any:
+        rule = self.peek()
+        if rule == "{":
+            return self.object()
+        if rule == "[":
+            return self.array()
+        if rule == "STRING":
+            return _strip_escape_tokens(self.take("STRING"))
+        if rule == "BOOLEAN":
+            return self.take("BOOLEAN") == "true"
+        if rule == "NULL":
+            self.take("NULL")
+            return None
+        if rule == "NUMBER":
+            text = self.take("NUMBER")
+            if not re.search(r"[0-9]", re.split("[eE]", text)[0]):
+                # `'-'? EXP` lexes, and `text.parse::<f64>()` refuses it.
+                raise _NotACall
+            number = float(text)
+            return number if math.isfinite(number) else None
+        raise _NotACall
 
 
 def _whole_call(block: str) -> ToolCall | None:
-    """`block` as exactly one call and nothing else, or `None`."""
-    head = _WHOLE_HEAD_RE.match(block)
-    if head is None or not readable_name(head.group("name")):
+    """`block` as exactly one call and nothing else, as the runtime reads it, or `None`."""
+    try:
+        return _CallReader(_runtime_tokens(block)).call()
+    except _NotACall:
         return None
-    values: dict[str, Any] = {}
-    pos = head.end()
-    if block.startswith("{", pos):
-        body = _read_arguments(block, pos + 1)
-        if body is None:
-            return None
-        values, pos = body
-    if block[pos:].strip(" \t\n\r"):
-        return None
-    return ToolCall(name=head.group("name"), args=values)
 
 
 def runtime_calls(text: str) -> list[ToolCall] | None:
@@ -377,10 +502,10 @@ def runtime_calls(text: str) -> list[ToolCall] | None:
     <end_function_call>` from the reply until it no longer matches: what comes
     before each pair is text, an empty pair is skipped, and a start marker with
     no end after it is text like the rest. Each block between a pair has to be
-    one whole call; one that is not fails the whole reply, because
-    `return_error_on_parse_failure` is on unless the caller turns it off. So a
-    call outside the markers is text, two calls in one pair are no reply, and
-    two pairs are two calls.
+    one whole call (`_whole_call`); one that is not fails the whole reply,
+    because `return_error_on_parse_failure` is on unless the caller turns it
+    off. So a call outside the markers is text, two calls in one pair are no
+    reply, and two pairs are two calls.
     """
     calls: list[ToolCall] = []
     pos = 0
