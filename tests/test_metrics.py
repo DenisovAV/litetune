@@ -219,6 +219,7 @@ def test_a_key_given_twice_keeps_its_first_value():
         (None, "null", True),
         ([1, 2], [1.0, 2.0], True),  # every number in a list comes back a double too
         (["3", 2], [3.0, 2], True),  # and item by item, as a value on its own
+        ({"a": "3"}, {"a": 3}, True),  # an object too, key by key
         ("1.0", "1", False),  # two strings stay two strings
         (7.5, 7, False),
         ("007", 7, False),  # not a number the lexer reads
@@ -302,6 +303,10 @@ START, END = "<start_function_call>", "<end_function_call>"
         (f"{START}call:f{{a:1.5e3}}{END}", None),  # fraction and exponent never together
         (f"{START}call:f{{call:1}}{END}", None),  # `call` is not a key
         (f"{START} {END}", None),  # a block that is not empty is a call or nothing
+        (f"{START}call:f{{}}\r{END}", [ToolCall("f", {})]),  # `\r` is the lexer's whitespace
+        # The first end marker closes the block the first start marker opened,
+        # and a second start marker inside it is not a call's start.
+        (f"{START}call:f{{}} {START}call:g{{}}{END}", None),
     ],
 )
 def test_a_reply_is_read_as_the_runtime_reads_it(text, calls):
@@ -953,3 +958,9 @@ def test_only_reasoning_that_opened_and_never_closed_counts_as_unclosed():
     # An opening marker after the answer did not open the generation's reasoning.
     assert not reasoning_unclosed("label_3 <think>")
     assert not reasoning_unclosed("<think>done</think>label_3")
+
+
+def test_equal_calls_hash_alike():
+    """A number the runtime hands back as a double is the integer it equals,
+    and a set of the two holds one call."""
+    assert len({ToolCall("f", {"x": 7}), ToolCall("f", {"x": 7.0})}) == 1

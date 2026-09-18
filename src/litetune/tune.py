@@ -271,8 +271,6 @@ def _refuse_calls_the_runtime_would_not_read(
             )
         elif calls is None:
             why = "the runtime would give no reply: a block between its markers is not one call"
-        if calls is None:
-            why = "the runtime would give no reply: a block between its markers is not one call"
         elif not calls:
             why = (
                 "the runtime reads no call in it: it reads one only between the call markers -- "

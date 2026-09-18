@@ -3278,6 +3278,8 @@ def test_a_row_with_no_completion_is_refused_before_anything_is_provisioned(
         json.dumps({"prompt": _rendered("q"), "completion": "a", "target": "a"})
         + "\n"
         + json.dumps({"prompt": _rendered("r"), "target": "b"})
+        + "\n"
+        + json.dumps({"prompt": _rendered("s"), "target": "c"})
         + "\n",
         encoding="utf-8",
     )
@@ -3286,7 +3288,9 @@ def test_a_row_with_no_completion_is_refused_before_anything_is_provisioned(
 
     (refused,) = [c for c in result.checks.checks if c.name == COMPLETIONS_CHECK]
     assert refused.outcome is Outcome.FAILED
+    # The first such row, and how many there are.
     assert f"{data}:2" in refused.detail and "Run prepare" in refused.detail
+    assert "2 row(s) like it" in refused.detail
     assert trainer.configs == []
     assert result.model_dir is None
 
@@ -3482,3 +3486,60 @@ def test_tune_records_the_digest_its_prompt_mode_compares(tmp_path, request_for,
     )
     assert result.declarations_sha256 == expected
     assert read_declarations(declarations)[1] != hash_file(declarations)
+
+
+def test_text_rows_for_a_checkpoint_whose_config_names_two_families_train(
+    tmp_path, request_for, trainer
+):
+    """The refusal is about marked calls; a split with none has nothing it
+    could get wrong."""
+    ckpt = _untold_checkpoint(tmp_path)
+    data = tmp_path / "text.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps({"prompt": f"q{i}", "completion": f"a{i}", "target": f"a{i}"}) + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+
+    run_tune(request_for(model=str(ckpt), data=data, prompt_mode=PromptMode.RUNTIME_RENDERED))
+
+    assert len(trainer.configs) == 1
+
+
+def test_two_calls_in_one_block_are_no_reply_not_no_call(tmp_path, request_for, trainer):
+    data, declarations = _split_of(
+        tmp_path, {"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}call:set{{}}{E}"
+    )
+
+    result = run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    (refused,) = [c for c in result.checks.checks if c.name == CALLS_CHECK]
+    assert "the runtime would give no reply" in refused.detail
+
+
+@pytest.mark.parametrize(
+    "args, completion, why",
+    [
+        ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E} Done!", "text follows the call"),
+        ({"a": "hi<eos>"}, f"{S}call:set{{a:<escape>hi<eos><escape>}}{E}", "holds '<eos>'"),
+        ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}call:set{{}}{E}", "would give no reply"),
+        ({"a": "x"}, "call:set{a:<escape>x<escape>}", "reads no call in it"),
+        ({"a": "x"}, f"{S}call:set{{a:<escape>y<escape>}}{E}", "the runtime reads it as"),
+    ],
+)
+def test_a_refused_completion_says_why(tmp_path, request_for, trainer, args, completion, why):
+    """Found in review: a broken branch chain replaced the reason for text
+    after a call, or a stop token in a string, with "the runtime reads it as"
+    the very call the target asks for."""
+    data, declarations = _split_of(tmp_path, args, completion)
+
+    result = run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    (refused,) = [c for c in result.checks.checks if c.name == CALLS_CHECK]
+    assert why in refused.detail

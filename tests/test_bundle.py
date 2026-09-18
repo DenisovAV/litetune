@@ -1411,3 +1411,47 @@ def test_a_runtime_rendered_disagreement_prints_both_kinds_of_digest(tmp_path, r
     detail = check_named(result, "declarations included").detail
     assert read_declarations(source)[1].split(":")[1][:16] + " as a tool list" in detail
     assert hash_file(source).split(":")[1][:16] + " as a file" in detail
+
+
+@pytest.mark.parametrize("spell", [str, str.upper])
+def test_a_runtime_rendered_contract_that_names_the_shipped_list_is_left_alone(
+    tmp_path, request_for, spell
+):
+    """Only a record of the file's bytes is rewritten; one of the list the
+    bundle ships -- in any case -- already names what ships."""
+    source = _unsorted_declarations(tmp_path)
+    listed = read_declarations(source)[1]
+    algorithm, hex_ = listed.split(":")
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED,
+                declarations_sha256=f"{algorithm}:{spell(hex_)}",
+            ),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+    assert not any("now names that list's digest" in text for text in result.limitations)
+
+
+def test_a_link_to_a_directory_where_the_declarations_go_is_replaced(tmp_path, request_for):
+    """A link is replaced whatever it points at; only a directory itself is refused."""
+    out = tmp_path / "bundle"
+    out.mkdir(exist_ok=True)
+    elsewhere = tmp_path / "a-directory"
+    elsewhere.mkdir()
+    (out / DECLARATIONS_NAME).symlink_to(elsewhere)
+
+    result = build_bundle(
+        request_for(
+            declarations=_unsorted_declarations(tmp_path),
+            output_dir=out,
+            contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+    assert elsewhere.is_dir() and not any(elsewhere.iterdir())

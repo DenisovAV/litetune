@@ -361,6 +361,8 @@ def test_an_exception_that_is_not_a_missing_reply_ends_the_run(tmp_path, monkeyp
             "Failed to open x\nFailed to send message: INTERNAL: y\n",
             "Failed to send message: INTERNAL: y",
         ),
+        # A blank line last is not the runtime's last word.
+        ("E0918 12:00:00.000000 4242 x.cc:1] INTERNAL: y\n\n", "INTERNAL: y"),
     ],
 )
 def test_a_reason_litetune_does_not_read_is_the_runtimes_last_word(log, reason):
@@ -822,6 +824,8 @@ def test_a_model_whose_own_output_never_parses_is_a_verdict_about_the_model(tmp_
     modes = result.manifest["tool_path"]["modes"]
     assert modes["unconstrained"]["parse_refusals"] == 8
     assert modes["constrained"]["no_reply"] == 0
+    # A reply refused is not a reply in prose.
+    assert check["observed"]["without_a_call"] == 0
 
 
 def test_a_model_that_answered_in_prose_is_said_to_have(tmp_path):
@@ -1596,5 +1600,46 @@ def test_a_scored_mode_counts_over_the_labelled_prompts(tmp_path):
     )
 
     assert result.manifest["tool_path"]["modes"]["unconstrained"]["of"] == 6
+    assert result.manifest["tool_path"]["reference"]["of"] == 6
     (live,) = result.manifest["liveness"]["candidate"]["checks"]
     assert live["observed"]["of"] == 8
+
+
+def test_a_reply_refused_with_nothing_logged_says_so(tmp_path, monkeypatch):
+    """The reply's own mark is not a line of its log."""
+    runtime = FakeRuntime(replies=[SEND_FAILED])
+
+    _, out = _run(runtime, tmp_path, monkeypatch)
+
+    (row,) = _rows_written(out)
+    assert row["error"] == "nothing in its log"
+
+
+def test_a_crash_with_nothing_logged_names_no_prompt(tmp_path):
+    env = _Crashing(lambda m: "", code=-9)
+    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=env)
+
+    with pytest.raises(ToolPathError) as caught:
+        probe.observe(["a"], constrained=False)
+
+    assert "on prompt" not in str(caught.value)
+
+
+def test_divergence_reads_the_run_an_application_gets_by_default(tmp_path):
+    """The grammar-off rows, not the grammar-on ones, are compared with the
+    base: every other divergence test gives both modes the same rows."""
+    rows_ = labelled_rows(8)
+    right = _rows(rows_, hits=8)
+    wrong = [_row(i, calls=[{"name": "open_app", "arguments": {}}]) for i in range(8)]
+
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"unconstrained": right, "constrained": wrong},
+        reference_texts=marked(correct_texts(rows_)),
+        request_extra={"reference_role": ReferenceRole.UNTUNED_BASE},
+    )
+
+    checks = result.manifest["liveness"]["candidate"]["checks"]
+    (divergence,) = [c for c in checks if c["name"] == "divergence from baseline"]
+    assert divergence["observed"]["divergence_share"] == pytest.approx(0.0)
