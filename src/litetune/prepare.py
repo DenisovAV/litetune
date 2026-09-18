@@ -193,9 +193,9 @@ def render_call(call: ToolCall) -> str:
     string.
 
     **Only what the runtime can read back is written.** A name or key its
-    lexer does not read as a name, a string holding an escape or a call, turn or
-    response marker, and a number a double cannot hold or its grammar cannot
-    spell are refused, with the row named, rather than trained: each would be a
+    lexer does not read as a name, a string holding an escape, a call marker or
+    a stop token (`CONTROL_TEXT`), and a number a double cannot hold or its
+    grammar cannot spell are refused, with the row named, rather than trained: each would be a
     call that cannot come back as written -- and a marker inside a string would
     let a dataset row write a second call into the training text.
 
@@ -243,16 +243,18 @@ def _render_argument(key: str, value: Any) -> str:
         if held:
             raise ValueError(
                 f"the argument {key!r} contains {held[0]!r}, which does not survive inside a "
-                "string: the runtime cuts a reply into calls at the call markers before it reads "
-                "one, its lexer ends a string at an escape, and generation stops at the turn "
-                "and response markers -- so the call would be cut there and the rest read as "
-                "something else"
+                f"string: {CONTROL_TEXT[held[0]]}, so the call would be cut there and the rest "
+                "read as something else"
             )
         return f"{key}:<escape>{value}<escape>"
     if value is None or isinstance(value, bool):
         return f"{key}:{json.dumps(value)}"
     if isinstance(value, int):
-        if float(value) != value:
+        try:
+            exact = float(value) == value
+        except OverflowError:
+            exact = False
+        if not exact:
             raise ValueError(
                 f"the argument {key!r} is {value}, which a double cannot hold exactly, and the "
                 "runtime reads every number as a double (fc_parser.rs): the caller would receive "
@@ -268,22 +270,28 @@ def _render_argument(key: str, value: Any) -> str:
     )
 
 
-# Text a string argument cannot carry. The call markers are what the runtime
-# cuts a reply into calls at (`parser_utils.cc`, before its lexer runs); the
-# escapes end a string (`AntlrFcLexer.g4`); the response and turn markers are
-# where generation stops or a turn begins, so a model trained to write one
-# mid-string stops there.
-CONTROL_TEXT = (
-    *ESCAPE_SPELLINGS,
-    START_CALL,
-    END_CALL,
-    "<start_function_response>",
-    "<end_function_response>",
-    "<start_function_declaration>",
-    "<end_function_declaration>",
-    "<start_of_turn>",
-    "<end_of_turn>",
+_CUT_AT_MARKERS = (
+    "the runtime cuts a reply into calls at the call markers before its lexer reads one "
+    "(parser_utils.cc)"
 )
+_ENDS_A_STRING = "the runtime's lexer ends a string at any of its escapes (AntlrFcLexer.g4)"
+_STOPS_GENERATION = (
+    "generation stops at it: a FunctionGemma bundle names it a stop token "
+    "(models.stop_tokens_for)"
+)
+
+# Text a string argument cannot carry, and what happens to a call that does.
+# Only what has a cause that can be pointed at: other control tokens are not
+# refused, because what the runtime does with one inside a string has not been
+# established.
+CONTROL_TEXT = {
+    **dict.fromkeys(ESCAPE_SPELLINGS, _ENDS_A_STRING),
+    START_CALL: _CUT_AT_MARKERS,
+    END_CALL: _CUT_AT_MARKERS,
+    "<end_of_turn>": _STOPS_GENERATION,
+    "<start_function_response>": _STOPS_GENERATION,
+    "<eos>": _STOPS_GENERATION,
+}
 
 
 def _render_number(key: str, value: float) -> str:
@@ -620,9 +628,9 @@ class HuggingFaceTokenCounter:
     """The real counter: a tokenizer inside `envs.TRAIN`, one subprocess per call.
 
     Raises rather than returning an estimate. A guessed token count that turns
-    out to be short is an over-length row reaching training, where it is
-    truncated and its answer disappears -- the failure this whole check exists
-    to prevent.
+    out to be short is an over-length row reaching `tune`, whose training script
+    refuses it only after the training environment is provisioned -- the late
+    failure this check exists to bring forward.
     """
 
     model: str
@@ -1220,17 +1228,6 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     )
     if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
         result.limitation(ASSUMED_WIRE_FORMAT)
-    # Only where it is true: lengths were measured, the prompts are bare, and
-    # the model's runtime is one litetune records as rendering a declaration
-    # turn in front of them.
-    if (
-        declarations_sha256 is not None
-        and request.tokens is not None
-        and evidence is PromptMode.RUNTIME_RENDERED
-        and request.base_model is not None
-        and renders_declarations_for(request.base_model)[0]
-    ):
-        result.limitation(DECLARATIONS_NOT_COUNTED)
     events.metric("rows", len(rows), source=str(request.data))
 
     # -- lengths -----------------------------------------------------------
@@ -1241,9 +1238,7 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 Check.unchecked(
                     LENGTH_CHECK,
                     "no tokenizer was supplied, so no example was measured against the "
-                    f"{request.context_length}-token context window. An over-length row reaches "
-                    "training and is truncated there, which removes the answer it was supposed "
-                    "to teach",
+                    f"{request.context_length}-token context window",
                     observed={"context_length": request.context_length},
                 )
             )
@@ -1286,11 +1281,22 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             "expected_supervised_token_fraction",
             round(result.lengths.expected_supervised_fraction, 6),
         )
+        # Only where it is true: lengths were measured, the prompts are bare,
+        # and the model's runtime is one litetune records as rendering a
+        # declaration turn in front of them.
+        if (
+            declarations_sha256 is not None
+            and evidence is PromptMode.RUNTIME_RENDERED
+            and request.base_model is not None
+            and renders_declarations_for(request.base_model)[0]
+        ):
+            result.limitation(DECLARATIONS_NOT_COUNTED)
     if not length_check.conclusive:
         result.limitation(
             f"token lengths were not measured ({length_check.detail}); whether every example fits "
-            "the context window is unknown here; `tune` measures the rendered sequence and "
-            "refuses a row over max_seq_length rather than truncating it"
+            "the context window is unknown here. `tune`'s training script measures the rendered "
+            "sequence and refuses a row over max_seq_length rather than truncating it, after the "
+            "training environment is provisioned"
         )
 
     # -- scoreability, before anyone pays for a GPU -------------------------
@@ -1408,8 +1414,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     elif length_check.outcome is Outcome.FAILED:
         # Deliberate: no split is written when rows do not fit. Writing one
         # anyway would put the over-length rows into a file that the next stage
-        # reads without ever seeing this check, which is precisely how a
-        # truncated example gets trained on.
+        # reads without ever seeing this check, and `tune` would refuse them
+        # only once its training environment is provisioned.
         #
         # Recorded as *skipped* rather than as an UNCHECKED check, following
         # `liveness.liveness_tier`. An unchecked item makes the whole CheckSet

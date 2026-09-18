@@ -84,8 +84,9 @@ def read_declarations(path: Path) -> tuple[list[Any], str]:
     except _RepeatedKey as exc:
         raise DeclarationsError(
             f"the declarations at {path} give the key {exc.args[0]!r} twice in one object. JSON "
-            "readers disagree on which one counts -- this one keeps the last, others the first "
-            "or refuse -- so the application and the model could be reading different lists"
+            "leaves which one counts to the reader (RFC 8259, section 4: implementations keep "
+            "the last, refuse the object, or keep both), so the application and the model could "
+            "be reading different lists"
         ) from exc
     _check(parsed, Path(path))
     ordered = _ordered(parsed)
@@ -212,9 +213,10 @@ def _check(parsed: Any, path: Path) -> None:
     repeated = sorted({name for name in names if names.count(name) > 1})
     if repeated:
         raise DeclarationsError(
-            f"{path} declares {repeated} more than once. A runtime that keys tools by name keeps "
-            "one of them -- LiteRT-LM's Kotlin API does -- and would render a different list "
-            "from the one the model was trained on"
+            f"{path} declares {repeated} more than once, so a call to that name cannot say which "
+            "declaration it answers. Where the runtime renders the list, one that keys tools by "
+            "name keeps one of them -- LiteRT-LM's Kotlin API does -- and renders a different "
+            "list from the one the model was trained on"
         )
 
 

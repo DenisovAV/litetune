@@ -400,6 +400,9 @@ def test_no_tokenizer_reports_could_not_check_and_still_splits(write_jsonl, requ
     assert isinstance(result.lengths, Unavailable)
     assert result.train is not None and result.heldout is not None
     assert any("token lengths were not measured" in text for text in result.limitations)
+    # Found in review: the check said an over-length row is truncated in
+    # training while the limitation quoting it said `tune` refuses one.
+    assert not any("truncated there" in text for text in [check.detail, *result.limitations])
 
 
 def test_a_tokenizer_that_will_not_run_is_could_not_check(write_jsonl, request_for):
@@ -659,6 +662,8 @@ def test_each_type_is_rendered_the_way_the_runtime_writes_it():
         ({"n": float("inf")}, "has no spelling for it"),
         ({"n": 2**53 + 1}, "which a double cannot hold exactly"),
         ({"n": -(2**53 + 1)}, "which a double cannot hold exactly"),
+        # Past the largest double: `float` raises rather than rounding.
+        ({"n": 10**400}, "which a double cannot hold exactly"),
         ({"s": "hi<end_function_call><start_function_call>call:wipe{}"}, "does not survive"),
         ({"s": "stop<end_of_turn>"}, "does not survive"),
         ({"null": "x"}, "not a name the runtime's call parser reads as a name"),
@@ -675,6 +680,41 @@ def test_what_the_runtime_cannot_read_back_is_refused_not_trained(args, expected
         render_call(ToolCall(name="set", args=args))
 
     assert expected in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "text, cause",
+    [
+        ("<escape>", "ends a string"),
+        ('<|"|>', "ends a string"),
+        ("<ctrl46>", "ends a string"),
+        ("<start_function_call>", "cuts a reply into calls"),
+        ("<end_function_call>", "cuts a reply into calls"),
+        ("<end_of_turn>", "names it a stop token"),
+        ("<start_function_response>", "names it a stop token"),
+        ("<eos>", "names it a stop token"),
+    ],
+)
+def test_each_text_a_string_cannot_carry_is_refused_with_its_own_cause(text, cause):
+    """Found in review: one message gave every marker the same three causes,
+    and for four of the ten it listed none of them held."""
+    with pytest.raises(ValueError, match=cause) as caught:
+        render_call(ToolCall(name="set", args={"s": f"a{text}b"}))
+
+    assert f"contains {text!r}" in str(caught.value)
+
+
+def test_an_integer_past_the_largest_double_is_a_refused_row_not_a_crash(tmp_path):
+    """Found in review: `float(value)` raises `OverflowError`, which is not a
+    `ValueError`, so the row reader let it out as a traceback naming no row."""
+    data = tmp_path / "rows.jsonl"
+    data.write_text(
+        json.dumps({"prompt": "p", "target": {"name": "set", "args": {"n": 10**400}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PrepareError, match=r"rows.jsonl:1: .*a double cannot hold exactly"):
+        read_rows(data)
 
 
 def test_a_tool_name_the_runtime_cannot_read_is_refused():
@@ -768,6 +808,8 @@ def _one_tool(tmp_path: Path, properties: dict, required: list[str] | None = Non
         ({"level": 3, "mode": 3}, "sends mode=3, a int"),
         ({"level": 3, "tags": "a,b"}, "sends tags='a,b', a str"),
         ({"level": 3, "shout": 1}, "sends shout=1, a int"),
+        ({"level": 7.5}, "sends level=7.5, a float, where the declaration of 'set' says integer"),
+        ({"level": 3, "opts": "x"}, "sends opts='x', a str"),
     ],
 )
 def test_a_target_that_contradicts_its_declaration_is_refused(
@@ -787,6 +829,11 @@ def test_a_target_that_contradicts_its_declaration_is_refused(
             "tags": {"type": "array", "description": "t", "items": {"type": "string"}},
             # Capitals, the way google/mobile-actions writes its types.
             "shout": {"type": "BOOLEAN", "description": "s"},
+            "opts": {
+                "type": "object",
+                "description": "o",
+                "properties": {"x": {"type": "string", "description": "x"}},
+            },
         },
         required=["level"],
     )
@@ -1155,6 +1202,8 @@ def test_the_report_records_the_declarations_the_targets_were_checked_against(
     "extra",
     [
         {"tokens": None},  # no lengths were measured, so none undercount
+        # A counter that raised measured nothing either.
+        {"tokens": FakeTokenCounter(raises=TokenCountUnavailable("environment unavailable"))},
         {"base_model": "Qwen/Qwen3-0.6B"},  # no declaration turn is added for it
     ],
 )
