@@ -363,17 +363,19 @@ class ToolPathRow:
         return self.error is not None
 
     @property
-    def parse_refusal(self) -> bool:
-        return self.kind == "parse"
+    def handed(self) -> list[ToolCall] | None:
+        """What an application is handed: `None` for no reply, else these calls in order.
 
-    @property
-    def call(self) -> dict[str, Any] | None:
-        """The one call this row answered with, or `None` for none or several.
-
-        Every target is one call, so a reply carrying two is not that answer:
-        an application would act on both.
+        The shape `metrics.runtime_calls` gives a text, so the two compare as
+        the same kind of thing. The arguments arrive typed -- `1234.0`, `True`
+        -- and `ToolCall` keeps that beside the flattened view the comparison
+        uses. Nothing is re-rendered and nothing is re-parsed on the way: the
+        point of this path is that the runtime's parser is the one being
+        measured.
         """
-        return self.calls[0] if len(self.calls) == 1 else None
+        if self.refused:
+            return None
+        return [ToolCall(name=c["name"], args=dict(c["arguments"])) for c in self.calls]
 
     @classmethod
     def read(cls, position: int, row: Any) -> ToolPathRow:
@@ -485,19 +487,6 @@ class ToolPathProbe:
             )
         self.runtime_version = written.get("runtime_version")
         return [ToolPathRow.read(position, row) for position, row in enumerate(rows)]
-
-
-def as_tool_call(call: dict[str, Any] | None) -> ToolCall | None:
-    """The runtime's call as the scorer's shape, or `None` when there was none.
-
-    The arguments arrive typed -- `1234.0`, `True` -- and `ToolCall` keeps that
-    beside the flattened view the comparison uses. Nothing is re-rendered and
-    nothing is re-parsed on the way: the point of this path is that the
-    runtime's parser is the one being measured.
-    """
-    if call is None or not isinstance(call.get("name"), str):
-        return None
-    return ToolCall(name=call["name"], args=dict(call.get("arguments") or {}))
 
 
 def _refuse_a_mode_with_unread_reasons(rows: list[ToolPathRow]) -> None:
@@ -665,8 +654,6 @@ class ToolPathBackend:
                 prompt=prompts[row.index],
                 text=row.text,
                 returncode=0,
-                call=row.call,
-                refusal=row.error,
             )
             for row in self.rows["unconstrained"]
         ]

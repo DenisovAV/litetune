@@ -351,7 +351,6 @@ def _read_arguments(text: str, pos: int) -> tuple[dict[str, Any], int] | None:
 # One block between the markers, whole: `start : functionCall EOF` with
 # `functionCall : CALL COLON ID object?`, whitespace skipped between tokens.
 _WHOLE_HEAD_RE = re.compile(rf"\s*call\s*:\s*(?P<name>{IDENTIFIER})\s*")
-_OPEN_RE = re.compile(r"\{")
 
 
 def _whole_call(block: str) -> ToolCall | None:
@@ -361,7 +360,7 @@ def _whole_call(block: str) -> ToolCall | None:
         return None
     values: dict[str, Any] = {}
     pos = head.end()
-    if _OPEN_RE.match(block, pos) is not None:
+    if block.startswith("{", pos):
         body = _read_arguments(block, pos + 1)
         if body is None:
             return None

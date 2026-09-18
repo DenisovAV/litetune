@@ -99,7 +99,6 @@ from litetune.toolpath import (
     GRAMMAR_OFF_BY_DEFAULT_IN,
     ToolPathBackend,
     ToolPathRow,
-    as_tool_call,
 )
 
 logger = logging.getLogger(__name__)
@@ -323,15 +322,12 @@ def _tool_path_liveness(point: MeasurementPoint, backend: GenerationBackend) -> 
     answered = sum(1 for row in rows if row.calls)
     prose = sum(1 for row in rows if not row.calls and not row.refused)
     unanswered = _unanswered(rows, list(range(len(rows))))
-    detail = (
-        f"with the grammar off, {answered} of {n} prompts returned a call"
-        + (f"; {prose} answered without calling anything" if prose else "")
-        + (
-            f"; the runtime gave no reply to {_why_no_reply(unanswered)}"
-            if unanswered["no_reply"]
-            else ""
-        )
-    )
+    parts = [f"with the grammar off, {answered} of {n} prompts returned a call"]
+    if prose:
+        parts.append(f"{prose} answered without calling anything")
+    if unanswered["no_reply"]:
+        parts.append(f"the runtime gave no reply to {_why_no_reply(unanswered)}")
+    detail = "; ".join(parts)
     observed = {"answered": answered, "n": n, "without_a_call": prose} | unanswered
     checks = CheckSet(name="liveness")
     if answered:
@@ -390,7 +386,7 @@ def _score_tool_path(
     if "unconstrained" not in rows:
         raise ValueError(f"the tool path reported modes {sorted(rows)}, without the grammar off")
     scored = {
-        mode: score_parsed(targets, [as_tool_call(rows[mode][i].call) for i in indices])
+        mode: score_parsed(targets, [_one_call(rows[mode][i].handed) for i in indices])
         for mode in rows
     }
     grammar: Difference | Unavailable = (
@@ -467,22 +463,12 @@ def _score_tool_path(
     return scored["unconstrained"], reported
 
 
-def _handed(calls: Sequence[ToolCall] | None) -> tuple:
-    """What an application is handed: no reply, or these calls in order.
-
-    One shape for both sides of the tool path, so a candidate's reply and a
-    text read as the runtime reads it compare as the same kind of thing: two
-    calls are not prose, and no reply is not a reply without a call.
-    """
-    return ("no reply",) if calls is None else ("calls", *calls)
-
-
 def _one_call(calls: Sequence[ToolCall] | None) -> ToolCall | None:
     """The one call a reply answered with, or `None` for none, several or no reply.
 
     Every target is one call, so a reply carrying two is not that answer: an
-    application would act on both. The rule `ToolPathRow.call` holds the
-    candidate to.
+    application would act on both. The same rule for the candidate and the
+    reference.
     """
     return calls[0] if calls is not None and len(calls) == 1 else None
 
@@ -1378,20 +1364,12 @@ def run_verify(
         # fail. Compared as calls instead, the base's read by the same parser
         # that scores it.
         if isinstance(pair.candidate, ToolPathBackend):
-            rows = pair.candidate.rows["unconstrained"]
             check = divergence_check(
                 candidate,
-                [_handed(calls) for calls in _reference_on_the_tool_path(reference.texts)],
+                _reference_on_the_tool_path(reference.texts),
                 "the untuned base",
                 request.thresholds,
-                calls=[
-                    _handed(
-                        None
-                        if row.refused
-                        else [ToolCall(c["name"], c["arguments"]) for c in row.calls]
-                    )
-                    for row in rows
-                ],
+                calls=[row.handed for row in pair.candidate.rows["unconstrained"]],
             )
         else:
             check = divergence_check(
@@ -1420,6 +1398,10 @@ def run_verify(
         indices = [e.index for e in labelled]
         targets = [e.target for e in labelled if e.target is not None]
         scorer = SCORERS[request.scorer]
+        # The reference always produces text: it is `transformers`, which has no
+        # tool path to answer on. Scored over the same rows as the candidate,
+        # every one of them; on the tool path read as the runtime reads a reply,
+        # where a reply with several calls is wrong on both sides.
         if pair.candidate.scores_structurally:
             candidate_metrics, tool_path = _score_tool_path(pair.candidate, targets, indices, run)
             # Label-free agreement compares two texts, and the candidate
@@ -1430,23 +1412,6 @@ def run_verify(
                 "there is no text-to-text agreement to report. The scored comparison is between "
                 "the call the runtime returned and the call the reference's text parses to"
             )
-        else:
-            tool_path = None
-            # The same removal on both sides, whatever shape each side's
-            # reasoning takes, so an answer is compared with an answer and not
-            # with markup.
-            candidate_metrics = scorer(
-                targets, [strip_reasoning(candidate.generations[i].text) for i in indices]
-            )
-            agreed = agreement(
-                [strip_reasoning(text) for text in candidate.texts],
-                [strip_reasoning(text) for text in reference.texts],
-            )
-        # The reference always produces text: it is `transformers`, which has no
-        # tool path to answer on. Scored over the same rows as the candidate,
-        # every one of them; on the tool path read as the runtime reads a reply,
-        # where a reply with several calls is wrong on both sides.
-        if tool_path is not None:
             read = _reference_on_the_tool_path([reference.generations[i].text for i in indices])
             # Every target is a call here: a scorer that reads text is refused
             # on the tool path, and a string among them would fail alignment.
@@ -1462,8 +1427,19 @@ def run_verify(
                 "call to a block, a block that is not one refusing the reply",
             }
         else:
+            tool_path = None
+            # The same removal on both sides, whatever shape each side's
+            # reasoning takes, so an answer is compared with an answer and not
+            # with markup.
+            candidate_metrics = scorer(
+                targets, [strip_reasoning(candidate.generations[i].text) for i in indices]
+            )
             reference_metrics = scorer(
                 targets, [strip_reasoning(reference.generations[i].text) for i in indices]
+            )
+            agreed = agreement(
+                [strip_reasoning(text) for text in candidate.texts],
+                [strip_reasoning(text) for text in reference.texts],
             )
         sink.append(
             Check.passed(

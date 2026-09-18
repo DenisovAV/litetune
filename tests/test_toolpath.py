@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from litetune.metrics import ToolCall
 from litetune.toolpath import _TOOL_PATH_SCRIPT, ToolPathError, ToolPathProbe, ToolPathRow
 
 TOOLS = [
@@ -506,15 +507,15 @@ def test_output_that_is_not_json_is_a_harness_failure(tmp_path):
         probe.observe(["a"], constrained=True)
 
 
-def test_a_row_answers_with_one_call_or_none():
-    one = {"name": "t", "arguments": {}}
+def test_a_row_hands_an_application_no_reply_or_its_calls():
+    one = {"name": "t", "arguments": {"hour": 7.0}}
     assert ToolPathRow(0, error="boom", kind="other").refused is True
-    assert ToolPathRow(0, error="x", kind="parse").parse_refusal is True
+    assert ToolPathRow(0, error="x", kind="parse").handed is None
     assert ToolPathRow(0, calls=(one,)).refused is False
-    assert ToolPathRow(0, calls=(one,)).call == one
-    # Two calls are not the one call a target asks for.
-    assert ToolPathRow(0, calls=(one, one)).call is None
-    assert ToolPathRow(0).call is None
+    assert ToolPathRow(0, calls=(one,)).handed == [ToolCall("t", {"hour": 7})]
+    assert ToolPathRow(0, calls=(one, one)).handed == [ToolCall("t", {"hour": 7})] * 2
+    # Prose is a reply without a call, which is not no reply.
+    assert ToolPathRow(0).handed == []
 
 
 # -- the backend, and how `verify` picks it ----------------------------------

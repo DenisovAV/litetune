@@ -789,30 +789,24 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     # nothing then shows the model learned that list, only that it ships with it.
     # Not when the declarations were refused, because then no list was shipped.
     contract = request.contract
-    if contract.declarations_sha256 is None and declarations_check.outcome is Outcome.PASSED:
-        contract = replace(
-            contract,
-            declarations_sha256=_shipped_digest(
-                request.declarations, not contract.runtime_renders_declarations
-            ),
-        )
-        result.limitation(NO_TRAINED_DECLARATIONS)
-    elif (
-        contract.declarations_sha256 is not None
-        and contract.runtime_renders_declarations
-        and declarations_check.outcome is Outcome.PASSED
-    ):
-        # The check accepted a record of the supplied file's bytes, which is
-        # all a contract built before digests named the tool list could carry.
-        # The bundle ships that list normalised, so the contract names what
-        # ships, or it would not hash to its own contract.
-        shipped = _shipped_digest(request.declarations, prerendered=False)
-        if contract.declarations_sha256.rpartition(":")[2].lower() != shipped.split(":", 1)[1]:
+    recorded = contract.declarations_sha256
+    if declarations_check.outcome is Outcome.PASSED:
+        shipped = _shipped_digest(request.declarations, not contract.runtime_renders_declarations)
+        if recorded is None:
+            contract = replace(contract, declarations_sha256=shipped)
+            result.limitation(NO_TRAINED_DECLARATIONS)
+        elif (
+            contract.runtime_renders_declarations
+            and recorded.rpartition(":")[2].lower() != shipped.split(":", 1)[1]
+        ):
+            # The check accepted a record of the supplied file's bytes, which is
+            # all a contract built before digests named the tool list could
+            # carry. The bundle ships that list normalised, so the contract
+            # names what ships, or it would not hash to its own contract.
             result.limitation(
-                f"the contract recorded {contract.declarations_sha256}, the digest of "
-                f"{request.declarations} as a file; the bundle ships the same tool list "
-                f"normalised, so the contract now names that list's digest, {shipped}, which "
-                "is what the shipped file hashes to"
+                f"the contract recorded {recorded}, the digest of {request.declarations} as a "
+                "file; the bundle ships the same tool list normalised, so the contract now names "
+                f"that list's digest, {shipped}, which is what the shipped file hashes to"
             )
             contract = replace(contract, declarations_sha256=shipped)
     if contract is not request.contract:

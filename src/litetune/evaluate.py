@@ -217,15 +217,6 @@ class Generation:
     # `returncode=0` erased the fact entirely, and putting the real code here
     # would make `ok` false for output that exists and is scoreable.
     batch_returncode: int | None = None
-    # The one call a tool-path run returned (`None` for none or several), and
-    # why the runtime gave no reply, when it gave none. Both are `None`
-    # on the text path, which is every backend that reads stdout: there the
-    # call is whatever `metrics.parse_call` makes of `text`, and a refusal is
-    # not something the runtime is in a position to report. Carried here rather
-    # than in a parallel list so that a row cannot lose its pairing with the
-    # prompt it answers.
-    call: dict[str, Any] | None = None
-    refusal: str | None = None
 
     @property
     def ran(self) -> bool:

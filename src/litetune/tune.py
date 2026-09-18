@@ -55,14 +55,14 @@ from litetune.declarations import (
 )
 from litetune.events import EventStream
 from litetune.exits import read_returncode
-from litetune.metrics import ToolCall, runtime_calls
+from litetune.metrics import START_CALL, ToolCall, runtime_calls
 from litetune.models import (
     PROVENANCE_NAME,
     identify,
     renders_declarations_for,
     wire_format_for,
 )
-from litetune.prepare import START_CALL, PrepareError, Row, read_rows, render_call
+from litetune.prepare import PrepareError, Row, read_rows, render_call
 from litetune.prompt_mode import RENDERING_SOURCE, PromptMode, PromptModeDecision, prompt_evidence
 
 logger = logging.getLogger(__name__)
@@ -97,7 +97,7 @@ def _refuse_calls_without_declarations(
     the declaration and there is nothing missing. The first version of this
     asked only the family, and refused the README's own walkthrough.
     """
-    if mode is not PromptMode.RUNTIME_RENDERED:
+    if request.declarations is not None or mode is not PromptMode.RUNTIME_RENDERED:
         return None
     renders, reason = renders_declarations_for(request.model)
     if not renders:
@@ -126,7 +126,7 @@ def _refuse_declarations_for_an_unrecorded_tool_channel(
     sends instead. Refused rather than trained, as the prompt-mode disagreement
     is; a split whose application renders the tools itself is `prerendered`.
     """
-    if mode is not PromptMode.RUNTIME_RENDERED:
+    if request.declarations is None or mode is not PromptMode.RUNTIME_RENDERED:
         return None
     renders, _ = renders_declarations_for(request.model)
     if renders:
@@ -1625,13 +1625,9 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     for refusal in (
         _refuse_rows_without_a_completion(request, rows),
         _refuse_calls_of_a_family_litetune_cannot_tell(request, decision.mode, rows),
-        None
-        if request.declarations is not None
-        else _refuse_calls_without_declarations(request, decision.mode, rows),
+        _refuse_calls_without_declarations(request, decision.mode, rows),
         _refuse_calls_the_runtime_would_not_read(request, decision.mode, rows),
-        None
-        if request.declarations is None
-        else _refuse_declarations_for_an_unrecorded_tool_channel(request, decision.mode),
+        _refuse_declarations_for_an_unrecorded_tool_channel(request, decision.mode),
     ):
         if refusal is not None:
             return _refused(result, events, refusal)
