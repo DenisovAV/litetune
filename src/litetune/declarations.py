@@ -149,11 +149,11 @@ def digest_matches(recorded: str, digest: str | None, path: Path, prerendered: b
 
     What `recorded_digest` records, for the same mode. In `prerendered` only
     the file's bytes: the order in the file is the convention the application
-    renders, so the same tools in another order are another prompt, and a list
-    digest would accept them. Otherwise the tool list's (`digest`, which is
-    `read_declarations`'s, or `None` where that refused the file) -- or the
-    file's bytes, which is what a `Contract` built in code before digests
-    identified the tool list could only have carried. A record may carry the
+    renders, so the same tools with their keys in another order are another
+    prompt, and a list digest would accept them. Otherwise the tool list's
+    (`digest`, which is `read_declarations`'s, or `None` where that refused the
+    file) -- or the file's bytes, which is what a `Contract` built in code
+    before digests identified the tool list could only have carried. A record may carry the
     algorithm prefix or not, in either case; one naming another algorithm is
     not this digest.
     """

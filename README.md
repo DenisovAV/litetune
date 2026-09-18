@@ -300,8 +300,9 @@ carry back:
   exponent like `e5` or `e-3`, which its lexer reads as other tokens);
 - a key given twice in one object, a tool declared twice, and text that is not
   valid Unicode;
-- a description or enum value holding an escape, a declaration marker or a turn
-  marker, which would end the declaration it is written in.
+- a description, an enum value or a property name holding `<escape>`, a
+  declaration marker or a turn marker, which would end the declaration it is
+  written in.
 
 Some are capability you give up — `nullable`, the reserved names, `enum` on a
 number, and OpenAI's strict mode; the rest you fix by writing the file
@@ -315,33 +316,38 @@ is Google's:
 `<start_function_call>` and `<end_function_call>`, strings between `<escape>`
 markers, numbers, booleans and null bare, and the arguments in the same order as
 the declarations — `call:set_alarm{hour:7,label:<escape>wake<escape>}`. Only what
-the runtime reads back is trained: a string holding an escape, a call marker or
-one of FunctionGemma's stop tokens (`<end_of_turn>`, `<start_function_response>`,
-`<eos>`), NaN or infinity, an integer a double cannot hold exactly and a name
-outside its grammar are refused with the row named, and so is a target whose
-arguments contradict its declaration.
+the runtime reads back is trained: a string holding an escape, the end-of-call
+marker or one of FunctionGemma's stop tokens (`<end_of_turn>`,
+`<start_function_response>`, `<eos>`), NaN or infinity, an integer a double
+cannot hold exactly and a name outside its grammar are refused with the row
+named, and so is a target whose arguments contradict its declaration.
 The order is not cosmetic: with constrained decoding on, the runtime enforces
 the declared property order, and an argument out of it is dropped from the
 call. So a `runtime_rendered` bundle ships its declarations in the order the
 model learned, and its contract's `declarations_sha256` names that list.
 
 **Who serves it this way.** LiteRT-LM's Python API, as
-`create_conversation(tools=...)`, which is how `verify` asks. Constrained
-decoding is off unless you pass a `ConstrainedDecodingConfig` that enables it,
-and automatic tool calling is on unless you turn it off; `verify` measures with
-it off, because the model was trained on one turn.
+`create_conversation(tools=...)` handed each entry of the bundle's
+`declarations.json` whole, `{"type": "function", ...}` — which is how `verify`
+asks. A Python function handed as a tool gets a schema the binding writes
+itself, and does not render what was trained. Constrained decoding is off
+unless you pass a `ConstrainedDecodingConfig` that enables it. Automatic tool
+calling is on unless you turn it off: with it on, the binding runs the tools
+itself and loops until the model answers in prose, so you are never handed the
+call; `verify` measures with it off.
 
 On Kotlin, an `OpenApiTool` returning each entry's `function` object from the
 bundle's `declarations.json` — not the whole `{"type": "function", ...}` entry,
 which it refuses — registered in the file's order. Parse the file into a JSON
 object that keeps its keys' order and hand it on; a data class serialised back
 out can reorder the keys. The reflection-based `@Tool` path writes its own keys,
-order and `nullable`, and does not render what was trained. Constrained decoding
-there is `ExperimentalFlags.enableConversationConstrainedDecoding`, off by
-default and global to the process, read when a conversation is created.
-Automatic tool calling is on by default in Kotlin too. The runtime reads every
-number in a call as a double, so an integer argument arrives as `7.0`: read it
-as a number and convert it.
+order and `nullable`, so it renders what was trained only for a tool declared
+with no `parameters` at all. Constrained decoding there is
+`ExperimentalFlags.enableConversationConstrainedDecoding`, off by default and
+global to the process, read when a conversation is created. Automatic tool
+calling is on by default in Kotlin too; turn it off to be handed the call. The
+runtime reads every number in a call as a double, so an integer argument
+arrives as `7.0`: read it as a number and convert it.
 
 flutter_gemma 1.8.3 does not use this path for FunctionGemma: it renders the
 declarations in Dart, and the `flutter_gemma_litertlm` engine (1.6.4) hands the
@@ -370,10 +376,13 @@ structured target for a family whose call format litetune has not measured:
 supply each row's `completion` instead. In `tune`, a row with a target and no
 completion — run `prepare`, which writes it — and a call row whose completion
 the runtime would not read as exactly its target's call, with the target's
-types: no call markers, as in a split prepared by 0.1.6 or earlier, or a number
-written as a string. Drop such a completion so `prepare` renders it. Marked
-calls in `runtime_rendered` for a checkpoint whose family litetune cannot tell:
-say which model it is in its `litetune.json`. `verify` without `--declarations`
+types, and nothing after it: no call markers, as in a split prepared by 0.1.6
+or earlier, a number written as a string, text after the call, or a stop token
+inside a string. Drop such a completion so `prepare` renders it. A call to a
+tool the declarations do not offer, and a call in a row whose target is text.
+Marked calls in `runtime_rendered` for a local checkpoint whose `config.json`
+says `gemma3_text`, which is FunctionGemma and Gemma 3 alike: say which it is in
+its `litetune.json`. `verify` without `--declarations`
 for a `runtime_rendered` checkpoint that recorded some, and `--scorer
 exact-text` on the tool path. In `prerendered` the declarations file's bytes are
 the record, so the file `tune` read has to reach `verify` and `bundle`
@@ -421,9 +430,10 @@ which supports neither. A bundle carrying it exports cleanly, is the right size,
 passes every liveness check, and still answers a plain text prompt — then
 fails the native tool-call path, where LiteRT-LM routes the call through the
 chat template, with `litert_lm_conversation_send_message_stream failed`, which
-is the whole error a caller through the C API gets. The split is in the runtime,
-so every consumer that hands it tools sees it, whatever it is written in.
-litetune ships a template the runtime can run and passes it on export. Measured on the same checkpoint: with the override the runtime answers
+is the whole error the Python binding raises. The split is in the runtime, so
+every consumer that hands it tools sees it, whatever it is written in. litetune
+ships a template the runtime can run and passes it on export. Measured on the
+same checkpoint: with the override the runtime answers
 `[tool_call] set_alarm{hour:7}`; without it, `INTERNAL: Failed to apply
 template`.
 
