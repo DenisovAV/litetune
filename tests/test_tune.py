@@ -2725,8 +2725,90 @@ def test_a_split_prepared_before_the_call_markers_is_refused_not_trained(
 
     assert result.outcome is Outcome.FAILED
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
-    assert any("Re-run prepare" in c.detail and f"{data}:1" in c.detail for c in failed)
+    assert any(
+        "carries no call markers" in c.detail
+        and "Drop the row's completion" in c.detail
+        and f"{data}:1" in c.detail
+        for c in failed
+    )
     assert trainer.configs == []
+
+
+def test_a_completion_the_runtime_reads_as_its_target_trains_in_any_spelling(
+    tmp_path, request_for, trainer
+):
+    """Found in review: the check compared bytes with `render_call`, so a row's
+    own completion with the arguments in another order, or `1.0` for 1, was
+    refused -- with advice to re-run prepare, which keeps that completion and
+    refused again. The runtime's parser reads either."""
+    data, declarations = _functiongemma_split(
+        tmp_path,
+        lambda i: (
+            "<start_function_call>call:change_background_color"
+            f"{{ color : <escape>s{i}<escape> }}<end_function_call>"
+        ),
+    )
+
+    run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    assert len(trainer.configs) == 1
+
+
+def test_a_completion_that_reads_as_another_call_is_refused_naming_what_it_reads_as(
+    tmp_path, request_for, trainer
+):
+    data, declarations = _functiongemma_split(
+        tmp_path,
+        lambda i: (
+            "<start_function_call>call:change_background_color{color:<escape>x<escape>}"
+            "<end_function_call>"
+        ),
+    )
+
+    result = run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any("it reads as" in c.detail for c in failed)
+    assert trainer.configs == []
+
+
+def test_a_row_litetune_cannot_render_does_not_stop_the_check_of_the_next(
+    tmp_path, request_for, trainer
+):
+    """A row with a list argument is its author's text and is left alone; the
+    rows after it are still checked."""
+    _, declarations = _functiongemma_split(tmp_path, lambda i: "")
+    data = tmp_path / "own.jsonl"
+    data.write_text(
+        json.dumps(
+            {
+                "prompt": "p0",
+                "completion": "anything",
+                "target": {"name": "change_background_color", "args": {"color": ["a"]}},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "prompt": "p1",
+                "completion": "call:change_background_color{color:<escape>s<escape>}",
+                "target": {"name": "change_background_color", "args": {"color": "s"}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any(f"{data}:2" in c.detail for c in failed)
 
 
 def test_a_split_prepared_now_trains(tmp_path, request_for, trainer):
@@ -2762,8 +2844,57 @@ def test_declarations_for_a_family_whose_runtime_never_sends_them_are_refused(
 
     assert result.outcome is Outcome.FAILED
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
-    assert any("never sends" in c.detail for c in failed)
+    assert any("records no tool channel for qwen-3" in c.detail for c in failed)
     assert trainer.configs == []
+
+
+def test_declarations_for_a_prerendered_split_of_any_family_train(tmp_path, request_for, trainer):
+    """The refusal is about the runtime rendering them; a prerendered prompt
+    carries them already, whatever the family."""
+    decl = "<start_of_turn>developer\ntools<end_of_turn>\n"
+    data = tmp_path / "prerendered.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps(
+                {"prompt": f"{decl}<start_of_turn>user\nq{i}<end_of_turn>\n", "completion": "a"}
+            )
+            + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+    _, declarations = _functiongemma_split(tmp_path, lambda i: "")
+
+    run_tune(
+        request_for(
+            model="Qwen/Qwen3-0.6B",
+            data=data,
+            prompt_mode=PromptMode.PRERENDERED,
+            declarations=declarations,
+        )
+    )
+
+    assert len(trainer.configs) == 1
+
+
+def test_a_checkpoint_whose_family_cannot_be_told_is_probed_when_its_calls_are_marked(
+    tmp_path, request_for, trainer
+):
+    """Found in review: a local FunctionGemma checkpoint without its sidecar
+    reads as an unidentified `gemma3_text`, and the probe -- and with it the
+    call ending -- was dropped. Marked completions say which format they are."""
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text('{"model_type": "gemma3_text"}', encoding="utf-8")
+    data, _ = _functiongemma_split(
+        tmp_path,
+        lambda i: render_call(ToolCall("change_background_color", {"color": f"s{i}"})),
+    )
+
+    run_tune(request_for(model=str(ckpt), data=data, prompt_mode=PromptMode.RUNTIME_RENDERED))
+
+    assert len(trainer.configs) == 1
+    assert trainer.configs[0]["call_probe"] is not None
 
 
 # -- how a call ends ---------------------------------------------------------
@@ -2921,3 +3052,31 @@ def test_the_script_is_handed_the_call_prepare_renders(tmp_path, request_for):
         "text": render_call(ToolCall(CALL_PROBE_NAME, {})),
     }
     assert spec["call_probe"]["text"].startswith("<start_function_call>")
+
+
+def test_declarations_for_a_checkpoint_whose_family_cannot_be_told_say_so(
+    tmp_path, request_for, trainer
+):
+    """Found in review: the refusal said the runtime "never sends" a declaration
+    turn, which is false of a family litetune merely cannot identify -- a local
+    FunctionGemma checkpoint without its sidecar reads as `gemma3_text`."""
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text('{"model_type": "gemma3_text"}', encoding="utf-8")
+    data, declarations = _functiongemma_split(
+        tmp_path,
+        lambda i: render_call(ToolCall("change_background_color", {"color": f"s{i}"})),
+    )
+
+    result = run_tune(
+        request_for(
+            model=str(ckpt),
+            data=data,
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+            declarations=declarations,
+        )
+    )
+
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any("cannot tell which model family" in c.detail for c in failed)
+    assert trainer.configs == []

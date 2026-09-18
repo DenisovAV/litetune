@@ -324,6 +324,9 @@ class Row:
     prompt: str
     completion: str
     target: ToolCall | str | None
+    # Whether `completion` was rendered here from `target` rather than given in
+    # the file. Only a given completion is evidence of the format a split is in.
+    rendered: bool = False
 
     @property
     def tool(self) -> str:
@@ -480,6 +483,7 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
             raise PrepareError(f"{path}:{lineno}: {exc}") from exc
 
         completion = obj.get("completion")
+        rendered = completion is None and target is not None
         if completion is None and target is not None:
             # A string target is already the text to supervise; a call has to be
             # rendered into the wire format the model is trained to emit.
@@ -499,6 +503,7 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
                 prompt=str(obj["prompt"]),
                 completion=completion,
                 target=target,
+                rendered=rendered,
             )
         )
     if not rows:
