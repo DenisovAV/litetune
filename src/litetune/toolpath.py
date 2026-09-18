@@ -13,11 +13,12 @@ that, and each of them is the reason for a piece of this module:
 
 **The runtime's parser is the one being measured, not ours.** A model that
 writes a call the runtime cannot read is a model that fails for an application.
-`metrics.parse_call` still exists and is still used -- for the transformers
-reference, which produces text and nothing else. The runtime's Python binding
-reports every failed reply as one `RuntimeError("litert_lm_conversation_send_message
-failed")` (`conversation.py`, v0.16.1) and writes the reason to its log, so the
-script reads the log around each reply to record the reason with the row.
+The transformers reference produces text and nothing else, and `verify` reads
+it with `metrics.runtime_calls`, which follows the runtime's reading of a reply.
+The runtime's Python binding reports every failed reply as one
+`RuntimeError("litert_lm_conversation_send_message failed")` (`conversation.py`,
+v0.16.1) and writes the reason to its log, so the script reads the log around
+each reply to record the reason with the row.
 
 **Constrained decoding is a choice the caller makes, and both are measured.**
 LiteRT-LM v0.16.1 leaves it off unless the caller enables it

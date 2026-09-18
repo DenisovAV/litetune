@@ -582,6 +582,12 @@ def _rows(rows_, hits: int, refusals: int = 0) -> list[dict]:
     return out
 
 
+def marked(texts: list[str]) -> list[str]:
+    """Calls in their markers, which is how the reference writes them and the
+    only place the runtime reads a call."""
+    return [f"<start_function_call>{t}<end_function_call>" for t in texts]
+
+
 def _verify(tmp_path, rows_, by_mode, reference_texts=None, request_extra=None, **kwargs):
     split = tmp_path / "heldout.jsonl"
     split.write_text("\n".join(json.dumps(r) for r in rows_) + "\n", encoding="utf-8")
@@ -596,7 +602,7 @@ def _verify(tmp_path, rows_, by_mode, reference_texts=None, request_extra=None, 
     )
     reference = FakeBackend(
         model="org/reference",
-        texts=reference_texts if reference_texts is not None else correct_texts(rows_),
+        texts=reference_texts if reference_texts is not None else marked(correct_texts(rows_)),
         prompt_mode=PromptMode.RUNTIME_RENDERED,
     )
     return run_verify(request, backends=BackendPair(candidate=candidate, reference=reference))
@@ -731,6 +737,20 @@ def test_a_model_whose_own_output_never_parses_is_a_verdict_about_the_model(tmp_
     modes = result.manifest["tool_path"]["modes"]
     assert modes["unconstrained"]["parse_refusals"] == 8
     assert modes["constrained"]["no_reply"] == 0
+
+
+def test_a_model_that_answered_in_prose_is_said_to_have(tmp_path):
+    """Found in review: only a row with no reply was given a reason, so a
+    liveness failure on prose read as if nothing had come back."""
+    rows_ = labelled_rows(8)
+    prose = [_row(i, text="I cannot do that.") for i in range(8)]
+
+    result = _verify(tmp_path, rows_, {"constrained": prose, "unconstrained": prose})
+
+    assert result.status is Status.FAILED_SMOKE
+    (check,) = result.manifest["liveness"]["candidate"]["checks"]
+    assert "8 answered without calling anything" in check["detail"]
+    assert check["observed"]["without_a_call"] == 8
 
 
 def test_the_grammar_refusing_every_row_is_measured_not_hidden(tmp_path):
@@ -984,7 +1004,9 @@ def test_divergence_from_the_base_compares_calls_on_the_tool_path(tmp_path, same
     called something, so it passed a candidate that was the untuned base."""
     rows_ = labelled_rows(8)
     both = _rows(rows_, 8)
-    base_texts = correct_texts(rows_) if same else [call_text("open_app", app="x") for _ in rows_]
+    base_texts = marked(
+        correct_texts(rows_) if same else [call_text("open_app", app="x") for _ in rows_]
+    )
 
     result = _verify(
         tmp_path,
@@ -1232,10 +1254,10 @@ def test_divergence_compares_calls_as_answers_not_as_text(tmp_path):
     returned = [
         _row(h, calls=[{"name": "set_alarm", "arguments": {"hour": float(h)}}]) for h in range(8)
     ]
-    same_base = [f"call:set_alarm{{hour:{h}}}" for h in range(8)]
-    other_base = [
-        f"call:send_email{{body:<escape>call:set_alarm{{hour:{h}}}<escape>}}" for h in range(8)
-    ]
+    same_base = marked([f"call:set_alarm{{hour:{h}}}" for h in range(8)])
+    other_base = marked(
+        [f"call:send_email{{body:<escape>call:set_alarm{{hour:{h}}}<escape>}}" for h in range(8)]
+    )
 
     same = _verify(
         tmp_path,
@@ -1312,3 +1334,109 @@ def test_each_mode_says_over_how_many_prompts_it_counted(tmp_path):
     assert result.manifest["tool_path"]["modes"]["unconstrained"]["of"] == 8
     liveness = result.manifest["liveness"]["candidate"]["checks"]
     assert liveness[0]["observed"]["of"] == 8
+
+
+@pytest.mark.parametrize(
+    "candidate, base",
+    [
+        # Found in review: a reply with two calls and a base that answered in
+        # prose were both "no call", so a candidate that always called twice
+        # read as the base.
+        ("two calls", "prose"),
+        # And a parse refusal read as the base's prose.
+        ("no reply", "prose"),
+        # A base that wrote its call outside the markers answered in prose, as
+        # the runtime reads it.
+        ("prose", "a call outside the markers"),
+    ],
+)
+def test_divergence_tells_what_an_application_is_handed_apart(tmp_path, candidate, base):
+    rows_ = labelled_rows(8)
+    target = rows_[0]["target"]
+    call = {"name": target["name"], "arguments": target["args"]}
+    row = {
+        "two calls": lambda i: _row(i, calls=[call, call]),
+        "no reply": lambda i: _row(i, error=PARSE_REFUSED, kind="parse"),
+        "prose": lambda i: _row(i, text="done"),
+    }[candidate]
+    text = {
+        "prose": "I have changed it for you.",
+        "a call outside the markers": call_text(target["name"], **target["args"]),
+    }[base]
+    # One prompt answered alike on both sides, so liveness lets the check run.
+    replies = [_row(0, calls=[call])] + [row(i) for i in range(1, 8)]
+    texts = marked([call_text(target["name"], **target["args"])]) + [text] * 7
+
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"constrained": replies, "unconstrained": replies},
+        reference_texts=texts,
+        request_extra={"reference_role": ReferenceRole.UNTUNED_BASE},
+    )
+
+    checks = result.manifest["liveness"]["candidate"]["checks"]
+    (divergence,) = [c for c in checks if c["name"] == "divergence from baseline"]
+    same_shape = (candidate, base) == ("prose", "a call outside the markers")
+    assert divergence["observed"]["divergence_share"] == pytest.approx(0.0 if same_shape else 7 / 8)
+
+
+@pytest.mark.parametrize(
+    "text, scored",
+    [
+        ("{call}", False),  # no markers: text to the runtime
+        ("<start_function_call>{call}", False),  # no end marker
+        ("{call} <start_function_call><end_function_call>", False),
+        ("<start_function_call>{call}{call}<end_function_call>", False),  # two in one block
+        ("<start_function_call>{call}<end_function_call>" * 2, False),  # two calls
+        ("<start_function_call>{call}<end_function_call>then more", True),
+    ],
+)
+def test_the_reference_is_read_as_the_runtime_reads_a_reply(tmp_path, text, scored):
+    """Found in review: the reference counted markers rather than reading
+    calls, so a call without markers, two calls in one block or a call beside
+    empty markers scored right on the reference side and wrong on the
+    candidate's, and the difference was reported as conversion cost."""
+    rows_ = labelled_rows(8)
+    texts = [text.format(call=call_text(r["target"]["name"], **r["target"]["args"])) for r in rows_]
+    both = _rows(rows_, hits=8)
+
+    result = _verify(tmp_path, rows_, {"constrained": both, "unconstrained": both}, texts)
+
+    reference = result.manifest["quality"]["reference"]["exact_match"]["value"]
+    assert reference == pytest.approx(1.0 if scored else 0.0)
+    counted = result.manifest["tool_path"]["reference"]
+    assert counted["of"] == 8
+    assert counted["several_calls"] == (8 if text.count("<start") == 2 else 0)
+    assert counted["no_reply"] == (8 if "}}call" in text or "{call}{call}" in text else 0)
+
+
+def test_a_structural_backend_that_keeps_no_rows_is_not_a_model_that_returned_nothing(tmp_path):
+    """Found in review: liveness read the rows only from a `ToolPathBackend`,
+    so any other backend declaring structured answers failed as a model that
+    returned no call on any prompt."""
+
+    rows_ = labelled_rows(8)
+    split = tmp_path / "heldout.jsonl"
+    split.write_text("\n".join(json.dumps(r) for r in rows_) + "\n", encoding="utf-8")
+    candidate = FakeBackend(
+        texts=correct_texts(rows_),
+        prompt_mode=PromptMode.RUNTIME_RENDERED,
+        scores_structurally=True,
+    )
+    reference = FakeBackend(
+        model="org/reference", texts=correct_texts(rows_), prompt_mode=PromptMode.RUNTIME_RENDERED
+    )
+
+    result = run_verify(
+        VerifyRequest(
+            model=tmp_path / "m.litertlm",
+            reference="org/reference",
+            data=split,
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+        ),
+        backends=BackendPair(candidate=candidate, reference=reference),
+    )
+
+    assert result.status is Status.FAILED_HARNESS
+    assert "keeps no per-mode rows" in json.dumps(result.manifest["liveness"])

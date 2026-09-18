@@ -310,8 +310,9 @@ def _add_verify(sub) -> None:
             "tool declarations JSON, the same file bundle takes. Refused when its digest "
             "disagrees with the one recorded beside --reference, because a model measured "
             "against a different tool list than it trained on is measured on another task. "
-            "Required when the checkpoint recorded declarations: without them the model would be "
-            "measured on a prompt lacking the tool list it learned, and the run is refused"
+            "Required when a runtime_rendered checkpoint recorded declarations: without them the "
+            "model would be measured on a prompt lacking the tool list it learned, and the run is "
+            "refused. A prerendered checkpoint's prompts carry the tool list already"
         ),
     )
     verify.add_argument(
@@ -831,11 +832,15 @@ def summarise(manifest: dict) -> list[str]:
         # The number is grammar off minus grammar on, so its sign alone reads
         # backwards: say which way the grammar moved the score.
         value = grammar.get("value") or 0
-        moved = "lowered" if value > 0 else "raised" if value < 0 else "did not change"
         resolved = "" if grammar.get("resolved") else "  (unresolved at this sample size)"
+        if value > 0:
+            moved = f"lowered the score by {_num(value)}"
+        elif value < 0:
+            moved = f"raised the score by {_num(-value)}"
+        else:
+            moved = "did not change the score"
         lines.append(
-            f"  grammar_effect: the grammar {moved} the score by "
-            f"{_num(abs(value))} ±{_num(grammar.get('ci95'))}{resolved}"
+            f"  grammar_effect: the grammar {moved} ±{_num(grammar.get('ci95'))}{resolved}"
         )
 
     for name, value in _mapping(manifest.get("attribution")).items():

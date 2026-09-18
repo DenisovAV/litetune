@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -71,18 +72,18 @@ from litetune.metrics import (
     Difference,
     Proportion,
     QualityMetrics,
+    ToolCall,
     Unavailable,
     agreement,
     carries_reasoning,
     paired_difference,
-    parse_call,
     reasoning_unclosed,
+    runtime_calls,
     score_parsed,
     strip_reasoning,
     terminators_trimmed,
 )
 from litetune.models import identify, renders_declarations_for
-from litetune.prepare import START_CALL
 from litetune.prompt_mode import (
     PromptMode,
     PromptModeConflict,
@@ -296,15 +297,20 @@ def _tool_path_liveness(point: MeasurementPoint, backend: GenerationBackend) -> 
     runtime's reasons with it.
     """
     never_ran = [g for g in point.generations if g.harness_error is not None]
-    if never_ran:
+    if never_ran or not isinstance(backend, ToolPathBackend):
         # Nothing was performed. `unchecked` rather than `failed`, which is the
         # distinction this whole tool exists to keep: a run that could not be
-        # made is not a model that answered badly.
+        # made is not a model that answered badly. What this reads is the
+        # per-mode rows, so a backend that answers with calls and keeps none
+        # leaves nothing to judge either.
         checks = CheckSet(name="liveness")
         checks.add(
             Check.unchecked(
                 TOOL_PATH_LIVENESS,
-                f"the tool path was not measured: {never_ran[0].harness_error}",
+                f"the tool path was not measured: {never_ran[0].harness_error}"
+                if never_ran
+                else f"{type(backend).__name__} declares structured answers but keeps no "
+                "per-mode rows",
                 observed={"n": len(point.generations)},
             )
         )
@@ -312,16 +318,21 @@ def _tool_path_liveness(point: MeasurementPoint, backend: GenerationBackend) -> 
             checks=checks,
             skipped=[SkippedCheck(name="text liveness tier", reason=_TEXT_TIER_SKIPPED)],
         )
-    rows = backend.rows.get("unconstrained", []) if isinstance(backend, ToolPathBackend) else []
+    rows = backend.rows["unconstrained"]
     n = len(point.generations)
     answered = sum(1 for row in rows if row.calls)
+    prose = sum(1 for row in rows if not row.calls and not row.refused)
     unanswered = _unanswered(rows, list(range(len(rows))))
-    detail = f"with the grammar off, {answered} of {n} prompts returned a call" + (
-        f"; the runtime gave no reply to {_why_no_reply(unanswered)}"
-        if unanswered["no_reply"]
-        else ""
+    detail = (
+        f"with the grammar off, {answered} of {n} prompts returned a call"
+        + (f"; {prose} answered without calling anything" if prose else "")
+        + (
+            f"; the runtime gave no reply to {_why_no_reply(unanswered)}"
+            if unanswered["no_reply"]
+            else ""
+        )
     )
-    observed = {"answered": answered, "n": n} | unanswered
+    observed = {"answered": answered, "n": n, "without_a_call": prose} | unanswered
     checks = CheckSet(name="liveness")
     if answered:
         checks.add(Check.passed(TOOL_PATH_LIVENESS, detail, observed=observed))
@@ -456,14 +467,36 @@ def _score_tool_path(
     return scored["unconstrained"], reported
 
 
-def _one_call_text(text: str) -> str:
-    """The reference's text, or nothing when it carries more than one call.
+def _handed(calls: Sequence[ToolCall] | None) -> tuple:
+    """What an application is handed: no reply, or these calls in order.
 
-    The candidate's reply with several calls is a wrong answer -- an
-    application acts on each -- and the reference is held to the same rule, or
-    the difference between the two rules would be reported as conversion cost.
+    One shape for both sides of the tool path, so a candidate's reply and a
+    text read as the runtime reads it compare as the same kind of thing: two
+    calls are not prose, and no reply is not a reply without a call.
     """
-    return text if text.count(START_CALL) <= 1 else ""
+    return ("no reply",) if calls is None else ("calls", *calls)
+
+
+def _one_call(calls: Sequence[ToolCall] | None) -> ToolCall | None:
+    """The one call a reply answered with, or `None` for none, several or no reply.
+
+    Every target is one call, so a reply carrying two is not that answer: an
+    application would act on both. The rule `ToolPathRow.call` holds the
+    candidate to.
+    """
+    return calls[0] if calls is not None and len(calls) == 1 else None
+
+
+def _reference_on_the_tool_path(texts: Sequence[str]) -> list[list[ToolCall] | None]:
+    """The reference's texts read as the runtime reads a reply (`runtime_calls`).
+
+    The reference is `transformers`, which has no tool path and produces text,
+    so its text is read by the rule the runtime reads the candidate's with:
+    only between the call markers, each block one whole call. Read any other
+    way, the difference between the two readings would be reported as
+    conversion cost.
+    """
+    return [runtime_calls(strip_reasoning(text)) for text in texts]
 
 
 def _unanswered(rows: list[ToolPathRow], indices: list[int]) -> dict[str, Any]:
@@ -1344,13 +1377,21 @@ def run_verify(
         # so its texts would differ from any base's and the check could not
         # fail. Compared as calls instead, the base's read by the same parser
         # that scores it.
-        if pair.candidate.scores_structurally:
+        if isinstance(pair.candidate, ToolPathBackend):
+            rows = pair.candidate.rows["unconstrained"]
             check = divergence_check(
                 candidate,
-                [parse_call(_one_call_text(text)) for text in reference.texts],
+                [_handed(calls) for calls in _reference_on_the_tool_path(reference.texts)],
                 "the untuned base",
                 request.thresholds,
-                calls=[as_tool_call(g.call) for g in candidate.generations],
+                calls=[
+                    _handed(
+                        None
+                        if row.refused
+                        else [ToolCall(c["name"], c["arguments"]) for c in row.calls]
+                    )
+                    for row in rows
+                ],
             )
         else:
             check = divergence_check(
@@ -1402,14 +1443,28 @@ def run_verify(
                 [strip_reasoning(text) for text in reference.texts],
             )
         # The reference always produces text: it is `transformers`, which has no
-        # tool path to answer on, and `parse_call` is the parser on that side.
-        # Scored over the same rows as the candidate, every one of them. On the
-        # tool path a reply with several calls is wrong on both sides.
-        one_call = _one_call_text if pair.candidate.scores_structurally else (lambda text: text)
-        reference_metrics = scorer(
-            targets,
-            [one_call(strip_reasoning(reference.generations[i].text)) for i in indices],
-        )
+        # tool path to answer on. Scored over the same rows as the candidate,
+        # every one of them; on the tool path read as the runtime reads a reply,
+        # where a reply with several calls is wrong on both sides.
+        if tool_path is not None:
+            read = _reference_on_the_tool_path([reference.generations[i].text for i in indices])
+            # Every target is a call here: a scorer that reads text is refused
+            # on the tool path, and a string among them would fail alignment.
+            reference_metrics = score_parsed(
+                [t for t in targets if isinstance(t, ToolCall)],
+                [_one_call(calls) for calls in read],
+            )
+            tool_path["reference"] = {
+                "of": len(read),
+                "no_reply": sum(1 for calls in read if calls is None),
+                "several_calls": sum(1 for calls in read if calls is not None and len(calls) > 1),
+                "read_as": "the runtime reads a reply: between the call markers, one whole "
+                "call to a block, a block that is not one refusing the reply",
+            }
+        else:
+            reference_metrics = scorer(
+                targets, [strip_reasoning(reference.generations[i].text) for i in indices]
+            )
         sink.append(
             Check.passed(
                 "quality measured",

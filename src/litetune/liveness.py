@@ -276,8 +276,9 @@ def divergence_check(
     lossless conversion, so `verify` skips this check there and records why.
 
     `calls` stands in for the candidate's texts when its answers are not text:
-    a tool-path candidate's calls, compared by equality with `baseline`'s,
-    which are then calls too. Not through `comparable_form`, which reads text:
+    what a tool-path candidate handed an application on each prompt -- no
+    reply, or its calls -- compared by equality with `baseline`'s, which is
+    then in the same form. Not through `comparable_form`, which reads text:
     two different calls carrying the same text in an argument would collapse.
     """
     name = "divergence from baseline"

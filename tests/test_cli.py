@@ -1920,6 +1920,36 @@ def test_the_summary_says_which_path_ran_and_prints_both_modes():
     assert "grammar_effect: the grammar lowered the score by 0.1700" in text
 
 
+@pytest.mark.parametrize(
+    "value, said",
+    [
+        (0.17, "the grammar lowered the score by 0.1700 ±0.0300"),
+        (-0.05, "the grammar raised the score by 0.0500 ±0.0300"),
+        # Found in review: the measured run's case printed "did not change the
+        # score by 0.0000".
+        (0.0, "the grammar did not change the score ±0.0300"),
+    ],
+)
+def test_the_grammar_effect_says_which_way_it_moved_the_score(value, said):
+    from litetune.cli import summarise
+
+    lines = summarise(
+        {
+            "status": "passed",
+            "tool_path": {
+                "grammar_effect": {
+                    "available": True,
+                    "value": value,
+                    "ci95": 0.03,
+                    "resolved": False,
+                }
+            },
+        }
+    )
+
+    assert f"grammar_effect: {said}  (unresolved at this sample size)" in "\n".join(lines)
+
+
 def test_the_summary_says_when_the_grammar_on_run_was_not_made():
     from litetune.cli import summarise
 
