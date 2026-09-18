@@ -44,6 +44,7 @@ from litetune.prepare import (
     split_seed,
 )
 from litetune.spec import Spec
+from litetune.storage import hash_file
 
 FUNCTIONGEMMA = "google/functiongemma-270m-it"
 
@@ -1254,3 +1255,28 @@ def test_the_arguments_are_written_in_the_order_the_declarations_are_sorted_into
         "body:<escape>text<escape>,subject:<escape>hi<escape>,to:<escape>a@b.c<escape>"
         "}<end_function_call>"
     )
+
+
+def test_a_prerendered_split_records_the_declarations_bytes_and_no_length_note(
+    tmp_path, write_jsonl, request_for
+):
+    """In `prerendered` the application renders the file as it is: the bytes
+    are the record, and the prompts carry the declaration turn already, so the
+    lengths measured count it."""
+    declarations = _declarations(tmp_path, "set_colour")
+    turn = "<start_of_turn>developer\ntools<end_of_turn>\n<start_of_turn>user\n"
+    rows_ = [
+        {
+            "prompt": f"{turn}make it red {i}<end_of_turn>\n<start_of_turn>model\n",
+            "target": {"name": "set_colour", "args": {"colour": "red"}},
+        }
+        for i in range(40)
+    ]
+
+    result = prepare(
+        request_for(write_jsonl(rows_), base_model=FUNCTIONGEMMA, declarations=declarations)
+    )
+
+    assert result.as_dict()["declarations_sha256"] == hash_file(declarations)
+    assert hash_file(declarations) != read_declarations(declarations)[1]
+    assert not any("without the declaration turn" in text for text in result.limitations)

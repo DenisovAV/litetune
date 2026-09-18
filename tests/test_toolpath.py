@@ -1295,6 +1295,7 @@ def test_a_runtime_other_than_the_one_the_default_was_read_from_is_said(tmp_path
     assert "litert-lm 0.16.1's source; this run used 0.17.1" in said
     # The kinds of a missing reply are read from that version's log sentences too.
     assert "log sentences" in said
+    assert "leaves its mode unmeasured rather than scored" in said
     assert any("a version it could not name" in x for x in unnamed.manifest["limitations"])
 
 
@@ -1433,6 +1434,8 @@ def test_each_mode_says_over_how_many_prompts_it_counted(tmp_path):
         # A base that wrote its call outside the markers answered in prose, as
         # the runtime reads it.
         ("prose", "a call outside the markers"),
+        # And a second call is a difference, not only the first.
+        ("two calls", "one call"),
     ],
 )
 def test_divergence_tells_what_an_application_is_handed_apart(tmp_path, candidate, base):
@@ -1447,6 +1450,7 @@ def test_divergence_tells_what_an_application_is_handed_apart(tmp_path, candidat
     text = {
         "prose": "I have changed it for you.",
         "a call outside the markers": call_text(target["name"], **target["args"]),
+        "one call": marked([call_text(target["name"], **target["args"])])[0],
     }[base]
     # One prompt answered alike on both sides, so liveness lets the check run.
     replies = [_row(0, calls=[call])] + [row(i) for i in range(1, 8)]
@@ -1573,3 +1577,24 @@ def test_a_grammar_off_run_not_measured_keeps_the_runtime_version_and_names_the_
     assert result.manifest["measurements"]["candidate"]["engine"]["runtime_version"] == "0.17.0"
     assert any("this run used 0.17.0" in x for x in result.manifest["limitations"])
     assert "(prompt 6, 7)" in json.dumps(result.manifest["tool_path"])
+
+
+def test_a_scored_mode_counts_over_the_labelled_prompts(tmp_path):
+    """Liveness counts every row; the scored block the labelled ones, and says
+    so in `of`."""
+    rows_ = labelled_rows(6) + [{"prompt": f"unlabelled {i}"} for i in range(2)]
+    replies = [
+        _row(i, calls=[{"name": r["target"]["name"], "arguments": r["target"]["args"]}])
+        for i, r in enumerate(rows_[:6])
+    ] + [_row(6, text="x"), _row(7, text="y")]
+
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"constrained": replies, "unconstrained": replies},
+        reference_texts=marked(correct_texts(rows_[:6])) + ["x", "y"],
+    )
+
+    assert result.manifest["tool_path"]["modes"]["unconstrained"]["of"] == 6
+    (live,) = result.manifest["liveness"]["candidate"]["checks"]
+    assert live["observed"]["of"] == 8

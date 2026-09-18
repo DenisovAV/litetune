@@ -1983,3 +1983,15 @@ def test_the_summary_says_when_the_grammar_on_run_was_not_made():
     assert "  grammar off: not measured — r" in off
     assert "no SentencePiece tokenizer" in text
     assert "grammar_effect" not in text
+
+
+def test_the_verify_declarations_help_says_which_checkpoints_need_them():
+    """Found in review: it said any checkpoint that recorded declarations needs
+    them; only a runtime_rendered one does."""
+    from litetune.cli import build_parser
+
+    verify = build_parser()._subparsers._group_actions[0].choices["verify"]
+    (action,) = [a for a in verify._actions if "--declarations" in a.option_strings]
+
+    assert "runtime_rendered checkpoint recorded declarations" in action.help
+    assert "A prerendered checkpoint's prompts carry the tool list already" in action.help

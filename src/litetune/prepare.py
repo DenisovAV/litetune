@@ -500,7 +500,7 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
 
         completion = obj.get("completion")
         rendered = completion is None and target is not None
-        if completion is None and target is not None:
+        if rendered:
             # A string target is already the text to supervise; a call has to be
             # rendered into the wire format the model is trained to emit.
             try:
