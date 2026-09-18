@@ -176,14 +176,15 @@ def test_a_structured_call_comes_back_with_its_argument_types(tmp_path, monkeypa
     Flattening them here would throw away the thing the tool path has that the
     text path does not.
     """
-    runtime = FakeRuntime(replies=[_reply("set_alarm", {"hour": 7, "loud": True})])
+    # A number comes back as a double: `fc_parser.rs` reads every NUMBER as f64.
+    runtime = FakeRuntime(replies=[_reply("set_alarm", {"hour": 7.0, "loud": True})])
 
     _, out = _run(runtime, tmp_path, monkeypatch)
 
     (row,) = json.loads(out.read_text(encoding="utf-8"))
     assert row == {
         "index": 0,
-        "call": {"name": "set_alarm", "arguments": {"hour": 7, "loud": True}},
+        "call": {"name": "set_alarm", "arguments": {"hour": 7.0, "loud": True}},
         "text": "",
         "error": None,
     }
@@ -390,6 +391,34 @@ def test_the_score_is_the_call_the_runtime_returned(tmp_path):
     assert result.status in (Status.PASSED, Status.FAILED_GATE, Status.INCONCLUSIVE)
     assert result.manifest["quality"]["candidate"]["exact_match"]["value"] == pytest.approx(0.75)
     assert result.manifest["tool_path"]["modes"]["constrained"]["score"]["n"] == 8
+
+
+def test_an_integer_the_runtime_returns_as_a_double_scores_as_that_integer(tmp_path):
+    """LiteRT-LM v0.16.1 hands `hour:7` back as `7.0`. Scored as the string
+    `"7.0"`, every correct integer argument was wrong on the tool path while the
+    reference, parsing `hour:7` itself, got it right -- a conversion cost made
+    of nothing but a type. mobile-actions has string arguments only, so the
+    measured run could not see it."""
+    rows_ = [
+        {"prompt": f"wake me at {h}", "target": {"name": "set_alarm", "args": {"hour": h}}}
+        for h in range(8)
+    ]
+    returned = [
+        {
+            "index": h,
+            "call": {"name": "set_alarm", "arguments": {"hour": float(h)}},
+            "text": "",
+            "error": None,
+        }
+        for h in range(8)
+    ]
+
+    result = _verify(tmp_path, rows_, {"constrained": returned, "unconstrained": returned})
+
+    modes = result.manifest["tool_path"]["modes"]
+    assert modes["constrained"]["score"]["exact_match"]["value"] == pytest.approx(1.0)
+    assert modes["unconstrained"]["score"]["exact_match"]["value"] == pytest.approx(1.0)
+    assert result.manifest["attribution"]["conversion_cost"]["value"] == pytest.approx(0.0)
 
 
 def test_both_decoding_modes_are_reported(tmp_path):

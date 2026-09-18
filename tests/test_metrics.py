@@ -6,6 +6,7 @@ unpaired one, changes what those tests conclude about a real comparison.
 """
 
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -111,6 +112,66 @@ def test_a_value_that_is_neither_escaped_nor_a_scalar_is_not_a_call():
     """A bare word is not a shape either renderer produces, and reading it as
     one would turn a malformed generation into a confident wrong answer."""
     assert parse_call("call:set{colour:red}") is None
+
+
+def test_a_number_the_runtime_hands_back_as_a_double_is_the_integer_it_equals():
+    """LiteRT-LM v0.16.1 reads every `NUMBER` as an f64, so a call the model
+    wrote as `hour:7` reaches the caller as `7.0`. Compared as `"7.0"` against a
+    target of `7`, every correct integer on the tool path scored wrong, and the
+    difference landed in the conversion cost."""
+    assert ToolCall("set_alarm", {"hour": 7.0}) == ToolCall("set_alarm", {"hour": 7})
+    assert ToolCall("set_alarm", {"hour": 7.0}) == parse_call("call:set_alarm{hour:7}")
+    assert ToolCall("set", {"n": 1e20}) == ToolCall("set", {"n": 10**20})
+    # A number that is not an integer keeps its value, and stays unequal to
+    # the integer beside it.
+    assert ToolCall("set", {"ratio": 0.5}).args == {"ratio": "0.5"}
+    assert ToolCall("set", {"n": 7.5}) != ToolCall("set", {"n": 7})
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "call:set{n:007}",  # INT is '0' | [1-9][0-9]*: no leading zero
+        "call:set{n:\u0663}",  # an Arabic-Indic three: `\d` matched it, the lexer does not
+        "call:set{n:1.5e-07}",  # FRAC and EXP never together
+        "call:set{n:e5}",  # lexes, but fc_parser.rs fails to read it as a number
+        "call:set{n:-}",
+    ],
+)
+def test_a_number_the_runtimes_lexer_refuses_is_not_a_call(text):
+    """Held to the grammar the runtime reads (`AntlrFcLexer.g4`, v0.16.1), and
+    never raised: `007` used to reach `json.loads` and crash `verify` from the
+    divergence check, which runs outside every guard."""
+    assert parse_call(text) is None
+
+
+def test_a_number_the_runtimes_lexer_reads_is_a_call():
+    call = parse_call("call:set{a:0,b:-3,c:0.25,d:1e+16,e:-2E-3,f:.5}")
+
+    assert call is not None
+    assert call.raw == {"a": 0, "b": -3, "c": 0.25, "d": 1e16, "e": -0.002, "f": 0.5}
+    # `0 == 0.0` in Python, so the type is asserted apart: rendered back, an
+    # integer read as a float would be written `0.0`.
+    assert [type(v) for v in call.raw.values()] == [int, int, float, float, float, float]
+
+
+@pytest.mark.parametrize("escape", ["<escape>", "<ctrl46>", '<|"|>'])
+def test_every_escape_the_runtime_reads_delimits_a_string(escape):
+    """The lexer's `ESCAPE` is three spellings, and `ESCAPED_STRING` ends at the
+    first of any of them. Reading only one would score as correct a string the
+    runtime cuts short."""
+    assert parse_call(f"call:set{{s:{escape}a,b{escape}}}") == ToolCall("set", {"s": "a,b"})
+    assert parse_call("call:set{s:<escape>a<ctrl46>b<escape>}") is None
+
+
+def test_raw_is_derived_and_cannot_disagree_with_args():
+    """A `raw` passed beside `args` compared as one answer and rendered as
+    another. Derived, it follows `replace` too."""
+    with pytest.raises(TypeError):
+        ToolCall("set", {"n": 3}, raw={"n": "3"})
+
+    moved = replace(ToolCall("set", {"n": 3}), args={"n": 5})
+    assert moved.raw == {"n": 5}
 
 
 def test_parses_a_call_in_its_markers_up_to_the_stop_token():

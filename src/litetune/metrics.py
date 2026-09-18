@@ -38,20 +38,45 @@ Z95 = 1.959963985
 # argument pairs instead of splitting the body on punctuation. `<escape>` is
 # part of the format, not a leaked special token -- see liveness.py, where
 # flagging it would fail every correct output. A number, a boolean and a null
-# are written bare, which is what the runtime returned when its tool path was
-# measured on 2026-09-16 (`1234.0` for a numeric argument, `"red"` for a string).
+# are written bare, as the runtime's goldens write them (`call:tool_name{x:1}`
+# beside `location:<escape>Paris<escape>`).
 #
 # Both are accepted, because the comparison has to span the change: every
-# checkpoint this project trained before the format was measured emits the
-# escaped form for everything, and the untuned base emits the bare one. A parser
-# that took only the new shape would fail to read both ends of the very
-# comparison it exists to make.
+# checkpoint this project trained before the format was read emits the escaped
+# form for everything, and the untuned base emits the bare one. A parser that
+# took only the new shape would fail to read both ends of the very comparison it
+# exists to make.
+#
+# The tokens are the runtime's own. LiteRT-LM v0.16.1 reads a call with the
+# ANTLR lexer `AntlrFcLexer.g4`: an identifier is `[a-zA-Z_][a-zA-Z0-9_.-]*`, an
+# escape is any of three spellings, and a number is
+# `'-'? INT (FRAC | EXP)? | '-'? FRAC | '-'? EXP` with `INT : '0' | [1-9][0-9]*`
+# -- no leading zero, no ASCII-only shortcut like `\d`, and a fraction and an
+# exponent never together. Text the lexer would refuse is text this refuses, so
+# the reference, parsed here, and the candidate, parsed by the runtime, are held
+# to the same grammar. (`-'? EXP` alone lexes but `fc_parser.rs` then fails to
+# read it as a number, so it is left out.)
 
-_HEAD_RE = re.compile(r"call:\s*(?P<name>[A-Za-z_][A-Za-z0-9_.\-]*)\s*\{")
-_KEY = r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]*)\s*:\s*"
-_ESCAPED_RE = re.compile(rf"\s*{_KEY}<escape>(?P<value>.*?)<escape>\s*", re.DOTALL)
-_BARE_RE = re.compile(rf"\s*{_KEY}(?P<value>true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*")
+IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_.\-]*"
+ESCAPE_SPELLINGS = ("<escape>", "<ctrl46>", '<|"|>')
+_ESCAPE = "(?:" + "|".join(re.escape(s) for s in ESCAPE_SPELLINGS) + ")"
+_INTEGER = r"-?(?:0|[1-9][0-9]*)"
+_NUMBER = rf"(?:{_INTEGER}(?:\.[0-9]+|[eE][+-]?[0-9]+)?|-?\.[0-9]+)"
+
+_HEAD_RE = re.compile(rf"call:\s*(?P<name>{IDENTIFIER})\s*\{{")
+_KEY = rf"(?P<key>{IDENTIFIER})\s*:\s*"
+_ESCAPED_RE = re.compile(rf"\s*{_KEY}{_ESCAPE}(?P<value>.*?){_ESCAPE}\s*", re.DOTALL)
+_BARE_RE = re.compile(rf"\s*{_KEY}(?P<value>true|false|null|{_NUMBER})\s*")
 _CLOSE_RE = re.compile(r"\s*\}")
+
+
+def _bare_value(text: str) -> Any:
+    """The value of a token `_BARE_RE` matched. Cannot raise: the regex is the grammar."""
+    if text in ("true", "false", "null"):
+        return json.loads(text)
+    if re.fullmatch(_INTEGER, text):
+        return int(text)
+    return float(text)
 
 
 def _stringify(value: Any) -> str:
@@ -62,11 +87,21 @@ def _stringify(value: Any) -> str:
     to their JSON spellings because that is the shape the training data used;
     `str(True)` would compare `"True"` against an emitted `"true"` and score a
     correct answer wrong.
+
+    **A number is compared by its value.** The runtime hands every number back
+    as a double -- `fc_parser.rs` reads a `NUMBER` with `text.parse::<f64>()` in
+    v0.16.1 -- so a call the model wrote as `hour:7` reaches the caller as
+    `7.0`, while the same text parsed here is the integer `7`. Written as
+    `str()`, those are `"7.0"` and `"7"`, and every correct integer on the tool
+    path would score wrong against a reference that got the same answer. An
+    integral float is therefore written as the integer it equals.
     """
     if isinstance(value, bool):
         return "true" if value else "false"
     if value is None:
         return "null"
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return str(int(value))
     return str(value).strip()
 
 
@@ -75,28 +110,27 @@ class ToolCall:
     """One parsed call. `args` values are always strings; see `_stringify`.
 
     `raw` carries the same arguments before `_stringify` flattened them, because
-    the wire format is typed where the comparison is not: the runtime's parser
-    reads a bare `3` as a number and an escaped one as a string, so rendering a
-    target back has to know which it was. Scoring never reads it -- it is out of
-    equality and out of `repr`, so every number this project has published stays
-    the number it was -- and nothing here makes the comparison type-aware. That
-    is deliberate and was paid for by earlier measurements.
+    the wire format is typed where the comparison is not: the runtime's goldens
+    write a number bare and a string escaped, so rendering a target back has to
+    know which it was. Scoring never reads it -- it is out of equality and out
+    of `repr` -- and nothing here makes the comparison type-aware.
+
+    It is derived, never passed: a `raw` supplied beside `args` could disagree
+    with it, and then the call would compare as one answer and render as
+    another.
     """
 
     name: str
     args: dict[str, str]
-    raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    raw: dict[str, Any] = field(init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         # Normalise on construction so that equality means "same answer"
         # regardless of which side of the comparison a value came from.
         object.__setattr__(self, "name", self.name.strip())
-        original = dict(self.args)
-        object.__setattr__(self, "args", {str(k): _stringify(v) for k, v in original.items()})
-        # A caller that knows the types states them; everyone else gets what
-        # they passed, which for a target read from JSON is already typed.
-        if not self.raw:
-            object.__setattr__(self, "raw", {str(k): v for k, v in original.items()})
+        original = {str(k): v for k, v in self.args.items()}
+        object.__setattr__(self, "args", {k: _stringify(v) for k, v in original.items()})
+        object.__setattr__(self, "raw", original)
 
     @classmethod
     def from_target(cls, obj: Any) -> ToolCall | None:
@@ -163,7 +197,7 @@ def parse_call(text: str) -> ToolCall | None:
             if bare is None:
                 # A body that starts but never closes cleanly is not half a call.
                 return None
-            values[bare.group("key")] = json.loads(bare.group("value"))
+            values[bare.group("key")] = _bare_value(bare.group("value"))
             pos = bare.end()
         if text[pos : pos + 1] == ",":
             pos += 1
