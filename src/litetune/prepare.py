@@ -1019,8 +1019,7 @@ class PrepareRequest:
     tokens: TokenCounter | None = None
     headroom: HeadroomProbe | None = None
     # The tool declarations this split's calls are made against, in the shape
-    # `bundle` takes. Absent is the run every existing caller makes, and it
-    # behaves exactly as it did before declarations were an input here.
+    # `bundle` takes. Absent, no row is checked against a tool list.
     declarations: Path | None = None
     # What this split is for. A structured target has to be rendered in the
     # spelling that model's runtime reads, and litetune records that per family

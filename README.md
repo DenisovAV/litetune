@@ -319,14 +319,25 @@ call. So a `runtime_rendered` bundle ships its declarations in the order the
 model learned, and its contract's `declarations_sha256` names that list.
 
 **Who serves it this way.** LiteRT-LM's Python API, as
-`create_conversation(tools=...)`, which is how `verify` asks. On Kotlin, an
-`OpenApiTool` returning each entry's `function` object as shipped, registered
-in the file's order; the reflection-based `@Tool` path writes its own keys,
-order and `nullable`, and does not render what was trained. flutter_gemma 1.8.3
-does not use this path for FunctionGemma: it renders the declarations in Dart
-and hands the runtime tools only for Gemma 4
-(`flutter_gemma_litertlm/lib/src/ffi/ffi_inference_model.dart`), so a model
-trained here is not served by it the way it was measured.
+`create_conversation(tools=...)`, which is how `verify` asks, and where
+constrained decoding is on only if you pass
+`ConstrainedDecodingConfig(enable=True)`.
+
+On Kotlin, an `OpenApiTool` returning each entry's `function` object as shipped
+— not the whole `{"type": "function", ...}` entry, which it refuses —
+registered in the file's order. Parse the file into a JSON object and hand it
+on; a data class serialised back out can reorder the keys. The reflection-based
+`@Tool` path writes its own keys, order and `nullable` for a tool that takes
+arguments, and does not render what was trained. Constrained decoding there is
+`ExperimentalFlags.enableConversationConstrainedDecoding`, off by default and
+held in memory, so set it on every start. Automatic tool calling is on by
+default in Kotlin; the model was trained on one turn, and `verify` measures with
+it off. A number reaches your tool as a double.
+
+flutter_gemma 1.8.3 does not use this path for FunctionGemma: it renders the
+declarations in Dart, and its `flutter_gemma_litertlm` package hands the runtime
+tools only for Gemma 4 (`lib/src/ffi/ffi_inference_model.dart`). A model trained
+here is not served by it the way it was measured.
 
 **`verify` picks the path from the model, not from a flag.** With declarations
 and a family whose runtime renders them, it asks the runtime for a structured
@@ -334,16 +345,22 @@ call instead of reading text, twice: with constrained decoding off — the
 runtime's default, and what the reference is compared with — and on, which is
 what an application that enables it gets. How far the two differ, and which way,
 is reported. A prompt the runtime gives no reply to is scored as a wrong answer
-and counted apart, with the reason the runtime logged.
+and counted apart by reason — its call parser, a prompt over the bundle's token
+limit, or something else it logged. A run the runtime could not answer at all,
+never for its parser, is a harness failure rather than a score; a grammar-on run
+that cannot be made is reported as not measured, and the grammar-off number
+stands. A reply with more than one call is a wrong answer on both sides.
 
 **What it refuses.** Structured targets in `runtime_rendered` without
 `--declarations`: their descriptions and types are your application's contract
-and cannot be read off the targets. `--declarations` for a family whose runtime
-does not render them. A structured target for a family whose call format
-litetune has not measured: supply each row's `completion` instead. A split whose
-call completions are not what `prepare` writes — one prepared by 0.1.6 or
-earlier: re-run `prepare`. `verify` without `--declarations` for a checkpoint
-that recorded some, and `--scorer exact-text` on the tool path. `prepare`
+and cannot be read off the targets. `--declarations` for a `runtime_rendered`
+split of a family whose runtime litetune does not record as rendering them. A
+structured target for a family whose call format litetune has not measured:
+supply each row's `completion` instead. A call row whose completion is not a
+call the runtime reads for its target — no call markers, as in a split prepared
+by 0.1.6 or earlier: drop the completion so `prepare` renders it. `verify`
+without `--declarations` for a `runtime_rendered` checkpoint that recorded
+some, and `--scorer exact-text` on the tool path. `prepare`
 without `--base-model` still renders FunctionGemma's format, and the report
 says that it assumed it.
 
@@ -389,8 +406,7 @@ passes every liveness check, and still answers a plain text prompt — then
 fails the native tool-call path, where LiteRT-LM routes the call through the
 chat template, with `litert_lm_conversation_send_message_stream failed`, which
 is the whole error the caller gets. The split is in the runtime, so every
-consumer sees it: the `flutter_gemma` plugin, the AI Edge Gallery, or the SDK
-used directly. litetune ships a template the runtime can run and passes it on
+consumer that hands it tools sees it, whatever it is written in. litetune ships a template the runtime can run and passes it on
 export. Measured on the same checkpoint: with the override the runtime answers
 `[tool_call] set_alarm{hour:7}`; without it, `INTERNAL: Failed to apply
 template`.

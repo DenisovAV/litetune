@@ -489,8 +489,8 @@ class ToolPathBackend:
 
     A `GenerationBackend` because it is one -- one answer per prompt, in order,
     never raising for a failed run. What it adds is on each `Generation`: the
-    structured call the runtime returned, and the runtime's refusal when its
-    parser rejected that generation.
+    structured call the runtime returned, and why it gave no reply when it gave
+    none -- its call parser rejecting the generation being one reason of several.
 
     `prompt_mode` is `RUNTIME_RENDERED` and cannot be anything else: the runtime
     builds this prompt, declarations and all. `verify._tool_path_reason` keeps a

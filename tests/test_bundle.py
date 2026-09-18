@@ -1246,9 +1246,10 @@ def test_the_contract_records_which_declarations_even_when_nobody_supplied_the_d
 def test_the_training_digest_matches_the_file_supplied_not_its_normalised_copy(
     tmp_path, request_for
 ):
-    """`tune` hashed the bytes it read. The shipped file is the same declarations
-    normalised, which hashes differently by design -- comparing the training
-    digest with that copy would refuse the one bundle this exists to produce."""
+    """The file supplied is compared with the training record, not the copy the
+    bundle writes: the copy is the same declarations normalised, and a record
+    over the supplied file's bytes -- what a `prerendered` run keeps -- would
+    refuse it."""
     source = _unsorted_declarations(tmp_path)
 
     result = build_bundle(

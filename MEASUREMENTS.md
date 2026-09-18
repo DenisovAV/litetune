@@ -702,7 +702,9 @@ measurement could see, because the text scorer finds `call:` anywhere:
   not pass them to the runtime, so this is not how it serves this model.
 - No row was refused by the runtime in either mode. Since this run, a row the
   runtime gives no reply to is scored as a wrong answer rather than left out,
-  which changes none of these numbers.
+  which changes none of these numbers. The run kept only the first call of each
+  reply, so whether any reply carried two -- now a wrong answer -- cannot be
+  read from its rows.
 - The untuned base could not be measured through the tool path: converted
   from its Hub id it carries no SentencePiece tokenizer, and litert-lm 0.16.1
   refuses constrained decoding without one. So there is no training gain here.
