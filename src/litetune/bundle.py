@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -580,9 +581,40 @@ def _copy_model(source: Path, output_dir: Path) -> Path:
     # spells out. Removing the recorded model before the copy meant a failure
     # partway -- a full disk, a source that vanished -- left the bundle without
     # the old artifact and without the new one.
-    shutil.copyfile(source, destination)
+    _copy_member(source, destination)
     _clear_previous_model(output_dir, keep=destination)
     return destination
+
+
+def _replace_member(destination: Path, write: Any) -> None:
+    """Put a new file at `destination` by renaming one into place, never writing through it.
+
+    A link at the path -- symbolic or hard, planted or left by a previous
+    bundle -- would have a write follow it to a file outside --output-dir;
+    `os.replace` swaps the directory entry and leaves whatever it pointed at
+    alone. `write` fills the new file, created fresh beside the destination.
+    """
+    handle, staging = tempfile.mkstemp(dir=destination.parent, prefix=f".{destination.name}.")
+    os.close(handle)
+    try:
+        write(Path(staging))
+        # `mkstemp` makes the file private; a member gets the mode a plain
+        # write would have given it, as every bundle before this did.
+        mask = os.umask(0)
+        os.umask(mask)
+        os.chmod(staging, 0o666 & ~mask)
+        os.replace(staging, destination)
+    except BaseException:
+        Path(staging).unlink(missing_ok=True)
+        raise
+
+
+def _write_member(destination: Path, text: str) -> None:
+    _replace_member(destination, lambda staging: staging.write_text(text, encoding="utf-8"))
+
+
+def _copy_member(source: Path, destination: Path) -> None:
+    _replace_member(destination, lambda staging: shutil.copyfile(source, staging))
 
 
 def _clear_previous_model(output_dir: Path, keep: Path) -> None:
@@ -814,9 +846,7 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
         request = replace(request, contract=contract)
         result.request = request
     contract_path = request.output_dir / CONTRACT_NAME
-    contract_path.write_text(
-        json.dumps(contract.as_dict(), indent=2, sort_keys=True), encoding="utf-8"
-    )
+    _write_member(contract_path, json.dumps(contract.as_dict(), indent=2, sort_keys=True))
     result.members.append(_member(CONTRACT_NAME, contract_path))
     contract_check = Check.passed(
         "contract recorded",
@@ -861,15 +891,13 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     # -- the manifest and the report, written whatever the outcome ---------
     manifest = _bundle_manifest(request, result)
     manifest_path = request.output_dir / MANIFEST_NAME
-    manifest_path.write_text(manifest.as_json(), encoding="utf-8")
+    _write_member(manifest_path, manifest.as_json())
     result.manifest_path = manifest_path
     result.members.append(_member(MANIFEST_NAME, manifest_path))
     events.artifact(str(manifest_path), name=MANIFEST_NAME)
 
     report_path = request.output_dir / REPORT_NAME
-    report_path.write_text(
-        json.dumps(result.as_dict(), indent=2, sort_keys=True, default=str), encoding="utf-8"
-    )
+    _write_member(report_path, json.dumps(result.as_dict(), indent=2, sort_keys=True, default=str))
     result.report_path = report_path
     # Added after writing: a file cannot contain its own hash. Recorded in the
     # result so the caller can still identify it.
@@ -921,7 +949,7 @@ def _copy_adapter(request: BundleRequest, result: BundleResult) -> Check | None:
                     f"the adapter at {request.adapter} is already inside --output-dir "
                     f"({request.output_dir}); name a source outside it"
                 )
-            shutil.copyfile(request.adapter, destination)
+            _copy_member(request.adapter, destination)
             members = [_member(destination.name, destination)]
     except BundleError as exc:
         return Check.failed(
@@ -989,12 +1017,18 @@ def _digest_disagreement(request: BundleRequest, source: Path, name: str) -> Che
     if digest_matches(recorded, digest, source, prerendered):
         return None
     # The kind of digest the contract records for this mode, so the two
-    # printed side by side are comparable.
-    actual = (hash_file(source) if prerendered or digest is None else digest).split(":", 1)[-1]
+    # printed side by side are comparable -- both kinds where the mode accepts
+    # both, since a record of either may be what disagrees.
+    as_file = hash_file(source).split(":", 1)[-1]
+    if prerendered or digest is None:
+        actual, shown = as_file, as_file[:16]
+    else:
+        actual = digest.split(":", 1)[-1]
+        shown = f"{actual[:16]} as a tool list and {as_file[:16]} as a file"
     expected = recorded.split(":", 1)[-1]
     return Check.failed(
         name,
-        f"the declarations supplied hash {actual[:16]} but the contract was written against "
+        f"the declarations supplied hash {shown}, but the contract was written against "
         f"{expected[:16]}: the model's calling convention was established against a different "
         "tool list than the one being shipped",
         observed={"actual": actual, "contract": expected},
@@ -1010,7 +1044,7 @@ def _write_declarations_as_trained(
     except DeclarationsError as exc:
         # Copied as given so it can be looked at; the check says it is not usable.
         try:
-            shutil.copyfile(source, destination)
+            _copy_member(source, destination)
             result.members.append(_member(DECLARATIONS_NAME, destination))
         except OSError:
             logger.exception("could not copy refused declarations from %s", source)
@@ -1018,7 +1052,7 @@ def _write_declarations_as_trained(
     disagreement = _digest_disagreement(request, source, name)
     if disagreement is not None:
         return disagreement
-    destination.write_text(canonical_text(parsed), encoding="utf-8")
+    _write_member(destination, canonical_text(parsed))
     result.members.append(_member(DECLARATIONS_NAME, destination))
     return Check.passed(
         name,
@@ -1085,7 +1119,7 @@ def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
     if request.contract.runtime_renders_declarations:
         return _write_declarations_as_trained(request, result, source, destination, name)
     try:
-        shutil.copyfile(source, destination)
+        _copy_member(source, destination)
         parsed = json.loads(destination.read_text(encoding="utf-8"))
     except (OSError, shutil.Error) as exc:
         logger.exception("could not copy declarations from %s", source)

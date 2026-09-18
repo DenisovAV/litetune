@@ -1341,3 +1341,73 @@ def test_the_training_digest_matches_the_file_supplied_not_its_normalised_copy(
     contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
     assert contract["declarations_sha256"] == hash_file(shipped)
     assert any("now names that list's digest" in text for text in result.limitations)
+
+
+@pytest.mark.parametrize("member", [CONTRACT_NAME, MANIFEST_NAME, REPORT_NAME, "model.litertlm"])
+@pytest.mark.parametrize("link", ["symbolic", "hard"])
+def test_no_member_is_written_through_a_link_already_at_its_path(
+    tmp_path, request_for, model_file, member, link
+):
+    """Found in review: the contract, manifest, report and model were written
+    through a link planted in --output-dir, over a file outside it -- a bundle
+    received as an archive can carry such links."""
+    out = tmp_path / "bundle"
+    out.mkdir(exist_ok=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("not yours", encoding="utf-8")
+    at = out / (model_file.name if member == "model.litertlm" else member)
+    if link == "symbolic":
+        at.symlink_to(elsewhere)
+    else:
+        os.link(elsewhere, at)
+
+    build_bundle(request_for(output_dir=out))
+
+    assert elsewhere.read_text(encoding="utf-8") == "not yours"
+    assert not at.is_symlink()
+    assert at.stat().st_mode & 0o777 == 0o666 & ~_umask()
+
+
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def test_a_rewritten_contract_is_the_one_reported(tmp_path, request_for):
+    """The report, the manifest and `contract.json` describe one contract,
+    including where the bundle rewrote its digest."""
+    source = _unsorted_declarations(tmp_path)
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED, declarations_sha256=hash_file(source)
+            ),
+        )
+    )
+
+    written = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert result.request.contract.declarations_sha256 == written["declarations_sha256"]
+    assert written["declarations_sha256"] != hash_file(source)
+
+
+def test_a_runtime_rendered_disagreement_prints_both_kinds_of_digest(tmp_path, request_for):
+    """Found in review: where the mode accepts a record of the list or of the
+    file, the refusal printed only the list's, beside what may be a record of
+    the file."""
+    source = _unsorted_declarations(tmp_path)
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED, declarations_sha256="sha256:" + "0" * 64
+            ),
+        )
+    )
+
+    detail = check_named(result, "declarations included").detail
+    assert read_declarations(source)[1].split(":")[1][:16] + " as a tool list" in detail
+    assert hash_file(source).split(":")[1][:16] + " as a file" in detail
