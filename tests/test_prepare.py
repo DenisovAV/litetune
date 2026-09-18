@@ -1103,6 +1103,29 @@ def test_prerendered_calls_prepare_without_declarations_because_the_prompt_carri
     assert result.n_rows == 40
 
 
+def test_the_report_records_the_declarations_the_targets_were_checked_against(
+    tmp_path, write_jsonl, request_for
+):
+    """Found in review: `tune` and `verify` record the digest and `prepare` did
+    not, so a split could not be traced to the tool list it was checked with.
+    Bare prompts, so the runtime adds a declaration turn this stage cannot
+    count, and the report says the length check undercounts."""
+    declarations = _declarations(tmp_path, "set_colour")
+    rows_ = [
+        {"prompt": f"make it red {i}", "target": {"name": "set_colour", "args": {"colour": "red"}}}
+        for i in range(40)
+    ]
+
+    result = prepare(
+        request_for(write_jsonl(rows_), base_model=FUNCTIONGEMMA, declarations=declarations)
+    )
+
+    record = result.as_dict()
+    assert record["declarations_sha256"] == read_declarations(declarations)[1]
+    assert record["request"]["declarations"] == str(declarations)
+    assert any("without the declaration turn" in text for text in result.limitations)
+
+
 def test_the_arguments_are_written_in_the_order_the_declarations_are_sorted_into():
     """The runtime's grammar enforces the declared property order, and
     `declarations.py` sorts the declarations. Measured 2026-09-17: a model

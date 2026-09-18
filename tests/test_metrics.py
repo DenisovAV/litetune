@@ -64,7 +64,10 @@ def test_the_types_are_out_of_the_comparison():
     assert typed == from_wire
     assert typed.raw != from_wire.raw
     assert "raw" not in repr(typed)
-    assert typed.as_dict() == {"name": "set", "args": {"n": "3"}}
+    # A split records the types, so a target read back renders as it did.
+    assert typed.as_dict() == {"name": "set", "args": {"n": 3}}
+    assert ToolCall.from_target(typed.as_dict()) == typed
+    assert ToolCall.from_target(typed.as_dict()).raw == {"n": 3}
 
 
 def test_parses_multiple_arguments():

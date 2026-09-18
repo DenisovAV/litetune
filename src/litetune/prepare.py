@@ -139,6 +139,14 @@ ASSUMED_WIRE_FORMAT = (
 )
 
 
+DECLARATIONS_NOT_COUNTED = (
+    "the token lengths above count each prompt without the declaration turn the runtime puts "
+    "in front of it, which this stage cannot render the way the runtime does. `tune` measures "
+    "the rendered sequence and refuses a row over max_seq_length, so nothing is truncated; the "
+    "check here is the earlier, cheaper one, and it undercounts"
+)
+
+
 def _identity(base_model: str | None, wire: WireFormat | None) -> dict[str, Any] | None:
     """What the model was resolved to, and from where. `None` when none was named."""
     if base_model is None or wire is None:
@@ -360,7 +368,7 @@ def refuse_calls_without_declarations(rows: Sequence[Row], base_model: str) -> N
             )
 
 
-def refuse_undeclared_tools(rows: Sequence[Row], data: Path, declarations: Path) -> None:
+def refuse_undeclared_tools(rows: Sequence[Row], data: Path, declarations: Path) -> str:
     """Refuse a row whose target calls a tool the declarations do not offer.
 
     Raised rather than recorded, which is this stage's exception to its own rule
@@ -380,7 +388,7 @@ def refuse_undeclared_tools(rows: Sequence[Row], data: Path, declarations: Path)
     text is the caller saying what to train, and litetune does not parse it back
     to second-guess which tool it names.
     """
-    parsed = read_declarations(declarations)[0]
+    parsed, digest = read_declarations(declarations)
     offered = tool_names(parsed)
     for row in rows:
         if not isinstance(row.target, ToolCall):
@@ -397,6 +405,7 @@ def refuse_undeclared_tools(rows: Sequence[Row], data: Path, declarations: Path)
                 f"{data}:{row.lineno}: the target {problem} in {declarations}. Training it "
                 "would teach a call that contradicts the declaration the prompt shows"
             )
+    return digest
 
 
 def _completion_for(target: ToolCall | str | None, wire_format: WireFormat | None) -> Any:
@@ -1019,6 +1028,7 @@ class PrepareRequest:
             "tokens": self.tokens.describe() if self.tokens is not None else None,
             "headroom_probe": type(self.headroom).__name__ if self.headroom else None,
             "base_model": self.base_model,
+            "declarations": str(self.declarations) if self.declarations is not None else None,
         }
 
 
@@ -1063,6 +1073,9 @@ class PrepareResult:
     # without re-running the resolution, and `ModelHint` already records
     # whether the answer came from the sidecar, the config or the name.
     identity: dict[str, Any] | None = None
+    # The digest of the declarations the targets were checked against, the
+    # same one `tune` records, so the split can be traced to its tool list.
+    declarations_sha256: str | None = None
     skipped: list[SkippedCheck] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
     report_path: Path | None = None
@@ -1126,6 +1139,7 @@ class PrepareResult:
             "unscoreable_arguments": [f"{a.tool}.{a.argument}" for a in self.unscoreable],
             "slices": [s.as_dict() for s in self.slices],
             "model": self.identity,
+            "declarations_sha256": self.declarations_sha256,
             "checks": self.checks.as_dict() | {"skipped": [s.as_dict() for s in self.skipped]},
             "limitations": list(self.limitations),
             "spec_fragment": self.spec_fragment(),
@@ -1166,8 +1180,9 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     # Before anything is profiled or split: a row calling a tool the prompt will
     # never offer is a row that cannot be trained, and saying so after a split
     # has been written means the caller re-runs the stage to learn it.
+    declarations_sha256 = None
     if request.declarations is not None:
-        refuse_undeclared_tools(rows, request.data, request.declarations)
+        declarations_sha256 = refuse_undeclared_tools(rows, request.data, request.declarations)
     elif request.base_model is not None:
         refuse_calls_without_declarations(rows, request.base_model)
     content_sha256 = hash_file(request.data)
@@ -1177,9 +1192,15 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         content_sha256=content_sha256,
         n_rows=len(rows),
         identity=_identity(request.base_model, wire),
+        declarations_sha256=declarations_sha256,
     )
     if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
         result.limitation(ASSUMED_WIRE_FORMAT)
+    if (
+        declarations_sha256 is not None
+        and prompt_evidence([row.prompt for row in rows]).mode is PromptMode.RUNTIME_RENDERED
+    ):
+        result.limitation(DECLARATIONS_NOT_COUNTED)
     events.metric("rows", len(rows), source=str(request.data))
 
     # -- lengths -----------------------------------------------------------

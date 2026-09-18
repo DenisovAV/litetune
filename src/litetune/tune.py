@@ -51,7 +51,7 @@ from litetune.declarations import DeclarationsError, entry_count, read_declarati
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.metrics import ToolCall
-from litetune.models import renders_declarations_for
+from litetune.models import renders_declarations_for, wire_format_for
 from litetune.prepare import PrepareError, read_rows, render_call
 from litetune.prompt_mode import RENDERING_SOURCE, PromptMode, PromptModeDecision, prompt_evidence
 
@@ -103,6 +103,75 @@ def _refuse_calls_without_declarations(request: TuneRequest, mode: PromptMode) -
         f"descriptions, types and required lists are the application's contract. {reason}",
         observed={"model": request.model, "declarations": None},
     )
+
+
+def _refuse_declarations_the_runtime_never_sends(
+    request: TuneRequest, mode: PromptMode
+) -> Check | None:
+    """Declarations for a `runtime_rendered` split whose runtime does not render them.
+
+    The training prompt would carry a declaration turn the runtime never puts in
+    front of the model, so the model learns to answer a prompt no application
+    sends. `verify` would then measure the candidate on the runtime's prompt,
+    without them. Refused rather than trained, as the prompt-mode disagreement
+    is; a split whose application renders the tools itself is `prerendered`.
+    """
+    if mode is not PromptMode.RUNTIME_RENDERED:
+        return None
+    renders, _ = renders_declarations_for(request.model)
+    if renders:
+        return None
+    return Check.failed(
+        DECLARATIONS_CHECK,
+        f"--declarations was given for a runtime_rendered split of {request.model}, and "
+        "litetune records no runtime of that family that renders tool declarations into the "
+        "prompt. The model would be trained on a declaration turn the runtime never sends. If "
+        "your application renders the tools into the prompt itself, the split is prerendered",
+        observed={"model": request.model, "declarations": str(request.declarations)},
+    )
+
+
+def _refuse_calls_not_written_as_rendered(request: TuneRequest, mode: PromptMode) -> Check | None:
+    """A call row whose completion is not the call `prepare` renders for its target.
+
+    The training script ends a call row with what the chat template puts after
+    a call, and that ending is only right after a call the runtime reads: in
+    its markers, its values spelled as the runtime writes them, its arguments
+    in declared order. A split prepared before that -- by litetune 0.1.6 or
+    earlier, or by hand -- carries completions without the markers, and trained
+    anyway it is the measured failure: no call returned on 5 of 5 prompts. The
+    template probe asks only whether the template renders a call the way
+    `render_call` does; this asks whether the completions are what `render_call`
+    writes.
+
+    Only for a family whose call format litetune knows, in `runtime_rendered`.
+    A row whose target cannot be rendered at all is the caller's own text and
+    is left alone, as `prepare` leaves it.
+    """
+    if mode is not PromptMode.RUNTIME_RENDERED or not wire_format_for(request.model).known:
+        return None
+    try:
+        rows = read_rows(request.data)
+    except (PrepareError, OSError):
+        return None
+    for row in rows:
+        if not isinstance(row.target, ToolCall):
+            continue
+        try:
+            expected = render_call(row.target)
+        except ValueError:
+            continue
+        if row.completion != expected:
+            return Check.failed(
+                DECLARATIONS_CHECK,
+                f"{request.data}:{row.lineno}: the completion {row.completion[:160]!r} is not the "
+                f"call litetune renders for its target, {expected[:160]!r}. The runtime reads a "
+                "call only in its markers, spelled and ordered as rendered; a split prepared by "
+                "litetune 0.1.6 or earlier trains calls it returns nothing for. Re-run prepare "
+                "on the raw file",
+                observed={"data": str(request.data), "line": row.lineno},
+            )
+    return None
 
 
 FORCE_PROMPT_MODE_FLAG = "--force-prompt-mode"
@@ -1008,12 +1077,15 @@ class TuneRequest:
             "tools": declarations,
             # The call `prepare` renders for a probe, so the script can ask the
             # chat template what ends a call turn and check that the template
-            # writes a call the way the completions do. The script cannot import
-            # litetune, so the text travels in the spec.
-            "call_probe": {
-                "name": CALL_PROBE_NAME,
-                "text": render_call(ToolCall(CALL_PROBE_NAME, {})),
-            },
+            # writes a call the way `render_call` does. The script cannot import
+            # litetune, so the text travels in the spec. Only for a family whose
+            # call format is known: any other family's call rows are the
+            # caller's own text, and end the way a text turn does.
+            "call_probe": (
+                {"name": CALL_PROBE_NAME, "text": render_call(ToolCall(CALL_PROBE_NAME, {}))}
+                if wire_format_for(self.model).known
+                else None
+            ),
             "model_dir": str(self.model_dir),
             "adapter_dir": str(self.adapter_dir) if self.adapter_dir else None,
             "metrics_out": str(metrics_out),
@@ -1443,7 +1515,19 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             events.check(undeclared)
             events.stage_finished(result.outcome.value, attempted=False)
             return result
+    not_as_rendered = _refuse_calls_not_written_as_rendered(request, decision.mode)
+    if not_as_rendered is not None:
+        result.checks.add(not_as_rendered)
+        events.check(not_as_rendered)
+        events.stage_finished(result.outcome.value, attempted=False)
+        return result
     if request.declarations is not None:
+        never_sent = _refuse_declarations_the_runtime_never_sends(request, decision.mode)
+        if never_sent is not None:
+            result.checks.add(never_sent)
+            events.check(never_sent)
+            events.stage_finished(result.outcome.value, attempted=False)
+            return result
         try:
             declarations, digest = read_declarations(request.declarations)
         except DeclarationsError as exc:

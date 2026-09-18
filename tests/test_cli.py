@@ -820,6 +820,39 @@ def test_prepare_on_a_file_that_is_not_there_makes_no_claim(tmp_path, capsys):
     assert "no claim is made about the model" in capsys.readouterr().err
 
 
+def test_prepare_refuses_a_declarations_file_rather_than_crashing(tmp_path, capsys):
+    """Found in review: `DeclarationsError` was not a refusal, so a file with a
+    shape the renderers disagree on printed a traceback and "could not complete
+    the run", burying the sentence that says what to change."""
+    bad = tmp_path / "tools.json"
+    bad.write_text(
+        '[{"type": "function", "function": {"name": "t", "description": "d",'
+        ' "parameters": {"type": "object", "properties": {"x": {"type": "string",'
+        ' "description": "d", "nullable": true}}}}}]',
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "prepare",
+            "--data",
+            str(_dataset(tmp_path)),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--context-length",
+            "1024",
+            "--declarations",
+            str(bad),
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert code == 4
+    assert "carries ['nullable']" in err
+    assert "Traceback" not in err
+    assert "could not complete the run" not in err
+
+
 # -- bundle -----------------------------------------------------------------
 
 

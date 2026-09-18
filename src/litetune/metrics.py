@@ -148,7 +148,14 @@ class ToolCall:
         return cls(name=str(obj["name"]), args=args)
 
     def as_dict(self) -> dict:
-        return {"name": self.name, "args": dict(self.args)}
+        """The call as a split records it: arguments with their types.
+
+        Typed rather than flattened, because a split's `target` is read back
+        and rendered again: flattened, `{"hour": 7}` came back as `"7"`, which
+        renders escaped, and the split's target contradicted its completion.
+        Reading it back flattens it for scoring as before.
+        """
+        return {"name": self.name, "args": dict(self.raw)}
 
 
 def read_target(obj: Any) -> ToolCall | str | None:

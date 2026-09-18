@@ -28,10 +28,12 @@ from litetune import envs
 from litetune.checks import Outcome
 from litetune.cli import OUTCOME_EXIT_CODES
 from litetune.events import EventStream
-from litetune.prepare import read_rows
+from litetune.metrics import ToolCall
+from litetune.prepare import read_rows, render_call
 from litetune.prompt_mode import PromptMode, PromptModeDecision
 from litetune.tune import (
     _TRAIN_SCRIPT,
+    CALL_PROBE_NAME,
     DECLARATIONS_CHECK,
     DEFAULT_ATTN_IMPLEMENTATION,
     DEFAULT_DTYPE,
@@ -2595,7 +2597,12 @@ def test_a_declaration_rendering_family_refuses_to_train_calls_without_them(tmp_
     assert result.model_dir is None
 
 
-def test_that_refusal_does_not_fire_on_a_family_with_no_tool_channel(tmp_path, request_for):
+def test_that_refusal_does_not_fire_on_a_family_with_no_tool_channel(
+    tmp_path, request_for, trainer
+):
+    """And the run reaches the trainer: the first version of this asserted only
+    that no refusal named the flag, which a run failing for any other reason --
+    it provisioned a real environment over the network -- satisfied too."""
     data = tmp_path / "targets.jsonl"
     data.write_text(
         "".join(
@@ -2611,10 +2618,14 @@ def test_that_refusal_does_not_fire_on_a_family_with_no_tool_channel(tmp_path, r
 
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
     assert not any("--declarations" in c.detail for c in failed)
+    assert len(trainer.configs) == 1
+    # No call format is known for the family, so its call rows are the caller's
+    # text and the template is not asked how a call ends.
+    assert trainer.configs[0]["call_probe"] is None
 
 
 def test_prerendered_calls_train_without_declarations_because_the_prompt_carries_them(
-    tmp_path, request_for
+    tmp_path, request_for, trainer
 ):
     """The refusal is about the runtime rendering the declarations. In
     `prerendered` the application has already rendered them into the prompt --
@@ -2651,6 +2662,104 @@ def test_prerendered_calls_train_without_declarations_because_the_prompt_carries
 
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
     assert not any("--declarations" in c.detail for c in failed)
+    assert len(trainer.configs) == 1
+
+
+def _functiongemma_split(tmp_path: Path, completion) -> tuple[Path, Path]:
+    """Bare prompts with call targets, and the declarations they call."""
+    data = tmp_path / "calls.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "prompt": f"set the background to swatch{i}",
+                    "completion": completion(i),
+                    "target": {"name": "change_background_color", "args": {"color": f"s{i}"}},
+                }
+            )
+            + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+    declarations = tmp_path / "tools.json"
+    declarations.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "change_background_color",
+                        "description": "d",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"color": {"type": "string", "description": "c"}},
+                        },
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return data, declarations
+
+
+def test_a_split_prepared_before_the_call_markers_is_refused_not_trained(
+    tmp_path, request_for, trainer
+):
+    """Found in review. The template probe asks only whether the template writes a
+    call the way `render_call` does; a split prepared by 0.1.6 carries calls with
+    no markers and trained with the call ending appended -- the shape that
+    returned no call from the runtime on 5 of 5 prompts."""
+    data, declarations = _functiongemma_split(
+        tmp_path, lambda i: f"call:change_background_color{{color:<escape>s{i}<escape>}}"
+    )
+
+    result = run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    assert result.outcome is Outcome.FAILED
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any("Re-run prepare" in c.detail and f"{data}:1" in c.detail for c in failed)
+    assert trainer.configs == []
+
+
+def test_a_split_prepared_now_trains(tmp_path, request_for, trainer):
+    data, declarations = _functiongemma_split(
+        tmp_path,
+        lambda i: render_call(ToolCall("change_background_color", {"color": f"s{i}"})),
+    )
+
+    run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    assert len(trainer.configs) == 1
+    assert trainer.configs[0]["call_probe"]["name"] == CALL_PROBE_NAME
+
+
+def test_declarations_for_a_family_whose_runtime_never_sends_them_are_refused(
+    tmp_path, request_for, trainer
+):
+    """Found in review: a Qwen split trained with --declarations carried a
+    declaration turn in every training prompt, and `litert-lm run` never sends
+    one -- so the candidate was then measured on a prompt it was not trained on."""
+    data, declarations = _functiongemma_split(tmp_path, lambda i: f"answer {i}")
+
+    result = run_tune(
+        request_for(
+            model="Qwen/Qwen3-0.6B",
+            data=data,
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+            declarations=declarations,
+        )
+    )
+
+    assert result.outcome is Outcome.FAILED
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any("never sends" in c.detail for c in failed)
+    assert trainer.configs == []
 
 
 # -- how a call ends ---------------------------------------------------------

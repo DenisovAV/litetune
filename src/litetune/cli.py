@@ -43,6 +43,7 @@ from litetune.bundle import (
     versions_from,
 )
 from litetune.checks import Outcome
+from litetune.declarations import DeclarationsError
 from litetune.envs import cached_environments, env_cache_root, remove_cached
 from litetune.evaluate import GREEDY, DataError
 from litetune.events import EventStream, TerminalRenderer
@@ -106,6 +107,10 @@ REFUSALS = (
     BundleError,
     TuneError,
     PrepareError,
+    # A declarations file the runtime or the reference template would render
+    # differently is refused with the property named; printed as a traceback,
+    # the sentence that says what to change was buried under it.
+    DeclarationsError,
     DataError,
     SpecError,
     FileNotFoundError,
