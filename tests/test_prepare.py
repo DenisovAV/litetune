@@ -20,7 +20,7 @@ from stage_fakes import spec_mapping
 from litetune.checks import Outcome
 from litetune.declarations import read_declarations
 from litetune.events import EventStream
-from litetune.metrics import Proportion, ToolCall, Unavailable, parse_call
+from litetune.metrics import Proportion, ToolCall, Unavailable, parse_call, runtime_calls
 from litetune.models import PROVENANCE_NAME
 from litetune.prepare import (
     ASSUMED_WIRE_FORMAT,
@@ -688,8 +688,7 @@ def test_what_the_runtime_cannot_read_back_is_refused_not_trained(args, expected
         ("<escape>", "ends a string"),
         ('<|"|>', "ends a string"),
         ("<ctrl46>", "ends a string"),
-        ("<start_function_call>", "cuts a reply into calls"),
-        ("<end_function_call>", "cuts a reply into calls"),
+        ("<end_function_call>", "ends a call at the first end-of-call marker"),
         ("<end_of_turn>", "names it a stop token"),
         ("<start_function_response>", "names it a stop token"),
         ("<eos>", "names it a stop token"),
@@ -702,6 +701,15 @@ def test_each_text_a_string_cannot_carry_is_refused_with_its_own_cause(text, cau
         render_call(ToolCall(name="set", args={"s": f"a{text}b"}))
 
     assert f"contains {text!r}" in str(caught.value)
+
+
+def test_a_start_of_call_marker_in_a_string_is_read_back_as_written():
+    """Found in review: it was refused as a place the runtime cuts a call, and
+    it is not -- the runtime has matched the call's own start marker by then,
+    and its lexer reads a second one inside the string as text."""
+    call = ToolCall(name="set", args={"s": "a<start_function_call>b"})
+
+    assert runtime_calls(render_call(call)) == [call]
 
 
 def test_an_integer_past_the_largest_double_is_a_refused_row_not_a_crash(tmp_path):

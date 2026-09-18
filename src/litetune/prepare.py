@@ -193,11 +193,12 @@ def render_call(call: ToolCall) -> str:
     string.
 
     **Only what the runtime can read back is written.** A name or key its
-    lexer does not read as a name, a string holding an escape, a call marker or
-    a stop token (`CONTROL_TEXT`), and a number a double cannot hold or its
-    grammar cannot spell are refused, with the row named, rather than trained: each would be a
-    call that cannot come back as written -- and a marker inside a string would
-    let a dataset row write a second call into the training text.
+    lexer does not read as a name, a string holding an escape, the end-of-call
+    marker or a stop token (`CONTROL_TEXT`), and a number a double cannot hold
+    or its grammar cannot spell are refused, with the row named, rather than
+    trained: each would be a call that cannot come back as written -- and an
+    end marker inside a string would let a dataset row write a second call into
+    the training text.
 
     **A call is wrapped in its markers.** `<start_function_call>` and
     `<end_function_call>` are what the runtime's parser looks for, and a call
@@ -264,14 +265,15 @@ def _render_argument(key: str, value: Any) -> str:
     if isinstance(value, float):
         return f"{key}:{_render_number(key, value)}"
     raise ValueError(
-        f"the argument {key!r} is a {type(value).__name__}, and nothing in this project "
-        "establishes what the runtime's call parser accepts for a list or an object. Supply the "
-        "row's 'completion' text instead, which is taken as written"
+        f"the argument {key!r} is a {type(value).__name__}: the runtime's parser reads a list or "
+        "an object (AntlrFcParser.g4), and how FunctionGemma writes one, and what its constrained "
+        "decoding allows, has not been measured here. Supply the row's 'completion' text instead, "
+        "which is taken as written"
     )
 
 
-_CUT_AT_MARKERS = (
-    "the runtime cuts a reply into calls at the call markers before its lexer reads one "
+_ENDS_THE_BLOCK = (
+    "the runtime ends a call at the first end-of-call marker, before its lexer reads the call "
     "(parser_utils.cc)"
 )
 _ENDS_A_STRING = "the runtime's lexer ends a string at any of its escapes (AntlrFcLexer.g4)"
@@ -283,11 +285,12 @@ _STOPS_GENERATION = (
 # Text a string argument cannot carry, and what happens to a call that does.
 # Only what has a cause that can be pointed at: other control tokens are not
 # refused, because what the runtime does with one inside a string has not been
-# established.
+# established. The start-of-call marker is not among them: the runtime has
+# already matched the call's own when it meets one inside a string, and its
+# lexer reads it there as part of the string.
 CONTROL_TEXT = {
     **dict.fromkeys(ESCAPE_SPELLINGS, _ENDS_A_STRING),
-    START_CALL: _CUT_AT_MARKERS,
-    END_CALL: _CUT_AT_MARKERS,
+    END_CALL: _ENDS_THE_BLOCK,
     "<end_of_turn>": _STOPS_GENERATION,
     "<start_function_response>": _STOPS_GENERATION,
     "<eos>": _STOPS_GENERATION,

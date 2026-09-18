@@ -57,7 +57,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from litetune.metrics import ESCAPE_SPELLINGS, NAME_RULE, readable_name
+from litetune.metrics import NAME_RULE, readable_name
 from litetune.storage import HASH_ALGORITHM, hash_file
 
 
@@ -301,22 +301,26 @@ def _check_renderable(parsed: Any, path: Path) -> None:
 
 
 _IN_A_STRING = (
-    "both renderers write a declaration's strings between escapes (`fc_tool_format_utils.cc`, "
-    "and the template litetune ships), so the string would end there"
+    "the runtime's formatter (`fc_tool_format_utils.cc`) and the checkpoint's own chat template "
+    "both write a declaration's strings between `<escape>` markers, so the string would end "
+    "there"
 )
 _AROUND_A_DECLARATION = (
     "the template litetune ships writes each declaration between the declaration markers, so "
     "the declaration would end there"
 )
 _AROUND_THE_TURN = (
-    "the template litetune ships opens and closes the turn the declarations are written in "
-    "with the turn markers, so the turn would end there"
+    "the template litetune ships writes the turn the declarations are in between the turn "
+    "markers, so the model would read a turn boundary there"
 )
-# Text a declaration's strings cannot carry: the model is shown what follows it
-# as something other than this declaration's text -- another declaration, or no
-# declaration at all -- and `tool_names` does not list it.
+# Text a declaration's strings and keys cannot carry: the model is shown what
+# follows it as something other than this declaration's text -- another
+# declaration, or no declaration at all -- and `tool_names` does not list it.
+# Only `<escape>` of the three escape spellings: the renderers write no other,
+# and FunctionGemma's tokenizer has no token for `<ctrl46>` or `<|"|>`, so in a
+# prompt they are text.
 DECLARATION_TEXT = {
-    **dict.fromkeys(ESCAPE_SPELLINGS, _IN_A_STRING),
+    "<escape>": _IN_A_STRING,
     "<start_function_declaration>": _AROUND_A_DECLARATION,
     "<end_function_declaration>": _AROUND_A_DECLARATION,
     "<start_of_turn>": _AROUND_THE_TURN,
@@ -325,7 +329,11 @@ DECLARATION_TEXT = {
 
 
 def _refuse_control_text(value: Any, where: str) -> None:
-    """Every string in a declaration, descriptions and enum values alike."""
+    """Every string in a declaration and every key, at any depth.
+
+    Keys too: the formatter writes a property's name as it is, unescaped, and
+    only the top-level properties are held to the call parser's name rule.
+    """
     if isinstance(value, str):
         held = [text for text in DECLARATION_TEXT if text in value]
         if held:
@@ -335,6 +343,7 @@ def _refuse_control_text(value: Any, where: str) -> None:
             )
     elif isinstance(value, dict):
         for key, item in value.items():
+            _refuse_control_text(key, f"{where} (a key)")
             _refuse_control_text(item, f"{where}.{key}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
