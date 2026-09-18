@@ -297,6 +297,17 @@ CONTROL_TEXT = {
 }
 
 
+def control_text_held(value: Any) -> str | None:
+    """The first `CONTROL_TEXT` a string anywhere in `value` holds, or `None`."""
+    if isinstance(value, str):
+        return next((text for text in CONTROL_TEXT if text in value), None)
+    if isinstance(value, dict):
+        value = list(value.values())
+    if isinstance(value, list):
+        return next((held for item in value if (held := control_text_held(item))), None)
+    return None
+
+
 def _render_number(key: str, value: float) -> str:
     """A float in a spelling the runtime's number grammar reads.
 

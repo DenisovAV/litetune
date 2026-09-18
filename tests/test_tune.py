@@ -27,6 +27,7 @@ from conftest import fake_torch, mark_provisioned
 from litetune import envs
 from litetune.checks import Outcome
 from litetune.cli import OUTCOME_EXIT_CODES
+from litetune.declarations import read_declarations
 from litetune.events import EventStream
 from litetune.metrics import ToolCall
 from litetune.prepare import read_rows, render_call
@@ -2910,13 +2911,14 @@ def _untold_checkpoint(tmp_path: Path) -> Path:
     return ckpt
 
 
-def test_a_checkpoint_whose_family_cannot_be_told_is_probed_when_its_calls_are_marked(
+def test_a_prerendered_checkpoint_whose_family_cannot_be_told_trains_its_calls(
     tmp_path, request_for, trainer
 ):
-    """Found in review: a local FunctionGemma checkpoint without its sidecar
-    reads as an unidentified `gemma3_text`, and the probe -- and with it the
-    call ending -- was dropped. Marked completions say which format they are.
-    In `prerendered`, where the application renders the declarations."""
+    """A local FunctionGemma checkpoint without its sidecar reads as an
+    unidentified `gemma3_text`. In `prerendered` that matters to nothing: the
+    application renders the declarations, and every row ends the way it reads a
+    reply, so the template is not asked about calls. Found in review: a probe
+    was handed to the script here and never used."""
     ckpt = _untold_checkpoint(tmp_path)
     data = tmp_path / "prerendered.jsonl"
     data.write_text(
@@ -2939,9 +2941,9 @@ def test_a_checkpoint_whose_family_cannot_be_told_is_probed_when_its_calls_are_m
     result = run_tune(request_for(model=str(ckpt), data=data))
 
     assert len(trainer.configs) == 1
-    assert trainer.configs[0]["call_probe"] is not None
+    assert trainer.configs[0]["call_probe"] is None
     # Found in review: the report recomputed the probe from the family alone
-    # and said `None` beside a script that was given one. It is the run's.
+    # and could say otherwise than the script was given. It is the run's.
     assert "call_probe" not in result.as_dict()["request"]
 
 
@@ -3124,13 +3126,21 @@ def test_the_script_is_handed_the_call_prepare_renders(tmp_path, request_for):
     from litetune.prepare import render_call
     from litetune.tune import CALL_PROBE_NAME
 
-    spec = request_for().config(tmp_path / "metrics.json")
+    runtime = decide_prompt_mode(["bare"], PromptMode.RUNTIME_RENDERED, force=False)
+    spec = request_for().config(tmp_path / "metrics.json", decision=runtime)
 
     assert spec["call_probe"] == {
         "name": CALL_PROBE_NAME,
         "text": render_call(ToolCall(CALL_PROBE_NAME, {})),
     }
     assert spec["call_probe"]["text"].startswith("<start_function_call>")
+    # Not in `prerendered`, where the script would not ask the template.
+    prerendered = decide_prompt_mode(
+        ["<start_of_turn>user\nq<end_of_turn>\n<start_of_turn>model\n"],
+        PromptMode.PRERENDERED,
+        force=False,
+    )
+    assert request_for().config(tmp_path / "m.json", decision=prerendered)["call_probe"] is None
 
 
 def test_declarations_for_a_checkpoint_whose_family_cannot_be_told_say_so(
@@ -3163,7 +3173,7 @@ def test_declarations_for_a_checkpoint_whose_family_cannot_be_told_say_so(
 
 def _split_of(tmp_path: Path, args: dict, completion: str) -> tuple[Path, Path]:
     """Eight bare-prompt rows calling `set` with `args`, each with `completion`."""
-    kinds = {bool: "boolean", int: "integer", float: "number", str: "string"}
+    kinds = {bool: "boolean", int: "integer", float: "number", str: "string", list: "array"}
     declarations = tmp_path / "set.json"
     declarations.write_text(
         json.dumps(
@@ -3177,6 +3187,7 @@ def _split_of(tmp_path: Path, args: dict, completion: str) -> tuple[Path, Path]:
                             "type": "object",
                             "properties": {
                                 key: {"type": kinds[type(value)], "description": key}
+                                | ({"items": {"type": "string"}} if isinstance(value, list) else {})
                                 for key, value in args.items()
                             },
                         },
@@ -3219,6 +3230,16 @@ S, E = "<start_function_call>", "<end_function_call>"
         ({"a": "7"}, f"{S}call:set{{a:7}}{E}", False),
         ({"a": "1.0"}, f"{S}call:set{{a:1}}{E}", False),
         ({"on": True}, f"{S}call:set{{on:<escape>true<escape>}}{E}", False),
+        # Found in review: text after the call trained, and the call ending the
+        # template writes is right only right after a call.
+        ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E} Done!", False),
+        ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E}{S}call:g{{", False),
+        # A stop token in a string stops generation before the end marker.
+        ({"a": "hi<eos>there"}, f"{S}call:set{{a:<escape>hi<eos>there<escape>}}{E}", False),
+        # A list the runtime reads trains, though prepare cannot write it.
+        ({"a": ["x", "y"]}, f"{S}call:set{{a:[<escape>x<escape>,<escape>y<escape>]}}{E}", True),
+        # A number the runtime hands over as another double does not.
+        ({"n": 2**53 + 1}, f"{S}call:set{{n:9007199254740993}}{E}", False),
         # Found in review: every one of these read as the target's call.
         ({"a": "x"}, f"call:set{{a:<escape>x<escape>}}{S}{E}", False),  # outside the markers
         ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}", False),  # no end marker
@@ -3317,3 +3338,147 @@ def test_a_row_with_no_completion_is_named_before_anything_is_read_from_the_comp
 
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
     assert [c.name for c in failed] == [COMPLETIONS_CHECK]
+
+
+def test_a_call_to_a_tool_the_declarations_do_not_offer_is_refused(tmp_path, request_for, trainer):
+    """Found in review: `prepare` refused it and `tune` did not, so a split
+    written by hand trained a call the prompt never offers."""
+    data, declarations = _split_of(tmp_path, {"a": "x"}, "")
+    data.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "prompt": f"wipe it {i}",
+                    "completion": render_call(ToolCall("wipe_disk", {"path": "/"})),
+                    "target": {"name": "wipe_disk", "args": {"path": "/"}},
+                }
+            )
+            + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any(c.name == DECLARATIONS_CHECK and "wipe_disk" in c.detail for c in failed)
+    assert trainer.configs == []
+
+
+def test_a_row_that_is_not_a_call_does_not_train_one(tmp_path, request_for, trainer):
+    """Found in review: only rows with a call target were read, so a text row
+    whose completion carried marked calls trained them unchecked."""
+    data, declarations = _split_of(tmp_path, {"a": "x"}, "")
+    call = render_call(ToolCall("wipe_disk", {"path": "/"}))
+    data.write_text(
+        "".join(
+            json.dumps({"prompt": f"hi {i}", "completion": f"ok {call}", "target": "ok"}) + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    (refused,) = [c for c in result.checks.checks if c.name == CALLS_CHECK]
+    assert "the row's target is not a call" in refused.detail
+    assert "wipe_disk" in refused.detail
+    assert trainer.configs == []
+
+
+def test_a_model_litetune_has_no_entry_for_trains_marked_calls_as_its_callers_text(
+    tmp_path, request_for, trainer
+):
+    """Found in review: marked completions for any model litetune could not
+    tell were refused with a `litetune.json` remedy that tells nothing about a
+    model it has no entry for, and before that were probed with a template that
+    has no call turn. For such a model the calls are the caller's text."""
+    data, _ = _functiongemma_split(
+        tmp_path,
+        lambda i: render_call(ToolCall("change_background_color", {"color": f"s{i}"})),
+    )
+
+    result = run_tune(
+        request_for(
+            model="meta-llama/Llama-3.2-1B-Instruct",
+            data=data,
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+        )
+    )
+
+    assert [c.name for c in result.checks.checks if c.outcome is Outcome.FAILED] == []
+    assert len(trainer.configs) == 1
+    assert trainer.configs[0]["call_probe"] is None
+
+
+def test_declarations_for_a_checkpoint_whose_config_names_two_families_say_so(
+    tmp_path, request_for, trainer
+):
+    """The refusal says which of its two cases it is: a family litetune records
+    no tool channel for, or one it cannot tell. The second, for a checkpoint
+    whose calls carry no markers, so the refusal before it does not fire."""
+    ckpt = _untold_checkpoint(tmp_path)
+    data, declarations = _functiongemma_split(tmp_path, lambda i: f"answer {i}")
+
+    result = run_tune(
+        request_for(
+            model=str(ckpt),
+            data=data,
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+            declarations=declarations,
+        )
+    )
+
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any(f"cannot tell which model family {ckpt} is" in c.detail for c in failed)
+
+
+def test_a_refused_completion_is_told_both_ways_through(tmp_path, request_for, trainer):
+    data, declarations = _split_of(tmp_path, {"a": "x"}, "call:set{a:<escape>x<escape>}")
+
+    result = run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    (refused,) = [c for c in result.checks.checks if c.name == CALLS_CHECK]
+    assert "Drop the row's completion and run prepare" in refused.detail
+    assert f"or write it as prepare does: {render_call(ToolCall('set', {'a': 'x'}))!r}" in (
+        refused.detail
+    )
+
+
+@pytest.mark.parametrize("mode", [PromptMode.RUNTIME_RENDERED, PromptMode.PRERENDERED])
+def test_tune_records_the_digest_its_prompt_mode_compares(tmp_path, request_for, trainer, mode):
+    """The tool list's where the runtime renders the declarations, the file's
+    bytes where the application does -- what `verify` and `bundle` compare."""
+    prompt = (lambda i: f"set it {i}") if mode is PromptMode.RUNTIME_RENDERED else _rendered
+    data, declarations = _split_of(tmp_path, {"a": "x"}, render_call(ToolCall("set", {"a": "x"})))
+    data.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "prompt": prompt(f"set it {i}"),
+                    "completion": render_call(ToolCall("set", {"a": "x"})),
+                    "target": {"name": "set", "args": {"a": "x"}},
+                }
+            )
+            + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_tune(request_for(data=data, prompt_mode=mode, declarations=declarations))
+
+    expected = (
+        read_declarations(declarations)[1]
+        if mode is PromptMode.RUNTIME_RENDERED
+        else hash_file(declarations)
+    )
+    assert result.declarations_sha256 == expected
+    assert read_declarations(declarations)[1] != hash_file(declarations)
