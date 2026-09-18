@@ -31,7 +31,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections import Counter
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -305,7 +304,7 @@ def _tool_path_liveness(point: MeasurementPoint, backend: GenerationBackend) -> 
         checks.add(
             Check.unchecked(
                 TOOL_PATH_LIVENESS,
-                f"the tool path did not run: {never_ran[0].harness_error}",
+                f"the tool path was not measured: {never_ran[0].harness_error}",
                 observed={"n": len(point.generations)},
             )
         )
@@ -387,7 +386,7 @@ def _score_tool_path(
         paired_difference(scored["unconstrained"].correct, scored["constrained"].correct)
         if "constrained" in scored
         else Unavailable(
-            "the grammar-on run could not be made: " + backend.unavailable.get("constrained", "")
+            "the grammar-on run was not measured: " + backend.unavailable.get("constrained", "")
         )
     )
     reported: dict[str, Any] = {
@@ -395,10 +394,7 @@ def _score_tool_path(
             mode: {"score": scored[mode].as_dict()} | _unanswered(rows[mode], indices)
             for mode in rows
         }
-        | {
-            mode: {"available": False, "reason": reason}
-            for mode, reason in backend.unavailable.items()
-        },
+        | _unavailable_modes(backend),
         "compared_with_reference": "unconstrained",
         "compared_with_reference_because": (
             "the reference generates with no grammar, so the conversion cost is measured against "
@@ -406,20 +402,28 @@ def _score_tool_path(
             "the application enables it, so this is also what an application gets by default"
         ),
         "grammar_effect": grammar.as_dict()
-        | {"sign": "positive means the runtime's grammar lowers the score"},
+        | (
+            {"sign": "positive means the runtime's grammar lowers the score"}
+            if isinstance(grammar, Difference)
+            else {}
+        ),
         "default_established_on": GRAMMAR_OFF_BY_DEFAULT_IN,
     }
     if backend.runtime_version != GRAMMAR_OFF_BY_DEFAULT_IN:
         run.limitation(
-            "that the runtime leaves constrained decoding off unless an application enables it "
-            f"was read from litert-lm {GRAMMAR_OFF_BY_DEFAULT_IN}'s source; this run used "
-            f"{backend.runtime_version or 'a version it could not name'}, where it was not "
-            "checked, so calling the grammar-off run the default is an assumption here"
+            "that the runtime leaves constrained decoding off unless an application enables it, "
+            "and the log sentences a missing reply's kind is read from, were read from litert-lm "
+            f"{GRAMMAR_OFF_BY_DEFAULT_IN}'s source; this run used "
+            f"{backend.runtime_version or 'a version it could not name'}, where they were not "
+            "checked, so calling the grammar-off run the default is an assumption here, and a "
+            "reply the runtime words differently ends the run rather than being scored"
         )
-    for mode, reason in backend.unavailable.items():
+    # Only the grammar-on run can be unmeasured here: without the grammar-off
+    # one nothing is scored.
+    if "constrained" in backend.unavailable:
         run.limitation(
-            f"the grammar-{'on' if mode == 'constrained' else 'off'} run could not be made, so "
-            f"what the grammar does was not measured: {reason}"
+            "the grammar-on run was not measured, so what the grammar does, and what an "
+            f"application that enables it gets, are not known: {backend.unavailable['constrained']}"
         )
     for mode in rows:
         state = "on" if mode == "constrained" else "off"
@@ -465,25 +469,23 @@ def _one_call_text(text: str) -> str:
 def _unanswered(rows: list[ToolPathRow], indices: list[int]) -> dict[str, Any]:
     """What one mode's rows say about the prompts that got no single call back.
 
-    A parse failure and a prompt over the token limit are counted by kind; any
-    other reason is kept in the runtime's words, the five commonest, and the
-    count of the rest is said rather than left out.
+    Over `of` prompts, which is every row at liveness and the labelled ones
+    when scored. A no-reply is a parse failure or a prompt over the token
+    limit: a mode with any other reason is not measured at all
+    (`toolpath._refuse_a_mode_with_unread_reasons`).
     """
     no_reply = [rows[i] for i in indices if rows[i].refused]
-    other = Counter(row.error or "" for row in no_reply if row.kind == "other")
-    shown = dict(other.most_common(5))
     return {
+        "of": len(indices),
         "no_reply": len(no_reply),
         "parse_refusals": sum(1 for row in no_reply if row.kind == "parse"),
         "too_long": sum(1 for row in no_reply if row.kind == "too_long"),
-        "other_reasons": shown,
-        "other_not_shown": sum(other.values()) - sum(shown.values()),
         "several_calls": sum(1 for i in indices if len(rows[i].calls) > 1),
     }
 
 
 def _why_no_reply(unanswered: dict[str, Any]) -> str:
-    """`N prompts: P ..., L ..., O ...` from `_unanswered`, naming only what occurred."""
+    """`N prompts: P ..., L ...` from `_unanswered`, naming only what occurred."""
     parts = []
     if unanswered["parse_refusals"]:
         parts.append(
@@ -491,15 +493,17 @@ def _why_no_reply(unanswered: dict[str, Any]) -> str:
         )
     if unanswered["too_long"]:
         parts.append(
-            f"{unanswered['too_long']} because the prompt was longer than the bundle's token "
-            "limit, a capacity of the converted bundle rather than an answer the model gave"
+            f"{unanswered['too_long']} because the prompt, with the declarations the runtime "
+            "renders into it, reached the bundle's token limit -- a capacity of the converted "
+            "bundle rather than an answer the model gave"
         )
-    other = sum(unanswered["other_reasons"].values()) + unanswered["other_not_shown"]
-    if other:
-        reasons = "; ".join(f"{n} x {r}" for r, n in unanswered["other_reasons"].items())
-        rest = f"; {unanswered['other_not_shown']} more" if unanswered["other_not_shown"] else ""
-        parts.append(f"{other} for another reason ({reasons}{rest})")
     return f"{unanswered['no_reply']} prompts: " + ", ".join(parts)
+
+
+def _unavailable_modes(backend: ToolPathBackend) -> dict[str, dict[str, Any]]:
+    return {
+        mode: {"available": False, "reason": reason} for mode, reason in backend.unavailable.items()
+    }
 
 
 def _candidate_backend(request: VerifyRequest, declarations: list | None) -> GenerationBackend:
@@ -1096,10 +1100,7 @@ def run_verify(
                     mode: _unanswered(rows, list(range(len(rows))))
                     for mode, rows in pair.candidate.rows.items()
                 }
-                | {
-                    mode: {"available": False, "reason": reason}
-                    for mode, reason in pair.candidate.unavailable.items()
-                }
+                | _unavailable_modes(pair.candidate)
             }
     else:
         live = liveness_tier(

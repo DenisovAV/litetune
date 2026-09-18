@@ -39,6 +39,7 @@ spec file in, a JSON row file out, one row per prompt in order.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import subprocess
@@ -64,6 +65,15 @@ class ToolPathError(RuntimeError):
     """The tool path could not be measured at all. Never a statement about the model."""
 
 
+class NotMeasured(ToolPathError):
+    """The runtime replied to the run, and not in a way litetune reads as the model's.
+
+    Apart from its parent because it is the one failure a grammar-on run may
+    be reported with while the grammar-off run stands: the script ran to its
+    end and wrote every row. Anything else ends the run in either mode.
+    """
+
+
 _TOOL_PATH_SCRIPT = r'''
 """The runtime's answer to each prompt, through its own tool path."""
 import json
@@ -75,11 +85,15 @@ from pathlib import Path
 # The binding's one signal that the runtime gave no reply (`conversation.py`,
 # litert-lm 0.16.1). Anything else `send_message` raises is not an answer from
 # the model -- an API change, memory, a closed conversation -- and ends the run
-# as a harness failure rather than being scored.
+# as a harness failure rather than being scored, in either decoding mode.
 NO_REPLY = "send_message failed"
 
 # absl's line prefix: severity, date, time, thread, file:line].
 ABSL_PREFIX = re.compile(r"^[IWEF][0-9]{4} [0-9:.]+ +[0-9]+ [^ \]]+:[0-9]+\] *")
+
+# Written to the log before each reply, so that a process that dies mid-reply
+# leaves its log cut into prompts, and only the last one is read for why.
+ROW_MARK = "litetune tool path: prompt "
 
 
 def text_of(reply):
@@ -113,7 +127,7 @@ def calls_of(reply):
     return calls
 
 
-def logged(action, log_path):
+def logged(action, log_path, row):
     """Run `action` with file descriptor 2 appended to `log_path`.
 
     Returns (reply, no-reply exception, what the runtime logged). The binding
@@ -121,11 +135,14 @@ def logged(action, log_path):
     writes the reason to file descriptor 2, so the descriptor itself is
     redirected -- `sys.stderr` is not where native code writes. Into a file the
     parent can read, not a temporary one: if native code aborts mid-call, the
-    reason it wrote would otherwise vanish with the process.
+    reason it wrote would otherwise vanish with the process. The row's mark
+    goes first, so the parent can tell this reply's lines from the ones before.
     """
     sys.stderr.flush()
     saved = os.dup(2)
     with open(log_path, "ab") as capture:
+        capture.write(f"\n{ROW_MARK}{row}\n".encode("utf-8"))
+        capture.flush()
         start = capture.tell()
         os.dup2(capture.fileno(), 2)
         try:
@@ -155,9 +172,14 @@ def reason_of(log):
     if "Failed to parse tool calls" in log:
         return "parse", "its call parser rejected the generation"
     if "Input token ids are too long" in log:
-        return "too_long", "the prompt was longer than the bundle's token limit"
+        return (
+            "too_long",
+            "the prompt, with the declarations the runtime renders into it, reached the "
+            "bundle's token limit",
+        )
     lines = [ABSL_PREFIX.sub("", line).strip() for line in log.splitlines()]
-    errors = [line for line in lines if "rror" in line or "ailed" in line]
+    lines = [line for line in lines if line]
+    errors = [line for line in lines if "rror" in line or "ailed" in line] or lines
     return "other", (errors[-1] if errors else "nothing in its log")[:200]
 
 
@@ -235,7 +257,7 @@ def main():
                 return 3
             with conversation:
                 reply, exc, log = logged(
-                    lambda: conversation.send_message(prompt), spec["log"]
+                    lambda: conversation.send_message(prompt), spec["log"], index
                 )
             if executed:
                 sys.stderr.write(
@@ -271,6 +293,36 @@ if __name__ == "__main__":
 '''
 
 
+@functools.cache
+def _script() -> dict[str, Any]:
+    """The script's own definitions, for the parent to apply the same rules.
+
+    Read from the one source rather than copied, so the mark the script writes
+    and the reason it would have given are the ones the parent reads a crashed
+    run's log with.
+    """
+    namespace: dict[str, Any] = {"__name__": "litetune_toolpath_script"}
+    exec(compile(_TOOL_PATH_SCRIPT, "litetune toolpath script", "exec"), namespace)  # noqa: S102
+    return namespace
+
+
+def _said_before_dying(log: Path) -> str:
+    """Why a run that died mid-reply died, from its last prompt's lines only.
+
+    The log holds every earlier reply's lines too, and a parse failure's carry
+    the model's code block and full response (`parser_utils.cc`), so they are
+    never quoted: the last prompt's lines go through the rule the script uses
+    for a row. Empty when the run died outside a reply.
+    """
+    text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+    _, mark, last = text.rpartition(_script()["ROW_MARK"])
+    if not mark:
+        return ""
+    number, _, said = last.partition("\n")
+    _, reason = _script()["reason_of"](said)
+    return f" on prompt {number}: {reason}"
+
+
 @dataclass(frozen=True)
 class ToolPathRow:
     """One prompt's answer through the tool path.
@@ -278,10 +330,11 @@ class ToolPathRow:
     No calls and no error is a real result -- the model answered without
     calling anything. `error` is set when the runtime gave no reply at all,
     with `kind` saying why: `parse` for its call parser rejecting the
-    generation, `too_long` for a prompt over the bundle's token limit, `other`
-    for anything else it logged. Either way an application got nothing it
-    could act on, and the row is scored as a wrong answer, counted apart so the
-    reason is visible.
+    generation, `too_long` for a prompt at the bundle's token limit, `other`
+    for anything else it logged. The first two are scored as wrong answers,
+    counted apart so the reason is visible: an application got nothing it
+    could act on. `other` is not the model's to answer for, and a mode with one
+    is not scored (`_refuse_a_mode_with_unread_reasons`).
     """
 
     index: int
@@ -289,6 +342,20 @@ class ToolPathRow:
     text: str = ""
     error: str | None = None
     kind: str | None = None
+
+    def __post_init__(self) -> None:
+        # The states a reply can be in, and no others: every count and every
+        # score below reads a row as exactly one of them.
+        if (self.error is None) != (self.kind is None) or self.kind not in (
+            None,
+            *NO_REPLY_KINDS,
+        ):
+            raise ToolPathError(
+                f"row {self.index} has error {self.error!r} and kind {self.kind!r}: a reply the "
+                f"runtime did not give has both, and its kind is one of {NO_REPLY_KINDS}"
+            )
+        if self.error is not None and self.calls:
+            raise ToolPathError(f"row {self.index} has both a reply and no reply")
 
     @property
     def refused(self) -> bool:
@@ -323,21 +390,13 @@ class ToolPathRow:
             for c in calls
         ):
             raise ToolPathError(f"the tool-path script wrote row {position} with calls {calls!r}")
-        error, kind = row.get("error"), row.get("kind")
-        if (error is None) != (kind is None) or kind not in (None, *NO_REPLY_KINDS):
-            raise ToolPathError(
-                f"the tool-path script wrote row {position} with error {error!r} and kind {kind!r}"
-            )
-        if error is not None and calls:
-            raise ToolPathError(
-                f"the tool-path script wrote row {position} with both a reply and no reply"
-            )
+        error = row.get("error")
         return cls(
             index=position,
             calls=tuple(calls),
             text=str(row.get("text") or ""),
             error=None if error is None else str(error),
-            kind=kind,
+            kind=row.get("kind"),
         )
 
 
@@ -406,15 +465,12 @@ class ToolPathProbe:
                 raise ToolPathError(f"could not start the tool-path script: {exc}") from exc
             if proc.returncode != 0 or not out.is_file():
                 reading = read_returncode(proc.returncode)
-                # What the runtime wrote while fd 2 pointed at the log, which is
-                # where a native abort mid-reply leaves its reason.
-                logged = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
-                said = "\n".join(
-                    part for part in (logged.strip(), (proc.stderr or "").strip()) if part
-                )
+                # Where a native abort mid-reply leaves its reason: the log,
+                # which fd 2 pointed at. Outside a reply it is stderr.
+                stderr = (proc.stderr or "").strip()[-400:]
                 raise ToolPathError(
-                    f"the tool-path script {reading.describe('the model')}: "
-                    f"{said[-400:] or 'no stderr'}"
+                    f"the tool-path script {reading.describe('the model')}"
+                    f"{_said_before_dying(log)}; stderr: {stderr or 'empty'}"
                 )
             try:
                 written = json.loads(out.read_text(encoding="utf-8"))
@@ -443,24 +499,30 @@ def as_tool_call(call: dict[str, Any] | None) -> ToolCall | None:
     return ToolCall(name=call["name"], args=dict(call.get("arguments") or {}))
 
 
-def _refuse_a_mode_nothing_answered(rows: list[ToolPathRow]) -> None:
-    """A mode where the runtime replied to no prompt, and never for its parser.
+def _refuse_a_mode_with_unread_reasons(rows: list[ToolPathRow]) -> None:
+    """A mode where the runtime gave no reply for a reason litetune does not read.
 
-    That is not a model answering badly: the runtime could not answer at all --
-    a constraint it could not build, a bundle it could not run -- and scoring
-    every row wrong would put a harness condition into the model's numbers.
-    Parser refusals on every row are the model's, and stay scored.
+    Two reasons are read: its call parser rejecting what the model wrote, which
+    is the model's wrong answer, and a prompt reaching the bundle's token limit,
+    which is the bundle's and is scored as what an application gets. Any other
+    -- a constraint it could not build, memory, a sentence another runtime
+    version words differently -- could be the machine as easily as the model,
+    so no row of the mode is scored. On one row as on all of them: the first
+    version asked whether every row failed, and one answered row turned the
+    other 639 into the model's wrong answers.
     """
-    if rows and all(row.refused and not row.parse_refusal for row in rows):
-        reasons = sorted({row.error or "" for row in rows})
-        raise ToolPathError(
-            f"the runtime gave no reply to any of {len(rows)} prompts, and never because its "
-            f"call parser rejected one: {'; '.join(reasons)[:300]}"
+    unread = [row for row in rows if row.kind == "other"]
+    if unread:
+        reasons = sorted({row.error or "" for row in unread})
+        raise NotMeasured(
+            f"the runtime gave no reply to {len(unread)} of {len(rows)} prompts for a reason "
+            f"litetune does not read as the model's: {'; '.join(reasons)[:300]}"
         )
 
 
 # The runtime version on which it was established, from its source, that
-# constrained decoding is off unless the caller enables it. `verify` says when a
+# constrained decoding is off unless the caller enables it -- and whose log
+# sentences `reason_of` reads a missing reply's kind from. `verify` says when a
 # run used another.
 GRAMMAR_OFF_BY_DEFAULT_IN = "0.16.1"
 
@@ -473,13 +535,14 @@ DISAGREEING_MODES = (
 )
 
 GRAMMAR_HELPED = (
-    "The grammar raised the score: the runtime returned calls under it that it did not return "
-    "without it. That can be the grammar holding a model that did not fully learn the format, "
-    "or forcing a tool name, an enum value or a single call; these numbers do not say which."
+    "The grammar raised the score: rows were right with it on that were wrong with it off. "
+    "These numbers do not say what it changed on them."
 )
 GRAMMAR_HURT = (
-    "The grammar lowered the score: it removed or changed something the model wrote on its own "
-    "-- measured once, arguments written out of declared order were dropped."
+    "The grammar lowered the score: rows were wrong with it on that were right with it off. "
+    "These numbers do not say what it changed on them; measured once, on a model trained in "
+    "an argument order other than the declared one, it dropped the arguments written out of "
+    "that order."
 )
 
 
@@ -506,9 +569,8 @@ class ToolPathBackend:
     # Filled by `generate`: the rows from each mode, kept so the manifest can
     # carry both numbers rather than only the one that was scored.
     rows: dict[str, list[ToolPathRow]] = field(default_factory=dict, init=False)
-    # A mode that could not be measured, and why. Only the grammar-on mode can
-    # land here: the grammar-off run is what the reference is compared with,
-    # and without it nothing is measured at all.
+    # A mode that was not measured, and why. Grammar off landing here means
+    # nothing was measured: it is what the reference is compared with.
     unavailable: dict[str, str] = field(default_factory=dict, init=False)
     runtime_version: str | None = field(default=None, init=False)
 
@@ -578,18 +640,19 @@ class ToolPathBackend:
             auto_provision=self.auto_provision,
             timeout_s=self.timeout_s,
         )
+        self.rows, self.unavailable, self.runtime_version = {}, {}, None
         # Grammar off first: it is the run the reference is compared with, so
-        # the grammar-on run failing must not cost it.
+        # the grammar-on run not being measured must not cost it.
         for mode, constrained in (("unconstrained", False), ("constrained", True)):
             try:
                 rows = probe.observe(prompts, constrained=constrained, events=events)
-                _refuse_a_mode_nothing_answered(rows)
+                _refuse_a_mode_with_unread_reasons(rows)
             except ToolPathError as exc:
                 logger.warning("the tool path could not be measured (%s): %s", mode, exc)
-                if mode == "constrained":
-                    self.unavailable[mode] = str(exc)
+                self.unavailable[mode] = str(exc)
+                if mode == "constrained" and isinstance(exc, NotMeasured):
                     continue
-                # Nothing was measured. Every prompt carries the same harness
+                # Nothing is scored. Every prompt carries the same harness
                 # error, which is what keeps these rows out of the score
                 # entirely instead of counting as wrong answers.
                 return [Generation(i, p, harness_error=str(exc)) for i, p in enumerate(prompts)]
