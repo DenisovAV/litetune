@@ -242,6 +242,12 @@ def _refuse_calls_the_runtime_would_not_read(
     Only where the call format is FunctionGemma's, in `runtime_rendered`. Every
     call row, including one whose target litetune could not render: its own
     completion is still what the runtime would read.
+
+    Text *before* the call trains: the runtime hands it over as the reply's
+    text beside the call, an application still gets the call, and the ending
+    the template writes still comes right after the call. Two reviews have
+    proposed refusing it; refusing would refuse a dataset whose answers say
+    something before calling, which is a choice its author is entitled to.
     """
     if mode is not PromptMode.RUNTIME_RENDERED or not wire_format_for(request.model).known:
         return None
