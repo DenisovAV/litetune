@@ -797,6 +797,25 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
             ),
         )
         result.limitation(NO_TRAINED_DECLARATIONS)
+    elif (
+        contract.declarations_sha256 is not None
+        and contract.runtime_renders_declarations
+        and declarations_check.outcome is Outcome.PASSED
+    ):
+        # The check accepted a record of the supplied file's bytes, which is
+        # all a contract built before digests named the tool list could carry.
+        # The bundle ships that list normalised, so the contract names what
+        # ships, or it would not hash to its own contract.
+        shipped = _shipped_digest(request.declarations, prerendered=False)
+        if contract.declarations_sha256.rpartition(":")[2].lower() != shipped.split(":", 1)[1]:
+            result.limitation(
+                f"the contract recorded {contract.declarations_sha256}, the digest of "
+                f"{request.declarations} as a file; the bundle ships the same tool list "
+                f"normalised, so the contract now names that list's digest, {shipped}, which "
+                "is what the shipped file hashes to"
+            )
+            contract = replace(contract, declarations_sha256=shipped)
+    if contract is not request.contract:
         # The report and the file must describe one contract.
         request = replace(request, contract=contract)
         result.request = request
@@ -950,29 +969,34 @@ def _shipped_digest(source: Path, prerendered: bool) -> str:
     """
     if prerendered:
         return hash_file(source)
-    try:
-        return read_declarations(source)[1]
-    except DeclarationsError:
-        return hash_file(source)
+    # Reached only once the declarations check passed, which in
+    # `runtime_rendered` means `read_declarations` accepted this file.
+    return read_declarations(source)[1]
 
 
 def _digest_disagreement(request: BundleRequest, source: Path, name: str) -> Check | None:
     """The contract's digest against the file supplied, when the contract carries one.
 
-    Compared by `declarations.digest_matches`, which names the tool list rather
-    than the file: the same list reformatted, or the normalised copy a
-    `runtime_rendered` bundle ships, is the list the model learned.
+    Compared by `declarations.digest_matches` for the contract's mode. Where
+    the runtime renders the declarations it names the tool list rather than
+    the file: the same list reformatted, or the normalised copy a
+    `runtime_rendered` bundle ships, is the list the model learned. In
+    `prerendered` it names the file's bytes, because the application renders
+    the file as it is and another order is another prompt.
     """
     recorded = request.contract.declarations_sha256
     if recorded is None:
         return None
+    prerendered = not request.contract.runtime_renders_declarations
     try:
         digest: str | None = read_declarations(source)[1]
     except DeclarationsError:
         digest = None
-    if digest_matches(recorded, digest, source):
+    if digest_matches(recorded, digest, source, prerendered):
         return None
-    actual = (digest or hash_file(source)).split(":", 1)[-1]
+    # The kind of digest the contract records for this mode, so the two
+    # printed side by side are comparable.
+    actual = (hash_file(source) if prerendered or digest is None else digest).split(":", 1)[-1]
     expected = recorded.split(":", 1)[-1]
     return Check.failed(
         name,
@@ -1051,6 +1075,17 @@ def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
             name,
             f"the declarations at {source} are the file this bundle would write its "
             f"declarations to ({destination}); name a source outside --output-dir",
+            observed={"declarations": str(source)},
+        )
+    if destination.is_symlink():
+        # Written through, a link would put the file wherever it points,
+        # outside --output-dir. Removing the link never touches its target.
+        destination.unlink()
+    elif destination.is_dir():
+        return Check.failed(
+            name,
+            f"{destination} is a directory, where this bundle writes its declarations; remove it "
+            "or name another --output-dir",
             observed={"declarations": str(source)},
         )
     if request.contract.runtime_renders_declarations:

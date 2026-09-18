@@ -713,7 +713,9 @@ def test_declarations_that_disagree_with_the_checkpoints_record_are_refused(tmp_
     assert result.status is Status.FAILED_HARNESS
     assert EXIT_CODES[result.status] == 4
     refusal = next(c for c in result.manifest["checks"] if c["name"] == DECLARATIONS_CHECK)
-    assert read_declarations(measured)[1] in refusal["detail"]
+    # In `prerendered` both are the files' bytes: the digest `tune` recorded
+    # for this mode, and the one the refusal compares it with.
+    assert hash_file(measured) in refusal["detail"]
     assert hash_file(trained) in refusal["detail"]
     # Refused before either side was asked for anything.
     assert candidate.prompts_seen == []
@@ -784,6 +786,39 @@ def test_a_record_of_the_files_bytes_still_matches_that_file(tmp_path, write_spl
 
     assert result.status is not Status.FAILED_HARNESS
     assert candidate.prompts_seen != []
+    # Found in review: the manifest recorded the tool list's digest where the
+    # checkpoint, `tune` and the bundle's contract record the file's bytes.
+    assert result.manifest["harness"]["declarations_sha256"] == hash_file(decls)
+    assert hash_file(decls) != read_declarations(decls)[1]
+
+
+def test_a_prerendered_record_matches_only_the_same_bytes(tmp_path, write_split):
+    """Found in review: a record of a file whose bytes were already the list's
+    canonical text -- one taken from a runtime_rendered bundle -- matched the
+    same tools reformatted, because the list's digest was accepted in either
+    mode. In `prerendered` the application renders the file as it is."""
+    from litetune.declarations import canonical_text
+
+    entries = [{"type": "function", "function": {"name": "send_email", "description": "d"}}]
+    trained = tmp_path / "trained.json"
+    trained.write_text(canonical_text(read_declarations_of(tmp_path, entries)), encoding="utf-8")
+    assert hash_file(trained) == read_declarations(trained)[1]
+    reformatted = tmp_path / "reformatted.json"
+    reformatted.write_text(json.dumps(entries), encoding="utf-8")
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(trained)}
+    )
+
+    result, candidate, _ = _verify_with(tmp_path, write_split, reference, reformatted)
+
+    assert result.status is Status.FAILED_HARNESS
+    assert candidate.prompts_seen == []
+
+
+def read_declarations_of(tmp_path, entries):
+    source = tmp_path / "entries.json"
+    source.write_text(json.dumps(entries), encoding="utf-8")
+    return read_declarations(source)[0]
 
 
 def test_the_declarations_a_bundle_shipped_match_the_record_of_the_file_trained_on(
@@ -804,8 +839,10 @@ def test_the_declarations_a_bundle_shipped_match_the_record_of_the_file_trained_
     shipped = tmp_path / "shipped.json"
     shipped.write_text(canonical_text(parsed), encoding="utf-8")
     assert shipped.read_bytes() != trained.read_bytes()
+    # `runtime_rendered`, as the docstring says: the fixture said `prerendered`,
+    # where the list's digest was accepted too until review found it should not.
     reference = _checkpoint(
-        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": recorded}
+        tmp_path, {"prompt_mode": "runtime_rendered", "declarations_sha256": recorded}
     )
 
     result, _, _ = _verify_with(tmp_path, write_split, reference, shipped)
@@ -822,7 +859,7 @@ def test_declarations_that_match_the_record_are_measured_and_recorded(tmp_path, 
     )
     recorded = read_declarations(decls)[1]
     reference = _checkpoint(
-        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": recorded}
+        tmp_path, {"prompt_mode": "runtime_rendered", "declarations_sha256": recorded}
     )
 
     result, candidate, _ = _verify_with(tmp_path, write_split, reference, decls)

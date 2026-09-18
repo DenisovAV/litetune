@@ -514,6 +514,7 @@ def test_a_lone_surrogate_is_refused_not_a_traceback(tmp_path):
         ("sha256:{hex}", True),
         ("{hex}", True),  # some records keep the prefix and some do not
         ("sha512:{hex}", False),  # another algorithm is not this digest
+        ("SHA256:{HEX}", True),  # a digest spelled in capitals is the same digest
     ],
 )
 def test_a_recorded_digest_names_its_algorithm_or_none(tmp_path, recorded, matches):
@@ -521,10 +522,27 @@ def test_a_recorded_digest_names_its_algorithm_or_none(tmp_path, recorded, match
     matched."""
     path = _write(tmp_path, WRAPPED)
     _, digest = read_declarations(path)
+    hex_ = digest.split(":", 1)[1]
 
-    record = recorded.format(hex=digest.split(":", 1)[1])
+    record = recorded.format(hex=hex_, HEX=hex_.upper())
 
-    assert digest_matches(record, digest, path) is matches
+    assert digest_matches(record, digest, path, prerendered=False) is matches
+
+
+def test_prerendered_accepts_only_the_files_bytes(tmp_path):
+    """Found in review: either digest matched in either mode, so a file whose
+    bytes were the list's canonical text matched the same tools reformatted."""
+    path = _write(tmp_path, WRAPPED)
+    listed, digest = read_declarations(path)
+    canonical = tmp_path / "canonical.json"
+    canonical.write_text(canonical_text(listed), encoding="utf-8")
+    record = hash_file(canonical)
+    assert record == digest
+
+    assert digest_matches(record, digest, canonical, prerendered=True)
+    assert not digest_matches(record, digest, path, prerendered=True)
+    # Where the runtime renders them, the same list reformatted is the same list.
+    assert digest_matches(record, digest, path, prerendered=False)
 
 
 def test_prerendered_records_the_bytes_and_runtime_rendered_the_list(tmp_path):

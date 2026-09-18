@@ -39,7 +39,7 @@ from typing import Any
 
 from litetune import envs, metrics, models
 from litetune.checks import Check, CheckSet, Outcome, guard
-from litetune.declarations import digest_matches, read_declarations
+from litetune.declarations import digest_matches, read_declarations, recorded_digest
 from litetune.evaluate import (
     GREEDY,
     DataError,
@@ -915,8 +915,14 @@ def run_verify(
                     )
                 )
         else:
-            declarations, digest = read_declarations(request.declarations)
-            if recorded is not None and not digest_matches(recorded, digest, request.declarations):
+            declarations, listed = read_declarations(request.declarations)
+            prerendered = request.prompt_mode is PromptMode.PRERENDERED
+            # What `tune` records for this mode, so the manifest and the
+            # checkpoint name the file the same way.
+            digest = recorded_digest(listed, request.declarations, prerendered)
+            if recorded is not None and not digest_matches(
+                recorded, listed, request.declarations, prerendered
+            ):
                 sink.append(
                     Check.failed(
                         DECLARATIONS_CHECK,

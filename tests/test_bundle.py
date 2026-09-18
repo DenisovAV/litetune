@@ -28,7 +28,7 @@ from litetune.bundle import (
     versions_from,
 )
 from litetune.checks import Outcome
-from litetune.declarations import read_declarations
+from litetune.declarations import canonical_text, read_declarations
 from litetune.events import EventStream
 from litetune.manifest import CacheOutcome, RunManifest, RunStatus, StageRecord
 from litetune.prompt_mode import PromptMode
@@ -1157,6 +1157,76 @@ def test_a_prerendered_bundle_refuses_the_same_tools_in_another_order(tmp_path, 
     assert check_named(result, "declarations included").outcome is Outcome.FAILED
 
 
+def test_a_prerendered_bundle_compares_bytes_even_where_they_are_the_lists_text(
+    tmp_path, request_for
+):
+    """Found in review: a record of a file already in canonical form -- one
+    taken from a runtime_rendered bundle -- is also the list's digest, and the
+    list's digest was accepted in either mode. The refusal prints the digest
+    the contract's mode records, so the two are comparable."""
+    listed, _ = read_declarations(_unsorted_declarations(tmp_path))
+    canonical = tmp_path / "canonical.json"
+    canonical.write_text(canonical_text(listed), encoding="utf-8")
+    reformatted = tmp_path / "reformatted.json"
+    reformatted.write_text(json.dumps(listed), encoding="utf-8")
+
+    result = build_bundle(
+        request_for(
+            declarations=reformatted,
+            contract=a_contract(
+                prompt_mode=PromptMode.PRERENDERED, declarations_sha256=hash_file(canonical)
+            ),
+        )
+    )
+
+    check = check_named(result, "declarations included")
+    assert check.outcome is Outcome.FAILED
+    assert hash_file(reformatted).split(":", 1)[1][:16] in check.detail
+
+
+@pytest.mark.parametrize("prompt_mode", list(PromptMode))
+def test_a_link_where_the_declarations_go_is_replaced_not_written_through(
+    tmp_path, request_for, prompt_mode
+):
+    """Found in review: a link at `out/declarations.json` was followed, and the
+    bundle wrote outside --output-dir."""
+    out = tmp_path / "bundle"
+    out.mkdir(exist_ok=True)
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text("not yours", encoding="utf-8")
+    (out / DECLARATIONS_NAME).symlink_to(elsewhere)
+
+    result = build_bundle(
+        request_for(
+            declarations=_unsorted_declarations(tmp_path),
+            output_dir=out,
+            contract=a_contract(prompt_mode=prompt_mode),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+    assert elsewhere.read_text(encoding="utf-8") == "not yours"
+    assert not (out / DECLARATIONS_NAME).is_symlink()
+
+
+def test_a_directory_where_the_declarations_go_is_refused(tmp_path, request_for):
+    """Found in review: runtime_rendered raised `IsADirectoryError` out of the stage."""
+    out = tmp_path / "bundle"
+    (out / DECLARATIONS_NAME).mkdir(parents=True)
+
+    result = build_bundle(
+        request_for(
+            declarations=_unsorted_declarations(tmp_path),
+            output_dir=out,
+            contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED),
+        )
+    )
+
+    check = check_named(result, "declarations included")
+    assert check.outcome is Outcome.FAILED
+    assert "is a directory" in check.detail
+
+
 def test_a_prerendered_contract_names_the_bytes_it_ships(tmp_path, request_for):
     source = _unsorted_declarations(tmp_path)
 
@@ -1263,4 +1333,11 @@ def test_the_training_digest_matches_the_file_supplied_not_its_normalised_copy(
 
     check = check_named(result, "declarations included")
     assert check.outcome is Outcome.PASSED
-    assert hash_file(tmp_path / "bundle" / DECLARATIONS_NAME) != hash_file(source)
+    shipped = tmp_path / "bundle" / DECLARATIONS_NAME
+    assert hash_file(shipped) != hash_file(source)
+    # Found in review: the contract kept the supplied file's digest, which the
+    # shipped copy does not hash to, and a bundle made again from the shipped
+    # file was refused. It names what ships, and says it changed it.
+    contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == hash_file(shipped)
+    assert any("now names that list's digest" in text for text in result.limitations)

@@ -7,12 +7,15 @@ the one that packages it. `bundle` has taken them since it existed; `prepare`,
 
 **One reader, because the digest has to match.** `tune` records a digest beside
 the checkpoint, `verify` refuses a set that disagrees with it, and a bundle's
-contract carries it. It identifies the tool list, not the file: the digest of
-`canonical_text` over the declarations as read here, so the file a user wrote,
-the one a `runtime_rendered` bundle ships and the same list reformatted all hash
-alike. A digest over the file's bytes, which this used before, made a bundle
-refuse the declarations file it had itself shipped, because the bundle writes
-them in the order the model learned and the user's file was in another.
+contract carries it. Where the runtime renders the declarations it identifies
+the tool list, not the file: the digest of `canonical_text` over the
+declarations as read here, so the file a user wrote, the one a
+`runtime_rendered` bundle ships and the same list reformatted all hash alike. A
+digest over the file's bytes made a bundle refuse the declarations file it had
+itself shipped, because the bundle writes them in the order the model learned
+and the user's file was in another. Where the application renders them the
+file's bytes are the record, because there the order in the file is the prompt
+(`recorded_digest`, `digest_matches`).
 
 **The shape is the runtime's, and the rules here are its rules.** One entry is
 the OpenAI function-tool object: `{"type": "function", "function": {"name",
@@ -141,20 +144,26 @@ def content_digest(entries: list[Any]) -> str:
     return f"{HASH_ALGORITHM}:{body}"
 
 
-def digest_matches(recorded: str, digest: str | None, path: Path) -> bool:
+def digest_matches(recorded: str, digest: str | None, path: Path, prerendered: bool) -> bool:
     """Whether a recorded digest names the declarations read from `path`.
 
-    `digest` is `read_declarations`'s, or `None` where that refused the file. A
-    digest over the file's bytes is accepted too: that is what a `prerendered`
-    run records, and what a `Contract` built in code before digests identified
-    the tool list could only have carried. A record may carry the algorithm
-    prefix or not; one naming another algorithm is not this digest.
+    What `recorded_digest` records, for the same mode. In `prerendered` only
+    the file's bytes: the order in the file is the convention the application
+    renders, so the same tools in another order are another prompt, and a list
+    digest would accept them. Otherwise the tool list's (`digest`, which is
+    `read_declarations`'s, or `None` where that refused the file) -- or the
+    file's bytes, which is what a `Contract` built in code before digests
+    identified the tool list could only have carried. A record may carry the
+    algorithm prefix or not, in either case; one naming another algorithm is
+    not this digest.
     """
     algorithm, _, wanted = recorded.rpartition(":")
-    if algorithm and algorithm != HASH_ALGORITHM:
+    if algorithm and algorithm.lower() != HASH_ALGORITHM:
         return False
-    known = [hash_file(Path(path))] + ([digest] if digest is not None else [])
-    return wanted in (d.split(":", 1)[-1] for d in known)
+    known = [hash_file(Path(path))]
+    if digest is not None and not prerendered:
+        known.append(digest)
+    return wanted.lower() in (d.split(":", 1)[-1] for d in known)
 
 
 def declared_order(keys: Iterable[str]) -> list[str]:
