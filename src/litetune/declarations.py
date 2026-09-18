@@ -57,7 +57,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from litetune.metrics import NAME_RULE, readable_name
+from litetune.metrics import ESCAPE_SPELLINGS, NAME_RULE, readable_name
 from litetune.storage import HASH_ALGORITHM, hash_file
 
 
@@ -288,6 +288,7 @@ def _check_renderable(parsed: Any, path: Path) -> None:
     for entry in parsed:
         function = entry["function"]
         where = f"{path}: tool {function['name']!r}"
+        _refuse_control_text(function, where)
         _refuse_extra_keys(set(function), {"name", "description", "parameters"}, where)
         if not isinstance(function.get("description"), str):
             raise DeclarationsError(
@@ -297,6 +298,47 @@ def _check_renderable(parsed: Any, path: Path) -> None:
             )
         if "parameters" in function:
             _check_parameters(function["parameters"], f"{where}: parameters")
+
+
+_IN_A_STRING = (
+    "both renderers write a declaration's strings between escapes (`fc_tool_format_utils.cc`, "
+    "and the template litetune ships), so the string would end there"
+)
+_AROUND_A_DECLARATION = (
+    "the template litetune ships writes each declaration between the declaration markers, so "
+    "the declaration would end there"
+)
+_AROUND_THE_TURN = (
+    "the template litetune ships opens and closes the turn the declarations are written in "
+    "with the turn markers, so the turn would end there"
+)
+# Text a declaration's strings cannot carry: the model is shown what follows it
+# as something other than this declaration's text -- another declaration, or no
+# declaration at all -- and `tool_names` does not list it.
+DECLARATION_TEXT = {
+    **dict.fromkeys(ESCAPE_SPELLINGS, _IN_A_STRING),
+    "<start_function_declaration>": _AROUND_A_DECLARATION,
+    "<end_function_declaration>": _AROUND_A_DECLARATION,
+    "<start_of_turn>": _AROUND_THE_TURN,
+    "<end_of_turn>": _AROUND_THE_TURN,
+}
+
+
+def _refuse_control_text(value: Any, where: str) -> None:
+    """Every string in a declaration, descriptions and enum values alike."""
+    if isinstance(value, str):
+        held = [text for text in DECLARATION_TEXT if text in value]
+        if held:
+            raise DeclarationsError(
+                f"{where} contains {held[0]!r}: {DECLARATION_TEXT[held[0]]}, and the model would "
+                "be shown the rest as something other than this declaration's text"
+            )
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _refuse_control_text(item, f"{where}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _refuse_control_text(item, f"{where}[{index}]")
 
 
 def _check_parameters(parameters: Any, where: str) -> None:
