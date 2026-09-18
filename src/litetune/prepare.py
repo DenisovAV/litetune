@@ -433,8 +433,9 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
 
     `wire_format` is what the model's family records for its calls. `None` means
     the caller named no model, which is every call that predates `--base-model`;
-    those keep today's behaviour and `prepare` records a limitation saying which
-    spelling was assumed, because breaking them would refuse splits that work.
+    those are rendered in FunctionGemma's format, the only one this project has
+    measured, and `prepare` records a limitation saying so, because refusing
+    them would refuse splits that work.
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -1174,7 +1175,7 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
 
     # The family decides how a structured target is spelled, and it is read
     # from the model rather than asked of the caller. A run that named no
-    # model gets `None`, which is today's behaviour plus a limitation.
+    # model gets `None`: FunctionGemma's format, and a limitation saying so.
     wire = wire_format_for(request.base_model) if request.base_model else None
     rows = read_rows(request.data, wire)
     # Before anything is profiled or split: a row calling a tool the prompt will

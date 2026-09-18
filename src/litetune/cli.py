@@ -310,7 +310,8 @@ def _add_verify(sub) -> None:
             "tool declarations JSON, the same file bundle takes. Refused when its digest "
             "disagrees with the one recorded beside --reference, because a model measured "
             "against a different tool list than it trained on is measured on another task. "
-            "Without it the run measures exactly what it measured before"
+            "Required when the checkpoint recorded declarations: without them the model would be "
+            "measured on a prompt lacking the tool list it learned, and the run is refused"
         ),
     )
     verify.add_argument(
@@ -370,7 +371,8 @@ def _add_prepare(sub) -> None:
         help=(
             "tool declarations JSON, the same file bundle takes. A row whose target names a "
             "tool the declarations do not offer is rejected, rather than teaching a call the "
-            "prompt never offers. Without it the split is built exactly as before"
+            "prompt never offers, and so is one whose arguments contradict its declaration. "
+            "Without it no row is checked against a tool list"
         ),
     )
     prep.add_argument(
@@ -380,8 +382,8 @@ def _add_prepare(sub) -> None:
             "decides how a structured target is spelled: litetune records that per family and "
             "refuses a family whose calls it has never measured, rather than rendering "
             "FunctionGemma's format for everyone. Not --tokenizer, which is declared as a "
-            "tokenizer. Without it the split is built exactly as before, with a limitation "
-            "saying which format was assumed"
+            "tokenizer. Without it a structured target is rendered in FunctionGemma's format, "
+            "the one this project has measured, and the report says that format was assumed"
         ),
     )
     prep.add_argument("--json", action="store_true", help="write the report to stdout")
@@ -431,7 +433,9 @@ def _add_tune(sub) -> None:
         help=(
             "tool declarations JSON, the same file bundle takes. Their digest is recorded "
             "beside the checkpoint, so verify reads what this run trained against rather than "
-            "being told it. Without it the run trains exactly what it trained before"
+            "being told it. Without it no declaration turn is rendered into the training "
+            "prompt, which a family whose runtime renders declarations refuses for a "
+            "runtime_rendered split that trains calls"
         ),
     )
     tune.add_argument(

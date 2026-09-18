@@ -137,14 +137,15 @@ Two shapes rather than a target plus a `--target-kind`, because those two could
 disagree and a shape cannot disagree with itself. Match it with `--scorer` when
 you get to `verify`.
 
-**The prompt is exactly what your application will send the model.** The tool
-call above is FunctionGemma's: its application renders the tool declarations and
-every turn marker into the prompt itself — flutter_gemma does it in Dart — so the
-runtime must not template it again, and `tune` trains it `prerendered`. The
-sentiment row is bare text for a runtime that applies the model's own chat
-template, so it trains `runtime_rendered`. `tune` tells the two apart by the
-control tokens in the prompts, and refuses a file that mixes them unless you
-declare which one it is.
+**The prompt is exactly what your application will send the model.** An
+application that renders the tool declarations and every turn marker into the
+prompt itself sends a prompt the runtime must not template again, and `tune`
+trains it `prerendered`. The sentiment row is bare text for a runtime that
+applies the model's own chat template, so it trains `runtime_rendered` — as does
+a tool call whose declarations the runtime renders, below in
+[Tool calling through the runtime](#tool-calling-through-the-runtime). `tune`
+tells the two apart by the control tokens in the prompts, and refuses a file
+that mixes them unless you declare which one it is.
 
 `prepare` splits one raw file into `train.jsonl` and `heldout.jsonl` and rejects
 what it cannot score: malformed JSON, and rows with no `prompt`. Given
@@ -277,43 +278,74 @@ litetune verify --model artifacts/<recipe>/<name>.litertlm \
 `tools.json` is a list of OpenAI function objects, the shape `bundle` takes.
 
 **The order of its keys is settled for you.** The runtime prints a declaration's
-keys in the order it is given; FunctionGemma's own chat template sorts them. So
-litetune sorts the file when it reads it, and the training prompt and the
-runtime then render the same tokens — the rendering check compares them on every
-`verify`. It refuses the shapes the two still render differently: `nullable`, a
-property with no `description`, a property named `description`, `type`,
-`properties`, `required` or `nullable`, an `enum` on a non-string, an empty
-collection, and a type written other than as one of the seven JSON Schema names
-in lowercase or in capitals. Two of those are capability you give up — `nullable`
-and a reserved property name; the rest you fix by writing the file differently,
-and whatever you remove, remove from what your application sends too: the
-runtime renders what it is given. `google/mobile-actions` meets one of them
-itself — its tools with no arguments carry `"properties": {}`. The disagreement is Google's:
+keys in the order it is given; FunctionGemma's own chat template sorts them with
+`dictsort`, which ignores case. So litetune sorts every mapping in the file the
+same way when it reads it, and the training prompt and the runtime then render
+the same tokens — the rendering check compares them on every `verify`.
+
+It refuses what the two still render differently, and what a call could not
+carry back:
+
+- any schema key the template does not print — among them `nullable`,
+  `default`, `format`, `minimum`, `additionalProperties`, a function-level
+  `strict`, and `enum` on anything but a string;
+- a tool or property with no `description`;
+- a property named `description`, `type`, `properties`, `required` or
+  `nullable`, and two properties equal but for case;
+- an empty collection, and an object property with no properties;
+- a type written other than as one of the seven JSON Schema names, in lowercase
+  or in capitals;
+- a tool or argument name the runtime's call parser cannot read
+  (`[a-zA-Z_][a-zA-Z0-9_.-]*`).
+
+Some are capability you give up — `nullable`, the reserved names, `enum` on a
+number, and OpenAI's strict mode; the rest you fix by writing the file
+differently. Whatever you remove, remove from what your application sends too:
+the runtime renders what it is given. `google/mobile-actions` meets one of them
+itself — its tools with no arguments carry `"properties": {}`. The disagreement
+is Google's:
 [LiteRT-LM#3638](https://github.com/google-ai-edge/LiteRT-LM/issues/3638).
 
 **A call is trained the way the runtime reads one**: inside
 `<start_function_call>` and `<end_function_call>`, strings between `<escape>`
-markers, numbers, booleans and null bare, and the arguments in the same sorted
-order as the declarations — `call:set_alarm{hour:7,label:<escape>wake<escape>}`.
-The order is not cosmetic: the runtime's constrained decoding enforces the
-declared property order, and an argument out of it is dropped from the call.
-So a `runtime_rendered` bundle ships its declarations in the order the model
-learned, and an application should send them as shipped.
+markers, numbers, booleans and null bare, and the arguments in the same order as
+the declarations — `call:set_alarm{hour:7,label:<escape>wake<escape>}`. Only what
+the runtime reads back is trained: a string holding an escape marker, NaN or
+infinity, an integer beyond 2⁵³ and a name outside its grammar are refused with
+the row named, and so is a target whose arguments contradict its declaration.
+The order is not cosmetic: with constrained decoding on, the runtime enforces
+the declared property order, and an argument out of it is dropped from the
+call. So a `runtime_rendered` bundle ships its declarations in the order the
+model learned, and its contract's `declarations_sha256` names that list.
+
+**Who serves it this way.** LiteRT-LM's Python API, as
+`create_conversation(tools=...)`, which is how `verify` asks. On Kotlin, an
+`OpenApiTool` returning each entry's `function` object as shipped, registered
+in the file's order; the reflection-based `@Tool` path writes its own keys,
+order and `nullable`, and does not render what was trained. flutter_gemma 1.8.3
+does not use this path for FunctionGemma: it renders the declarations in Dart
+and hands the runtime tools only for Gemma 4
+(`flutter_gemma_litertlm/lib/src/ffi/ffi_inference_model.dart`), so a model
+trained here is not served by it the way it was measured.
 
 **`verify` picks the path from the model, not from a flag.** With declarations
 and a family whose runtime renders them, it asks the runtime for a structured
-call instead of reading text, twice: with the runtime's constrained decoding on,
-which is what an application gets, and off, which is the only evidence the model
-learned the format rather than being held to it. A gap between the two is
-reported. A generation the runtime's parser refuses is counted apart from wrong
-answers, and both sides are scored over the rows it could read.
+call instead of reading text, twice: with constrained decoding off — the
+runtime's default, and what the reference is compared with — and on, which is
+what an application that enables it gets. How far the two differ, and which way,
+is reported. A prompt the runtime gives no reply to is scored as a wrong answer
+and counted apart, with the reason the runtime logged.
 
 **What it refuses.** Structured targets in `runtime_rendered` without
 `--declarations`: their descriptions and types are your application's contract
-and cannot be read off the targets. And a structured target for a family whose
-call format litetune has not measured: supply each row's `completion` instead.
-`prepare` without `--base-model` still renders FunctionGemma's format, and the
-report says that it assumed it.
+and cannot be read off the targets. `--declarations` for a family whose runtime
+does not render them. A structured target for a family whose call format
+litetune has not measured: supply each row's `completion` instead. A split whose
+call completions are not what `prepare` writes — one prepared by 0.1.6 or
+earlier: re-run `prepare`. `verify` without `--declarations` for a checkpoint
+that recorded some, and `--scorer exact-text` on the tool path. `prepare`
+without `--base-model` still renders FunctionGemma's format, and the report
+says that it assumed it.
 
 ---
 

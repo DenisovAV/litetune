@@ -711,7 +711,7 @@ def test_the_one_family_whose_tool_path_was_measured_carries_it():
 
 @pytest.mark.parametrize("model", ["Qwen/Qwen3-0.6B", "google/gemma-3-270m-it"])
 def test_a_family_with_an_entry_and_no_measured_format_says_so(model):
-    """The live case D11 exists for.
+    """Why the answer has three states rather than two.
 
     Qwen-3 has an entry that deliberately records nothing about its calls. Under
     a single "does litetune know this model" question it would read as fine, and

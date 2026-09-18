@@ -206,8 +206,8 @@ class VerifyRequest:
     contract: Path | None = None
     # The tool declarations to measure against, in the shape `bundle` takes. A
     # set whose digest disagrees with the one recorded beside the reference
-    # checkpoint is refused rather than measured. Absent measures exactly what
-    # it measured before.
+    # checkpoint is refused rather than measured, and so is a run given none
+    # for a checkpoint that recorded some.
     declarations: Path | None = None
 
 

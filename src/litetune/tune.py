@@ -967,8 +967,7 @@ class TuneRequest:
     force_prompt_mode: bool = field(default=False, kw_only=True)
     # The tool declarations the run trains against, in the shape `bundle` takes.
     # Their digest is recorded beside the checkpoint, where `verify` reads it
-    # back rather than being told it. Absent trains exactly what it trained
-    # before.
+    # back rather than being told it. Absent, no declaration turn is rendered.
     declarations: Path | None = field(default=None, kw_only=True)
     timeout_s: int = DEFAULT_TIMEOUT_S
     env: envs.StageEnv = envs.TRAIN

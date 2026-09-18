@@ -183,8 +183,8 @@ def test_a_split_whose_calls_are_all_declared_is_prepared(tmp_path, write_jsonl,
 
 
 def test_without_declarations_nothing_about_tools_is_checked(tmp_path, write_jsonl, request_for):
-    """The flag is additive: every split that prepared before declarations were
-    an input prepares the same way now."""
+    """Without declarations no row is checked against a tool list: a split that
+    names tools prepares without a file saying which exist."""
     data = write_jsonl(rows(3, tool="open_app") + rows(1, tool="send_email", start=3))
 
     result = prepare(request_for(data))
@@ -859,7 +859,9 @@ def test_only_a_structured_target_reaches_the_refusal(write_jsonl, request_for):
         assert first["completion"] == "call:set_colour{colour:red}"
 
 
-def test_naming_no_model_keeps_today_s_behaviour_and_says_what_it_assumed(write_jsonl, request_for):
+def test_naming_no_model_renders_functiongemmas_format_and_says_it_assumed_it(
+    write_jsonl, request_for
+):
     """Every caller that predates the flag. Refusing them would refuse splits
     that work; saying nothing would leave the assumption invisible."""
     result = prepare(request_for(write_jsonl(CALL_ROWS * 40)))
@@ -873,7 +875,7 @@ def test_naming_no_model_keeps_today_s_behaviour_and_says_what_it_assumed(write_
 
 
 def test_a_plain_text_split_never_mentions_a_wire_format(write_jsonl, request_for):
-    """4.7's guard at this level: nothing about declarations or formats applies."""
+    """Plain text at this level: nothing about declarations or formats applies."""
     rows = [{"prompt": f"q{i}", "completion": "an answer"} for i in range(40)]
 
     result = prepare(request_for(write_jsonl(rows)))

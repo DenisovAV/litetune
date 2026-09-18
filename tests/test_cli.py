@@ -277,10 +277,9 @@ def test_tune_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     "stage, argv",
     [("verify", _VERIFY_ARGV), ("prepare", _PREPARE_ARGV), ("tune", ["tune", "--model", "m"])],
 )
-def test_a_run_without_declarations_is_the_run_it_was_before(stage, argv):
-    """Absent is not a default that stands in for something. Every stage here
-    behaved one way before declarations were an input, and a caller who does not
-    pass them gets exactly that -- which is what makes this change additive."""
+def test_declarations_are_optional_and_nothing_stands_in_for_them(stage, argv):
+    """Absent is not a default that stands in for something: no stage invents a
+    tool list the caller did not give it."""
     from litetune.cli import build_parser
 
     full = argv if stage != "tune" else [*argv, "--data", "d.jsonl", "--output-dir", "out"]

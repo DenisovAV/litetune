@@ -42,11 +42,11 @@ consumer takes.
 
 **Which path this applies to.** Everything in this section is about prompts an
 application renders itself — `prerendered`, the path these runs took. Through
-the runtime's tool path the runtime renders the declarations from JSON before
-any template runs, so neither order in the table below is what it sends there.
-On that path litetune sorts the declarations file when it reads it, and the
-rendering check found the training prompt and the runtime's identical by token
-ids — three of three prompts, on a two-property tool.
+the runtime's tool path the runtime renders the declarations from JSON in the
+order it is handed, and litetune hands it the file sorted the way the template's
+`dictsort` sorts — the `dictsort` column below. There the rendering check found
+the training prompt and the runtime's identical by token ids on all 640 prompts
+of the run [below](#the-same-model-through-the-runtimes-tool-path).
 
 Which order the weights prefer was argued rather than measured until it was
 measured. Same greedy decode, same parser, one variable:
@@ -686,14 +686,23 @@ measurement could see, because the text scorer finds `call:` anywhere:
 ### Limitations carried by these numbers
 
 - One run, one recipe, one dataset. The dataset's arguments are all strings, so
-  nothing here says how the runtime's parser treats a number.
+  no number went through the runtime here. Its parser returns every number as a
+  double (`fc_parser.rs`, v0.16.1), and litetune compares numbers by value
+  since — this run could not have shown the difference.
 - The prompt is one user turn with the developer turn's date lines moved into
   it: litetune trains no system message. The 3220 rows with two or three calls
   were left out; every target here is one call.
-- An application whose declarations list the properties in a different order
-  than litetune trained against meets the grammar problem above. A
-  `runtime_rendered` bundle therefore ships its declarations in the order the
-  model learned; an application that builds its own list has to keep that order.
+- An application that enables constrained decoding with declarations whose
+  properties are in another order than litetune trained against meets the
+  grammar problem above; with it off, the runtime's default, the order changes
+  only the prompt. A `runtime_rendered` bundle ships its declarations in the
+  order the model learned; an application that builds its own list has to keep
+  that order.
+- flutter_gemma 1.8.3 renders FunctionGemma's declarations in Dart and does
+  not pass them to the runtime, so this is not how it serves this model.
+- No row was refused by the runtime in either mode. Since this run, a row the
+  runtime gives no reply to is scored as a wrong answer rather than left out,
+  which changes none of these numbers.
 - The untuned base could not be measured through the tool path: converted
   from its Hub id it carries no SentencePiece tokenizer, and litert-lm 0.16.1
   refuses constrained decoding without one. So there is no training gain here.

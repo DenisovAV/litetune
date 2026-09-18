@@ -7,8 +7,8 @@ declaration. So both renderers the measurement compares require the OpenAI
 function object, and these tests hold this module to those rules.
 
 Beyond them it holds the module to one more thing, measured rather than
-preferred: the two renderers disagree about key order and about four shapes, so
-the file is sorted and those shapes are refused. Each refusal below names the
+preferred: the two renderers disagree about key order and about a set of
+shapes, so the file is sorted and those shapes are refused. Each refusal below names the
 difference it prevents, and every one of them was reproduced against a real
 bundle and the published chat template on 2026-09-17.
 """
