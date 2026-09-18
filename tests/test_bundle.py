@@ -924,3 +924,149 @@ def test_the_wire_convention_is_recorded_or_declared_unknown():
     # And it survives the round trip, so a manifest can carry it forward.
     assert Contract.read(recorded).wire_convention is WireConvention.TEMPLATE_DICTSORT
     assert Contract.read(unknown).wire_convention is None
+
+
+# ---------------------------------------------------------------------------
+# The declarations ship in the order the model learned
+# ---------------------------------------------------------------------------
+
+
+def _unsorted_declarations(tmp_path) -> Path:
+    """`send_email` with its properties in the order an application might write
+    them: not the order litetune's reader sorts them into, which is the order a
+    runtime_rendered model is trained against."""
+    path = tmp_path / "source" / "unsorted_tools.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "send_email",
+                        "description": "Sends an email.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "to": {"type": "STRING", "description": "recipient"},
+                                "subject": {"type": "STRING", "description": "subject"},
+                                "body": {"type": "STRING", "description": "body"},
+                            },
+                            "required": ["to", "subject"],
+                        },
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_runtime_rendered_bundle_ships_the_declarations_in_the_order_the_model_learned(
+    tmp_path, request_for
+):
+    """The runtime's grammar enforces the declared property order. Measured
+    2026-09-17: declarations in an order other than the one the model was trained
+    to write lost `send_email.body` on 110 of 110 rows. So a bundle an application
+    loads its tools from ships them normalised by the same reader that shaped the
+    training prompt, not as they were typed."""
+    source = _unsorted_declarations(tmp_path)
+
+    result = build_bundle(
+        request_for(
+            declarations=source, contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED)
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+    shipped = json.loads((tmp_path / "bundle" / DECLARATIONS_NAME).read_text(encoding="utf-8"))
+    properties = shipped[0]["function"]["parameters"]["properties"]
+    assert list(properties) == ["body", "subject", "to"]
+    # The identity of the tool list is still the file the model trained against.
+    contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == hash_file(source)
+
+
+def test_a_prerendered_bundle_ships_the_declarations_exactly_as_given(tmp_path, request_for):
+    """There the application renders the declarations itself and the order in
+    the file is the convention `WireConvention` records -- sorting it would
+    change the contract, not normalise it."""
+    source = _unsorted_declarations(tmp_path)
+
+    build_bundle(request_for(declarations=source))
+
+    assert (tmp_path / "bundle" / DECLARATIONS_NAME).read_bytes() == source.read_bytes()
+
+
+def test_a_runtime_rendered_bundle_refuses_what_the_two_renderers_disagree_on(
+    tmp_path, request_for
+):
+    """The same reader, so the same refusals: shipping `nullable` would put a
+    declaration in front of the runtime that the model was never trained on."""
+    source = tmp_path / "source" / "nullable.json"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "t",
+                        "description": "d",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "string", "description": "d", "nullable": True}
+                            },
+                        },
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = build_bundle(
+        request_for(
+            declarations=source, contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED)
+        )
+    )
+
+    check = check_named(result, "declarations included")
+    assert check.outcome is Outcome.FAILED
+    assert "nullable" in check.detail
+
+
+def test_the_contract_records_which_declarations_even_when_nobody_supplied_the_digest(
+    tmp_path, request_for, declarations
+):
+    """A contract shipped with `declarations_sha256: null` beside a declarations
+    file -- measured on a real bundle -- could not say which tool list it was
+    written against."""
+    build_bundle(request_for())
+
+    contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == hash_file(declarations)
+
+
+def test_the_training_digest_matches_the_file_supplied_not_its_normalised_copy(
+    tmp_path, request_for
+):
+    """`tune` hashed the bytes it read. The shipped file is the same declarations
+    normalised, which hashes differently by design -- comparing the training
+    digest with that copy would refuse the one bundle this exists to produce."""
+    source = _unsorted_declarations(tmp_path)
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED, declarations_sha256=hash_file(source)
+            ),
+        )
+    )
+
+    check = check_named(result, "declarations included")
+    assert check.outcome is Outcome.PASSED
+    assert hash_file(tmp_path / "bundle" / DECLARATIONS_NAME) != hash_file(source)

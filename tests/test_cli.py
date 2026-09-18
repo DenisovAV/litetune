@@ -1821,3 +1821,34 @@ def test_convert_help_names_the_recipe_litetune_defines(capsys):
     # The catalogue's own one-line description reaches the user, the way the
     # scorer help is held to `SCORERS`' `describes`.
     assert "int4 weights in blocks of 32 with int8 embeddings" in out
+
+
+def test_bundle_takes_the_declarations_digest_from_the_training_record(tmp_path, deliverable):
+    """`tune` records which declarations the model was trained against. A
+    bundle given those carries that digest in its contract."""
+    from litetune.storage import hash_file
+
+    model, declarations = deliverable
+    metrics = _train_metrics(tmp_path, declarations_sha256=hash_file(declarations))
+
+    main(_bundle_argv(tmp_path, model, declarations, "--train-metrics", str(metrics)))
+
+    contract = json.loads((tmp_path / "bundle" / "contract.json").read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == hash_file(declarations)
+
+
+def test_bundle_refuses_declarations_the_model_was_not_trained_against(
+    tmp_path, deliverable, capsys
+):
+    """The same weights against a different tool list are a different model to
+    the caller. The training record says which list; a bundle shipping another
+    is refused rather than packaged."""
+    model, declarations = deliverable
+    metrics = _train_metrics(tmp_path, declarations_sha256="sha256:" + "0" * 64)
+
+    code = main(_bundle_argv(tmp_path, model, declarations, "--train-metrics", str(metrics)))
+
+    assert code != 0
+    report = json.loads((tmp_path / "bundle" / "report.json").read_text(encoding="utf-8"))
+    failed = [c for c in report["checks"]["checks"] if c["outcome"] == "failed"]
+    assert any("different tool list" in c["detail"] for c in failed)

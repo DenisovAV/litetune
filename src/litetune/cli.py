@@ -1326,6 +1326,12 @@ def _bundle(args: argparse.Namespace) -> int:
         established_against=versions_from(envs.RUNTIME),
         base_model=args.base_model,
         base_model_revision=args.base_model_revision,
+        # Which declarations the model was trained against, from the run that
+        # trained it. `bundle` refuses a file that hashes differently: the same
+        # weights against another tool list are another model to the caller. A
+        # record from before `tune` took declarations carries none, and the
+        # bundle then records the digest of the file it was given.
+        declarations_sha256=recorded.get("declarations_sha256"),
         context_length=args.context_length,
         stop_tokens=stop_tokens,
         notes=tuple(args.note) + terminator_notes + (prompt_mode_note,),

@@ -38,13 +38,14 @@ import logging
 import os
 import shutil
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from litetune import envs
 from litetune.checks import Check, CheckSet, Outcome
+from litetune.declarations import DeclarationsError, read_declarations
 from litetune.events import EventStream
 from litetune.manifest import RunManifest, RunStatus
 from litetune.metrics import Unavailable
@@ -776,9 +777,19 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     events.check(declarations_check)
 
     # -- the contract ------------------------------------------------------
+    # Which declarations this contract was written against, always. A contract
+    # shipped with `declarations_sha256: null` beside a declarations file -- a
+    # real bundle, 2026-09-17 -- cannot say which tool list it describes. The
+    # digest is the supplied file's: the one `tune` recorded over the same bytes.
+    contract = request.contract
+    if contract.declarations_sha256 is None and request.declarations.is_file():
+        contract = replace(contract, declarations_sha256=hash_file(request.declarations))
+        # The report and the file must describe one contract.
+        request = replace(request, contract=contract)
+        result.request = request
     contract_path = request.output_dir / CONTRACT_NAME
     contract_path.write_text(
-        json.dumps(request.contract.as_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        json.dumps(contract.as_dict(), indent=2, sort_keys=True), encoding="utf-8"
     )
     result.members.append(_member(CONTRACT_NAME, contract_path))
     contract_check = Check.passed(
@@ -909,8 +920,77 @@ def _copy_adapter(request: BundleRequest, result: BundleResult) -> Check | None:
     )
 
 
+def _digest_disagreement(request: BundleRequest, source: Path, name: str) -> Check | None:
+    """The contract's digest against the file supplied, when the contract carries one.
+
+    Against the *source*, not the shipped copy: the digest is the one `tune`
+    recorded over the bytes it read, and in `runtime_rendered` the shipped file
+    is the same declarations normalised, which hashes differently by design.
+    """
+    if request.contract.declarations_sha256 is None:
+        return None
+    actual = hash_file(source).split(":", 1)[-1]
+    expected = request.contract.declarations_sha256.split(":", 1)[-1]
+    if actual == expected:
+        return None
+    return Check.failed(
+        name,
+        f"the declarations supplied hash {actual[:16]} but the contract was written against "
+        f"{expected[:16]}: the model's calling convention was established against a different "
+        "tool list than the one being shipped",
+        observed={"actual": actual, "contract": expected},
+    )
+
+
+def _write_declarations_as_trained(
+    request: BundleRequest, result: BundleResult, source: Path, destination: Path, name: str
+) -> Check:
+    """`runtime_rendered`: the declarations in the key order the model learned."""
+    try:
+        parsed, digest = read_declarations(source)
+    except DeclarationsError as exc:
+        # Copied as given so it can be looked at; the check says it is not usable.
+        try:
+            shutil.copyfile(source, destination)
+            result.members.append(_member(DECLARATIONS_NAME, destination))
+        except OSError:
+            logger.exception("could not copy refused declarations from %s", source)
+        return Check.failed(name, str(exc), observed={"declarations": str(source)})
+    disagreement = _digest_disagreement(request, source, name)
+    if disagreement is not None:
+        return disagreement
+    destination.write_text(json.dumps(parsed, indent=2) + "\n", encoding="utf-8")
+    result.members.append(_member(DECLARATIONS_NAME, destination))
+    return Check.passed(
+        name,
+        f"{len(parsed)} tool declaration(s) packaged from {source.name}, in the key order the "
+        "model was trained against",
+        observed={
+            "declarations": str(destination),
+            "entries": len(parsed),
+            "source_sha256": digest,
+            "shipped_sha256": hash_file(destination),
+            "normalised": True,
+        },
+    )
+
+
 def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
-    """Copy the tool declarations in, and check they are readable as declarations."""
+    """Put the tool declarations in, and check they are readable as declarations.
+
+    **Two modes, and the order in the file means something different in each.**
+    In `prerendered` the application renders the declarations itself, and the
+    order in the file is the convention `WireConvention` records -- so the file
+    ships exactly as given. In `runtime_rendered` the runtime renders them, and
+    its constrained decoding enforces the declared property order: an argument
+    out of that order is illegal and the call closes without it. Measured
+    2026-09-17 on FunctionGemma, declarations in an order other than the one the
+    model was trained to write lost `send_email.body` on 110 of 110 rows. So
+    there the file is read by `declarations.read_declarations` -- the reader that
+    shaped the training prompt, with its refusals -- and shipped in the key order
+    the model learned, which is what an application loading its tools from this
+    bundle then sends.
+    """
     name = "declarations included"
     source = request.declarations
     if not source.is_file():
@@ -921,6 +1001,8 @@ def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
             observed={"declarations": str(source)},
         )
     destination = request.output_dir / DECLARATIONS_NAME
+    if request.contract.runtime_renders_declarations:
+        return _write_declarations_as_trained(request, result, source, destination, name)
     try:
         shutil.copyfile(source, destination)
         parsed = json.loads(destination.read_text(encoding="utf-8"))
@@ -945,17 +1027,9 @@ def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
 
     result.members.append(_member(DECLARATIONS_NAME, destination))
     count = len(parsed) if isinstance(parsed, list | dict) else None
-    if request.contract.declarations_sha256 is not None:
-        actual = hash_file(destination).split(":", 1)[-1]
-        expected = request.contract.declarations_sha256.split(":", 1)[-1]
-        if actual != expected:
-            return Check.failed(
-                name,
-                f"the declarations in this bundle hash {actual[:16]} but the contract was written "
-                f"against {expected[:16]}: the model's calling convention was established against "
-                "a different tool list than the one being shipped",
-                observed={"actual": actual, "contract": expected},
-            )
+    disagreement = _digest_disagreement(request, source, name)
+    if disagreement is not None:
+        return disagreement
     return Check.passed(
         name,
         f"{count if count is not None else 'the'} tool declaration(s) packaged from {source.name}",
