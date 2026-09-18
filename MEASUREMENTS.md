@@ -701,10 +701,15 @@ measurement could see, because the text scorer finds `call:` anywhere:
 - flutter_gemma 1.8.3 renders FunctionGemma's declarations in Dart and does
   not pass them to the runtime, so this is not how it serves this model.
 - No row was refused by the runtime in either mode. Since this run, a row the
-  runtime gives no reply to is scored as a wrong answer rather than left out,
-  which changes none of these numbers. The run kept only the first call of each
-  reply, so whether any reply carried two -- now a wrong answer -- cannot be
-  read from its rows.
+  runtime gives no reply to is scored as a wrong answer when its parser refused
+  it or the prompt reached the token limit, and leaves the mode unmeasured for
+  any other reason; neither changes these numbers. The run kept only the first
+  call of each reply, so whether any reply carried two -- now a wrong answer --
+  cannot be read from its rows.
+- The reference was read with the text path's parser, which takes the first
+  call anywhere in the text. It is now read as the runtime reads a reply, only
+  between the call markers and one call to a pair. The run did not keep the
+  reference's texts, so what that does to 0.9250 is not known.
 - The untuned base could not be measured through the tool path: converted
   from its Hub id it carries no SentencePiece tokenizer, and litert-lm 0.16.1
   refuses constrained decoding without one. So there is no training gain here.
