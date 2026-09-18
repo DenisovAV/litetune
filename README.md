@@ -291,9 +291,14 @@ runtime renders what it is given. `google/mobile-actions` meets one of them
 itself — its tools with no arguments carry `"properties": {}`. The disagreement is Google's:
 [LiteRT-LM#3638](https://github.com/google-ai-edge/LiteRT-LM/issues/3638).
 
-**A call is trained the way the runtime writes one**: strings between
-`<escape>` markers, numbers, booleans and null bare —
-`call:set_alarm{label:<escape>wake<escape>,hour:7}`.
+**A call is trained the way the runtime reads one**: inside
+`<start_function_call>` and `<end_function_call>`, strings between `<escape>`
+markers, numbers, booleans and null bare, and the arguments in the same sorted
+order as the declarations — `call:set_alarm{hour:7,label:<escape>wake<escape>}`.
+The order is not cosmetic: the runtime's constrained decoding enforces the
+declared property order, and an argument out of it is dropped from the call.
+So a `runtime_rendered` bundle ships its declarations in the order the model
+learned, and an application should send them as shipped.
 
 **`verify` picks the path from the model, not from a flag.** With declarations
 and a family whose runtime renders them, it asks the runtime for a structured

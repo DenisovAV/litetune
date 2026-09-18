@@ -691,8 +691,9 @@ measurement could see, because the text scorer finds `call:` anywhere:
   it: litetune trains no system message. The 3220 rows with two or three calls
   were left out; every target here is one call.
 - An application whose declarations list the properties in a different order
-  than litetune trained against meets the grammar problem above. `bundle`
-  ships the declarations file as given, not in the order the model learned.
+  than litetune trained against meets the grammar problem above. A
+  `runtime_rendered` bundle therefore ships its declarations in the order the
+  model learned; an application that builds its own list has to keep that order.
 - The untuned base could not be measured through the tool path: converted
   from its Hub id it carries no SentencePiece tokenizer, and litert-lm 0.16.1
   refuses constrained decoding without one. So there is no training gain here.
