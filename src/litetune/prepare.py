@@ -63,7 +63,10 @@ from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.liveness import SkippedCheck
 from litetune.metrics import (
+    END_CALL,
     ESCAPE_SPELLINGS,
+    NAME_RULE,
+    START_CALL,
     Proportion,
     ToolCall,
     Unavailable,
@@ -156,11 +159,6 @@ def _identity(base_model: str | None, wire: WireFormat | None) -> dict[str, Any]
         "wire_format": wire.name,
         "wire_format_reason": wire.reason,
     }
-
-
-# FunctionGemma's call markers, single tokens in its vocabulary (48 and 49).
-START_CALL = "<start_function_call>"
-END_CALL = "<end_function_call>"
 
 
 class PrepareError(ValueError):
@@ -285,11 +283,6 @@ CONTROL_TEXT = (
     "<end_function_declaration>",
     "<start_of_turn>",
     "<end_of_turn>",
-)
-
-NAME_RULE = (
-    "[a-zA-Z_][a-zA-Z0-9_.-]*, and not `call`, `true`, `false`, `null` or an exponent like "
-    "`e5`, which its lexer reads as other tokens"
 )
 
 

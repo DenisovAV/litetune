@@ -54,7 +54,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from litetune.metrics import readable_name
+from litetune.metrics import NAME_RULE, readable_name
 from litetune.storage import HASH_ALGORITHM, hash_file
 
 
@@ -319,10 +319,8 @@ def _refuse_unreadable_name(name: str, where: str) -> None:
     if not readable_name(name):
         raise DeclarationsError(
             f"{where}, which the runtime's call parser does not read as a name: its lexer "
-            "takes [a-zA-Z_][a-zA-Z0-9_.-]* and reads `call`, `true`, `false`, `null` and an "
-            "exponent like `e5` as other tokens (AntlrFcLexer.g4, LiteRT-LM v0.16.1), so no "
-            "call can come back under that name. Rename it here and in the declarations your "
-            "application sends"
+            f"takes {NAME_RULE} (AntlrFcLexer.g4, LiteRT-LM v0.16.1), so no call can come back "
+            "under that name. Rename it here and in the declarations your application sends"
         )
 
 

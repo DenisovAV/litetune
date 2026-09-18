@@ -22,7 +22,10 @@ from litetune.metrics import (
     difference,
     paired_difference,
     parse_call,
+    readable_name,
     reasoning_unclosed,
+    runtime_calls,
+    same_answer,
     score,
     strip_reasoning,
 )
@@ -51,19 +54,21 @@ def test_a_targets_types_survive_beside_the_flattened_arguments():
     assert call.raw == {"n": 3, "ratio": 0.5, "on": True, "who": "ann", "gone": None}
 
 
-def test_the_types_are_out_of_the_comparison():
-    """Every number this project has published was produced by comparing `args`.
-
-    A `raw` that took part in equality would silently re-score all of them, so
-    two calls that agree on the flattened arguments agree, whatever they carry
-    beside them.
+def test_scoring_compares_answers_and_equality_what_an_application_is_handed():
+    """Every number this project has published scored `3` and `"3"` as one
+    answer, and scoring still does. Equality does not: an application handed
+    the string is handed something else, and a relation where `"3"` and
+    `"3.0"` both equal `3` and not each other cannot be equality -- a set of
+    the three kept one or two of them depending on the order they went in.
     """
     typed = ToolCall("set", {"n": 3})
     from_wire = ToolCall("set", {"n": "3"})
 
-    assert typed == from_wire
-    assert typed.raw != from_wire.raw
-    assert "raw" not in repr(typed)
+    assert same_answer(typed, from_wire)
+    assert typed != from_wire
+    assert repr(typed) == "ToolCall('set', {'n': 3})"
+    for values in ((3, "3", "3.0"), ("3.0", "3", 3), ("3", 3, "3.0")):
+        assert len({ToolCall("set", {"n": v}) for v in values}) == 3
     # A split records the types, so a target read back renders as it did.
     assert typed.as_dict() == {"name": "set", "args": {"n": 3}}
     assert ToolCall.from_target(typed.as_dict()) == typed
@@ -105,8 +110,9 @@ def test_an_escaped_number_still_parses_and_still_compares_equal():
     old = parse_call("call:set{n:<escape>3<escape>}")
     new = parse_call("call:set{n:3}")
 
-    assert old == new == ToolCall("set", {"n": 3})
     assert old is not None and new is not None
+    assert same_answer(old, new)
+    assert same_answer(old, ToolCall("set", {"n": 3}))
     assert old.raw == {"n": "3"}
     assert new.raw == {"n": 3}
 
@@ -173,14 +179,16 @@ def test_every_escape_the_runtime_reads_delimits_a_string(escape, value):
     assert parse_call("call:set{s:<escape>a<ctrl46>b<escape>}") is None
 
 
-@pytest.mark.parametrize("word", ["call", "true", "false", "null", "e5", "E10"])
+@pytest.mark.parametrize("word", ["call", "true", "false", "null", "e5", "E10", "e-3", "E+5"])
 def test_a_name_the_lexer_reads_as_another_token_is_not_a_call(word):
     """Found in review: these match the identifier pattern, but the lexer's
     `CALL`, `BOOLEAN`, `NULL_LITERAL` and `NUMBER` rules come first and win the
     tie, so the runtime's parser never sees an identifier there."""
+    assert not readable_name(word)
     assert parse_call(f"call:{word}{{a:1}}") is None
     assert parse_call(f"call:f{{{word}:1}}") is None
-    assert parse_call("call:f{called:1,nullable:2,e5x:3}") is not None
+    # Longer than the token it starts with, so `ID` wins.
+    assert parse_call("call:f{called:1,nullable:2,e5x:3,e-3x:4}") is not None
 
 
 @pytest.mark.parametrize(
@@ -205,17 +213,96 @@ def test_a_key_given_twice_keeps_its_first_value():
         (3.0, "3.0", True),  # an escaped number from a checkpoint trained before
         (7, 7.0, True),  # the runtime hands every number back as a double
         ("7", 7.0, True),
+        # `_stringify` made these one answer before the format was read, and a
+        # re-scored checkpoint keeps them.
         (True, "true", True),
         (None, "null", True),
+        ([1, 2], [1.0, 2.0], True),  # every number in a list comes back a double too
+        (["3", 2], [3.0, 2], True),  # and item by item, as a value on its own
         ("1.0", "1", False),  # two strings stay two strings
         (7.5, 7, False),
         ("007", 7, False),  # not a number the lexer reads
+        (True, 1, False),
+        (False, None, False),
     ],
 )
-def test_the_same_answer_compares_equal_whatever_its_spelling(one, other, same):
+def test_the_same_answer_whatever_its_spelling(one, other, same):
     """Found in review: comparing numbers by their string made an escaped `3.0`
     from an older checkpoint wrong against a target of `3.0`."""
-    assert (ToolCall("f", {"x": one}) == ToolCall("f", {"x": other})) is same
+    assert same_answer(ToolCall("f", {"x": one}), ToolCall("f", {"x": other})) is same
+    assert same_answer(ToolCall("f", {"x": other}), ToolCall("f", {"x": one})) is same
+
+
+@pytest.mark.parametrize(
+    "one, other, equal",
+    [
+        (7, 7.0, True),  # the runtime hands every number back as a double
+        (10**20, 1e20, True),
+        ([1, 2], [1.0, 2.0], True),
+        ({"a": 1}, {"a": 1.0}, True),
+        ("7", 7, False),  # a string is never a number
+        ("7", 7.0, False),
+        (True, 1, False),  # nor a boolean
+        (True, "true", False),
+        (None, "null", False),
+        ("a", "a ", False),  # whitespace is part of a string
+        ([1], [1, 2], False),
+    ],
+)
+def test_equal_calls_hand_an_application_the_same_json(one, other, equal):
+    assert (ToolCall("f", {"x": one}) == ToolCall("f", {"x": other})) is equal
+    assert (ToolCall("f", {"x": other}) == ToolCall("f", {"x": one})) is equal
+
+
+def test_a_call_is_its_name_and_every_argument_in_any_order():
+    call = ToolCall("f", {"a": 1, "b": "x"})
+
+    for relation in (same_answer, lambda p, q: p == q):
+        assert relation(call, ToolCall("f", {"b": "x", "a": 1}))
+        assert not relation(call, ToolCall("g", {"a": 1, "b": "x"}))
+        assert not relation(call, ToolCall("f", {"a": 1}))
+        assert not relation(call, ToolCall("f", {"a": 1, "b": "x", "c": 2}))
+
+
+START, END = "<start_function_call>", "<end_function_call>"
+
+
+@pytest.mark.parametrize(
+    "text, calls",
+    [
+        (f"{START}call:f{{a:1}}{END}", [ToolCall("f", {"a": 1})]),
+        (f"Sure. {START}call:f{{}}{END}<end_of_turn>", [ToolCall("f", {})]),
+        # `object?`, and whitespace between any two tokens
+        (f"{START} call : f \n{END}", [ToolCall("f", {})]),
+        (f"{START}call:f{{}}{END}{START}call:g{{}}{END}", [ToolCall("f", {}), ToolCall("g", {})]),
+        (f"{START}call:f{{a:1}}{END}{START}call:g{{", [ToolCall("f", {"a": 1})]),
+        (f"{START}{END}", []),
+        ("call:f{a:1}", []),  # no markers: text
+        (f"{START}call:f{{a:1}}", []),  # no end marker: text
+        (f"call:f{{}}{END}{START}", []),  # reversed
+        (f"call:f{{a:1}} {START}{END}", []),  # the call outside the markers is text
+        (f"{START}call:f{{}}call:g{{}}{END}", None),  # two calls in one block
+        (f"{START}call:f{{a:1}} and more{END}", None),
+        (f"{START}not a call{END}call:f{{a:1}}", None),
+        (f"{START}call:f{{a:1}}{END}{START}call:g{{a:}}{END}", None),  # one block fails all
+        (f"{START}call:f{{a:[1]}}{END}", None),  # an array: not read here
+        (f"{START}call:true{{}}{END}", None),  # `true` is not a name
+    ],
+)
+def test_a_reply_is_read_as_the_runtime_reads_it(text, calls):
+    """`parser_utils.cc`: text and marked blocks, each block one whole call,
+    and one that is not fails the reply. Found in review: the reference and
+    tune's check read the first call anywhere, and five shapes that the
+    runtime reads differently were scored or trained as the call."""
+    assert runtime_calls(text) == calls
+
+
+def test_a_number_past_pythons_digit_limit_is_read_as_the_runtime_reads_it():
+    """`int` refuses text longer than 4300 digits; a double reads it."""
+    call = parse_call("call:f{n:" + "1" * 5000 + "}")
+
+    assert call is not None and call.raw == {"n": math.inf}
+    assert not same_answer(ToolCall("f", {"n": "1" * 5000}), ToolCall("f", {"n": 1}))
 
 
 def test_raw_is_derived_and_cannot_disagree_with_args():
@@ -299,9 +386,12 @@ def test_targets_are_stringified_because_the_format_is_untyped():
     assert target.args == {"seconds": "3", "loud": "true", "x": "null"}
 
 
-def test_an_integer_target_matches_the_string_the_model_emits():
+def test_an_integer_target_is_the_answer_the_model_emits_as_a_string():
     target = ToolCall.from_target({"name": "wait", "args": {"seconds": 3}})
-    assert parse_call("call:wait{seconds:<escape>3<escape>}") == target
+    emitted = parse_call("call:wait{seconds:<escape>3<escape>}")
+    assert target is not None and emitted is not None
+    assert same_answer(emitted, target)
+    assert score([target], ["call:wait{seconds:<escape>3<escape>}"]).exact_match.value == 1.0
 
 
 def test_unlabelled_target_is_none_not_an_error():

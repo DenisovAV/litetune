@@ -50,7 +50,7 @@ Z95 = 1.959963985
 # The tokens follow the runtime's. LiteRT-LM v0.16.1 reads a call with the ANTLR
 # lexer `AntlrFcLexer.g4`: an identifier is `[a-zA-Z_][a-zA-Z0-9_.-]*` but never
 # one of the words its earlier rules take (`call`, `true`, `false`, `null`, or an
-# exponent like `e5`, which lexes as a number); an escape is any of three
+# exponent like `e5` or `e-3`, which lexes as a number); an escape is any of three
 # spellings; and a number is `'-'? INT (FRAC | EXP)? | '-'? FRAC | '-'? EXP` with
 # `INT : '0' | [1-9][0-9]*` -- no leading zero, ASCII digits only where Python's
 # `\d` takes any script's, and a fraction and an exponent never together. After
@@ -59,16 +59,29 @@ Z95 = 1.959963985
 # string's ends and leaves `<ctrl46>` in it. (`-'? EXP` alone lexes but
 # `fc_parser.rs` then fails to read it as a number, so it is left out.)
 #
-# What this does not mirror, so the two sides can still differ on a malformed
-# generation: the runtime reads only between the call markers and requires
-# exactly one call there, while this reads the first call anywhere and ignores
-# what follows; it takes `call:NAME` with no braces and skips whitespace and
-# characters its lexer cannot read, where this refuses them.
+# Two readers are built on these tokens. `parse_call` is the scorer's on the
+# text path: it reads the first call anywhere in a generation and ignores what
+# follows, which is what every published text-path number was scored with.
+# `runtime_calls` is the runtime's reading of a reply, for everything held to
+# the tool path: only between the call markers, and each block one whole call.
+# Neither reads an array or an object as a value, which the runtime's grammar
+# accepts; `prepare` refuses to train one, so only a completion a split gives
+# can carry it. Inside a call, both refuse a character the lexer has no rule
+# for; what the runtime's lexer does with one is not established here.
 
 IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_.\-]*"
 # Words matching IDENTIFIER that the lexer reads as something else, because the
-# rule that matches them is declared before `ID` and wins a tie.
-_NOT_AN_IDENTIFIER = re.compile(r"call|true|false|null|[eE][0-9]+")
+# rule that matches them is declared before `ID` and wins a tie of equal length:
+# the keywords, and `'-'? EXP` with `EXP : [eE] [+-]? [0-9]+`.
+_NOT_AN_IDENTIFIER = re.compile(r"call|true|false|null|[eE][+-]?[0-9]+")
+NAME_RULE = (
+    "[a-zA-Z_][a-zA-Z0-9_.-]*, and not `call`, `true`, `false`, `null` or an exponent like "
+    "`e5` or `e-3`, which its lexer reads as other tokens"
+)
+# FunctionGemma's call markers, single tokens in its vocabulary (48 and 49). The
+# runtime cuts a reply into calls at them before its lexer runs (`parser_utils.cc`).
+START_CALL = "<start_function_call>"
+END_CALL = "<end_function_call>"
 ESCAPE_SPELLINGS = ("<escape>", "<ctrl46>", '<|"|>')
 _ESCAPE = "(?:" + "|".join(re.escape(s) for s in ESCAPE_SPELLINGS) + ")"
 _INTEGER = r"-?(?:0|[1-9][0-9]*)"
@@ -102,7 +115,12 @@ def _bare_value(text: str) -> Any:
     if text in ("true", "false", "null"):
         return json.loads(text)
     if re.fullmatch(_INTEGER, text):
-        return int(text)
+        try:
+            return int(text)
+        except ValueError:
+            # Past Python's limit on the digits `int` reads from text. The
+            # runtime reads it as a double, and so does this.
+            return float(text)
     return float(text)
 
 
@@ -134,20 +152,29 @@ def _as_number(value: Any) -> int | float | None:
 
 
 def _same_value(x: Any, y: Any) -> bool:
-    """Whether two argument values are the same answer.
+    """Whether two argument values are the same answer, for scoring.
 
-    The format is untyped where it matters for scoring: a target of `3` and an
-    emitted `3` are the same answer, whichever of them was escaped -- every
-    checkpoint trained before the format was read escaped everything, and a
-    re-scored one must not lose a right answer to its spelling. So a number is
-    compared by its value with a number or with a string written as one: the
-    runtime hands every number back as a double (`fc_parser.rs` reads a
-    `NUMBER` with `text.parse::<f64>()` in v0.16.1), and `hour:7` returning as
-    `7.0` is the answer `7`. Two strings are compared as strings, so `"1.0"`
-    and `"1"` stay two answers.
+    Untyped, as scoring has always been (`_stringify` compared everything as
+    text): a target of `3` and an emitted `3` are the same answer, whichever of
+    them was escaped -- every checkpoint trained before the format was read
+    escaped everything, and a re-scored one must not lose a right answer to its
+    spelling. The same holds for `true` and `null` against the strings
+    `"true"` and `"null"`, which `_stringify` makes equal as it always did. A
+    number is compared by its value with a number or with a string written as
+    one: the runtime hands every number back as a double (`fc_parser.rs` reads
+    a `NUMBER` with `text.parse::<f64>()` in v0.16.1), and `hour:7` returning
+    as `7.0` is the answer `7`. Two strings are compared as strings, so `"1.0"`
+    and `"1"` stay two answers; a list or an object item by item.
+
+    Not an equivalence -- `"3"` and `"3.0"` both match `3` and not each other --
+    so it is a question asked of two values, never `ToolCall`'s equality.
     """
     if isinstance(x, str) and isinstance(y, str):
         return x.strip() == y.strip()
+    if isinstance(x, list) and isinstance(y, list):
+        return len(x) == len(y) and all(_same_value(a, b) for a, b in zip(x, y, strict=True))
+    if isinstance(x, dict) and isinstance(y, dict):
+        return same_arguments(x, y)
     nx, ny = _as_number(x), _as_number(y)
     if nx is not None and ny is not None:
         return nx == ny
@@ -159,41 +186,72 @@ def same_arguments(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return set(a) == set(b) and all(_same_value(a[key], b[key]) for key in a)
 
 
+def same_answer(a: ToolCall, b: ToolCall) -> bool:
+    """Whether two calls are the same answer: scoring's question, see `_same_value`."""
+    return a.name == b.name and same_arguments(a.raw, b.raw)
+
+
+def _same_json(x: Any, y: Any) -> bool:
+    """The same JSON value: the same type, with numbers compared by value.
+
+    What an application is handed. A number the runtime returns as a double is
+    the integer it equals, because every number comes back a double; a string
+    is never a number, a boolean never a number, and whitespace is part of a
+    string.
+    """
+    if isinstance(x, bool) or isinstance(y, bool) or x is None or y is None:
+        return type(x) is type(y) and x == y
+    if isinstance(x, int | float) or isinstance(y, int | float):
+        return isinstance(x, int | float) and isinstance(y, int | float) and x == y
+    if isinstance(x, list) and isinstance(y, list):
+        return len(x) == len(y) and all(_same_json(a, b) for a, b in zip(x, y, strict=True))
+    if isinstance(x, dict) and isinstance(y, dict):
+        return set(x) == set(y) and all(_same_json(x[k], y[k]) for k in x)
+    return type(x) is type(y) and x == y
+
+
 @dataclass(frozen=True, eq=False)
 class ToolCall:
     """One parsed call. `args` values are always strings; see `_stringify`.
 
     `raw` carries the same arguments before `_stringify` flattened them, because
-    the wire format is typed where the comparison is not: the runtime's goldens
-    write a number bare and a string escaped, so rendering a target back has to
-    know which it was. Scoring never reads it -- it is out of equality and out
-    of `repr` -- and nothing here makes the comparison type-aware.
+    the wire format is typed: the runtime's goldens write a number bare and a
+    string escaped, so rendering a target back has to know which it was, and
+    an application is handed the type it was written in.
 
-    It is derived, never passed: a `raw` supplied beside `args` could disagree
+    Two calls are equal when an application would be handed the same thing: the
+    same name and the same JSON arguments, a number by its value (`_same_json`).
+    Scoring asks a looser question, `same_answer`, which is not an equivalence
+    and so is not this.
+
+    `raw` is derived, never passed: one supplied beside `args` could disagree
     with it, and then the call would compare as one answer and render as
     another.
     """
 
     name: str
     args: dict[str, str]
-    raw: dict[str, Any] = field(init=False, compare=False, repr=False)
+    raw: dict[str, Any] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        # Normalise on construction so that equality means "same answer"
-        # regardless of which side of the comparison a value came from.
         object.__setattr__(self, "name", self.name.strip())
         original = {str(k): v for k, v in self.args.items()}
         object.__setattr__(self, "args", {k: _stringify(v) for k, v in original.items()})
         object.__setattr__(self, "raw", original)
 
     def __eq__(self, other: object) -> bool:
-        # The same answer, not the same spelling: see `_same_value`.
         if not isinstance(other, ToolCall):
             return NotImplemented
-        return self.name == other.name and same_arguments(self.raw, other.raw)
+        return self.name == other.name and _same_json(self.raw, other.raw)
 
     def __hash__(self) -> int:
+        # The keys only: equal calls have equal keys, and a value may be a list.
         return hash((self.name, tuple(sorted(self.raw))))
+
+    def __repr__(self) -> str:
+        # The typed arguments, because they are what equality compares: two
+        # calls printed with the same flattened `args` could be unequal.
+        return f"ToolCall({self.name!r}, {self.raw!r})"
 
     @classmethod
     def from_target(cls, obj: Any) -> ToolCall | None:
@@ -249,16 +307,25 @@ def parse_call(text: str) -> ToolCall | None:
     head = _HEAD_RE.search(text)
     if head is None or not readable_name(head.group("name")):
         return None
-    pos = head.end()
+    body = _read_arguments(text, head.end())
+    return None if body is None else ToolCall(name=head.group("name"), args=body[0])
+
+
+def _read_arguments(text: str, pos: int) -> tuple[dict[str, Any], int] | None:
+    """The pairs from `pos`, just past an opening brace, to the closing one.
+
+    Returns the typed values and the position after the brace, or `None` for a
+    body that starts but never closes cleanly, which is not half a call.
+    """
     values: dict[str, Any] = {}
-    if _CLOSE_RE.match(text, pos) is not None:
-        return ToolCall(name=head.group("name"), args=values)
+    close = _CLOSE_RE.match(text, pos)
+    if close is not None:
+        return values, close.end()
     while True:
         escaped = _ESCAPED_RE.match(text, pos)
         bare = None if escaped is not None else _BARE_RE.match(text, pos)
         pair = escaped or bare
         if pair is None or not readable_name(pair.group("key")):
-            # A body that starts but never closes cleanly is not half a call.
             return None
         value = (
             _strip_escape_tokens(pair.group("value"))
@@ -271,14 +338,66 @@ def parse_call(text: str) -> ToolCall | None:
         close = _CLOSE_RE.match(text, pos)
         if close is not None:
             # `values` is typed; the constructor flattens it into `args`, and
-            # keeps it as `raw`, which is what a renderer reads and scoring
-            # compares. So a rendered target and a parsed generation are the
-            # same round trip.
-            return ToolCall(name=head.group("name"), args=values)
+            # keeps it as `raw`, which is what a renderer reads and a
+            # comparison compares. So a rendered target and a parsed
+            # generation are the same round trip.
+            return values, close.end()
         comma = _COMMA_RE.match(text, pos)
         if comma is None:
             return None
         pos = comma.end()
+
+
+# One block between the markers, whole: `start : functionCall EOF` with
+# `functionCall : CALL COLON ID object?`, whitespace skipped between tokens.
+_WHOLE_HEAD_RE = re.compile(rf"\s*call\s*:\s*(?P<name>{IDENTIFIER})\s*")
+_OPEN_RE = re.compile(r"\{")
+
+
+def _whole_call(block: str) -> ToolCall | None:
+    """`block` as exactly one call and nothing else, or `None`."""
+    head = _WHOLE_HEAD_RE.match(block)
+    if head is None or not readable_name(head.group("name")):
+        return None
+    values: dict[str, Any] = {}
+    pos = head.end()
+    if _OPEN_RE.match(block, pos) is not None:
+        body = _read_arguments(block, pos + 1)
+        if body is None:
+            return None
+        values, pos = body
+    if block[pos:].strip(" \t\n\r"):
+        return None
+    return ToolCall(name=head.group("name"), args=values)
+
+
+def runtime_calls(text: str) -> list[ToolCall] | None:
+    """The calls LiteRT-LM returns for a reply, or `None` where it returns no reply.
+
+    `parser_utils.cc` (v0.16.1) consumes `(.*?)<start_function_call>(.*?)
+    <end_function_call>` from the reply until it no longer matches: what comes
+    before each pair is text, an empty pair is skipped, and a start marker with
+    no end after it is text like the rest. Each block between a pair has to be
+    one whole call; one that is not fails the whole reply, because
+    `return_error_on_parse_failure` is on unless the caller turns it off. So a
+    call outside the markers is text, two calls in one pair are no reply, and
+    two pairs are two calls.
+    """
+    calls: list[ToolCall] = []
+    pos = 0
+    while (start := text.find(START_CALL, pos)) >= 0:
+        end = text.find(END_CALL, start + len(START_CALL))
+        if end < 0:
+            break
+        block = text[start + len(START_CALL) : end]
+        pos = end + len(END_CALL)
+        if not block:
+            continue
+        call = _whole_call(block)
+        if call is None:
+            return None
+        calls.append(call)
+    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -566,10 +685,7 @@ def score_parsed(targets: Sequence[ToolCall], parsed: Sequence[ToolCall | None])
     n_parsed = sum(p is not None for p in parsed)
     name_hits = [p is not None and p.name == t.name for p, t in zip(parsed, targets, strict=True)]
     n_name = sum(name_hits)
-    correct = [
-        bool(name_ok and p is not None and same_arguments(p.raw, t.raw))
-        for p, t, name_ok in zip(parsed, targets, name_hits, strict=True)
-    ]
+    correct = [p is not None and same_answer(p, t) for p, t in zip(parsed, targets, strict=True)]
     n_exact = sum(correct)
 
     if n_name:
