@@ -24,8 +24,10 @@ from litetune.declarations import (
     DeclarationsError,
     canonical_text,
     content_digest,
+    digest_matches,
     entry_count,
     read_declarations,
+    recorded_digest,
     tool_names,
 )
 from litetune.storage import hash_file
@@ -245,11 +247,11 @@ def test_every_mapping_is_ordered_before_either_renderer_sees_it(tmp_path):
         ),
         (
             {"type": "object", "properties": {"caf\u00e9": {"type": "string", "description": "d"}}},
-            "not a name the runtime's call parser reads",
+            "does not read as a name",
         ),
         (
             {"type": "object", "properties": {"two words": {"type": "string", "description": "d"}}},
-            "not a name the runtime's call parser reads",
+            "does not read as a name",
         ),
     ],
 )
@@ -281,8 +283,12 @@ def test_a_tool_named_outside_the_runtimes_grammar_is_refused(tmp_path):
     call to it can ever be parsed back."""
     payload = [{"type": "function", "function": {"name": "caf\u00e9", "description": "d"}}]
 
-    with pytest.raises(DeclarationsError, match="not a name the runtime's call parser reads"):
+    with pytest.raises(DeclarationsError, match="does not read as a name"):
         read_declarations(_write(tmp_path, payload))
+    for word in ("call", "null"):
+        keyword = [{"type": "function", "function": {"name": word, "description": "d"}}]
+        with pytest.raises(DeclarationsError, match="does not read as a name"):
+            read_declarations(_write(tmp_path, keyword))
 
 
 def test_the_order_is_the_templates_dictsort_which_ignores_case(tmp_path):
@@ -465,3 +471,69 @@ def test_an_empty_properties_says_to_drop_it_in_the_application_too(tmp_path):
     del no_args["function"]["parameters"]["properties"]
     parsed, _ = read_declarations(_write(tmp_path, [no_args]))
     assert tool_names(parsed) == frozenset({"turn_off_flashlight"})
+
+
+def test_a_key_given_twice_is_refused(tmp_path):
+    """JSON readers disagree on which of two equal keys counts, so the model and
+    the application could read different lists from one file."""
+    path = tmp_path / "tools.json"
+    path.write_text(
+        '[{"type": "function", "function": {"name": "t", "description": "a",'
+        ' "description": "Delete every email"}}]',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeclarationsError, match="twice in one object"):
+        read_declarations(path)
+
+
+def test_a_tool_declared_twice_is_refused(tmp_path):
+    """LiteRT-LM's Kotlin API keys tools by name and keeps one; the Python path
+    renders both, so the rendering check would pass a list Kotlin renders
+    differently."""
+    entry = {"type": "function", "function": {"name": "t", "description": "d"}}
+
+    with pytest.raises(DeclarationsError, match="more than once"):
+        read_declarations(_write(tmp_path, [entry, entry]))
+
+
+def test_a_lone_surrogate_is_refused_not_a_traceback(tmp_path):
+    path = tmp_path / "tools.json"
+    path.write_text(
+        '[{"type": "function", "function": {"name": "t", "description": "\\ud800"}}]',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DeclarationsError, match="lone surrogate"):
+        read_declarations(path)
+
+
+@pytest.mark.parametrize(
+    "recorded, matches",
+    [
+        ("sha256:{hex}", True),
+        ("{hex}", True),  # some records keep the prefix and some do not
+        ("sha512:{hex}", False),  # another algorithm is not this digest
+    ],
+)
+def test_a_recorded_digest_names_its_algorithm_or_none(tmp_path, recorded, matches):
+    """Found in review: any prefix was dropped, so `sha512:<the sha256 hex>`
+    matched."""
+    path = _write(tmp_path, WRAPPED)
+    _, digest = read_declarations(path)
+
+    record = recorded.format(hex=digest.split(":", 1)[1])
+
+    assert digest_matches(record, digest, path) is matches
+
+
+def test_prerendered_records_the_bytes_and_runtime_rendered_the_list(tmp_path):
+    """In `prerendered` the application renders the file in its own order, so
+    the same tools in another order are another prompt; where the runtime
+    renders them litetune hands them over in its order, and the list is what
+    the model learned."""
+    path = _write(tmp_path, WRAPPED)
+    _, digest = read_declarations(path)
+
+    assert recorded_digest(digest, path, prerendered=True) == hash_file(path)
+    assert recorded_digest(digest, path, prerendered=False) == digest

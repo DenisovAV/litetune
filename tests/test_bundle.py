@@ -7,6 +7,7 @@ disk, because what is under test is what travels with it.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -1109,6 +1110,62 @@ def test_refused_declarations_give_the_contract_no_digest(tmp_path, request_for)
     assert check_named(result, "declarations included").outcome is Outcome.FAILED
     contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
     assert contract["declarations_sha256"] is None
+
+
+def test_the_same_file_under_another_spelling_is_refused_not_rewritten(tmp_path, request_for):
+    """Found in review: the guard compared resolved paths, so on a
+    case-insensitive filesystem `out/Declarations.json` passed and was rewritten,
+    and so was a hard link to the user's file."""
+    out = tmp_path / "bundle"
+    out.mkdir(exist_ok=True)
+    source = _unsorted_declarations(tmp_path)
+    linked = out / DECLARATIONS_NAME
+    os.link(source, linked)
+    before = source.read_bytes()
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            output_dir=out,
+            contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.FAILED
+    assert source.read_bytes() == before
+
+
+def test_a_prerendered_bundle_refuses_the_same_tools_in_another_order(tmp_path, request_for):
+    """Found in review: with the digest over the sorted list, a prerendered file
+    with the properties in another order matched -- and there the order is the
+    convention the application renders, measured to move the score."""
+    source = _unsorted_declarations(tmp_path)
+    recorded = hash_file(source)
+    reordered = tmp_path / "reordered.json"
+    entries = json.loads(source.read_text(encoding="utf-8"))
+    properties = entries[0]["function"]["parameters"]["properties"]
+    entries[0]["function"]["parameters"]["properties"] = dict(reversed(list(properties.items())))
+    reordered.write_text(json.dumps(entries), encoding="utf-8")
+
+    result = build_bundle(
+        request_for(
+            declarations=reordered,
+            contract=a_contract(prompt_mode=PromptMode.PRERENDERED, declarations_sha256=recorded),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.FAILED
+
+
+def test_a_prerendered_contract_names_the_bytes_it_ships(tmp_path, request_for):
+    source = _unsorted_declarations(tmp_path)
+
+    build_bundle(
+        request_for(declarations=source, contract=a_contract(prompt_mode=PromptMode.PRERENDERED))
+    )
+
+    contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == hash_file(tmp_path / "bundle" / DECLARATIONS_NAME)
 
 
 def test_a_digest_no_training_run_recorded_is_said_to_be_the_shipped_list(tmp_path, request_for):

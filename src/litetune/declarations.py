@@ -50,12 +50,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from litetune.metrics import IDENTIFIER
+from litetune.metrics import readable_name
 from litetune.storage import HASH_ALGORITHM, hash_file
 
 
@@ -76,16 +75,53 @@ def read_declarations(path: Path) -> tuple[list[Any], str]:
             f"the declarations at {path} could not be read: {type(exc).__name__}: {exc}"
         ) from exc
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(text, object_pairs_hook=_refuse_repeated_keys)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise DeclarationsError(
             f"the declarations at {path} are not valid JSON ({exc}); a runtime cannot render a "
             "tool list it cannot parse"
         ) from exc
+    except _RepeatedKey as exc:
+        raise DeclarationsError(
+            f"the declarations at {path} give the key {exc.args[0]!r} twice in one object. JSON "
+            "readers disagree on which one counts -- this one keeps the last, others the first "
+            "or refuse -- so the application and the model could be reading different lists"
+        ) from exc
     _check(parsed, Path(path))
     ordered = _ordered(parsed)
     _check_renderable(ordered, Path(path))
-    return ordered, content_digest(ordered)
+    try:
+        return ordered, content_digest(ordered)
+    except UnicodeEncodeError as exc:
+        raise DeclarationsError(
+            f"the declarations at {path} carry text that is not valid Unicode ({exc.reason} at "
+            f"position {exc.start}), a lone surrogate from a \\u escape; no renderer can write it"
+        ) from exc
+
+
+class _RepeatedKey(Exception):
+    pass
+
+
+def _refuse_repeated_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise _RepeatedKey(key)
+        seen[key] = value
+    return seen
+
+
+def recorded_digest(digest: str, path: Path, prerendered: bool) -> str:
+    """The digest a stage records for declarations read from `path`.
+
+    The tool list's (`digest`) where the runtime renders them, because there
+    litetune hands them over in its own order and the file's order is not the
+    model's. The file's bytes where the application renders them, because there
+    the order in the file is the convention it renders, and a file with the same
+    tools in another order is another prompt.
+    """
+    return hash_file(Path(path)) if prerendered else digest
 
 
 def canonical_text(entries: list[Any]) -> str:
@@ -108,12 +144,14 @@ def digest_matches(recorded: str, digest: str | None, path: Path) -> bool:
     """Whether a recorded digest names the declarations read from `path`.
 
     `digest` is `read_declarations`'s, or `None` where that refused the file. A
-    digest over the file's bytes is accepted too: a `Contract` built in code
-    before digests identified the tool list could only have carried that one.
-    Compared without the algorithm prefix, which some records keep and some do
-    not.
+    digest over the file's bytes is accepted too: that is what a `prerendered`
+    run records, and what a `Contract` built in code before digests identified
+    the tool list could only have carried. A record may carry the algorithm
+    prefix or not; one naming another algorithm is not this digest.
     """
-    wanted = recorded.split(":", 1)[-1]
+    algorithm, _, wanted = recorded.rpartition(":")
+    if algorithm and algorithm != HASH_ALGORITHM:
+        return False
     known = [hash_file(Path(path))] + ([digest] if digest is not None else [])
     return wanted in (d.split(":", 1)[-1] for d in known)
 
@@ -170,6 +208,14 @@ def _check(parsed: Any, path: Path) -> None:
                 "reference chat template reads the same two keys"
             )
         _refuse_unreadable_name(function["name"], f"{where} is named {function['name']!r}")
+    names = [entry["function"]["name"] for entry in parsed]
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise DeclarationsError(
+            f"{path} declares {repeated} more than once. A runtime that keys tools by name keeps "
+            "one of them -- LiteRT-LM's Kotlin API does -- and would render a different list "
+            "from the one the model was trained on"
+        )
 
 
 # The seven names the runtime's formatter uppercases. It leaves anything else
@@ -270,11 +316,12 @@ def _check_parameters(parameters: Any, where: str) -> None:
 
 def _refuse_unreadable_name(name: str, where: str) -> None:
     """A name a call must carry has to be one the runtime's call parser reads."""
-    if not re.fullmatch(IDENTIFIER, name):
+    if not readable_name(name):
         raise DeclarationsError(
-            f"{where}, which is not a name the runtime's call parser reads: its lexer takes "
-            "[a-zA-Z_][a-zA-Z0-9_.-]* (AntlrFcLexer.g4, LiteRT-LM v0.16.1), so a call to it "
-            "would be refused on every row. Rename it here and in the declarations your "
+            f"{where}, which the runtime's call parser does not read as a name: its lexer "
+            "takes [a-zA-Z_][a-zA-Z0-9_.-]* and reads `call`, `true`, `false`, `null` and an "
+            "exponent like `e5` as other tokens (AntlrFcLexer.g4, LiteRT-LM v0.16.1), so no "
+            "call can come back under that name. Rename it here and in the declarations your "
             "application sends"
         )
 
@@ -369,12 +416,19 @@ def _refuse_extra_keys(
 
 # Which Python values a JSON-typed argument may hold. A bool is an int in
 # Python and never a number in JSON Schema, so it is excluded by name.
+# An integral float is an integer here: the runtime returns every number as a
+# double, and `prepare.render_call` writes an integral float as its integer.
 _HOLDS = {
     "string": lambda v: isinstance(v, str),
-    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "integer": lambda v: (
+        (isinstance(v, int) and not isinstance(v, bool))
+        or (isinstance(v, float) and v.is_integer())
+    ),
     "number": lambda v: isinstance(v, int | float) and not isinstance(v, bool),
     "boolean": lambda v: isinstance(v, bool),
     "null": lambda v: v is None,
+    "array": lambda v: isinstance(v, list),
+    "object": lambda v: isinstance(v, dict),
 }
 
 
@@ -385,9 +439,14 @@ def argument_problem(parsed: list[Any], name: str, args: dict[str, Any]) -> str 
     that sends something else trains the model to break the contract it was
     just shown. Checked: every argument declared, every required one present,
     each value of its declared type, and within its enum. An array or object
-    value is not checked here -- `prepare` refuses those before rendering.
+    value's own contents are not checked: `prepare` refuses a list or an object
+    when it renders a target, and a row with its own completion is its author's.
     """
-    function = next(entry["function"] for entry in parsed if entry["function"]["name"] == name)
+    function = next(
+        (entry["function"] for entry in parsed if entry["function"]["name"] == name), None
+    )
+    if function is None:
+        return f"calls {name!r}, which is not declared"
     parameters = function.get("parameters") or {}
     properties = parameters.get("properties") or {}
     undeclared = sorted(set(args) - set(properties))

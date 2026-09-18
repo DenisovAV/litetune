@@ -1050,3 +1050,18 @@ def test_a_rendered_prompt_reaches_the_reference_with_one_bos(tmp_path, monkeypa
 def test_a_prerendered_prompt_still_gets_the_tokenizers_bos(tmp_path, monkeypatch):
     captured = _run_hf_generate_script(tmp_path, monkeypatch)
     assert captured["tokenized"] == [[2, 10]]
+
+
+def test_a_splits_id_does_not_depend_on_whether_a_target_kept_its_types(tmp_path):
+    """Found in review: a split's target now keeps its argument types, and the id
+    computed from it changed for the same file. The id is over the flattened
+    target, as it was before, so a file prepared by main and by this version
+    identifies the same split."""
+    from litetune.evaluate import load_split
+
+    typed = tmp_path / "typed.jsonl"
+    typed.write_text('{"prompt": "p", "target": {"name": "f", "args": {"n": 3}}}\n')
+    flat = tmp_path / "flat.jsonl"
+    flat.write_text('{"prompt": "p", "target": {"name": "f", "args": {"n": "3"}}}\n')
+
+    assert load_split(typed).id == load_split(flat).id

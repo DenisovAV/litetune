@@ -168,7 +168,13 @@ def load_split(path: Path, limit: int | None = None) -> Split:
         [
             {
                 "prompt": e.prompt,
-                "target": (e.target.as_dict() if isinstance(e.target, ToolCall) else e.target),
+                # Flattened, as every split id before targets kept their types:
+                # the same file must keep the same id.
+                "target": (
+                    {"name": e.target.name, "args": dict(e.target.args)}
+                    if isinstance(e.target, ToolCall)
+                    else e.target
+                ),
             }
             for e in examples
         ],

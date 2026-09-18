@@ -158,13 +158,64 @@ def test_a_number_the_runtimes_lexer_reads_is_a_call():
     assert [type(v) for v in call.raw.values()] == [int, int, float, float, float, float]
 
 
-@pytest.mark.parametrize("escape", ["<escape>", "<ctrl46>", '<|"|>'])
-def test_every_escape_the_runtime_reads_delimits_a_string(escape):
+@pytest.mark.parametrize(
+    "escape, value",
+    # `fc_parser.rs` strips `<escape>` and `<|"|>` from a string's ends and
+    # leaves `<ctrl46>` in it, so a value delimited by it comes back delimited.
+    [("<escape>", "a,b"), ('<|"|>', "a,b"), ("<ctrl46>", "<ctrl46>a,b<ctrl46>")],
+)
+def test_every_escape_the_runtime_reads_delimits_a_string(escape, value):
     """The lexer's `ESCAPE` is three spellings, and `ESCAPED_STRING` ends at the
     first of any of them. Reading only one would score as correct a string the
-    runtime cuts short."""
-    assert parse_call(f"call:set{{s:{escape}a,b{escape}}}") == ToolCall("set", {"s": "a,b"})
+    runtime cuts short; stripping all three would score as correct a string the
+    runtime returns with its delimiters on."""
+    assert parse_call(f"call:set{{s:{escape}a,b{escape}}}").raw == {"s": value}
     assert parse_call("call:set{s:<escape>a<ctrl46>b<escape>}") is None
+
+
+@pytest.mark.parametrize("word", ["call", "true", "false", "null", "e5", "E10"])
+def test_a_name_the_lexer_reads_as_another_token_is_not_a_call(word):
+    """Found in review: these match the identifier pattern, but the lexer's
+    `CALL`, `BOOLEAN`, `NULL_LITERAL` and `NUMBER` rules come first and win the
+    tie, so the runtime's parser never sees an identifier there."""
+    assert parse_call(f"call:{word}{{a:1}}") is None
+    assert parse_call(f"call:f{{{word}:1}}") is None
+    assert parse_call("call:f{called:1,nullable:2,e5x:3}") is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["call:set{a:1,}", "call:set{a:1 b:2}", "call:set{,a:1}", "call:set{a:1,,b:2}"],
+)
+def test_pairs_are_separated_the_way_the_parser_requires(text):
+    """`object : '{' (pair (',' pair)*)? '}'`: a trailing comma, a missing one or
+    a doubled one is a call the runtime refuses."""
+    assert parse_call(text) is None
+
+
+def test_a_key_given_twice_keeps_its_first_value():
+    """`fc_parser.rs` ignores a repeated key; a parser that kept the last value
+    would score as right a call the runtime reads as wrong."""
+    assert parse_call("call:set{a:1,a:2}").raw == {"a": 1}
+
+
+@pytest.mark.parametrize(
+    "one, other, same",
+    [
+        (3.0, "3.0", True),  # an escaped number from a checkpoint trained before
+        (7, 7.0, True),  # the runtime hands every number back as a double
+        ("7", 7.0, True),
+        (True, "true", True),
+        (None, "null", True),
+        ("1.0", "1", False),  # two strings stay two strings
+        (7.5, 7, False),
+        ("007", 7, False),  # not a number the lexer reads
+    ],
+)
+def test_the_same_answer_compares_equal_whatever_its_spelling(one, other, same):
+    """Found in review: comparing numbers by their string made an escaped `3.0`
+    from an older checkpoint wrong against a target of `3.0`."""
+    assert (ToolCall("f", {"x": one}) == ToolCall("f", {"x": other})) is same
 
 
 def test_raw_is_derived_and_cannot_disagree_with_args():

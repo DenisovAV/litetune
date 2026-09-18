@@ -31,6 +31,7 @@ from litetune.events import EventStream
 from litetune.metrics import ToolCall
 from litetune.prepare import read_rows, render_call
 from litetune.prompt_mode import PromptMode, PromptModeDecision
+from litetune.storage import hash_file
 from litetune.tune import (
     _TRAIN_SCRIPT,
     CALL_PROBE_NAME,
@@ -1862,7 +1863,10 @@ def test_the_digest_is_the_results_and_the_file_is_the_requests(trainer, request
         '[{"type": "function", "function": {"name": "set_timer", "description": "d"}}]',
         encoding="utf-8",
     )
-    parsed, digest = read_declarations(decls)
+    parsed, _ = read_declarations(decls)
+    # `request_for` trains `prerendered`, where the file's bytes are what is
+    # recorded: there the order in the file is the application's convention.
+    digest = hash_file(decls)
 
     record = run_tune(request_for(declarations=decls)).as_dict()
 

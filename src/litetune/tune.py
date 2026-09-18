@@ -47,7 +47,12 @@ from typing import Any
 
 from litetune import envs, models
 from litetune.checks import Check, CheckSet, Outcome, guard
-from litetune.declarations import DeclarationsError, entry_count, read_declarations
+from litetune.declarations import (
+    DeclarationsError,
+    entry_count,
+    read_declarations,
+    recorded_digest,
+)
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.metrics import ToolCall
@@ -1539,6 +1544,12 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             events.check(refused)
             events.stage_finished(result.outcome.value, attempted=False)
             return result
+        # The digest recorded for this run, which `verify` and `bundle` compare
+        # with: the tool list's where the runtime renders them, the file's
+        # bytes where the application does -- see `recorded_digest`.
+        digest = recorded_digest(
+            digest, request.declarations, decision.mode is PromptMode.PRERENDERED
+        )
         result.declarations_sha256 = digest
         count = entry_count(declarations)
         read = Check.passed(

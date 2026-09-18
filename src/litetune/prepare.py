@@ -41,7 +41,6 @@ import hashlib
 import json
 import logging
 import math
-import re
 import statistics
 import subprocess
 import tempfile
@@ -57,6 +56,7 @@ from litetune.declarations import (
     argument_problem,
     declared_order,
     read_declarations,
+    recorded_digest,
     tool_names,
 )
 from litetune.events import EventStream
@@ -64,11 +64,11 @@ from litetune.exits import read_returncode
 from litetune.liveness import SkippedCheck
 from litetune.metrics import (
     ESCAPE_SPELLINGS,
-    IDENTIFIER,
     Proportion,
     ToolCall,
     Unavailable,
     read_target,
+    readable_name,
 )
 from litetune.models import (
     WireFormat,
@@ -194,11 +194,11 @@ def render_call(call: ToolCall) -> str:
     format was read, taught the model to send a number the caller receives as a
     string.
 
-    **Only what the runtime can read back is written.** A name or key outside
-    its identifier grammar, a string holding one of the lexer's three escape
-    spellings, and a number with no spelling in its grammar are refused, with
-    the row named, rather than trained: each would be a call the runtime refuses
-    or cuts short on every generation -- and an escape inside a string would
+    **Only what the runtime can read back is written.** A name or key its
+    lexer does not read as a name, a string holding an escape or a call, turn or
+    response marker, and a number a double cannot hold or its grammar cannot
+    spell are refused, with the row named, rather than trained: each would be a
+    call that cannot come back as written -- and a marker inside a string would
     let a dataset row write a second call into the training text.
 
     **A call is wrapped in its markers.** `<start_function_call>` and
@@ -224,10 +224,10 @@ def render_call(call: ToolCall) -> str:
     probe over 20 of them: declared `to, subject, body`, the grammar kept `body`
     on 20 of 20; declared alphabetically, on 0 of 20.
     """
-    if not re.fullmatch(IDENTIFIER, call.name):
+    if not readable_name(call.name):
         raise ValueError(
-            f"the tool name {call.name!r} is not one the runtime's call parser reads "
-            "([a-zA-Z_][a-zA-Z0-9_.-]*), so a call to it would be refused on every generation"
+            f"the tool name {call.name!r} is not one the runtime's call parser reads as a name "
+            f"({NAME_RULE}), so no call to it can come back under that name"
         )
     body = ",".join(_render_argument(key, call.raw[key]) for key in declared_order(call.args))
     return f"{START_CALL}call:{call.name}{{{body}}}{END_CALL}"
@@ -235,29 +235,30 @@ def render_call(call: ToolCall) -> str:
 
 def _render_argument(key: str, value: Any) -> str:
     """One `key:value` pair. Raises `ValueError` for anything the runtime cannot read back."""
-    if not re.fullmatch(IDENTIFIER, key):
+    if not readable_name(key):
         raise ValueError(
-            f"the argument {key!r} is not a name the runtime's call parser reads "
-            "([a-zA-Z_][a-zA-Z0-9_.-]*), so a call carrying it would be refused on every "
-            "generation"
+            f"the argument {key!r} is not a name the runtime's call parser reads as a name "
+            f"({NAME_RULE}), so no call carrying it can come back with it"
         )
     if isinstance(value, str):
-        held = [spelling for spelling in ESCAPE_SPELLINGS if spelling in value]
+        held = [text for text in CONTROL_TEXT if text in value]
         if held:
             raise ValueError(
-                f"the argument {key!r} contains {held[0]!r}, which the runtime's lexer reads as "
-                "the end of a string: the call would be cut there, and the rest of the value "
-                "read as call syntax. There is no way to carry it inside a string"
+                f"the argument {key!r} contains {held[0]!r}, which does not survive inside a "
+                "string: the runtime cuts a reply into calls at the call markers before it reads "
+                "one, its lexer ends a string at an escape, and generation stops at the turn "
+                "and response markers -- so the call would be cut there and the rest read as "
+                "something else"
             )
         return f"{key}:<escape>{value}<escape>"
     if value is None or isinstance(value, bool):
         return f"{key}:{json.dumps(value)}"
     if isinstance(value, int):
-        if abs(value) > _EXACT_IN_A_DOUBLE:
+        if float(value) != value:
             raise ValueError(
-                f"the argument {key!r} is {value}, and the runtime reads every number as a double "
-                "(fc_parser.rs), which holds an integer exactly only up to 2**53: the caller would "
-                "receive a different number than the one trained. Send it as a string"
+                f"the argument {key!r} is {value}, which a double cannot hold exactly, and the "
+                "runtime reads every number as a double (fc_parser.rs): the caller would receive "
+                "a different number than the one trained. Send it as a string"
             )
         return f"{key}:{value}"
     if isinstance(value, float):
@@ -269,7 +270,27 @@ def _render_argument(key: str, value: Any) -> str:
     )
 
 
-_EXACT_IN_A_DOUBLE = 2**53
+# Text a string argument cannot carry. The call markers are what the runtime
+# cuts a reply into calls at (`parser_utils.cc`, before its lexer runs); the
+# escapes end a string (`AntlrFcLexer.g4`); the response and turn markers are
+# where generation stops or a turn begins, so a model trained to write one
+# mid-string stops there.
+CONTROL_TEXT = (
+    *ESCAPE_SPELLINGS,
+    START_CALL,
+    END_CALL,
+    "<start_function_response>",
+    "<end_function_response>",
+    "<start_function_declaration>",
+    "<end_function_declaration>",
+    "<start_of_turn>",
+    "<end_of_turn>",
+)
+
+NAME_RULE = (
+    "[a-zA-Z_][a-zA-Z0-9_.-]*, and not `call`, `true`, `false`, `null` or an exponent like "
+    "`e5`, which its lexer reads as other tokens"
+)
 
 
 def _render_number(key: str, value: float) -> str:
@@ -1182,8 +1203,13 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     # never offer is a row that cannot be trained, and saying so after a split
     # has been written means the caller re-runs the stage to learn it.
     declarations_sha256 = None
+    evidence = prompt_evidence([row.prompt for row in rows]).mode
     if request.declarations is not None:
-        declarations_sha256 = refuse_undeclared_tools(rows, request.data, request.declarations)
+        declarations_sha256 = recorded_digest(
+            refuse_undeclared_tools(rows, request.data, request.declarations),
+            request.declarations,
+            evidence is PromptMode.PRERENDERED,
+        )
     elif request.base_model is not None:
         refuse_calls_without_declarations(rows, request.base_model)
     content_sha256 = hash_file(request.data)
@@ -1197,9 +1223,15 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     )
     if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
         result.limitation(ASSUMED_WIRE_FORMAT)
+    # Only where it is true: lengths were measured, the prompts are bare, and
+    # the model's runtime is one litetune records as rendering a declaration
+    # turn in front of them.
     if (
         declarations_sha256 is not None
-        and prompt_evidence([row.prompt for row in rows]).mode is PromptMode.RUNTIME_RENDERED
+        and request.tokens is not None
+        and evidence is PromptMode.RUNTIME_RENDERED
+        and request.base_model is not None
+        and renders_declarations_for(request.base_model)[0]
     ):
         result.limitation(DECLARATIONS_NOT_COUNTED)
     events.metric("rows", len(rows), source=str(request.data))
@@ -1260,8 +1292,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     if not length_check.conclusive:
         result.limitation(
             f"token lengths were not measured ({length_check.detail}); whether every example fits "
-            "the context window is unknown, and a row that does not fit is truncated during "
-            "training without a warning"
+            "the context window is unknown here; `tune` measures the rendered sequence and "
+            "refuses a row over max_seq_length rather than truncating it"
         )
 
     # -- scoreability, before anyone pays for a GPU -------------------------

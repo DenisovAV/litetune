@@ -790,7 +790,12 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     # Not when the declarations were refused, because then no list was shipped.
     contract = request.contract
     if contract.declarations_sha256 is None and declarations_check.outcome is Outcome.PASSED:
-        contract = replace(contract, declarations_sha256=_shipped_digest(request.declarations))
+        contract = replace(
+            contract,
+            declarations_sha256=_shipped_digest(
+                request.declarations, not contract.runtime_renders_declarations
+            ),
+        )
         result.limitation(NO_TRAINED_DECLARATIONS)
         # The report and the file must describe one contract.
         request = replace(request, contract=contract)
@@ -936,13 +941,15 @@ NO_TRAINED_DECLARATIONS = (
 )
 
 
-def _shipped_digest(source: Path) -> str:
-    """The digest a contract records for `source`: the tool list's, or the bytes'.
+def _shipped_digest(source: Path, prerendered: bool) -> str:
+    """The digest a contract records for `source`, as `tune` would record it.
 
-    The list's where `read_declarations` accepts the file, which is what `tune`
-    records. A `prerendered` bundle ships a file litetune does not otherwise
-    read, so where it is refused the bytes' digest is all there is.
+    The file's bytes in `prerendered`, where the file ships as given and its
+    order is the application's convention; the tool list's otherwise, which is
+    what the shipped normalised file hashes to (`declarations.recorded_digest`).
     """
+    if prerendered:
+        return hash_file(source)
     try:
         return read_declarations(source)[1]
     except DeclarationsError:
@@ -1034,14 +1041,16 @@ def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
             observed={"declarations": str(source)},
         )
     destination = request.output_dir / DECLARATIONS_NAME
-    if source.resolve() == destination.resolve():
+    if destination.exists() and os.path.samefile(source, destination):
         # The shipped copy is written over the destination, so a source already
         # there would be replaced by its normalised copy -- the user's own file
-        # rewritten -- or, when copied, fail as the same file.
+        # rewritten -- or, when copied, fail as the same file. The same file, not
+        # the same path: on a case-insensitive filesystem `Declarations.json` is
+        # this file, and so is a hard link to it.
         return Check.failed(
             name,
-            f"the declarations at {source} are already inside --output-dir "
-            f"({request.output_dir}); name a source outside it",
+            f"the declarations at {source} are the file this bundle would write its "
+            f"declarations to ({destination}); name a source outside --output-dir",
             observed={"declarations": str(source)},
         )
     if request.contract.runtime_renders_declarations:
