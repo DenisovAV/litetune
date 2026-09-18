@@ -55,9 +55,14 @@ from litetune.declarations import (
 )
 from litetune.events import EventStream
 from litetune.exits import read_returncode
-from litetune.metrics import ToolCall, parse_call
-from litetune.models import identify, renders_declarations_for, wire_format_for
-from litetune.prepare import END_CALL, START_CALL, PrepareError, Row, read_rows, render_call
+from litetune.metrics import ToolCall, runtime_calls
+from litetune.models import (
+    PROVENANCE_NAME,
+    identify,
+    renders_declarations_for,
+    wire_format_for,
+)
+from litetune.prepare import START_CALL, PrepareError, Row, read_rows, render_call
 from litetune.prompt_mode import RENDERING_SOURCE, PromptMode, PromptModeDecision, prompt_evidence
 
 logger = logging.getLogger(__name__)
@@ -70,12 +75,15 @@ TUNE_SCHEMA = "litetune.tune/1"
 PROMPT_MODE_CHECK = "prompt mode"
 DECLARATIONS_CHECK = "tool declarations"
 CALLS_CHECK = "calls are written as the runtime reads them"
+COMPLETIONS_CHECK = "every row carries its completion"
 
 # A name no declaration could plausibly use, rendered only to ask the template how a call ends.
 CALL_PROBE_NAME = "litetune_probe"
 
 
-def _refuse_calls_without_declarations(request: TuneRequest, mode: PromptMode) -> Check | None:
+def _refuse_calls_without_declarations(
+    request: TuneRequest, mode: PromptMode, rows: Sequence[Row]
+) -> Check | None:
     """A structured target for a declaration-rendering family, with none supplied.
 
     `prepare` refuses the same thing, and this is not a duplicate: a split
@@ -94,11 +102,6 @@ def _refuse_calls_without_declarations(request: TuneRequest, mode: PromptMode) -
     renders, reason = renders_declarations_for(request.model)
     if not renders:
         return None
-    try:
-        rows = read_rows(request.data)
-    except (PrepareError, OSError):
-        # Not this check's business. The row reader's own refusal follows.
-        return None
     if not any(isinstance(row.target, ToolCall) for row in rows):
         return None
     return Check.failed(
@@ -111,15 +114,16 @@ def _refuse_calls_without_declarations(request: TuneRequest, mode: PromptMode) -
     )
 
 
-def _refuse_declarations_the_runtime_never_sends(
+def _refuse_declarations_for_an_unrecorded_tool_channel(
     request: TuneRequest, mode: PromptMode
 ) -> Check | None:
-    """Declarations for a `runtime_rendered` split whose runtime does not render them.
+    """Declarations for a `runtime_rendered` split of a family litetune records no tool channel for.
 
-    The training prompt would carry a declaration turn the runtime never puts in
-    front of the model, so the model learns to answer a prompt no application
-    sends. `verify` would then measure the candidate on the runtime's prompt,
-    without them. Refused rather than trained, as the prompt-mode disagreement
+    Training renders the declarations into the prompt the way the family's
+    runtime is recorded to; for a family with no such record -- one litetune
+    has not measured, or one it cannot tell -- there is no measured prompt to
+    train, and `verify` would measure the candidate on whatever the runtime
+    sends instead. Refused rather than trained, as the prompt-mode disagreement
     is; a split whose application renders the tools itself is `prerendered`.
     """
     if mode is not PromptMode.RUNTIME_RENDERED:
@@ -145,39 +149,99 @@ def _refuse_declarations_the_runtime_never_sends(
     )
 
 
+def _family_untold(model: str) -> bool:
+    """Whether litetune cannot tell which family `model` is."""
+    rules = identify(model)
+    return rules is None or rules.config_only
+
+
+def _marks_calls(rows: Sequence[Row]) -> bool:
+    """Whether a call row's completion carries FunctionGemma's call markers."""
+    return any(isinstance(row.target, ToolCall) and START_CALL in row.completion for row in rows)
+
+
 def _writes_calls_as_rendered(model: str, rows: Sequence[Row]) -> bool:
     """Whether this run's call rows are FunctionGemma's calls.
 
-    Recorded for the family, or evident in the split: a completion the file
-    gives, carrying the call markers. The second catches a FunctionGemma
-    checkpoint whose family cannot be told from its directory, which would
-    otherwise train its calls with a text turn's ending. A completion rendered
-    here from a target is not evidence: it is in the format this assumed.
+    Recorded for the family, or -- where litetune cannot tell the family --
+    evident in the split: a completion carrying the call markers. The second
+    catches a FunctionGemma checkpoint whose family cannot be told from its
+    directory, which would otherwise train its calls with a text turn's ending.
+    For a family litetune can tell and records no call format for, marked
+    completions are the caller's own text -- `prepare` writes FunctionGemma's
+    format for a split given no `--base-model` -- and end as a text turn does.
     """
-    return wire_format_for(model).known or any(
-        isinstance(row.target, ToolCall) and not row.rendered and START_CALL in row.completion
-        for row in rows
+    return wire_format_for(model).known or (_family_untold(model) and _marks_calls(rows))
+
+
+def _refuse_rows_without_a_completion(request: TuneRequest, rows: Sequence[Row]) -> Check | None:
+    """A row that gives a target and no completion.
+
+    The training script trains the completion a row carries -- `build_examples`
+    reads `row["completion"]` from the file -- so such a row failed there, as a
+    `KeyError`, after the training environment was provisioned. `prepare`
+    writes the completion from the target.
+    """
+    bare = [row for row in rows if row.rendered]
+    if not bare:
+        return None
+    return Check.failed(
+        COMPLETIONS_CHECK,
+        f"{request.data}:{bare[0].lineno}: the row gives a target and no completion, and `tune` "
+        f"trains the completion a row carries ({len(bare)} row(s) like it). Run prepare on the "
+        "file, which writes each completion from its target, and train the split it writes",
+        observed={"data": str(request.data), "line": bare[0].lineno, "rows": len(bare)},
+    )
+
+
+def _refuse_calls_of_a_family_litetune_cannot_tell(
+    request: TuneRequest, mode: PromptMode, rows: Sequence[Row]
+) -> Check | None:
+    """Marked calls, `runtime_rendered`, for a model whose family litetune cannot tell.
+
+    The calls say FunctionGemma; nothing litetune can read says whether this
+    checkpoint's runtime renders the declarations into the prompt, which is
+    recorded per family. Without it, trained with `--declarations` the prompt
+    may carry a turn the runtime never sends, and trained without, it may lack
+    one the runtime always sends. Refused either way, naming what settles it.
+    """
+    if mode is not PromptMode.RUNTIME_RENDERED or not _family_untold(request.model):
+        return None
+    if not _marks_calls(rows):
+        return None
+    return Check.failed(
+        DECLARATIONS_CHECK,
+        f"litetune cannot tell which model family {request.model} is, and this split's calls "
+        "carry FunctionGemma's call markers. Whether a runtime renders the tool declarations "
+        "into the prompt is recorded per family, so the prompt this run would train cannot be "
+        "told from the one the runtime sends. Record which model the checkpoint is in "
+        f"{PROVENANCE_NAME} beside its config.json, as a checkpoint litetune trained does "
+        '(`{"base_model": "<model id>"}`)',
+        observed={"model": request.model, "declarations": str(request.declarations)},
     )
 
 
 def _refuse_calls_the_runtime_would_not_read(
     request: TuneRequest, mode: PromptMode, rows: Sequence[Row]
 ) -> Check | None:
-    """A call row whose completion is not a call the runtime reads for its target.
+    """A call row whose completion the runtime would not read as its target.
 
     The training script ends a call row with what the chat template puts after
-    a call, and that ending is only right after a call. The runtime's parser
-    reads a call only between `<start_function_call>` and `<end_function_call>`
-    (`parser_utils.cc`); a model trained on calls without them, closed by
-    `<end_of_turn>`, returned no call on 5 of 5 prompts. Splits prepared by
-    litetune 0.1.6 or earlier carry none. So a completion needs the markers and
-    has to read, between them, as its target's call -- spelling and order are
-    free, as the runtime's parser leaves them free; only with constrained
-    decoding on is the order held, which `prepare` settles for rows it renders.
+    a call, and that ending is only right after a call. The runtime reads a
+    reply's calls only between `<start_function_call>` and
+    `<end_function_call>`, each block one whole call (`parser_utils.cc`); a
+    model trained on calls without the markers, closed by `<end_of_turn>`,
+    returned no call on 5 of 5 prompts, and splits prepared by litetune 0.1.6
+    or earlier carry none. So a completion has to read, the way
+    `metrics.runtime_calls` reads a reply, as exactly its target's call, with
+    the target's JSON types: an escaped `7` reaches an application as the
+    string `"7"`. Spelling and argument order are free, as the runtime's parser
+    leaves them free; only with constrained decoding on is the order held,
+    which `prepare` settles for rows it renders.
 
-    Only where the call format is FunctionGemma's, in `runtime_rendered`. A row
-    whose target cannot be rendered at all is the caller's own text and is left
-    alone, as `prepare` leaves it.
+    Only where the call format is FunctionGemma's, in `runtime_rendered`. Every
+    call row, including one whose target litetune could not render: its own
+    completion is still what the runtime would read.
     """
     if mode is not PromptMode.RUNTIME_RENDERED or not _writes_calls_as_rendered(
         request.model, rows
@@ -186,27 +250,38 @@ def _refuse_calls_the_runtime_would_not_read(
     for row in rows:
         if not isinstance(row.target, ToolCall):
             continue
+        calls = runtime_calls(row.completion)
+        if calls == [row.target]:
+            continue
+        if calls is None:
+            why = "the runtime would give no reply: a block between its markers is not one call"
+        elif not calls:
+            why = (
+                "the runtime reads no call in it: it reads one only between the call markers -- "
+                "splits prepared by litetune 0.1.6 or earlier carry none"
+            )
+        else:
+            why = f"the runtime reads it as {calls!r}"
         try:
-            expected = render_call(row.target)
-        except ValueError:
-            continue
-        marked = START_CALL in row.completion and END_CALL in row.completion
-        if marked and parse_call(row.completion) == row.target:
-            continue
-        why = (
-            f"it reads as {parse_call(row.completion)!r}"
-            if marked
-            else "it carries no call markers, and the runtime's parser reads a call only between "
-            "them -- splits prepared by litetune 0.1.6 or earlier carry none"
-        )
+            advice = f"or write it as prepare does: {render_call(row.target)[:160]!r}"
+        except ValueError as exc:
+            advice = f"though prepare cannot write this target either: {exc}"
         return Check.failed(
             CALLS_CHECK,
-            f"{request.data}:{row.lineno}: the completion {row.completion[:160]!r} is not a call "
-            f"the runtime reads for its target: {why}. Drop the row's completion so prepare "
-            f"renders it from the target, or write it as prepare does: {expected[:160]!r}",
+            f"{request.data}:{row.lineno}: the completion {row.completion[:160]!r} is not its "
+            f"target's call, {row.target!r}: {why}. Drop the row's completion and run prepare, "
+            f"which writes it from the target, {advice}",
             observed={"data": str(request.data), "line": row.lineno},
         )
     return None
+
+
+def _refused(result: TuneResult, events: EventStream, check: Check) -> TuneResult:
+    """End the stage on a refusal made before anything was attempted."""
+    result.checks.add(check)
+    events.check(check)
+    events.stage_finished(result.outcome.value, attempted=False)
+    return result
 
 
 FORCE_PROMPT_MODE_FLAG = "--force-prompt-mode"
@@ -1113,9 +1188,10 @@ class TuneRequest:
             # The call `prepare` renders for a probe, so the script can ask the
             # chat template what ends a call turn and check that the template
             # writes a call the way `render_call` does. The script cannot import
-            # litetune, so the text travels in the spec. Only for a family whose
-            # call format is known: any other family's call rows are the
-            # caller's own text, and end the way a text turn does.
+            # litetune, so the text travels in the spec. Only where the calls
+            # are FunctionGemma's -- recorded for the family, or evident in the
+            # split (`_writes_calls_as_rendered`): any other family's call rows
+            # are the caller's own text, and end the way a text turn does.
             "call_probe": (
                 {"name": CALL_PROBE_NAME, "text": render_call(ToolCall(CALL_PROBE_NAME, {}))}
                 if (wire_format_for(self.model).known if probe_calls is None else probe_calls)
@@ -1137,6 +1213,10 @@ class TuneRequest:
         # write `None` into `request` on every report, beside the real digest at
         # the top level -- two fields in one record disagreeing about one fact.
         record.pop("declarations_sha256")
+        # And the probe, which the run decides from the split as well as the
+        # family: recomputed here from the family alone, it disagreed with the
+        # one the script was given (`train_config.json`).
+        record.pop("call_probe")
         record["declarations"] = str(self.declarations) if self.declarations else None
         record["force_prompt_mode"] = self.force_prompt_mode
         record["learning_rate_source"] = (
@@ -1498,33 +1578,35 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     if not request.data.is_file():
         # A check, not an exception: "the split is not there" is an observation
         # about this run, and the report has to carry it.
-        missing = Check.failed(
-            TRAINING_CHECK,
-            f"the training split {request.data} does not exist, so nothing was trained",
-            observed={"data": str(request.data)},
+        return _refused(
+            result,
+            events,
+            Check.failed(
+                TRAINING_CHECK,
+                f"the training split {request.data} does not exist, so nothing was trained",
+                observed={"data": str(request.data)},
+            ),
         )
-        result.checks.add(missing)
-        events.check(missing)
-        events.stage_finished(result.outcome.value, attempted=False)
-        return result
 
     try:
         rows = read_rows(request.data)
         prompts = [row.prompt for row in rows]
         decision = decide_prompt_mode(prompts, request.prompt_mode, force=request.force_prompt_mode)
     except (TuneError, PrepareError, OSError) as exc:
-        refused = Check.failed(
-            PROMPT_MODE_CHECK,
-            str(exc),
-            observed={
-                "declared": request.prompt_mode.value if request.prompt_mode is not None else None,
-                "force_prompt_mode": request.force_prompt_mode,
-            },
+        return _refused(
+            result,
+            events,
+            Check.failed(
+                PROMPT_MODE_CHECK,
+                str(exc),
+                observed={
+                    "declared": (
+                        request.prompt_mode.value if request.prompt_mode is not None else None
+                    ),
+                    "force_prompt_mode": request.force_prompt_mode,
+                },
+            ),
         )
-        result.checks.add(refused)
-        events.check(refused)
-        events.stage_finished(result.outcome.value, attempted=False)
-        return result
     result.prompt_mode_decision = decision
     decided = Check.passed(
         PROMPT_MODE_CHECK,
@@ -1534,48 +1616,41 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     result.checks.add(decided)
     events.check(decided)
 
-    # Before the environment, like the mode above: a declarations file that
-    # cannot be read is a fact about the request, and finding it out after
-    # provisioning costs minutes and a download to say so.
+    # Before the environment, like the mode above: each of these is a fact about
+    # the request, and finding it out after provisioning costs minutes and a
+    # download to say so. A family whose runtime renders declarations trains a
+    # prompt that carries them -- refused here as well as in `prepare`, because
+    # a hand-written split reaches this stage without passing through that one,
+    # and by the time the loss curve is available it looks fine.
+    for refusal in (
+        _refuse_rows_without_a_completion(request, rows),
+        _refuse_calls_of_a_family_litetune_cannot_tell(request, decision.mode, rows),
+        None
+        if request.declarations is not None
+        else _refuse_calls_without_declarations(request, decision.mode, rows),
+        _refuse_calls_the_runtime_would_not_read(request, decision.mode, rows),
+        None
+        if request.declarations is None
+        else _refuse_declarations_for_an_unrecorded_tool_channel(request, decision.mode),
+    ):
+        if refusal is not None:
+            return _refused(result, events, refusal)
     # Bound before the branch: the script's spec is built further down on every
     # path, including the one where no declarations were supplied.
     declarations: list | None = None
-    if request.declarations is None:
-        # A family whose runtime renders declarations trains a prompt that
-        # carries them. Refused here as well as in `prepare`, because a
-        # hand-written split reaches this stage without passing through that
-        # one, and by the time the loss curve is available it looks fine.
-        undeclared = _refuse_calls_without_declarations(request, decision.mode)
-        if undeclared is not None:
-            result.checks.add(undeclared)
-            events.check(undeclared)
-            events.stage_finished(result.outcome.value, attempted=False)
-            return result
-    not_as_rendered = _refuse_calls_the_runtime_would_not_read(request, decision.mode, rows)
-    if not_as_rendered is not None:
-        result.checks.add(not_as_rendered)
-        events.check(not_as_rendered)
-        events.stage_finished(result.outcome.value, attempted=False)
-        return result
     if request.declarations is not None:
-        never_sent = _refuse_declarations_the_runtime_never_sends(request, decision.mode)
-        if never_sent is not None:
-            result.checks.add(never_sent)
-            events.check(never_sent)
-            events.stage_finished(result.outcome.value, attempted=False)
-            return result
         try:
             declarations, digest = read_declarations(request.declarations)
         except DeclarationsError as exc:
-            refused = Check.failed(
-                DECLARATIONS_CHECK,
-                str(exc),
-                observed={"declarations": str(request.declarations)},
+            return _refused(
+                result,
+                events,
+                Check.failed(
+                    DECLARATIONS_CHECK,
+                    str(exc),
+                    observed={"declarations": str(request.declarations)},
+                ),
             )
-            result.checks.add(refused)
-            events.check(refused)
-            events.stage_finished(result.outcome.value, attempted=False)
-            return result
         # The digest recorded for this run, which `verify` and `bundle` compare
         # with: the tool list's where the runtime renders them, the file's
         # bytes where the application does -- see `recorded_digest`.

@@ -326,7 +326,8 @@ class Row:
     completion: str
     target: ToolCall | str | None
     # Whether `completion` was rendered here from `target` rather than given in
-    # the file. Only a given completion is evidence of the format a split is in.
+    # the file. `tune` trains the completion a file gives, and refuses a row
+    # that gives none; every row of a split `prepare` writes gives one.
     rendered: bool = False
 
     @property

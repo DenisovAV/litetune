@@ -35,6 +35,8 @@ from litetune.storage import hash_file
 from litetune.tune import (
     _TRAIN_SCRIPT,
     CALL_PROBE_NAME,
+    CALLS_CHECK,
+    COMPLETIONS_CHECK,
     DECLARATIONS_CHECK,
     DEFAULT_ATTN_IMPLEMENTATION,
     DEFAULT_DTYPE,
@@ -2577,6 +2579,9 @@ def test_a_declaration_rendering_family_refuses_to_train_calls_without_them(tmp_
             json.dumps(
                 {
                     "prompt": f"set the background to swatch{i}",
+                    "completion": render_call(
+                        ToolCall("change_background_color", {"color": f"swatch{i}"})
+                    ),
                     "target": {
                         "name": "change_background_color",
                         "args": {"color": f"swatch{i}"},
@@ -2607,10 +2612,19 @@ def test_that_refusal_does_not_fire_on_a_family_with_no_tool_channel(
     """And the run reaches the trainer: the first version of this asserted only
     that no refusal named the flag, which a run failing for any other reason --
     it provisioned a real environment over the network -- satisfied too."""
+    # Completions in FunctionGemma's format, which `prepare` writes for a split
+    # given no --base-model: for a family litetune can tell, the caller's text.
     data = tmp_path / "targets.jsonl"
     data.write_text(
         "".join(
-            json.dumps({"prompt": f"q{i}", "target": {"name": "t", "args": {"a": "b"}}}) + "\n"
+            json.dumps(
+                {
+                    "prompt": f"q{i}",
+                    "completion": render_call(ToolCall("t", {"a": "b"})),
+                    "target": {"name": "t", "args": {"a": "b"}},
+                }
+            )
+            + "\n"
             for i in range(8)
         ),
         encoding="utf-8",
@@ -2726,7 +2740,8 @@ def test_a_split_prepared_before_the_call_markers_is_refused_not_trained(
     assert result.outcome is Outcome.FAILED
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
     assert any(
-        "carries no call markers" in c.detail
+        c.name == CALLS_CHECK
+        and "reads no call in it" in c.detail
         and "Drop the row's completion" in c.detail
         and f"{data}:1" in c.detail
         for c in failed
@@ -2772,15 +2787,21 @@ def test_a_completion_that_reads_as_another_call_is_refused_naming_what_it_reads
     )
 
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
-    assert any("it reads as" in c.detail for c in failed)
+    # What the runtime would read, typed, beside the target it is not.
+    assert any(
+        "the runtime reads it as [ToolCall('change_background_color', {'color': 'x'})]" in c.detail
+        and "ToolCall('change_background_color', {'color': 's0'})" in c.detail
+        for c in failed
+    )
     assert trainer.configs == []
 
 
-def test_a_row_litetune_cannot_render_does_not_stop_the_check_of_the_next(
+def test_a_row_litetune_cannot_render_is_still_read_as_the_runtime_would(
     tmp_path, request_for, trainer
 ):
-    """A row with a list argument is its author's text and is left alone; the
-    rows after it are still checked."""
+    """Found in review: a row whose target `render_call` refused was skipped, so
+    its own completion trained unread -- one carrying a second call's markers
+    in a string among them. The completion is what the runtime reads."""
     _, declarations = _functiongemma_split(tmp_path, lambda i: "")
     data = tmp_path / "own.jsonl"
     data.write_text(
@@ -2808,7 +2829,10 @@ def test_a_row_litetune_cannot_render_does_not_stop_the_check_of_the_next(
     )
 
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
-    assert any(f"{data}:2" in c.detail for c in failed)
+    assert any(
+        f"{data}:1" in c.detail and "prepare cannot write this target either" in c.detail
+        for c in failed
+    )
 
 
 def test_a_split_prepared_now_trains(tmp_path, request_for, trainer):
@@ -2825,12 +2849,13 @@ def test_a_split_prepared_now_trains(tmp_path, request_for, trainer):
     assert trainer.configs[0]["call_probe"]["name"] == CALL_PROBE_NAME
 
 
-def test_declarations_for_a_family_whose_runtime_never_sends_them_are_refused(
+def test_declarations_for_a_family_litetune_records_no_tool_channel_for_are_refused(
     tmp_path, request_for, trainer
 ):
     """Found in review: a Qwen split trained with --declarations carried a
-    declaration turn in every training prompt, and `litert-lm run` never sends
-    one -- so the candidate was then measured on a prompt it was not trained on."""
+    declaration turn in every training prompt, rendered in a way nothing here
+    has measured Qwen's runtime to render -- so the candidate would be measured
+    on a prompt it was not trained on."""
     data, declarations = _functiongemma_split(tmp_path, lambda i: f"answer {i}")
 
     result = run_tune(
@@ -2877,24 +2902,78 @@ def test_declarations_for_a_prerendered_split_of_any_family_train(tmp_path, requ
     assert len(trainer.configs) == 1
 
 
+def _untold_checkpoint(tmp_path: Path) -> Path:
+    """A local FunctionGemma checkpoint without its sidecar: `gemma3_text`, no name."""
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text('{"model_type": "gemma3_text"}', encoding="utf-8")
+    return ckpt
+
+
 def test_a_checkpoint_whose_family_cannot_be_told_is_probed_when_its_calls_are_marked(
     tmp_path, request_for, trainer
 ):
     """Found in review: a local FunctionGemma checkpoint without its sidecar
     reads as an unidentified `gemma3_text`, and the probe -- and with it the
-    call ending -- was dropped. Marked completions say which format they are."""
-    ckpt = tmp_path / "ckpt"
-    ckpt.mkdir()
-    (ckpt / "config.json").write_text('{"model_type": "gemma3_text"}', encoding="utf-8")
-    data, _ = _functiongemma_split(
+    call ending -- was dropped. Marked completions say which format they are.
+    In `prerendered`, where the application renders the declarations."""
+    ckpt = _untold_checkpoint(tmp_path)
+    data = tmp_path / "prerendered.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "prompt": _rendered(f"set the background to swatch{i}"),
+                    "completion": render_call(
+                        ToolCall("change_background_color", {"color": f"s{i}"})
+                    ),
+                    "target": {"name": "change_background_color", "args": {"color": f"s{i}"}},
+                }
+            )
+            + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_tune(request_for(model=str(ckpt), data=data))
+
+    assert len(trainer.configs) == 1
+    assert trainer.configs[0]["call_probe"] is not None
+    # Found in review: the report recomputed the probe from the family alone
+    # and said `None` beside a script that was given one. It is the run's.
+    assert "call_probe" not in result.as_dict()["request"]
+
+
+@pytest.mark.parametrize("with_declarations", [False, True])
+def test_marked_calls_for_a_family_litetune_cannot_tell_are_refused_where_the_runtime_renders(
+    tmp_path, request_for, trainer, with_declarations
+):
+    """Found in review: the evidence turned the probe on and reached neither
+    declarations gate, so without --declarations the run trained a prompt with
+    no tool list and with them it was refused with no way forward. Whether the
+    runtime renders the declarations is recorded per family; the refusal names
+    what records it."""
+    ckpt = _untold_checkpoint(tmp_path)
+    data, declarations = _functiongemma_split(
         tmp_path,
         lambda i: render_call(ToolCall("change_background_color", {"color": f"s{i}"})),
     )
 
-    run_tune(request_for(model=str(ckpt), data=data, prompt_mode=PromptMode.RUNTIME_RENDERED))
+    result = run_tune(
+        request_for(
+            model=str(ckpt),
+            data=data,
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+            declarations=declarations if with_declarations else None,
+        )
+    )
 
-    assert len(trainer.configs) == 1
-    assert trainer.configs[0]["call_probe"] is not None
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any(
+        "cannot tell which model family" in c.detail and "litetune.json" in c.detail for c in failed
+    )
+    assert trainer.configs == []
 
 
 # -- how a call ends ---------------------------------------------------------
@@ -3080,3 +3159,161 @@ def test_declarations_for_a_checkpoint_whose_family_cannot_be_told_say_so(
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
     assert any("cannot tell which model family" in c.detail for c in failed)
     assert trainer.configs == []
+
+
+def _split_of(tmp_path: Path, args: dict, completion: str) -> tuple[Path, Path]:
+    """Eight bare-prompt rows calling `set` with `args`, each with `completion`."""
+    kinds = {bool: "boolean", int: "integer", float: "number", str: "string"}
+    declarations = tmp_path / "set.json"
+    declarations.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "set",
+                        "description": "d",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                key: {"type": kinds[type(value)], "description": key}
+                                for key, value in args.items()
+                            },
+                        },
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    data = tmp_path / "set.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "prompt": f"set it {i}",
+                    "completion": completion,
+                    "target": {"name": "set", "args": args},
+                }
+            )
+            + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+    return data, declarations
+
+
+S, E = "<start_function_call>", "<end_function_call>"
+
+
+@pytest.mark.parametrize(
+    "args, completion, trains",
+    [
+        # Spelling and order are free, as the runtime's parser leaves them.
+        ({"a": "x", "n": 1}, f"{S}call:set{{n:1,a:<escape>x<escape>}}{E}", True),
+        ({"a": "x", "n": 1}, f"{S} call : set {{ a : <escape>x<escape> , n : 1.0 }} {E}", True),
+        ({"a": "x", "n": 1}, f"Sure. {S}call:set{{a:<escape>x<escape>,n:1}}{E}", True),
+        # The type is not: an application is handed what the call carries.
+        ({"n": 7}, f"{S}call:set{{n:<escape>7<escape>}}{E}", False),
+        ({"a": "7"}, f"{S}call:set{{a:7}}{E}", False),
+        ({"a": "1.0"}, f"{S}call:set{{a:1}}{E}", False),
+        ({"on": True}, f"{S}call:set{{on:<escape>true<escape>}}{E}", False),
+        # Found in review: every one of these read as the target's call.
+        ({"a": "x"}, f"call:set{{a:<escape>x<escape>}}{S}{E}", False),  # outside the markers
+        ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}", False),  # no end marker
+        ({"a": "x"}, f"call:set{{a:<escape>x<escape>}}{E}", False),  # no start marker
+        ({"a": "x"}, f"{E}call:set{{a:<escape>x<escape>}}{S}", False),  # reversed
+        ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E}{S}call:wipe{{}}{E}", False),
+        ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}call:wipe{{}}{E}", False),
+        ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}} and more{E}", False),
+        ({"a": "x"}, f"{S}not a call{E}call:set{{a:<escape>x<escape>}}", False),
+    ],
+)
+def test_a_completion_trains_only_as_exactly_its_targets_call(
+    tmp_path, request_for, trainer, args, completion, trains
+):
+    """Found in review: the check asked only that both markers occur somewhere
+    and that the first `call:` anywhere read as the target, loosely."""
+    data, declarations = _split_of(tmp_path, args, completion)
+
+    result = run_tune(
+        request_for(data=data, prompt_mode=PromptMode.RUNTIME_RENDERED, declarations=declarations)
+    )
+
+    refused = [c for c in result.checks.checks if c.name == CALLS_CHECK]
+    assert bool(refused) is not trains
+    assert (len(trainer.configs) == 1) is trains
+
+
+def test_a_row_with_no_completion_is_refused_before_anything_is_provisioned(
+    tmp_path, request_for, trainer
+):
+    """Found in review: the training script reads `row["completion"]`, so a
+    row with only a target failed there, as a `KeyError`, after the
+    environment was provisioned."""
+    data = tmp_path / "targets.jsonl"
+    data.write_text(
+        json.dumps({"prompt": _rendered("q"), "completion": "a", "target": "a"})
+        + "\n"
+        + json.dumps({"prompt": _rendered("r"), "target": "b"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = run_tune(request_for(data=data))
+
+    (refused,) = [c for c in result.checks.checks if c.name == COMPLETIONS_CHECK]
+    assert refused.outcome is Outcome.FAILED
+    assert f"{data}:2" in refused.detail and "Run prepare" in refused.detail
+    assert trainer.configs == []
+    assert result.model_dir is None
+
+
+def test_declarations_for_a_model_litetune_has_no_entry_for_say_so(tmp_path, request_for, trainer):
+    """`identify` returns nothing for it at all, where an untold checkpoint
+    matches a rule that says it cannot tell."""
+    data, declarations = _functiongemma_split(tmp_path, lambda i: f"answer {i}")
+
+    result = run_tune(
+        request_for(
+            model="acme/x",
+            data=data,
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+            declarations=declarations,
+        )
+    )
+
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any("cannot tell which model family acme/x is" in c.detail for c in failed)
+    assert trainer.configs == []
+
+
+def test_a_row_with_no_completion_is_named_before_anything_is_read_from_the_completions(
+    tmp_path, request_for, trainer
+):
+    """The row reader writes a missing completion in FunctionGemma's format, so
+    for a checkpoint litetune cannot tell a row with only a target would read as
+    evidence of marked calls. The missing completion is what to fix first."""
+    ckpt = _untold_checkpoint(tmp_path)
+    data = tmp_path / "targets.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "prompt": f"set it {i}",
+                    "target": {"name": "change_background_color", "args": {"color": "s"}},
+                }
+            )
+            + "\n"
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_tune(
+        request_for(model=str(ckpt), data=data, prompt_mode=PromptMode.RUNTIME_RENDERED)
+    )
+
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert [c.name for c in failed] == [COMPLETIONS_CHECK]
