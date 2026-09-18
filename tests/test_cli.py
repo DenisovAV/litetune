@@ -1971,6 +1971,15 @@ def test_the_summary_says_when_the_grammar_on_run_was_not_made():
     text = "\n".join(lines)
 
     assert "path: text path" in text
-    assert "grammar on: what an application that enables it gets: not measured" in text
+    assert "grammar on: not measured" in text
+    # Found in review: the grammar-off line said "the candidate above" when no
+    # candidate line had been printed; a mode not measured is named alone.
+    off = summarise(
+        {
+            "status": "failed_harness",
+            "tool_path": {"modes": {"unconstrained": {"available": False, "reason": "r"}}},
+        }
+    )
+    assert "  grammar off: not measured — r" in off
     assert "no SentencePiece tokenizer" in text
     assert "grammar_effect" not in text

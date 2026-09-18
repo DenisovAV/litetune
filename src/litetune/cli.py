@@ -813,13 +813,15 @@ def summarise(manifest: dict) -> list[str]:
     if selection:
         lines.append(f"  path: {'tool path' if selection.get('tool_path') else 'text path'}")
     tool_path = _mapping(manifest.get("tool_path"))
-    for mode, meaning in (
-        ("unconstrained", "grammar off: the candidate above, the runtime's default"),
-        ("constrained", "grammar on: what an application that enables it gets"),
+    for mode, meaning, state in (
+        ("unconstrained", "grammar off: the candidate above, the runtime's default", "grammar off"),
+        ("constrained", "grammar on: what an application that enables it gets", "grammar on"),
     ):
         block = _mapping(_mapping(tool_path.get("modes")).get(mode))
         if block.get("available") is False:
-            lines.append(f"  {meaning}: not measured — {block.get('reason')}")
+            # Not "the candidate above": when a mode was not measured, no
+            # candidate line was printed for it.
+            lines.append(f"  {state}: not measured — {block.get('reason')}")
             continue
         exact = _mapping(_mapping(block.get("score")).get("exact_match"))
         if exact:

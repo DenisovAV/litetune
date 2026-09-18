@@ -121,6 +121,10 @@ def _run(runtime: FakeRuntime, tmp_path: Path, monkeypatch, **spec_extra) -> tup
         "constrained": True,
         "out": str(out),
         "log": str(tmp_path / "runtime.log"),
+        "mark": "litetune-test",
+        # What `runtime_version()` reports here, where litert-lm is not
+        # installed: the version whose log sentences were read.
+        "log_read_from": None,
     }
     spec.update(spec_extra)
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
@@ -283,7 +287,16 @@ PARSE_FAILURE_LOG = (
     "INVALID_ARGUMENT: Failed to parse tool calls from code block: call:secret_tool{}\n"
     "full response: SECRET card 4111\nerror: Failed to parse FC tool calls\n"
 )
-ROW_MARK = _exec(_TOOL_PATH_SCRIPT, "toolpath_script_under_test")["ROW_MARK"]
+SCRIPT = _exec(_TOOL_PATH_SCRIPT, "toolpath_script_under_test")
+PINNED = ("litert-lm==0.16.1",)
+
+
+def started(mark: str, row: int) -> str:
+    return f"\n{mark} {SCRIPT['STARTED']} {row}\n"
+
+
+def finished(mark: str, row: int) -> str:
+    return f"\n{mark} {SCRIPT['FINISHED']} {row}\n"
 
 
 def test_a_reply_the_runtime_refused_carries_the_kind_of_reason_from_its_log(tmp_path, monkeypatch):
@@ -366,7 +379,9 @@ def test_a_conversation_that_cannot_be_created_ends_the_run(tmp_path, monkeypatc
 
     code, out = _run(runtime, tmp_path, monkeypatch, prompts=["a", "b"])
 
-    assert code == 3
+    # Its own exit, so the parent can tell it from a crash: with the grammar on
+    # it is the grammar's refusal.
+    assert code == SCRIPT["CREATE_REFUSED"] == 4
     assert not out.exists()
 
 
@@ -429,20 +444,28 @@ def test_a_row_that_is_not_the_row_at_its_position_is_a_harness_failure(tmp_path
         probe.observe(["a", "b"], constrained=True)
 
 
+class _Crashing(_WritingEnv):
+    """A script that died, leaving `log(mark)` in its log and exiting `code`."""
+
+    requirements = PINNED
+
+    def __init__(self, log, code=-6, stderr=""):
+        self.log, self.code, self.stderr = log, code, stderr
+
+    def run(self, argv, timeout=None):
+        spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+        Path(spec["log"]).write_text(self.log(spec["mark"]), encoding="utf-8")
+        return types.SimpleNamespace(returncode=self.code, stderr=self.stderr)
+
+
 def test_a_native_crash_leaves_its_reason_in_the_error(tmp_path):
     """Found in review: fd 2 pointed at an unlinked temporary file during a
     reply, so a native abort's reason vanished with the process and the run
     said "no stderr". The log is a file the parent reads."""
-
-    class Crashing(_WritingEnv):
-        def run(self, argv, timeout=None):
-            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
-            Path(spec["log"]).write_text(
-                f"\n{ROW_MARK}0\nF0918 kv_cache.cc:12] Check failed: kv_cache != nullptr\n"
-            )
-            return types.SimpleNamespace(returncode=-6, stderr="")
-
-    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=Crashing(None))
+    env = _Crashing(
+        lambda m: started(m, 0) + "F0918 kv_cache.cc:12] Check failed: kv_cache != nullptr\n"
+    )
+    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=env)
 
     with pytest.raises(ToolPathError, match="on prompt 0: .*kv_cache != nullptr"):
         probe.observe(["a"], constrained=False)
@@ -464,15 +487,10 @@ def test_a_crash_quotes_only_the_prompt_it_died_on_and_never_the_models_text(
     full response -- into the manifest a bundle ships, and named as the reason
     for a crash on another prompt."""
 
-    class Crashing(_WritingEnv):
-        def run(self, argv, timeout=None):
-            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
-            Path(spec["log"]).write_text(
-                f"\n{ROW_MARK}0\n{PARSE_FAILURE_LOG}\n{ROW_MARK}1\n{last}", encoding="utf-8"
-            )
-            return types.SimpleNamespace(returncode=-6, stderr="")
-
-    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=Crashing(None))
+    env = _Crashing(
+        lambda m: started(m, 0) + PARSE_FAILURE_LOG + finished(m, 0) + started(m, 1) + last
+    )
+    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=env)
 
     with pytest.raises(ToolPathError) as caught:
         probe.observe(["a", "b"], constrained=True)
@@ -480,6 +498,53 @@ def test_a_crash_quotes_only_the_prompt_it_died_on_and_never_the_models_text(
     said = str(caught.value)
     assert reason in said.split("on prompt 1: ", 1)[1]
     assert "SECRET" not in said and "secret_tool" not in said
+
+
+def test_a_death_between_replies_is_not_blamed_on_the_reply_before_it(tmp_path):
+    """Found in review: nothing marked where a reply ended, so a conversation
+    that could not be created for prompt 1 was reported as prompt 0's parse
+    refusal."""
+    env = _Crashing(
+        lambda m: started(m, 0) + PARSE_FAILURE_LOG + finished(m, 0),
+        code=3,
+        stderr="could not create a conversation with declarations: ValueError: gone",
+    )
+    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=env)
+
+    with pytest.raises(ToolPathError) as caught:
+        probe.observe(["a", "b"], constrained=False)
+
+    assert "on prompt" not in str(caught.value)
+    assert "ValueError: gone" in str(caught.value)
+
+
+def test_a_mark_the_model_wrote_is_not_a_mark(tmp_path):
+    """Found in review: the marks were a fixed sentence, and a parse failure's
+    log line carries the model's full response -- which could write one, and
+    have what followed it quoted. The run's marks carry a token drawn for it."""
+    forged = "litetune tool path: prompt SECRET\nlitetune-0000 started prompt 9\nSECRET too\n"
+    env = _Crashing(lambda m: started(m, 0) + "F0918 x.cc:1] Check failed: real\n" + forged)
+    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=env)
+
+    with pytest.raises(ToolPathError) as caught:
+        probe.observe(["a"], constrained=False)
+
+    assert "on prompt 0:" in str(caught.value)
+    assert "on prompt 9" not in str(caught.value)
+
+
+def test_a_crash_log_is_quoted_only_where_the_runtime_is_the_one_read(tmp_path):
+    """On another runtime a parse failure worded differently would not read as
+    one, and its line carries the model's text."""
+    env = _Crashing(lambda m: started(m, 0) + "E0918 x.cc:1] Reworded failure: SECRET\n")
+    env.requirements = ("litert-lm==0.17.0",)
+    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=env)
+
+    with pytest.raises(ToolPathError) as caught:
+        probe.observe(["a"], constrained=False)
+
+    assert "SECRET" not in str(caught.value)
+    assert "not quoted" in str(caught.value)
 
 
 def test_the_script_marks_each_reply_in_the_log_with_the_mark_the_parent_reads(
@@ -490,8 +555,26 @@ def test_the_script_marks_each_reply_in_the_log_with_the_mark_the_parent_reads(
     _run(runtime, tmp_path, monkeypatch, prompts=["a", "b"])
 
     log = (tmp_path / "runtime.log").read_text(encoding="utf-8")
-    assert log.index(f"{ROW_MARK}0") < log.index("first") < log.index(f"{ROW_MARK}1")
-    assert log.index(f"{ROW_MARK}1") < log.index("second")
+    order = [
+        started("litetune-test", 0),
+        "first",
+        finished("litetune-test", 0),
+        started("litetune-test", 1),
+        "second",
+        finished("litetune-test", 1),
+    ]
+    positions = [log.index(part) for part in order]
+    assert positions == sorted(positions)
+
+
+def test_a_row_reason_is_quoted_only_on_the_runtime_whose_log_was_read(tmp_path, monkeypatch):
+    runtime = FakeRuntime(replies=[SEND_FAILED], logs={0: "E0918 x.cc:1] INTERNAL: SECRET\n"})
+
+    _, out = _run(runtime, tmp_path, monkeypatch, log_read_from="0.16.1")
+
+    (row,) = _rows_written(out)
+    assert row["kind"] == "other"
+    assert "SECRET" not in row["error"]
 
 
 def test_output_that_is_not_json_is_a_harness_failure(tmp_path):
@@ -547,7 +630,8 @@ class CannedEnv:
     fail: str | None = None
     # Fail only these modes, when `fail` is set; every mode otherwise.
     fail_modes: tuple[str, ...] = ("constrained", "unconstrained")
-    runtime_version: str = "0.16.1"
+    runtime_version: str | None = "0.16.1"
+    fail_code: int = 3
     # Every spec the script was handed, so a test can see what reached it.
     specs: list[dict] = field(default_factory=list)
 
@@ -559,7 +643,7 @@ class CannedEnv:
         self.specs.append(spec)
         mode = "constrained" if spec["constrained"] else "unconstrained"
         if self.fail is not None and mode in self.fail_modes:
-            return types.SimpleNamespace(returncode=3, stderr=self.fail)
+            return types.SimpleNamespace(returncode=self.fail_code, stderr=self.fail)
         written = {"runtime_version": self.runtime_version, "rows": self.by_mode[mode]}
         Path(spec["out"]).write_text(json.dumps(written), encoding="utf-8")
         return types.SimpleNamespace(returncode=0, stderr="")
@@ -1441,3 +1525,51 @@ def test_a_structural_backend_that_keeps_no_rows_is_not_a_model_that_returned_no
 
     assert result.status is Status.FAILED_HARNESS
     assert "keeps no per-mode rows" in json.dumps(result.manifest["liveness"])
+
+
+@pytest.mark.parametrize("constrained, status", [(True, Status.PASSED), (False, None)])
+def test_a_conversation_refused_with_the_grammar_on_is_the_grammars_refusal(
+    tmp_path, constrained, status
+):
+    """Found in review: the grammar is built in two places -- the provider when
+    a conversation is created, the per-tools constraint on the first send --
+    and a failure in the first ended the run, discarding the grammar-off rows,
+    while one in the second left the mode unmeasured. With the grammar off the
+    same declarations made a conversation a moment before, so a refusal with it
+    on is the grammar's. With it off there is nothing to measure."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"unconstrained": _rows(rows_, hits=8), "constrained": _rows(rows_, hits=8)},
+        fail="could not create a conversation with declarations: RuntimeError: SentencePiece",
+        fail_modes=("constrained",) if constrained else ("unconstrained",),
+        fail_code=4,
+    )
+
+    if status is not None:
+        assert result.status is status
+        reason = result.manifest["tool_path"]["modes"]["constrained"]["reason"]
+        assert "SentencePiece" in reason
+        assert any("grammar-on run was not measured" in x for x in result.manifest["limitations"])
+    else:
+        assert result.status is Status.FAILED_HARNESS
+        assert "with the grammar off" in json.dumps(result.manifest["liveness"])
+
+
+def test_a_grammar_off_run_not_measured_keeps_the_runtime_version_and_names_the_prompts(tmp_path):
+    """Found in review: the version was set only after a mode passed, so the
+    one exit a differently worded runtime takes carried none, and no limitation
+    said so; the reason named no prompt."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"unconstrained": _other_on(rows_, 2, answered=6), "constrained": _rows(rows_, hits=8)},
+        runtime_version="0.17.0",
+    )
+
+    assert result.status is Status.FAILED_HARNESS
+    assert result.manifest["measurements"]["candidate"]["engine"]["runtime_version"] == "0.17.0"
+    assert any("this run used 0.17.0" in x for x in result.manifest["limitations"])
+    assert "(prompt 6, 7)" in json.dumps(result.manifest["tool_path"])

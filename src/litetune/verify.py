@@ -416,15 +416,6 @@ def _score_tool_path(
         ),
         "default_established_on": GRAMMAR_OFF_BY_DEFAULT_IN,
     }
-    if backend.runtime_version != GRAMMAR_OFF_BY_DEFAULT_IN:
-        run.limitation(
-            "that the runtime leaves constrained decoding off unless an application enables it, "
-            "and the log sentences a missing reply's kind is read from, were read from litert-lm "
-            f"{GRAMMAR_OFF_BY_DEFAULT_IN}'s source; this run used "
-            f"{backend.runtime_version or 'a version it could not name'}, where they were not "
-            "checked, so calling the grammar-off run the default is an assumption here, and a "
-            "reply the runtime words differently ends the run rather than being scored"
-        )
     # Only the grammar-on run can be unmeasured here: without the grammar-off
     # one nothing is scored.
     if "constrained" in backend.unavailable:
@@ -489,7 +480,7 @@ def _unanswered(rows: list[ToolPathRow], indices: list[int]) -> dict[str, Any]:
     """What one mode's rows say about the prompts that got no single call back.
 
     Over `of` prompts, which is every row at liveness and the labelled ones
-    when scored. A no-reply is a parse failure or a prompt over the token
+    when scored. A no-reply is a parse failure or a prompt at the token
     limit: a mode with any other reason is not measured at all
     (`toolpath._refuse_a_mode_with_unread_reasons`).
     """
@@ -517,6 +508,23 @@ def _why_no_reply(unanswered: dict[str, Any]) -> str:
             "bundle rather than an answer the model gave"
         )
     return f"{unanswered['no_reply']} prompts: " + ", ".join(parts)
+
+
+def _runtime_version_limitation(run: Any, backend: ToolPathBackend) -> None:
+    """Say so when the runtime is not the version what litetune reads was read from.
+
+    At the first exit a tool-path run can take, not at scoring: a reply worded
+    differently is exactly what ends a run at liveness.
+    """
+    if backend.runtime_version != GRAMMAR_OFF_BY_DEFAULT_IN:
+        run.limitation(
+            "that the runtime leaves constrained decoding off unless an application enables it, "
+            "and the log sentences a missing reply's kind is read from, were read from litert-lm "
+            f"{GRAMMAR_OFF_BY_DEFAULT_IN}'s source; this run used "
+            f"{backend.runtime_version or 'a version it could not name'}, where they were not "
+            "checked, so calling the grammar-off run the default is an assumption here, and a "
+            "reply the runtime words differently leaves its mode unmeasured rather than scored"
+        )
 
 
 def _unavailable_modes(backend: ToolPathBackend) -> dict[str, dict[str, Any]]:
@@ -1121,6 +1129,7 @@ def run_verify(
                 }
                 | _unavailable_modes(pair.candidate)
             }
+            _runtime_version_limitation(run, pair.candidate)
     else:
         live = liveness_tier(
             candidate,

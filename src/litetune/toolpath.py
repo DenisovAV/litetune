@@ -43,6 +43,8 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import re
+import secrets
 import subprocess
 import tempfile
 from collections.abc import Sequence
@@ -64,6 +66,10 @@ TOOL_PATH_TIMEOUT_S = 3600
 
 class ToolPathError(RuntimeError):
     """The tool path could not be measured at all. Never a statement about the model."""
+
+
+class ConversationRefused(ToolPathError):
+    """The runtime would not create a conversation with these declarations in this mode."""
 
 
 class NotMeasured(ToolPathError):
@@ -92,9 +98,16 @@ NO_REPLY = "send_message failed"
 # absl's line prefix: severity, date, time, thread, file:line].
 ABSL_PREFIX = re.compile(r"^[IWEF][0-9]{4} [0-9:.]+ +[0-9]+ [^ \]]+:[0-9]+\] *")
 
-# Written to the log before each reply, so that a process that dies mid-reply
-# leaves its log cut into prompts, and only the last one is read for why.
-ROW_MARK = "litetune tool path: prompt "
+# Written to the log on lines of their own before and after each reply, so a
+# process that dies mid-reply leaves its log cut into prompts and the parent
+# reads only the one it died on. Each begins with a token the parent draws for
+# the run, which no model output can carry, because the log holds the model's
+# text too.
+STARTED = "started prompt"
+FINISHED = "finished prompt"
+
+# The script's exit when the runtime would not create a conversation at all.
+CREATE_REFUSED = 4
 
 
 def text_of(reply):
@@ -128,7 +141,7 @@ def calls_of(reply):
     return calls
 
 
-def logged(action, log_path, row):
+def logged(action, log_path, row, mark):
     """Run `action` with file descriptor 2 appended to `log_path`.
 
     Returns (reply, no-reply exception, what the runtime logged). The binding
@@ -136,13 +149,13 @@ def logged(action, log_path, row):
     writes the reason to file descriptor 2, so the descriptor itself is
     redirected -- `sys.stderr` is not where native code writes. Into a file the
     parent can read, not a temporary one: if native code aborts mid-call, the
-    reason it wrote would otherwise vanish with the process. The row's mark
-    goes first, so the parent can tell this reply's lines from the ones before.
+    reason it wrote would otherwise vanish with the process. The reply's lines
+    sit between its two marks, so the parent can tell them from the others.
     """
     sys.stderr.flush()
     saved = os.dup(2)
     with open(log_path, "ab") as capture:
-        capture.write(f"\n{ROW_MARK}{row}\n".encode("utf-8"))
+        capture.write(f"\n{mark} {STARTED} {row}\n".encode("utf-8"))
         capture.flush()
         start = capture.tell()
         os.dup2(capture.fileno(), 2)
@@ -159,16 +172,22 @@ def logged(action, log_path, row):
     with open(log_path, "rb") as written:
         written.seek(start)
         log = written.read().decode("utf-8", errors="replace")
+    with open(log_path, "ab") as capture:
+        capture.write(f"\n{mark} {FINISHED} {row}\n".encode("utf-8"))
     return result, error, log
 
 
-def reason_of(log):
+def reason_of(log, quote=True):
     """(kind, reason) for a reply the runtime did not give, without the model's text.
 
     A parse failure's message carries the model's code block and full response
     (`parser_utils.cc`), and that must not travel into a manifest a bundle
     ships, so a parse failure is its kind alone. The two kinds are told apart
-    by the runtime's own sentences, both in `liblitert-lm` 0.16.1.
+    by the runtime's own sentences, both in `liblitert-lm` 0.16.1. Any other
+    reason is the runtime's last error line, or its last line -- only where
+    `quote` says the runtime is the version those sentences were read from: on
+    another, a parse failure worded differently would land here, model text and
+    all.
     """
     if "Failed to parse tool calls" in log:
         return "parse", "its call parser rejected the generation"
@@ -178,6 +197,8 @@ def reason_of(log):
             "the prompt, with the declarations the runtime renders into it, reached the "
             "bundle's token limit",
         )
+    if not quote:
+        return "other", "not quoted: litetune read the log of another runtime version"
     lines = [ABSL_PREFIX.sub("", line).strip() for line in log.splitlines()]
     lines = [line for line in lines if line]
     errors = [line for line in lines if "rror" in line or "ailed" in line] or lines
@@ -204,6 +225,7 @@ def main():
         pass
 
     executed = []
+    version = runtime_version()
 
     class Declared(litert_lm.Tool):
         """A declaration the runtime renders and must never run.
@@ -255,10 +277,10 @@ def main():
                     "could not create a conversation with declarations: "
                     f"{type(exc).__name__}: {exc}\n"
                 )
-                return 3
+                return CREATE_REFUSED
             with conversation:
                 reply, exc, log = logged(
-                    lambda: conversation.send_message(prompt), spec["log"], index
+                    lambda: conversation.send_message(prompt), spec["log"], index, spec["mark"]
                 )
             if executed:
                 sys.stderr.write(
@@ -269,7 +291,7 @@ def main():
             if exc is not None:
                 # A result about this row: the runtime gave no reply an
                 # application could act on. Its reason is in its log.
-                kind, reason = reason_of(log)
+                kind, reason = reason_of(log, quote=version == spec["log_read_from"])
                 rows.append(
                     {"index": index, "calls": [], "text": "", "error": reason, "kind": kind}
                 )
@@ -284,7 +306,7 @@ def main():
                 }
             )
     Path(spec["out"]).write_text(
-        json.dumps({"runtime_version": runtime_version(), "rows": rows}), encoding="utf-8"
+        json.dumps({"runtime_version": version, "rows": rows}), encoding="utf-8"
     )
     return 0
 
@@ -307,21 +329,29 @@ def _script() -> dict[str, Any]:
     return namespace
 
 
-def _said_before_dying(log: Path) -> str:
-    """Why a run that died mid-reply died, from its last prompt's lines only.
+def _said_before_dying(log: Path, mark: str, quote: bool) -> str:
+    """Why a run that died mid-reply died, from that reply's lines only.
 
     The log holds every earlier reply's lines too, and a parse failure's carry
     the model's code block and full response (`parser_utils.cc`), so they are
-    never quoted: the last prompt's lines go through the rule the script uses
-    for a row. Empty when the run died outside a reply.
+    never quoted: the lines after the last reply that started and never
+    finished go through the rule the script uses for a row. Empty when the run
+    died outside a reply. The marks carry the run's own token, which no line
+    the model wrote can.
     """
     text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
-    _, mark, last = text.rpartition(_script()["ROW_MARK"])
-    if not mark:
+    script = _script()
+    marks = list(
+        re.finditer(
+            rf"^{re.escape(mark)} ({script['STARTED']}|{script['FINISHED']}) ([0-9]+)$",
+            text,
+            re.MULTILINE,
+        )
+    )
+    if not marks or marks[-1].group(1) != script["STARTED"]:
         return ""
-    number, _, said = last.partition("\n")
-    _, reason = _script()["reason_of"](said)
-    return f" on prompt {number}: {reason}"
+    _, reason = script["reason_of"](text[marks[-1].end() :], quote=quote)
+    return f" on prompt {marks[-1].group(2)}: {reason}"
 
 
 @dataclass(frozen=True)
@@ -437,6 +467,7 @@ class ToolPathProbe:
             out = work / "rows.json"
             log = work / "runtime.log"
             spec = work / "spec.json"
+            mark = f"litetune-{secrets.token_hex(8)}"
             spec.write_text(
                 json.dumps(
                     {
@@ -447,6 +478,8 @@ class ToolPathProbe:
                         "constrained": constrained,
                         "out": str(out),
                         "log": str(log),
+                        "mark": mark,
+                        "log_read_from": GRAMMAR_OFF_BY_DEFAULT_IN,
                     }
                 ),
                 encoding="utf-8",
@@ -469,12 +502,20 @@ class ToolPathProbe:
             if proc.returncode != 0 or not out.is_file():
                 reading = read_returncode(proc.returncode)
                 # Where a native abort mid-reply leaves its reason: the log,
-                # which fd 2 pointed at. Outside a reply it is stderr.
-                stderr = (proc.stderr or "").strip()[-400:]
-                raise ToolPathError(
-                    f"the tool-path script {reading.describe('the model')}"
-                    f"{_said_before_dying(log)}; stderr: {stderr or 'empty'}"
+                # which fd 2 pointed at. Outside a reply it is stderr. The log
+                # is quoted only where the environment pins the runtime whose
+                # sentences were read, as the script quotes a row's.
+                pinned = f"litert-lm=={GRAMMAR_OFF_BY_DEFAULT_IN}" in getattr(
+                    self.env, "requirements", ()
                 )
+                stderr = (proc.stderr or "").strip()[-400:]
+                said = (
+                    f"the tool-path script {reading.describe('the model')}"
+                    f"{_said_before_dying(log, mark, pinned)}; stderr: {stderr or 'empty'}"
+                )
+                if proc.returncode == _script()["CREATE_REFUSED"]:
+                    raise ConversationRefused(said)
+                raise ToolPathError(said)
             try:
                 written = json.loads(out.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -504,9 +545,13 @@ def _refuse_a_mode_with_unread_reasons(rows: list[ToolPathRow]) -> None:
     unread = [row for row in rows if row.kind == "other"]
     if unread:
         reasons = sorted({row.error or "" for row in unread})
+        which = ", ".join(str(row.index) for row in unread[:5]) + (
+            f" and {len(unread) - 5} more" if len(unread) > 5 else ""
+        )
         raise NotMeasured(
-            f"the runtime gave no reply to {len(unread)} of {len(rows)} prompts for a reason "
-            f"litetune does not read as the model's: {'; '.join(reasons)[:300]}"
+            f"the runtime gave no reply to {len(unread)} of {len(rows)} prompts (prompt "
+            f"{which}) for a reason litetune does not read as the model's: "
+            f"{'; '.join(reasons)[:300]}"
         )
 
 
@@ -559,8 +604,8 @@ class ToolPathBackend:
     # Filled by `generate`: the rows from each mode, kept so the manifest can
     # carry both numbers rather than only the one that was scored.
     rows: dict[str, list[ToolPathRow]] = field(default_factory=dict, init=False)
-    # A mode that was not measured, and why. Grammar off landing here means
-    # nothing was measured: it is what the reference is compared with.
+    # A mode that was not measured, and why. Grammar off landing here, or
+    # anything ending the run, means nothing is scored: the reason says which.
     unavailable: dict[str, str] = field(default_factory=dict, init=False)
     runtime_version: str | None = field(default=None, init=False)
 
@@ -634,20 +679,28 @@ class ToolPathBackend:
         # Grammar off first: it is the run the reference is compared with, so
         # the grammar-on run not being measured must not cost it.
         for mode, constrained in (("unconstrained", False), ("constrained", True)):
+            state = "on" if constrained else "off"
             try:
                 rows = probe.observe(prompts, constrained=constrained, events=events)
+                # Before the rows are judged: a mode not measured is where the
+                # runtime's version matters most.
+                self.runtime_version = probe.runtime_version
                 _refuse_a_mode_with_unread_reasons(rows)
             except ToolPathError as exc:
                 logger.warning("the tool path could not be measured (%s): %s", mode, exc)
-                self.unavailable[mode] = str(exc)
-                if mode == "constrained" and isinstance(exc, NotMeasured):
+                # A conversation the runtime would not create with the grammar
+                # on is the grammar's refusal: with it off, the same
+                # declarations made one for every prompt a moment ago.
+                if constrained and isinstance(exc, NotMeasured | ConversationRefused):
+                    self.unavailable[mode] = str(exc)
                     continue
+                self.unavailable[mode] = f"the run ended: {exc}"
                 # Nothing is scored. Every prompt carries the same harness
                 # error, which is what keeps these rows out of the score
                 # entirely instead of counting as wrong answers.
-                return [Generation(i, p, harness_error=str(exc)) for i, p in enumerate(prompts)]
+                ended = f"with the grammar {state}: {exc}"
+                return [Generation(i, p, harness_error=ended) for i, p in enumerate(prompts)]
             self.rows[mode] = rows
-            self.runtime_version = probe.runtime_version
         return [
             Generation(
                 index=row.index,
