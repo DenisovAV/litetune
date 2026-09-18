@@ -9,6 +9,7 @@ and neither needs a bundle to pin.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import types
 from dataclasses import dataclass, field
@@ -41,24 +42,35 @@ class FakeRuntime:
     conversations: list[dict] = field(default_factory=list)
     sent: list[str] = field(default_factory=list)
     create_raises: BaseException | None = None
+    # What the native runtime writes to file descriptor 2 before a reply fails.
+    logs: dict[int, str] = field(default_factory=dict)
+    # Execute the declared tools, as the binding does with automatic calling on.
+    execute_tools: bool = False
 
 
 def _fake_litert_lm(runtime: FakeRuntime) -> Any:
     module: Any = types.ModuleType("litert_lm")
 
     class Conversation:
-        def __init__(self, **kwargs: Any):
-            runtime.conversations.append(kwargs)
-
         def __enter__(self) -> Conversation:
             return self
 
         def __exit__(self, *exc: object) -> None:
             return None
 
+        def __init__(self, **kwargs: Any):
+            runtime.conversations.append(kwargs)
+            self.tools = kwargs.get("tools") or []
+
         def send_message(self, prompt: str) -> Any:
             runtime.sent.append(prompt)
-            reply = runtime.replies[len(runtime.sent) - 1]
+            index = len(runtime.sent) - 1
+            if index in runtime.logs:
+                os.write(2, runtime.logs[index].encode("utf-8"))
+            if runtime.execute_tools:
+                for tool in self.tools:
+                    tool.execute({})
+            reply = runtime.replies[index]
             if isinstance(reply, BaseException):
                 raise reply
             return reply
@@ -142,16 +154,17 @@ def test_it_asks_the_runtime_the_question_an_application_asks(tmp_path, monkeypa
     assert [tool.get_tool_description() for tool in args["tools"]] == TOOLS
 
 
-def test_a_declared_tool_raises_rather_than_running(tmp_path, monkeypatch):
-    """The guard behind the flag above. If automatic calling were ever on, the
-    run says so instead of quietly executing a caller's function."""
-    runtime = FakeRuntime(replies=[_reply("set_colour", {})])
+def test_a_declared_tool_asked_to_run_stops_the_run(tmp_path, monkeypatch):
+    """With automatic calling off the binding returns before it can run a tool,
+    so `execute` is unreachable. If it is ever reached anyway, the run stops
+    and says so: the binding catches what `execute` raises and would hand the
+    text back to the model as a tool response, changing the reply."""
+    runtime = FakeRuntime(replies=[_reply("set_colour", {})], execute_tools=True)
 
-    _run(runtime, tmp_path, monkeypatch)
+    code, out = _run(runtime, tmp_path, monkeypatch)
 
-    (args,) = runtime.conversations
-    with pytest.raises(AssertionError, match="automatic tool calling should be off"):
-        args["tools"][0].execute({})
+    assert code == 3
+    assert not out.exists()
 
 
 @pytest.mark.parametrize("constrained", [True, False])
@@ -170,6 +183,11 @@ def test_the_decoding_mode_reaches_the_runtime(tmp_path, monkeypatch, constraine
 # -- what it writes ----------------------------------------------------------
 
 
+def _rows_written(out: Path) -> list[dict]:
+    written = json.loads(out.read_text(encoding="utf-8"))
+    return written["rows"]
+
+
 def test_a_structured_call_comes_back_with_its_argument_types(tmp_path, monkeypatch):
     """The runtime types the arguments, and that survives to the row.
 
@@ -181,13 +199,46 @@ def test_a_structured_call_comes_back_with_its_argument_types(tmp_path, monkeypa
 
     _, out = _run(runtime, tmp_path, monkeypatch)
 
-    (row,) = json.loads(out.read_text(encoding="utf-8"))
+    (row,) = _rows_written(out)
     assert row == {
         "index": 0,
-        "call": {"name": "set_alarm", "arguments": {"hour": 7.0, "loud": True}},
+        "calls": [{"name": "set_alarm", "arguments": {"hour": 7.0, "loud": True}}],
         "text": "",
         "error": None,
+        "parse_refusal": False,
     }
+
+
+def test_every_call_in_a_reply_is_kept(tmp_path, monkeypatch):
+    """An application acts on each call it is handed, so a second one is part of
+    the answer. Keeping only the first scored a reply with an extra call as a
+    clean match."""
+    reply = _reply("set_colour", {"colour": "red"})
+    reply["tool_calls"].append({"type": "function", "function": {"name": "open_app"}})
+    runtime = FakeRuntime(replies=[reply])
+
+    _, out = _run(runtime, tmp_path, monkeypatch)
+
+    (row,) = _rows_written(out)
+    assert [call["name"] for call in row["calls"]] == ["set_colour", "open_app"]
+
+
+def test_the_runtimes_version_is_written_beside_the_rows(tmp_path, monkeypatch):
+    """A manifest that cannot say which runtime produced its rows cannot be
+    compared with a run on another one."""
+    import importlib.metadata
+
+    real = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: "0.16.1" if name == "litert-lm" else real(name),
+    )
+    runtime = FakeRuntime(replies=[_reply("set_colour", {})])
+
+    _, out = _run(runtime, tmp_path, monkeypatch)
+
+    assert json.loads(out.read_text(encoding="utf-8"))["runtime_version"] == "0.16.1"
 
 
 def test_a_reply_with_no_call_is_a_result_not_a_failure(tmp_path, monkeypatch):
@@ -198,8 +249,8 @@ def test_a_reply_with_no_call_is_a_result_not_a_failure(tmp_path, monkeypatch):
 
     _, out = _run(runtime, tmp_path, monkeypatch)
 
-    (row,) = json.loads(out.read_text(encoding="utf-8"))
-    assert row["call"] is None
+    (row,) = _rows_written(out)
+    assert row["calls"] == []
     assert row["error"] is None
     assert row["text"] == "I cannot do that."
 
@@ -210,7 +261,7 @@ def test_every_prompt_gets_a_row_in_order(tmp_path, monkeypatch):
 
     _, out = _run(runtime, tmp_path, monkeypatch, prompts=prompts)
 
-    rows = json.loads(out.read_text(encoding="utf-8"))
+    rows = _rows_written(out)
     assert [row["index"] for row in rows] == [0, 1, 2]
     assert runtime.sent == prompts
     # One conversation per prompt: every row is a first turn, as every other
@@ -220,26 +271,33 @@ def test_every_prompt_gets_a_row_in_order(tmp_path, monkeypatch):
 
 # -- how it fails ------------------------------------------------------------
 
+# What the binding raises for every failed reply, in LiteRT-LM v0.16.1.
+SEND_FAILED = RuntimeError("litert_lm_conversation_send_message failed")
 
-def test_the_runtimes_refusal_of_one_row_is_recorded_not_raised(tmp_path, monkeypatch):
-    """`Failed to parse tool calls from code block` is the runtime rejecting a
-    generation. It is a fact about that row, in the runtime's own words, and the
-    rows around it are still measurable."""
+
+def test_a_reply_the_runtime_refused_carries_the_reason_from_its_log(tmp_path, monkeypatch):
+    """The binding says only that the reply failed; the runtime says why, on its
+    log. The first version recorded the binding's sentence -- the same on every
+    row -- and called it the runtime's own words."""
     runtime = FakeRuntime(
-        replies=[
-            _reply("set_colour", {"colour": "red"}),
-            ValueError("INVALID_ARGUMENT: Failed to parse tool calls from code block"),
-            _reply("set_colour", {"colour": "blue"}),
-        ]
+        replies=[_reply("set_colour", {"colour": "red"}), SEND_FAILED, SEND_FAILED],
+        logs={
+            1: "E0918 conversation.cc:88] INVALID_ARGUMENT: Failed to parse tool calls from "
+            "code block\n",
+            2: "E0918 conversation.cc:91] Failed to send message: input is too long\n",
+        },
     )
 
     code, out = _run(runtime, tmp_path, monkeypatch, prompts=["a", "b", "c"])
 
     assert code == 0
-    rows = json.loads(out.read_text(encoding="utf-8"))
-    assert rows[1]["call"] is None
+    rows = _rows_written(out)
+    assert rows[0]["calls"] and rows[0]["error"] is None
     assert "Failed to parse tool calls" in rows[1]["error"]
-    assert rows[0]["call"] is not None and rows[2]["call"] is not None
+    assert rows[1]["parse_refusal"] is True
+    assert "input is too long" in rows[2]["error"]
+    assert rows[2]["parse_refusal"] is False
+    assert all(row["calls"] == [] for row in rows[1:])
 
 
 def test_a_conversation_that_cannot_be_created_ends_the_run(tmp_path, monkeypatch):
@@ -259,40 +317,91 @@ def test_a_conversation_that_cannot_be_created_ends_the_run(tmp_path, monkeypatc
 # -- the probe around it -----------------------------------------------------
 
 
+class _WritingEnv:
+    """A runtime environment whose script writes `written` as its output."""
+
+    name = "runtime"
+
+    def __init__(self, written: Any):
+        self.written = written
+
+    def provision(self, events=None):
+        return None
+
+    def run(self, argv, timeout=None):
+        spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+        Path(spec["out"]).write_text(json.dumps(self.written), encoding="utf-8")
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+
+def _row(index: int, **fields: Any) -> dict:
+    return {"index": index, "calls": [], "text": "", "error": None, "parse_refusal": False} | fields
+
+
 def test_a_script_that_writes_the_wrong_number_of_rows_is_a_harness_failure(tmp_path):
     """Silent truncation would score the missing prompts as unanswered."""
-
-    class ShortEnv:
-        name = "runtime"
-
-        def provision(self, events=None):
-            return None
-
-        def run(self, argv, timeout=None):
-            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
-            Path(spec["out"]).write_text(json.dumps([{"index": 0}]), encoding="utf-8")
-            return types.SimpleNamespace(returncode=0, stderr="")
-
-    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=ShortEnv())
+    probe = ToolPathProbe(
+        model=tmp_path / "m.litertlm", declarations=TOOLS, env=_WritingEnv({"rows": [_row(0)]})
+    )
 
     with pytest.raises(ToolPathError, match="wrote 1 rows for 2 prompts"):
         probe.observe(["a", "b"], constrained=True)
 
 
-def test_a_refused_row_says_so(tmp_path):
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [_row(1), _row(0)],  # swapped: scoring pairs by position
+        [_row(0, calls={"name": "t"}), _row(1)],
+        [_row(0), "not a row"],
+    ],
+)
+def test_a_row_that_is_not_the_row_at_its_position_is_a_harness_failure(tmp_path, rows):
+    """Found in review: a row was built with `ToolPathRow(**row)` and its index
+    never checked, so two swapped rows were scored against each other's
+    targets, and an unexpected field escaped as a `TypeError` from a backend
+    that promises never to raise."""
+    probe = ToolPathProbe(
+        model=tmp_path / "m.litertlm", declarations=TOOLS, env=_WritingEnv({"rows": rows})
+    )
+
+    with pytest.raises(ToolPathError):
+        probe.observe(["a", "b"], constrained=True)
+
+
+def test_output_that_is_not_json_is_a_harness_failure(tmp_path):
+    class Garbled(_WritingEnv):
+        def run(self, argv, timeout=None):
+            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            Path(spec["out"]).write_text("{not json", encoding="utf-8")
+            return types.SimpleNamespace(returncode=0, stderr="")
+
+    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=Garbled(None))
+
+    with pytest.raises(ToolPathError, match="unreadable"):
+        probe.observe(["a"], constrained=True)
+
+
+def test_a_row_answers_with_one_call_or_none():
+    one = {"name": "t", "arguments": {}}
     assert ToolPathRow(0, error="boom").refused is True
-    assert ToolPathRow(0, call={"name": "t", "arguments": {}}).refused is False
+    assert ToolPathRow(0, calls=(one,)).refused is False
+    assert ToolPathRow(0, calls=(one,)).call == one
+    # Two calls are not the one call a target asks for.
+    assert ToolPathRow(0, calls=(one, one)).call is None
+    assert ToolPathRow(0).call is None
 
 
 # -- the backend, and how `verify` picks it ----------------------------------
 
 
-from conftest import FakeBackend, correct_texts, labelled_rows  # noqa: E402
+from conftest import FakeBackend, call_text, correct_texts, labelled_rows  # noqa: E402
 
 from litetune.prompt_mode import PromptMode  # noqa: E402
 from litetune.toolpath import ToolPathBackend  # noqa: E402
 from litetune.verify import (  # noqa: E402
     BackendPair,
+    ReferenceRole,
     Status,
     VerifyRequest,
     build_backends,
@@ -310,17 +419,27 @@ class CannedEnv:
     by_mode: dict[str, list[dict]]
     name: str = "runtime"
     fail: str | None = None
+    # Every spec the script was handed, so a test can see what reached it.
+    specs: list[dict] = field(default_factory=list)
 
     def provision(self, events=None):
         return None
 
     def run(self, argv, timeout=None):
         spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+        self.specs.append(spec)
         if self.fail is not None:
             return types.SimpleNamespace(returncode=3, stderr=self.fail)
         mode = "constrained" if spec["constrained"] else "unconstrained"
-        Path(spec["out"]).write_text(json.dumps(self.by_mode[mode]), encoding="utf-8")
+        written = {"runtime_version": "0.16.1", "rows": self.by_mode[mode]}
+        Path(spec["out"]).write_text(json.dumps(written), encoding="utf-8")
         return types.SimpleNamespace(returncode=0, stderr="")
+
+
+PARSE_REFUSED = (
+    "RuntimeError: litert_lm_conversation_send_message failed: "
+    "INVALID_ARGUMENT: Failed to parse tool calls from code block"
+)
 
 
 def _rows(rows_, hits: int, refusals: int = 0) -> list[dict]:
@@ -329,52 +448,30 @@ def _rows(rows_, hits: int, refusals: int = 0) -> list[dict]:
     for i, row in enumerate(rows_):
         target = row["target"]
         if i < hits:
-            out.append(
-                {
-                    "index": i,
-                    "call": {"name": target["name"], "arguments": target["args"]},
-                    "text": "",
-                    "error": None,
-                }
-            )
+            calls = [{"name": target["name"], "arguments": target["args"]}]
+            out.append(_row(i, calls=calls))
         elif i < hits + refusals:
-            out.append(
-                {
-                    "index": i,
-                    "call": None,
-                    "text": "",
-                    "error": "INVALID_ARGUMENT: Failed to parse tool calls from code block",
-                }
-            )
+            out.append(_row(i, error=PARSE_REFUSED, parse_refusal=True))
         else:
-            out.append(
-                {
-                    "index": i,
-                    "call": {"name": target["name"], "arguments": {"color": "no"}},
-                    "text": "",
-                    "error": None,
-                }
-            )
+            out.append(_row(i, calls=[{"name": target["name"], "arguments": {"color": "no"}}]))
     return out
 
 
-def _verify(tmp_path, rows_, by_mode, **kwargs):
+def _verify(tmp_path, rows_, by_mode, reference_texts=None, request_extra=None, **kwargs):
     split = tmp_path / "heldout.jsonl"
     split.write_text("\n".join(json.dumps(r) for r in rows_) + "\n", encoding="utf-8")
-    candidate = ToolPathBackend(
-        model=tmp_path / "m.litertlm",
-        declarations=DECLS,
-        env=CannedEnv(by_mode=by_mode, **kwargs),
-    )
+    env = CannedEnv(by_mode=by_mode, **kwargs)
+    candidate = ToolPathBackend(model=tmp_path / "m.litertlm", declarations=DECLS, env=env)
     request = VerifyRequest(
         model=tmp_path / "m.litertlm",
         reference="org/reference",
         data=split,
         prompt_mode=PromptMode.RUNTIME_RENDERED,
+        **(request_extra or {}),
     )
     reference = FakeBackend(
         model="org/reference",
-        texts=correct_texts(rows_),
+        texts=reference_texts if reference_texts is not None else correct_texts(rows_),
         prompt_mode=PromptMode.RUNTIME_RENDERED,
     )
     return run_verify(request, backends=BackendPair(candidate=candidate, reference=reference))
@@ -404,13 +501,7 @@ def test_an_integer_the_runtime_returns_as_a_double_scores_as_that_integer(tmp_p
         for h in range(8)
     ]
     returned = [
-        {
-            "index": h,
-            "call": {"name": "set_alarm", "arguments": {"hour": float(h)}},
-            "text": "",
-            "error": None,
-        }
-        for h in range(8)
+        _row(h, calls=[{"name": "set_alarm", "arguments": {"hour": float(h)}}]) for h in range(8)
     ]
 
     result = _verify(tmp_path, rows_, {"constrained": returned, "unconstrained": returned})
@@ -432,15 +523,21 @@ def test_both_decoding_modes_are_reported(tmp_path):
     assert path["unconstrained"]["score"]["exact_match"]["value"] == pytest.approx(0.5)
 
 
-def test_modes_that_disagree_raise_a_limitation(tmp_path):
-    """The grammar can carry a model that never learned the format. A run that
-    reported only the constrained number would report such a model as working."""
+@pytest.mark.parametrize(
+    "on, off, direction",
+    [(8, 4, "The grammar raised the score"), (4, 8, "The grammar lowered the score")],
+)
+def test_modes_that_disagree_say_which_way(tmp_path, on, off, direction):
+    """The first wording said a gap was "the model leaning on the grammar", and
+    the one gap ever measured went the other way: the grammar removed arguments."""
     rows_ = labelled_rows(8)
     result = _verify(
-        tmp_path, rows_, {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 4)}
+        tmp_path, rows_, {"constrained": _rows(rows_, on), "unconstrained": _rows(rows_, off)}
     )
 
-    assert any("did not agree" in limitation for limitation in result.manifest["limitations"])
+    (text,) = [x for x in result.manifest["limitations"] if "did not agree" in x]
+    assert direction in text
+    assert "grammar-off number is what an application gets by default" in text
 
 
 def test_modes_that_agree_raise_none(tmp_path):
@@ -452,19 +549,85 @@ def test_modes_that_agree_raise_none(tmp_path):
     assert not any("did not agree" in limitation for limitation in result.manifest["limitations"])
 
 
-def test_a_refusal_is_counted_and_kept_out_of_the_score(tmp_path):
-    """A model whose output the parser rejected failed differently from one that
-    called the wrong tool, and an average over both describes neither."""
+def test_a_prompt_the_runtime_gave_no_reply_to_is_a_wrong_answer(tmp_path):
+    """Found in review: such rows were kept out of every score, so the worse the
+    candidate the easier the comparison -- 195 of 200 refused read as a cost of
+    0.0 over five. An application handed no reply has nothing to act on, and
+    the reference's unparseable text is already a wrong answer on its side."""
     rows_ = labelled_rows(8)
     both = _rows(rows_, hits=6, refusals=2)
     result = _verify(tmp_path, rows_, {"constrained": both, "unconstrained": both})
 
-    path = result.manifest["tool_path"]["modes"]
-    assert path["constrained"]["refused_by_the_runtime"] == 2
-    # Six correct out of the six the runtime could read, not out of eight.
-    assert path["constrained"]["score"]["n"] == 6
-    assert path["constrained"]["score"]["exact_match"]["value"] == pytest.approx(1.0)
-    assert any("refused 2 of 8" in limitation for limitation in result.manifest["limitations"])
+    mode = result.manifest["tool_path"]["modes"]["unconstrained"]
+    assert mode["score"]["n"] == 8
+    assert mode["score"]["exact_match"]["value"] == pytest.approx(0.75)
+    assert (mode["no_reply"], mode["parse_refusals"]) == (2, 2)
+    assert mode["no_reply_reasons"] == {PARSE_REFUSED: 2}
+    assert result.manifest["quality"]["reference"]["n"] == 8
+    assert any(
+        "gave no reply to 2 of 8" in text and PARSE_REFUSED in text
+        for text in result.manifest["limitations"]
+    )
+
+
+def test_a_worse_candidate_does_not_pass_more_easily(tmp_path):
+    rows_ = labelled_rows(40)
+    result = _verify(
+        tmp_path,
+        rows_,
+        {
+            "constrained": _rows(rows_, hits=3, refusals=37),
+            "unconstrained": _rows(rows_, hits=3, refusals=37),
+        },
+        request_extra={"max_conversion_cost": 0.05},
+    )
+
+    cost = result.manifest["attribution"]["conversion_cost"]
+    assert cost["value"] == pytest.approx(37 / 40)
+    assert result.status is Status.FAILED_GATE
+
+
+def test_a_model_whose_own_output_never_parses_is_a_verdict_about_the_model(tmp_path):
+    """The case this change started from: clean calls with the grammar on,
+    refused with it off. It ended as a harness failure -- "says nothing about
+    the model" -- which is the one thing it does say something about."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"constrained": _rows(rows_, hits=8), "unconstrained": _rows(rows_, 0, refusals=8)},
+    )
+
+    assert result.status is Status.FAILED_SMOKE
+    (check,) = result.manifest["liveness"]["candidate"]["checks"]
+    assert "with the grammar off, 0 of 8 prompts returned a call" in check["detail"]
+
+
+def test_the_grammar_refusing_every_row_is_measured_not_hidden(tmp_path):
+    """The mirror case: the model's own output parses and the grammar breaks it.
+    What an application gets by default is compared with the reference, and
+    what the grammar does is reported beside it."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"constrained": _rows(rows_, 0, refusals=8), "unconstrained": _rows(rows_, hits=8)},
+    )
+
+    assert result.status is Status.PASSED
+    assert result.manifest["tool_path"]["grammar_effect"]["value"] == pytest.approx(1.0)
+
+
+def test_a_reply_with_a_call_the_target_did_not_ask_for_is_a_wrong_answer(tmp_path):
+    rows_ = labelled_rows(8)
+    doubled = _rows(rows_, hits=8)
+    doubled[0]["calls"].append({"name": "open_app", "arguments": {}})
+    result = _verify(tmp_path, rows_, {"constrained": doubled, "unconstrained": doubled})
+
+    mode = result.manifest["tool_path"]["modes"]["unconstrained"]
+    assert mode["score"]["exact_match"]["value"] == pytest.approx(7 / 8)
+    assert mode["several_calls"] == 1
+    assert any("more than one call on 1 of 8" in x for x in result.manifest["limitations"])
 
 
 def test_a_tool_path_that_cannot_run_is_a_harness_failure_naming_the_runtime(tmp_path):
@@ -480,6 +643,60 @@ def test_a_tool_path_that_cannot_run_is_a_harness_failure_naming_the_runtime(tmp
 
     assert result.status is Status.FAILED_HARNESS
     assert "no tool support" in json.dumps(result.manifest)
+
+
+def test_a_scorer_that_reads_text_is_refused_on_the_tool_path(tmp_path):
+    """Found in review: `--scorer exact-text` scored the candidate's calls by the
+    tool-call rule and the reference's text by exact-text, two different rules
+    under one conversion cost, and crashed outright on a string target."""
+    rows_ = labelled_rows(8)
+    split = tmp_path / "heldout.jsonl"
+    split.write_text("\n".join(json.dumps(r) for r in rows_) + "\n", encoding="utf-8")
+    both = _rows(rows_, 8)
+    candidate = ToolPathBackend(
+        model=tmp_path / "m.litertlm",
+        declarations=DECLS,
+        env=CannedEnv(by_mode={"constrained": both, "unconstrained": both}),
+    )
+    reference = FakeBackend(
+        model="org/reference", texts=correct_texts(rows_), prompt_mode=PromptMode.RUNTIME_RENDERED
+    )
+    request = VerifyRequest(
+        model=tmp_path / "m.litertlm",
+        reference="org/reference",
+        data=split,
+        prompt_mode=PromptMode.RUNTIME_RENDERED,
+        scorer="exact-text",
+    )
+
+    result = run_verify(request, backends=BackendPair(candidate=candidate, reference=reference))
+
+    assert result.status is Status.FAILED_HARNESS
+    assert "--scorer tool-call" in json.dumps(result.manifest["checks"])
+
+
+def test_the_runtime_version_is_in_the_manifest(tmp_path):
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path, rows_, {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)}
+    )
+
+    assert result.manifest["measurements"]["candidate"]["engine"]["runtime_version"] == "0.16.1"
+
+
+def test_the_declarations_reach_the_runtime_in_both_modes(tmp_path):
+    """Found in review: every place the declarations are handed on could be
+    emptied and no test failed, because the fake environment ignored them."""
+    rows_ = labelled_rows(8)
+    env = CannedEnv(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
+    backend = ToolPathBackend(model=tmp_path / "m.litertlm", declarations=DECLS, env=env)
+
+    backend.generate([r["prompt"] for r in rows_])
+
+    assert [(spec["constrained"], spec["tools"]) for spec in env.specs] == [
+        (True, DECLS),
+        (False, DECLS),
+    ]
 
 
 def test_the_path_is_chosen_from_the_model_and_the_declarations(tmp_path):
@@ -602,39 +819,77 @@ def test_the_conversion_cost_is_measured_with_the_grammar_off_like_the_reference
     assert cost["value"] == pytest.approx(0.0)
     path = result.manifest["tool_path"]
     assert path["compared_with_reference"] == "unconstrained"
-    assert path["application_score"]["value"] == pytest.approx(0.5)
+    assert "what an application gets by default" in path["compared_with_reference_because"]
     assert path["grammar_effect"]["value"] == pytest.approx(0.5)
     assert path["grammar_effect"]["resolved"] is True
 
 
-def test_a_row_refused_in_either_mode_is_out_of_every_score(tmp_path):
-    """Keeping out different rows per mode would unpair the grammar's effect and
-    the comparison with the reference at once."""
-    rows_ = labelled_rows(8)
-    constrained = _rows(rows_, hits=6, refusals=2)
-    unconstrained = _rows(rows_, hits=8)
-
-    result = _verify(tmp_path, rows_, {"constrained": constrained, "unconstrained": unconstrained})
-
-    modes = result.manifest["tool_path"]["modes"]
-    assert modes["constrained"]["score"]["n"] == modes["unconstrained"]["score"]["n"] == 6
-    assert modes["constrained"]["refused_by_the_runtime"] == 2
-    assert modes["unconstrained"]["refused_by_the_runtime"] == 0
-    assert result.manifest["quality"]["reference"]["n"] == 6
-
-
-def test_a_row_refused_only_with_the_grammar_off_is_out_of_every_score_too(tmp_path):
-    """The mirror case. A mutant that kept out only the grammar-on refusals
-    passed the test above, because it refused only in that mode."""
+def test_a_row_refused_in_one_mode_stays_in_both(tmp_path):
+    """Every row is scored in both modes, so the grammar's effect stays paired
+    over the same rows and the reference is scored over all of them."""
     rows_ = labelled_rows(8)
 
     result = _verify(
         tmp_path,
         rows_,
-        {"constrained": _rows(rows_, hits=8), "unconstrained": _rows(rows_, hits=6, refusals=2)},
+        {"constrained": _rows(rows_, hits=6, refusals=2), "unconstrained": _rows(rows_, hits=8)},
     )
 
     modes = result.manifest["tool_path"]["modes"]
-    assert modes["constrained"]["score"]["n"] == modes["unconstrained"]["score"]["n"] == 6
-    assert modes["unconstrained"]["refused_by_the_runtime"] == 2
-    assert any("grammar off" in limitation for limitation in result.manifest["limitations"])
+    assert modes["constrained"]["score"]["n"] == modes["unconstrained"]["score"]["n"] == 8
+    assert (modes["constrained"]["no_reply"], modes["unconstrained"]["no_reply"]) == (2, 0)
+    assert result.manifest["quality"]["reference"]["n"] == 8
+    assert result.manifest["tool_path"]["grammar_effect"]["value"] == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize(
+    "same, status",
+    # Against an untuned base there is no conversion cost to attribute, so a
+    # candidate that differs from it ends unmeasured rather than passed.
+    [(True, Status.FAILED_SMOKE), (False, Status.UNMEASURED)],
+)
+def test_divergence_from_the_base_compares_calls_on_the_tool_path(tmp_path, same, status):
+    """Found in review: it compared the candidate's text, which is empty when it
+    called something, so it passed a candidate that was the untuned base."""
+    rows_ = labelled_rows(8)
+    both = _rows(rows_, 8)
+    base_texts = correct_texts(rows_) if same else [call_text("open_app", app="x") for _ in rows_]
+
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"constrained": both, "unconstrained": both},
+        reference_texts=base_texts,
+        request_extra={"reference_role": ReferenceRole.UNTUNED_BASE},
+    )
+
+    assert result.status is status
+    checks = result.manifest["liveness"]["candidate"]["checks"]
+    (divergence,) = [c for c in checks if c["name"] == "divergence from baseline"]
+    assert divergence["observed"]["divergence_share"] == pytest.approx(0.0 if same else 1.0)
+
+
+def test_declarations_reach_the_reference_and_the_rendering_check_only_on_the_tool_path(
+    tmp_path,
+):
+    """Found in review: with a family that has no tool channel, the reference and
+    the rendering check were handed the declarations while the candidate, on
+    `litert-lm run`, never was -- a rendering check vouching for a prompt the
+    candidate is never sent."""
+
+    def request(reference: str) -> VerifyRequest:
+        return VerifyRequest(
+            model=tmp_path / "m.litertlm",
+            reference=reference,
+            data=tmp_path / "heldout.jsonl",
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+        )
+
+    tool_path = build_backends(request(FUNCTIONGEMMA), declarations=DECLS)
+    assert tool_path.candidate.declarations == DECLS
+    assert tool_path.reference.declarations == DECLS
+    assert tool_path.rendering.declarations == DECLS
+
+    text_path = build_backends(request("Qwen/Qwen3-0.6B"), declarations=DECLS)
+    assert text_path.reference.declarations is None
+    assert text_path.rendering.declarations is None

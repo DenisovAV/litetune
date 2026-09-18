@@ -796,6 +796,32 @@ def summarise(manifest: dict) -> list[str]:
     else:
         lines.append(f"  quality: not measured — {quality.get('reason')}")
 
+    # On the tool path the candidate line above is the grammar-off run. Both
+    # modes are printed with what each one is, because "candidate" alone would
+    # leave the reader to guess which of two numbers it was.
+    selection = _mapping(_mapping(manifest.get("harness")).get("tool_path_selection"))
+    if selection:
+        lines.append(f"  path: {'tool path' if selection.get('tool_path') else 'text path'}")
+    tool_path = _mapping(manifest.get("tool_path"))
+    for mode, meaning in (
+        ("unconstrained", "grammar off: the candidate above, the runtime's default"),
+        ("constrained", "grammar on: what an application that enables it gets"),
+    ):
+        exact = _mapping(_mapping(_mapping(tool_path.get("modes")).get(mode)).get("score"))
+        exact = _mapping(exact.get("exact_match"))
+        if exact:
+            lines.append(
+                f"  {meaning}: {_num(exact.get('value'))} ±{_num(exact.get('ci95'))} "
+                f"(n={exact.get('n', '?')})"
+            )
+    grammar = _mapping(tool_path.get("grammar_effect"))
+    if grammar.get("available"):
+        resolved = "" if grammar.get("resolved") else "  (unresolved at this sample size)"
+        lines.append(
+            f"  grammar_effect: {_num(grammar.get('value'), signed=True)} "
+            f"±{_num(grammar.get('ci95'))}{resolved}"
+        )
+
     for name, value in _mapping(manifest.get("attribution")).items():
         if not isinstance(value, dict):
             continue

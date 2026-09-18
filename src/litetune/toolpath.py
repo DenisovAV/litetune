@@ -12,22 +12,26 @@ So this asks the runtime the question an application asks --
 that, and each of them is the reason for a piece of this module:
 
 **The runtime's parser is the one being measured, not ours.** A model that
-writes a call the runtime cannot read is a model that fails for an application,
-and the refusal comes back as the runtime's own message rather than as a parse
-of a parse. `metrics.parse_call` still exists and is still used -- for the
-transformers reference, which produces text and nothing else.
+writes a call the runtime cannot read is a model that fails for an application.
+`metrics.parse_call` still exists and is still used -- for the transformers
+reference, which produces text and nothing else. The runtime's Python binding
+reports every failed reply as one `RuntimeError("litert_lm_conversation_send_message
+failed")` (`conversation.py`, v0.16.1) and writes the reason to its log, so the
+script reads the log around each reply to record the reason with the row.
 
-**Constrained decoding hides the defect it is there to prevent.** It is on
-whenever tools are passed, and with it on, a model that writes
-`call{name{...}}` -- the shape the colab-tuned demo model writes -- returns
-clean calls anyway. With it off the same model is refused with
-`Failed to parse tool calls from code block`. One number from each mode is the
-only evidence that the model learned the format rather than being forced into
-it, so both are run and neither is reported alone.
+**Constrained decoding is a choice the caller makes, and both are measured.**
+LiteRT-LM v0.16.1 leaves it off unless the caller enables it
+(`ConstrainedDecodingConfig(enable=True)`; the binding sets nothing otherwise),
+so the unconstrained number is what an application gets by default. With it on
+the runtime holds the model to the declared grammar -- which can carry a model
+that never learned the format, and which, measured on 2026-09-17, removed
+arguments written out of declared order. One number from each mode is the only
+way to see either, so both are run and neither is reported alone.
 
 **Automatic tool calling is off.** Left on, the runtime would execute the
-declared tools and loop until prose. Measuring a model must not run somebody's
-functions, and a declared tool here raises if it is ever called.
+declared tools and loop until prose. With it off the binding returns the reply
+before it reaches `_handle_tool_calls`, so no declared tool can run; if one were
+ever asked to, the script stops and says so rather than carry on.
 
 The script runs under `envs.RUNTIME` in the shape `rendering.py` established: a
 spec file in, a JSON row file out, one row per prompt in order.
@@ -61,9 +65,11 @@ class ToolPathError(RuntimeError):
 
 
 _TOOL_PATH_SCRIPT = r'''
-"""One structured call per prompt, through the runtime's own tool path."""
+"""The runtime's answer to each prompt, through its own tool path."""
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -83,20 +89,59 @@ def text_of(reply):
     return "".join(parts)
 
 
-def first_call(reply):
-    """The first `tool_calls` entry, flattened to name and arguments.
+def calls_of(reply):
+    """Every `tool_calls` entry, flattened to name and arguments.
 
     The runtime returns the OpenAI shape, `{"type": "function", "function":
-    {...}}`. One call, because every target in this project is one call and
-    scoring a list against a single target would be inventing a rule nobody
-    measured.
+    {...}}`. All of them, not the first: an application acts on each call it
+    is handed, so a second one the target does not ask for is part of the
+    answer.
     """
-    calls = reply.get("tool_calls") or []
-    if not calls:
+    calls = []
+    for entry in reply.get("tool_calls") or []:
+        function = entry.get("function", entry) if isinstance(entry, dict) else {}
+        calls.append({"name": function.get("name"), "arguments": function.get("arguments") or {}})
+    return calls
+
+
+def logged(action):
+    """Run `action` with the process's stderr captured: (result, exception, log).
+
+    The binding raises one generic `RuntimeError` for any failed reply and the
+    runtime writes the reason to file descriptor 2, so the descriptor itself is
+    redirected -- `sys.stderr` is not where native code writes.
+    """
+    sys.stderr.flush()
+    saved = os.dup(2)
+    with tempfile.TemporaryFile() as capture:
+        os.dup2(capture.fileno(), 2)
+        try:
+            result, error = action(), None
+        except Exception as exc:  # noqa: BLE001
+            result, error = None, exc
+        finally:
+            sys.stderr.flush()
+            os.dup2(saved, 2)
+            os.close(saved)
+        capture.seek(0)
+        log = capture.read().decode("utf-8", errors="replace")
+    return result, error, log
+
+
+def reason_in(log):
+    """The runtime's own sentence for a failed reply: its last error line."""
+    lines = [line.strip() for line in log.splitlines() if line.strip()]
+    errors = [line for line in lines if "rror" in line or "ailed" in line or "INVALID" in line]
+    return (errors or lines or [""])[-1][-400:]
+
+
+def runtime_version():
+    try:
+        from importlib.metadata import version
+
+        return version("litert-lm")
+    except Exception:  # noqa: BLE001
         return None
-    entry = calls[0]
-    function = entry.get("function", entry) if isinstance(entry, dict) else {}
-    return {"name": function.get("name"), "arguments": function.get("arguments") or {}}
 
 
 def main():
@@ -109,12 +154,17 @@ def main():
     except AttributeError:
         pass
 
+    executed = []
+
     class Declared(litert_lm.Tool):
         """A declaration the runtime renders and must never run.
 
         `create_conversation` takes `Tool` instances, never raw JSON: it asks
         each for `get_tool_description()`. Handing the file's entries back
-        unchanged keeps the runtime's own refusal as the refusal.
+        unchanged keeps the runtime's own refusal as the refusal. `execute` is
+        unreachable with automatic tool calling off; if it is reached it is
+        recorded, because the binding catches what it raises and would feed
+        the text back to the model as a tool response.
         """
 
         def __init__(self, description):
@@ -124,10 +174,8 @@ def main():
             return self._description
 
         def execute(self, param):
-            raise AssertionError(
-                "the runtime executed a declared tool while measuring; automatic tool "
-                "calling should be off"
-            )
+            executed.append(self._description.get("function", {}).get("name"))
+            return {"error": "not executed: litetune is measuring, not running tools"}
 
     conversation_args = {
         "sampler_config": litert_lm.SamplerConfig(
@@ -160,29 +208,39 @@ def main():
                 )
                 return 3
             with conversation:
-                try:
-                    reply = conversation.send_message(prompt)
-                except Exception as exc:  # noqa: BLE001
-                    # The runtime's parser refusing this generation is a result
-                    # about this row, recorded with the runtime's own words.
-                    rows.append(
-                        {
-                            "index": index,
-                            "call": None,
-                            "text": "",
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
-                    )
-                    continue
+                reply, exc, log = logged(lambda: conversation.send_message(prompt))
+            if executed:
+                sys.stderr.write(
+                    f"the runtime executed the declared tool {executed[0]!r} while measuring, "
+                    "with automatic tool calling off\n"
+                )
+                return 3
+            if exc is not None:
+                # A result about this row: the runtime gave no reply an
+                # application could act on. Its reason is in its log.
+                reason = reason_in(log)
+                rows.append(
+                    {
+                        "index": index,
+                        "calls": [],
+                        "text": "",
+                        "error": f"{type(exc).__name__}: {exc}" + (f": {reason}" if reason else ""),
+                        "parse_refusal": "Failed to parse tool calls" in log,
+                    }
+                )
+                continue
             rows.append(
                 {
                     "index": index,
-                    "call": first_call(reply),
+                    "calls": calls_of(reply),
                     "text": text_of(reply),
                     "error": None,
+                    "parse_refusal": False,
                 }
             )
-    Path(spec["out"]).write_text(json.dumps(rows), encoding="utf-8")
+    Path(spec["out"]).write_text(
+        json.dumps({"runtime_version": runtime_version(), "rows": rows}), encoding="utf-8"
+    )
     return 0
 
 
@@ -195,24 +253,51 @@ if __name__ == "__main__":
 class ToolPathRow:
     """One prompt's answer through the tool path.
 
-    `call is None` with `error is None` is a real result -- the model answered
-    without calling anything. `error` is the runtime's refusal for this row,
-    which is counted separately and never scored as a wrong answer: a model
-    whose output the parser rejected has failed differently from one that called
-    the wrong tool, and averaging the two together hides which.
+    No calls and no error is a real result -- the model answered without
+    calling anything. `error` is set when the runtime gave no reply at all,
+    with the reason from its log; `parse_refusal` says whether that reason was
+    its call parser rejecting the generation. Either way an application got
+    nothing it could act on, and the row is scored as a wrong answer, counted
+    apart so the reason is visible.
     """
 
     index: int
-    call: dict[str, Any] | None = None
+    calls: tuple[dict[str, Any], ...] = ()
     text: str = ""
     error: str | None = None
+    parse_refusal: bool = False
 
     @property
     def refused(self) -> bool:
         return self.error is not None
 
-    def as_dict(self) -> dict[str, Any]:
-        return {"index": self.index, "call": self.call, "text": self.text, "error": self.error}
+    @property
+    def call(self) -> dict[str, Any] | None:
+        """The one call this row answered with, or `None` for none or several.
+
+        Every target is one call, so a reply carrying two is not that answer:
+        an application would act on both.
+        """
+        return self.calls[0] if len(self.calls) == 1 else None
+
+    @classmethod
+    def read(cls, position: int, row: Any) -> ToolPathRow:
+        """A row as the script wrote it. Raises `ToolPathError` for anything else."""
+        if not isinstance(row, dict) or row.get("index") != position:
+            raise ToolPathError(
+                f"the tool-path script wrote row {position} as {str(row)[:200]}, which is not "
+                "that row"
+            )
+        calls = row.get("calls")
+        if not isinstance(calls, list) or not all(isinstance(c, dict) for c in calls):
+            raise ToolPathError(f"the tool-path script wrote row {position} with calls {calls!r}")
+        return cls(
+            index=position,
+            calls=tuple(calls),
+            text=str(row.get("text") or ""),
+            error=None if row.get("error") is None else str(row["error"]),
+            parse_refusal=bool(row.get("parse_refusal")),
+        )
 
 
 @dataclass
@@ -225,6 +310,9 @@ class ToolPathProbe:
     env: envs.StageEnv = envs.RUNTIME
     auto_provision: bool = True
     timeout_s: int = TOOL_PATH_TIMEOUT_S
+    # Filled by `observe`, from the runtime's own metadata: which runtime
+    # produced the rows, because a manifest that cannot say so cannot be
+    # compared with a run on another one.
     runtime_version: str | None = field(default=None, init=False)
 
     def observe(
@@ -276,13 +364,18 @@ class ToolPathProbe:
                     f"the tool-path script {reading.describe('the model')}: "
                     f"{(proc.stderr or '').strip()[-300:] or 'no stderr'}"
                 )
-            rows = json.loads(out.read_text(encoding="utf-8"))
+            try:
+                written = json.loads(out.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ToolPathError(f"the tool-path script's output is unreadable: {exc}") from exc
+        rows = written.get("rows") if isinstance(written, dict) else None
         if not isinstance(rows, list) or len(rows) != len(prompts):
             raise ToolPathError(
                 f"the tool-path script wrote {len(rows) if isinstance(rows, list) else 'no'} rows "
                 f"for {len(prompts)} prompts"
             )
-        return [ToolPathRow(**row) for row in rows]
+        self.runtime_version = written.get("runtime_version")
+        return [ToolPathRow.read(position, row) for position, row in enumerate(rows)]
 
 
 def as_tool_call(call: dict[str, Any] | None) -> ToolCall | None:
@@ -300,10 +393,19 @@ def as_tool_call(call: dict[str, Any] | None) -> ToolCall | None:
 
 DISAGREEING_MODES = (
     "the two decoding modes did not agree: {constrained:.4f} with the runtime's grammar on and "
-    "{unconstrained:.4f} with it off, over {n} scored rows. The constrained number is what an "
-    "application gets; the unconstrained one is the only evidence the model learned the format "
-    "rather than being held to it, and a gap between them is the model leaning on the grammar. "
-    "Neither number describes the other."
+    "{unconstrained:.4f} with it off, over {n} rows. {direction} The runtime leaves the grammar "
+    "off unless the application enables it, so the grammar-off number is what an application "
+    "gets by default and the grammar-on number what it gets if it enables it; neither describes "
+    "the other."
+)
+
+GRAMMAR_HELPED = (
+    "The grammar raised the score: output the runtime reads only when held to the grammar is a "
+    "model that did not fully learn the format."
+)
+GRAMMAR_HURT = (
+    "The grammar lowered the score: it removed or changed something the model wrote on its own "
+    "-- measured once, arguments written out of declared order were dropped."
 )
 
 
@@ -317,9 +419,8 @@ class ToolPathBackend:
     parser rejected that generation.
 
     `prompt_mode` is `RUNTIME_RENDERED` and cannot be anything else: the runtime
-    builds this prompt, declarations and all. A caller who resolved
-    `prerendered` and still reached here has a contradiction rather than a
-    choice, and `run_verify` refuses before building this.
+    builds this prompt, declarations and all. `verify._tool_path_reason` keeps a
+    `prerendered` run on the text path, so it never builds this.
     """
 
     model: Path
@@ -331,7 +432,7 @@ class ToolPathBackend:
     # Filled by `generate`: the rows from each mode, kept so the manifest can
     # carry both numbers rather than only the one that was scored.
     rows: dict[str, list[ToolPathRow]] = field(default_factory=dict, init=False)
-    harness_error: str | None = field(default=None, init=False)
+    runtime_version: str | None = field(default=None, init=False)
 
     name = "litert-lm tool path"
 
@@ -377,17 +478,19 @@ class ToolPathBackend:
             "declarations": len(self.declarations),
             "automatic_tool_calling": False,
             "modes": sorted(self.rows),
+            "runtime_version": self.runtime_version,
         }
 
     def generate(
         self, prompts: Sequence[str], events: EventStream | None = None
     ) -> list[Generation]:
-        """The constrained run's answers. Both runs happen; both are kept.
+        """The unconstrained run's answers. Both runs happen; both are kept.
 
-        Constrained is what is returned, because it is what an application gets.
-        The unconstrained rows sit in `self.rows` for the manifest and for the
-        agreement check, and a caller that reported only one of the two would be
-        reporting the number that cannot fail.
+        Unconstrained is what is returned, because it is what an application
+        gets by default and it is what liveness judges: a model whose own output
+        never parses is not alive for an application that has not enabled the
+        grammar. The constrained rows sit in `self.rows` beside them for the
+        manifest and the grammar's paired effect.
         """
         probe = ToolPathProbe(
             model=self.model,
@@ -404,9 +507,9 @@ class ToolPathBackend:
                 # Nothing was measured. Every prompt carries the same harness
                 # error, which is what keeps these rows out of the score
                 # entirely instead of counting as wrong answers.
-                self.harness_error = str(exc)
                 logger.warning("the tool path could not be measured: %s", exc)
                 return [Generation(i, p, harness_error=str(exc)) for i, p in enumerate(prompts)]
+            self.runtime_version = probe.runtime_version
         return [
             Generation(
                 index=row.index,
@@ -416,5 +519,5 @@ class ToolPathBackend:
                 call=row.call,
                 refusal=row.error,
             )
-            for row in self.rows["constrained"]
+            for row in self.rows["unconstrained"]
         ]

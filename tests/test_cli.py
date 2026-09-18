@@ -1852,3 +1852,35 @@ def test_bundle_refuses_declarations_the_model_was_not_trained_against(
     report = json.loads((tmp_path / "bundle" / "report.json").read_text(encoding="utf-8"))
     failed = [c for c in report["checks"]["checks"] if c["outcome"] == "failed"]
     assert any("different tool list" in c["detail"] for c in failed)
+
+
+def test_the_summary_says_which_path_ran_and_prints_both_modes():
+    """Found in review: the grammar-off number was printed as "candidate", the
+    grammar-on number and the grammar's effect not at all, and nothing said which
+    path had run."""
+    from litetune.cli import summarise
+
+    def score(value):
+        return {"score": {"exact_match": {"value": value, "ci95": 0.02, "n": 640}}}
+
+    lines = summarise(
+        {
+            "status": "passed",
+            "harness": {"tool_path_selection": {"tool_path": True, "why": "w"}},
+            "tool_path": {
+                "modes": {"unconstrained": score(0.9125), "constrained": score(0.7422)},
+                "grammar_effect": {
+                    "available": True,
+                    "value": 0.17,
+                    "ci95": 0.03,
+                    "resolved": True,
+                },
+            },
+        }
+    )
+    text = "\n".join(lines)
+
+    assert "path: tool path" in text
+    assert "grammar off: the candidate above, the runtime's default: 0.9125" in text
+    assert "grammar on: what an application that enables it gets: 0.7422" in text
+    assert "grammar_effect: +0.1700" in text

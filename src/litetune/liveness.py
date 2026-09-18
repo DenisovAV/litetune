@@ -266,15 +266,19 @@ def divergence_check(
     baseline: Sequence[str],
     baseline_label: str,
     thresholds: LivenessThresholds,
+    forms: Sequence[str] | None = None,
 ) -> Check:
     """Does the candidate say anything different from the baseline model?
 
     Only meaningful against a *different* model -- an untuned base. Against the
     float twin of the same weights, agreement is the desired outcome of a
     lossless conversion, so `verify` skips this check there and records why.
+
+    `forms` stands in for the candidate's texts when its answers are not text:
+    a tool-path candidate's calls, compared with `baseline` in the same form.
     """
     name = "divergence from baseline"
-    share = divergence_share(point.texts, baseline)
+    share = divergence_share(point.texts if forms is None else forms, baseline)
     observed = {
         "divergence_share": round(share, 6),
         "n": point.n,

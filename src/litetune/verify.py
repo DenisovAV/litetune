@@ -71,10 +71,12 @@ from litetune.metrics import (
     Difference,
     Proportion,
     QualityMetrics,
+    ToolCall,
     Unavailable,
     agreement,
     carries_reasoning,
     paired_difference,
+    parse_call,
     reasoning_unclosed,
     score_parsed,
     strip_reasoning,
@@ -89,7 +91,14 @@ from litetune.prompt_mode import (
     resolve_prompt_mode,
 )
 from litetune.rendering import RENDERING_CHECK, RenderingObserver, RenderingProbe
-from litetune.toolpath import DISAGREEING_MODES, ToolPathBackend, as_tool_call
+from litetune.toolpath import (
+    DISAGREEING_MODES,
+    GRAMMAR_HELPED,
+    GRAMMAR_HURT,
+    ToolPathBackend,
+    ToolPathRow,
+    as_tool_call,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -271,15 +280,17 @@ _TEXT_TIER_SKIPPED = (
 )
 
 
-def _tool_path_liveness(point: MeasurementPoint, run: Any) -> LivenessResult:
+def _tool_path_liveness(point: MeasurementPoint) -> LivenessResult:
     """Liveness for a candidate that answered with calls rather than text.
 
     The text tier's checks would fail every row of a healthy tool-path run, so
     they are recorded as skipped rather than failed. What stands in their place
-    is a stronger signal than any of them: the runtime returned a structured
-    call, which it does only for output its own parser accepted. A run where it
-    returned none is a model that produced nothing an application could use, and
-    that is a smoke failure in the same sense the text tier means it.
+    is whether the runtime returned a structured call -- which it does only for
+    output its own parser accepted -- on the grammar-off run, the one an
+    application gets by default. A run where it returned none is a model that
+    produced nothing an application could use, and that is a smoke failure in
+    the same sense the text tier means it. How many rows returned a call is the
+    score's business, not this check's: every row that did not is scored wrong.
     """
     never_ran = [g for g in point.generations if g.harness_error is not None]
     if never_ran:
@@ -302,7 +313,10 @@ def _tool_path_liveness(point: MeasurementPoint, run: Any) -> LivenessResult:
     refused = sum(1 for g in point.generations if g.refusal is not None)
     n = len(point.generations)
     checks = CheckSet(name="liveness")
-    detail = f"{answered} of {n} prompts returned a call; the runtime refused {refused}"
+    detail = (
+        f"with the grammar off, {answered} of {n} prompts returned a call; the runtime gave no "
+        f"reply to {refused}"
+    )
     if answered:
         checks.add(
             Check.passed(
@@ -331,47 +345,38 @@ def _score_tool_path(
     indices: list[int],
     run: Any,
 ) -> tuple[QualityMetrics, dict[str, Any], list[int], list]:
-    """Both decoding modes, scored over the rows the runtime read in both.
+    """Both decoding modes, each scored over every labelled row.
 
-    Three numbers come out of a tool-path run and they answer three questions,
-    so none of them stands in for another.
+    Two numbers come out of a tool-path run and a third compares them, and they
+    answer three questions, so none of them stands in for another.
 
-    - **Compared with the reference: grammar off.** The float reference is
-      `transformers` generating greedily with no grammar, so the conversion cost
-      is measured against the tool path with the runtime's grammar off too.
+    - **Grammar off: compared with the reference, and what an application gets
+      by default.** The float reference is `transformers` generating greedily
+      with no grammar, so the conversion cost is measured against the tool path
+      with the runtime's grammar off too. LiteRT-LM v0.16.1 leaves it off
+      unless the caller enables it, so this is also the default.
       Measured 2026-09-17 on FunctionGemma x mobile-actions at n=640: reference
       0.9234, grammar off 0.9172, grammar on 0.7422. The first version compared
       the reference with the grammar-on number and reported a *resolved*
       conversion cost of 0.1812 that was almost entirely the grammar.
-    - **What an application gets: grammar on**, which is the runtime's default
-      whenever tools are passed. Reported as that, under its own name.
+    - **Grammar on: what an application that enables it gets.**
     - **What the grammar does: the paired difference between the two**, over the
-      same rows. Its own quantity with its own interval, because one number
-      cannot separate two effects.
+      same rows. Its own quantity with its own interval.
 
-    Rows the runtime refused in either mode are counted and kept out of every
-    score: a model whose output the parser rejected failed differently from one
-    that called the wrong tool. Keeping out the same rows everywhere is what
-    keeps all three comparisons paired.
+    **A row the runtime gave no reply to is a wrong answer**, in the mode it
+    happened in, and is counted apart so the reason is visible. The reference's
+    unparseable text is a wrong answer on its side, and an application handed
+    no reply has nothing to act on. An earlier version kept such rows out of
+    every score instead, which made the comparison easier to pass the worse the
+    candidate was: 195 of 200 rows refused read as a cost of 0.0 over five.
     """
-    assert isinstance(backend, ToolPathBackend)
+    if not isinstance(backend, ToolPathBackend):
+        raise TypeError(
+            f"{type(backend).__name__} declares structured scoring but carries no per-mode rows"
+        )
     rows = backend.rows
     if set(rows) != {"constrained", "unconstrained"}:
         raise ValueError(f"the tool path reported modes {sorted(rows)}, not both")
-    refused = {mode: sum(1 for i in indices if rows[mode][i].refused) for mode in rows}
-    kept = [
-        (i, target)
-        for i, target in zip(indices, targets, strict=True)
-        if not rows["constrained"][i].refused and not rows["unconstrained"][i].refused
-    ]
-    if not kept:
-        raise ValueError(
-            f"the runtime refused a generation on every one of the {len(indices)} rows in at "
-            "least one decoding mode, so there is nothing to score"
-        )
-    scored_over = len(indices)
-    indices = [i for i, _ in kept]
-    targets = [target for _, target in kept]
     scored = {
         mode: score_parsed(targets, [as_tool_call(rows[mode][i].call) for i in indices])
         for mode in rows
@@ -379,38 +384,72 @@ def _score_tool_path(
     grammar = paired_difference(scored["unconstrained"].correct, scored["constrained"].correct)
     reported: dict[str, Any] = {
         "modes": {
-            mode: {"score": scored[mode].as_dict(), "refused_by_the_runtime": refused[mode]}
+            mode: {"score": scored[mode].as_dict()} | _unanswered(rows[mode], indices)
             for mode in rows
         },
         "compared_with_reference": "unconstrained",
         "compared_with_reference_because": (
             "the reference generates with no grammar, so the conversion cost is measured against "
-            "the runtime with its grammar off as well"
+            "the runtime with its grammar off as well; the runtime leaves the grammar off unless "
+            "the application enables it, so this is also what an application gets by default"
         ),
-        "application_score": scored["constrained"].exact_match.as_dict(),
         "grammar_effect": grammar.as_dict()
         | {"sign": "positive means the runtime's grammar lowers the score"},
     }
-    for mode, count in refused.items():
-        if count:
-            state = "on" if mode == "constrained" else "off"
-            run.limitation(
-                f"the runtime refused {count} of {scored_over} generations with the grammar "
-                f"{state}: those rows are counted here and kept out of every score, because a "
-                "model whose output the parser rejected failed differently from one that called "
-                "the wrong tool and an average over both describes neither"
+    for mode in rows:
+        state = "on" if mode == "constrained" else "off"
+        unanswered = reported["modes"][mode]
+        if unanswered["no_reply"]:
+            reasons = "; ".join(
+                f"{count} x {reason}" for reason, count in unanswered["no_reply_reasons"].items()
             )
-    if scored["constrained"].exact_match.value != scored["unconstrained"].exact_match.value:
+            run.limitation(
+                f"with the grammar {state}, the runtime gave no reply to {unanswered['no_reply']} "
+                f"of {len(indices)} prompts ({unanswered['parse_refusals']} of them its call "
+                "parser rejecting the generation). Each is scored as a wrong answer: an "
+                f"application gets nothing to act on. The runtime's reasons: {reasons}"
+            )
+        if unanswered["several_calls"]:
+            run.limitation(
+                f"with the grammar {state}, the runtime returned more than one call on "
+                f"{unanswered['several_calls']} of {len(indices)} prompts, each of which asks "
+                "for one. Scored as wrong answers: an application acts on every call it is handed"
+            )
+    constrained = scored["constrained"].exact_match.value
+    unconstrained = scored["unconstrained"].exact_match.value
+    if constrained != unconstrained:
         run.limitation(
             DISAGREEING_MODES.format(
-                constrained=scored["constrained"].exact_match.value,
-                unconstrained=scored["unconstrained"].exact_match.value,
+                constrained=constrained,
+                unconstrained=unconstrained,
                 n=len(indices),
+                direction=GRAMMAR_HURT if constrained < unconstrained else GRAMMAR_HELPED,
             )
             + f" The conversion cost here is measured with the grammar off; what the grammar "
             f"does is reported apart, as {grammar.detail}."
         )
     return scored["unconstrained"], reported, indices, targets
+
+
+def _call_form(call: ToolCall | None) -> str:
+    """A call as one comparable string: name and flattened arguments, in order."""
+    return "" if call is None else json.dumps([call.name, sorted(call.args.items())])
+
+
+def _unanswered(rows: list[ToolPathRow], indices: list[int]) -> dict[str, Any]:
+    """What one mode's rows say about the prompts that got no single call back."""
+    no_reply = [rows[i] for i in indices if rows[i].refused]
+    reasons: dict[str, int] = {}
+    for row in no_reply:
+        reasons[row.error or ""] = reasons.get(row.error or "", 0) + 1
+    return {
+        "no_reply": len(no_reply),
+        "parse_refusals": sum(1 for row in no_reply if row.parse_refusal),
+        # The five commonest, so a run where every reply failed the same way
+        # says so in one line and one that failed many ways is not a wall.
+        "no_reply_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])[:5]),
+        "several_calls": sum(1 for i in indices if len(rows[i].calls) > 1),
+    }
 
 
 def _candidate_backend(request: VerifyRequest, declarations: list | None) -> GenerationBackend:
@@ -435,24 +474,29 @@ def build_backends(request: VerifyRequest, declarations: list | None = None) -> 
     `declarations` arrive parsed rather than as the path on the request: the
     scripts these backends run live in other environments, which cannot read
     the caller's file, and `run_verify` has already read it to compare its
-    digest against the checkpoint's record. The candidate is not given them
-    here -- it is measured through `litert-lm run`, which has no tools argument
-    at all, and giving it one is the tool-path work, not this.
+    digest against the checkpoint's record. They reach the reference and the
+    rendering check only when the candidate is measured through the tool path,
+    which is the only candidate they reach: on the text path `litert-lm run`
+    takes no tools, and a reference and a rendering check given them would
+    validate a prompt the candidate is never sent.
     """
+    chosen, _ = _tool_path_reason(request, declarations)
+    rendered = declarations if chosen else None
     return BackendPair(
         candidate=_candidate_backend(request, declarations),
         reference=HuggingFaceBackend(
             model=request.reference,
             decode=request.decode,
             declared_prompt_mode=request.prompt_mode,
-            declarations=declarations,
+            declarations=rendered,
         ),
         rendering=RenderingProbe(
-            model=request.model, reference=request.reference, declarations=declarations
+            model=request.model, reference=request.reference, declarations=rendered
         ),
     )
 
 
+SCORER_CHECK = "the scorer reads what the candidate returns"
 CONTRACT_CHECK = "prompt-rendering mode is known"
 DECLARATIONS_CHECK = "declarations match the checkpoint's record"
 
@@ -852,6 +896,19 @@ def run_verify(
         "tool_path": ran,
         "why": why if ran == chosen else SUPPLIED_BACKENDS,
     }
+    if ran and request.scorer != "tool-call":
+        # The candidate answers with calls and the reference with text; scored
+        # by different rules, the two sides would not be one comparison, and a
+        # string target has no call to compare a call with at all.
+        run.record(
+            Check.failed(
+                SCORER_CHECK,
+                f"the candidate is measured through the tool path, which returns calls, and "
+                f"--scorer {request.scorer} compares text. A model whose runtime renders its "
+                "declarations is scored as calls: drop --scorer or pass --scorer tool-call",
+            )
+        )
+        return run.finish(Status.FAILED_HARNESS)
 
     # -- do both sides put the same prompt tokens in front of the model? ---
     # Before any generation: a candidate and a reference that were shown
@@ -971,7 +1028,7 @@ def run_verify(
         # statement about the tier rather than about the model. What replaces
         # it is stronger than any of them: the runtime returned a structured
         # call, which it does only for output its own parser accepted.
-        live = _tool_path_liveness(candidate, run)
+        live = _tool_path_liveness(candidate)
     else:
         live = liveness_tier(
             candidate,
@@ -1210,7 +1267,23 @@ def run_verify(
 
     # -- liveness check 5, now that a baseline exists ----------------------
     if request.reference_role is ReferenceRole.UNTUNED_BASE:
-        check = divergence_check(candidate, reference.texts, "the untuned base", request.thresholds)
+        # A tool-path candidate's text is empty whenever it called something,
+        # so its texts would differ from any base's and the check could not
+        # fail. Compared as calls instead, the base's read by the same parser
+        # that scores it.
+        forms = (
+            [_call_form(as_tool_call(g.call)) for g in candidate.generations]
+            if pair.candidate.scores_structurally
+            else None
+        )
+        baseline = (
+            [_call_form(parse_call(text)) for text in reference.texts]
+            if forms is not None
+            else reference.texts
+        )
+        check = divergence_check(
+            candidate, baseline, "the untuned base", request.thresholds, forms=forms
+        )
         live.checks.add(check)
         events.check(check)
         run.manifest["liveness"]["candidate"] = live.as_dict()
