@@ -518,13 +518,7 @@ def runtime_calls(text: str) -> list[ToolCall] | None:
     reply, and two pairs are two calls.
     """
     calls: list[ToolCall] = []
-    pos = 0
-    while (start := text.find(START_CALL, pos)) >= 0:
-        end = text.find(END_CALL, start + len(START_CALL))
-        if end < 0:
-            break
-        block = text[start + len(START_CALL) : end]
-        pos = end + len(END_CALL)
+    for block in _marked_blocks(text)[0]:
         if not block:
             continue
         call = _whole_call(block)
@@ -532,6 +526,29 @@ def runtime_calls(text: str) -> list[ToolCall] | None:
             return None
         calls.append(call)
     return calls
+
+
+def _marked_blocks(text: str) -> tuple[list[str], int]:
+    """Every block the runtime cuts out of `text`, and where the last one ended."""
+    blocks: list[str] = []
+    pos = ended = 0
+    while (start := text.find(START_CALL, pos)) >= 0:
+        end = text.find(END_CALL, start + len(START_CALL))
+        if end < 0:
+            break
+        blocks.append(text[start + len(START_CALL) : end])
+        pos = ended = end + len(END_CALL)
+    return blocks, ended
+
+
+def text_after_the_calls(text: str) -> str:
+    """What the runtime keeps as the reply's text after the last call it read.
+
+    Not what follows the last end marker in the text: one with no start marker
+    before it is text like any other, and `RE2::Consume` stops at the last pair
+    it matched.
+    """
+    return text[_marked_blocks(text)[1] :]
 
 
 # ---------------------------------------------------------------------------

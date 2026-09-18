@@ -3235,6 +3235,9 @@ S, E = "<start_function_call>", "<end_function_call>"
         ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E} Done!", False),
         # The runtime hands a trailing newline over as the reply's text too.
         ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E}\n", False),
+        # And an end marker with no start marker before it is text, not the
+        # end of the call: what precedes it still follows the call.
+        ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E} prose {E}", False),
         ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E}{S}call:g{{", False),
         # A stop token in a string stops generation before the end marker.
         ({"a": "hi<eos>there"}, f"{S}call:set{{a:<escape>hi<eos>there<escape>}}{E}", False),

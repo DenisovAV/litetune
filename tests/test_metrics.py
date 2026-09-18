@@ -28,6 +28,7 @@ from litetune.metrics import (
     same_answer,
     score,
     strip_reasoning,
+    text_after_the_calls,
 )
 
 # -- the wire format --------------------------------------------------------
@@ -964,6 +965,22 @@ def test_only_reasoning_that_opened_and_never_closed_counts_as_unclosed():
     # An opening marker after the answer did not open the generation's reasoning.
     assert not reasoning_unclosed("label_3 <think>")
     assert not reasoning_unclosed("<think>done</think>label_3")
+
+
+@pytest.mark.parametrize(
+    "text, after",
+    [
+        (f"{START}call:f{{}}{END} and more", " and more"),
+        # An end marker with no start marker before it is text the runtime
+        # keeps, not the end of a block: `RE2::Consume` stops at the last pair.
+        (f"{START}call:f{{}}{END} prose {END}", f" prose {END}"),
+        (f"{START}call:f{{}}{END}", ""),
+        ("no markers here", "no markers here"),
+        (f"{START}call:f{{}}", f"{START}call:f{{}}"),
+    ],
+)
+def test_the_text_a_reply_keeps_after_its_calls(text, after):
+    assert text_after_the_calls(text) == after
 
 
 def test_equal_calls_hash_alike():

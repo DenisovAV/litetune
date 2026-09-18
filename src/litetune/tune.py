@@ -55,7 +55,7 @@ from litetune.declarations import (
 )
 from litetune.events import EventStream
 from litetune.exits import read_returncode
-from litetune.metrics import END_CALL, START_CALL, ToolCall, runtime_calls
+from litetune.metrics import START_CALL, ToolCall, runtime_calls, text_after_the_calls
 from litetune.models import (
     PROVENANCE_NAME,
     identify,
@@ -258,7 +258,7 @@ def _refuse_calls_the_runtime_would_not_read(
                 + ". A call trained on a row nothing checks is a call to anything",
                 observed={"data": str(request.data), "line": row.lineno},
             )
-        after = row.completion.rpartition(END_CALL)[2]
+        after = text_after_the_calls(row.completion)
         held = control_text_held(row.target.raw)
         if calls == [row.target] and not after and held is None:
             continue
