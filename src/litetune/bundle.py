@@ -45,7 +45,12 @@ from typing import Any
 
 from litetune import envs
 from litetune.checks import Check, CheckSet, Outcome
-from litetune.declarations import DeclarationsError, read_declarations
+from litetune.declarations import (
+    DeclarationsError,
+    canonical_text,
+    digest_matches,
+    read_declarations,
+)
 from litetune.events import EventStream
 from litetune.manifest import RunManifest, RunStatus
 from litetune.metrics import Unavailable
@@ -779,11 +784,14 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     # -- the contract ------------------------------------------------------
     # Which declarations this contract was written against, always. A contract
     # shipped with `declarations_sha256: null` beside a declarations file -- a
-    # real bundle, 2026-09-17 -- cannot say which tool list it describes. The
-    # digest is the supplied file's: the one `tune` recorded over the same bytes.
+    # real bundle, 2026-09-17 -- cannot say which tool list it describes. With no
+    # training record the digest is the shipped list's, and the bundle says so:
+    # nothing then shows the model learned that list, only that it ships with it.
+    # Not when the declarations were refused, because then no list was shipped.
     contract = request.contract
-    if contract.declarations_sha256 is None and request.declarations.is_file():
-        contract = replace(contract, declarations_sha256=hash_file(request.declarations))
+    if contract.declarations_sha256 is None and declarations_check.outcome is Outcome.PASSED:
+        contract = replace(contract, declarations_sha256=_shipped_digest(request.declarations))
+        result.limitation(NO_TRAINED_DECLARATIONS)
         # The report and the file must describe one contract.
         request = replace(request, contract=contract)
         result.request = request
@@ -920,19 +928,45 @@ def _copy_adapter(request: BundleRequest, result: BundleResult) -> Check | None:
     )
 
 
+NO_TRAINED_DECLARATIONS = (
+    "no training record named the declarations this model learned, so the contract's "
+    "declarations_sha256 is the digest of the list this bundle ships -- which says what ships "
+    "with the model, not what it was trained against. Pass --train-metrics from a `tune` run "
+    "given --declarations to have it checked"
+)
+
+
+def _shipped_digest(source: Path) -> str:
+    """The digest a contract records for `source`: the tool list's, or the bytes'.
+
+    The list's where `read_declarations` accepts the file, which is what `tune`
+    records. A `prerendered` bundle ships a file litetune does not otherwise
+    read, so where it is refused the bytes' digest is all there is.
+    """
+    try:
+        return read_declarations(source)[1]
+    except DeclarationsError:
+        return hash_file(source)
+
+
 def _digest_disagreement(request: BundleRequest, source: Path, name: str) -> Check | None:
     """The contract's digest against the file supplied, when the contract carries one.
 
-    Against the *source*, not the shipped copy: the digest is the one `tune`
-    recorded over the bytes it read, and in `runtime_rendered` the shipped file
-    is the same declarations normalised, which hashes differently by design.
+    Compared by `declarations.digest_matches`, which names the tool list rather
+    than the file: the same list reformatted, or the normalised copy a
+    `runtime_rendered` bundle ships, is the list the model learned.
     """
-    if request.contract.declarations_sha256 is None:
+    recorded = request.contract.declarations_sha256
+    if recorded is None:
         return None
-    actual = hash_file(source).split(":", 1)[-1]
-    expected = request.contract.declarations_sha256.split(":", 1)[-1]
-    if actual == expected:
+    try:
+        digest: str | None = read_declarations(source)[1]
+    except DeclarationsError:
+        digest = None
+    if digest_matches(recorded, digest, source):
         return None
+    actual = (digest or hash_file(source)).split(":", 1)[-1]
+    expected = recorded.split(":", 1)[-1]
     return Check.failed(
         name,
         f"the declarations supplied hash {actual[:16]} but the contract was written against "
@@ -959,17 +993,16 @@ def _write_declarations_as_trained(
     disagreement = _digest_disagreement(request, source, name)
     if disagreement is not None:
         return disagreement
-    destination.write_text(json.dumps(parsed, indent=2) + "\n", encoding="utf-8")
+    destination.write_text(canonical_text(parsed), encoding="utf-8")
     result.members.append(_member(DECLARATIONS_NAME, destination))
     return Check.passed(
         name,
-        f"{len(parsed)} tool declaration(s) packaged from {source.name}, in the key order the "
-        "model was trained against",
+        f"{len(parsed)} tool declaration(s) packaged from {source.name}, in the key order "
+        "`tune` renders them in",
         observed={
             "declarations": str(destination),
             "entries": len(parsed),
-            "source_sha256": digest,
-            "shipped_sha256": hash_file(destination),
+            "sha256": digest,
             "normalised": True,
         },
     )
@@ -1001,6 +1034,16 @@ def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
             observed={"declarations": str(source)},
         )
     destination = request.output_dir / DECLARATIONS_NAME
+    if source.resolve() == destination.resolve():
+        # The shipped copy is written over the destination, so a source already
+        # there would be replaced by its normalised copy -- the user's own file
+        # rewritten -- or, when copied, fail as the same file.
+        return Check.failed(
+            name,
+            f"the declarations at {source} are already inside --output-dir "
+            f"({request.output_dir}); name a source outside it",
+            observed={"declarations": str(source)},
+        )
     if request.contract.runtime_renders_declarations:
         return _write_declarations_as_trained(request, result, source, destination, name)
     try:

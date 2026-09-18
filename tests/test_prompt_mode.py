@@ -20,6 +20,7 @@ from conftest import FakeBackend, correct_texts, labelled_rows
 
 from litetune import envs
 from litetune.bundle import Contract
+from litetune.declarations import canonical_text, read_declarations
 from litetune.evaluate import HuggingFaceBackend, LiteRtLmBackend
 from litetune.prompt_mode import (
     RENDERING_SOURCE,
@@ -711,14 +712,40 @@ def test_declarations_that_disagree_with_the_checkpoints_record_are_refused(tmp_
     assert result.status is Status.FAILED_HARNESS
     assert EXIT_CODES[result.status] == 4
     refusal = next(c for c in result.manifest["checks"] if c["name"] == DECLARATIONS_CHECK)
-    assert hash_file(measured) in refusal["detail"]
+    assert read_declarations(measured)[1] in refusal["detail"]
     assert hash_file(trained) in refusal["detail"]
     # Refused before either side was asked for anything.
     assert candidate.prompts_seen == []
     assert reference_backend.prompts_seen == []
 
 
-def test_declarations_that_match_the_record_are_measured_and_recorded(tmp_path, write_split):
+def test_a_checkpoint_that_learned_declarations_is_not_measured_without_them(tmp_path, write_split):
+    """Found in review: the check ran only when the flag was given, so a
+    checkpoint that recorded declarations and a run that forgot them was measured
+    on a prompt without the tool list it learned -- 0 of 5 on both sides when
+    measured -- and passed with no word about it."""
+    trained = tmp_path / "trained.json"
+    trained.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
+    reference = _checkpoint(
+        tmp_path,
+        {"prompt_mode": "prerendered", "declarations_sha256": read_declarations(trained)[1]},
+    )
+
+    result, candidate, reference_backend = _verify_with(tmp_path, write_split, reference, None)
+
+    assert result.status is Status.FAILED_HARNESS
+    refusal = next(c for c in result.manifest["checks"] if c["name"] == DECLARATIONS_CHECK)
+    assert "Pass --declarations" in refusal["detail"]
+    assert candidate.prompts_seen == []
+    assert reference_backend.prompts_seen == []
+
+
+def test_a_record_of_the_files_bytes_still_matches_that_file(tmp_path, write_split):
+    """Checkpoints trained before the digest named the tool list recorded the
+    digest of the file's bytes, and are still the same model on the same list."""
     from litetune.storage import hash_file
 
     decls = tmp_path / "declarations.json"
@@ -733,7 +760,52 @@ def test_declarations_that_match_the_record_are_measured_and_recorded(tmp_path, 
     result, candidate, _ = _verify_with(tmp_path, write_split, reference, decls)
 
     assert result.status is not Status.FAILED_HARNESS
-    assert result.manifest["harness"]["declarations_sha256"] == hash_file(decls)
+    assert candidate.prompts_seen != []
+
+
+def test_the_declarations_a_bundle_shipped_match_the_record_of_the_file_trained_on(
+    tmp_path, write_split
+):
+    """A `runtime_rendered` bundle ships the list in declared order, and the
+    README tells an application to send it as shipped. Its bytes differ from the
+    file `tune` read; its tool list does not, and that is what is compared."""
+    trained = tmp_path / "trained.json"
+    trained.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d",'
+        ' "parameters": {"type": "object", "properties": {'
+        '"to": {"type": "string", "description": "t"},'
+        ' "body": {"type": "string", "description": "b"}}}}}]',
+        encoding="utf-8",
+    )
+    parsed, recorded = read_declarations(trained)
+    shipped = tmp_path / "shipped.json"
+    shipped.write_text(canonical_text(parsed), encoding="utf-8")
+    assert shipped.read_bytes() != trained.read_bytes()
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": recorded}
+    )
+
+    result, _, _ = _verify_with(tmp_path, write_split, reference, shipped)
+
+    assert result.status is not Status.FAILED_HARNESS
+    assert result.manifest["harness"]["declarations_sha256"] == recorded
+
+
+def test_declarations_that_match_the_record_are_measured_and_recorded(tmp_path, write_split):
+    decls = tmp_path / "declarations.json"
+    decls.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
+    recorded = read_declarations(decls)[1]
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": recorded}
+    )
+
+    result, candidate, _ = _verify_with(tmp_path, write_split, reference, decls)
+
+    assert result.status is not Status.FAILED_HARNESS
+    assert result.manifest["harness"]["declarations_sha256"] == recorded
     assert candidate.prompts_seen != []
 
 

@@ -38,7 +38,7 @@ from typing import Any
 
 from litetune import envs, metrics, models
 from litetune.checks import Check, CheckSet, Outcome, guard
-from litetune.declarations import read_declarations
+from litetune.declarations import digest_matches, read_declarations
 from litetune.evaluate import (
     GREEDY,
     DataError,
@@ -801,12 +801,26 @@ def run_verify(
     # Initialised before the guard, not inside it: `guard` turns an exception
     # into a recorded check rather than a raise, so an assignment made only in
     # the body is not one the code below can rely on.
+    # A checkpoint that recorded declarations and a run given none is the same
+    # disagreement from the other side: the model would be measured on a prompt
+    # without the tool list it learned, which measured 0 of 5 on both sides.
     declarations: list | None = None
-    if request.declarations is not None:
-        with guard(DECLARATIONS_CHECK) as sink:
+    with guard(DECLARATIONS_CHECK) as sink:
+        recorded = recorded_declarations_sha256(request.reference)
+        if request.declarations is None:
+            if recorded is not None:
+                sink.append(
+                    Check.failed(
+                        DECLARATIONS_CHECK,
+                        f"the checkpoint at {request.reference} records that it was trained "
+                        f"against declarations ({recorded}), and none were given. Pass "
+                        "--declarations with the same file `tune` was given; without it the "
+                        "model is measured on a prompt that lacks the tool list it learned",
+                    )
+                )
+        else:
             declarations, digest = read_declarations(request.declarations)
-            recorded = recorded_declarations_sha256(request.reference)
-            if recorded is not None and recorded != digest:
+            if recorded is not None and not digest_matches(recorded, digest, request.declarations):
                 sink.append(
                     Check.failed(
                         DECLARATIONS_CHECK,
@@ -815,9 +829,10 @@ def run_verify(
                         "tool list and would be measured against another",
                     )
                 )
-        if sink:
-            run.record(sink[0])
-            return run.finish(Status.FAILED_HARNESS)
+    if sink:
+        run.record(sink[0])
+        return run.finish(Status.FAILED_HARNESS)
+    if request.declarations is not None:
         run.manifest["harness"]["declarations_sha256"] = digest
 
     # -- what does litetune know about this model family? ------------------

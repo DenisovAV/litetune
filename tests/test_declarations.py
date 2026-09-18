@@ -22,6 +22,8 @@ import pytest
 
 from litetune.declarations import (
     DeclarationsError,
+    canonical_text,
+    content_digest,
     entry_count,
     read_declarations,
     tool_names,
@@ -51,19 +53,31 @@ def _write(tmp_path: Path, payload) -> Path:
     return path
 
 
-def test_the_digest_is_the_one_a_bundle_contract_is_compared_against(tmp_path):
-    """`tune` records this digest and `verify` refuses a set that disagrees with
-    it, and `bundle` compares its contract against `hash_file` over the same
-    bytes. A second way of computing it -- over the parsed value, or over the
-    text rather than the bytes -- is a different string for the same file, and
-    would turn that comparison into a refusal of a matching set.
+def test_the_digest_names_the_tool_list_not_the_file(tmp_path):
+    """`tune` records this digest, `verify` refuses a set that disagrees with it,
+    and a bundle's contract carries it. Over the file's bytes it made a bundle
+    refuse the declarations it had itself shipped: a `runtime_rendered` bundle
+    writes them in the order the model learned, and the user's file was in
+    another. So the digest is over `canonical_text`, and the text a bundle ships
+    hashes to it byte for byte.
     """
     path = _write(tmp_path, WRAPPED)
+    pretty = tmp_path / "pretty.json"
+    pretty.write_text(json.dumps(WRAPPED, indent=4), encoding="utf-8")
+    reordered = tmp_path / "reordered.json"
+    reordered.write_text(json.dumps(list(reversed(WRAPPED))), encoding="utf-8")
 
     parsed, digest = read_declarations(path)
 
-    assert digest == hash_file(path)
+    assert digest == content_digest(parsed)
     assert digest.startswith("sha256:")
+    shipped = tmp_path / "shipped.json"
+    shipped.write_text(canonical_text(parsed), encoding="utf-8")
+    assert hash_file(shipped) == digest
+    assert read_declarations(shipped)[1] == digest
+    assert read_declarations(pretty)[1] == digest
+    # Another tool order is another list: the order of the tools is the prompt's.
+    assert read_declarations(reordered)[1] != digest
     assert entry_count(parsed) == 2
 
 
@@ -156,8 +170,8 @@ def test_every_mapping_is_ordered_before_either_renderer_sees_it(tmp_path):
     assert list(function["parameters"]) == ["properties", "required", "type"]
     assert list(function["parameters"]["properties"]) == ["alpha", "zebra"]
     assert list(function["parameters"]["properties"]["alpha"]) == ["description", "type"]
-    # Sorting changes what is rendered, never what is recorded.
-    assert digest == hash_file(_write(tmp_path, payload))
+    # The same list written in another key order is the same list.
+    assert digest == content_digest(parsed)
 
 
 @pytest.mark.parametrize(
@@ -215,6 +229,28 @@ def test_every_mapping_is_ordered_before_either_renderer_sees_it(tmp_path):
             },
             "not a non-empty object",
         ),
+        (
+            {"type": "Object", "properties": {"x": {"type": "string", "description": "d"}}},
+            "has type 'Object'",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {
+                    "Name": {"type": "string", "description": "d"},
+                    "name": {"type": "string", "description": "d"},
+                },
+            },
+            "equal but for case",
+        ),
+        (
+            {"type": "object", "properties": {"caf\u00e9": {"type": "string", "description": "d"}}},
+            "not a name the runtime's call parser reads",
+        ),
+        (
+            {"type": "object", "properties": {"two words": {"type": "string", "description": "d"}}},
+            "not a name the runtime's call parser reads",
+        ),
     ],
 )
 def test_a_shape_the_two_renderers_render_differently_is_refused(tmp_path, parameters, expected):
@@ -237,6 +273,42 @@ def test_a_shape_the_two_renderers_render_differently_is_refused(tmp_path, param
         read_declarations(_write(tmp_path, payload))
 
     assert expected in str(caught.value)
+
+
+def test_a_tool_named_outside_the_runtimes_grammar_is_refused(tmp_path):
+    """The runtime's lexer reads an identifier as `[a-zA-Z_][a-zA-Z0-9_.-]*`
+    (AntlrFcLexer.g4, v0.16.1). A tool named otherwise can be declared, but no
+    call to it can ever be parsed back."""
+    payload = [{"type": "function", "function": {"name": "caf\u00e9", "description": "d"}}]
+
+    with pytest.raises(DeclarationsError, match="not a name the runtime's call parser reads"):
+        read_declarations(_write(tmp_path, payload))
+
+
+def test_the_order_is_the_templates_dictsort_which_ignores_case(tmp_path):
+    """Found in review, checked with jinja2 3.1.6 against functiongemma-270m-it's
+    template: `dictsort` puts `body` before `URL`, where a plain `sorted` puts
+    `URL` first -- and the runtime prints whichever order it is handed."""
+    payload = [
+        {
+            "type": "function",
+            "function": {
+                "name": "send",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "URL": {"type": "string", "description": "u"},
+                        "body": {"type": "string", "description": "b"},
+                    },
+                },
+            },
+        }
+    ]
+
+    parsed, _ = read_declarations(_write(tmp_path, payload))
+
+    assert list(parsed[0]["function"]["parameters"]["properties"]) == ["body", "URL"]
 
 
 def test_a_tool_with_no_description_is_refused(tmp_path):

@@ -18,6 +18,7 @@ import pytest
 from stage_fakes import spec_mapping
 
 from litetune.checks import Outcome
+from litetune.declarations import read_declarations
 from litetune.events import EventStream
 from litetune.metrics import Proportion, ToolCall, Unavailable, parse_call
 from litetune.models import PROVENANCE_NAME
@@ -37,6 +38,7 @@ from litetune.prepare import (
     prepare,
     profile_arguments,
     read_rows,
+    refuse_undeclared_tools,
     render_call,
     split_rows,
     split_seed,
@@ -118,12 +120,29 @@ def request_for(tmp_path):
     return _build
 
 
+# The arguments this file's targets send, declared as optional strings so a
+# declaration does not refuse a row for a reason the test is not about.
+_ARGUMENTS = {
+    "type": "object",
+    "properties": {
+        "color": {"type": "string", "description": "c"},
+        "colour": {"type": "string", "description": "c"},
+    },
+}
+
+
 def _declarations(tmp_path: Path, *names: str) -> Path:
     """The OpenAI function objects the runtime requires, for `names`."""
     path = tmp_path / "declarations.json"
     path.write_text(
         json.dumps(
-            [{"type": "function", "function": {"name": name, "description": "d"}} for name in names]
+            [
+                {
+                    "type": "function",
+                    "function": {"name": name, "description": "d", "parameters": _ARGUMENTS},
+                }
+                for name in names
+            ]
         ),
         encoding="utf-8",
     )
@@ -615,8 +634,8 @@ def test_each_type_is_rendered_the_way_the_runtime_writes_it():
     """The exact trained completion, byte for byte.
 
     A string is delimited by `<escape>`; a number, a boolean and a null are
-    bare. Measured through the runtime's own tool path on 2026-09-16, where a
-    numeric argument came back as `1234.0` and a string one as `"red"`.
+    bare, as the runtime's goldens write them, and `fc_parser.rs` reads the
+    first back as a string and the rest as values.
     """
     call = ToolCall(
         name="set",
@@ -628,6 +647,154 @@ def test_each_type_is_rendered_the_way_the_runtime_writes_it():
         "call:set{gone:null,n:3,off:false,on:true,ratio:0.5,who:<escape>ann<escape>}"
         "<end_function_call>"
     )
+
+
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        ({"s": "a<escape>b"}, "which the runtime's lexer reads as the end of a string"),
+        ({"s": 'a<|"|>b'}, "which the runtime's lexer reads as the end of a string"),
+        ({"s": "a<ctrl46>b"}, "which the runtime's lexer reads as the end of a string"),
+        ({"n": float("nan")}, "has no spelling for it"),
+        ({"n": float("inf")}, "has no spelling for it"),
+        ({"n": 2**53 + 1}, "holds an integer exactly only up to 2**53"),
+        ({"two words": "x"}, "not a name the runtime's call parser reads"),
+    ],
+)
+def test_what_the_runtime_cannot_read_back_is_refused_not_trained(args, expected):
+    """Found in review. A string holding an escape let a dataset row write a
+    second call into the training text (`bob<escape>}<end_function_call>...`),
+    and the rest would be calls the runtime refuses or cuts short on every
+    generation."""
+    with pytest.raises(ValueError) as caught:
+        render_call(ToolCall(name="set", args=args))
+
+    assert expected in str(caught.value)
+
+
+def test_a_tool_name_the_runtime_cannot_read_is_refused():
+    with pytest.raises(ValueError, match="not one the runtime's call parser reads"):
+        render_call(ToolCall(name="caf\u00e9", args={}))
+
+
+@pytest.mark.parametrize(
+    "value, spelled",
+    [
+        (1.5e-07, "0.00000015"),
+        (12345678901234567890.0, "12345678901234567168"),
+        (7.0, "7"),
+        (2**53, "9007199254740992"),
+    ],
+)
+def test_a_number_is_spelled_the_way_the_runtimes_lexer_reads_it(value, spelled):
+    """`json.dumps` writes `1.5e-07` and `1.2345678901234567e+19`, and the lexer
+    takes a fraction or an exponent, never both. The same double, in digits."""
+    rendered = render_call(ToolCall(name="set", args={"n": value}))
+
+    assert f"{{n:{spelled}}}" in rendered
+    assert parse_call(rendered) == ToolCall(name="set", args={"n": value})
+
+
+def test_the_arguments_follow_the_declared_order_whatever_the_case(tmp_path):
+    """One sort for both, and it is the template's `dictsort`, which ignores
+    case: the grammar holds a call to the order the declarations were handed
+    over in, so the order trained here has to be that order."""
+    path = tmp_path / "declarations.json"
+    properties = {
+        "URL": {"type": "string", "description": "u"},
+        "body": {"type": "string", "description": "b"},
+    }
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "send",
+                        "description": "d",
+                        "parameters": {"type": "object", "properties": properties},
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    declared = list(read_declarations(path)[0][0]["function"]["parameters"]["properties"])
+
+    parsed = parse_call(render_call(ToolCall(name="send", args={"URL": "u", "body": "b"})))
+
+    assert parsed is not None
+    assert list(parsed.args) == declared == ["body", "URL"]
+
+
+def _one_tool(tmp_path: Path, properties: dict, required: list[str] | None = None) -> Path:
+    parameters: dict = {"type": "object", "properties": properties}
+    if required:
+        parameters["required"] = required
+    path = tmp_path / "declarations.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "set", "description": "d", "parameters": parameters},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        ({"level": 3, "extra": "x"}, "sends ['extra'], which the declaration of 'set' does not"),
+        ({"mode": "loud"}, "leaves out ['level'], which the declaration of 'set' requires"),
+        ({"level": "3"}, "sends level='3', a str, where the declaration of 'set' says integer"),
+        ({"level": True}, "sends level=True, a bool, where the declaration of 'set' says integer"),
+        ({"level": 3, "mode": "shout"}, "which is not in the declared enum ['loud', 'soft']"),
+    ],
+)
+def test_a_target_that_contradicts_its_declaration_is_refused(
+    tmp_path, write_jsonl, args, expected
+):
+    """Found in review: only the tool's name was checked. A target that sends an
+    undeclared argument, leaves out a required one, or sends another type or a
+    value outside the enum trains a call contradicting the declaration the
+    prompt shows the model."""
+    declarations = _one_tool(
+        tmp_path,
+        {
+            "level": {"type": "integer", "description": "l"},
+            "mode": {"type": "string", "description": "m", "enum": ["loud", "soft"]},
+        },
+        required=["level"],
+    )
+    data = write_jsonl([{"prompt": "set it", "target": {"name": "set", "args": args}}])
+
+    with pytest.raises(PrepareError) as caught:
+        refuse_undeclared_tools(read_rows(data), data, declarations)
+
+    assert expected in str(caught.value)
+    assert f"{data}:1" in str(caught.value)
+
+
+def test_a_target_that_keeps_to_its_declaration_passes(tmp_path, write_jsonl):
+    declarations = _one_tool(
+        tmp_path,
+        {
+            "level": {"type": "INTEGER", "description": "l"},
+            "ratio": {"type": "number", "description": "r"},
+            "mode": {"type": "string", "description": "m", "enum": ["loud", "soft"]},
+        },
+        required=["level"],
+    )
+    data = write_jsonl(
+        [{"prompt": "set it", "target": {"name": "set", "args": {"level": 3, "ratio": 1}}}]
+    )
+
+    refuse_undeclared_tools(read_rows(data), data, declarations)
 
 
 CALL_ROWS = [

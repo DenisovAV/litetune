@@ -1853,19 +1853,25 @@ def test_the_digest_is_the_results_and_the_file_is_the_requests(trainer, request
     file the caller named, and the digest of what was in it belongs to the
     result, which is the division `prompt_mode_decision` already follows.
     """
-    from litetune.storage import hash_file
+    from litetune.declarations import read_declarations
 
     decls = tmp_path / "declarations.json"
     decls.write_text(
         '[{"type": "function", "function": {"name": "set_timer", "description": "d"}}]',
         encoding="utf-8",
     )
+    parsed, digest = read_declarations(decls)
 
     record = run_tune(request_for(declarations=decls)).as_dict()
 
-    assert record["declarations_sha256"] == hash_file(decls)
+    assert record["declarations_sha256"] == digest
     assert record["request"]["declarations"] == str(decls)
     assert "declarations_sha256" not in record["request"]
+    # And the script is handed both: the digest it writes beside the checkpoint
+    # for `verify` and `bundle`, and the declarations it renders into every
+    # training prompt. Dropping either survived this whole file in review.
+    assert trainer.configs[0]["declarations_sha256"] == digest
+    assert trainer.configs[0]["tools"] == parsed
 
 
 def test_declarations_that_do_not_parse_are_refused_before_the_environment(

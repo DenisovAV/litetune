@@ -6,12 +6,13 @@ the one that packages it. `bundle` has taken them since it existed; `prepare`,
 `tune` and `verify` take the same file.
 
 **One reader, because the digest has to match.** `tune` records a digest beside
-the checkpoint and `verify` refuses a set that disagrees with it, and both are
-compared against the `declarations_sha256` a bundle's contract carries. A second
-way of computing it -- hashing the parsed value, or the text rather than the
-bytes -- would produce a different string for the same file and turn that
-comparison into a false refusal. So the digest is `storage.hash_file`, the
-function `bundle` already compares with, over the same bytes.
+the checkpoint, `verify` refuses a set that disagrees with it, and a bundle's
+contract carries it. It identifies the tool list, not the file: the digest of
+`canonical_text` over the declarations as read here, so the file a user wrote,
+the one a `runtime_rendered` bundle ships and the same list reformatted all hash
+alike. A digest over the file's bytes, which this used before, made a bundle
+refuse the declarations file it had itself shipped, because the bundle writes
+them in the order the model learned and the user's file was in another.
 
 **The shape is the runtime's, and the rules here are its rules.** One entry is
 the OpenAI function-tool object: `{"type": "function", "function": {"name",
@@ -26,12 +27,13 @@ refused by the runtime rather than rendered differently.
 declaration in C++ (`fc_tool_format_utils.cc`) by walking an insertion-ordered
 JSON, so it prints the key order it is handed; the chat template a FunctionGemma
 checkpoint carries pipes every mapping through `dictsort`, so it prints them
-alphabetically. Measured on 2026-09-17: sorting every mapping here makes the two
-agree on ordering, and what survives the sort is four shapes the template drops
-or invents a field for. Those are refused below, each against a measured
-difference rather than against a schema this project preferred, and the refusal
-names the property so a caller learns it here instead of as a token position in
-the rendering check. `_RENDERABLE` records the template's own emission rules.
+in `dictsort`'s order. Measured on 2026-09-17: sorting every mapping here the way
+`dictsort` does makes the two agree on ordering, and what survives the sort are
+shapes the template drops or invents a field for. Those are refused below, each
+against a measured difference rather than against a schema this project
+preferred, and the refusal names the property so a caller learns it here instead
+of as a token position in the rendering check. `_RENDERABLE` records the
+template's own emission rules.
 
 So this enforces the three rules the runtime enforces -- a list, each entry an
 object, `function.name` a string -- and then the subset both renderers render
@@ -46,18 +48,22 @@ here may be imported by any stage without a cycle.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from litetune.storage import hash_file
+from litetune.metrics import IDENTIFIER
+from litetune.storage import HASH_ALGORITHM, hash_file
 
 
 class DeclarationsError(Exception):
     """A declarations file that cannot be used. Names the file and what was wrong."""
 
 
-def read_declarations(path: Path) -> tuple[Any, str]:
+def read_declarations(path: Path) -> tuple[list[Any], str]:
     """The parsed declarations and their digest, in the shape `bundle` accepts.
 
     Raises `DeclarationsError` when the file cannot be read, is not JSON, or
@@ -79,10 +85,53 @@ def read_declarations(path: Path) -> tuple[Any, str]:
     _check(parsed, Path(path))
     ordered = _ordered(parsed)
     _check_renderable(ordered, Path(path))
-    # The digest is over the file's bytes, not over `text` or `parsed`: sorting
-    # changes what is rendered, never what is recorded, and the digest is what
-    # `bundle` compares its contract against.
-    return ordered, hash_file(Path(path))
+    return ordered, content_digest(ordered)
+
+
+def canonical_text(entries: list[Any]) -> str:
+    """The one way these declarations are written out: what a bundle ships.
+
+    Two-space JSON, UTF-8 left as UTF-8, a trailing newline, in the order
+    `read_declarations` returns them. `content_digest` is the digest of exactly
+    this text, so a shipped file's bytes hash to its contract's digest.
+    """
+    return json.dumps(entries, ensure_ascii=False, indent=2) + "\n"
+
+
+def content_digest(entries: list[Any]) -> str:
+    """The digest of a tool list, in the format `storage.hash_file` writes."""
+    body = hashlib.sha256(canonical_text(entries).encode("utf-8")).hexdigest()
+    return f"{HASH_ALGORITHM}:{body}"
+
+
+def digest_matches(recorded: str, digest: str | None, path: Path) -> bool:
+    """Whether a recorded digest names the declarations read from `path`.
+
+    `digest` is `read_declarations`'s, or `None` where that refused the file. A
+    digest over the file's bytes is accepted too: a `Contract` built in code
+    before digests identified the tool list could only have carried that one.
+    Compared without the algorithm prefix, which some records keep and some do
+    not.
+    """
+    wanted = recorded.split(":", 1)[-1]
+    known = [hash_file(Path(path))] + ([digest] if digest is not None else [])
+    return wanted in (d.split(":", 1)[-1] for d in known)
+
+
+def declared_order(keys: Iterable[str]) -> list[str]:
+    """`keys` in the order the reference template's `dictsort` prints them.
+
+    One key for every place that has to agree with that template: the
+    declarations handed to both renderers, and the argument order
+    `prepare.render_call` trains, which the runtime's grammar holds to the
+    declared order. `dictsort` is case-insensitive by default, so a plain
+    `sorted` disagrees with it on `URL` beside `body`: rendered with jinja2
+    3.1.6, `dictsort` puts `body` first, `sorted` puts `URL` first, and the
+    runtime -- which prints the order it is handed -- would have been handed the
+    other one. Names equal but for case are refused in `_check_properties`,
+    because no sort orders them.
+    """
+    return sorted(keys, key=str.lower)
 
 
 def _ordered(value: Any) -> Any:
@@ -95,7 +144,7 @@ def _ordered(value: Any) -> Any:
     differing token id rather than as a missing call.
     """
     if isinstance(value, dict):
-        return {key: _ordered(value[key]) for key in sorted(value)}
+        return {key: _ordered(value[key]) for key in declared_order(value)}
     if isinstance(value, list):
         return [_ordered(item) for item in value]
     return value
@@ -120,6 +169,7 @@ def _check(parsed: Any, path: Path) -> None:
                 "The runtime refuses anything else before it renders a declaration, and the "
                 "reference chat template reads the same two keys"
             )
+        _refuse_unreadable_name(function["name"], f"{where} is named {function['name']!r}")
 
 
 # The seven names the runtime's formatter uppercases. It leaves anything else
@@ -158,6 +208,13 @@ _RESERVED = ("description", "nullable", "properties", "required", "type")
 # emits `description`, then these, then `type`, and nothing else in any branch.
 _RENDERABLE = {"string": ("enum",), "object": ("properties", "required"), "array": ("items",)}
 
+_WHY_TYPE = (
+    f"The runtime's formatter uppercases only the lowercase names {', '.join(_TYPES)} and "
+    "leaves anything else as written, while the reference template uppercases whatever it is "
+    "given -- so a lowercase name, or the same name in capitals, renders one way and any other "
+    "spelling renders two"
+)
+
 _WHY_ORDER = (
     "the runtime's formatter prints every key it is given and the reference chat template "
     "prints only the keys it knows, so the two prompts would differ"
@@ -168,8 +225,8 @@ def _check_renderable(parsed: Any, path: Path) -> None:
     """Refuse what the runtime and the reference template render differently.
 
     Every rule is one measured difference, not a preference: see the module
-    docstring and design decision D13. Runs after `_ordered`, so a mapping here
-    is already in the order both renderers will be given.
+    docstring. Runs after `_ordered`, so a mapping here is already in the order
+    both renderers will be given.
     """
     for entry in parsed:
         function = entry["function"]
@@ -198,13 +255,41 @@ def _check_parameters(parameters: Any, where: str) -> None:
                 f"{where} has an empty {key}. The reference template omits it and the runtime "
                 f"prints it empty; {_ALSO_IN_THE_APP}"
             )
+    if "type" in parameters and _type_name(parameters["type"]) is None:
+        raise DeclarationsError(f"{where} has type {parameters['type']!r}. {_WHY_TYPE}")
     if "properties" in parameters:
         if not isinstance(parameters["properties"], dict):
             raise DeclarationsError(f"{where}: properties is not an object")
+        # These names are the call's argument keys, so they have to be names
+        # the runtime's call parser reads. Nested properties never reach a
+        # call: `prepare` refuses an object argument.
+        for name in parameters["properties"]:
+            _refuse_unreadable_name(name, f"{where}.{name}")
         _check_properties(parameters["properties"], where)
 
 
+def _refuse_unreadable_name(name: str, where: str) -> None:
+    """A name a call must carry has to be one the runtime's call parser reads."""
+    if not re.fullmatch(IDENTIFIER, name):
+        raise DeclarationsError(
+            f"{where}, which is not a name the runtime's call parser reads: its lexer takes "
+            "[a-zA-Z_][a-zA-Z0-9_.-]* (AntlrFcLexer.g4, LiteRT-LM v0.16.1), so a call to it "
+            "would be refused on every row. Rename it here and in the declarations your "
+            "application sends"
+        )
+
+
 def _check_properties(properties: dict[str, Any], where: str) -> None:
+    folded: dict[str, str] = {}
+    for name in properties:
+        if name.lower() in folded:
+            raise DeclarationsError(
+                f"{where} has properties {folded[name.lower()]!r} and {name!r}, equal but for "
+                "case. The reference template's `dictsort` ignores case, so no sort puts them in "
+                "the same order for both renderers, and the runtime's grammar holds a call to "
+                "that order. Rename one here and in the declarations your application sends"
+            )
+        folded[name.lower()] = name
     for name, prop in properties.items():
         here = f"{where}.{name}"
         if name in _RESERVED:
@@ -224,12 +309,7 @@ def _check_properties(properties: dict[str, Any], where: str) -> None:
         written = prop.get("type")
         kind = _type_name(written)
         if kind is None:
-            raise DeclarationsError(
-                f"{here} has type {written!r}. The runtime's formatter uppercases only the "
-                f"lowercase names {', '.join(_TYPES)} and leaves anything else as written, while "
-                "the reference template uppercases whatever it is given -- so a lowercase name, "
-                "or the same name in capitals, renders one way and any other spelling renders two"
-            )
+            raise DeclarationsError(f"{here} has type {written!r}. {_WHY_TYPE}")
         _refuse_extra_keys(
             set(prop), {"description", "type", *_RENDERABLE.get(kind, ())}, here, kind=written
         )
@@ -285,6 +365,49 @@ def _refuse_extra_keys(
     raise DeclarationsError(
         f"{where}{of_type} carries {extra} beside {sorted(allowed)}. Here {_WHY_ORDER}"
     )
+
+
+# Which Python values a JSON-typed argument may hold. A bool is an int in
+# Python and never a number in JSON Schema, so it is excluded by name.
+_HOLDS = {
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, int | float) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+    "null": lambda v: v is None,
+}
+
+
+def argument_problem(parsed: list[Any], name: str, args: dict[str, Any]) -> str | None:
+    """Why a call's arguments contradict the declaration of `name`, or `None`.
+
+    The declaration is what the prompt tells the model it may send; a target
+    that sends something else trains the model to break the contract it was
+    just shown. Checked: every argument declared, every required one present,
+    each value of its declared type, and within its enum. An array or object
+    value is not checked here -- `prepare` refuses those before rendering.
+    """
+    function = next(entry["function"] for entry in parsed if entry["function"]["name"] == name)
+    parameters = function.get("parameters") or {}
+    properties = parameters.get("properties") or {}
+    undeclared = sorted(set(args) - set(properties))
+    if undeclared:
+        return f"sends {undeclared}, which the declaration of {name!r} does not have"
+    missing = [key for key in parameters.get("required") or [] if key not in args]
+    if missing:
+        return f"leaves out {missing}, which the declaration of {name!r} requires"
+    for key, value in args.items():
+        prop = properties[key]
+        kind = _type_name(prop["type"])
+        holds = _HOLDS.get(kind or "")
+        if holds is not None and not holds(value):
+            return (
+                f"sends {key}={value!r}, a {type(value).__name__}, where the declaration of "
+                f"{name!r} says {prop['type']}"
+            )
+        if "enum" in prop and value not in prop["enum"]:
+            return f"sends {key}={value!r}, which is not in the declared enum {prop['enum']}"
+    return None
 
 
 def tool_names(parsed: Any) -> frozenset[str]:

@@ -40,21 +40,36 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
+import re
 import statistics
 import subprocess
 import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
 from litetune import envs
 from litetune.checks import Check, CheckSet, Outcome, guard
-from litetune.declarations import read_declarations, tool_names
+from litetune.declarations import (
+    argument_problem,
+    declared_order,
+    read_declarations,
+    tool_names,
+)
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.liveness import SkippedCheck
-from litetune.metrics import Proportion, ToolCall, Unavailable, read_target
+from litetune.metrics import (
+    ESCAPE_SPELLINGS,
+    IDENTIFIER,
+    Proportion,
+    ToolCall,
+    Unavailable,
+    read_target,
+)
 from litetune.models import (
     WireFormat,
     hint_for,
@@ -165,9 +180,18 @@ def render_call(call: ToolCall) -> str:
     shape, and its goldens say so directly: `function_gemma_data_processor_test`
     carries `call:get_weather{location:<escape>Paris<escape>}` beside
     `call:tool_name{x:1}`, and the same rule holds in a tool response, where
-    `temperature:20` sits next to `unit:<escape>C<escape>`. Escaping everything,
-    which this did until the format was read, teaches the model to send a number
-    as a string.
+    `temperature:20` sits next to `unit:<escape>C<escape>`. The parser reads the
+    two differently -- `fc_parser.rs` returns an escaped value as a string and a
+    bare number as a double -- so escaping everything, which this did until the
+    format was read, taught the model to send a number the caller receives as a
+    string.
+
+    **Only what the runtime can read back is written.** A name or key outside
+    its identifier grammar, a string holding one of the lexer's three escape
+    spellings, and a number with no spelling in its grammar are refused, with
+    the row named, rather than trained: each would be a call the runtime refuses
+    or cuts short on every generation -- and an escape inside a string would
+    let a dataset row write a second call into the training text.
 
     **A call is wrapped in its markers.** `<start_function_call>` and
     `<end_function_call>` are what the runtime's parser looks for, and a call
@@ -179,36 +203,88 @@ def render_call(call: ToolCall) -> str:
     is not written here: it depends on who reads the reply, and `tune` asks the
     chat template for it.
 
-    **The arguments are sorted, because the runtime's grammar enforces the order
-    the declarations list.** `declarations.py` sorts every mapping in the file,
-    so the declared property order is alphabetical; sorting here makes the order
-    the model is trained to write the same one. Measured 2026-09-17 on
-    FunctionGemma x mobile-actions, n=640: trained in the dataset's own argument
-    order, the model wrote `to, subject, body`, and with the runtime's grammar
-    on it emitted `subject, to` and never `body` -- an argument out of declared
-    order is not merely discouraged, it is illegal, and the call closes without
-    it. 112 of 640 rows lost an argument that way, 0.9172 falling to 0.7422. A
+    **The arguments are in declared order, because the runtime's grammar
+    enforces the order the declarations list.** `declarations.py` puts every
+    mapping in the file in `declared_order`; writing the arguments in the same
+    order makes the order the model is trained to write the declared one.
+    Measured 2026-09-17 on FunctionGemma x mobile-actions, n=640: trained in the
+    dataset's own argument order, the model wrote `to, subject, body`, and with
+    the runtime's grammar on it emitted `subject, to` and never `body` -- an
+    argument out of declared order is not merely discouraged, it is illegal,
+    and the call closes without it. 112 rows were right with the grammar off
+    and wrong with it on, each for a lost argument; 0.9172 fell to 0.7422. A
     probe over 20 of them: declared `to, subject, body`, the grammar kept `body`
     on 20 of 20; declared alphabetically, on 0 of 20.
     """
-    body = ",".join(_render_argument(key, call.raw[key]) for key in sorted(call.args))
+    if not re.fullmatch(IDENTIFIER, call.name):
+        raise ValueError(
+            f"the tool name {call.name!r} is not one the runtime's call parser reads "
+            "([a-zA-Z_][a-zA-Z0-9_.-]*), so a call to it would be refused on every generation"
+        )
+    body = ",".join(_render_argument(key, call.raw[key]) for key in declared_order(call.args))
     return f"{START_CALL}call:{call.name}{{{body}}}{END_CALL}"
 
 
 def _render_argument(key: str, value: Any) -> str:
-    """One `key:value` pair. Raises `ValueError` for a value with no known shape."""
+    """One `key:value` pair. Raises `ValueError` for anything the runtime cannot read back."""
+    if not re.fullmatch(IDENTIFIER, key):
+        raise ValueError(
+            f"the argument {key!r} is not a name the runtime's call parser reads "
+            "([a-zA-Z_][a-zA-Z0-9_.-]*), so a call carrying it would be refused on every "
+            "generation"
+        )
     if isinstance(value, str):
+        held = [spelling for spelling in ESCAPE_SPELLINGS if spelling in value]
+        if held:
+            raise ValueError(
+                f"the argument {key!r} contains {held[0]!r}, which the runtime's lexer reads as "
+                "the end of a string: the call would be cut there, and the rest of the value "
+                "read as call syntax. There is no way to carry it inside a string"
+            )
         return f"{key}:<escape>{value}<escape>"
-    if value is None or isinstance(value, int | float):
-        # `json.dumps` spells all four the way the wire format does -- `3`,
-        # `0.5`, `true`, `null` -- where `str` would write `True` and `None`.
-        # A bool is an int, so it takes this branch too.
+    if value is None or isinstance(value, bool):
         return f"{key}:{json.dumps(value)}"
+    if isinstance(value, int):
+        if abs(value) > _EXACT_IN_A_DOUBLE:
+            raise ValueError(
+                f"the argument {key!r} is {value}, and the runtime reads every number as a double "
+                "(fc_parser.rs), which holds an integer exactly only up to 2**53: the caller would "
+                "receive a different number than the one trained. Send it as a string"
+            )
+        return f"{key}:{value}"
+    if isinstance(value, float):
+        return f"{key}:{_render_number(key, value)}"
     raise ValueError(
         f"the argument {key!r} is a {type(value).__name__}, and nothing in this project "
         "establishes what the runtime's call parser accepts for a list or an object. Supply the "
         "row's 'completion' text instead, which is taken as written"
     )
+
+
+_EXACT_IN_A_DOUBLE = 2**53
+
+
+def _render_number(key: str, value: float) -> str:
+    """A float in a spelling the runtime's number grammar reads.
+
+    An integral float is written as the integer it equals, which both parsers
+    read back as that value -- where `json.dumps` would write
+    `1.2345678901234567e+19`, a spelling the lexer refuses. `json.dumps` also
+    writes `1.5e-07` for a small number, and the lexer takes a fraction or an
+    exponent but never both (`AntlrFcLexer.g4`), so such a number is written in
+    plain decimal instead: the same digits, read back as the same double.
+    """
+    if not math.isfinite(value):
+        raise ValueError(
+            f"the argument {key!r} is {value!r}, and the runtime's number grammar has no "
+            "spelling for it"
+        )
+    if value.is_integer():
+        return str(int(value))
+    spelled = json.dumps(value)
+    if "." in spelled and ("e" in spelled or "E" in spelled):
+        spelled = format(Decimal(spelled), "f")
+    return spelled
 
 
 @dataclass(frozen=True)
@@ -295,17 +371,31 @@ def refuse_undeclared_tools(rows: Sequence[Row], data: Path, declarations: Path)
     something no runtime will have declared to it, and the loss curve would look
     exactly like a run that worked.
 
+    The arguments are checked against the declaration too, on the same ground:
+    an argument it does not declare, a required one left out, a value of another
+    type or outside its enum would train a call that contradicts the contract
+    the prompt shows the model.
+
     Only a structured target is checked. A row that supplies its own completion
     text is the caller saying what to train, and litetune does not parse it back
     to second-guess which tool it names.
     """
-    offered = tool_names(read_declarations(declarations)[0])
+    parsed = read_declarations(declarations)[0]
+    offered = tool_names(parsed)
     for row in rows:
-        if isinstance(row.target, ToolCall) and row.target.name not in offered:
+        if not isinstance(row.target, ToolCall):
+            continue
+        if row.target.name not in offered:
             raise PrepareError(
                 f"{data}:{row.lineno}: the target calls {row.target.name!r}, which "
                 f"{declarations} does not declare. It offers "
                 f"{', '.join(sorted(offered)) if offered else 'no tools at all'}"
+            )
+        problem = argument_problem(parsed, row.target.name, row.target.raw)
+        if problem is not None:
+            raise PrepareError(
+                f"{data}:{row.lineno}: the target {problem} in {declarations}. Training it "
+                "would teach a call that contradicts the declaration the prompt shows"
             )
 
 
