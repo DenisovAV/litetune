@@ -260,14 +260,15 @@ def _refuse_calls_the_runtime_would_not_read(
             )
         after = row.completion.rpartition(END_CALL)[2]
         held = control_text_held(row.target.raw)
-        if calls == [row.target] and not after.strip() and held is None:
+        if calls == [row.target] and not after and held is None:
             continue
         if calls == [row.target] and held is not None:
             why = f"a string in it holds {held!r}: {CONTROL_TEXT[held]}"
         elif calls == [row.target]:
             why = (
-                f"text follows the call ({after.strip()[:80]!r}), and the call ending the "
-                "template writes is right only right after a call"
+                f"text follows the call ({after[:80]!r}), which the runtime hands over as the "
+                "reply's text, and the call ending the template writes is right only right "
+                "after a call"
             )
         elif calls is None:
             why = "the runtime would give no reply: a block between its markers is not one call"

@@ -438,38 +438,46 @@ class _CallReader:
             raise _NotACall
         return ToolCall(name=name, args=arguments)
 
-    def object(self) -> dict[str, Any]:
+    def object(self, read: bool = True) -> dict[str, Any]:
         self.take("{")
         values: dict[str, Any] = {}
         if self.peek() != "}":
             while True:
                 key = self.take("ID")
                 self.take(":")
-                values.setdefault(key, self.value())
+                # A key the object already has: `parse_object` logs it and
+                # `continue`s without reading its value, so a value that one
+                # could not be read from does not fail the reply. The parse
+                # tree is still built for it, so its syntax must hold.
+                fresh = key not in values
+                value = self.value(read and fresh)
+                if fresh:
+                    values[key] = value
                 if self.peek() != ",":
                     break
                 self.take(",")
         self.take("}")
         return values
 
-    def array(self) -> list[Any]:
+    def array(self, read: bool = True) -> list[Any]:
         self.take("[")
         items: list[Any] = []
         if self.peek() != "]":
             while True:
-                items.append(self.value())
+                items.append(self.value(read))
                 if self.peek() != ",":
                     break
                 self.take(",")
         self.take("]")
         return items
 
-    def value(self) -> Any:
+    def value(self, read: bool = True) -> Any:
+        """One value. `read` is false where the runtime parses but never reads it."""
         rule = self.peek()
         if rule == "{":
-            return self.object()
+            return self.object(read)
         if rule == "[":
-            return self.array()
+            return self.array(read)
         if rule == "STRING":
             return _strip_escape_tokens(self.take("STRING"))
         if rule == "BOOLEAN":
@@ -479,6 +487,8 @@ class _CallReader:
             return None
         if rule == "NUMBER":
             text = self.take("NUMBER")
+            if not read:
+                return None
             if not re.search(r"[0-9]", re.split("[eE]", text)[0]):
                 # `'-'? EXP` lexes, and `text.parse::<f64>()` refuses it.
                 raise _NotACall

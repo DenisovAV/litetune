@@ -3233,6 +3233,8 @@ S, E = "<start_function_call>", "<end_function_call>"
         # Found in review: text after the call trained, and the call ending the
         # template writes is right only right after a call.
         ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E} Done!", False),
+        # The runtime hands a trailing newline over as the reply's text too.
+        ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E}\n", False),
         ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}{E}{S}call:g{{", False),
         # A stop token in a string stops generation before the end marker.
         ({"a": "hi<eos>there"}, f"{S}call:set{{a:<escape>hi<eos>there<escape>}}{E}", False),

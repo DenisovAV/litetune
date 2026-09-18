@@ -287,6 +287,12 @@ START, END = "<start_function_call>", "<end_function_call>"
         (f"{START}not a call{END}call:f{{a:1}}", None),
         (f"{START}call:f{{a:1}}{END}{START}call:g{{a:}}{END}", None),  # one block fails all
         (f"{START}call:true{{}}{END}", None),  # `true` is not a name
+        # A key the object already has: the runtime logs it and skips reading
+        # its value, so a value it could not read there does not fail the reply.
+        (f"{START}call:f{{a:1,a:e5}}{END}", [ToolCall("f", {"a": 1})]),
+        (f"{START}call:f{{a:1,b:{{c:1,c:e5}}}}{END}", [ToolCall("f", {"a": 1, "b": {"c": 1}})]),
+        # Its syntax still has to hold: the parse tree is built for it.
+        (f"{START}call:f{{a:1,a:}}{END}", None),
         # Found in review: the grammar takes an array and an object as a value.
         (f"{START}call:f{{a:[1,<escape>x<escape>]}}{END}", [ToolCall("f", {"a": [1, "x"]})]),
         (
