@@ -1915,4 +1915,32 @@ def test_the_summary_says_which_path_ran_and_prints_both_modes():
     assert "path: tool path" in text
     assert "grammar off: the candidate above, the runtime's default: 0.9125" in text
     assert "grammar on: what an application that enables it gets: 0.7422" in text
-    assert "grammar_effect: +0.1700" in text
+    # Grammar on scored lower, so the grammar lowered the score; the manifest's
+    # +0.17 printed bare read as a gain.
+    assert "grammar_effect: the grammar lowered the score by 0.1700" in text
+
+
+def test_the_summary_says_when_the_grammar_on_run_was_not_made():
+    from litetune.cli import summarise
+
+    lines = summarise(
+        {
+            "status": "passed",
+            "harness": {"tool_path_selection": {"tool_path": False, "why": "w"}},
+            "tool_path": {
+                "modes": {
+                    "unconstrained": {
+                        "score": {"exact_match": {"value": 0.9, "ci95": 0.02, "n": 640}}
+                    },
+                    "constrained": {"available": False, "reason": "no SentencePiece tokenizer"},
+                },
+                "grammar_effect": {"available": False, "reason": "not measured"},
+            },
+        }
+    )
+    text = "\n".join(lines)
+
+    assert "path: text path" in text
+    assert "grammar on: what an application that enables it gets: not measured" in text
+    assert "no SentencePiece tokenizer" in text
+    assert "grammar_effect" not in text

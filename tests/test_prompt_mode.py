@@ -32,6 +32,7 @@ from litetune.prompt_mode import (
     prompt_evidence,
     resolve_prompt_mode,
 )
+from litetune.storage import hash_file
 from litetune.verify import (
     DECLARATIONS_CHECK,
     EXIT_CODES,
@@ -723,7 +724,8 @@ def test_a_checkpoint_that_learned_declarations_is_not_measured_without_them(tmp
     """Found in review: the check ran only when the flag was given, so a
     checkpoint that recorded declarations and a run that forgot them was measured
     on a prompt without the tool list it learned -- 0 of 5 on both sides when
-    measured -- and passed with no word about it."""
+    measured -- and passed with no word about it. Only where the runtime renders
+    the declarations: in `prerendered` the prompts carry them already."""
     trained = tmp_path / "trained.json"
     trained.write_text(
         '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
@@ -731,7 +733,7 @@ def test_a_checkpoint_that_learned_declarations_is_not_measured_without_them(tmp
     )
     reference = _checkpoint(
         tmp_path,
-        {"prompt_mode": "prerendered", "declarations_sha256": read_declarations(trained)[1]},
+        {"prompt_mode": "runtime_rendered", "declarations_sha256": read_declarations(trained)[1]},
     )
 
     result, candidate, reference_backend = _verify_with(tmp_path, write_split, reference, None)
@@ -741,6 +743,27 @@ def test_a_checkpoint_that_learned_declarations_is_not_measured_without_them(tmp
     assert "Pass --declarations" in refusal["detail"]
     assert candidate.prompts_seen == []
     assert reference_backend.prompts_seen == []
+
+
+def test_a_prerendered_checkpoint_is_measured_without_declarations_it_recorded(
+    tmp_path, write_split
+):
+    """Found in review: the refusal fired in `prerendered` too, with a false
+    reason -- there the prompts already carry the tool list and the flag reaches
+    no backend -- and the README's own walkthrough led into it."""
+    trained = tmp_path / "trained.json"
+    trained.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(trained)}
+    )
+
+    result, candidate, _ = _verify_with(tmp_path, write_split, reference, None)
+
+    assert result.status is not Status.FAILED_HARNESS
+    assert candidate.prompts_seen != []
 
 
 def test_a_record_of_the_files_bytes_still_matches_that_file(tmp_path, write_split):

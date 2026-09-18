@@ -816,8 +816,11 @@ def summarise(manifest: dict) -> list[str]:
         ("unconstrained", "grammar off: the candidate above, the runtime's default"),
         ("constrained", "grammar on: what an application that enables it gets"),
     ):
-        exact = _mapping(_mapping(_mapping(tool_path.get("modes")).get(mode)).get("score"))
-        exact = _mapping(exact.get("exact_match"))
+        block = _mapping(_mapping(tool_path.get("modes")).get(mode))
+        if block.get("available") is False:
+            lines.append(f"  {meaning}: not measured — {block.get('reason')}")
+            continue
+        exact = _mapping(_mapping(block.get("score")).get("exact_match"))
         if exact:
             lines.append(
                 f"  {meaning}: {_num(exact.get('value'))} ±{_num(exact.get('ci95'))} "
@@ -825,10 +828,14 @@ def summarise(manifest: dict) -> list[str]:
             )
     grammar = _mapping(tool_path.get("grammar_effect"))
     if grammar.get("available"):
+        # The number is grammar off minus grammar on, so its sign alone reads
+        # backwards: say which way the grammar moved the score.
+        value = grammar.get("value") or 0
+        moved = "lowered" if value > 0 else "raised" if value < 0 else "did not change"
         resolved = "" if grammar.get("resolved") else "  (unresolved at this sample size)"
         lines.append(
-            f"  grammar_effect: {_num(grammar.get('value'), signed=True)} "
-            f"±{_num(grammar.get('ci95'))}{resolved}"
+            f"  grammar_effect: the grammar {moved} the score by "
+            f"{_num(abs(value))} ±{_num(grammar.get('ci95'))}{resolved}"
         )
 
     for name, value in _mapping(manifest.get("attribution")).items():

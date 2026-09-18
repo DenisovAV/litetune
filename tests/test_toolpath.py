@@ -118,6 +118,7 @@ def _run(runtime: FakeRuntime, tmp_path: Path, monkeypatch, **spec_extra) -> tup
         "max_tokens": 64,
         "constrained": True,
         "out": str(out),
+        "log": str(tmp_path / "runtime.log"),
     }
     spec.update(spec_extra)
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
@@ -205,7 +206,7 @@ def test_a_structured_call_comes_back_with_its_argument_types(tmp_path, monkeypa
         "calls": [{"name": "set_alarm", "arguments": {"hour": 7.0, "loud": True}}],
         "text": "",
         "error": None,
-        "parse_refusal": False,
+        "kind": None,
     }
 
 
@@ -275,29 +276,45 @@ def test_every_prompt_gets_a_row_in_order(tmp_path, monkeypatch):
 SEND_FAILED = RuntimeError("litert_lm_conversation_send_message failed")
 
 
-def test_a_reply_the_runtime_refused_carries_the_reason_from_its_log(tmp_path, monkeypatch):
+def test_a_reply_the_runtime_refused_carries_the_kind_of_reason_from_its_log(tmp_path, monkeypatch):
     """The binding says only that the reply failed; the runtime says why, on its
-    log. The first version recorded the binding's sentence -- the same on every
-    row -- and called it the runtime's own words."""
+    log. A parse failure's message carries the model's code block and response
+    (`parser_utils.cc`), which must not travel into a manifest a bundle ships,
+    so it is kept as its kind. The log lines are absl's shape."""
     runtime = FakeRuntime(
-        replies=[_reply("set_colour", {"colour": "red"}), SEND_FAILED, SEND_FAILED],
+        replies=[_reply("set_colour", {"colour": "red"}), SEND_FAILED, SEND_FAILED, SEND_FAILED],
         logs={
-            1: "E0918 conversation.cc:88] INVALID_ARGUMENT: Failed to parse tool calls from "
-            "code block\n",
-            2: "E0918 conversation.cc:91] Failed to send message: input is too long\n",
+            1: "E0918 12:00:00.000000 4242 conversation.cc:552] Failed to send message: "
+            "INVALID_ARGUMENT: Failed to parse tool calls from code block: call:secret_tool{}\n"
+            "full response: the model's private text\nerror: Failed to parse FC tool calls\n",
+            2: "E0918 12:00:00.000000 4242 conversation.cc:552] Failed to send message: "
+            "Input token ids are too long. Exceeding the maximum number of tokens allowed: "
+            "4101 >= 4096\n",
+            3: "E0918 12:00:00.000000 4242 conversation.cc:552] Failed to send message: "
+            "INTERNAL: something else\n",
         },
     )
 
-    code, out = _run(runtime, tmp_path, monkeypatch, prompts=["a", "b", "c"])
+    code, out = _run(runtime, tmp_path, monkeypatch, prompts=["a", "b", "c", "d"])
 
     assert code == 0
     rows = _rows_written(out)
-    assert rows[0]["calls"] and rows[0]["error"] is None
-    assert "Failed to parse tool calls" in rows[1]["error"]
-    assert rows[1]["parse_refusal"] is True
-    assert "input is too long" in rows[2]["error"]
-    assert rows[2]["parse_refusal"] is False
+    assert rows[0]["calls"] and rows[0]["error"] is None and rows[0]["kind"] is None
+    assert [row["kind"] for row in rows[1:]] == ["parse", "too_long", "other"]
+    assert "secret_tool" not in json.dumps(rows) and "private text" not in json.dumps(rows)
+    # Anything else in the runtime's own words, without absl's prefix.
+    assert rows[3]["error"] == "Failed to send message: INTERNAL: something else"
     assert all(row["calls"] == [] for row in rows[1:])
+
+
+def test_an_exception_that_is_not_a_missing_reply_ends_the_run(tmp_path, monkeypatch):
+    """Found in review: any exception from `send_message` was scored as the
+    model's wrong answer -- an API change, memory, a closed conversation. Only
+    the binding's own no-reply error is a result about a row."""
+    runtime = FakeRuntime(replies=[TypeError("send_message() got an unexpected keyword")])
+
+    with pytest.raises(TypeError):
+        _run(runtime, tmp_path, monkeypatch)
 
 
 def test_a_conversation_that_cannot_be_created_ends_the_run(tmp_path, monkeypatch):
@@ -335,7 +352,7 @@ class _WritingEnv:
 
 
 def _row(index: int, **fields: Any) -> dict:
-    return {"index": index, "calls": [], "text": "", "error": None, "parse_refusal": False} | fields
+    return {"index": index, "calls": [], "text": "", "error": None, "kind": None} | fields
 
 
 def test_a_script_that_writes_the_wrong_number_of_rows_is_a_harness_failure(tmp_path):
@@ -354,6 +371,10 @@ def test_a_script_that_writes_the_wrong_number_of_rows_is_a_harness_failure(tmp_
         [_row(1), _row(0)],  # swapped: scoring pairs by position
         [_row(0, calls={"name": "t"}), _row(1)],
         [_row(0), "not a row"],
+        [_row(0, calls=[{"name": "t", "arguments": "oops"}]), _row(1)],
+        [_row(0, error="boom"), _row(1)],  # an error needs its kind
+        [_row(0, kind="parse"), _row(1)],  # and a kind its error
+        [_row(0, error="x", kind="parse", calls=[{"name": "t", "arguments": {}}]), _row(1)],
     ],
 )
 def test_a_row_that_is_not_the_row_at_its_position_is_a_harness_failure(tmp_path, rows):
@@ -367,6 +388,25 @@ def test_a_row_that_is_not_the_row_at_its_position_is_a_harness_failure(tmp_path
 
     with pytest.raises(ToolPathError):
         probe.observe(["a", "b"], constrained=True)
+
+
+def test_a_native_crash_leaves_its_reason_in_the_error(tmp_path):
+    """Found in review: fd 2 pointed at an unlinked temporary file during a
+    reply, so a native abort's reason vanished with the process and the run
+    said "no stderr". The log is a file the parent reads."""
+
+    class Crashing(_WritingEnv):
+        def run(self, argv, timeout=None):
+            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            Path(spec["log"]).write_text(
+                "F0918 kv_cache.cc:12] Check failed: kv_cache != nullptr\n"
+            )
+            return types.SimpleNamespace(returncode=-6, stderr="")
+
+    probe = ToolPathProbe(model=tmp_path / "m.litertlm", declarations=TOOLS, env=Crashing(None))
+
+    with pytest.raises(ToolPathError, match="kv_cache != nullptr"):
+        probe.observe(["a"], constrained=False)
 
 
 def test_output_that_is_not_json_is_a_harness_failure(tmp_path):
@@ -384,7 +424,8 @@ def test_output_that_is_not_json_is_a_harness_failure(tmp_path):
 
 def test_a_row_answers_with_one_call_or_none():
     one = {"name": "t", "arguments": {}}
-    assert ToolPathRow(0, error="boom").refused is True
+    assert ToolPathRow(0, error="boom", kind="other").refused is True
+    assert ToolPathRow(0, error="x", kind="parse").parse_refusal is True
     assert ToolPathRow(0, calls=(one,)).refused is False
     assert ToolPathRow(0, calls=(one,)).call == one
     # Two calls are not the one call a target asks for.
@@ -419,6 +460,9 @@ class CannedEnv:
     by_mode: dict[str, list[dict]]
     name: str = "runtime"
     fail: str | None = None
+    # Fail only these modes, when `fail` is set; every mode otherwise.
+    fail_modes: tuple[str, ...] = ("constrained", "unconstrained")
+    runtime_version: str = "0.16.1"
     # Every spec the script was handed, so a test can see what reached it.
     specs: list[dict] = field(default_factory=list)
 
@@ -428,18 +472,15 @@ class CannedEnv:
     def run(self, argv, timeout=None):
         spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
         self.specs.append(spec)
-        if self.fail is not None:
-            return types.SimpleNamespace(returncode=3, stderr=self.fail)
         mode = "constrained" if spec["constrained"] else "unconstrained"
-        written = {"runtime_version": "0.16.1", "rows": self.by_mode[mode]}
+        if self.fail is not None and mode in self.fail_modes:
+            return types.SimpleNamespace(returncode=3, stderr=self.fail)
+        written = {"runtime_version": self.runtime_version, "rows": self.by_mode[mode]}
         Path(spec["out"]).write_text(json.dumps(written), encoding="utf-8")
         return types.SimpleNamespace(returncode=0, stderr="")
 
 
-PARSE_REFUSED = (
-    "RuntimeError: litert_lm_conversation_send_message failed: "
-    "INVALID_ARGUMENT: Failed to parse tool calls from code block"
-)
+PARSE_REFUSED = "its call parser rejected the generation"
 
 
 def _rows(rows_, hits: int, refusals: int = 0) -> list[dict]:
@@ -451,7 +492,7 @@ def _rows(rows_, hits: int, refusals: int = 0) -> list[dict]:
             calls = [{"name": target["name"], "arguments": target["args"]}]
             out.append(_row(i, calls=calls))
         elif i < hits + refusals:
-            out.append(_row(i, error=PARSE_REFUSED, parse_refusal=True))
+            out.append(_row(i, error=PARSE_REFUSED, kind="parse"))
         else:
             out.append(_row(i, calls=[{"name": target["name"], "arguments": {"color": "no"}}]))
     return out
@@ -561,11 +602,11 @@ def test_a_prompt_the_runtime_gave_no_reply_to_is_a_wrong_answer(tmp_path):
     mode = result.manifest["tool_path"]["modes"]["unconstrained"]
     assert mode["score"]["n"] == 8
     assert mode["score"]["exact_match"]["value"] == pytest.approx(0.75)
-    assert (mode["no_reply"], mode["parse_refusals"]) == (2, 2)
-    assert mode["no_reply_reasons"] == {PARSE_REFUSED: 2}
+    assert (mode["no_reply"], mode["parse_refusals"], mode["too_long"]) == (2, 2, 0)
     assert result.manifest["quality"]["reference"]["n"] == 8
     assert any(
-        "gave no reply to 2 of 8" in text and PARSE_REFUSED in text
+        "gave no reply to 2 prompts: 2 because its call parser rejected the generation" in text
+        and "grammar off" in text
         for text in result.manifest["limitations"]
     )
 
@@ -601,6 +642,11 @@ def test_a_model_whose_own_output_never_parses_is_a_verdict_about_the_model(tmp_
     assert result.status is Status.FAILED_SMOKE
     (check,) = result.manifest["liveness"]["candidate"]["checks"]
     assert "with the grammar off, 0 of 8 prompts returned a call" in check["detail"]
+    # Found in review: the run stopped here with the runtime's reasons lost.
+    assert "8 because its call parser rejected the generation" in check["detail"]
+    modes = result.manifest["tool_path"]["modes"]
+    assert modes["unconstrained"]["parse_refusals"] == 8
+    assert modes["constrained"]["no_reply"] == 0
 
 
 def test_the_grammar_refusing_every_row_is_measured_not_hidden(tmp_path):
@@ -693,9 +739,10 @@ def test_the_declarations_reach_the_runtime_in_both_modes(tmp_path):
 
     backend.generate([r["prompt"] for r in rows_])
 
+    # Grammar off first: it is the run the reference is compared with.
     assert [(spec["constrained"], spec["tools"]) for spec in env.specs] == [
-        (True, DECLS),
         (False, DECLS),
+        (True, DECLS),
     ]
 
 
@@ -893,3 +940,186 @@ def test_declarations_reach_the_reference_and_the_rendering_check_only_on_the_to
     text_path = build_backends(request("Qwen/Qwen3-0.6B"), declarations=DECLS)
     assert text_path.reference.declarations is None
     assert text_path.rendering.declarations is None
+
+
+def _no_reply(rows_, kind: str, reason: str) -> list[dict]:
+    return [_row(i, error=reason, kind=kind) for i in range(len(rows_))]
+
+
+def test_a_grammar_on_run_the_runtime_could_not_make_is_reported_not_scored(tmp_path):
+    """Found in review: a grammar-on run where every reply failed for a reason
+    that was not the parser -- a constraint it could not build -- passed with
+    "the grammar lowered the score". It is a mode not measured, and the
+    grammar-off run, the one compared with the reference, stands."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path,
+        rows_,
+        {
+            "constrained": _no_reply(rows_, "other", "Failed to create constraint with tools."),
+            "unconstrained": _rows(rows_, hits=8),
+        },
+    )
+
+    assert result.status is Status.PASSED
+    path = result.manifest["tool_path"]
+    assert path["modes"]["constrained"]["available"] is False
+    assert "Failed to create constraint" in path["modes"]["constrained"]["reason"]
+    assert path["grammar_effect"]["available"] is False
+    assert any("grammar-on run could not be made" in x for x in result.manifest["limitations"])
+    assert not any("lowered the score" in x for x in result.manifest["limitations"])
+
+
+def test_a_grammar_on_run_that_fails_outright_keeps_the_grammar_off_one(tmp_path):
+    """Found in review: grammar on ran first, and its failure discarded the
+    grammar-off run -- the primary number."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"unconstrained": _rows(rows_, hits=8)},
+        fail="no SentencePiece tokenizer",
+        fail_modes=("constrained",),
+    )
+
+    assert result.status is Status.PASSED
+    assert (
+        "no SentencePiece tokenizer"
+        in result.manifest["tool_path"]["modes"]["constrained"]["reason"]
+    )
+
+
+def test_a_grammar_off_run_nothing_answered_but_the_parser_is_a_harness_failure(tmp_path):
+    """The same condition on the run the reference is compared with: nothing
+    was measured, and scoring it would put the harness into the model's number."""
+    rows_ = labelled_rows(8)
+    result = _verify(
+        tmp_path,
+        rows_,
+        {
+            "unconstrained": _no_reply(rows_, "too_long", "longer than the bundle's token limit"),
+            "constrained": _rows(rows_, hits=8),
+        },
+    )
+
+    assert result.status is Status.FAILED_HARNESS
+    assert "never because its call parser rejected one" in json.dumps(result.manifest)
+
+
+def test_a_reply_with_several_calls_on_every_prompt_is_alive_and_wrong(tmp_path):
+    """Found in review: several calls were stored as no call, so liveness said
+    nothing came back when every prompt had returned two."""
+    rows_ = labelled_rows(8)
+    doubled = _rows(rows_, hits=8)
+    for row in doubled:
+        row["calls"].append({"name": "open_app", "arguments": {}})
+
+    result = _verify(tmp_path, rows_, {"constrained": doubled, "unconstrained": doubled})
+
+    assert result.status is not Status.FAILED_SMOKE
+    mode = result.manifest["tool_path"]["modes"]["unconstrained"]
+    assert mode["several_calls"] == 8
+    assert mode["score"]["exact_match"]["value"] == pytest.approx(0.0)
+
+
+def test_the_reference_is_held_to_the_one_call_rule_too(tmp_path):
+    """Found in review: the reference's parser took the first of two calls
+    while the candidate's two were wrong, so the difference between the rules
+    was reported as conversion cost."""
+    rows_ = labelled_rows(8)
+    texts = [f"<start_function_call>{t}<end_function_call>" for t in correct_texts(rows_)]
+    texts[0] += "<start_function_call>call:open_app{}<end_function_call>"
+
+    result = _verify(
+        tmp_path,
+        rows_,
+        {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        reference_texts=texts,
+    )
+
+    assert result.manifest["quality"]["reference"]["exact_match"]["value"] == pytest.approx(7 / 8)
+
+
+def test_a_runtime_other_than_the_one_the_default_was_read_from_is_said(tmp_path):
+    rows_ = labelled_rows(8)
+    both = _rows(rows_, 8)
+
+    same = _verify(tmp_path, rows_, {"constrained": both, "unconstrained": both})
+    other = _verify(
+        tmp_path, rows_, {"constrained": both, "unconstrained": both}, runtime_version="0.17.1"
+    )
+
+    assert not any("was not checked" in x for x in same.manifest["limitations"])
+    assert any(
+        "litert-lm 0.16.1's source; this run used 0.17.1" in x
+        for x in other.manifest["limitations"]
+    )
+
+
+def test_the_default_was_read_from_the_runtime_this_project_pins():
+    """The constant names a version; the pin is what actually runs."""
+    from litetune import envs
+    from litetune.toolpath import GRAMMAR_OFF_BY_DEFAULT_IN
+
+    assert f"litert-lm=={GRAMMAR_OFF_BY_DEFAULT_IN}" in envs.RUNTIME.requirements
+
+
+def test_a_prompt_over_the_token_limit_is_counted_as_the_bundles_limit(tmp_path):
+    """Scored wrong -- an application gets no reply -- but named as a capacity
+    of the converted bundle rather than an answer the model gave."""
+    rows_ = labelled_rows(8)
+    mixed = _rows(rows_, hits=6)
+    for i in (6, 7):
+        mixed[i] = _row(
+            i, error="the prompt was longer than the bundle's token limit", kind="too_long"
+        )
+
+    result = _verify(tmp_path, rows_, {"constrained": mixed, "unconstrained": mixed})
+
+    mode = result.manifest["tool_path"]["modes"]["unconstrained"]
+    assert (mode["no_reply"], mode["too_long"], mode["parse_refusals"]) == (2, 2, 0)
+    assert any(
+        "2 because the prompt was longer than the bundle's token limit" in x
+        for x in result.manifest["limitations"]
+    )
+
+
+def test_divergence_compares_calls_as_answers_not_as_text(tmp_path):
+    """Found in review: calls were turned into text and read back by the text
+    parser, so two different calls carrying the same text collapsed. Compared as
+    calls, a double `7.0` from the runtime is the base's `7`, and a different
+    tool is a different answer whatever its arguments say."""
+    rows_ = [
+        {"prompt": f"wake me at {h}", "target": {"name": "set_alarm", "args": {"hour": h}}}
+        for h in range(8)
+    ]
+    returned = [
+        _row(h, calls=[{"name": "set_alarm", "arguments": {"hour": float(h)}}]) for h in range(8)
+    ]
+    same_base = [f"call:set_alarm{{hour:{h}}}" for h in range(8)]
+    other_base = [
+        f"call:send_email{{body:<escape>call:set_alarm{{hour:{h}}}<escape>}}" for h in range(8)
+    ]
+
+    same = _verify(
+        tmp_path,
+        rows_,
+        {"constrained": returned, "unconstrained": returned},
+        reference_texts=same_base,
+        request_extra={"reference_role": ReferenceRole.UNTUNED_BASE},
+    )
+    other = _verify(
+        tmp_path,
+        rows_,
+        {"constrained": returned, "unconstrained": returned},
+        reference_texts=other_base,
+        request_extra={"reference_role": ReferenceRole.UNTUNED_BASE},
+    )
+
+    def share(result):
+        checks = result.manifest["liveness"]["candidate"]["checks"]
+        (check,) = [c for c in checks if c["name"] == "divergence from baseline"]
+        return check["observed"]["divergence_share"]
+
+    assert share(same) == pytest.approx(0.0)
+    assert share(other) == pytest.approx(1.0)

@@ -28,6 +28,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.evaluate import MeasurementPoint
@@ -263,10 +264,10 @@ def repetition_check(point: MeasurementPoint, thresholds: LivenessThresholds) ->
 
 def divergence_check(
     point: MeasurementPoint,
-    baseline: Sequence[str],
+    baseline: Sequence[Any],
     baseline_label: str,
     thresholds: LivenessThresholds,
-    forms: Sequence[str] | None = None,
+    calls: Sequence[Any] | None = None,
 ) -> Check:
     """Does the candidate say anything different from the baseline model?
 
@@ -274,11 +275,20 @@ def divergence_check(
     float twin of the same weights, agreement is the desired outcome of a
     lossless conversion, so `verify` skips this check there and records why.
 
-    `forms` stands in for the candidate's texts when its answers are not text:
-    a tool-path candidate's calls, compared with `baseline` in the same form.
+    `calls` stands in for the candidate's texts when its answers are not text:
+    a tool-path candidate's calls, compared by equality with `baseline`'s,
+    which are then calls too. Not through `comparable_form`, which reads text:
+    two different calls carrying the same text in an argument would collapse.
     """
     name = "divergence from baseline"
-    share = divergence_share(point.texts if forms is None else forms, baseline)
+    if calls is None:
+        share = divergence_share(point.texts, baseline)
+    else:
+        if len(calls) != len(baseline):
+            raise ValueError(f"{len(calls)} calls against {len(baseline)}: not the same prompts")
+        if not calls:
+            raise ValueError("no outputs to compare")
+        share = sum(a != b for a, b in zip(calls, baseline, strict=True)) / len(calls)
     observed = {
         "divergence_share": round(share, 6),
         "n": point.n,

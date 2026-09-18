@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -71,7 +72,6 @@ from litetune.metrics import (
     Difference,
     Proportion,
     QualityMetrics,
-    ToolCall,
     Unavailable,
     agreement,
     carries_reasoning,
@@ -83,6 +83,7 @@ from litetune.metrics import (
     terminators_trimmed,
 )
 from litetune.models import identify, renders_declarations_for
+from litetune.prepare import START_CALL
 from litetune.prompt_mode import (
     PromptMode,
     PromptModeConflict,
@@ -95,6 +96,7 @@ from litetune.toolpath import (
     DISAGREEING_MODES,
     GRAMMAR_HELPED,
     GRAMMAR_HURT,
+    GRAMMAR_OFF_BY_DEFAULT_IN,
     ToolPathBackend,
     ToolPathRow,
     as_tool_call,
@@ -280,7 +282,7 @@ _TEXT_TIER_SKIPPED = (
 )
 
 
-def _tool_path_liveness(point: MeasurementPoint) -> LivenessResult:
+def _tool_path_liveness(point: MeasurementPoint, backend: GenerationBackend) -> LivenessResult:
     """Liveness for a candidate that answered with calls rather than text.
 
     The text tier's checks would fail every row of a healthy tool-path run, so
@@ -289,8 +291,10 @@ def _tool_path_liveness(point: MeasurementPoint) -> LivenessResult:
     output its own parser accepted -- on the grammar-off run, the one an
     application gets by default. A run where it returned none is a model that
     produced nothing an application could use, and that is a smoke failure in
-    the same sense the text tier means it. How many rows returned a call is the
-    score's business, not this check's: every row that did not is scored wrong.
+    the same sense the text tier means it. A reply with several calls returned
+    calls: it is the score, not this check, that counts it wrong. The detail
+    says why the rows that returned none did not, so a failure here carries the
+    runtime's reasons with it.
     """
     never_ran = [g for g in point.generations if g.harness_error is not None]
     if never_ran:
@@ -309,28 +313,25 @@ def _tool_path_liveness(point: MeasurementPoint) -> LivenessResult:
             checks=checks,
             skipped=[SkippedCheck(name="text liveness tier", reason=_TEXT_TIER_SKIPPED)],
         )
-    answered = sum(1 for g in point.generations if g.call is not None)
-    refused = sum(1 for g in point.generations if g.refusal is not None)
+    rows = backend.rows.get("unconstrained", []) if isinstance(backend, ToolPathBackend) else []
     n = len(point.generations)
-    checks = CheckSet(name="liveness")
-    detail = (
-        f"with the grammar off, {answered} of {n} prompts returned a call; the runtime gave no "
-        f"reply to {refused}"
+    answered = sum(1 for row in rows if row.calls)
+    unanswered = _unanswered(rows, list(range(len(rows))))
+    detail = f"with the grammar off, {answered} of {n} prompts returned a call" + (
+        f"; the runtime gave no reply to {_why_no_reply(unanswered)}"
+        if unanswered["no_reply"]
+        else ""
     )
+    observed = {"answered": answered, "n": n} | unanswered
+    checks = CheckSet(name="liveness")
     if answered:
-        checks.add(
-            Check.passed(
-                TOOL_PATH_LIVENESS,
-                detail,
-                observed={"answered": answered, "refused": refused, "n": n},
-            )
-        )
+        checks.add(Check.passed(TOOL_PATH_LIVENESS, detail, observed=observed))
     else:
         checks.add(
             Check.failed(
                 TOOL_PATH_LIVENESS,
                 f"{detail}. Nothing an application could act on came back from any prompt",
-                observed={"answered": 0, "refused": refused, "n": n},
+                observed=observed,
             )
         )
     return LivenessResult(
@@ -344,7 +345,7 @@ def _score_tool_path(
     targets: list,
     indices: list[int],
     run: Any,
-) -> tuple[QualityMetrics, dict[str, Any], list[int], list]:
+) -> tuple[QualityMetrics, dict[str, Any]]:
     """Both decoding modes, each scored over every labelled row.
 
     Two numbers come out of a tool-path run and a third compares them, and they
@@ -368,24 +369,35 @@ def _score_tool_path(
     unparseable text is a wrong answer on its side, and an application handed
     no reply has nothing to act on. An earlier version kept such rows out of
     every score instead, which made the comparison easier to pass the worse the
-    candidate was: 195 of 200 rows refused read as a cost of 0.0 over five.
+    candidate was: on fakes, 195 of 200 rows refused read as a cost of 0.0 over
+    five.
     """
     if not isinstance(backend, ToolPathBackend):
         raise TypeError(
             f"{type(backend).__name__} declares structured scoring but carries no per-mode rows"
         )
     rows = backend.rows
-    if set(rows) != {"constrained", "unconstrained"}:
-        raise ValueError(f"the tool path reported modes {sorted(rows)}, not both")
+    if "unconstrained" not in rows:
+        raise ValueError(f"the tool path reported modes {sorted(rows)}, without the grammar off")
     scored = {
         mode: score_parsed(targets, [as_tool_call(rows[mode][i].call) for i in indices])
         for mode in rows
     }
-    grammar = paired_difference(scored["unconstrained"].correct, scored["constrained"].correct)
+    grammar: Difference | Unavailable = (
+        paired_difference(scored["unconstrained"].correct, scored["constrained"].correct)
+        if "constrained" in scored
+        else Unavailable(
+            "the grammar-on run could not be made: " + backend.unavailable.get("constrained", "")
+        )
+    )
     reported: dict[str, Any] = {
         "modes": {
             mode: {"score": scored[mode].as_dict()} | _unanswered(rows[mode], indices)
             for mode in rows
+        }
+        | {
+            mode: {"available": False, "reason": reason}
+            for mode, reason in backend.unavailable.items()
         },
         "compared_with_reference": "unconstrained",
         "compared_with_reference_because": (
@@ -395,19 +407,28 @@ def _score_tool_path(
         ),
         "grammar_effect": grammar.as_dict()
         | {"sign": "positive means the runtime's grammar lowers the score"},
+        "default_established_on": GRAMMAR_OFF_BY_DEFAULT_IN,
     }
+    if backend.runtime_version != GRAMMAR_OFF_BY_DEFAULT_IN:
+        run.limitation(
+            "that the runtime leaves constrained decoding off unless an application enables it "
+            f"was read from litert-lm {GRAMMAR_OFF_BY_DEFAULT_IN}'s source; this run used "
+            f"{backend.runtime_version or 'a version it could not name'}, where it was not "
+            "checked, so calling the grammar-off run the default is an assumption here"
+        )
+    for mode, reason in backend.unavailable.items():
+        run.limitation(
+            f"the grammar-{'on' if mode == 'constrained' else 'off'} run could not be made, so "
+            f"what the grammar does was not measured: {reason}"
+        )
     for mode in rows:
         state = "on" if mode == "constrained" else "off"
         unanswered = reported["modes"][mode]
         if unanswered["no_reply"]:
-            reasons = "; ".join(
-                f"{count} x {reason}" for reason, count in unanswered["no_reply_reasons"].items()
-            )
             run.limitation(
-                f"with the grammar {state}, the runtime gave no reply to {unanswered['no_reply']} "
-                f"of {len(indices)} prompts ({unanswered['parse_refusals']} of them its call "
-                "parser rejecting the generation). Each is scored as a wrong answer: an "
-                f"application gets nothing to act on. The runtime's reasons: {reasons}"
+                f"with the grammar {state}, the runtime gave no reply to "
+                f"{_why_no_reply(unanswered)}, of {len(indices)} prompts. Each is scored as a "
+                "wrong answer: an application gets nothing to act on"
             )
         if unanswered["several_calls"]:
             run.limitation(
@@ -415,9 +436,9 @@ def _score_tool_path(
                 f"{unanswered['several_calls']} of {len(indices)} prompts, each of which asks "
                 "for one. Scored as wrong answers: an application acts on every call it is handed"
             )
-    constrained = scored["constrained"].exact_match.value
     unconstrained = scored["unconstrained"].exact_match.value
-    if constrained != unconstrained:
+    constrained = scored["constrained"].exact_match.value if "constrained" in scored else None
+    if constrained is not None and constrained != unconstrained and isinstance(grammar, Difference):
         run.limitation(
             DISAGREEING_MODES.format(
                 constrained=constrained,
@@ -428,28 +449,57 @@ def _score_tool_path(
             + f" The conversion cost here is measured with the grammar off; what the grammar "
             f"does is reported apart, as {grammar.detail}."
         )
-    return scored["unconstrained"], reported, indices, targets
+    return scored["unconstrained"], reported
 
 
-def _call_form(call: ToolCall | None) -> str:
-    """A call as one comparable string: name and flattened arguments, in order."""
-    return "" if call is None else json.dumps([call.name, sorted(call.args.items())])
+def _one_call_text(text: str) -> str:
+    """The reference's text, or nothing when it carries more than one call.
+
+    The candidate's reply with several calls is a wrong answer -- an
+    application acts on each -- and the reference is held to the same rule, or
+    the difference between the two rules would be reported as conversion cost.
+    """
+    return text if text.count(START_CALL) <= 1 else ""
 
 
 def _unanswered(rows: list[ToolPathRow], indices: list[int]) -> dict[str, Any]:
-    """What one mode's rows say about the prompts that got no single call back."""
+    """What one mode's rows say about the prompts that got no single call back.
+
+    A parse failure and a prompt over the token limit are counted by kind; any
+    other reason is kept in the runtime's words, the five commonest, and the
+    count of the rest is said rather than left out.
+    """
     no_reply = [rows[i] for i in indices if rows[i].refused]
-    reasons: dict[str, int] = {}
-    for row in no_reply:
-        reasons[row.error or ""] = reasons.get(row.error or "", 0) + 1
+    other = Counter(row.error or "" for row in no_reply if row.kind == "other")
+    shown = dict(other.most_common(5))
     return {
         "no_reply": len(no_reply),
-        "parse_refusals": sum(1 for row in no_reply if row.parse_refusal),
-        # The five commonest, so a run where every reply failed the same way
-        # says so in one line and one that failed many ways is not a wall.
-        "no_reply_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])[:5]),
+        "parse_refusals": sum(1 for row in no_reply if row.kind == "parse"),
+        "too_long": sum(1 for row in no_reply if row.kind == "too_long"),
+        "other_reasons": shown,
+        "other_not_shown": sum(other.values()) - sum(shown.values()),
         "several_calls": sum(1 for i in indices if len(rows[i].calls) > 1),
     }
+
+
+def _why_no_reply(unanswered: dict[str, Any]) -> str:
+    """`N prompts: P ..., L ..., O ...` from `_unanswered`, naming only what occurred."""
+    parts = []
+    if unanswered["parse_refusals"]:
+        parts.append(
+            f"{unanswered['parse_refusals']} because its call parser rejected the generation"
+        )
+    if unanswered["too_long"]:
+        parts.append(
+            f"{unanswered['too_long']} because the prompt was longer than the bundle's token "
+            "limit, a capacity of the converted bundle rather than an answer the model gave"
+        )
+    other = sum(unanswered["other_reasons"].values()) + unanswered["other_not_shown"]
+    if other:
+        reasons = "; ".join(f"{n} x {r}" for r, n in unanswered["other_reasons"].items())
+        rest = f"; {unanswered['other_not_shown']} more" if unanswered["other_not_shown"] else ""
+        parts.append(f"{other} for another reason ({reasons}{rest})")
+    return f"{unanswered['no_reply']} prompts: " + ", ".join(parts)
 
 
 def _candidate_backend(request: VerifyRequest, declarations: list | None) -> GenerationBackend:
@@ -852,7 +902,9 @@ def run_verify(
     with guard(DECLARATIONS_CHECK) as sink:
         recorded = recorded_declarations_sha256(request.reference)
         if request.declarations is None:
-            if recorded is not None:
+            # Only where the runtime renders them: in `prerendered` the prompts
+            # already carry the tool list, so the flag changes nothing measured.
+            if recorded is not None and request.prompt_mode is PromptMode.RUNTIME_RENDERED:
                 sink.append(
                     Check.failed(
                         DECLARATIONS_CHECK,
@@ -1028,7 +1080,21 @@ def run_verify(
         # statement about the tier rather than about the model. What replaces
         # it is stronger than any of them: the runtime returned a structured
         # call, which it does only for output its own parser accepted.
-        live = _tool_path_liveness(candidate)
+        live = _tool_path_liveness(candidate, pair.candidate)
+        if isinstance(pair.candidate, ToolPathBackend):
+            # What each mode's rows say, written now: a run that ends at the
+            # liveness check still carries the runtime's reasons. Quality, when
+            # it is reached, replaces this with the scored report.
+            run.manifest["tool_path"] = {
+                "modes": {
+                    mode: _unanswered(rows, list(range(len(rows))))
+                    for mode, rows in pair.candidate.rows.items()
+                }
+                | {
+                    mode: {"available": False, "reason": reason}
+                    for mode, reason in pair.candidate.unavailable.items()
+                }
+            }
     else:
         live = liveness_tier(
             candidate,
@@ -1271,19 +1337,18 @@ def run_verify(
         # so its texts would differ from any base's and the check could not
         # fail. Compared as calls instead, the base's read by the same parser
         # that scores it.
-        forms = (
-            [_call_form(as_tool_call(g.call)) for g in candidate.generations]
-            if pair.candidate.scores_structurally
-            else None
-        )
-        baseline = (
-            [_call_form(parse_call(text)) for text in reference.texts]
-            if forms is not None
-            else reference.texts
-        )
-        check = divergence_check(
-            candidate, baseline, "the untuned base", request.thresholds, forms=forms
-        )
+        if pair.candidate.scores_structurally:
+            check = divergence_check(
+                candidate,
+                [parse_call(_one_call_text(text)) for text in reference.texts],
+                "the untuned base",
+                request.thresholds,
+                calls=[as_tool_call(g.call) for g in candidate.generations],
+            )
+        else:
+            check = divergence_check(
+                candidate, reference.texts, "the untuned base", request.thresholds
+            )
         live.checks.add(check)
         events.check(check)
         run.manifest["liveness"]["candidate"] = live.as_dict()
@@ -1308,9 +1373,7 @@ def run_verify(
         targets = [e.target for e in labelled if e.target is not None]
         scorer = SCORERS[request.scorer]
         if pair.candidate.scores_structurally:
-            candidate_metrics, tool_path, indices, targets = _score_tool_path(
-                pair.candidate, targets, indices, run
-            )
+            candidate_metrics, tool_path = _score_tool_path(pair.candidate, targets, indices, run)
             # Label-free agreement compares two texts, and the candidate
             # produced calls. Reporting zero here would read as total
             # disagreement rather than as a question that was never asked.
@@ -1331,14 +1394,14 @@ def run_verify(
                 [strip_reasoning(text) for text in candidate.texts],
                 [strip_reasoning(text) for text in reference.texts],
             )
-        # After the branch above, which narrows `indices` on the tool path to
-        # the rows the runtime could read. The reference is scored over exactly
-        # those, or the paired comparison would be comparing different rows --
-        # `paired_difference` refuses that outright, which is how this was found.
         # The reference always produces text: it is `transformers`, which has no
-        # tool path to answer on. `parse_call` is still the parser on that side.
+        # tool path to answer on, and `parse_call` is the parser on that side.
+        # Scored over the same rows as the candidate, every one of them. On the
+        # tool path a reply with several calls is wrong on both sides.
+        one_call = _one_call_text if pair.candidate.scores_structurally else (lambda text: text)
         reference_metrics = scorer(
-            targets, [strip_reasoning(reference.generations[i].text) for i in indices]
+            targets,
+            [one_call(strip_reasoning(reference.generations[i].text)) for i in indices],
         )
         sink.append(
             Check.passed(
