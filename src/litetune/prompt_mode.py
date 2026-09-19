@@ -266,7 +266,7 @@ def parse_prompt_mode(raw: object, where: str) -> PromptMode:
 # hand-written copy in any of them agrees with the others only until one of
 # them is edited.
 RENDERING_SOURCE = r'''
-def render_prompt(tok, prompt, runtime_rendered):
+def render_prompt(tok, prompt, runtime_rendered, tools=None):
     """The text the tokenizer receives, and whether it may add special tokens.
 
     Two mutually exclusive conventions, and a model learns whichever one it was
@@ -278,11 +278,26 @@ def render_prompt(tok, prompt, runtime_rendered):
     after apply_chat_template(tokenize=False). Without it google/gemma-3-270m-it
     gave 15 ids with two leading <bos> where the template renders 14; in
     training the second BOS shifts every position by one, invisibly in the loss.
+
+    `tools` are the declarations the serving runtime will be given, in the shape
+    it requires. The template renders them into a developer turn ahead of the
+    user turn, which is the prompt the model is actually sent; without them it
+    renders a bare user turn, which is what this trained before declarations
+    were an input.
+
+    Two calls rather than one with `tools=None`, on purpose. The no-declarations
+    path has to stay byte-identical to what it rendered before, and passing a
+    new keyword to someone else's template to find out whether it changes
+    nothing is not the same as not passing it.
     """
     if not runtime_rendered:
         return prompt, True
-    text = tok.apply_chat_template(
-        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
-    )
+    messages = [{"role": "user", "content": prompt}]
+    if tools:
+        text = tok.apply_chat_template(
+            messages, tools=tools, tokenize=False, add_generation_prompt=True
+        )
+    else:
+        text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     return text, False
 '''

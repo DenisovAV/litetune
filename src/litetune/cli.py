@@ -43,6 +43,7 @@ from litetune.bundle import (
     versions_from,
 )
 from litetune.checks import Outcome
+from litetune.declarations import DeclarationsError
 from litetune.envs import cached_environments, env_cache_root, remove_cached
 from litetune.evaluate import GREEDY, DataError
 from litetune.events import EventStream, TerminalRenderer
@@ -106,6 +107,10 @@ REFUSALS = (
     BundleError,
     TuneError,
     PrepareError,
+    # A declarations file the runtime or the reference template would render
+    # differently is refused with the property named; printed as a traceback,
+    # the sentence that says what to change was buried under it.
+    DeclarationsError,
     DataError,
     SpecError,
     FileNotFoundError,
@@ -299,6 +304,18 @@ def _add_verify(sub) -> None:
         ),
     )
     verify.add_argument(
+        "--declarations",
+        type=Path,
+        help=(
+            "tool declarations JSON, the same file bundle takes. Refused when its digest "
+            "disagrees with the one recorded beside --reference, because a model measured "
+            "against a different tool list than it trained on is measured on another task. "
+            "Required when a runtime_rendered checkpoint recorded declarations: without them the "
+            "model would be measured on a prompt lacking the tool list it learned, and the run is "
+            "refused. A prerendered checkpoint's prompts carry the tool list already"
+        ),
+    )
+    verify.add_argument(
         "--max-tokens",
         type=_positive,
         help=(
@@ -349,6 +366,27 @@ def _add_prepare(sub) -> None:
         ),
     )
     prep.add_argument("--tokenizer-revision", help="revision of --tokenizer")
+    prep.add_argument(
+        "--declarations",
+        type=Path,
+        help=(
+            "tool declarations JSON, the same file bundle takes. A row whose target names a "
+            "tool the declarations do not offer is rejected, rather than teaching a call the "
+            "prompt never offers, and so is one whose arguments contradict its declaration. "
+            "Without it no row is checked against a tool list"
+        ),
+    )
+    prep.add_argument(
+        "--base-model",
+        help=(
+            "the model this split is for, resolved the way convert and bundle resolve it. It "
+            "decides how a structured target is spelled: litetune records that per family and "
+            "refuses a family whose calls it has never measured, rather than rendering "
+            "FunctionGemma's format for everyone. Not --tokenizer, which is declared as a "
+            "tokenizer. Without it a structured target is rendered in FunctionGemma's format, "
+            "the one this project has measured, and the report says that format was assumed"
+        ),
+    )
     prep.add_argument("--json", action="store_true", help="write the report to stdout")
 
 
@@ -388,6 +426,17 @@ def _add_tune(sub) -> None:
             "train in --prompt-mode even though the training prompts contradict it. The check "
             "reads control tokens and cannot see how your application calls the model; the "
             "report records that it was overridden"
+        ),
+    )
+    tune.add_argument(
+        "--declarations",
+        type=Path,
+        help=(
+            "tool declarations JSON, the same file bundle takes. Their digest is recorded "
+            "beside the checkpoint, so verify reads what this run trained against rather than "
+            "being told it. Without it no declaration turn is rendered into the training "
+            "prompt, which a family whose runtime renders declarations refuses for a "
+            "runtime_rendered split that trains calls"
         ),
     )
     tune.add_argument(
@@ -690,6 +739,7 @@ def _verify(args: argparse.Namespace) -> int:
         max_conversion_cost=args.max_conversion_cost,
         prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
         contract=args.contract,
+        declarations=args.declarations,
         # `is not None`, not truthiness: `--max-tokens 0` is a request this
         # cannot honour, and silently substituting the default would report a
         # limit the run did not use.
@@ -756,6 +806,45 @@ def summarise(manifest: dict) -> list[str]:
     else:
         lines.append(f"  quality: not measured — {quality.get('reason')}")
 
+    # On the tool path the candidate line above is the grammar-off run. Both
+    # modes are printed with what each one is, because "candidate" alone would
+    # leave the reader to guess which of two numbers it was.
+    selection = _mapping(_mapping(manifest.get("harness")).get("tool_path_selection"))
+    if selection:
+        lines.append(f"  path: {'tool path' if selection.get('tool_path') else 'text path'}")
+    tool_path = _mapping(manifest.get("tool_path"))
+    for mode, meaning, state in (
+        ("unconstrained", "grammar off: the candidate above, the runtime's default", "grammar off"),
+        ("constrained", "grammar on: what an application that enables it gets", "grammar on"),
+    ):
+        block = _mapping(_mapping(tool_path.get("modes")).get(mode))
+        if block.get("available") is False:
+            # Not "the candidate above": when a mode was not measured, no
+            # candidate line was printed for it.
+            lines.append(f"  {state}: not measured — {block.get('reason')}")
+            continue
+        exact = _mapping(_mapping(block.get("score")).get("exact_match"))
+        if exact:
+            lines.append(
+                f"  {meaning}: {_num(exact.get('value'))} ±{_num(exact.get('ci95'))} "
+                f"(n={exact.get('n', '?')})"
+            )
+    grammar = _mapping(tool_path.get("grammar_effect"))
+    if grammar.get("available"):
+        # The number is grammar off minus grammar on, so its sign alone reads
+        # backwards: say which way the grammar moved the score.
+        value = grammar.get("value") or 0
+        resolved = "" if grammar.get("resolved") else "  (unresolved at this sample size)"
+        if value > 0:
+            moved = f"lowered the score by {_num(value)}"
+        elif value < 0:
+            moved = f"raised the score by {_num(-value)}"
+        else:
+            moved = "did not change the score"
+        lines.append(
+            f"  grammar_effect: the grammar {moved} ±{_num(grammar.get('ci95'))}{resolved}"
+        )
+
     for name, value in _mapping(manifest.get("attribution")).items():
         if not isinstance(value, dict):
             continue
@@ -818,6 +907,8 @@ def _prepare(args: argparse.Namespace) -> int:
         heldout_size=args.heldout_size,
         min_heldout_examples=args.min_heldout_examples,
         tokens=counter,
+        declarations=args.declarations,
+        base_model=args.base_model,
     )
     result = prepare(request, events=events)
     delivered = _report(result.as_dict(), lambda: summarise_prepare(result), args.json)
@@ -881,6 +972,7 @@ def _tune(args: argparse.Namespace) -> int:
         attn_implementation=args.attn_implementation,
         prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
         force_prompt_mode=args.force_prompt_mode,
+        declarations=args.declarations,
         timeout_s=args.timeout_s,
         auto_provision=not args.no_provision,
     )
@@ -1283,6 +1375,12 @@ def _bundle(args: argparse.Namespace) -> int:
         established_against=versions_from(envs.RUNTIME),
         base_model=args.base_model,
         base_model_revision=args.base_model_revision,
+        # Which declarations the model was trained against, from the run that
+        # trained it. `bundle` refuses a file that hashes differently: the same
+        # weights against another tool list are another model to the caller. A
+        # record from before `tune` took declarations carries none, and the
+        # bundle then records the digest of the file it was given.
+        declarations_sha256=recorded.get("declarations_sha256"),
         context_length=args.context_length,
         stop_tokens=stop_tokens,
         notes=tuple(args.note) + terminator_notes + (prompt_mode_note,),

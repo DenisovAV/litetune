@@ -40,20 +40,46 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import statistics
 import subprocess
 import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
 from litetune import envs
 from litetune.checks import Check, CheckSet, Outcome, guard
+from litetune.declarations import (
+    argument_problem,
+    declared_order,
+    read_declarations,
+    recorded_digest,
+    tool_names,
+)
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.liveness import SkippedCheck
-from litetune.metrics import Proportion, ToolCall, Unavailable, read_target
+from litetune.metrics import (
+    END_CALL,
+    ESCAPE_SPELLINGS,
+    NAME_RULE,
+    START_CALL,
+    Proportion,
+    ToolCall,
+    Unavailable,
+    read_target,
+    readable_name,
+)
+from litetune.models import (
+    WireFormat,
+    hint_for,
+    renders_declarations_for,
+    wire_format_for,
+)
+from litetune.prompt_mode import PromptMode, prompt_evidence
 from litetune.spec import DEFAULT_MIN_HELDOUT_EXAMPLES
 from litetune.storage import hash_file
 
@@ -107,6 +133,34 @@ NO_HEADROOM_MEASUREMENT = (
 )
 
 
+ASSUMED_WIRE_FORMAT = (
+    "structured targets were rendered in FunctionGemma's call format because no model was "
+    "named. That format is the only one this project has measured, and it is what this stage "
+    "has always assumed -- but a model of another family is trained to emit a spelling its own "
+    "runtime does not read, and nothing downstream can see it. Pass --base-model to have the "
+    "format read from the model instead of assumed."
+)
+
+
+DECLARATIONS_NOT_COUNTED = (
+    "the token lengths above count each prompt without the declaration turn the runtime puts "
+    "in front of it, which this stage cannot render the way the runtime does. `tune` measures "
+    "the rendered sequence and refuses a row over max_seq_length, so nothing is truncated; the "
+    "check here is the earlier, cheaper one, and it undercounts"
+)
+
+
+def _identity(base_model: str | None, wire: WireFormat | None) -> dict[str, Any] | None:
+    """What the model was resolved to, and from where. `None` when none was named."""
+    if base_model is None or wire is None:
+        return None
+    return hint_for(base_model).as_dict() | {
+        "family": wire.family,
+        "wire_format": wire.name,
+        "wire_format_reason": wire.reason,
+    }
+
+
 class PrepareError(ValueError):
     """The dataset could not be read as a dataset. The message names the row."""
 
@@ -126,9 +180,155 @@ def render_call(call: ToolCall) -> str:
     The inverse of `metrics.parse_call`, and it has to stay one: the completion
     a model is trained to emit must be byte-identical to the string the scorer
     will parse, or training and measurement are working from different targets.
+
+    **Values are typed on the wire.** A string is delimited by `<escape>`; a
+    number, a boolean and a null are written bare. That is the runtime's own
+    shape, and its goldens say so directly: `function_gemma_data_processor_test`
+    carries `call:get_weather{location:<escape>Paris<escape>}` beside
+    `call:tool_name{x:1}`, and the same rule holds in a tool response, where
+    `temperature:20` sits next to `unit:<escape>C<escape>`. The parser reads the
+    two differently -- `fc_parser.rs` returns an escaped value as a string and a
+    bare number as a double -- so escaping everything, which this did until the
+    format was read, taught the model to send a number the caller receives as a
+    string.
+
+    **Only what the runtime can read back is written.** A name or key its
+    lexer does not read as a name, a string holding an escape, the end-of-call
+    marker or a stop token (`CONTROL_TEXT`), and a number a double cannot hold
+    or its grammar cannot spell are refused, with the row named, rather than
+    trained: each would be a call that cannot come back as written -- and an
+    end marker inside a string would let a dataset row write a second call into
+    the training text.
+
+    **A call is wrapped in its markers.** `<start_function_call>` and
+    `<end_function_call>` are what the runtime's parser looks for, and a call
+    without them is plain text to it: no call returned and nothing refused.
+    Measured 2026-09-17, on a checkpoint trained from this function before it
+    wrote them -- 0 of 5 prompts returned a call. The goldens carry them, both
+    FunctionGemma templates render them, and the spike encoder that trained the
+    bundle whose tool path did work wrote them. What follows the closing marker
+    is not written here: it depends on who reads the reply, and `tune` asks the
+    chat template for it.
+
+    **The arguments are in declared order, because the runtime's grammar
+    enforces the order the declarations list.** `declarations.py` puts every
+    mapping in the file in `declared_order`; writing the arguments in the same
+    order makes the order the model is trained to write the declared one.
+    Measured 2026-09-17 on FunctionGemma x mobile-actions, n=640: trained in the
+    dataset's own argument order, the model wrote `to, subject, body`, and with
+    the runtime's grammar on it emitted `subject, to` and never `body` -- an
+    argument out of declared order is not merely discouraged, it is illegal,
+    and the call closes without it. 112 rows were right with the grammar off
+    and wrong with it on, each for a lost argument; 0.9172 fell to 0.7422. A
+    probe over 20 of them: declared `to, subject, body`, the grammar kept `body`
+    on 20 of 20; declared alphabetically, on 0 of 20.
     """
-    body = ",".join(f"{key}:<escape>{value}<escape>" for key, value in call.args.items())
-    return f"call:{call.name}{{{body}}}"
+    if not readable_name(call.name):
+        raise ValueError(
+            f"the tool name {call.name!r} is not one the runtime's call parser reads as a name "
+            f"({NAME_RULE}), so no call to it can come back under that name"
+        )
+    body = ",".join(_render_argument(key, call.raw[key]) for key in declared_order(call.args))
+    return f"{START_CALL}call:{call.name}{{{body}}}{END_CALL}"
+
+
+def _render_argument(key: str, value: Any) -> str:
+    """One `key:value` pair. Raises `ValueError` for anything the runtime cannot read back."""
+    if not readable_name(key):
+        raise ValueError(
+            f"the argument {key!r} is not a name the runtime's call parser reads as a name "
+            f"({NAME_RULE}), so no call carrying it can come back with it"
+        )
+    if isinstance(value, str):
+        held = [text for text in CONTROL_TEXT if text in value]
+        if held:
+            raise ValueError(
+                f"the argument {key!r} contains {held[0]!r}, which does not survive inside a "
+                f"string: {CONTROL_TEXT[held[0]]}, so the call would be cut there and the rest "
+                "read as something else"
+            )
+        return f"{key}:<escape>{value}<escape>"
+    if value is None or isinstance(value, bool):
+        return f"{key}:{json.dumps(value)}"
+    if isinstance(value, int):
+        try:
+            exact = float(value) == value
+        except OverflowError:
+            exact = False
+        if not exact:
+            raise ValueError(
+                f"the argument {key!r} is {value}, which a double cannot hold exactly, and the "
+                "runtime reads every number as a double (fc_parser.rs): the caller would receive "
+                "a different number than the one trained. Send it as a string"
+            )
+        return f"{key}:{value}"
+    if isinstance(value, float):
+        return f"{key}:{_render_number(key, value)}"
+    raise ValueError(
+        f"the argument {key!r} is a {type(value).__name__}: the runtime's parser reads a list or "
+        "an object (AntlrFcParser.g4), and how FunctionGemma writes one, and what its constrained "
+        "decoding allows, has not been measured here. Supply the row's 'completion' text instead, "
+        "which is taken as written"
+    )
+
+
+_ENDS_THE_BLOCK = (
+    "the runtime ends a call at the first end-of-call marker, before its lexer reads the call "
+    "(parser_utils.cc)"
+)
+_ENDS_A_STRING = "the runtime's lexer ends a string at any of its escapes (AntlrFcLexer.g4)"
+_STOPS_GENERATION = (
+    "generation stops at it: a FunctionGemma bundle names it a stop token "
+    "(models.stop_tokens_for)"
+)
+
+# Text a string argument cannot carry, and what happens to a call that does.
+# Only what has a cause that can be pointed at: other control tokens are not
+# refused, because what the runtime does with one inside a string has not been
+# established. The start-of-call marker is not among them: the runtime has
+# already matched the call's own when it meets one inside a string, and its
+# lexer reads it there as part of the string.
+CONTROL_TEXT = {
+    **dict.fromkeys(ESCAPE_SPELLINGS, _ENDS_A_STRING),
+    END_CALL: _ENDS_THE_BLOCK,
+    "<end_of_turn>": _STOPS_GENERATION,
+    "<start_function_response>": _STOPS_GENERATION,
+    "<eos>": _STOPS_GENERATION,
+}
+
+
+def control_text_held(value: Any) -> str | None:
+    """The first `CONTROL_TEXT` a string anywhere in `value` holds, or `None`."""
+    if isinstance(value, str):
+        return next((text for text in CONTROL_TEXT if text in value), None)
+    if isinstance(value, dict):
+        value = list(value.values())
+    if isinstance(value, list):
+        return next((held for item in value if (held := control_text_held(item))), None)
+    return None
+
+
+def _render_number(key: str, value: float) -> str:
+    """A float in a spelling the runtime's number grammar reads.
+
+    An integral float is written as the integer it equals, which both parsers
+    read back as that value -- where `json.dumps` would write
+    `1.2345678901234567e+19`, a spelling the lexer refuses. `json.dumps` also
+    writes `1.5e-07` for a small number, and the lexer takes a fraction or an
+    exponent but never both (`AntlrFcLexer.g4`), so such a number is written in
+    plain decimal instead: the same digits, read back as the same double.
+    """
+    if not math.isfinite(value):
+        raise ValueError(
+            f"the argument {key!r} is {value!r}, and the runtime's number grammar has no "
+            "spelling for it"
+        )
+    if value.is_integer():
+        return str(int(value))
+    spelled = json.dumps(value)
+    if "." in spelled and ("e" in spelled or "E" in spelled):
+        spelled = format(Decimal(spelled), "f")
+    return spelled
 
 
 @dataclass(frozen=True)
@@ -139,6 +339,10 @@ class Row:
     prompt: str
     completion: str
     target: ToolCall | str | None
+    # Whether `completion` was rendered here from `target` rather than given in
+    # the file. `tune` trains the completion a file gives, and refuses a row
+    # that gives none; every row of a split `prepare` writes gives one.
+    rendered: bool = False
 
     @property
     def tool(self) -> str:
@@ -164,13 +368,114 @@ class Row:
         }
 
 
-def read_rows(path: Path) -> list[Row]:
+def refuse_calls_without_declarations(rows: Sequence[Row], base_model: str) -> None:
+    """Refuse structured targets for a family whose runtime renders declarations.
+
+    Such a runtime puts the declarations into the prompt before the model ever
+    sees the question. A split trained without them teaches the model to answer
+    a prompt no application sends -- 79 characters where the runtime sends 809,
+    measured -- and nothing downstream can see it, because the training loss and
+    the scorer both work from the same short prompt.
+
+    Named rather than inferred: the declarations cannot be derived from the
+    targets. The tool names are there, but the descriptions, types, enums and
+    required lists are the application's contract, and a prompt built from
+    invented schemas trains the model on something no caller sends. So the
+    automatic behaviour is a refusal naming the flag, the treatment
+    `--prompt-mode` already gets.
+
+    Only for bare prompts. Prompts that already carry control tokens were
+    rendered by the application, declarations included -- flutter_gemma does
+    that for FunctionGemma -- so nothing is missing from them. This stage has no
+    mode of its own, so it asks `prompt_evidence`, the classification `tune` and
+    `verify` already share, rather than a heuristic of its own; a split whose
+    prompts disagree is left to `tune`, which refuses it unless a mode is
+    declared.
+    """
+    renders, reason = renders_declarations_for(base_model)
+    if not renders:
+        return
+    if prompt_evidence([row.prompt for row in rows]).mode is not PromptMode.RUNTIME_RENDERED:
+        return
+    for row in rows:
+        if isinstance(row.target, ToolCall):
+            raise PrepareError(
+                f"this split trains tool calls for {base_model}, whose runtime renders the tool "
+                "declarations into the prompt, and no declarations were given. Pass "
+                "--declarations with the same JSON bundle takes. They cannot be derived from the "
+                "targets: the names are there, but the descriptions, types and required lists are "
+                f"the application's contract. {reason}"
+            )
+
+
+def refuse_undeclared_tools(rows: Sequence[Row], data: Path, declarations: Path) -> str:
+    """Refuse a row whose target calls a tool the declarations do not offer.
+
+    Raised rather than recorded, which is this stage's exception to its own rule
+    that a fact about the data belongs in the report rather than in an
+    exception. A row teaching a call the prompt never offers is not a fact to
+    carry forward: it cannot be trained honestly, on the same ground `read_rows`
+    refuses a row with no supervised span. The model would learn to call
+    something no runtime will have declared to it, and the loss curve would look
+    exactly like a run that worked.
+
+    The arguments are checked against the declaration too, on the same ground:
+    an argument it does not declare, a required one left out, a value of another
+    type or outside its enum would train a call that contradicts the contract
+    the prompt shows the model.
+
+    Only a structured target is checked. A row that supplies its own completion
+    text is the caller saying what to train, and litetune does not parse it back
+    to second-guess which tool it names.
+    """
+    parsed, digest = read_declarations(declarations)
+    offered = tool_names(parsed)
+    for row in rows:
+        if not isinstance(row.target, ToolCall):
+            continue
+        if row.target.name not in offered:
+            raise PrepareError(
+                f"{data}:{row.lineno}: the target calls {row.target.name!r}, which "
+                f"{declarations} does not declare. It offers "
+                f"{', '.join(sorted(offered)) if offered else 'no tools at all'}"
+            )
+        problem = argument_problem(parsed, row.target.name, row.target.raw)
+        if problem is not None:
+            raise PrepareError(
+                f"{data}:{row.lineno}: the target {problem} in {declarations}. Training it "
+                "would teach a call that contradicts the declaration the prompt shows"
+            )
+    return digest
+
+
+def _completion_for(target: ToolCall | str | None, wire_format: WireFormat | None) -> Any:
+    """The text to supervise for this target, or a refusal naming why there is none.
+
+    A row that brings its own completion never reaches here: that is the caller
+    saying what to train, and litetune does not parse it back to second-guess
+    the family. Only a structured target has to be rendered, and rendering it
+    means choosing a spelling -- which is the thing only the model knows.
+    """
+    if not isinstance(target, ToolCall):
+        return target
+    if wire_format is not None and not wire_format.known:
+        raise ValueError(wire_format.reason)
+    return render_call(target)
+
+
+def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
     """Read training JSONL. Raises `PrepareError` naming `path:lineno`.
 
     A row is `{"prompt": str}` plus either an explicit `"completion"` or a
     `"target"` this renders into one. A row with neither is an error rather than
     a skip: a training file that silently loses a tenth of its rows produces a
     model nobody can explain and a loss curve that looks normal.
+
+    `wire_format` is what the model's family records for its calls. `None` means
+    the caller named no model, which is every call that predates `--base-model`;
+    those are rendered in FunctionGemma's format, the only one this project has
+    measured, and `prepare` records a limitation saying so, because refusing
+    them would refuse splits that work.
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -194,10 +499,14 @@ def read_rows(path: Path) -> list[Row]:
             raise PrepareError(f"{path}:{lineno}: {exc}") from exc
 
         completion = obj.get("completion")
-        if completion is None and target is not None:
+        rendered = completion is None and target is not None
+        if rendered:
             # A string target is already the text to supervise; a call has to be
             # rendered into the wire format the model is trained to emit.
-            completion = render_call(target) if isinstance(target, ToolCall) else target
+            try:
+                completion = _completion_for(target, wire_format)
+            except ValueError as exc:
+                raise PrepareError(f"{path}:{lineno}: {exc}") from exc
         if not isinstance(completion, str) or not completion.strip():
             raise PrepareError(
                 f"{path}:{lineno}: no supervised span. A row needs a 'completion' string or a "
@@ -210,6 +519,7 @@ def read_rows(path: Path) -> list[Row]:
                 prompt=str(obj["prompt"]),
                 completion=completion,
                 target=target,
+                rendered=rendered,
             )
         )
     if not rows:
@@ -333,9 +643,9 @@ class HuggingFaceTokenCounter:
     """The real counter: a tokenizer inside `envs.TRAIN`, one subprocess per call.
 
     Raises rather than returning an estimate. A guessed token count that turns
-    out to be short is an over-length row reaching training, where it is
-    truncated and its answer disappears -- the failure this whole check exists
-    to prevent.
+    out to be short is an over-length row reaching `tune`, whose training script
+    refuses it only after the training environment is provisioned -- the late
+    failure this check exists to bring forward.
     """
 
     model: str
@@ -724,6 +1034,17 @@ class PrepareRequest:
     min_heldout_examples: int = MIN_HELDOUT_EXAMPLES
     tokens: TokenCounter | None = None
     headroom: HeadroomProbe | None = None
+    # The tool declarations this split's calls are made against, in the shape
+    # `bundle` takes. Absent, no row is checked against a tool list.
+    declarations: Path | None = None
+    # What this split is for. A structured target has to be rendered in the
+    # spelling that model's runtime reads, and litetune records that per family
+    # rather than asking -- but it has to know which family, and this stage
+    # carried no model reference at all. `--base-model`, the flag `convert` and
+    # `bundle` already take, not `--tokenizer`: that one is declared as a
+    # tokenizer, and making the wire format depend on it would tie the trained
+    # format to whether the caller asked for length measurement.
+    base_model: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", Path(self.data))
@@ -748,6 +1069,8 @@ class PrepareRequest:
             "min_heldout_examples": self.min_heldout_examples,
             "tokens": self.tokens.describe() if self.tokens is not None else None,
             "headroom_probe": type(self.headroom).__name__ if self.headroom else None,
+            "base_model": self.base_model,
+            "declarations": str(self.declarations) if self.declarations is not None else None,
         }
 
 
@@ -787,6 +1110,14 @@ class PrepareResult:
     # Checks that were never in scope for this run, with the reason. Not a
     # fourth outcome: a reader must be able to tell that two checks ran rather
     # than assuming three did. Same construction as `liveness.LivenessResult`.
+    # What the model was resolved to and from where, when one was named. A
+    # reader has to be able to tell which spelling the completions are in
+    # without re-running the resolution, and `ModelHint` already records
+    # whether the answer came from the sidecar, the config or the name.
+    identity: dict[str, Any] | None = None
+    # The digest of the declarations the targets were checked against, the
+    # same one `tune` records, so the split can be traced to its tool list.
+    declarations_sha256: str | None = None
     skipped: list[SkippedCheck] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
     report_path: Path | None = None
@@ -849,6 +1180,8 @@ class PrepareResult:
             "arguments": [a.as_dict() for a in self.arguments],
             "unscoreable_arguments": [f"{a.tool}.{a.argument}" for a in self.unscoreable],
             "slices": [s.as_dict() for s in self.slices],
+            "model": self.identity,
+            "declarations_sha256": self.declarations_sha256,
             "checks": self.checks.as_dict() | {"skipped": [s.as_dict() for s in self.skipped]},
             "limitations": list(self.limitations),
             "spec_fragment": self.spec_fragment(),
@@ -881,14 +1214,35 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     events = events or EventStream(echo_json=False)
     events.stage_started("prepare", data=str(request.data), seed=request.seed)
 
-    rows = read_rows(request.data)
+    # The family decides how a structured target is spelled, and it is read
+    # from the model rather than asked of the caller. A run that named no
+    # model gets `None`: FunctionGemma's format, and a limitation saying so.
+    wire = wire_format_for(request.base_model) if request.base_model else None
+    rows = read_rows(request.data, wire)
+    # Before anything is profiled or split: a row calling a tool the prompt will
+    # never offer is a row that cannot be trained, and saying so after a split
+    # has been written means the caller re-runs the stage to learn it.
+    declarations_sha256 = None
+    evidence = prompt_evidence([row.prompt for row in rows]).mode
+    if request.declarations is not None:
+        declarations_sha256 = recorded_digest(
+            refuse_undeclared_tools(rows, request.data, request.declarations),
+            request.declarations,
+            evidence is PromptMode.PRERENDERED,
+        )
+    elif request.base_model is not None:
+        refuse_calls_without_declarations(rows, request.base_model)
     content_sha256 = hash_file(request.data)
     result = PrepareResult(
         request=request,
         checks=CheckSet(name=f"prepare:{request.data.name}"),
         content_sha256=content_sha256,
         n_rows=len(rows),
+        identity=_identity(request.base_model, wire),
+        declarations_sha256=declarations_sha256,
     )
+    if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
+        result.limitation(ASSUMED_WIRE_FORMAT)
     events.metric("rows", len(rows), source=str(request.data))
 
     # -- lengths -----------------------------------------------------------
@@ -899,9 +1253,7 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 Check.unchecked(
                     LENGTH_CHECK,
                     "no tokenizer was supplied, so no example was measured against the "
-                    f"{request.context_length}-token context window. An over-length row reaches "
-                    "training and is truncated there, which removes the answer it was supposed "
-                    "to teach",
+                    f"{request.context_length}-token context window",
                     observed={"context_length": request.context_length},
                 )
             )
@@ -944,11 +1296,22 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             "expected_supervised_token_fraction",
             round(result.lengths.expected_supervised_fraction, 6),
         )
+        # Only where it is true: lengths were measured, the prompts are bare,
+        # and the model's runtime is one litetune records as rendering a
+        # declaration turn in front of them.
+        if (
+            declarations_sha256 is not None
+            and evidence is PromptMode.RUNTIME_RENDERED
+            and request.base_model is not None
+            and renders_declarations_for(request.base_model)[0]
+        ):
+            result.limitation(DECLARATIONS_NOT_COUNTED)
     if not length_check.conclusive:
         result.limitation(
             f"token lengths were not measured ({length_check.detail}); whether every example fits "
-            "the context window is unknown, and a row that does not fit is truncated during "
-            "training without a warning"
+            "the context window is unknown here. `tune`'s training script measures the rendered "
+            "sequence and refuses a row over max_seq_length rather than truncating it, after the "
+            "training environment is provisioned"
         )
 
     # -- scoreability, before anyone pays for a GPU -------------------------
@@ -1066,8 +1429,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     elif length_check.outcome is Outcome.FAILED:
         # Deliberate: no split is written when rows do not fit. Writing one
         # anyway would put the over-length rows into a file that the next stage
-        # reads without ever seeing this check, which is precisely how a
-        # truncated example gets trained on.
+        # reads without ever seeing this check, and `tune` would refuse them
+        # only once its training environment is provisioned.
         #
         # Recorded as *skipped* rather than as an UNCHECKED check, following
         # `liveness.liveness_tier`. An unchecked item makes the whole CheckSet

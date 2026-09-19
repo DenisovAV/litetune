@@ -137,21 +137,23 @@ Two shapes rather than a target plus a `--target-kind`, because those two could
 disagree and a shape cannot disagree with itself. Match it with `--scorer` when
 you get to `verify`.
 
-**The prompt is exactly what your application will send the model.** The tool
-call above is FunctionGemma's: its application renders the tool declarations and
-every turn marker into the prompt itself — flutter_gemma does it in Dart — so the
-runtime must not template it again, and `tune` trains it `prerendered`. The
-sentiment row is bare text for a runtime that applies the model's own chat
-template, so it trains `runtime_rendered`. `tune` tells the two apart by the
-control tokens in the prompts, and refuses a file that mixes them unless you
-declare which one it is.
+**The prompt is exactly what your application will send the model.** An
+application that renders the tool declarations and every turn marker into the
+prompt itself sends a prompt the runtime must not template again, and `tune`
+trains it `prerendered`. The sentiment row is bare text for a runtime that
+applies the model's own chat template, so it trains `runtime_rendered` — as does
+a tool call whose declarations the runtime renders, below in
+[Tool calling through the runtime](#tool-calling-through-the-runtime). `tune`
+tells the two apart by the control tokens in the prompts, and refuses a file
+that mixes them unless you declare which one it is.
 
 `prepare` splits one raw file into `train.jsonl` and `heldout.jsonl` and rejects
 what it cannot score: malformed JSON, and rows with no `prompt`. Given
 `--tokenizer` it also reports the token-length distribution, so a row too long
 for the sequence limit fails before you rent a GPU rather than after.
 
-The held-out half is never trained on. Scoring a model on rows it was fitted to
+The held-out rows — a fifth of the file by default, `--heldout-fraction` or
+`--heldout-size` to change it — are never trained on. Scoring a model on rows it was fitted to
 measures memorisation rather than whether it answers new inputs. The split is
 derived from the file's content hash, so re-running `prepare` puts the same rows
 on the same side.
@@ -170,12 +172,13 @@ single `run` would hide which one you are in.
 litetune prepare --data raw.jsonl --output-dir data --context-length 1024 \
                  --tokenizer google/functiongemma-270m-it
 
-# 2. Fine-tune. Runs on CUDA if the box has one, otherwise CPU; size your
-#    expectations accordingly either way. The prompt mode is read off the
-#    prompts (these carry FunctionGemma's control tokens, so prerendered) and
-#    recorded beside the checkpoint, where steps 4 and 5 take it from.
+# 2. Fine-tune. Runs on CUDA if the box has one, otherwise CPU. Declare the
+#    prompt mode rather than leave it to be read off the prompts: these carry
+#    FunctionGemma's control tokens, so prerendered. It is recorded beside the
+#    checkpoint, where steps 4 and 5 take it from. On a CPU add --dtype float32:
+#    bfloat16 runs single-threaded there (see the flag table below).
 litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
-              --output-dir tuned --method lora
+              --output-dir tuned --method lora --prompt-mode prerendered
 
 # 3. Convert, sweeping recipes rather than trusting a default.
 litetune convert --model tuned/model --output-dir artifacts \
@@ -183,6 +186,8 @@ litetune convert --model tuned/model --output-dir artifacts \
 
 # 4. Measure what the conversion cost, against the float twin.
 #    `convert` names the artifact; look the filename up rather than build it.
+#    The prompt mode is read from the record step 2 left beside tuned/model,
+#    and a --prompt-mode that disagrees with it is refused.
 litetune verify --model artifacts/weight_only_wi8_afp32/<name>.litertlm \
                 --reference tuned/model --data data/heldout.jsonl \
                 --json > manifest.json
@@ -246,7 +251,143 @@ those numbers do not establish.
 | `--dtype` | Training precision for `tune`. Default `bfloat16`. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records the banking77 runs' dtype — bfloat16, trained on a GPU where this flag's reason does not apply — and says nothing about the headline table's, so the report records yours. |
 | `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused: they resolve to different weights on different days while the bundle reads identically. |
 | `--scorer` | What counts as correct, on `verify`. `tool-call` (default) or `exact-text`. It has to match the shape of your targets; nothing else in the pipeline changes. The manifest records which one ran, because two manifests scored differently are not comparable. |
-| `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. See [MEASUREMENTS.md](MEASUREMENTS.md). |
+| `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. It applies to prompts your application renders. When the runtime renders the declarations, litetune settles the order itself — see [Tool calling through the runtime](#tool-calling-through-the-runtime). See [MEASUREMENTS.md](MEASUREMENTS.md). |
+
+### Tool calling through the runtime
+
+The walkthrough above renders the declarations into every prompt itself. The
+other way is to let the runtime do it: bare prompts, and the declarations passed
+as a file to `create_conversation(tools=...)`. Then they are an input to every
+stage, not only to `bundle`:
+
+```bash
+litetune prepare --data raw.jsonl --output-dir data --context-length 1024 \
+                 --tokenizer google/functiongemma-270m-it \
+                 --base-model google/functiongemma-270m-it --declarations tools.json
+
+litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
+              --output-dir tuned --method lora \
+              --prompt-mode runtime_rendered --declarations tools.json
+
+# convert as in step 3, then:
+litetune verify --model artifacts/<recipe>/<name>.litertlm \
+                --reference tuned/model --data data/heldout.jsonl \
+                --declarations tools.json --json > manifest.json
+```
+
+`tools.json` is a list of OpenAI function objects, the shape `bundle` takes.
+
+**The order of its keys is settled for you.** The runtime prints a declaration's
+keys in the order it is given; FunctionGemma's own chat template sorts them with
+`dictsort`, which ignores case. So litetune sorts every mapping in the file the
+same way when it reads it, and the training prompt and the runtime then render
+the same tokens — the rendering check compares them on every `verify`.
+
+It refuses what the two still render differently, and what a call could not
+carry back:
+
+- any schema key the template does not print — among them `nullable`,
+  `default`, `format`, `minimum`, `additionalProperties`, a function-level
+  `strict`, and `enum` on anything but a string;
+- a tool or property with no `description`;
+- a property named `description`, `type`, `properties`, `required` or
+  `nullable`, and two properties equal but for case;
+- an empty collection, and an object property with no properties;
+- a type written other than as one of the seven JSON Schema names, in lowercase
+  or in capitals;
+- a tool or argument name the runtime's call parser cannot read
+  (`[a-zA-Z_][a-zA-Z0-9_.-]*`, and not `call`, `true`, `false`, `null` or an
+  exponent like `e5` or `e-3`, which its lexer reads as other tokens);
+- a key given twice in one object, a tool declared twice, and text that is not
+  valid Unicode;
+- a description, an enum value or a property name holding `<escape>`, a
+  declaration marker or a turn marker, which would end the declaration it is
+  written in.
+
+Some are capability you give up — `nullable`, the reserved names, `enum` on a
+number, and OpenAI's strict mode; the rest you fix by writing the file
+differently. Whatever you remove, remove from what your application sends too:
+the runtime renders what it is given. `google/mobile-actions` meets one of them
+itself — its tools with no arguments carry `"properties": {}`. The disagreement
+is Google's:
+[LiteRT-LM#3638](https://github.com/google-ai-edge/LiteRT-LM/issues/3638).
+
+**A call is trained the way the runtime reads one**: inside
+`<start_function_call>` and `<end_function_call>`, strings between `<escape>`
+markers, numbers, booleans and null bare, and the arguments in the same order as
+the declarations — `call:set_alarm{hour:7,label:<escape>wake<escape>}`. Only what
+the runtime reads back is trained: a string holding an escape, the end-of-call
+marker or one of FunctionGemma's stop tokens (`<end_of_turn>`,
+`<start_function_response>`, `<eos>`), NaN or infinity, an integer a double
+cannot hold exactly and a name outside its grammar are refused with the row
+named, and so is a target whose arguments contradict its declaration.
+The order is not cosmetic: with constrained decoding on, the runtime enforces
+the declared property order, and an argument out of it is dropped from the
+call. So a `runtime_rendered` bundle ships its declarations in the order the
+model learned, and its contract's `declarations_sha256` names that list.
+
+**Who serves it this way.** LiteRT-LM's Python API, as
+`create_conversation(tools=...)` handed each entry of the bundle's
+`declarations.json` whole, `{"type": "function", ...}` — which is how `verify`
+asks. A Python function handed as a tool gets a schema the binding writes
+itself, and does not render what was trained. Constrained decoding is off
+unless you pass a `ConstrainedDecodingConfig` that enables it. Automatic tool
+calling is on unless you turn it off: with it on, the binding runs the tools
+itself and loops until the model answers in prose, so you are never handed the
+call; `verify` measures with it off.
+
+On Kotlin, an `OpenApiTool` returning each entry's `function` object from the
+bundle's `declarations.json` — not the whole `{"type": "function", ...}` entry,
+which it refuses — registered in the file's order. Parse the file into a JSON
+object that keeps its keys' order and hand it on; a data class serialised back
+out can reorder the keys. The reflection-based `@Tool` path writes its own keys,
+order and `nullable`, so it renders what was trained only for a tool declared
+with no `parameters` at all. Constrained decoding there is
+`ExperimentalFlags.enableConversationConstrainedDecoding`, off by default and
+global to the process, read when a conversation is created. Automatic tool
+calling is on by default in Kotlin too; turn it off to be handed the call. The
+runtime reads every number in a call as a double, so an integer argument
+arrives as `7.0`: read it as a number and convert it.
+
+flutter_gemma 1.8.3 does not use this path for FunctionGemma: it renders the
+declarations in Dart, and the `flutter_gemma_litertlm` engine (1.6.4) hands the
+runtime tools only for Gemma 4 (`lib/src/ffi/ffi_inference_model.dart`). A model
+trained here is not served by it the way it was measured.
+
+**`verify` picks the path from the model, not from a flag.** With declarations
+and a family whose runtime renders them, it asks the runtime for a structured
+call instead of reading text, twice: with constrained decoding off — the
+runtime's default, and what the reference is compared with — and on, which is
+what an application that enables it gets. How far the two differ, and which way,
+is reported. A prompt the runtime gives no reply to is scored as a wrong answer
+and counted apart by reason: its call parser rejecting what the model wrote, or
+a prompt reaching the bundle's token limit. Any other reason, on any prompt,
+leaves that mode unmeasured — with the grammar off the run ends as a harness
+failure, with it on the mode is reported as not measured and the grammar-off
+number stands — and anything else going wrong ends the run. The reference's
+text is read the way the runtime reads a reply, only between the call markers,
+and a reply with more than one call is a wrong answer on both sides.
+
+**What it refuses.** Structured targets in `runtime_rendered` without
+`--declarations`: their descriptions and types are your application's contract
+and cannot be read off the targets. `--declarations` for a `runtime_rendered`
+split of a family whose runtime litetune does not record as rendering them. A
+structured target for a family whose call format litetune has not measured:
+supply each row's `completion` instead. In `tune`, a row with a target and no
+completion — run `prepare`, which writes it — and a call row whose completion
+the runtime would not read as exactly its target's call, with the target's
+types, and nothing after it: no call markers, as in a split prepared by 0.1.6
+or earlier, a number written as a string, text after the call, or a stop token
+inside a string. Drop such a completion so `prepare` renders it. A call to a
+tool the declarations do not offer, and a call in a row whose target is text.
+Marked calls in `runtime_rendered` for a local checkpoint whose `config.json`
+says `gemma3_text`, which is FunctionGemma and Gemma 3 alike: say which it is in
+its `litetune.json`. `verify` without `--declarations`
+for a `runtime_rendered` checkpoint that recorded some, and `--scorer
+exact-text` on the tool path. In `prerendered` the declarations file's bytes are
+the record, so the file `tune` read has to reach `verify` and `bundle`
+unchanged. `prepare` without `--base-model` still renders FunctionGemma's
+format, and the report says that it assumed it.
 
 ---
 
@@ -289,10 +430,10 @@ which supports neither. A bundle carrying it exports cleanly, is the right size,
 passes every liveness check, and still answers a plain text prompt — then
 fails the native tool-call path, where LiteRT-LM routes the call through the
 chat template, with `litert_lm_conversation_send_message_stream failed`, which
-is the whole error the caller gets. The split is in the runtime, so every
-consumer sees it: the `flutter_gemma` plugin, the AI Edge Gallery, or the SDK
-used directly. litetune ships a template the runtime can run and passes it on
-export. Measured on the same checkpoint: with the override the runtime answers
+is the whole error the Python binding raises. The split is in the runtime, so
+every consumer that hands it tools sees it, whatever it is written in. litetune
+ships a template the runtime can run and passes it on export. Measured on the
+same checkpoint: with the override the runtime answers
 `[tool_call] set_alarm{hour:7}`; without it, `INTERNAL: Failed to apply
 template`.
 

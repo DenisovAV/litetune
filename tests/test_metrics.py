@@ -6,6 +6,7 @@ unpaired one, changes what those tests conclude about a real comparison.
 """
 
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -21,9 +22,13 @@ from litetune.metrics import (
     difference,
     paired_difference,
     parse_call,
+    readable_name,
     reasoning_unclosed,
+    runtime_calls,
+    same_answer,
     score,
     strip_reasoning,
+    text_after_the_calls,
 )
 
 # -- the wire format --------------------------------------------------------
@@ -34,10 +39,330 @@ def test_parses_a_single_call():
     assert call == ToolCall("change_background_color", {"color": "red"})
 
 
+def test_a_targets_types_survive_beside_the_flattened_arguments():
+    """The comparison is untyped and stays untyped; rendering is not.
+
+    `args` is what scoring reads and it is still strings. `raw` is what the
+    renderer reads, because the runtime's parser distinguishes a bare `3` from
+    an escaped one and a target flattened to `"3"` cannot say which it was.
+    """
+    call = ToolCall.from_target(
+        {"name": "set", "args": {"n": 3, "ratio": 0.5, "on": True, "who": "ann", "gone": None}}
+    )
+
+    assert call is not None
+    assert call.args == {"n": "3", "ratio": "0.5", "on": "true", "who": "ann", "gone": "null"}
+    assert call.raw == {"n": 3, "ratio": 0.5, "on": True, "who": "ann", "gone": None}
+
+
+def test_scoring_compares_answers_and_equality_what_an_application_is_handed():
+    """Every number this project has published scored `3` and `"3"` as one
+    answer, and scoring still does. Equality does not: an application handed
+    the string is handed something else, and a relation where `"3"` and
+    `"3.0"` both equal `3` and not each other cannot be equality -- a set of
+    the three kept one or two of them depending on the order they went in.
+    """
+    typed = ToolCall("set", {"n": 3})
+    from_wire = ToolCall("set", {"n": "3"})
+
+    assert same_answer(typed, from_wire)
+    assert typed != from_wire
+    assert repr(typed) == "ToolCall('set', {'n': 3})"
+    for values in ((3, "3", "3.0"), ("3.0", "3", 3), ("3", 3, "3.0")):
+        assert len({ToolCall("set", {"n": v}) for v in values}) == 3
+    # A split records the types, so a target read back renders as it did.
+    assert typed.as_dict() == {"name": "set", "args": {"n": 3}}
+    assert ToolCall.from_target(typed.as_dict()) == typed
+    assert ToolCall.from_target(typed.as_dict()).raw == {"n": 3}
+
+
 def test_parses_multiple_arguments():
     call = parse_call("call:set{a:<escape>1<escape>,b:<escape>two<escape>}")
     assert call is not None
     assert call.args == {"a": "1", "b": "two"}
+
+
+def test_parses_a_bare_scalar_the_way_the_runtime_writes_it():
+    call = parse_call("call:set{n:3,ratio:0.5,on:true,off:false,gone:null}")
+
+    assert call is not None
+    # Scoring stays untyped: the flattened view is what it compares.
+    assert call.args == {"n": "3", "ratio": "0.5", "on": "true", "off": "false", "gone": "null"}
+    assert call.raw == {"n": 3, "ratio": 0.5, "on": True, "off": False, "gone": None}
+
+
+def test_parses_a_generation_mixing_both_forms():
+    """The untuned base writes bare and every checkpoint trained before the
+    format was measured writes escaped, so a comparison spans both -- sometimes
+    inside one call."""
+    call = parse_call("call:set{who:<escape>ann<escape>,n:3,label:<escape>7<escape>}")
+
+    assert call is not None
+    assert call.args == {"who": "ann", "n": "3", "label": "7"}
+    assert call.raw == {"who": "ann", "n": 3, "label": "7"}
+
+
+def test_an_escaped_number_still_parses_and_still_compares_equal():
+    """What an old checkpoint emits has to keep scoring against a typed target.
+
+    The comparison was untyped before this change and stays untyped, so a run
+    measured last month and one measured today are the same measurement.
+    """
+    old = parse_call("call:set{n:<escape>3<escape>}")
+    new = parse_call("call:set{n:3}")
+
+    assert old is not None and new is not None
+    assert same_answer(old, new)
+    assert same_answer(old, ToolCall("set", {"n": 3}))
+    assert old.raw == {"n": "3"}
+    assert new.raw == {"n": 3}
+
+
+def test_a_value_that_is_neither_escaped_nor_a_scalar_is_not_a_call():
+    """A bare word is not a shape either renderer produces, and reading it as
+    one would turn a malformed generation into a confident wrong answer."""
+    assert parse_call("call:set{colour:red}") is None
+
+
+def test_a_number_the_runtime_hands_back_as_a_double_is_the_integer_it_equals():
+    """LiteRT-LM v0.16.1 reads every `NUMBER` as an f64, so a call the model
+    wrote as `hour:7` reaches the caller as `7.0`. Compared as `"7.0"` against a
+    target of `7`, every correct integer on the tool path scored wrong, and the
+    difference landed in the conversion cost."""
+    assert ToolCall("set_alarm", {"hour": 7.0}) == ToolCall("set_alarm", {"hour": 7})
+    assert ToolCall("set_alarm", {"hour": 7.0}) == parse_call("call:set_alarm{hour:7}")
+    assert ToolCall("set", {"n": 1e20}) == ToolCall("set", {"n": 10**20})
+    # A number that is not an integer keeps its value, and stays unequal to
+    # the integer beside it.
+    assert ToolCall("set", {"ratio": 0.5}).args == {"ratio": "0.5"}
+    assert ToolCall("set", {"n": 7.5}) != ToolCall("set", {"n": 7})
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "call:set{n:007}",  # INT is '0' | [1-9][0-9]*: no leading zero
+        "call:set{n:\u0663}",  # an Arabic-Indic three: `\d` matched it, the lexer does not
+        "call:set{n:1.5e-07}",  # FRAC and EXP never together
+        "call:set{n:e5}",  # lexes, but fc_parser.rs fails to read it as a number
+        "call:set{n:-}",
+    ],
+)
+def test_a_number_the_runtimes_lexer_refuses_is_not_a_call(text):
+    """Held to the grammar the runtime reads (`AntlrFcLexer.g4`, v0.16.1), and
+    never raised: `007` used to reach `json.loads` and crash `verify` from the
+    divergence check, which runs outside every guard."""
+    assert parse_call(text) is None
+
+
+def test_a_number_the_runtimes_lexer_reads_is_a_call():
+    call = parse_call("call:set{a:0,b:-3,c:0.25,d:1e+16,e:-2E-3,f:.5}")
+
+    assert call is not None
+    assert call.raw == {"a": 0, "b": -3, "c": 0.25, "d": 1e16, "e": -0.002, "f": 0.5}
+    # `0 == 0.0` in Python, so the type is asserted apart: rendered back, an
+    # integer read as a float would be written `0.0`.
+    assert [type(v) for v in call.raw.values()] == [int, int, float, float, float, float]
+
+
+@pytest.mark.parametrize(
+    "escape, value",
+    # `fc_parser.rs` strips `<escape>` and `<|"|>` from a string's ends and
+    # leaves `<ctrl46>` in it, so a value delimited by it comes back delimited.
+    [("<escape>", "a,b"), ('<|"|>', "a,b"), ("<ctrl46>", "<ctrl46>a,b<ctrl46>")],
+)
+def test_every_escape_the_runtime_reads_delimits_a_string(escape, value):
+    """The lexer's `ESCAPE` is three spellings, and `ESCAPED_STRING` ends at the
+    first of any of them. Reading only one would score as correct a string the
+    runtime cuts short; stripping all three would score as correct a string the
+    runtime returns with its delimiters on."""
+    assert parse_call(f"call:set{{s:{escape}a,b{escape}}}").raw == {"s": value}
+    assert parse_call("call:set{s:<escape>a<ctrl46>b<escape>}") is None
+
+
+@pytest.mark.parametrize("word", ["call", "true", "false", "null", "e5", "E10", "e-3", "E+5"])
+def test_a_name_the_lexer_reads_as_another_token_is_not_a_call(word):
+    """Found in review: these match the identifier pattern, but the lexer's
+    `CALL`, `BOOLEAN`, `NULL_LITERAL` and `NUMBER` rules come first and win the
+    tie, so the runtime's parser never sees an identifier there."""
+    assert not readable_name(word)
+    assert parse_call(f"call:{word}{{a:1}}") is None
+    assert parse_call(f"call:f{{{word}:1}}") is None
+    # Longer than the token it starts with, so `ID` wins.
+    assert parse_call("call:f{called:1,nullable:2,e5x:3,e-3x:4}") is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["call:set{a:1,}", "call:set{a:1 b:2}", "call:set{,a:1}", "call:set{a:1,,b:2}"],
+)
+def test_pairs_are_separated_the_way_the_parser_requires(text):
+    """`object : '{' (pair (',' pair)*)? '}'`: a trailing comma, a missing one or
+    a doubled one is a call the runtime refuses."""
+    assert parse_call(text) is None
+
+
+def test_a_key_given_twice_keeps_its_first_value():
+    """`fc_parser.rs` ignores a repeated key; a parser that kept the last value
+    would score as right a call the runtime reads as wrong."""
+    assert parse_call("call:set{a:1,a:2}").raw == {"a": 1}
+
+
+@pytest.mark.parametrize(
+    "one, other, same",
+    [
+        (3.0, "3.0", True),  # an escaped number from a checkpoint trained before
+        (7, 7.0, True),  # the runtime hands every number back as a double
+        ("7", 7.0, True),
+        # `_stringify` made these one answer before the format was read, and a
+        # re-scored checkpoint keeps them.
+        (True, "true", True),
+        (None, "null", True),
+        ([1, 2], [1.0, 2.0], True),  # every number in a list comes back a double too
+        (["3", 2], [3.0, 2], True),  # and item by item, as a value on its own
+        ({"a": "3"}, {"a": 3}, True),  # an object too, key by key
+        ("1.0", "1", False),  # two strings stay two strings
+        (7.5, 7, False),
+        ("007", 7, False),  # not a number the lexer reads
+        (True, 1, False),
+        (False, None, False),
+    ],
+)
+def test_the_same_answer_whatever_its_spelling(one, other, same):
+    """Found in review: comparing numbers by their string made an escaped `3.0`
+    from an older checkpoint wrong against a target of `3.0`."""
+    assert same_answer(ToolCall("f", {"x": one}), ToolCall("f", {"x": other})) is same
+    assert same_answer(ToolCall("f", {"x": other}), ToolCall("f", {"x": one})) is same
+
+
+@pytest.mark.parametrize(
+    "one, other, equal",
+    [
+        (7, 7.0, True),  # the runtime hands every number back as a double
+        (10**20, 1e20, True),
+        ([1, 2], [1.0, 2.0], True),
+        ({"a": 1}, {"a": 1.0}, True),
+        ("7", 7, False),  # a string is never a number
+        ("7", 7.0, False),
+        (True, 1, False),  # nor a boolean
+        (True, "true", False),
+        (None, "null", False),
+        ("a", "a ", False),  # whitespace is part of a string
+        ([1], [1, 2], False),
+    ],
+)
+def test_equal_calls_hand_an_application_the_same_json(one, other, equal):
+    assert (ToolCall("f", {"x": one}) == ToolCall("f", {"x": other})) is equal
+    assert (ToolCall("f", {"x": other}) == ToolCall("f", {"x": one})) is equal
+
+
+def test_a_call_is_its_name_and_every_argument_in_any_order():
+    call = ToolCall("f", {"a": 1, "b": "x"})
+
+    for relation in (same_answer, lambda p, q: p == q):
+        assert relation(call, ToolCall("f", {"b": "x", "a": 1}))
+        assert not relation(call, ToolCall("g", {"a": 1, "b": "x"}))
+        assert not relation(call, ToolCall("f", {"a": 1}))
+        assert not relation(call, ToolCall("f", {"a": 1, "b": "x", "c": 2}))
+
+
+START, END = "<start_function_call>", "<end_function_call>"
+
+
+@pytest.mark.parametrize(
+    "text, calls",
+    [
+        (f"{START}call:f{{a:1}}{END}", [ToolCall("f", {"a": 1})]),
+        (f"Sure. {START}call:f{{}}{END}<end_of_turn>", [ToolCall("f", {})]),
+        # `object?`, and whitespace between any two tokens
+        (f"{START} call : f \n{END}", [ToolCall("f", {})]),
+        (f"{START}call:f{{}}{END}{START}call:g{{}}{END}", [ToolCall("f", {}), ToolCall("g", {})]),
+        (f"{START}call:f{{a:1}}{END}{START}call:g{{", [ToolCall("f", {"a": 1})]),
+        (f"{START}{END}", []),
+        ("call:f{a:1}", []),  # no markers: text
+        (f"{START}call:f{{a:1}}", []),  # no end marker: text
+        (f"call:f{{}}{END}{START}", []),  # reversed
+        (f"call:f{{a:1}} {START}{END}", []),  # the call outside the markers is text
+        (f"{START}call:f{{}}call:g{{}}{END}", None),  # two calls in one block
+        (f"{START}call:f{{a:1}} and more{END}", None),
+        (f"{START}not a call{END}call:f{{a:1}}", None),
+        (f"{START}call:f{{a:1}}{END}{START}call:g{{a:}}{END}", None),  # one block fails all
+        (f"{START}call:true{{}}{END}", None),  # `true` is not a name
+        # A key the object already has: the runtime logs it and skips reading
+        # its value, so a value it could not read there does not fail the reply.
+        (f"{START}call:f{{a:1,a:e5}}{END}", [ToolCall("f", {"a": 1})]),
+        (f"{START}call:f{{a:1,b:{{c:1,c:e5}}}}{END}", [ToolCall("f", {"a": 1, "b": {"c": 1}})]),
+        # Its syntax still has to hold: the parse tree is built for it.
+        (f"{START}call:f{{a:1,a:}}{END}", None),
+        # Found in review: the grammar takes an array and an object as a value.
+        (f"{START}call:f{{a:[1,<escape>x<escape>]}}{END}", [ToolCall("f", {"a": [1, "x"]})]),
+        (
+            f"{START}call:f{{a:{{b:true,c:null}}}}{END}",
+            [ToolCall("f", {"a": {"b": True, "c": None}})],
+        ),
+        # And a character no lexer rule matches is skipped, not refused.
+        (f"{START}call:f{{a:1}};{END}", [ToolCall("f", {"a": 1})]),
+        (f"{START}call:f{{a:5.}}{END}", [ToolCall("f", {"a": 5})]),
+        (f"{START}call:(f){{}}{END}", [ToolCall("f", {})]),
+        (f"{START}call:f{{a:\x0b1}}{END}", [ToolCall("f", {"a": 1})]),
+        (f"{START}call:f{{a:1e400}}{END}", [ToolCall("f", {"a": None})]),  # json! of inf
+        (f"{START}call:f{{a:e5}}{END}", None),  # lexes, and Rust cannot parse it
+        (f"{START}call:f{{a:1.5e3}}{END}", None),  # fraction and exponent never together
+        (f"{START}call:f{{call:1}}{END}", None),  # `call` is not a key
+        (f"{START} {END}", None),  # a block that is not empty is a call or nothing
+        (f"{START}call:f{{}}\r{END}", [ToolCall("f", {})]),  # `\r` is the lexer's whitespace
+        # The first end marker closes the block the first start marker opened,
+        # and a second start marker inside it is not a call's start.
+        (f"{START}call:f{{}} {START}call:g{{}}{END}", None),
+    ],
+)
+def test_a_reply_is_read_as_the_runtime_reads_it(text, calls):
+    """`parser_utils.cc`: text and marked blocks, each block one whole call,
+    and one that is not fails the reply. Found in review: the reference and
+    tune's check read the first call anywhere, and five shapes that the
+    runtime reads differently were scored or trained as the call."""
+    assert runtime_calls(text) == calls
+
+
+def test_the_runtime_reads_every_number_as_a_double():
+    """`fc_parser.rs` parses a `NUMBER` with `text.parse::<f64>()`, so an integer
+    past 2**53 reaches an application as the nearest double -- and a target of
+    its exact digits is not what it is handed."""
+    (call,) = runtime_calls(f"{START}call:f{{n:9007199254740993,m:7}}{END}")
+
+    assert call.raw == {"n": 9007199254740992.0, "m": 7.0}
+    assert [type(v) for v in call.raw.values()] == [float, float]
+    assert call != ToolCall("f", {"n": 9007199254740993, "m": 7})
+
+
+def test_a_number_past_pythons_digit_limit_is_read_as_the_runtime_reads_it():
+    """`int` refuses text longer than 4300 digits; a double reads it."""
+    call = parse_call("call:f{n:" + "1" * 5000 + "}")
+
+    assert call is not None and call.raw == {"n": math.inf}
+    assert not same_answer(ToolCall("f", {"n": "1" * 5000}), ToolCall("f", {"n": 1}))
+
+
+def test_raw_is_derived_and_cannot_disagree_with_args():
+    """A `raw` passed beside `args` compared as one answer and rendered as
+    another. Derived, it follows `replace` too."""
+    with pytest.raises(TypeError):
+        ToolCall("set", {"n": 3}, raw={"n": "3"})
+
+    moved = replace(ToolCall("set", {"n": 3}), args={"n": 5})
+    assert moved.raw == {"n": 5}
+
+
+def test_parses_a_call_in_its_markers_up_to_the_stop_token():
+    """What a correctly trained model emits on the tool path's text side, and
+    what the transformers reference now generates: the call in its markers,
+    followed by the token the model stops on."""
+    text = (
+        "<start_function_call>call:set_alarm{hour:<escape>7<escape>}"
+        "<end_function_call><start_function_response>"
+    )
+
+    assert parse_call(text) == ToolCall("set_alarm", {"hour": "7"})
 
 
 def test_parses_a_call_with_no_arguments():
@@ -99,9 +424,12 @@ def test_targets_are_stringified_because_the_format_is_untyped():
     assert target.args == {"seconds": "3", "loud": "true", "x": "null"}
 
 
-def test_an_integer_target_matches_the_string_the_model_emits():
+def test_an_integer_target_is_the_answer_the_model_emits_as_a_string():
     target = ToolCall.from_target({"name": "wait", "args": {"seconds": 3}})
-    assert parse_call("call:wait{seconds:<escape>3<escape>}") == target
+    emitted = parse_call("call:wait{seconds:<escape>3<escape>}")
+    assert target is not None and emitted is not None
+    assert same_answer(emitted, target)
+    assert score([target], ["call:wait{seconds:<escape>3<escape>}"]).exact_match.value == 1.0
 
 
 def test_unlabelled_target_is_none_not_an_error():
@@ -637,3 +965,25 @@ def test_only_reasoning_that_opened_and_never_closed_counts_as_unclosed():
     # An opening marker after the answer did not open the generation's reasoning.
     assert not reasoning_unclosed("label_3 <think>")
     assert not reasoning_unclosed("<think>done</think>label_3")
+
+
+@pytest.mark.parametrize(
+    "text, after",
+    [
+        (f"{START}call:f{{}}{END} and more", " and more"),
+        # An end marker with no start marker before it is text the runtime
+        # keeps, not the end of a block: `RE2::Consume` stops at the last pair.
+        (f"{START}call:f{{}}{END} prose {END}", f" prose {END}"),
+        (f"{START}call:f{{}}{END}", ""),
+        ("no markers here", "no markers here"),
+        (f"{START}call:f{{}}", f"{START}call:f{{}}"),
+    ],
+)
+def test_the_text_a_reply_keeps_after_its_calls(text, after):
+    assert text_after_the_calls(text) == after
+
+
+def test_equal_calls_hash_alike():
+    """A number the runtime hands back as a double is the integer it equals,
+    and a set of the two holds one call."""
+    assert len({ToolCall("f", {"x": 7}), ToolCall("f", {"x": 7.0})}) == 1

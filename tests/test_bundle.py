@@ -7,6 +7,7 @@ disk, because what is under test is what travels with it.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from litetune.bundle import (
     versions_from,
 )
 from litetune.checks import Outcome
+from litetune.declarations import canonical_text, read_declarations
 from litetune.events import EventStream
 from litetune.manifest import CacheOutcome, RunManifest, RunStatus, StageRecord
 from litetune.prompt_mode import PromptMode
@@ -64,9 +66,34 @@ def declarations(tmp_path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
+            # The OpenAI function object the runtime requires: it refuses a tool
+            # whose description has no `['function']['name']` before it renders
+            # anything, and the reference chat template reads the same keys.
             [
-                {"name": "change_background_color", "parameters": {"color": "string"}},
-                {"name": "open_app", "parameters": {"app": "string"}},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "change_background_color",
+                        "description": "Changes the app background colour",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"color": {"type": "string"}},
+                            "required": ["color"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "open_app",
+                        "description": "Opens an app by name",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"app": {"type": "string"}},
+                            "required": ["app"],
+                        },
+                    },
+                },
             ]
         ),
         encoding="utf-8",
@@ -899,3 +926,532 @@ def test_the_wire_convention_is_recorded_or_declared_unknown():
     # And it survives the round trip, so a manifest can carry it forward.
     assert Contract.read(recorded).wire_convention is WireConvention.TEMPLATE_DICTSORT
     assert Contract.read(unknown).wire_convention is None
+
+
+# ---------------------------------------------------------------------------
+# The declarations ship in the order the model learned
+# ---------------------------------------------------------------------------
+
+
+def _unsorted_declarations(tmp_path) -> Path:
+    """`send_email` with its properties in the order an application might write
+    them: not the order litetune's reader sorts them into, which is the order a
+    runtime_rendered model is trained against."""
+    path = tmp_path / "source" / "unsorted_tools.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "send_email",
+                        # Not ASCII on purpose: the shipped text keeps UTF-8 as
+                        # UTF-8, which `json.dumps`' default would escape.
+                        "description": "Sends an email \u2014 now.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "to": {"type": "STRING", "description": "recipient"},
+                                "subject": {"type": "STRING", "description": "subject"},
+                                "body": {"type": "STRING", "description": "body"},
+                            },
+                            "required": ["to", "subject"],
+                        },
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_runtime_rendered_bundle_ships_the_declarations_in_the_order_the_model_learned(
+    tmp_path, request_for
+):
+    """The runtime's grammar enforces the declared property order. Measured
+    2026-09-17: declarations in an order other than the one the model was trained
+    to write lost `send_email.body` on 110 of 110 rows. So a bundle an application
+    loads its tools from ships them normalised by the same reader that shaped the
+    training prompt, not as they were typed."""
+    source = _unsorted_declarations(tmp_path)
+
+    result = build_bundle(
+        request_for(
+            declarations=source, contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED)
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+    shipped = json.loads((tmp_path / "bundle" / DECLARATIONS_NAME).read_text(encoding="utf-8"))
+    properties = shipped[0]["function"]["parameters"]["properties"]
+    assert list(properties) == ["body", "subject", "to"]
+    # The digest names the tool list: the file supplied and the file shipped
+    # are the same list, and the shipped bytes hash to the contract's digest.
+    contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == read_declarations(source)[1]
+    assert contract["declarations_sha256"] == hash_file(tmp_path / "bundle" / DECLARATIONS_NAME)
+    # Written as UTF-8, not escaped: it is a file an application developer reads.
+    assert "\u2014" in (tmp_path / "bundle" / DECLARATIONS_NAME).read_text(encoding="utf-8")
+
+
+def test_the_declarations_a_bundle_shipped_are_accepted_as_the_ones_it_was_built_from(
+    tmp_path, request_for
+):
+    """Found in review: with a digest over the source file's bytes, the file a
+    `runtime_rendered` bundle shipped -- the same list, sorted -- was refused as
+    another tool list by `verify` and by a second `bundle`, though the README
+    tells an application to send it as shipped."""
+    source = _unsorted_declarations(tmp_path)
+    recorded = read_declarations(source)[1]
+    build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED, declarations_sha256=recorded
+            ),
+        )
+    )
+    shipped = tmp_path / "shipped.json"
+    shipped.write_bytes((tmp_path / "bundle" / DECLARATIONS_NAME).read_bytes())
+
+    again = build_bundle(
+        request_for(
+            declarations=shipped,
+            output_dir=tmp_path / "again",
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED, declarations_sha256=recorded
+            ),
+        )
+    )
+
+    assert check_named(again, "declarations included").outcome is Outcome.PASSED
+
+
+def test_a_runtime_rendered_bundle_refuses_declarations_the_model_did_not_train_on(
+    tmp_path, request_for
+):
+    """The case this branch exists for had no test: every mismatch test was
+    `prerendered`, and removing the check from the `runtime_rendered` path
+    survived."""
+    source = _unsorted_declarations(tmp_path)
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED, declarations_sha256="sha256:" + "0" * 64
+            ),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.FAILED
+
+
+def test_declarations_already_inside_the_output_dir_are_refused_not_rewritten(
+    tmp_path, request_for
+):
+    """`--declarations out/declarations.json --output-dir out` rewrote the
+    user's own file with its normalised copy."""
+    out = tmp_path / "bundle"
+    out.mkdir(exist_ok=True)
+    source = _unsorted_declarations(tmp_path)
+    inside = out / DECLARATIONS_NAME
+    inside.write_bytes(source.read_bytes())
+    before = inside.read_bytes()
+
+    result = build_bundle(
+        request_for(
+            declarations=inside,
+            output_dir=out,
+            contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.FAILED
+    assert inside.read_bytes() == before
+
+
+def test_a_digest_over_the_files_bytes_is_still_accepted(tmp_path, request_for):
+    """A `Contract` built in code before digests named the tool list could only
+    carry the bytes' digest, and main compared that one."""
+    source = _unsorted_declarations(tmp_path)
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED, declarations_sha256=hash_file(source)
+            ),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+
+
+def test_refused_declarations_give_the_contract_no_digest(tmp_path, request_for):
+    """Found in review: the digest was filled in even when the declarations
+    check failed, so the contract vouched for a list the bundle refused."""
+    refused = tmp_path / "refused.json"
+    refused.write_text(
+        '[{"type": "function", "function": {"name": "t", "description": "d",'
+        ' "parameters": {"type": "object", "properties": {"x": {"type": "string",'
+        ' "description": "d", "nullable": true}}}}}]',
+        encoding="utf-8",
+    )
+
+    result = build_bundle(
+        request_for(
+            declarations=refused, contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED)
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.FAILED
+    contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] is None
+
+
+def test_the_same_file_under_another_spelling_is_refused_not_rewritten(tmp_path, request_for):
+    """Found in review: the guard compared resolved paths, so on a
+    case-insensitive filesystem `out/Declarations.json` passed and was rewritten,
+    and so was a hard link to the user's file."""
+    out = tmp_path / "bundle"
+    out.mkdir(exist_ok=True)
+    source = _unsorted_declarations(tmp_path)
+    linked = out / DECLARATIONS_NAME
+    os.link(source, linked)
+    before = source.read_bytes()
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            output_dir=out,
+            contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.FAILED
+    assert source.read_bytes() == before
+
+
+def test_a_prerendered_bundle_refuses_the_same_tools_in_another_order(tmp_path, request_for):
+    """Found in review: with the digest over the sorted list, a prerendered file
+    with the properties in another order matched -- and there the order is the
+    convention the application renders, measured to move the score."""
+    source = _unsorted_declarations(tmp_path)
+    recorded = hash_file(source)
+    reordered = tmp_path / "reordered.json"
+    entries = json.loads(source.read_text(encoding="utf-8"))
+    properties = entries[0]["function"]["parameters"]["properties"]
+    entries[0]["function"]["parameters"]["properties"] = dict(reversed(list(properties.items())))
+    reordered.write_text(json.dumps(entries), encoding="utf-8")
+
+    result = build_bundle(
+        request_for(
+            declarations=reordered,
+            contract=a_contract(prompt_mode=PromptMode.PRERENDERED, declarations_sha256=recorded),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.FAILED
+
+
+def test_a_prerendered_bundle_compares_bytes_even_where_they_are_the_lists_text(
+    tmp_path, request_for
+):
+    """Found in review: a record of a file already in canonical form -- one
+    taken from a runtime_rendered bundle -- is also the list's digest, and the
+    list's digest was accepted in either mode. The refusal prints the digest
+    the contract's mode records, so the two are comparable."""
+    listed, _ = read_declarations(_unsorted_declarations(tmp_path))
+    canonical = tmp_path / "canonical.json"
+    canonical.write_text(canonical_text(listed), encoding="utf-8")
+    reformatted = tmp_path / "reformatted.json"
+    reformatted.write_text(json.dumps(listed), encoding="utf-8")
+
+    result = build_bundle(
+        request_for(
+            declarations=reformatted,
+            contract=a_contract(
+                prompt_mode=PromptMode.PRERENDERED, declarations_sha256=hash_file(canonical)
+            ),
+        )
+    )
+
+    check = check_named(result, "declarations included")
+    assert check.outcome is Outcome.FAILED
+    assert hash_file(reformatted).split(":", 1)[1][:16] in check.detail
+
+
+@pytest.mark.parametrize("prompt_mode", list(PromptMode))
+def test_a_link_where_the_declarations_go_is_replaced_not_written_through(
+    tmp_path, request_for, prompt_mode
+):
+    """Found in review: a link at `out/declarations.json` was followed, and the
+    bundle wrote outside --output-dir."""
+    out = tmp_path / "bundle"
+    out.mkdir(exist_ok=True)
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text("not yours", encoding="utf-8")
+    (out / DECLARATIONS_NAME).symlink_to(elsewhere)
+
+    result = build_bundle(
+        request_for(
+            declarations=_unsorted_declarations(tmp_path),
+            output_dir=out,
+            contract=a_contract(prompt_mode=prompt_mode),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+    assert elsewhere.read_text(encoding="utf-8") == "not yours"
+    assert not (out / DECLARATIONS_NAME).is_symlink()
+
+
+def test_a_directory_where_the_declarations_go_is_refused(tmp_path, request_for):
+    """Found in review: runtime_rendered raised `IsADirectoryError` out of the stage."""
+    out = tmp_path / "bundle"
+    (out / DECLARATIONS_NAME).mkdir(parents=True)
+
+    result = build_bundle(
+        request_for(
+            declarations=_unsorted_declarations(tmp_path),
+            output_dir=out,
+            contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED),
+        )
+    )
+
+    check = check_named(result, "declarations included")
+    assert check.outcome is Outcome.FAILED
+    assert "is a directory" in check.detail
+
+
+def test_a_prerendered_contract_names_the_bytes_it_ships(tmp_path, request_for):
+    source = _unsorted_declarations(tmp_path)
+
+    build_bundle(
+        request_for(declarations=source, contract=a_contract(prompt_mode=PromptMode.PRERENDERED))
+    )
+
+    contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == hash_file(tmp_path / "bundle" / DECLARATIONS_NAME)
+
+
+def test_a_digest_no_training_run_recorded_is_said_to_be_the_shipped_list(tmp_path, request_for):
+    """With no `--train-metrics` the contract still names its tool list, but it
+    must not pass for what the model was trained against."""
+    result = build_bundle(
+        request_for(
+            declarations=_unsorted_declarations(tmp_path),
+            contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED),
+        )
+    )
+
+    assert any("no training record" in text for text in result.limitations)
+
+
+def test_a_prerendered_bundle_ships_the_declarations_exactly_as_given(tmp_path, request_for):
+    """There the application renders the declarations itself and the order in
+    the file is the convention `WireConvention` records -- sorting it would
+    change the contract, not normalise it."""
+    source = _unsorted_declarations(tmp_path)
+
+    build_bundle(request_for(declarations=source))
+
+    assert (tmp_path / "bundle" / DECLARATIONS_NAME).read_bytes() == source.read_bytes()
+
+
+def test_a_runtime_rendered_bundle_refuses_what_the_two_renderers_disagree_on(
+    tmp_path, request_for
+):
+    """The same reader, so the same refusals: shipping `nullable` would put a
+    declaration in front of the runtime that the model was never trained on."""
+    source = tmp_path / "source" / "nullable.json"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "t",
+                        "description": "d",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "string", "description": "d", "nullable": True}
+                            },
+                        },
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = build_bundle(
+        request_for(
+            declarations=source, contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED)
+        )
+    )
+
+    check = check_named(result, "declarations included")
+    assert check.outcome is Outcome.FAILED
+    assert "nullable" in check.detail
+
+
+def test_the_contract_records_which_declarations_even_when_nobody_supplied_the_digest(
+    tmp_path, request_for, declarations
+):
+    """A contract shipped with `declarations_sha256: null` beside a declarations
+    file -- measured on a real bundle -- could not say which tool list it was
+    written against."""
+    build_bundle(request_for())
+
+    contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == hash_file(declarations)
+
+
+def test_the_training_digest_matches_the_file_supplied_not_its_normalised_copy(
+    tmp_path, request_for
+):
+    """The file supplied is compared with the training record, not the copy the
+    bundle writes: the copy is the same declarations normalised, and a record
+    over the supplied file's bytes -- what a `prerendered` run keeps -- would
+    refuse it."""
+    source = _unsorted_declarations(tmp_path)
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED, declarations_sha256=hash_file(source)
+            ),
+        )
+    )
+
+    check = check_named(result, "declarations included")
+    assert check.outcome is Outcome.PASSED
+    shipped = tmp_path / "bundle" / DECLARATIONS_NAME
+    assert hash_file(shipped) != hash_file(source)
+    # Found in review: the contract kept the supplied file's digest, which the
+    # shipped copy does not hash to, and a bundle made again from the shipped
+    # file was refused. It names what ships, and says it changed it.
+    contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == hash_file(shipped)
+    assert any("now names that list's digest" in text for text in result.limitations)
+
+
+@pytest.mark.parametrize("member", [CONTRACT_NAME, MANIFEST_NAME, REPORT_NAME, "model.litertlm"])
+@pytest.mark.parametrize("link", ["symbolic", "hard"])
+def test_no_member_is_written_through_a_link_already_at_its_path(
+    tmp_path, request_for, model_file, member, link
+):
+    """Found in review: the contract, manifest, report and model were written
+    through a link planted in --output-dir, over a file outside it -- a bundle
+    received as an archive can carry such links."""
+    out = tmp_path / "bundle"
+    out.mkdir(exist_ok=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("not yours", encoding="utf-8")
+    at = out / (model_file.name if member == "model.litertlm" else member)
+    if link == "symbolic":
+        at.symlink_to(elsewhere)
+    else:
+        os.link(elsewhere, at)
+
+    build_bundle(request_for(output_dir=out))
+
+    assert elsewhere.read_text(encoding="utf-8") == "not yours"
+    assert not at.is_symlink()
+    assert at.stat().st_mode & 0o777 == 0o666 & ~_umask()
+
+
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def test_a_rewritten_contract_is_the_one_reported(tmp_path, request_for):
+    """The report, the manifest and `contract.json` describe one contract,
+    including where the bundle rewrote its digest."""
+    source = _unsorted_declarations(tmp_path)
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED, declarations_sha256=hash_file(source)
+            ),
+        )
+    )
+
+    written = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert result.request.contract.declarations_sha256 == written["declarations_sha256"]
+    assert written["declarations_sha256"] != hash_file(source)
+
+
+def test_a_runtime_rendered_disagreement_prints_both_kinds_of_digest(tmp_path, request_for):
+    """Found in review: where the mode accepts a record of the list or of the
+    file, the refusal printed only the list's, beside what may be a record of
+    the file."""
+    source = _unsorted_declarations(tmp_path)
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED, declarations_sha256="sha256:" + "0" * 64
+            ),
+        )
+    )
+
+    detail = check_named(result, "declarations included").detail
+    assert read_declarations(source)[1].split(":")[1][:16] + " as a tool list" in detail
+    assert hash_file(source).split(":")[1][:16] + " as a file" in detail
+
+
+@pytest.mark.parametrize("spell", [str, str.upper])
+def test_a_runtime_rendered_contract_that_names_the_shipped_list_is_left_alone(
+    tmp_path, request_for, spell
+):
+    """Only a record of the file's bytes is rewritten; one of the list the
+    bundle ships -- in any case -- already names what ships."""
+    source = _unsorted_declarations(tmp_path)
+    listed = read_declarations(source)[1]
+    algorithm, hex_ = listed.split(":")
+
+    result = build_bundle(
+        request_for(
+            declarations=source,
+            contract=a_contract(
+                prompt_mode=PromptMode.RUNTIME_RENDERED,
+                declarations_sha256=f"{algorithm}:{spell(hex_)}",
+            ),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+    assert not any("now names that list's digest" in text for text in result.limitations)
+
+
+def test_a_link_to_a_directory_where_the_declarations_go_is_replaced(tmp_path, request_for):
+    """A link is replaced whatever it points at; only a directory itself is refused."""
+    out = tmp_path / "bundle"
+    out.mkdir(exist_ok=True)
+    elsewhere = tmp_path / "a-directory"
+    elsewhere.mkdir()
+    (out / DECLARATIONS_NAME).symlink_to(elsewhere)
+
+    result = build_bundle(
+        request_for(
+            declarations=_unsorted_declarations(tmp_path),
+            output_dir=out,
+            contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+    assert elsewhere.is_dir() and not any(elsewhere.iterdir())

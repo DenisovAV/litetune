@@ -170,6 +170,18 @@ class ModelRules:
     extra_stop_tokens: tuple[str, ...] = ()
     stop_token_reason: str = ""
 
+    # The tool path, recorded together because one measurement establishes both:
+    # whether this family's serving runtime renders tool declarations into the
+    # prompt, and the spelling its calls use. Neither is in `config.json` and
+    # neither can be asked of the user without letting them contradict the
+    # runtime. A family that records no `wire_format` is not a family litetune
+    # knows nothing about -- that is `identify` returning `None` -- it is one
+    # whose calls this project has never measured, which is why the two are
+    # different answers with different messages.
+    renders_declarations: bool = False
+    wire_format: str | None = None
+    tool_path_reason: str = ""
+
     # Whether this rule's patterns may be satisfied by the *path*. `hint_for`
     # merges the model string and the config values into one text, so by default
     # a directory named after a base model matches as if the config had said so.
@@ -199,6 +211,9 @@ class ModelRules:
             "limitations": list(self.limitations),
             "extra_stop_tokens": list(self.extra_stop_tokens),
             "stop_token_reason": self.stop_token_reason,
+            "renders_declarations": self.renders_declarations,
+            "wire_format": self.wire_format,
+            "tool_path_reason": self.tool_path_reason,
         }
 
 
@@ -374,6 +389,22 @@ _FUNCTION_TEMPLATE_REASON = (
     "`INTERNAL: Failed to apply template`"
 )
 
+# Sourced from the runtime rather than from a description of it. The declaration
+# side: `create_conversation(tools=...)` renders a developer turn carrying
+# `<start_function_declaration>declaration:...<end_function_declaration>`,
+# measured 2026-09-16 against a local bundle, and the declaration text is built
+# by `fc_tool_format_utils.cc` before any template runs. The call side:
+# LiteRT-LM's own goldens in `function_gemma_data_processor_test.cc` carry
+# `call:get_weather{location:<escape>Paris<escape>}` beside `call:tool_name{x:1}`.
+_TOOL_PATH_REASON = (
+    "FunctionGemma's runtime renders tool declarations into a developer turn of the prompt, and "
+    "its calls spell a string between `<escape>` markers and a number, a boolean or a null bare: "
+    "`call:name{who:<escape>ann<escape>,n:3}`. Both were read from the runtime -- the declaration "
+    "turn measured against a bundle through the Python API, the call spelling from LiteRT-LM's "
+    "own goldens -- not from the model card. This is the only family here whose tool path has "
+    "been measured, which is why every other entry records none rather than a guess"
+)
+
 _FUNCTION_RESPONSE_REASON = (
     "a FunctionGemma turn does not end at the call: after `<end_function_call>` the "
     "application has to execute the tool and send the result back, and the model must stop "
@@ -450,6 +481,9 @@ RULES: tuple[ModelRules, ...] = (
         ),
         extra_stop_tokens=("<start_function_response>",),
         stop_token_reason=_FUNCTION_RESPONSE_REASON,
+        renders_declarations=True,
+        wire_format="functiongemma",
+        tool_path_reason=_TOOL_PATH_REASON,
     ),
     ModelRules(
         family="gemma-3-text",
@@ -786,6 +820,67 @@ def stop_tokens_for(model: str) -> tuple[tuple[str, ...], str]:
     if rules is None:
         return (), ""
     return rules.extra_stop_tokens, rules.stop_token_reason
+
+
+@dataclass(frozen=True)
+class WireFormat:
+    """How a family spells a tool call, or why litetune cannot say.
+
+    Three answers, not two, because they need three different messages. `family`
+    is `None` when litetune has no entry for this model at all -- knowing nothing
+    about Llama is not knowing it is wrong, and
+    `test_an_architecture_with_no_rules_is_a_note_not_a_refusal` pins that. A
+    named family with `name` `None` is the live case: Qwen-3 has an entry that
+    deliberately records no format, and under a single "is it known" question it
+    would read as fine.
+    """
+
+    family: str | None
+    name: str | None
+    reason: str
+
+    @property
+    def known(self) -> bool:
+        return self.name is not None
+
+
+_NO_ENTRY = (
+    "litetune has no entry for this model, so it records neither a wire format for its calls "
+    "nor the absence of one. Name a model it knows with `--base-model`, or supply each row's "
+    "completion text, which is trained exactly as written"
+)
+_NO_FORMAT = (
+    "litetune has an entry for {family} but records no wire format for its calls: nothing in "
+    "this project has measured how that family's runtime spells one, and rendering "
+    "FunctionGemma's spelling for it would train a format its runtime does not read. Supply "
+    "each row's completion text instead, which is trained exactly as written"
+)
+
+
+def wire_format_for(model: str) -> WireFormat:
+    """The spelling this family's calls use, with the reason it was recorded."""
+    rules = identify(model)
+    if rules is None:
+        return WireFormat(family=None, name=None, reason=_NO_ENTRY)
+    if rules.wire_format is None:
+        return WireFormat(
+            family=rules.family, name=None, reason=_NO_FORMAT.format(family=rules.family)
+        )
+    return WireFormat(family=rules.family, name=rules.wire_format, reason=rules.tool_path_reason)
+
+
+def renders_declarations_for(model: str) -> tuple[bool, str]:
+    """Whether this family's runtime puts tool declarations in the prompt, and why.
+
+    A separate question from `wire_format_for` on purpose: a family could render
+    declarations and spell its calls in a way nobody here has measured, and
+    answering both from one flag would make the second a guess dressed as the
+    first.
+    """
+    rules = identify(model)
+    if rules is None:
+        return False, ""
+    return rules.renders_declarations, rules.tool_path_reason
 
 
 # ---------------------------------------------------------------------------

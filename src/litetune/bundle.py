@@ -37,14 +37,21 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from litetune import envs
 from litetune.checks import Check, CheckSet, Outcome
+from litetune.declarations import (
+    DeclarationsError,
+    canonical_text,
+    digest_matches,
+    read_declarations,
+)
 from litetune.events import EventStream
 from litetune.manifest import RunManifest, RunStatus
 from litetune.metrics import Unavailable
@@ -574,9 +581,40 @@ def _copy_model(source: Path, output_dir: Path) -> Path:
     # spells out. Removing the recorded model before the copy meant a failure
     # partway -- a full disk, a source that vanished -- left the bundle without
     # the old artifact and without the new one.
-    shutil.copyfile(source, destination)
+    _copy_member(source, destination)
     _clear_previous_model(output_dir, keep=destination)
     return destination
+
+
+def _replace_member(destination: Path, write: Any) -> None:
+    """Put a new file at `destination` by renaming one into place, never writing through it.
+
+    A link at the path -- symbolic or hard, planted or left by a previous
+    bundle -- would have a write follow it to a file outside --output-dir;
+    `os.replace` swaps the directory entry and leaves whatever it pointed at
+    alone. `write` fills the new file, created fresh beside the destination.
+    """
+    handle, staging = tempfile.mkstemp(dir=destination.parent, prefix=f".{destination.name}.")
+    os.close(handle)
+    try:
+        write(Path(staging))
+        # `mkstemp` makes the file private; a member gets the mode a plain
+        # write would have given it, as every bundle before this did.
+        mask = os.umask(0)
+        os.umask(mask)
+        os.chmod(staging, 0o666 & ~mask)
+        os.replace(staging, destination)
+    except BaseException:
+        Path(staging).unlink(missing_ok=True)
+        raise
+
+
+def _write_member(destination: Path, text: str) -> None:
+    _replace_member(destination, lambda staging: staging.write_text(text, encoding="utf-8"))
+
+
+def _copy_member(source: Path, destination: Path) -> None:
+    _replace_member(destination, lambda staging: shutil.copyfile(source, staging))
 
 
 def _clear_previous_model(output_dir: Path, keep: Path) -> None:
@@ -776,10 +814,39 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     events.check(declarations_check)
 
     # -- the contract ------------------------------------------------------
+    # Which declarations this contract was written against, always. A contract
+    # shipped with `declarations_sha256: null` beside a declarations file -- a
+    # real bundle, 2026-09-17 -- cannot say which tool list it describes. With no
+    # training record the digest is the shipped list's, and the bundle says so:
+    # nothing then shows the model learned that list, only that it ships with it.
+    # Not when the declarations were refused, because then no list was shipped.
+    contract = request.contract
+    recorded = contract.declarations_sha256
+    if declarations_check.outcome is Outcome.PASSED:
+        shipped = _shipped_digest(request.declarations, not contract.runtime_renders_declarations)
+        if recorded is None:
+            contract = replace(contract, declarations_sha256=shipped)
+            result.limitation(NO_TRAINED_DECLARATIONS)
+        elif (
+            contract.runtime_renders_declarations
+            and recorded.rpartition(":")[2].lower() != shipped.split(":", 1)[1]
+        ):
+            # The check accepted a record of the supplied file's bytes, which is
+            # all a contract built before digests named the tool list could
+            # carry. The bundle ships that list normalised, so the contract
+            # names what ships, or it would not hash to its own contract.
+            result.limitation(
+                f"the contract recorded {recorded}, the digest of {request.declarations} as a "
+                "file; the bundle ships the same tool list normalised, so the contract now names "
+                f"that list's digest, {shipped}, which is what the shipped file hashes to"
+            )
+            contract = replace(contract, declarations_sha256=shipped)
+    if contract is not request.contract:
+        # The report and the file must describe one contract.
+        request = replace(request, contract=contract)
+        result.request = request
     contract_path = request.output_dir / CONTRACT_NAME
-    contract_path.write_text(
-        json.dumps(request.contract.as_dict(), indent=2, sort_keys=True), encoding="utf-8"
-    )
+    _write_member(contract_path, json.dumps(contract.as_dict(), indent=2, sort_keys=True))
     result.members.append(_member(CONTRACT_NAME, contract_path))
     contract_check = Check.passed(
         "contract recorded",
@@ -824,15 +891,13 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     # -- the manifest and the report, written whatever the outcome ---------
     manifest = _bundle_manifest(request, result)
     manifest_path = request.output_dir / MANIFEST_NAME
-    manifest_path.write_text(manifest.as_json(), encoding="utf-8")
+    _write_member(manifest_path, manifest.as_json())
     result.manifest_path = manifest_path
     result.members.append(_member(MANIFEST_NAME, manifest_path))
     events.artifact(str(manifest_path), name=MANIFEST_NAME)
 
     report_path = request.output_dir / REPORT_NAME
-    report_path.write_text(
-        json.dumps(result.as_dict(), indent=2, sort_keys=True, default=str), encoding="utf-8"
-    )
+    _write_member(report_path, json.dumps(result.as_dict(), indent=2, sort_keys=True, default=str))
     result.report_path = report_path
     # Added after writing: a file cannot contain its own hash. Recorded in the
     # result so the caller can still identify it.
@@ -884,7 +949,7 @@ def _copy_adapter(request: BundleRequest, result: BundleResult) -> Check | None:
                     f"the adapter at {request.adapter} is already inside --output-dir "
                     f"({request.output_dir}); name a source outside it"
                 )
-            shutil.copyfile(request.adapter, destination)
+            _copy_member(request.adapter, destination)
             members = [_member(destination.name, destination)]
     except BundleError as exc:
         return Check.failed(
@@ -909,8 +974,115 @@ def _copy_adapter(request: BundleRequest, result: BundleResult) -> Check | None:
     )
 
 
+NO_TRAINED_DECLARATIONS = (
+    "no training record named the declarations this model learned, so the contract's "
+    "declarations_sha256 is the digest of the list this bundle ships -- which says what ships "
+    "with the model, not what it was trained against. Pass --train-metrics from a `tune` run "
+    "given --declarations to have it checked"
+)
+
+
+def _shipped_digest(source: Path, prerendered: bool) -> str:
+    """The digest a contract records for `source`, as `tune` would record it.
+
+    The file's bytes in `prerendered`, where the file ships as given and its
+    order is the application's convention; the tool list's otherwise, which is
+    what the shipped normalised file hashes to (`declarations.recorded_digest`).
+    """
+    if prerendered:
+        return hash_file(source)
+    # Reached only once the declarations check passed, which in
+    # `runtime_rendered` means `read_declarations` accepted this file.
+    return read_declarations(source)[1]
+
+
+def _digest_disagreement(request: BundleRequest, source: Path, name: str) -> Check | None:
+    """The contract's digest against the file supplied, when the contract carries one.
+
+    Compared by `declarations.digest_matches` for the contract's mode. Where
+    the runtime renders the declarations it names the tool list rather than
+    the file: the same list reformatted, or the normalised copy a
+    `runtime_rendered` bundle ships, is the list the model learned. In
+    `prerendered` it names the file's bytes, because the application renders
+    the file as it is and another order is another prompt.
+    """
+    recorded = request.contract.declarations_sha256
+    if recorded is None:
+        return None
+    prerendered = not request.contract.runtime_renders_declarations
+    try:
+        digest: str | None = read_declarations(source)[1]
+    except DeclarationsError:
+        digest = None
+    if digest_matches(recorded, digest, source, prerendered):
+        return None
+    # The kind of digest the contract records for this mode, so the two
+    # printed side by side are comparable -- both kinds where the mode accepts
+    # both, since a record of either may be what disagrees.
+    as_file = hash_file(source).split(":", 1)[-1]
+    if prerendered or digest is None:
+        actual, shown = as_file, as_file[:16]
+    else:
+        actual = digest.split(":", 1)[-1]
+        shown = f"{actual[:16]} as a tool list and {as_file[:16]} as a file"
+    expected = recorded.split(":", 1)[-1]
+    return Check.failed(
+        name,
+        f"the declarations supplied hash {shown}, but the contract was written against "
+        f"{expected[:16]}: the model's calling convention was established against a different "
+        "tool list than the one being shipped",
+        observed={"actual": actual, "contract": expected},
+    )
+
+
+def _write_declarations_as_trained(
+    request: BundleRequest, result: BundleResult, source: Path, destination: Path, name: str
+) -> Check:
+    """`runtime_rendered`: the declarations in the key order the model learned."""
+    try:
+        parsed, digest = read_declarations(source)
+    except DeclarationsError as exc:
+        # Copied as given so it can be looked at; the check says it is not usable.
+        try:
+            _copy_member(source, destination)
+            result.members.append(_member(DECLARATIONS_NAME, destination))
+        except OSError:
+            logger.exception("could not copy refused declarations from %s", source)
+        return Check.failed(name, str(exc), observed={"declarations": str(source)})
+    disagreement = _digest_disagreement(request, source, name)
+    if disagreement is not None:
+        return disagreement
+    _write_member(destination, canonical_text(parsed))
+    result.members.append(_member(DECLARATIONS_NAME, destination))
+    return Check.passed(
+        name,
+        f"{len(parsed)} tool declaration(s) packaged from {source.name}, in the key order "
+        "`tune` renders them in",
+        observed={
+            "declarations": str(destination),
+            "entries": len(parsed),
+            "sha256": digest,
+            "normalised": True,
+        },
+    )
+
+
 def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
-    """Copy the tool declarations in, and check they are readable as declarations."""
+    """Put the tool declarations in, and check they are readable as declarations.
+
+    **Two modes, and the order in the file means something different in each.**
+    In `prerendered` the application renders the declarations itself, and the
+    order in the file is the convention `WireConvention` records -- so the file
+    ships exactly as given. In `runtime_rendered` the runtime renders them, and
+    its constrained decoding enforces the declared property order: an argument
+    out of that order is illegal and the call closes without it. Measured
+    2026-09-17 on FunctionGemma, declarations in an order other than the one the
+    model was trained to write lost `send_email.body` on 110 of 110 rows. So
+    there the file is read by `declarations.read_declarations` -- the reader that
+    shaped the training prompt, with its refusals -- and shipped in the key order
+    the model learned, which is what an application loading its tools from this
+    bundle then sends.
+    """
     name = "declarations included"
     source = request.declarations
     if not source.is_file():
@@ -921,8 +1093,33 @@ def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
             observed={"declarations": str(source)},
         )
     destination = request.output_dir / DECLARATIONS_NAME
+    if destination.exists() and os.path.samefile(source, destination):
+        # The shipped copy is written over the destination, so a source already
+        # there would be replaced by its normalised copy -- the user's own file
+        # rewritten -- or, when copied, fail as the same file. The same file, not
+        # the same path: on a case-insensitive filesystem `Declarations.json` is
+        # this file, and so is a hard link to it.
+        return Check.failed(
+            name,
+            f"the declarations at {source} are the file this bundle would write its "
+            f"declarations to ({destination}); name a source outside --output-dir",
+            observed={"declarations": str(source)},
+        )
+    if destination.is_symlink():
+        # Written through, a link would put the file wherever it points,
+        # outside --output-dir. Removing the link never touches its target.
+        destination.unlink()
+    elif destination.is_dir():
+        return Check.failed(
+            name,
+            f"{destination} is a directory, where this bundle writes its declarations; remove it "
+            "or name another --output-dir",
+            observed={"declarations": str(source)},
+        )
+    if request.contract.runtime_renders_declarations:
+        return _write_declarations_as_trained(request, result, source, destination, name)
     try:
-        shutil.copyfile(source, destination)
+        _copy_member(source, destination)
         parsed = json.loads(destination.read_text(encoding="utf-8"))
     except (OSError, shutil.Error) as exc:
         logger.exception("could not copy declarations from %s", source)
@@ -945,17 +1142,9 @@ def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
 
     result.members.append(_member(DECLARATIONS_NAME, destination))
     count = len(parsed) if isinstance(parsed, list | dict) else None
-    if request.contract.declarations_sha256 is not None:
-        actual = hash_file(destination).split(":", 1)[-1]
-        expected = request.contract.declarations_sha256.split(":", 1)[-1]
-        if actual != expected:
-            return Check.failed(
-                name,
-                f"the declarations in this bundle hash {actual[:16]} but the contract was written "
-                f"against {expected[:16]}: the model's calling convention was established against "
-                "a different tool list than the one being shipped",
-                observed={"actual": actual, "contract": expected},
-            )
+    disagreement = _digest_disagreement(request, source, name)
+    if disagreement is not None:
+        return disagreement
     return Check.passed(
         name,
         f"{count if count is not None else 'the'} tool declaration(s) packaged from {source.name}",

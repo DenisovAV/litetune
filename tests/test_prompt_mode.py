@@ -20,6 +20,7 @@ from conftest import FakeBackend, correct_texts, labelled_rows
 
 from litetune import envs
 from litetune.bundle import Contract
+from litetune.declarations import canonical_text, read_declarations
 from litetune.evaluate import HuggingFaceBackend, LiteRtLmBackend
 from litetune.prompt_mode import (
     RENDERING_SOURCE,
@@ -31,7 +32,16 @@ from litetune.prompt_mode import (
     prompt_evidence,
     resolve_prompt_mode,
 )
-from litetune.verify import BackendPair, Status, VerifyRequest, build_backends, run_verify
+from litetune.storage import hash_file
+from litetune.verify import (
+    DECLARATIONS_CHECK,
+    EXIT_CODES,
+    BackendPair,
+    Status,
+    VerifyRequest,
+    build_backends,
+    run_verify,
+)
 
 RENDERED = "<start_of_turn>user\nset the background to red<end_of_turn>\n<start_of_turn>model\n"
 BARE = "set the background to red"
@@ -446,6 +456,97 @@ def test_training_the_reference_and_the_rendering_check_render_from_one_source()
         assert script.count("def render_prompt(") == 1
 
 
+def test_every_generated_script_is_valid_python():
+    """Counting copies of the source does not prove any of them parses.
+
+    A docstring edited into `RENDERING_SOURCE` at the wrong depth once produced
+    seven failures in tests about dtype and device -- every test that execs a
+    script -- and none of them said the script would not compile. This says it.
+    """
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+    from litetune.rendering import _REFERENCE_SCRIPT
+    from litetune.tune import _TRAIN_SCRIPT
+
+    for name, script in [
+        ("train", _TRAIN_SCRIPT),
+        ("generate", _HF_GENERATE_SCRIPT),
+        ("reference", _REFERENCE_SCRIPT),
+    ]:
+        compile(script, f"{name}_script.py", "exec")
+
+
+def _render_prompt():
+    """`render_prompt` out of the shared source, the way every script gets it."""
+    namespace: dict = {}
+    exec(compile(RENDERING_SOURCE, "rendering_source.py", "exec"), namespace)
+    return namespace["render_prompt"]
+
+
+class _RecordingTokenizer:
+    """A tokenizer double that records exactly how the template was called."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append(dict(kwargs))
+        tools = kwargs.get("tools")
+        declarations = "".join(
+            f"<start_function_declaration>declaration:{t['function']['name']}"
+            f"<end_function_declaration>"
+            for t in (tools or [])
+        )
+        return f"{declarations}<start_of_turn>user\n{messages[0]['content']}<end_of_turn>\n"
+
+
+def test_declarations_reach_the_prompt_the_model_is_trained_on():
+    """The runtime renders a developer turn carrying the declarations, and this
+    is the source both the training prompt and the reference's prompt come
+    from. Without them the two sides agree on a prompt no serving caller sends.
+    """
+    tok = _RecordingTokenizer()
+    tools = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]
+
+    text, add_special = _render_prompt()(tok, "open maps", True, tools)
+
+    assert "declaration:open_app" in text
+    assert tok.calls[0]["tools"] == tools
+    assert add_special is False
+
+
+def test_without_declarations_the_template_is_not_even_asked_about_tools():
+    """Byte-identical is not "renders the same thing anyway".
+
+    Four tokenizer doubles in this suite declare `apply_chat_template` without a
+    `tools` parameter, and real templates branch on it. Passing `tools=None` to
+    find out whether it changes nothing is not the same as not passing it, so
+    the no-declarations path must not mention the keyword at all.
+    """
+    tok = _RecordingTokenizer()
+
+    with_none = _render_prompt()(tok, "open maps", True)
+    with_empty = _render_prompt()(tok, "open maps", True, [])
+
+    assert "tools" not in tok.calls[0]
+    assert "tools" not in tok.calls[1]
+    assert with_none == with_empty
+    assert "declaration:" not in with_none[0]
+
+
+def test_a_prerendered_prompt_is_untouched_by_declarations():
+    """The mode decides whether a template runs at all. `prerendered` means the
+    caller built the whole prompt, so there is nothing for declarations to be
+    rendered into."""
+    tok = _RecordingTokenizer()
+    tools = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]
+
+    text, add_special = _render_prompt()(tok, "already rendered", False, tools)
+
+    assert text == "already rendered"
+    assert add_special is True
+    assert tok.calls == []
+
+
 @pytest.mark.parametrize("raw", ["prerendered", PromptMode.RUNTIME_RENDERED])
 def test_a_recorded_mode_reads_back_as_itself(raw):
     assert parse_prompt_mode(raw, "the record") is PromptMode(raw)
@@ -562,3 +663,224 @@ def test_a_reference_with_no_sidecar_is_still_no_record(tmp_path):
 
     assert recorded_prompt_mode(str(empty)) is None
     assert recorded_prompt_mode("Qwen/Qwen3-0.6B") is None
+
+
+def _verify_with(tmp_path, write_split, reference, declarations, rows=None):
+    """`run_verify` with backends this test keeps a handle on.
+
+    `_verify` above builds its pair inside, which is enough when the question is
+    what the manifest says. Here the question is whether anything ran at all, so
+    the fakes have to be visible to the assertions.
+    """
+    rows = rows if rows is not None else labelled_rows(8)
+    candidate = FakeBackend(texts=correct_texts(rows))
+    reference_backend = FakeBackend(model="org/reference", texts=correct_texts(rows))
+    result = run_verify(
+        VerifyRequest(
+            model=tmp_path / "m.litertlm",
+            reference=reference,
+            data=write_split(rows),
+            declarations=declarations,
+        ),
+        backends=BackendPair(candidate=candidate, reference=reference_backend),
+    )
+    return result, candidate, reference_backend
+
+
+def test_declarations_that_disagree_with_the_checkpoints_record_are_refused(tmp_path, write_split):
+    """A model measured against a different tool list than it learned is measured
+    on another task, and the number that comes out of that reads as a conversion
+    cost. The refusal names both digests, because "they differ" without saying
+    which is which leaves the reader to guess what to fix."""
+    from litetune.storage import hash_file
+
+    trained = tmp_path / "trained.json"
+    trained.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
+    measured = tmp_path / "measured.json"
+    measured.write_text(
+        '[{"type": "function", "function": {"name": "set_timer", "description": "d"}}]',
+        encoding="utf-8",
+    )
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(trained)}
+    )
+
+    result, candidate, reference_backend = _verify_with(tmp_path, write_split, reference, measured)
+
+    assert result.status is Status.FAILED_HARNESS
+    assert EXIT_CODES[result.status] == 4
+    refusal = next(c for c in result.manifest["checks"] if c["name"] == DECLARATIONS_CHECK)
+    # In `prerendered` both are the files' bytes: the digest `tune` recorded
+    # for this mode, and the one the refusal compares it with.
+    assert hash_file(measured) in refusal["detail"]
+    assert hash_file(trained) in refusal["detail"]
+    # Refused before either side was asked for anything.
+    assert candidate.prompts_seen == []
+    assert reference_backend.prompts_seen == []
+
+
+def test_a_checkpoint_that_learned_declarations_is_not_measured_without_them(tmp_path, write_split):
+    """Found in review: the check ran only when the flag was given, so a
+    checkpoint that recorded declarations and a run that forgot them was measured
+    on a prompt without the tool list it learned -- 0 of 5 on both sides when
+    measured -- and passed with no word about it. Only where the runtime renders
+    the declarations: in `prerendered` the prompts carry them already."""
+    trained = tmp_path / "trained.json"
+    trained.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
+    reference = _checkpoint(
+        tmp_path,
+        {"prompt_mode": "runtime_rendered", "declarations_sha256": read_declarations(trained)[1]},
+    )
+
+    result, candidate, reference_backend = _verify_with(tmp_path, write_split, reference, None)
+
+    assert result.status is Status.FAILED_HARNESS
+    refusal = next(c for c in result.manifest["checks"] if c["name"] == DECLARATIONS_CHECK)
+    assert "Pass --declarations" in refusal["detail"]
+    assert candidate.prompts_seen == []
+    assert reference_backend.prompts_seen == []
+
+
+def test_a_prerendered_checkpoint_is_measured_without_declarations_it_recorded(
+    tmp_path, write_split
+):
+    """Found in review: the refusal fired in `prerendered` too, with a false
+    reason -- there the prompts already carry the tool list and the flag reaches
+    no backend -- and the README's own walkthrough led into it."""
+    trained = tmp_path / "trained.json"
+    trained.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(trained)}
+    )
+
+    result, candidate, _ = _verify_with(tmp_path, write_split, reference, None)
+
+    assert result.status is not Status.FAILED_HARNESS
+    assert candidate.prompts_seen != []
+
+
+def test_a_record_of_the_files_bytes_still_matches_that_file(tmp_path, write_split):
+    """Checkpoints trained before the digest named the tool list recorded the
+    digest of the file's bytes, and are still the same model on the same list."""
+    from litetune.storage import hash_file
+
+    decls = tmp_path / "declarations.json"
+    decls.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(decls)}
+    )
+
+    result, candidate, _ = _verify_with(tmp_path, write_split, reference, decls)
+
+    assert result.status is not Status.FAILED_HARNESS
+    assert candidate.prompts_seen != []
+    # Found in review: the manifest recorded the tool list's digest where the
+    # checkpoint, `tune` and the bundle's contract record the file's bytes.
+    assert result.manifest["harness"]["declarations_sha256"] == hash_file(decls)
+    assert hash_file(decls) != read_declarations(decls)[1]
+
+
+def test_a_prerendered_record_matches_only_the_same_bytes(tmp_path, write_split):
+    """Found in review: a record of a file whose bytes were already the list's
+    canonical text -- one taken from a runtime_rendered bundle -- matched the
+    same tools reformatted, because the list's digest was accepted in either
+    mode. In `prerendered` the application renders the file as it is."""
+    from litetune.declarations import canonical_text
+
+    entries = [{"type": "function", "function": {"name": "send_email", "description": "d"}}]
+    trained = tmp_path / "trained.json"
+    trained.write_text(canonical_text(read_declarations_of(tmp_path, entries)), encoding="utf-8")
+    assert hash_file(trained) == read_declarations(trained)[1]
+    reformatted = tmp_path / "reformatted.json"
+    reformatted.write_text(json.dumps(entries), encoding="utf-8")
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "prerendered", "declarations_sha256": hash_file(trained)}
+    )
+
+    result, candidate, _ = _verify_with(tmp_path, write_split, reference, reformatted)
+
+    assert result.status is Status.FAILED_HARNESS
+    assert candidate.prompts_seen == []
+
+
+def read_declarations_of(tmp_path, entries):
+    source = tmp_path / "entries.json"
+    source.write_text(json.dumps(entries), encoding="utf-8")
+    return read_declarations(source)[0]
+
+
+def test_the_declarations_a_bundle_shipped_match_the_record_of_the_file_trained_on(
+    tmp_path, write_split
+):
+    """A `runtime_rendered` bundle ships the list in declared order, and the
+    README tells an application to send it as shipped. Its bytes differ from the
+    file `tune` read; its tool list does not, and that is what is compared."""
+    trained = tmp_path / "trained.json"
+    trained.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d",'
+        ' "parameters": {"type": "object", "properties": {'
+        '"to": {"type": "string", "description": "t"},'
+        ' "body": {"type": "string", "description": "b"}}}}}]',
+        encoding="utf-8",
+    )
+    parsed, recorded = read_declarations(trained)
+    shipped = tmp_path / "shipped.json"
+    shipped.write_text(canonical_text(parsed), encoding="utf-8")
+    assert shipped.read_bytes() != trained.read_bytes()
+    # `runtime_rendered`, as the docstring says: the fixture said `prerendered`,
+    # where the list's digest was accepted too until review found it should not.
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "runtime_rendered", "declarations_sha256": recorded}
+    )
+
+    result, _, _ = _verify_with(tmp_path, write_split, reference, shipped)
+
+    assert result.status is not Status.FAILED_HARNESS
+    assert result.manifest["harness"]["declarations_sha256"] == recorded
+
+
+def test_declarations_that_match_the_record_are_measured_and_recorded(tmp_path, write_split):
+    decls = tmp_path / "declarations.json"
+    decls.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
+    recorded = read_declarations(decls)[1]
+    reference = _checkpoint(
+        tmp_path, {"prompt_mode": "runtime_rendered", "declarations_sha256": recorded}
+    )
+
+    result, candidate, _ = _verify_with(tmp_path, write_split, reference, decls)
+
+    assert result.status is not Status.FAILED_HARNESS
+    assert result.manifest["harness"]["declarations_sha256"] == recorded
+    assert candidate.prompts_seen != []
+
+
+def test_a_checkpoint_that_recorded_no_declarations_is_not_a_disagreement(tmp_path, write_split):
+    """`None` is the absence of something to disagree with, not a mismatch. Every
+    checkpoint trained before declarations were an input records nothing here,
+    and refusing those would refuse every run that predates this change."""
+    decls = tmp_path / "declarations.json"
+    decls.write_text(
+        '[{"type": "function", "function": {"name": "send_email", "description": "d"}}]',
+        encoding="utf-8",
+    )
+    reference = _checkpoint(tmp_path, {"prompt_mode": "prerendered"})
+
+    result, candidate, _ = _verify_with(tmp_path, write_split, reference, decls)
+
+    assert result.status is not Status.FAILED_HARNESS
+    assert candidate.prompts_seen != []

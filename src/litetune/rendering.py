@@ -98,13 +98,49 @@ def main():
     except AttributeError:
         pass
     greedy = litert_lm.SamplerConfig(top_k=1, top_p=1.0, temperature=1.0, seed=0)
+
+    # Without declarations this is the call it has always made, and it touches
+    # nothing new: the adapter below is built only when there are tools, so a
+    # runtime without a `Tool` base is never asked for one on that path.
+    conversation_args = {"sampler_config": greedy, "max_output_tokens": 1}
+    declared = spec.get("tools")
+    if declared:
+
+        class Declared(litert_lm.Tool):
+            """A declaration the runtime may render and must never run.
+
+            Inside `main` because `litert_lm` is imported there: the base class
+            does not exist until then. `create_conversation` takes `Tool`
+            instances or callables, never the raw JSON -- it calls
+            `get_tool_description()` and refuses a description with no
+            `['function']['name']` -- so the file's entries are handed back
+            unchanged and the refusal, when it comes, is the runtime's own.
+            """
+
+            def __init__(self, description):
+                self._description = description
+
+            def get_tool_description(self):
+                return self._description
+
+            def execute(self, param):
+                raise AssertionError(
+                    "the runtime executed a declared tool during a rendering check; "
+                    "automatic tool calling should be off"
+                )
+
+        conversation_args["tools"] = [Declared(entry) for entry in declared]
+        # The prefill sample below really sends a message, and a check that
+        # executed someone's tool in order to measure a prompt would be doing
+        # something nobody asked for.
+        conversation_args["automatic_tool_calling"] = False
     rows = []
     with litert_lm.Engine(
         spec["model"], backend=litert_lm.Backend.CPU(), enable_benchmark=True
     ) as engine:
         # Rendering reads the conversation's history and never adds to it, so
         # one conversation renders every prompt as the first turn it would be.
-        with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as renderer:
+        with engine.create_conversation(**conversation_args) as renderer:
             for index, prompt in enumerate(spec["prompts"]):
                 rendered = renderer.render_message_to_string(prompt)
                 rows.append(
@@ -116,9 +152,7 @@ def main():
                     }
                 )
         for row in rows[: spec["prefill_sample"]]:
-            with engine.create_conversation(
-                sampler_config=greedy, max_output_tokens=1
-            ) as conversation:
+            with engine.create_conversation(**conversation_args) as conversation:
                 conversation.send_message(spec["prompts"][row["index"]])
                 row["prefill_tokens"] = conversation.get_benchmark_info().last_prefill_token_count
     Path(spec["out"]).write_text(json.dumps(rows), encoding="utf-8")
@@ -147,7 +181,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(spec["model"])
     rows = []
     for index, prompt in enumerate(spec["prompts"]):
-        text, add_special = render_prompt(tok, prompt, True)
+        text, add_special = render_prompt(tok, prompt, True, spec.get("tools"))
         ids = tok(text, add_special_tokens=add_special)["input_ids"]
         rows.append({"index": index, "rendered": text, "ids": [int(i) for i in ids]})
     Path(spec["out"]).write_text(json.dumps(rows), encoding="utf-8")
@@ -367,6 +401,11 @@ class RenderingProbe:
 
     model: Path
     reference: str
+    # The declarations both sides render, as parsed JSON: the scripts run in
+    # environments that cannot read the caller's file. The check is only
+    # meaningful when both sides are asked for the same thing, so one field
+    # feeds both scripts.
+    declarations: list | None = None
     prefill_sample: int = DEFAULT_PREFILL_SAMPLE
     runtime_env: envs.StageEnv = envs.RUNTIME
     reference_env: envs.StageEnv = envs.TRAIN
@@ -383,13 +422,18 @@ class RenderingProbe:
                 "model": str(self.model),
                 "prompts": list(prompts),
                 "prefill_sample": self.prefill_sample,
+                "tools": self.declarations,
             },
             events,
         )
         reference_rows = self._run(
             self.reference_env,
             _REFERENCE_SCRIPT,
-            {"model": self.reference, "prompts": list(prompts)},
+            {
+                "model": self.reference,
+                "prompts": list(prompts),
+                "tools": self.declarations,
+            },
             events,
         )
         return compare_renderings(

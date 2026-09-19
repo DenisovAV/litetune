@@ -168,7 +168,13 @@ def load_split(path: Path, limit: int | None = None) -> Split:
         [
             {
                 "prompt": e.prompt,
-                "target": (e.target.as_dict() if isinstance(e.target, ToolCall) else e.target),
+                # Flattened, as every split id before targets kept their types:
+                # the same file must keep the same id.
+                "target": (
+                    {"name": e.target.name, "args": dict(e.target.args)}
+                    if isinstance(e.target, ToolCall)
+                    else e.target
+                ),
             }
             for e in examples
         ],
@@ -287,6 +293,17 @@ class GenerationBackend(Protocol):
         """
         ...
 
+    @property
+    def scores_structurally(self) -> bool:
+        """Whether this backend's answers are calls rather than text.
+
+        Here for the same reason as `decode_enforced`: a run whose model
+        answered in prose on every prompt is indistinguishable from a text run
+        by looking at the rows, so the backend declares it and a backend that
+        forgets fails to type-check rather than being scored the wrong way.
+        """
+        ...
+
     def describe(self) -> dict[str, Any]:
         """Engine identity: which backend and which pinned versions produced this."""
 
@@ -339,6 +356,8 @@ class LiteRtLmBackend:
     # limitation -- and it is litetune's gap, not the toolchain's: 0.16.1 does
     # accept --top-k, --top-p, --temperature and --seed.
     decode_enforced = False
+    # Text off stdout; a call is whatever `parse_call` makes of it.
+    scores_structurally = False
 
     @property
     def prompt_mode(self) -> PromptMode:
@@ -536,7 +555,9 @@ def main() -> int:
 
     with Path(spec["out"]).open("w", encoding="utf-8") as sink:
         for i, prompt in enumerate(spec["prompts"]):
-            text, add_special = render_prompt(tok, prompt, spec["runtime_rendered"])
+            text, add_special = render_prompt(
+                tok, prompt, spec["runtime_rendered"], spec.get("tools")
+            )
             enc = tok(text, return_tensors="pt", add_special_tokens=add_special).to(device)
             with torch.no_grad():
                 ids = model.generate(
@@ -576,6 +597,11 @@ class HuggingFaceBackend:
     env: envs.StageEnv = envs.TRAIN
     auto_provision: bool = True
     runtime_rendered: bool = False
+    # The tool declarations the chat template renders into a developer turn, as
+    # parsed JSON rather than a path: this backend's script runs in another
+    # environment, which cannot read the caller's file. `None` renders the bare
+    # user turn this rendered before declarations were an input.
+    declarations: list | None = None
     # Must match training. `spec.BaseModel.attn_implementation` carries the
     # same default and exists to be threaded here.
     attn_implementation: str = "eager"
@@ -622,6 +648,8 @@ class HuggingFaceBackend:
     # `generate()` receives max_new_tokens and the stop condition, so here the
     # declared configuration is the applied one.
     decode_enforced = True
+    # Text off stdout; a call is whatever `parse_call` makes of it.
+    scores_structurally = False
 
     @property
     def model_ref(self) -> str:
@@ -705,6 +733,7 @@ class HuggingFaceBackend:
                         "prompts": list(prompts),
                         "max_tokens": self.decode.max_tokens,
                         "runtime_rendered": self.uses_template,
+                        "tools": self.declarations,
                         "attn_implementation": self.attn_implementation,
                         "device": device_for_run,
                         "out": str(results),

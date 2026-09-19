@@ -5,7 +5,8 @@ LoRA-tuned on `google/mobile-actions`, scored on 640 held-out single-call
 examples; exact match means the tool name **and** every argument value. Each
 section after them is another family: `gemma-3-270m-it` with the second scorer,
 `gemma-4-E2B-it` converted from its base weights, and `Qwen3-0.6B`, the first
-that is not a Gemma.
+that is not a Gemma. The last returns to `functiongemma-270m-it`, measured
+through the runtime's tool path the way an application calls it.
 
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
@@ -38,6 +39,14 @@ ship renders them with `dictsort` — measured, eight occurrences, including on
 declaration properties. On this dataset the two orders disagree for **100% of
 rows**, so one bundle presents two different prompts depending on which path a
 consumer takes.
+
+**Which path this applies to.** Everything in this section is about prompts an
+application renders itself — `prerendered`, the path these runs took. Through
+the runtime's tool path the runtime renders the declarations from JSON in the
+order it is handed, and litetune hands it the file sorted the way the template's
+`dictsort` sorts — the `dictsort` column below. There the rendering check found
+the training prompt and the runtime's identical by token ids on all 640 prompts
+of the run [below](#the-same-model-through-the-runtimes-tool-path).
 
 Which order the weights prefer was argued rather than measured until it was
 measured. Same greedy decode, same parser, one variable:
@@ -631,3 +640,80 @@ What the phone run does not establish: the difference between it and the cloud
 CPU number for the same file (0.6817 against 0.6917) is two numbers, not a paired
 test, because the cloud candidate's per-row generations were never shipped. One
 phone model, one run per cell, greedy decoding.
+
+## The same model through the runtime's tool path
+
+`functiongemma-270m-it` LoRA-tuned on the 6434 single-call rows of
+`google/mobile-actions` (5794 trained, 640 held out), in `runtime_rendered`
+with the dataset's seven tool declarations, converted `dynamic_wi8_afp32`, and
+measured the way an application calls it: `create_conversation(tools=...)`, the
+runtime rendering the declarations and parsing the call itself. Both sides on
+CPU. One run, 2026-09-17; a second, every stage from `prepare` on with the code
+that reads a reply the way the runtime does, gave the same number in every cell
+on 2026-09-19.
+
+| | exact match | tool name | arguments | refused by the runtime |
+|---|---|---|---|---|
+| Float reference | 0.9250 ±0.0204 | | | |
+| Tool path, runtime grammar off | 0.9125 ±0.0219 | 1.0000 | 0.9125 | 0 |
+| Tool path, runtime grammar on | 0.9125 ±0.0219 | 1.0000 | 0.9125 | 0 |
+| Cost of conversion | **+0.0125** ±0.0087 *(resolved, 8 discordant)* | | | |
+| Effect of the grammar | 0.0000 *(no discordant row)* | | | |
+
+The rendering check compared all 640 prompts, declarations included, and found
+identical token ids on both sides. Every loss is in the arguments: the model
+picked the right tool on all 640.
+
+### What it took to get there
+
+The first two runs of this pipeline failed in ways no unit test and no earlier
+measurement could see, because the text scorer finds `call:` anywhere:
+
+- **No call at all.** Trained completions lacked the `<start_function_call>`
+  and `<end_function_call>` markers the runtime's parser looks for, and ended
+  with the text turn's `<end_of_turn>`. Through the tool path the model
+  returned no call on 5 of 5 prompts and nothing was refused.
+- **A grammar that cost 0.1750.** With the markers in place, the same pipeline
+  scored 0.9172 ±0.0214 with the runtime's grammar off and 0.7422 ±0.0339 with
+  it on, against a reference of 0.9234. All 112 rows that differed had lost an
+  argument — `send_email.body` on every row that carried one — and no row was
+  helped by the grammar. The grammar enforces the declared property order, the
+  declarations were sorted, and the model had been trained in the dataset's own
+  argument order: an argument out of place is illegal, so the call closed
+  without it. A 20-row probe confirmed it: `body` kept on 20 of 20 with the
+  properties declared in the order the model writes them, on 0 of 20 with them
+  sorted, and on 1 of 20 with four times the token budget. With arguments
+  trained in the declared order, the grammar's effect is the zero above.
+
+### Limitations carried by these numbers
+
+- One run, one recipe, one dataset. The dataset's arguments are all strings, so
+  no number went through the runtime here. Its parser returns every number as a
+  double (`fc_parser.rs`, v0.16.1), and litetune compares numbers by value
+  since — this run could not have shown the difference.
+- The prompt is one user turn with the developer turn's date lines moved into
+  it: litetune trains no system message. The 3220 rows with two or three calls
+  were left out; every target here is one call.
+- An application that enables constrained decoding with declarations whose
+  properties are in another order than litetune trained against meets the
+  grammar problem above; with it off, the runtime's default, the order changes
+  only the prompt. A `runtime_rendered` bundle ships its declarations in the
+  order the model learned; an application that builds its own list has to keep
+  that order.
+- flutter_gemma 1.8.3 renders FunctionGemma's declarations in Dart and does
+  not pass them to the runtime, so this is not how it serves this model.
+- No row was refused by the runtime in either mode, in either run. A row the
+  runtime gives no reply to is scored as a wrong answer when its parser refused
+  it or the prompt reached the token limit, and leaves the mode unmeasured for
+  any other reason. The second run read every reply whole: none carried two
+  calls, in either mode or in the reference.
+- The first run read the reference with the text path's parser, which takes the
+  first call anywhere in the text. It is now read as the runtime reads a reply,
+  only between the call markers and one call to a pair. The second run kept the
+  reference's texts and read them both ways: 0.9250 either way, and no row reads
+  differently.
+- The untuned base could not be measured through the tool path: converted
+  from its Hub id it carries no SentencePiece tokenizer, and litert-lm 0.16.1
+  refuses constrained decoding without one. So there is no training gain here.
+- Without declarations in the prompt the text path measures nothing useful for
+  this model: the reference itself degenerated on 50 of 640 generations.

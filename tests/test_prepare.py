@@ -18,9 +18,12 @@ import pytest
 from stage_fakes import spec_mapping
 
 from litetune.checks import Outcome
+from litetune.declarations import read_declarations
 from litetune.events import EventStream
-from litetune.metrics import Proportion, ToolCall, Unavailable, parse_call
+from litetune.metrics import Proportion, ToolCall, Unavailable, parse_call, runtime_calls
+from litetune.models import PROVENANCE_NAME
 from litetune.prepare import (
+    ASSUMED_WIRE_FORMAT,
     HIGH_CARDINALITY_SHARE,
     LENGTH_CHECK,
     MIN_HELDOUT_EXAMPLES,
@@ -34,11 +37,16 @@ from litetune.prepare import (
     is_extractive,
     prepare,
     profile_arguments,
+    read_rows,
+    refuse_undeclared_tools,
     render_call,
     split_rows,
     split_seed,
 )
 from litetune.spec import Spec
+from litetune.storage import hash_file
+
+FUNCTIONGEMMA = "google/functiongemma-270m-it"
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -111,6 +119,95 @@ def request_for(tmp_path):
         return PrepareRequest(data=data, **params)
 
     return _build
+
+
+# The arguments this file's targets send, declared as optional strings so a
+# declaration does not refuse a row for a reason the test is not about.
+_ARGUMENTS = {
+    "type": "object",
+    "properties": {
+        "color": {"type": "string", "description": "c"},
+        "colour": {"type": "string", "description": "c"},
+    },
+}
+
+
+def _declarations(tmp_path: Path, *names: str) -> Path:
+    """The OpenAI function objects the runtime requires, for `names`."""
+    path = tmp_path / "declarations.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {"name": name, "description": "d", "parameters": _ARGUMENTS},
+                }
+                for name in names
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_row_calling_an_undeclared_tool_is_refused_by_name(tmp_path, write_jsonl, request_for):
+    """Training it would teach a call the prompt never offers.
+
+    The model would learn to ask for a tool no runtime declares to it, and
+    nothing downstream would say so: the loss curve of such a run looks exactly
+    like one that worked, and the failure only appears when an application gets
+    a call it has no handler for.
+    """
+    data = write_jsonl(rows(3, tool="open_app") + rows(1, tool="send_email", start=3))
+    declarations = _declarations(tmp_path, "open_app")
+
+    with pytest.raises(PrepareError) as caught:
+        prepare(request_for(data, declarations=declarations))
+
+    message = str(caught.value)
+    # The fourth record is the fourth line, and the row carries its line number
+    # precisely so it can be found in the file it came from.
+    assert f"{data}:4" in message
+    assert "'send_email'" in message
+    assert "It offers open_app" in message
+    assert not (tmp_path / "prepared" / "train.jsonl").exists()
+
+
+def test_a_split_whose_calls_are_all_declared_is_prepared(tmp_path, write_jsonl, request_for):
+    data = write_jsonl(rows(6, tool="open_app"))
+    declarations = _declarations(tmp_path, "open_app", "set_timer")
+
+    result = prepare(request_for(data, declarations=declarations))
+
+    assert result.n_rows == 6
+    assert result.train is not None
+
+
+def test_without_declarations_nothing_about_tools_is_checked(tmp_path, write_jsonl, request_for):
+    """Without declarations no row is checked against a tool list: a split that
+    names tools prepares without a file saying which exist."""
+    data = write_jsonl(rows(3, tool="open_app") + rows(1, tool="send_email", start=3))
+
+    result = prepare(request_for(data))
+
+    assert result.n_rows == 4
+
+
+def test_a_row_that_brings_its_own_completion_is_not_second_guessed(
+    tmp_path, write_jsonl, request_for
+):
+    """Only a structured target is checked. A caller who wrote the completion
+    text said what to train, and litetune does not parse it back to work out
+    which tool it names -- it would be guessing at a string it did not render.
+    """
+    data = write_jsonl(
+        [{"prompt": "call it", "completion": "call:send_email{to:<escape>x<escape>}"}] * 4
+    )
+    declarations = _declarations(tmp_path, "open_app")
+
+    result = prepare(request_for(data, declarations=declarations))
+
+    assert result.n_rows == 4
 
 
 def heldout_lines(result) -> set[int]:
@@ -304,6 +401,9 @@ def test_no_tokenizer_reports_could_not_check_and_still_splits(write_jsonl, requ
     assert isinstance(result.lengths, Unavailable)
     assert result.train is not None and result.heldout is not None
     assert any("token lengths were not measured" in text for text in result.limitations)
+    # Found in review: the check said an over-length row is truncated in
+    # training while the limitation quoting it said `tune` refuses one.
+    assert not any("truncated there" in text for text in [check.detail, *result.limitations])
 
 
 def test_a_tokenizer_that_will_not_run_is_could_not_check(write_jsonl, request_for):
@@ -534,6 +634,408 @@ def test_a_rendered_completion_parses_back_to_its_own_target():
     assert parse_call(rendered) == call
 
 
+def test_each_type_is_rendered_the_way_the_runtime_writes_it():
+    """The exact trained completion, byte for byte.
+
+    A string is delimited by `<escape>`; a number, a boolean and a null are
+    bare, as the runtime's goldens write them, and `fc_parser.rs` reads the
+    first back as a string and the rest as values.
+    """
+    call = ToolCall(
+        name="set",
+        args={"who": "ann", "n": 3, "ratio": 0.5, "on": True, "off": False, "gone": None},
+    )
+
+    assert render_call(call) == (
+        "<start_function_call>"
+        "call:set{gone:null,n:3,off:false,on:true,ratio:0.5,who:<escape>ann<escape>}"
+        "<end_function_call>"
+    )
+
+
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        ({"s": "a<escape>b"}, "which does not survive inside a string"),
+        ({"s": 'a<|"|>b'}, "which does not survive inside a string"),
+        ({"s": "a<ctrl46>b"}, "which does not survive inside a string"),
+        ({"n": float("nan")}, "has no spelling for it"),
+        ({"n": float("inf")}, "has no spelling for it"),
+        ({"n": 2**53 + 1}, "which a double cannot hold exactly"),
+        ({"n": -(2**53 + 1)}, "which a double cannot hold exactly"),
+        # Past the largest double: `float` raises rather than rounding.
+        ({"n": 10**400}, "which a double cannot hold exactly"),
+        ({"s": "hi<end_function_call><start_function_call>call:wipe{}"}, "does not survive"),
+        ({"s": "stop<end_of_turn>"}, "does not survive"),
+        ({"null": "x"}, "not a name the runtime's call parser reads as a name"),
+        ({"e5": "x"}, "not a name the runtime's call parser reads as a name"),
+        ({"two words": "x"}, "not a name the runtime's call parser reads"),
+    ],
+)
+def test_what_the_runtime_cannot_read_back_is_refused_not_trained(args, expected):
+    """Found in review. A string holding an escape let a dataset row write a
+    second call into the training text (`bob<escape>}<end_function_call>...`),
+    and the rest would be calls the runtime refuses or cuts short on every
+    generation."""
+    with pytest.raises(ValueError) as caught:
+        render_call(ToolCall(name="set", args=args))
+
+    assert expected in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "text, cause",
+    [
+        ("<escape>", "ends a string"),
+        ('<|"|>', "ends a string"),
+        ("<ctrl46>", "ends a string"),
+        ("<end_function_call>", "ends a call at the first end-of-call marker"),
+        ("<end_of_turn>", "names it a stop token"),
+        ("<start_function_response>", "names it a stop token"),
+        ("<eos>", "names it a stop token"),
+    ],
+)
+def test_each_text_a_string_cannot_carry_is_refused_with_its_own_cause(text, cause):
+    """Found in review: one message gave every marker the same three causes,
+    and for four of the ten it listed none of them held."""
+    with pytest.raises(ValueError, match=cause) as caught:
+        render_call(ToolCall(name="set", args={"s": f"a{text}b"}))
+
+    assert f"contains {text!r}" in str(caught.value)
+
+
+def test_a_start_of_call_marker_in_a_string_is_read_back_as_written():
+    """Found in review: it was refused as a place the runtime cuts a call, and
+    it is not -- the runtime has matched the call's own start marker by then,
+    and its lexer reads a second one inside the string as text."""
+    call = ToolCall(name="set", args={"s": "a<start_function_call>b"})
+
+    assert runtime_calls(render_call(call)) == [call]
+
+
+def test_an_integer_past_the_largest_double_is_a_refused_row_not_a_crash(tmp_path):
+    """Found in review: `float(value)` raises `OverflowError`, which is not a
+    `ValueError`, so the row reader let it out as a traceback naming no row."""
+    data = tmp_path / "rows.jsonl"
+    data.write_text(
+        json.dumps({"prompt": "p", "target": {"name": "set", "args": {"n": 10**400}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PrepareError, match=r"rows.jsonl:1: .*a double cannot hold exactly"):
+        read_rows(data)
+
+
+def test_a_tool_name_the_runtime_cannot_read_is_refused():
+    for name in ("caf\u00e9", "call", "true"):
+        with pytest.raises(ValueError, match="not one the runtime's call parser reads"):
+            render_call(ToolCall(name=name, args={}))
+
+
+@pytest.mark.parametrize(
+    "value, spelled",
+    [
+        (1.5e-07, "0.00000015"),
+        (12345678901234567890.0, "12345678901234567168"),
+        (7.0, "7"),
+        (2**53, "9007199254740992"),
+        # Past 2**53 but held exactly by a double: nothing is lost, so it is
+        # written, where the first version refused every integer this large.
+        (10**20, "100000000000000000000"),
+    ],
+)
+def test_a_number_is_spelled_the_way_the_runtimes_lexer_reads_it(value, spelled):
+    """`json.dumps` writes `1.5e-07` and `1.2345678901234567e+19`, and the lexer
+    takes a fraction or an exponent, never both. The same double, in digits."""
+    rendered = render_call(ToolCall(name="set", args={"n": value}))
+
+    assert f"{{n:{spelled}}}" in rendered
+    assert parse_call(rendered) == ToolCall(name="set", args={"n": value})
+
+
+def test_the_arguments_follow_the_declared_order_whatever_the_case(tmp_path):
+    """One sort for both, and it is the template's `dictsort`, which ignores
+    case: the grammar holds a call to the order the declarations were handed
+    over in, so the order trained here has to be that order."""
+    path = tmp_path / "declarations.json"
+    properties = {
+        "URL": {"type": "string", "description": "u"},
+        "body": {"type": "string", "description": "b"},
+    }
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "send",
+                        "description": "d",
+                        "parameters": {"type": "object", "properties": properties},
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    declared = list(read_declarations(path)[0][0]["function"]["parameters"]["properties"])
+
+    parsed = parse_call(render_call(ToolCall(name="send", args={"URL": "u", "body": "b"})))
+
+    assert parsed is not None
+    assert list(parsed.args) == declared == ["body", "URL"]
+
+
+def _one_tool(tmp_path: Path, properties: dict, required: list[str] | None = None) -> Path:
+    parameters: dict = {"type": "object", "properties": properties}
+    if required:
+        parameters["required"] = required
+    path = tmp_path / "declarations.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "set", "description": "d", "parameters": parameters},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        ({"level": 3, "extra": "x"}, "sends ['extra'], which the declaration of 'set' does not"),
+        ({"mode": "loud"}, "leaves out ['level'], which the declaration of 'set' requires"),
+        ({"level": "3"}, "sends level='3', a str, where the declaration of 'set' says integer"),
+        ({"level": True}, "sends level=True, a bool, where the declaration of 'set' says integer"),
+        ({"level": 3, "mode": "shout"}, "which is not in the declared enum ['loud', 'soft']"),
+        ({"level": 3, "ratio": True}, "sends ratio=True, a bool"),
+        ({"level": 3, "loud": 1}, "sends loud=1, a int"),
+        ({"level": 3, "mode": 3}, "sends mode=3, a int"),
+        ({"level": 3, "tags": "a,b"}, "sends tags='a,b', a str"),
+        ({"level": 3, "shout": 1}, "sends shout=1, a int"),
+        ({"level": 7.5}, "sends level=7.5, a float, where the declaration of 'set' says integer"),
+        ({"level": 3, "opts": "x"}, "sends opts='x', a str"),
+    ],
+)
+def test_a_target_that_contradicts_its_declaration_is_refused(
+    tmp_path, write_jsonl, args, expected
+):
+    """Found in review: only the tool's name was checked. A target that sends an
+    undeclared argument, leaves out a required one, or sends another type or a
+    value outside the enum trains a call contradicting the declaration the
+    prompt shows the model."""
+    declarations = _one_tool(
+        tmp_path,
+        {
+            "level": {"type": "integer", "description": "l"},
+            "mode": {"type": "string", "description": "m", "enum": ["loud", "soft"]},
+            "ratio": {"type": "number", "description": "r"},
+            "loud": {"type": "boolean", "description": "b"},
+            "tags": {"type": "array", "description": "t", "items": {"type": "string"}},
+            # Capitals, the way google/mobile-actions writes its types.
+            "shout": {"type": "BOOLEAN", "description": "s"},
+            "opts": {
+                "type": "object",
+                "description": "o",
+                "properties": {"x": {"type": "string", "description": "x"}},
+            },
+        },
+        required=["level"],
+    )
+    data = write_jsonl([{"prompt": "set it", "target": {"name": "set", "args": args}}])
+
+    with pytest.raises(PrepareError) as caught:
+        refuse_undeclared_tools(read_rows(data), data, declarations)
+
+    assert expected in str(caught.value)
+    assert f"{data}:1" in str(caught.value)
+
+
+def test_a_target_that_keeps_to_its_declaration_passes(tmp_path, write_jsonl):
+    declarations = _one_tool(
+        tmp_path,
+        {
+            "level": {"type": "INTEGER", "description": "l"},
+            "ratio": {"type": "number", "description": "r"},
+            "mode": {"type": "string", "description": "m", "enum": ["loud", "soft"]},
+        },
+        required=["level"],
+    )
+    data = write_jsonl(
+        [
+            {"prompt": "set it", "target": {"name": "set", "args": {"level": 3, "ratio": 1}}},
+            # An integral float is an integer: it is written `7` and returned 7.0.
+            {"prompt": "set it", "target": {"name": "set", "args": {"level": 7.0}}},
+        ]
+    )
+
+    refuse_undeclared_tools(read_rows(data), data, declarations)
+
+
+CALL_ROWS = [
+    {"prompt": "make it red", "target": {"name": "set_colour", "args": {"colour": "red"}}},
+]
+
+
+def test_a_family_whose_calls_were_measured_is_rendered_in_its_own_format(
+    tmp_path, write_jsonl, request_for
+):
+    result = prepare(
+        request_for(
+            write_jsonl(CALL_ROWS * 40),
+            base_model=FUNCTIONGEMMA,
+            declarations=_declarations(tmp_path, "set_colour"),
+        )
+    )
+
+    assert result.identity is not None
+    assert result.identity["family"] == "functiongemma"
+    assert result.identity["wire_format"] == "functiongemma"
+    first = json.loads(result.train.path.read_text(encoding="utf-8").splitlines()[0])
+    assert first["completion"] == (
+        "<start_function_call>call:set_colour{colour:<escape>red<escape>}<end_function_call>"
+    )
+    assert ASSUMED_WIRE_FORMAT not in result.limitations
+
+
+def test_a_family_with_no_measured_call_format_is_refused_by_row(write_jsonl, request_for):
+    """Qwen-3 has an entry that deliberately records nothing about its calls.
+
+    Rendering FunctionGemma's spelling for it trains a format its runtime does
+    not read, and no check downstream can see that -- which is the defect this
+    gate exists to close.
+    """
+    with pytest.raises(PrepareError) as caught:
+        prepare(request_for(write_jsonl(CALL_ROWS * 40), base_model="Qwen/Qwen3-0.6B"))
+
+    assert "qwen-3" in str(caught.value)
+    assert "completion" in str(caught.value)
+
+
+def test_a_model_litetune_has_no_entry_for_says_that_instead(write_jsonl, request_for):
+    with pytest.raises(PrepareError) as caught:
+        prepare(request_for(write_jsonl(CALL_ROWS * 40), base_model="meta-llama/Llama-3.2-1B"))
+
+    assert "no entry for this model" in str(caught.value)
+
+
+def test_only_a_structured_target_reaches_the_refusal(write_jsonl, request_for):
+    """A row that brings its own completion is the caller saying what to train.
+
+    litetune does not parse it back to work out which family it is in, so the
+    gate never fires on it -- whatever the model is, and whether or not litetune
+    has an entry for it.
+    """
+    rows = [{"prompt": "make it red", "completion": "call:set_colour{colour:red}"}] * 40
+
+    for model in ("Qwen/Qwen3-0.6B", "meta-llama/Llama-3.2-1B", FUNCTIONGEMMA):
+        result = prepare(request_for(write_jsonl(rows), base_model=model))
+        first = json.loads(result.train.path.read_text(encoding="utf-8").splitlines()[0])
+        assert first["completion"] == "call:set_colour{colour:red}"
+
+
+def test_naming_no_model_renders_functiongemmas_format_and_says_it_assumed_it(
+    write_jsonl, request_for
+):
+    """Every caller that predates the flag. Refusing them would refuse splits
+    that work; saying nothing would leave the assumption invisible."""
+    result = prepare(request_for(write_jsonl(CALL_ROWS * 40)))
+
+    assert result.identity is None
+    assert ASSUMED_WIRE_FORMAT in result.limitations
+    first = json.loads(result.train.path.read_text(encoding="utf-8").splitlines()[0])
+    assert first["completion"] == (
+        "<start_function_call>call:set_colour{colour:<escape>red<escape>}<end_function_call>"
+    )
+
+
+def test_a_plain_text_split_never_mentions_a_wire_format(write_jsonl, request_for):
+    """Plain text at this level: nothing about declarations or formats applies."""
+    rows = [{"prompt": f"q{i}", "completion": "an answer"} for i in range(40)]
+
+    result = prepare(request_for(write_jsonl(rows)))
+
+    assert ASSUMED_WIRE_FORMAT not in result.limitations
+    assert result.identity is None
+
+
+def test_the_family_resolves_from_a_checkpoint_the_way_convert_resolves_it(
+    tmp_path, write_jsonl, request_for
+):
+    """Sidecar, then config, then the name -- the existing order, not a second one.
+
+    The folder is named after the wrong family on purpose: that is the case the
+    order exists for, and a path must not outrank what is inside.
+    """
+    checkpoint = tmp_path / "runs" / "qwen-ish" / "model"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "gemma3_text"}), encoding="utf-8"
+    )
+    (checkpoint / PROVENANCE_NAME).write_text(
+        json.dumps({"base_model": FUNCTIONGEMMA}), encoding="utf-8"
+    )
+
+    result = prepare(
+        request_for(
+            write_jsonl(CALL_ROWS * 40),
+            base_model=str(checkpoint),
+            declarations=_declarations(tmp_path, "set_colour"),
+        )
+    )
+
+    assert result.identity is not None
+    assert result.identity["family"] == "functiongemma"
+    assert result.identity["identity_recorded"] is True
+
+
+def test_a_declaration_rendering_family_refuses_to_train_calls_without_them(
+    write_jsonl, request_for
+):
+    """The runtime puts the declarations in the prompt before the model sees the
+    question -- 809 characters where a run without them trains 79. A split that
+    skips them teaches an answer to a prompt no application sends, and the loss
+    curve of such a run is indistinguishable from one that worked."""
+    with pytest.raises(PrepareError) as caught:
+        prepare(request_for(write_jsonl(CALL_ROWS * 40), base_model=FUNCTIONGEMMA))
+
+    message = str(caught.value)
+    assert "--declarations" in message
+    assert "cannot be derived from the targets" in message
+
+
+def test_that_refusal_does_not_fire_on_plain_text_for_the_same_family(write_jsonl, request_for):
+    rows_ = [{"prompt": f"q{i}", "completion": "an answer"} for i in range(40)]
+
+    result = prepare(request_for(write_jsonl(rows_), base_model=FUNCTIONGEMMA))
+
+    assert result.n_rows == 40
+
+
+def test_a_value_with_no_measured_shape_is_refused_by_row(write_jsonl, request_for):
+    """A list or an object has no established spelling in a call.
+
+    Nothing in this project says what the runtime's parser accepts for one, and
+    guessing would teach the model a format nobody has seen the runtime read.
+    The row names the way through, which is the path `read_rows` already
+    prefers: supply the completion text.
+    """
+    data = write_jsonl(
+        [{"prompt": "tag it", "target": {"name": "tag", "args": {"labels": ["a", "b"]}}}]
+    )
+
+    with pytest.raises(PrepareError) as caught:
+        read_rows(data)
+
+    assert ":1:" in str(caught.value)
+    assert "'labels' is a list" in str(caught.value)
+    assert "'completion'" in str(caught.value)
+
+
 # ---------------------------------------------------------------------------
 # The report and what comes after it
 # ---------------------------------------------------------------------------
@@ -655,3 +1157,126 @@ def test_prepare_splits_a_text_task_and_says_the_profile_does_not_apply(tmp_path
     first = json.loads((tmp_path / "out" / "train.jsonl").read_text().splitlines()[0])
     assert first["completion"] in {"red", "blue"}
     assert first["target"] == first["completion"]
+
+
+def test_prerendered_calls_prepare_without_declarations_because_the_prompt_carries_them(
+    write_jsonl, request_for
+):
+    """In `prerendered` the application rendered the declarations into the
+    prompt already, so there is nothing for `--declarations` to add. The first
+    version of this refusal asked only the family, which refused the README's
+    own walkthrough."""
+    decl = (
+        "<start_of_turn>developer\n<start_function_declaration>declaration:set_colour"
+        "{description:<escape>d<escape>}<end_function_declaration>\n<end_of_turn>\n"
+    )
+    rows_ = [
+        {
+            "prompt": f"{decl}<start_of_turn>user\nmake it red {i}<end_of_turn>\n"
+            "<start_of_turn>model\n",
+            "target": {"name": "set_colour", "args": {"colour": "red"}},
+        }
+        for i in range(40)
+    ]
+
+    result = prepare(request_for(write_jsonl(rows_), base_model=FUNCTIONGEMMA))
+
+    assert result.n_rows == 40
+
+
+def test_the_report_records_the_declarations_the_targets_were_checked_against(
+    tmp_path, write_jsonl, request_for
+):
+    """Found in review: `tune` and `verify` record the digest and `prepare` did
+    not, so a split could not be traced to the tool list it was checked with.
+    Bare prompts, so the runtime adds a declaration turn this stage cannot
+    count, and the report says the length check undercounts."""
+    declarations = _declarations(tmp_path, "set_colour")
+    rows_ = [
+        {"prompt": f"make it red {i}", "target": {"name": "set_colour", "args": {"colour": "red"}}}
+        for i in range(40)
+    ]
+
+    result = prepare(
+        request_for(write_jsonl(rows_), base_model=FUNCTIONGEMMA, declarations=declarations)
+    )
+
+    record = result.as_dict()
+    assert record["declarations_sha256"] == read_declarations(declarations)[1]
+    assert record["request"]["declarations"] == str(declarations)
+    assert any("without the declaration turn" in text for text in result.limitations)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"tokens": None},  # no lengths were measured, so none undercount
+        # A counter that raised measured nothing either.
+        {"tokens": FakeTokenCounter(raises=TokenCountUnavailable("environment unavailable"))},
+        {"base_model": "Qwen/Qwen3-0.6B"},  # no declaration turn is added for it
+    ],
+)
+def test_the_length_note_is_said_only_where_it_is_true(tmp_path, write_jsonl, request_for, extra):
+    """Found in review: it fired with no tokenizer and for a family whose
+    runtime puts no declaration turn in front of the prompt."""
+    declarations = _declarations(tmp_path, "set_colour")
+    rows_ = [
+        {"prompt": f"make it red {i}", "target": {"name": "set_colour", "args": {"colour": "red"}}}
+        for i in range(40)
+    ]
+    params = {"base_model": FUNCTIONGEMMA, "declarations": declarations} | extra
+    if params["base_model"] != FUNCTIONGEMMA:
+        rows_ = [{"prompt": r["prompt"], "completion": "red"} for r in rows_]
+
+    result = prepare(request_for(write_jsonl(rows_), **params))
+
+    assert not any("without the declaration turn" in text for text in result.limitations)
+
+
+def test_an_undeclared_tool_is_a_reason_not_an_exception(tmp_path):
+    from litetune.declarations import argument_problem
+
+    parsed = read_declarations(_declarations(tmp_path, "set_colour"))[0]
+
+    assert argument_problem(parsed, "open_app", {}) == "calls 'open_app', which is not declared"
+
+
+def test_the_arguments_are_written_in_the_order_the_declarations_are_sorted_into():
+    """The runtime's grammar enforces the declared property order, and
+    `declarations.py` sorts the declarations. Measured 2026-09-17: a model
+    trained in the dataset's own argument order lost an argument on 112 of 640
+    rows under the grammar -- `send_email` came back as `subject, to`, never
+    with `body`, because `body` sorts first and the model wrote it last.
+    """
+    call = ToolCall(name="send_email", args={"to": "a@b.c", "subject": "hi", "body": "text"})
+
+    assert render_call(call) == (
+        "<start_function_call>call:send_email{"
+        "body:<escape>text<escape>,subject:<escape>hi<escape>,to:<escape>a@b.c<escape>"
+        "}<end_function_call>"
+    )
+
+
+def test_a_prerendered_split_records_the_declarations_bytes_and_no_length_note(
+    tmp_path, write_jsonl, request_for
+):
+    """In `prerendered` the application renders the file as it is: the bytes
+    are the record, and the prompts carry the declaration turn already, so the
+    lengths measured count it."""
+    declarations = _declarations(tmp_path, "set_colour")
+    turn = "<start_of_turn>developer\ntools<end_of_turn>\n<start_of_turn>user\n"
+    rows_ = [
+        {
+            "prompt": f"{turn}make it red {i}<end_of_turn>\n<start_of_turn>model\n",
+            "target": {"name": "set_colour", "args": {"colour": "red"}},
+        }
+        for i in range(40)
+    ]
+
+    result = prepare(
+        request_for(write_jsonl(rows_), base_model=FUNCTIONGEMMA, declarations=declarations)
+    )
+
+    assert result.as_dict()["declarations_sha256"] == hash_file(declarations)
+    assert hash_file(declarations) != read_declarations(declarations)[1]
+    assert not any("without the declaration turn" in text for text in result.limitations)

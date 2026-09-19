@@ -31,13 +31,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from litetune import envs, metrics, models
-from litetune.checks import Check, Outcome, guard
+from litetune.checks import Check, CheckSet, Outcome, guard
+from litetune.declarations import digest_matches, read_declarations, recorded_digest
 from litetune.evaluate import (
     GREEDY,
     DataError,
@@ -70,14 +72,18 @@ from litetune.metrics import (
     Difference,
     Proportion,
     QualityMetrics,
+    ToolCall,
     Unavailable,
     agreement,
     carries_reasoning,
     paired_difference,
     reasoning_unclosed,
+    runtime_calls,
+    score_parsed,
     strip_reasoning,
     terminators_trimmed,
 )
+from litetune.models import identify, renders_declarations_for
 from litetune.prompt_mode import (
     PromptMode,
     PromptModeConflict,
@@ -86,6 +92,14 @@ from litetune.prompt_mode import (
     resolve_prompt_mode,
 )
 from litetune.rendering import RENDERING_CHECK, RenderingObserver, RenderingProbe
+from litetune.toolpath import (
+    DISAGREEING_MODES,
+    GRAMMAR_HELPED,
+    GRAMMAR_HURT,
+    GRAMMAR_OFF_BY_DEFAULT_IN,
+    ToolPathBackend,
+    ToolPathRow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +205,11 @@ class VerifyRequest:
     # default nobody chose.
     prompt_mode: PromptMode | None = None
     contract: Path | None = None
+    # The tool declarations to measure against, in the shape `bundle` takes. A
+    # set whose digest disagrees with the one recorded beside the reference
+    # checkpoint is refused rather than measured, and so is a run given none
+    # for a checkpoint that recorded some.
+    declarations: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -203,26 +222,364 @@ class BackendPair:
     rendering: RenderingObserver | None = None
 
 
-def build_backends(request: VerifyRequest) -> BackendPair:
+TOOL_PATH_CHOSEN = (
+    "measured through the runtime's tool path: {model} is {family}, whose runtime renders tool "
+    "declarations into the prompt, and this run supplied {n} of them. Nothing asked for it -- the "
+    "family and the declarations decide, because a flag could disagree with the model"
+)
+TOOL_PATH_NOT_CHOSEN = {
+    "no_declarations": (
+        "measured through the text path: no declarations were supplied, so there is nothing for "
+        "the runtime to declare and no structured call to read back"
+    ),
+    "family": (
+        "measured through the text path: litetune records no tool channel for {model}, so it "
+        "reads generated text the way it always has"
+    ),
+    "prerendered": (
+        "measured through the text path: the prompts are pre-rendered, which routes the runtime "
+        "past the conversation the tool path needs. The two are mutually exclusive by "
+        "construction rather than by choice"
+    ),
+}
+
+
+SUPPLIED_BACKENDS = (
+    "the caller supplied its own backends, so the measurement path was not selected by this run"
+)
+
+
+def _tool_path_reason(request: VerifyRequest, declarations: list | None) -> tuple[bool, str]:
+    """Whether to measure through the tool path, and the sentence the manifest carries.
+
+    Selected from the model and the declarations, never from a flag: a flag can
+    disagree with the model, and the run would then measure a path the artifact
+    does not serve. `--declarations` is not that flag -- it supplies the
+    declarations themselves, which cannot be derived from anything.
+    """
+    if not declarations:
+        return False, TOOL_PATH_NOT_CHOSEN["no_declarations"]
+    renders, _ = renders_declarations_for(request.reference)
+    if not renders:
+        return False, TOOL_PATH_NOT_CHOSEN["family"].format(model=request.reference)
+    if request.prompt_mode is not PromptMode.RUNTIME_RENDERED:
+        return False, TOOL_PATH_NOT_CHOSEN["prerendered"]
+    family = identify(request.reference)
+    return True, TOOL_PATH_CHOSEN.format(
+        model=request.reference,
+        family=family.family if family else "a declaration-rendering family",
+        n=len(declarations),
+    )
+
+
+TOOL_PATH_LIVENESS = "the runtime returned a call"
+
+_TEXT_TIER_SKIPPED = (
+    "the candidate answered with structured calls, so the text tier's checks -- non-empty "
+    "output, a turn terminator, leaked control tokens, a reasoning block left open -- have "
+    "nothing to read. They are not failed here; they were never in scope"
+)
+
+
+def _tool_path_liveness(point: MeasurementPoint, backend: GenerationBackend) -> LivenessResult:
+    """Liveness for a candidate that answered with calls rather than text.
+
+    The text tier's checks would fail every row of a healthy tool-path run, so
+    they are recorded as skipped rather than failed. What stands in their place
+    is whether the runtime returned a structured call -- which it does only for
+    output its own parser accepted -- on the grammar-off run, the one an
+    application gets by default. A run where it returned none is a model that
+    produced nothing an application could use, and that is a smoke failure in
+    the same sense the text tier means it. A reply with several calls returned
+    calls: it is the score, not this check, that counts it wrong. The detail
+    says why the rows that returned none did not, so a failure here carries the
+    runtime's reasons with it.
+    """
+    never_ran = [g for g in point.generations if g.harness_error is not None]
+    if never_ran or not isinstance(backend, ToolPathBackend):
+        # Nothing was performed. `unchecked` rather than `failed`, which is the
+        # distinction this whole tool exists to keep: a run that could not be
+        # made is not a model that answered badly. What this reads is the
+        # per-mode rows, so a backend that answers with calls and keeps none
+        # leaves nothing to judge either.
+        checks = CheckSet(name="liveness")
+        checks.add(
+            Check.unchecked(
+                TOOL_PATH_LIVENESS,
+                f"the tool path was not measured: {never_ran[0].harness_error}"
+                if never_ran
+                else f"{type(backend).__name__} declares structured answers but keeps no "
+                "per-mode rows",
+                observed={"n": len(point.generations)},
+            )
+        )
+        return LivenessResult(
+            checks=checks,
+            skipped=[SkippedCheck(name="text liveness tier", reason=_TEXT_TIER_SKIPPED)],
+        )
+    rows = backend.rows["unconstrained"]
+    n = len(point.generations)
+    answered = sum(1 for row in rows if row.calls)
+    prose = sum(1 for row in rows if not row.calls and not row.refused)
+    unanswered = _unanswered(rows, list(range(len(rows))))
+    parts = [f"with the grammar off, {answered} of {n} prompts returned a call"]
+    if prose:
+        parts.append(f"{prose} answered without calling anything")
+    if unanswered["no_reply"]:
+        parts.append(f"the runtime gave no reply to {_why_no_reply(unanswered)}")
+    detail = "; ".join(parts)
+    observed = {"answered": answered, "n": n, "without_a_call": prose} | unanswered
+    checks = CheckSet(name="liveness")
+    if answered:
+        checks.add(Check.passed(TOOL_PATH_LIVENESS, detail, observed=observed))
+    else:
+        checks.add(
+            Check.failed(
+                TOOL_PATH_LIVENESS,
+                f"{detail}. Nothing an application could act on came back from any prompt",
+                observed=observed,
+            )
+        )
+    return LivenessResult(
+        checks=checks,
+        skipped=[SkippedCheck(name="text liveness tier", reason=_TEXT_TIER_SKIPPED)],
+    )
+
+
+def _score_tool_path(
+    backend: GenerationBackend,
+    targets: list,
+    indices: list[int],
+    run: Any,
+) -> tuple[QualityMetrics, dict[str, Any]]:
+    """Both decoding modes, each scored over every labelled row.
+
+    Two numbers come out of a tool-path run and a third compares them, and they
+    answer three questions, so none of them stands in for another.
+
+    - **Grammar off: compared with the reference, and what an application gets
+      by default.** The float reference is `transformers` generating greedily
+      with no grammar, so the conversion cost is measured against the tool path
+      with the runtime's grammar off too. LiteRT-LM v0.16.1 leaves it off
+      unless the caller enables it, so this is also the default.
+      Measured 2026-09-17 on FunctionGemma x mobile-actions at n=640: reference
+      0.9234, grammar off 0.9172, grammar on 0.7422. The first version compared
+      the reference with the grammar-on number and reported a *resolved*
+      conversion cost of 0.1812 that was almost entirely the grammar.
+    - **Grammar on: what an application that enables it gets.**
+    - **What the grammar does: the paired difference between the two**, over the
+      same rows. Its own quantity with its own interval.
+
+    **A row the runtime gave no reply to is a wrong answer**, in the mode it
+    happened in, and is counted apart so the reason is visible. The reference's
+    unparseable text is a wrong answer on its side, and an application handed
+    no reply has nothing to act on. An earlier version kept such rows out of
+    every score instead, which made the comparison easier to pass the worse the
+    candidate was: on fakes, 195 of 200 rows refused read as a cost of 0.0 over
+    five.
+    """
+    if not isinstance(backend, ToolPathBackend):
+        raise TypeError(
+            f"{type(backend).__name__} declares structured scoring but carries no per-mode rows"
+        )
+    rows = backend.rows
+    if "unconstrained" not in rows:
+        raise ValueError(f"the tool path reported modes {sorted(rows)}, without the grammar off")
+    scored = {
+        mode: score_parsed(targets, [_one_call(rows[mode][i].handed) for i in indices])
+        for mode in rows
+    }
+    grammar: Difference | Unavailable = (
+        paired_difference(scored["unconstrained"].correct, scored["constrained"].correct)
+        if "constrained" in scored
+        else Unavailable(
+            "the grammar-on run was not measured: " + backend.unavailable.get("constrained", "")
+        )
+    )
+    reported: dict[str, Any] = {
+        "modes": {
+            mode: {"score": scored[mode].as_dict()} | _unanswered(rows[mode], indices)
+            for mode in rows
+        }
+        | _unavailable_modes(backend),
+        "compared_with_reference": "unconstrained",
+        "compared_with_reference_because": (
+            "the reference generates with no grammar, so the conversion cost is measured against "
+            "the runtime with its grammar off as well; the runtime leaves the grammar off unless "
+            "the application enables it, so this is also what an application gets by default"
+        ),
+        "grammar_effect": grammar.as_dict()
+        | (
+            {"sign": "positive means the runtime's grammar lowers the score"}
+            if isinstance(grammar, Difference)
+            else {}
+        ),
+        "default_established_on": GRAMMAR_OFF_BY_DEFAULT_IN,
+    }
+    # Only the grammar-on run can be unmeasured here: without the grammar-off
+    # one nothing is scored.
+    if "constrained" in backend.unavailable:
+        run.limitation(
+            "the grammar-on run was not measured, so what the grammar does, and what an "
+            f"application that enables it gets, are not known: {backend.unavailable['constrained']}"
+        )
+    for mode in rows:
+        state = "on" if mode == "constrained" else "off"
+        unanswered = reported["modes"][mode]
+        if unanswered["no_reply"]:
+            run.limitation(
+                f"with the grammar {state}, the runtime gave no reply to "
+                f"{_why_no_reply(unanswered)}, of {len(indices)} prompts. Each is scored as a "
+                "wrong answer: an application gets nothing to act on"
+            )
+        if unanswered["several_calls"]:
+            run.limitation(
+                f"with the grammar {state}, the runtime returned more than one call on "
+                f"{unanswered['several_calls']} of {len(indices)} prompts, each of which asks "
+                "for one. Scored as wrong answers: an application acts on every call it is handed"
+            )
+    unconstrained = scored["unconstrained"].exact_match.value
+    constrained = scored["constrained"].exact_match.value if "constrained" in scored else None
+    if constrained is not None and constrained != unconstrained and isinstance(grammar, Difference):
+        run.limitation(
+            DISAGREEING_MODES.format(
+                constrained=constrained,
+                unconstrained=unconstrained,
+                n=len(indices),
+                direction=GRAMMAR_HURT if constrained < unconstrained else GRAMMAR_HELPED,
+            )
+            + f" The conversion cost here is measured with the grammar off; what the grammar "
+            f"does is reported apart, as {grammar.detail}."
+        )
+    return scored["unconstrained"], reported
+
+
+def _one_call(calls: Sequence[ToolCall] | None) -> ToolCall | None:
+    """The one call a reply answered with, or `None` for none, several or no reply.
+
+    Every target is one call, so a reply carrying two is not that answer: an
+    application would act on both. The same rule for the candidate and the
+    reference.
+    """
+    return calls[0] if calls is not None and len(calls) == 1 else None
+
+
+def _reference_on_the_tool_path(texts: Sequence[str]) -> list[list[ToolCall] | None]:
+    """The reference's texts read as the runtime reads a reply (`runtime_calls`).
+
+    The reference is `transformers`, which has no tool path and produces text,
+    so its text is read by the rule the runtime reads the candidate's with:
+    only between the call markers, each block one whole call. Read any other
+    way, the difference between the two readings would be reported as
+    conversion cost.
+    """
+    return [runtime_calls(strip_reasoning(text)) for text in texts]
+
+
+def _unanswered(rows: list[ToolPathRow], indices: list[int]) -> dict[str, Any]:
+    """What one mode's rows say about the prompts that got no single call back.
+
+    Over `of` prompts, which is every row at liveness and the labelled ones
+    when scored. A no-reply is a parse failure or a prompt at the token
+    limit: a mode with any other reason is not measured at all
+    (`toolpath._refuse_a_mode_with_unread_reasons`).
+    """
+    no_reply = [rows[i] for i in indices if rows[i].refused]
+    return {
+        "of": len(indices),
+        "no_reply": len(no_reply),
+        "parse_refusals": sum(1 for row in no_reply if row.kind == "parse"),
+        "too_long": sum(1 for row in no_reply if row.kind == "too_long"),
+        "several_calls": sum(1 for i in indices if len(rows[i].calls) > 1),
+    }
+
+
+def _why_no_reply(unanswered: dict[str, Any]) -> str:
+    """`N prompts: P ..., L ...` from `_unanswered`, naming only what occurred."""
+    parts = []
+    if unanswered["parse_refusals"]:
+        parts.append(
+            f"{unanswered['parse_refusals']} because its call parser rejected the generation"
+        )
+    if unanswered["too_long"]:
+        parts.append(
+            f"{unanswered['too_long']} because the prompt, with the declarations the runtime "
+            "renders into it, reached the bundle's token limit -- a capacity of the converted "
+            "bundle rather than an answer the model gave"
+        )
+    return f"{unanswered['no_reply']} prompts: " + ", ".join(parts)
+
+
+def _runtime_version_limitation(run: Any, backend: ToolPathBackend) -> None:
+    """Say so when the runtime is not the version what litetune reads was read from.
+
+    At the first exit a tool-path run can take, not at scoring: a reply worded
+    differently is exactly what ends a run at liveness.
+    """
+    if backend.runtime_version != GRAMMAR_OFF_BY_DEFAULT_IN:
+        run.limitation(
+            "that the runtime leaves constrained decoding off unless an application enables it, "
+            "and the log sentences a missing reply's kind is read from, were read from litert-lm "
+            f"{GRAMMAR_OFF_BY_DEFAULT_IN}'s source; this run used "
+            f"{backend.runtime_version or 'a version it could not name'}, where they were not "
+            "checked, so calling the grammar-off run the default is an assumption here, and a "
+            "reply the runtime words differently leaves its mode unmeasured rather than scored"
+        )
+
+
+def _unavailable_modes(backend: ToolPathBackend) -> dict[str, dict[str, Any]]:
+    return {
+        mode: {"available": False, "reason": reason} for mode, reason in backend.unavailable.items()
+    }
+
+
+def _candidate_backend(request: VerifyRequest, declarations: list | None) -> GenerationBackend:
+    chosen, _ = _tool_path_reason(request, declarations)
+    if chosen:
+        return ToolPathBackend(
+            model=request.model, declarations=list(declarations or []), decode=request.decode
+        )
+    return LiteRtLmBackend(
+        model=request.model, decode=request.decode, declared_prompt_mode=request.prompt_mode
+    )
+
+
+def build_backends(request: VerifyRequest, declarations: list | None = None) -> BackendPair:
     """The real backends. Tests pass their own pair to `run_verify` instead.
 
     `request.prompt_mode` has been resolved by the time this is called, so both
     sides are configured from one decision: the runtime gets `--no-template`
     only when the prompts are pre-rendered, and the reference applies its chat
     template only when they are not.
+
+    `declarations` arrive parsed rather than as the path on the request: the
+    scripts these backends run live in other environments, which cannot read
+    the caller's file, and `run_verify` has already read it to compare its
+    digest against the checkpoint's record. They reach the reference and the
+    rendering check only when the candidate is measured through the tool path,
+    which is the only candidate they reach: on the text path `litert-lm run`
+    takes no tools, and a reference and a rendering check given them would
+    validate a prompt the candidate is never sent.
     """
+    chosen, _ = _tool_path_reason(request, declarations)
+    rendered = declarations if chosen else None
     return BackendPair(
-        candidate=LiteRtLmBackend(
-            model=request.model, decode=request.decode, declared_prompt_mode=request.prompt_mode
-        ),
+        candidate=_candidate_backend(request, declarations),
         reference=HuggingFaceBackend(
-            model=request.reference, decode=request.decode, declared_prompt_mode=request.prompt_mode
+            model=request.reference,
+            decode=request.decode,
+            declared_prompt_mode=request.prompt_mode,
+            declarations=rendered,
         ),
-        rendering=RenderingProbe(model=request.model, reference=request.reference),
+        rendering=RenderingProbe(
+            model=request.model, reference=request.reference, declarations=rendered
+        ),
     )
 
 
+SCORER_CHECK = "the scorer reads what the candidate returns"
 CONTRACT_CHECK = "prompt-rendering mode is known"
+DECLARATIONS_CHECK = "declarations match the checkpoint's record"
 
 INFERRED_PROMPT_MODE = (
     "the prompt-rendering mode was not declared and no bundle contract was supplied, so it was "
@@ -255,12 +612,53 @@ def contract_prompt_mode(path: Path) -> PromptMode:
 def recorded_prompt_mode(reference: str) -> PromptMode | None:
     """The mode `tune` recorded beside a local reference checkpoint, if it recorded one.
 
-    `None` for a Hugging Face id, a directory with no `litetune.json`, or a
-    `litetune.json` that records no mode -- including when that directory is
-    reached through a symlink that resolves. A sidecar that exists and cannot
-    be read raises, and so does a reference that is a link going nowhere:
-    falling back to the contract or the prompts would silently replace a mode
-    the checkpoint wrote down.
+    `None` when the checkpoint records no mode, and under every condition
+    `_recorded` returns `None` for. Those conditions are written down there
+    rather than here, because they are the same for every question asked of the
+    sidecar and two copies of them would drift. Falling back to the contract or
+    to the prompts when a record exists would silently replace a mode the
+    checkpoint wrote down, which is why an unreadable record raises instead of
+    reading as absent.
+    """
+    read = _recorded(reference)
+    if read is None:
+        return None
+    data, sidecar = read
+    raw = data.get("prompt_mode")
+    return None if raw is None else parse_prompt_mode(raw, str(sidecar))
+
+
+def recorded_declarations_sha256(reference: str) -> str | None:
+    """The declarations digest `tune` recorded beside a local reference checkpoint.
+
+    `None` under the same conditions `recorded_prompt_mode` returns `None`, and
+    additionally for a checkpoint that recorded no declarations -- every run
+    that trained plain text. Comparing against `None` is not a disagreement:
+    it is the absence of anything to disagree with.
+    """
+    read = _recorded(reference)
+    if read is None:
+        return None
+    raw = read[0].get("declarations_sha256")
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(f"{read[1]} records declarations_sha256 {raw!r}, which is not a string")
+    return raw
+
+
+def _recorded(reference: str) -> tuple[dict, Path] | None:
+    """The checkpoint's own record and where it was read from, or `None` for no record.
+
+    One reader for every question asked of `litetune.json`. The distinction
+    below is subtle enough that a second copy would drift from it, and the two
+    copies would then disagree about whether a checkpoint said anything.
+
+    `None` for a Hugging Face id, for a directory with no `litetune.json`, and
+    for a reference that is not a directory at all -- including a directory
+    reached through a symlink that resolves and simply has no sidecar. A
+    sidecar that exists and cannot be read raises, and so does a reference that
+    is a link going nowhere.
 
     A link going nowhere further up the path is not detected. Reading through
     it raises the same `FileNotFoundError` as an absent directory, and the
@@ -272,8 +670,8 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
         text = sidecar.read_text(encoding="utf-8")
     except FileNotFoundError:
         # A link going nowhere raises this too, and it is not the same
-        # statement: the link is an entry, so something recorded a mode here
-        # and the link no longer reaches it.
+        # statement: the link is an entry, so something recorded a checkpoint's
+        # own account here and the link no longer reaches it.
         #
         # The two calls are not the same test. For the sidecar, `is_symlink`
         # settles it: a link that resolved would have been read, so a link that
@@ -290,13 +688,12 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
         # The reference is not a directory at all: a Hugging Face id, or a file.
         return None
     # Every other OSError propagates -- a permission, a stale mount -- because
-    # falling through to the contract or to inference would silently replace a
-    # mode the checkpoint wrote down.
+    # falling through to the contract, to inference, or to "no declarations
+    # recorded" would silently replace what the checkpoint wrote down.
     data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError(f"{sidecar} does not contain a JSON object")
-    raw = data.get("prompt_mode")
-    return None if raw is None else parse_prompt_mode(raw, str(sidecar))
+    return data, sidecar
 
 
 def _resolve_mode(request: VerifyRequest, split: Split) -> PromptModeDecision:
@@ -522,13 +919,85 @@ def run_verify(
         run.limitation(INFERRED_PROMPT_MODE.format(evidence=decision.evidence))
     request = replace(request, prompt_mode=decision.mode)
 
+    # -- are these the declarations the checkpoint trained against? ---------
+    # Before the backends, for the same reason the mode is: a model measured
+    # against a different tool list than it learned is measured on another
+    # task, and the number that comes out looks like a conversion cost.
+    # Initialised before the guard, not inside it: `guard` turns an exception
+    # into a recorded check rather than a raise, so an assignment made only in
+    # the body is not one the code below can rely on.
+    # A checkpoint that recorded declarations and a run given none is the same
+    # disagreement from the other side: the model would be measured on a prompt
+    # without the tool list it learned, which measured 0 of 5 on both sides.
+    declarations: list | None = None
+    with guard(DECLARATIONS_CHECK) as sink:
+        recorded = recorded_declarations_sha256(request.reference)
+        if request.declarations is None:
+            # Only where the runtime renders them: in `prerendered` the prompts
+            # already carry the tool list, so the flag changes nothing measured.
+            if recorded is not None and request.prompt_mode is PromptMode.RUNTIME_RENDERED:
+                sink.append(
+                    Check.failed(
+                        DECLARATIONS_CHECK,
+                        f"the checkpoint at {request.reference} records that it was trained "
+                        f"against declarations ({recorded}), and none were given. Pass "
+                        "--declarations with the same file `tune` was given; without it the "
+                        "model is measured on a prompt that lacks the tool list it learned",
+                    )
+                )
+        else:
+            declarations, listed = read_declarations(request.declarations)
+            prerendered = request.prompt_mode is PromptMode.PRERENDERED
+            # What `tune` records for this mode, so the manifest and the
+            # checkpoint name the file the same way.
+            digest = recorded_digest(listed, request.declarations, prerendered)
+            if recorded is not None and not digest_matches(
+                recorded, listed, request.declarations, prerendered
+            ):
+                sink.append(
+                    Check.failed(
+                        DECLARATIONS_CHECK,
+                        f"{request.declarations} hashes {digest}, and the checkpoint at "
+                        f"{request.reference} records {recorded}. The model learned to call one "
+                        "tool list and would be measured against another",
+                    )
+                )
+    if sink:
+        run.record(sink[0])
+        return run.finish(Status.FAILED_HARNESS)
+    if request.declarations is not None:
+        run.manifest["harness"]["declarations_sha256"] = digest
+
     # -- what does litetune know about this model family? ------------------
     rules_for, rules = _model_rules(request)
     run.manifest["model_rules"] = models.report(rules_for)
     for text in rules.limitations if rules is not None else ():
         run.limitation(text)
 
-    pair = backends or build_backends(request)
+    pair = backends or build_backends(request, declarations)
+    # Which path the candidate is measured through, and why. From what actually
+    # runs rather than from the rule alone: a caller that supplies its own
+    # backends has chosen the path itself, and a manifest that named the rule's
+    # answer instead would describe a run that did not happen.
+    chosen, why = _tool_path_reason(request, declarations)
+    ran = pair.candidate.scores_structurally
+    run.manifest["harness"]["tool_path_selection"] = {
+        "tool_path": ran,
+        "why": why if ran == chosen else SUPPLIED_BACKENDS,
+    }
+    if ran and request.scorer != "tool-call":
+        # The candidate answers with calls and the reference with text; scored
+        # by different rules, the two sides would not be one comparison, and a
+        # string target has no call to compare a call with at all.
+        run.record(
+            Check.failed(
+                SCORER_CHECK,
+                f"the candidate is measured through the tool path, which returns calls, and "
+                f"--scorer {request.scorer} compares text. A model whose runtime renders its "
+                "declarations is scored as calls: drop --scorer or pass --scorer tool-call",
+            )
+        )
+        return run.finish(Status.FAILED_HARNESS)
 
     # -- do both sides put the same prompt tokens in front of the model? ---
     # Before any generation: a candidate and a reference that were shown
@@ -641,13 +1110,34 @@ def run_verify(
     # Check 5 (divergence) is deferred: the caller decides whether it applies,
     # and generating the reference before the candidate is known alive would pay
     # for a comparison that must not be made.
-    live = liveness_tier(
-        candidate,
-        thresholds=request.thresholds,
-        baseline=None,
-        baseline_absent_reason=None,
-        events=events,
-    )
+    if pair.candidate.scores_structurally:
+        # The tier reads text, and this candidate produced calls. Its checks --
+        # non-empty output, a turn terminator, leaked control tokens -- would
+        # fail every row of a perfectly healthy tool-path run, which is a
+        # statement about the tier rather than about the model. What replaces
+        # it is stronger than any of them: the runtime returned a structured
+        # call, which it does only for output its own parser accepted.
+        live = _tool_path_liveness(candidate, pair.candidate)
+        if isinstance(pair.candidate, ToolPathBackend):
+            # What each mode's rows say, written now: a run that ends at the
+            # liveness check still carries the runtime's reasons. Quality, when
+            # it is reached, replaces this with the scored report.
+            run.manifest["tool_path"] = {
+                "modes": {
+                    mode: _unanswered(rows, list(range(len(rows))))
+                    for mode, rows in pair.candidate.rows.items()
+                }
+                | _unavailable_modes(pair.candidate)
+            }
+            _runtime_version_limitation(run, pair.candidate)
+    else:
+        live = liveness_tier(
+            candidate,
+            thresholds=request.thresholds,
+            baseline=None,
+            baseline_absent_reason=None,
+            events=events,
+        )
     run.manifest["liveness"]["candidate"] = live.as_dict()
     if live.outcome is Outcome.UNCHECKED:
         return run.finish(Status.FAILED_HARNESS)
@@ -878,7 +1368,22 @@ def run_verify(
 
     # -- liveness check 5, now that a baseline exists ----------------------
     if request.reference_role is ReferenceRole.UNTUNED_BASE:
-        check = divergence_check(candidate, reference.texts, "the untuned base", request.thresholds)
+        # A tool-path candidate's text is empty whenever it called something,
+        # so its texts would differ from any base's and the check could not
+        # fail. Compared as calls instead, the base's read by the same parser
+        # that scores it.
+        if isinstance(pair.candidate, ToolPathBackend):
+            check = divergence_check(
+                candidate,
+                _reference_on_the_tool_path(reference.texts),
+                "the untuned base",
+                request.thresholds,
+                calls=[row.handed for row in pair.candidate.rows["unconstrained"]],
+            )
+        else:
+            check = divergence_check(
+                candidate, reference.texts, "the untuned base", request.thresholds
+            )
         live.checks.add(check)
         events.check(check)
         run.manifest["liveness"]["candidate"] = live.as_dict()
@@ -902,18 +1407,49 @@ def run_verify(
         indices = [e.index for e in labelled]
         targets = [e.target for e in labelled if e.target is not None]
         scorer = SCORERS[request.scorer]
-        # The same removal on both sides, whatever shape each side's reasoning
-        # takes, so an answer is compared with an answer and not with markup.
-        candidate_metrics = scorer(
-            targets, [strip_reasoning(candidate.generations[i].text) for i in indices]
-        )
-        reference_metrics = scorer(
-            targets, [strip_reasoning(reference.generations[i].text) for i in indices]
-        )
-        agreed = agreement(
-            [strip_reasoning(text) for text in candidate.texts],
-            [strip_reasoning(text) for text in reference.texts],
-        )
+        # The reference always produces text: it is `transformers`, which has no
+        # tool path to answer on. Scored over the same rows as the candidate,
+        # every one of them; on the tool path read as the runtime reads a reply,
+        # where a reply with several calls is wrong on both sides.
+        if pair.candidate.scores_structurally:
+            candidate_metrics, tool_path = _score_tool_path(pair.candidate, targets, indices, run)
+            # Label-free agreement compares two texts, and the candidate
+            # produced calls. Reporting zero here would read as total
+            # disagreement rather than as a question that was never asked.
+            agreed: Proportion | Unavailable = Unavailable(
+                "the candidate answered with structured calls and the reference with text, so "
+                "there is no text-to-text agreement to report. The scored comparison is between "
+                "the call the runtime returned and the call the reference's text parses to"
+            )
+            read = _reference_on_the_tool_path([reference.generations[i].text for i in indices])
+            # Every target is a call here: a scorer that reads text is refused
+            # on the tool path, and a string among them would fail alignment.
+            reference_metrics = score_parsed(
+                [t for t in targets if isinstance(t, ToolCall)],
+                [_one_call(calls) for calls in read],
+            )
+            tool_path["reference"] = {
+                "of": len(read),
+                "no_reply": sum(1 for calls in read if calls is None),
+                "several_calls": sum(1 for calls in read if calls is not None and len(calls) > 1),
+                "read_as": "the runtime reads a reply: between the call markers, one whole "
+                "call to a block, a block that is not one refusing the reply",
+            }
+        else:
+            tool_path = None
+            # The same removal on both sides, whatever shape each side's
+            # reasoning takes, so an answer is compared with an answer and not
+            # with markup.
+            candidate_metrics = scorer(
+                targets, [strip_reasoning(candidate.generations[i].text) for i in indices]
+            )
+            reference_metrics = scorer(
+                targets, [strip_reasoning(reference.generations[i].text) for i in indices]
+            )
+            agreed = agreement(
+                [strip_reasoning(text) for text in candidate.texts],
+                [strip_reasoning(text) for text in reference.texts],
+            )
         sink.append(
             Check.passed(
                 "quality measured",
@@ -925,6 +1461,8 @@ def run_verify(
     if not run.record(sink[0]).conclusive:
         return run.finish(Status.FAILED_HARNESS)
 
+    if tool_path is not None:
+        run.manifest["tool_path"] = tool_path
     run.manifest["quality"] = {
         "available": True,
         "candidate": candidate_metrics.as_dict(),

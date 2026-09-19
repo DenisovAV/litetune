@@ -141,6 +141,10 @@ class FakeEngine:
         self.prefill_extra = prefill_extra
         self.sent: list[str] = []
         self.rendered: list[str] = []
+        # Every `create_conversation` call, by the arguments it was given. What
+        # the runtime is asked for is the thing under test once declarations are
+        # in play, and a rendered string cannot show whether they were passed.
+        self.conversations: list[dict] = []
 
     def tokenize(self, text: str) -> list[int]:
         return [ord(c) for c in text]
@@ -187,6 +191,7 @@ def _fake_litert_lm(engine: FakeEngine) -> Any:
         def __init__(self, **kwargs: Any):
             self.kwargs = kwargs
             self.prefill: int | None = None
+            engine.conversations.append(kwargs)
 
         def __enter__(self) -> Conversation:
             return self
@@ -218,6 +223,18 @@ def _fake_litert_lm(engine: FakeEngine) -> Any:
             return None
 
     module.Engine = Engine
+
+    class Tool:
+        """The base `create_conversation` requires: it takes `Tool` instances or
+        callables, never raw JSON, and asks each for `get_tool_description()`."""
+
+        def get_tool_description(self) -> dict:
+            raise NotImplementedError
+
+        def execute(self, param: Any) -> Any:
+            raise NotImplementedError
+
+    module.Tool = Tool
     module.Backend = types.SimpleNamespace(CPU=lambda: "cpu")
     module.SamplerConfig = lambda **kwargs: kwargs
     module.LogSeverity = types.SimpleNamespace(ERROR="error")
@@ -253,6 +270,74 @@ def test_the_runtime_script_renders_every_prompt_and_sends_only_the_sample(tmp_p
     assert [row["prefill_tokens"] for row in written] == [3, 4, None]
     assert written[1]["rendered"] == "[bb]"
     assert written[1]["ids"] == [2, ord("["), ord("b"), ord("b"), ord("]")]
+
+
+TOOLS = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]
+
+
+def test_the_runtime_script_declares_the_tools_it_was_given(tmp_path, monkeypatch):
+    """The runtime renders the declaration turn itself, from the tools it is
+    handed. Nothing else in this check would notice their absence: the ids would
+    simply agree on a prompt neither side carries declarations in.
+    """
+    engine = FakeEngine(bos=2)
+
+    _run_script(
+        _RUNTIME_SCRIPT,
+        tmp_path,
+        monkeypatch,
+        {"litert_lm": _fake_litert_lm(engine)},
+        {"model": "m.litertlm", "prompts": ["hi"], "prefill_sample": 1, "tools": TOOLS},
+    )
+
+    assert engine.conversations, "no conversation was created at all"
+    for call in engine.conversations:
+        assert [t.get_tool_description() for t in call["tools"]] == TOOLS
+        # The prefill sample sends a message for real; executing a declared tool
+        # to measure a prompt is not something a check may do.
+        assert call["automatic_tool_calling"] is False
+
+
+def test_without_declarations_the_conversation_is_the_one_it_always_made(tmp_path, monkeypatch):
+    """The no-declarations path must not acquire arguments. A runtime whose
+    Python API has no `Tool` at all -- an older one, or a fake in a suite that
+    never needed it -- still has to render."""
+    engine = FakeEngine(bos=2)
+
+    _run_script(
+        _RUNTIME_SCRIPT,
+        tmp_path,
+        monkeypatch,
+        {"litert_lm": _fake_litert_lm(engine)},
+        {"model": "m.litertlm", "prompts": ["hi"], "prefill_sample": 1},
+    )
+
+    assert engine.conversations
+    for call in engine.conversations:
+        assert "tools" not in call
+        assert "automatic_tool_calling" not in call
+
+
+def test_both_sides_are_asked_about_the_same_declarations(monkeypatch, tmp_path):
+    """The check compares what two renderers produce. Asking them different
+    questions would compare two different prompts and report the difference as a
+    rendering fault."""
+    seen: list[tuple[str, dict]] = []
+
+    def run(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        seen.append((self.name, spec))
+        Path(spec["out"]).write_text(json.dumps(rows([[1, 2]])), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    probe = _probe(monkeypatch, tmp_path, run)
+    probe.declarations = TOOLS
+
+    probe.observe(["hi"])
+
+    assert [name for name, _ in seen] == [envs.RUNTIME.name, envs.TRAIN.name]
+    assert seen[0][1]["tools"] == TOOLS
+    assert seen[1][1]["tools"] == TOOLS
 
 
 @pytest.mark.parametrize(
@@ -295,8 +380,14 @@ def _fake_transformers() -> Any:
             ids = [2 if word == "<bos>" else 10 + n for n, word in enumerate(text.split())]
             return {"input_ids": [2, *ids] if add_special_tokens else ids}
 
-        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-            return "<bos> user " + messages[0]["content"] + " model"
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=False, tools=None
+        ):
+            # Without tools this renders exactly what it rendered before they
+            # were an input, word for word, so the test below still pins the
+            # same ids.
+            declarations = "".join(f"decl:{t['function']['name']} " for t in (tools or []))
+            return "<bos> " + declarations + "user " + messages[0]["content"] + " model"
 
     module: Any = types.ModuleType("transformers")
     module.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda model: Tokenizer())
@@ -315,6 +406,33 @@ def test_the_reference_script_gives_the_ids_the_reference_generates_from(tmp_pat
     # One BOS: the template's. The same ids the generation script is given --
     # `test_evaluate.py` pins that side with the same tokenizer shape.
     assert written == [{"index": 0, "rendered": "<bos> user hi model", "ids": [2, 11, 12, 13]}]
+
+
+def test_the_reference_script_renders_the_declarations_the_spec_carries(tmp_path, monkeypatch):
+    """The spec is how the declarations reach this side, and the shared source
+    renders them here exactly as it does in training.
+
+    Without this, a script that stopped passing them would leave both sides
+    agreeing on a prompt no serving caller sends, and every other test in this
+    suite would stay green: the others render `render_prompt` directly or supply
+    no tools at all.
+    """
+    written = _run_script(
+        _REFERENCE_SCRIPT,
+        tmp_path,
+        monkeypatch,
+        {"transformers": _fake_transformers()},
+        {
+            "model": "org/reference",
+            "prompts": ["hi"],
+            "tools": [{"type": "function", "function": {"name": "open_app", "description": "d"}}],
+        },
+    )
+
+    assert "decl:open_app" in written[0]["rendered"]
+    # The declaration is part of what the model is measured on, not a label
+    # beside it: one more rendered word is one more id.
+    assert written[0]["ids"] == [2, 11, 12, 13, 14]
 
 
 # ---------------------------------------------------------------------------

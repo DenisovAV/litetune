@@ -1050,3 +1050,132 @@ def test_a_rendered_prompt_reaches_the_reference_with_one_bos(tmp_path, monkeypa
 def test_a_prerendered_prompt_still_gets_the_tokenizers_bos(tmp_path, monkeypatch):
     captured = _run_hf_generate_script(tmp_path, monkeypatch)
     assert captured["tokenized"] == [[2, 10]]
+
+
+def test_a_splits_id_does_not_depend_on_whether_a_target_kept_its_types(tmp_path):
+    """Found in review: a split's target now keeps its argument types, and the id
+    computed from it changed for the same file. The id is over the flattened
+    target, as it was before, so a file prepared by main and by this version
+    identifies the same split."""
+    from litetune.evaluate import load_split
+
+    typed = tmp_path / "typed.jsonl"
+    typed.write_text('{"prompt": "p", "target": {"name": "f", "args": {"n": 3}}}\n')
+    flat = tmp_path / "flat.jsonl"
+    flat.write_text('{"prompt": "p", "target": {"name": "f", "args": {"n": "3"}}}\n')
+
+    assert load_split(typed).id == load_split(flat).id
+
+
+DECLS = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]
+
+
+def test_the_reference_backend_hands_the_declarations_to_its_script(monkeypatch):
+    """Found in review: removing the declarations from the reference's spec left
+    every test green, and the reference was then measured on a bare prompt while
+    the candidate's runtime rendered the tool list."""
+    specs: list[dict] = []
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text())
+        specs.append(spec)
+        Path(spec["out"]).write_text(json.dumps({"index": 0, "text": "x"}) + "\n")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    HuggingFaceBackend(
+        model="org/m", auto_provision=False, runtime_rendered=True, declarations=DECLS
+    ).generate(["a"])
+
+    assert specs[0]["tools"] == DECLS
+
+
+def test_the_reference_script_renders_the_prompt_with_the_declarations(tmp_path, monkeypatch):
+    """The script side of the same wiring: the spec's tools reach the chat
+    template the reference generates from."""
+    import sys
+    import types
+
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+
+    rendered: list[str] = []
+
+    class Ids(list):
+        shape = (1, 1)
+
+        def to(self, device):
+            return self
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=False, tools=None
+        ):
+            text = (
+                "".join(f"decl:{t['function']['name']} " for t in (tools or []))
+                + messages[0]["content"]
+            )
+            rendered.append(text)
+            return text
+
+        def __call__(self, text, return_tensors=None, add_special_tokens=True):
+            return _Encoded({"input_ids": Ids([[5]])})
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "answer"
+
+    class _Encoded(dict):
+        def to(self, device):
+            return self
+
+    class Model:
+        def eval(self):
+            return self
+
+        def to(self, device):
+            return self
+
+        def generate(self, **kwargs):
+            return [[5, 6]]
+
+    class NoGrad:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    torch = types.SimpleNamespace(
+        float32="float32",
+        cuda=types.SimpleNamespace(is_available=lambda: False),
+        no_grad=NoGrad,
+    )
+    transformers = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda model: Tokenizer()),
+        AutoModelForCausalLM=types.SimpleNamespace(from_pretrained=lambda *a, **k: Model()),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    spec = tmp_path / "spec.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "model": "org/m",
+                "prompts": ["hi"],
+                "runtime_rendered": True,
+                "tools": DECLS,
+                "attn_implementation": "eager",
+                "max_tokens": 4,
+                "out": str(tmp_path / "out.jsonl"),
+                "run_report": str(tmp_path / "report.json"),
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "argv", ["generate.py", str(spec)])
+    namespace: dict = {"__name__": "hf_script_under_test"}
+    exec(compile(_HF_GENERATE_SCRIPT, "hf_script_under_test", "exec"), namespace)  # noqa: S102
+
+    assert namespace["main"]() == 0
+    assert rendered == ["decl:open_app hi"]

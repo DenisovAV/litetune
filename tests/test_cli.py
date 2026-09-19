@@ -24,10 +24,18 @@ from litetune.verify import BackendPair, Status
 
 @pytest.fixture
 def fake_backends(monkeypatch):
-    """Install canned backends behind the CLI's own construction path."""
+    """Install canned backends behind the CLI's own construction path.
+
+    The signature follows `build_backends`, including the declarations it is
+    handed: a double that takes fewer arguments than the function it replaces
+    fails at the call rather than at the behaviour, and says nothing about
+    either. These backends ignore the declarations deliberately -- the tests
+    using this fixture are about what the manifest records, and the rendering
+    they would feed is covered where the renderer itself is.
+    """
 
     def install(candidate_texts, reference_texts):
-        def build(request):
+        def build(request, declarations=None):
             return BackendPair(
                 candidate=FakeBackend(texts=candidate_texts),
                 reference=FakeBackend(model=request.reference, texts=reference_texts),
@@ -185,6 +193,99 @@ def test_without_the_flag_the_default_limit_is_unchanged():
 
     assert args.max_tokens is None
     assert GREEDY.max_tokens == 256
+
+
+def _captured_request(monkeypatch, entry_point: str, argv: list[str]):
+    """Drive one stage's CLI function and return the request it was given.
+
+    Through the stage's own `_verify`/`_prepare` rather than around it: asserting
+    on the parsed namespace would pass while the flag never reached the request,
+    which is the whole thing these tests exist to catch.
+    """
+    import litetune.cli as cli
+
+    seen: dict[str, object] = {}
+
+    def capture(request, **kwargs):
+        seen["request"] = request
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli, entry_point, capture)
+    args = cli.build_parser().parse_args(argv)
+    with pytest.raises(SystemExit):
+        {"run_verify": cli._verify, "prepare": cli._prepare}[entry_point](args)
+    return seen["request"]
+
+
+_VERIFY_ARGV = ["verify", "--model", "m.litertlm", "--reference", "r", "--data", "d.jsonl"]
+_PREPARE_ARGV = ["prepare", "--data", "d.jsonl", "--output-dir", "out", "--context-length", "1024"]
+
+
+def test_verify_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
+    """The flag exists so `verify` can refuse a set the checkpoint did not train
+    on. It cannot refuse what never reached it."""
+    decls = tmp_path / "declarations.json"
+
+    request = _captured_request(
+        monkeypatch, "run_verify", [*_VERIFY_ARGV, "--declarations", str(decls)]
+    )
+
+    assert request.declarations == decls
+
+
+def test_prepare_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
+    decls = tmp_path / "declarations.json"
+
+    request = _captured_request(
+        monkeypatch, "prepare", [*_PREPARE_ARGV, "--declarations", str(decls)]
+    )
+
+    assert request.declarations == decls
+
+
+def test_tune_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
+    from litetune import cli
+    from litetune.checks import CheckSet
+    from litetune.tune import TuneResult
+
+    decls = tmp_path / "declarations.json"
+    seen = {}
+
+    def fake_run_tune(request, events=None):
+        seen["request"] = request
+        return TuneResult(request=request, checks=CheckSet(name="train"))
+
+    monkeypatch.setattr(cli, "run_tune", fake_run_tune)
+    main(
+        [
+            "tune",
+            "--model",
+            "m",
+            "--data",
+            str(tmp_path / "d.jsonl"),
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--declarations",
+            str(decls),
+        ]
+    )
+
+    assert seen["request"].declarations == decls
+
+
+@pytest.mark.parametrize(
+    "stage, argv",
+    [("verify", _VERIFY_ARGV), ("prepare", _PREPARE_ARGV), ("tune", ["tune", "--model", "m"])],
+)
+def test_declarations_are_optional_and_nothing_stands_in_for_them(stage, argv):
+    """Absent is not a default that stands in for something: no stage invents a
+    tool list the caller did not give it."""
+    from litetune.cli import build_parser
+
+    full = argv if stage != "tune" else [*argv, "--data", "d.jsonl", "--output-dir", "out"]
+    args = build_parser().parse_args(full)
+
+    assert args.declarations is None
 
 
 def test_verify_runs_standalone_and_prints_a_result(tmp_path, capsys, write_split, fake_backends):
@@ -718,6 +819,39 @@ def test_prepare_on_a_file_that_is_not_there_makes_no_claim(tmp_path, capsys):
     assert "no claim is made about the model" in capsys.readouterr().err
 
 
+def test_prepare_refuses_a_declarations_file_rather_than_crashing(tmp_path, capsys):
+    """Found in review: `DeclarationsError` was not a refusal, so a file with a
+    shape the renderers disagree on printed a traceback and "could not complete
+    the run", burying the sentence that says what to change."""
+    bad = tmp_path / "tools.json"
+    bad.write_text(
+        '[{"type": "function", "function": {"name": "t", "description": "d",'
+        ' "parameters": {"type": "object", "properties": {"x": {"type": "string",'
+        ' "description": "d", "nullable": true}}}}}]',
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "prepare",
+            "--data",
+            str(_dataset(tmp_path)),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--context-length",
+            "1024",
+            "--declarations",
+            str(bad),
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert code == 4
+    assert "carries ['nullable']" in err
+    assert "Traceback" not in err
+    assert "could not complete the run" not in err
+
+
 # -- bundle -----------------------------------------------------------------
 
 
@@ -726,7 +860,17 @@ def deliverable(tmp_path):
     model = tmp_path / "model.litertlm"
     model.write_bytes(b"weights")
     declarations = tmp_path / "tools.json"
-    declarations.write_text(json.dumps([{"name": "change_background_color"}]), encoding="utf-8")
+    declarations.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "change_background_color", "description": "d"},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
     return model, declarations
 
 
@@ -1709,3 +1853,145 @@ def test_convert_help_names_the_recipe_litetune_defines(capsys):
     # The catalogue's own one-line description reaches the user, the way the
     # scorer help is held to `SCORERS`' `describes`.
     assert "int4 weights in blocks of 32 with int8 embeddings" in out
+
+
+def test_bundle_takes_the_declarations_digest_from_the_training_record(tmp_path, deliverable):
+    """`tune` records which declarations the model was trained against. A
+    bundle given those carries that digest in its contract."""
+    from litetune.storage import hash_file
+
+    model, declarations = deliverable
+    metrics = _train_metrics(tmp_path, declarations_sha256=hash_file(declarations))
+
+    main(_bundle_argv(tmp_path, model, declarations, "--train-metrics", str(metrics)))
+
+    contract = json.loads((tmp_path / "bundle" / "contract.json").read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == hash_file(declarations)
+
+
+def test_bundle_refuses_declarations_the_model_was_not_trained_against(
+    tmp_path, deliverable, capsys
+):
+    """The same weights against a different tool list are a different model to
+    the caller. The training record says which list; a bundle shipping another
+    is refused rather than packaged."""
+    model, declarations = deliverable
+    metrics = _train_metrics(tmp_path, declarations_sha256="sha256:" + "0" * 64)
+
+    code = main(_bundle_argv(tmp_path, model, declarations, "--train-metrics", str(metrics)))
+
+    assert code != 0
+    report = json.loads((tmp_path / "bundle" / "report.json").read_text(encoding="utf-8"))
+    failed = [c for c in report["checks"]["checks"] if c["outcome"] == "failed"]
+    assert any("different tool list" in c["detail"] for c in failed)
+
+
+def test_the_summary_says_which_path_ran_and_prints_both_modes():
+    """Found in review: the grammar-off number was printed as "candidate", the
+    grammar-on number and the grammar's effect not at all, and nothing said which
+    path had run."""
+    from litetune.cli import summarise
+
+    def score(value):
+        return {"score": {"exact_match": {"value": value, "ci95": 0.02, "n": 640}}}
+
+    lines = summarise(
+        {
+            "status": "passed",
+            "harness": {"tool_path_selection": {"tool_path": True, "why": "w"}},
+            "tool_path": {
+                "modes": {"unconstrained": score(0.9125), "constrained": score(0.7422)},
+                "grammar_effect": {
+                    "available": True,
+                    "value": 0.17,
+                    "ci95": 0.03,
+                    "resolved": True,
+                },
+            },
+        }
+    )
+    text = "\n".join(lines)
+
+    assert "path: tool path" in text
+    assert "grammar off: the candidate above, the runtime's default: 0.9125" in text
+    assert "grammar on: what an application that enables it gets: 0.7422" in text
+    # Grammar on scored lower, so the grammar lowered the score; the manifest's
+    # +0.17 printed bare read as a gain.
+    assert "grammar_effect: the grammar lowered the score by 0.1700" in text
+
+
+@pytest.mark.parametrize(
+    "value, said",
+    [
+        (0.17, "the grammar lowered the score by 0.1700 ±0.0300"),
+        (-0.05, "the grammar raised the score by 0.0500 ±0.0300"),
+        # Found in review: the measured run's case printed "did not change the
+        # score by 0.0000".
+        (0.0, "the grammar did not change the score ±0.0300"),
+    ],
+)
+def test_the_grammar_effect_says_which_way_it_moved_the_score(value, said):
+    from litetune.cli import summarise
+
+    lines = summarise(
+        {
+            "status": "passed",
+            "tool_path": {
+                "grammar_effect": {
+                    "available": True,
+                    "value": value,
+                    "ci95": 0.03,
+                    "resolved": False,
+                }
+            },
+        }
+    )
+
+    assert f"grammar_effect: {said}  (unresolved at this sample size)" in "\n".join(lines)
+
+
+def test_the_summary_says_when_the_grammar_on_run_was_not_made():
+    from litetune.cli import summarise
+
+    lines = summarise(
+        {
+            "status": "passed",
+            "harness": {"tool_path_selection": {"tool_path": False, "why": "w"}},
+            "tool_path": {
+                "modes": {
+                    "unconstrained": {
+                        "score": {"exact_match": {"value": 0.9, "ci95": 0.02, "n": 640}}
+                    },
+                    "constrained": {"available": False, "reason": "no SentencePiece tokenizer"},
+                },
+                "grammar_effect": {"available": False, "reason": "not measured"},
+            },
+        }
+    )
+    text = "\n".join(lines)
+
+    assert "path: text path" in text
+    assert "grammar on: not measured" in text
+    # Found in review: the grammar-off line said "the candidate above" when no
+    # candidate line had been printed; a mode not measured is named alone.
+    off = summarise(
+        {
+            "status": "failed_harness",
+            "tool_path": {"modes": {"unconstrained": {"available": False, "reason": "r"}}},
+        }
+    )
+    assert "  grammar off: not measured — r" in off
+    assert "no SentencePiece tokenizer" in text
+    assert "grammar_effect" not in text
+
+
+def test_the_verify_declarations_help_says_which_checkpoints_need_them():
+    """Found in review: it said any checkpoint that recorded declarations needs
+    them; only a runtime_rendered one does."""
+    from litetune.cli import build_parser
+
+    verify = build_parser()._subparsers._group_actions[0].choices["verify"]
+    (action,) = [a for a in verify._actions if "--declarations" in a.option_strings]
+
+    assert "runtime_rendered checkpoint recorded declarations" in action.help
+    assert "A prerendered checkpoint's prompts carry the tool list already" in action.help
