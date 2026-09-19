@@ -5,7 +5,7 @@ Newest first. Full notes for each release are on
 
 ## 0.1.7 — 2026-09-19
 - **Re-prepare and re-train any FunctionGemma tool-call split made with 0.1.6 or earlier** — its calls carry no call markers, so the runtime's tool path returns no call (#41).
-- **Re-run any `runtime_rendered` `verify` against a reference whose chat template writes `<bos>` itself, such as Gemma 3** — the reference was prompted with two (#40).
+- **Re-run any `runtime_rendered` `verify` against a reference whose chat template writes `<bos>` itself, such as Gemma 3 and FunctionGemma** — the reference was prompted with two (#40).
 - **Re-train `runtime_rendered` any checkpoint trained `prerendered` on bare prompts that an app serves through its chat template** — neither training nor `verify` saw that template (#40).
 - **Breaking:** `tune` refuses a `--prompt-mode` its training prompts contradict; `--force-prompt-mode` overrides and records it (#40).
 - `--prompt-mode` is optional: `tune` reads it off the prompts, `verify` and `bundle` from the training record, and each refuses a value that disagrees (#40).

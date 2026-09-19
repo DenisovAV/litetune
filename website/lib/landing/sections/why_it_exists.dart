@@ -39,7 +39,10 @@ import '../../theme/brand.dart';
 /// The note under the cards says "at eight bits" because four bits did not
 /// come out small: `MEASUREMENTS.md`'s "What four bits cost" has Gemma 3 270M
 /// at +0.3483 and +0.3200 under the two block-wise recipes, both resolved.
-/// Without the qualifier the note would say the opposite of that table.
+/// Without the qualifier the note would say the opposite of that table. It
+/// says "on CPU" because the same file records the Qwen3 bundles on a
+/// phone as well, where the backend changes the answer: the GPU costs
+/// +0.0483 on the 8-bit bundle where the phone's CPU costs +0.0167.
 ///
 /// The size is in the card name because `models.py` scopes the `gemma-3-text`
 /// family to the 270M and the 1B, and only the 270M was measured. Qwen3's card
@@ -84,9 +87,9 @@ class WhyItExists extends StatelessComponent {
           ]),
           p(classes: 'measured-note', [
             Component.text(
-              'Every conversion measured on CPU. At eight bits the conversion '
-              'cost came out small on all three, and at these sample sizes the '
-              'method is near its limit. Four bits cost Gemma 3 270M far more. ',
+              'Measured on CPU, the conversion cost came out small at eight bits '
+              'on all three, and at these sample sizes the method is near its '
+              'limit. Four bits cost Gemma 3 270M far more. ',
             ),
             a(
               href:
