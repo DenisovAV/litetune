@@ -3,6 +3,22 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.1.7 — 2026-09-19
+- **Re-prepare and re-train any FunctionGemma tool-call split made with 0.1.6 or earlier** — its calls carry no call markers, so the runtime's tool path returns no call (#41).
+- **Re-run any `runtime_rendered` `verify` against a reference whose chat template writes `<bos>` itself, such as Gemma 3** — the reference was prompted with two (#40).
+- **Re-train `runtime_rendered` any checkpoint trained `prerendered` on bare prompts that an app serves through its chat template** — neither training nor `verify` saw that template (#40).
+- **Breaking:** `tune` refuses a `--prompt-mode` its training prompts contradict; `--force-prompt-mode` overrides and records it (#40).
+- `--prompt-mode` is optional: `tune` reads it off the prompts, `verify` and `bundle` from the training record, and each refuses a value that disagrees (#40).
+- `verify` in `runtime_rendered` checks that both sides get the same token ids before it generates (#40).
+- Reasoning blocks are removed from both sides before scoring (#40).
+- Qwen3-0.6B is a checked family, `dynamic_wi4b32_emb8_afp32` is litetune's own recipe, and both are measured on banking77 (#40).
+- Tool declarations are an input to `prepare`, `tune`, `verify` and `bundle`; shapes the runtime and the chat template render differently are refused (#41).
+- `verify` measures a model whose runtime renders its declarations through the runtime's tool path, grammar off and on; a reply the runtime cannot parse is a wrong answer (#41).
+- `tune` refuses a completion the runtime would not read back as its call, and a call to a tool the split does not declare (#41).
+- `bundle` ships declarations in the order the model learned, and refuses a set the training run did not record (#41).
+- Scoring ends a Gemma 4 turn at `<turn|>` and `<|tool_response>`, so the comparisons 0.1.6 refused now run, and bundles list both as stop tokens (#37).
+- The README's NPU mask boundary is per model, not a formula to carry to another (#38).
+
 ## 0.1.6 — 2026-09-13
 - **Re-run any `tune`, `convert` or `verify` done with `PYTHONPATH` set** — it outranked the stage's pinned packages while the manifest named the pin (#33).
 - **Run `litetune env --clean` if `PIP_TARGET`, `PIP_PREFIX` or `PIP_ROOT` was set when a stage first provisioned** — pip installed elsewhere and the environment was marked ready (#33).
