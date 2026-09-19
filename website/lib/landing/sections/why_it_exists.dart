@@ -36,6 +36,11 @@ import '../../theme/brand.dart';
 /// rather than "never answered in the shape the task requires".
 /// `MEASUREMENTS.md` uses the active verb for the same reason.
 ///
+/// The note under the cards says "at eight bits" because four bits did not
+/// come out small: `MEASUREMENTS.md`'s "What four bits cost" has Gemma 3 270M
+/// at +0.3483 and +0.3200 under the two block-wise recipes, both resolved.
+/// Without the qualifier the note would say the opposite of that table.
+///
 /// The size is in the card name because `models.py` scopes the `gemma-3-text`
 /// family to the 270M and the 1B, and only the 270M was measured. Qwen3's card
 /// carries its size because its rule is scoped to the one size that was run.
@@ -79,9 +84,9 @@ class WhyItExists extends StatelessComponent {
           ]),
           p(classes: 'measured-note', [
             Component.text(
-              'Every conversion measured on CPU. Conversion cost came out small '
-              'on all three, and at these sample sizes the method is near its '
-              'limit. ',
+              'Every conversion measured on CPU. At eight bits the conversion '
+              'cost came out small on all three, and at these sample sizes the '
+              'method is near its limit. Four bits cost Gemma 3 270M far more. ',
             ),
             a(
               href:
