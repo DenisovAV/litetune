@@ -648,7 +648,9 @@ phone model, one run per cell, greedy decoding.
 with the dataset's seven tool declarations, converted `dynamic_wi8_afp32`, and
 measured the way an application calls it: `create_conversation(tools=...)`, the
 runtime rendering the declarations and parsing the call itself. Both sides on
-CPU. One run, 2026-09-17.
+CPU. One run, 2026-09-17; a second, every stage from `prepare` on with the code
+that reads a reply the way the runtime does, gave the same number in every cell
+on 2026-09-19.
 
 | | exact match | tool name | arguments | refused by the runtime |
 |---|---|---|---|---|
@@ -700,16 +702,16 @@ measurement could see, because the text scorer finds `call:` anywhere:
   that order.
 - flutter_gemma 1.8.3 renders FunctionGemma's declarations in Dart and does
   not pass them to the runtime, so this is not how it serves this model.
-- No row was refused by the runtime in either mode. Since this run, a row the
+- No row was refused by the runtime in either mode, in either run. A row the
   runtime gives no reply to is scored as a wrong answer when its parser refused
   it or the prompt reached the token limit, and leaves the mode unmeasured for
-  any other reason; neither changes these numbers. The run kept only the first
-  call of each reply, so whether any reply carried two -- now a wrong answer --
-  cannot be read from its rows.
-- The reference was read with the text path's parser, which takes the first
-  call anywhere in the text. It is now read as the runtime reads a reply, only
-  between the call markers and one call to a pair. The run did not keep the
-  reference's texts, so what that does to 0.9250 is not known.
+  any other reason. The second run read every reply whole: none carried two
+  calls, in either mode or in the reference.
+- The first run read the reference with the text path's parser, which takes the
+  first call anywhere in the text. It is now read as the runtime reads a reply,
+  only between the call markers and one call to a pair. The second run kept the
+  reference's texts and read them both ways: 0.9250 either way, and no row reads
+  differently.
 - The untuned base could not be measured through the tool path: converted
   from its Hub id it carries no SentencePiece tokenizer, and litert-lm 0.16.1
   refuses constrained decoding without one. So there is no training gain here.
