@@ -11,6 +11,7 @@ eight confident negatives during the measurement work, so each has its own test.
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,91 @@ def test_runtime_log_lines_are_not_model_output():
 
 def _litertlm(tmp_path: Path, **kwargs) -> LiteRtLmBackend:
     return LiteRtLmBackend(model=tmp_path / "model.litertlm", auto_provision=False, **kwargs)
+
+
+def test_a_generation_with_bytes_that_did_not_decode_is_not_the_model_s_answer(
+    monkeypatch, tmp_path
+):
+    """An undecodable byte is the pipe's failure, and scoring it would be the bug one step on.
+
+    The pipe is read UTF-8 with `errors="surrogateescape"`, so a byte the
+    runtime wrote that is not UTF-8 survives as a lone surrogate instead of
+    raising. Scored, that row is wrong, every liveness check passes, and the
+    loss is reported as a conversion cost -- the shape this path exists to
+    avoid. Through a real child, because the decode is the subject.
+    """
+
+    def wrote_bytes_that_are_not_utf8(self, args, timeout: int = 3600, env=None):
+        return envs._run_guarded(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write('перевод'.encode('cp1251'))",
+            ],
+            timeout=timeout,
+            env=env,
+        )
+
+    monkeypatch.setattr(envs.StageEnv, "run", wrote_bytes_that_are_not_utf8)
+
+    generation = _litertlm(tmp_path).generate(["hello"])[0]
+
+    assert not generation.ok
+    assert generation.harness_error is not None
+    assert "not UTF-8" in generation.harness_error
+    assert generation.text == "", "nothing of it is the model's answer, so none of it is scored"
+
+
+def test_a_generation_that_really_contains_the_replacement_character_is_scored(
+    monkeypatch, tmp_path
+):
+    """U+FFFD is an ordinary character, and a model may write it.
+
+    It is in the vocabulary of every byte-level tokenizer, and a dataset that
+    has been through one lossy decode is full of it. Refusing on U+FFFD --
+    the first shape of this check, which a review caught -- would call such an
+    answer a harness failure, which is the same class of wrong as scoring
+    garbage, pointing the other way.
+    """
+    answer = "the file is named \ufffd, literally"
+
+    def a_real_child(self, args, timeout: int = 3600, env=None):
+        return envs._run_guarded(
+            [sys.executable, "-c", f"print({answer!r})"], timeout=timeout, env=env
+        )
+
+    monkeypatch.setattr(envs.StageEnv, "run", a_real_child)
+
+    generation = _litertlm(tmp_path).generate(["hello"])[0]
+
+    assert generation.ok
+    assert generation.harness_error is None
+    assert generation.text == answer
+
+
+def test_a_non_ascii_generation_survives_the_pipe_end_to_end(monkeypatch, tmp_path):
+    """The claim this path rests on, through a real child and the real pipe.
+
+    Every other test of this backend replaces `StageEnv.run` with a double
+    that hands back a `str`, so the decode boundary -- where the generation
+    actually is -- is never crossed. This one replaces only the environment
+    lookup: `_run_guarded` is real, the child is real, and the host asks for
+    an encoding that cannot hold the answer.
+    """
+    monkeypatch.setenv("PYTHONIOENCODING", "ascii")
+    answer = "перевод — 変換"
+
+    def a_real_child(self, args, timeout: int = 3600, env=None):
+        return envs._run_guarded(
+            [sys.executable, "-c", f"print({answer!r})"], timeout=timeout, env=env
+        )
+
+    monkeypatch.setattr(envs.StageEnv, "run", a_real_child)
+
+    generation = _litertlm(tmp_path).generate(["hello"])[0]
+
+    assert generation.ran
+    assert generation.text == answer
 
 
 def test_argv_pins_the_prompt_construction_mode(tmp_path):

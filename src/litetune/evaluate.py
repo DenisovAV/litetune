@@ -231,6 +231,18 @@ class Generation:
 # `litert-lm` dlopen()s a vulkan-linked library even for the CPU backend; when
 # it is absent every invocation, `--help` included, dies in under a second and
 # looks exactly like a model that cannot generate.
+# What `errors="surrogateescape"` leaves behind: one lone surrogate per byte
+# that was not UTF-8, in a range no correct text can contain. A generation
+# carrying one is a decode that failed, not a model that answered.
+#
+# Deliberately not U+FFFD. `errors="replace"` would write that instead, and
+# U+FFFD is a character a model may generate -- it is in the vocabulary of
+# every byte-level tokenizer, and a dataset that has been through a lossy
+# decode once is full of it. Refusing on U+FFFD would call a real answer a
+# harness failure; a surrogate in this range cannot be anything but a byte
+# that did not decode.
+UNDECODED_BYTE = re.compile("[\udc80-\udcff]")
+
 _HOST_FAILURE_RE = re.compile(
     r"(libvulkan|error while loading shared libraries|cannot open shared object file"
     r"|ModuleNotFoundError|ImportError|command not found|No such file or directory)",
@@ -480,10 +492,31 @@ class LiteRtLmBackend:
                 stderr=proc.stderr[-2000:],
                 harness_error=f"generation host failed to start: {proc.stderr.strip()[-300:]}",
             )
+        text = strip_runtime_noise(proc.stdout or "")
+        undecoded = UNDECODED_BYTE.findall(text)
+        if undecoded:
+            # The pipe is decoded UTF-8 with `errors="surrogateescape"`, so a
+            # byte the runtime wrote that is not UTF-8 survives as a surrogate
+            # rather than raising. Scoring that would be the failure this whole
+            # path exists to avoid, one step further on: the row is wrong,
+            # every liveness check passes, and the loss is reported as a
+            # conversion cost. What the model generated is not in this string.
+            logger.error("prompt %d came back with bytes that are not UTF-8", index)
+            return Generation(
+                index,
+                prompt,
+                returncode=proc.returncode,
+                stderr=(proc.stderr or "")[-2000:],
+                harness_error=(
+                    f"the runtime's output for this prompt was not UTF-8: {len(undecoded)} "
+                    f"byte(s) did not decode, so what it generated is not recoverable from "
+                    f"this run"
+                ),
+            )
         return Generation(
             index,
             prompt,
-            text=strip_runtime_noise(proc.stdout or ""),
+            text=text,
             returncode=proc.returncode,
             stderr=(proc.stderr or "")[-2000:],
         )

@@ -963,6 +963,12 @@ def test_an_unreadable_sidecar_reaches_the_report(tmp_path):
             base_model="google/functiongemma-270m-it",
             output_dir=tmp_path / "out",
             recipes=("dynamic_wi8_afp32",),
+            # Without this the request provisions the real export environment:
+            # `pip install litert-torch-nightly ...` from PyPI, on a test that
+            # only reads a sidecar. The workflow says the suite reaches no
+            # network, and on 3.10 and 3.12 -- where the interpreter ceiling
+            # does not refuse first -- it did.
+            auto_provision=False,
         )
     )
     assert any("could not be read" in line for line in result.limitations)
