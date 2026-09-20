@@ -20,21 +20,12 @@ import '../../theme/brand.dart';
 /// that one run's verdict should not be quoted as the answer. A card is the
 /// shortest place there is to quote a verdict, so it quotes none.
 ///
-/// What each card carries instead is the fact that is unambiguous and belongs
-/// to that run alone. FunctionGemma was also run on a phone, on the same 640
-/// rows, which neither of the others has a counterpart to. Gemma 3 270M's
-/// untuned base could not be scored at all -- it repeated itself on 571 of 600
-/// prompts and `verify` stopped before the quality tier -- which is why its
-/// training gain is unattributable in principle rather than merely unmeasured.
-/// Qwen3 0.6B is the one model here that exported with no per-model flag:
-/// `models.py` had no rule for it until that run established none was needed.
-///
-/// The card says "verify refused" and not "the base could not be scored". The
-/// refusal is the tool doing its job, and the passive form hands the failure
-/// to the model: an exact-match score against those generations would have
-/// been a number near zero, and it would have read as "bad at this task"
-/// rather than "never answered in the shape the task requires".
-/// `MEASUREMENTS.md` uses the active verb for the same reason.
+/// A card carries the model, the scorer and the sample size, and stops there.
+/// It used to carry a third line apiece -- a phone run, a refused base, an
+/// export that needed no flag -- and four cards' worth of those read as
+/// footnotes rather than as one fact each, with nothing shared to compare
+/// across. What is worth saying about a single run is worth a sentence in
+/// `MEASUREMENTS.md`, which the link below the cards goes to.
 ///
 /// The note under the cards says "at eight bits" because four bits did not
 /// come out small: `MEASUREMENTS.md`'s "What four bits cost" has Gemma 3 270M
@@ -42,11 +33,15 @@ import '../../theme/brand.dart';
 /// Without the qualifier the note would say the opposite of that table. It
 /// says "on CPU" because the same file records the Qwen3 bundles on a
 /// phone as well, where the backend changes the answer: the GPU costs
-/// +0.0483 on the 8-bit bundle where the phone's CPU costs +0.0167.
+/// +0.0483 on the 8-bit bundle where the phone's CPU costs +0.0167. And it
+/// ends on the model rather than the family because the same four-bit recipes
+/// cost the 1B 8.83 points against the 270M's 34.83 -- one Gemma 3 rule, two
+/// answers, which is the whole reason a card carries no verdict.
 ///
 /// The size is in the card name because `models.py` scopes the `gemma-3-text`
-/// family to the 270M and the 1B, and only the 270M was measured. Qwen3's card
-/// carries its size because its rule is scoped to the one size that was run.
+/// family to the 270M and the 1B, and both are now measured -- two cards that
+/// differ in nothing but size. Qwen3's card carries its size because its rule
+/// is scoped to the one size that was run.
 class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
@@ -69,27 +64,23 @@ class WhyItExists extends StatelessComponent {
             Component.text('Measured end to end so far'),
           ]),
           div(classes: 'cards', [
+            _card('FunctionGemma 270M', 'tool-call scoring, 640 held-out rows'),
+            _card('Gemma 3 270M', 'exact-text scoring, 600 held-out rows'),
             _card(
-              'FunctionGemma 270M',
-              'tool-call scoring, 640 held-out rows',
-              'Also run on a Snapdragon Galaxy S24.',
-            ),
-            _card(
-              'Gemma 3 270M',
-              'exact-text scoring, 600 held-out rows',
-              'verify refused to score the untuned base at all.',
+              'Gemma 3 1B',
+              'exact-text scoring, the same 600 held-out rows',
             ),
             _card(
               'Qwen3 0.6B',
               'exact-text scoring, the same 600 held-out rows',
-              'Exported with no per-model flag.',
             ),
           ]),
           p(classes: 'measured-note', [
             Component.text(
               'Measured on CPU, the conversion cost came out small at eight bits '
-              'on all three, and at these sample sizes the method is near its '
-              'limit. Four bits cost Gemma 3 270M far more. ',
+              'on all four, and at these sample sizes the method is near its '
+              'limit. Four bits cost more, and how much more depends on the '
+              'model rather than on its family. ',
             ),
             a(
               href:
@@ -103,12 +94,10 @@ class WhyItExists extends StatelessComponent {
     ]);
   }
 
-  static Component _card(String model, String how, String note) =>
-      div(classes: 'card', [
-        div(classes: 'card-model', [Component.text(model)]),
-        div(classes: 'card-how', [Component.text(how)]),
-        div(classes: 'card-note', [Component.text(note)]),
-      ]);
+  static Component _card(String model, String how) => div(classes: 'card', [
+    div(classes: 'card-model', [Component.text(model)]),
+    div(classes: 'card-how', [Component.text(how)]),
+  ]);
 
   @css
   static List<StyleRule> get styles => [
@@ -150,9 +139,6 @@ class WhyItExists extends StatelessComponent {
       '.card-model',
     ).styles(color: Brand.ink, fontSize: 1.05.rem, fontWeight: FontWeight.w500),
     css('.card-how').styles(color: Brand.body, fontSize: 0.9.rem),
-    css(
-      '.card-note',
-    ).styles(color: Brand.muted, fontSize: 0.9.rem, lineHeight: 1.45.em),
     css('.measured-note').styles(
       color: Brand.muted,
       fontSize: 0.9.rem,
