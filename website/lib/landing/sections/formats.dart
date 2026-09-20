@@ -15,8 +15,8 @@ import '../../theme/brand.dart';
 ///
 /// The models row is cut to what was actually run, where cutting is what it
 /// takes. The
-/// qualifier says "Gemma 3 270M" and not "Gemma 3" because `models.py` scopes
-/// `gemma-3-text` to the 270M and the 1B and only the 270M was measured, and
+/// qualifier names the two sizes and not "Gemma 3" because `models.py` scopes
+/// `gemma-3-text` to the 270M and the 1B, and both are now measured, and
 /// the list says "Gemma 3 (text)" for the same reason one level up: that
 /// family rule covers those two sizes and no others. 4B and larger match no
 /// rule at all. They are `Gemma3ForConditionalGeneration` with a vision
@@ -105,8 +105,8 @@ class Formats extends StatelessComponent {
           ),
           span(classes: 'qualifier', [
             Component.text(
-              ' — measured end to end on FunctionGemma, Gemma 3 270M and '
-              'Qwen3 0.6B so far',
+              ' — measured end to end on FunctionGemma, Gemma 3 270M, '
+              'Gemma 3 1B and Qwen3 0.6B so far',
             ),
           ]),
         ]),

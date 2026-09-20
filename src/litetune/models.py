@@ -498,6 +498,15 @@ RULES: tuple[ModelRules, ...] = (
         # recognise") that is untrue of them. Multimodal export is not
         # something this project has run, and a family rule is a claim to have
         # checked. They fall through to the unknown-family note instead.
+        #
+        # Both sizes have now been run end to end on banking77, each exported
+        # with this override added by litetune and each with a conversion cost
+        # in MEASUREMENTS.md; the 1B on 2026-09-19, which is the run that first
+        # exercised the flag at that size. The rule had claimed the 1B on the
+        # strength of the 270M until then. What the 1B run adds is that the
+        # claim held, and that the two sizes answer differently at four bits --
+        # 8.83 points against 34.83 -- which is a fact about the model rather
+        # than about this rule.
         patterns=(r"gemma-?3-270m", r"gemma-?3-1b"),
         required_flags=(
             RequiredFlag(
