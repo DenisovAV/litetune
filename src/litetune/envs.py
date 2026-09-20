@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import selectors
 import shutil
 import signal
@@ -176,6 +177,48 @@ _HOST_OVERRIDES = (
 # the pipe with `errors="surrogateescape"`, so the two agree: neither side
 # raises on text the other could not represent.
 _CHILD_TEXT = (("PYTHONUTF8", "1"), ("PYTHONIOENCODING", "utf-8:surrogateescape"))
+
+
+# pip's two spellings of "there is no such distribution for this machine", and
+# the package name it was looking for. `pip install` prints one of these and
+# exits 1 without touching the network again, so the message a user gets for a
+# package that exists but is not built for their platform reads the same as one
+# for a package that does not exist at all.
+def _canonical(name: str) -> str:
+    """A distribution name in the one spelling that compares equal.
+
+    `litert_converter`, `litert.converter` and `LiteRT-Converter` are the same
+    project: PyPA's name specification normalises runs of `-`, `_` and `.` to a
+    single `-` and lowercases. pip prints whichever spelling the requirement
+    used, so a comparison against a literal has to normalise or it silently
+    misses.
+    """
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+_NO_DISTRIBUTION = re.compile(
+    r"(?:Could not find a version that satisfies the requirement|"
+    r"No matching distribution found for)\s+([A-Za-z0-9._-]+)"
+)
+
+# What to say when the missing distribution is the converter. Read off pip's
+# output rather than `sys.platform`, on purpose: the day `litert-converter`
+# publishes a wheel for a platform it does not build for today, this stops
+# firing on its own. A check on the platform would go on refusing until
+# somebody edited it, which is the failure mode of every hardcoded
+# compatibility table.
+_CONVERTER_PACKAGES = ("litert-converter",)
+_CONVERTER_UNAVAILABLE = (
+    "{package} has no distribution for this machine, and `convert` cannot run without it: it is "
+    "the MLIR converter that turns a checkpoint into a `.tflite`. Its releases carry wheels for "
+    "manylinux x86_64 and macOS on Apple Silicon and no source distribution, so Windows, ARM "
+    "Linux and Intel macOS have nothing to install -- upstream tracks it as "
+    "google-ai-edge/litert-torch#968. Nothing else in litetune needs it: `prepare`, `tune`, "
+    "`verify` and `bundle` install everywhere their own pins do. Convert on a machine that has "
+    "it (a Linux box, WSL2, Colab) and bring the `.litertlm` back -- `verify` takes it with the "
+    "float checkpoint it came from and asks nothing of this environment"
+)
+
 
 # How long to wait for the pipes after killing a process group. A grandchild
 # that called `setsid()` itself escapes the group, and if it still holds the
@@ -1879,20 +1922,7 @@ class StageEnv:
                         "itself); the install may be waiting on the network"
                     ) from None
                 if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"could not provision environment {self.name!r} on "
-                        f"{sys.platform}/python{sys.version_info.major}."
-                        f"{sys.version_info.minor}. It pins {', '.join(self.requirements)}"
-                        + (
-                            " and needs the system package(s) "
-                            + ", ".join(self.system_requirements)
-                            if self.system_requirements
-                            else ""
-                        )
-                        + ". The export and runtime toolchains are published for Linux; on "
-                        "other platforms the install fails here rather than later. pip "
-                        f"said:\n{proc.stderr[-2000:]}"
-                    )
+                    raise RuntimeError(self._provisioning_failed(proc.stderr))
                 # Written last, and the only thing `ready` consults: an
                 # environment interrupted anywhere above this line has no
                 # marker, so the next run rebuilds it instead of trusting a
@@ -1920,6 +1950,41 @@ class StageEnv:
         if events:
             events.note(f"environment {self.name!r} ready at {self.path}")
         return self.path
+
+    def _provisioning_failed(self, stderr: str) -> str:
+        """Why the install failed, in the terms the reader can act on.
+
+        A missing distribution is a different fact from a broken install, and
+        it is the one this project meets: a pin that exists on PyPI but is not
+        built for this machine. pip says so in one line and then prints its
+        resolution trace, so without this the reader gets 2000 characters of
+        pip and has to find that line themselves.
+        """
+        missing = _NO_DISTRIBUTION.search(stderr or "")
+        package = missing.group(1) if missing else None
+        detail = (
+            f"could not provision environment {self.name!r} on "
+            f"{sys.platform}/python{sys.version_info.major}.{sys.version_info.minor}. "
+            f"It pins {', '.join(self.requirements)}"
+        )
+        if self.system_requirements:
+            # Named as what they are: Debian package names, which is the only
+            # spelling this project has checked. Printing them unqualified on
+            # macOS or Windows reads as an instruction that cannot be followed.
+            detail += " and needs the Debian package(s) " + ", ".join(self.system_requirements)
+        if package and _canonical(package) in _CONVERTER_PACKAGES:
+            return (
+                f"{detail}. {_CONVERTER_UNAVAILABLE.format(package=package)}. pip said:\n"
+                f"{(stderr or '')[-2000:]}"
+            )
+        if package:
+            return (
+                f"{detail}. pip found no distribution of {package} for this machine: a pin can "
+                f"exist on PyPI and still publish no wheel for this platform, Python version or "
+                f"architecture, and with no source distribution there is nothing to build "
+                f"either. pip said:\n{(stderr or '')[-2000:]}"
+            )
+        return f"{detail}. pip said:\n{(stderr or '')[-2000:]}"
 
     def run(
         self,

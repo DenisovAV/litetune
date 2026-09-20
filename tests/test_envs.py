@@ -3592,3 +3592,90 @@ def test_a_stage_pipe_carries_a_non_ascii_generation_whole(monkeypatch, tmp_path
 
     assert result.returncode == 0, result.stderr[-300:]
     assert result.stdout.strip() == answer
+
+
+def test_a_pin_with_no_wheel_for_this_machine_is_named_as_that():
+    """pip's "no matching distribution" is a different fact from a broken install.
+
+    A pin can exist on PyPI and publish nothing for this platform, Python
+    version or architecture. Without this the reader gets 2000 characters of
+    pip's resolution trace and has to find the one line that says so.
+    """
+    message = envs.EXPORT._provisioning_failed(
+        "ERROR: No matching distribution found for nosuchpkg==1.0"
+    )
+
+    assert "no distribution of nosuchpkg for this machine" in message
+    assert "litert-torch#968" not in message, "only the converter gets the converter's answer"
+
+
+def test_the_missing_converter_is_explained_rather_than_dumped():
+    """The one pin this project knows has no wheel for three platforms.
+
+    Read off pip's output rather than `sys.platform`: the day `litert-converter`
+    publishes a wheel for a platform it does not build for today, this stops
+    firing without anyone editing a table.
+    """
+    for said in (
+        "ERROR: Could not find a version that satisfies the requirement "
+        "litert-converter>=0.0.0.dev0 (from versions: none)",
+        "ERROR: No matching distribution found for litert_converter",
+    ):
+        message = envs.EXPORT._provisioning_failed(said)
+
+        assert "convert` cannot run without it" in message
+        assert "litert-torch#968" in message
+        assert "verify" in message, "the reader is told what still works and how to use it"
+
+
+def test_the_converter_is_recognised_in_any_spelling_of_its_name():
+    """`litert_converter` and `litert.converter` are the same project.
+
+    PyPA's name specification normalises runs of `-`, `_` and `.` to one `-`,
+    and pip prints whichever spelling the requirement used -- so a comparison
+    against a literal misses two thirds of the time without normalising.
+    """
+    for spelling in (
+        "litert-converter",
+        "litert_converter",
+        "litert.converter",
+        "LiteRT-Converter",
+    ):
+        message = envs.EXPORT._provisioning_failed(
+            f"ERROR: No matching distribution found for {spelling}>=0.0.0.dev0"
+        )
+        assert "litert-torch#968" in message, spelling
+
+
+def test_the_converter_message_keeps_what_pip_said_too():
+    """The explanation replaces reading pip's trace, not having it.
+
+    The resolver's own output carries the index it consulted and the versions
+    it saw, which is what tells a reader whether they were pointed at a
+    private mirror.
+    """
+    message = envs.EXPORT._provisioning_failed(
+        "ERROR: No matching distribution found for litert-converter\n"
+        "Looking in indexes: https://example.invalid/simple"
+    )
+
+    assert "litert-torch#968" in message
+    assert "example.invalid" in message
+
+
+def test_an_unrecognised_pip_failure_still_hands_over_what_pip_said():
+    """No pattern matched is not a reason to hide the output."""
+    message = envs.EXPORT._provisioning_failed("ERROR: something else went wrong")
+
+    assert "something else went wrong" in message
+
+
+def test_a_system_package_is_named_as_the_debian_package_it_is():
+    """`libvulkan1` is a Debian name, printed on every platform.
+
+    Unqualified, it reads as an instruction a macOS or Windows reader cannot
+    follow, in the message that is already telling them their install failed.
+    """
+    message = envs.EXPORT._provisioning_failed("ERROR: something else went wrong")
+
+    assert "Debian package(s) libvulkan1" in message
