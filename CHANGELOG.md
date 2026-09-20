@@ -3,6 +3,16 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.1.8 — 2026-09-20
+- **Re-run any `verify` whose host does not default to UTF-8 — Windows always, POSIX with a locale like `en_US.ISO8859-1`** — the runtime's generations were decoded in the host's encoding, so a non-ASCII answer scored as a wrong one (#44).
+- **Re-make any bundle or split written on Windows** — text writes turned LF into CRLF, so a bundle's declarations did not hash to its own contract and a split's `content_sha256` differed from the same rows elsewhere (#44).
+- **Re-run any stage that crashed on Windows and was reported as a failed model** — an exit code carrying a terminating NTSTATUS is now read as a kill, which is `could not check` (#44).
+- A generation whose bytes did not decode is a harness error, not a scored answer; U+FFFD from the model still scores (#44).
+- Stage subprocesses are given UTF-8 on both sides of the pipe, and a host value that would decide it is replaced and said (#44).
+- `prepare`, `tune`, `verify` and `bundle` run on Windows; `convert` cannot, and the refusal now names `litert-converter` and what to do instead (#45).
+- A failed install names the distribution pip could not find rather than printing its trace (#45).
+- `gemma-3-1b-it` on banking77, measured: four bits cost it 8.83 points against the 270M's 34.83 (#43).
+
 ## 0.1.7 — 2026-09-19
 - **Re-prepare and re-train any FunctionGemma tool-call split made with 0.1.6 or earlier** — its calls carry no call markers, so the runtime's tool path returns no call (#41).
 - **Re-run any `runtime_rendered` `verify` against a reference whose chat template writes `<bos>` itself, such as Gemma 3 and FunctionGemma** — the reference was prompted with two (#40).
