@@ -491,7 +491,7 @@ def test_an_invalid_byte_ahead_of_the_answer_does_not_crash_the_run(probe_env):
 
     No mock of `StageEnv.run`: the fake "python" below is a real executable at
     the real path `run` looks for, so this exercises the actual
-    `errors="replace"` decode the fix lives in, not a
+    `errors="surrogateescape"` decode the fix lives in, not a
     stand-in that hands back an already-decoded string and could not have
     caught the regression.
     """
@@ -515,7 +515,7 @@ def test_an_invalid_byte_ahead_of_the_answer_does_not_crash_the_run(probe_env):
 
 
 def test_a_decode_error_out_of_env_run_does_not_escape_resolve_device(probe_env, monkeypatch):
-    """The other half of the same fix, pinned independently of `errors="replace"`.
+    """The other half of the same fix, pinned independently of the decode's error handler.
 
     `env.run` no longer raises `UnicodeDecodeError` for this, but
     `resolve_device`'s own contract -- it never raises -- must not depend on
@@ -1675,10 +1675,17 @@ def test_the_exception_is_used_when_the_popen_kept_nothing(monkeypatch):
 
 def test_bytes_from_a_text_mode_pipe_are_decoded():
     """`_check_timeout` attaches the raw chunks without decoding, even in text
-    mode, so the decode has to happen on the way out."""
+    mode, so the decode has to happen on the way out.
+
+    A byte that is not UTF-8 survives as the lone surrogate `surrogateescape`
+    gives it, the same handler the pipe itself is opened with: `replace` would
+    write U+FFFD, and U+FFFD is a character a model may legitimately generate,
+    so erasing the difference costs `evaluate` the one signal that says this
+    text never decoded.
+    """
     assert envs._as_text(None) == ""
     assert envs._as_text("already text") == "already text"
-    assert envs._as_text(b"a \xff byte") == "a � byte"
+    assert envs._as_text(b"a \xff byte") == "a \udcff byte"
 
 
 def test_every_variable_the_comment_argues_for_is_actually_dropped():
@@ -3423,3 +3430,165 @@ def test_a_grandchild_is_collected_after_its_parent_has_exited(tmp_path, monkeyp
     time.sleep(0.3)
     with pytest.raises(ProcessLookupError):
         os.killpg(pgid, 0)
+
+
+def test_a_stage_pipe_is_decoded_as_utf8_whatever_the_host_calls_its_encoding(monkeypatch):
+    """The generation comes back through this pipe, so the locale must not shape it.
+
+    `text=True` alone decodes with the locale's encoding -- the ANSI code page
+    on Windows -- and `evaluate.LiteRtLmBackend` reads the model's own answer
+    off that stream. A character outside the page then arrives mangled, the
+    row scores wrong, and the loss is reported as a conversion cost. Pinned as
+    the argument rather than as behaviour because there is no CI runner whose
+    locale is not already UTF-8: the point is that litetune does not ask.
+    """
+    started = {}
+
+    def capture(argv, **kwargs):
+        started.update(kwargs)
+        return _FakePopen()
+
+    monkeypatch.setattr(envs.subprocess, "Popen", capture)
+    envs._run_guarded(["python", "-c", "pass"], timeout=5)
+
+    assert started.get("encoding") == "utf-8"
+    assert started.get("errors") == "surrogateescape", (
+        "a byte that is not UTF-8 must neither raise out of the decode nor be erased: "
+        "U+FFFD is a character a model may write, a lone surrogate is not"
+    )
+
+
+def test_a_stage_child_writes_utf8_whatever_the_host_calls_its_encoding():
+    """The other half: the child has to be able to write what the parent reads.
+
+    A Python child writing to a pipe encodes with its own locale, and the
+    runtime CLI that prints a generation catches the resulting
+    `UnicodeEncodeError` itself, prints an apology and exits zero -- which
+    litetune would score as the model's answer.
+    """
+    env = envs._child_env()
+
+    assert env["PYTHONUTF8"] == "1"
+    assert env["PYTHONIOENCODING"].startswith("utf-8")
+
+
+def test_the_child_s_error_handler_matches_the_parent_s():
+    """`utf-8` with no handler means `strict`, where UTF-8 mode means `surrogateescape`.
+
+    Measured on 3.12. Strict would make a child raise on a lone surrogate --
+    a path that came back through `os.fsdecode`, a filename in a traceback --
+    and the runtime CLI catches that, prints an apology and exits zero, which
+    is the failure this pair exists to prevent. The parent reads the pipe with
+    `errors="surrogateescape"`, so neither side raises on what the other cannot hold.
+    """
+    assert envs._child_env()["PYTHONIOENCODING"] == "utf-8:surrogateescape"
+
+
+def test_a_host_cannot_choose_the_encoding_a_measurement_comes_back_in(monkeypatch):
+    """`PYTHONIOENCODING` wins over UTF-8 mode, so setting the mode is not enough.
+
+    Measured on CPython 3.12: `PYTHONUTF8=1 PYTHONIOENCODING=cp1252` gives
+    `sys.stdout.encoding == "cp1252"`. A host that carries either variable
+    would otherwise decide what a generation looks like by the time litetune
+    scores it -- the same argument `_HOST_OVERRIDES` makes about the pins,
+    about the one value that cannot be recovered afterwards.
+    """
+    monkeypatch.setenv("PYTHONUTF8", "0")
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+
+    env = envs._child_env()
+
+    assert env["PYTHONUTF8"] == "1"
+    assert env["PYTHONIOENCODING"].startswith("utf-8")
+
+
+def test_a_host_value_a_caller_asked_for_is_not_reported_as_dropped(monkeypatch, caplog):
+    """The warning names what was taken away, and an override was not taken away.
+
+    The drop warning beside it has excluded `overrides` since it was written,
+    for the same reason: a caller who asked for this value gets it, so saying
+    it was not passed states the opposite of what happens.
+    """
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    envs.forget_reported_drops()
+
+    with caplog.at_level("WARNING"):
+        env = envs._child_env({"PYTHONIOENCODING": "cp1252"})
+
+    assert env["PYTHONIOENCODING"] == "cp1252"
+    assert "not passing PYTHONIOENCODING" not in caplog.text, (
+        "the drop warning must not name a key the caller chose; the override warning, "
+        "which says something else and is tested next door, may"
+    )
+
+
+def test_the_warning_names_the_host_encoding_it_replaced_once(monkeypatch, caplog):
+    """Said out loud, and said once.
+
+    `_child_env` runs per prompt during evaluation, so a per-call warning is
+    several hundred identical lines through a progress report -- the reason
+    `_REPORTED_DROPS` exists for the drop beside this one.
+    """
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    envs.forget_reported_drops()
+
+    with caplog.at_level("WARNING"):
+        envs._child_env()
+        envs._child_env()
+
+    assert caplog.text.count("not passing PYTHONIOENCODING") == 1
+
+
+def test_an_override_that_splits_the_two_sides_is_said_out_loud(caplog):
+    """The parent's pipe is UTF-8 whatever the child is told.
+
+    A caller may still choose -- every override may -- but choosing another
+    encoding for the child alone is mojibake in a scored generation, and that
+    is worth hearing before the numbers rather than from them.
+    """
+    with caplog.at_level("WARNING"):
+        env = envs._child_env({"PYTHONIOENCODING": "cp1252"})
+
+    assert env["PYTHONIOENCODING"] == "cp1252"
+    assert "PYTHONIOENCODING=cp1252 was overridden" in caplog.text
+
+
+def test_an_override_that_keeps_utf8_is_not_warned_about(caplog):
+    """Only a different codec splits the two sides.
+
+    `PYTHONIOENCODING` wins over UTF-8 mode, so overriding `PYTHONUTF8` alone
+    leaves the child writing UTF-8; naming the same codec another way, or
+    choosing another error handler, changes what the child does with text it
+    cannot encode and not the bytes the parent reads.
+    """
+    with caplog.at_level("WARNING"):
+        envs._child_env({"PYTHONUTF8": "0"})
+        envs._child_env({"PYTHONIOENCODING": "UTF8"})
+        envs._child_env({"PYTHONIOENCODING": "utf-8:strict"})
+
+    assert "was overridden" not in caplog.text
+
+
+def test_a_caller_can_still_choose_the_child_s_encoding():
+    """Set, not imposed: `overrides` are applied after, as they are for every other key."""
+    env = envs._child_env({"PYTHONUTF8": "0"})
+
+    assert env["PYTHONUTF8"] == "0"
+
+
+def test_a_stage_pipe_carries_a_non_ascii_generation_whole(monkeypatch, tmp_path):
+    """The round trip through a real child, with the host asking for something else.
+
+    Without `PYTHONIOENCODING=ascii` this passes on any machine litetune is
+    developed on, fix or no fix: the host is UTF-8 already, so the child
+    encodes UTF-8 by default and the parent decodes it. Forcing the host is
+    what makes it a test of litetune rather than of the laptop -- reverted,
+    the child dies of `UnicodeEncodeError` and this comes back empty.
+    """
+    monkeypatch.setenv("PYTHONIOENCODING", "ascii")
+    answer = "перевод — 変換 — ✅"
+
+    result = envs._run_guarded([sys.executable, "-c", f"print({answer!r})"], timeout=30)
+
+    assert result.returncode == 0, result.stderr[-300:]
+    assert result.stdout.strip() == answer

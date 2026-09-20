@@ -1455,3 +1455,37 @@ def test_a_link_to_a_directory_where_the_declarations_go_is_replaced(tmp_path, r
 
     assert check_named(result, "declarations included").outcome is Outcome.PASSED
     assert elsewhere.is_dir() and not any(elsewhere.iterdir())
+
+
+def test_the_shipped_declarations_hash_to_the_contract_on_a_platform_that_rewrites_newlines(
+    tmp_path, request_for, windows_text_writes
+):
+    """The contract's digest is of the text; the file must be those bytes.
+
+    `contract.declarations_sha256` is `declarations.content_digest`, taken over
+    the canonical text in memory, and the module says in so many words that a
+    shipped file's bytes hash to it. A text write that translates `\n` --
+    which is what `open()` does on Windows unless told otherwise -- breaks that
+    silently: the bundle still reports `passed`, and `report.json` and
+    `contract.json` then carry two different digests for one file.
+    """
+    result = build_bundle(
+        request_for(
+            declarations=_unsorted_declarations(tmp_path),
+            contract=a_contract(prompt_mode=PromptMode.RUNTIME_RENDERED),
+        )
+    )
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+    shipped = tmp_path / "bundle" / DECLARATIONS_NAME
+    contract = json.loads((tmp_path / "bundle" / CONTRACT_NAME).read_text(encoding="utf-8"))
+    assert contract["declarations_sha256"] == hash_file(shipped)
+    assert b"\r\n" not in shipped.read_bytes(), (
+        "a member whose digest a reader is invited to check carries the bytes "
+        "it was hashed as, on every platform"
+    )
+    # Every member `_write_member` writes, not only the two with a digest to
+    # match: each is recorded in `report.json` as `content_sha256` of its bytes,
+    # and a reader who hashes the file compares against that.
+    for name in (CONTRACT_NAME, "manifest.json", "report.json"):
+        assert b"\r\n" not in (tmp_path / "bundle" / name).read_bytes(), name

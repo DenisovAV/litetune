@@ -8,6 +8,7 @@ loading a real tokenizer.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -1280,3 +1281,33 @@ def test_a_prerendered_split_records_the_declarations_bytes_and_no_length_note(
     assert result.as_dict()["declarations_sha256"] == hash_file(declarations)
     assert hash_file(declarations) != read_declarations(declarations)[1]
     assert not any("without the declaration turn" in text for text in result.limitations)
+
+
+def test_a_split_has_the_same_digest_on_a_platform_that_rewrites_newlines(
+    tmp_path, write_jsonl, request_for, windows_text_writes
+):
+    """The digest the report publishes is of rows, not of a platform's line ending.
+
+    `_write_split` hashes the file it just wrote, and that digest is what
+    `prepare` records as `dataset.content_sha256` and
+    `eval.heldout_content_sha256` -- the values a user pastes into a spec, and
+    the ones the report calls the thing the split is a function of. A text
+    write that turns `\n` into `\r\n` gives identical rows a different digest,
+    so a spec written on one machine fails its data check on another.
+    """
+    data = write_jsonl(rows(6, tool="open_app"))
+
+    result = prepare(request_for(data))
+
+    assert result.train is not None
+    for split in (result.train, result.heldout):
+        assert (
+            b"\r\n" not in split.path.read_bytes()
+        ), "the rows are the split's identity; a line ending is the platform's"
+    # The digest a spec carries, against the bytes those rows have with no
+    # translation anywhere: computed here rather than by a second `prepare`
+    # under the same fixture, which would compare a platform with itself.
+    for split in (result.train, result.heldout):
+        rows_as_written = split.path.read_text(encoding="utf-8").splitlines()
+        payload = "".join(line + "\n" for line in rows_as_written).encode("utf-8")
+        assert split.content_sha256 == f"sha256:{hashlib.sha256(payload).hexdigest()}"

@@ -19,6 +19,7 @@ is useless if its *definition* resolves differently on different days, so
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import hashlib
 import json
@@ -155,6 +156,26 @@ _HOST_OVERRIDES = (
     "LD_PRELOAD",
     "DYLD_INSERT_LIBRARIES",
 )
+
+# What a stage's text is encoded in, decided here rather than by the machine.
+# `_run_guarded` reads the pipes as UTF-8, and these are the child's side of
+# that: `PYTHONUTF8=1` puts it in UTF-8 mode, and `PYTHONIOENCODING` is set
+# too because it wins over the mode -- measured on 3.12, `PYTHONUTF8=1
+# PYTHONIOENCODING=cp1252` gives `sys.stdout.encoding == "cp1252"`. Both are
+# overwritten rather than defaulted: a host value would decide what a
+# measurement's text looks like, which is the same argument `_HOST_OVERRIDES`
+# makes about the pins, and `PYTHONUTF8=0` from a host would leave the child
+# on the locale's encoding -- the ANSI code page on Windows.
+#
+# `utf-8:surrogateescape` and not bare `utf-8`: naming an encoding with no error
+# handler sets the child's stdout to `strict`, where UTF-8 mode alone gives
+# `surrogateescape` (PEP 540; measured on 3.12). Strict would make a child raise
+# on a lone surrogate -- anything that came back through `os.fsdecode`, a path in
+# a traceback -- and the runtime CLI catches that, prints "An error occurred" and
+# exits zero, which is the failure this pair exists to prevent. The parent reads
+# the pipe with `errors="surrogateescape"`, so the two agree: neither side
+# raises on text the other could not represent.
+_CHILD_TEXT = (("PYTHONUTF8", "1"), ("PYTHONIOENCODING", "utf-8:surrogateescape"))
 
 # How long to wait for the pipes after killing a process group. A grandchild
 # that called `setsid()` itself escapes the group, and if it still holds the
@@ -1311,7 +1332,16 @@ def _run_guarded(
     decide whether a non-zero exit is a failed check or an unperformed one,
     and that distinction is the whole point of litetune.checks.
 
-    `errors="replace"` on the decode: `text=True` decodes stdout/stderr
+    `encoding="utf-8"` rather than the locale's: `text=True` alone decodes with
+    `locale.getpreferredencoding(False)`, which on Windows is the machine's ANSI
+    code page. A stage's stdout is where a generation comes back from the
+    runtime (`evaluate.LiteRtLmBackend`), so on a cp1252 host every character
+    outside that page is mangled on the way in and the row scores wrong -- a
+    conversion cost that measures the console. The child is put in UTF-8 mode
+    by `_child_env` for the same reason, and the two have to agree: one without
+    the other still loses the text.
+
+    `errors="surrogateescape"` on the decode: `text=True` decodes stdout/stderr
     eagerly, and a stray non-UTF-8 byte -- a CUDA or driver banner ahead of a
     probe's own JSON line, in the same class of weird environment the
     last-non-empty-line rule in `resolve_device` exists to survive -- raised
@@ -1319,6 +1349,14 @@ def _run_guarded(
     `OSError` every caller was written to expect. That escaped
     `resolve_device` and both of its callers and ended a `tune` or `verify`
     run with a traceback instead of an unanswered probe.
+
+    `surrogateescape` and not `replace`, which is what it used to be: both
+    keep the decode from raising, but `replace` writes U+FFFD, and U+FFFD is
+    an ordinary character a model may generate. Erasing the difference means a
+    generation that arrived broken cannot be told from one that says so -- and
+    `evaluate` must tell them apart, because one is a harness failure and the
+    other is an answer. A surrogate in U+DC80-U+DCFF is a byte that was not
+    UTF-8 and nothing else.
 
     `env` is *overrides*, not a whole environment: the base is the host's
     minus `_HOST_OVERRIDES`, so a caller cannot accidentally hand the pins
@@ -1330,7 +1368,8 @@ def _run_guarded(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        errors="replace",
+        encoding="utf-8",
+        errors="surrogateescape",
         # The timeout message names a prompt as a cause; this is what stops
         # one from being waited on at all.
         stdin=subprocess.DEVNULL,
@@ -1407,7 +1446,7 @@ def _as_text(chunk: str | bytes | None, encoding: str = "utf-8") -> str:
     """
     if chunk is None:
         return ""
-    return chunk if isinstance(chunk, str) else chunk.decode(encoding, "replace")
+    return chunk if isinstance(chunk, str) else chunk.decode(encoding, "surrogateescape")
 
 
 def _describe(proc: subprocess.Popen) -> str:
@@ -1443,6 +1482,50 @@ def _child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
             ", ".join(unreported),
         )
     env = {k: v for k, v in os.environ.items() if k not in _HOST_OVERRIDES}
+    # The other half of `_run_guarded`'s `encoding="utf-8"`. A Python child
+    # writing to a pipe encodes with the locale's encoding -- the ANSI code
+    # page on Windows -- and litert-lm's CLI prints a generation through it. A
+    # character the page cannot hold raises inside that CLI, whose own handler
+    # prints "An error occurred" and returns zero, so litetune scores the
+    # apology as the model's answer. UTF-8 mode also settles the encoding of
+    # every file the generated stage scripts read and write, which is the same
+    # question one layer down. Applied before `overrides`, so a caller who
+    # means to choose something else still can.
+    # `k not in overrides` for the same reason the drop above has it: a caller
+    # who chose this key gets it, and saying it was not passed would state the
+    # opposite of what happens.
+    replaced = [
+        k
+        for k, v in _CHILD_TEXT
+        if k in os.environ and k not in (overrides or {}) and os.environ[k] != v
+        if k not in _REPORTED_DROPS
+    ]
+    if replaced:
+        _REPORTED_DROPS.update(replaced)
+        logger.warning(
+            "not passing %s to the stage subprocess: the text a stage hands back is a "
+            "measurement, and its encoding is litetune's to fix rather than the machine's",
+            ", ".join(sorted(replaced)),
+        )
+    env.update(_CHILD_TEXT)
+    # An override wins, as every override does -- but the parent's pipe is
+    # opened UTF-8 whatever the child is told, so a caller choosing another
+    # encoding splits the two sides, and what comes back is mojibake in a
+    # scored generation. Nothing in this package does it; a caller that starts
+    # hears about it rather than finding out from the numbers.
+    # Only a different *codec* splits the two sides. `PYTHONIOENCODING` wins
+    # over UTF-8 mode, so an override of `PYTHONUTF8` alone leaves the child's
+    # stdout UTF-8 and is nobody's business here; an error handler is a choice
+    # about what the child does with text it cannot encode, not about the bytes
+    # the parent will read.
+    chosen = (overrides or {}).get("PYTHONIOENCODING")
+    if chosen is not None and codecs.lookup(chosen.split(":", 1)[0]) != codecs.lookup("utf-8"):
+        logger.warning(
+            "PYTHONIOENCODING=%s was overridden for this stage: the pipe litetune reads is "
+            "decoded as UTF-8 whatever the child writes, so a different encoding on one side "
+            "is mojibake in whatever the stage hands back",
+            chosen,
+        )
     if overrides:
         env.update(overrides)
     return env
@@ -1814,7 +1897,7 @@ class StageEnv:
                 # environment interrupted anywhere above this line has no
                 # marker, so the next run rebuilds it instead of trusting a
                 # half-installed tree.
-                (self.path / ".litetune-ready").write_text(self.identity)
+                (self.path / ".litetune-ready").write_text(self.identity, encoding="utf-8")
             except BaseException:
                 # Put the working environment back. This covers the timeout and
                 # pip-failure paths above, and Ctrl-C, which is why it catches
@@ -1988,7 +2071,7 @@ def resolve_device(
         # raises `UnicodeDecodeError` -- a `ValueError`, not an `OSError` -- on
         # a stray non-UTF-8 byte ahead of the probe's own line, which is
         # exactly the "banner before the answer" case the last-non-empty-line
-        # rule below exists to survive. `env.run` now passes `errors="replace"`
+        # rule below exists to survive. `env.run` now passes `errors="surrogateescape"`
         # so that byte no longer raises there, but this catch is what stops
         # this function's contract -- it never raises -- from depending on
         # every caller of `env.run` getting that right.

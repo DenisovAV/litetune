@@ -8,6 +8,7 @@ a method name and this will not.
 
 from __future__ import annotations
 
+import builtins
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -90,6 +91,21 @@ class FakeBackend:
 
 
 @pytest.fixture(autouse=True)
+def _forget_reported_drops():
+    """Clear the once-per-run warning state around every test.
+
+    `envs._REPORTED_DROPS` is module level, so a test that triggers the
+    "not passing X" warning silences it for every test that runs after it in
+    the same process -- including any test whose subject *is* that warning.
+    """
+    from litetune import envs
+
+    envs.forget_reported_drops()
+    yield
+    envs.forget_reported_drops()
+
+
+@pytest.fixture(autouse=True)
 def _isolated_env_cache(monkeypatch, tmp_path):
     """Point the stage-environment cache at this test's own directory.
 
@@ -104,6 +120,44 @@ def _isolated_env_cache(monkeypatch, tmp_path):
     guarantees they start from a machine with none.
     """
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "litetune-envs"))
+
+
+@pytest.fixture
+def windows_text_writes(monkeypatch):
+    """Make text writes translate `\n` the way Windows does.
+
+    `open()` with `newline=None` writes `os.linesep` for every `\n`, so on
+    Windows a file written in text mode holds CRLF. Every digest litetune
+    publishes over a file it wrote itself is therefore platform-dependent
+    unless the write says `newline=""`. There is no Windows runner to prove
+    that on -- CI is ubuntu-only -- so this reproduces the one behaviour that
+    matters, which is the same thing the `newline` argument of `open()`
+    documents.
+
+    Deliberately not selective: on Windows *every* text write translates, the
+    fixtures in a test included, which is what makes a digest taken over one
+    of those files differ from the digest taken over its text. Both routes are
+    patched for the same reason -- a review found that patching
+    `Path.write_text` alone let the same bug back in through `open(..., "w")`
+    with both CRLF tests still green.
+    """
+    real_write_text = Path.write_text
+    real_open = builtins.open
+
+    def translating(self, data, encoding=None, errors=None, newline=None):
+        if newline is None:
+            data = data.replace("\n", "\r\n")
+            newline = ""
+        return real_write_text(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    def translating_open(file, mode="r", *args, **kwargs):
+        writing_text = "b" not in mode and any(m in mode for m in "wax+")
+        if writing_text and kwargs.get("newline") is None:
+            kwargs["newline"] = "\r\n"
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", translating)
+    monkeypatch.setattr(builtins, "open", translating_open)
 
 
 @pytest.fixture

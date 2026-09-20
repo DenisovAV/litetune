@@ -1196,7 +1196,11 @@ class PrepareResult:
 def _write_split(path: Path, rows: Sequence[Row]) -> SplitFile:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = "".join(json.dumps(row.as_record(), sort_keys=True) + "\n" for row in rows)
-    path.write_text(payload, encoding="utf-8")
+    # `newline=""`: the digest below is taken over the bytes this writes, and a
+    # platform that turns `\n` into `\r\n` would give the same rows a different
+    # `content_sha256` -- the one a user pastes into a spec, and the one the
+    # report says the split is a function of.
+    path.write_text(payload, encoding="utf-8", newline="")
     return SplitFile(name=path.stem, path=path, n=len(rows), content_sha256=hash_file(path))
 
 

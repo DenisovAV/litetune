@@ -610,7 +610,16 @@ def _replace_member(destination: Path, write: Any) -> None:
 
 
 def _write_member(destination: Path, text: str) -> None:
-    _replace_member(destination, lambda staging: staging.write_text(text, encoding="utf-8"))
+    # `newline=""` writes the `\n` this text already carries and nothing else.
+    # Without it Python translates to `os.linesep` on Windows, and the shipped
+    # `declarations.json` then holds CRLF while `contract.declarations_sha256`
+    # is the digest of the LF text the contract was built from -- two digests
+    # for one file, in a bundle that reports `passed`. Every member here is
+    # canonical text whose bytes a reader is invited to hash.
+    _replace_member(
+        destination,
+        lambda staging: staging.write_text(text, encoding="utf-8", newline=""),
+    )
 
 
 def _copy_member(source: Path, destination: Path) -> None:
