@@ -79,7 +79,9 @@ Or through Homebrew, which brings its own Python 3.12:
 brew install DenisovAV/tap/litetune
 ```
 
-**Linux or macOS**, Python 3.10–3.12. On Linux you also need `libvulkan1` —
+**Linux, macOS or Windows**, Python 3.10–3.12 — with `convert` needing Linux
+x86_64 or an Apple Silicon Mac, for the reason below. On Linux you also need
+`libvulkan1` —
 `litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, and
 without it every invocation, `--help` included, dies in under a second:
 
@@ -87,7 +89,42 @@ without it every invocation, `--help` included, dies in under a second:
 sudo apt-get install -y libvulkan1     # Debian/Ubuntu
 ```
 
-macOS needs nothing extra; Colab works out of the box; Windows is untried.
+macOS needs nothing extra; Colab works out of the box.
+
+**Windows runs everything but `convert`.** `prepare`, `tune`, `verify` and
+`bundle` install and run on Windows x64: every pin in those environments has a
+wheel that installs there — `win_amd64` for the ones with native code,
+`litert-lm-api` included, and `py3-none-any` for the rest. `convert` cannot,
+because [`litert-converter`](https://pypi.org/project/litert-converter/) — the
+MLIR converter `litert-torch` depends on — has never published a Windows wheel
+or a source distribution, so the install fails while pip is still resolving.
+Upstream tracks it as
+[litert-torch#968](https://github.com/google-ai-edge/litert-torch/issues/968),
+where a collaborator says Windows is planned and gives no date. Google's
+[verified platforms](https://developers.google.com/edge/litert/cli/troubleshooting)
+page says the same: "Windows: `litert compile` and `litert convert` not
+supported yet." The same gap covers ARM Linux and Intel macOS. There are wheels
+for macOS on Apple Silicon, though upstream's README still names Linux as its
+operating system, and this project has only ever converted on Linux.
+
+Two ways round it. Run everything under WSL2 with Ubuntu — install
+`pythonX.Y-dev`, or the build stops on a missing `libpython3.x.so`
+([litert-torch#74](https://github.com/google-ai-edge/litert-torch/issues/74)),
+and keep the checkout and `~/.cache/litetune` on the Linux filesystem rather
+than under `/mnt/c`. Or
+convert on any Linux machine and bring the `.litertlm` back: `verify` takes it
+with the float checkpoint it came from and asks nothing of the export
+environment.
+
+`tune` on Windows trains on the CPU unless you say otherwise, and that is
+PyTorch's packaging rather than litetune's: every CUDA dependency of
+`torch==2.5.1` is marked `platform_system == "Linux"`, so the wheel PyPI serves
+Windows is the CPU build. `PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124`
+reaches the stage install and gets you the CUDA one — after `litetune env
+--clean`, because an environment's identity is a hash of the interpreter and
+the pins, which an index does not change, so a cached CPU environment would be
+reused in silence. Either way the run records what it got: `device` and
+`cuda_build` are in the training metrics.
 
 Python 3.13 runs `tune`, `prepare` and `bundle` but not `convert` or `verify`:
 each stage builds its own environment from the interpreter you launched, and
