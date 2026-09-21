@@ -45,6 +45,21 @@ import '../../theme/brand.dart';
 /// differ in nothing but size. Qwen3's card carries its size because its rule
 /// is scoped to the one size that was run, and Qwen2.5's for the same reason,
 /// where the rule is scoped to the one size *and* variant.
+///
+/// Each card opens. The panel under it names the checkpoint the run actually
+/// used -- the Hub id and, where `MEASUREMENTS.md` pins one, the revision --
+/// and links to the model on the Hub and to the section that measured it. It
+/// carries no score either, for the reason the face of the card carries none:
+/// a panel one click deep is still the shortest place there is to quote a
+/// verdict, and a reader who wants the number is one link from the table with
+/// its interval, its sample size and its refusals next to it.
+///
+/// `<details>`, not a dialog and not an island. The site builds in `static`
+/// mode with no `@client` component anywhere, so a disclosure that needs
+/// JavaScript would make this the page that ends that -- for a panel the
+/// browser already implements, keyboard-operable and open-by-default when
+/// JavaScript is off or printing. `.cards` gets `align-items: start` so an
+/// open card grows downward instead of stretching the ones beside it.
 class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
@@ -66,21 +81,8 @@ class WhyItExists extends StatelessComponent {
           div(classes: 'measured-label', [
             Component.text('Measured end to end so far'),
           ]),
-          div(classes: 'cards', [
-            _card('FunctionGemma 270M', 'tool-call scoring, 640 held-out rows'),
-            _card('Gemma 3 270M', 'exact-text scoring, 600 held-out rows'),
-            _card(
-              'Gemma 3 1B',
-              'exact-text scoring, the same 600 held-out rows',
-            ),
-            _card(
-              'Qwen3 0.6B',
-              'exact-text scoring, the same 600 held-out rows',
-            ),
-            _card(
-              'Qwen2.5 0.5B',
-              'exact-text scoring, the same 600 held-out rows',
-            ),
+          div(classes: 'measured-cards', [
+            for (final model in measured) _card(model),
           ]),
           p(classes: 'measured-note', [
             Component.text(
@@ -101,11 +103,104 @@ class WhyItExists extends StatelessComponent {
     ]);
   }
 
-  static Component _card(String model, String how) => div(classes: 'card', [
-    div(classes: 'card-model', [Component.text(model)]),
-    div(classes: 'card-how', [Component.text(how)]),
+  /// A measured run, as the card and its panel say it.
+  ///
+  /// `revision` is null where `MEASUREMENTS.md` pins none -- FunctionGemma's
+  /// runs record the dataset and the split but never a base-model commit --
+  /// and the panel then omits the line rather than showing an empty one or a
+  /// revision nobody wrote down.
+  static const measured =
+      <
+        ({
+          String name,
+          String how,
+          String hubId,
+          String? revision,
+          String anchor,
+        })
+      >[
+        (
+          name: 'FunctionGemma 270M',
+          how: 'tool-call scoring, 640 held-out rows',
+          hubId: 'google/functiongemma-270m-it',
+          revision: null,
+          anchor: 'the-headline-numbers',
+        ),
+        (
+          name: 'Gemma 3 270M',
+          how: 'exact-text scoring, 600 held-out rows',
+          hubId: 'google/gemma-3-270m-it',
+          revision: 'ac82b4e8',
+          anchor: 'a-second-family-and-the-second-scorer',
+        ),
+        (
+          name: 'Gemma 3 1B',
+          how: 'exact-text scoring, the same 600 held-out rows',
+          hubId: 'google/gemma-3-1b-it',
+          revision: 'dcc83ea8',
+          anchor: 'the-same-family-four-times-the-size',
+        ),
+        (
+          name: 'Qwen3 0.6B',
+          how: 'exact-text scoring, the same 600 held-out rows',
+          hubId: 'Qwen/Qwen3-0.6B',
+          revision: 'c1899de2',
+          anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
+        ),
+        (
+          name: 'Qwen2.5 0.5B',
+          how: 'exact-text scoring, the same 600 held-out rows',
+          hubId: 'Qwen/Qwen2.5-0.5B-Instruct',
+          revision: '7ae55760',
+          anchor:
+              'a-fifth-family-and-the-first-where-channelwise-four-bits-answered',
+        ),
+      ];
+
+  static const _newTab = {'target': '_blank', 'rel': 'noopener'};
+
+  static Component _card(
+    ({String name, String how, String hubId, String? revision, String anchor})
+    model,
+  ) => details(classes: 'measured-card', [
+    summary(classes: 'measured-card-summary', [
+      div(classes: 'measured-card-model', [Component.text(model.name)]),
+      div(classes: 'measured-card-how', [Component.text(model.how)]),
+    ]),
+    div(classes: 'measured-card-panel', [
+      div(classes: 'measured-card-fact', [
+        span(classes: 'measured-card-key', [Component.text('Checkpoint')]),
+        span(classes: 'measured-card-id', [Component.text(model.hubId)]),
+      ]),
+      if (model.revision case final revision?)
+        div(classes: 'measured-card-fact', [
+          span(classes: 'measured-card-key', [Component.text('Revision')]),
+          span(classes: 'measured-card-id', [Component.text(revision)]),
+        ]),
+      div(classes: 'measured-card-links', [
+        a(href: 'https://huggingface.co/${model.hubId}', attributes: _newTab, [
+          Component.text('On Hugging Face'),
+        ]),
+        a(
+          href:
+              'https://github.com/DenisovAV/litetune/blob/main/MEASUREMENTS.md#${model.anchor}',
+          attributes: _newTab,
+          [Component.text('What this run established')],
+        ),
+      ]),
+    ]),
   ]);
 
+  // Every class here carries the section's `measured-` prefix, including the
+  // cards. jaspr collects each component's `@css` into one stylesheet, so a
+  // class name is global: `where_to_run.dart` also styles `.cards` and
+  // `.card`, and the two rules landed on the same elements -- whichever the
+  // bundle emitted second won each property, which is why that section's
+  // cards were drawn with this one's 1rem padding rather than their own
+  // 1.4rem. Scoping the names here ends that for these elements, and the
+  // `<details>` makes it matter more than it did: the other rule sets
+  // `display: flex` and `flex: 1 1 240px`, which would otherwise apply to a
+  // disclosure that wants neither.
   @css
   static List<StyleRule> get styles => [
     css('.why-body').styles(
@@ -126,26 +221,79 @@ class WhyItExists extends StatelessComponent {
       fontSize: 0.9.rem,
       margin: Margin.only(bottom: 0.75.rem),
     ),
-    css('.cards').styles(
+    css('.measured-cards').styles(
       display: Display.grid,
       gap: Gap.all(0.75.rem),
       raw: const {
         'grid-template-columns': 'repeat(auto-fit, minmax(16rem, 1fr))',
+        // An open card grows downward; the ones beside it keep their height.
+        'align-items': 'start',
       },
     ),
-    css('.card').styles(
-      display: Display.flex,
-      flexDirection: FlexDirection.column,
-      gap: Gap.all(0.3.rem),
+    css('.measured-card').styles(
       padding: Padding.all(1.rem),
       backgroundColor: Brand.surface,
       radius: BorderRadius.circular(0.6.rem),
       border: Border.all(color: Brand.line, width: 1.px),
     ),
+    // The default triangle is replaced by a sign that lines up with the
+    // model name, and `list-style` covers the browsers that draw the marker
+    // as a list marker rather than through the WebKit pseudo-element.
+    css('.measured-card-summary').styles(
+      display: Display.flex,
+      flexDirection: FlexDirection.column,
+      gap: Gap.all(0.3.rem),
+      raw: const {'cursor': 'pointer', 'list-style': 'none'},
+    ),
     css(
-      '.card-model',
+      '.measured-card-summary::-webkit-details-marker',
+    ).styles(raw: const {'display': 'none'}),
+    css('.measured-card-summary::after').styles(
+      color: Brand.muted,
+      fontSize: 0.85.rem,
+      raw: const {'content': '"+ checkpoint"'},
+    ),
+    css(
+      '.measured-card[open] .measured-card-summary::after',
+    ).styles(raw: const {'content': '"− checkpoint"'}),
+    css(
+      '.measured-card-model',
     ).styles(color: Brand.ink, fontSize: 1.05.rem, fontWeight: FontWeight.w500),
-    css('.card-how').styles(color: Brand.body, fontSize: 0.9.rem),
+    css('.measured-card-how').styles(color: Brand.body, fontSize: 0.9.rem),
+    css('.measured-card-panel').styles(
+      display: Display.flex,
+      flexDirection: FlexDirection.column,
+      gap: Gap.all(0.4.rem),
+      margin: Margin.only(top: 0.75.rem),
+      padding: Padding.only(top: 0.75.rem),
+      border: Border.only(
+        top: BorderSide(
+          color: Brand.line,
+          width: 1.px,
+          style: BorderStyle.solid,
+        ),
+      ),
+    ),
+    css('.measured-card-fact').styles(
+      display: Display.flex,
+      flexDirection: FlexDirection.column,
+      gap: Gap.all(0.1.rem),
+    ),
+    css('.measured-card-key').styles(color: Brand.muted, fontSize: 0.75.rem),
+    css('.measured-card-id').styles(
+      color: Brand.body,
+      fontFamily: Brand.fontMono,
+      fontSize: 0.85.rem,
+      raw: const {'overflow-wrap': 'anywhere'},
+    ),
+    css('.measured-card-links').styles(
+      display: Display.flex,
+      flexWrap: FlexWrap.wrap,
+      gap: Gap.all(0.9.rem),
+      margin: Margin.only(top: 0.25.rem),
+      fontSize: 0.85.rem,
+    ),
+    css('.measured-card-links a').styles(color: Brand.body),
     css('.measured-note').styles(
       color: Brand.muted,
       fontSize: 0.9.rem,

@@ -1,0 +1,82 @@
+// The panel's links, checked against the files they point into.
+//
+// Each card links to a section of `MEASUREMENTS.md` by GitHub's own heading
+// anchor. Nothing in a Dart build knows whether that section still exists, and
+// a renamed heading leaves a link that lands on the top of a 900-line file
+// instead of the run it promised -- silently, on the live site. So the anchors
+// are computed from the headings here and compared with the ones the cards
+// carry.
+//
+// The same check covers the Hub links by their shape only: whether
+// huggingface.co still serves a repository is not something a unit test can
+// answer, and a test that pretends to would be worse than none.
+import 'dart:io';
+
+import 'package:litetune_website/landing/sections/why_it_exists.dart';
+import 'package:test/test.dart';
+
+/// GitHub's anchor for a markdown heading: lowercased, punctuation dropped,
+/// spaces hyphenated.
+String anchorFor(String heading) => heading
+    .toLowerCase()
+    .replaceAll(RegExp(r'[^\w\- ]'), '')
+    .replaceAll(' ', '-');
+
+File _measurements() {
+  for (final candidate in [Directory.current.parent, Directory.current]) {
+    final file = File('${candidate.path}/MEASUREMENTS.md');
+    if (file.existsSync()) return file;
+  }
+  throw StateError('cannot find MEASUREMENTS.md from ${Directory.current.path}');
+}
+
+void main() {
+  final headings = _measurements()
+      .readAsLinesSync()
+      .where((line) => line.startsWith('## '))
+      .map((line) => anchorFor(line.substring(3).trim()))
+      .toSet();
+
+  test('MEASUREMENTS.md has the sections the cards link to', () {
+    expect(headings, isNotEmpty, reason: 'no "## " headings were found at all');
+    for (final model in WhyItExists.measured) {
+      expect(
+        headings,
+        contains(model.anchor),
+        reason:
+            '${model.name} links to MEASUREMENTS.md#${model.anchor}, and no '
+            'heading in that file produces this anchor',
+      );
+    }
+  });
+
+  test('every card names a Hub repository as owner/name', () {
+    for (final model in WhyItExists.measured) {
+      expect(
+        model.hubId,
+        matches(RegExp(r'^[\w.-]+/[\w.-]+$')),
+        reason: '${model.name} would build a broken huggingface.co URL',
+      );
+    }
+  });
+
+  test('a revision, where a card carries one, is the short sha the file pins', () {
+    final text = _measurements().readAsStringSync();
+    for (final model in WhyItExists.measured) {
+      final revision = model.revision;
+      if (revision == null) continue;
+      expect(
+        revision,
+        matches(RegExp(r'^[0-9a-f]{8}$')),
+        reason: '${model.name} carries a revision that is not a short sha',
+      );
+      expect(
+        text,
+        contains(revision),
+        reason:
+            '${model.name} pins $revision, which MEASUREMENTS.md does not '
+            'mention -- the card would name a commit no run recorded',
+      );
+    }
+  });
+}
