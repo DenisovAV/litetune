@@ -541,6 +541,46 @@ RULES: tuple[ModelRules, ...] = (
         patterns=(r"qwen-?3-0-6b",),
     ),
     ModelRules(
+        family="qwen-2.5",
+        # Nothing to add here either, and this entry says so with a run behind
+        # it. `config.json` declares `model_type: "qwen2"`, which
+        # `litert_lm_builder.py` matches as `case 'qwen2' | 'qwen2p5'`, so no
+        # override: unlike the gemma3_text families there is no ambiguity for
+        # one to resolve. Qwen 3 is typed from its own config in the same way,
+        # one case up; what is particular here is only that the runtime's type
+        # is named for the later generation than the config asks for.
+        #
+        # Measured 2026-09-20 on Qwen/Qwen2.5-0.5B-Instruct @ 7ae55760: both
+        # int8 recipes and all four 4-bit recipes exported with no flag from
+        # litetune, six bundles, conversion costs in MEASUREMENTS.md. Before
+        # that run `identify` returned None for this checkpoint and `export`
+        # printed its unknown-family note on every convert, which was the
+        # honest state and is what this rule replaces.
+        #
+        # By size *and* variant, for the reason the qwen-3 rule above gives:
+        # `Qwen2.5-0.5B-Instruct` was run and `Qwen2.5-0.5B` was not. They are
+        # two checkpoints, and this file's own history is that a rule written
+        # on the strength of a neighbouring one goes unexercised for weeks --
+        # the gemma-3-text rule claimed the 1B for three weeks before anything
+        # exported it.
+        #
+        # The tail is what makes that true. `identify` searches rather than
+        # matches, so a bare `qwen-?2-5-0-5b-instruct` also claims
+        # any id that continues past it -- an `-AWQ`, a `-GPTQ-Int4`, a
+        # bnb-4bit repack -- which name already-quantized checkpoints nobody
+        # here exported, and for which "no flags needed" is least likely to
+        # hold. The tests pin the regex against those spellings; whether each
+        # repository exists is not something this checks. So the
+        # pattern ends either at the end of the hint text or at the
+        # `model_type` `hint_for` appends for a local checkpoint: this run's
+        # merged model read `qwen-qwen2-5-0-5b-instruct-qwen2-qwen2forcausallm`
+        # and must keep matching, a repack must not.
+        #
+        # No `min_transformers` -- the pinned 5.16.1 loaded it, and nothing
+        # here establishes a floor, which is not the same as there being none.
+        patterns=(r"qwen-?2-5-0-5b-instruct(?:$|-qwen2\b)",),
+    ),
+    ModelRules(
         family="gemma3-text-unidentified",
         # Last, so a checkpoint that names its family is matched by name first.
         # This is the fallback for one that does not: `config.json` establishes
