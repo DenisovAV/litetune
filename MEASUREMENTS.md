@@ -6,9 +6,9 @@ examples; exact match means the tool name **and** every argument value. Each
 section after them is another family: `gemma-3-270m-it` with the second scorer,
 `gemma-4-E2B-it` converted from its base weights, `Qwen3-0.6B`, the first that
 is not a Gemma, `gemma-3-1b-it`, the other size one export rule claims, and
-`Qwen2.5-0.5B-Instruct`, the one model here litetune holds no rule for. The last
-returns to `functiongemma-270m-it`, measured through the runtime's tool path the
-way an application calls it.
+`Qwen2.5-0.5B-Instruct`, the one checkpoint here whose channelwise four-bit
+export produced a score. The last returns to `functiongemma-270m-it`, measured
+through the runtime's tool path the way an application calls it.
 
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
@@ -607,13 +607,14 @@ device from their candidates.
 
 ## A fifth family, and the first where channelwise four bits answered
 
-`Qwen/Qwen2.5-0.5B-Instruct` @ `7ae55760`, the smallest and the oldest model in
-this file, and the first one litetune holds no rule for. `models.identify`
-returns None for it, so every `convert` in this run printed the unknown-family
-note — that litetune's rules were paid for one family at a time and a family it
-has not met is one whose required flags are simply unknown. The bundle is typed
-correctly regardless, and not by litetune: `config.json` says `model_type:
-"qwen2"`, and `litert_lm_builder.py`'s switch has `case 'qwen2' | 'qwen2p5'`.
+`Qwen/Qwen2.5-0.5B-Instruct` @ `7ae55760`, 494,032,768 parameters, and a
+checkpoint litetune held no rule for when it ran — as Qwen3-0.6B was when *it*
+ran. `models.identify` returned None for it, so every `convert` in this run
+printed the unknown-family note — that litetune's rules were paid for one
+family at a time and a family it has not met is one whose required flags are
+simply unknown. The bundle is typed correctly regardless, and not by
+litetune: `config.json` says `model_type: "qwen2"`, and
+`litert_lm_builder.py`'s switch has `case 'qwen2' | 'qwen2p5'`.
 Unlike both Gemma models here the checkpoint is not gated, so the weights were
 fetched from the Hub during the run rather than shipped as a local copy.
 
@@ -654,7 +655,7 @@ conversion is free.
 
 **It scores higher than any model measured before it on these rows** — 0.7700
 against gemma-3-1b's 0.7533, Qwen3-0.6B's 0.6983 and gemma-3-270m's 0.6717,
-from the smallest and oldest of the four. As with the 1B, this is an
+from the second smallest of the four. As with the 1B, this is an
 observation and not a resolved difference: litetune computes no interval for a
 difference between two models, and every reference here ran on a different
 device from its candidate.
