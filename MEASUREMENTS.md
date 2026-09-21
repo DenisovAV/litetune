@@ -616,10 +616,12 @@ simply unknown. The bundle is typed correctly regardless, and not by
 litetune: `config.json` says `model_type: "qwen2"`, and the switch in
 `litert_lm_builder.py` — which lives in the export environment rather than in
 this repository, read at `litert_torch/generative/export_hf/core/` in
-litert-torch 0.10.0.dev20260826 — has `case 'qwen2' | 'qwen2p5'`. The weights
-were fetched from the Hub during the run rather than shipped as a local copy:
-this run logged `HF_HUB_OFFLINE=unset` where both Gemma 3 runs logged
-`HF_HUB_OFFLINE=1`, the 1B's because that checkpoint is gated.
+litert-torch 0.10.0.dev20260826 — has `case 'qwen2' | 'qwen2p5'`. It did not
+run offline: this run logged `HF_HUB_OFFLINE=unset` where both Gemma 3 runs
+logged `HF_HUB_OFFLINE=1`, the 1B's because that checkpoint is gated and
+travelled as a copy of a local cache. Whether the weights then came over the
+network or off a cache already on the instance is not something these
+manifests record.
 
 The task, the rows and the scorer are the second family's, and `max_seq_length`
 256 is the fourth family's: LoRA α32, lr 2e-4, one epoch, bfloat16 over the same

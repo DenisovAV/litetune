@@ -32,39 +32,50 @@ File _measurements() {
   );
 }
 
-/// Every anchor a link could land on: `##` and `###` alike.
-Set<String> _anchors(List<String> lines) => {
-  for (final line in lines)
-    if (RegExp(r'^#{2,3} (.+)$').firstMatch(line) case final heading?)
-      anchorFor(heading.group(1)!.trim()),
-};
-
-/// What a reader sees after following a link to a `##` heading: that section
-/// and the `###` subsections under it, which is where most of the detail
-/// lives -- the FunctionGemma run names its checkpoint in a subsection of
-/// "The headline numbers", not under the heading itself.
+/// The file by heading anchor, each entry running to the next heading of the
+/// same level or higher.
+///
+/// So a `##` entry carries its `###` subsections -- which is what a reader
+/// following the link sees, and where most of the detail lives: the
+/// FunctionGemma run names its checkpoint in a subsection of "The headline
+/// numbers", not under the heading itself -- while a `###` entry exists in
+/// its own right, so a card linked to a subsection is looked up rather than
+/// reported as a heading that does not exist.
 Map<String, String> _sectionsByAnchor(List<String> lines) {
   final sections = <String, StringBuffer>{};
-  StringBuffer? current;
+  final open = <int, StringBuffer>{};
   for (final line in lines) {
-    if (RegExp(r'^## (.+)$').firstMatch(line) case final heading?) {
-      current = sections[anchorFor(heading.group(1)!.trim())] = StringBuffer();
+    final heading = RegExp(r'^(#{2,3}) (.+)$').firstMatch(line);
+    if (heading != null) {
+      final level = heading.group(1)!.length;
+      open.removeWhere((depth, _) => depth >= level);
+      open[level] = sections[anchorFor(heading.group(2)!.trim())] =
+          StringBuffer();
     }
-    current?.writeln(line);
+    for (final buffer in open.values) {
+      buffer.writeln(line);
+    }
   }
   return {for (final e in sections.entries) e.key: e.value.toString()};
 }
 
+File _readme() {
+  final file = File('${_measurements().parent.path}/README.md');
+  if (!file.existsSync()) {
+    throw StateError('cannot find README.md beside MEASUREMENTS.md');
+  }
+  return file;
+}
+
 void main() {
-  final lines = _measurements().readAsLinesSync();
-  final anchors = _anchors(lines);
-  final sections = _sectionsByAnchor(lines);
+  final sections = _sectionsByAnchor(_measurements().readAsLinesSync());
+  final readme = _readme().readAsStringSync();
 
   test('MEASUREMENTS.md has the sections the cards link to', () {
-    expect(anchors, isNotEmpty, reason: 'no headings were found at all');
+    expect(sections, isNotEmpty, reason: 'no headings were found at all');
     for (final model in WhyItExists.measured) {
       expect(
-        anchors,
+        sections.keys,
         contains(model.anchor),
         reason:
             '${model.name} links to MEASUREMENTS.md#${model.anchor}, and no '
@@ -84,6 +95,24 @@ void main() {
         reason:
             '${model.name} links to #${model.anchor}, which never mentions '
             '${model.hubId} -- the panel would send a reader to another run',
+      );
+    }
+  });
+
+  test('a card names a checkpoint the repository knows, owner included', () {
+    // The section names the repository but not always its owner --
+    // MEASUREMENTS.md writes `functiongemma-270m-it` bare -- so the test
+    // above would accept `another-owner/Qwen3-0.6B`, a re-upload nobody ran,
+    // and the panel's Hub link would go to it. README names all of them in
+    // full.
+    for (final model in WhyItExists.measured) {
+      expect(
+        readme,
+        contains(model.hubId),
+        reason:
+            '${model.name} links to huggingface.co/${model.hubId}, which this '
+            'repository never names -- the card would point at a checkpoint '
+            'no run here used',
       );
     }
   });
