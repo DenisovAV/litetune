@@ -664,9 +664,11 @@ device from its candidate.
 sides score **0.0000 on all 600 rows**, `verify` reports `unmeasured` and exits
 3, and its manifest gives the same reason as the 1B's: the reference is the
 untuned base, so training and conversion are confounded and both attribution
-fields are unavailable. Of the five models in this file, not one has a recorded
-training gain — two scored zero on both sides, one was refused for repetition,
-and one was never scored.
+fields are unavailable. Of the four models measured on banking77, not one has a
+recorded training gain — two scored zero on both sides, one was refused for
+repetition, and one was never scored. FunctionGemma's **+0.1906 ±0.0357** at the
+top of this file is still the only training gain here, on another task with
+another scorer.
 
 **The terminator is the template's close, as everywhere else here.** `tune`
 recorded `turn_terminator: {ids: [151645, 198], source: "chat_template", text:

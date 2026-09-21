@@ -294,16 +294,50 @@ def test_a_qwen25_export_carries_no_flags_and_is_typed_by_its_own_config():
     assert models.UNKNOWN_FAMILY not in plan.notes
 
 
-def test_the_qwen25_rule_claims_only_the_size_that_was_run():
-    """A size suffix is not a licence over the family.
+def test_the_qwen25_rule_claims_only_the_checkpoint_that_was_run():
+    """A size suffix is not a licence over the family, and neither is a prefix.
 
-    `Qwen2-5B` is a Qwen 2 of five billion parameters, not a Qwen 2.5, and the
-    1.5B and the base 0.5B were never exported here. Claiming any of them
-    would assert a check nobody performed.
+    `Qwen2-5B` is a Qwen 2 of five billion parameters, not a Qwen 2.5; the
+    1.5B and the base 0.5B were never exported here; and the AWQ, GPTQ and
+    bnb repacks are already-quantized checkpoints that no run in this
+    repository touched. `identify` searches rather than matches, so an
+    unanchored pattern claims every one of those and silences the
+    unknown-family note on it -- which is the note that would otherwise be
+    the only thing telling the user litetune has never seen this artifact.
     """
     assert identify("Qwen/Qwen2.5-0.5B-Instruct").family == "qwen-2.5"
-    for unclaimed in ("Qwen/Qwen2-5B", "Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-7B-Instruct"):
+    for unclaimed in (
+        "Qwen/Qwen2-5B",
+        "Qwen/Qwen2.5-1.5B-Instruct",
+        "Qwen/Qwen2.5-7B-Instruct",
+        "Qwen/Qwen2.5-0.5B-Instruct-AWQ",
+        "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4",
+        "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit",
+    ):
         assert identify(unclaimed) is None, unclaimed
+
+
+def test_the_qwen25_rule_still_matches_the_checkpoint_tune_wrote(tmp_path):
+    """The anchor must not cost the tuned model its own rule.
+
+    `hint_for` folds a local checkpoint's `model_type` and architecture into
+    the text it matches against -- this run's merged model read
+    `qwen-qwen2-5-0-5b-instruct-qwen2-qwen2forcausallm` -- so a pattern
+    anchored at the end of the string alone would identify the Hub id and
+    lose the checkpoint converted from it.
+    """
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": "Qwen/Qwen2.5-0.5B-Instruct"}), encoding="utf-8"
+    )
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]}),
+        encoding="utf-8",
+    )
+    rules = identify(str(checkpoint))
+    assert rules is not None, models.hint_for(str(checkpoint)).text
+    assert rules.family == "qwen-2.5"
 
 
 def test_functiongemma_gets_the_model_type_its_runtime_needs():

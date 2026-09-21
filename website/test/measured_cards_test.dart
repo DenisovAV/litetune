@@ -27,7 +27,9 @@ File _measurements() {
     final file = File('${candidate.path}/MEASUREMENTS.md');
     if (file.existsSync()) return file;
   }
-  throw StateError('cannot find MEASUREMENTS.md from ${Directory.current.path}');
+  throw StateError(
+    'cannot find MEASUREMENTS.md from ${Directory.current.path}',
+  );
 }
 
 void main() {
@@ -60,8 +62,21 @@ void main() {
     }
   });
 
-  test('a revision, where a card carries one, is the short sha the file pins', () {
-    final text = _measurements().readAsStringSync();
+  test('a revision belongs to the section its own card links to', () {
+    // Not "appears somewhere in the file": every revision in MEASUREMENTS.md
+    // would satisfy that, so two cards with their revisions swapped would
+    // pass while the panel told a reader the wrong commit. The sha has to be
+    // in the section the same card links to.
+    final sections = <String, StringBuffer>{};
+    StringBuffer? current;
+    for (final line in _measurements().readAsLinesSync()) {
+      if (line.startsWith('## ')) {
+        current = sections[anchorFor(line.substring(3).trim())] =
+            StringBuffer();
+      }
+      current?.writeln(line);
+    }
+
     for (final model in WhyItExists.measured) {
       final revision = model.revision;
       if (revision == null) continue;
@@ -71,11 +86,12 @@ void main() {
         reason: '${model.name} carries a revision that is not a short sha',
       );
       expect(
-        text,
+        sections[model.anchor]?.toString(),
         contains(revision),
         reason:
-            '${model.name} pins $revision, which MEASUREMENTS.md does not '
-            'mention -- the card would name a commit no run recorded',
+            '${model.name} pins $revision, which the section it links to '
+            '(#${model.anchor}) does not mention -- the card would name a '
+            'commit that run did not record',
       );
     }
   });

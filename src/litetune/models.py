@@ -543,11 +543,12 @@ RULES: tuple[ModelRules, ...] = (
     ModelRules(
         family="qwen-2.5",
         # Nothing to add here either, and this entry says so with a run behind
-        # it. `config.json` declares `model_type: "qwen2"`, and
-        # `litert_lm_builder.py` matches `case 'qwen2' | 'qwen2p5'` -- the one
-        # family in this tuple that the exporter types correctly *and* names
-        # its own generation for. So no override, and unlike the gemma3_text
-        # families there is no ambiguity for one to resolve.
+        # it. `config.json` declares `model_type: "qwen2"`, which
+        # `litert_lm_builder.py` matches as `case 'qwen2' | 'qwen2p5'`, so no
+        # override: unlike the gemma3_text families there is no ambiguity for
+        # one to resolve. Qwen 3 is typed from its own config in the same way,
+        # one case up; what is particular here is only that the runtime's type
+        # is named for the later generation than the config asks for.
         #
         # Measured 2026-09-20 on Qwen/Qwen2.5-0.5B-Instruct @ 7ae55760: both
         # int8 recipes and all four 4-bit recipes exported with no flag from
@@ -561,13 +562,21 @@ RULES: tuple[ModelRules, ...] = (
         # two checkpoints, and this file's own history is that a rule written
         # on the strength of a neighbouring one goes unexercised for weeks --
         # the gemma-3-text rule claimed the 1B for three weeks before anything
-        # exported it. A tuned checkpoint still matches: `tune` records the
-        # base model id, and the hint text for this run's merged model read
-        # `qwen-qwen2-5-0-5b-instruct-qwen2-qwen2forcausallm`.
+        # exported it.
+        #
+        # The tail is what makes that true. `identify` searches rather than
+        # matches, so a bare `qwen-?2-5-0-5b-instruct` also claims
+        # `Qwen2.5-0.5B-Instruct-AWQ`, `-GPTQ-Int4` and the bnb-4bit repacks --
+        # checkpoints that are already quantized, that nobody here exported,
+        # and for which "no flags needed" is least likely to hold. So the
+        # pattern ends either at the end of the hint text or at the
+        # `model_type` `hint_for` appends for a local checkpoint: this run's
+        # merged model read `qwen-qwen2-5-0-5b-instruct-qwen2-qwen2forcausallm`
+        # and must keep matching, a repack must not.
         #
         # No `min_transformers` -- the pinned 5.16.1 loaded it, and nothing
         # here establishes a floor, which is not the same as there being none.
-        patterns=(r"qwen-?2-5-0-5b-instruct",),
+        patterns=(r"qwen-?2-5-0-5b-instruct(?:$|-qwen2\b)",),
     ),
     ModelRules(
         family="gemma3-text-unidentified",

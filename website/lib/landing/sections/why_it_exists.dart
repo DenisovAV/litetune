@@ -34,11 +34,12 @@ import '../../theme/brand.dart';
 /// says "on CPU" because the same file records the Qwen3 bundles on a
 /// phone as well, where the backend changes the answer: the GPU costs
 /// +0.0483 on the 8-bit bundle where the phone's CPU costs +0.0167. And it
-/// ends on the model rather than the family or the size because the same
-/// four-bit recipes cost the 1B 8.83 points against the 270M's 34.83 -- one
-/// Gemma 3 rule, two answers -- and because the four costs do not order by
+/// says what the cost does *not* follow from rather than what it does: the
+/// same four-bit recipes cost the 1B 8.83 points against the 270M's 34.83 --
+/// one Gemma 3 rule, two answers -- and the four costs do not order by
 /// parameter count either: 3.50 on a 0.6B Qwen3, 7.67 on a 0.5B Qwen2.5, 8.83
-/// on the 1B. That is the whole reason a card carries no verdict.
+/// on the 1B. What does determine it is not something these runs separate,
+/// which is the whole reason a card carries no verdict.
 ///
 /// The size is in the card name because `models.py` scopes the `gemma-3-text`
 /// family to the 270M and the 1B, and both are now measured -- two cards that
@@ -88,8 +89,8 @@ class WhyItExists extends StatelessComponent {
             Component.text(
               'Measured on CPU, the conversion cost came out small at eight bits '
               'on all five, and at these sample sizes the method is near its '
-              'limit. Four bits cost more, and how much more depends on the '
-              'model rather than on its family or its size. ',
+              'limit. Four bits cost more, and how much more does not follow '
+              'from the family or the parameter count. ',
             ),
             a(
               href:

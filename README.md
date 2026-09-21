@@ -276,10 +276,9 @@ to the rest is a measurement of what each costs on your task:
 | `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550, +0.0917, +0.0883 and +0.3200 on the same four |
 
 `--recipe` has no default. A sweep of one is not a comparison. **At four bits,
-every model measured here lost accuracy the sample resolves, and how much
-depends on the model rather than on its family or its size: 3.50 points on a
-0.6B Qwen3, 7.67 on a 0.5B Qwen2.5, 8.83 on a 1B Gemma 3 and 34.83 on the
-270M** — see
+every model measured here lost accuracy the sample resolves, and how much does
+not follow from its family or its parameter count: 3.50 points on a 0.6B
+Qwen3, 7.67 on a 0.5B Qwen2.5, 8.83 on a 1B Gemma 3 and 34.83 on the 270M** — see
 [MEASUREMENTS.md](MEASUREMENTS.md) for the intervals, the refusals and what
 those numbers do not establish.
 
