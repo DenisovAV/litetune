@@ -619,10 +619,9 @@ litetune: `config.json` says `model_type: "qwen2"`, and the switch in
 this repository, read at `litert_torch/generative/export_hf/core/` in
 litert-torch 0.10.0.dev20260826 — has `case 'qwen2' | 'qwen2p5'`. It did not
 run offline: this run logged `HF_HUB_OFFLINE=unset` where both Gemma 3 runs
-logged `HF_HUB_OFFLINE=1`, both because those checkpoints are gated and
-travelled as copies of a local cache. Whether the weights then came over the
-network or off a cache already on the instance is not something these
-manifests record.
+logged `HF_HUB_OFFLINE=1`. Whether the weights then came over the network or
+off a cache already on the instance is not something these manifests record,
+for this run or for those.
 
 The task, the rows and the scorer are the second family's, and `max_seq_length`
 256 is the fourth family's: LoRA α32, lr 2e-4, one epoch, bfloat16 over the same

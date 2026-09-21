@@ -251,8 +251,8 @@ class WhyItExists extends StatelessComponent {
     // The accessible-name computation includes `::before` and `::after`
     // content, so the words are read out on top of the expanded/collapsed
     // state the platform already announces. Kept because they are what tell a
-    // sighted reader there is anything to open, and recorded because
-    // generated content cannot be hidden from the name.
+    // sighted reader there is anything to open, and recorded because nothing
+    // here gives the control an explicit label to exclude them.
     css('.measured-card-summary').styles(
       display: Display.flex,
       flexDirection: FlexDirection.column,
