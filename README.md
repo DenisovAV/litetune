@@ -277,8 +277,8 @@ to the rest is a measurement of what each costs on your task:
 
 `--recipe` has no default. A sweep of one is not a comparison. **At four bits,
 every model measured here lost accuracy the sample resolves, and how much does
-not follow from its family or its parameter count: 3.50 points on a 0.6B
-Qwen3, 7.67 on a 0.5B Qwen2.5, 8.83 on a 1B Gemma 3 and 34.83 on the 270M** — see
+not follow from its family or its parameter count: 3.50 points on
+Qwen3-0.6B, 7.67 on Qwen2.5-0.5B, 8.83 on Gemma 3 1B and 34.83 on the 270M** — see
 [MEASUREMENTS.md](MEASUREMENTS.md) for the intervals, the refusals and what
 those numbers do not establish.
 

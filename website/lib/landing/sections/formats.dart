@@ -100,8 +100,8 @@ class Formats extends StatelessComponent {
         ]),
         _row('Models', [
           Component.text(
-            'Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3 0.6B, Qwen2.5 0.5B, '
-            'Qwen3.5, FunctionGemma',
+            'Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3 0.6B, '
+            'Qwen2.5 0.5B Instruct, Qwen3.5, FunctionGemma',
           ),
           span(classes: 'qualifier', [
             Component.text(

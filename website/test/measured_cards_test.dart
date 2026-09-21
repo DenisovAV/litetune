@@ -32,22 +32,58 @@ File _measurements() {
   );
 }
 
+/// Every anchor a link could land on: `##` and `###` alike.
+Set<String> _anchors(List<String> lines) => {
+  for (final line in lines)
+    if (RegExp(r'^#{2,3} (.+)$').firstMatch(line) case final heading?)
+      anchorFor(heading.group(1)!.trim()),
+};
+
+/// What a reader sees after following a link to a `##` heading: that section
+/// and the `###` subsections under it, which is where most of the detail
+/// lives -- the FunctionGemma run names its checkpoint in a subsection of
+/// "The headline numbers", not under the heading itself.
+Map<String, String> _sectionsByAnchor(List<String> lines) {
+  final sections = <String, StringBuffer>{};
+  StringBuffer? current;
+  for (final line in lines) {
+    if (RegExp(r'^## (.+)$').firstMatch(line) case final heading?) {
+      current = sections[anchorFor(heading.group(1)!.trim())] = StringBuffer();
+    }
+    current?.writeln(line);
+  }
+  return {for (final e in sections.entries) e.key: e.value.toString()};
+}
+
 void main() {
-  final headings = _measurements()
-      .readAsLinesSync()
-      .where((line) => line.startsWith('## '))
-      .map((line) => anchorFor(line.substring(3).trim()))
-      .toSet();
+  final lines = _measurements().readAsLinesSync();
+  final anchors = _anchors(lines);
+  final sections = _sectionsByAnchor(lines);
 
   test('MEASUREMENTS.md has the sections the cards link to', () {
-    expect(headings, isNotEmpty, reason: 'no "## " headings were found at all');
+    expect(anchors, isNotEmpty, reason: 'no headings were found at all');
     for (final model in WhyItExists.measured) {
       expect(
-        headings,
+        anchors,
         contains(model.anchor),
         reason:
             '${model.name} links to MEASUREMENTS.md#${model.anchor}, and no '
             'heading in that file produces this anchor',
+      );
+    }
+  });
+
+  test('each card links to a section that names its own checkpoint', () {
+    // What pins a card to a run when it carries no revision: FunctionGemma's
+    // does not, so without this its anchor could point at any section that
+    // exists. The section has to name the repository the panel shows.
+    for (final model in WhyItExists.measured) {
+      expect(
+        sections[model.anchor],
+        contains(model.hubId.split('/').last),
+        reason:
+            '${model.name} links to #${model.anchor}, which never mentions '
+            '${model.hubId} -- the panel would send a reader to another run',
       );
     }
   });
@@ -65,18 +101,7 @@ void main() {
   test('a revision belongs to the section its own card links to', () {
     // Not "appears somewhere in the file": every revision in MEASUREMENTS.md
     // would satisfy that, so two cards with their revisions swapped would
-    // pass while the panel told a reader the wrong commit. The sha has to be
-    // in the section the same card links to.
-    final sections = <String, StringBuffer>{};
-    StringBuffer? current;
-    for (final line in _measurements().readAsLinesSync()) {
-      if (line.startsWith('## ')) {
-        current = sections[anchorFor(line.substring(3).trim())] =
-            StringBuffer();
-      }
-      current?.writeln(line);
-    }
-
+    // pass while the panel told a reader the wrong commit.
     for (final model in WhyItExists.measured) {
       final revision = model.revision;
       if (revision == null) continue;
@@ -86,7 +111,7 @@ void main() {
         reason: '${model.name} carries a revision that is not a short sha',
       );
       expect(
-        sections[model.anchor]?.toString(),
+        sections[model.anchor],
         contains(revision),
         reason:
             '${model.name} pins $revision, which the section it links to '

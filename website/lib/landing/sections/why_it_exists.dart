@@ -3,6 +3,22 @@ import 'package:jaspr/jaspr.dart';
 
 import '../../theme/brand.dart';
 
+/// One end-to-end run, as the card and its panel say it.
+///
+/// `revision` is null where `MEASUREMENTS.md` pins none -- FunctionGemma's
+/// runs record the dataset and the split but never a base-model commit -- and
+/// the panel omits the line rather than showing an empty one or a revision
+/// nobody wrote down. `anchor` is GitHub's own heading anchor for the section
+/// that measured this model; `measured_cards_test.dart` checks that the
+/// section still exists and still names this checkpoint.
+typedef MeasuredRun = ({
+  String name,
+  String how,
+  String hubId,
+  String? revision,
+  String anchor,
+});
+
 /// The one paragraph that explains the tool's reason to exist, and the runs
 /// where it was actually done.
 ///
@@ -58,9 +74,12 @@ import '../../theme/brand.dart';
 /// `<details>`, not a dialog and not an island. The site builds in `static`
 /// mode with no `@client` component anywhere, so a disclosure that needs
 /// JavaScript would make this the page that ends that -- for a panel the
-/// browser already implements, keyboard-operable and open-by-default when
-/// JavaScript is off or printing. `.cards` gets `align-items: start` so an
-/// open card grows downward instead of stretching the ones beside it.
+/// browser already implements and operates from the keyboard. No card is
+/// rendered `open`, which is the cost as well as the point: with scripting
+/// off the panel still opens, but on paper it does not, and a printed page
+/// carries the model names without the checkpoints. `.measured-cards` gets
+/// `align-items: start` so an open card grows downward instead of stretching
+/// the ones beside it.
 class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
@@ -95,7 +114,7 @@ class WhyItExists extends StatelessComponent {
             a(
               href:
                   'https://github.com/DenisovAV/litetune/blob/main/MEASUREMENTS.md',
-              attributes: const {'target': '_blank', 'rel': 'noopener'},
+              attributes: _newTab,
               [Component.text('The numbers, and what they do not establish')],
             ),
           ]),
@@ -104,69 +123,54 @@ class WhyItExists extends StatelessComponent {
     ]);
   }
 
-  /// A measured run, as the card and its panel say it.
-  ///
-  /// `revision` is null where `MEASUREMENTS.md` pins none -- FunctionGemma's
-  /// runs record the dataset and the split but never a base-model commit --
-  /// and the panel then omits the line rather than showing an empty one or a
-  /// revision nobody wrote down.
-  static const measured =
-      <
-        ({
-          String name,
-          String how,
-          String hubId,
-          String? revision,
-          String anchor,
-        })
-      >[
-        (
-          name: 'FunctionGemma 270M',
-          how: 'tool-call scoring, 640 held-out rows',
-          hubId: 'google/functiongemma-270m-it',
-          revision: null,
-          anchor: 'the-headline-numbers',
-        ),
-        (
-          name: 'Gemma 3 270M',
-          how: 'exact-text scoring, 600 held-out rows',
-          hubId: 'google/gemma-3-270m-it',
-          revision: 'ac82b4e8',
-          anchor: 'a-second-family-and-the-second-scorer',
-        ),
-        (
-          name: 'Gemma 3 1B',
-          how: 'exact-text scoring, the same 600 held-out rows',
-          hubId: 'google/gemma-3-1b-it',
-          revision: 'dcc83ea8',
-          anchor: 'the-same-family-four-times-the-size',
-        ),
-        (
-          name: 'Qwen3 0.6B',
-          how: 'exact-text scoring, the same 600 held-out rows',
-          hubId: 'Qwen/Qwen3-0.6B',
-          revision: 'c1899de2',
-          anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
-        ),
-        (
-          name: 'Qwen2.5 0.5B',
-          how: 'exact-text scoring, the same 600 held-out rows',
-          hubId: 'Qwen/Qwen2.5-0.5B-Instruct',
-          revision: '7ae55760',
-          anchor:
-              'a-fifth-family-and-the-first-where-channelwise-four-bits-answered',
-        ),
-      ];
+  /// The runs, in the order the cards show them.
+  static const measured = <MeasuredRun>[
+    (
+      name: 'FunctionGemma 270M',
+      how: 'tool-call scoring, 640 held-out rows',
+      hubId: 'google/functiongemma-270m-it',
+      revision: null,
+      anchor: 'the-headline-numbers',
+    ),
+    (
+      name: 'Gemma 3 270M',
+      how: 'exact-text scoring, 600 held-out rows',
+      hubId: 'google/gemma-3-270m-it',
+      revision: 'ac82b4e8',
+      anchor: 'a-second-family-and-the-second-scorer',
+    ),
+    (
+      name: 'Gemma 3 1B',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      hubId: 'google/gemma-3-1b-it',
+      revision: 'dcc83ea8',
+      anchor: 'the-same-family-four-times-the-size',
+    ),
+    (
+      name: 'Qwen3 0.6B',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      hubId: 'Qwen/Qwen3-0.6B',
+      revision: 'c1899de2',
+      anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
+    ),
+    (
+      name: 'Qwen2.5 0.5B',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      hubId: 'Qwen/Qwen2.5-0.5B-Instruct',
+      revision: '7ae55760',
+      anchor:
+          'a-fifth-family-and-the-first-where-channelwise-four-bits-answered',
+    ),
+  ];
 
   static const _newTab = {'target': '_blank', 'rel': 'noopener'};
 
   static Component _card(
-    ({String name, String how, String hubId, String? revision, String anchor})
-    model,
+    MeasuredRun model,
   ) => details(classes: 'measured-card', [
     summary(classes: 'measured-card-summary', [
-      div(classes: 'measured-card-model', [Component.text(model.name)]),
-      div(classes: 'measured-card-how', [Component.text(model.how)]),
+      span(classes: 'measured-card-model', [Component.text(model.name)]),
+      span(classes: 'measured-card-how', [Component.text(model.how)]),
     ]),
     div(classes: 'measured-card-panel', [
       div(classes: 'measured-card-fact', [
@@ -225,10 +229,10 @@ class WhyItExists extends StatelessComponent {
     css('.measured-cards').styles(
       display: Display.grid,
       gap: Gap.all(0.75.rem),
+      // An open card grows downward; the ones beside it keep their height.
+      alignItems: AlignItems.start,
       raw: const {
         'grid-template-columns': 'repeat(auto-fit, minmax(16rem, 1fr))',
-        // An open card grows downward; the ones beside it keep their height.
-        'align-items': 'start',
       },
     ),
     css('.measured-card').styles(
@@ -238,25 +242,33 @@ class WhyItExists extends StatelessComponent {
       border: Border.all(color: Brand.line, width: 1.px),
     ),
     // The default triangle is replaced by a sign that lines up with the
-    // model name, and `list-style` covers the browsers that draw the marker
-    // as a list marker rather than through the WebKit pseudo-element.
+    // model name. `display: flex` below is what actually removes it in
+    // Chromium and Firefox -- the triangle is the UA's `summary { display:
+    // list-item }`, which this overrides -- so `list-style: none` is
+    // belt-and-braces and the WebKit pseudo-element rule is the one doing
+    // work where it is needed.
+    //
+    // The marker's text lands in the control's accessible name, so a screen
+    // reader says "… + checkpoint" on top of the expanded/collapsed state it
+    // already announces. Kept because the words are what tell a sighted
+    // reader there is anything to open; recorded because it is a real cost
+    // and `content` cannot be hidden from the name.
     css('.measured-card-summary').styles(
       display: Display.flex,
       flexDirection: FlexDirection.column,
       gap: Gap.all(0.3.rem),
-      raw: const {'cursor': 'pointer', 'list-style': 'none'},
+      cursor: Cursor.pointer,
+      listStyle: ListStyle.none,
     ),
     css(
       '.measured-card-summary::-webkit-details-marker',
     ).styles(raw: const {'display': 'none'}),
-    css('.measured-card-summary::after').styles(
-      color: Brand.muted,
-      fontSize: 0.85.rem,
-      raw: const {'content': '"+ checkpoint"'},
-    ),
+    css(
+      '.measured-card-summary::after',
+    ).styles(color: Brand.muted, fontSize: 0.85.rem, content: '+ checkpoint'),
     css(
       '.measured-card[open] .measured-card-summary::after',
-    ).styles(raw: const {'content': '"− checkpoint"'}),
+    ).styles(content: '− checkpoint'),
     css(
       '.measured-card-model',
     ).styles(color: Brand.ink, fontSize: 1.05.rem, fontWeight: FontWeight.w500),
