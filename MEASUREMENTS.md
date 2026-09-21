@@ -589,7 +589,8 @@ comparison names the untuned base as its reference, so conversion and training
 are confounded in it and both attribution fields are unavailable. The zero is
 what is left when that is said — two scores of nothing to subtract from each
 other. The second family reached the same dead end from the other
-side, where the base repeated itself and never reached the quality tier. Two
+side, where the base never reached the quality tier — refused for empty output
+in the run of record, and for repetition in the withdrawn `prerendered` one. Two
 sizes of one family, two ways of establishing nothing about training gain.
 
 **The terminator is the template's close, as it is for the 270M.**
@@ -618,8 +619,8 @@ litetune: `config.json` says `model_type: "qwen2"`, and the switch in
 this repository, read at `litert_torch/generative/export_hf/core/` in
 litert-torch 0.10.0.dev20260826 — has `case 'qwen2' | 'qwen2p5'`. It did not
 run offline: this run logged `HF_HUB_OFFLINE=unset` where both Gemma 3 runs
-logged `HF_HUB_OFFLINE=1`, the 1B's because that checkpoint is gated and
-travelled as a copy of a local cache. Whether the weights then came over the
+logged `HF_HUB_OFFLINE=1`, both because those checkpoints are gated and
+travelled as copies of a local cache. Whether the weights then came over the
 network or off a cache already on the instance is not something these
 manifests record.
 
@@ -669,14 +670,14 @@ device from its candidate.
 sides score **0.0000 on all 600 rows**, `verify` reports `unmeasured` and exits
 3, and its manifest gives the same reason as the 1B's: the reference is the
 untuned base, so training and conversion are confounded and both attribution
-fields are unavailable. Of the four models measured on banking77, not one has a
-recorded training gain — two scored zero on both sides, one was refused for
-empty output, and one was never scored. FunctionGemma's **+0.1906 ±0.0357** at the
-top of this file is still the only training gain here, on another task with
-another scorer.
+fields are unavailable. Of the four models fine-tuned and measured on banking77, not
+one has a recorded training gain — two scored zero on both sides, one was refused for
+empty output, and one was never scored. FunctionGemma, at the top of this file, is the only model
+here with one at all — on another task, with another scorer, and with three
+readings of the figure that section sets against each other.
 
-**The terminator is the template's close, as in every banking77 run here.**
-`tune`
+**The terminator is the template's close, as in the three banking77 runs of
+record before it.** `tune`
 recorded `turn_terminator: {ids: [151645, 198], source: "chat_template", text:
 "<|im_end|>\n"}`, and on the reference `terminators_trimmed` read 600 of 600,
 one marker each. On litert-lm it read 0 of 600 — the runtime hands back the text
@@ -770,8 +771,9 @@ generation to the timeout. `dynamic_wi4_afp32`, which keeps activations in
 integers, is the one that eventually answered. So integer activations are not
 what separates a working bundle from a broken one here — if anything the
 evidence runs the other way, and on three of the four checkpoints neither recipe
-produced an answer at all. A five-prompt diagnostic through every bundle of gemma-3-270m and
-Qwen3-0.6B says the same from the other side: at 8 bits both models emit the reference's label
+produced an answer at all. A five-prompt diagnostic through both int8 and both channelwise bundles of
+gemma-3-270m and Qwen3-0.6B — the two block-wise recipes were never in it —
+says the same from the other side: at 8 bits both models emit the reference's label
 and stop, the terminator scoring at or above −0.001 in log-probability; at 4 bits
 channelwise, Qwen3 matches one of five labels exactly and on another emits the
 right label and then does not stop — its terminator scores −0.64 to −4.17 — while

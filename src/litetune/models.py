@@ -566,9 +566,11 @@ RULES: tuple[ModelRules, ...] = (
         #
         # The tail is what makes that true. `identify` searches rather than
         # matches, so a bare `qwen-?2-5-0-5b-instruct` also claims
-        # `Qwen2.5-0.5B-Instruct-AWQ`, `-GPTQ-Int4` and the bnb-4bit repacks --
-        # checkpoints that are already quantized, that nobody here exported,
-        # and for which "no flags needed" is least likely to hold. So the
+        # any id that continues past it -- an `-AWQ`, a `-GPTQ-Int4`, a
+        # bnb-4bit repack -- which name already-quantized checkpoints nobody
+        # here exported, and for which "no flags needed" is least likely to
+        # hold. The tests pin the regex against those spellings; whether each
+        # repository exists is not something this checks. So the
         # pattern ends either at the end of the hint text or at the
         # `model_type` `hint_for` appends for a local checkpoint: this run's
         # merged model read `qwen-qwen2-5-0-5b-instruct-qwen2-qwen2forcausallm`

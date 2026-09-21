@@ -53,9 +53,9 @@ typedef MeasuredRun = ({
 /// says what the cost does *not* follow from rather than what it does: the
 /// same four-bit recipes cost the 1B 8.83 points against the 270M's 34.83 --
 /// one Gemma 3 rule, two answers -- and the four costs do not order by
-/// parameter count either: 3.50 on a 0.6B Qwen3, 7.67 on a 0.5B Qwen2.5, 8.83
-/// on the 1B. What does determine it is not something these runs separate,
-/// which is the whole reason a card carries no verdict.
+/// parameter count either: 3.50 on Qwen3-0.6B, 7.67 on Qwen2.5-0.5B, 8.83 on
+/// the 1B, 34.83 on the 270M. What does determine it is not something these
+/// runs separate, which is the whole reason a card carries no verdict.
 ///
 /// The size is in the card name because `models.py` scopes the `gemma-3-text`
 /// family to the 270M and the 1B, and both are now measured -- two cards that
@@ -242,17 +242,17 @@ class WhyItExists extends StatelessComponent {
       border: Border.all(color: Brand.line, width: 1.px),
     ),
     // The default triangle is replaced by a sign that lines up with the
-    // model name. `display: flex` below is what actually removes it in
-    // Chromium and Firefox -- the triangle is the UA's `summary { display:
-    // list-item }`, which this overrides -- so `list-style: none` is
-    // belt-and-braces and the WebKit pseudo-element rule is the one doing
-    // work where it is needed.
+    // model name. Both the `display: flex` here and `list-style: none` below
+    // can suppress a marker drawn as a list marker, and the WebKit
+    // pseudo-element needs its own rule; which one is load-bearing depends on
+    // the engine, and nothing in this repository tests that, so all three
+    // stay.
     //
-    // The marker's text lands in the control's accessible name, so a screen
-    // reader says "… + checkpoint" on top of the expanded/collapsed state it
-    // already announces. Kept because the words are what tell a sighted
-    // reader there is anything to open; recorded because it is a real cost
-    // and `content` cannot be hidden from the name.
+    // The accessible-name computation includes `::before` and `::after`
+    // content, so the words are read out on top of the expanded/collapsed
+    // state the platform already announces. Kept because they are what tell a
+    // sighted reader there is anything to open, and recorded because
+    // generated content cannot be hidden from the name.
     css('.measured-card-summary').styles(
       display: Display.flex,
       flexDirection: FlexDirection.column,
