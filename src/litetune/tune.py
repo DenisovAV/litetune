@@ -484,6 +484,7 @@ metrics file into events.
 """
 import json
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -802,6 +803,20 @@ def main() -> int:
     model.to(device)
 
     trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    target_modules = list(spec["lora_targets"])
+    container = spec.get("lora_container")
+    if container:
+        # peft matches a list of names by suffix, and on a multimodal
+        # checkpoint the same projection names occur in the vision and audio
+        # towers. A regex is the only shape `target_modules` has that says
+        # "these projections, and only under this container". The container has
+        # to be a whole path segment: `.*language_model\.` also matches a
+        # sibling named `xlanguage_model`, because `.*` absorbs the prefix, so
+        # what precedes it is either nothing or something ending in a dot.
+        target_modules = r"(?:.*\.)?%s\..*\.(%s)" % (
+            re.escape(container),
+            "|".join(re.escape(name) for name in target_modules),
+        )
     if spec["method"] == "lora":
         from peft import LoraConfig, get_peft_model
 
@@ -813,7 +828,7 @@ def main() -> int:
                 lora_dropout=spec["lora_dropout"],
                 bias="none",
                 task_type="CAUSAL_LM",
-                target_modules=list(spec["lora_targets"]),
+                target_modules=target_modules,
             ),
         )
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -939,6 +954,12 @@ def main() -> int:
                 "turn_terminator": terminator,
                 "trainable_parameters": trainable,
                 "base_parameters": trainable_before,
+                # What peft was actually given: the projection list, or the
+                # regex that restricts it to one container. Recorded because
+                # two runs called `lora` are only the same method if this is
+                # the same, and on a multimodal checkpoint it is not derivable
+                # from the model id.
+                "lora_target_modules": target_modules if spec["method"] == "lora" else None,
                 "epochs": epochs,
                 "model_dir": str(model_dir),
                 "adapter_dir": str(adapter_dir) if adapter_dir else None,
@@ -1158,6 +1179,7 @@ class TuneRequest:
         decision: PromptModeDecision | None = None,
         declarations_sha256: str | None = None,
         declarations: list | None = None,
+        lora_container: str | None = None,
     ) -> dict[str, Any]:
         """Everything the generated script needs. Also what the report records.
 
@@ -1191,6 +1213,11 @@ class TuneRequest:
             "lora_alpha": self.lora_alpha,
             "lora_dropout": self.lora_dropout,
             "lora_targets": list(self.lora_targets),
+            # Which container those projections are restricted to, from the
+            # family's rules -- decided in the parent, like the device and the
+            # prompt mode, so a run says what it is about to adapt while there
+            # is still something to do about it.
+            "lora_container": lora_container,
             "dtype": self.dtype,
             "attn_implementation": self.attn_implementation,
             "prompt_mode": mode.value if mode is not None else None,
@@ -1744,6 +1771,17 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     # the checkpoint downloaded, and reads as a litetune bug rather than a
     # version requirement.
     rules = models.identify(request.model)
+    lora_container = rules.lora_container if rules is not None else None
+    if rules is not None and rules.lora_container and request.method == "lora":
+        # Said out loud rather than applied quietly: this is the difference
+        # between adapting a text tower and adapting a whole multimodal
+        # checkpoint, and the artifact it produces looks identical either way.
+        result.limitation(
+            f"LoRA was restricted to modules under `{lora_container}`: "
+            f"{rules.lora_container_reason}. The projection set is unchanged, so this run is "
+            f"comparable with the other families here; an unscoped run on this checkpoint would "
+            f"not be"
+        )
     if rules is not None and rules.min_transformers:
         version_check = models.transformers_check(
             request.model,
@@ -1828,6 +1866,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
                 decision=result.prompt_mode_decision,
                 declarations_sha256=result.declarations_sha256,
                 declarations=declarations,
+                lora_container=lora_container,
             ),
             indent=2,
         ),

@@ -16,6 +16,7 @@ one thing in this tool that failed silently and cost nine times the base score.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field, fields
@@ -978,6 +979,37 @@ def test_a_different_dtype_is_allowed_and_named_as_a_limitation(trainer, request
     assert not any("fluent, wrong" in text for text in result.limitations)
 
 
+def test_scoping_lora_to_a_container_is_named_as_a_limitation(trainer, request_for):
+    """Said out loud, because the artifact looks identical either way.
+
+    The difference between adapting a text tower and adapting a whole
+    multimodal checkpoint is invisible in the output: both train, both save,
+    both pass every check. A reader comparing this run with another family's
+    has to be told which one happened.
+    """
+    result = run_tune(request_for(model="google/gemma-4-E2B-it", method="lora"))
+
+    scoped = [t for t in result.limitations if "restricted to modules under `language_model`" in t]
+    assert len(scoped) == 1, result.limitations
+    assert "112 vision" in scoped[0], "the limitation carries the count it rests on"
+    assert "comparable with the other families" in scoped[0]
+
+
+def test_a_text_only_family_is_not_told_its_lora_was_scoped(trainer, request_for):
+    """No container, no limitation -- `functiongemma` has one tower."""
+    result = run_tune(request_for(method="lora"))
+
+    assert not any("restricted to modules under" in t for t in result.limitations)
+
+
+def test_a_full_run_on_a_scoped_family_carries_no_scope_limitation(trainer, request_for):
+    """Scoping describes an adapter. A full fine-tune has none, so saying its
+    LoRA was restricted would describe something that did not happen."""
+    result = run_tune(request_for(model="google/gemma-4-E2B-it", method="full"))
+
+    assert not any("restricted to modules under" in t for t in result.limitations)
+
+
 def test_a_different_attention_implementation_is_named_as_a_limitation(trainer, request_for):
     result = run_tune(request_for(attn_implementation="sdpa"))
 
@@ -1317,6 +1349,7 @@ def run_real_script(
     decision: PromptModeDecision | None = None,
     declarations_sha256: str | None = None,
     declarations: list | None = None,
+    lora_container: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Runs `_TRAIN_SCRIPT` for real, against the stub modules `stub_env` wrote.
 
@@ -1337,6 +1370,7 @@ def run_real_script(
                 decision=decision,
                 declarations_sha256=declarations_sha256,
                 declarations=declarations,
+                lora_container=lora_container,
             )
         ),
         encoding="utf-8",
@@ -1378,6 +1412,62 @@ def test_the_real_script_writes_metrics_this_module_can_read(request_for, stub_e
     assert metrics.supervised_token_fraction < 0.4
     assert [e.epoch for e in metrics.epochs] == [1, 2]
     assert metrics.final_loss == pytest.approx(1.45)
+
+
+def test_a_scoped_lora_run_reaches_the_text_tower_and_nothing_beside_it(request_for, stub_env):
+    """The regex the script hands peft, tried against the real module graph.
+
+    The three names below are leaf modules of `google/gemma-4-E2B-it`, read off
+    its module graph: one per tower, all called `q_proj`. peft matches a plain
+    list by name suffix, so all three would be adapted by the projection list
+    alone -- which is the defect the container exists to prevent.
+
+    The fourth name is the one a right-anchor alone would let through:
+    `.*language_model\\.` matches a sibling called `xlanguage_model`, because
+    `.*` absorbs everything before it. The container has to be a whole path
+    segment, and this is where that is enforced.
+    """
+    request = request_for(method="lora")
+    proc = run_real_script(request, stub_env, lora_container="language_model")
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    pattern = recorded["lora_target_modules"]
+    assert isinstance(pattern, str), "a scoped run has to hand peft a regex, not a list"
+
+    assert re.fullmatch(pattern, "model.language_model.layers.0.self_attn.q_proj")
+    assert not re.fullmatch(pattern, "model.vision_tower.encoder.layers.0.self_attn.q_proj")
+    assert not re.fullmatch(pattern, "model.audio_tower.layers.0.self_attn.q_proj")
+    assert not re.fullmatch(pattern, "model.xlanguage_model.layers.0.self_attn.q_proj")
+    # And the mirror of it: the separator after the container is what stops
+    # `language_model` matching a sibling that merely starts with the word.
+    assert not re.fullmatch(pattern, "model.language_model_v2.layers.0.self_attn.q_proj")
+
+    # The projection set is untouched: scoping decides where, never which.
+    assert re.fullmatch(pattern, "model.language_model.layers.0.mlp.down_proj")
+    assert not re.fullmatch(pattern, "model.language_model.layers.0.self_attn.qkv_proj")
+
+
+def test_an_unscoped_run_hands_peft_the_projection_list_itself(request_for, stub_env):
+    """No container means no regex -- every other family is text-only, and a
+    scope there would be a claim about a structure that does not exist."""
+    request = request_for(method="lora")
+    proc = run_real_script(request, stub_env)
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["lora_target_modules"] == list(request.lora_targets)
+
+
+def test_a_full_fine_tune_records_no_target_modules(request_for, stub_env):
+    """`lora_target_modules` describes an adapter. A full run has none, and
+    recording one would read as a LoRA run in the manifest."""
+    request = request_for(method="full")
+    proc = run_real_script(request, stub_env)
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["lora_target_modules"] is None
 
 
 def test_the_real_script_records_the_declarations_in_both_files(request_for, stub_env, tmp_path):

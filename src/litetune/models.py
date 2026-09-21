@@ -170,6 +170,14 @@ class ModelRules:
     extra_stop_tokens: tuple[str, ...] = ()
     stop_token_reason: str = ""
 
+    # Which part of a multimodal checkpoint a LoRA run may adapt, named as the
+    # container its modules sit under -- `tune` restricts its projection set to
+    # modules whose path passes through it. Empty for a text-only family, where
+    # every module is in scope and a container would be a claim about a
+    # structure that does not exist.
+    lora_container: str | None = None
+    lora_container_reason: str = ""
+
     # The tool path, recorded together because one measurement establishes both:
     # whether this family's serving runtime renders tool declarations into the
     # prompt, and the spelling its calls use. Neither is in `config.json` and
@@ -284,6 +292,24 @@ _GEMMA4_RECIPE_REASON = (
 
 # Sourced: litert-torch#1044 -- "Right now litert-torch don't support QAT
 # checkpoint conversion".
+# Sourced: peft 0.20.0 ships this scope itself. Its
+# `TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING` maps `gemma4` to the
+# regex `.*language_model\..*\.(q_proj|v_proj)`, and Google's own
+# fine-tuning guide passes no `target_modules` at all, commenting "no
+# target_modules -- PEFT's Gemma 4 defaults scope to the LM layers".
+# litetune cannot take that default: it names its projection set explicitly so
+# that two runs recorded as `lora` are the same method, and passing
+# `target_modules` is what switches the default off.
+_GEMMA4_LORA_CONTAINER_REASON = (
+    "the checkpoint is multimodal and its towers use the same projection names as its text "
+    "layers. Counted on the module graph of google/gemma-4-E2B-it: 112 vision modules and 36 "
+    "audio modules are named q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj or down_proj, "
+    "against 205 in the text tower. peft matches target modules by name suffix, so an unscoped "
+    "run adapts all 353 -- it trains, it saves, and every check passes, while `lora` means "
+    "something other than it does on every other family here. Scoping to `language_model` "
+    "leaves the projection set alone and drops the towers"
+)
+
 _GEMMA4_NOT_GOOGLES_ARTIFACT = (
     "a Gemma 4 export made here is NOT equivalent to Google's published .litertlm. Google's comes "
     "from a quantized-safetensors (QAT) path that litert-torch does not support -- 'Right now "
@@ -328,6 +354,8 @@ def _gemma4(family: str, patterns: tuple[str, ...], override_repo: str | None) -
         limitations=(_GEMMA4_NOT_GOOGLES_ARTIFACT,),
         extra_stop_tokens=("<turn|>", "<|tool_response>"),
         stop_token_reason=_GEMMA4_STOP_REASON,
+        lora_container="language_model",
+        lora_container_reason=_GEMMA4_LORA_CONTAINER_REASON,
     )
 
 

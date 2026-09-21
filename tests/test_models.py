@@ -161,6 +161,39 @@ def test_gemma_4_declares_the_stop_tokens_its_generation_config_names():
         assert rules.stop_token_reason, f"{family} declares stop tokens with no evidence"
 
 
+def test_gemma_4_scopes_lora_to_its_text_tower():
+    """A LoRA run on Gemma 4 must adapt the text tower and nothing else.
+
+    peft matches `target_modules` by name suffix, and this checkpoint's vision
+    and audio towers use the same projection names as its text layers: counted
+    on the module graph of `google/gemma-4-E2B-it`, 112 vision and 36 audio
+    modules against 205 text ones. An unscoped run adapts all 353, trains,
+    saves, and passes every check -- while `lora` means something other than it
+    does on every other family here.
+
+    Per variant, because `_gemma4` builds three and one dropped argument would
+    leave all three unscoped while every other test stayed green.
+    """
+    for family in ("gemma-4-e2b", "gemma-4-e4b", "gemma-4"):
+        rules = next(r for r in models.RULES if r.family == family)
+        assert rules.lora_container == "language_model", family
+        assert rules.lora_container_reason, f"{family} scopes LoRA with no evidence"
+
+
+def test_only_a_multimodal_family_scopes_lora_at_all():
+    """The container is a claim about structure, so a text-only family makes none.
+
+    Asserted as "every family except these", not as a list of the text-only
+    ones: a family added later without deciding this question fails here rather
+    than silently inheriting a scope that does not describe it.
+    """
+    scoped = {r.family for r in models.RULES if r.lora_container}
+    assert scoped == {"gemma-4-e2b", "gemma-4-e4b", "gemma-4"}, sorted(scoped)
+    for rules in models.RULES:
+        if not rules.lora_container:
+            assert not rules.lora_container_reason, rules.family
+
+
 def test_a_config_that_cannot_be_read_says_so_rather_than_reporting_no_rules(tmp_path):
     checkpoint = tmp_path / "model"
     checkpoint.mkdir()
