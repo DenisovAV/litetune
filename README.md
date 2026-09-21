@@ -50,10 +50,10 @@ is workable at 270M and the first thing you will want to change above about
 1B. Bring your own checkpoint and skip the first two steps, or bring a
 `.litertlm` and its float checkpoint and run only `verify`.
 
-> **Alpha.** Measured end to end on four models: `google/functiongemma-270m-it`
+> **Alpha.** Measured end to end on five models: `google/functiongemma-270m-it`
 > with the tool-call scorer, and `google/gemma-3-270m-it`,
-> `google/gemma-3-1b-it` and `Qwen/Qwen3-0.6B` with `exact-text` on the same
-> 77-way intent task — every conversion scored on
+> `google/gemma-3-1b-it`, `Qwen/Qwen3-0.6B` and `Qwen/Qwen2.5-0.5B-Instruct`
+> with `exact-text` on the same 77-way intent task — every conversion scored on
 > CPU, two of them also on a phone's CPU and GPU, all in
 > [MEASUREMENTS.md](MEASUREMENTS.md).
 > Qwen3.5 exports and needs no flags from litetune, only a `transformers`
@@ -270,15 +270,16 @@ to the rest is a measurement of what each costs on your task:
 |---|---|
 | `dynamic_wi8_afp32` | the toolchain's default; its own docstring warns quality "may suffer" |
 | `weight_only_wi8_afp32` | dequantizes before compute, so slower by an unmeasured amount |
-| `dynamic_wi4_afp32` | 4-bit channelwise. Refused on all three models measured — a leaked `<bos>` on gemma-3-270m, degenerate repetition on Qwen3 and, past the gate, on 65 of 600 rows on gemma-3-1b |
-| `weight_only_wi4_afp32` | 4-bit channelwise, dequantised before compute. Refused too, and differently: prompts that never finished |
-| `dynamic_wi4b32_afp32` | 4-bit in blocks of 32. Reached a score on all three; cost +0.0350 on a tuned Qwen3-0.6B, +0.0883 on a tuned gemma-3-1b and +0.3483 on a tuned gemma-3-270m |
-| `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550, +0.0883 and +0.3200 on the same three |
+| `dynamic_wi4_afp32` | 4-bit channelwise. Refused on three of the four models measured — a leaked `<bos>` on gemma-3-270m, degenerate repetition on Qwen3 and, past the gate, on 65 of 600 rows on gemma-3-1b. On Qwen2.5-0.5B it ran all 600 and cost +0.2567, a third of the model's accuracy |
+| `weight_only_wi4_afp32` | 4-bit channelwise, dequantised before compute. Refused on all four, and always the same way: prompts that never finished. On Qwen2.5-0.5B the gate opened and one generation of 600 still timed out, so there is no score |
+| `dynamic_wi4b32_afp32` | 4-bit in blocks of 32. Reached a score on all four; cost +0.0350 on a tuned Qwen3-0.6B, +0.0767 on a tuned Qwen2.5-0.5B, +0.0883 on a tuned gemma-3-1b and +0.3483 on a tuned gemma-3-270m |
+| `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550, +0.0917, +0.0883 and +0.3200 on the same four |
 
 `--recipe` has no default. A sweep of one is not a comparison. **At four bits,
 every model measured here lost accuracy the sample resolves, and how much
-depends on the model rather than on the family: 8.83 points on a 1B Gemma 3
-against 34.83 on the 270M** — see
+depends on the model rather than on its family or its size: 3.50 points on a
+0.6B Qwen3, 7.67 on a 0.5B Qwen2.5, 8.83 on a 1B Gemma 3 and 34.83 on the
+270M** — see
 [MEASUREMENTS.md](MEASUREMENTS.md) for the intervals, the refusals and what
 those numbers do not establish.
 
@@ -641,13 +642,14 @@ withdrawn after re-measurement.
 
 **Limits on the numbers**
 
-- **Measured on five models, four of them fine-tuned here.**
+- **Measured on six models, five of them fine-tuned here.**
   `functiongemma-270m-it` with the tool-call scorer, and `gemma-3-270m-it`,
-  `gemma-3-1b-it` and `Qwen3-0.6B` with `exact-text`, each with a conversion
+  `gemma-3-1b-it`, `Qwen3-0.6B` and `Qwen2.5-0.5B-Instruct` with `exact-text`,
+  each with a conversion
   cost against its own float twin. Only FunctionGemma also has a training gain:
   no banking77 run has an untuned base figure to subtract — Gemma 3 270M's base
-  was run and refused to score, the 1B's scored 0.0000 on both sides, and
-  Qwen3's never reached the base step at all — and every one of those manifests
+  was run and refused to score, the 1B's and Qwen2.5's scored 0.0000 on both
+  sides, and Qwen3's never reached the base step at all — and every one of those manifests
   records the gain as unavailable. `gemma-4-E2B-it` was not
   fine-tuned at all: base weights, two conversions of them compared against the
   float reference, so that run has a conversion cost and no training gain.

@@ -34,14 +34,17 @@ import '../../theme/brand.dart';
 /// says "on CPU" because the same file records the Qwen3 bundles on a
 /// phone as well, where the backend changes the answer: the GPU costs
 /// +0.0483 on the 8-bit bundle where the phone's CPU costs +0.0167. And it
-/// ends on the model rather than the family because the same four-bit recipes
-/// cost the 1B 8.83 points against the 270M's 34.83 -- one Gemma 3 rule, two
-/// answers, which is the whole reason a card carries no verdict.
+/// ends on the model rather than the family or the size because the same
+/// four-bit recipes cost the 1B 8.83 points against the 270M's 34.83 -- one
+/// Gemma 3 rule, two answers -- and because the four costs do not order by
+/// parameter count either: 3.50 on a 0.6B Qwen3, 7.67 on a 0.5B Qwen2.5, 8.83
+/// on the 1B. That is the whole reason a card carries no verdict.
 ///
 /// The size is in the card name because `models.py` scopes the `gemma-3-text`
 /// family to the 270M and the 1B, and both are now measured -- two cards that
 /// differ in nothing but size. Qwen3's card carries its size because its rule
-/// is scoped to the one size that was run.
+/// is scoped to the one size that was run, and Qwen2.5's for the same reason,
+/// where the rule is scoped to the one size *and* variant.
 class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
@@ -74,13 +77,17 @@ class WhyItExists extends StatelessComponent {
               'Qwen3 0.6B',
               'exact-text scoring, the same 600 held-out rows',
             ),
+            _card(
+              'Qwen2.5 0.5B',
+              'exact-text scoring, the same 600 held-out rows',
+            ),
           ]),
           p(classes: 'measured-note', [
             Component.text(
               'Measured on CPU, the conversion cost came out small at eight bits '
-              'on all four, and at these sample sizes the method is near its '
+              'on all five, and at these sample sizes the method is near its '
               'limit. Four bits cost more, and how much more depends on the '
-              'model rather than on its family. ',
+              'model rather than on its family or its size. ',
             ),
             a(
               href:

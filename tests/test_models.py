@@ -72,8 +72,10 @@ def test_families_are_recognised(model, family):
         # declare `model_type: gemma3_text`, which the exporter does not
         # recognise, so without an override both bundle as `generic_model`.
         # Qwen3-0.6B sat here until its export and conversion cost were
-        # measured. Its rule adds nothing; the rest of Qwen 3 stays below.
-        "Qwen/Qwen2.5-0.5B-Instruct",
+        # measured, and Qwen2.5-0.5B-Instruct until 2026-09-20. Both rules add
+        # nothing; the rest of both families stays below.
+        "Qwen/Qwen2.5-1.5B-Instruct",
+        "Qwen/Qwen2.5-0.5B",
         # Claimed by size, and only the size that was measured. The TTS model is
         # here because its name ends in 0.6B too.
         "Qwen/Qwen3-1.7B",
@@ -247,7 +249,7 @@ def test_an_export_request_carries_the_required_flags_into_its_argv(tmp_path):
 
 
 def test_a_family_with_no_rules_has_its_flags_left_alone(tmp_path):
-    plan = plan_export("Qwen/Qwen2.5-0.5B-Instruct", ("--some_flag=1",), ("dynamic_wi8_afp32",))
+    plan = plan_export("Qwen/Qwen2.5-1.5B-Instruct", ("--some_flag=1",), ("dynamic_wi8_afp32",))
     assert plan.flags == ("--some_flag=1",)
     assert plan.added == ()
     assert plan.usable
@@ -270,6 +272,38 @@ def test_a_qwen3_export_carries_no_flags_and_no_longer_says_the_family_is_unknow
     assert plan.checks == ()
     assert plan.usable
     assert models.UNKNOWN_FAMILY not in plan.notes
+
+
+def test_a_qwen25_export_carries_no_flags_and_is_typed_by_its_own_config():
+    """The one family here the exporter types correctly without being told.
+
+    Measured 2026-09-20 on Qwen/Qwen2.5-0.5B-Instruct: six bundles, no flag
+    added by litetune, conversion costs in MEASUREMENTS.md. The bundle is
+    typed from `config.json`'s `model_type: "qwen2"`, which
+    `litert_lm_builder.py` matches as `case 'qwen2' | 'qwen2p5'` -- so unlike
+    the gemma3_text families there is nothing for an override to disambiguate,
+    and unlike an unknown family there is nothing left unsaid.
+    """
+    plan = plan_export("Qwen/Qwen2.5-0.5B-Instruct", ("--some_flag=1",), ("dynamic_wi8_afp32",))
+    assert plan.rules is not None
+    assert plan.rules.family == "qwen-2.5"
+    assert plan.flags == ("--some_flag=1",)
+    assert plan.added == ()
+    assert plan.checks == ()
+    assert plan.usable
+    assert models.UNKNOWN_FAMILY not in plan.notes
+
+
+def test_the_qwen25_rule_claims_only_the_size_that_was_run():
+    """A size suffix is not a licence over the family.
+
+    `Qwen2-5B` is a Qwen 2 of five billion parameters, not a Qwen 2.5, and the
+    1.5B and the base 0.5B were never exported here. Claiming any of them
+    would assert a check nobody performed.
+    """
+    assert identify("Qwen/Qwen2.5-0.5B-Instruct").family == "qwen-2.5"
+    for unclaimed in ("Qwen/Qwen2-5B", "Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-7B-Instruct"):
+        assert identify(unclaimed) is None, unclaimed
 
 
 def test_functiongemma_gets_the_model_type_its_runtime_needs():

@@ -541,6 +541,35 @@ RULES: tuple[ModelRules, ...] = (
         patterns=(r"qwen-?3-0-6b",),
     ),
     ModelRules(
+        family="qwen-2.5",
+        # Nothing to add here either, and this entry says so with a run behind
+        # it. `config.json` declares `model_type: "qwen2"`, and
+        # `litert_lm_builder.py` matches `case 'qwen2' | 'qwen2p5'` -- the one
+        # family in this tuple that the exporter types correctly *and* names
+        # its own generation for. So no override, and unlike the gemma3_text
+        # families there is no ambiguity for one to resolve.
+        #
+        # Measured 2026-09-20 on Qwen/Qwen2.5-0.5B-Instruct @ 7ae55760: both
+        # int8 recipes and all four 4-bit recipes exported with no flag from
+        # litetune, six bundles, conversion costs in MEASUREMENTS.md. Before
+        # that run `identify` returned None for this checkpoint and `export`
+        # printed its unknown-family note on every convert, which was the
+        # honest state and is what this rule replaces.
+        #
+        # By size *and* variant, for the reason the qwen-3 rule above gives:
+        # `Qwen2.5-0.5B-Instruct` was run and `Qwen2.5-0.5B` was not. They are
+        # two checkpoints, and this file's own history is that a rule written
+        # on the strength of a neighbouring one goes unexercised for weeks --
+        # the gemma-3-text rule claimed the 1B for three weeks before anything
+        # exported it. A tuned checkpoint still matches: `tune` records the
+        # base model id, and the hint text for this run's merged model read
+        # `qwen-qwen2-5-0-5b-instruct-qwen2-qwen2forcausallm`.
+        #
+        # No `min_transformers` -- the pinned 5.16.1 loaded it, and nothing
+        # here establishes a floor, which is not the same as there being none.
+        patterns=(r"qwen-?2-5-0-5b-instruct",),
+    ),
+    ModelRules(
         family="gemma3-text-unidentified",
         # Last, so a checkpoint that names its family is matched by name first.
         # This is the fallback for one that does not: `config.json` establishes

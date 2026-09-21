@@ -4,9 +4,11 @@ Numbers for `litetune`. The first sections are `functiongemma-270m-it`
 LoRA-tuned on `google/mobile-actions`, scored on 640 held-out single-call
 examples; exact match means the tool name **and** every argument value. Each
 section after them is another family: `gemma-3-270m-it` with the second scorer,
-`gemma-4-E2B-it` converted from its base weights, and `Qwen3-0.6B`, the first
-that is not a Gemma. The last returns to `functiongemma-270m-it`, measured
-through the runtime's tool path the way an application calls it.
+`gemma-4-E2B-it` converted from its base weights, `Qwen3-0.6B`, the first that
+is not a Gemma, `gemma-3-1b-it`, the other size one export rule claims, and
+`Qwen2.5-0.5B-Instruct`, the one model here litetune holds no rule for. The last
+returns to `functiongemma-270m-it`, measured through the runtime's tool path the
+way an application calls it.
 
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
@@ -603,14 +605,83 @@ observation, not a resolved difference: litetune computes no interval for a
 difference between two models, and all three references ran on a different
 device from their candidates.
 
+## A fifth family, and the first where channelwise four bits answered
+
+`Qwen/Qwen2.5-0.5B-Instruct` @ `7ae55760`, the smallest and the oldest model in
+this file, and the first one litetune holds no rule for. `models.identify`
+returns None for it, so every `convert` in this run printed the unknown-family
+note — that litetune's rules were paid for one family at a time and a family it
+has not met is one whose required flags are simply unknown. The bundle is typed
+correctly regardless, and not by litetune: `config.json` says `model_type:
+"qwen2"`, and `litert_lm_builder.py`'s switch has `case 'qwen2' | 'qwen2p5'`.
+Unlike both Gemma models here the checkpoint is not gated, so the weights were
+fetched from the Hub during the run rather than shipped as a local copy.
+
+The task, the rows and the scorer are the second family's, and `max_seq_length`
+256 is the fourth family's: LoRA α32, lr 2e-4, one epoch, bfloat16 over the same
+2,400 rows of `mteb/banking77`, scored on the same 600 held-out rows of split
+`0c7505b2b6f69ab1`, `--scorer exact-text`, a 256-token decode limit, prompt mode
+`runtime_rendered`. `tune` was given no `--prompt-mode` and inferred it: 0% of
+the 2,400 training prompts carry a control token. `verify` read that record back
+from beside the checkpoint and, before generating anything, found the runtime
+and the reference rendering identical token ids on all 600 prompts, with the
+runtime's prefill count equal to the reference's on the 8 it was sent — on all
+seven verifies this run produced, the untuned base included. 8,798,208 of 494,032,768 parameters trained, final
+loss 0.4472, the loss computed on 0.0946 of tokens. Training and the float
+reference ran on one A100-SXM4-40GB, every candidate on litert-lm 0.16.1's CPU
+backend in the same container, 12 vCPU. litetune 0.1.8; training environment
+`torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0`,
+`sentencepiece==0.2.0`; runtime `litert-lm==0.16.1`, `numpy==2.0.2`.
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Base model | **0.0000** | 0.0000 | — |
+| Fine-tuned | **0.7700** ±0.0337 | 0.7600 ±0.0342 | 0.7600 ±0.0342 |
+| Cost of conversion | — | +0.0100 ±0.0131 *(unresolved, 16 discordant)* | +0.0100 ±0.0103 *(unresolved, 10 discordant)* |
+
+Sizes are 647,312,304 and 647,492,736 bytes.
+
+### What this run established that the table does not show
+
+**Neither eight-bit cost resolves here, and on the two models before it one
+did.** Qwen3-0.6B and gemma-3-1b both had `weight_only_wi8_afp32` resolve at
++0.0167 while `dynamic_wi8_afp32` did not; this model puts both inside their
+intervals. The reason is in the discordant column rather than in the accuracy:
+conversion changed the answer on 16 rows under one recipe and 10 under the
+other, and a paired test on 600 examples cannot separate a difference that small
+from none. That is a statement about this sample, not a finding that the
+conversion is free.
+
+**It scores higher than any model measured before it on these rows** — 0.7700
+against gemma-3-1b's 0.7533, Qwen3-0.6B's 0.6983 and gemma-3-270m's 0.6717,
+from the smallest and oldest of the four. As with the 1B, this is an
+observation and not a resolved difference: litetune computes no interval for a
+difference between two models, and every reference here ran on a different
+device from its candidate.
+
+**The untuned base establishes nothing, for the third model running.** Both
+sides score **0.0000 on all 600 rows**, `verify` reports `unmeasured` and exits
+3, and its manifest gives the same reason as the 1B's: the reference is the
+untuned base, so training and conversion are confounded and both attribution
+fields are unavailable. Of the five models in this file, not one has a recorded
+training gain — two scored zero on both sides, one was refused for repetition,
+and one was never scored.
+
+**The terminator is the template's close, as everywhere else here.** `tune`
+recorded `turn_terminator: {ids: [151645, 198], source: "chat_template", text:
+"<|im_end|>\n"}`, and on the reference `terminators_trimmed` read 600 of 600,
+one marker each. On litert-lm it read 0 of 600 — the runtime hands back the text
+without its stop token, which the fourth family's section describes.
+
 ## What four bits cost
 
 Everything above is 8-bit, except the Gemma 4 table, whose `dynamic_wi4b32_afp32`
 row is a block-wise four-bit export of base weights rather than a tuned
-checkpoint. This section converts three tuned checkpoints four more
+checkpoint. This section converts four tuned checkpoints four more
 ways: the `gemma-3-270m-it` run of the second family, `Qwen/Qwen3-0.6B` @
-`c1899de2`, and the `gemma-3-1b-it` run above, each trained the same way — LoRA
-α32, lr 2e-4, one epoch, bfloat16, over the same 2,400 banking77 rows. All are
+`c1899de2`, the `gemma-3-1b-it` run, and the `Qwen2.5-0.5B-Instruct` run above,
+each trained the same way — LoRA α32, lr 2e-4, one epoch, bfloat16, over the
+same 2,400 banking77 rows. All are
 scored on the same 600 held-out rows of split `0c7505b2b6f69ab1`, `--scorer exact-text`, 256-token limit, prompt
 mode `runtime_rendered`, litert-lm 0.16.1's CPU backend against each model's own
 float twin. Sizes are the `.litertlm` the export wrote.
@@ -639,9 +710,18 @@ float twin. Sizes are the `.litertlm` the export wrote.
 | `dynamic_wi4b32_afp32` | 741,578,240 | 0.6650 ±0.0378 | **+0.0883** ±0.0287 *(resolved)* | 77 of 600 |
 | `dynamic_wi4b32_emb8_afp32` | 879,990,064 | 0.6650 ±0.0378 | **+0.0883** ±0.0290 *(resolved)* | 79 of 600 |
 
-**Channelwise four bits never reached a score.** The measurement harness gates a
-bundle on five prompts before spending an hour on 600 — litetune has no gate of
-its own — and both channelwise recipes failed that gate on both models: under
+| Qwen2.5-0.5B-Instruct | bytes | exact match | cost of conversion | discordant |
+|---|---|---|---|---|
+| float twin | — | **0.7700** ±0.0337 | — | — |
+| `dynamic_wi4_afp32` | 332,256,176 | 0.5133 ±0.0400 | **+0.2567** ±0.0436 *(resolved)* | 178 of 600 |
+| `weight_only_wi4_afp32` | 332,436,608 | *one generation of 600 never finished* | — | — |
+| `dynamic_wi4b32_afp32` | 359,203,968 | 0.6933 ±0.0369 | **+0.0767** ±0.0257 *(resolved)* | 62 of 600 |
+| `dynamic_wi4b32_emb8_afp32` | 422,409,136 | 0.6783 ±0.0374 | **+0.0917** ±0.0271 *(resolved)* | 69 of 600 |
+
+**Channelwise four bits reached a score on one model of four.** On the other
+three the harness never got that far. It gates a bundle on five prompts before
+spending an hour on 600 — litetune has no gate of its own — and both channelwise
+recipes failed that gate on gemma-3-270m and on Qwen3-0.6B: under
 `dynamic_wi4_afp32` Qwen3 repeated itself on one of five prompts at a ratio of
 0.9937 and gemma leaked `<bos>`; under `weight_only_wi4_afp32` Qwen3 did not
 finish one prompt within 300 s, and gemma hit litetune's own 300 s per-prompt
@@ -659,11 +739,28 @@ gate is a cheap way to catch a bundle that is broken on every row, and no way
 to catch one that is broken on one row in ten — a limitation of the harness's
 gate, not of `verify`, which is what found it.
 
-**Both recipes collapse, which points at the weights rather than the integer
-kernels.** `weight_only_wi4_afp32` dequantises before compute and failed on the
-same checkpoints as `dynamic_wi4_afp32` — on a different check, but neither
-produced an answer — so integer activations are not what separates a working
-bundle from a broken one here. A five-prompt diagnostic through every bundle of each checkpoint says
+**On Qwen2.5-0.5B both channelwise recipes cleared the gate, and one of them
+answered.** `dynamic_wi4_afp32` ran all 600 rows: 0.5133 against the float
+twin's 0.7700, a cost of **+0.2567** that resolves on 178 changed rows. That is
+the first channelwise figure in this file, and it is a third of the model's
+accuracy — the recipe is not rehabilitated by having finally produced a number.
+`weight_only_wi4_afp32` got further here than on any earlier model and still
+produced nothing: its gate opened, 599 of 600 generations ran, one exceeded the
+300 s per-prompt limit, and `verify` returned `failed_harness` and exit 4 rather
+than scoring the rows that did finish. Across four models the same two recipes
+have now produced a refusal at the gate, a refusal after the gate, a refusal at
+the last row, and one resolved cost — which is four ways of learning that what
+these recipes do is a property of the checkpoint they are given.
+
+**Dequantising before compute rescued nothing, on any of the four.**
+`weight_only_wi4_afp32` does exactly that, and it is the one recipe in this file
+that has never produced a score: it failed the gate on gemma-3-270m, Qwen3-0.6B
+and gemma-3-1b, and on Qwen2.5-0.5B it cleared the gate and then lost a single
+generation to the timeout. `dynamic_wi4_afp32`, which keeps activations in
+integers, is the one that eventually answered. So integer activations are not
+what separates a working bundle from a broken one here — if anything the
+evidence runs the other way, and on three of the four checkpoints neither recipe
+produced an answer at all. A five-prompt diagnostic through every bundle of each checkpoint says
 the same from the other side: at 8 bits both models emit the reference's label
 and stop, the terminator scoring at or above −0.001 in log-probability; at 4 bits
 channelwise, Qwen3 matches one of five labels exactly and on another emits the
@@ -674,19 +771,23 @@ against −0.03 to −0.47 at 8 bits. Those last figures are the diagnostic's
 why they are not the raw totals in `*__diag-int4.json`.
 
 **Blocks of 32 fix the breakage and still cost accuracy.** A scale per 32 weights
-instead of one per output channel passes the gate on all three models and scores
+instead of one per output channel passes the gate on all four models and scores
 all 600 rows. That costs the tuned Qwen3-0.6B 3.50 points of exact match, the
-tuned gemma-3-1b 8.83, and the tuned gemma-3-270m 34.83. Every interval clears
-zero: these are differences this sample settles, not noise.
+tuned Qwen2.5-0.5B 7.67, the tuned gemma-3-1b 8.83, and the tuned gemma-3-270m
+34.83. Every interval clears zero: these are differences this sample settles,
+not noise.
 
 **Whatever the 270M's collapse is, it is not a property of Gemma 3.** The 1B is
 the same family, the same export rule, the same template and the same run recipe
 as the 270M, and four bits cost it 8.83 points where they cost the 270M 34.83.
 So the family does not predict the cost, which is the one thing this pair
-settles. It does not settle that size does: two sizes of one family on one
-dataset, one run each, and no pairing between the two models. Parameter count,
-the share of the model that is embeddings and the headroom a higher float score
-leaves all vary together here, and nothing in this design separates them.
+settles. It does not settle that size does, and the fourth model argues against
+it: at 0.49B Qwen2.5 pays 7.67 points where Qwen3 at 0.6B pays 3.50 and
+gemma-3-1b at 1.00B pays 8.83, so the four costs do not order by parameter count
+in either direction. Only the 270M's 34.83 stands apart, and it is the smallest.
+Parameter count, the share of the model that is embeddings, the architecture and
+the headroom a higher float score leaves all vary together across these four,
+and nothing in this design separates them.
 
 **int8 embeddings do not rescue gemma-3-270m.** gemma holds 168M of its 268M
 parameters in embeddings — a 262,144-token vocabulary at a hidden size of 640,
@@ -708,11 +809,12 @@ vocabulary at a hidden size of 1,152, a smaller share of the model than the
 
 **What this does not establish.** That either block-wise recipe is better than
 the other. Each was paired against its float twin and never against the other,
-and the intervals overlap on all three models — with int8 embeddings Qwen3 reads
-worse (+0.0550 against +0.0350), gemma-3-270m better (+0.3200 against +0.3483)
-and gemma-3-1b identically (+0.0883 either way), and none of those differences is
-one this design can settle. Nor does it say anything about models larger than
-these three, or about 4-bit weights produced some other way, such as by
+and the intervals overlap on all four models — with int8 embeddings Qwen3 reads
+worse (+0.0550 against +0.0350), Qwen2.5 worse as well (+0.0917 against
++0.0767), gemma-3-270m better (+0.3200 against +0.3483) and gemma-3-1b
+identically (+0.0883 either way), and none of those differences is one this
+design can settle. Nor does it say anything about models larger than these
+four, or about 4-bit weights produced some other way, such as by
 quantization-aware training. One run each, one runtime.
 
 **On a phone, the backend changes the answer.** The Qwen3-0.6B artifacts above
