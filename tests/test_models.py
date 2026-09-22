@@ -213,6 +213,19 @@ def test_only_a_multimodal_family_scopes_lora_at_all():
             assert not rules.lora_container_reason, rules.family
 
 
+def test_the_family_report_names_the_lora_container():
+    """The scope has to reach a record a user reads.
+
+    `ModelRules.as_dict` is what `convert --json` and every verify manifest
+    publish under `model_rules`, and README points a reader there. Dropping
+    either key from it changed nothing any test could see.
+    """
+    record = models.report("google/gemma-4-E2B-it")
+
+    assert record["lora_container"] == "language_model"
+    assert "same projection names" in record["lora_container_reason"]
+
+
 def test_a_config_that_cannot_be_read_says_so_rather_than_reporting_no_rules(tmp_path):
     checkpoint = tmp_path / "model"
     checkpoint.mkdir()

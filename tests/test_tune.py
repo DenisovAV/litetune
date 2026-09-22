@@ -1010,7 +1010,7 @@ def test_a_full_run_on_a_scoped_family_carries_no_scope_limitation(trainer, requ
     assert not any("restricted to modules under" in t for t in result.limitations)
 
 
-def test_the_container_reaches_the_script_that_uses_it(trainer, request_for, tmp_path):
+def test_the_container_reaches_the_script_that_uses_it(trainer, request_for):
     """The one link between the family rule and the training script.
 
     Found by mutation: replacing `lora_container=lora_container` in `run_tune`'s
@@ -1636,12 +1636,13 @@ def test_a_scoped_lora_run_reaches_the_text_tower_and_nothing_beside_it(request_
 def test_a_container_with_a_dot_in_it_is_a_dot_and_not_a_wildcard(request_for, stub_env):
     """`re.escape` on the container, which no test could previously hold.
 
-    Both `re.escape` calls could be deleted with the suite green, because the
-    only container in the table is `language_model` and the seven projections
-    are all `*_proj` -- no metacharacter anywhere. The container is a
-    hand-edited table entry, and a future one carrying a dot is the same defect
-    the branch is about: unescaped, the dot matches any character and the scope
-    silently widens to a sibling tower.
+    This holds the container half. Both `re.escape` calls could be deleted with
+    the suite green, because the only container in the table is
+    `language_model` and the seven projections are all `*_proj` -- no
+    metacharacter anywhere. The projection half is the test below. The
+    container is a hand-edited table entry, and a future one carrying a dot is
+    the same defect the branch is about: unescaped, the dot matches any
+    character and the scope silently widens to a sibling tower.
     """
     request = request_for(method="lora")
     proc = run_real_script(
@@ -1658,7 +1659,100 @@ def test_a_container_with_a_dot_in_it_is_a_dot_and_not_a_wildcard(request_for, s
     assert not re.fullmatch(pattern, "model.text_modelXdecoder.layers.0.self_attn.q_proj")
 
 
-def test_the_projection_set_is_the_one_the_measurement_was_taken_with(request_for, stub_env):
+def test_a_projection_name_with_a_dot_in_it_is_a_dot_too(request_for, stub_env):
+    """The projection half of `re.escape`, which the container test cannot reach.
+
+    Deleting `re.escape` from the projection names survived the whole suite:
+    every name in `DEFAULT_LORA_TARGETS` is `*_proj`, so escaped and unescaped
+    are the same string and nothing could tell them apart.
+    """
+    request = request_for(method="lora", lora_targets=("q.proj",))
+    proc = run_real_script(
+        request,
+        stub_env,
+        lora_container="language_model",
+        stub_modules=["model.language_model.layers.0.self_attn.q.proj"],
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    pattern = recorded["lora_target_modules"]
+    assert re.fullmatch(pattern, "model.language_model.layers.0.self_attn.q.proj")
+    assert not re.fullmatch(pattern, "model.language_model.layers.0.self_attn.qXproj")
+
+
+def test_a_container_that_matches_nothing_stops_the_run(request_for, stub_env):
+    """The premise the rest of this rests on: a zero match is loud.
+
+    peft raises when a target matches nothing, which is why `None` and not `0`
+    is what an unreadable match records -- zero is a state peft does not let
+    through. Nothing held that premise, in peft or in the stub that stands in
+    for it, so the stub could drift back to silence unnoticed.
+    """
+    request = request_for(method="lora")
+    proc = run_real_script(
+        request,
+        stub_env,
+        lora_container="not_a_tower",
+        stub_modules=["model.language_model.layers.0.self_attn.q_proj"],
+    )
+
+    assert proc.returncode != 0
+    assert "not found in the base model" in proc.stderr
+    assert not (request.output_dir / "metrics.json").exists()
+
+
+def test_the_metrics_carry_what_the_lora_run_matched():
+    """`from_dict` and `as_dict` round-trip, which is the whole contract here.
+
+    Nothing in `src/` reads these three fields: they are parsed out of
+    `metrics.json` and re-serialised into `tune.json`, so dropping any one of
+    them from either method changed no behaviour any test could see. Six such
+    mutants survived the suite.
+    """
+    payload = {
+        "n_examples": 1,
+        "supervised_tokens": 1,
+        "total_tokens": 2,
+        "masked_tokens": 1,
+        "supervised_token_fraction": 0.5,
+        "epochs": [],
+        "lora_target_modules": r"(?:.*\.)?language_model\..*\.(q_proj)",
+        "lora_modules_matched": 2,
+        "lora_modules": ["model.language_model.layers.0.self_attn.q_proj"],
+        "lora_match_note": None,
+    }
+    metrics = TrainingMetrics.from_dict(payload)
+
+    assert metrics.lora_target_modules == payload["lora_target_modules"]
+    assert metrics.lora_modules_matched == 2
+    assert metrics.lora_modules == ("model.language_model.layers.0.self_attn.q_proj",)
+    record = metrics.as_dict()
+    assert record["lora_modules_matched"] == 2
+    assert record["lora_modules"] == payload["lora_modules"]
+    assert record["lora_target_modules"] == payload["lora_target_modules"]
+
+    # A script that predates the fields leaves them absent, not zero.
+    for key in ("lora_target_modules", "lora_modules_matched", "lora_modules", "lora_match_note"):
+        del payload[key]
+    older = TrainingMetrics.from_dict(payload)
+    assert older.lora_modules is None
+    assert older.lora_modules_matched is None
+
+
+def test_a_family_litetune_knows_is_not_told_it_is_unknown(trainer, request_for):
+    """The mirror of the unknown-checkpoint limitation.
+
+    Widening its condition to also fire on a known family with no container
+    survived the suite, and would tell every text-only run that litetune has no
+    rules for it.
+    """
+    result = run_tune(request_for(method="lora"))
+
+    assert not any("no per-model rules for this checkpoint" in t for t in result.limitations)
+
+
+def test_the_projection_set_is_the_one_the_measurement_was_taken_with():
     """Seven names, pinned as a set.
 
     MEASUREMENTS.md rests a number on "seven projections, as shipped" against
@@ -1687,6 +1781,12 @@ def test_an_unscoped_run_hands_peft_the_projection_list_itself(request_for, stub
 
     recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
     assert recorded["lora_target_modules"] == list(request.lora_targets)
+    # The other half of the pair. Over the same three-tower graph the scoped
+    # run matches two modules and this one matches four -- with an identical
+    # leaf set, which is why the paths and not the leaves are what get
+    # recorded.
+    assert recorded["lora_modules_matched"] == 4
+    assert any("vision_tower" in m for m in recorded["lora_modules"])
 
 
 def test_a_full_fine_tune_records_no_target_modules(request_for, stub_env):
