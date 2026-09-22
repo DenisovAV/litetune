@@ -165,11 +165,10 @@ def test_gemma_4_scopes_lora_to_its_text_tower():
     """A LoRA run on Gemma 4 must adapt the text tower and nothing else.
 
     peft matches `target_modules` by name suffix, and this checkpoint's vision
-    and audio towers use the same projection names as its text layers: counted
-    on the module graph of `google/gemma-4-E2B-it`, 112 vision and 36 audio
-    modules against 205 text ones. An unscoped run adapts all 353, trains,
-    saves, and passes every check -- while `lora` means something other than it
-    does on every other family here.
+    and audio towers use the same projection names as its text layers, so a run
+    scoped by name alone adapts all three -- it trains, it saves, and it passes
+    every check, while `lora` means something other than it does on every other
+    family here.
 
     Per variant, because `_gemma4` builds three and one dropped argument would
     leave all three unscoped while every other test stayed green.
@@ -183,10 +182,30 @@ def test_gemma_4_scopes_lora_to_its_text_tower():
 def test_only_a_multimodal_family_scopes_lora_at_all():
     """The container is a claim about structure, so a text-only family makes none.
 
-    Asserted as "every family except these", not as a list of the text-only
-    ones: a family added later without deciding this question fails here rather
-    than silently inheriting a scope that does not describe it.
+    The scoped set alone does not hold this. `lora_container` defaults to
+    `None`, so a multimodal family added without filling it in leaves the
+    scoped set unchanged and passes -- adapting every tower, reporting cleanly,
+    with no limitation and a green suite, which is the pre-scope behaviour
+    reached through the path of least resistance. Found by reviewing the commit
+    that added the check.
+
+    So the whole roster is asserted, not the scoped part of it. Adding a family
+    fails here and the author has to decide the question before the list can be
+    updated. That is the only moment anyone is looking at the checkpoint's
+    module graph.
     """
+    families = {r.family for r in models.RULES}
+    assert families == {
+        "functiongemma",
+        "gemma-3-text",
+        "gemma3-text-unidentified",
+        "gemma-4",
+        "gemma-4-e2b",
+        "gemma-4-e4b",
+        "qwen-2.5",
+        "qwen-3",
+        "qwen-3.5",
+    }, sorted(families)
     scoped = {r.family for r in models.RULES if r.lora_container}
     assert scoped == {"gemma-4-e2b", "gemma-4-e4b", "gemma-4"}, sorted(scoped)
     for rules in models.RULES:

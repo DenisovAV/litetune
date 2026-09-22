@@ -456,7 +456,8 @@ families litetune restricts the run to modules under `language_model` and
 hands peft a regex rather than a name list, because peft matches a plain
 `target_modules` list by name suffix and a suffix cannot say "only under this
 container". `tune` reports it on the run, in plain output as well as
-`--json`, and `litetune models <id>` names it under `lora_container`. What
+`--json`, and `convert --json` and every verify manifest carry it under
+`model_rules.lora_container`. What
 the projection set is worth was measured once: the seven names litetune uses
 against the two peft's own Gemma 4 default would have chosen, 24 points apart
 on banking77, in [MEASUREMENTS.md](MEASUREMENTS.md).

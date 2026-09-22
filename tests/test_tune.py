@@ -1078,6 +1078,36 @@ def test_a_refused_run_on_a_scoped_family_still_says_which_container(
     assert result.as_dict()["lora_container"] == "language_model"
 
 
+def test_a_readback_that_fails_says_so_instead_of_reporting_nothing_matched(request_for, stub_env):
+    """Zero is the one value that could only mean the readback broke.
+
+    `base_model` on a transformers model is a property that falls back to
+    `self`, and peft's tuner forwards missing attributes to the model it wraps,
+    so a renamed `targeted_module_names` arrives as None rather than raising.
+    `or []` turned that into "matched nothing" -- and peft raises on a real
+    zero match, so "matched nothing" is a state that cannot occur. The run
+    stayed green and the record said 0.
+    """
+    request = request_for(method="lora")
+    proc = run_real_script(request, stub_env, hide_matched=True)
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["lora_modules_matched"] is None
+    assert recorded["lora_modules"] is None
+    assert "was not recorded" in recorded["lora_match_note"]
+    # And the request is still there, so the record says what it does know.
+    assert recorded["lora_target_modules"] == list(request.lora_targets)
+
+
+def test_a_full_run_on_a_scoped_family_records_no_container(trainer, request_for):
+    """A full fine-tune adapts everything, so it was restricted to nothing."""
+    result = run_tune(request_for(model="google/gemma-4-E2B-it", method="full"))
+
+    assert result.lora_container is None
+    assert result.as_dict()["lora_container"] is None
+
+
 def test_a_full_fine_tune_records_no_match_rather_than_an_empty_one(request_for, stub_env):
     """A full run has no adapter, so it has no matched set.
 
@@ -1093,7 +1123,8 @@ def test_a_full_fine_tune_records_no_match_rather_than_an_empty_one(request_for,
     recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
     assert recorded["lora_target_modules"] is None
     assert recorded["lora_modules_matched"] is None
-    assert recorded["lora_leaves_matched"] is None
+    assert recorded["lora_modules"] is None
+    assert recorded["lora_match_note"] is None
 
 
 def test_a_full_run_on_an_unknown_checkpoint_is_not_told_about_lora_scoping(trainer, request_for):
@@ -1456,7 +1487,8 @@ def get_peft_model(model, config):
         )
     model.tag = "adapter"
     model.lora = config
-    model.base_model = _Tuner(matched)
+    if not os.environ.get("LITETUNE_STUB_HIDE_MATCHED"):
+        model.base_model = _Tuner(matched)
     return model
 """
 
@@ -1482,6 +1514,7 @@ def run_real_script(
     declarations: list | None = None,
     lora_container: str | None = None,
     stub_modules: list[str] | None = None,
+    hide_matched: bool = False,
 ) -> subprocess.CompletedProcess:
     """Runs `_TRAIN_SCRIPT` for real, against the stub modules `stub_env` wrote.
 
@@ -1517,6 +1550,7 @@ def run_real_script(
             "LITETUNE_STUB_LOG": str(log),
             "LITETUNE_STUB_CUDA": "1" if cuda else "0",
             **({"LITETUNE_STUB_MODULES": ",".join(stub_modules)} if stub_modules else {}),
+            **({"LITETUNE_STUB_HIDE_MATCHED": "1"} if hide_matched else {}),
         },
     )
 
@@ -1591,7 +1625,12 @@ def test_a_scoped_lora_run_reaches_the_text_tower_and_nothing_beside_it(request_
     # modules where the scoped run reports two. Passing the list while
     # recording the regex survived the suite before this.
     assert recorded["lora_modules_matched"] == 2
-    assert recorded["lora_leaves_matched"] == ["down_proj", "q_proj"]
+    assert recorded["lora_match_note"] is None
+    # The paths, not the leaf names: an unscoped run over this same graph
+    # matches four modules whose leaf set is identical to these two. Only the
+    # prefix says which tower a module sat in.
+    assert all("language_model." in m for m in recorded["lora_modules"])
+    assert not any("vision_tower" in m or "audio_tower" in m for m in recorded["lora_modules"])
 
 
 def test_a_container_with_a_dot_in_it_is_a_dot_and_not_a_wildcard(request_for, stub_env):
