@@ -1059,6 +1059,43 @@ def test_a_checkpoint_with_no_rules_is_told_its_lora_was_not_scoped(trainer, req
     assert any("no per-model rules for this checkpoint" in t for t in result.limitations)
 
 
+def test_a_refused_run_on_a_scoped_family_still_says_which_container(
+    trainer, request_for, tmp_path
+):
+    """Six returns in `run_tune` write a report before the run reaches peft.
+
+    Found by reviewing the commit that fixed the same defect elsewhere: the
+    container was resolved a hundred lines below those returns, so a refused
+    Gemma 4 run reported `lora_container: null`. That does not read as "the run
+    stopped before this mattered" -- `null` in that field reads as "every tower
+    was adapted".
+    """
+    result = run_tune(
+        request_for(model="google/gemma-4-E2B-it", method="lora", data=tmp_path / "absent.jsonl")
+    )
+
+    assert result.outcome is not Outcome.PASSED
+    assert result.as_dict()["lora_container"] == "language_model"
+
+
+def test_a_full_fine_tune_records_no_match_rather_than_an_empty_one(request_for, stub_env):
+    """A full run has no adapter, so it has no matched set.
+
+    `0` and `[]` would make "no adapter was used" indistinguishable from "the
+    target matched nothing", and would disagree with `lora_target_modules:
+    null` in the same record -- two fields in one record saying different
+    things about one fact, which is what this file forbids.
+    """
+    request = request_for(method="full")
+    proc = run_real_script(request, stub_env)
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["lora_target_modules"] is None
+    assert recorded["lora_modules_matched"] is None
+    assert recorded["lora_leaves_matched"] is None
+
+
 def test_a_full_run_on_an_unknown_checkpoint_is_not_told_about_lora_scoping(trainer, request_for):
     result = run_tune(request_for(model="myorg/g4-e2b-it", method="full"))
 

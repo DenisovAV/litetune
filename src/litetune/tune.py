@@ -975,8 +975,14 @@ def main() -> int:
                 # distinguishes a partial match from a full one; the leaf names
                 # say whether a whole projection was missed, and the container
                 # prefixes say whether anything outside the scope was adapted.
-                "lora_modules_matched": len(matched_modules),
-                "lora_leaves_matched": sorted({m.rsplit(".", 1)[-1] for m in matched_modules}),
+                "lora_modules_matched": (
+                    len(matched_modules) if spec["method"] == "lora" else None
+                ),
+                "lora_leaves_matched": (
+                    sorted({m.rsplit(".", 1)[-1] for m in matched_modules})
+                    if spec["method"] == "lora"
+                    else None
+                ),
                 "epochs": epochs,
                 "model_dir": str(model_dir),
                 "adapter_dir": str(adapter_dir) if adapter_dir else None,
@@ -1614,6 +1620,15 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         learning_rate=request.rate,
     )
     result = TuneResult(request=request, checks=CheckSet(name=f"train:{request.model}"))
+    # Resolved here, not where it is first used: six of the returns below write
+    # a report, and every one of them ran before this was set. A refused run on
+    # a scoped family reported `lora_container: null` -- which does not read as
+    # "the run stopped before this mattered", it reads as "every tower was
+    # adapted". `identify` is a lookup on the model id; it needs no environment
+    # and no checkpoint.
+    rules = models.identify(request.model)
+    lora_container = rules.lora_container if rules is not None else None
+    result.lora_container = lora_container
     result.limitation(NOT_VERIFIED)
     if request.dtype == DEFAULT_DTYPE:
         # Named because it is a real cost of the bfloat16 default: the
@@ -1823,9 +1838,6 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     # tokenizer load -- which arrives after the environment has been built and
     # the checkpoint downloaded, and reads as a litetune bug rather than a
     # version requirement.
-    rules = models.identify(request.model)
-    lora_container = rules.lora_container if rules is not None else None
-    result.lora_container = lora_container
     if rules is None and request.method == "lora":
         # `identify` returning None is "litetune has no entry for this", not
         # "no rules apply" -- its own docstring says the difference is reported
