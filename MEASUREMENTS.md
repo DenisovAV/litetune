@@ -4,8 +4,8 @@ Numbers for `litetune`. The first sections are `functiongemma-270m-it`
 LoRA-tuned on `google/mobile-actions`, scored on 640 held-out single-call
 examples; exact match means the tool name **and** every argument value. Each
 section after them is another family: `gemma-3-270m-it` with the second scorer,
-`gemma-4-E2B-it` converted from its base weights, `Qwen3-0.6B`, the first that
-is not a Gemma, `gemma-3-1b-it`, the other size one export rule claims, and
+`gemma-4-E2B-it`, converted from its base weights and then fine-tuned,
+`Qwen3-0.6B`, the first that is not a Gemma, `gemma-3-1b-it`, the other size one export rule claims, and
 `Qwen2.5-0.5B-Instruct`, the one checkpoint here whose channelwise four-bit
 export produced a score. The last returns to `functiongemma-270m-it`, measured
 through the runtime's tool path the way an application calls it.
@@ -374,11 +374,13 @@ degenerate run would be the mistake `attribution` exists to refuse.
 
 ## A third family, and the marker the vocabulary did not know
 
-The two sections above measure models this project fine-tuned. This one
-measures neither: it compares two *conversions of the same base weights* --
+The two sections above measure models this project fine-tuned. This one opens
+with neither: it compares two *conversions of the same base weights* --
 `google/gemma-4-E2B-it`, untouched -- because `models.py` records that a Google
 engineer recommends two recipes "to remain the model quality" and, in the same
-sentence, that litetune had measured neither.
+sentence, that litetune had measured neither. The two subsections after it do
+fine-tune that checkpoint, and the second converts and verifies one of those
+runs.
 
 600 held-out rows of `mteb/banking77` with all 77 labels listed in the prompt,
 `--scorer exact-text`, 256-token limit, prompt mode `runtime_rendered`,
@@ -452,10 +454,10 @@ later run on this family should pin it.
 | `q_proj` and `v_proj`, peft's own default | 0.5483 ±0.0398 | 2,678,784 |
 
 Paired, the difference is **+0.2400 ±0.0457, resolved**, on 196 of 600
-discordant. The interval would have to be five times wider to contain zero.
+discordant. The interval would have to be more than five times wider to contain zero.
 
 **What it establishes.** On this task the projection set matters more than the
-model does. The five families measured on this split span 0.6717 to 0.7883 --
+model does. The five checkpoints measured on this split span 0.6717 to 0.7883 --
 11.7 points between the smallest checkpoint and the largest -- and changing
 which projections a LoRA run adapts moved one checkpoint 24. Taking peft's
 default would have left 5.1 billion parameters scoring 0.5483, below every
@@ -473,10 +475,13 @@ section below.
 
 ### End to end, on the seven-projection checkpoint
 
-Arm A's tuned weights through `convert` and `verify`: two eight-bit recipes,
-the same 600 held-out rows of split `0c7505b2b6f69ab1`, `--scorer exact-text`,
+Arm A is `google/gemma-4-E2B-it` at `3e22461f65e89153144f8adb70e3b8c2cc9845a7`
+-- the commit read back from the cache after the run rather than pinned by it,
+as the section above records. Its tuned weights through `convert` and `verify`:
+two eight-bit recipes, the same 600 held-out rows of split `0c7505b2b6f69ab1`, `--scorer exact-text`,
 prompt mode `runtime_rendered`, greedy. Candidate on litert-lm's CPU backend in
-the same container, 12 vCPU; reference on the A100 through transformers.
+the same container as the tuning run, 12 vCPU; reference on the A100 through
+transformers.
 litetune 0.1.8; runtime `litert-lm==0.16.1`, `numpy==2.0.2`; reference
 `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0`,
 `sentencepiece==0.2.0`.
@@ -488,11 +493,21 @@ litetune 0.1.8; runtime `litert-lm==0.16.1`, `numpy==2.0.2`; reference
 
 Sizes are 5,071,853,520 and 5,072,115,888 bytes.
 
-**Both eight-bit costs resolve, and neither had both resolve before.**
-`dynamic_wi8_afp32` did not resolve in any of the five earlier runs of it in
-this file -- the four families on this split, and FunctionGemma on the
-tool-call scorer. Here it does, and so does `weight_only_wi8_afp32`. What is
-different is the size: 5.1 billion parameters against 0.5 to 1.
+**Both eight-bit costs resolve, which no earlier section here has had happen
+together.** Each recipe has resolved before on its own: `dynamic_wi8_afp32` in
+run A of the FunctionGemma triple, on both phone backends for Qwen3-0.6B, and
+on the tool path; `weight_only_wi8_afp32` in FunctionGemma's run B, on
+Qwen3-0.6B and on gemma-3-1b. What has not happened before is both in one
+run -- the closest is the FunctionGemma triple, where run A resolved one
+recipe and run B the other.
+
+**What that does not establish.** This checkpoint is roughly five times the
+largest measured before it, and it is tempting to read the resolution off the
+size. Nothing here separates size from the rest: one run, a different family,
+a different litetune version. `dynamic_wi8_afp32` resolved on a 0.6B bundle on
+a phone, so resolution is not gated on size -- and what buys an interval is
+the imbalance among the discordant pairs, which this file says three times
+over.
 
 **Limitations carried by these two numbers.** The candidate ran on
 litert-lm's CPU backend and the reference on cuda, so each cost carries a
@@ -500,8 +515,11 @@ hardware difference as well as a conversion one; `verify` reports that rather
 than refusing it. Decoding was passed explicitly to transformers and not to
 litert-lm, which used the pinned runtime's defaults; both are greedy. And
 `weight_only_wi8_afp32` shipped with no `prefer_activation_type` -- its repack
-did not finish inside `REPACK_TIMEOUT_S` (300 s), which was sized against a
-455 MB bundle and not a 5 GB one, and the original was kept. That does not
+did not finish inside the repack ceiling (`REPACK_TIMEOUT_S`, 300 s, or less if
+the recipe's export timeout had less left), and the original was kept. That
+ceiling is documented as a bound on a stalled tool rather than a budget,
+chosen when a real repack of a 455 MB bundle finished in seconds; a 5 GB
+bundle is the case it was not sized against. That does not
 touch the number above, which was measured on CPU, but the bundle as shipped
 is not the one to hand a GPU.
 
@@ -748,7 +766,7 @@ device from its candidate.
 sides score **0.0000 on all 600 rows**, `verify` reports `unmeasured` and exits
 3, and its manifest gives the same reason as the 1B's: the reference is the
 untuned base, so training and conversion are confounded and both attribution
-fields are unavailable. Of the four models fine-tuned and measured on banking77, not
+fields are unavailable. Of the five models fine-tuned and measured on banking77, not
 one has a recorded training gain — two scored zero on both sides, one was refused for
 empty output, and one was never scored. FunctionGemma, at the top of this file, is the only model
 here with one at all — on another task, with another scorer, and with three

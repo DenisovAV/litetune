@@ -172,9 +172,10 @@ class ModelRules:
 
     # Which part of a multimodal checkpoint a LoRA run may adapt, named as the
     # container its modules sit under -- `tune` restricts its projection set to
-    # modules whose path passes through it. Empty for a text-only family, where
-    # every module is in scope and a container would be a claim about a
-    # structure that does not exist.
+    # modules whose path passes through it. `None` for a text-only family:
+    # there is no second tower to exclude, so the projection list alone decides
+    # which modules are adapted, and naming a container would be a claim about
+    # a structure that does not exist.
     lora_container: str | None = None
     lora_container_reason: str = ""
 
@@ -219,6 +220,8 @@ class ModelRules:
             "limitations": list(self.limitations),
             "extra_stop_tokens": list(self.extra_stop_tokens),
             "stop_token_reason": self.stop_token_reason,
+            "lora_container": self.lora_container,
+            "lora_container_reason": self.lora_container_reason,
             "renders_declarations": self.renders_declarations,
             "wire_format": self.wire_format,
             "tool_path_reason": self.tool_path_reason,
@@ -287,28 +290,35 @@ _GEMMA4_RECIPE_REASON = (
     "for Gemma 4 a Google engineer recommends dynamic_wi4c_hr_afp32 or dynamic_wi4b32_afp32 'to "
     "remain the model quality', noting that the published artifact is half int2 while the public "
     "recipes reach int4. This is a recommendation and not a substitution: the recipe you asked for "
-    "is the recipe that was exported, and litetune has measured neither of these two"
+    "is the recipe that was exported. Of the two, litetune has measured dynamic_wi4b32_afp32 once, "
+    "on base weights rather than a tuned checkpoint (MEASUREMENTS.md), and dynamic_wi4c_hr_afp32 "
+    "not at all"
+)
+
+# Sourced: peft 0.20.0 ships this scope itself. Its
+# `TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING` maps `gemma4` to the
+# regex `.*language_model\..*\.(q_proj|v_proj)` -- so upstream agrees both
+# that the container is called `language_model` and that a name list is not
+# enough to reach it. litetune cannot take that default: it names its
+# projection set explicitly so that two runs recorded as `lora` are the same
+# method, and passing `target_modules` is what switches the default off.
+#
+# The reason below says which modules repeat across the towers and not how
+# many. An earlier draft carried three counts off the module graph; nothing in
+# this repository derives, stores or re-derives them, no revision was attached
+# to them, and the checkpoint they describe is one this project does not pin --
+# so they were precision the tree cannot point at. What a reader needs is the
+# structure, and that is checkable against any Gemma 4 config.
+_GEMMA4_LORA_CONTAINER_REASON = (
+    "the checkpoint is multimodal and its vision and audio towers use the same projection names "
+    "as its text layers. peft matches target modules by name suffix, so a run scoped by name "
+    "alone adapts all three towers -- it trains, it saves, and every check passes, while `lora` "
+    "means something other than it does on every other family here. Scoping to `language_model` "
+    "leaves the projection set alone and drops the towers"
 )
 
 # Sourced: litert-torch#1044 -- "Right now litert-torch don't support QAT
 # checkpoint conversion".
-# Sourced: peft 0.20.0 ships this scope itself. Its
-# `TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING` maps `gemma4` to the
-# regex `.*language_model\..*\.(q_proj|v_proj)`, and Google's own
-# fine-tuning guide passes no `target_modules` at all, commenting "no
-# target_modules -- PEFT's Gemma 4 defaults scope to the LM layers".
-# litetune cannot take that default: it names its projection set explicitly so
-# that two runs recorded as `lora` are the same method, and passing
-# `target_modules` is what switches the default off.
-_GEMMA4_LORA_CONTAINER_REASON = (
-    "the checkpoint is multimodal and its towers use the same projection names as its text "
-    "layers. Counted on the module graph of google/gemma-4-E2B-it: 112 vision modules and 36 "
-    "audio modules are named q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj or down_proj, "
-    "against 205 in the text tower. peft matches target modules by name suffix, so an unscoped "
-    "run adapts all 353 -- it trains, it saves, and every check passes, while `lora` means "
-    "something other than it does on every other family here. Scoping to `language_model` "
-    "leaves the projection set alone and drops the towers"
-)
 
 _GEMMA4_NOT_GOOGLES_ARTIFACT = (
     "a Gemma 4 export made here is NOT equivalent to Google's published .litertlm. Google's comes "

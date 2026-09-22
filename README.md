@@ -61,10 +61,13 @@ is workable at 270M and the first thing you will want to change above about
 > — `E2B` or `E4B` — because the chat template override is per-variant; a bare
 > `gemma-4` is refused rather than guessed at, and the refusal names the flag
 > to pass if you want to choose the template yourself. It carries two numbers
-> the others do not: a conversion cost measured on base weights, and a
-> comparison of two LoRA runs that differ only in which projections they adapt
-> — the seven litetune names against the two peft would have chosen, which is
-> 24 points apart. Try it on yours and open an issue.
+> the others do not: an earlier conversion cost measured on its untouched base
+> weights, which used prompts listing all 77 labels and so does not sit beside
+> the five above it, and a comparison of two LoRA runs that differ only in
+> which projections they adapt — the seven litetune names against the two peft
+> would have chosen, which is 24 points apart. On a multimodal checkpoint
+> litetune keeps a LoRA run inside the text tower; `tune` says so in its own
+> output. Try it on yours and open an issue.
 
 ---
 
@@ -446,6 +449,18 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 | `gemma-4-e2b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm` |
 | `gemma-4-e4b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E4B-it-litert-lm` |
 
+**A LoRA scope keyed on model identity.** On a multimodal checkpoint the
+vision and audio towers use the same projection names as the text layers, so
+`--method lora` scoped by name alone adapts all three. For the Gemma 4
+families litetune restricts the run to modules under `language_model` and
+hands peft a regex rather than a name list, because peft matches a plain
+`target_modules` list by name suffix and a suffix cannot say "only under this
+container". `tune` reports it on the run, in plain output as well as
+`--json`, and `litetune models <id>` names it under `lora_container`. What
+the projection set is worth was measured once: the seven names litetune uses
+against the two peft's own Gemma 4 default would have chosen, 24 points apart
+on banking77, in [MEASUREMENTS.md](MEASUREMENTS.md).
+
 Without the first, FunctionGemma exports as a generic model — its `config.json`
 says `gemma3_text`, which the exporter does not recognise, so it falls through a
 silent catch-all. The runtime then builds no tool-call channel at all. An app
@@ -642,17 +657,20 @@ withdrawn after re-measurement.
 
 **Limits on the numbers**
 
-- **Measured on six models, five of them fine-tuned here.**
+- **Measured on six models, all six fine-tuned here.**
   `functiongemma-270m-it` with the tool-call scorer, and `gemma-3-270m-it`,
-  `gemma-3-1b-it`, `Qwen3-0.6B` and `Qwen2.5-0.5B-Instruct` with `exact-text`,
-  each with a conversion
+  `gemma-3-1b-it`, `Qwen3-0.6B`, `Qwen2.5-0.5B-Instruct` and
+  `gemma-4-E2B-it` with `exact-text`, each with a conversion
   cost against its own float twin. Only FunctionGemma also has a training gain:
   no banking77 run has an untuned base figure to subtract — Gemma 3 270M's base
   was run and refused to score, the 1B's and Qwen2.5's scored 0.0000 on both
-  sides, and Qwen3's never reached the base step at all — and every one of those manifests
-  records the gain as unavailable. `gemma-4-E2B-it` was not
-  fine-tuned at all: base weights, two conversions of them compared against the
-  float reference, so that run has a conversion cost and no training gain.
+  sides, Qwen3's never reached the base step at all, and Gemma 4's tuned run
+  records no base figure either — and every one of those manifests
+  records the gain as unavailable. `gemma-4-E2B-it` carries a second,
+  earlier run as well: two conversions of its untouched base weights against
+  the float reference, on prompts that list all 77 labels rather than the
+  prompts the tuned runs use, so that figure is not comparable with the five
+  above it.
   Qwen3.5 exports but has no quality figure, and a Gemma 4 without its variant
   is still refused unless you supply the template override yourself.
 - **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
@@ -796,7 +814,7 @@ Wiring `|| exit 1` on anything non-zero throws all of this away.
 ## Contributing
 
 Issues and pull requests welcome, particularly measurements on models other
-than the four above — that is the gap this alpha most needs closed.
+than the six above — that is the gap this alpha most needs closed.
 
 Run the checks with `pytest`, `ruff check`, `ruff format --check` and `mypy src`.
 

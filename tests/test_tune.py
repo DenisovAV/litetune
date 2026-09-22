@@ -991,7 +991,7 @@ def test_scoping_lora_to_a_container_is_named_as_a_limitation(trainer, request_f
 
     scoped = [t for t in result.limitations if "restricted to modules under `language_model`" in t]
     assert len(scoped) == 1, result.limitations
-    assert "112 vision" in scoped[0], "the limitation carries the count it rests on"
+    assert "same projection names" in scoped[0], "the limitation carries the reason it rests on"
     assert "comparable with the other families" in scoped[0]
 
 
@@ -1008,6 +1008,61 @@ def test_a_full_run_on_a_scoped_family_carries_no_scope_limitation(trainer, requ
     result = run_tune(request_for(model="google/gemma-4-E2B-it", method="full"))
 
     assert not any("restricted to modules under" in t for t in result.limitations)
+
+
+def test_the_container_reaches_the_script_that_uses_it(trainer, request_for, tmp_path):
+    """The one link between the family rule and the training script.
+
+    Found by mutation: replacing `lora_container=lora_container` in `run_tune`'s
+    `config(...)` call with `None` left all 1529 tests green. Nothing went
+    through `run_tune` into `train_config.json`, so the link that decides
+    whether peft is handed a regex or a bare name list was held by no test at
+    all -- and the failure it allows is silent, because the report would still
+    carry "LoRA was restricted to modules under `language_model`".
+    """
+    run_tune(request_for(model="google/gemma-4-E2B-it", method="lora"))
+
+    assert trainer.configs[0]["lora_container"] == "language_model"
+
+
+def test_a_text_only_family_hands_the_script_no_container(trainer, request_for):
+    run_tune(request_for(method="lora"))
+
+    assert trainer.configs[0]["lora_container"] is None
+
+
+def test_the_report_does_not_claim_an_unscoped_run_when_the_run_was_scoped(trainer, request_for):
+    """`request` never held this, and `null` there reads as "not scoped".
+
+    The same defect has been fixed in this method three times -- for
+    `prompt_mode_decision`, `declarations_sha256` and `call_probe`. Those were
+    removed, where absent reads as "not recorded here". This one was present
+    and wrong.
+    """
+    record = run_tune(request_for(model="google/gemma-4-E2B-it", method="lora")).as_dict()
+
+    assert "lora_container" not in record["request"]
+    assert record["lora_container"] == "language_model"
+
+
+def test_a_checkpoint_with_no_rules_is_told_its_lora_was_not_scoped(trainer, request_for):
+    """`identify` returning None is "no entry for this", not "no rules apply".
+
+    A mirror of a multimodal checkpoint under a name the patterns miss takes
+    the plain projection list, peft matches it by suffix, and every tower is
+    adapted -- while the report reads exactly like a scoped run's, because
+    neither the scope limitation nor any other mentions the difference.
+    """
+    result = run_tune(request_for(model="myorg/g4-e2b-it", method="lora"))
+
+    assert result.lora_container is None
+    assert any("no per-model rules for this checkpoint" in t for t in result.limitations)
+
+
+def test_a_full_run_on_an_unknown_checkpoint_is_not_told_about_lora_scoping(trainer, request_for):
+    result = run_tune(request_for(model="myorg/g4-e2b-it", method="full"))
+
+    assert not any("not scoped to any container" in t for t in result.limitations)
 
 
 def test_a_different_attention_implementation_is_named_as_a_limitation(trainer, request_for):
@@ -1317,15 +1372,54 @@ class AutoModelForCausalLM:
         return _Model("full")
 """
 
+# The stub matches `target_modules` against a module list the way peft does --
+# `re.fullmatch` for a string, name-suffix for a list -- and raises on an empty
+# match, as peft 0.20.0 does. It ignored the argument entirely before, which
+# meant no test in this file could tell a regex that matched the whole text
+# tower from one that matched nothing: the fourth `FakeToolchain`-shaped trap.
+# `LITETUNE_STUB_MODULES` is how a test supplies the graph; the default is the
+# three-tower shape of `google/gemma-4-E2B-it`, one leaf per tower.
 _STUB_PEFT = """
+import os
+import re
+
+DEFAULT_MODULES = [
+    "model.language_model.layers.0.self_attn.q_proj",
+    "model.language_model.layers.0.mlp.down_proj",
+    "model.vision_tower.encoder.layers.0.self_attn.q_proj",
+    "model.audio_tower.encoder.layers.0.self_attn.q_proj",
+]
+
+
 class LoraConfig:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
 
+class _Tuner:
+    def __init__(self, names):
+        self.targeted_module_names = names
+
+
+def _matches(name, targets):
+    if isinstance(targets, str):
+        return re.fullmatch(targets, name) is not None
+    return any(name.split(".")[-1] == t for t in targets)
+
+
 def get_peft_model(model, config):
+    names = os.environ.get("LITETUNE_STUB_MODULES")
+    modules = names.split(",") if names else DEFAULT_MODULES
+    targets = config.kwargs.get("target_modules")
+    matched = [m for m in modules if _matches(m, targets)]
+    if not matched:
+        raise ValueError(
+            f"Target modules {targets} not found in the base model. "
+            "Please check the target modules and try again."
+        )
     model.tag = "adapter"
     model.lora = config
+    model.base_model = _Tuner(matched)
     return model
 """
 
@@ -1350,6 +1444,7 @@ def run_real_script(
     declarations_sha256: str | None = None,
     declarations: list | None = None,
     lora_container: str | None = None,
+    stub_modules: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Runs `_TRAIN_SCRIPT` for real, against the stub modules `stub_env` wrote.
 
@@ -1384,6 +1479,7 @@ def run_real_script(
             "PYTHONPATH": str(stubs),
             "LITETUNE_STUB_LOG": str(log),
             "LITETUNE_STUB_CUDA": "1" if cuda else "0",
+            **({"LITETUNE_STUB_MODULES": ",".join(stub_modules)} if stub_modules else {}),
         },
     )
 
@@ -1446,6 +1542,64 @@ def test_a_scoped_lora_run_reaches_the_text_tower_and_nothing_beside_it(request_
     # The projection set is untouched: scoping decides where, never which.
     assert re.fullmatch(pattern, "model.language_model.layers.0.mlp.down_proj")
     assert not re.fullmatch(pattern, "model.language_model.layers.0.self_attn.qkv_proj")
+    # The mirror of the `xlanguage_model` case, on the other side: the prefix
+    # group is optional, so a graph rooted at the container matches too. Only
+    # the mandatory half was asserted, and making the group mandatory survived
+    # the whole suite.
+    assert re.fullmatch(pattern, "language_model.layers.0.self_attn.q_proj")
+
+    # And what peft was actually handed, rather than what the record says it
+    # was: the stub matches the way peft does, so a run given the plain name
+    # list instead of this regex matches the towers by suffix and reports four
+    # modules where the scoped run reports two. Passing the list while
+    # recording the regex survived the suite before this.
+    assert recorded["lora_modules_matched"] == 2
+    assert recorded["lora_leaves_matched"] == ["down_proj", "q_proj"]
+
+
+def test_a_container_with_a_dot_in_it_is_a_dot_and_not_a_wildcard(request_for, stub_env):
+    """`re.escape` on the container, which no test could previously hold.
+
+    Both `re.escape` calls could be deleted with the suite green, because the
+    only container in the table is `language_model` and the seven projections
+    are all `*_proj` -- no metacharacter anywhere. The container is a
+    hand-edited table entry, and a future one carrying a dot is the same defect
+    the branch is about: unescaped, the dot matches any character and the scope
+    silently widens to a sibling tower.
+    """
+    request = request_for(method="lora")
+    proc = run_real_script(
+        request,
+        stub_env,
+        lora_container="text_model.decoder",
+        stub_modules=["model.text_model.decoder.layers.0.self_attn.q_proj"],
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    pattern = recorded["lora_target_modules"]
+    assert re.fullmatch(pattern, "model.text_model.decoder.layers.0.self_attn.q_proj")
+    assert not re.fullmatch(pattern, "model.text_modelXdecoder.layers.0.self_attn.q_proj")
+
+
+def test_the_projection_set_is_the_one_the_measurement_was_taken_with(request_for, stub_env):
+    """Seven names, pinned as a set.
+
+    MEASUREMENTS.md rests a number on "seven projections, as shipped" against
+    peft's two, so the set is load-bearing prose now. Deleting `k_proj` from it
+    changed nothing any test could see.
+    """
+    from litetune.tune import DEFAULT_LORA_TARGETS
+
+    assert DEFAULT_LORA_TARGETS == (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    )
 
 
 def test_an_unscoped_run_hands_peft_the_projection_list_itself(request_for, stub_env):

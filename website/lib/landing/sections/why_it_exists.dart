@@ -63,9 +63,9 @@ typedef MeasuredRun = ({
 /// is scoped to the one size that was run, and Qwen2.5's for the same reason,
 /// where the rule is scoped to the one size *and* variant.
 ///
-/// Each card opens. The panel under it names the checkpoint the run actually
-/// used -- the Hub id and, where `MEASUREMENTS.md` pins one, the revision --
-/// and links to the model on the Hub and to the section that measured it. It
+/// Each card opens a panel. It names the checkpoint the run actually used --
+/// the Hub id and, where `MEASUREMENTS.md` pins one, the revision -- and links
+/// to the model on the Hub and to the section that measured it. It
 /// carries no score either, for the reason the face of the card carries none:
 /// a panel one click deep is still the shortest place there is to quote a
 /// verdict, and a reader who wants the number is one link from the table with
@@ -85,9 +85,12 @@ typedef MeasuredRun = ({
 /// the URL, so a reader who opened one and shared the address shares it open.
 /// On paper nothing is open, as before.
 ///
-/// `role="dialog"` and `aria-modal` are set because the element is presented
-/// as one; they describe what the styling already does rather than add
-/// behaviour.
+/// `role="dialog"` labels the element. `aria-modal="true"` does not describe
+/// the styling -- it tells assistive tech to treat everything outside as
+/// inert, which nothing here makes true; it is set as the same trade as the
+/// missing focus trap. `tabindex="-1"` is what makes the panel a focusable
+/// area, so navigating to the fragment lands focus on it rather than leaving
+/// it on the card behind.
 class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
@@ -105,7 +108,7 @@ class WhyItExists extends StatelessComponent {
             'it came from, and tells you the difference.',
           ),
         ]),
-        div(classes: 'measured', attributes: const {'id': 'measured'}, [
+        div(classes: 'measured', attributes: const {'id': closeTarget}, [
           div(classes: 'measured-label', [
             Component.text('Measured end to end so far'),
           ]),
@@ -115,8 +118,8 @@ class WhyItExists extends StatelessComponent {
           p(classes: 'measured-note', [
             Component.text(
               'Measured on CPU, the conversion cost came out small at eight bits '
-              'on all five, and at these sample sizes the method is near its '
-              'limit. Four bits cost more, and how much more does not follow '
+              'on all six, and at these sample sizes it often does not resolve '
+              'at all. Four bits cost more, and how much more does not follow '
               'from the family or the parameter count. ',
             ),
             a(
@@ -174,17 +177,30 @@ class WhyItExists extends StatelessComponent {
       name: 'Gemma 4 E2B',
       how: 'exact-text scoring, the same 600 held-out rows',
       hubId: 'google/gemma-4-E2B-it',
-      revision: '3e22461f',
-      anchor: 'what-the-projection-set-is-worth-on-this-family',
+      // Null although MEASUREMENTS.md names a commit: that run passed no
+      // `--revision` and the hash was read back from the cache afterwards.
+      // Showing it here in the same slot as four pinned ones would give it a
+      // parity the section it links to explicitly denies.
+      revision: null,
+      anchor: 'end-to-end-on-the-seven-projection-checkpoint',
     ),
   ];
 
   static const _newTab = {'target': '_blank', 'rel': 'noopener'};
 
+  /// Where both close links point, and the id of the block they land on.
+  /// A literal in three places was three chances for a panel that cannot be
+  /// closed: `:target` stops matching when the fragment names nothing, so a
+  /// renamed container leaves the × and the scrim pointing at dead air while
+  /// every test still passes.
+  static const closeTarget = 'measured';
+
   /// The panel's id, and what the card links to. Taken from the Hub id rather
-  /// than the display name: the five last segments are already unique and are
+  /// than the display name: the six last segments are already unique and are
   /// the thing that identifies the run, while two cards could one day differ
-  /// in name alone.
+  /// in name alone. The `.` two Qwen ids carry is legal in an id and in a
+  /// fragment, and is inert only because nothing selects these by id -- the
+  /// stylesheet matches on class.
   static String slugFor(MeasuredRun model) =>
       'measured-${model.hubId.split('/').last.toLowerCase()}';
 
@@ -204,12 +220,17 @@ class WhyItExists extends StatelessComponent {
       'id': slugFor(model),
       'role': 'dialog',
       'aria-modal': 'true',
+      // Without this the div is not a focusable area, so the browser's
+      // navigate-to-fragment focusing step falls through to the viewport and
+      // a screen reader is told a dialog opened while the cursor stays outside
+      // it.
+      'tabindex': '-1',
       'aria-label': '${model.name}: the checkpoint this run used',
     },
     [
       a(
         classes: 'measured-modal-scrim',
-        href: '#measured',
+        href: '#$closeTarget',
         attributes: const {'aria-label': 'Close'},
         const [],
       ),
@@ -218,7 +239,7 @@ class WhyItExists extends StatelessComponent {
           span(classes: 'measured-modal-title', [Component.text(model.name)]),
           a(
             classes: 'measured-modal-close',
-            href: '#measured',
+            href: '#$closeTarget',
             attributes: const {'aria-label': 'Close'},
             [Component.text('\u00d7')],
           ),
