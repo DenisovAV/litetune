@@ -60,10 +60,12 @@ is workable at 270M and the first thing you will want to change above about
 > floor. Gemma 4 exports once you name the variant — `E2B` or `E4B` — because
 > the chat template override is per-variant; a bare `gemma-4` is refused
 > rather than guessed at, and the refusal names the flag to pass if you want
-> to choose the template yourself. Qwen3.5 has no quality number. Gemma 4 has a
-> conversion cost measured on base weights — two conversions compared against
-> the float reference, no training gain because nothing was fine-tuned — also
-> in [MEASUREMENTS.md](MEASUREMENTS.md). Try it on yours and open an issue.
+> to choose the template yourself. Qwen3.5 has no quality number. Gemma 4 has
+> two, neither of them end to end: a conversion cost measured on base weights,
+> and a comparison of two LoRA runs that differ only in which projections they
+> adapt — the seven litetune names against the two peft would have chosen,
+> which is 24 points apart. Both in [MEASUREMENTS.md](MEASUREMENTS.md). Try it
+> on yours and open an issue.
 
 ---
 

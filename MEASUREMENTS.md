@@ -426,6 +426,45 @@ direction and it is also useless until the vocabulary learns the marker. It has
 since: `terminators_trimmed` then read 600 of 600, one marker each. The table
 above is from the re-run.
 
+### What the projection set is worth, on this family
+
+Scoping says *where* a LoRA run may adapt. It does not say *which* projections,
+and there `models.py` made a choice it could not defend with a number: litetune
+names seven, while peft 0.20.0's own mapping for `gemma4` is
+`.*language_model\..*\.(q_proj|v_proj)` -- two -- and Google's fine-tuning guide
+passes no `target_modules` at all so that default applies. So both were run.
+
+`google/gemma-4-E2B-it` fine-tuned on 2,400 rows of `mteb/banking77`, scored on
+the 600 held-out rows of split `0c7505b2b6f69ab1` with `--scorer exact-text`,
+prompt mode `runtime_rendered`, greedy, on one A100-SXM4-40GB. One base, one
+split, one set of hyper-parameters; the projection set is the only difference,
+and everything not named here was left at litetune's default.
+
+| | exact match | trainable parameters |
+|---|---|---|
+| seven projections, as shipped | **0.7883** ±0.0327 | 24,158,208 |
+| `q_proj` and `v_proj`, peft's own default | 0.5483 ±0.0398 | 2,678,784 |
+
+Paired, the difference is **+0.2400 ±0.0457, resolved**, on 196 of 600
+discordant. The interval would have to be five times wider to contain zero.
+
+**What it establishes.** On this task the projection set matters more than the
+model does. The five families measured on this split span 0.6717 to 0.7883 --
+11.7 points between the smallest checkpoint and the largest -- and changing
+which projections a LoRA run adapts moved one checkpoint 24. Taking peft's
+default would have left 5.1 billion parameters scoring 0.5483, below every
+other family here.
+
+**What it does not.** That seven is the right number, that a third set would not
+do better, or that any of this holds on another task or another family. It is
+two points on one task.
+
+**Not the kind of number the table above carries.** Those are converted
+artifacts against a float twin. These are two float checkpoints against each
+other with no conversion between them, so the difference is training and
+nothing else. Gemma 4 still has no end-to-end run: nothing here was converted
+or verified.
+
 ## A fourth family, and the first that is not Gemma
 
 Every section above measures a Gemma: FunctionGemma and Gemma 3 fine-tuned
