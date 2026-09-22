@@ -440,6 +440,12 @@ prompt mode `runtime_rendered`, greedy, on one A100-SXM4-40GB. One base, one
 split, one set of hyper-parameters; the projection set is the only difference,
 and everything not named here was left at litetune's default.
 
+The run passed no `--revision`, so it took whatever `main` pointed at that day:
+`3e22461f65e89153144f8adb70e3b8c2cc9845a7`, read back afterwards from the
+snapshot directory and `refs/main` in the cache rather than recorded by the run
+itself. Both arms downloaded once into the same cache, so they share it; a
+later run on this family should pin it.
+
 | | exact match | trainable parameters |
 |---|---|---|
 | seven projections, as shipped | **0.7883** ±0.0327 | 24,158,208 |
@@ -462,8 +468,42 @@ two points on one task.
 **Not the kind of number the table above carries.** Those are converted
 artifacts against a float twin. These are two float checkpoints against each
 other with no conversion between them, so the difference is training and
-nothing else. Gemma 4 still has no end-to-end run: nothing here was converted
-or verified.
+nothing else. Arm A's checkpoint was then converted and verified, which is the
+section below.
+
+### End to end, on the seven-projection checkpoint
+
+Arm A's tuned weights through `convert` and `verify`: two eight-bit recipes,
+the same 600 held-out rows of split `0c7505b2b6f69ab1`, `--scorer exact-text`,
+prompt mode `runtime_rendered`, greedy. Candidate on litert-lm's CPU backend in
+the same container, 12 vCPU; reference on the A100 through transformers.
+litetune 0.1.8; runtime `litert-lm==0.16.1`, `numpy==2.0.2`; reference
+`torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0`,
+`sentencepiece==0.2.0`.
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Fine-tuned, seven projections | **0.7883** ±0.0327 | 0.7667 ±0.0338 | 0.7700 ±0.0337 |
+| Cost of conversion | — | **+0.0217** ±0.0142 *(resolved, 19 discordant)* | **+0.0183** ±0.0108 *(resolved, 11 discordant)* |
+
+Sizes are 5,071,853,520 and 5,072,115,888 bytes.
+
+**Both eight-bit costs resolve, and neither had both resolve before.**
+`dynamic_wi8_afp32` did not resolve in any of the five earlier runs of it in
+this file -- the four families on this split, and FunctionGemma on the
+tool-call scorer. Here it does, and so does `weight_only_wi8_afp32`. What is
+different is the size: 5.1 billion parameters against 0.5 to 1.
+
+**Limitations carried by these two numbers.** The candidate ran on
+litert-lm's CPU backend and the reference on cuda, so each cost carries a
+hardware difference as well as a conversion one; `verify` reports that rather
+than refusing it. Decoding was passed explicitly to transformers and not to
+litert-lm, which used the pinned runtime's defaults; both are greedy. And
+`weight_only_wi8_afp32` shipped with no `prefer_activation_type` -- its repack
+did not finish inside `REPACK_TIMEOUT_S` (300 s), which was sized against a
+455 MB bundle and not a 5 GB one, and the original was kept. That does not
+touch the number above, which was measured on CPU, but the bundle as shipped
+is not the one to hand a GPU.
 
 ## A fourth family, and the first that is not Gemma
 

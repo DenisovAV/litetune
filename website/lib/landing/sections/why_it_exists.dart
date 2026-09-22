@@ -170,6 +170,13 @@ class WhyItExists extends StatelessComponent {
       anchor:
           'a-fifth-family-and-the-first-where-channelwise-four-bits-answered',
     ),
+    (
+      name: 'Gemma 4 E2B',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      hubId: 'google/gemma-4-E2B-it',
+      revision: '3e22461f',
+      anchor: 'what-the-projection-set-is-worth-on-this-family',
+    ),
   ];
 
   static const _newTab = {'target': '_blank', 'rel': 'noopener'};

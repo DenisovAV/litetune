@@ -50,22 +50,21 @@ is workable at 270M and the first thing you will want to change above about
 1B. Bring your own checkpoint and skip the first two steps, or bring a
 `.litertlm` and its float checkpoint and run only `verify`.
 
-> **Alpha.** Measured end to end on five models: `google/functiongemma-270m-it`
+> **Alpha.** Measured end to end on six models: `google/functiongemma-270m-it`
 > with the tool-call scorer, and `google/gemma-3-270m-it`,
-> `google/gemma-3-1b-it`, `Qwen/Qwen3-0.6B` and `Qwen/Qwen2.5-0.5B-Instruct`
-> with `exact-text` on the same 77-way intent task — every conversion scored on
-> CPU, two of them also on a phone's CPU and GPU, all in
-> [MEASUREMENTS.md](MEASUREMENTS.md).
+> `google/gemma-3-1b-it`, `Qwen/Qwen3-0.6B`, `Qwen/Qwen2.5-0.5B-Instruct` and
+> `google/gemma-4-E2B-it` with `exact-text` on the same 77-way intent task —
+> every conversion scored on CPU, two of them also on a phone's CPU and GPU,
+> all in [MEASUREMENTS.md](MEASUREMENTS.md).
 > Qwen3.5 exports and needs no flags from litetune, only a `transformers`
-> floor. Gemma 4 exports once you name the variant — `E2B` or `E4B` — because
-> the chat template override is per-variant; a bare `gemma-4` is refused
-> rather than guessed at, and the refusal names the flag to pass if you want
-> to choose the template yourself. Qwen3.5 has no quality number. Gemma 4 has
-> two, neither of them end to end: a conversion cost measured on base weights,
-> and a comparison of two LoRA runs that differ only in which projections they
-> adapt — the seven litetune names against the two peft would have chosen,
-> which is 24 points apart. Both in [MEASUREMENTS.md](MEASUREMENTS.md). Try it
-> on yours and open an issue.
+> floor, and has no quality number. Gemma 4 exports once you name the variant
+> — `E2B` or `E4B` — because the chat template override is per-variant; a bare
+> `gemma-4` is refused rather than guessed at, and the refusal names the flag
+> to pass if you want to choose the template yourself. It carries two numbers
+> the others do not: a conversion cost measured on base weights, and a
+> comparison of two LoRA runs that differ only in which projections they adapt
+> — the seven litetune names against the two peft would have chosen, which is
+> 24 points apart. Try it on yours and open an issue.
 
 ---
 
