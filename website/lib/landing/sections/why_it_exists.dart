@@ -71,15 +71,23 @@ typedef MeasuredRun = ({
 /// verdict, and a reader who wants the number is one link from the table with
 /// its interval, its sample size and its refusals next to it.
 ///
-/// `<details>`, not a dialog and not an island. The site builds in `static`
-/// mode with no `@client` component anywhere, so a disclosure that needs
-/// JavaScript would make this the page that ends that -- for a panel the
-/// browser already implements and operates from the keyboard. No card is
-/// rendered `open`, which is the cost as well as the point: with scripting
-/// off the panel still opens, but on paper it does not, and a printed page
-/// carries the model names without the checkpoints. `.measured-cards` gets
-/// `align-items: start` so an open card grows downward instead of stretching
-/// the ones beside it.
+/// The panel opens over the page rather than under the card, and it does it
+/// with `:target` -- the card is a link to the panel's own id, and CSS shows
+/// that panel while the URL names it. No `@client` component, no island, no
+/// script: the site builds in `static` mode and this page is not the one that
+/// ends that. `<dialog>` would have been the semantically right element and
+/// needs `showModal()` to behave as one, which is the trade this makes.
+///
+/// What that costs, said plainly. There is no focus trap and no
+/// Escape-to-close, because both are JavaScript; closing is a link, of which
+/// there are two -- the scrim behind the panel and the × in its corner -- and
+/// both are reachable from the keyboard. Opening a panel puts a fragment in
+/// the URL, so a reader who opened one and shared the address shares it open.
+/// On paper nothing is open, as before.
+///
+/// `role="dialog"` and `aria-modal` are set because the element is presented
+/// as one; they describe what the styling already does rather than add
+/// behaviour.
 class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
@@ -97,7 +105,7 @@ class WhyItExists extends StatelessComponent {
             'it came from, and tells you the difference.',
           ),
         ]),
-        div(classes: 'measured', [
+        div(classes: 'measured', attributes: const {'id': 'measured'}, [
           div(classes: 'measured-label', [
             Component.text('Measured end to end so far'),
           ]),
@@ -118,6 +126,7 @@ class WhyItExists extends StatelessComponent {
               [Component.text('The numbers, and what they do not establish')],
             ),
           ]),
+          for (final model in measured) _modal(model),
         ]),
       ]),
     ]);
@@ -165,36 +174,71 @@ class WhyItExists extends StatelessComponent {
 
   static const _newTab = {'target': '_blank', 'rel': 'noopener'};
 
-  static Component _card(
-    MeasuredRun model,
-  ) => details(classes: 'measured-card', [
-    summary(classes: 'measured-card-summary', [
+  /// The panel's id, and what the card links to. Taken from the Hub id rather
+  /// than the display name: the five last segments are already unique and are
+  /// the thing that identifies the run, while two cards could one day differ
+  /// in name alone.
+  static String slugFor(MeasuredRun model) =>
+      'measured-${model.hubId.split('/').last.toLowerCase()}';
+
+  static Component _card(MeasuredRun model) => a(
+    classes: 'measured-card',
+    href: '#${slugFor(model)}',
+    [
       span(classes: 'measured-card-model', [Component.text(model.name)]),
       span(classes: 'measured-card-how', [Component.text(model.how)]),
-    ]),
-    div(classes: 'measured-card-panel', [
-      div(classes: 'measured-card-fact', [
-        span(classes: 'measured-card-key', [Component.text('Checkpoint')]),
-        span(classes: 'measured-card-id', [Component.text(model.hubId)]),
-      ]),
-      if (model.revision case final revision?)
+      span(classes: 'measured-card-more', [Component.text('checkpoint')]),
+    ],
+  );
+
+  static Component _modal(MeasuredRun model) => div(
+    classes: 'measured-modal',
+    attributes: {
+      'id': slugFor(model),
+      'role': 'dialog',
+      'aria-modal': 'true',
+      'aria-label': '${model.name}: the checkpoint this run used',
+    },
+    [
+      a(
+        classes: 'measured-modal-scrim',
+        href: '#measured',
+        attributes: const {'aria-label': 'Close'},
+        const [],
+      ),
+      div(classes: 'measured-modal-box', [
+        div(classes: 'measured-modal-head', [
+          span(classes: 'measured-modal-title', [Component.text(model.name)]),
+          a(
+            classes: 'measured-modal-close',
+            href: '#measured',
+            attributes: const {'aria-label': 'Close'},
+            [Component.text('\u00d7')],
+          ),
+        ]),
         div(classes: 'measured-card-fact', [
-          span(classes: 'measured-card-key', [Component.text('Revision')]),
-          span(classes: 'measured-card-id', [Component.text(revision)]),
+          span(classes: 'measured-card-key', [Component.text('Checkpoint')]),
+          span(classes: 'measured-card-id', [Component.text(model.hubId)]),
         ]),
-      div(classes: 'measured-card-links', [
-        a(href: 'https://huggingface.co/${model.hubId}', attributes: _newTab, [
-          Component.text('On Hugging Face'),
+        if (model.revision case final revision?)
+          div(classes: 'measured-card-fact', [
+            span(classes: 'measured-card-key', [Component.text('Revision')]),
+            span(classes: 'measured-card-id', [Component.text(revision)]),
+          ]),
+        div(classes: 'measured-card-links', [
+          a(href: 'https://huggingface.co/${model.hubId}', attributes: _newTab, [
+            Component.text('On Hugging Face'),
+          ]),
+          a(
+            href:
+                'https://github.com/DenisovAV/litetune/blob/main/MEASUREMENTS.md#${model.anchor}',
+            attributes: _newTab,
+            [Component.text('What this run established')],
+          ),
         ]),
-        a(
-          href:
-              'https://github.com/DenisovAV/litetune/blob/main/MEASUREMENTS.md#${model.anchor}',
-          attributes: _newTab,
-          [Component.text('What this run established')],
-        ),
       ]),
-    ]),
-  ]);
+    ],
+  );
 
   // Every class here carries the section's `measured-` prefix, including the
   // cards. jaspr collects each component's `@css` into one stylesheet, so a
@@ -229,64 +273,84 @@ class WhyItExists extends StatelessComponent {
     css('.measured-cards').styles(
       display: Display.grid,
       gap: Gap.all(0.75.rem),
-      // An open card grows downward; the ones beside it keep their height.
-      alignItems: AlignItems.start,
       raw: const {
         'grid-template-columns': 'repeat(auto-fit, minmax(16rem, 1fr))',
       },
     ),
     css('.measured-card').styles(
+      display: Display.flex,
+      flexDirection: FlexDirection.column,
+      gap: Gap.all(0.3.rem),
       padding: Padding.all(1.rem),
       backgroundColor: Brand.surface,
       radius: BorderRadius.circular(0.6.rem),
       border: Border.all(color: Brand.line, width: 1.px),
+      cursor: Cursor.pointer,
+      raw: const {'text-decoration': 'none'},
     ),
-    // The default triangle is replaced by a sign that lines up with the
-    // model name. Both the `display: flex` here and `list-style: none` below
-    // can suppress a marker drawn as a list marker, and the WebKit
-    // pseudo-element needs its own rule; which one is load-bearing depends on
-    // the engine, and nothing in this repository tests that, so all three
-    // stay.
-    //
-    // The accessible-name computation includes `::before` and `::after`
-    // content, so the words are read out on top of the expanded/collapsed
-    // state the platform already announces. Kept because they are what tell a
-    // sighted reader there is anything to open, and recorded because nothing
-    // here gives the control an explicit label to exclude them.
-    css('.measured-card-summary').styles(
+    // The affordance, as a line of the card rather than a generated
+    // `::after`: the old one hung off `summary` and its text was read out on
+    // top of the platform's own expanded/collapsed announcement. A link needs
+    // no such announcement, so the word can simply be in the card.
+    css('.measured-card-more').styles(color: Brand.muted, fontSize: 0.85.rem),
+    // Hidden until the URL names it. `:target` is the whole mechanism -- see
+    // the class docstring for what that buys and what it costs.
+    css('.measured-modal').styles(raw: const {'display': 'none'}),
+    css('.measured-modal:target').styles(
+      raw: const {
+        'display': 'flex',
+        'position': 'fixed',
+        'inset': '0',
+        'z-index': '50',
+        'align-items': 'center',
+        'justify-content': 'center',
+        'padding': '1.5rem',
+      },
+    ),
+    // The scrim is a link, so clicking beside the panel closes it. It is
+    // drawn behind the box by source order, which is why the box is `relative`
+    // rather than the scrim being negatively stacked.
+    css('.measured-modal-scrim').styles(
+      raw: const {
+        'position': 'absolute',
+        'inset': '0',
+        'background': 'rgba(0, 0, 0, 0.45)',
+      },
+    ),
+    css('.measured-modal-box').styles(
       display: Display.flex,
       flexDirection: FlexDirection.column,
-      gap: Gap.all(0.3.rem),
-      cursor: Cursor.pointer,
-      listStyle: ListStyle.none,
+      gap: Gap.all(0.6.rem),
+      padding: Padding.all(1.25.rem),
+      backgroundColor: Brand.surface,
+      radius: BorderRadius.circular(0.7.rem),
+      border: Border.all(color: Brand.line, width: 1.px),
+      raw: const {
+        'position': 'relative',
+        'width': 'min(30rem, 100%)',
+        'max-height': '80vh',
+        'overflow-y': 'auto',
+      },
+    ),
+    css('.measured-modal-head').styles(
+      display: Display.flex,
+      alignItems: AlignItems.center,
+      gap: Gap.all(1.rem),
+      raw: const {'justify-content': 'space-between'},
     ),
     css(
-      '.measured-card-summary::-webkit-details-marker',
-    ).styles(raw: const {'display': 'none'}),
-    css(
-      '.measured-card-summary::after',
-    ).styles(color: Brand.muted, fontSize: 0.85.rem, content: '+ checkpoint'),
-    css(
-      '.measured-card[open] .measured-card-summary::after',
-    ).styles(content: '− checkpoint'),
+      '.measured-modal-title',
+    ).styles(color: Brand.ink, fontSize: 1.05.rem, fontWeight: FontWeight.w500),
+    css('.measured-modal-close').styles(
+      color: Brand.muted,
+      fontSize: 1.3.rem,
+      lineHeight: 1.em,
+      raw: const {'text-decoration': 'none'},
+    ),
     css(
       '.measured-card-model',
     ).styles(color: Brand.ink, fontSize: 1.05.rem, fontWeight: FontWeight.w500),
     css('.measured-card-how').styles(color: Brand.body, fontSize: 0.9.rem),
-    css('.measured-card-panel').styles(
-      display: Display.flex,
-      flexDirection: FlexDirection.column,
-      gap: Gap.all(0.4.rem),
-      margin: Margin.only(top: 0.75.rem),
-      padding: Padding.only(top: 0.75.rem),
-      border: Border.only(
-        top: BorderSide(
-          color: Brand.line,
-          width: 1.px,
-          style: BorderStyle.solid,
-        ),
-      ),
-    ),
     css('.measured-card-fact').styles(
       display: Display.flex,
       flexDirection: FlexDirection.column,

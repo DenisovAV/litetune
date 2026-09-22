@@ -68,6 +68,7 @@ File _readme() {
 }
 
 void main() {
+  _slugs();
   final sections = _sectionsByAnchor(_measurements().readAsLinesSync());
   final readme = _readme().readAsStringSync();
 
@@ -146,6 +147,34 @@ void main() {
             '${model.name} pins $revision, which the section it links to '
             '(#${model.anchor}) does not mention -- the card would name a '
             'commit that run did not record',
+      );
+    }
+  });
+}
+
+// The card is a link to its own panel, so the panel's id is what makes the
+// two meet. Nothing in a Dart build notices two elements sharing an id: the
+// browser opens the first, and the second card silently shows the first
+// card's checkpoint. The id is derived from the Hub id's last segment, which
+// is unique across today's five and is not guaranteed to stay that way --
+// `google/gemma-3-1b-it` and `someone-else/gemma-3-1b-it` would collide.
+void _slugs() {
+  test('each card opens its own panel and no one else\'s', () {
+    final slugs = [for (final model in WhyItExists.measured) WhyItExists.slugFor(model)];
+    expect(
+      slugs.toSet().length,
+      slugs.length,
+      reason: 'two cards share a panel id: $slugs',
+    );
+  });
+
+  test('a panel id is usable as a URL fragment', () {
+    for (final model in WhyItExists.measured) {
+      final slug = WhyItExists.slugFor(model);
+      expect(
+        slug,
+        matches(RegExp(r'^[a-z][a-z0-9._-]*$')),
+        reason: '${model.name} produces a fragment a browser cannot target',
       );
     }
   });
