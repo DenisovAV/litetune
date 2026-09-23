@@ -67,3 +67,12 @@ final String packageVersion = () {
 final String changelogMarkdown = File(
   '${_root.path}/CHANGELOG.md',
 ).readAsStringSync();
+
+/// `MEASUREMENTS.md` at the repository root, as written.
+///
+/// Read here rather than copied into the site, so that the page and the
+/// measured-run cards that link into it come out of one file: a section that
+/// is renamed takes its own anchors with it.
+final String measurementsMarkdown = File(
+  '${_root.path}/MEASUREMENTS.md',
+).readAsStringSync();

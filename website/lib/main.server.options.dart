@@ -20,6 +20,8 @@ import 'package:litetune_website/landing/sections/where_to_run.dart'
 import 'package:litetune_website/landing/sections/why_it_exists.dart'
     as _why_it_exists;
 import 'package:litetune_website/landing/landing_page.dart' as _landing_page;
+import 'package:litetune_website/measurements/measurements_page.dart'
+    as _measurements_page;
 
 /// Default [ServerOptions] for use with your Jaspr project.
 ///
@@ -50,5 +52,6 @@ ServerOptions get defaultServerOptions => ServerOptions(
     ..._what_it_does.WhatItDoes.styles,
     ..._where_to_run.WhereToRun.styles,
     ..._why_it_exists.WhyItExists.styles,
+    ..._measurements_page.MeasurementsPage.styles,
   ],
 );

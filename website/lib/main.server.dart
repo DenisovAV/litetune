@@ -1,7 +1,8 @@
 /// The entrypoint for the **server** environment, which for a static build is
 /// the only one that renders anything: `jaspr build` runs this once and writes
-/// one HTML file per route -- `build/jaspr/index.html` and
-/// `build/jaspr/changelog/index.html`.
+/// one HTML file per route -- `build/jaspr/index.html`,
+/// `build/jaspr/changelog/index.html` and
+/// `build/jaspr/measurements/index.html`.
 library;
 
 import 'package:jaspr/server.dart';
@@ -9,6 +10,7 @@ import 'package:jaspr_router/jaspr_router.dart';
 
 import 'changelog/changelog_page.dart';
 import 'landing/landing_page.dart';
+import 'measurements/measurements_page.dart';
 import 'project.dart';
 import 'seo.dart';
 
@@ -27,6 +29,12 @@ const String _changelogDescription =
     'result wrong says so first, and says what to do about it.';
 
 const String _changelogTitle = 'Changelog — litetune';
+
+const String _measurementsDescription =
+    'Every number litetune has measured, with the interval, the sample size '
+    'and the refusals beside it -- and what each run does not establish.';
+
+const String _measurementsTitle = 'Measurements — litetune';
 
 void main() {
   Jaspr.initializeApp(options: defaultServerOptions);
@@ -68,6 +76,27 @@ void main() {
             body: ChangelogPage(
               version: packageVersion,
               markdown: changelogMarkdown,
+            ),
+          ),
+        ),
+        Route(
+          path: '/measurements',
+          builder: (context, state) => Document(
+            title: _measurementsTitle,
+            lang: 'en',
+            meta: const {'description': _measurementsDescription},
+            head: [
+              ...fontLinks(),
+              ...seoHead(
+                title: _measurementsTitle,
+                description: _measurementsDescription,
+                applicationDescription: _description,
+                path: '/measurements',
+              ),
+            ],
+            body: MeasurementsPage(
+              version: packageVersion,
+              markdown: measurementsMarkdown,
             ),
           ),
         ),

@@ -126,12 +126,9 @@ class WhyItExists extends StatelessComponent {
                 'at all. Four bits cost more, and how much more does not follow '
                 'from the family or the parameter count. ',
               ),
-              a(
-                href:
-                    'https://github.com/DenisovAV/litetune/blob/main/MEASUREMENTS.md',
-                attributes: _newTab,
-                [Component.text('The numbers, and what they do not establish')],
-              ),
+              a(href: '/measurements', [
+                Component.text('The numbers, and what they do not establish'),
+              ]),
             ]),
             for (final model in measured) _modal(model),
           ],
@@ -278,12 +275,9 @@ class WhyItExists extends StatelessComponent {
             attributes: _newTab,
             [Component.text('On Hugging Face')],
           ),
-          a(
-            href:
-                'https://github.com/DenisovAV/litetune/blob/main/MEASUREMENTS.md#${model.anchor}',
-            attributes: _newTab,
-            [Component.text('What this run established')],
-          ),
+          a(href: '/measurements#${model.anchor}', [
+            Component.text('Scores and intervals for this run'),
+          ]),
         ]),
       ]),
     ],

@@ -94,7 +94,11 @@ class ChangelogPage extends StatelessComponent {
   /// page already has one of. Both are refused loudly rather than rendered.
   static const _allowedTags = <String, Set<String>>{
     'h2': {'id'},
-    'h3': {},
+    // `id` on both, because `MeasurementsPage` holds its file to this same
+    // allowlist and puts one on every `##` and `###` -- that is how a card
+    // opens the section that measured its model. Markdown writes neither by
+    // itself, so nothing here is loosened for a file that writes its own.
+    'h3': {'id'},
     'h4': {},
     'h5': {},
     'h6': {},

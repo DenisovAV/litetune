@@ -29,10 +29,7 @@ class NavBar extends StatelessComponent {
           a(href: '/changelog', [Component.text('Changelog')]),
           _link('https://github.com/DenisovAV/litetune', 'GitHub'),
           _link('https://pypi.org/project/litetune/', 'PyPI'),
-          _link(
-            'https://github.com/DenisovAV/litetune/blob/main/MEASUREMENTS.md',
-            'Measurements',
-          ),
+          a(href: '/measurements', [Component.text('Measurements')]),
         ]),
       ]),
     ]);
