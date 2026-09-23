@@ -161,6 +161,93 @@ def test_gemma_4_declares_the_stop_tokens_its_generation_config_names():
         assert rules.stop_token_reason, f"{family} declares stop tokens with no evidence"
 
 
+def test_gemma_4_scopes_lora_to_its_text_tower():
+    """A LoRA run on Gemma 4 must adapt the text tower and nothing else.
+
+    peft matches `target_modules` by name suffix, and this checkpoint's vision
+    and audio towers use the same projection names as its text layers, so a run
+    scoped by name alone reaches all three, and peft then refuses the tower
+    ones: transformers wraps them in `Gemma4ClippableLinear` and peft
+    dispatches on a bare `nn.Linear`, so the run stops in `get_peft_model`.
+    The scope is what lets the projection set apply at all.
+
+    Per variant, because `_gemma4` builds three and one dropped argument would
+    leave all three unscoped while every other test stayed green.
+    """
+    for family in ("gemma-4-e2b", "gemma-4-e4b", "gemma-4"):
+        rules = next(r for r in models.RULES if r.family == family)
+        assert rules.lora_container == "language_model", family
+        assert rules.lora_container_reason, f"{family} scopes LoRA with no evidence"
+
+
+def test_only_a_multimodal_family_scopes_lora_at_all():
+    """The container is a claim about structure, so a text-only family makes none.
+
+    The scoped set alone does not hold this. `lora_container` defaults to
+    `None`, so a multimodal family added without filling it in leaves the
+    scoped set unchanged and passes -- adapting every tower, reporting cleanly,
+    with no limitation and a green suite, which is the pre-scope behaviour
+    reached through the path of least resistance. Found by reviewing the commit
+    that added the check.
+
+    So the whole roster is asserted, not the scoped part of it. Adding a family
+    fails here and the author has to decide the question before the list can be
+    updated. That is the only moment anyone is looking at the checkpoint's
+    module graph.
+    """
+    families = {r.family for r in models.RULES}
+    assert families == {
+        "functiongemma",
+        "gemma-3-text",
+        "gemma3-text-unidentified",
+        "gemma-4",
+        "gemma-4-e2b",
+        "gemma-4-e4b",
+        "qwen-2.5",
+        "qwen-3",
+        "qwen-3.5",
+    }, sorted(families)
+    scoped = {r.family for r in models.RULES if r.lora_container}
+    assert scoped == {"gemma-4-e2b", "gemma-4-e4b", "gemma-4"}, sorted(scoped)
+    # And every family says why, including the ones with no container. The
+    # reason used to be asserted *empty* there, which made "examined, and it
+    # has one tower" and "nobody decided" arrive as the same empty string --
+    # in `ModelRules.as_dict`, which every convert and verify manifest
+    # publishes. An entry cannot leave the question at its default now.
+    for rules in models.RULES:
+        assert rules.lora_container_reason, rules.family
+
+
+def test_the_scope_reason_says_what_an_unscoped_run_actually_does():
+    """It refuses; it does not train the wrong thing quietly.
+
+    The first draft of this string said an unscoped run "trains, it saves, and
+    every check passes". Executed against peft 0.20.0 with the module shapes
+    transformers 5.16.1 gives this family, it raises in `get_peft_model`: the
+    tower projections are `Gemma4ClippableLinear` and peft dispatches on a bare
+    `nn.Linear`. The quiet version is the more frightening claim and the false
+    one, so it is the one worth pinning against.
+    """
+    reason = models.identify("google/gemma-4-E2B-it").lora_container_reason
+
+    assert "Gemma4ClippableLinear" in reason
+    assert "get_peft_model" in reason
+    assert "trains" not in reason
+
+
+def test_the_family_report_names_the_lora_container():
+    """The scope has to reach a record a user reads.
+
+    `ModelRules.as_dict` is what `convert --json` and every verify manifest
+    publish under `model_rules`, and README points a reader there. Dropping
+    either key from it changed nothing any test could see.
+    """
+    record = models.report("google/gemma-4-E2B-it")
+
+    assert record["lora_container"] == "language_model"
+    assert "same projection names" in record["lora_container_reason"]
+
+
 def test_a_config_that_cannot_be_read_says_so_rather_than_reporting_no_rules(tmp_path):
     checkpoint = tmp_path / "model"
     checkpoint.mkdir()

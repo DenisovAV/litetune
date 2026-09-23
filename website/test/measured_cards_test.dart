@@ -68,6 +68,7 @@ File _readme() {
 }
 
 void main() {
+  _slugs();
   final sections = _sectionsByAnchor(_measurements().readAsLinesSync());
   final readme = _readme().readAsStringSync();
 
@@ -80,6 +81,25 @@ void main() {
         reason:
             '${model.name} links to MEASUREMENTS.md#${model.anchor}, and no '
             'heading in that file produces this anchor',
+      );
+    }
+  });
+
+  test('each card links to a section that measured a conversion', () {
+    // Naming the checkpoint is not enough: a model can appear in more than one
+    // section, and only some of them convert anything. The Gemma 4 card was
+    // filed against a section comparing two float checkpoints -- which says so
+    // itself, "no conversion between them" -- while sitting under the label
+    // "Measured end to end so far". A cost-of-conversion row is what every
+    // section behind these cards has and a training comparison does not.
+    for (final model in WhyItExists.measured) {
+      expect(
+        sections[model.anchor]?.toLowerCase(),
+        contains('cost of conversion'),
+        reason:
+            '${model.name} links to #${model.anchor}, which has no '
+            'cost-of-conversion row -- the card promises a conversion the '
+            'section it opens did not measure',
       );
     }
   });
@@ -146,6 +166,48 @@ void main() {
             '${model.name} pins $revision, which the section it links to '
             '(#${model.anchor}) does not mention -- the card would name a '
             'commit that run did not record',
+      );
+    }
+  });
+}
+
+// The card is a link to its own panel, so the panel's id is what makes the
+// two meet. Nothing in a Dart build notices two elements sharing an id: the
+// browser opens the first, and the second card silently shows the first
+// card's checkpoint. The id is derived from the Hub id's last segment, which
+// is unique across today's six and is not guaranteed to stay that way --
+// `google/gemma-3-1b-it` and `someone-else/gemma-3-1b-it` would collide.
+void _slugs() {
+  test('closing a panel lands somewhere, and not on another panel', () {
+    // Both close links point at `#${WhyItExists.closeTarget}`, and `:target`
+    // stops matching when the fragment names nothing -- so a container id that
+    // drifts from the close links leaves a panel that cannot be closed, with
+    // every test green. The second half matters too: if the close target were
+    // also a panel id, closing one panel would open another.
+    expect(WhyItExists.closeTarget, isNotEmpty);
+    expect(
+      [for (final model in WhyItExists.measured) WhyItExists.slugFor(model)],
+      isNot(contains(WhyItExists.closeTarget)),
+      reason: 'closing a panel would open another one',
+    );
+  });
+
+  test('each card opens its own panel and no one else\'s', () {
+    final slugs = [for (final model in WhyItExists.measured) WhyItExists.slugFor(model)];
+    expect(
+      slugs.toSet().length,
+      slugs.length,
+      reason: 'two cards share a panel id: $slugs',
+    );
+  });
+
+  test('a panel id is usable as a URL fragment', () {
+    for (final model in WhyItExists.measured) {
+      final slug = WhyItExists.slugFor(model);
+      expect(
+        slug,
+        matches(RegExp(r'^[a-z][a-z0-9._-]*$')),
+        reason: '${model.name} produces a fragment a browser cannot target',
       );
     }
   });

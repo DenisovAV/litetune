@@ -484,6 +484,7 @@ metrics file into events.
 """
 import json
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -802,6 +803,22 @@ def main() -> int:
     model.to(device)
 
     trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    target_modules = list(spec["lora_targets"])
+    container = spec.get("lora_container")
+    if container:
+        # peft matches a list of names by suffix, and on a multimodal
+        # checkpoint the same projection names occur in the vision and audio
+        # towers. A regex is the only shape `target_modules` has that says
+        # "these projections, and only under this container". The container has
+        # to be a whole path segment: `.*language_model\.` also matches a
+        # sibling named `xlanguage_model`, because `.*` absorbs the prefix, so
+        # what precedes it is either nothing or something ending in a dot.
+        target_modules = r"(?:.*\.)?%s\..*\.(%s)" % (
+            re.escape(container),
+            "|".join(re.escape(name) for name in target_modules),
+        )
+    matched_modules: list[str] | None = None
+    match_note = None
     if spec["method"] == "lora":
         from peft import LoraConfig, get_peft_model
 
@@ -813,9 +830,35 @@ def main() -> int:
                 lora_dropout=spec["lora_dropout"],
                 bias="none",
                 task_type="CAUSAL_LM",
-                target_modules=list(spec["lora_targets"]),
+                target_modules=target_modules,
             ),
         )
+        # What peft matched, not what it was asked for. peft raises when a
+        # target matches nothing at all, so a zero match is already loud -- but
+        # it says nothing about a partial one, and a run that adapted six of
+        # thirty layers writes the same request string, the same limitation and
+        # the same `passed` as a run that adapted all thirty. peft keeps the
+        # matched names on the tuner and never persists them: `adapter_config`
+        # stores the request. Read them here or they are gone.
+        #
+        # `or []` was wrong here and the mistake is worth naming. `base_model`
+        # on a transformers model is a property that falls back to `self`, and
+        # peft's tuner forwards every missing attribute to the model it wraps,
+        # so a renamed or absent `targeted_module_names` does not raise -- it
+        # arrives as None. Collapsing that to an empty list wrote "matched
+        # nothing" for "could not read", and since peft raises on a real zero
+        # match, zero was the one value that could only mean the readback
+        # broke. Absent is absent.
+        tuner = getattr(model, "base_model", model)
+        names = getattr(tuner, "targeted_module_names", None)
+        if names is None:
+            match_note = (
+                "peft exposed no `targeted_module_names` on "
+                f"{type(tuner).__name__}, so what this run adapted was not recorded; "
+                "the target below is what peft was asked for, not what it matched"
+            )
+        else:
+            matched_modules = sorted(names)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     model.train()
@@ -939,6 +982,27 @@ def main() -> int:
                 "turn_terminator": terminator,
                 "trainable_parameters": trainable,
                 "base_parameters": trainable_before,
+                # What peft was actually given: the projection list, or the
+                # regex that restricts it to one container. Recorded because
+                # two runs called `lora` are only the same method if this is
+                # the same, and on a multimodal checkpoint it is not derivable
+                # from the model id.
+                "lora_target_modules": target_modules if spec["method"] == "lora" else None,
+                # And what that request actually matched, which is the fact the
+                # name above sounds like and is not. `None` throughout means no
+                # adapter was built or the matched names could not be read --
+                # `lora_match_note` says which -- and never "matched nothing",
+                # which peft refuses before it gets here.
+                #
+                # The paths go in whole rather than as leaf names. A scoped run
+                # and a run that adapted every tower have the *same* leaf set:
+                # only the prefix says which tower a module sat in, so a record
+                # that keeps leaves alone cannot answer the question the scope
+                # limitation sends a reader here to ask. The count alone cannot
+                # either, having no denominator.
+                "lora_modules_matched": (None if matched_modules is None else len(matched_modules)),
+                "lora_modules": matched_modules,
+                "lora_match_note": match_note,
                 "epochs": epochs,
                 "model_dir": str(model_dir),
                 "adapter_dir": str(adapter_dir) if adapter_dir else None,
@@ -1158,6 +1222,7 @@ class TuneRequest:
         decision: PromptModeDecision | None = None,
         declarations_sha256: str | None = None,
         declarations: list | None = None,
+        lora_container: str | None = None,
     ) -> dict[str, Any]:
         """Everything the generated script needs. Also what the report records.
 
@@ -1191,6 +1256,11 @@ class TuneRequest:
             "lora_alpha": self.lora_alpha,
             "lora_dropout": self.lora_dropout,
             "lora_targets": list(self.lora_targets),
+            # Which container those projections are restricted to, from the
+            # family's rules -- decided in the parent, like the device and the
+            # prompt mode, so a run says what it is about to adapt while there
+            # is still something to do about it.
+            "lora_container": lora_container,
             "dtype": self.dtype,
             "attn_implementation": self.attn_implementation,
             "prompt_mode": mode.value if mode is not None else None,
@@ -1242,6 +1312,14 @@ class TuneRequest:
         # family: recomputed here from the family alone, it disagreed with the
         # one the script was given (`train_config.json`).
         record.pop("call_probe")
+        # And the container, for the same reason and with a sharper edge: the
+        # caller never names it, `config()` defaults it to `None`, and the real
+        # value only ever reaches `train_config.json`. Left here it printed
+        # `lora_container: null` on a run that was scoped -- not a missing
+        # field a reader skips, but a positive claim that the run adapted
+        # every tower. It is the result's fact and is reported at the top
+        # level of `TuneResult.as_dict`.
+        record.pop("lora_container", None)
         record["declarations"] = str(self.declarations) if self.declarations else None
         record["force_prompt_mode"] = self.force_prompt_mode
         record["learning_rate_source"] = (
@@ -1296,6 +1374,16 @@ class TrainingMetrics:
     epochs: tuple[EpochMetrics, ...]
     trainable_parameters: int | None = None
     base_parameters: int | None = None
+    # What peft was asked for, and what that request matched. `None` on a full
+    # fine-tune and on a script that predates the fields. The pair is the point:
+    # the request alone cannot tell a partial match from a whole one, and
+    # `trainable_parameters` is an integer with no expected value beside it.
+    lora_target_modules: str | list[str] | None = None
+    lora_modules_matched: int | None = None
+    lora_modules: tuple[str, ...] | None = None
+    # Why the two above are `None` on a run that did use LoRA. `None` here and
+    # a set count is the ordinary case.
+    lora_match_note: str | None = None
     # `None` when the script predates the field. Absent is absent, not "cpu".
     device: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
@@ -1326,6 +1414,12 @@ class TrainingMetrics:
             epochs=epochs,
             trainable_parameters=data.get("trainable_parameters"),
             base_parameters=data.get("base_parameters"),
+            lora_target_modules=data.get("lora_target_modules"),
+            lora_modules_matched=data.get("lora_modules_matched"),
+            lora_modules=(
+                None if data.get("lora_modules") is None else tuple(data["lora_modules"])
+            ),
+            lora_match_note=data.get("lora_match_note"),
             device=data.get("device"),
             raw=dict(data),
         )
@@ -1340,6 +1434,10 @@ class TrainingMetrics:
             "expected_supervised_token_fraction": EXPECTED_SUPERVISED_FRACTION,
             "trainable_parameters": self.trainable_parameters,
             "base_parameters": self.base_parameters,
+            "lora_target_modules": self.lora_target_modules,
+            "lora_modules_matched": self.lora_modules_matched,
+            "lora_modules": (None if self.lora_modules is None else list(self.lora_modules)),
+            "lora_match_note": self.lora_match_note,
             "device": self.device,
             "epochs": [e.as_dict() for e in self.epochs],
             "final_loss": self.final_loss,
@@ -1425,6 +1523,11 @@ class TuneResult:
     # environment was touched. `None` when none were supplied, which is every
     # run that trains plain text.
     declarations_sha256: str | None = None
+    # The container this run's LoRA was restricted to, as the family's rules
+    # gave it. `None` on a full fine-tune, on a text-only family, and on a
+    # checkpoint litetune has no rules for -- which are three different things,
+    # and the limitations say which.
+    lora_container: str | None = None
 
     @property
     def outcome(self) -> Outcome:
@@ -1477,6 +1580,10 @@ class TuneResult:
             # Top-level for the same reason as the mode: a bundle's contract is
             # built from this, and a reader must not have to go looking for it.
             "declarations_sha256": self.declarations_sha256,
+            # Top-level because `request` cannot hold it: the caller does not
+            # choose it, the family's rules do. See the pop in
+            # `TuneRequest.as_dict`.
+            "lora_container": self.lora_container,
             "request": self.request.as_dict(device=self.device),
             "metrics": self.metrics.as_dict() if self.metrics else None,
             "model_dir": str(self.model_dir) if self.model_dir else None,
@@ -1534,6 +1641,18 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         learning_rate=request.rate,
     )
     result = TuneResult(request=request, checks=CheckSet(name=f"train:{request.model}"))
+    # Resolved here, not where it is first used: six of the returns below write
+    # a report, and every one of them ran before this was set. A refused run on
+    # a scoped family reported `lora_container: null` -- which does not read as
+    # "the run stopped before this mattered", it reads as "every tower was
+    # adapted". `identify` is a lookup on the model id; it needs no environment
+    # and no checkpoint.
+    rules = models.identify(request.model)
+    lora_container = rules.lora_container if rules is not None else None
+    # Only on a LoRA run. A full fine-tune adapts everything, so naming a
+    # container there describes a restriction that did not happen -- the
+    # docstring on the field said `None` for it before the code did.
+    result.lora_container = lora_container if request.method == "lora" else None
     result.limitation(NOT_VERIFIED)
     if request.dtype == DEFAULT_DTYPE:
         # Named because it is a real cost of the bfloat16 default: the
@@ -1743,7 +1862,22 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     # tokenizer load -- which arrives after the environment has been built and
     # the checkpoint downloaded, and reads as a litetune bug rather than a
     # version requirement.
-    rules = models.identify(request.model)
+    if rules is None and request.method == "lora":
+        # `identify` returning None is "litetune has no entry for this", not
+        # "no rules apply" -- its own docstring says the difference is reported
+        # by every caller, and this caller used to swallow it. A mirror of a
+        # multimodal checkpoint under a name the patterns miss gets the plain
+        # projection list, which peft matches by suffix, so every tower is
+        # adapted and the report looks exactly like a scoped run's.
+        result.limitation(
+            "litetune has no per-model rules for this checkpoint, so this LoRA run was not "
+            "scoped to any container. On a multimodal checkpoint the projection names repeat "
+            "across the towers, so a name-suffix match reaches them too -- and peft then either "
+            "adapts them, which makes `lora` mean something other than it does elsewhere, or "
+            "refuses the whole run, depending on how that checkpoint defines those modules. On "
+            "Gemma 4 it refuses. If the run reaches the end, `metrics.json` records the module "
+            "paths peft matched, which is where to look"
+        )
     if rules is not None and rules.min_transformers:
         version_check = models.transformers_check(
             request.model,
@@ -1761,6 +1895,24 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             result.limitation(f"training was not attempted: {version_check.detail}")
             events.stage_finished(result.outcome.value, attempted=False)
             return result
+
+    if lora_container and request.method == "lora" and rules is not None:
+        # Said out loud rather than applied quietly: this is the difference
+        # between adapting a text tower and adapting a whole multimodal
+        # checkpoint, and the artifact it produces looks identical either way.
+        #
+        # Below the version gate, not above it: stated earlier it was appended
+        # to reports whose run was refused before `get_peft_model` was ever
+        # called, so "LoRA was restricted to ..." sat next to "training was not
+        # attempted" in one report. It is still written from the rules rather
+        # than from the run -- what the run matched is in `metrics.json`, which
+        # does not exist yet here.
+        result.limitation(
+            f"LoRA was restricted to modules under `{lora_container}`: "
+            f"{rules.lora_container_reason}. The projection set is unchanged, so this run is "
+            f"comparable with the other families here; an unscoped run on this checkpoint would "
+            f"not be"
+        )
 
     # -- where will this run? -----------------------------------------------
     # Asked once, here, in the parent, before the training script starts,
@@ -1828,6 +1980,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
                 decision=result.prompt_mode_decision,
                 declarations_sha256=result.declarations_sha256,
                 declarations=declarations,
+                lora_container=lora_container,
             ),
             indent=2,
         ),

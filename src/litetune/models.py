@@ -170,6 +170,15 @@ class ModelRules:
     extra_stop_tokens: tuple[str, ...] = ()
     stop_token_reason: str = ""
 
+    # Which part of a multimodal checkpoint a LoRA run may adapt, named as the
+    # container its modules sit under -- `tune` restricts its projection set to
+    # modules whose path passes through it. `None` for a text-only family:
+    # there is no second tower to exclude, so the projection list alone decides
+    # which modules are adapted, and naming a container would be a claim about
+    # a structure that does not exist.
+    lora_container: str | None = None
+    lora_container_reason: str = ""
+
     # The tool path, recorded together because one measurement establishes both:
     # whether this family's serving runtime renders tool declarations into the
     # prompt, and the spelling its calls use. Neither is in `config.json` and
@@ -211,6 +220,8 @@ class ModelRules:
             "limitations": list(self.limitations),
             "extra_stop_tokens": list(self.extra_stop_tokens),
             "stop_token_reason": self.stop_token_reason,
+            "lora_container": self.lora_container,
+            "lora_container_reason": self.lora_container_reason,
             "renders_declarations": self.renders_declarations,
             "wire_format": self.wire_format,
             "tool_path_reason": self.tool_path_reason,
@@ -279,11 +290,74 @@ _GEMMA4_RECIPE_REASON = (
     "for Gemma 4 a Google engineer recommends dynamic_wi4c_hr_afp32 or dynamic_wi4b32_afp32 'to "
     "remain the model quality', noting that the published artifact is half int2 while the public "
     "recipes reach int4. This is a recommendation and not a substitution: the recipe you asked for "
-    "is the recipe that was exported, and litetune has measured neither of these two"
+    "is the recipe that was exported. Of the two, litetune has measured dynamic_wi4b32_afp32 once, "
+    "on base weights rather than a tuned checkpoint (MEASUREMENTS.md), and dynamic_wi4c_hr_afp32 "
+    "not at all"
+)
+
+# Sourced: peft 0.20.0 ships this scope itself. Its
+# `TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING` maps `gemma4` to the
+# regex `.*language_model\..*\.(q_proj|v_proj)` -- so upstream agrees both
+# that the container is called `language_model` and that a name list is not
+# enough to reach it. litetune cannot take that default: it names its
+# projection set explicitly so that two runs recorded as `lora` are the same
+# method, and passing `target_modules` is what switches the default off.
+#
+# The reason below says which modules repeat across the towers and not how
+# many. An earlier draft carried three counts off the module graph; nothing in
+# this repository derives, stores or re-derives them, no revision was attached
+# to them, and the checkpoint they describe is one this project does not pin --
+# so they were precision the tree cannot point at. What a reader needs is the
+# structure, and that is checkable against any Gemma 4 config.
+# Sourced: the same peft mapping, read the other way. It gives every entry
+# below a plain projection-name list and reserves the container regex for
+# `gemma4` alone -- which is upstream recording that a suffix match on these
+# has no second tower to reach. litetune records the decision rather than the
+# default, so that "examined, text-only" and "nobody looked" do not arrive as
+# the same empty string.
+_NO_CONTAINER_UPSTREAM = (
+    "no container. peft 0.20.0 maps this architecture to a plain projection-name list and "
+    "reserves its container regex for the multimodal `gemma4`, which is upstream recording "
+    "that a suffix match here has no second tower to reach"
+)
+
+# And the one family that mapping does not cover at all.
+_NO_CONTAINER_NOT_ESTABLISHED = (
+    "no container is needed: `AutoModelForCausalLM` loads this architecture as a text-only "
+    "model and its vision projections are named qkv/proj/linear_fc1/linear_fc2, which none of "
+    "the seven names reaches. What a LoRA run here does NOT reach is the other half of its own "
+    "text tower: the gated-delta-net layers project through in_proj_qkv/in_proj_z/in_proj_b/"
+    "in_proj_a/out_proj, so `lora` adapts attention in the full-attention layers only, and the "
+    "MLP everywhere. Read off transformers 5.16.1; peft 0.20.0 has no entry for this "
+    "architecture to compare against"
+)
+
+# Sourced twice, because an earlier draft of this string was wrong in the more
+# frightening direction. The counts are re-derivable from `config.json` at
+# 3e22461f: 16 vision layers x 7 names, 12 audio layers x 3 (their MLPs are
+# `ffw_layer_*`, which none of the seven names matches), and 35 text layers of
+# which `num_kv_shared_layers: 20` carry no `k_proj`/`v_proj`, so 15 x 7 +
+# 20 x 5. What an unscoped run then *does* was read out of transformers 5.16.1
+# -- the tower projections are `Gemma4ClippableLinear`, an `nn.Module` holding
+# an `nn.Linear`, while the text ones are bare -- and executed against peft
+# 0.20.0, whose `dispatch_default` takes a bare `nn.Linear` and raises on
+# anything else. The earlier draft said such a run trained quietly. It does
+# not; it stops before the first step.
+_GEMMA4_LORA_CONTAINER_REASON = (
+    "the checkpoint is multimodal and its vision and audio towers use the same projection names "
+    "as its text layers, so a name-suffix match reaches all three: 112 modules in the vision "
+    "tower and 36 in the audio tower against 205 in the text one, on google/gemma-4-E2B-it at "
+    "3e22461f. peft cannot adapt the tower ones -- transformers wraps them in "
+    "Gemma4ClippableLinear and peft 0.20.0 dispatches on a bare nn.Linear -- so an unscoped run "
+    "stops in get_peft_model with 'Target module ... is not supported' rather than training the "
+    "wrong thing quietly. Scoping to `language_model` is what lets the projection set apply at "
+    "all. The refusal is loud because the towers are unadaptable, not because they are unwanted: "
+    "a peft that learned to wrap them would make the same run silent"
 )
 
 # Sourced: litert-torch#1044 -- "Right now litert-torch don't support QAT
 # checkpoint conversion".
+
 _GEMMA4_NOT_GOOGLES_ARTIFACT = (
     "a Gemma 4 export made here is NOT equivalent to Google's published .litertlm. Google's comes "
     "from a quantized-safetensors (QAT) path that litert-torch does not support -- 'Right now "
@@ -328,6 +402,8 @@ def _gemma4(family: str, patterns: tuple[str, ...], override_repo: str | None) -
         limitations=(_GEMMA4_NOT_GOOGLES_ARTIFACT,),
         extra_stop_tokens=("<turn|>", "<|tool_response>"),
         stop_token_reason=_GEMMA4_STOP_REASON,
+        lora_container="language_model",
+        lora_container_reason=_GEMMA4_LORA_CONTAINER_REASON,
     )
 
 
@@ -466,6 +542,7 @@ RULES: tuple[ModelRules, ...] = (
     _gemma4("gemma-4", (r"gemma-?4(?![\db])",), None),
     ModelRules(
         family="functiongemma",
+        lora_container_reason=_NO_CONTAINER_UPSTREAM,
         patterns=(r"function-?gemma",),
         required_flags=(
             RequiredFlag(
@@ -487,6 +564,7 @@ RULES: tuple[ModelRules, ...] = (
     ),
     ModelRules(
         family="gemma-3-text",
+        lora_container_reason=_NO_CONTAINER_UPSTREAM,
         # After functiongemma, which is also a gemma3_text config and needs a
         # different value. Order in this tuple is the disambiguation.
         #
@@ -518,6 +596,7 @@ RULES: tuple[ModelRules, ...] = (
     ),
     ModelRules(
         family="qwen-3.5",
+        lora_container_reason=_NO_CONTAINER_NOT_ESTABLISHED,
         # Same guard: `Qwen3-5B` would be a Qwen 3, not a Qwen 3.5.
         patterns=(r"qwen-?3-5(?![\db])",),
         min_transformers="5.0.0",
@@ -525,6 +604,7 @@ RULES: tuple[ModelRules, ...] = (
     ),
     ModelRules(
         family="qwen-3",
+        lora_container_reason=_NO_CONTAINER_UPSTREAM,
         # Nothing to add, and that is what this entry records. `qwen3` is on the
         # exporter's own type list (the model-type trap, above), so a config
         # that says `model_type: "qwen3"` is typed correctly with no override.
@@ -542,6 +622,7 @@ RULES: tuple[ModelRules, ...] = (
     ),
     ModelRules(
         family="qwen-2.5",
+        lora_container_reason=_NO_CONTAINER_UPSTREAM,
         # Nothing to add here either, and this entry says so with a run behind
         # it. `config.json` declares `model_type: "qwen2"`, which
         # `litert_lm_builder.py` matches as `case 'qwen2' | 'qwen2p5'`, so no
@@ -582,6 +663,7 @@ RULES: tuple[ModelRules, ...] = (
     ),
     ModelRules(
         family="gemma3-text-unidentified",
+        lora_container_reason=_NO_CONTAINER_UPSTREAM,
         # Last, so a checkpoint that names its family is matched by name first.
         # This is the fallback for one that does not: `config.json` establishes
         # with certainty that an override is *required*, and cannot establish
