@@ -1871,10 +1871,12 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         # adapted and the report looks exactly like a scoped run's.
         result.limitation(
             "litetune has no per-model rules for this checkpoint, so this LoRA run was not "
-            "scoped to any container. On a multimodal checkpoint that adapts the vision and "
-            "audio towers as well as the text one, because the projection names repeat across "
-            "them. If the run reaches the end, `metrics.json` records the module paths peft "
-            "matched, which is where to look"
+            "scoped to any container. On a multimodal checkpoint the projection names repeat "
+            "across the towers, so a name-suffix match reaches them too -- and peft then either "
+            "adapts them, which makes `lora` mean something other than it does elsewhere, or "
+            "refuses the whole run, depending on how that checkpoint defines those modules. On "
+            "Gemma 4 it refuses. If the run reaches the end, `metrics.json` records the module "
+            "paths peft matched, which is where to look"
         )
     if rules is not None and rules.min_transformers:
         version_check = models.transformers_check(

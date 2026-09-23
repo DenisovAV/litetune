@@ -323,17 +323,36 @@ _NO_CONTAINER_UPSTREAM = (
 
 # And the one family that mapping does not cover at all.
 _NO_CONTAINER_NOT_ESTABLISHED = (
-    "no container, which is not a finding: peft 0.20.0 has no entry for this architecture and "
-    "litetune has not walked its module graph, so nothing here rules a second tower out. A "
-    "LoRA run on it is scoped by projection name alone"
+    "no container is needed: `AutoModelForCausalLM` loads this architecture as a text-only "
+    "model and its vision projections are named qkv/proj/linear_fc1/linear_fc2, which none of "
+    "the seven names reaches. What a LoRA run here does NOT reach is the other half of its own "
+    "text tower: the gated-delta-net layers project through in_proj_qkv/in_proj_z/in_proj_b/"
+    "in_proj_a/out_proj, so `lora` adapts attention in the full-attention layers only, and the "
+    "MLP everywhere. Read off transformers 5.16.1; peft 0.20.0 has no entry for this "
+    "architecture to compare against"
 )
 
+# Sourced twice, because an earlier draft of this string was wrong in the more
+# frightening direction. The counts are re-derivable from `config.json` at
+# 3e22461f: 16 vision layers x 7 names, 12 audio layers x 3 (their MLPs are
+# `ffw_layer_*`, which none of the seven names matches), and 35 text layers of
+# which `num_kv_shared_layers: 20` carry no `k_proj`/`v_proj`, so 15 x 7 +
+# 20 x 5. What an unscoped run then *does* was read out of transformers 5.16.1
+# -- the tower projections are `Gemma4ClippableLinear`, an `nn.Module` holding
+# an `nn.Linear`, while the text ones are bare -- and executed against peft
+# 0.20.0, whose `dispatch_default` takes a bare `nn.Linear` and raises on
+# anything else. The earlier draft said such a run trained quietly. It does
+# not; it stops before the first step.
 _GEMMA4_LORA_CONTAINER_REASON = (
     "the checkpoint is multimodal and its vision and audio towers use the same projection names "
-    "as its text layers. peft matches target modules by name suffix, so a run scoped by name "
-    "alone adapts all three towers -- it trains, it saves, and every check passes, while `lora` "
-    "means something other than it does on every other family here. Scoping to `language_model` "
-    "leaves the projection set alone and drops the towers"
+    "as its text layers, so a name-suffix match reaches all three: 112 modules in the vision "
+    "tower and 36 in the audio tower against 205 in the text one, on google/gemma-4-E2B-it at "
+    "3e22461f. peft cannot adapt the tower ones -- transformers wraps them in "
+    "Gemma4ClippableLinear and peft 0.20.0 dispatches on a bare nn.Linear -- so an unscoped run "
+    "stops in get_peft_model with 'Target module ... is not supported' rather than training the "
+    "wrong thing quietly. Scoping to `language_model` is what lets the projection set apply at "
+    "all. The refusal is loud because the towers are unadaptable, not because they are unwanted: "
+    "a peft that learned to wrap them would make the same run silent"
 )
 
 # Sourced: litert-torch#1044 -- "Right now litert-torch don't support QAT

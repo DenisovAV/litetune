@@ -448,6 +448,13 @@ snapshot directory and `refs/main` in the cache rather than recorded by the run
 itself. Both arms downloaded once into the same cache, so they share it; a
 later run on this family should pin it.
 
+Both arms ran on the branch that added `lora_container`, not on a release. No
+released litetune could have produced arm A: up to 0.1.8 `tune` hands peft the
+bare projection list, and on this checkpoint that stops in `get_peft_model` --
+the vision and audio projections are `Gemma4ClippableLinear` wrappers and peft
+0.20.0 dispatches on a bare `nn.Linear`. Arm B reproduces peft's own `gemma4`
+default, which is a container regex for the same reason.
+
 | | exact match | trainable parameters |
 |---|---|---|
 | seven projections, as shipped | **0.7883** ±0.0327 | 24,158,208 |
@@ -768,7 +775,8 @@ sides score **0.0000 on all 600 rows**, `verify` reports `unmeasured` and exits
 untuned base, so training and conversion are confounded and both attribution
 fields are unavailable. Of the five models fine-tuned and measured on banking77, not
 one has a recorded training gain — two scored zero on both sides, one was refused for
-empty output, and one was never scored. FunctionGemma, at the top of this file, is the only model
+empty output, one was never scored, and Gemma 4's tuned run records no base figure at
+all. FunctionGemma, at the top of this file, is the only model
 here with one at all — on another task, with another scorer, and with three
 readings of the figure that section sets against each other.
 

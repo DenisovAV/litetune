@@ -451,13 +451,18 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 
 **A LoRA scope keyed on model identity.** On a multimodal checkpoint the
 vision and audio towers use the same projection names as the text layers, so
-`--method lora` scoped by name alone adapts all three. For the Gemma 4
+`--method lora` scoped by name alone reaches all three, and peft refuses the
+tower ones rather than adapting them -- transformers wraps those in
+`Gemma4ClippableLinear` and peft dispatches on a bare `nn.Linear` -- so such a
+run stops before its first step. For the Gemma 4
 families litetune restricts the run to modules under `language_model` and
 hands peft a regex rather than a name list, because peft matches a plain
 `target_modules` list by name suffix and a suffix cannot say "only under this
 container". `tune` reports it on the run, in plain output as well as
 `--json`, and `convert --json` and every verify manifest carry it under
-`model_rules.lora_container`. What
+`model_rules.rules.lora_container` in convert's output and
+`model_rules.lora_container` in a verify manifest, which nest it differently.
+What
 the projection set is worth was measured once: the seven names litetune uses
 against the two peft's own Gemma 4 default would have chosen, 24 points apart
 on banking77, in [MEASUREMENTS.md](MEASUREMENTS.md).

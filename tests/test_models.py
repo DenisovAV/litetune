@@ -166,9 +166,10 @@ def test_gemma_4_scopes_lora_to_its_text_tower():
 
     peft matches `target_modules` by name suffix, and this checkpoint's vision
     and audio towers use the same projection names as its text layers, so a run
-    scoped by name alone adapts all three -- it trains, it saves, and it passes
-    every check, while `lora` means something other than it does on every other
-    family here.
+    scoped by name alone reaches all three, and peft then refuses the tower
+    ones: transformers wraps them in `Gemma4ClippableLinear` and peft
+    dispatches on a bare `nn.Linear`, so the run stops in `get_peft_model`.
+    The scope is what lets the projection set apply at all.
 
     Per variant, because `_gemma4` builds three and one dropped argument would
     leave all three unscoped while every other test stayed green.
@@ -215,6 +216,23 @@ def test_only_a_multimodal_family_scopes_lora_at_all():
     # publishes. An entry cannot leave the question at its default now.
     for rules in models.RULES:
         assert rules.lora_container_reason, rules.family
+
+
+def test_the_scope_reason_says_what_an_unscoped_run_actually_does():
+    """It refuses; it does not train the wrong thing quietly.
+
+    The first draft of this string said an unscoped run "trains, it saves, and
+    every check passes". Executed against peft 0.20.0 with the module shapes
+    transformers 5.16.1 gives this family, it raises in `get_peft_model`: the
+    tower projections are `Gemma4ClippableLinear` and peft dispatches on a bare
+    `nn.Linear`. The quiet version is the more frightening claim and the false
+    one, so it is the one worth pinning against.
+    """
+    reason = models.identify("google/gemma-4-E2B-it").lora_container_reason
+
+    assert "Gemma4ClippableLinear" in reason
+    assert "get_peft_model" in reason
+    assert "trains" not in reason
 
 
 def test_the_family_report_names_the_lora_container():
