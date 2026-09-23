@@ -208,9 +208,13 @@ def test_only_a_multimodal_family_scopes_lora_at_all():
     }, sorted(families)
     scoped = {r.family for r in models.RULES if r.lora_container}
     assert scoped == {"gemma-4-e2b", "gemma-4-e4b", "gemma-4"}, sorted(scoped)
+    # And every family says why, including the ones with no container. The
+    # reason used to be asserted *empty* there, which made "examined, and it
+    # has one tower" and "nobody decided" arrive as the same empty string --
+    # in `ModelRules.as_dict`, which every convert and verify manifest
+    # publishes. An entry cannot leave the question at its default now.
     for rules in models.RULES:
-        if not rules.lora_container:
-            assert not rules.lora_container_reason, rules.family
+        assert rules.lora_container_reason, rules.family
 
 
 def test_the_family_report_names_the_lora_container():

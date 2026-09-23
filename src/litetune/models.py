@@ -309,6 +309,25 @@ _GEMMA4_RECIPE_REASON = (
 # to them, and the checkpoint they describe is one this project does not pin --
 # so they were precision the tree cannot point at. What a reader needs is the
 # structure, and that is checkable against any Gemma 4 config.
+# Sourced: the same peft mapping, read the other way. It gives every entry
+# below a plain projection-name list and reserves the container regex for
+# `gemma4` alone -- which is upstream recording that a suffix match on these
+# has no second tower to reach. litetune records the decision rather than the
+# default, so that "examined, text-only" and "nobody looked" do not arrive as
+# the same empty string.
+_NO_CONTAINER_UPSTREAM = (
+    "no container. peft 0.20.0 maps this architecture to a plain projection-name list and "
+    "reserves its container regex for the multimodal `gemma4`, which is upstream recording "
+    "that a suffix match here has no second tower to reach"
+)
+
+# And the one family that mapping does not cover at all.
+_NO_CONTAINER_NOT_ESTABLISHED = (
+    "no container, which is not a finding: peft 0.20.0 has no entry for this architecture and "
+    "litetune has not walked its module graph, so nothing here rules a second tower out. A "
+    "LoRA run on it is scoped by projection name alone"
+)
+
 _GEMMA4_LORA_CONTAINER_REASON = (
     "the checkpoint is multimodal and its vision and audio towers use the same projection names "
     "as its text layers. peft matches target modules by name suffix, so a run scoped by name "
@@ -504,6 +523,7 @@ RULES: tuple[ModelRules, ...] = (
     _gemma4("gemma-4", (r"gemma-?4(?![\db])",), None),
     ModelRules(
         family="functiongemma",
+        lora_container_reason=_NO_CONTAINER_UPSTREAM,
         patterns=(r"function-?gemma",),
         required_flags=(
             RequiredFlag(
@@ -525,6 +545,7 @@ RULES: tuple[ModelRules, ...] = (
     ),
     ModelRules(
         family="gemma-3-text",
+        lora_container_reason=_NO_CONTAINER_UPSTREAM,
         # After functiongemma, which is also a gemma3_text config and needs a
         # different value. Order in this tuple is the disambiguation.
         #
@@ -556,6 +577,7 @@ RULES: tuple[ModelRules, ...] = (
     ),
     ModelRules(
         family="qwen-3.5",
+        lora_container_reason=_NO_CONTAINER_NOT_ESTABLISHED,
         # Same guard: `Qwen3-5B` would be a Qwen 3, not a Qwen 3.5.
         patterns=(r"qwen-?3-5(?![\db])",),
         min_transformers="5.0.0",
@@ -563,6 +585,7 @@ RULES: tuple[ModelRules, ...] = (
     ),
     ModelRules(
         family="qwen-3",
+        lora_container_reason=_NO_CONTAINER_UPSTREAM,
         # Nothing to add, and that is what this entry records. `qwen3` is on the
         # exporter's own type list (the model-type trap, above), so a config
         # that says `model_type: "qwen3"` is typed correctly with no override.
@@ -580,6 +603,7 @@ RULES: tuple[ModelRules, ...] = (
     ),
     ModelRules(
         family="qwen-2.5",
+        lora_container_reason=_NO_CONTAINER_UPSTREAM,
         # Nothing to add here either, and this entry says so with a run behind
         # it. `config.json` declares `model_type: "qwen2"`, which
         # `litert_lm_builder.py` matches as `case 'qwen2' | 'qwen2p5'`, so no
@@ -620,6 +644,7 @@ RULES: tuple[ModelRules, ...] = (
     ),
     ModelRules(
         family="gemma3-text-unidentified",
+        lora_container_reason=_NO_CONTAINER_UPSTREAM,
         # Last, so a checkpoint that names its family is matched by name first.
         # This is the fallback for one that does not: `config.json` establishes
         # with certainty that an override is *required*, and cannot establish
