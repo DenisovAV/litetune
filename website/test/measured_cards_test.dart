@@ -1,11 +1,12 @@
 // The panel's links, checked against the files they point into.
 //
-// Each card links to a section of `MEASUREMENTS.md` by GitHub's own heading
-// anchor. Nothing in a Dart build knows whether that section still exists, and
-// a renamed heading leaves a link that lands on the top of a 900-line file
-// instead of the run it promised -- silently, on the live site. So the anchors
-// are computed from the headings here and compared with the ones the cards
-// carry.
+// Each card links to a section of the `/measurements` page by its heading id.
+// That page is `MEASUREMENTS.md` rendered, so a renamed heading takes its own
+// id with it -- but the card still names the section it wants, and a card
+// pointing at an id the page does not emit is a link that lands on the top of
+// a 1000-line page instead of the run it promised, silently, on the live site.
+// So the ids are taken from the page's own spelling rather than from a second
+// copy of it here.
 //
 // The same check covers the Hub links by their shape only: whether
 // huggingface.co still serves a repository is not something a unit test can
@@ -13,14 +14,13 @@
 import 'dart:io';
 
 import 'package:litetune_website/landing/sections/why_it_exists.dart';
+import 'package:litetune_website/measurements/measurements_page.dart';
 import 'package:test/test.dart';
 
-/// GitHub's anchor for a markdown heading: lowercased, punctuation dropped,
-/// spaces hyphenated.
-String anchorFor(String heading) => heading
-    .toLowerCase()
-    .replaceAll(RegExp(r'[^\w\- ]'), '')
-    .replaceAll(' ', '-');
+/// The page's own spelling, not a second copy of it. There used to be one
+/// here, which meant a test could agree with itself and disagree with the
+/// site.
+String anchorFor(String heading) => MeasurementsPage.headingId(heading);
 
 File _measurements() {
   for (final candidate in [Directory.current.parent, Directory.current]) {
@@ -72,15 +72,39 @@ void main() {
   final sections = _sectionsByAnchor(_measurements().readAsLinesSync());
   final readme = _readme().readAsStringSync();
 
-  test('MEASUREMENTS.md has the sections the cards link to', () {
-    expect(sections, isNotEmpty, reason: 'no headings were found at all');
+  test('the measurements page emits the ids the cards link to', () {
+    // Against the ids the page renders, not the headings a file happens to
+    // have: the card's href and this list now come out of one function, so a
+    // heading that is renamed fails here rather than on the live site.
+    final ids = MeasurementsPage.idsIn(_measurements().readAsStringSync());
+    expect(ids, isNotEmpty, reason: 'the page emitted no heading ids at all');
     for (final model in WhyItExists.measured) {
       expect(
-        sections.keys,
+        ids,
         contains(model.anchor),
         reason:
-            '${model.name} links to MEASUREMENTS.md#${model.anchor}, and no '
-            'heading in that file produces this anchor',
+            '${model.name} links to /measurements#${model.anchor}, which is '
+            'not an id that page emits',
+      );
+    }
+  });
+
+  test('every card says what its model is and what it is for', () {
+    // The line a reader needs before any of the rest means anything. A record
+    // field cannot be omitted in Dart, but it can be left empty, and an empty
+    // one renders as a blank row rather than as an absence anyone would
+    // notice.
+    for (final model in WhyItExists.measured) {
+      expect(
+        model.what.trim(),
+        isNotEmpty,
+        reason: '${model.name} carries no description',
+      );
+      // Size first, because it is what a reader is choosing between.
+      expect(
+        model.what,
+        matches(RegExp(r'^\d+(\.\d+)?[MB], ')),
+        reason: '${model.name} does not open with its size: ${model.what}',
       );
     }
   });
@@ -193,7 +217,9 @@ void _slugs() {
   });
 
   test('each card opens its own panel and no one else\'s', () {
-    final slugs = [for (final model in WhyItExists.measured) WhyItExists.slugFor(model)];
+    final slugs = [
+      for (final model in WhyItExists.measured) WhyItExists.slugFor(model),
+    ];
     expect(
       slugs.toSet().length,
       slugs.length,

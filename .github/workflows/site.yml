@@ -23,13 +23,17 @@ permissions:
   contents: read
 
 on:
-  # The two files outside `website/` are read by the build: the nav shows the
-  # version from `_version.py`, and `/changelog` is `CHANGELOG.md` rendered.
+  # The three files outside `website/` are read by the build: the nav shows the
+  # version from `_version.py`, `/changelog` is `CHANGELOG.md` rendered, and
+  # `/measurements` is `MEASUREMENTS.md` rendered. A path missing from these
+  # lists is a page that goes stale without anything saying so -- the file
+  # changes, nothing rebuilds, and the site keeps serving the old one.
   pull_request:
     paths:
       - 'website/**'
       - '.github/workflows/site.yml'
       - 'CHANGELOG.md'
+      - 'MEASUREMENTS.md'
       - 'src/litetune/_version.py'
   push:
     branches: [main]
@@ -37,6 +41,7 @@ on:
       - 'website/**'
       - '.github/workflows/site.yml'
       - 'CHANGELOG.md'
+      - 'MEASUREMENTS.md'
       - 'src/litetune/_version.py'
   # The deploy that puts a new version on the site. A push to `main` cannot be
   # that deploy: the version is bumped on `main` before the release exists, and
@@ -116,11 +121,27 @@ jobs:
       - name: Install the Jaspr CLI
         run: dart pub global activate jaspr_cli 0.23.1
 
-      - name: Analyse
+      # The Dart half of the gate `pyproject.toml` describes for ruff and mypy:
+      # its job is to give the same answer on the same source, so the version
+      # that decides it has to be pinned. Here the SDK pin above does that --
+      # `dart format` ships inside it, so 3.13.3 is the formatter as well as
+      # the compiler, and a run on a laptop with the same SDK agrees with this
+      # one.
+      #
+      # Before `analyze`, because the two can disagree: the formatter splits a
+      # long single-line `if` across two lines, and a brace-less `if` spread
+      # over two lines is what `curly_braces_in_flow_control_structures`
+      # objects to. Formatting first means the analyser reads what will be
+      # committed rather than what was written.
+      - name: Check formatting
         working-directory: website
         run: |
           dart pub get
-          dart analyze lib test
+          dart format --output=none --set-exit-if-changed lib test
+
+      - name: Analyse
+        working-directory: website
+        run: dart analyze lib test
 
       # What the changelog page refuses to render, and what it must go on
       # rendering. Each refusal is a payload a review round got past an earlier

@@ -13,6 +13,7 @@ import '../../theme/brand.dart';
 /// section still exists and still names this checkpoint.
 typedef MeasuredRun = ({
   String name,
+  String what,
   String how,
   String hubId,
   String? revision,
@@ -108,29 +109,30 @@ class WhyItExists extends StatelessComponent {
             'it came from, and tells you the difference.',
           ),
         ]),
-        div(classes: 'measured', attributes: const {'id': closeTarget}, [
-          div(classes: 'measured-label', [
-            Component.text('Measured end to end so far'),
-          ]),
-          div(classes: 'measured-cards', [
-            for (final model in measured) _card(model),
-          ]),
-          p(classes: 'measured-note', [
-            Component.text(
-              'Measured on CPU, the conversion cost came out small at eight bits '
-              'on all six, and at these sample sizes it often does not resolve '
-              'at all. Four bits cost more, and how much more does not follow '
-              'from the family or the parameter count. ',
-            ),
-            a(
-              href:
-                  'https://github.com/DenisovAV/litetune/blob/main/MEASUREMENTS.md',
-              attributes: _newTab,
-              [Component.text('The numbers, and what they do not establish')],
-            ),
-          ]),
-          for (final model in measured) _modal(model),
-        ]),
+        div(
+          classes: 'measured',
+          attributes: const {'id': closeTarget},
+          [
+            div(classes: 'measured-label', [
+              Component.text('Measured end to end so far'),
+            ]),
+            div(classes: 'measured-cards', [
+              for (final model in measured) _card(model),
+            ]),
+            p(classes: 'measured-note', [
+              Component.text(
+                'Measured on CPU, the conversion cost came out small at eight bits '
+                'on all six, and at these sample sizes it often does not resolve '
+                'at all. Four bits cost more, and how much more does not follow '
+                'from the family or the parameter count. ',
+              ),
+              a(href: '/measurements', [
+                Component.text('The numbers, and what they do not establish'),
+              ]),
+            ]),
+            for (final model in measured) _modal(model),
+          ],
+        ),
       ]),
     ]);
   }
@@ -140,6 +142,9 @@ class WhyItExists extends StatelessComponent {
     (
       name: 'FunctionGemma 270M',
       how: 'tool-call scoring, 640 held-out rows',
+      what:
+          '270M, text — built for tool calls: picking a function and filling its '
+          'arguments on the device.',
       hubId: 'google/functiongemma-270m-it',
       revision: null,
       anchor: 'the-headline-numbers',
@@ -147,6 +152,9 @@ class WhyItExists extends StatelessComponent {
     (
       name: 'Gemma 3 270M',
       how: 'exact-text scoring, 600 held-out rows',
+      what:
+          '270M, text — the smallest here that still learns a task. Classification '
+          'and routing, not conversation.',
       hubId: 'google/gemma-3-270m-it',
       revision: 'ac82b4e8',
       anchor: 'a-second-family-and-the-second-scorer',
@@ -154,6 +162,9 @@ class WhyItExists extends StatelessComponent {
     (
       name: 'Gemma 3 1B',
       how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          '1B, text — the same export rule as the 270M, for when the 270M stops '
+          'holding the task.',
       hubId: 'google/gemma-3-1b-it',
       revision: 'dcc83ea8',
       anchor: 'the-same-family-four-times-the-size',
@@ -161,6 +172,7 @@ class WhyItExists extends StatelessComponent {
     (
       name: 'Qwen3 0.6B',
       how: 'exact-text scoring, the same 600 held-out rows',
+      what: '0.6B, text — a first try when the task is labels.',
       hubId: 'Qwen/Qwen3-0.6B',
       revision: 'c1899de2',
       anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
@@ -168,6 +180,9 @@ class WhyItExists extends StatelessComponent {
     (
       name: 'Qwen2.5 0.5B',
       how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          '0.5B, text — reach for it when memory is the budget: its four-bit export '
+          'is the only one here that scored.',
       hubId: 'Qwen/Qwen2.5-0.5B-Instruct',
       revision: '7ae55760',
       anchor:
@@ -176,6 +191,9 @@ class WhyItExists extends StatelessComponent {
     (
       name: 'Gemma 4 E2B',
       how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          '5B, multimodal — text, vision and audio. For an assistant that has to '
+          'see or hear.',
       hubId: 'google/gemma-4-E2B-it',
       // Null although MEASUREMENTS.md names a commit: that run passed no
       // `--revision` and the hash was read back from the cache afterwards.
@@ -204,15 +222,13 @@ class WhyItExists extends StatelessComponent {
   static String slugFor(MeasuredRun model) =>
       'measured-${model.hubId.split('/').last.toLowerCase()}';
 
-  static Component _card(MeasuredRun model) => a(
-    classes: 'measured-card',
-    href: '#${slugFor(model)}',
-    [
-      span(classes: 'measured-card-model', [Component.text(model.name)]),
-      span(classes: 'measured-card-how', [Component.text(model.how)]),
-      span(classes: 'measured-card-more', [Component.text('checkpoint')]),
-    ],
-  );
+  static Component _card(MeasuredRun model) =>
+      a(classes: 'measured-card', href: '#${slugFor(model)}', [
+        span(classes: 'measured-card-model', [Component.text(model.name)]),
+        span(classes: 'measured-card-what', [Component.text(model.what)]),
+        span(classes: 'measured-card-how', [Component.text(model.how)]),
+        span(classes: 'measured-card-more', [Component.text('checkpoint')]),
+      ]);
 
   static Component _modal(MeasuredRun model) => div(
     classes: 'measured-modal',
@@ -254,15 +270,14 @@ class WhyItExists extends StatelessComponent {
             span(classes: 'measured-card-id', [Component.text(revision)]),
           ]),
         div(classes: 'measured-card-links', [
-          a(href: 'https://huggingface.co/${model.hubId}', attributes: _newTab, [
-            Component.text('On Hugging Face'),
-          ]),
           a(
-            href:
-                'https://github.com/DenisovAV/litetune/blob/main/MEASUREMENTS.md#${model.anchor}',
+            href: 'https://huggingface.co/${model.hubId}',
             attributes: _newTab,
-            [Component.text('What this run established')],
+            [Component.text('On Hugging Face')],
           ),
+          a(href: '/measurements#${model.anchor}', [
+            Component.text('Scores and intervals for this run'),
+          ]),
         ]),
       ]),
     ],
@@ -378,7 +393,14 @@ class WhyItExists extends StatelessComponent {
     css(
       '.measured-card-model',
     ).styles(color: Brand.ink, fontSize: 1.05.rem, fontWeight: FontWeight.w500),
-    css('.measured-card-how').styles(color: Brand.body, fontSize: 0.9.rem),
+    css('.measured-card-what').styles(
+      color: Brand.body,
+      fontSize: 0.9.rem,
+      raw: const {'line-height': '1.45'},
+    ),
+    // Demoted a step now that the line above it carries the reading: how a run
+    // was scored is provenance, and it stops competing with what the model is.
+    css('.measured-card-how').styles(color: Brand.muted, fontSize: 0.8.rem),
     css('.measured-card-fact').styles(
       display: Display.flex,
       flexDirection: FlexDirection.column,

@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from litetune._version import __version__
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -133,13 +135,16 @@ def test_the_changelog_opens_with_the_version_being_shipped():
     ), f"_version.py says {__version__} and the newest CHANGELOG.md entry is {releases[0]}"
 
 
-def test_the_changelog_holds_no_raw_html():
-    """The file stays plain markdown: no tags, no exotic link destinations.
+@pytest.mark.parametrize("name", ["CHANGELOG.md", "MEASUREMENTS.md"])
+def test_a_rendered_file_holds_no_raw_html(name):
+    """Every file the site renders stays plain markdown: no tags, no exotic
+    link destinations.
 
-    What makes the page safe is the check in
+    What makes a page safe is the check in
     `website/lib/changelog/changelog_page.dart`, which refuses to render a
-    changelog whose HTML is not what a release entry is written with, links
-    included. This is the tidiness rule in front of it, and it is
+    file whose HTML is not what its own markdown writes, links included --
+    `MeasurementsPage` holds `MEASUREMENTS.md` to that same allowlist. This
+    is the tidiness rule in front of it, and it is
     deliberately not a second implementation of markdown: reviews got a
     `javascript:` link past one reader by ending a code span with a longer
     backtick run than it opened with, and past another by spelling the scheme
@@ -150,7 +155,7 @@ def test_the_changelog_holds_no_raw_html():
     spelled with a scheme the filter would drop. Autolinks are markdown's own
     `<scheme:...>` form and become links.
     """
-    text = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    text = (_ROOT / name).read_text(encoding="utf-8")
     offenders: list[str] = []
     schemes: list[str] = []
     # Block by block: a code span never spans a blank line, and a reader that
@@ -172,11 +177,11 @@ def test_the_changelog_holds_no_raw_html():
         offenders += re.findall(r"</?[A-Za-z!?][^\s>]{0,20}", outside_code)
         schemes += re.findall(r"(?:\]\(|\]:\s*)\s*([A-Za-z][A-Za-z0-9+.-]*)\s*:", outside_code)
     assert not offenders, (
-        f"raw HTML reaches the page as markup: {offenders} "
+        f"raw HTML in {name} reaches the page as markup: {offenders} "
         "-- write it in backticks if it should read as text"
     )
     unwanted = sorted({s for s in schemes if s.lower() not in {"http", "https", "mailto"}})
-    assert not unwanted, f"link destinations the page's filter would drop: {unwanted}"
+    assert not unwanted, f"link destinations {name}'s page would drop: {unwanted}"
 
 
 def test_every_release_is_listed_once():
