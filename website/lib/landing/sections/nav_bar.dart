@@ -100,7 +100,9 @@ class NavBar extends StatelessComponent {
         css('.nav-links').styles(gap: Gap.all(1.1.rem), fontSize: 0.8.rem),
         // Four links and a version do not fit one line at phone width; the
         // links wrap under the wordmark instead of overflowing the page.
-        css('.nav-inner').styles(flexWrap: FlexWrap.wrap, gap: Gap.all(0.75.rem)),
+        css(
+          '.nav-inner',
+        ).styles(flexWrap: FlexWrap.wrap, gap: Gap.all(0.75.rem)),
         css('.nav-links').styles(
           flexWrap: FlexWrap.wrap,
           margin: Margin.only(left: Unit.zero),

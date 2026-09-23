@@ -85,6 +85,26 @@ void main() {
     }
   });
 
+  test('every card says what its model is and what it is for', () {
+    // The line a reader needs before any of the rest means anything. A record
+    // field cannot be omitted in Dart, but it can be left empty, and an empty
+    // one renders as a blank row rather than as an absence anyone would
+    // notice.
+    for (final model in WhyItExists.measured) {
+      expect(
+        model.what.trim(),
+        isNotEmpty,
+        reason: '${model.name} carries no description',
+      );
+      // Size first, because it is what a reader is choosing between.
+      expect(
+        model.what,
+        matches(RegExp(r'^\d+(\.\d+)?[MB], ')),
+        reason: '${model.name} does not open with its size: ${model.what}',
+      );
+    }
+  });
+
   test('each card links to a section that measured a conversion', () {
     // Naming the checkpoint is not enough: a model can appear in more than one
     // section, and only some of them convert anything. The Gemma 4 card was
@@ -193,7 +213,9 @@ void _slugs() {
   });
 
   test('each card opens its own panel and no one else\'s', () {
-    final slugs = [for (final model in WhyItExists.measured) WhyItExists.slugFor(model)];
+    final slugs = [
+      for (final model in WhyItExists.measured) WhyItExists.slugFor(model),
+    ];
     expect(
       slugs.toSet().length,
       slugs.length,

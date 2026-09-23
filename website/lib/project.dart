@@ -43,12 +43,17 @@ final Directory _root = _repositoryRoot();
 /// With two, this would render the first while Python imports the last, and
 /// the page and the package would name different versions.
 final String packageVersion = () {
-  final source = File('${_root.path}/src/litetune/_version.py').readAsStringSync();
+  final source = File(
+    '${_root.path}/src/litetune/_version.py',
+  ).readAsStringSync();
   final matches = RegExp(
     r'^__version__ = "([^"]+)"$',
     multiLine: true,
   ).allMatches(source).toList();
-  final assignments = RegExp(r'^__version__ = ', multiLine: true).allMatches(source).length;
+  final assignments = RegExp(
+    r'^__version__ = ',
+    multiLine: true,
+  ).allMatches(source).length;
   if (matches.length != 1 || assignments != 1) {
     throw StateError(
       'src/litetune/_version.py must have exactly one `__version__ = "..."` line; '

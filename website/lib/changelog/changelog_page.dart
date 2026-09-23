@@ -70,7 +70,8 @@ class ChangelogPage extends StatelessComponent {
       throw StateError(
         'CHANGELOG.md renders HTML this page does not write, at: '
         '${html.substring(at, math.min(at + 80, html.length))} '
-        '-- write it in backticks if it should read as text',      );
+        '-- write it in backticks if it should read as text',
+      );
     }
     return html;
   }
@@ -170,12 +171,18 @@ class ChangelogPage extends StatelessComponent {
     return out.toString();
   }
 
-  static final _tag = RegExp(r'<(/?)([A-Za-z][A-Za-z0-9-]*)([^>]*)>', dotAll: true);
+  static final _tag = RegExp(
+    r'<(/?)([A-Za-z][A-Za-z0-9-]*)([^>]*)>',
+    dotAll: true,
+  );
+
   /// `key="value"`: markdown's renderer writes every attribute that way, a
   /// task list's `checked="true"` included. A bare one came from the file, and
   /// dropping it is what makes the difference that refuses the build.
   static final _attribute = RegExp(r'([A-Za-z-]+)\s*=\s*"([^"]*)"');
-  static final _entity = RegExp(r'&(?:#(\d+)|#[xX]([0-9A-Fa-f]+)|([A-Za-z][A-Za-z0-9]*));');
+  static final _entity = RegExp(
+    r'&(?:#(\d+)|#[xX]([0-9A-Fa-f]+)|([A-Za-z][A-Za-z0-9]*));',
+  );
 
   /// The classes markdown writes: a fence's language -- whatever the first
   /// word of its info string is, `c#` and `f*` included -- and a task list's
@@ -212,7 +219,9 @@ class ChangelogPage extends StatelessComponent {
     // the value below cannot see one that was never written. The closing tag
     // above is left alone because markdown writes one -- `<input …></input>`
     // -- and a stray one on its own is nothing to a browser.
-    if (name == 'input' && !rest.contains('type="checkbox"')) return '&lt;input$rest>';
+    if (name == 'input' && !rest.contains('type="checkbox"')) {
+      return '&lt;input$rest>';
+    }
     final kept = StringBuffer('<$name');
     for (final attribute in _attribute.allMatches(rest)) {
       final key = attribute.group(1)!.toLowerCase();
@@ -226,7 +235,10 @@ class ChangelogPage extends StatelessComponent {
       // one. Nothing here takes an element out of flow today; the first rule
       // that does would make an arbitrary class an overlay.
       if (key == 'class' && !_classes.hasMatch(value)) continue;
-      if (key == 'align' && !const {'left', 'right', 'center'}.contains(value)) continue;
+      if (key == 'align' &&
+          !const {'left', 'right', 'center'}.contains(value)) {
+        continue;
+      }
       kept.write(' $key="$value"');
     }
     kept.write(rest.trimRight().endsWith('/') ? ' />' : '>');
@@ -255,11 +267,14 @@ class ChangelogPage extends StatelessComponent {
           ? int.tryParse(m.group(1)!)
           : m.group(2) != null
           ? int.tryParse(m.group(2)!, radix: 16)
-          : const {'amp': 38, 'lt': 60, 'gt': 62, 'quot': 34, 'apos': 39}[m.group(3)];
+          : const {'amp': 38, 'lt': 60, 'gt': 62, 'quot': 34, 'apos': 39}[m
+                .group(3)];
       // Above the last code point there is nothing to decode to, and
       // `String.fromCharCode` throws rather than saying so; a browser reads
       // such a reference as the replacement character.
-      return code == null || code > 0x10FFFF ? m.group(0)! : String.fromCharCode(code);
+      return code == null || code > 0x10FFFF
+          ? m.group(0)!
+          : String.fromCharCode(code);
     }).trim();
     // Decoded as well as written: `&#9;` carries its semicolon, so it passes
     // the test above, and decodes to the tab a URL parser drops -- `/&#9;/host`
@@ -273,7 +288,11 @@ class ChangelogPage extends StatelessComponent {
     if (slashes.startsWith('/')) return true;
     final scheme = RegExp(r'^([A-Za-z][A-Za-z0-9+.-]*):').firstMatch(slashes);
     if (scheme == null) return !slashes.contains(':');
-    return const {'http', 'https', 'mailto'}.contains(scheme.group(1)!.toLowerCase());
+    return const {
+      'http',
+      'https',
+      'mailto',
+    }.contains(scheme.group(1)!.toLowerCase());
   }
 
   /// A release heading: a version -- an optional epoch, then numbers and dots,
@@ -321,11 +340,9 @@ class ChangelogPage extends StatelessComponent {
       letterSpacing: (-0.02).em,
       color: Brand.ink,
     ),
-    css('.changelog-body').styles(
-      color: Brand.body,
-      fontSize: 1.rem,
-      lineHeight: 1.65.em,
-    ),
+    css(
+      '.changelog-body',
+    ).styles(color: Brand.body, fontSize: 1.rem, lineHeight: 1.65.em),
     // One rule above each release, so the versions read as a column of entries
     // rather than one long list.
     css('.changelog-body h2').styles(
@@ -344,10 +361,9 @@ class ChangelogPage extends StatelessComponent {
       padding: Padding.only(left: 1.25.rem),
     ),
     css('.changelog-body li').styles(margin: Margin.only(bottom: 0.6.rem)),
-    css('.changelog-body strong').styles(
-      color: Brand.ink,
-      fontWeight: FontWeight.w500,
-    ),
+    css(
+      '.changelog-body strong',
+    ).styles(color: Brand.ink, fontWeight: FontWeight.w500),
     css('.changelog-body code').styles(
       padding: Padding.symmetric(horizontal: 0.3.em, vertical: 0.1.em),
       backgroundColor: Brand.surface,
@@ -356,10 +372,9 @@ class ChangelogPage extends StatelessComponent {
       color: Brand.ink,
       raw: const {'border-radius': '3px', 'overflow-wrap': 'anywhere'},
     ),
-    css('.changelog-body a').styles(
-      color: Brand.ink,
-      raw: const {'text-underline-offset': '3px'},
-    ),
+    css(
+      '.changelog-body a',
+    ).styles(color: Brand.ink, raw: const {'text-underline-offset': '3px'}),
     StyleRule.media(
       query: MediaQuery.screen(maxWidth: 640.px),
       styles: [
