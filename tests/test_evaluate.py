@@ -25,10 +25,12 @@ from litetune.evaluate import (
     DecodeConfig,
     HuggingFaceBackend,
     LiteRtLmBackend,
+    assemble_generations,
     device_mismatch,
     evaluate,
     harness_mismatch,
     load_split,
+    read_jsonl_results,
     strip_runtime_noise,
 )
 from litetune.metrics import score_exact_text, trim_terminator
@@ -104,30 +106,38 @@ def _litertlm(tmp_path: Path, **kwargs) -> LiteRtLmBackend:
     return LiteRtLmBackend(model=tmp_path / "model.litertlm", auto_provision=False, **kwargs)
 
 
+def _writes_results(rows, returncode: int = 0, stderr: str = ""):
+    """A stand-in for the driver script: writes the JSONL it would write.
+
+    The transport is a file now, not a pipe, so a double that hands back
+    stdout is testing a channel nothing reads. `args[2]` is the spec path, the
+    same shape the reference backend's doubles use.
+    """
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        Path(spec["out"]).write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(args, returncode, stdout="", stderr=stderr)
+
+    return fake_run
+
+
 def test_a_generation_with_bytes_that_did_not_decode_is_not_the_model_s_answer(
     monkeypatch, tmp_path
 ):
-    """An undecodable byte is the pipe's failure, and scoring it would be the bug one step on.
+    """An undecodable byte is the runtime's failure, and scoring it is the bug one step on.
 
-    The pipe is read UTF-8 with `errors="surrogateescape"`, so a byte the
-    runtime wrote that is not UTF-8 survives as a lone surrogate instead of
-    raising. Scored, that row is wrong, every liveness check passes, and the
-    loss is reported as a conversion cost -- the shape this path exists to
-    avoid. Through a real child, because the decode is the subject.
+    The byte reaches here as a lone surrogate: the runtime handed the script a
+    `str` with one in it, `json.dumps` escaped it as `\\udcXX`, and the file
+    stayed valid UTF-8 the whole way -- so nothing raises, and the row would
+    score as an ordinary wrong answer while every liveness check passed and
+    the loss was reported as a conversion cost.
     """
-
-    def wrote_bytes_that_are_not_utf8(self, args, timeout: int = 3600, env=None):
-        return envs._run_guarded(
-            [
-                sys.executable,
-                "-c",
-                "import sys; sys.stdout.buffer.write('перевод'.encode('cp1251'))",
-            ],
-            timeout=timeout,
-            env=env,
-        )
-
-    monkeypatch.setattr(envs.StageEnv, "run", wrote_bytes_that_are_not_utf8)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _writes_results([{"index": 0, "text": "\udcbf\udce5"}])
+    )
 
     generation = _litertlm(tmp_path).generate(["hello"])[0]
 
@@ -149,13 +159,7 @@ def test_a_generation_that_really_contains_the_replacement_character_is_scored(
     garbage, pointing the other way.
     """
     answer = "the file is named \ufffd, literally"
-
-    def a_real_child(self, args, timeout: int = 3600, env=None):
-        return envs._run_guarded(
-            [sys.executable, "-c", f"print({answer!r})"], timeout=timeout, env=env
-        )
-
-    monkeypatch.setattr(envs.StageEnv, "run", a_real_child)
+    monkeypatch.setattr(envs.StageEnv, "run", _writes_results([{"index": 0, "text": answer}]))
 
     generation = _litertlm(tmp_path).generate(["hello"])[0]
 
@@ -164,22 +168,26 @@ def test_a_generation_that_really_contains_the_replacement_character_is_scored(
     assert generation.text == answer
 
 
-def test_a_non_ascii_generation_survives_the_pipe_end_to_end(monkeypatch, tmp_path):
-    """The claim this path rests on, through a real child and the real pipe.
+def test_a_non_ascii_generation_survives_the_file_end_to_end(monkeypatch, tmp_path):
+    """The claim this path rests on, through a real child and a real file.
 
     Every other test of this backend replaces `StageEnv.run` with a double
-    that hands back a `str`, so the decode boundary -- where the generation
-    actually is -- is never crossed. This one replaces only the environment
-    lookup: `_run_guarded` is real, the child is real, and the host asks for
-    an encoding that cannot hold the answer.
+    that writes the results itself, so the encode/decode boundary -- where the
+    generation actually is -- is never crossed. This one runs a real child
+    that writes the file, with the host asking for an encoding that cannot
+    hold the answer.
     """
     monkeypatch.setenv("PYTHONIOENCODING", "ascii")
     answer = "перевод — 変換"
 
     def a_real_child(self, args, timeout: int = 3600, env=None):
-        return envs._run_guarded(
-            [sys.executable, "-c", f"print({answer!r})"], timeout=timeout, env=env
+        out = json.loads(Path(args[2]).read_text(encoding="utf-8"))["out"]
+        code = (
+            "import json,pathlib;"
+            f"pathlib.Path({out!r}).write_text("
+            f"json.dumps({{'index':0,'text':{answer!r}}}), encoding='utf-8')"
         )
+        return envs._run_guarded([sys.executable, "-c", code], timeout=timeout, env=env)
 
     monkeypatch.setattr(envs.StageEnv, "run", a_real_child)
 
@@ -189,29 +197,41 @@ def test_a_non_ascii_generation_survives_the_pipe_end_to_end(monkeypatch, tmp_pa
     assert generation.text == answer
 
 
-def test_argv_pins_the_prompt_construction_mode(tmp_path):
+def test_the_runner_call_pins_the_prompt_construction_mode(tmp_path):
+    """The distinction `--no-template` used to carry, said as the call it picks.
+
+    `create_session(apply_prompt_template=False)` forces the runtime's tool
+    list to null, so the prompt must arrive already rendered. The mode has to
+    say so.
+    """
     backend = _litertlm(tmp_path)
-    argv = backend.argv("hello")
-    assert argv[:2] == ["litert-lm", "run"]
-    assert "--backend=cpu" in argv
-    assert "--no-template" in argv
-    assert "--prompt=hello" in argv
-    # --no-template forces the runtime's tool list to null, so the prompt must
-    # arrive already rendered. The mode has to say so.
+
+    assert backend.runner_call == "Engine.create_session(apply_prompt_template=False)"
     assert backend.prompt_mode is PromptMode.PRERENDERED
+    record = backend.describe()
+    assert record["backend"] == "cpu"
+    assert record["transport"] == "litert_lm python api, one process per split"
+    assert record["template_flag"] == "apply_prompt_template=False"
 
 
-def test_one_process_per_prompt(monkeypatch, tmp_path):
+def test_one_process_per_split(monkeypatch, tmp_path):
+    """The point of the transport: the whole split in one process.
+
+    It used to be one per prompt, and roughly 90% of a run's wall time was
+    startup and model reload rather than decoding.
+    """
     seen = []
+    write = _writes_results([{"index": 0, "text": "a"}, {"index": 1, "text": "b"}])
 
     def fake_run(self, args, timeout=3600, **kwargs):
         seen.append(args)
-        return subprocess.CompletedProcess(args, 0, stdout="call:a{}", stderr="")
+        return write(self, args, timeout=timeout, **kwargs)
 
     monkeypatch.setattr(envs.StageEnv, "run", fake_run)
     gens = _litertlm(tmp_path).generate(["one", "two"])
-    assert len(seen) == 2
-    assert [g.text for g in gens] == ["call:a{}", "call:a{}"]
+
+    assert len(seen) == 1, "one process, not one per prompt"
+    assert [g.text for g in gens] == ["a", "b"]
     assert all(g.ok for g in gens)
 
 
@@ -250,14 +270,29 @@ def test_a_missing_system_library_is_unperformed_not_failed(monkeypatch, tmp_pat
     assert not gen.ran
 
 
-def test_an_ordinary_non_zero_exit_is_a_real_observation(monkeypatch, tmp_path):
-    def fake_run(self, args, timeout=3600, **kwargs):
-        return subprocess.CompletedProcess(args, 1, stdout="", stderr="decode failed at token 4")
+def test_a_script_that_answered_and_then_failed_keeps_its_answers(monkeypatch, tmp_path):
+    """What a non-zero exit means moved with the transport, and it had to.
 
-    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
-    gen = _litertlm(tmp_path).generate(["one"])[0]
-    assert gen.harness_error is None
-    assert gen.ran and not gen.ok
+    One process per prompt let "this prompt produced nothing and the process
+    exited 1" be an observation about the model. One process per split cannot:
+    a script that exits non-zero having written nothing has broken, and
+    reporting that as 600 models declining to answer would be the reverse of
+    the error this file exists to prevent. So a row that arrived is kept and
+    scored, with the failure travelling beside it, and a prompt with no row is
+    a harness error.
+    """
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _writes_results([{"index": 0, "text": "label_3"}], returncode=1, stderr="died at 2"),
+    )
+
+    answered, missing = _litertlm(tmp_path).generate(["one", "two"])
+
+    assert answered.ran and answered.ok
+    assert answered.text == "label_3"
+    assert answered.batch_returncode == 1, "the failure travels with the answer"
+    assert missing.harness_error is not None and "exited 1" in missing.harness_error
 
 
 def test_backend_reports_which_engine_produced_the_numbers(tmp_path):
@@ -305,12 +340,12 @@ def test_a_generation_script_that_dies_reports_unperformed(monkeypatch):
 def test_a_reference_generation_reaches_scoring_with_its_terminator_intact(tmp_path):
     """The HF script keeps the terminator on purpose; nothing between the
     results file and the scorer may strip it, or liveness goes blind to
-    leakage. A transport mutation stripping `<eos>` in `_read_results`
+    leakage. A transport mutation stripping `<eos>` in `read_jsonl_results`
     survived the whole suite before this test existed.
     """
     results = tmp_path / "r.jsonl"
     results.write_text('{"index": 0, "text": "label_3<end_of_turn>\\n<eos>"}\n', encoding="utf-8")
-    texts = HuggingFaceBackend(model="org/m", auto_provision=False)._read_results(results)
+    texts, _ = read_jsonl_results(results)
     assert texts[0] == "label_3<end_of_turn>\n<eos>"
     assert trim_terminator(texts[0]) == "label_3"
     assert score_exact_text(["label_3"], [texts[0]]).exact_match.value == 1.0
@@ -499,7 +534,7 @@ def test_a_script_that_wrote_no_report_leaves_the_prediction_standing(monkeypatc
 
 
 def test_a_run_report_that_is_not_valid_utf8_leaves_the_prediction_standing(tmp_path):
-    """Same family as the blocker: `_read_results` a few lines below already
+    """Same family as the blocker: `read_jsonl_results` a few lines below already
     catches `UnicodeDecodeError` on a damaged results file; `_read_run_report`
     used to let it escape, which would have aborted verification after the
     generations that report was only ever supposed to annotate had already
@@ -748,12 +783,9 @@ def test_a_script_that_failed_after_writing_results_is_not_recorded_as_clean():
     """
     import subprocess
 
-    from litetune.evaluate import HuggingFaceBackend
-
-    backend = HuggingFaceBackend(model="org/m", declared_prompt_mode=PromptMode.PRERENDERED)
     proc = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="teardown blew up")
 
-    out = backend._assemble(["p0", "p1"], {0: "a", 1: "b"}, proc)
+    out = assemble_generations(["p0", "p1"], {0: "a", 1: "b"}, proc)
 
     assert [g.text for g in out] == ["a", "b"]
     # Typed, not buried in a message: `returncode` stays 0 so the generation is
@@ -772,11 +804,10 @@ def test_a_failed_batch_is_counted_where_something_reads_it():
     """
     import subprocess
 
-    from litetune.evaluate import GREEDY, HuggingFaceBackend, MeasurementPoint
+    from litetune.evaluate import GREEDY, MeasurementPoint
 
-    backend = HuggingFaceBackend(model="org/m", declared_prompt_mode=PromptMode.PRERENDERED)
     proc = subprocess.CompletedProcess(args=[], returncode=3, stdout="", stderr="died")
-    generations = backend._assemble(["p0", "p1"], {0: "a", 1: "b"}, proc)
+    generations = assemble_generations(["p0", "p1"], {0: "a", 1: "b"}, proc)
 
     point = MeasurementPoint(
         label="candidate",
@@ -1069,7 +1100,7 @@ def test_the_reference_script_moves_everything_to_the_device_it_resolves(tmp_pat
 
 
 def test_the_reference_script_writes_its_device_where_the_parent_can_read_it(tmp_path, monkeypatch):
-    """Structured, not only printed to stderr -- `_assemble` discards stderr
+    """Structured, not only printed to stderr -- `assemble_generations` discards stderr
     on a clean exit, which is the path that matters."""
     captured = _run_hf_generate_script(tmp_path, monkeypatch, cuda=True)
     assert captured["run_report"] == {"device": "cuda"}

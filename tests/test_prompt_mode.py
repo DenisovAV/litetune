@@ -139,8 +139,8 @@ def test_the_runtime_only_gets_no_template_for_a_prerendered_prompt(tmp_path):
     templated = LiteRtLmBackend(
         model=model, auto_provision=False, declared_prompt_mode=PromptMode.RUNTIME_RENDERED
     )
-    assert "--no-template" in prerendered.argv("hi")
-    assert "--no-template" not in templated.argv("hi")
+    assert "apply_prompt_template=False" in prerendered.runner_call
+    assert templated.runner_call == "Engine.create_conversation()"
     assert templated.describe()["template_flag"] is None
     assert templated.prompt_mode is PromptMode.RUNTIME_RENDERED
 
@@ -187,7 +187,7 @@ def test_both_sides_are_built_from_one_decision(tmp_path):
     )
     assert pair.candidate.prompt_mode is PromptMode.RUNTIME_RENDERED
     assert pair.reference.prompt_mode is PromptMode.RUNTIME_RENDERED
-    assert "--no-template" not in pair.candidate.argv("hi")
+    assert pair.candidate.runner_call == "Engine.create_conversation()"
 
 
 # ---------------------------------------------------------------------------
