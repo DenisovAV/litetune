@@ -485,6 +485,14 @@ class LiteRtLmBackend:
     this is that code reached directly rather than a second way of asking --
     which is why `runner_call` names the call instead of a flag.
 
+    Measured rather than argued, because a transport that changed the text
+    would make every number taken before it incomparable with every number
+    after: on Linux CPU with `litert-lm==0.16.1` and
+    `litert-community/Qwen3-0.6B.litertlm`, six prompts through both entry
+    points in both modes came back byte-identical, 12 of 12, against the CLI
+    path's own stdout cleaning. See the note at the top of MEASUREMENTS.md for
+    what that does not cover.
+
     Two things the change costs, both named where they happen: `timeout_s`
     still means the budget one prompt gets and the split gets the sum, so a
     hung prompt now takes the budget the rest would have had; and progress is

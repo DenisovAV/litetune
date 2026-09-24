@@ -13,6 +13,28 @@ through the runtime's tool path the way an application calls it.
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
 
+## The transport under every number here changed once, and was measured first
+
+Every candidate figure below was taken through `litert-lm run`, one process per
+prompt. `verify` now generates a whole split in one process through
+litert-lm's Python API instead — the same `Engine` and the same
+`create_session` / `create_conversation` the CLI wraps, called directly.
+
+A transport swap that changed the text would make every number taken before it
+incomparable with every number taken after, so it was measured rather than
+argued. On Linux CPU with `litert-lm==0.16.1` and
+`litert-community/Qwen3-0.6B.litertlm`, six prompts through both entry points
+in both prompt modes — `create_session` for pre-rendered and
+`create_conversation` for runtime-rendered — **12 of 12 came back
+byte-identical after the CLI path's own stdout cleaning, and none differed**.
+The prompts were chosen to stress the difference rather than to look like a
+dataset: a label task, a one-word answer, a numeric answer, non-ASCII text, a
+single character, and a list.
+
+What that does not establish: one model, one runtime version, six prompts, and
+nothing about the GPU backend or the tool path, where channel content composes
+into the answer and the two paths have more to disagree about.
+
 ## The headline numbers
 
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
