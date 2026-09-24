@@ -488,11 +488,19 @@ class LiteRtLmBackend:
 
     Measured rather than argued, because a transport that changed the text
     would make every number taken before it incomparable with every number
-    after: on Linux CPU with `litert-lm==0.16.1` and
-    `litert-community/Qwen3-0.6B.litertlm`, six prompts through both entry
-    points in both modes came back byte-identical, 12 of 12, against the CLI
-    path's own stdout cleaning. See the note at the top of MEASUREMENTS.md for
-    what that does not cover.
+    after. On Linux CPU with `litert-lm==0.16.1`, both prompt modes, against
+    the CLI path's own stdout cleaning: 30 of 30 prompts byte-identical -- 12
+    on `litert-community/Qwen3-0.6B.litertlm` and 18 on
+    `litert-community/functiongemma-mobile-actions_q8_ekv1024.litertlm`, a
+    different family, template and tokenizer.
+
+    What those 30 do not cover, and it is most of the risk: a probe of the raw
+    chunks found no `channels` key on any of them, so every one took the plain
+    text branch. Channel composition -- the one part of the driver script that
+    is not a direct call -- is held by the synthetic streams in
+    `test_the_driver_composes_what_the_cli_printed` instead, because a sampled
+    model can only show a branch was not taken. Nothing here covers the GPU
+    backend.
 
     Two things the change costs, both named where they happen: `timeout_s`
     still means the budget one prompt gets and the split gets the sum, so a

@@ -13,45 +13,6 @@ through the runtime's tool path the way an application calls it.
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
 
-## The transport under every number here changed once, and was measured first
-
-Every candidate figure below was taken through `litert-lm run`, one process per
-prompt. `verify` now generates a whole split in one process through
-litert-lm's Python API instead — the same `Engine` and the same
-`create_session` / `create_conversation` the CLI wraps, called directly.
-
-A transport swap that changed the text would make every number taken before it
-incomparable with every number taken after, so it was measured rather than
-argued. On Linux CPU with `litert-lm==0.16.1`, both prompt modes —
-`create_session` for pre-rendered and `create_conversation` for
-runtime-rendered — **30 of 30 prompts came back byte-identical after the CLI
-path's own stdout cleaning**: 12 on `litert-community/Qwen3-0.6B.litertlm` and
-18 on `litert-community/functiongemma-mobile-actions_q8_ekv1024.litertlm`, a
-different family, template and tokenizer. The prompts stress the difference
-rather than resembling a dataset — a label task, a one-word answer, a numeric
-answer, non-ASCII text, a single character, a list, and three action-shaped
-ones.
-
-**Those 30 matches are also proof that one branch of the new path never ran.**
-Everything the driver does is a direct call into litert-lm except one thing:
-composing a reply that carries a *channel*, which `litert-lm run` prints
-between `[name] ` and ` [/name]` ahead of the answer. A probe of the raw
-chunks on FunctionGemma found no `channels` key on any of them, so none of the
-30 reached that branch — and the branch, as first written, opened a channel
-and never closed it. `metrics.REASONING_BLOCKS` keys on that closing marker
-and `_split_reasoning` cuts at the last one, so a channel-bearing reply would
-have been scored against thought-plus-answer and counted as `unclosed` rather
-than `closed`: a wrong number with nothing failing. The composition now
-mirrors the CLI's printer as a state machine, and seven synthetic streams pin
-it — six of the seven fail against the version that shipped in the first
-draft.
-
-What none of this establishes: two models, one runtime version, 30 prompts,
-nothing about the GPU backend, and no *measured* channel-bearing reply. The
-comment above `REASONING_BLOCKS` records `[thought]`/`[/thought]` observed on
-2026-09-14, so channels do occur here; which bundles declare them was not
-established.
-
 ## The headline numbers
 
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
