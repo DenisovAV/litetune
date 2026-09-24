@@ -607,33 +607,27 @@ class LiteRtLmBackend:
     Measured rather than argued, because a transport that changed the text
     would make every number taken before it incomparable with every number
     after. On Linux CPU with `litert-lm==0.16.1`, both prompt modes, against
-    the CLI path's own stdout cleaning: 30 of 30 comparisons byte-identical --
-    6 prompts in both prompt modes on `Qwen3-0.6B.litertlm` from
-    `litert-community/Qwen3-0.6B`, which holds four bundles, and 9 in both on
+    the CLI path's own stdout cleaning: 36 of 36 comparisons byte-identical --
+    9 prompts in both prompt modes on `Qwen3-0.6B.litertlm` from
+    `litert-community/Qwen3-0.6B`, which holds four bundles, and the same 9 in
+    both on `mobile-actions_q8_ekv1024.litertlm` from
     `litert-community/functiongemma-mobile-actions_q8_ekv1024.litertlm`, a
-    different family, template and tokenizer.
+    different family, template and tokenizer. The script compared was this one:
+    the run extracted it from this file rather than restating it, and the
+    extraction hashes equal.
 
-    Those 30 were taken against an earlier revision of the script below. Four
-    of the differences could change what the model was asked or what came back:
-    it left a channel open where this one closes it, it let one prompt's
-    exception end the whole split, it imported litert-lm at module level, and
-    it passed no `cache_dir`. The rest are removals of code nothing reached --
-    a run report the parent never opened, a `backend_for` parameter, and an
-    `activation_data_type` the parent never wrote into the spec, which is also
-    why the first three of the four cannot have moved a single one of the 30:
-    a channel opened under that revision would have come back missing its
-    closing marker and so could not have matched the CLI byte for byte, and no
-    prompt raised. `cache_dir` is the one that reaches the engine. The
-    comparison has not been re-taken against the code as it stands, and that is
-    the honest size of the evidence.
+    An earlier revision of the script was run beside it on the same prompts and
+    agreed on all 36 as well, which retires the two rounds taken against that
+    revision and answers the one thing they could not: that revision never
+    closed a channel, so had any chunk carried one the two would have differed
+    by a ` [/name]` and a newline. None did. Nothing in this run composed a
+    channel.
 
-    What those 30 do not cover, and it is most of the risk: none of them
-    composed a channel. Fifteen are session-path comparisons, and
-    `text_from_session` reads `chunk.texts` and nothing else, so there is no
-    channel branch for them to take; of the fifteen conversation-path ones, a
-    probe of the raw chunks on the FunctionGemma bundle found no `channels` key
-    on any of its nine, and the six on Qwen3 matched the CLI byte for byte,
-    which a composed channel could not have done under that revision.
+    Which is what those 36 do not cover, and it is most of the risk. Eighteen
+    are session-path comparisons, and `text_from_session` reads `chunk.texts`
+    and nothing else, so there is no channel branch for them to take; the other
+    eighteen took it and found nothing to compose, on two families whose
+    templates differ.
     Channel composition -- the one part of the driver script that is not a
     direct call -- is held by the synthetic streams in
     `test_the_driver_composes_what_the_cli_printed` instead, because a sampled
