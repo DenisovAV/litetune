@@ -100,11 +100,22 @@ void main() {
         isNotEmpty,
         reason: '${model.name} carries no description',
       );
-      // Size first, because it is what a reader is choosing between.
+      // Size first, because it is what a reader is choosing between. The
+      // punctuation after it is not pinned -- this caught the move from a
+      // one-line card face to a paragraph in the panel, which is a change of
+      // shape and not of rule.
       expect(
         model.what,
-        matches(RegExp(r'^\d+(\.\d+)?[MB], ')),
+        matches(RegExp(r'^(About )?\d+(\.\d+)?[MB]\b')),
         reason: '${model.name} does not open with its size: ${model.what}',
+      );
+      // It reads in the panel now, not on the card face, and it is meant to
+      // say enough to choose on. A one-liner that drifted back here would
+      // render as a lonely sentence above the checkpoint row.
+      expect(
+        model.what.length,
+        greaterThan(140),
+        reason: '${model.name} says too little to be worth opening',
       );
     }
   });

@@ -143,8 +143,11 @@ class WhyItExists extends StatelessComponent {
       name: 'FunctionGemma 270M',
       how: 'tool-call scoring, 640 held-out rows',
       what:
-          '270M, text — built for tool calls: picking a function and filling its '
-          'arguments on the device.',
+          '270M parameters, text only. Google built it for tool calls: '
+          'given a list of functions it picks one and fills in its '
+          'arguments, which is the job an app needs done on the phone '
+          'rather than in a round trip to a server. Small enough that '
+          'the whole model ships inside the app.',
       hubId: 'google/functiongemma-270m-it',
       revision: null,
       anchor: 'the-headline-numbers',
@@ -153,8 +156,10 @@ class WhyItExists extends StatelessComponent {
       name: 'Gemma 3 270M',
       how: 'exact-text scoring, 600 held-out rows',
       what:
-          '270M, text — the smallest here that still learns a task. Classification '
-          'and routing, not conversation.',
+          '270M parameters, text only — the smallest checkpoint '
+          'measured here. It still learns a task from a few thousand '
+          'examples, which makes it the one to try first when the job '
+          'is classification or routing rather than conversation.',
       hubId: 'google/gemma-3-270m-it',
       revision: 'ac82b4e8',
       anchor: 'a-second-family-and-the-second-scorer',
@@ -163,8 +168,10 @@ class WhyItExists extends StatelessComponent {
       name: 'Gemma 3 1B',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
-          '1B, text — the same export rule as the 270M, for when the 270M stops '
-          'holding the task.',
+          '1B parameters, text only. Four times the 270M and covered by '
+          'the same export rule, so it is the size to move to when the '
+          'smaller one stops holding the task: same pipeline, same '
+          'flags, more room.',
       hubId: 'google/gemma-3-1b-it',
       revision: 'dcc83ea8',
       anchor: 'the-same-family-four-times-the-size',
@@ -172,7 +179,11 @@ class WhyItExists extends StatelessComponent {
     (
       name: 'Qwen3 0.6B',
       how: 'exact-text scoring, the same 600 held-out rows',
-      what: '0.6B, text — a first try when the task is labels.',
+      what:
+          '0.6B parameters, text only. A reasonable first try when the '
+          'task is labels, and the first family measured here that '
+          'litetune had no per-model rule for — it exports and converts '
+          'on the plain path, with nothing added for its name.',
       hubId: 'Qwen/Qwen3-0.6B',
       revision: 'c1899de2',
       anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
@@ -181,8 +192,10 @@ class WhyItExists extends StatelessComponent {
       name: 'Qwen2.5 0.5B',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
-          '0.5B, text — reach for it when memory is the budget: its four-bit export '
-          'is the only one here that scored.',
+          '0.5B parameters, text only. Reach for it when memory is the '
+          'binding constraint: it is the one checkpoint here whose '
+          'channelwise four-bit export produced a usable score at all, '
+          'where the others either refused or came apart.',
       hubId: 'Qwen/Qwen2.5-0.5B-Instruct',
       revision: '7ae55760',
       anchor:
@@ -192,8 +205,12 @@ class WhyItExists extends StatelessComponent {
       name: 'Gemma 4 E2B',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
-          '5B, multimodal — text, vision and audio. For an assistant that has to '
-          'see or hear.',
+          'About 5B parameters, and multimodal — a text tower with '
+          'vision and audio towers beside it. For an assistant that has '
+          'to see or hear as well as read. A LoRA run on it is scoped '
+          'to the text tower, because all three use the same projection '
+          'names and a run scoped by name alone reaches every one of '
+          'them.',
       hubId: 'google/gemma-4-E2B-it',
       // Null although MEASUREMENTS.md names a commit: that run passed no
       // `--revision` and the hash was read back from the cache afterwards.
@@ -225,9 +242,12 @@ class WhyItExists extends StatelessComponent {
   static Component _card(MeasuredRun model) =>
       a(classes: 'measured-card', href: '#${slugFor(model)}', [
         span(classes: 'measured-card-model', [Component.text(model.name)]),
-        span(classes: 'measured-card-what', [Component.text(model.what)]),
         span(classes: 'measured-card-how', [Component.text(model.how)]),
-        span(classes: 'measured-card-more', [Component.text('checkpoint')]),
+        // What opening it gets you. It used to read `checkpoint`, which named
+        // one row of the panel rather than the reason to open it.
+        span(classes: 'measured-card-more', [
+          Component.text('what it is, and what it is for'),
+        ]),
       ]);
 
   static Component _modal(MeasuredRun model) => div(
@@ -260,6 +280,7 @@ class WhyItExists extends StatelessComponent {
             [Component.text('\u00d7')],
           ),
         ]),
+        p(classes: 'measured-modal-what', [Component.text(model.what)]),
         div(classes: 'measured-card-fact', [
           span(classes: 'measured-card-key', [Component.text('Checkpoint')]),
           span(classes: 'measured-card-id', [Component.text(model.hubId)]),
@@ -393,14 +414,13 @@ class WhyItExists extends StatelessComponent {
     css(
       '.measured-card-model',
     ).styles(color: Brand.ink, fontSize: 1.05.rem, fontWeight: FontWeight.w500),
-    css('.measured-card-what').styles(
+    css('.measured-modal-what').styles(
       color: Brand.body,
-      fontSize: 0.9.rem,
-      raw: const {'line-height': '1.45'},
+      fontSize: 0.95.rem,
+      margin: Margin.only(bottom: 0.4.rem),
+      raw: const {'line-height': '1.55'},
     ),
-    // Demoted a step now that the line above it carries the reading: how a run
-    // was scored is provenance, and it stops competing with what the model is.
-    css('.measured-card-how').styles(color: Brand.muted, fontSize: 0.8.rem),
+    css('.measured-card-how').styles(color: Brand.body, fontSize: 0.9.rem),
     css('.measured-card-fact').styles(
       display: Display.flex,
       flexDirection: FlexDirection.column,
