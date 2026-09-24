@@ -298,6 +298,32 @@ def test_the_driver_composes_what_the_cli_printed(name, chunks, expected):
     assert compose(_ScriptedConversation(chunks), "p").strip() == expected
 
 
+def test_a_timeout_keeps_the_answers_the_script_had_already_written(monkeypatch, tmp_path):
+    """The promise the docstring makes, which only held for a kill.
+
+    The script flushes a row per prompt so a run that dies partway keeps what
+    it finished. The first version of this returned before reading the file,
+    and the temp directory took the rows with it -- so 599 finished
+    generations were thrown away because the six-hundredth hung.
+    """
+
+    def times_out_after_writing(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        Path(spec["out"]).write_text(
+            json.dumps({"index": 0, "text": "label_3"}) + "\n", encoding="utf-8"
+        )
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+
+    monkeypatch.setattr(envs.StageEnv, "run", times_out_after_writing)
+
+    answered, missing = _litertlm(tmp_path).generate(["one", "two"])
+
+    assert answered.ok and answered.text == "label_3"
+    assert answered.harness_error is None
+    assert not missing.ran
+    assert missing.harness_error is not None and "timeout" in missing.harness_error
+
+
 def test_one_process_per_split(monkeypatch, tmp_path):
     """The point of the transport: the whole split in one process.
 

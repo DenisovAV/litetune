@@ -640,11 +640,27 @@ class LiteRtLmBackend:
                     timeout=self.timeout_s * len(prompts),
                 )
             except subprocess.TimeoutExpired:
-                logger.warning(
-                    "litert-lm generation timed out after %ss", self.timeout_s * len(prompts)
-                )
-                reason = f"no result after {self.timeout_s * len(prompts)}s (timeout)"
-                return [Generation(i, p, harness_error=reason) for i, p in enumerate(prompts)]
+                budget = self.timeout_s * len(prompts)
+                logger.warning("litert-lm generation timed out after %ss", budget)
+                # Read what the script had already flushed, rather than
+                # discarding it. The docstring promises a run killed at prompt
+                # 400 keeps the first 399, and the first version of this made
+                # that true of a kill and false of a timeout -- it returned
+                # before reading the file, and the temp directory took the rows
+                # with it. Every row here is a complete generation: the script
+                # flushes after each one, and a half-written last line fails to
+                # parse and is dropped by the reader.
+                texts, faults = read_jsonl_results(results)
+                reason = f"no result after {budget}s (timeout)"
+                timed_out: list[Generation] = []
+                for i, prompt in enumerate(prompts):
+                    if i in faults:
+                        timed_out.append(Generation(i, prompt, harness_error=faults[i]))
+                    elif i in texts:
+                        timed_out.append(Generation(i, prompt, text=texts[i].strip(), returncode=0))
+                    else:
+                        timed_out.append(Generation(i, prompt, harness_error=reason))
+                return timed_out
             except OSError as exc:
                 logger.exception("could not start the litert-lm generation script")
                 reason = f"{type(exc).__name__}: {exc}"
