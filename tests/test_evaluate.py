@@ -324,6 +324,98 @@ def test_a_timeout_keeps_the_answers_the_script_had_already_written(monkeypatch,
     assert missing.harness_error is not None and "timeout" in missing.harness_error
 
 
+@pytest.mark.parametrize(
+    ("value", "shape"),
+    [(None, "NoneType"), (12345, "int"), ({"a": 1}, "dict")],
+    ids=["null", "number", "object"],
+)
+def test_a_row_whose_text_is_not_a_string_is_not_the_model_s_answer(
+    monkeypatch, tmp_path, value, shape
+):
+    """`str(row["text"])` accepted all three, so the wrong-shape guard was inert.
+
+    A JSON `null` came back as the four characters "None", scored as an
+    ordinary wrong answer with every liveness check green and the loss folded
+    into the conversion cost.
+    """
+    monkeypatch.setattr(envs.StageEnv, "run", _writes_results([{"index": 0, "text": value}]))
+
+    generation = _litertlm(tmp_path).generate(["hello"])[0]
+
+    assert not generation.ok
+    assert generation.text == ""
+    assert generation.harness_error is not None
+    assert shape in generation.harness_error
+    assert "not a string" in generation.harness_error
+
+
+def test_two_rows_claiming_one_prompt_are_both_refused(monkeypatch, tmp_path):
+    """The last row silently won, and nothing said the file had disagreed."""
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _writes_results([{"index": 0, "text": "first"}, {"index": 0, "text": "second"}]),
+    )
+
+    generation = _litertlm(tmp_path).generate(["hello"])[0]
+
+    assert not generation.ok
+    assert generation.text == ""
+    assert "two rows" in (generation.harness_error or "")
+
+
+def test_a_row_no_prompt_claims_is_reported(monkeypatch, tmp_path, caplog):
+    """It used to vanish -- including a fault already logged at ERROR.
+
+    What binds row N to prompt N is an integer in a file and nothing else, so
+    a row nobody claims is the visible end of that binding going wrong.
+    """
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _writes_results([{"index": 0, "text": "mine"}, {"index": 7, "text": "nobody's"}]),
+    )
+
+    with caplog.at_level("ERROR"):
+        generations = _litertlm(tmp_path).generate(["hello"])
+
+    assert len(generations) == 1
+    assert generations[0].text == "mine"
+    assert any("index no prompt has" in r.getMessage() for r in caplog.records)
+
+
+def test_a_timed_out_split_does_not_look_like_a_clean_one(monkeypatch, tmp_path):
+    """Salvaged rows are scored, and they have to say the run was killed.
+
+    Given `returncode=0` and nothing else, a split killed after writing every
+    row was byte-identical to a clean one and liveness reported "n/n
+    generations exited zero" about a group that was SIGKILLed. `_run_guarded`
+    puts the child's last words on the exception for exactly this, and the
+    first version of the salvage threw them away.
+    """
+
+    def times_out_after_writing_everything(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        Path(spec["out"]).write_text(
+            "".join(json.dumps({"index": i, "text": f"answer {i}"}) + "\n" for i in range(2)),
+            encoding="utf-8",
+        )
+        raise subprocess.TimeoutExpired(
+            cmd=args, timeout=timeout, stderr="killed while decoding prompt 2"
+        )
+
+    monkeypatch.setattr(envs.StageEnv, "run", times_out_after_writing_everything)
+
+    generations = _litertlm(tmp_path).generate(["one", "two"])
+
+    assert [g.text for g in generations] == ["answer 0", "answer 1"]
+    assert all(g.ok for g in generations), "a finished row is still a real answer"
+    assert all(
+        g.batch_returncode not in (None, 0) for g in generations
+    ), "a killed run must not read as a clean one"
+    assert all("killed while decoding" in g.stderr for g in generations)
+
+
 def test_one_process_per_split(monkeypatch, tmp_path):
     """The point of the transport: the whole split in one process.
 

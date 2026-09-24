@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import re
+import signal
 import subprocess
 import tempfile
 from collections.abc import Sequence
@@ -307,7 +308,7 @@ def read_jsonl_results(results: Path) -> tuple[dict[int, str], dict[int, str]]:
             )
             continue
         try:
-            index, text = int(row["index"]), str(row["text"])
+            index = int(row["index"])
         except (KeyError, TypeError, ValueError) as exc:
             # Valid JSON, wrong shape. Same fault class as a malformed line
             # and it must not escape the loop that reports them.
@@ -316,6 +317,23 @@ def read_jsonl_results(results: Path) -> tuple[dict[int, str], dict[int, str]]:
                 lineno,
                 results.name,
                 exc,
+            )
+            continue
+        text = row.get("text")
+        if not isinstance(text, str):
+            # `str(text)` accepted all of these, so the guard above only ever
+            # caught a bad index: a JSON `null` came back as the four
+            # characters "None" and scored as the model's answer, with every
+            # liveness check green. Reported against its own prompt rather
+            # than dropped, because the row did arrive.
+            logger.error(
+                "prompt %d came back with a %s where its text should be",
+                index,
+                type(text).__name__,
+            )
+            faults[index] = (
+                f"the runtime's output for this prompt was a {type(text).__name__}, not a "
+                f"string, so what it generated is not recoverable from this run"
             )
             continue
         undecoded = UNDECODED_BYTE.findall(text)
@@ -331,6 +349,16 @@ def read_jsonl_results(results: Path) -> tuple[dict[int, str], dict[int, str]]:
                 f"byte(s) did not decode, so what it generated is not recoverable from "
                 f"this run"
             )
+            continue
+        if index in texts or index in faults:
+            # Silently the last row won. Both are suspect: nothing here can
+            # say which of them the runtime produced for that prompt.
+            logger.error("two rows in %s claim index %d", results.name, index)
+            faults[index] = (
+                f"two rows in the results file claim prompt {index}, so which of them the "
+                f"runtime produced for it is not recoverable from this run"
+            )
+            texts.pop(index, None)
             continue
         texts[index] = text
     return texts, faults
@@ -362,6 +390,13 @@ def assemble_generations(
             "generation script wrote %d results and exited %s", len(texts), proc.returncode
         )
     faults = faults or {}
+    stray = sorted((texts.keys() | faults.keys()) - set(range(len(prompts))))
+    if stray:
+        # Dropped without a word before -- including a fault the reader had
+        # already logged at ERROR, which then vanished for being unclaimable.
+        # What binds row N to prompt N is an integer in a file and nothing
+        # else, so a row nobody claims is the visible end of that.
+        logger.error("%d result row(s) carry an index no prompt has: %s", len(stray), stray[:10])
     out: list[Generation] = []
     for i, prompt in enumerate(prompts):
         if i in faults:
@@ -639,7 +674,7 @@ class LiteRtLmBackend:
                     ["python", str(script), str(spec)],
                     timeout=self.timeout_s * len(prompts),
                 )
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as expired:
                 budget = self.timeout_s * len(prompts)
                 logger.warning("litert-lm generation timed out after %ss", budget)
                 # Read what the script had already flushed, rather than
@@ -651,15 +686,41 @@ class LiteRtLmBackend:
                 # flushes after each one, and a half-written last line fails to
                 # parse and is dropped by the reader.
                 texts, faults = read_jsonl_results(results)
+                # `_run_guarded` kills the group and drains it precisely to put
+                # the child's last words on this exception; the first version
+                # of this discarded them, leaving the budget as the whole
+                # diagnostic.
+                killed = expired.stderr or ""
+                if isinstance(killed, bytes):
+                    killed = killed.decode("utf-8", "surrogateescape")
+                killed = killed[-2000:]
                 reason = f"no result after {budget}s (timeout)"
+                # A salvaged row is a real answer and is scored -- and it has
+                # to say the run did not end. With `returncode=0` and nothing
+                # else, a split killed after writing every row was
+                # byte-identical to a clean one, and liveness reported "n/n
+                # generations exited zero" about a group that was SIGKILLed.
+                # That is the erasure `batch_returncode` exists to prevent,
+                # reintroduced by the fix for the other half of it.
                 timed_out: list[Generation] = []
                 for i, prompt in enumerate(prompts):
                     if i in faults:
-                        timed_out.append(Generation(i, prompt, harness_error=faults[i]))
+                        timed_out.append(
+                            Generation(i, prompt, stderr=killed, harness_error=faults[i])
+                        )
                     elif i in texts:
-                        timed_out.append(Generation(i, prompt, text=texts[i].strip(), returncode=0))
+                        timed_out.append(
+                            Generation(
+                                i,
+                                prompt,
+                                text=texts[i].strip(),
+                                returncode=0,
+                                stderr=killed,
+                                batch_returncode=-signal.SIGKILL,
+                            )
+                        )
                     else:
-                        timed_out.append(Generation(i, prompt, harness_error=reason))
+                        timed_out.append(Generation(i, prompt, stderr=killed, harness_error=reason))
                 return timed_out
             except OSError as exc:
                 logger.exception("could not start the litert-lm generation script")
