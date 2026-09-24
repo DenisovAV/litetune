@@ -416,6 +416,39 @@ def test_a_timed_out_split_does_not_look_like_a_clean_one(monkeypatch, tmp_path)
     assert all("killed while decoding" in g.stderr for g in generations)
 
 
+def test_a_prompt_the_runtime_refuses_does_not_take_the_split_with_it(monkeypatch, tmp_path):
+    """One row, not the rest of the run.
+
+    The runtime raises for a prefill that will not fit and for any stream
+    error it does not recognise. Without containment the first of those ends
+    the split: prompt 1 raises and everything after it comes back as "the
+    script exited 1".
+
+    The CLI contained it differently and worse -- it caught everything at the
+    top of the command, printed "An error occurred" to stdout and exited 0, so
+    the old transport scored that sentence as the model's answer.
+    """
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _writes_results(
+            [
+                {"index": 0, "text": "first"},
+                {"index": 1, "error": "RuntimeError: prefill failed"},
+                {"index": 2, "text": "third"},
+            ]
+        ),
+    )
+
+    first, refused, third = _litertlm(tmp_path).generate(["a", "b", "c"])
+
+    assert first.ok and first.text == "first"
+    assert third.ok and third.text == "third", "the split carried on past the failure"
+    assert not refused.ok
+    assert refused.text == "", "an error is not an answer"
+    assert "prefill failed" in (refused.harness_error or "")
+
+
 def test_one_process_per_split(monkeypatch, tmp_path):
     """The point of the transport: the whole split in one process.
 

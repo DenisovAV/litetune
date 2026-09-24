@@ -319,6 +319,16 @@ def read_jsonl_results(results: Path) -> tuple[dict[int, str], dict[int, str]]:
                 exc,
             )
             continue
+        if isinstance(row.get("error"), str):
+            # The driver reached this prompt, the runtime refused it, and the
+            # split carried on. Not "no result": the run learned something
+            # about this prompt and what it learned was a failure.
+            logger.error("prompt %d was refused by the runtime: %s", index, row["error"])
+            faults[index] = (
+                f"the runtime raised on this prompt and the split continued without it: "
+                f"{row['error'][:200]}"
+            )
+            continue
         text = row.get("text")
         if not isinstance(text, str):
             # `str(text)` accepted all of these, so the guard above only ever
@@ -854,15 +864,32 @@ def main(spec_path):
                 # first still in context -- the CLI started a process per
                 # prompt and could not get this wrong; this script can, and a
                 # split scored with drifting context looks like nothing.
-                if runtime_rendered:
-                    with engine.create_conversation(sampler_config=None) as runner:
-                        text = text_from_conversation(runner, prompt)
+                try:
+                    if runtime_rendered:
+                        with engine.create_conversation(sampler_config=None) as runner:
+                            text = text_from_conversation(runner, prompt)
+                    else:
+                        with engine.create_session(
+                            apply_prompt_template=False, sampler_config=None
+                        ) as runner:
+                            text = text_from_session(runner, prompt)
+                except Exception as exc:  # noqa: BLE001
+                    # One prompt, not the rest of the split. The runtime raises
+                    # for a prefill that will not fit and for any stream error
+                    # it does not recognise, and without this the first of
+                    # those ends the run: prompt 137 raises and 138 through 599
+                    # come back as "the script exited 1", which is most of a
+                    # measurement thrown away for one row.
+                    #
+                    # The CLI contained it differently and worse -- it caught
+                    # everything at the top of the command, printed "An error
+                    # occurred" to stdout and exited 0, so the old transport
+                    # scored that sentence as the model's answer. A row that
+                    # says it failed is neither that nor a lost split.
+                    row = {"index": index, "error": "%s: %s" % (type(exc).__name__, exc)}
                 else:
-                    with engine.create_session(
-                        apply_prompt_template=False, sampler_config=None
-                    ) as runner:
-                        text = text_from_session(runner, prompt)
-                out.write(json.dumps({"index": index, "text": text}) + "\n")
+                    row = {"index": index, "text": text}
+                out.write(json.dumps(row) + "\n")
                 out.flush()
     Path(spec["run_report"]).write_text(
         json.dumps(
