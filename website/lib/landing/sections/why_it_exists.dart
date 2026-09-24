@@ -359,6 +359,14 @@ class WhyItExists extends StatelessComponent {
     // top of the platform's own expanded/collapsed announcement. A link needs
     // no such announcement, so the word can simply be in the card.
     css('.measured-card-more').styles(color: Brand.muted, fontSize: 0.85.rem),
+    // The convention the rest of the site uses for a clickable card
+    // (`where_to_run.dart`, `nav_bar.dart`, `site_footer.dart`): the border
+    // brightens. Without it the only cue that a card is a link was a muted
+    // caption -- which is the line this change is about.
+    css('.measured-card:hover').styles(
+      border: Border.all(color: Brand.muted, width: 1.px),
+    ),
+    css('.measured-card:hover .measured-card-more').styles(color: Brand.ink),
     // Hidden until the URL names it. `:target` is the whole mechanism -- see
     // the class docstring for what that buys and what it costs.
     css('.measured-modal').styles(raw: const {'display': 'none'}),
@@ -394,7 +402,7 @@ class WhyItExists extends StatelessComponent {
       raw: const {
         'position': 'relative',
         'width': 'min(30rem, 100%)',
-        'max-height': '80vh',
+        'max-height': '80dvh',
         'overflow-y': 'auto',
       },
     ),
@@ -431,7 +439,11 @@ class WhyItExists extends StatelessComponent {
     css('.measured-modal-what').styles(
       color: Brand.body,
       fontSize: 0.95.rem,
-      margin: Margin.only(bottom: 0.4.rem),
+      // Both sides, not just the bottom. Nothing on this page resets `p`, so
+      // the UA's `margin-block-start: 1em` applied -- and inside a flex column
+      // margins do not collapse, so the paragraph sat further from the title
+      // than from the row under it, which is backwards.
+      margin: Margin.only(top: 0.px, bottom: 0.4.rem),
       raw: const {'line-height': '1.55'},
     ),
     css('.measured-card-how').styles(color: Brand.body, fontSize: 0.9.rem),

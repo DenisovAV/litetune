@@ -89,11 +89,12 @@ void main() {
     }
   });
 
-  test('every card says what its model is and what it is for', () {
-    // The line a reader needs before any of the rest means anything. A record
-    // field cannot be omitted in Dart, but it can be left empty, and an empty
-    // one renders as a blank row rather than as an absence anyone would
-    // notice.
+  test('every panel says what its model is and what it is for', () {
+    // What a reader opens a card for. It is not on the card face -- that
+    // carries the model and how it was scored -- so an empty one renders as a
+    // blank paragraph above the checkpoint row rather than as an absence
+    // anyone would notice. A record field cannot be omitted in Dart; it can be
+    // left empty.
     for (final model in WhyItExists.measured) {
       expect(
         model.what.trim(),
