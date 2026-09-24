@@ -64,9 +64,10 @@ typedef MeasuredRun = ({
 /// is scoped to the one size that was run, and Qwen2.5's for the same reason,
 /// where the rule is scoped to the one size *and* variant.
 ///
-/// Each card opens a panel. It names the checkpoint the run actually used --
-/// the Hub id and, where `MEASUREMENTS.md` pins one, the revision -- and links
-/// to the model on the Hub and to the section that measured it. It
+/// Each card opens a panel. It says what the model is and what it is for,
+/// names the checkpoint the run actually used -- the Hub id and, where
+/// `MEASUREMENTS.md` pins one, the revision -- and links to the model on the
+/// Hub and to the section that measured it. It
 /// carries no score either, for the reason the face of the card carries none:
 /// a panel one click deep is still the shortest place there is to quote a
 /// verdict, and a reader who wants the number is one link from the table with
@@ -261,7 +262,8 @@ class WhyItExists extends StatelessComponent {
       // a screen reader is told a dialog opened while the cursor stays outside
       // it.
       'tabindex': '-1',
-      'aria-label': '${model.name}: the checkpoint this run used',
+      'aria-label':
+          '${model.name}: what it is, and the checkpoint this run used',
     },
     [
       a(
@@ -396,11 +398,23 @@ class WhyItExists extends StatelessComponent {
         'overflow-y': 'auto',
       },
     ),
+    // Sticky, because the box scrolls and the head carries the only explicit
+    // way out. A one-line description fitted without scrolling; a paragraph
+    // does not, and on a short viewport the visitor would have scrolled the
+    // close control off the top of the thing they were trying to close. The
+    // background is the box's own, so the text passes under it rather than
+    // through it.
     css('.measured-modal-head').styles(
       display: Display.flex,
       alignItems: AlignItems.center,
       gap: Gap.all(1.rem),
-      raw: const {'justify-content': 'space-between'},
+      backgroundColor: Brand.surface,
+      padding: Padding.only(bottom: 0.4.rem),
+      raw: const {
+        'justify-content': 'space-between',
+        'position': 'sticky',
+        'top': '0',
+      },
     ),
     css(
       '.measured-modal-title',
