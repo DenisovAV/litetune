@@ -214,6 +214,90 @@ def test_the_runner_call_pins_the_prompt_construction_mode(tmp_path):
     assert record["template_flag"] == "apply_prompt_template=False"
 
 
+class _ScriptedConversation:
+    """A conversation that yields the chunks it was given, and nothing else."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def send_message_async(self, prompt):
+        return iter(self._chunks)
+
+
+# What `litert-lm run` prints for each of these streams, on a pipe, after
+# `strip_runtime_noise` and the `.strip()` the scorer sees. Written out rather
+# than produced, because the CLI is not installed in the environment this suite
+# runs in -- so the pin is on `litert_lm_cli/commands/run.py` at the version
+# `envs.RUNTIME` pins, read at lines 50-53 (`close_channel` writes
+# `" [/name]"` and a newline) and 104-125 (it is called before every text item,
+# on a switch between channels, and at end of stream).
+#
+# The composition in the driver script is the one part of it that is not a
+# direct call into litert-lm, so it is the one part that can be wrong by
+# itself -- and it was: the first version opened a channel and never closed it.
+# `metrics.REASONING_BLOCKS` keys on the closing marker, and `_split_reasoning`
+# cuts at the *last* one, so without it the reasoning stays in the answer, the
+# row is scored against thought-plus-answer, and the generation is counted as
+# `unclosed` instead of `closed`. Nothing fails; the number moves.
+CHANNEL_CASES = [
+    (
+        "text only",
+        [{"content": [{"type": "text", "text": "hello"}]}],
+        "hello",
+    ),
+    (
+        "a channel and nothing else",
+        [{"channels": {"thought": "abc"}}],
+        "[thought] abc [/thought]",
+    ),
+    (
+        "a channel, then the answer",
+        [
+            {"channels": {"thought": "abc"}},
+            {"content": [{"type": "text", "text": "answer"}]},
+        ],
+        "[thought] abc [/thought]\nanswer",
+    ),
+    (
+        "the same channel reopened after the answer",
+        [
+            {"channels": {"thought": "a"}},
+            {"content": [{"type": "text", "text": "X"}]},
+            {"channels": {"thought": "b"}},
+        ],
+        "[thought] a [/thought]\nX[thought] b [/thought]",
+    ),
+    (
+        "two channels in turn",
+        [{"channels": {"thought": "a"}}, {"channels": {"plan": "b"}}],
+        "[thought] a [/thought]\n[plan] b [/plan]",
+    ),
+    (
+        "one channel split across chunks",
+        [{"channels": {"thought": "ab"}}, {"channels": {"thought": "cd"}}],
+        "[thought] abcd [/thought]",
+    ),
+    (
+        "a channel that carried nothing",
+        [{"channels": {"thought": ""}}],
+        "[thought]  [/thought]",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "chunks", "expected"),
+    CHANNEL_CASES,
+    ids=[case[0].replace(" ", "-") for case in CHANNEL_CASES],
+)
+def test_the_driver_composes_what_the_cli_printed(name, chunks, expected):
+    from litetune.evaluate import _litertlm_script
+
+    compose = _litertlm_script()["text_from_conversation"]
+
+    assert compose(_ScriptedConversation(chunks), "p").strip() == expected
+
+
 def test_one_process_per_split(monkeypatch, tmp_path):
     """The point of the transport: the whole split in one process.
 

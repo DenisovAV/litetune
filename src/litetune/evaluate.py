@@ -23,6 +23,7 @@ and `could not check` for the second.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -687,12 +688,16 @@ import json
 import sys
 from pathlib import Path
 
-import litert_lm
-from litert_lm.interfaces import CPU, GPU
-
 
 def backend_for(name, decode_steps_per_sync=None):
-    """The engine's backend, from the same word the CLI's --backend takes."""
+    """The engine's backend, from the same word the CLI's --backend takes.
+
+    litert-lm is imported here and in `main` rather than at the top, so the
+    parent can exec this script and test the text composition below without
+    the runtime installed -- the same reason `toolpath.py` does it.
+    """
+    from litert_lm.interfaces import CPU, GPU
+
     if name == "gpu":
         return GPU() if decode_steps_per_sync is None else GPU(decode_steps_per_sync)
     if name == "cpu":
@@ -716,29 +721,49 @@ def text_from_session(session, prompt):
 
 
 def text_from_conversation(conversation, prompt):
-    """The runtime-rendered path, composed the way the CLI composes stdout.
+    """The runtime-rendered path, composed exactly the way the CLI composes stdout.
 
-    Channel content is included, behind the `[name] ` prefix the CLI prints
-    before it, because that is what reached stdout and so what every number in
-    MEASUREMENTS.md was scored on. Dropping it here would be a tidier answer
-    and a different one.
+    Channel content reaches the score. `litert-lm run` prints it between
+    `[name] ` and ` [/name]` ahead of the answer, the old stdout scraper kept
+    both markers, and `metrics.REASONING_BLOCKS` keys on that exact pair to
+    take reasoning off before scoring. A composition that opens a channel and
+    never closes it does not merely look different: `_split_reasoning` cuts at
+    the *last closing* marker, so with none the reasoning stays in the answer,
+    the row scores against thought-plus-answer, and the generation moves from
+    `generations_with_reasoning` to `generations_with_unclosed_reasoning`
+    without anything failing.
+
+    So this mirrors `litert_lm_cli/commands/run.py` as a state machine rather
+    than approximating it: `close_channel` (run.py:50-53) writes
+    `" [/name]"` followed by a newline, and is called before every text item,
+    on a switch between channels, and at the end of the stream.
     """
     parts = []
-    active = None
+    active = [None]
+
+    def close():
+        if active[0] is not None:
+            parts.append(" [/%s]\n" % active[0])
+            active[0] = None
+
     for chunk in conversation.send_message_async(prompt):
         for item in chunk.get("content", []) or []:
             if item.get("type") == "text":
-                active = None
+                close()
                 parts.append(item.get("text", ""))
         for name, content in (chunk.get("channels", {}) or {}).items():
-            if active != name:
+            if active[0] != name:
+                close()
                 parts.append("[%s] " % name)
-                active = name
+                active[0] = name
             parts.append(content)
+    close()
     return "".join(parts)
 
 
 def main(spec_path):
+    import litert_lm
+
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     runtime_rendered = bool(spec["runtime_rendered"])
     backend = backend_for(spec["backend"], spec.get("gpu_decode_steps_per_sync"))
@@ -774,6 +799,21 @@ def main(spec_path):
 if __name__ == "__main__":
     main(sys.argv[1])
 '''
+
+
+@functools.cache
+def _litertlm_script() -> dict[str, Any]:
+    """The driver script's own definitions, so the parent can test them.
+
+    Read from the one source rather than copied. The composition in
+    `text_from_conversation` is the only part of that script not a direct call
+    into litert-lm, so it is the only part that can be wrong on its own -- and
+    a copy here would be a second thing to keep right. Same device as
+    `toolpath._script`.
+    """
+    namespace: dict[str, Any] = {"__name__": "litetune_litertlm_script"}
+    exec(compile(_LITERTLM_GENERATE_SCRIPT, "litetune litertlm script", "exec"), namespace)  # noqa: S102
+    return namespace
 
 
 # Runs inside envs.TRAIN, which is the only environment with torch and
