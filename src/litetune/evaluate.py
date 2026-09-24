@@ -43,9 +43,6 @@ from litetune.prompt_mode import RENDERING_SOURCE, PromptMode
 
 logger = logging.getLogger(__name__)
 
-# How often a long generation run reports progress. Emitted as events; nothing
-# here prints.
-PROGRESS_EVERY = 25
 
 DEFAULT_MAX_TOKENS = 256
 
@@ -243,12 +240,6 @@ class Generation:
 # harness failure; a surrogate in this range cannot be anything but a byte
 # that did not decode.
 UNDECODED_BYTE = re.compile("[\udc80-\udcff]")
-
-_HOST_FAILURE_RE = re.compile(
-    r"(libvulkan|error while loading shared libraries|cannot open shared object file"
-    r"|ModuleNotFoundError|ImportError|command not found|No such file or directory)",
-    re.IGNORECASE,
-)
 
 # glog-style banner lines and the runtime's own timing block, neither of which
 # is model output.
@@ -526,7 +517,6 @@ class LiteRtLmBackend:
     timeout_s: int = 300
     env: envs.StageEnv = envs.RUNTIME
     auto_provision: bool = True
-    extra_args: tuple[str, ...] = ()
     # The mode this measurement is taken in, when the caller knows it. `None`
     # means nobody said, and the fallback below is what this backend has always
     # done rather than a considered answer for the model in hand -- so it is
@@ -592,10 +582,11 @@ class LiteRtLmBackend:
             "template_flag": None if self.uses_template else "apply_prompt_template=False",
             # Nothing here is passed to the CLI, so `decode` is the *declared*
             # configuration: greedy, to the runtime's own token limit. It is
-            # recorded because comparability depends on it, and any deviation
-            # must be passed through `extra_args` where it is visible in
-            # `argv_template` above -- which is also how the CLI's own
-            # --top-k/--top-p/--temperature/--seed would reach it today.
+            # recorded because comparability depends on it. There is no way to
+            # pass a deviation today -- the driver script builds no sampler and
+            # `create_*(sampler_config=None)` takes the engine's own -- which is
+            # what `decode_enforced = False` says, and why `verify` reports the
+            # asymmetry as a limitation rather than hiding it.
             "decode_declared": self.decode.as_dict(),
             "decode_passed_to_cli": self.decode_enforced,
         }

@@ -388,7 +388,8 @@ BFLOAT16_CPU_HINT = (
 # and `Check.failed` on that exit is a verdict about the recipe drawn from a
 # fact about the machine -- the reading `litetune.exits` exists to forbid,
 # reachable here only since the run stopped being pinned to the CPU. It is
-# routed to `unchecked` the same way `evaluate.py` routes `_HOST_FAILURE_RE`.
+# routed to `unchecked`, the way `evaluate.py` keeps a host failure out of the
+# model's record.
 #
 # An enumeration, deliberately, and not the `CUDA error:` prefix. That prefix
 # would be shorter and is wrong: `CUDA error: device-side assert triggered` is
