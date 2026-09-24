@@ -1,6 +1,6 @@
 """Measuring a tool-calling model the way an application calls it.
 
-`evaluate.LiteRtLmBackend` runs `litert-lm run` and reads text off stdout. That
+`evaluate.LiteRtLmBackend` asks litert-lm for text and scores the text. That
 is the text path, and a FunctionGemma model does not answer on it the way it
 answers an application: the runtime renders the declarations into the prompt,
 parses the model's output itself, and hands back a structured call. A number

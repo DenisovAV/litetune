@@ -139,8 +139,8 @@ def test_the_runtime_only_gets_no_template_for_a_prerendered_prompt(tmp_path):
     templated = LiteRtLmBackend(
         model=model, auto_provision=False, declared_prompt_mode=PromptMode.RUNTIME_RENDERED
     )
-    assert "--no-template" in prerendered.argv("hi")
-    assert "--no-template" not in templated.argv("hi")
+    assert "apply_prompt_template=False" in prerendered.runner_call
+    assert templated.runner_call == "Engine.create_conversation()"
     assert templated.describe()["template_flag"] is None
     assert templated.prompt_mode is PromptMode.RUNTIME_RENDERED
 
@@ -187,7 +187,7 @@ def test_both_sides_are_built_from_one_decision(tmp_path):
     )
     assert pair.candidate.prompt_mode is PromptMode.RUNTIME_RENDERED
     assert pair.reference.prompt_mode is PromptMode.RUNTIME_RENDERED
-    assert "--no-template" not in pair.candidate.argv("hi")
+    assert pair.candidate.runner_call == "Engine.create_conversation()"
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +279,16 @@ def test_an_inferred_mode_travels_with_the_measurement(tmp_path, write_split):
     decision = result.manifest["harness"]["prompt_mode_decision"]
     assert decision["source"] == "inferred"
     # These prompts are bare text, so the runtime has to render its own
-    # template: the flag was never general.
+    # template: the pre-rendered mode was never the general one.
     assert decision["prompt_mode"] == "runtime_rendered"
     note = next(text for text in result.manifest["limitations"] if "was not declared" in text)
-    assert "--no-template" in note
-    assert "create_session()" in note
+    # It used to say `--no-template`, quoting the help of a command line no
+    # run has built since the transport moved to litert-lm's Python API. A
+    # limitation ships in the manifest, so a reader was being told to look for
+    # a flag nothing passes.
+    assert "--no-template" not in note
+    assert "create_session(apply_prompt_template=False)" in note
+    assert "create_conversation()" in note
 
 
 def test_a_supplied_backend_that_ignores_the_resolved_mode_is_recorded(tmp_path, write_split):

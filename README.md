@@ -769,8 +769,6 @@ withdrawn after re-measurement.
   device, so the reference is held to an explicit token limit while the device
   runs to the runtime's own. The manifest says so and counts unterminated
   generations.
-- **Evaluation is slower than it needs to be** — one subprocess per prompt. A
-  persistent `litert-lm serve` client is worth roughly thirtyfold.
 - **`convert` does not compile for an NPU.** The NPU bundle described under
   *Known to be broken* was built by hand: the four functions in litert-torch's
   `generative/export_hf/experimental/npu_export/stages.py` — `npu_export`,

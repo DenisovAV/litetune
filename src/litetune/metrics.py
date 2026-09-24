@@ -1000,8 +1000,10 @@ TERMINATORS = (
 
 
 # The markers reasoning is enclosed in, in the two shapes observed on 2026-09-14:
-# `litert-lm run` prints the conversation's thought channel between `[thought]`
-# and `[/thought]` ahead of the answer, and the transformers reference, decoded
+# a conversation's thought channel arrives between `[thought]` and `[/thought]`
+# ahead of the answer -- `litert-lm run` printed it that way, and the driver
+# script in `evaluate.py` composes it the same way on purpose so that this
+# vocabulary keeps matching -- and the transformers reference, decoded
 # with special tokens kept, leaves Qwen3's `<think>`...`</think>` inline.
 # `verify` removes reasoning from both sides before scoring, so answers are
 # compared with answers, and reports how many generations carried it.

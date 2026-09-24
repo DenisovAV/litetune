@@ -8,8 +8,8 @@ weeks, at which point the difference between two points stops measuring what it
 claims to. So there is one evaluator here, parameterized by (model reference,
 backend, split), and the parameters it was given travel with the result.
 
-`PromptMode` travels with every measurement for a specific reason: the
-reference runtime's `--no-template` forces the tool list to null, so a model
+`PromptMode` travels with every measurement for a specific reason: asking the
+runtime for a pre-rendered prompt forces its tool list to null, so a model
 whose declarations are rendered by the runtime and one whose prompt was built by
 the application cannot be compared at all -- the difference measures the mode,
 not the model. `harness_mismatch` exists to refuse that comparison rather than
@@ -17,12 +17,19 @@ report it.
 
 Nothing in this module raises on a failed generation. A non-zero exit is an
 observation; a process that never started is a *different* observation, and
-`Generation` keeps them apart so that liveness can report `failed` for the first
-and `could not check` for the second.
+`Generation` keeps them apart rather than scoring either as a wrong answer.
+
+Where each lands: a driver script that wrote its results and then exited
+non-zero keeps its text, and the exit travels beside it in `batch_returncode`;
+a prompt with no result of its own carries a `harness_error`, which `ran` reads
+as "not performed". No backend here builds a generation that ran and is not ok,
+so the `failed` count in `MeasurementPoint.as_dict` is currently always zero --
+the shape of a verdict, not one being reported.
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -42,9 +49,6 @@ from litetune.prompt_mode import RENDERING_SOURCE, PromptMode
 
 logger = logging.getLogger(__name__)
 
-# How often a long generation run reports progress. Emitted as events; nothing
-# here prints.
-PROGRESS_EVERY = 25
 
 DEFAULT_MAX_TOKENS = 256
 
@@ -243,31 +247,284 @@ class Generation:
 # that did not decode.
 UNDECODED_BYTE = re.compile("[\udc80-\udcff]")
 
-_HOST_FAILURE_RE = re.compile(
-    r"(libvulkan|error while loading shared libraries|cannot open shared object file"
-    r"|ModuleNotFoundError|ImportError|command not found|No such file or directory)",
-    re.IGNORECASE,
-)
+# `batch_returncode` for a run that was killed rather than one that exited.
+# Not a signal number: `TimeoutExpired` carries no status, the stage kills with
+# SIGTERM and only then SIGKILL (`envs.py`), and Windows has no SIGKILL
+# (`envs.py` reads it with `getattr` for that reason; SIGTERM it has) -- so any
+# number here would assert something nobody observed. What it has to be is
+# non-zero and not `None`, which is all `MeasurementPoint.batch_failures`
+# reads; the reason travels in `stderr` and in the limitation `verify` emits.
+BATCH_KILLED = -1
 
-# glog-style banner lines and the runtime's own timing block, neither of which
-# is model output.
-_LOG_LINE_RE = re.compile(r"^[IWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d+\s")
-_STATS_LINE_RE = re.compile(r"^\s*(Prefill|Decode)\s+(speed|latency)\b", re.IGNORECASE)
+# Shared by the two driver-script backends below. Neither touched `self`, and
+# a second copy of this error handling is the duplication this file has been
+# bitten by before: the same fault has to be reported the same way whichever
+# environment the script ran in.
 
 
-def strip_runtime_noise(stdout: str) -> str:
-    """Drop the runtime's own chatter from captured stdout.
+def read_jsonl_results(results: Path) -> tuple[dict[int, str], dict[int, str]]:
+    """The texts a driver script wrote, and the rows that cannot be scored.
 
-    A heuristic, and deliberately a narrow one: if it removes too much, the
-    non-empty liveness check fails loudly rather than the score quietly
-    dropping.
+    Two channels, because "no result for this prompt" and "this prompt's
+    result is not the model's answer" are different facts and the second one
+    used to be reported as the first. A row carrying a byte that did not
+    decode is the case: the runtime wrote it, `json.dumps` escaped it as a
+    lone surrogate, and the file stayed valid UTF-8 all the way here -- so
+    nothing raises and the row would score as an ordinary wrong answer, with
+    every liveness check passing and the loss reported as a conversion cost.
+
+    The shapes it accepts are {"index": int, "text": str} and, for a prompt the
+    runtime refused, {"index": int, "error": str}. Everything else is a fault
+    against whichever prompt it names, or, where it names none, a warning and
+    a dropped line. The two maps it returns never both claim a prompt.
     """
-    kept = [
-        line
-        for line in stdout.splitlines()
-        if not _LOG_LINE_RE.match(line) and not _STATS_LINE_RE.match(line)
-    ]
-    return "\n".join(kept).strip()
+    if not results.exists():
+        return {}, {}
+    texts: dict[int, str] = {}
+    faults: dict[int, str] = {}
+
+    def fault(index: int, message: str) -> None:
+        # The two maps must not both claim a prompt: every caller checks
+        # `faults` first, so a text left behind here is invisible until
+        # someone reads `texts` alone -- and the duplicate branch below was
+        # the only path that remembered to drop it. A file can disagree with
+        # itself in more ways than that: a row with the text and a second row
+        # with an error for the same prompt reached here as a fault with the
+        # text still standing.
+        faults[index] = message
+        texts.pop(index, None)
+
+    try:
+        body = results.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # Not decodable at all: report it as one fault rather than letting
+        # it escape from a loop that exists to report per-line ones.
+        logger.warning("results file %s is not valid UTF-8: %s", results.name, exc)
+        return {}, {}
+    for lineno, line in enumerate(body.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            # Which line, and what it looked like: the eventual error is
+            # "no result for prompt N", which says nothing about why.
+            logger.warning(
+                "malformed result on line %d of %s (%s): %.120s",
+                lineno,
+                results.name,
+                exc,
+                line,
+            )
+            continue
+        try:
+            index = row["index"]
+        except KeyError as exc:
+            # Valid JSON, wrong shape. Same fault class as a malformed line
+            # and it must not escape the loop that reports them.
+            logger.warning(
+                "result on line %d of %s lacks a usable index/text (%s)",
+                lineno,
+                results.name,
+                exc,
+            )
+            continue
+        # `int(index)` was how this read the field, and `int` is a coercion
+        # rather than a check: `int(1.9)` is 1 and `int(True)` is 1, so a row
+        # carrying either took prompt 1's slot and was scored as its answer.
+        # What binds a row to a prompt is this integer and nothing else, so it
+        # has to be one already. `bool` is an `int` subclass and is excluded
+        # for the same reason it was reachable.
+        if not isinstance(index, int) or isinstance(index, bool):
+            logger.warning(
+                "result on line %d of %s carries a %s where its index should be",
+                lineno,
+                results.name,
+                type(index).__name__,
+            )
+            continue
+        if isinstance(row.get("error"), str):
+            # The driver reached this prompt, the runtime refused it, and the
+            # split carried on. Not "no result": the run learned something
+            # about this prompt and what it learned was a failure.
+            logger.error("prompt %d was refused by the runtime: %s", index, row["error"])
+            fault(
+                index,
+                f"the runtime raised on this prompt and the split continued without it: "
+                f"{row['error'][:200]}",
+            )
+            continue
+        text = row.get("text")
+        if not isinstance(text, str):
+            # `str(text)` accepted all of these, so the guard above only ever
+            # caught a bad index: a JSON `null` came back as the four
+            # characters "None" and scored as the model's answer, with every
+            # liveness check green. Reported against its own prompt rather
+            # than dropped, because the row did arrive.
+            logger.error(
+                "prompt %d came back with a %s where its text should be",
+                index,
+                type(text).__name__,
+            )
+            fault(
+                index,
+                f"the runtime's output for this prompt was a {type(text).__name__}, not a "
+                f"string, so what it generated is not recoverable from this run",
+            )
+            continue
+        undecoded = UNDECODED_BYTE.findall(text)
+        if undecoded:
+            # The runtime wrote a byte that is not UTF-8. `json.dumps` escaped
+            # it as a lone surrogate, so the file is valid UTF-8 and nothing
+            # raised on the way here -- scored, the row is wrong, every
+            # liveness check passes, and the loss is reported as a conversion
+            # cost. What the model generated is not in this string.
+            logger.error("prompt %d came back with bytes that are not UTF-8", index)
+            fault(
+                index,
+                f"the runtime's output for this prompt was not UTF-8: {len(undecoded)} "
+                f"byte(s) did not decode, so what it generated is not recoverable from "
+                f"this run",
+            )
+            continue
+        if index in texts or index in faults:
+            # Silently the last row won. Both are suspect: nothing here can
+            # say which of them the runtime produced for that prompt.
+            logger.error("two rows in %s claim index %d", results.name, index)
+            fault(
+                index,
+                f"two rows in the results file claim prompt {index}, so which of them the "
+                f"runtime produced for it is not recoverable from this run",
+            )
+            continue
+        texts[index] = text
+    return texts, faults
+
+
+def report_stray(
+    prompts: Sequence[str], texts: dict[int, str], faults: dict[int, str]
+) -> list[int]:
+    """Rows whose index no prompt claims, said out loud.
+
+    Dropped without a word before -- including a fault the reader had already
+    logged at ERROR, which then vanished for being unclaimable. What binds row
+    N to prompt N is an integer in a file and nothing else, so a row nobody
+    claims is the visible end of that.
+    """
+    stray = sorted((texts.keys() | faults.keys()) - set(range(len(prompts))))
+    if stray:
+        logger.error("%d result row(s) carry an index no prompt has: %s", len(stray), stray[:10])
+    return stray
+
+
+def salvage_after_kill(
+    prompts: Sequence[str],
+    texts: dict[int, str],
+    faults: dict[int, str],
+    stderr: str,
+    reason: str,
+) -> list[Generation]:
+    """What a killed split still knows, with the kill travelling beside it.
+
+    A salvaged row is a real answer and is scored -- and it has to say the run
+    did not end. With `returncode=0` and nothing else, a split killed after
+    writing every row was byte-identical to a clean one, and liveness reported
+    "n/n generations exited zero" about a group that was SIGKILLed. That is the
+    erasure `batch_returncode` exists to prevent.
+
+    Shared rather than written twice: both driver scripts flush after every
+    row, so both have rows to save, and the same fault has to be reported the
+    same way whichever environment the script ran in.
+    """
+    report_stray(prompts, texts, faults)
+    out: list[Generation] = []
+    for i, prompt in enumerate(prompts):
+        if i in faults:
+            out.append(Generation(i, prompt, stderr=stderr, harness_error=faults[i]))
+        elif i in texts:
+            out.append(
+                Generation(
+                    i,
+                    prompt,
+                    text=texts[i].strip(),
+                    returncode=0,
+                    stderr=stderr,
+                    batch_returncode=BATCH_KILLED,
+                )
+            )
+        else:
+            out.append(Generation(i, prompt, stderr=stderr, harness_error=reason))
+    return out
+
+
+def assemble_generations(
+    prompts: Sequence[str],
+    texts: dict[int, str],
+    proc: subprocess.CompletedProcess,
+    faults: dict[int, str] | None = None,
+) -> list[Generation]:
+    stderr = (proc.stderr or "")[-2000:]
+    reading = read_returncode(proc.returncode)
+    # A killed script is not a script that failed: `-9` is the out-of-memory
+    # killer, and generation for a whole split is exactly the kind of job
+    # that meets a memory ceiling. See `litetune.exits`.
+    died = (
+        reading.describe("the model")
+        if not reading.conclusive
+        else f"generation script exited {proc.returncode}"
+    )
+    # A script that wrote every result and *then* exited non-zero used to be
+    # recorded as a clean run: each result carried `returncode=0, stderr=""`
+    # and the process failure was erased. The generation did happen, so it
+    # keeps its text and stays scoreable -- but the evidence travels with it.
+    failed_after_writing = texts and proc.returncode != 0
+    if failed_after_writing:
+        logger.warning(
+            "generation script wrote %d results and exited %s", len(texts), proc.returncode
+        )
+    faults = faults or {}
+    report_stray(prompts, texts, faults)
+    out: list[Generation] = []
+    for i, prompt in enumerate(prompts):
+        if i in faults:
+            # Said in its own words rather than as the absence below: the row
+            # arrived, and what is wrong with it is not that it is missing.
+            out.append(
+                Generation(
+                    i, prompt, returncode=proc.returncode, stderr=stderr, harness_error=faults[i]
+                )
+            )
+            continue
+        if i in texts:
+            out.append(
+                Generation(
+                    i,
+                    prompt,
+                    text=texts[i].strip(),
+                    returncode=0,
+                    stderr=stderr if failed_after_writing else "",
+                    batch_returncode=proc.returncode if failed_after_writing else None,
+                )
+            )
+            continue
+        # A missing result cannot be distinguished from here between "the
+        # model failed on this prompt" and "the environment died before
+        # reaching it", so it is recorded as not performed. That is the
+        # conservative direction: `could not check` rather than a verdict
+        # the run did not earn.
+        out.append(
+            Generation(
+                i,
+                prompt,
+                returncode=proc.returncode,
+                stderr=stderr,
+                harness_error=(
+                    f"{died} without a result for this prompt: "
+                    f"{stderr.strip()[-300:] or 'no stderr'}"
+                ),
+            )
+        )
+    return out
 
 
 class GenerationBackend(Protocol):
@@ -327,14 +584,62 @@ class GenerationBackend(Protocol):
 
 @dataclass
 class LiteRtLmBackend:
-    """Generation through `litert-lm run`, one process per prompt.
+    """Generation through litert-lm's Python API, one process per split.
 
-    One process per prompt is what the measurement runs did, and roughly 90% of
-    their wall time was process startup and model reload rather than decoding.
-    The fix is `litert-lm serve` plus a persistent client -- worth about a
-    thirtyfold reduction in evaluation time -- and it is deliberately not
-    implemented yet, because the serve path changes the prompt-construction
-    surface and that has to be measured before it is trusted.
+    It used to be `litert-lm run` once per prompt: a 600-row verify started
+    the process and reloaded the bundle six hundred times. Beside the bundle
+    litert-lm writes an XNNPACK cache, and MEASUREMENTS.md records both for
+    `weight_only_wi8_afp32` -- 2,385,932,008 bytes of cache against that
+    bundle's 771,404,928 -- and a cache of 601,946,856 for `dynamic_wi8_afp32`,
+    whose bundle size it does not give. What a reload reads, and what share of
+    a run's wall time six hundred of them were, nothing here measured: the file
+    closes that paragraph with "Nothing measured whether the cache is the
+    reason."
+
+    `litert-lm serve` plus a persistent client was the fix this docstring used
+    to name, and it was rejected for the right reason: the serve path changes
+    the prompt-construction surface, and that would have to be measured before
+    it could be trusted. The API does not. The CLI is a thin wrapper over the
+    same `Engine` and the same `create_session` / `create_conversation`, so
+    this is that code reached directly rather than a second way of asking --
+    which is why `runner_call` names the call instead of a flag.
+
+    Measured rather than argued, because a transport that changed the text
+    would make every number taken before it incomparable with every number
+    after. On Linux CPU with `litert-lm==0.16.1`, both prompt modes, against
+    the CLI path's own stdout cleaning: 36 of 36 comparisons byte-identical --
+    9 prompts in both prompt modes on `Qwen3-0.6B.litertlm` from
+    `litert-community/Qwen3-0.6B`, which holds four bundles, and the same 9 in
+    both on `mobile-actions_q8_ekv1024.litertlm` from
+    `litert-community/functiongemma-mobile-actions_q8_ekv1024.litertlm`, a
+    different family, template and tokenizer. The script compared was this one:
+    the run extracted it from this file rather than restating it, and the
+    extraction hashes equal.
+
+    An earlier revision of the script was run beside it on the same prompts and
+    agreed on all 36 as well, which retires the two rounds taken against that
+    revision and answers the one thing they could not: that revision never
+    closed a channel, so had any chunk carried one the two would have differed
+    by a ` [/name]` and a newline. None did. Nothing in this run composed a
+    channel.
+
+    Which is what those 36 do not cover, and it is most of the risk. Eighteen
+    are session-path comparisons, and `text_from_session` reads `chunk.texts`
+    and nothing else, so there is no channel branch for them to take; the other
+    eighteen took it and found nothing to compose, on two families whose
+    templates differ.
+    Channel composition -- the one part of the driver script that is not a
+    direct call -- is held by the synthetic streams in
+    `test_the_driver_composes_what_the_cli_printed` instead, because a sampled
+    model can only show a branch was not taken. Nothing here covers the GPU
+    backend.
+
+    Two things the change costs, both named where they happen: `timeout_s`
+    still means the budget one prompt gets and the split gets the sum, so a
+    hung prompt now takes the budget the rest would have had; and progress is
+    one note at the start rather than a count every twenty-five prompts,
+    because the parent is blocked on one child instead of watching six hundred
+    finish.
 
     Measurement here runs on CPU while users run on a phone. Measured
     2026-09-05 on one Snapdragon Galaxy S24, one recipe: the device's CPU
@@ -353,7 +658,6 @@ class LiteRtLmBackend:
     timeout_s: int = 300
     env: envs.StageEnv = envs.RUNTIME
     auto_provision: bool = True
-    extra_args: tuple[str, ...] = ()
     # The mode this measurement is taken in, when the caller knows it. `None`
     # means nobody said, and the fallback below is what this backend has always
     # done rather than a considered answer for the model in hand -- so it is
@@ -362,13 +666,14 @@ class LiteRtLmBackend:
     declared_prompt_mode: PromptMode | None = None
 
     name = "litert-lm"
-    # litetune passes no decoding flags to this CLI, so `decode` is a
+    # litetune passes no decoding parameters to the runtime, so `decode` is a
     # declaration here and not an instruction. Stated as a value rather than
     # left to a default, because the asymmetry is what `verify` reports as a
-    # limitation -- and it is litetune's gap, not the toolchain's: 0.16.1 does
-    # accept --top-k, --top-p, --temperature and --seed.
+    # limitation -- and it is litetune's gap, not the toolchain's:
+    # `create_session` and `create_conversation` both take a `sampler_config`
+    # and the driver script passes `None`, so the engine uses its own.
     decode_enforced = False
-    # Text off stdout; a call is whatever `parse_call` makes of it.
+    # Text, not structured calls; a call is whatever `parse_call` makes of it.
     scores_structurally = False
 
     @property
@@ -383,22 +688,20 @@ class LiteRtLmBackend:
     def model_ref(self) -> str:
         return str(self.model)
 
-    def argv(self, prompt: str) -> list[str]:
-        # `--no-template` routes the CLI to create_session() instead of
-        # create_conversation(), bypassing the chat template, the `<|turn>model`
-        # anchor, tool handling and channel extraction. It belongs on a prompt
-        # that already carries its own control tokens and nowhere else, which is
-        # why it is tied to the mode rather than always passed.
-        template_args = [] if self.uses_template else ["--no-template"]
-        return [
-            "litert-lm",
-            "run",
-            str(self.model),
-            f"--backend={self.backend_flag}",
-            *template_args,
-            f"--prompt={prompt}",
-            *self.extra_args,
-        ]
+    @property
+    def runner_call(self) -> str:
+        """Which of litert-lm's two entry points this mode uses.
+
+        The distinction `--no-template` used to carry on a command line, said
+        as the call it selects. `create_session(apply_prompt_template=False)`
+        bypasses the chat template, the `<|turn>model` anchor, tool handling
+        and channel extraction; it belongs on a prompt that already carries
+        its own control tokens and nowhere else, which is why it is tied to
+        the mode rather than chosen.
+        """
+        if self.uses_template:
+            return "Engine.create_conversation()"
+        return "Engine.create_session(apply_prompt_template=False)"
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -407,21 +710,27 @@ class LiteRtLmBackend:
             # The flag as passed, not a device torch chose: see
             # `HuggingFaceBackend.describe`, where the same key carries the
             # other vocabulary.
-            "backend_vocabulary": "litert-lm --backend flag",
+            "backend_vocabulary": "litert-lm Python API Backend",
             "requirements": list(self.env.requirements),
             "system_requirements": list(self.env.system_requirements),
-            "argv_template": self.argv("<prompt>"),
+            # What the script calls, in place of the command line this
+            # backend used to build. A manifest that recorded `argv` for a run
+            # that never spawned one would be describing a transport by name
+            # only.
+            "transport": "litert_lm python api, one process per split",
+            "runner_call": self.runner_call,
             "prompt_mode": self.prompt_mode.value,
             "prompt_mode_declared": self.declared_prompt_mode is not None,
-            "template_flag": None if self.uses_template else "--no-template",
-            # Nothing here is passed to the CLI, so `decode` is the *declared*
+            "template_flag": None if self.uses_template else "apply_prompt_template=False",
+            # Nothing here is passed to the runtime, so `decode` is the *declared*
             # configuration: greedy, to the runtime's own token limit. It is
-            # recorded because comparability depends on it, and any deviation
-            # must be passed through `extra_args` where it is visible in
-            # `argv_template` above -- which is also how the CLI's own
-            # --top-k/--top-p/--temperature/--seed would reach it today.
+            # recorded because comparability depends on it. There is no way to
+            # pass a deviation today -- the driver script builds no sampler and
+            # `create_*(sampler_config=None)` takes the engine's own -- which is
+            # what `decode_enforced = False` says, and why `verify` reports the
+            # asymmetry as a limitation rather than hiding it.
             "decode_declared": self.decode.as_dict(),
-            "decode_passed_to_cli": self.decode_enforced,
+            "decode_passed_to_runtime": self.decode_enforced,
         }
 
     def generate(
@@ -430,17 +739,77 @@ class LiteRtLmBackend:
         blocked = self._ensure_env(events)
         if blocked is not None:
             return [Generation(i, p, harness_error=blocked) for i, p in enumerate(prompts)]
-        out: list[Generation] = []
-        for i, prompt in enumerate(prompts):
-            out.append(self._one(i, prompt))
-            if events and (i + 1) % PROGRESS_EVERY == 0:
+        if not prompts:
+            return []
+
+        with tempfile.TemporaryDirectory(prefix="litetune-litertlm-") as tmp:
+            work = Path(tmp)
+            script = work / "generate.py"
+            script.write_text(_LITERTLM_GENERATE_SCRIPT, encoding="utf-8")
+            results = work / "generations.jsonl"
+            spec = work / "spec.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "model": str(self.model),
+                        "prompts": list(prompts),
+                        "runtime_rendered": self.uses_template,
+                        "backend": self.backend_flag,
+                        "out": str(results),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            if events:
                 events.note(
-                    f"{self.name}: {i + 1}/{len(prompts)} prompts",
+                    f"{self.name}: generating {len(prompts)} completions",
                     backend=self.name,
-                    done=i + 1,
                     total=len(prompts),
                 )
-        return out
+            try:
+                # `timeout_s` still means what it always did -- the budget one
+                # prompt gets -- so the whole split gets the sum of them, and a
+                # run that used to be allowed 300 s per prompt is allowed no
+                # less now. What is gone is the *granularity*: one prompt that
+                # hangs takes the budget the rest would have had, where before
+                # it was cut at 300 s and the run carried on. That is a real
+                # loss and not a theoretical one: MEASUREMENTS.md records a
+                # 600-row verify where one prompt exceeded the 300 s limit --
+                # though `verify` refused that run rather than scoring the 599
+                # that finished, so the granularity bought nothing there.
+                proc = self.env.run(
+                    ["python", str(script), str(spec)],
+                    timeout=self.timeout_s * len(prompts),
+                )
+            except subprocess.TimeoutExpired as expired:
+                budget = self.timeout_s * len(prompts)
+                logger.warning("litert-lm generation timed out after %ss", budget)
+                # Read what the script had already flushed, rather than
+                # discarding it. The docstring promises a run killed at prompt
+                # 400 keeps the first 399, and the first version of this made
+                # that true of a kill and false of a timeout -- it returned
+                # before reading the file, and the temp directory took the rows
+                # with it. Every row here is a complete generation: the script
+                # flushes after each one, and a half-written last line fails to
+                # parse and is dropped by the reader.
+                texts, faults = read_jsonl_results(results)
+                # `_run_guarded` kills the group and drains it precisely to put
+                # the child's last words on this exception; the first version
+                # of this discarded them, leaving the budget as the whole
+                # diagnostic.
+                killed = expired.stderr or ""
+                if isinstance(killed, bytes):
+                    killed = killed.decode("utf-8", "surrogateescape")
+                killed = killed[-2000:]
+                reason = f"no result after {budget}s (timeout)"
+                return salvage_after_kill(prompts, texts, faults, killed, reason)
+            except OSError as exc:
+                logger.exception("could not start the litert-lm generation script")
+                reason = f"{type(exc).__name__}: {exc}"
+                return [Generation(i, p, harness_error=reason) for i, p in enumerate(prompts)]
+
+            texts, faults = read_jsonl_results(results)
+        return assemble_generations(prompts, texts, proc, faults)
 
     def _ensure_env(self, events: EventStream | None) -> str | None:
         """Provision the runtime environment. Returns why it could not be, or None."""
@@ -453,73 +822,200 @@ class LiteRtLmBackend:
             return f"environment {self.env.name!r} unavailable: {exc}"
         return None
 
-    def _one(self, index: int, prompt: str) -> Generation:
-        argv = self.argv(prompt)
-        try:
-            proc = self.env.run(argv, timeout=self.timeout_s)
-        except subprocess.TimeoutExpired:
-            logger.warning("litert-lm timed out after %ss on prompt %d", self.timeout_s, index)
-            # A hang is indistinguishable from a stalled environment from out
-            # here, so it is recorded as not performed rather than as a verdict
-            # about the model.
-            return Generation(
-                index, prompt, harness_error=f"no result after {self.timeout_s}s (timeout)"
-            )
-        except OSError as exc:
-            logger.exception("could not start litert-lm for prompt %d", index)
-            return Generation(index, prompt, harness_error=f"{type(exc).__name__}: {exc}")
 
-        reading = read_returncode(proc.returncode)
-        if not reading.conclusive:
-            # Killed, not failed: the runtime never chose an exit status, so
-            # this prompt was not measured. See `litetune.exits` -- a -9 read as
-            # a failure is how a memory ceiling became a verdict about a model.
-            logger.error("litert-lm was killed on prompt %d: %s", index, reading.describe())
-            return Generation(
-                index,
-                prompt,
-                returncode=proc.returncode,
-                stderr=(proc.stderr or "")[-2000:],
-                harness_error=reading.describe("the model"),
-            )
+# Runs inside envs.RUNTIME, the only environment with litert-lm in it.
+#
+# One process for a whole split, where this module used to start one per
+# prompt: six hundred process starts and six hundred bundle reloads for a
+# 600-row verify. What that cost in wall time is not measured here; the class
+# docstring carries the sizes that are.
+#
+# What it must not be is a different measurement. The CLI is a thin wrapper
+# over the same three calls this makes -- `Engine`, then `create_session` or
+# `create_conversation`, then the stream -- so this is that code reached
+# directly rather than a second way of asking. Where the CLI's behaviour is
+# not obvious the script copies it deliberately and says so.
+_LITERTLM_GENERATE_SCRIPT = r'''
+"""Generation for one split through litert-lm's Python API.
 
-        if proc.returncode != 0 and _HOST_FAILURE_RE.search(proc.stderr or ""):
-            logger.error("litert-lm host failure on prompt %d: %s", index, proc.stderr[-400:])
-            return Generation(
-                index,
-                prompt,
-                returncode=proc.returncode,
-                stderr=proc.stderr[-2000:],
-                harness_error=f"generation host failed to start: {proc.stderr.strip()[-300:]}",
-            )
-        text = strip_runtime_noise(proc.stdout or "")
-        undecoded = UNDECODED_BYTE.findall(text)
-        if undecoded:
-            # The pipe is decoded UTF-8 with `errors="surrogateescape"`, so a
-            # byte the runtime wrote that is not UTF-8 survives as a surrogate
-            # rather than raising. Scoring that would be the failure this whole
-            # path exists to avoid, one step further on: the row is wrong,
-            # every liveness check passes, and the loss is reported as a
-            # conversion cost. What the model generated is not in this string.
-            logger.error("prompt %d came back with bytes that are not UTF-8", index)
-            return Generation(
-                index,
-                prompt,
-                returncode=proc.returncode,
-                stderr=(proc.stderr or "")[-2000:],
-                harness_error=(
-                    f"the runtime's output for this prompt was not UTF-8: {len(undecoded)} "
-                    f"byte(s) did not decode, so what it generated is not recoverable from "
-                    f"this run"
-                ),
-            )
-        return Generation(
-            index,
-            prompt,
-            text=text,
-            returncode=proc.returncode,
-            stderr=(proc.stderr or "")[-2000:],
-        )
+Writes JSONL, one line per prompt, flushed as it goes -- a run killed at
+prompt 400 keeps the first 399. A line is either {"index": int, "text": str}
+or, where the runtime refused that prompt, {"index": int, "error": str}: the
+reader treats the second as a fault against that prompt rather than as a
+missing row, so the split carries on and the refusal is not scored as an
+answer.
+"""
+import json
+import sys
+from pathlib import Path
+
+
+def backend_for(name):
+    """The engine's backend, from the same word the CLI's --backend takes.
+
+    litert-lm is imported here and in `main` rather than at the top, so the
+    parent can exec this script and test the text composition below without
+    the runtime installed -- the same reason `toolpath.py` does it.
+    """
+    from litert_lm.interfaces import CPU, GPU
+
+    if name == "gpu":
+        return GPU()
+    if name == "cpu":
+        return CPU()
+    raise SystemExit("unsupported backend %r: this script knows cpu and gpu" % (name,))
+
+
+def text_from_session(session, prompt):
+    """The pre-rendered path, which `--no-template` selects in the CLI.
+
+    `create_session(apply_prompt_template=False)` is what that flag chooses,
+    and prefill-then-decode is what the CLI does with it
+    (`litert_lm_cli/commands/run.py::_execute_raw_prompt`).
+    """
+    session.run_prefill([prompt])
+    parts = []
+    for chunk in session.run_decode_async():
+        if chunk.texts:
+            parts.append(chunk.texts[0])
+    return "".join(parts)
+
+
+def text_from_conversation(conversation, prompt):
+    """The runtime-rendered path, composed exactly the way the CLI composes stdout.
+
+    Channel content reaches the score. `litert-lm run` prints it between
+    `[name] ` and ` [/name]` ahead of the answer, the old stdout scraper kept
+    both markers, and `metrics.REASONING_BLOCKS` is a fixed two-entry tuple
+    holding `[thought]`/`[/thought]` and `<think>`/`</think>` -- so a thought
+    channel comes off before scoring and any other channel name does not.
+    A composition that opens a channel and never closes it does not merely
+    look different: `_split_reasoning` cuts at
+    the *last closing* marker, so with none the reasoning stays in the answer,
+    the row scores against thought-plus-answer, and nothing fails. Where it
+    lands afterwards depends on the shape: `_split_reasoning` calls it
+    `unclosed` only when the text *starts* with an opening marker, so a stream
+    that emitted an answer before opening the channel is counted as carrying no
+    reasoning at all.
+
+    So this mirrors `litert_lm_cli/commands/run.py` as a state machine rather
+    than approximating it. Read at the v0.16.1 tag, the version `envs.RUNTIME`
+    pins: `close_channel` (run.py:50-53) writes `" [/name]"` and a newline,
+    and run.py:108-125 calls it before every text item, on a switch between
+    channels, and at the end of the stream. The one branch not mirrored is the
+    bare `click.echo()` the CLI emits instead when no channel was open at the
+    end, which is a trailing newline the scorer strips.
+    """
+    parts = []
+    active = [None]
+
+    def close():
+        if active[0] is not None:
+            parts.append(" [/%s]\n" % active[0])
+            active[0] = None
+
+    for chunk in conversation.send_message_async(prompt):
+        for item in chunk.get("content", []) or []:
+            if item.get("type") == "text":
+                close()
+                parts.append(item.get("text", ""))
+        for name, content in (chunk.get("channels", {}) or {}).items():
+            if active[0] != name:
+                close()
+                parts.append("[%s] " % name)
+                active[0] = name
+            parts.append(content)
+    close()
+    return "".join(parts)
+
+
+def main(spec_path):
+    import litert_lm
+
+    spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    runtime_rendered = bool(spec["runtime_rendered"])
+    backend = backend_for(spec["backend"])
+    with Path(spec["out"]).open("w", encoding="utf-8") as out:
+        # `cache_dir=""` is what the CLI passes on its default `--cache`:
+        # `cache_dir_value_from_cache_mode` (common.py) maps both `None` and
+        # "disk" to the empty string, and `Engine.__init__` reaches
+        # `litert_lm_engine_settings_set_cache_dir` only when `cache_dir is not
+        # None` (engine.py:149-151 at v0.16.1). Leaving it out would not be the
+        # CLI's behaviour but a fourth state beside disk, memory and none.
+        # Which of the three that fourth state resolves to is decided in the
+        # C++ the binding calls, not in anything readable from here.
+        with litert_lm.Engine(spec["model"], backend=backend, cache_dir="") as engine:
+            for index, prompt in enumerate(spec["prompts"]):
+                # A runner per prompt, not one per split. A conversation keeps
+                # its history, so the second prompt would be answered with the
+                # first still in context -- the CLI started a process per
+                # prompt and could not get this wrong; this script can, and a
+                # split scored with drifting context looks like nothing.
+                try:
+                    if runtime_rendered:
+                        with engine.create_conversation(sampler_config=None) as runner:
+                            text = text_from_conversation(runner, prompt)
+                    else:
+                        with engine.create_session(
+                            apply_prompt_template=False, sampler_config=None
+                        ) as runner:
+                            text = text_from_session(runner, prompt)
+                except MemoryError:
+                    # Not one prompt's problem. The engine that could not
+                    # allocate for this prompt will not allocate for the next
+                    # one either, so containing it here turns one fatal
+                    # condition into `len(prompts)` attempts at it, each slower
+                    # than the last on a box that is already thrashing, under a
+                    # parent budget of `timeout_s * len(prompts)`. Let it end
+                    # the process: the rows already flushed are salvaged by the
+                    # non-zero-exit path, which is what that path is for.
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # One prompt, not the rest of the split. The runtime
+                    # raises `RuntimeError` when a prefill or a decode call
+                    # fails (`litert_lm/session.py:70` and `:99` at v0.16.1)
+                    # and when a send fails (`conversation.py:326`), and
+                    # without this the first of those ends the process: every
+                    # later prompt comes back as "the script exited 1".
+                    #
+                    # What this does not buy is the measurement. Any generation
+                    # carrying a `harness_error` makes `liveness.exit_status_check`
+                    # return UNCHECKED, and `verify` turns that into
+                    # `failed_harness` -- so the run is still refused, exactly
+                    # as MEASUREMENTS.md records for the split that generated
+                    # 599 of 600. What it buys is that the manifest names the
+                    # prompt and the reason, and carries the 599 rows, instead
+                    # of saying the script exited 1 about all six hundred.
+                    #
+                    # The CLI contained it differently and worse -- it caught
+                    # everything at the top of the command, printed "An error
+                    # occurred" to stdout and exited 0, so the old transport
+                    # scored that sentence as the model's answer. A row that
+                    # says it failed is neither that nor a lost split.
+                    row = {"index": index, "error": "%s: %s" % (type(exc).__name__, exc)}
+                else:
+                    row = {"index": index, "text": text}
+                out.write(json.dumps(row) + "\n")
+                out.flush()
+
+if __name__ == "__main__":
+    main(sys.argv[1])
+'''
+
+
+@functools.cache
+def _litertlm_script() -> dict[str, Any]:
+    """The driver script's own definitions, so the parent can test them.
+
+    Read from the one source rather than copied. The composition in
+    `text_from_conversation` is the only part of that script not a direct call
+    into litert-lm, so it is the only part that can be wrong on its own -- and
+    a copy here would be a second thing to keep right. Same device as
+    `toolpath._script`.
+    """
+    namespace: dict[str, Any] = {"__name__": "litetune_litertlm_script"}
+    exec(compile(_LITERTLM_GENERATE_SCRIPT, "litetune litertlm script", "exec"), namespace)  # noqa: S102
+    return namespace
 
 
 # Runs inside envs.TRAIN, which is the only environment with torch and
@@ -619,9 +1115,10 @@ if __name__ == "__main__":
 class HuggingFaceBackend:
     """Float reference generation through `transformers`, inside `envs.TRAIN`.
 
-    The whole split runs in one process: unlike the runtime CLI there is no
-    per-prompt startup to pay, and reloading a checkpoint 640 times would
-    dominate the measurement.
+    The whole split runs in one process, so a checkpoint is loaded once rather
+    than once per prompt. What that saves is not measured anywhere here, and
+    the litert-lm backend no longer differs on it -- it stopped starting a
+    process per prompt when the transport moved to the Python API.
     """
 
     model: str
@@ -681,7 +1178,7 @@ class HuggingFaceBackend:
     # `generate()` receives max_new_tokens and the stop condition, so here the
     # declared configuration is the applied one.
     decode_enforced = True
-    # Text off stdout; a call is whatever `parse_call` makes of it.
+    # Text, not structured calls; a call is whatever `parse_call` makes of it.
     scores_structurally = False
 
     @property
@@ -730,7 +1227,7 @@ class HuggingFaceBackend:
             "backend_vocabulary": "torch device",
             "requirements": list(self.env.requirements),
             "decode_declared": self.decode.as_dict(),
-            "decode_passed_to_cli": self.decode_enforced,
+            "decode_passed_to_runtime": self.decode_enforced,
             "prompt_mode": self.prompt_mode.value,
             "prompt_mode_declared": self.declared_prompt_mode is not None,
             "applies_chat_template": self.uses_template,
@@ -783,21 +1280,30 @@ class HuggingFaceBackend:
                 )
             try:
                 proc = self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as expired:
                 logger.warning("transformers generation timed out after %ss", self.timeout_s)
                 reason = f"no result after {self.timeout_s}s (timeout)"
-                # Nothing ran, so nothing has a confirmed device: a prediction
+                # The run report is written after the last prompt, so a killed
+                # run has none and the device stays unconfirmed. A prediction
                 # left standing here would be reported by `describe()` as the
-                # backend for a run that produced zero generations.
+                # backend a run used when nothing confirmed it.
                 self.device = None
-                return [Generation(i, p, harness_error=reason) for i, p in enumerate(prompts)]
+                # This script flushes after every row too, and until now every
+                # one of them was thrown away here: a reference run killed at
+                # prompt 600 of 640 lost all 599 it had already written, which
+                # is the same erasure the litert-lm path was fixed for.
+                killed = expired.stderr or ""
+                if isinstance(killed, bytes):
+                    killed = killed.decode("utf-8", "surrogateescape")
+                texts, faults = read_jsonl_results(results)
+                return salvage_after_kill(prompts, texts, faults, killed[-2000:], reason)
             except OSError as exc:
                 logger.exception("could not start the generation script")
                 reason = f"{type(exc).__name__}: {exc}"
                 self.device = None
                 return [Generation(i, p, harness_error=reason) for i, p in enumerate(prompts)]
 
-            texts = self._read_results(results)
+            texts, faults = read_jsonl_results(results)
             # The script's own answer wins over the probe's prediction. The
             # temp directory goes away at the end of this block, so it is read
             # here rather than anywhere later.
@@ -812,7 +1318,7 @@ class HuggingFaceBackend:
                     observed,
                 )
             self.device = observed
-        return self._assemble(prompts, texts, proc)
+        return assemble_generations(prompts, texts, proc, faults)
 
     def _ensure_env(self, events: EventStream | None) -> str | None:
         """Provision the environment when asked to, then ask it its device.
@@ -900,101 +1406,6 @@ class HuggingFaceBackend:
             logger.warning("generation script wrote no usable run report: %s", exc)
             return None
         return device if isinstance(device, str) else None
-
-    def _read_results(self, results: Path) -> dict[int, str]:
-        if not results.exists():
-            return {}
-        texts: dict[int, str] = {}
-        try:
-            body = results.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            # Not decodable at all: report it as one fault rather than letting
-            # it escape from a loop that exists to report per-line ones.
-            logger.warning("results file %s is not valid UTF-8: %s", results.name, exc)
-            return {}
-        for lineno, line in enumerate(body.splitlines(), 1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                # Which line, and what it looked like: the eventual error is
-                # "no result for prompt N", which says nothing about why.
-                logger.warning(
-                    "malformed result on line %d of %s (%s): %.120s",
-                    lineno,
-                    results.name,
-                    exc,
-                    line,
-                )
-                continue
-            try:
-                texts[int(row["index"])] = str(row["text"])
-            except (KeyError, TypeError, ValueError) as exc:
-                # Valid JSON, wrong shape. Same fault class as a malformed line
-                # and it must not escape the loop that reports them.
-                logger.warning(
-                    "result on line %d of %s lacks a usable index/text (%s)",
-                    lineno,
-                    results.name,
-                    exc,
-                )
-        return texts
-
-    def _assemble(
-        self, prompts: Sequence[str], texts: dict[int, str], proc: subprocess.CompletedProcess
-    ) -> list[Generation]:
-        stderr = (proc.stderr or "")[-2000:]
-        reading = read_returncode(proc.returncode)
-        # A killed script is not a script that failed: `-9` is the out-of-memory
-        # killer, and generation for a whole split is exactly the kind of job
-        # that meets a memory ceiling. See `litetune.exits`.
-        died = (
-            reading.describe("the model")
-            if not reading.conclusive
-            else f"generation script exited {proc.returncode}"
-        )
-        # A script that wrote every result and *then* exited non-zero used to be
-        # recorded as a clean run: each result carried `returncode=0, stderr=""`
-        # and the process failure was erased. The generation did happen, so it
-        # keeps its text and stays scoreable -- but the evidence travels with it.
-        failed_after_writing = texts and proc.returncode != 0
-        if failed_after_writing:
-            logger.warning(
-                "generation script wrote %d results and exited %s", len(texts), proc.returncode
-            )
-        out: list[Generation] = []
-        for i, prompt in enumerate(prompts):
-            if i in texts:
-                out.append(
-                    Generation(
-                        i,
-                        prompt,
-                        text=texts[i].strip(),
-                        returncode=0,
-                        stderr=stderr if failed_after_writing else "",
-                        batch_returncode=proc.returncode if failed_after_writing else None,
-                    )
-                )
-                continue
-            # A missing result cannot be distinguished from here between "the
-            # model failed on this prompt" and "the environment died before
-            # reaching it", so it is recorded as not performed. That is the
-            # conservative direction: `could not check` rather than a verdict
-            # the run did not earn.
-            out.append(
-                Generation(
-                    i,
-                    prompt,
-                    returncode=proc.returncode,
-                    stderr=stderr,
-                    harness_error=(
-                        f"{died} without a result for this prompt: "
-                        f"{stderr.strip()[-300:] or 'no stderr'}"
-                    ),
-                )
-            )
-        return out
 
 
 # ---------------------------------------------------------------------------
@@ -1145,8 +1556,8 @@ def device_mismatch(a: MeasurementPoint, b: MeasurementPoint) -> str | None:
 def harness_mismatch(a: MeasurementPoint, b: MeasurementPoint) -> str | None:
     """Why `a` and `b` cannot be compared, or None if they can.
 
-    Prompt mode is checked first and is the reason this function exists. Under
-    `--no-template` the runtime's tool list is null, so a runtime-rendered
+    Prompt mode is checked first and is the reason this function exists. On the
+    pre-rendered path the runtime's tool list is null, so a runtime-rendered
     measurement and a pre-rendered one differ by the whole declaration block;
     subtracting them reports the effect of the rendering mode as though it were
     the effect of conversion. That comparison is refused, not annotated.
