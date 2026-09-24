@@ -31,7 +31,6 @@ from litetune.evaluate import (
     harness_mismatch,
     load_split,
     read_jsonl_results,
-    strip_runtime_noise,
 )
 from litetune.metrics import score_exact_text, trim_terminator
 from litetune.prompt_mode import PromptMode
@@ -85,18 +84,6 @@ def test_malformed_line_names_itself(write_split, tmp_path):
 def test_row_without_a_prompt_is_refused(write_split):
     with pytest.raises(DataError):
         load_split(write_split([{"target": {"name": "x", "args": {}}}]))
-
-
-# -- output cleaning --------------------------------------------------------
-
-
-def test_runtime_log_lines_are_not_model_output():
-    stdout = (
-        "I0830 12:00:00.123456 12 engine.cc:42] loading\n"
-        "call:open{app:<escape>maps<escape>}\n"
-        "Prefill speed: 120 tok/s\n"
-    )
-    assert strip_runtime_noise(stdout) == "call:open{app:<escape>maps<escape>}"
 
 
 # -- litert-lm --------------------------------------------------------------
@@ -225,7 +212,7 @@ class _ScriptedConversation:
 
 
 # What `litert-lm run` prints for each of these streams, on a pipe, after
-# `strip_runtime_noise` and the `.strip()` the scorer sees. Written out rather
+# the `.strip()` the scorer sees. Written out rather
 # than produced, because the CLI is not installed in the environment this suite
 # runs in -- so the pin is on `litert_lm_cli/commands/run.py` at the version
 # `envs.RUNTIME` pins, read at lines 50-53 (`close_channel` writes

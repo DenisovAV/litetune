@@ -557,8 +557,8 @@ def build_backends(request: VerifyRequest, declarations: list | None = None) -> 
     the caller's file, and `run_verify` has already read it to compare its
     digest against the checkpoint's record. They reach the reference and the
     rendering check only when the candidate is measured through the tool path,
-    which is the only candidate they reach: on the text path `litert-lm run`
-    takes no tools, and a reference and a rendering check given them would
+    which is the only candidate they reach: the text path sends no
+    declarations at all, and a reference and a rendering check given them would
     validate a prompt the candidate is never sent.
     """
     chosen, _ = _tool_path_reason(request, declarations)
@@ -1047,9 +1047,10 @@ def run_verify(
     # The terminator vocabulary is `metrics.TERMINATORS`, recorded at
     # harness.terminators. A count here moves only for a marker the vocabulary
     # lists but the runtime did not consume. On a litert-lm candidate it has
-    # been observed at zero -- but `strip_runtime_noise` (evaluate.py) removes
-    # only log banners and stats lines, nothing that looks like a stop token, so
-    # that is what was seen, not what the code guarantees. A candidate count
+    # been observed at zero -- and the transport no longer cleans anything on
+    # the way: the driver script composes the text out of the stream's own text
+    # items and writes it to JSONL, so what is trimmed here is what the runtime
+    # handed back rather than what survived a scrape. A candidate count
     # above zero is the model emitting its terminator as text and continuing,
     # the defect README describes as "trained to emit the wrong one never
     # closes its turn".
@@ -1335,8 +1336,9 @@ def run_verify(
         if point.batch_failures:
             run.limitation(
                 f"{point.batch_failures} of {point.n} {point.label} generations came from a "
-                f"process that exited non-zero after writing its results; the outputs exist and "
-                "are scored, but the run that produced them did not end cleanly"
+                f"process that did not end cleanly -- it exited non-zero after writing them, or "
+                f"was killed before it finished the split; the outputs exist and are scored, but "
+                f"the run that produced them did not complete"
             )
     run.manifest["harness"]["equivalent"] = True
     run.manifest["harness"]["prompt_mode"] = candidate.prompt_mode.value

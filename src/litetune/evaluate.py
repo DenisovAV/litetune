@@ -17,8 +17,14 @@ report it.
 
 Nothing in this module raises on a failed generation. A non-zero exit is an
 observation; a process that never started is a *different* observation, and
-`Generation` keeps them apart so that liveness can report `failed` for the first
-and `could not check` for the second.
+`Generation` keeps them apart rather than scoring either as a wrong answer.
+
+Where each lands: a driver script that wrote its results and then exited
+non-zero keeps its text, and the exit travels beside it in `batch_returncode`;
+a prompt with no result of its own carries a `harness_error`, which `ran` reads
+as "not performed". No backend here builds a generation that ran and is not ok,
+so the `failed` count in `MeasurementPoint.as_dict` is currently always zero --
+the shape of a verdict, not one being reported.
 """
 
 from __future__ import annotations
@@ -28,7 +34,6 @@ import hashlib
 import json
 import logging
 import re
-import signal
 import subprocess
 import tempfile
 from collections.abc import Sequence
@@ -242,26 +247,13 @@ class Generation:
 # that did not decode.
 UNDECODED_BYTE = re.compile("[\udc80-\udcff]")
 
-# glog-style banner lines and the runtime's own timing block, neither of which
-# is model output.
-_LOG_LINE_RE = re.compile(r"^[IWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d+\s")
-_STATS_LINE_RE = re.compile(r"^\s*(Prefill|Decode)\s+(speed|latency)\b", re.IGNORECASE)
-
-
-def strip_runtime_noise(stdout: str) -> str:
-    """Drop the runtime's own chatter from captured stdout.
-
-    A heuristic, and deliberately a narrow one: if it removes too much, the
-    non-empty liveness check fails loudly rather than the score quietly
-    dropping.
-    """
-    kept = [
-        line
-        for line in stdout.splitlines()
-        if not _LOG_LINE_RE.match(line) and not _STATS_LINE_RE.match(line)
-    ]
-    return "\n".join(kept).strip()
-
+# `batch_returncode` for a run that was killed rather than one that exited.
+# Not a signal number: `TimeoutExpired` carries no status, the stage kills with
+# SIGTERM and only then SIGKILL (`envs.py`), and Windows has neither -- so any
+# number here would assert something nobody observed. What it has to be is
+# non-zero and not `None`, which is all `MeasurementPoint.batch_failures`
+# reads; the reason travels in `stderr` and in the limitation `verify` emits.
+BATCH_KILLED = -1
 
 # Shared by the two driver-script backends below. Neither touched `self`, and
 # a second copy of this error handling is the duplication this file has been
@@ -478,8 +470,8 @@ class GenerationBackend(Protocol):
         On the Protocol rather than inside `describe()`, because a backend that
         forgets it must fail to type-check rather than be silently recorded as
         enforcing parameters it never received. The first version of this was
-        `describe().get("decode_passed_to_cli", True)` in one place and
-        `.get("decode_passed_to_cli")` -- defaulting to None -- in another, so
+        `describe().get("decode_passed_to_runtime", True)` in one place and
+        `.get("decode_passed_to_runtime")` -- defaulting to None -- in another, so
         two backends that both omitted the key compared equal and the
         limitation they exist to raise disappeared from the manifest.
         """
@@ -509,10 +501,12 @@ class GenerationBackend(Protocol):
 class LiteRtLmBackend:
     """Generation through litert-lm's Python API, one process per split.
 
-    It used to be `litert-lm run` once per prompt, and roughly 90% of a
-    measurement run's wall time was process startup and model reload rather
-    than decoding -- on a 5 GB bundle with a 9 GB XNNPack cache beside it,
-    six hundred times over.
+    It used to be `litert-lm run` once per prompt: a 600-row verify started
+    the process and reloaded the bundle six hundred times, each reload reading
+    the bundle and the XNNPACK cache litert-lm writes beside it -- 771,404,928
+    bytes against caches of 601,946,856 and 2,385,932,008 for the two recipes
+    MEASUREMENTS.md timed. What share of a run's wall time that was, nothing
+    here measured.
 
     `litert-lm serve` plus a persistent client was the fix this docstring used
     to name, and it was rejected for the right reason: the serve path changes
@@ -525,15 +519,25 @@ class LiteRtLmBackend:
     Measured rather than argued, because a transport that changed the text
     would make every number taken before it incomparable with every number
     after. On Linux CPU with `litert-lm==0.16.1`, both prompt modes, against
-    the CLI path's own stdout cleaning: 30 of 30 prompts byte-identical -- 12
-    on `litert-community/Qwen3-0.6B.litertlm` and 18 on
+    the CLI path's own stdout cleaning: 30 of 30 comparisons byte-identical --
+    6 prompts in both prompt modes on `litert-community/Qwen3-0.6B`
+    and 9 in both on
     `litert-community/functiongemma-mobile-actions_q8_ekv1024.litertlm`, a
     different family, template and tokenizer.
 
+    Those 30 were taken against an earlier revision of the script below, which
+    differs from it in four ways: it left a channel open where this one closes
+    it, it let one prompt's exception end the whole split, it imported
+    litert-lm at module level, and it passed no `cache_dir`. Only the last of
+    those can reach the engine, and none of the 30 opened a channel or raised
+    -- but the comparison has not been re-taken against the code as it stands,
+    and that is the honest size of the evidence.
+
     What those 30 do not cover, and it is most of the risk: a probe of the raw
-    chunks found no `channels` key on any of them, so every one took the plain
-    text branch. Channel composition -- the one part of the driver script that
-    is not a direct call -- is held by the synthetic streams in
+    chunks on the FunctionGemma bundle found no `channels` key on any of them,
+    and the fifteen session-path comparisons have no channel branch to take.
+    Channel composition -- the one part of the driver script that is not a
+    direct call -- is held by the synthetic streams in
     `test_the_driver_composes_what_the_cli_printed` instead, because a sampled
     model can only show a branch was not taken. Nothing here covers the GPU
     backend.
@@ -573,10 +577,11 @@ class LiteRtLmBackend:
     # litetune passes no decoding flags to this CLI, so `decode` is a
     # declaration here and not an instruction. Stated as a value rather than
     # left to a default, because the asymmetry is what `verify` reports as a
-    # limitation -- and it is litetune's gap, not the toolchain's: 0.16.1 does
-    # accept --top-k, --top-p, --temperature and --seed.
+    # limitation -- and it is litetune's gap, not the toolchain's:
+    # `create_session` and `create_conversation` both take a `sampler_config`
+    # and the driver script passes `None`, so the engine uses its own.
     decode_enforced = False
-    # Text off stdout; a call is whatever `parse_call` makes of it.
+    # Text, not structured calls; a call is whatever `parse_call` makes of it.
     scores_structurally = False
 
     @property
@@ -633,7 +638,7 @@ class LiteRtLmBackend:
             # what `decode_enforced = False` says, and why `verify` reports the
             # asymmetry as a limitation rather than hiding it.
             "decode_declared": self.decode.as_dict(),
-            "decode_passed_to_cli": self.decode_enforced,
+            "decode_passed_to_runtime": self.decode_enforced,
         }
 
     def generate(
@@ -650,7 +655,6 @@ class LiteRtLmBackend:
             script = work / "generate.py"
             script.write_text(_LITERTLM_GENERATE_SCRIPT, encoding="utf-8")
             results = work / "generations.jsonl"
-            report = work / "run.json"
             spec = work / "spec.json"
             spec.write_text(
                 json.dumps(
@@ -660,7 +664,6 @@ class LiteRtLmBackend:
                         "runtime_rendered": self.uses_template,
                         "backend": self.backend_flag,
                         "out": str(results),
-                        "run_report": str(report),
                     }
                 ),
                 encoding="utf-8",
@@ -677,9 +680,11 @@ class LiteRtLmBackend:
                 # run that used to be allowed 300 s per prompt is allowed no
                 # less now. What is gone is the *granularity*: one prompt that
                 # hangs takes the budget the rest would have had, where before
-                # it was cut at 300 s and the run carried on. The trade is the
-                # point of the change; a hung prompt is rarer than 600 model
-                # reloads.
+                # it was cut at 300 s and the run carried on. That is a real
+                # loss and not a theoretical one: MEASUREMENTS.md records a
+                # 600-row verify where one prompt exceeded the 300 s limit --
+                # though `verify` refused that run rather than scoring the 599
+                # that finished, so the granularity bought nothing there.
                 proc = self.env.run(
                     ["python", str(script), str(spec)],
                     timeout=self.timeout_s * len(prompts),
@@ -726,7 +731,7 @@ class LiteRtLmBackend:
                                 text=texts[i].strip(),
                                 returncode=0,
                                 stderr=killed,
-                                batch_returncode=-signal.SIGKILL,
+                                batch_returncode=BATCH_KILLED,
                             )
                         )
                     else:
@@ -755,9 +760,9 @@ class LiteRtLmBackend:
 # Runs inside envs.RUNTIME, the only environment with litert-lm in it.
 #
 # One process for a whole split, where this module used to start one per
-# prompt: roughly 90% of a measurement run's wall time was process startup
-# and model reload, and on a 5 GB bundle with a 9 GB XNNPack cache beside it
-# that is not a rounding error.
+# prompt: six hundred process starts and six hundred bundle reloads for a
+# 600-row verify. What that cost in wall time is not measured here; the class
+# docstring carries the sizes that are.
 #
 # What it must not be is a different measurement. The CLI is a thin wrapper
 # over the same three calls this makes -- `Engine`, then `create_session` or
@@ -775,7 +780,7 @@ import sys
 from pathlib import Path
 
 
-def backend_for(name, decode_steps_per_sync=None):
+def backend_for(name):
     """The engine's backend, from the same word the CLI's --backend takes.
 
     litert-lm is imported here and in `main` rather than at the top, so the
@@ -785,7 +790,7 @@ def backend_for(name, decode_steps_per_sync=None):
     from litert_lm.interfaces import CPU, GPU
 
     if name == "gpu":
-        return GPU() if decode_steps_per_sync is None else GPU(decode_steps_per_sync)
+        return GPU()
     if name == "cpu":
         return CPU()
     raise SystemExit("unsupported backend %r: this script knows cpu and gpu" % (name,))
@@ -811,18 +816,23 @@ def text_from_conversation(conversation, prompt):
 
     Channel content reaches the score. `litert-lm run` prints it between
     `[name] ` and ` [/name]` ahead of the answer, the old stdout scraper kept
-    both markers, and `metrics.REASONING_BLOCKS` keys on that exact pair to
-    take reasoning off before scoring. A composition that opens a channel and
-    never closes it does not merely look different: `_split_reasoning` cuts at
+    both markers, and `metrics.REASONING_BLOCKS` is a fixed two-entry tuple
+    holding `[thought]`/`[/thought]` and `<think>`/`</think>` -- so a thought
+    channel comes off before scoring and any other channel name does not.
+    A composition that opens a channel and never closes it does not merely
+    look different: `_split_reasoning` cuts at
     the *last closing* marker, so with none the reasoning stays in the answer,
     the row scores against thought-plus-answer, and the generation moves from
     `generations_with_reasoning` to `generations_with_unclosed_reasoning`
     without anything failing.
 
     So this mirrors `litert_lm_cli/commands/run.py` as a state machine rather
-    than approximating it: `close_channel` (run.py:50-53) writes
-    `" [/name]"` followed by a newline, and is called before every text item,
-    on a switch between channels, and at the end of the stream.
+    than approximating it. Read at the v0.16.1 tag, the version `envs.RUNTIME`
+    pins: `close_channel` (run.py:50-53) writes `" [/name]"` and a newline,
+    and run.py:107-123 calls it before every text item, on a switch between
+    channels, and at the end of the stream. The one branch not mirrored is the
+    bare `click.echo()` the CLI emits instead when no channel was open at the
+    end, which is a trailing newline the scorer strips.
     """
     parts = []
     active = [None]
@@ -852,12 +862,17 @@ def main(spec_path):
 
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     runtime_rendered = bool(spec["runtime_rendered"])
-    backend = backend_for(spec["backend"], spec.get("gpu_decode_steps_per_sync"))
-    engine_kwargs = {}
-    if spec.get("activation_data_type"):
-        engine_kwargs["activation_data_type"] = spec["activation_data_type"]
+    backend = backend_for(spec["backend"])
     with Path(spec["out"]).open("w", encoding="utf-8") as out:
-        with litert_lm.Engine(spec["model"], backend=backend, **engine_kwargs) as engine:
+        # `cache_dir=""` is what the CLI passes on its default `--cache`:
+        # `cache_dir_value_from_cache_mode` (common.py) maps both `None` and
+        # "disk" to the empty string, and `Engine.__init__` reaches
+        # `litert_lm_engine_settings_set_cache_dir` only when `cache_dir is not
+        # None` (engine.py:149-151 at v0.16.1). Leaving it out would not be the
+        # CLI's behaviour but a fourth state beside disk, memory and none, and
+        # it is what decides whether the XNNPACK cache beside the bundle is
+        # written at all.
+        with litert_lm.Engine(spec["model"], backend=backend, cache_dir="") as engine:
             for index, prompt in enumerate(spec["prompts"]):
                 # A runner per prompt, not one per split. A conversation keeps
                 # its history, so the second prompt would be answered with the
@@ -891,13 +906,6 @@ def main(spec_path):
                     row = {"index": index, "text": text}
                 out.write(json.dumps(row) + "\n")
                 out.flush()
-    Path(spec["run_report"]).write_text(
-        json.dumps(
-            {"backend": spec["backend"], "litert_lm": getattr(litert_lm, "__version__", None)}
-        ),
-        encoding="utf-8",
-    )
-
 
 if __name__ == "__main__":
     main(sys.argv[1])
@@ -1078,7 +1086,7 @@ class HuggingFaceBackend:
     # `generate()` receives max_new_tokens and the stop condition, so here the
     # declared configuration is the applied one.
     decode_enforced = True
-    # Text off stdout; a call is whatever `parse_call` makes of it.
+    # Text, not structured calls; a call is whatever `parse_call` makes of it.
     scores_structurally = False
 
     @property
@@ -1127,7 +1135,7 @@ class HuggingFaceBackend:
             "backend_vocabulary": "torch device",
             "requirements": list(self.env.requirements),
             "decode_declared": self.decode.as_dict(),
-            "decode_passed_to_cli": self.decode_enforced,
+            "decode_passed_to_runtime": self.decode_enforced,
             "prompt_mode": self.prompt_mode.value,
             "prompt_mode_declared": self.declared_prompt_mode is not None,
             "applies_chat_template": self.uses_template,
