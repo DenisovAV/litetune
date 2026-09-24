@@ -12,19 +12,21 @@ eight confident negatives during the measurement work, so each has its own test.
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
 import pytest
 from conftest import FakeBackend, call_text, fake_torch, labelled_rows, mark_provisioned
 
-from litetune import envs
+from litetune import envs, toolpath
 from litetune.evaluate import (
     UNKNOWN_BACKEND,
     DataError,
     DecodeConfig,
     HuggingFaceBackend,
     LiteRtLmBackend,
+    _litertlm_script,
     assemble_generations,
     device_mismatch,
     evaluate,
@@ -216,7 +218,7 @@ class _ScriptedConversation:
 # than produced, because the CLI is not installed in the environment this suite
 # runs in -- so the pin is on `litert_lm_cli/commands/run.py` at the version
 # `envs.RUNTIME` pins, read at lines 50-53 (`close_channel` writes
-# `" [/name]"` and a newline) and 104-125 (it is called before every text item,
+# `" [/name]"` and a newline) and 108-125 (it is called before every text item,
 # on a switch between channels, and at end of stream).
 #
 # The composition in the driver script is the one part of it that is not a
@@ -278,8 +280,6 @@ CHANNEL_CASES = [
     ids=[case[0].replace(" ", "-") for case in CHANNEL_CASES],
 )
 def test_the_driver_composes_what_the_cli_printed(name, chunks, expected):
-    from litetune.evaluate import _litertlm_script
-
     compose = _litertlm_script()["text_from_conversation"]
 
     assert compose(_ScriptedConversation(chunks), "p").strip() == expected
@@ -351,6 +351,62 @@ def test_two_rows_claiming_one_prompt_are_both_refused(monkeypatch, tmp_path):
     assert "two rows" in (generation.harness_error or "")
 
 
+def test_an_index_that_is_not_an_integer_claims_no_prompt(monkeypatch, tmp_path, caplog):
+    """`int()` is a coercion, not a check.
+
+    `int(1.9)` is 1 and `int(True)` is 1, so a row carrying either took prompt
+    1's slot and was scored as its answer -- in the one function whose whole
+    job is that a row which is not the model's answer does not reach the score.
+    """
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _writes_results(
+            [
+                {"index": 0, "text": "real"},
+                {"index": 1.9, "text": "a float claiming prompt 1"},
+                {"index": True, "text": "a bool claiming prompt 1"},
+            ]
+        ),
+    )
+
+    generations = _litertlm(tmp_path).generate(["zero", "one"])
+
+    assert generations[0].text == "real"
+    # Prompt 1 got no row of its own, and neither impostor became one.
+    assert not generations[1].ran
+    assert "a float" not in (generations[1].text or "")
+    assert "a bool" not in (generations[1].text or "")
+
+
+def test_the_reader_never_returns_a_prompt_in_both_maps(tmp_path):
+    """One prompt is either an answer or a fault, never both.
+
+    Every caller checks `faults` first, so a text left standing beside a fault
+    is invisible until something reads `texts` alone -- and a file can disagree
+    with itself in more ways than a plain duplicate: a row with the text and a
+    second row with an error for the same prompt used to arrive as a fault with
+    the text still there.
+    """
+    results = tmp_path / "out.jsonl"
+    results.write_text(
+        "\n".join(
+            [
+                json.dumps({"index": 0, "text": "an answer"}),
+                json.dumps({"index": 0, "error": "RuntimeError: and also a refusal"}),
+                json.dumps({"index": 1, "text": "untroubled"}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    texts, faults = read_jsonl_results(results)
+
+    assert not (texts.keys() & faults.keys())
+    assert 0 in faults
+    assert texts == {1: "untroubled"}
+
+
 def test_a_row_no_prompt_claims_is_reported(monkeypatch, tmp_path, caplog):
     """It used to vanish -- including a fault already logged at ERROR.
 
@@ -403,6 +459,36 @@ def test_a_timed_out_split_does_not_look_like_a_clean_one(monkeypatch, tmp_path)
     assert all("killed while decoding" in g.stderr for g in generations)
 
 
+def test_a_stray_row_is_reported_when_the_split_was_killed_too(monkeypatch, tmp_path, caplog):
+    """The salvage used to walk the prompts and never look at the leftovers.
+
+    On the clean path a row whose index no prompt claims is logged at ERROR.
+    The timeout path iterated `enumerate(prompts)` only, so the same row --
+    written by a child that was about to be killed, which is when the binding
+    between rows and prompts is least trustworthy -- disappeared without a
+    word.
+    """
+
+    def times_out_after_writing_a_stray(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        Path(spec["out"]).write_text(
+            json.dumps({"index": 0, "text": "mine"})
+            + "\n"
+            + json.dumps({"index": 9, "text": "nobody's"})
+            + "\n",
+            encoding="utf-8",
+        )
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout, stderr="killed")
+
+    monkeypatch.setattr(envs.StageEnv, "run", times_out_after_writing_a_stray)
+
+    with caplog.at_level("ERROR"):
+        generations = _litertlm(tmp_path).generate(["one"])
+
+    assert [g.text for g in generations] == ["mine"]
+    assert any("index no prompt has" in r.getMessage() for r in caplog.records)
+
+
 def test_a_prompt_the_runtime_refuses_does_not_take_the_split_with_it(monkeypatch, tmp_path):
     """One row, not the rest of the run.
 
@@ -439,8 +525,8 @@ def test_a_prompt_the_runtime_refuses_does_not_take_the_split_with_it(monkeypatc
 def test_one_process_per_split(monkeypatch, tmp_path):
     """The point of the transport: the whole split in one process.
 
-    It used to be one per prompt, and roughly 90% of a run's wall time was
-    startup and model reload rather than decoding.
+    It used to be one per prompt: six hundred process starts and six hundred
+    bundle reloads for a 600-row verify. What that cost is not measured here.
     """
     seen = []
     write = _writes_results([{"index": 0, "text": "a"}, {"index": 1, "text": "b"}])
@@ -592,16 +678,27 @@ def test_hugging_face_backend_reports_an_unknown_device_before_it_has_run():
 def test_the_two_backends_say_which_vocabulary_their_backend_field_is_in(tmp_path):
     """One key, two answers to two different questions.
 
-    `backend` is a torch device on the reference side and the flag passed to
-    `litert-lm` on the candidate side. They overlap at exactly one string,
+    `backend` is a torch device on the reference side and the word litert-lm's
+    `Backend` takes on the candidate side. They overlap at exactly one string,
     "cpu", where they mean different things -- so each `describe()` says which
     question it answered.
+
+    It used to say "litert-lm --backend flag", which named a command line this
+    backend has not built since the transport moved to the Python API, and
+    `toolpath` -- the other backend that speaks this vocabulary -- said
+    something else. One spelling, and it is the one that is true.
     """
     reference = HuggingFaceBackend(model="org/m", auto_provision=False).describe()
     candidate = _litertlm(tmp_path).describe()
     assert reference["backend_vocabulary"] == "torch device"
-    assert candidate["backend_vocabulary"] == "litert-lm --backend flag"
+    assert candidate["backend_vocabulary"] == "litert-lm Python API Backend"
     assert reference["backend_vocabulary"] != candidate["backend_vocabulary"]
+    # The other backend that reaches the same runtime the same way. Two
+    # spellings of one vocabulary is how a reader concludes they are two.
+    tool_path = (Path(toolpath.__file__).read_text(encoding="utf-8")).count(
+        '"backend_vocabulary": "litert-lm Python API Backend"'
+    )
+    assert tool_path == 1, "toolpath.py no longer spells the vocabulary the same way"
 
 
 def test_hugging_face_backend_reports_the_device_it_actually_used(monkeypatch):
@@ -1518,3 +1615,182 @@ def test_the_reference_script_renders_the_prompt_with_the_declarations(tmp_path,
 
     assert namespace["main"]() == 0
     assert rendered == ["decl:open_app hi"]
+
+
+# -- the driver script's own main -------------------------------------------
+#
+# Until this block the script's `main` ran nowhere: the suite drove
+# `LiteRtLmBackend` with a `StageEnv.run` double that fabricated the JSONL, so
+# the reader and the writer agreed only by inspection. Writing `"err"` instead
+# of `"error"` in the script, or dropping the per-row flush, passed everything.
+# `litert_lm` is imported inside `backend_for` and `main` precisely so a fake
+# can stand in for it, which is what the cloud equivalence harness already does.
+
+
+class _FakeRunner:
+    """One conversation or session. Records what it was asked."""
+
+    def __init__(self, registry, raise_on):
+        self.registry = registry
+        self.raise_on = raise_on
+        self.closed = False
+        registry.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+        return False
+
+    def _answer(self, prompt):
+        if prompt in self.raise_on:
+            raise self.raise_on[prompt]
+        return "answer to " + prompt
+
+    def run_prefill(self, prompts):
+        self._prompt = prompts[0]
+
+    def run_decode_async(self):
+        chunk = type("Chunk", (), {})()
+        chunk.texts = [self._answer(self._prompt)]
+        return [chunk]
+
+    def send_message_async(self, prompt):
+        return [{"content": [{"type": "text", "text": self._answer(prompt)}], "channels": {}}]
+
+
+class _FakeEngine:
+    def __init__(self, path, backend=None, **kwargs):
+        self.path = path
+        self.kwargs = kwargs
+        self.runners: list[_FakeRunner] = []
+        self.raise_on: dict[str, BaseException] = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def create_session(self, **kwargs):
+        return _FakeRunner(self.runners, self.raise_on)
+
+    def create_conversation(self, **kwargs):
+        return _FakeRunner(self.runners, self.raise_on)
+
+
+def _fake_litert_lm(monkeypatch, raise_on=None):
+    """A `litert_lm` the script can import, and the engine it hands back."""
+    engines: list[_FakeEngine] = []
+
+    class _Backend:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    def make_engine(path, backend=None, **kwargs):
+        engine = _FakeEngine(path, backend, **kwargs)
+        engine.raise_on = raise_on or {}
+        engines.append(engine)
+        return engine
+
+    module = types.ModuleType("litert_lm")
+    module.Engine = make_engine
+    interfaces = types.ModuleType("litert_lm.interfaces")
+    interfaces.CPU = _Backend
+    interfaces.GPU = _Backend
+    monkeypatch.setitem(sys.modules, "litert_lm", module)
+    monkeypatch.setitem(sys.modules, "litert_lm.interfaces", interfaces)
+    return engines
+
+
+def _run_script(tmp_path, prompts, runtime_rendered=True, raise_on=None, monkeypatch=None):
+    engines = _fake_litert_lm(monkeypatch, raise_on)
+    spec = tmp_path / "spec.json"
+    out = tmp_path / "out.jsonl"
+    spec.write_text(
+        json.dumps(
+            {
+                "model": str(tmp_path / "m.litertlm"),
+                "prompts": prompts,
+                "runtime_rendered": runtime_rendered,
+                "backend": "cpu",
+                "out": str(out),
+            }
+        ),
+        encoding="utf-8",
+    )
+    _litertlm_script()["main"](str(spec))
+    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line]
+    return rows, engines
+
+
+@pytest.mark.parametrize("runtime_rendered", [True, False])
+def test_the_script_writes_one_row_per_prompt_in_order(tmp_path, monkeypatch, runtime_rendered):
+    rows, engines = _run_script(
+        tmp_path, ["one", "two", "three"], runtime_rendered, monkeypatch=monkeypatch
+    )
+    assert [r["index"] for r in rows] == [0, 1, 2]
+    assert [r["text"] for r in rows] == ["answer to one", "answer to two", "answer to three"]
+    # A runner per prompt, not one per split: a conversation keeps its history,
+    # so a shared one would answer the second prompt with the first still in
+    # context and the split would score as drifting nonsense.
+    assert len(engines[0].runners) == 3
+    assert all(runner.closed for runner in engines[0].runners)
+
+
+def test_one_refused_prompt_is_one_row(tmp_path, monkeypatch):
+    """The whole of `15b9ada`, which until now no test touched.
+
+    The runtime raises mid-split -- `session.py:70` on a prefill that fails,
+    `conversation.py:326` on a failed send, both at v0.16.1 -- and without the
+    containment the first of those ends the process, so every later prompt
+    comes back as "the script exited 1".
+    """
+    rows, _ = _run_script(
+        tmp_path,
+        ["one", "two", "three"],
+        raise_on={"two": RuntimeError("litert_lm_session_run_prefill failed")},
+        monkeypatch=monkeypatch,
+    )
+    assert [r["index"] for r in rows] == [0, 1, 2]
+    assert rows[0]["text"] == "answer to one"
+    assert "text" not in rows[1]
+    assert rows[1]["error"] == "RuntimeError: litert_lm_session_run_prefill failed"
+    assert rows[2]["text"] == "answer to three"
+    # And the reader turns that row into a fault rather than an answer.
+    texts, faults = read_jsonl_results(tmp_path / "out.jsonl")
+    assert set(texts) == {0, 2}
+    assert "litert_lm_session_run_prefill failed" in faults[1]
+
+
+def test_memory_error_is_not_contained(tmp_path, monkeypatch):
+    """Containing it would turn one fatal condition into `len(prompts)` of them.
+
+    The engine that could not allocate for this prompt will not allocate for
+    the next, so the loop would re-OOM every remaining prompt under a parent
+    budget of `timeout_s * len(prompts)`. The rows already flushed are salvaged
+    by the non-zero-exit path instead.
+    """
+    with pytest.raises(MemoryError):
+        _run_script(
+            tmp_path,
+            ["one", "two"],
+            raise_on={"one": MemoryError("cannot allocate the KV cache")},
+            monkeypatch=monkeypatch,
+        )
+
+
+def test_the_script_asks_for_the_cache_the_cli_asks_for(tmp_path, monkeypatch):
+    """`cache_dir=""` is the CLI's own default, and omitting it is a fourth state."""
+    _, engines = _run_script(tmp_path, ["one"], monkeypatch=monkeypatch)
+    assert engines[0].kwargs["cache_dir"] == ""
+
+
+def test_the_script_refuses_a_backend_it_does_not_know(tmp_path, monkeypatch):
+    _fake_litert_lm(monkeypatch)
+    backend_for = _litertlm_script()["backend_for"]
+    assert backend_for("cpu") is not None
+    assert backend_for("gpu") is not None
+    with pytest.raises(SystemExit):
+        backend_for("npu")

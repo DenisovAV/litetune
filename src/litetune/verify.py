@@ -548,9 +548,10 @@ def build_backends(request: VerifyRequest, declarations: list | None = None) -> 
     """The real backends. Tests pass their own pair to `run_verify` instead.
 
     `request.prompt_mode` has been resolved by the time this is called, so both
-    sides are configured from one decision: the runtime gets `--no-template`
-    only when the prompts are pre-rendered, and the reference applies its chat
-    template only when they are not.
+    sides are configured from one decision: the runtime is asked for
+    `create_session(apply_prompt_template=False)` only when the prompts are
+    pre-rendered, and the reference applies its chat template only when they
+    are not.
 
     `declarations` arrive parsed rather than as the path on the request: the
     scripts these backends run live in other environments, which cannot read
@@ -584,11 +585,11 @@ DECLARATIONS_CHECK = "declarations match the checkpoint's record"
 INFERRED_PROMPT_MODE = (
     "the prompt-rendering mode was not declared and no bundle contract was supplied, so it was "
     "inferred from the held-out prompts: {evidence}. This is a guess about a calling convention. "
-    "`--no-template` is narrow, not general -- it routes the runtime to create_session() "
-    "instead of create_conversation(), bypassing the chat template, the <|turn>model anchor, "
-    "tool handling and channel extraction, and its own help says 'the input should include "
-    "all control tokens for the "
-    "model expected'. It is right only when the caller built the whole prompt, which is what "
+    "Pre-rendered is narrow, not general -- it routes the runtime to create_session"
+    "(apply_prompt_template=False) instead of create_conversation(), bypassing the chat "
+    "template, the <|turn>model anchor, tool handling and channel extraction. It is right "
+    "only when the caller built the whole prompt, including every control token the model "
+    "expects, which is what "
     "training decided. Pass the mode explicitly, or point --contract at the bundle this model "
     "shipped with"
 )
@@ -1047,10 +1048,12 @@ def run_verify(
     # The terminator vocabulary is `metrics.TERMINATORS`, recorded at
     # harness.terminators. A count here moves only for a marker the vocabulary
     # lists but the runtime did not consume. On a litert-lm candidate it has
-    # been observed at zero -- and the transport no longer cleans anything on
-    # the way: the driver script composes the text out of the stream's own text
-    # items and writes it to JSONL, so what is trimmed here is what the runtime
-    # handed back rather than what survived a scrape. A candidate count
+    # been observed at zero -- and nothing between the runtime and here
+    # removes a stop token: the driver script writes the stream's own text
+    # items to JSONL, and the only edits on the way are the channel markers it
+    # composes around channel content and a `.strip()`. So what is trimmed here
+    # is what the runtime handed back, not what survived a scrape. A candidate
+    # count
     # above zero is the model emitting its terminator as text and continuing,
     # the defect README describes as "trained to emit the wrong one never
     # closes its turn".
