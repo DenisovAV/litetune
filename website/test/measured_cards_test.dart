@@ -89,22 +89,34 @@ void main() {
     }
   });
 
-  test('every card says what its model is and what it is for', () {
-    // The line a reader needs before any of the rest means anything. A record
-    // field cannot be omitted in Dart, but it can be left empty, and an empty
-    // one renders as a blank row rather than as an absence anyone would
-    // notice.
+  test('every panel says what its model is and what it is for', () {
+    // What a reader opens a card for. It is not on the card face -- that
+    // carries the model and how it was scored -- so an empty one renders as a
+    // blank paragraph above the checkpoint row rather than as an absence
+    // anyone would notice. A record field cannot be omitted in Dart; it can be
+    // left empty.
     for (final model in WhyItExists.measured) {
       expect(
         model.what.trim(),
         isNotEmpty,
         reason: '${model.name} carries no description',
       );
-      // Size first, because it is what a reader is choosing between.
+      // Size first, because it is what a reader is choosing between. The
+      // punctuation after it is not pinned -- this caught the move from a
+      // one-line card face to a paragraph in the panel, which is a change of
+      // shape and not of rule.
       expect(
         model.what,
-        matches(RegExp(r'^\d+(\.\d+)?[MB], ')),
+        matches(RegExp(r'^(About )?\d+(\.\d+)?[MB]\b')),
         reason: '${model.name} does not open with its size: ${model.what}',
+      );
+      // It reads in the panel now, not on the card face, and it is meant to
+      // say enough to choose on. A one-liner that drifted back here would
+      // render as a lonely sentence above the checkpoint row.
+      expect(
+        model.what.length,
+        greaterThan(140),
+        reason: '${model.name} says too little to be worth opening',
       );
     }
   });

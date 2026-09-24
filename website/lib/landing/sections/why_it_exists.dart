@@ -64,9 +64,10 @@ typedef MeasuredRun = ({
 /// is scoped to the one size that was run, and Qwen2.5's for the same reason,
 /// where the rule is scoped to the one size *and* variant.
 ///
-/// Each card opens a panel. It names the checkpoint the run actually used --
-/// the Hub id and, where `MEASUREMENTS.md` pins one, the revision -- and links
-/// to the model on the Hub and to the section that measured it. It
+/// Each card opens a panel. It says what the model is and what it is for,
+/// names the checkpoint the run actually used -- the Hub id and, where
+/// `MEASUREMENTS.md` pins one, the revision -- and links to the model on the
+/// Hub and to the section that measured it. It
 /// carries no score either, for the reason the face of the card carries none:
 /// a panel one click deep is still the shortest place there is to quote a
 /// verdict, and a reader who wants the number is one link from the table with
@@ -143,8 +144,11 @@ class WhyItExists extends StatelessComponent {
       name: 'FunctionGemma 270M',
       how: 'tool-call scoring, 640 held-out rows',
       what:
-          '270M, text — built for tool calls: picking a function and filling its '
-          'arguments on the device.',
+          '270M parameters, text only. Google built it for tool calls: '
+          'given a list of functions it picks one and fills in its '
+          'arguments, which is the job an app needs done on the phone '
+          'rather than in a round trip to a server. Small enough that '
+          'the whole model ships inside the app.',
       hubId: 'google/functiongemma-270m-it',
       revision: null,
       anchor: 'the-headline-numbers',
@@ -153,8 +157,10 @@ class WhyItExists extends StatelessComponent {
       name: 'Gemma 3 270M',
       how: 'exact-text scoring, 600 held-out rows',
       what:
-          '270M, text — the smallest here that still learns a task. Classification '
-          'and routing, not conversation.',
+          '270M parameters, text only — the smallest checkpoint '
+          'measured here. It still learns a task from a few thousand '
+          'examples, which makes it the one to try first when the job '
+          'is classification or routing rather than conversation.',
       hubId: 'google/gemma-3-270m-it',
       revision: 'ac82b4e8',
       anchor: 'a-second-family-and-the-second-scorer',
@@ -163,8 +169,10 @@ class WhyItExists extends StatelessComponent {
       name: 'Gemma 3 1B',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
-          '1B, text — the same export rule as the 270M, for when the 270M stops '
-          'holding the task.',
+          '1B parameters, text only. Four times the 270M and covered by '
+          'the same export rule, so it is the size to move to when the '
+          'smaller one stops holding the task: same pipeline, same '
+          'flags, more room.',
       hubId: 'google/gemma-3-1b-it',
       revision: 'dcc83ea8',
       anchor: 'the-same-family-four-times-the-size',
@@ -172,7 +180,11 @@ class WhyItExists extends StatelessComponent {
     (
       name: 'Qwen3 0.6B',
       how: 'exact-text scoring, the same 600 held-out rows',
-      what: '0.6B, text — a first try when the task is labels.',
+      what:
+          '0.6B parameters, text only. A reasonable first try when the '
+          'task is labels, and the first family measured here that '
+          'litetune had no per-model rule for — it exports and converts '
+          'on the plain path, with nothing added for its name.',
       hubId: 'Qwen/Qwen3-0.6B',
       revision: 'c1899de2',
       anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
@@ -181,8 +193,10 @@ class WhyItExists extends StatelessComponent {
       name: 'Qwen2.5 0.5B',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
-          '0.5B, text — reach for it when memory is the budget: its four-bit export '
-          'is the only one here that scored.',
+          '0.5B parameters, text only. Reach for it when memory is the '
+          'binding constraint: it is the one checkpoint here whose '
+          'channelwise four-bit export produced a usable score at all, '
+          'where the others either refused or came apart.',
       hubId: 'Qwen/Qwen2.5-0.5B-Instruct',
       revision: '7ae55760',
       anchor:
@@ -192,8 +206,12 @@ class WhyItExists extends StatelessComponent {
       name: 'Gemma 4 E2B',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
-          '5B, multimodal — text, vision and audio. For an assistant that has to '
-          'see or hear.',
+          'About 5B parameters, and multimodal — a text tower with '
+          'vision and audio towers beside it. For an assistant that has '
+          'to see or hear as well as read. A LoRA run on it is scoped '
+          'to the text tower, because all three use the same projection '
+          'names and a run scoped by name alone reaches every one of '
+          'them.',
       hubId: 'google/gemma-4-E2B-it',
       // Null although MEASUREMENTS.md names a commit: that run passed no
       // `--revision` and the hash was read back from the cache afterwards.
@@ -225,9 +243,12 @@ class WhyItExists extends StatelessComponent {
   static Component _card(MeasuredRun model) =>
       a(classes: 'measured-card', href: '#${slugFor(model)}', [
         span(classes: 'measured-card-model', [Component.text(model.name)]),
-        span(classes: 'measured-card-what', [Component.text(model.what)]),
         span(classes: 'measured-card-how', [Component.text(model.how)]),
-        span(classes: 'measured-card-more', [Component.text('checkpoint')]),
+        // What opening it gets you. It used to read `checkpoint`, which named
+        // one row of the panel rather than the reason to open it.
+        span(classes: 'measured-card-more', [
+          Component.text('what it is, and what it is for'),
+        ]),
       ]);
 
   static Component _modal(MeasuredRun model) => div(
@@ -241,7 +262,8 @@ class WhyItExists extends StatelessComponent {
       // a screen reader is told a dialog opened while the cursor stays outside
       // it.
       'tabindex': '-1',
-      'aria-label': '${model.name}: the checkpoint this run used',
+      'aria-label':
+          '${model.name}: what it is, and the checkpoint this run used',
     },
     [
       a(
@@ -260,6 +282,7 @@ class WhyItExists extends StatelessComponent {
             [Component.text('\u00d7')],
           ),
         ]),
+        p(classes: 'measured-modal-what', [Component.text(model.what)]),
         div(classes: 'measured-card-fact', [
           span(classes: 'measured-card-key', [Component.text('Checkpoint')]),
           span(classes: 'measured-card-id', [Component.text(model.hubId)]),
@@ -336,6 +359,14 @@ class WhyItExists extends StatelessComponent {
     // top of the platform's own expanded/collapsed announcement. A link needs
     // no such announcement, so the word can simply be in the card.
     css('.measured-card-more').styles(color: Brand.muted, fontSize: 0.85.rem),
+    // The convention the rest of the site uses for a clickable card
+    // (`where_to_run.dart`, `nav_bar.dart`, `site_footer.dart`): the border
+    // brightens. Without it the only cue that a card is a link was a muted
+    // caption -- which is the line this change is about.
+    css('.measured-card:hover').styles(
+      border: Border.all(color: Brand.muted, width: 1.px),
+    ),
+    css('.measured-card:hover .measured-card-more').styles(color: Brand.ink),
     // Hidden until the URL names it. `:target` is the whole mechanism -- see
     // the class docstring for what that buys and what it costs.
     css('.measured-modal').styles(raw: const {'display': 'none'}),
@@ -371,15 +402,27 @@ class WhyItExists extends StatelessComponent {
       raw: const {
         'position': 'relative',
         'width': 'min(30rem, 100%)',
-        'max-height': '80vh',
+        'max-height': '80dvh',
         'overflow-y': 'auto',
       },
     ),
+    // Sticky, because the box scrolls and the head carries the only explicit
+    // way out. A one-line description fitted without scrolling; a paragraph
+    // does not, and on a short viewport the visitor would have scrolled the
+    // close control off the top of the thing they were trying to close. The
+    // background is the box's own, so the text passes under it rather than
+    // through it.
     css('.measured-modal-head').styles(
       display: Display.flex,
       alignItems: AlignItems.center,
       gap: Gap.all(1.rem),
-      raw: const {'justify-content': 'space-between'},
+      backgroundColor: Brand.surface,
+      padding: Padding.only(bottom: 0.4.rem),
+      raw: const {
+        'justify-content': 'space-between',
+        'position': 'sticky',
+        'top': '0',
+      },
     ),
     css(
       '.measured-modal-title',
@@ -393,14 +436,17 @@ class WhyItExists extends StatelessComponent {
     css(
       '.measured-card-model',
     ).styles(color: Brand.ink, fontSize: 1.05.rem, fontWeight: FontWeight.w500),
-    css('.measured-card-what').styles(
+    css('.measured-modal-what').styles(
       color: Brand.body,
-      fontSize: 0.9.rem,
-      raw: const {'line-height': '1.45'},
+      fontSize: 0.95.rem,
+      // Both sides, not just the bottom. Nothing on this page resets `p`, so
+      // the UA's `margin-block-start: 1em` applied -- and inside a flex column
+      // margins do not collapse, so the paragraph sat further from the title
+      // than from the row under it, which is backwards.
+      margin: Margin.only(top: 0.px, bottom: 0.4.rem),
+      raw: const {'line-height': '1.55'},
     ),
-    // Demoted a step now that the line above it carries the reading: how a run
-    // was scored is provenance, and it stops competing with what the model is.
-    css('.measured-card-how').styles(color: Brand.muted, fontSize: 0.8.rem),
+    css('.measured-card-how').styles(color: Brand.body, fontSize: 0.9.rem),
     css('.measured-card-fact').styles(
       display: Display.flex,
       flexDirection: FlexDirection.column,
