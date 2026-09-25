@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from litetune.evaluate import (
+    BACKEND_OBSERVED,
     GREEDY,
     UNKNOWN_BACKEND,
     DecodeConfig,
@@ -55,6 +56,11 @@ class FakeBackend:
     # asserting the recorded backend then passes against code that never reads
     # the manifest at all.
     backend: str = UNKNOWN_BACKEND
+    # Settable too, and `False` by default for the same reason `backend` is
+    # `UNKNOWN_BACKEND`: a double read nothing back off any device. A test that
+    # needs the other state sets it, so that state is visible in the test
+    # rather than assumed by the double.
+    backend_observed: bool = False
     prompts_seen: list[list[str]] = field(default_factory=list)
 
     @property
@@ -72,7 +78,11 @@ class FakeBackend:
         # Several subclasses override `describe()` with a literal dict, some of
         # them nested inside test functions where a module-level search misses
         # them. On those, setting `backend=` is silently a no-op.
-        return {"engine": "fake", "backend": self.backend}
+        return {
+            "engine": "fake",
+            "backend": self.backend,
+            BACKEND_OBSERVED: self.backend_observed,
+        }
 
     def generate(self, prompts: Sequence[str], events=None) -> list[Generation]:
         self.prompts_seen.append(list(prompts))

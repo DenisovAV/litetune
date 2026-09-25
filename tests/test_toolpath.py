@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from litetune.evaluate import BACKEND_OBSERVED
 from litetune.metrics import ToolCall
 from litetune.toolpath import _TOOL_PATH_SCRIPT, ToolPathError, ToolPathProbe, ToolPathRow
 
@@ -1034,6 +1035,10 @@ def test_the_device_is_named_in_the_vocabulary_verify_reads(tmp_path):
 
     engine = result.manifest["measurements"]["candidate"]["engine"]
     assert (engine["engine"], engine["backend"]) == ("litert-lm", "cpu")
+    # The script hardcodes `Backend.CPU()` and reads nothing back, so it says
+    # so -- and the sentence still reads "measured on", because a CPU request
+    # has nowhere else to go. An accelerator is the case that needs a reading.
+    assert engine[BACKEND_OBSERVED] is False
     assert any(
         "measured on the cpu backend of litert-lm" in limitation
         for limitation in result.manifest["limitations"]

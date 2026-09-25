@@ -36,7 +36,7 @@ import logging
 import re
 import subprocess
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -64,6 +64,37 @@ UNDECLARED_PROMPT_MODE = PromptMode.PRERENDERED
 # `unknown` when the key is missing or null, so this
 # is the same word for what is, to a reader of the manifest, the same state.
 UNKNOWN_BACKEND = "unknown"
+
+# The one backend a request establishes on its own: nothing falls back past it.
+CPU_BACKEND = "cpu"
+
+# Whether `describe()["backend"]` is something the run established or something
+# it asked for. One key has carried both: `HuggingFaceBackend` reads its device
+# back out of the script's own run report and writes `UNKNOWN_BACKEND` when
+# nothing answered, while the litert-lm backends write the flag they passed.
+#
+# That difference is invisible while the flag can only be "cpu". It stops being
+# invisible the moment a GPU flag exists, because `verify` silences its
+# "the GPU backend is a different executor" caveat for a run whose backend
+# *is* the GPU.
+#
+# Nothing in this tree reads an accelerator back off a litert-lm engine: the
+# three construction sites (`_LITERTLM_GENERATE_SCRIPT`, `toolpath.py`,
+# `rendering.py`) pass a `Backend` in and read no device out, and the only
+# field any of them reads afterwards is a token count off `BenchmarkInfo`
+# (`rendering.py`). Whether the runtime could answer at all is a question
+# about litert-lm 0.16.1, which is installed in `envs.RUNTIME` and not here --
+# so it is a question a reader has to take to that package, and one this
+# comment does not answer for them.
+#
+# What a request is not: on Linux with litert-lm 0.16.1, 2026-09-25, an engine
+# built with `Backend.GPU()` on a machine with no usable GPU was created
+# without error and then produced no token for a single prompt in fifty-five
+# minutes. That is what "asked for" has to be allowed to mean.
+#
+# So the caveat is silenced only where the value was observed. A backend that
+# cannot observe says so, and says it here rather than by convention.
+BACKEND_OBSERVED = "backend_observed"
 
 
 @dataclass(frozen=True)
@@ -563,6 +594,23 @@ class GenerationBackend(Protocol):
         ...
 
     @property
+    def backend_observed(self) -> bool:
+        """Whether `describe()["backend"]` is a device this run read back.
+
+        Here for the same reason as `decode_enforced`, and against the same
+        defect: the first version of this was a bare `describe()` key with an
+        implicit default, which is exactly the shape that comment describes
+        going wrong. A backend that can read its device back must say so, and
+        one that forgets must fail to type-check rather than have its request
+        quietly reported as a measurement.
+
+        False is not "the backend is wrong". It is "nothing here established
+        it", which is the truth for every backend that passes a flag to a
+        runtime and is told nothing in return.
+        """
+        ...
+
+    @property
     def scores_structurally(self) -> bool:
         """Whether this backend's answers are calls rather than text.
 
@@ -673,6 +721,9 @@ class LiteRtLmBackend:
     # `create_session` and `create_conversation` both take a `sampler_config`
     # and the driver script passes `None`, so the engine uses its own.
     decode_enforced = False
+    # The flag this backend passes, never a device read back: litert-lm's
+    # Python API names no accelerator. See `GenerationBackend.backend_observed`.
+    backend_observed = False
     # Text, not structured calls; a call is whatever `parse_call` makes of it.
     scores_structurally = False
 
@@ -707,6 +758,7 @@ class LiteRtLmBackend:
         return {
             "engine": "litert-lm",
             "backend": self.backend_flag,
+            BACKEND_OBSERVED: self.backend_observed,
             # The flag as passed, not a device torch chose: see
             # `HuggingFaceBackend.describe`, where the same key carries the
             # other vocabulary.
@@ -1178,8 +1230,18 @@ class HuggingFaceBackend:
     # `generate()` receives max_new_tokens and the stop condition, so here the
     # declared configuration is the applied one.
     decode_enforced = True
+    # Set only where the run report answers, and cleared wherever `device` is.
+    # `device is not None` is the wrong question: the probe writes a prediction
+    # into it before the run, and `_read_run_report` deliberately leaves that
+    # prediction standing when no report arrives -- so a script that died at
+    # `model.to(device)` would otherwise have its probe reported as a reading.
+    device_observed: bool = False
     # Text, not structured calls; a call is whatever `parse_call` makes of it.
     scores_structurally = False
+
+    @property
+    def backend_observed(self) -> bool:
+        return self.device_observed
 
     @property
     def model_ref(self) -> str:
@@ -1212,6 +1274,7 @@ class HuggingFaceBackend:
             # second word for the same state would have put two names for one
             # thing in one manifest.
             "backend": self.device if self.device is not None else UNKNOWN_BACKEND,
+            BACKEND_OBSERVED: self.backend_observed,
             # What was predicted before the run, so a reader can see the two
             # disagree rather than only the winner. `None` when nothing was
             # asked; equal to `backend` on every run that used what it was
@@ -1236,6 +1299,13 @@ class HuggingFaceBackend:
     def generate(
         self, prompts: Sequence[str], events: EventStream | None = None
     ) -> list[Generation]:
+        # A run reports what it read back, not what an earlier one did:
+        # `device` survives a run that established nothing, by the do-not-erase
+        # rule below, and that survival must not be reported as this run's
+        # reading. First, before any return: a blocked environment clears
+        # `device` in `_ensure_env`, and a `True` left from the previous run
+        # would then sit beside `UNKNOWN_BACKEND` claiming it was read back.
+        self.device_observed = False
         blocked = self._ensure_env(events)
         if blocked is not None:
             return [Generation(i, p, harness_error=blocked) for i, p in enumerate(prompts)]
@@ -1318,6 +1388,7 @@ class HuggingFaceBackend:
                     observed,
                 )
             self.device = observed
+            self.device_observed = True
         return assemble_generations(prompts, texts, proc, faults)
 
     def _ensure_env(self, events: EventStream | None) -> str | None:
@@ -1520,6 +1591,26 @@ def evaluate(
     )
 
 
+def backend_established(engine: Mapping[str, Any]) -> bool:
+    """Whether `backend` may be stated as where the work happened.
+
+    Two of the three backends here fill it from a flag they passed and are
+    told nothing in return, so for them the sentence is only as good as the
+    ask. It is good enough for `cpu`: there is nothing below it to fall back
+    to, and every number in MEASUREMENTS.md rests on asking litert-lm for its
+    CPU backend and getting it. It is not good enough for an accelerator,
+    which is the case measured to fail quietly -- an engine built for a GPU
+    that is not there neither raises nor answers.
+
+    `UNKNOWN_BACKEND` passes because it claims nothing: "measured on the
+    unknown backend" is already a statement of ignorance, and rewording it
+    would put a second name on the state that constant exists to name.
+    """
+    if engine.get(BACKEND_OBSERVED) is True:
+        return True
+    return str(engine.get("backend") or UNKNOWN_BACKEND).lower() in (CPU_BACKEND, UNKNOWN_BACKEND)
+
+
 def device_mismatch(a: MeasurementPoint, b: MeasurementPoint) -> str | None:
     """The two points ran on different hardware, said in full, or None.
 
@@ -1531,8 +1622,11 @@ def device_mismatch(a: MeasurementPoint, b: MeasurementPoint) -> str | None:
     both. Refusing that comparison would leave a GPU box unable to verify at
     all, which is worse than a number that says what else is in it.
 
-    Read from `engine["backend"]`, which each backend fills with the device or
-    the flag it actually used. The two vocabularies do not overlap except at
+    Read from `engine["backend"]`, which each backend fills with the device it
+    read back or the flag it passed -- `BACKEND_OBSERVED` says which, and
+    `backend_established` turns that into the verb this sentence uses.
+
+    The two vocabularies do not overlap except at
     the string "cpu" -- see `backend_vocabulary` in either `describe()` -- so
     this reports both values and names neither as the right one. A value that
     is missing or `UNKNOWN_BACKEND` is not a difference: nothing was
@@ -1544,10 +1638,24 @@ def device_mismatch(a: MeasurementPoint, b: MeasurementPoint) -> str | None:
         return None
     if UNKNOWN_BACKEND in (left, right) or left == right:
         return None
+
+    # Each side gets the verb its evidence supports. Saying both "was measured
+    # on" would attribute part of a score gap to hardware that, on a side
+    # reporting a flag nobody read back, was never established to have served
+    # the run.
+    def ran(point: MeasurementPoint, value: str) -> str:
+        verb = "was measured on" if backend_established(point.engine) else "asked for"
+        return f"{point.label} {verb} {value} ({point.engine.get('engine') or UNKNOWN_BACKEND})"
+
+    established = backend_established(a.engine) and backend_established(b.engine)
+    carries = (
+        "so the difference between them carries a hardware difference as well as a conversion one"
+        if established
+        else "so the difference between them may carry a hardware difference as well as a "
+        "conversion one -- may, because a backend above that was asked for rather than read back"
+    )
     return (
-        f"{a.label} was measured on {left} ({a.engine.get('engine', 'unknown')}) and {b.label} on "
-        f"{right} ({b.engine.get('engine', 'unknown')}), so the difference between them carries a "
-        "hardware difference as well as a conversion one. The comparison is reported rather than "
+        f"{ran(a, left)} and {ran(b, right)}, {carries}. The comparison is reported rather than "
         "refused: pinning both sides to one device is not something litetune can do for the "
         "runtime side, and a refusal would leave such a machine unable to verify at all"
     )

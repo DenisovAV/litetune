@@ -21,6 +21,7 @@ from conftest import FakeBackend, call_text, fake_torch, labelled_rows, mark_pro
 
 from litetune import envs, toolpath
 from litetune.evaluate import (
+    BACKEND_OBSERVED,
     UNKNOWN_BACKEND,
     DataError,
     DecodeConfig,
@@ -965,10 +966,36 @@ def test_a_blocked_environment_clears_the_device(monkeypatch):
     assert gens[0].harness_error is not None
 
 
+def test_a_blocked_run_does_not_inherit_the_previous_runs_reading(monkeypatch):
+    """Found by review: the reset sat after the blocked return.
+
+    One run reads its device back; the next cannot provision. `_ensure_env`
+    clears `device`, and a `True` left over from the first run would then sit
+    beside `UNKNOWN_BACKEND` claiming this run read something back.
+    """
+    _ready_env()
+    _generating_env(monkeypatch, probe="cpu", script_device="cuda")
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+    assert backend.describe()[BACKEND_OBSERVED] is True
+
+    def explode(self, events=None, force=False):
+        raise RuntimeError("no interpreter")
+
+    monkeypatch.setattr(envs.StageEnv, "provision", explode)
+    backend.auto_provision = True
+    gens = backend.generate(["b"])
+
+    assert gens[0].harness_error is not None
+    described = backend.describe()
+    assert described["backend"] == UNKNOWN_BACKEND
+    assert described[BACKEND_OBSERVED] is False
+
+
 # -- comparing two points that ran on different hardware ---------------------
 
 
-def _point(label: str, backend: str, engine: str = "transformers"):
+def _point(label: str, backend: str, engine: str = "transformers", observed: bool = False):
     from litetune.evaluate import GREEDY, MeasurementPoint
 
     return MeasurementPoint(
@@ -978,9 +1005,40 @@ def _point(label: str, backend: str, engine: str = "transformers"):
         prompt_mode=PromptMode.PRERENDERED,
         decode=GREEDY,
         split_id="s",
-        engine={"engine": engine, "backend": backend},
+        engine={"engine": engine, "backend": backend, BACKEND_OBSERVED: observed},
         decode_enforced=True,
     )
+
+
+def test_a_side_that_read_nothing_back_is_said_to_have_asked(write_split=None):
+    """One sentence, two verbs, because the two sides have different evidence.
+
+    The reference reads its device out of its own run report; the runtime side
+    passes a flag and is told nothing. Giving both "was measured on" attributes
+    part of a score gap to hardware that, on the flag side, nobody established
+    served the run -- and on an accelerator that is the failure this whole key
+    exists for, since an engine built for an absent GPU neither raises nor
+    answers.
+    """
+    note = device_mismatch(
+        _point("candidate", "gpu", engine="litert-lm", observed=False),
+        _point("reference", "cuda", observed=True),
+    )
+    assert note is not None
+    assert "candidate asked for gpu" in note
+    assert "reference was measured on cuda" in note
+    # And the conclusion softens with them.
+    assert "may carry a hardware difference" in note
+
+
+def test_two_sides_that_both_read_back_are_said_to_have_measured():
+    note = device_mismatch(
+        _point("candidate", "gpu", engine="litert-lm", observed=True),
+        _point("reference", "cuda", observed=True),
+    )
+    assert note is not None
+    assert "candidate was measured on gpu" in note and "reference was measured on cuda" in note
+    assert "carries a hardware difference" in note
 
 
 def test_two_points_on_different_hardware_are_annotated_not_refused():
@@ -1794,3 +1852,76 @@ def test_the_script_refuses_a_backend_it_does_not_know(tmp_path, monkeypatch):
     assert backend_for("gpu") is not None
     with pytest.raises(SystemExit):
         backend_for("npu")
+
+
+# -- which backends can say they read a device back -------------------------
+#
+# Every one of these was a mutant that survived: flipping either litert-lm
+# backend's answer to `True`, or deriving the transformers one from `device is
+# not None`, left the whole suite green, because absent and `False` are
+# indistinguishable at the only consumer. The consumer-side tests in
+# `test_verify.py` pin the gate; these pin what the shipped backends feed it.
+
+
+def test_the_litertlm_backend_never_claims_it_read_a_device_back(tmp_path):
+    """It passes a flag and litert-lm's Python API tells it nothing in return."""
+    assert _litertlm(tmp_path).backend_observed is False
+    assert _litertlm(tmp_path).describe()[BACKEND_OBSERVED] is False
+
+
+def test_a_transformers_backend_that_never_ran_claims_nothing(monkeypatch):
+    _ready_env()
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    assert backend.describe()[BACKEND_OBSERVED] is False
+    assert backend.describe()["backend"] == UNKNOWN_BACKEND
+
+
+def test_a_transformers_run_whose_script_reported_its_device_says_so(monkeypatch):
+    _ready_env()
+    _generating_env(monkeypatch, probe="cpu", script_device="cuda")
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    described = backend.describe()
+    assert described["backend"] == "cuda"
+    assert described[BACKEND_OBSERVED] is True
+
+
+def test_a_prediction_left_standing_is_not_reported_as_a_reading(monkeypatch):
+    """The whole reason this is not `device is not None`.
+
+    The probe writes its answer into `device` before the run, and a script
+    that died before writing its report leaves that prediction standing --
+    deliberately, and `test_a_script_that_wrote_no_report_leaves_the_prediction_standing`
+    pins it. The prediction is still the best thing known and stays in
+    `backend`; what it is not is something this run read back.
+    """
+    _ready_env()
+    _generating_env(monkeypatch, probe="cuda", script_device=None)
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    described = backend.describe()
+    assert described["backend"] == "cuda"
+    assert described[BACKEND_OBSERVED] is False
+
+
+def test_a_device_kept_by_the_do_not_erase_rule_is_not_reported_as_read_back(monkeypatch):
+    """`device` survives a run that established nothing; the claim must not.
+
+    This is the reuse case `test_a_failed_probe_does_not_erase_a_device_already_known`
+    pins: a later run whose probe cannot answer and whose script writes no
+    report keeps the earlier `cuda`, because that is a better record than
+    `None`. It is still not something *this* run read back.
+    """
+    _ready_env()
+    _generating_env(monkeypatch, probe=None, script_device=None)
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False, device="cuda")
+    backend.generate(["a"])
+
+    described = backend.describe()
+    assert described["backend"] == "cuda"
+    assert described[BACKEND_OBSERVED] is False

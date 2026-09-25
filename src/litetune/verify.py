@@ -42,6 +42,7 @@ from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
 from litetune.evaluate import (
     GREEDY,
+    UNKNOWN_BACKEND,
     DataError,
     DecodeConfig,
     GenerationBackend,
@@ -49,6 +50,7 @@ from litetune.evaluate import (
     LiteRtLmBackend,
     MeasurementPoint,
     Split,
+    backend_established,
     device_mismatch,
     evaluate,
     harness_mismatch,
@@ -107,7 +109,12 @@ MANIFEST_SCHEMA = "litetune.verify/1"
 
 
 # The one measurement that answers the caveat below: litert-lm's own GPU
-# backend. Not any accelerator -- an NPU is a third executor and predicts the
+# backend, *and only when the run established that it ran there* -- see
+# `evaluate.BACKEND_OBSERVED`. Silencing it on the strength of a flag would
+# turn a request into the sentence "measured on the gpu backend of litert-lm",
+# which is the claim this file exists to avoid making.
+#
+# Not any accelerator -- an NPU is a third executor and predicts the
 # GPU no better than the CPU does -- and deliberately not a torch `cuda` device
 # either. `evaluate.py` warns that `backend` holds two vocabularies under one
 # key, a torch device and a litert-lm flag, overlapping only at `cpu`; a
@@ -1092,16 +1099,28 @@ def run_verify(
     # README section where the figures live with the conditions that make them
     # readable.
     #
-    # Silenced only for a litert-lm run on its GPU backend: there, and only
-    # there, the sentence would name the executor the run already used. An NPU,
-    # a torch cuda device and an unestablished backend all keep it.
+    # Silenced only for a litert-lm run on its GPU backend, and only when the
+    # backend was observed rather than asked for: there, and only there, the
+    # sentence would name the executor the run already used. An NPU, a torch
+    # cuda device, an unestablished backend and a backend nobody read back all
+    # keep it.
     # `or` rather than a default: a third-party backend may put the key there
     # with a null value, which `.get`'s default does not cover, and this module
     # promises never to raise.
-    backend = str(candidate.engine.get("backend") or "unknown")
-    engine = str(candidate.engine.get("engine") or "unknown")
-    measured_on = f"measured on the {backend} backend of {engine}"
-    if (engine.lower(), backend.lower()) != GPU_MEASURED:
+    backend = str(candidate.engine.get("backend") or UNKNOWN_BACKEND)
+    engine = str(candidate.engine.get("engine") or UNKNOWN_BACKEND)
+    # The stem, not only the caveat. Gating the caveat alone left the sentence
+    # "measured on the gpu backend of litert-lm" in the manifest and merely
+    # appended a contradiction to it, which is the claim this file is here to
+    # not make, with a footnote.
+    established = backend_established(candidate.engine)
+    measured_on = (
+        f"measured on the {backend} backend of {engine}"
+        if established
+        else f"asked {engine} for its {backend} backend; nothing read back which device "
+        "served the run"
+    )
+    if not established or (engine.lower(), backend.lower()) != GPU_MEASURED:
         run.limitation(
             f"{measured_on}. litert-lm's GPU backend is a different executor and this "
             "number does not predict it; README.md's limitations section carries what one "

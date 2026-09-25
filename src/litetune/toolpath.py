@@ -53,7 +53,7 @@ from pathlib import Path
 from typing import Any
 
 from litetune import envs
-from litetune.evaluate import GREEDY, DecodeConfig, Generation
+from litetune.evaluate import BACKEND_OBSERVED, GREEDY, DecodeConfig, Generation
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.metrics import ToolCall
@@ -626,6 +626,17 @@ class ToolPathBackend:
         return True
 
     @property
+    def backend_observed(self) -> bool:
+        """Nothing here reads back which device served the run.
+
+        The script hardcodes `Backend.CPU()` and litert-lm's Python API names
+        no accelerator, so this backend's `backend` is what it asked for. The
+        request cannot go anywhere else -- there is no flag to disagree with --
+        but that is an argument, and this key records readings.
+        """
+        return False
+
+    @property
     def scores_structurally(self) -> bool:
         """This backend's answers are calls, not text, and are scored as calls.
 
@@ -646,6 +657,7 @@ class ToolPathBackend:
             # (unknown)" instead of on the CPU the script asks for.
             "engine": "litert-lm",
             "backend": "cpu",
+            BACKEND_OBSERVED: self.backend_observed,
             "backend_vocabulary": "litert-lm Python API Backend",
             "path": "tool path",
             "model": self.model_ref,
