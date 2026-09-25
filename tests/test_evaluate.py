@@ -2098,6 +2098,23 @@ def test_only_this_processs_client_and_its_gpu_time_count():
     assert client_of(_LISTING, 11) == (None, None)
 
 
+def test_gpu_time_on_every_client_of_this_process_counts():
+    """Work on a second client is still this process's work: an idle first
+    client must not hide it and turn a GPU run into "not used"."""
+    second = (
+        _LISTING
+        + "\n"
+        + "\n".join(
+            [
+                "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x3>",
+                '    |   "IOUserClientCreator" = "pid 4242, python3.12"',
+                '    |   "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=1000})',
+            ]
+        )
+    )
+    assert _litertlm_script()["gpu_client_of"](second, 4242) == ("pid 4242, python3.12", 1042)
+
+
 def test_a_platform_nobody_observed_is_not_looked_at(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     report = _litertlm_script()["device_report"]()
@@ -2158,6 +2175,123 @@ def test_a_kernel_query_that_exits_non_zero_did_not_look(monkeypatch):
     report = _litertlm_script()["device_report"]()
     assert report["looked"] is False
     assert "denied" in report["error"]
+
+
+@pytest.mark.parametrize("listing", [b"", b"+-o Root  <class IORegistryEntry>\n"])
+def test_a_listing_with_no_gpu_client_of_anyone_did_not_look(monkeypatch, listing):
+    """Exit 0 and no client at all is not "no client of ours": the class
+    asked for is not there to be asked. Read as looked it would say the GPU
+    was not used."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, listing, b"")
+    )
+    report = _litertlm_script()["device_report"]()
+    assert report["looked"] is False
+    assert "no GPU client of any process" in report["error"]
+
+
+def _fake_builder(monkeypatch, sections):
+    """A `litert_lm_builder` whose header holds `sections`: a list of
+    (model_type, {key: value}) where a str value is a StringValue and any
+    other value is some other type."""
+    string_type = 1
+
+    class _Value:
+        def __init__(self, raw):
+            self.Bytes, self.Pos = {0: raw}, 0
+
+    class _Item:
+        def __init__(self, key, value):
+            self._key, self._value = key.encode(), value
+
+        def Key(self):
+            return self._key
+
+        def ValueType(self):
+            return string_type if isinstance(self._value, str) else string_type + 1
+
+        def Value(self):
+            return _Value(self._value.encode() if isinstance(self._value, str) else b"")
+
+    class _Section:
+        def __init__(self, model_type, items):
+            self.model_type = model_type
+            self._items = [_Item(k, v) for k, v in items.items()]
+
+        def ItemsLength(self):
+            return len(self._items)
+
+        def Items(self, j):
+            return self._items[j]
+
+    class _Sections:
+        def __init__(self, sections):
+            self._sections = [_Section(t, items) for t, items in sections]
+
+        def ObjectsLength(self):
+            return len(self._sections)
+
+        def Objects(self, i):
+            return self._sections[i]
+
+    class _StringValue:
+        def Init(self, buf, pos):
+            self._raw = buf[pos]
+
+        def Value(self):
+            return self._raw
+
+    header = types.SimpleNamespace(SectionMetadata=lambda: _Sections(sections))
+    peek = types.SimpleNamespace(
+        read_litertlm_header=lambda path, out: header,
+        get_model_type=lambda section: section.model_type,
+    )
+    schema = types.SimpleNamespace(
+        VData=types.SimpleNamespace(StringValue=string_type), StringValue=_StringValue
+    )
+    package = types.ModuleType("litert_lm_builder")
+    package.litertlm_peek = peek
+    package.litertlm_header_schema_py_generated = schema
+    monkeypatch.setitem(sys.modules, "litert_lm_builder", package)
+    monkeypatch.setitem(sys.modules, "litert_lm_builder.litertlm_peek", peek)
+    monkeypatch.setitem(
+        sys.modules, "litert_lm_builder.litertlm_header_schema_py_generated", schema
+    )
+
+
+_PD = "tf_lite_prefill_decode"
+
+
+@pytest.mark.parametrize(
+    ("sections", "declared"),
+    [
+        ([(_PD, {"prefer_activation_type": "fp32"})], "fp32"),
+        ([(_PD, {"other": "x"})], None),
+        ([("tf_lite_embedder", {"prefer_activation_type": "fp16"}), (_PD, {})], None),
+        ([(_PD, {"prefer_activation_type": "fp32"})] * 2, "fp32"),
+    ],
+)
+def test_the_bundle_key_is_read_from_its_prefill_decode_sections(monkeypatch, sections, declared):
+    _fake_builder(monkeypatch, sections)
+    assert _litertlm_script()["bundle_activation"]("m.litertlm") == declared
+
+
+@pytest.mark.parametrize(
+    "sections",
+    [
+        # The first section is not the bundle's answer when a later one differs.
+        [(_PD, {"prefer_activation_type": "fp32"}), (_PD, {"prefer_activation_type": "fp32_fp16"})],
+        [(_PD, {"prefer_activation_type": "fp32"}), (_PD, {})],
+        # Not a string: unreadable, not "declares none".
+        [(_PD, {"prefer_activation_type": 7}), (_PD, {"prefer_activation_type": "fp32"})],
+    ],
+)
+def test_a_bundle_key_that_is_not_one_answer_is_unreadable(monkeypatch, sections):
+    _fake_builder(monkeypatch, sections)
+    report = _litertlm_script()["run_report"]({"model": "m.litertlm"}, None)
+    assert report["bundle_activation"] is None
+    assert report["bundle_activation_error"].startswith("ValueError")
 
 
 @pytest.mark.parametrize(

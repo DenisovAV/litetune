@@ -1171,6 +1171,12 @@ def device_report():
             )
             return report
         listing = done.stdout.decode("utf-8", "replace")
+        if '"IOUserClientCreator"' not in listing:
+            # Not "no client of ours": no GPU client of anyone's -- ioreg lists
+            # them under the driver's subclass, AGXDeviceUserClient on an M4
+            # Pro -- so there was nothing to find this process among.
+            report["error"] = "ioreg listed no GPU client of any process"
+            return report
     except Exception as exc:  # noqa: BLE001 -- a diagnostic must not end a run
         report["error"] = "%s: %s" % (type(exc).__name__, exc)
         return report
@@ -1186,21 +1192,23 @@ def gpu_client_of(listing, pid):
 
     Separate from `device_report` so the rule can be tested without a GPU:
     only a client whose creator is this pid counts, and its GPU time is the
-    sum of `accumulatedGPUTime` across that client's `AppUsage` entries.
-    `ioreg -l` writes one object per `+-o` line, with its properties below
-    it until the next one.
+    sum of `accumulatedGPUTime` across the `AppUsage` entries of every such
+    client -- a process may hold more than one, and work on any of them is
+    work. `ioreg -l` writes one object per `+-o` line, with its properties
+    below it until the next one.
     """
     import re
 
     marker = '"IOUserClientCreator" = "pid %d,' % pid
+    client, times = None, []
     for block in listing.split("+-o "):
         if marker not in block:
             continue
-        line = next(l for l in block.splitlines() if marker in l)
-        client = line.split('" = ', 1)[1].strip().strip('"')
-        times = [int(t) for t in re.findall(r'"accumulatedGPUTime"=(\d+)', block)]
-        return client, (sum(times) if times else None)
-    return None, None
+        if client is None:
+            line = next(l for l in block.splitlines() if marker in l)
+            client = line.split('" = ', 1)[1].strip().strip('"')
+        times += [int(t) for t in re.findall(r'"accumulatedGPUTime"=(\d+)', block)]
+    return client, (sum(times) if times else None)
 
 
 def bundle_activation(path):
@@ -1211,9 +1219,10 @@ def bundle_activation(path):
     the bundle *plus* that override; this is what lets the manifest say so
     when the bundle alone would not get it. Read through
     `litert_lm_builder`, which `litert-lm` depends on, from the header only --
-    no section is unpacked. None when the key is absent, and also when the
-    builder cannot be imported or the header cannot be read, recorded
-    separately by the caller.
+    no section is unpacked. None when the key is absent. Raises -- recorded
+    by the caller as unreadable -- when the builder cannot be imported, the
+    header cannot be read, the value is not a string, or two prefill-decode
+    sections disagree: the first section is not the bundle's answer then.
     """
     import io
 
@@ -1222,22 +1231,27 @@ def bundle_activation(path):
 
     metadata = peek.read_litertlm_header(str(path), io.StringIO())
     sections = metadata.SectionMetadata()
+    declared = []
     for i in range(sections.ObjectsLength() if sections else 0):
         section = sections.Objects(i)
         if peek.get_model_type(section) != "tf_lite_prefill_decode":
             continue
+        found = None
         for j in range(section.ItemsLength()):
             item = section.Items(j)
             key = item.Key().decode("utf-8") if item is not None and item.Key() else None
             if key != "prefer_activation_type":
                 continue
             if item.ValueType() != schema.VData.StringValue:
-                return None
+                raise ValueError("prefer_activation_type is not a string")
             value = schema.StringValue()
             value.Init(item.Value().Bytes, item.Value().Pos)
             raw = value.Value()
-            return raw.decode("utf-8") if raw else None
-    return None
+            found = raw.decode("utf-8") if raw else None
+        declared.append(found)
+    if len(set(declared)) > 1:
+        raise ValueError("prefill-decode sections declare %s" % sorted(map(str, declared)))
+    return declared[0] if declared else None
 
 
 def run_report(spec, at_engine, after_generation=None):
