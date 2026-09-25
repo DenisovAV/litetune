@@ -139,7 +139,7 @@ def describe_gpu_activation(value: str | None) -> str:
     """The one sentence both the check detail and the console line print."""
     state = GpuActivationState.of(value)
     if state is GpuActivationState.UNSET:
-        return "CPU-only (GPU activations not set)"
+        return "CPU-only for an app that passes none (GPU activations not set)"
     if state is GpuActivationState.SET:
         return f"GPU activations {value}"
     return f"GPU activations {value} (declared upstream, not {GPU_ACTIVATION})"

@@ -757,8 +757,9 @@ withdrawn after re-measurement.
   said, in the limitations, not to have used the GPU. Off macOS nothing is
   looked at yet, and the manifest records the GPU as asked for. On a host
   without a usable GPU, a GPU engine has been measured to produce nothing, so
-  a GPU split first runs one prompt within one prompt's budget and stops
-  there if it gets no answer.
+  a GPU split on the text path first runs one prompt within one prompt's
+  budget and stops there if it gets no answer. The tool path has no such
+  check yet: there each decoding mode waits out its own budget, an hour.
 - **The NPU number is 20 rows on one SoC.** The same
   `functiongemma-270m-it` (base weights, not the fine-tune) through
   litert-torch's `npu_export` stages for a Snapdragon 8 Elite (`SM8750`,

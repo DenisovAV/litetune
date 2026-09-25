@@ -939,9 +939,11 @@ class LiteRtLmBackend:
                     killed = killed.decode("utf-8", "surrogateescape")
                 killed = killed.strip()[-2000:]
                 return (
-                    f"the gpu backend gave no answer to one prompt in {self.timeout_s}s, so "
-                    "the split was not started. On a host without a usable GPU litert-lm has "
-                    "been measured to build a GPU engine without error and then produce nothing"
+                    f"the gpu backend gave no answer to one prompt in {self.timeout_s}s, a "
+                    "budget that also covered building the engine, so the split was not "
+                    "started. On a host without a usable GPU litert-lm has been measured to "
+                    "build a GPU engine without error and then produce nothing; a slow engine "
+                    "build on a working GPU would end here too"
                     + (f". The runtime's last output: {killed}" if killed else "")
                 )
             except OSError:
@@ -1199,7 +1201,8 @@ def device_report():
     the pid that created it and, under `AppUsage`, an `accumulatedGPUTime`
     for that client. Measured on an M4 Pro with litert-lm 0.16.1: a GPU
     engine owns such a client from the moment it is built and its GPU time
-    grew by about four thousand times across one generated reply; a CPU
+    grew from 6.5-6.9 million to 174-181 million across one generated
+    reply, in each of three runs on 2026-09-25; a CPU
     engine owned none. The pid is the evidence, not a name -- every other
     process's clients are in the same listing and are ignored.
 

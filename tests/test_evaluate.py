@@ -2052,8 +2052,8 @@ def test_the_runtime_backend_describes_what_it_asked_for(tmp_path):
 # GPU engine owns a GPU user client from the moment it is built, recorded
 # against the pid that created it, and the client's GPU time grows while it
 # generates. Measured 2026-09-25 on an M4 Pro with litert-lm 0.16.1: one client
-# after a GPU engine was built, its GPU time grown about four thousand times
-# after one reply; none for a CPU engine.
+# after a GPU engine was built, its GPU time grown from 6.5-6.9 million to
+# 174-181 million after one reply, in three runs; none for a CPU engine.
 
 
 def _reading(

@@ -573,11 +573,17 @@ def _limit_gpu_reading(run: Any, engine: dict[str, Any]) -> None:
     real measurement, and what it is a measurement *of* is said beside it.
     """
     if engine.get("gpu_unused") is True:
+        # "A process", not "the": on the tool path each decoding mode runs in
+        # its own, and one mode doing no GPU work is enough to say this.
         run.limitation(
-            "the GPU backend was asked for, and the kernel showed no GPU work from the "
-            "candidate's process: by that reading the GPU was not used, and this is not a GPU "
-            "number"
+            "the GPU backend was asked for, and the kernel showed no GPU work from a process "
+            "that generated this run's answers: by that reading the GPU was not used there, "
+            "and not every number here is a GPU number"
         )
+        # The bundle's key is read only by the GPU executor, so what it would
+        # have changed is not what this run measured; saying the number is
+        # "for the bundle plus that override" would contradict the line above.
+        return
     declared = engine.get("bundle_activation")
     unread = engine.get("bundle_activation_error")
     if declared == GPU_ACTIVATION:
@@ -1175,7 +1181,15 @@ def run_verify(
         else f"asked {engine} for its {backend} backend; nothing established which device "
         "served the run"
     )
-    if not established or (engine.lower(), backend.lower()) != GPU_MEASURED:
+    if not established and (engine.lower(), backend.lower()) == GPU_MEASURED:
+        # Asked for the very executor the other caveat compares against: the
+        # doubt is not which executor it predicts but whether it ran there.
+        run.limitation(
+            f"{measured_on}, so this may not be a GPU number. litetune asks the kernel on "
+            "macOS only, and there only a reading that shows GPU work establishes it; "
+            "README.md's limitations section says what the reading is"
+        )
+    elif not established or (engine.lower(), backend.lower()) != GPU_MEASURED:
         run.limitation(
             f"{measured_on}. litert-lm's GPU backend is a different executor and this "
             "number does not predict it; README.md's limitations section carries what one "

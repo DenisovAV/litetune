@@ -336,8 +336,9 @@ def _add_verify(sub) -> None:
             "records what the bundle alone declares, since an app that passes no override gets "
             "that instead. litert-lm reports no device back; on macOS litetune asks the kernel "
             "whether its process did GPU work and records the run as measured on the GPU only "
-            "then, and elsewhere as asked for. A GPU split starts with one prompt and stops if "
-            "it gets no answer within one prompt's budget. This is not a torch device: the "
+            "then, and elsewhere as asked for. On the text path a GPU split starts with one "
+            "prompt and stops if it gets no answer within one prompt's budget; the tool path "
+            "has no such check. This is not a torch device: the "
             "float reference resolves its own"
         ),
     )
@@ -495,7 +496,8 @@ def _add_convert(sub) -> None:
             "section: without it the Android GPU backend computes in F16 and floods <pad> while "
             "reporting success (measured on one Snapdragon Galaxy S24, 3/20 vs 20/20 tool names "
             "on 20 rows). The repack changes one metadata string and no bytes of the model; a "
-            "bundle that could not be repacked is kept, named in the report, and is CPU-only. "
+            "bundle that could not be repacked is kept, named in the report, and is CPU-only for "
+            "an app that passes no activation type. "
             "--json records what each bundle carries as exports[].gpu_activation. "
             f"{STAGE_EXIT_CODE_HELP}"
         ),

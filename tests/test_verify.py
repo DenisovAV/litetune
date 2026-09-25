@@ -586,7 +586,10 @@ def test_a_gpu_backend_nobody_read_back_keeps_the_caveat(write_split):
     )
 
     notes = result.manifest["limitations"]
-    assert any("different executor" in note for note in notes)
+    # Asked for litert-lm's GPU and not shown to have used it: the doubt is
+    # whether it ran there, not which executor it predicts.
+    assert any("may not be a GPU number" in note for note in notes)
+    assert not any("different executor" in note for note in notes)
 
 
 def test_a_truthy_answer_that_is_not_true_keeps_the_caveat(write_split):
@@ -613,7 +616,10 @@ def test_a_truthy_answer_that_is_not_true_keeps_the_caveat(write_split):
     )
 
     notes = result.manifest["limitations"]
-    assert any("different executor" in note for note in notes)
+    # Asked for litert-lm's GPU and not shown to have used it: the doubt is
+    # whether it ran there, not which executor it predicts.
+    assert any("may not be a GPU number" in note for note in notes)
+    assert not any("different executor" in note for note in notes)
     assert any("asked litert-lm for its gpu backend" in note for note in notes)
 
 
@@ -642,7 +648,10 @@ def test_the_shipped_runtime_backend_on_a_gpu_flag_keeps_the_caveat(write_split,
         reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
     )
     notes = result.manifest["limitations"]
-    assert any("different executor" in note for note in notes)
+    # Asked for litert-lm's GPU and not shown to have used it: the doubt is
+    # whether it ran there, not which executor it predicts.
+    assert any("may not be a GPU number" in note for note in notes)
+    assert not any("different executor" in note for note in notes)
     assert not any("measured on the gpu backend" in note for note in notes)
 
 
@@ -666,7 +675,10 @@ def test_a_backend_that_omits_the_observed_key_keeps_the_caveat(write_split):
         reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
     )
 
-    assert any("different executor" in note for note in result.manifest["limitations"])
+    # Asked for litert-lm's GPU and not shown to have used it: the doubt is
+    # whether it ran there, not which executor it predicts.
+    assert any("may not be a GPU number" in note for note in result.manifest["limitations"])
+    assert not any("different executor" in note for note in result.manifest["limitations"])
 
 
 def test_a_backend_that_reports_a_null_device_does_not_crash_the_run(write_split):
@@ -1916,7 +1928,18 @@ def test_a_gpu_run_the_kernel_shows_unused_says_so_where_it_is_read(write_split)
     a run under `backend: gpu` that the kernel says never worked there is a
     CPU number, and nothing else would tell its reader."""
     notes = _limitations_for(write_split, _gpu_engine(gpu_unused=True, bundle_activation="fp32"))
-    assert any("the GPU was not used" in n and "not a GPU number" in n for n in notes)
+    assert any("the GPU was not used" in n and "not every number here" in n for n in notes)
+
+
+def test_an_unused_gpu_says_nothing_about_what_the_override_shaped(write_split):
+    """The key is read only by the GPU executor. A run the kernel shows off the
+    GPU was not shaped by it, and "this number is for the bundle plus that
+    override" beside "the GPU was not used" says two opposite things."""
+    notes = _limitations_for(write_split, _gpu_engine(gpu_unused=True, bundle_activation=None))
+    joined = " ".join(notes)
+    assert "the GPU was not used" in joined
+    assert "the bundle declares" not in joined
+    assert "bundle plus that override" not in joined
 
 
 def test_a_bundle_that_declares_no_activations_is_said_to_rely_on_the_override(write_split):
