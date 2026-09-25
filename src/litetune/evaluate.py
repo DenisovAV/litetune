@@ -932,13 +932,21 @@ class LiteRtLmBackend:
             )
             try:
                 self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as expired:
+                # The child's last words, as the split's own timeout keeps them.
+                killed = expired.stderr or ""
+                if isinstance(killed, bytes):
+                    killed = killed.decode("utf-8", "surrogateescape")
+                killed = killed.strip()[-2000:]
                 return (
                     f"the gpu backend gave no answer to one prompt in {self.timeout_s}s, so "
                     "the split was not started. On a host without a usable GPU litert-lm has "
                     "been measured to build a GPU engine without error and then produce nothing"
+                    + (f". The runtime's last output: {killed}" if killed else "")
                 )
             except OSError:
+                # The split starts the same script and reports this with its rows.
+                logger.exception("could not start the litert-lm gpu preflight")
                 return None
         return None
 
@@ -1006,7 +1014,9 @@ def _read_device_report(path: Path) -> dict[str, Any] | None:
 
     Missing is ordinary -- a script that died before building its engine, or a
     run that never started -- and it means "not established", which is what
-    `gpu_observed` makes of `None`. Unreadable is logged, because it is not.
+    `gpu_observed` makes of `None`. Unreadable is not ordinary, so it is kept
+    as `{"unreadable": why}`: that reads as "not established" too, and
+    `bundle_activation_error_of` carries the reason into the manifest.
     """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1014,8 +1024,11 @@ def _read_device_report(path: Path) -> dict[str, Any] | None:
         return None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         logger.warning("device report %s is unreadable: %s", path.name, exc)
-        return None
-    return payload if isinstance(payload, dict) else None
+        return {"unreadable": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(payload, dict):
+        logger.warning("device report %s is not a JSON object", path.name)
+        return {"unreadable": f"a JSON {type(payload).__name__}, not an object"}
+    return payload
 
 
 def _gpu_work(report: Any) -> tuple[bool | None, Any]:
@@ -1049,6 +1062,11 @@ def _gpu_work(report: Any) -> tuple[bool | None, Any]:
     return None, end
 
 
+def _is_count(value: Any) -> bool:
+    """An integer GPU time; a bool is an int to `isinstance` and is not one."""
+    return type(value) is int
+
+
 def _clients_worked(start: Any, end: dict) -> bool | None:
     """Whether GPU time grew, compared client by client across the readings.
 
@@ -1073,14 +1091,14 @@ def _clients_worked(start: Any, end: dict) -> bool | None:
     unread = False
     for key, time in after.items():
         base = before.get(key, 0)
-        if not isinstance(base, int):
+        if not _is_count(base):
             unread = True
             continue
-        if isinstance(time, int) and time > base:
+        if _is_count(time) and time > base:
             return True
     if unread or not set(before) <= set(after):
         return None
-    if all(isinstance(t, int) for t in after.values()):
+    if all(_is_count(t) for t in after.values()):
         return False
     return None
 
@@ -1109,14 +1127,22 @@ def bundle_activation_of(report: Any) -> str | None:
 
 
 def bundle_activation_error_of(report: Any) -> str | None:
-    """Why the driver script could not read the bundle's key, if it could not.
+    """Why the bundle's key was not read, or None when it was.
 
     Kept apart from `bundle_activation_of`, whose None means both "the bundle
     declares none" and "nobody could tell": the first is a finding about the
-    bundle, the second is not.
+    bundle, the second is not. So None here only for a report that carries a
+    reading -- a run that wrote no report, or an unreadable one, read nothing
+    about the bundle, and saying it declares none would be a claim about it.
     """
-    if isinstance(report, dict) and isinstance(report.get("bundle_activation_error"), str):
+    if not isinstance(report, dict):
+        return "the run wrote no device report"
+    if isinstance(report.get("unreadable"), str):
+        return f"the run's device report is unreadable ({report['unreadable']})"
+    if isinstance(report.get("bundle_activation_error"), str):
         return report["bundle_activation_error"]
+    if "bundle_activation" not in report:
+        return "the run's device report carries no reading of the bundle"
     return None
 
 
@@ -1237,7 +1263,8 @@ def gpu_client_of(listing, pid):
     Separate from `device_report` so the rule can be tested without a GPU:
     only a client whose creator is this pid counts. Each is keyed by its
     registry id, with the sum of `accumulatedGPUTime` across its `AppUsage`
-    entries, or None when it has none -- per client, because a process may
+    entries -- 0 for an empty `AppUsage = ()`, None when there is no
+    `AppUsage` to read -- per client, because a process may
     hold more than one and the two readings are compared client by client.
     `ioreg -l` writes one object per `+-o` line, with its properties below
     it until the next one.
@@ -1254,7 +1281,15 @@ def gpu_client_of(listing, pid):
             client = line.split('" = ', 1)[1].strip().strip('"')
         found = re.search(r"\bid (0x[0-9a-fA-F]+)", block.splitlines()[0])
         times = [int(t) for t in re.findall(r'"accumulatedGPUTime"=(\d+)', block)]
-        clients[found.group(1) if found else "#%d" % n] = sum(times) if times else None
+        if not found:
+            time = None  # no id to match across readings: not comparable
+        elif times:
+            time = sum(times)
+        elif '"AppUsage" = ()' in block:
+            time = 0  # read, and empty: no GPU time yet -- most idle clients look so
+        else:
+            time = None
+        clients[found.group(1) if found else "#%d" % n] = time
     return client, clients
 
 
@@ -1295,7 +1330,7 @@ def bundle_activation(path):
             value = schema.StringValue()
             value.Init(item.Value().Bytes, item.Value().Pos)
             raw = value.Value()
-            found.append(raw.decode("utf-8") if raw else None)
+            found.append(raw.decode("utf-8") if raw is not None else None)
         # The builder lets `additional_metadata` repeat the key in one section.
         declared.extend(found or [None])
     if len(set(declared)) > 1:

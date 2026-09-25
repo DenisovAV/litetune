@@ -689,6 +689,15 @@ class ToolPathBackend:
         """
         return True
 
+    def _bundle_readings(self) -> list[dict[str, Any]]:
+        """The modes' reports that carry a reading of the bundle's key."""
+        return [
+            r
+            for r in self.device_reports
+            if bundle_activation_error_of(r) is None
+            or (isinstance(r, dict) and "bundle_activation_error" in r)
+        ]
+
     def describe(self) -> dict[str, Any]:
         return {
             # The same keys and vocabulary `LiteRtLmBackend` uses, because
@@ -705,12 +714,18 @@ class ToolPathBackend:
             # Either mode showing no GPU work is enough: each built its own
             # engine, and the one that did not use the GPU produced rows too.
             "gpu_unused": any(gpu_unused(self.backend_flag, r) for r in self.device_reports),
+            # From the modes whose report carries a reading of the bundle; with
+            # none, why none did -- not "declares none", which is a claim.
             "bundle_activation": next(
-                (a for a in map(bundle_activation_of, self.device_reports) if a is not None),
+                (a for a in map(bundle_activation_of, self._bundle_readings()) if a is not None),
                 None,
             ),
             "bundle_activation_error": next(
-                (e for e in map(bundle_activation_error_of, self.device_reports) if e is not None),
+                (
+                    e
+                    for e in map(bundle_activation_error_of, self._bundle_readings() or [None])
+                    if e is not None
+                ),
                 None,
             ),
             "backend_vocabulary": "litert-lm Python API Backend",

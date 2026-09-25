@@ -29,7 +29,9 @@ from litetune.evaluate import (
     HuggingFaceBackend,
     LiteRtLmBackend,
     _litertlm_script,
+    _read_device_report,
     assemble_generations,
+    bundle_activation_error_of,
     device_mismatch,
     evaluate,
     gpu_observed,
@@ -2152,6 +2154,55 @@ def test_every_client_of_this_process_is_read_by_its_own_id():
     )
 
 
+def test_an_empty_app_usage_is_zero_time_and_a_missing_one_is_unread():
+    """Real `ioreg -l` prints `"AppUsage" = ()` for a client that has done no
+    GPU work yet (65 of 88 clients on an M4 Pro): that is a reading of zero.
+    Read as unread, a GPU engine whose client started idle could never be
+    observed working."""
+    listing = "\n".join(
+        [
+            "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x100000f52, active>",
+            '    |   "IOUserClientCreator" = "pid 4242, python3.12"',
+            '    |   "AppUsage" = ()',
+            "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x100000f53, active>",
+            '    |   "IOUserClientCreator" = "pid 4242, python3.12"',
+        ]
+    )
+    client_of = _litertlm_script()["gpu_client_of"]
+    assert client_of(listing, 4242)[1] == {"0x100000f52": 0, "0x100000f53": None}
+
+
+def test_a_client_with_no_registry_id_is_not_compared():
+    """Its fallback key is its position in one listing, which moves between
+    readings: counted from zero, any time on it would read as new work."""
+    listing = "\n".join(
+        [
+            "+-o AGXDeviceUserClient  <class AGXDeviceUserClient>",
+            '    |   "IOUserClientCreator" = "pid 4242, python3.12"',
+            '    |   "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=900})',
+        ]
+    )
+    assert _litertlm_script()["gpu_client_of"](listing, 4242)[1] == {"#1": None}
+
+
+def test_an_idle_client_that_starts_working_is_observed():
+    report = _run_report(
+        _reading(gpu_time=0, clients={"0x1": 0}), _reading(gpu_time=5000, clients={"0x1": 5000})
+    )
+    assert gpu_observed("gpu", report) is True
+    idle = _run_report(
+        _reading(gpu_time=0, clients={"0x1": 0}), _reading(gpu_time=0, clients={"0x1": 0})
+    )
+    assert gpu_unused("gpu", idle) is True
+
+
+def test_a_bool_in_a_report_is_not_gpu_time():
+    report = _run_report(
+        _reading(gpu_time=0, clients={"0x1": 0}), _reading(gpu_time=True, clients={"0x1": True})
+    )
+    assert gpu_observed("gpu", report) is False
+
+
 def test_a_platform_nobody_observed_is_not_looked_at(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     report = _litertlm_script()["device_report"]()
@@ -2337,6 +2388,8 @@ def test_the_bundle_key_is_read_from_its_prefill_decode_sections(monkeypatch, se
         # The first section is not the bundle's answer when a later one differs.
         [_pd((_KEY, "fp32")), _pd((_KEY, "fp32_fp16"))],
         [_pd((_KEY, "fp32")), _pd()],
+        # An empty value is a declaration of "", not an absent key.
+        [_pd((_KEY, "fp32")), _pd((_KEY, ""))],
         # Within one section: `additional_metadata` may repeat the key.
         [_pd((_KEY, "fp32"), (_KEY, "fp16"))],
         # Not a string: unreadable, not "declares none".
@@ -2454,9 +2507,9 @@ def test_a_run_killed_after_its_engine_opened_the_gpu_is_not_called_a_gpu_run(
 
 
 @pytest.mark.parametrize("written", ["{", "[]", '"a string"'])
-def test_a_report_that_cannot_be_read_is_no_report(monkeypatch, tmp_path, written):
+def test_a_report_that_cannot_be_read_establishes_nothing(monkeypatch, tmp_path, written):
     """Truncated by a kill mid-write, or not an object: either way nothing was
-    established, and neither may escape `generate`."""
+    established, neither may escape `generate`, and the manifest says why."""
 
     def writes(self, args, timeout=3600, **kwargs):
         spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
@@ -2468,7 +2521,11 @@ def test_a_report_that_cannot_be_read_is_no_report(monkeypatch, tmp_path, writte
     backend = _litertlm(tmp_path, backend_flag="gpu")
     backend.generate(["one"])
 
-    assert backend.describe()["device_report"] is None
+    described = backend.describe()
+    assert set(described["device_report"]) == {"unreadable"}
+    assert described[BACKEND_OBSERVED] is False
+    assert described["gpu_unused"] is False
+    assert "unreadable" in described["bundle_activation_error"]
     assert backend.backend_observed is False
 
 
@@ -2530,6 +2587,50 @@ def test_a_gpu_that_never_answers_is_reported_in_one_prompts_time(monkeypatch, t
     assert budgets == [7], "one prompt's budget, and the split never started"
     assert all(not g.ran for g in generations)
     assert "gpu backend gave no answer to one prompt in 7s" in generations[0].harness_error
+
+
+def test_a_silent_gpu_keeps_the_runtimes_last_words_and_claims_nothing_about_the_bundle(
+    monkeypatch, tmp_path
+):
+    """The preflight's timeout keeps the child's stderr, as the split's does;
+    and with no report written, the bundle's key was never read -- "declares
+    none" would be a claim about a bundle nobody opened."""
+
+    def silent(self, args, timeout=3600, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout, stderr=b"opencl: no device")
+
+    monkeypatch.setattr(envs.StageEnv, "run", silent)
+    backend = _litertlm(tmp_path, backend_flag="gpu", timeout_s=7)
+    generations = backend.generate(["a", "b"])
+
+    assert "opencl: no device" in generations[0].harness_error
+    described = backend.describe()
+    assert described["bundle_activation"] is None
+    assert described["bundle_activation_error"] == "the run wrote no device report"
+
+
+@pytest.mark.parametrize(
+    ("content", "why"),
+    [('{"at_engine": ', "JSONDecodeError"), ("[1, 2]", "a JSON list, not an object")],
+)
+def test_an_unreadable_device_report_says_so_in_the_manifest(tmp_path, content, why):
+    """Not only in a log line: read as "no report" it would be indistinguishable
+    from a run that never started."""
+    path = tmp_path / "device.json"
+    path.write_text(content, encoding="utf-8")
+    report = _read_device_report(path)
+
+    assert why in report["unreadable"]
+    assert gpu_observed("gpu", report) is False
+    assert gpu_unused("gpu", report) is False
+    assert "unreadable" in bundle_activation_error_of(report)
+
+
+def test_a_report_without_a_bundle_reading_is_not_a_bundle_that_declares_none():
+    assert bundle_activation_error_of({"at_engine": None}) == (
+        "the run's device report carries no reading of the bundle"
+    )
+    assert bundle_activation_error_of({"bundle_activation": None}) is None
 
 
 def test_a_cpu_split_starts_without_a_preflight(monkeypatch, tmp_path):

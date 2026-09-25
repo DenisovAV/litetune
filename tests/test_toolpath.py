@@ -1824,6 +1824,25 @@ def test_a_tool_path_run_that_wrote_no_report_claims_nothing(tmp_path):
     assert backend.describe()[BACKEND_OBSERVED] is False
     assert backend.describe()["gpu_unused"] is False
     assert backend.describe()["device_reports"] == [None, None]
+    # Nothing about the bundle was read, so nothing about it is said.
+    assert backend.describe()["bundle_activation"] is None
+    assert backend.describe()["bundle_activation_error"] == "the run wrote no device report"
+
+
+def test_one_mode_that_read_the_bundle_speaks_for_it(tmp_path):
+    """A mode with no report says nothing; the other mode's reading stands."""
+    backend = _gpu_run(tmp_path, {"unconstrained": _WORKED})
+
+    assert backend.describe()["bundle_activation"] == "fp32"
+    assert backend.describe()["bundle_activation_error"] is None
+
+
+def test_a_mode_that_read_no_key_is_not_overruled_by_a_mode_with_no_report(tmp_path):
+    unkeyed = {**_WORKED, "bundle_activation": None}
+    backend = _gpu_run(tmp_path, {"unconstrained": unkeyed})
+
+    assert backend.describe()["bundle_activation"] is None
+    assert backend.describe()["bundle_activation_error"] is None, "declares none: a finding"
 
 
 def test_the_tool_path_script_returns_both_readings_and_the_bundles_key(tmp_path, monkeypatch):
