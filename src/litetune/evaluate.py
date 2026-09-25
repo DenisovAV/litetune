@@ -1299,15 +1299,16 @@ class HuggingFaceBackend:
     def generate(
         self, prompts: Sequence[str], events: EventStream | None = None
     ) -> list[Generation]:
-        blocked = self._ensure_env(events)
-        if blocked is not None:
-            return [Generation(i, p, harness_error=blocked) for i, p in enumerate(prompts)]
-
         # A run reports what it read back, not what an earlier one did:
         # `device` survives a run that established nothing, by the do-not-erase
         # rule below, and that survival must not be reported as this run's
-        # reading.
+        # reading. First, before any return: a blocked environment clears
+        # `device` in `_ensure_env`, and a `True` left from the previous run
+        # would then sit beside `UNKNOWN_BACKEND` claiming it was read back.
         self.device_observed = False
+        blocked = self._ensure_env(events)
+        if blocked is not None:
+            return [Generation(i, p, harness_error=blocked) for i, p in enumerate(prompts)]
 
         # This call's own probe only, not `self.device`: the do-not-erase rule
         # in `_ensure_env` deliberately lets `self.device` keep a stale answer

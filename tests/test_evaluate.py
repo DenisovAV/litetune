@@ -966,6 +966,32 @@ def test_a_blocked_environment_clears_the_device(monkeypatch):
     assert gens[0].harness_error is not None
 
 
+def test_a_blocked_run_does_not_inherit_the_previous_runs_reading(monkeypatch):
+    """Found by review: the reset sat after the blocked return.
+
+    One run reads its device back; the next cannot provision. `_ensure_env`
+    clears `device`, and a `True` left over from the first run would then sit
+    beside `UNKNOWN_BACKEND` claiming this run read something back.
+    """
+    _ready_env()
+    _generating_env(monkeypatch, probe="cpu", script_device="cuda")
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+    assert backend.describe()[BACKEND_OBSERVED] is True
+
+    def explode(self, events=None, force=False):
+        raise RuntimeError("no interpreter")
+
+    monkeypatch.setattr(envs.StageEnv, "provision", explode)
+    backend.auto_provision = True
+    gens = backend.generate(["b"])
+
+    assert gens[0].harness_error is not None
+    described = backend.describe()
+    assert described["backend"] == UNKNOWN_BACKEND
+    assert described[BACKEND_OBSERVED] is False
+
+
 # -- comparing two points that ran on different hardware ---------------------
 
 
