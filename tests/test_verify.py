@@ -15,7 +15,7 @@ import pytest
 from conftest import FakeBackend, call_text, correct_texts, labelled_rows, mark_provisioned
 
 from litetune import envs
-from litetune.evaluate import Generation, HuggingFaceBackend
+from litetune.evaluate import BACKEND_OBSERVED, Generation, HuggingFaceBackend
 from litetune.prompt_mode import PromptMode
 from litetune.verify import (
     BackendPair,
@@ -531,15 +531,16 @@ def test_a_litertlm_run_on_its_own_gpu_backend_is_told_nothing_about_it(write_sp
     `cuda` run: `backend` holds two vocabularies under one key, and a
     transformers measurement on cuda says least of all about litert-lm's GPU.
 
-    No litetune command reaches this branch: `build_backends` never passes
-    `backend_flag`, and litetune cannot drive a phone's GPU from a laptop. It
-    is reachable by a library caller assembling its own `BackendPair`, which is
-    the case the limitation above this one exists for.
+    And only a run that *established* it ran there. No litetune command reaches
+    this branch: `build_backends` never passes `backend_flag`, and litetune
+    cannot drive a phone's GPU from a laptop. It is reachable by a library
+    caller assembling its own `BackendPair`, which is the case the limitation
+    above this one exists for.
     """
 
     class LiteRtLmOnGpu(FakeBackend):
         def describe(self) -> dict:
-            return {"engine": "litert-lm", "backend": "gpu"}
+            return {"engine": "litert-lm", "backend": "gpu", BACKEND_OBSERVED: True}
 
     rows = labelled_rows(4)
     result = verify(
@@ -552,6 +553,59 @@ def test_a_litertlm_run_on_its_own_gpu_backend_is_told_nothing_about_it(write_sp
     notes = result.manifest["limitations"]
     assert any("measured on the gpu backend of litert-lm" in note for note in notes)
     assert not any("different executor" in note for note in notes)
+
+
+def test_a_gpu_backend_nobody_read_back_keeps_the_caveat(write_split):
+    """A flag is not a measurement, and this is the trap that was armed.
+
+    `describe()["backend"]` carries a device the run read back on the
+    transformers side and the flag it passed on the litert-lm side. Silencing
+    the caveat on the strength of that key would, the day a `--backend gpu`
+    flag exists, write "measured on the gpu backend of litert-lm" into the
+    manifest of a run on a machine with no usable GPU -- and litert-lm's Python
+    API names no accelerator, so nothing would contradict it.
+
+    Same describe() as the test above but for the one key, and the caveat has
+    to survive.
+    """
+
+    class ClaimsGpu(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "litert-lm", "backend": "gpu", BACKEND_OBSERVED: False}
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=ClaimsGpu(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    notes = result.manifest["limitations"]
+    assert any("different executor" in note for note in notes)
+
+
+def test_a_backend_that_omits_the_observed_key_keeps_the_caveat(write_split):
+    """The default is "not established", not "true".
+
+    A third-party backend, or one written before this key existed, says
+    nothing about it. Reading that silence as an observation is the same
+    mistake as reading a flag as one.
+    """
+
+    class SaysNothing(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "litert-lm", "backend": "gpu"}
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=SaysNothing(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    assert any("different executor" in note for note in result.manifest["limitations"])
 
 
 def test_a_backend_that_reports_a_null_device_does_not_crash_the_run(write_split):

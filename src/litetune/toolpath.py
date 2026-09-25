@@ -53,7 +53,7 @@ from pathlib import Path
 from typing import Any
 
 from litetune import envs
-from litetune.evaluate import GREEDY, DecodeConfig, Generation
+from litetune.evaluate import BACKEND_OBSERVED, GREEDY, DecodeConfig, Generation
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.metrics import ToolCall
@@ -646,6 +646,9 @@ class ToolPathBackend:
             # (unknown)" instead of on the CPU the script asks for.
             "engine": "litert-lm",
             "backend": "cpu",
+            # A constant, like `LiteRtLmBackend`'s flag: this script asks for
+            # the CPU and nothing reads back what served the run.
+            BACKEND_OBSERVED: False,
             "backend_vocabulary": "litert-lm Python API Backend",
             "path": "tool path",
             "model": self.model_ref,

@@ -41,6 +41,7 @@ from litetune import envs, metrics, models
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
 from litetune.evaluate import (
+    BACKEND_OBSERVED,
     GREEDY,
     DataError,
     DecodeConfig,
@@ -107,7 +108,12 @@ MANIFEST_SCHEMA = "litetune.verify/1"
 
 
 # The one measurement that answers the caveat below: litert-lm's own GPU
-# backend. Not any accelerator -- an NPU is a third executor and predicts the
+# backend, *and only when the run established that it ran there* -- see
+# `evaluate.BACKEND_OBSERVED`. Silencing it on the strength of a flag would
+# turn a request into the sentence "measured on the gpu backend of litert-lm",
+# which is the claim this file exists to avoid making.
+#
+# Not any accelerator -- an NPU is a third executor and predicts the
 # GPU no better than the CPU does -- and deliberately not a torch `cuda` device
 # either. `evaluate.py` warns that `backend` holds two vocabularies under one
 # key, a torch device and a litert-lm flag, overlapping only at `cpu`; a
@@ -1092,16 +1098,19 @@ def run_verify(
     # README section where the figures live with the conditions that make them
     # readable.
     #
-    # Silenced only for a litert-lm run on its GPU backend: there, and only
-    # there, the sentence would name the executor the run already used. An NPU,
-    # a torch cuda device and an unestablished backend all keep it.
+    # Silenced only for a litert-lm run on its GPU backend, and only when the
+    # backend was observed rather than asked for: there, and only there, the
+    # sentence would name the executor the run already used. An NPU, a torch
+    # cuda device, an unestablished backend and a backend nobody read back all
+    # keep it.
     # `or` rather than a default: a third-party backend may put the key there
     # with a null value, which `.get`'s default does not cover, and this module
     # promises never to raise.
     backend = str(candidate.engine.get("backend") or "unknown")
     engine = str(candidate.engine.get("engine") or "unknown")
     measured_on = f"measured on the {backend} backend of {engine}"
-    if (engine.lower(), backend.lower()) != GPU_MEASURED:
+    observed = candidate.engine.get(BACKEND_OBSERVED) is True
+    if not observed or (engine.lower(), backend.lower()) != GPU_MEASURED:
         run.limitation(
             f"{measured_on}. litert-lm's GPU backend is a different executor and this "
             "number does not predict it; README.md's limitations section carries what one "

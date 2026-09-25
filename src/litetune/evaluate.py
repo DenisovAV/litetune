@@ -65,6 +65,24 @@ UNDECLARED_PROMPT_MODE = PromptMode.PRERENDERED
 # is the same word for what is, to a reader of the manifest, the same state.
 UNKNOWN_BACKEND = "unknown"
 
+# Whether `describe()["backend"]` is something the run established or something
+# it asked for. One key has carried both: `HuggingFaceBackend` reads its device
+# back out of the script's own run report and writes `UNKNOWN_BACKEND` when
+# nothing answered, while the litert-lm backends write the flag they passed.
+#
+# That difference is invisible while the flag can only be "cpu". It stops being
+# invisible the moment a GPU flag exists, because `verify` silences its
+# "the GPU backend is a different executor" caveat for a run whose backend
+# *is* the GPU -- and litert-lm's Python API offers nothing that names the
+# accelerator a run actually used: the engine echoes the backend it was given,
+# and `BenchmarkInfo` carries timings only. Measured 2026-09-25: an engine
+# built with `Backend.GPU()` on a machine with no usable GPU raises nothing and
+# returns nothing, so even a failure is not a signal.
+#
+# So the caveat is silenced only where the value was observed. A backend that
+# cannot observe says so, and says it here rather than by convention.
+BACKEND_OBSERVED = "backend_observed"
+
 
 @dataclass(frozen=True)
 class DecodeConfig:
@@ -707,6 +725,9 @@ class LiteRtLmBackend:
         return {
             "engine": "litert-lm",
             "backend": self.backend_flag,
+            # The flag this backend passed, not an accelerator anything read
+            # back. See `BACKEND_OBSERVED`.
+            BACKEND_OBSERVED: False,
             # The flag as passed, not a device torch chose: see
             # `HuggingFaceBackend.describe`, where the same key carries the
             # other vocabulary.
@@ -1212,6 +1233,9 @@ class HuggingFaceBackend:
             # second word for the same state would have put two names for one
             # thing in one manifest.
             "backend": self.device if self.device is not None else UNKNOWN_BACKEND,
+            # Read back out of the script's run report, so unlike the litert-lm
+            # backends this one is reporting what ran. See `BACKEND_OBSERVED`.
+            BACKEND_OBSERVED: self.device is not None,
             # What was predicted before the run, so a reader can see the two
             # disagree rather than only the winner. `None` when nothing was
             # asked; equal to `backend` on every run that used what it was
