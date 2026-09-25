@@ -2096,6 +2096,13 @@ _NEW_CLIENT = _run_report(
     _reading(gpu_time=100, clients={"0x1": 100}),
     _reading(gpu_time=150, clients={"0x1": 100, "0x2": 50}),
 )
+# The engine reading failed: the client's 10 may all be engine construction.
+_ENGINE_UNREAD = _run_report(
+    _reading(looked=False, client=None, clients=None), _reading(gpu_time=10, clients={"0x2": 10})
+)
+_BASELINE_UNTIMED = _run_report(
+    _reading(gpu_time=None, clients={"0x2": None}), _reading(gpu_time=10, clients={"0x2": 10})
+)
 _SECOND_WORKED = _run_report(
     _reading(gpu_time=200, clients={"0x1": 100, "0x2": 100}),
     _reading(gpu_time=300, clients={"0x1": 100, "0x2": 200}),
@@ -2352,6 +2359,8 @@ def test_a_bundle_key_that_is_not_one_answer_is_unreadable(monkeypatch, sections
         ("gpu", _SWAPPED, False, False),  # a client closed: its work is not established
         ("gpu", _NEW_CLIENT, True, False),  # a client opened while generating did work
         ("gpu", _SECOND_WORKED, True, False),  # an idle first client does not hide it
+        ("gpu", _ENGINE_UNREAD, False, False),  # no baseline: the time may predate decoding
+        ("gpu", _BASELINE_UNTIMED, False, False),  # a client with no time at the engine
         ("gpu", None, False, False),  # no report at all
         ("cpu", _WORKED, False, False),  # a CPU run is never read as a GPU one
     ],

@@ -1050,21 +1050,33 @@ def _clients_worked(start: Any, end: dict) -> bool | None:
 
     A client's total is compared only with that same client's: one that did
     work and closed would otherwise leave a sum that did not grow, and a
-    replacement would stand in for it. A client new since the engine reading
-    counts from zero. No growth is only a "no" when every client seen at the
-    engine is still there and every time was read; otherwise it is None.
+    replacement would stand in for it. The key is the registry id `ioreg`
+    prints (`IORegistryEntryGetRegistryEntryID`, IOKitTools ioreg.c), which
+    xnu hands out from a counter it only increments (IORegistryEntry.cpp), so
+    an id is not reused before a reboot. A client absent from the engine
+    reading was opened after it, so all its time came later and counts from
+    zero. Without a successful engine reading, or with a client whose time
+    was not read there, growth is not established. No growth is a "no" only
+    when every client seen at the engine is still there and every time on
+    both sides was read; otherwise it is None.
     """
     after = end.get("gpu_clients")
-    if not isinstance(after, dict):
+    if not isinstance(start, dict) or start.get("looked") is not True:
         return None
-    before = start.get("gpu_clients") if isinstance(start, dict) else None
-    if not isinstance(before, dict):
-        before = {}
+    before = start.get("gpu_clients")
+    if not isinstance(after, dict) or not isinstance(before, dict):
+        return None
+    unread = False
     for key, time in after.items():
-        base = before.get(key)
-        if isinstance(time, int) and time > (base if isinstance(base, int) else 0):
+        base = before.get(key, 0)
+        if not isinstance(base, int):
+            unread = True
+            continue
+        if isinstance(time, int) and time > base:
             return True
-    if set(before) <= set(after) and all(isinstance(t, int) for t in after.values()):
+    if unread or not set(before) <= set(after):
+        return None
+    if all(isinstance(t, int) for t in after.values()):
         return False
     return None
 
