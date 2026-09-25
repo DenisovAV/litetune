@@ -2103,6 +2103,8 @@ _ENGINE_UNREAD = _run_report(
 _BASELINE_UNTIMED = _run_report(
     _reading(gpu_time=None, clients={"0x2": None}), _reading(gpu_time=10, clients={"0x2": 10})
 )
+_CLOSED_BY_END = _run_report(_reading(gpu_time=10), _reading(client=None))
+_NO_CLIENT_THEN_KILLED = _run_report(_reading(client=None), None)
 _SECOND_WORKED = _run_report(
     _reading(gpu_time=200, clients={"0x1": 100, "0x2": 100}),
     _reading(gpu_time=300, clients={"0x1": 100, "0x2": 200}),
@@ -2361,6 +2363,8 @@ def test_a_bundle_key_that_is_not_one_answer_is_unreadable(monkeypatch, sections
         ("gpu", _SECOND_WORKED, True, False),  # an idle first client does not hide it
         ("gpu", _ENGINE_UNREAD, False, False),  # no baseline: the time may predate decoding
         ("gpu", _BASELINE_UNTIMED, False, False),  # a client with no time at the engine
+        ("gpu", _CLOSED_BY_END, False, False),  # a client that worked may have closed
+        ("gpu", _NO_CLIENT_THEN_KILLED, False, False),  # one reading proves nothing
         ("gpu", None, False, False),  # no report at all
         ("cpu", _WORKED, False, False),  # a CPU run is never read as a GPU one
     ],

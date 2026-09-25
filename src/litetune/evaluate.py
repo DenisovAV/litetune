@@ -1024,25 +1024,29 @@ def _gpu_work(report: Any) -> tuple[bool | None, Any]:
     True when the kernel was asked after generating and one of the process's
     GPU clients showed more GPU time than it had once the engine was built --
     the runtime opened the GPU *and* worked there. False when the kernel was
-    asked and showed no client for this pid, or clients whose time did not grow:
-    measured on the host where this was built, a GPU engine always owns one
-    from construction and its time grows while it decodes, so that reading
-    says the GPU was not used. None when nothing was established either way --
-    the kernel was not asked, the run died before the second reading, or the
-    report is missing.
+    asked at both readings and showed no client for this pid either time, or
+    the same clients with time that did not grow: measured on the host where
+    this was built, a GPU engine always owns one from construction and its
+    time grows while it decodes, so those readings say the GPU was not used.
+    None when nothing was established either way -- the kernel was not asked,
+    the run died before the second reading, a client seen at the engine was
+    gone by the end, or the report is missing.
     """
     if not isinstance(report, dict):
         return None, None
     end = report.get("after_generation")
     start = report.get("at_engine")
-    if isinstance(end, dict) and end.get("looked") is True:
-        if not isinstance(end.get("gpu_client"), str):
-            return False, end
+    if not isinstance(end, dict) or end.get("looked") is not True:
+        return None, None
+    if isinstance(end.get("gpu_client"), str):
         return _clients_worked(start, end), end
-    if isinstance(start, dict) and start.get("looked") is True:
-        if not isinstance(start.get("gpu_client"), str):
-            return False, start
-    return None, None
+    if (
+        isinstance(start, dict)
+        and start.get("looked") is True
+        and not isinstance(start.get("gpu_client"), str)
+    ):
+        return False, end
+    return None, end
 
 
 def _clients_worked(start: Any, end: dict) -> bool | None:
