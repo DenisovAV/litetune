@@ -15,7 +15,12 @@ import pytest
 from conftest import FakeBackend, call_text, correct_texts, labelled_rows, mark_provisioned
 
 from litetune import envs
-from litetune.evaluate import BACKEND_OBSERVED, Generation, HuggingFaceBackend
+from litetune.evaluate import (
+    BACKEND_OBSERVED,
+    Generation,
+    HuggingFaceBackend,
+    LiteRtLmBackend,
+)
 from litetune.prompt_mode import PromptMode
 from litetune.verify import (
     BackendPair,
@@ -446,9 +451,10 @@ def test_every_run_reports_which_backend_measured_it(write_split):
     # the manifest and hardcoded the fallback would have passed.
     backend = result.manifest["measurements"]["candidate"]["engine"]["backend"]
     assert backend == "npu"
-    assert any(
-        f"measured on the {backend} backend" in note for note in result.manifest["limitations"]
-    )
+    # Not the verb: it now varies with whether anything read the backend back,
+    # and this test is about the backend reaching the sentence at all. Pinning
+    # the verb here is what the comment above warns against.
+    assert any(f"{backend} backend" in note for note in result.manifest["limitations"])
 
 
 def test_a_cpu_measurement_is_warned_that_the_gpu_is_a_different_executor(write_split):
@@ -559,11 +565,10 @@ def test_a_gpu_backend_nobody_read_back_keeps_the_caveat(write_split):
     """A flag is not a measurement, and this is the trap that was armed.
 
     `describe()["backend"]` carries a device the run read back on the
-    transformers side and the flag it passed on the litert-lm side. Silencing
-    the caveat on the strength of that key would, the day a `--backend gpu`
-    flag exists, write "measured on the gpu backend of litert-lm" into the
-    manifest of a run on a machine with no usable GPU -- and litert-lm's Python
-    API names no accelerator, so nothing would contradict it.
+    transformers side and the flag it passed on the litert-lm side. Reading
+    the second as the first would, the day a `--backend gpu` flag exists, put
+    "measured on the gpu backend of litert-lm" into a manifest on the strength
+    of the ask. See `evaluate.BACKEND_OBSERVED` for what an ask is worth.
 
     Same describe() as the test above but for the one key, and the caveat has
     to survive.
@@ -583,6 +588,63 @@ def test_a_gpu_backend_nobody_read_back_keeps_the_caveat(write_split):
 
     notes = result.manifest["limitations"]
     assert any("different executor" in note for note in notes)
+
+
+def test_a_truthy_answer_that_is_not_true_keeps_the_caveat(write_split):
+    """`is True`, not `bool(...)`, and this is what tells them apart.
+
+    Replacing the check with `bool(...)` passes every other test here: they
+    cover `True`, `False` and absent, and all three agree under either
+    spelling. The population that can reach this branch at all is third-party
+    backends -- litetune's own three all answer `False` -- and a backend
+    writing `"no"` or `"unverified"` is exactly the caller `verify.py` already
+    reasons about when it refuses to trust a `.get` default.
+    """
+
+    class SaysYes(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "litert-lm", "backend": "gpu", BACKEND_OBSERVED: "yes"}
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=SaysYes(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    notes = result.manifest["limitations"]
+    assert any("different executor" in note for note in notes)
+    assert any("asked litert-lm for its gpu backend" in note for note in notes)
+
+
+def test_the_shipped_runtime_backend_on_a_gpu_flag_keeps_the_caveat(write_split, tmp_path):
+    """The real backend, not a double, on the flag this all exists for.
+
+    Every other test on this branch hand-writes a `describe()`. This one asks
+    `LiteRtLmBackend` itself, so that flipping its answer to `True` -- which
+    re-arms the whole defect -- cannot stay green.
+    """
+    rows = labelled_rows(4)
+    candidate = LiteRtLmBackend(model=tmp_path / "m.litertlm", backend_flag="gpu")
+    described = candidate.describe()
+    assert (described["engine"], described["backend"]) == ("litert-lm", "gpu")
+    assert described[BACKEND_OBSERVED] is False
+
+    # And what that produces where it matters.
+    class ShippedDescribe(FakeBackend):
+        def describe(self) -> dict:
+            return described
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=ShippedDescribe(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+    notes = result.manifest["limitations"]
+    assert any("different executor" in note for note in notes)
+    assert not any("measured on the gpu backend" in note for note in notes)
 
 
 def test_a_backend_that_omits_the_observed_key_keeps_the_caveat(write_split):
@@ -659,7 +721,11 @@ def test_some_other_engine_on_a_gpu_keeps_the_warning(write_split):
     )
 
     notes = result.manifest["limitations"]
-    assert any("measured on the gpu backend of vllm" in note for note in notes)
+    # And "asked for", not "measured on": this double reads nothing back, so
+    # the stem says what it did -- ask. The caveat below is the assertion this
+    # test exists for; the stem is here because both used to say "measured on"
+    # whatever the evidence was.
+    assert any("asked vllm for its gpu backend" in note for note in notes)
     assert any("different executor" in note for note in notes)
 
 

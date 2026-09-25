@@ -41,8 +41,8 @@ from litetune import envs, metrics, models
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
 from litetune.evaluate import (
-    BACKEND_OBSERVED,
     GREEDY,
+    UNKNOWN_BACKEND,
     DataError,
     DecodeConfig,
     GenerationBackend,
@@ -50,6 +50,7 @@ from litetune.evaluate import (
     LiteRtLmBackend,
     MeasurementPoint,
     Split,
+    backend_established,
     device_mismatch,
     evaluate,
     harness_mismatch,
@@ -1106,11 +1107,20 @@ def run_verify(
     # `or` rather than a default: a third-party backend may put the key there
     # with a null value, which `.get`'s default does not cover, and this module
     # promises never to raise.
-    backend = str(candidate.engine.get("backend") or "unknown")
-    engine = str(candidate.engine.get("engine") or "unknown")
-    measured_on = f"measured on the {backend} backend of {engine}"
-    observed = candidate.engine.get(BACKEND_OBSERVED) is True
-    if not observed or (engine.lower(), backend.lower()) != GPU_MEASURED:
+    backend = str(candidate.engine.get("backend") or UNKNOWN_BACKEND)
+    engine = str(candidate.engine.get("engine") or UNKNOWN_BACKEND)
+    # The stem, not only the caveat. Gating the caveat alone left the sentence
+    # "measured on the gpu backend of litert-lm" in the manifest and merely
+    # appended a contradiction to it, which is the claim this file is here to
+    # not make, with a footnote.
+    established = backend_established(candidate.engine)
+    measured_on = (
+        f"measured on the {backend} backend of {engine}"
+        if established
+        else f"asked {engine} for its {backend} backend; nothing read back which device "
+        "served the run"
+    )
+    if not established or (engine.lower(), backend.lower()) != GPU_MEASURED:
         run.limitation(
             f"{measured_on}. litert-lm's GPU backend is a different executor and this "
             "number does not predict it; README.md's limitations section carries what one "
