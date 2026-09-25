@@ -1762,7 +1762,13 @@ def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path):
 
 
 def _reading(client="pid 4242, python3.12", gpu_time=None):
-    return {"platform": "darwin", "looked": True, "gpu_client": client, "gpu_time": gpu_time}
+    return {
+        "platform": "darwin",
+        "looked": True,
+        "gpu_client": client,
+        "gpu_time": gpu_time,
+        "gpu_clients": {"0x2": gpu_time} if client is not None else {},
+    }
 
 
 # What the tool-path script returns beside its rows: a reading once the engine

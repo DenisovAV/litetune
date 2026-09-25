@@ -1021,10 +1021,10 @@ def _read_device_report(path: Path) -> dict[str, Any] | None:
 def _gpu_work(report: Any) -> tuple[bool | None, Any]:
     """What a run report says about GPU work: (did it happen, the reading).
 
-    True when the kernel was asked after generating and the process's GPU
-    client showed more GPU time than it had once the engine was built -- the
-    runtime opened the GPU *and* worked there. False when the kernel was asked
-    and showed no client for this pid, or a client whose time did not grow:
+    True when the kernel was asked after generating and one of the process's
+    GPU clients showed more GPU time than it had once the engine was built --
+    the runtime opened the GPU *and* worked there. False when the kernel was
+    asked and showed no client for this pid, or clients whose time did not grow:
     measured on the host where this was built, a GPU engine always owns one
     from construction and its time grows while it decodes, so that reading
     says the GPU was not used. None when nothing was established either way --
@@ -1038,15 +1038,35 @@ def _gpu_work(report: Any) -> tuple[bool | None, Any]:
     if isinstance(end, dict) and end.get("looked") is True:
         if not isinstance(end.get("gpu_client"), str):
             return False, end
-        before = start.get("gpu_time") if isinstance(start, dict) else None
-        after = end.get("gpu_time")
-        if isinstance(after, int):
-            return after > (before if isinstance(before, int) else 0), end
-        return None, end
+        return _clients_worked(start, end), end
     if isinstance(start, dict) and start.get("looked") is True:
         if not isinstance(start.get("gpu_client"), str):
             return False, start
     return None, None
+
+
+def _clients_worked(start: Any, end: dict) -> bool | None:
+    """Whether GPU time grew, compared client by client across the readings.
+
+    A client's total is compared only with that same client's: one that did
+    work and closed would otherwise leave a sum that did not grow, and a
+    replacement would stand in for it. A client new since the engine reading
+    counts from zero. No growth is only a "no" when every client seen at the
+    engine is still there and every time was read; otherwise it is None.
+    """
+    after = end.get("gpu_clients")
+    if not isinstance(after, dict):
+        return None
+    before = start.get("gpu_clients") if isinstance(start, dict) else None
+    if not isinstance(before, dict):
+        before = {}
+    for key, time in after.items():
+        base = before.get(key)
+        if isinstance(time, int) and time > (base if isinstance(base, int) else 0):
+            return True
+    if set(before) <= set(after) and all(isinstance(t, int) for t in after.values()):
+        return False
+    return None
 
 
 def gpu_observed(backend: str, report: Any) -> bool:
@@ -1153,7 +1173,13 @@ def device_report():
     import os
     import sys
 
-    report = {"platform": sys.platform, "looked": False, "gpu_client": None, "gpu_time": None}
+    report = {
+        "platform": sys.platform,
+        "looked": False,
+        "gpu_client": None,
+        "gpu_time": None,
+        "gpu_clients": None,
+    }
     if sys.platform != "darwin":
         return report
     try:
@@ -1181,34 +1207,39 @@ def device_report():
         report["error"] = "%s: %s" % (type(exc).__name__, exc)
         return report
     report["looked"] = True
-    client, gpu_time = gpu_client_of(listing, os.getpid())
+    client, clients = gpu_client_of(listing, os.getpid())
+    times = [t for t in clients.values() if t is not None]
     report["gpu_client"] = client
-    report["gpu_time"] = gpu_time
+    report["gpu_time"] = sum(times) if times else None
+    report["gpu_clients"] = clients
     return report
 
 
 def gpu_client_of(listing, pid):
-    """The GPU client `pid` created and its accumulated GPU time, or (None, None).
+    """The GPU clients `pid` created: the first one's name, and each one's time.
 
     Separate from `device_report` so the rule can be tested without a GPU:
-    only a client whose creator is this pid counts, and its GPU time is the
-    sum of `accumulatedGPUTime` across the `AppUsage` entries of every such
-    client -- a process may hold more than one, and work on any of them is
-    work. `ioreg -l` writes one object per `+-o` line, with its properties
-    below it until the next one.
+    only a client whose creator is this pid counts. Each is keyed by its
+    registry id, with the sum of `accumulatedGPUTime` across its `AppUsage`
+    entries, or None when it has none -- per client, because a process may
+    hold more than one and the two readings are compared client by client.
+    `ioreg -l` writes one object per `+-o` line, with its properties below
+    it until the next one.
     """
     import re
 
     marker = '"IOUserClientCreator" = "pid %d,' % pid
-    client, times = None, []
-    for block in listing.split("+-o "):
+    client, clients = None, {}
+    for n, block in enumerate(listing.split("+-o ")):
         if marker not in block:
             continue
         if client is None:
             line = next(l for l in block.splitlines() if marker in l)
             client = line.split('" = ', 1)[1].strip().strip('"')
-        times += [int(t) for t in re.findall(r'"accumulatedGPUTime"=(\d+)', block)]
-    return client, (sum(times) if times else None)
+        found = re.search(r"\bid (0x[0-9a-fA-F]+)", block.splitlines()[0])
+        times = [int(t) for t in re.findall(r'"accumulatedGPUTime"=(\d+)', block)]
+        clients[found.group(1) if found else "#%d" % n] = sum(times) if times else None
+    return client, clients
 
 
 def bundle_activation(path):
@@ -1221,8 +1252,9 @@ def bundle_activation(path):
     `litert_lm_builder`, which `litert-lm` depends on, from the header only --
     no section is unpacked. None when the key is absent. Raises -- recorded
     by the caller as unreadable -- when the builder cannot be imported, the
-    header cannot be read, the value is not a string, or two prefill-decode
-    sections disagree: the first section is not the bundle's answer then.
+    header cannot be read, a value is not a string, or the values disagree --
+    across prefill-decode sections or within one: no single entry is the
+    bundle's answer then.
     """
     import io
 
@@ -1236,7 +1268,7 @@ def bundle_activation(path):
         section = sections.Objects(i)
         if peek.get_model_type(section) != "tf_lite_prefill_decode":
             continue
-        found = None
+        found = []
         for j in range(section.ItemsLength()):
             item = section.Items(j)
             key = item.Key().decode("utf-8") if item is not None and item.Key() else None
@@ -1247,8 +1279,9 @@ def bundle_activation(path):
             value = schema.StringValue()
             value.Init(item.Value().Bytes, item.Value().Pos)
             raw = value.Value()
-            found = raw.decode("utf-8") if raw else None
-        declared.append(found)
+            found.append(raw.decode("utf-8") if raw else None)
+        # The builder lets `additional_metadata` repeat the key in one section.
+        declared.extend(found or [None])
     if len(set(declared)) > 1:
         raise ValueError("prefill-decode sections declare %s" % sorted(map(str, declared)))
     return declared[0] if declared else None

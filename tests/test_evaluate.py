@@ -2054,8 +2054,19 @@ def test_the_runtime_backend_describes_what_it_asked_for(tmp_path):
 # after one reply; none for a CPU engine.
 
 
-def _reading(looked=True, client="pid 4242, python3.12", gpu_time=None, platform="darwin"):
-    return {"platform": platform, "looked": looked, "gpu_client": client, "gpu_time": gpu_time}
+def _reading(
+    looked=True, client="pid 4242, python3.12", gpu_time=None, platform="darwin", clients=None
+):
+    """One reading; `clients` defaults to a single client holding `gpu_time`."""
+    if clients is None and looked:
+        clients = {"0x2": gpu_time} if client is not None else {}
+    return {
+        "platform": platform,
+        "looked": looked,
+        "gpu_client": client,
+        "gpu_time": gpu_time,
+        "gpu_clients": clients,
+    }
 
 
 def _run_report(at_engine, after_generation, bundle_activation="fp32"):
@@ -2075,6 +2086,20 @@ _NOT_LOOKED = _run_report(
     bundle_activation=None,
 )
 _KILLED_AFTER_ENGINE = _run_report(_reading(gpu_time=1_000), None)
+# 0x1 closed after the engine reading and 0x2 did not grow: whatever 0x1 did
+# before it closed was never read, so "no growth" is not established.
+_SWAPPED = _run_report(
+    _reading(gpu_time=200, clients={"0x1": 100, "0x2": 100}),
+    _reading(gpu_time=100, clients={"0x2": 100}),
+)
+_NEW_CLIENT = _run_report(
+    _reading(gpu_time=100, clients={"0x1": 100}),
+    _reading(gpu_time=150, clients={"0x1": 100, "0x2": 50}),
+)
+_SECOND_WORKED = _run_report(
+    _reading(gpu_time=200, clients={"0x1": 100, "0x2": 100}),
+    _reading(gpu_time=300, clients={"0x1": 100, "0x2": 200}),
+)
 
 _LISTING = "\n".join(
     [
@@ -2093,14 +2118,14 @@ def test_only_this_processs_client_and_its_gpu_time_count():
     """Every process's GPU clients are in one listing -- a browser, a chat app.
     The pid is the evidence, and a prefix of another pid is not this pid."""
     client_of = _litertlm_script()["gpu_client_of"]
-    assert client_of(_LISTING, 4242) == ("pid 4242, python3.12", 42)
-    assert client_of(_LISTING, 424) == (None, None)
-    assert client_of(_LISTING, 11) == (None, None)
+    assert client_of(_LISTING, 4242) == ("pid 4242, python3.12", {"0x2": 42})
+    assert client_of(_LISTING, 424) == (None, {})
+    assert client_of(_LISTING, 11) == (None, {})
 
 
-def test_gpu_time_on_every_client_of_this_process_counts():
-    """Work on a second client is still this process's work: an idle first
-    client must not hide it and turn a GPU run into "not used"."""
+def test_every_client_of_this_process_is_read_by_its_own_id():
+    """A process may hold more than one GPU client; each is kept apart so the
+    two readings can be compared client by client."""
     second = (
         _LISTING
         + "\n"
@@ -2112,7 +2137,10 @@ def test_gpu_time_on_every_client_of_this_process_counts():
             ]
         )
     )
-    assert _litertlm_script()["gpu_client_of"](second, 4242) == ("pid 4242, python3.12", 1042)
+    assert _litertlm_script()["gpu_client_of"](second, 4242) == (
+        "pid 4242, python3.12",
+        {"0x2": 42, "0x3": 1000},
+    )
 
 
 def test_a_platform_nobody_observed_is_not_looked_at(monkeypatch):
@@ -2139,6 +2167,7 @@ def test_on_macos_the_kernel_is_asked_about_this_pid(monkeypatch):
     assert report["looked"] is True
     assert report["gpu_client"] == f"pid {os.getpid()}, python3.12"
     assert report["gpu_time"] == 42
+    assert report["gpu_clients"] == {"0x2": 42}
 
 
 @pytest.mark.parametrize(
@@ -2192,14 +2221,16 @@ def test_a_listing_with_no_gpu_client_of_anyone_did_not_look(monkeypatch, listin
 
 
 def _fake_builder(monkeypatch, sections):
-    """A `litert_lm_builder` whose header holds `sections`: a list of
-    (model_type, {key: value}) where a str value is a StringValue and any
-    other value is some other type."""
+    """A `litert_lm_builder` whose header holds `sections`, each a list of
+    (key, value) items as the builder writes them -- `model_type` among them,
+    and a key may repeat. A str value is a StringValue, anything else another
+    type. `get_model_type` reads the items the way the real one does
+    (`litertlm_peek.get_model_type`, 0.16.1), not a side attribute."""
     string_type = 1
 
     class _Value:
         def __init__(self, raw):
-            self.Bytes, self.Pos = {0: raw}, 0
+            self.Bytes, self.Pos = {1: raw}, 1
 
     class _Item:
         def __init__(self, key, value):
@@ -2215,9 +2246,8 @@ def _fake_builder(monkeypatch, sections):
             return _Value(self._value.encode() if isinstance(self._value, str) else b"")
 
     class _Section:
-        def __init__(self, model_type, items):
-            self.model_type = model_type
-            self._items = [_Item(k, v) for k, v in items.items()]
+        def __init__(self, items):
+            self._items = [_Item(k, v) for k, v in items]
 
         def ItemsLength(self):
             return len(self._items)
@@ -2227,7 +2257,7 @@ def _fake_builder(monkeypatch, sections):
 
     class _Sections:
         def __init__(self, sections):
-            self._sections = [_Section(t, items) for t, items in sections]
+            self._sections = [_Section(items) for items in sections]
 
         def ObjectsLength(self):
             return len(self._sections)
@@ -2242,10 +2272,18 @@ def _fake_builder(monkeypatch, sections):
         def Value(self):
             return self._raw
 
+    def get_model_type(section):
+        for j in range(section.ItemsLength()):
+            item = section.Items(j)
+            if item.Key() == b"model_type" and item.ValueType() == string_type:
+                value = _StringValue()
+                value.Init(item.Value().Bytes, item.Value().Pos)
+                return value.Value().decode("utf-8")
+        return None
+
     header = types.SimpleNamespace(SectionMetadata=lambda: _Sections(sections))
     peek = types.SimpleNamespace(
-        read_litertlm_header=lambda path, out: header,
-        get_model_type=lambda section: section.model_type,
+        read_litertlm_header=lambda path, out: header, get_model_type=get_model_type
     )
     schema = types.SimpleNamespace(
         VData=types.SimpleNamespace(StringValue=string_type), StringValue=_StringValue
@@ -2260,16 +2298,23 @@ def _fake_builder(monkeypatch, sections):
     )
 
 
-_PD = "tf_lite_prefill_decode"
+def _pd(*items):
+    """A prefill-decode section with these extra items."""
+    return [("model_type", "tf_lite_prefill_decode"), *items]
+
+
+_KEY = "prefer_activation_type"
 
 
 @pytest.mark.parametrize(
     ("sections", "declared"),
     [
-        ([(_PD, {"prefer_activation_type": "fp32"})], "fp32"),
-        ([(_PD, {"other": "x"})], None),
-        ([("tf_lite_embedder", {"prefer_activation_type": "fp16"}), (_PD, {})], None),
-        ([(_PD, {"prefer_activation_type": "fp32"})] * 2, "fp32"),
+        ([_pd((_KEY, "fp32"))], "fp32"),
+        ([_pd(("other", "x"))], None),
+        ([[("model_type", "tf_lite_embedder"), (_KEY, "fp16")], _pd()], None),
+        # The key without a model_type item is in no prefill-decode section.
+        ([[(_KEY, "fp32")]], None),
+        ([_pd((_KEY, "fp32"))] * 2, "fp32"),
     ],
 )
 def test_the_bundle_key_is_read_from_its_prefill_decode_sections(monkeypatch, sections, declared):
@@ -2281,10 +2326,12 @@ def test_the_bundle_key_is_read_from_its_prefill_decode_sections(monkeypatch, se
     "sections",
     [
         # The first section is not the bundle's answer when a later one differs.
-        [(_PD, {"prefer_activation_type": "fp32"}), (_PD, {"prefer_activation_type": "fp32_fp16"})],
-        [(_PD, {"prefer_activation_type": "fp32"}), (_PD, {})],
+        [_pd((_KEY, "fp32")), _pd((_KEY, "fp32_fp16"))],
+        [_pd((_KEY, "fp32")), _pd()],
+        # Within one section: `additional_metadata` may repeat the key.
+        [_pd((_KEY, "fp32"), (_KEY, "fp16"))],
         # Not a string: unreadable, not "declares none".
-        [(_PD, {"prefer_activation_type": 7}), (_PD, {"prefer_activation_type": "fp32"})],
+        [_pd((_KEY, 7)), _pd((_KEY, "fp32"))],
     ],
 )
 def test_a_bundle_key_that_is_not_one_answer_is_unreadable(monkeypatch, sections):
@@ -2302,6 +2349,9 @@ def test_a_bundle_key_that_is_not_one_answer_is_unreadable(monkeypatch, sections
         ("gpu", _NO_CLIENT, False, True),  # asked, looked, no client for this pid
         ("gpu", _NOT_LOOKED, False, False),  # asked, not looked: not established
         ("gpu", _KILLED_AFTER_ENGINE, False, False),  # opened, work not established
+        ("gpu", _SWAPPED, False, False),  # a client closed: its work is not established
+        ("gpu", _NEW_CLIENT, True, False),  # a client opened while generating did work
+        ("gpu", _SECOND_WORKED, True, False),  # an idle first client does not hide it
         ("gpu", None, False, False),  # no report at all
         ("cpu", _WORKED, False, False),  # a CPU run is never read as a GPU one
     ],
