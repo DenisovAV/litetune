@@ -45,7 +45,7 @@ from litetune.bundle import (
 from litetune.checks import Outcome
 from litetune.declarations import DeclarationsError
 from litetune.envs import cached_environments, env_cache_root, remove_cached
-from litetune.evaluate import GREEDY, DataError
+from litetune.evaluate import CANDIDATE_BACKENDS, GREEDY, DataError
 from litetune.events import EventStream, TerminalRenderer
 from litetune.export import (
     MEASURED_RECIPES,
@@ -324,6 +324,21 @@ def _add_verify(sub) -> None:
             "manifest names that asymmetry and counts how many runtime generations end "
             "without a terminator. The pinned litert-lm does accept --top-k, --top-p, "
             "--temperature and --seed; wiring them through would close the gap"
+        ),
+    )
+    verify.add_argument(
+        "--backend",
+        choices=CANDIDATE_BACKENDS,
+        default="cpu",
+        help=(
+            "litert-lm backend for the converted model (default cpu). On gpu litetune passes "
+            "--activation-data-type=fp32 itself (an option upstream calls experimental) and "
+            "records what the bundle alone declares, since an app that passes no override gets "
+            "that instead. litert-lm reports no device back; on macOS litetune asks the kernel "
+            "whether its process did GPU work and records the run as measured on the GPU only "
+            "then, and elsewhere as asked for. A GPU split starts with one prompt and stops if "
+            "it gets no answer within one prompt's budget. This is not a torch device: the "
+            "float reference resolves its own"
         ),
     )
     verify.add_argument("--json", action="store_true", help="write the manifest to stdout")
@@ -740,6 +755,7 @@ def _verify(args: argparse.Namespace) -> int:
         prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
         contract=args.contract,
         declarations=args.declarations,
+        backend=args.backend,
         # `is not None`, not truthiness: `--max-tokens 0` is a request this
         # cannot honour, and silently substituting the default would report a
         # limit the run did not use.

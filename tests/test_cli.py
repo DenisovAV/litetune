@@ -233,6 +233,23 @@ def test_verify_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     assert request.declarations == decls
 
 
+def test_verify_carries_the_backend_to_the_request(monkeypatch):
+    request = _captured_request(monkeypatch, "run_verify", [*_VERIFY_ARGV, "--backend", "gpu"])
+    assert request.backend == "gpu"
+
+
+def test_verify_asks_for_the_cpu_backend_unless_told_otherwise(monkeypatch):
+    """Every run before this flag existed measured on the CPU backend, and
+    every number published so far is one of those runs."""
+    request = _captured_request(monkeypatch, "run_verify", list(_VERIFY_ARGV))
+    assert request.backend == "cpu"
+
+
+def test_verify_refuses_a_backend_it_does_not_offer():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([*_VERIFY_ARGV, "--backend", "npu"])
+
+
 def test_prepare_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     decls = tmp_path / "declarations.json"
 

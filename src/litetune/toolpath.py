@@ -53,7 +53,18 @@ from pathlib import Path
 from typing import Any
 
 from litetune import envs
-from litetune.evaluate import BACKEND_OBSERVED, GREEDY, DecodeConfig, Generation
+from litetune.evaluate import (
+    BACKEND_OBSERVED,
+    GREEDY,
+    RUNTIME_ENGINE_SOURCE,
+    DecodeConfig,
+    Generation,
+    bundle_activation_error_of,
+    bundle_activation_of,
+    gpu_observed,
+    gpu_unused,
+    runtime_engine_spec,
+)
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.metrics import ToolCall
@@ -81,13 +92,17 @@ class NotMeasured(ToolPathError):
     """
 
 
-_TOOL_PATH_SCRIPT = r'''
+_TOOL_PATH_SCRIPT = (
+    r'''
 """The runtime's answer to each prompt, through its own tool path."""
 import json
 import os
 import re
 import sys
 from pathlib import Path
+'''
+    + RUNTIME_ENGINE_SOURCE
+    + r'''
 
 # The binding's one signal that the runtime gave no reply (`conversation.py`,
 # litert-lm 0.16.1). Anything else `send_message` raises is not an answer from
@@ -261,9 +276,9 @@ def main():
     }
 
     rows = []
-    with litert_lm.Engine(
-        spec["model"], backend=litert_lm.Backend.CPU()
-    ) as engine:
+    with litert_lm.Engine(spec["model"], **engine_kwargs(spec)) as engine:
+        # Once the engine exists, which is when a GPU engine opens the GPU.
+        at_engine = device_report()
         for index, prompt in enumerate(spec["prompts"]):
             # One conversation per prompt: each row is a first turn, the way
             # every other measurement in this project asks it.
@@ -305,8 +320,12 @@ def main():
                     "kind": None,
                 }
             )
+        # Inside the engine's lifetime: its GPU time is read off a client
+        # that exists only while the engine does.
+        device = run_report(spec, at_engine, device_report())
     Path(spec["out"]).write_text(
-        json.dumps({"runtime_version": version, "rows": rows}), encoding="utf-8"
+        json.dumps({"runtime_version": version, "rows": rows, "device": device}),
+        encoding="utf-8",
     )
     return 0
 
@@ -314,6 +333,7 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 '''
+)
 
 
 @functools.cache
@@ -446,6 +466,14 @@ class ToolPathProbe:
     env: envs.StageEnv = envs.RUNTIME
     auto_provision: bool = True
     timeout_s: int = TOOL_PATH_TIMEOUT_S
+    # The litert-lm backend asked for, in the word `evaluate.CANDIDATE_BACKENDS`
+    # lists. It used to be `Backend.CPU()` written into the script, with no
+    # reason given anywhere; the tool path ran on Metal on 2026-09-25 with it
+    # changed, 40 of 40 rows answered and every function name agreeing with
+    # the CPU run.
+    backend_flag: str = "cpu"
+    # What the script saw of its process after building the engine.
+    device_report: dict[str, Any] | None = field(default=None, init=False)
     # Filled by `observe`, from the runtime's own metadata: which runtime
     # produced the rows, because a manifest that cannot say so cannot be
     # compared with a run on another one.
@@ -476,6 +504,7 @@ class ToolPathProbe:
                         "tools": self.declarations,
                         "max_tokens": self.max_tokens,
                         "constrained": constrained,
+                        **runtime_engine_spec(self.backend_flag),
                         "out": str(out),
                         "log": str(log),
                         "mark": mark,
@@ -495,7 +524,8 @@ class ToolPathProbe:
                 proc = self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
             except subprocess.TimeoutExpired:
                 raise ToolPathError(
-                    f"the tool-path script gave no result after {self.timeout_s}s"
+                    f"the tool-path script gave no result after {self.timeout_s}s on the "
+                    f"{self.backend_flag} backend"
                 ) from None
             except OSError as exc:
                 raise ToolPathError(f"could not start the tool-path script: {exc}") from exc
@@ -527,6 +557,8 @@ class ToolPathProbe:
                 f"for {len(prompts)} prompts"
             )
         self.runtime_version = written.get("runtime_version")
+        device = written.get("device")
+        self.device_report = device if isinstance(device, dict) else None
         return [ToolPathRow.read(position, row) for position, row in enumerate(rows)]
 
 
@@ -601,6 +633,14 @@ class ToolPathBackend:
     env: envs.StageEnv = envs.RUNTIME
     auto_provision: bool = True
     timeout_s: int = TOOL_PATH_TIMEOUT_S
+    # The litert-lm backend asked for, in the word `evaluate.CANDIDATE_BACKENDS`
+    # lists. It used to be `Backend.CPU()` written into the script, with no
+    # reason given anywhere; the tool path ran on Metal on 2026-09-25 with it
+    # changed, 40 of 40 rows answered and every function name agreeing with
+    # the CPU run.
+    backend_flag: str = "cpu"
+    # One `ToolPathProbe.device_report` per decoding mode that ran.
+    device_reports: list[dict[str, Any] | None] = field(default_factory=list, init=False)
     # Filled by `generate`: the rows from each mode, kept so the manifest can
     # carry both numbers rather than only the one that was scored.
     rows: dict[str, list[ToolPathRow]] = field(default_factory=dict, init=False)
@@ -627,14 +667,15 @@ class ToolPathBackend:
 
     @property
     def backend_observed(self) -> bool:
-        """Nothing here reads back which device served the run.
+        """Whether the kernel held a GPU client for every mode that ran.
 
-        The script hardcodes `Backend.CPU()` and litert-lm's Python API names
-        no accelerator, so this backend's `backend` is what it asked for. The
-        request cannot go anywhere else -- there is no flag to disagree with --
-        but that is an argument, and this key records readings.
+        Both decoding modes build their own engine in their own process, so
+        one mode's reading says nothing about the other's; a run is observed
+        on the GPU only if each did. See `evaluate.gpu_observed`.
         """
-        return False
+        return bool(self.device_reports) and all(
+            gpu_observed(self.backend_flag, report) for report in self.device_reports
+        )
 
     @property
     def scores_structurally(self) -> bool:
@@ -656,8 +697,22 @@ class ToolPathBackend:
             # said the candidate was measured on "litert-lm tool path
             # (unknown)" instead of on the CPU the script asks for.
             "engine": "litert-lm",
-            "backend": "cpu",
+            "backend": self.backend_flag,
             BACKEND_OBSERVED: self.backend_observed,
+            "activation_data_type": runtime_engine_spec(self.backend_flag)["activation_data_type"],
+            # One per decoding mode that ran, verbatim; see `backend_observed`.
+            "device_reports": list(self.device_reports),
+            # Either mode showing no GPU work is enough: each built its own
+            # engine, and the one that did not use the GPU produced rows too.
+            "gpu_unused": any(gpu_unused(self.backend_flag, r) for r in self.device_reports),
+            "bundle_activation": next(
+                (a for a in map(bundle_activation_of, self.device_reports) if a is not None),
+                None,
+            ),
+            "bundle_activation_error": next(
+                (e for e in map(bundle_activation_error_of, self.device_reports) if e is not None),
+                None,
+            ),
             "backend_vocabulary": "litert-lm Python API Backend",
             "path": "tool path",
             "model": self.model_ref,
@@ -679,6 +734,8 @@ class ToolPathBackend:
         grammar. The constrained rows sit in `self.rows` beside them for the
         manifest and the grammar's paired effect.
         """
+        # First, before any return: this run's readings or none.
+        self.device_reports = []
         probe = ToolPathProbe(
             model=self.model,
             declarations=self.declarations,
@@ -686,6 +743,7 @@ class ToolPathBackend:
             env=self.env,
             auto_provision=self.auto_provision,
             timeout_s=self.timeout_s,
+            backend_flag=self.backend_flag,
         )
         self.rows, self.unavailable, self.runtime_version = {}, {}, None
         # Grammar off first: it is the run the reference is compared with, so
@@ -697,6 +755,7 @@ class ToolPathBackend:
                 # Before the rows are judged: a mode not measured is where the
                 # runtime's version matters most.
                 self.runtime_version = probe.runtime_version
+                self.device_reports.append(probe.device_report)
                 _refuse_a_mode_with_unread_reasons(rows)
             except ToolPathError as exc:
                 logger.warning("the tool path could not be measured (%s): %s", mode, exc)

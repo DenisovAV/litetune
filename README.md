@@ -45,7 +45,10 @@ always runs on CPU, deliberately — export is a pure format conversion, and
 pinning it keeps the measured export time reproducible on a runner with no
 GPU at all. There is no `--device` flag; to force CPU on `tune` or `verify`
 regardless of what the box has, set `CUDA_VISIBLE_DEVICES=""` in the shell
-you launch it from — the stage subprocess inherits the environment. CPU alone
+you launch it from — the stage subprocess inherits the environment. The
+converted model's backend is chosen separately, by `verify --backend`
+(`cpu` unless you say `gpu`); whether litert-lm's GPU backend also honours
+that variable has not been measured. CPU alone
 is workable at 270M and the first thing you will want to change above about
 1B. Bring your own checkpoint and skip the first two steps, or bring a
 `.litertlm` and its float checkpoint and run only `verify`.
@@ -708,8 +711,8 @@ withdrawn after re-measurement.
   through the last `[/thought]` or `</think>`, and counted per side at
   `measurements.<side>.reasoning_removed`, including generations that never
   closed it.
-- **The candidate is pinned to CPU; the reference is not, and your users run
-  on a phone.** On one Snapdragon
+- **The candidate runs on CPU unless you pass `--backend gpu`; the reference
+  resolves its own device, and your users run on a phone.** On one Snapdragon
   Galaxy S24 (`SC-51E`), the `dynamic_wi8_afp32` bundle on the device's CPU
   scored 0.8703 ±0.026 on the 640 held-out rows against 0.8906 for the cloud
   CPU run that produced it (run A in [MEASUREMENTS.md](MEASUREMENTS.md); runs
@@ -717,9 +720,9 @@ withdrawn after re-measurement.
   reference number predicted the phone to within about 0.03. One device, one
   recipe.
 - **On a GPU box, the reference and the candidate can run on different
-  hardware, and it is recorded rather than refused.** `build_backends` pins
-  the candidate to `litert-lm`'s CPU backend and lets the reference resolve
-  its own device; where the reference lands on `cuda`, the two sides differ
+  hardware, and it is recorded rather than refused.** The candidate runs on
+  the `litert-lm` backend `--backend` names, `cpu` by default, and the
+  reference resolves its own device; where the reference lands on `cuda`, the two sides differ
   in hardware as well as in conversion. `harness.device_mismatch` in the
   manifest names both devices and both engines, and the same text is carried
   into the run's limitations, so the conversion-cost number does not silently
@@ -732,8 +735,30 @@ withdrawn after re-measurement.
   (3/20), while the engine reports success. `convert` writes that key into
   every bundle it produces that does not already declare one; `--json` records
   what each carries as `exports[].gpu_activation`, and a bundle that could not
-  be repacked is named in the limitations and is CPU-only. litetune cannot
-  drive a phone GPU from a laptop, so a device run is a separate job.
+  be repacked is named in the limitations: an app that loads it without an
+  activation override gets the F16 default. litetune cannot drive a phone GPU
+  from a laptop, so a device run is a separate job.
+- **`verify --backend gpu` measures on this machine's GPU, with fp32 passed
+  by litetune.** The activation type is passed on every GPU run, so a bundle
+  without the key is measured rather than flooding — upstream calls the
+  option experimental. On an M4 Pro's Metal with litert-lm 0.16.1, the
+  FunctionGemma bundles above, 40 held-out rows through the tool path with
+  grammar off: a bundle without the key answered identically to one with it
+  on all 40 rows, and the same bundle with the override withheld flooded
+  `<pad>` on all 40. Because that number is for the bundle *plus* the
+  override, `verify` reads the bundle's own key and says so in the manifest
+  when it is not `fp32`. GPU and CPU still do not agree row for row: the
+  function name matched on all 40, the whole first call on 29, and every
+  difference was a free-form date. litert-lm reports no device back, so
+  litetune asks the kernel: on macOS a GPU engine's process owns a GPU user
+  client, and the run is recorded as measured on the GPU only when that
+  client's GPU time grew while it generated — measured on the same M4 Pro,
+  where a CPU engine owned none. A run the kernel shows doing no GPU work is
+  said, in the limitations, not to have used the GPU. Off macOS nothing is
+  looked at yet, and the manifest records the GPU as asked for. On a host
+  without a usable GPU, a GPU engine has been measured to produce nothing, so
+  a GPU split first runs one prompt within one prompt's budget and stops
+  there if it gets no answer.
 - **The NPU number is 20 rows on one SoC.** The same
   `functiongemma-270m-it` (base weights, not the fine-tune) through
   litert-torch's `npu_export` stages for a Snapdragon 8 Elite (`SM8750`,

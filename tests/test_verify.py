@@ -537,11 +537,10 @@ def test_a_litertlm_run_on_its_own_gpu_backend_is_told_nothing_about_it(write_sp
     `cuda` run: `backend` holds two vocabularies under one key, and a
     transformers measurement on cuda says least of all about litert-lm's GPU.
 
-    And only a run that *established* it ran there. No litetune command reaches
-    this branch: `build_backends` never passes `backend_flag`, and litetune
-    cannot drive a phone's GPU from a laptop. It is reachable by a library
-    caller assembling its own `BackendPair`, which is the case the limitation
-    above this one exists for.
+    And only a run that *established* it ran there. `verify --backend gpu`
+    reaches this branch on macOS when the kernel shows the candidate's process
+    doing GPU work; the sentence is then replaced, not dropped -- see
+    `test_an_observed_gpu_run_replaces_the_caveat_rather_than_dropping_it`.
     """
 
     class LiteRtLmOnGpu(FakeBackend):
@@ -1020,8 +1019,8 @@ class CudaReferenceBackend(TransformersLikeBackend):
 
 
 def test_a_cross_device_comparison_is_annotated_and_still_measured(write_split):
-    """`build_backends` pins the candidate to litert-lm's CPU backend and lets
-    the reference resolve its own device, so on a GPU box the "cost of
+    """By default the candidate runs on litert-lm's CPU backend and the
+    reference resolves its own device, so on a GPU box the "cost of
     conversion" carries a hardware difference too. Recorded, not refused:
     refusing would leave a GPU box unable to verify at all, which is worse
     than a number that says what else is in it.
@@ -1888,3 +1887,89 @@ def test_reasoning_that_never_closed_is_scored_unchanged_and_counted(write_split
     assert removed["generations_with_reasoning"] == 0
     assert removed["generations_with_unclosed_reasoning"] == 10
     assert result.manifest["quality"]["candidate"]["exact_match"]["value"] == 0.75
+
+
+# -- what a GPU run is told about itself --------------------------------------
+
+
+def _gpu_engine(**extra) -> dict:
+    return {"engine": "litert-lm", "backend": "gpu", BACKEND_OBSERVED: False, **extra}
+
+
+def _limitations_for(write_split, engine: dict) -> list[str]:
+    class Described(FakeBackend):
+        def describe(self) -> dict:
+            return engine
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=Described(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+    return result.manifest["limitations"]
+
+
+def test_a_gpu_run_the_kernel_shows_unused_says_so_where_it_is_read(write_split):
+    """In the limitations, which the console prints, and not only in the JSON:
+    a run under `backend: gpu` that the kernel says never worked there is a
+    CPU number, and nothing else would tell its reader."""
+    notes = _limitations_for(write_split, _gpu_engine(gpu_unused=True, bundle_activation="fp32"))
+    assert any("the GPU was not used" in n and "not a GPU number" in n for n in notes)
+
+
+def test_a_bundle_that_declares_no_activations_is_said_to_rely_on_the_override(write_split):
+    """The decision: measure, and say what was measured. litetune passes fp32
+    itself; an app loading the same file without an override gets F16."""
+    notes = _limitations_for(write_split, _gpu_engine(bundle_activation=None))
+    joined = " ".join(notes)
+    assert "the bundle declares none" in joined
+    assert "not for the bundle as shipped" in joined
+
+
+def test_a_bundle_that_declares_something_else_is_named(write_split):
+    notes = _limitations_for(write_split, _gpu_engine(bundle_activation="fp32_fp16"))
+    assert any("'fp32_fp16'" in n and "did not measure" in n for n in notes)
+
+
+def test_a_bundle_that_declares_fp32_needs_no_word(write_split):
+    notes = _limitations_for(write_split, _gpu_engine(bundle_activation="fp32"))
+    assert not any("the bundle declares" in n for n in notes)
+
+
+def test_a_bundle_key_nobody_could_read_is_not_reported_as_absent(write_split):
+    """ "Declares none" is a finding about the bundle; "could not read" is not."""
+    notes = _limitations_for(
+        write_split,
+        _gpu_engine(bundle_activation=None, bundle_activation_error="ModuleNotFoundError: x"),
+    )
+    joined = " ".join(notes)
+    assert "could not read" in joined
+    assert "declares none" not in joined
+
+
+def test_an_observed_gpu_run_replaces_the_caveat_rather_than_dropping_it(write_split):
+    """What the caveat warned about is still true of every GPU but this one:
+    a phone's GPU is a different backend, and an app there gets the bundle's
+    own activations."""
+    notes = _limitations_for(
+        write_split, _gpu_engine(**{BACKEND_OBSERVED: True, "bundle_activation": "fp32"})
+    )
+    measured = [n for n in notes if n.startswith("measured on the gpu backend of litert-lm")]
+    assert measured, notes
+    assert "the kernel showed" in measured[0]
+    assert "a phone's GPU is a different backend" in measured[0]
+
+
+def test_a_cpu_run_is_told_nothing_about_gpu_activations(write_split):
+    notes = _limitations_for(
+        write_split,
+        {
+            "engine": "litert-lm",
+            "backend": "cpu",
+            BACKEND_OBSERVED: False,
+            "bundle_activation": None,
+        },
+    )
+    assert not any("the bundle declares" in n or "GPU was not used" in n for n in notes)

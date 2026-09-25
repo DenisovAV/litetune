@@ -1577,7 +1577,10 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
             f"{GPU_ACTIVATION_KEY} could not be written into {named}. On the GPU "
             "backend the runtime will compute activations in F16, which measured as `<pad>` "
             "floods and wrong tool names on a Snapdragon Galaxy S24 (3/20 vs 20/20 on CPU, "
-            "n=20). These bundles are CPU-only until repacked"
+            "n=20). An app that loads these bundles without an activation override gets that "
+            "default, so for an app that passes none they are CPU-only until repacked; "
+            "`verify --backend gpu` "
+            "passes fp32 itself and can still measure them on a GPU"
         )
 
     events.stage_finished(
