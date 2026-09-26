@@ -572,7 +572,8 @@ def _limit_gpu_reading(run: Any, engine: dict[str, Any]) -> None:
     Both are limitations rather than refusals, by decision: the number is a
     real measurement, and what it is a measurement *of* is said beside it.
     """
-    if engine.get("gpu_unused") is True:
+    unused = engine.get("gpu_unused") is True
+    if unused:
         # "A process", not "the": on the tool path each decoding mode runs in
         # its own, and one mode doing no GPU work is enough to say this.
         run.limitation(
@@ -580,10 +581,16 @@ def _limit_gpu_reading(run: Any, engine: dict[str, Any]) -> None:
             "that generated this run's answers: by that reading the GPU was not used there, "
             "and not every number here is a GPU number"
         )
-        # The bundle's key is read only by the GPU executor, so what it would
-        # have changed is not what this run measured; saying the number is
-        # "for the bundle plus that override" would contradict the line above.
-        return
+    # The bundle notes stay either way: what an app gets from the bundle is
+    # true whatever this run did, and on the tool path the other mode may have
+    # run on the GPU with the override. Only what the number is *for* changes:
+    # beside "not used" it cannot be called the bundle plus the override.
+    measured = (
+        "Where this run used the GPU it did so with that override, not with the bundle as "
+        "shipped"
+        if unused
+        else "This number is for the bundle plus that override, not for the bundle as shipped"
+    )
     declared = engine.get("bundle_activation")
     unread = engine.get("bundle_activation_error")
     if declared == GPU_ACTIVATION:
@@ -600,9 +607,8 @@ def _limit_gpu_reading(run: Any, engine: dict[str, Any]) -> None:
             f"litetune passed {GPU_ACTIVATION} activations itself; the bundle declares none. An "
             "app that loads it on a GPU without an override gets the runtime's F16 default, "
             "measured as <pad> floods on an M4 Pro's Metal (40 of 40 rows) and on a Galaxy S24 "
-            "(14 of 20). This number is for the bundle plus that override, not for the bundle "
-            "as shipped -- `convert` writes the key, and a bundle it could not repack is named "
-            "in its report"
+            f"(14 of 20). {measured} -- `convert` writes the key, and a bundle it could not "
+            "repack is named in its report"
         )
         return
     run.limitation(

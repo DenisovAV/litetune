@@ -1931,15 +1931,18 @@ def test_a_gpu_run_the_kernel_shows_unused_says_so_where_it_is_read(write_split)
     assert any("the GPU was not used" in n and "not every number here" in n for n in notes)
 
 
-def test_an_unused_gpu_says_nothing_about_what_the_override_shaped(write_split):
-    """The key is read only by the GPU executor. A run the kernel shows off the
-    GPU was not shaped by it, and "this number is for the bundle plus that
-    override" beside "the GPU was not used" says two opposite things."""
+def test_an_unused_gpu_still_warns_about_the_bundle_but_not_about_this_number(write_split):
+    """On the tool path one mode may have used the GPU, with the override, and
+    the other not: the app shipping an unkeyed bundle still needs the F16
+    warning. What goes is only "this number is for the bundle plus that
+    override", which beside "the GPU was not used" says two opposite things."""
     notes = _limitations_for(write_split, _gpu_engine(gpu_unused=True, bundle_activation=None))
     joined = " ".join(notes)
     assert "the GPU was not used" in joined
-    assert "the bundle declares" not in joined
-    assert "bundle plus that override" not in joined
+    assert "the bundle declares none" in joined
+    assert "F16 default" in joined
+    assert "This number is for the bundle plus that override" not in joined
+    assert "Where this run used the GPU it did so with that override" in joined
 
 
 def test_a_bundle_that_declares_no_activations_is_said_to_rely_on_the_override(write_split):

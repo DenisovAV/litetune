@@ -496,8 +496,8 @@ def _add_convert(sub) -> None:
             "section: without it the Android GPU backend computes in F16 and floods <pad> while "
             "reporting success (measured on one Snapdragon Galaxy S24, 3/20 vs 20/20 tool names "
             "on 20 rows). The repack changes one metadata string and no bytes of the model; a "
-            "bundle that could not be repacked is kept, named in the report, and is CPU-only for "
-            "an app that passes no activation type. "
+            "bundle that could not be repacked is kept, named in the report, and gets the F16 "
+            "default on the GPU in an app that passes no activation type. "
             "--json records what each bundle carries as exports[].gpu_activation. "
             f"{STAGE_EXIT_CODE_HELP}"
         ),
@@ -1166,7 +1166,7 @@ def _artifact_line(export: RecipeExport) -> str:
     """
     beside = (export.shipped_bytes or 0) - (export.artifact_bytes or 0)
     companions = f" (+{beside:,} bytes beside it)" if beside > 0 else ""
-    # Named on the line, not only in the JSON: a bundle without it is CPU-only
+    # Named on the line, not only in the JSON: a bundle without it floods on a GPU
     # and looks identical to one with it from every other field here.
     gpu = describe_gpu_activation(export.gpu_activation)
     return (

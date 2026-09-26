@@ -1732,7 +1732,7 @@ def test_convert_names_the_gpu_state_of_every_artifact(toolchain, tmp_path, caps
     )
     captured = capsys.readouterr()
     assert code == 0
-    assert "CPU-only for an app that passes none (GPU activations not set)" in captured.out
+    assert "GPU activations not set: an app that passes none gets F16 on the GPU" in captured.out
     assert "No module named 'litert_lm_builder'" in captured.out, "the reason reaches the console"
     assert "prefer_activation_type could not be written" in captured.out
 
@@ -1764,7 +1764,7 @@ def test_convert_json_records_gpu_activation(toolchain, tmp_path, capsys):
         ("fp32", "GPU activations fp32 —"),
         ("fp16", "GPU activations fp16 (declared upstream, not fp32)"),
         ("fp32_fp16", "GPU activations fp32_fp16 (declared upstream, not fp32)"),
-        (None, "CPU-only for an app that passes none (GPU activations not set)"),
+        (None, "GPU activations not set: an app that passes none gets F16 on the GPU"),
     ],
 )
 def test_the_convert_line_marks_an_upstream_declaration(declared, expect, tmp_path):
