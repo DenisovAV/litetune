@@ -1242,6 +1242,96 @@ def measurements_from_verify(manifest: dict[str, Any]) -> dict[str, Any]:
     return points
 
 
+def _candidate_engine(manifest: dict[str, Any]) -> dict:
+    measured = _mapping(manifest.get("measurements"))
+    return _mapping(_mapping(measured.get("candidate")).get("engine"))
+
+
+def cpu_from_verify(manifest: dict[str, Any]) -> str | None:
+    """The CPU model a verify manifest's litert-lm candidate computed on, or None."""
+    engine = _candidate_engine(manifest)
+    cpu = engine.get("cpu") if engine.get("engine") == "litert-lm" else None
+    model = cpu.get("model") if isinstance(cpu, dict) else None
+    return model if isinstance(model, str) and model else None
+
+
+def runtime_from_verify(manifest: dict[str, Any]) -> str | None:
+    """The litert-lm version a verify manifest's candidate was measured on, or None.
+
+    The version the driver script read off its own installation; for a manifest
+    that predates that record, the runtime pin its environment declared. Two
+    runtimes are not to be assumed to give each
+    other's answers (MEASUREMENTS.md, "Which runtime a number was taken on"), so
+    a bundle records this and not the pin of whichever litetune packs it.
+    """
+    engine = _candidate_engine(manifest)
+    if engine.get("engine") != "litert-lm":
+        return None
+    installed = engine.get("runtime_version")
+    if isinstance(installed, str) and installed:
+        return installed
+    if "runtime_version" in engine:
+        # Asked and not answered: a manifest from this version whose driver
+        # could not read its runtime. The pin beside it is what was asked for,
+        # not what ran -- verify's own limitation says as much.
+        return None
+    # A manifest from before the text path recorded the version: the pin is
+    # the only record there is, and 0.1.x pinned one runtime throughout.
+    requirements = engine.get("requirements")
+    for requirement in requirements if isinstance(requirements, list) else ():
+        if isinstance(requirement, str):
+            name, sep, version = requirement.partition("==")
+            if sep and name.strip() == "litert-lm" and version.strip():
+                return version.strip()
+    return None
+
+
+def _runtime_established(
+    manifest: dict[str, Any], pinned: dict[str, str]
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """`established_against` for a bundle, and what to say where it is not certain."""
+    established = dict(pinned)
+    notes: list[str] = []
+    cpu = cpu_from_verify(manifest) if manifest else None
+    if cpu is not None:
+        established["cpu"] = cpu
+    if not manifest or _candidate_engine(manifest).get("engine") != "litert-lm":
+        # No measurement of a litert-lm candidate to attribute: the pins stand,
+        # and there is no runtime a note could be about.
+        return established, ()
+    if cpu is None:
+        notes.append(
+            "the verify manifest does not record which CPU model its candidate computed on, and "
+            "two CPU models are not to be assumed to give the same arithmetic -- an Intel and "
+            "an AMD server CPU did not -- so these numbers cannot be matched to another bundle's"
+        )
+    measured_on = runtime_from_verify(manifest)
+    ours = pinned.get("litert-lm")
+    if measured_on is None:
+        notes.append(
+            "the verify manifest does not record which litert-lm its candidate ran on, so "
+            f"established_against names this litetune's pin, litert-lm {ours}, which is not "
+            "established to be the runtime the measurements were taken on"
+        )
+        return established, tuple(notes)
+    established["litert-lm"] = measured_on
+    engine = _candidate_engine(manifest)
+    if not isinstance(engine.get("runtime_version"), str):
+        notes.append(
+            f"the verify manifest records its runtime pin, litert-lm {measured_on}, and not the "
+            "version it read at run time, which it predates; established_against takes the pin"
+        )
+    if measured_on != ours:
+        notes.append(
+            f"the measurements were taken on litert-lm {measured_on}, and this litetune pins "
+            f"{ours}. Two runtimes are not to be assumed to give the same answers, so these "
+            "numbers describe "
+            f"the bundle on {measured_on}; re-run verify with this litetune, on the same CPU "
+            f"model, to measure it on {ours}"
+        )
+    return established, tuple(notes)
+
+
 def _bundle_prompt_mode(
     args: argparse.Namespace, recorded: Mapping[str, Any]
 ) -> tuple[PromptMode, str]:
@@ -1383,14 +1473,13 @@ def _bundle(args: argparse.Namespace) -> int:
     else:
         terminator_notes = tuple(n for n in (terminator_note,) if n)
 
+    established_against, runtime_notes = _runtime_established(manifest, versions_from(envs.RUNTIME))
     contract = Contract(
         prompt_mode=prompt_mode,
         wire_convention=(WireConvention(args.wire_convention) if args.wire_convention else None),
-        # The runtime's pins, because which prompt a runtime renders is a
-        # property of that runtime's release. `export.resolve_toolchain` reads
-        # the resolved closure and is better; a run that produced one should
-        # pass it in rather than declaring it here.
-        established_against=versions_from(envs.RUNTIME),
+        # The runtime the verify manifest's candidate ran on, where it records
+        # one; the runtime's pins otherwise, said so in the limitations.
+        established_against=established_against,
         base_model=args.base_model,
         base_model_revision=args.base_model_revision,
         # Which declarations the model was trained against, from the run that
@@ -1413,6 +1502,7 @@ def _bundle(args: argparse.Namespace) -> int:
         measurements=measurements_from_verify(manifest),
         attribution=manifest.get("attribution") or {},
         limitations=tuple(manifest.get("limitations") or ())
+        + runtime_notes
         + tuple(models.limitations_for(args.base_model))
         # Only when there are declarations to order. A model called without
         # tools cannot be affected by this, and a limitation that does not

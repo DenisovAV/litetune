@@ -3663,8 +3663,10 @@ S, E = "<start_function_call>", "<end_function_call>"
         ({"a": "hi<eos>there"}, f"{S}call:set{{a:<escape>hi<eos>there<escape>}}{E}", False),
         # A list the runtime reads trains, though prepare cannot write it.
         ({"a": ["x", "y"]}, f"{S}call:set{{a:[<escape>x<escape>,<escape>y<escape>]}}{E}", True),
-        # A number the runtime hands over as another double does not.
-        ({"n": 2**53 + 1}, f"{S}call:set{{n:9007199254740993}}{E}", False),
+        # The runtime hands an integer over exact, 2**53 + 1 included (v0.17.1).
+        ({"n": 2**53 + 1}, f"{S}call:set{{n:9007199254740993}}{E}", True),
+        # One past an i64 it hands over as a double, which is another number.
+        ({"n": 2**63 + 1}, f"{S}call:set{{n:9223372036854775809}}{E}", False),
         # Found in review: every one of these read as the target's call.
         ({"a": "x"}, f"call:set{{a:<escape>x<escape>}}{S}{E}", False),  # outside the markers
         ({"a": "x"}, f"{S}call:set{{a:<escape>x<escape>}}", False),  # no end marker

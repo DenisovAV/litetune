@@ -17,11 +17,11 @@ The transformers reference produces text and nothing else, and `verify` reads
 it with `metrics.runtime_calls`, which follows the runtime's reading of a reply.
 The runtime's Python binding reports every failed reply as one
 `RuntimeError("litert_lm_conversation_send_message failed")` (`conversation.py`,
-v0.16.1) and writes the reason to its log, so the script reads the log around
+v0.17.1) and writes the reason to its log, so the script reads the log around
 each reply to record the reason with the row.
 
 **Constrained decoding is a choice the caller makes, and both are measured.**
-LiteRT-LM v0.16.1 leaves it off unless the caller enables it
+LiteRT-LM v0.17.1 leaves it off unless the caller enables it
 (`ConstrainedDecodingConfig(enable=True)`; the binding sets nothing otherwise),
 so the unconstrained number is what an application gets by default. With it on
 the runtime holds the model to the declared grammar -- which can carry a model
@@ -61,6 +61,7 @@ from litetune.evaluate import (
     Generation,
     bundle_activation_error_of,
     bundle_activation_of,
+    cpu_of,
     gpu_observed,
     gpu_unused,
     runtime_engine_spec,
@@ -105,7 +106,7 @@ from pathlib import Path
     + r'''
 
 # The binding's one signal that the runtime gave no reply (`conversation.py`,
-# litert-lm 0.16.1). Anything else `send_message` raises is not an answer from
+# litert-lm 0.17.1). Anything else `send_message` raises is not an answer from
 # the model -- an API change, memory, a closed conversation -- and ends the run
 # as a harness failure rather than being scored, in either decoding mode.
 NO_REPLY = "send_message failed"
@@ -123,6 +124,53 @@ FINISHED = "finished prompt"
 
 # The script's exit when the runtime would not create a conversation at all.
 CREATE_REFUSED = 4
+
+
+def tokenizer_sections(path):
+    """The tokenizer section types the bundle's header lists, e.g. {"SP_Tokenizer"}.
+
+    Read for the grammar: LiteRT-LM builds its constraint only from a
+    SentencePiece tokenizer, and where there is none v0.16.1 refused the
+    conversation while v0.17.1 logs a warning and decodes unconstrained
+    (`gemma3_data_processor.cc`, `function_gemma_data_processor.cc`). Raises
+    when the header cannot be read.
+    """
+    import io
+
+    from litert_lm_builder import litertlm_core as core
+    from litert_lm_builder import litertlm_peek as peek
+
+    metadata = peek.read_litertlm_header(str(path), io.StringIO())
+    sections = metadata.SectionMetadata()
+    found = set()
+    for i in range(sections.ObjectsLength() if sections else 0):
+        try:
+            name = core.any_section_data_type_to_string(sections.Objects(i).DataType())
+        except ValueError:
+            continue  # a section type this builder does not name is not a tokenizer it knows
+        if name in ("SP_Tokenizer", "HF_Tokenizer_Zlib"):
+            found.add(name)
+    return found
+
+
+def grammar_refusal(spec):
+    """Why the grammar-on mode cannot be what it says, or None when it can."""
+    if not spec["constrained"]:
+        return None
+    try:
+        found = tokenizer_sections(spec["model"])
+    except Exception as exc:  # noqa: BLE001
+        return (
+            "could not read which tokenizer the bundle carries (%s: %s), so whether the "
+            "runtime can apply its grammar is not established" % (type(exc).__name__, exc)
+        )
+    if "SP_Tokenizer" not in found:
+        return (
+            "the bundle carries no SentencePiece tokenizer (%s), and the runtime builds its "
+            "grammar only from one: it would decode without the grammar while this mode is "
+            "reported as grammar on" % (", ".join(sorted(found)) or "no tokenizer section")
+        )
+    return None
 
 
 def text_of(reply):
@@ -198,11 +246,11 @@ def reason_of(log, quote=True):
     A parse failure's message carries the model's code block and full response
     (`parser_utils.cc`), and that must not travel into a manifest a bundle
     ships, so a parse failure is its kind alone. The two kinds are told apart
-    by the runtime's own sentences, both in `liblitert-lm` 0.16.1. Any other
-    reason is the runtime's last error line, or its last line -- only where
-    `quote` says the runtime is the version those sentences were read from: on
-    another, a parse failure worded differently would land here, model text and
-    all.
+    by the runtime's own sentences, both in `liblitert-lm` 0.17.1
+    (`parser_utils.cc`, `tasks.cc`). Any other reason is the runtime's last
+    error line, or its last line -- only where `quote` says the runtime is
+    the version those sentences were read from: on another, a parse failure
+    worded differently would land here, model text and all.
     """
     if "Failed to parse tool calls" in log:
         return "parse", "its call parser rejected the generation"
@@ -218,15 +266,6 @@ def reason_of(log, quote=True):
     lines = [line for line in lines if line]
     errors = [line for line in lines if "rror" in line or "ailed" in line] or lines
     return "other", (errors[-1] if errors else "nothing in its log")[:200]
-
-
-def runtime_version():
-    try:
-        from importlib.metadata import version
-
-        return version("litert-lm")
-    except Exception:  # noqa: BLE001
-        return None
 
 
 def main():
@@ -274,6 +313,11 @@ def main():
             enable=spec["constrained"]
         ),
     }
+
+    refused = grammar_refusal(spec)
+    if refused is not None:
+        sys.stderr.write(refused + "\n")
+        return CREATE_REFUSED
 
     rows = []
     with litert_lm.Engine(spec["model"], **engine_kwargs(spec)) as engine:
@@ -591,7 +635,7 @@ def _refuse_a_mode_with_unread_reasons(rows: list[ToolPathRow]) -> None:
 # constrained decoding is off unless the caller enables it -- and whose log
 # sentences `reason_of` reads a missing reply's kind from. `verify` says when a
 # run used another.
-GRAMMAR_OFF_BY_DEFAULT_IN = "0.16.1"
+GRAMMAR_OFF_BY_DEFAULT_IN = "0.17.1"
 
 DISAGREEING_MODES = (
     "the two decoding modes did not agree: {constrained:.4f} with the runtime's grammar on and "
@@ -611,6 +655,16 @@ GRAMMAR_HURT = (
     "an argument order other than the declared one, it dropped the arguments written out of "
     "that order."
 )
+
+
+def _one_or_none(values: list[Any]) -> Any:
+    """The value every entry agrees on, or None where they differ or there is none.
+
+    None entries do not vote: a mode that could not read its runtime or CPU
+    says nothing against one that could.
+    """
+    read = [v for v in values if v is not None]
+    return read[0] if read and all(v == read[0] for v in read) else None
 
 
 @dataclass
@@ -647,7 +701,10 @@ class ToolPathBackend:
     # A mode that was not measured, and why. Grammar off landing here, or
     # anything ending the run, means nothing is scored: the reason says which.
     unavailable: dict[str, str] = field(default_factory=dict, init=False)
+    # One runtime for the run where every mode that read one agrees, else None.
     runtime_version: str | None = field(default=None, init=False)
+    # Each mode's own reading: two processes, which need not agree.
+    runtime_versions: list[str | None] = field(default_factory=list, init=False)
 
     name = "litert-lm tool path"
 
@@ -733,6 +790,21 @@ class ToolPathBackend:
             "automatic_tool_calling": False,
             "modes": sorted(self.rows),
             "runtime_version": self.runtime_version,
+            # Both modes run on this host, so the first report that read one names it.
+            # Each mode is its own process. One attribution stands only where
+            # every mode that read one agrees; otherwise each mode's is kept.
+            "cpu": _one_or_none(
+                [
+                    c
+                    for c in map(cpu_of, self.device_reports)
+                    if c and (c.get("model") or c.get("models"))
+                ]
+            ),
+            "cpu_by_mode": [cpu_of(r) for r in self.device_reports],
+            "runtime_versions_by_mode": list(self.runtime_versions),
+            # The pin beside what ran, as the text path records it, so verify
+            # can say when the two differ.
+            "requirements": list(getattr(self.env, "requirements", ())),
         }
 
     def generate(
@@ -758,6 +830,7 @@ class ToolPathBackend:
             backend_flag=self.backend_flag,
         )
         self.rows, self.unavailable, self.runtime_version = {}, {}, None
+        self.runtime_versions = []
         # Grammar off first: it is the run the reference is compared with, so
         # the grammar-on run not being measured must not cost it.
         for mode, constrained in (("unconstrained", False), ("constrained", True)):
@@ -766,7 +839,8 @@ class ToolPathBackend:
                 rows = probe.observe(prompts, constrained=constrained, events=events)
                 # Before the rows are judged: a mode not measured is where the
                 # runtime's version matters most.
-                self.runtime_version = probe.runtime_version
+                self.runtime_versions.append(probe.runtime_version)
+                self.runtime_version = _one_or_none(self.runtime_versions)
                 self.device_reports.append(probe.device_report)
                 _refuse_a_mode_with_unread_reasons(rows)
             except ToolPathError as exc:

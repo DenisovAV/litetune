@@ -1999,3 +1999,48 @@ def test_a_cpu_run_is_told_nothing_about_gpu_activations(write_split):
         },
     )
     assert not any("the bundle declares" in n or "GPU was not used" in n for n in notes)
+
+
+@pytest.mark.parametrize(
+    ("ran", "said"),
+    [
+        (None, "did not report which litert-lm it was"),
+        ("0.16.1", "ran on litert-lm 0.16.1, not the pinned 0.17.1"),
+        ("0.17.1", None),
+    ],
+)
+def test_a_litert_lm_run_names_its_runtime_or_says_it_cannot(write_split, ran, said):
+    """Runtimes do not give each other's answers, on either path."""
+    engine = {"engine": "litert-lm", "backend": "cpu", "requirements": ["litert-lm==0.17.1"]}
+    if ran is not None:
+        engine["runtime_version"] = ran
+    notes = _limitations_for(write_split, engine)
+    about = [n for n in notes if "litert-lm" in n and ("pinned" in n or "report which" in n)]
+    if said is None:
+        assert about == []
+    else:
+        assert any(said in n for n in about)
+
+
+def test_a_candidate_that_is_not_litert_lm_gets_no_runtime_or_cpu_note(write_split):
+    """Found by mutation: only a limitation count elsewhere noticed."""
+    notes = _limitations_for(write_split, {"engine": "transformers", "backend": "cpu"})
+    assert not any("litert-lm" in n and ("pinned" in n or "report which" in n) for n in notes)
+    assert not any("CPU model the candidate" in n for n in notes)
+
+
+def test_a_litert_lm_run_that_cannot_name_its_cpu_says_so(write_split):
+    engine = {
+        "engine": "litert-lm",
+        "backend": "cpu",
+        "requirements": ["litert-lm==0.17.1"],
+        "runtime_version": "0.17.1",
+    }
+    unnamed = _limitations_for(write_split, {**engine, "cpu": {"model": None}})
+    assert any("which CPU model the candidate computed on is not recorded" in n for n in unnamed)
+
+    named = _limitations_for(write_split, {**engine, "cpu": {"model": "AMD EPYC 7B12"}})
+    assert not any("CPU model the candidate" in n for n in named)
+
+    mixed = _limitations_for(write_split, {**engine, "cpu": {"models": ["Big", "Little"]}})
+    assert any("more than one kind of core (Big, Little)" in n for n in mixed)

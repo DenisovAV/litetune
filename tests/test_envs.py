@@ -3679,3 +3679,19 @@ def test_a_system_package_is_named_as_the_debian_package_it_is():
     message = envs.EXPORT._provisioning_failed("ERROR: something else went wrong")
 
     assert "Debian package(s) libvulkan1" in message
+
+
+def test_the_export_environment_pins_what_litert_torch_leaves_open():
+    """Found by mutation: no test read these pins. litert-torch-nightly names
+    its quantizer, LiteRT and converter without a version, so each is pinned
+    here; transformers is the one training uses, so a checkpoint is exported
+    by the version that trained it."""
+    pins = dict(r.split("==", 1) for r in envs.EXPORT.requirements if "==" in r)
+    train = dict(r.split("==", 1) for r in envs.TRAIN.requirements if "==" in r)
+
+    for name in ("ai-edge-litert-nightly", "ai-edge-quantizer-nightly", "litert-converter"):
+        assert name in pins
+    assert pins["transformers"] == train["transformers"]
+    assert pins["litert-lm"] == pins["litert-lm-builder"]
+    runtime = dict(r.split("==", 1) for r in envs.RUNTIME.requirements if "==" in r)
+    assert pins["litert-lm"] == runtime["litert-lm"]

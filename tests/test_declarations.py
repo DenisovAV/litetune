@@ -279,7 +279,7 @@ def test_a_shape_the_two_renderers_render_differently_is_refused(tmp_path, param
 
 def test_a_tool_named_outside_the_runtimes_grammar_is_refused(tmp_path):
     """The runtime's lexer reads an identifier as `[a-zA-Z_][a-zA-Z0-9_.-]*`
-    (AntlrFcLexer.g4, v0.16.1). A tool named otherwise can be declared, but no
+    (AntlrFcLexer.g4, v0.17.1). A tool named otherwise can be declared, but no
     call to it can ever be parsed back."""
     payload = [{"type": "function", "function": {"name": "caf\u00e9", "description": "d"}}]
 

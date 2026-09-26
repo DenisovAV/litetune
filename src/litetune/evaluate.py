@@ -84,7 +84,7 @@ CPU_BACKEND = "cpu"
 # `rendering.py`) pass a `Backend` in and read no device out, and the only
 # field any of them reads afterwards is a token count off `BenchmarkInfo`
 # (`rendering.py`). Whether the runtime could answer at all is a question
-# about litert-lm 0.16.1, which is installed in `envs.RUNTIME` and not here --
+# about litert-lm 0.17.1, which is installed in `envs.RUNTIME` and not here --
 # so it is a question a reader has to take to that package, and one this
 # comment does not answer for them.
 #
@@ -786,6 +786,12 @@ class LiteRtLmBackend:
             # `HuggingFaceBackend.describe`, where the same key carries the
             # other vocabulary.
             "backend_vocabulary": "litert-lm Python API Backend",
+            # Installed, as the script read it -- the pin says what was asked
+            # for, this what ran. `None` when no report was read.
+            "runtime_version": runtime_version_of(self.device_report),
+            # The arithmetic depends on the CPU model as much as on the runtime,
+            # so the CPU travels with the number. `None` when no report was read.
+            "cpu": cpu_of(self.device_report),
             "requirements": list(self.env.requirements),
             "system_requirements": list(self.env.system_requirements),
             # What the script calls, in place of the command line this
@@ -987,7 +993,7 @@ def runtime_engine_spec(backend: str) -> dict[str, Any]:
     The activation type is stated on every GPU run rather than left to the
     bundle. The bundle's `prefer_activation_type` is only a default: the
     runtime's `--activation-data-type` overrides it (`litert_lm_cli/common.py:216`
-    at v0.16.1, where the option is hidden and called experimental and "may
+    at v0.16.1 and v0.17.1, where the option is hidden and called experimental and "may
     not always work"; that it overrides in both directions is from
     LiteRT-LM#2992). A bundle that says nothing leaves the GPU text executor
     in F16 while the engine reports success: `<pad>` on 40 of 40 rows on an
@@ -1119,6 +1125,20 @@ def gpu_observed(backend: str, report: Any) -> bool:
 def gpu_unused(backend: str, report: Any) -> bool:
     """Whether a run asked for the GPU and the kernel shows it was not used."""
     return backend == "gpu" and _gpu_work(report)[0] is False
+
+
+def cpu_of(report: Any) -> dict[str, Any] | None:
+    """The CPU the driver script reported computing on, or None."""
+    if isinstance(report, dict) and isinstance(report.get("cpu"), dict):
+        return report["cpu"]
+    return None
+
+
+def runtime_version_of(report: Any) -> str | None:
+    """The litert-lm version the driver script ran under, as it read it, or None."""
+    if isinstance(report, dict) and isinstance(report.get("runtime_version"), str):
+        return report["runtime_version"]
+    return None
 
 
 def bundle_activation_of(report: Any) -> str | None:
@@ -1341,13 +1361,142 @@ def bundle_activation(path):
     return declared[0] if declared else None
 
 
+def runtime_version():
+    """The litert-lm this script runs under, as installed, or None.
+
+    Not the pin: a manifest says what produced its numbers, and runtimes do
+    not reproduce one another's answers -- MEASUREMENTS.md, "Which runtime a
+    number was taken on".
+    """
+    try:
+        from importlib.metadata import version
+
+        return version("litert-lm")
+    except Exception:  # noqa: BLE001 -- a diagnostic must not end a run
+        return None
+
+
+# x86 instruction-set features of the kind kernel libraries such as XNNPACK
+# dispatch on, as /proc/cpuinfo names them. Recorded, not interpreted, and not a
+# claim to be XNNPACK's exact list: two CPUs with the same set can still give
+# different arithmetic, which is why the model is recorded too.
+CPU_FLAGS = ("avx", "avx2", "fma", "f16c", "gfni", "avx512f", "avx512dq",
+             "avx512cd", "avx512bw", "avx512vl", "avx512vbmi", "avx512_vnni",
+             "avx512_bf16", "avx512_fp16", "avx_vnni", "amx_tile", "amx_int8",
+             "amx_bf16")
+
+
+def cpu_report():
+    """The CPU this script computes on: model, architecture, features, count.
+
+    litert-lm's CPU arithmetic depends on the CPU model: the same runtime and
+    bundle gave per-token scores identical to the bit on three machines with one
+    Intel model and different on every prompt on an AMD one, while the thread
+    count changed nothing (MEASUREMENTS.md, "Which runtime a number was taken
+    on"). So a number names its CPU the way it names its runtime. Never raises;
+    what could not be read is None.
+    """
+    import os
+    import platform
+    import subprocess
+    import sys
+
+    report = {"machine": None, "model": None, "flags": None, "count": None}
+    try:
+        report["machine"] = platform.machine() or None
+        # The CPUs this process may use, not the host's: a container pinned to
+        # two of sixty-four computes on two.
+        try:
+            report["count"] = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            report["count"] = os.cpu_count()
+        if sys.platform.startswith("linux"):
+            with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as info:
+                text = info.read()
+            # One block per logical CPU. The first one this process may run on,
+            # not processor 0: a pinned container on a host with two core types
+            # can be kept off processor 0.
+            try:
+                allowed = os.sched_getaffinity(0)
+            except (AttributeError, OSError):
+                allowed = None
+            blocks = []
+            for chunk in text.split("\n\n"):
+                fields = {}
+                for line in chunk.splitlines():
+                    key, _, value = line.partition(":")
+                    fields.setdefault(key.strip(), value.strip())
+                if fields:
+                    blocks.append(fields)
+            usable = [
+                b for b in blocks
+                if "processor" in b and (
+                    allowed is None or not b["processor"].isdigit()
+                    or int(b["processor"]) in allowed
+                )
+            ] or blocks[:1]
+
+            def model_of(block):
+                named = block.get("model name") or block.get("Model") or block.get("Hardware")
+                if named:
+                    return named
+                # arm64 Linux servers name no model; the core is its
+                # implementer and part, e.g. 0x41/0xd0c for a Neoverse N1.
+                if block.get("CPU implementer") and block.get("CPU part"):
+                    return "implementer %s part %s variant %s revision %s" % (
+                        block["CPU implementer"], block["CPU part"],
+                        block.get("CPU variant", "?"), block.get("CPU revision", "?"),
+                    )
+                return None
+
+            models = []
+            for block in usable:
+                name = model_of(block)
+                if name and name not in models:
+                    models.append(name)
+            if len(models) > 1:
+                # Cores of more than one kind, all open to this process: which
+                # of them computed a number is not something it can name.
+                report["models"] = models
+            else:
+                report["model"] = models[0] if models else next(
+                    # ARM lists its model once, outside the per-CPU blocks.
+                    (model_of(b) for b in blocks if model_of(b)), None
+                )
+                chosen = usable[0] if usable else {}
+                if "flags" in chosen:
+                    have = set(chosen["flags"].split())
+                    report["flags"] = sorted(f for f in CPU_FLAGS if f in have)
+                elif "Features" in chosen:
+                    report["flags"] = sorted(set(chosen["Features"].split()))
+        elif sys.platform == "darwin":
+            done = subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True, timeout=10,
+            )
+            if done.returncode == 0:
+                report["model"] = done.stdout.decode("utf-8", "replace").strip() or None
+            else:
+                report["error"] = "sysctl exited %d" % done.returncode
+        else:
+            report["model"] = platform.processor() or None
+    except Exception as exc:  # noqa: BLE001 -- a diagnostic must not end a run
+        report["error"] = "%s: %s" % (type(exc).__name__, exc)
+    return report
+
+
 def run_report(spec, at_engine, after_generation=None):
     """The report a driver script writes about its run, beside its answers.
 
     `bundle_activation` is read here, in the script, because `litert_lm_builder`
     is installed where the script runs and not where litetune runs.
     """
-    report = {"at_engine": at_engine, "after_generation": after_generation}
+    report = {
+        "at_engine": at_engine,
+        "after_generation": after_generation,
+        "runtime_version": runtime_version(),
+        "cpu": cpu_report(),
+    }
     try:
         report["bundle_activation"] = bundle_activation(spec["model"])
     except Exception as exc:  # noqa: BLE001 -- a diagnostic must not end a run
@@ -1408,8 +1557,9 @@ def text_from_conversation(conversation, prompt):
     reasoning at all.
 
     So this mirrors `litert_lm_cli/commands/run.py` as a state machine rather
-    than approximating it. Read at the v0.16.1 tag, the version `envs.RUNTIME`
-    pins: `close_channel` (run.py:50-53) writes `" [/name]"` and a newline,
+    than approximating it. Read at the v0.16.1 tag, and unchanged but for a type
+    checker's comment at v0.17.1, the version `envs.RUNTIME` pins:
+    `close_channel` (run.py:50-53) writes `" [/name]"` and a newline,
     and run.py:108-125 calls it before every text item, on a switch between
     channels, and at the end of the stream. The one branch not mirrored is the
     bare `click.echo()` the CLI emits instead when no channel was open at the
@@ -1449,7 +1599,7 @@ def main(spec_path):
         # `cache_dir_value_from_cache_mode` (common.py) maps both `None` and
         # "disk" to the empty string, and `Engine.__init__` reaches
         # `litert_lm_engine_settings_set_cache_dir` only when `cache_dir is not
-        # None` (engine.py:149-151 at v0.16.1). Leaving it out would not be the
+        # None` (engine.py:149-151 at v0.17.1). Leaving it out would not be the
         # CLI's behaviour but a fourth state beside disk, memory and none.
         # Which of the three that fourth state resolves to is decided in the
         # C++ the binding calls, not in anything readable from here.
@@ -1490,8 +1640,8 @@ def main(spec_path):
                 except Exception as exc:  # noqa: BLE001
                     # One prompt, not the rest of the split. The runtime
                     # raises `RuntimeError` when a prefill or a decode call
-                    # fails (`litert_lm/session.py:70` and `:99` at v0.16.1)
-                    # and when a send fails (`conversation.py:326`), and
+                    # fails (`litert_lm/session.py:72` and `:101` at v0.17.1)
+                    # and when a send fails (`conversation.py:328`), and
                     # without this the first of those ends the process: every
                     # later prompt comes back as "the script exited 1".
                     #

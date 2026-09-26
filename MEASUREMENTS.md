@@ -13,6 +13,77 @@ through the runtime's tool path the way an application calls it.
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
 
+## Which runtime a number was taken on
+
+Every litetune from 0.1.0a1 to 0.1.9 pins the same toolchain:
+`litert-lm==0.16.1` for the candidate, `litert-torch-nightly==0.10.0.dev20260826`
+for conversion (with `litert-lm-builder==0.16.1` from 0.1.4), and `torch==2.5.1`,
+`transformers==5.16.1`, `peft==0.20.0` for training and the float reference. The
+sections below name the runtime they ran on where they record one; the phone
+sections ran a runtime of their own.
+
+litetune after 0.1.9 pins `litert-lm==0.17.1`, and that runtime does not give
+0.16.1's answers. Nor does one CPU give another's. Measured 2026-09-27 on
+Linux x86-64, CPU backend, through litetune's own driver scripts, each version
+in its own environment and each run on its own copy of the bundles, with no
+weight cache from another run beside it. The bundles were litert-community's
+`gemma3-270m-it-q8` and `gemma3-1b-it-int4` and a FunctionGemma bundle this
+project converted and keyed `fp32`; each of twelve prompts was prefilled and
+one fixed sentence scored after it with `run_text_scoring`, which no sampler or
+detokenizer touches -- the model's arithmetic and nothing else.
+
+| Per-token scores identical, of 36 prompt-bundle scorings | same runtime | 0.16.1 against 0.17.1 |
+|---|---|---|
+| same CPU model, another run or machine | **36** | **1** |
+| Intel Xeon @ 2.20GHz against AMD EPYC 7B12 | **0** | 0 |
+
+Six builds took part, each on a machine drawn from a pool of 32-vCPU ones: four
+landed on the Intel model and two on the AMD one. The two that recorded their
+CPU features showed AVX2 and FMA and none of AVX-512 or AMX. Two builds did not
+record their CPU and are placed with a model because their scores equal that
+model's recorded builds' to the bit -- an inference, not a record. Within a CPU
+model every run reproduced every
+score to the bit, across machines and, on 0.17.1 on the Intel model, with 1, 4,
+8, 16 or 32 threads alike; across the two models not one scoring did, by as much
+as 1.52 nats on a single token, and across the two runtimes one did, by as much
+as 1.33.
+So a litert-lm number belongs to a runtime version *and* a CPU model, and two
+compare only when both match. Since this release a `verify` manifest records
+the CPU its candidate ran on beside the runtime, wherever the driver could read
+it. The sections below
+name their runtime and not their CPU, and those taken on machines drawn from a
+pool may have landed on different CPU models.
+
+The same holds for what litetune scores. litetune's driver scripts on one
+machine -- twelve prompts in both prompt modes on the three bundles,
+and forty held-out tool-path rows with the grammar off and on -- gave the same
+output on 152 of 152 when 0.16.1 ran twice, and on 47 of 152 between 0.16.1 and
+0.17.1. That pair was taken on the AMD model, by the same inference; a second
+0.17.1 run, whose scores place it with the Intel model, matched the first on 43 of 152, which is the CPU
+and not nondeterminism. What in the runtime changed the arithmetic is not
+isolated. Between the tags LiteRT-LM moves its LiteRT dependency three times, across two
+XNNPACK updates and changes to int8 and dynamically quantised fully-connected
+kernels; its own call parser, prompt rendering and the binding calls litetune
+makes read the same, apart from integers the parser now returns as integers.
+
+Neither version is shown to be the more accurate: that needs both scored
+against the float model, and it is not done here. The FunctionGemma bundle in
+these runs is an early conversion that answers most tool-path rows with several
+calls, so its exact match says nothing about quality and is not quoted. On the
+Intel model a scoring process, three bundles in turn, peaked at 1.07 to 1.14 GiB
+resident, whatever the thread count.
+
+One behaviour changed that a number can hide. Where a bundle carries no
+SentencePiece tokenizer, v0.16.1 refused to create a conversation with the
+grammar on; v0.17.1 logs a warning and decodes without the grammar
+(`gemma3_data_processor.cc`, `function_gemma_data_processor.cc`). litetune reads
+the bundle's tokenizer sections first and refuses that mode itself, so a
+grammar-on number is never unconstrained output.
+
+So two numbers compare only when they name the same runtime. The sections below
+keep their 0.16.1 numbers; one taken on 0.17.1 goes beside them and never in
+place of them.
+
 ## The headline numbers
 
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
@@ -150,6 +221,13 @@ until you have them, rather than picking a winner.
 Nothing in the file size, the exit code, or the logs separates those two
 artifacts: they are 455,759,152 and 455,939,600 bytes, 0.04% apart. Running both
 against held-out data is the only thing that does.
+
+**Which CPU each run's candidate ran on was not recorded**, and "the same
+configuration end to end" did not include it. On litert-lm the CPU model changes
+the arithmetic about as much as the runtime version does (see *Which runtime a
+number was taken on*). The fine-tuned float scores differ between the three runs
+as well, so the spread above is not the CPU's alone; how much of the converted
+numbers' spread is the CPU's cannot be separated after the fact.
 
 Three points rather than two, because only the differences mean anything. A
 single accuracy figure for a converted model cannot distinguish a good

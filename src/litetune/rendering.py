@@ -9,7 +9,7 @@ two engines can render the same template differently, and a tokenizer can add
 tokens neither template shows.
 
 So the check compares token ids. For every prompt, a script in `envs.RUNTIME`
-renders it with `Conversation.render_message_to_string` -- in LiteRT-LM v0.16.1
+renders it with `Conversation.render_message_to_string` -- in LiteRT-LM v0.17.1
 that returns `GetSingleTurnText`, the function `SendMessage` renders with --
 and turns the result into ids the way a first-turn prefill does. A script in the reference's
 environment produces the ids the reference generates from, through the same
@@ -60,7 +60,7 @@ def prefill_ids(engine, text):
     `Engine.tokenize` calls the tokenizer directly. Prefill first strips a
     leading BOS string and inserts the BOS id in its place, because the
     tokenizer does not read that string as the token (LiteRT-LM
-    runtime/core/session_utils.cc, StringToProcessedInputText, v0.16.1). This
+    runtime/core/session_utils.cc, StringToProcessedInputText, v0.17.1). This
     mirrors that step, and a mirror can be wrong: the prefill count the parent
     compares is what would say so.
     """
@@ -76,7 +76,7 @@ def runtime_ids(engine, rendered):
     """What a first turn gives the model: the session's BOS, then the rendered text.
 
     A session prepends the BOS string on its first turn, outside the rendered
-    text (runtime/core/session_utils.cc, ApplyPromptTemplates, v0.16.1), and
+    text (runtime/core/session_utils.cc, ApplyPromptTemplates, v0.17.1), and
     prefill turns that string into the BOS id. Measured on a gemma-3-270m export
     on 2026-09-15: `render_message_to_string` gave 46 ids, the conversation
     prefilled 47, and the transformers template renders 47 with one <bos>. A

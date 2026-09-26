@@ -2209,7 +2209,10 @@ RUNTIME = StageEnv(
     python_ceiling=(3, 12),
     ceiling_pin="numpy==2.0.2",
     requirements=(
-        "litert-lm==0.16.1",
+        # 0.17.1, the runtime flutter_gemma_litertlm 1.8.0 ships. It does not
+        # reproduce 0.16.1's answers (see MEASUREMENTS.md, "Which runtime a
+        # number was taken on"), so every number records the one it ran on.
+        "litert-lm==0.17.1",
         "numpy==2.0.2",  # last of the 2.0 line; `<2.1` is a bound, not a pin
     ),
     # litert-lm dlopen()s a native library that links vulkan unconditionally,
@@ -2223,14 +2226,26 @@ EXPORT = StageEnv(
     python_ceiling=(3, 12),
     ceiling_pin="numpy==2.0.2",
     requirements=(
-        "litert-torch-nightly==0.10.0.dev20260826",
-        "litert-lm==0.16.1",
+        "litert-torch-nightly==0.10.0.dev20260926",
+        "litert-lm==0.17.1",
         # Provides `litert-lm-builder` and `litert-lm-peek`, which `export`
         # runs to write the GPU activation type into each bundle and to read
         # the result back. Pinned by name: `litert-lm` happens to require
         # this exact version today and `litert-torch` accepts any, so without
         # this line the builder floats the moment the other two pins move.
-        "litert-lm-builder==0.16.1",
+        "litert-lm-builder==0.17.1",
+        # `litert-torch-nightly` requires the first two by name only and the
+        # third as `>=0.0.0.dev0`, so up to 0.1.9 each install took whatever
+        # was newest that day: the same pin could convert with a different
+        # quantizer a day later. These are what `uv pip compile` resolved
+        # 0.10.0.dev20260926 to on 2026-09-26, for Linux x86-64 and macOS
+        # arm64 alike. `convert` records the full `pip freeze`.
+        "ai-edge-litert-nightly==2.3.0.dev20260925",
+        "ai-edge-quantizer-nightly==0.10.0.dev20260926",
+        "litert-converter==0.4.0",
+        # The version `TRAIN` pins, so a checkpoint is exported by the
+        # transformers that trained it; unpinned, it resolved to 5.17.0.
+        "transformers==5.16.1",
         "numpy==2.0.2",  # last of the 2.0 line; `<2.1` is a bound, not a pin
     ),
     system_requirements=("libvulkan1",),
