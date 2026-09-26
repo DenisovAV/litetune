@@ -694,11 +694,12 @@ class ToolPathBackend:
         return [
             r
             for r in self.device_reports
-            if bundle_activation_error_of(r) is None
-            or (isinstance(r, dict) and "bundle_activation_error" in r)
+            if isinstance(r, dict)
+            and (bundle_activation_error_of(r) is None or "bundle_activation_error" in r)
         ]
 
     def describe(self) -> dict[str, Any]:
+        readings = self._bundle_readings()
         return {
             # The same keys and vocabulary `LiteRtLmBackend` uses, because
             # `verify` reads the device from them: the first version put this
@@ -717,16 +718,12 @@ class ToolPathBackend:
             # From the modes whose report carries a reading of the bundle; with
             # none, why none did -- not "declares none", which is a claim.
             "bundle_activation": next(
-                (a for a in map(bundle_activation_of, self._bundle_readings()) if a is not None),
-                None,
+                (a for a in map(bundle_activation_of, readings) if a is not None), None
             ),
-            "bundle_activation_error": next(
-                (
-                    e
-                    for e in map(bundle_activation_error_of, self._bundle_readings() or [None])
-                    if e is not None
-                ),
-                None,
+            "bundle_activation_error": (
+                next((e for e in map(bundle_activation_error_of, readings) if e is not None), None)
+                if readings
+                else bundle_activation_error_of(None)
             ),
             "backend_vocabulary": "litert-lm Python API Backend",
             "path": "tool path",
