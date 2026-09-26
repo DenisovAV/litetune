@@ -3,6 +3,17 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.1.9 — 2026-09-26
+- `verify --backend gpu` measures the converted model on litert-lm's GPU backend, passing fp32 activations itself and naming it when the bundle alone would get something else (#53).
+- On macOS a GPU run is recorded as measured on the GPU only when the kernel shows its process doing GPU work; elsewhere, and when the reading is not conclusive, the manifest says the GPU was asked for (#53).
+- Every manifest says whether the candidate's backend was observed or only asked for (#52).
+- `verify` generates a whole split in one litert-lm process through the runtime's Python API rather than one `litert-lm run` per prompt; the split's budget is still the per-prompt timeout times its prompts, so one hung prompt can use the rest's share (#50).
+- A LoRA run on Gemma 4 adapts the text tower only, where before it stopped in peft on the vision and audio projections, and `metrics.json` records what peft matched (#48).
+- Gemma 4 E2B is measured end to end on banking77, and litetune's seven LoRA projections against peft's default two (#48).
+- Qwen2.5-0.5B-Instruct is a checked family and is measured on banking77 (#47).
+- The site renders MEASUREMENTS.md, and each measured model's card links to the section that measured it (#49).
+- Each measured model's card says what the model is and what it is for (#49, #51).
+
 ## 0.1.8 — 2026-09-20
 - **Re-run any `verify` whose host does not default to UTF-8 — Windows always, POSIX with a locale like `en_US.ISO8859-1`** — the runtime's generations were decoded in the host's encoding, so a non-ASCII answer scored as a wrong one (#44).
 - **Re-make any bundle or split written on Windows** — text writes turned LF into CRLF, so a bundle's declarations did not hash to its own contract and a split's `content_sha256` differed from the same rows elsewhere (#44).
