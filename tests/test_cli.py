@@ -233,6 +233,23 @@ def test_verify_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     assert request.declarations == decls
 
 
+def test_verify_carries_the_backend_to_the_request(monkeypatch):
+    request = _captured_request(monkeypatch, "run_verify", [*_VERIFY_ARGV, "--backend", "gpu"])
+    assert request.backend == "gpu"
+
+
+def test_verify_asks_for_the_cpu_backend_unless_told_otherwise(monkeypatch):
+    """Every run before this flag existed measured on the CPU backend, and
+    every number published so far is one of those runs."""
+    request = _captured_request(monkeypatch, "run_verify", list(_VERIFY_ARGV))
+    assert request.backend == "cpu"
+
+
+def test_verify_refuses_a_backend_it_does_not_offer():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([*_VERIFY_ARGV, "--backend", "npu"])
+
+
 def test_prepare_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     decls = tmp_path / "declarations.json"
 
@@ -1715,7 +1732,7 @@ def test_convert_names_the_gpu_state_of_every_artifact(toolchain, tmp_path, caps
     )
     captured = capsys.readouterr()
     assert code == 0
-    assert "CPU-only (GPU activations not set)" in captured.out
+    assert "GPU activations not set: an app that passes none gets F16 on the GPU" in captured.out
     assert "No module named 'litert_lm_builder'" in captured.out, "the reason reaches the console"
     assert "prefer_activation_type could not be written" in captured.out
 
@@ -1747,7 +1764,7 @@ def test_convert_json_records_gpu_activation(toolchain, tmp_path, capsys):
         ("fp32", "GPU activations fp32 —"),
         ("fp16", "GPU activations fp16 (declared upstream, not fp32)"),
         ("fp32_fp16", "GPU activations fp32_fp16 (declared upstream, not fp32)"),
-        (None, "CPU-only (GPU activations not set)"),
+        (None, "GPU activations not set: an app that passes none gets F16 on the GPU"),
     ],
 )
 def test_the_convert_line_marks_an_upstream_declaration(declared, expect, tmp_path):

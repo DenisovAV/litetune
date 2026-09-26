@@ -122,7 +122,7 @@ class GpuActivationState(str, Enum):
     is read back out of the bundle; what is closed is how litetune reads it.
     """
 
-    UNSET = "unset"  # no declaration: the runtime's F16 default, CPU-only in practice
+    UNSET = "unset"  # no declaration: the runtime's F16 default on the GPU
     SET = "set"  # carries GPU_ACTIVATION, written by litetune or found upstream
     DECLARED_UPSTREAM = "declared_upstream"  # carries something else, left as found
 
@@ -139,7 +139,7 @@ def describe_gpu_activation(value: str | None) -> str:
     """The one sentence both the check detail and the console line print."""
     state = GpuActivationState.of(value)
     if state is GpuActivationState.UNSET:
-        return "CPU-only (GPU activations not set)"
+        return "GPU activations not set: an app that passes none gets F16 on the GPU"
     if state is GpuActivationState.SET:
         return f"GPU activations {value}"
     return f"GPU activations {value} (declared upstream, not {GPU_ACTIVATION})"
@@ -962,7 +962,7 @@ def set_gpu_activation(
         # Whatever went wrong here, the toolchain's artifact is intact and is a
         # working CPU bundle. Escaping would let `guard` record the whole
         # recipe as "could not check", which is a smaller truth than the one
-        # available: exported, CPU-only, and here is why. The frame is kept in
+        # available: exported, without the GPU key, and here is why. The frame is kept in
         # the log; the note is what the user reads.
         logger.exception("GPU activation repack of %s failed", artifact)
         return None, f"{type(exc).__name__}: {exc}; the original was kept"
@@ -1577,7 +1577,10 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
             f"{GPU_ACTIVATION_KEY} could not be written into {named}. On the GPU "
             "backend the runtime will compute activations in F16, which measured as `<pad>` "
             "floods and wrong tool names on a Snapdragon Galaxy S24 (3/20 vs 20/20 on CPU, "
-            "n=20). These bundles are CPU-only until repacked"
+            "n=20). An app that loads these bundles without an activation override gets that "
+            "default until they are repacked; "
+            "`verify --backend gpu` "
+            "passes fp32 itself and can still measure them on a GPU"
         )
 
     events.stage_finished(

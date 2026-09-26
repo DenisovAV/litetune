@@ -44,6 +44,7 @@ from typing import Any, Protocol
 from litetune import envs
 from litetune.events import EventStream
 from litetune.exits import read_returncode
+from litetune.export import GPU_ACTIVATION
 from litetune.metrics import ToolCall, read_target
 from litetune.prompt_mode import RENDERING_SOURCE, PromptMode
 
@@ -689,7 +690,8 @@ class LiteRtLmBackend:
     because the parent is blocked on one child instead of watching six hundred
     finish.
 
-    Measurement here runs on CPU while users run on a phone. Measured
+    Measurement here runs on this machine -- its CPU by default, its GPU with
+    `backend_flag="gpu"` -- while users run on a phone. Measured
     2026-09-05 on one Snapdragon Galaxy S24, one recipe: the device's CPU
     scored 0.8703 ±0.026 on 640 rows against 0.8906, 0.9016 and 0.8969 for
     the three reference runs of that recipe -- within about 0.03, with two of
@@ -721,9 +723,11 @@ class LiteRtLmBackend:
     # `create_session` and `create_conversation` both take a `sampler_config`
     # and the driver script passes `None`, so the engine uses its own.
     decode_enforced = False
-    # The flag this backend passes, never a device read back: litert-lm's
-    # Python API names no accelerator. See `GenerationBackend.backend_observed`.
-    backend_observed = False
+    # What the driver script saw of the process after building its engine; see
+    # `device_report` in `RUNTIME_ENGINE_SOURCE`. Cleared at the start of every
+    # run, before any return, so one run's reading is never reported as the
+    # next one's.
+    device_report: dict[str, Any] | None = field(default=None, init=False)
     # Text, not structured calls; a call is whatever `parse_call` makes of it.
     scores_structurally = False
 
@@ -738,6 +742,10 @@ class LiteRtLmBackend:
     @property
     def model_ref(self) -> str:
         return str(self.model)
+
+    @property
+    def backend_observed(self) -> bool:
+        return gpu_observed(self.backend_flag, self.device_report)
 
     @property
     def runner_call(self) -> str:
@@ -759,6 +767,21 @@ class LiteRtLmBackend:
             "engine": "litert-lm",
             "backend": self.backend_flag,
             BACKEND_OBSERVED: self.backend_observed,
+            # Stated rather than inherited from the bundle; see
+            # `runtime_engine_spec`. `None` on the CPU backend, where nothing
+            # is passed.
+            "activation_data_type": runtime_engine_spec(self.backend_flag)["activation_data_type"],
+            # What the script saw of its own process after building the engine,
+            # verbatim, so a reader can tell "looked and found no GPU client"
+            # from "did not look". `None` before a run and after one that wrote
+            # nothing.
+            "device_report": self.device_report,
+            # Read off that report: the kernel was asked and showed no GPU work
+            # from this process although the GPU was asked for, and what the
+            # bundle itself declares for GPU activations.
+            "gpu_unused": gpu_unused(self.backend_flag, self.device_report),
+            "bundle_activation": bundle_activation_of(self.device_report),
+            "bundle_activation_error": bundle_activation_error_of(self.device_report),
             # The flag as passed, not a device torch chose: see
             # `HuggingFaceBackend.describe`, where the same key carries the
             # other vocabulary.
@@ -788,17 +811,24 @@ class LiteRtLmBackend:
     def generate(
         self, prompts: Sequence[str], events: EventStream | None = None
     ) -> list[Generation]:
+        # First, before any return: this run's reading or none.
+        self.device_report = None
         blocked = self._ensure_env(events)
         if blocked is not None:
             return [Generation(i, p, harness_error=blocked) for i, p in enumerate(prompts)]
         if not prompts:
             return []
+        if self.backend_flag == "gpu" and len(prompts) > 1:
+            silent = self._gpu_preflight(prompts[0], events)
+            if silent is not None:
+                return [Generation(i, p, harness_error=silent) for i, p in enumerate(prompts)]
 
         with tempfile.TemporaryDirectory(prefix="litetune-litertlm-") as tmp:
             work = Path(tmp)
             script = work / "generate.py"
             script.write_text(_LITERTLM_GENERATE_SCRIPT, encoding="utf-8")
             results = work / "generations.jsonl"
+            report = work / "device.json"
             spec = work / "spec.json"
             spec.write_text(
                 json.dumps(
@@ -806,15 +836,17 @@ class LiteRtLmBackend:
                         "model": str(self.model),
                         "prompts": list(prompts),
                         "runtime_rendered": self.uses_template,
-                        "backend": self.backend_flag,
+                        **runtime_engine_spec(self.backend_flag),
                         "out": str(results),
+                        "report": str(report),
                     }
                 ),
                 encoding="utf-8",
             )
             if events:
                 events.note(
-                    f"{self.name}: generating {len(prompts)} completions",
+                    f"{self.name}: generating {len(prompts)} completions on the "
+                    f"{self.backend_flag} backend",
                     backend=self.name,
                     total=len(prompts),
                 )
@@ -845,6 +877,7 @@ class LiteRtLmBackend:
                 # flushes after each one, and a half-written last line fails to
                 # parse and is dropped by the reader.
                 texts, faults = read_jsonl_results(results)
+                self.device_report = _read_device_report(report)
                 # `_run_guarded` kills the group and drains it precisely to put
                 # the child's last words on this exception; the first version
                 # of this discarded them, leaving the budget as the whole
@@ -853,7 +886,7 @@ class LiteRtLmBackend:
                 if isinstance(killed, bytes):
                     killed = killed.decode("utf-8", "surrogateescape")
                 killed = killed[-2000:]
-                reason = f"no result after {budget}s (timeout)"
+                reason = f"no result after {budget}s on the {self.backend_flag} backend (timeout)"
                 return salvage_after_kill(prompts, texts, faults, killed, reason)
             except OSError as exc:
                 logger.exception("could not start the litert-lm generation script")
@@ -861,7 +894,63 @@ class LiteRtLmBackend:
                 return [Generation(i, p, harness_error=reason) for i, p in enumerate(prompts)]
 
             texts, faults = read_jsonl_results(results)
+            self.device_report = _read_device_report(report)
         return assemble_generations(prompts, texts, proc, faults)
+
+    def _gpu_preflight(self, prompt: str, events: EventStream | None) -> str | None:
+        """One prompt on the GPU backend, with one prompt's budget, before the split.
+
+        An engine built for a GPU that is not usable raises nothing and answers
+        nothing: measured on Linux with litert-lm 0.16.1, created without
+        error, then no token for a single prompt in fifty-five minutes. The
+        split's budget is `timeout_s` per prompt, so a 600-row run would wait
+        fifty hours to report what one prompt can show in `timeout_s`. Only
+        the silence is judged here -- anything else the run itself reports,
+        with the split's own evidence. Costs one extra engine load.
+        """
+        if events:
+            events.note(
+                f"{self.name}: one prompt on the gpu backend first, within {self.timeout_s}s",
+                backend=self.name,
+            )
+        with tempfile.TemporaryDirectory(prefix="litetune-litertlm-preflight-") as tmp:
+            work = Path(tmp)
+            script = work / "generate.py"
+            script.write_text(_LITERTLM_GENERATE_SCRIPT, encoding="utf-8")
+            spec = work / "spec.json"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "model": str(self.model),
+                        "prompts": [prompt],
+                        "runtime_rendered": self.uses_template,
+                        **runtime_engine_spec(self.backend_flag),
+                        "out": str(work / "generations.jsonl"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            try:
+                self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
+            except subprocess.TimeoutExpired as expired:
+                # The child's last words, as the split's own timeout keeps them.
+                killed = expired.stderr or ""
+                if isinstance(killed, bytes):
+                    killed = killed.decode("utf-8", "surrogateescape")
+                killed = killed.strip()[-2000:]
+                return (
+                    f"the gpu backend gave no answer to one prompt in {self.timeout_s}s, a "
+                    "budget that also covered building the engine, so the split was not "
+                    "started. On a host without a usable GPU litert-lm has been measured to "
+                    "build a GPU engine without error and then produce nothing; a slow engine "
+                    "build on a working GPU would end here too"
+                    + (f". The runtime's last output: {killed}" if killed else "")
+                )
+            except OSError:
+                # The split starts the same script and reports this with its rows.
+                logger.exception("could not start the litert-lm gpu preflight")
+                return None
+        return None
 
     def _ensure_env(self, events: EventStream | None) -> str | None:
         """Provision the runtime environment. Returns why it could not be, or None."""
@@ -887,7 +976,389 @@ class LiteRtLmBackend:
 # `create_conversation`, then the stream -- so this is that code reached
 # directly rather than a second way of asking. Where the CLI's behaviour is
 # not obvious the script copies it deliberately and says so.
-_LITERTLM_GENERATE_SCRIPT = r'''
+# The backends a litert-lm candidate can be asked for, in the word both the
+# CLI's `--backend` and `verify --backend` use.
+CANDIDATE_BACKENDS = ("cpu", "gpu")
+
+
+def runtime_engine_spec(backend: str) -> dict[str, Any]:
+    """What a driver script needs to construct its engine, as spec keys.
+
+    The activation type is stated on every GPU run rather than left to the
+    bundle. The bundle's `prefer_activation_type` is only a default: the
+    runtime's `--activation-data-type` overrides it (`litert_lm_cli/common.py:216`
+    at v0.16.1, where the option is hidden and called experimental and "may
+    not always work"; that it overrides in both directions is from
+    LiteRT-LM#2992). A bundle that says nothing leaves the GPU text executor
+    in F16 while the engine reports success: `<pad>` on 40 of 40 rows on an
+    M4 Pro's Metal, and floods on 14 of 20 on a Galaxy S24. Passing
+    `export.GPU_ACTIVATION` here keeps our runs out of that state whatever the
+    bundle carries -- measured on Metal, where an unkeyed bundle answered as a
+    keyed one did -- and `verify` records what the bundle alone declares,
+    because an app that passes no override gets that instead.
+
+    On the CPU backend nothing is passed: the option exists to force FP32 on a
+    GPU, and the CPU path has been measured with nothing passed since the
+    first number in MEASUREMENTS.md.
+    """
+    if backend not in CANDIDATE_BACKENDS:
+        raise ValueError(
+            f"unknown litert-lm backend {backend!r}: expected one of {CANDIDATE_BACKENDS}"
+        )
+    return {
+        "backend": backend,
+        "activation_data_type": GPU_ACTIVATION if backend == "gpu" else None,
+    }
+
+
+def _read_device_report(path: Path) -> dict[str, Any] | None:
+    """The device report a driver script wrote, or `None` if it wrote none.
+
+    Missing is ordinary -- a script that died before building its engine, or a
+    run that never started -- and it means "not established", which is what
+    `gpu_observed` makes of `None`. Unreadable is not ordinary, so it is kept
+    as `{"unreadable": why}`: that reads as "not established" too, and
+    `bundle_activation_error_of` carries the reason into the manifest.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("device report %s is unreadable: %s", path.name, exc)
+        return {"unreadable": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(payload, dict):
+        logger.warning("device report %s is not a JSON object", path.name)
+        return {"unreadable": f"a JSON {type(payload).__name__}, not an object"}
+    return payload
+
+
+def _gpu_work(report: Any) -> tuple[bool | None, Any]:
+    """What a run report says about GPU work: (did it happen, the reading).
+
+    True when the kernel was asked after generating and one of the process's
+    GPU clients showed more GPU time than it had once the engine was built --
+    the runtime opened the GPU *and* worked there. False when the kernel was
+    asked at both readings and showed no client for this pid either time, or
+    the same clients with time that did not grow: measured on the host where
+    this was built, a GPU engine always owns one from construction and its
+    time grows while it decodes, so those readings say the GPU was not used.
+    None when nothing was established either way -- the kernel was not asked,
+    the run died before the second reading, a client seen at the engine was
+    gone by the end, or the report is missing.
+    """
+    if not isinstance(report, dict):
+        return None, None
+    end = report.get("after_generation")
+    start = report.get("at_engine")
+    if not isinstance(end, dict) or end.get("looked") is not True:
+        return None, None
+    if isinstance(end.get("gpu_client"), str):
+        return _clients_worked(start, end), end
+    if (
+        isinstance(start, dict)
+        and start.get("looked") is True
+        and not isinstance(start.get("gpu_client"), str)
+    ):
+        return False, end
+    return None, end
+
+
+def _is_count(value: Any) -> bool:
+    """An integer GPU time; a bool is an int to `isinstance` and is not one."""
+    return type(value) is int
+
+
+def _clients_worked(start: Any, end: dict) -> bool | None:
+    """Whether GPU time grew, compared client by client across the readings.
+
+    A client's total is compared only with that same client's: one that did
+    work and closed would otherwise leave a sum that did not grow, and a
+    replacement would stand in for it. The key is the registry id `ioreg`
+    prints (`IORegistryEntryGetRegistryEntryID`, IOKitTools ioreg.c), which
+    xnu hands out from a counter it only increments (IORegistryEntry.cpp), so
+    an id is not reused before a reboot. A client absent from the engine
+    reading was opened after it, so all its time came later and counts from
+    zero. Without a successful engine reading, or with a client whose time
+    was not read there, growth is not established. No growth is a "no" only
+    when every client seen at the engine is still there and every time on
+    both sides was read; otherwise it is None.
+    """
+    after = end.get("gpu_clients")
+    if not isinstance(start, dict) or start.get("looked") is not True:
+        return None
+    before = start.get("gpu_clients")
+    if not isinstance(after, dict) or not isinstance(before, dict):
+        return None
+    unread = False
+    for key, time in after.items():
+        base = before.get(key, 0)
+        if not _is_count(base):
+            unread = True
+            continue
+        if _is_count(time) and time > base:
+            return True
+    if unread or not set(before) <= set(after):
+        return None
+    if all(_is_count(t) for t in after.values()):
+        return False
+    return None
+
+
+def gpu_observed(backend: str, report: Any) -> bool:
+    """Whether a run asked for the GPU and the kernel shows it worked there.
+
+    The only way a litert-lm backend here comes to say it observed its device.
+    A CPU run is never "observed" this way -- no GPU work does not prove the
+    CPU served the run -- and `backend_established` does not need it to be: a
+    CPU request is stated on its own.
+    """
+    return backend == "gpu" and _gpu_work(report)[0] is True
+
+
+def gpu_unused(backend: str, report: Any) -> bool:
+    """Whether a run asked for the GPU and the kernel shows it was not used."""
+    return backend == "gpu" and _gpu_work(report)[0] is False
+
+
+def bundle_activation_of(report: Any) -> str | None:
+    """The bundle's own activation key as the driver script read it, or None."""
+    if isinstance(report, dict) and isinstance(report.get("bundle_activation"), str):
+        return report["bundle_activation"]
+    return None
+
+
+def bundle_activation_error_of(report: Any) -> str | None:
+    """Why the bundle's key was not read, or None when it was.
+
+    Kept apart from `bundle_activation_of`, whose None means both "the bundle
+    declares none" and "nobody could tell": the first is a finding about the
+    bundle, the second is not. So None here only for a report that carries a
+    reading -- a run that wrote no report, or an unreadable one, read nothing
+    about the bundle, and saying it declares none would be a claim about it.
+    """
+    if not isinstance(report, dict):
+        return "the run wrote no device report"
+    if isinstance(report.get("unreadable"), str):
+        return f"the run's device report is unreadable ({report['unreadable']})"
+    if isinstance(report.get("bundle_activation_error"), str):
+        return report["bundle_activation_error"]
+    if "bundle_activation" not in report:
+        return "the run's device report carries no reading of the bundle"
+    return None
+
+
+# Pasted into each driver script that constructs a litert-lm engine -- the
+# text path's below and the tool path's in `toolpath.py` -- so the two cannot
+# disagree about how a backend is built or whether the activation type is
+# passed. Scripts are written to a file and run in `envs.RUNTIME`; they cannot
+# import from this package, so the one source is text.
+RUNTIME_ENGINE_SOURCE = r'''
+
+def backend_for(name):
+    """The engine's backend, from the same word the CLI's --backend takes.
+
+    litert-lm is imported inside the functions that need it rather than at the
+    top, so the parent can exec a script and test what it composes without
+    the runtime installed.
+    """
+    from litert_lm.interfaces import CPU, GPU
+
+    if name == "gpu":
+        return GPU()
+    if name == "cpu":
+        return CPU()
+    raise SystemExit("unsupported backend %r: this script knows cpu and gpu" % (name,))
+
+
+def engine_kwargs(spec):
+    """Everything passed to `litert_lm.Engine` beside the model and cache.
+
+    `ActivationDataType.from_str("fp32")` is `FLOAT32`, whose value is 0, so
+    nothing here may test the converted value for truth. `from_str` returns
+    None for a name it does not know, and an engine given None builds as if
+    nothing were asked -- which on a GPU is the F16 default this key exists to
+    prevent -- so an unknown name ends the run instead.
+    """
+    kwargs = {"backend": backend_for(spec.get("backend", "cpu"))}
+    requested = spec.get("activation_data_type")
+    if requested is not None:
+        from litert_lm import ActivationDataType
+
+        kind = ActivationDataType.from_str(requested)
+        if kind is None:
+            raise SystemExit("unknown activation data type %r" % (requested,))
+        kwargs["activation_data_type"] = kind
+    return kwargs
+
+
+def device_report():
+    """What the kernel says this process has done on the GPU, as of now.
+
+    The engine cannot say where it ran: it echoes the backend it was given.
+    The kernel can. A process that opens the GPU gets a user client in the
+    IORegistry (`IOGPUDeviceUserClient` and its subclasses), which records
+    the pid that created it and, under `AppUsage`, an `accumulatedGPUTime`
+    for that client. Measured on an M4 Pro with litert-lm 0.16.1: a GPU
+    engine owns such a client from the moment it is built and its GPU time
+    grew from 6.5-6.9 million to 174-181 million across one generated
+    reply, in each of three runs on 2026-09-25; a CPU
+    engine owned none. The pid is the evidence, not a name -- every other
+    process's clients are in the same listing and are ignored.
+
+    Taken twice by each driver script -- once the engine exists, and again
+    after generating -- because a client proves the runtime opened the GPU,
+    and only the growth proves work was done there.
+
+    A diagnostic, so it must never end a run: any failure is recorded in
+    `error` and the report says it did not look. Other platforms are not
+    looked at, because which signal marks litert-lm's GPU path there has not
+    been observed.
+    """
+    import os
+    import sys
+
+    report = {
+        "platform": sys.platform,
+        "looked": False,
+        "gpu_client": None,
+        "gpu_time": None,
+        "gpu_clients": None,
+    }
+    if sys.platform != "darwin":
+        return report
+    try:
+        import subprocess
+
+        done = subprocess.run(
+            ["/usr/sbin/ioreg", "-r", "-c", "IOGPUDeviceUserClient", "-l"],
+            capture_output=True,
+            timeout=30,
+        )
+        if done.returncode != 0:
+            report["error"] = "ioreg exited %d: %s" % (
+                done.returncode,
+                done.stderr.decode("utf-8", "replace").strip()[-200:],
+            )
+            return report
+        listing = done.stdout.decode("utf-8", "replace")
+        if '"IOUserClientCreator"' not in listing:
+            # Not "no client of ours": no GPU client of anyone's -- ioreg lists
+            # them under the driver's subclass, AGXDeviceUserClient on an M4
+            # Pro -- so there was nothing to find this process among.
+            report["error"] = "ioreg listed no GPU client of any process"
+            return report
+    except Exception as exc:  # noqa: BLE001 -- a diagnostic must not end a run
+        report["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return report
+    report["looked"] = True
+    client, clients = gpu_client_of(listing, os.getpid())
+    times = [t for t in clients.values() if t is not None]
+    report["gpu_client"] = client
+    report["gpu_time"] = sum(times) if times else None
+    report["gpu_clients"] = clients
+    return report
+
+
+def gpu_client_of(listing, pid):
+    """The GPU clients `pid` created: the first one's name, and each one's time.
+
+    Separate from `device_report` so the rule can be tested without a GPU:
+    only a client whose creator is this pid counts. Each is keyed by its
+    registry id, with the sum of `accumulatedGPUTime` across its `AppUsage`
+    entries -- 0 for an empty `AppUsage = ()`, None when there is no
+    `AppUsage` to read -- per client, because a process may
+    hold more than one and the two readings are compared client by client.
+    `ioreg -l` writes one object per `+-o` line, with its properties below
+    it until the next one.
+    """
+    import re
+
+    marker = '"IOUserClientCreator" = "pid %d,' % pid
+    client, clients = None, {}
+    for n, block in enumerate(listing.split("+-o ")):
+        if marker not in block:
+            continue
+        if client is None:
+            line = next(l for l in block.splitlines() if marker in l)
+            client = line.split('" = ', 1)[1].strip().strip('"')
+        found = re.search(r"\bid (0x[0-9a-fA-F]+)", block.splitlines()[0])
+        times = [int(t) for t in re.findall(r'"accumulatedGPUTime"=(\d+)', block)]
+        if not found:
+            time = None  # no id to match across readings: not comparable
+        elif times:
+            time = sum(times)
+        elif '"AppUsage" = ()' in block:
+            time = 0  # read, and empty: no GPU time yet -- most idle clients look so
+        else:
+            time = None
+        clients[found.group(1) if found else "#%d" % n] = time
+    return client, clients
+
+
+def bundle_activation(path):
+    """The bundle's own `prefer_activation_type`, read from its header, or None.
+
+    What an application gets on the GPU when it loads this bundle without an
+    override. `verify` always passes fp32 itself, so its GPU number describes
+    the bundle *plus* that override; this is what lets the manifest say so
+    when the bundle alone would not get it. Read through
+    `litert_lm_builder`, which `litert-lm` depends on, from the header only --
+    no section is unpacked. None when the key is absent. Raises -- recorded
+    by the caller as unreadable -- when the builder cannot be imported, the
+    header cannot be read, a value is not a string, or the values disagree --
+    across prefill-decode sections or within one: no single entry is the
+    bundle's answer then.
+    """
+    import io
+
+    from litert_lm_builder import litertlm_header_schema_py_generated as schema
+    from litert_lm_builder import litertlm_peek as peek
+
+    metadata = peek.read_litertlm_header(str(path), io.StringIO())
+    sections = metadata.SectionMetadata()
+    declared = []
+    for i in range(sections.ObjectsLength() if sections else 0):
+        section = sections.Objects(i)
+        if peek.get_model_type(section) != "tf_lite_prefill_decode":
+            continue
+        found = []
+        for j in range(section.ItemsLength()):
+            item = section.Items(j)
+            key = item.Key().decode("utf-8") if item is not None and item.Key() else None
+            if key != "prefer_activation_type":
+                continue
+            if item.ValueType() != schema.VData.StringValue:
+                raise ValueError("prefer_activation_type is not a string")
+            value = schema.StringValue()
+            value.Init(item.Value().Bytes, item.Value().Pos)
+            raw = value.Value()
+            found.append(raw.decode("utf-8") if raw is not None else None)
+        # The builder lets `additional_metadata` repeat the key in one section.
+        declared.extend(found or [None])
+    if len(set(declared)) > 1:
+        raise ValueError("prefill-decode sections declare %s" % sorted(map(str, declared)))
+    return declared[0] if declared else None
+
+
+def run_report(spec, at_engine, after_generation=None):
+    """The report a driver script writes about its run, beside its answers.
+
+    `bundle_activation` is read here, in the script, because `litert_lm_builder`
+    is installed where the script runs and not where litetune runs.
+    """
+    report = {"at_engine": at_engine, "after_generation": after_generation}
+    try:
+        report["bundle_activation"] = bundle_activation(spec["model"])
+    except Exception as exc:  # noqa: BLE001 -- a diagnostic must not end a run
+        report["bundle_activation"] = None
+        report["bundle_activation_error"] = "%s: %s" % (type(exc).__name__, exc)
+    return report
+'''
+
+
+_LITERTLM_GENERATE_SCRIPT = (
+    r'''
 """Generation for one split through litert-lm's Python API.
 
 Writes JSONL, one line per prompt, flushed as it goes -- a run killed at
@@ -900,23 +1371,9 @@ answer.
 import json
 import sys
 from pathlib import Path
-
-
-def backend_for(name):
-    """The engine's backend, from the same word the CLI's --backend takes.
-
-    litert-lm is imported here and in `main` rather than at the top, so the
-    parent can exec this script and test the text composition below without
-    the runtime installed -- the same reason `toolpath.py` does it.
-    """
-    from litert_lm.interfaces import CPU, GPU
-
-    if name == "gpu":
-        return GPU()
-    if name == "cpu":
-        return CPU()
-    raise SystemExit("unsupported backend %r: this script knows cpu and gpu" % (name,))
-
+'''
+    + RUNTIME_ENGINE_SOURCE
+    + r'''
 
 def text_from_session(session, prompt):
     """The pre-rendered path, which `--no-template` selects in the CLI.
@@ -986,7 +1443,7 @@ def main(spec_path):
 
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     runtime_rendered = bool(spec["runtime_rendered"])
-    backend = backend_for(spec["backend"])
+    engine_args = engine_kwargs(spec)
     with Path(spec["out"]).open("w", encoding="utf-8") as out:
         # `cache_dir=""` is what the CLI passes on its default `--cache`:
         # `cache_dir_value_from_cache_mode` (common.py) maps both `None` and
@@ -996,7 +1453,15 @@ def main(spec_path):
         # CLI's behaviour but a fourth state beside disk, memory and none.
         # Which of the three that fourth state resolves to is decided in the
         # C++ the binding calls, not in anything readable from here.
-        with litert_lm.Engine(spec["model"], backend=backend, cache_dir="") as engine:
+        with litert_lm.Engine(spec["model"], cache_dir="", **engine_args) as engine:
+            # Before the first prompt, so a run killed part-way still says
+            # where it was running -- the same reason the transformers script
+            # writes its report before generating.
+            at_engine = device_report()
+            if spec.get("report"):
+                Path(spec["report"]).write_text(
+                    json.dumps(run_report(spec, at_engine)), encoding="utf-8"
+                )
             for index, prompt in enumerate(spec["prompts"]):
                 # A runner per prompt, not one per split. A conversation keeps
                 # its history, so the second prompt would be answered with the
@@ -1049,10 +1514,18 @@ def main(spec_path):
                     row = {"index": index, "text": text}
                 out.write(json.dumps(row) + "\n")
                 out.flush()
+            # Again after generating, with the engine still alive: a client
+            # shows the runtime opened the GPU, and only its GPU time growing
+            # across the split shows work was done there.
+            if spec.get("report"):
+                Path(spec["report"]).write_text(
+                    json.dumps(run_report(spec, at_engine, device_report())), encoding="utf-8"
+                )
 
 if __name__ == "__main__":
     main(sys.argv[1])
 '''
+)
 
 
 @functools.cache
@@ -1594,13 +2067,15 @@ def evaluate(
 def backend_established(engine: Mapping[str, Any]) -> bool:
     """Whether `backend` may be stated as where the work happened.
 
-    Two of the three backends here fill it from a flag they passed and are
-    told nothing in return, so for them the sentence is only as good as the
-    ask. It is good enough for `cpu`: there is nothing below it to fall back
-    to, and every number in MEASUREMENTS.md rests on asking litert-lm for its
-    CPU backend and getting it. It is not good enough for an accelerator,
-    which is the case measured to fail quietly -- an engine built for a GPU
-    that is not there neither raises nor answers.
+    The litert-lm backends fill it from the flag they passed. On a GPU run on
+    macOS the kernel is asked as well (`BACKEND_OBSERVED`); otherwise the
+    sentence is only as good as the ask. It is good enough for `cpu`: there
+    is nothing below it to fall back to, and every number in MEASUREMENTS.md
+    rests on asking litert-lm for its CPU backend and getting it. It is not
+    good enough for an accelerator, which is the case measured to fail
+    quietly -- an engine built for a GPU that was not usable was created
+    without error and then produced no token for one prompt in fifty-five
+    minutes (Linux, litert-lm 0.16.1).
 
     `UNKNOWN_BACKEND` passes because it claims nothing: "measured on the
     unknown backend" is already a statement of ignorance, and rewording it
@@ -1615,9 +2090,10 @@ def device_mismatch(a: MeasurementPoint, b: MeasurementPoint) -> str | None:
     """The two points ran on different hardware, said in full, or None.
 
     A limitation, not a refusal, and the difference from `harness_mismatch` is
-    the decision rather than an oversight. `build_backends` gives the candidate
-    `LiteRtLmBackend`'s default `backend_flag="cpu"` and never overrides it, so
-    on a machine where the reference now resolves to cuda the two sides differ
+    the decision rather than an oversight. The candidate runs on the litert-lm
+    backend `verify --backend` names, `cpu` by default, and the reference
+    resolves its own device, so on a machine where the reference resolves to
+    cuda the two sides differ
     in hardware as well as in conversion, and the "cost of conversion" carries
     both. Refusing that comparison would leave a GPU box unable to verify at
     all, which is worse than a number that says what else is in it.

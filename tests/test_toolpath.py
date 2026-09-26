@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from litetune.evaluate import BACKEND_OBSERVED
+from litetune.evaluate import BACKEND_OBSERVED, runtime_engine_spec
 from litetune.metrics import ToolCall
 from litetune.toolpath import _TOOL_PATH_SCRIPT, ToolPathError, ToolPathProbe, ToolPathRow
 
@@ -79,8 +79,11 @@ def _fake_litert_lm(runtime: FakeRuntime) -> Any:
             return reply
 
     class Engine:
-        def __init__(self, model: str, backend: object):
+        def __init__(self, model: str, backend: object, **kwargs: Any):
             module.opened = model
+            # What the script built the engine with, so a test can see the
+            # backend and the activation type reach it.
+            module.engine_args = {"backend": backend, **kwargs}
 
         def __enter__(self) -> Engine:
             return self
@@ -103,6 +106,21 @@ def _fake_litert_lm(runtime: FakeRuntime) -> Any:
     module.Engine = Engine
     module.Tool = Tool
     module.Backend = types.SimpleNamespace(CPU=lambda: "cpu")
+
+    # The shared engine block imports these. `FLOAT32` is 0 in the real enum,
+    # and so here, so a test catches code that drops it for being falsy.
+    class ActivationDataType:
+        FLOAT32 = 0
+
+        @classmethod
+        def from_str(cls, value: str) -> Any:
+            return {"fp32": cls.FLOAT32}.get(value.lower())
+
+    module.ActivationDataType = ActivationDataType
+    interfaces: Any = types.ModuleType("litert_lm.interfaces")
+    interfaces.CPU = lambda: "cpu"
+    interfaces.GPU = lambda: "gpu"
+    module.interfaces = interfaces
     module.SamplerConfig = lambda **kwargs: kwargs
     module.ConstrainedDecodingConfig = lambda **kwargs: kwargs
     module.LogSeverity = types.SimpleNamespace(ERROR="error")
@@ -111,7 +129,9 @@ def _fake_litert_lm(runtime: FakeRuntime) -> Any:
 
 
 def _run(runtime: FakeRuntime, tmp_path: Path, monkeypatch, **spec_extra) -> tuple[int, Path]:
-    monkeypatch.setitem(sys.modules, "litert_lm", _fake_litert_lm(runtime))
+    fake = _fake_litert_lm(runtime)
+    monkeypatch.setitem(sys.modules, "litert_lm", fake)
+    monkeypatch.setitem(sys.modules, "litert_lm.interfaces", fake.interfaces)
     out = tmp_path / "rows.json"
     spec_path = tmp_path / "spec.json"
     spec: dict[str, Any] = {
@@ -634,6 +654,9 @@ class CannedEnv:
     # Fail only these modes, when `fail` is set; every mode otherwise.
     fail_modes: tuple[str, ...] = ("constrained", "unconstrained")
     runtime_version: str | None = "0.16.1"
+    # The device report each mode's script writes, by mode; absent means the
+    # script wrote none.
+    device_by_mode: dict[str, dict] = field(default_factory=dict)
     fail_code: int = 3
     # Every spec the script was handed, so a test can see what reached it.
     specs: list[dict] = field(default_factory=list)
@@ -648,6 +671,8 @@ class CannedEnv:
         if self.fail is not None and mode in self.fail_modes:
             return types.SimpleNamespace(returncode=self.fail_code, stderr=self.fail)
         written = {"runtime_version": self.runtime_version, "rows": self.by_mode[mode]}
+        if mode in self.device_by_mode:
+            written["device"] = self.device_by_mode[mode]
         Path(spec["out"]).write_text(json.dumps(written), encoding="utf-8")
         return types.SimpleNamespace(returncode=0, stderr="")
 
@@ -1026,8 +1051,8 @@ def test_supplied_backends_are_not_described_as_selected(tmp_path):
 
 def test_the_device_is_named_in_the_vocabulary_verify_reads(tmp_path):
     """`verify` reads the candidate's device from `engine` and `backend`. The
-    script opens the engine on `Backend.CPU()`, and a real run's manifest has to
-    say so rather than naming the path where the device belongs."""
+    default run asks for the CPU backend, and a real run's manifest has to say
+    so rather than naming the path where the device belongs."""
     rows_ = labelled_rows(8)
     result = _verify(
         tmp_path, rows_, {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)}
@@ -1035,9 +1060,9 @@ def test_the_device_is_named_in_the_vocabulary_verify_reads(tmp_path):
 
     engine = result.manifest["measurements"]["candidate"]["engine"]
     assert (engine["engine"], engine["backend"]) == ("litert-lm", "cpu")
-    # The script hardcodes `Backend.CPU()` and reads nothing back, so it says
-    # so -- and the sentence still reads "measured on", because a CPU request
-    # has nowhere else to go. An accelerator is the case that needs a reading.
+    # A CPU run is never "observed" -- the kernel reading is for the GPU -- and
+    # the sentence still reads "measured on", because a CPU request has
+    # nowhere else to go. An accelerator is the case that needs a reading.
     assert engine[BACKEND_OBSERVED] is False
     assert any(
         "measured on the cpu backend of litert-lm" in limitation
@@ -1648,3 +1673,208 @@ def test_divergence_reads_the_run_an_application_gets_by_default(tmp_path):
     checks = result.manifest["liveness"]["candidate"]["checks"]
     (divergence,) = [c for c in checks if c["name"] == "divergence from baseline"]
     assert divergence["observed"]["divergence_share"] == pytest.approx(0.0)
+
+
+# -- the GPU backend -----------------------------------------------------------
+
+
+def test_the_tool_path_script_builds_a_gpu_engine_with_fp32(tmp_path, monkeypatch):
+    """It used to be `Backend.CPU()` in the script, with no reason given.
+
+    Measured on Metal 2026-09-25 with it changed: 40 of 40 rows answered and
+    every function name agreed with the CPU run. The activation type rides
+    along because a bundle without the GPU activation key floods `<pad>` on
+    the GPU -- and on this path the flood is parsed as no call and scored as
+    wrong answers. A total flood fails the tool path's liveness check, which
+    asks only that some row returned a call; a partial one, like the 14 of 20
+    measured on a Galaxy S24, gets past it.
+    """
+    runtime = FakeRuntime(replies=[_reply("set_colour", {"colour": "red"})])
+    code, _ = _run(runtime, tmp_path, monkeypatch, **runtime_engine_spec("gpu"))
+
+    assert code == 0
+    args = sys.modules["litert_lm"].engine_args
+    assert args["backend"] == "gpu"
+    assert "activation_data_type" in args and args["activation_data_type"] == 0
+
+
+def test_the_tool_path_script_still_builds_a_cpu_engine_by_default(tmp_path, monkeypatch):
+    runtime = FakeRuntime(replies=[_reply("set_colour", {"colour": "red"})])
+    code, _ = _run(runtime, tmp_path, monkeypatch)
+
+    assert code == 0
+    args = sys.modules["litert_lm"].engine_args
+    assert args["backend"] == "cpu"
+    assert "activation_data_type" not in args
+
+
+def test_the_tool_path_backend_describes_what_it_asked_for(tmp_path):
+    gpu = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, backend_flag="gpu"
+    ).describe()
+    assert (gpu["backend"], gpu["activation_data_type"], gpu[BACKEND_OBSERVED]) == (
+        "gpu",
+        "fp32",
+        False,
+    )
+
+
+def test_verify_hands_the_backend_to_whichever_candidate_it_picks(tmp_path):
+    request = VerifyRequest(
+        model=tmp_path / "m.litertlm",
+        reference=FUNCTIONGEMMA,
+        data=tmp_path / "heldout.jsonl",
+        prompt_mode=PromptMode.RUNTIME_RENDERED,
+        backend="gpu",
+    )
+
+    tool_path = build_backends(request, declarations=DECLS).candidate
+    text_path = build_backends(request).candidate
+
+    assert isinstance(tool_path, ToolPathBackend)
+    assert tool_path.backend_flag == "gpu"
+    assert not isinstance(text_path, ToolPathBackend)
+    assert text_path.describe()["backend"] == "gpu"
+
+
+def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path):
+    """Found by mutation: the backend could stop at `ToolPathBackend` and no
+    test failed.
+
+    The backend describes itself from its own field, and the probe writes the
+    spec the script runs from, so dropping the hand-over left a manifest that
+    said "gpu" over a run the script built on the CPU -- a silently ignored
+    flag, on the path the `<pad>` flood was measured on.
+    """
+    rows_ = labelled_rows(8)
+    env = CannedEnv(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+
+    backend.generate([r["prompt"] for r in rows_])
+
+    assert [(spec["backend"], spec["activation_data_type"]) for spec in env.specs] == [
+        ("gpu", "fp32"),
+        ("gpu", "fp32"),
+    ]
+    assert backend.describe()["backend"] == "gpu"
+
+
+def _reading(client="pid 4242, python3.12", gpu_time=None):
+    return {
+        "platform": "darwin",
+        "looked": True,
+        "gpu_client": client,
+        "gpu_time": gpu_time,
+        "gpu_clients": {"0x2": gpu_time} if client is not None else {},
+    }
+
+
+# What the tool-path script returns beside its rows: a reading once the engine
+# exists and one after generating, and the bundle's own activation key.
+_WORKED = {
+    "at_engine": _reading(gpu_time=1_000),
+    "after_generation": _reading(gpu_time=5_000_000),
+    "bundle_activation": "fp32",
+}
+_NO_CLIENT = {
+    "at_engine": _reading(client=None),
+    "after_generation": _reading(client=None),
+    "bundle_activation": "fp32",
+}
+
+
+def _gpu_run(tmp_path, device_by_mode):
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        device_by_mode=device_by_mode,
+    )
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    backend.generate([r["prompt"] for r in rows_])
+    return backend
+
+
+def test_the_tool_path_is_observed_on_the_gpu_when_both_modes_worked_there(tmp_path):
+    backend = _gpu_run(tmp_path, {"constrained": _WORKED, "unconstrained": _WORKED})
+
+    described = backend.describe()
+    assert described[BACKEND_OBSERVED] is True
+    assert described["gpu_unused"] is False
+    assert described["bundle_activation"] == "fp32"
+    assert described["device_reports"] == [_WORKED, _WORKED]
+
+
+def test_one_mode_without_gpu_work_is_enough_to_say_the_gpu_was_not_used(tmp_path):
+    """Each mode builds its own engine in its own process, so one mode's
+    reading says nothing about the other's -- and the one that did no GPU work
+    produced rows too."""
+    backend = _gpu_run(tmp_path, {"constrained": _WORKED, "unconstrained": _NO_CLIENT})
+
+    assert backend.describe()[BACKEND_OBSERVED] is False
+    assert backend.describe()["gpu_unused"] is True
+
+
+def test_a_tool_path_run_that_wrote_no_report_claims_nothing(tmp_path):
+    backend = _gpu_run(tmp_path, {})
+
+    assert backend.describe()[BACKEND_OBSERVED] is False
+    assert backend.describe()["gpu_unused"] is False
+    assert backend.describe()["device_reports"] == [None, None]
+    # Nothing about the bundle was read, so nothing about it is said.
+    assert backend.describe()["bundle_activation"] is None
+    assert backend.describe()["bundle_activation_error"] == "the run wrote no device report"
+
+
+def test_one_mode_that_read_the_bundle_speaks_for_it(tmp_path):
+    """A mode with no report says nothing; the other mode's reading stands."""
+    backend = _gpu_run(tmp_path, {"unconstrained": _WORKED})
+
+    assert backend.describe()["bundle_activation"] == "fp32"
+    assert backend.describe()["bundle_activation_error"] is None
+
+
+def test_a_mode_that_read_no_key_is_not_overruled_by_a_mode_with_no_report(tmp_path):
+    unkeyed = {**_WORKED, "bundle_activation": None}
+    backend = _gpu_run(tmp_path, {"unconstrained": unkeyed})
+
+    assert backend.describe()["bundle_activation"] is None
+    assert backend.describe()["bundle_activation_error"] is None, "declares none: a finding"
+
+
+def test_the_tool_path_script_returns_both_readings_and_the_bundles_key(tmp_path, monkeypatch):
+    runtime = FakeRuntime(replies=[_reply("set_colour", {"colour": "red"})])
+    _, out = _run(runtime, tmp_path, monkeypatch, **runtime_engine_spec("gpu"))
+
+    device = json.loads(out.read_text(encoding="utf-8"))["device"]
+    assert set(device) >= {"at_engine", "after_generation", "bundle_activation"}
+    # Both readings taken, not merely named: found by mutation, a script that
+    # skipped the second one wrote `after_generation: null` and passed. Only
+    # the second can show work, so without it no tool-path run is observed.
+    for reading in ("at_engine", "after_generation"):
+        assert set(device[reading]) >= {"platform", "looked", "gpu_client", "gpu_time"}
+
+
+def test_a_second_tool_path_run_is_judged_on_its_own_readings(tmp_path):
+    """Found by mutation: without the reset the readings accumulated, so a run
+    that worked on the GPU in both modes stayed unobserved because an earlier
+    run had not."""
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        device_by_mode={"constrained": _WORKED},
+    )
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    backend.generate([r["prompt"] for r in rows_])
+    assert backend.backend_observed is False
+
+    env.device_by_mode = {"constrained": _WORKED, "unconstrained": _WORKED}
+    backend.generate([r["prompt"] for r in rows_])
+
+    assert backend.backend_observed is True
+    assert len(backend.describe()["device_reports"]) == 2

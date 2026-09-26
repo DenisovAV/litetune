@@ -10,6 +10,7 @@ eight confident negatives during the measurement work, so each has its own test.
 """
 
 import json
+import os
 import subprocess
 import sys
 import types
@@ -28,12 +29,17 @@ from litetune.evaluate import (
     HuggingFaceBackend,
     LiteRtLmBackend,
     _litertlm_script,
+    _read_device_report,
     assemble_generations,
+    bundle_activation_error_of,
     device_mismatch,
     evaluate,
+    gpu_observed,
+    gpu_unused,
     harness_mismatch,
     load_split,
     read_jsonl_results,
+    runtime_engine_spec,
 )
 from litetune.metrics import score_exact_text, trim_terminator
 from litetune.prompt_mode import PromptMode
@@ -96,12 +102,14 @@ def _litertlm(tmp_path: Path, **kwargs) -> LiteRtLmBackend:
     return LiteRtLmBackend(model=tmp_path / "model.litertlm", auto_provision=False, **kwargs)
 
 
-def _writes_results(rows, returncode: int = 0, stderr: str = ""):
+def _writes_results(rows, returncode: int = 0, stderr: str = "", device=None):
     """A stand-in for the driver script: writes the JSONL it would write.
 
     The transport is a file now, not a pipe, so a double that hands back
     stdout is testing a channel nothing reads. `args[2]` is the spec path, the
-    same shape the reference backend's doubles use.
+    same shape the reference backend's doubles use. `device`, when given, is
+    the report the script writes about its own process after building the
+    engine.
     """
 
     def fake_run(self, args, timeout=3600, **kwargs):
@@ -109,6 +117,8 @@ def _writes_results(rows, returncode: int = 0, stderr: str = ""):
         Path(spec["out"]).write_text(
             "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
         )
+        if device is not None:
+            Path(spec["report"]).write_text(json.dumps(device), encoding="utf-8")
         return subprocess.CompletedProcess(args, returncode, stdout="", stderr=stderr)
 
     return fake_run
@@ -1042,8 +1052,8 @@ def test_two_sides_that_both_read_back_are_said_to_have_measured():
 
 
 def test_two_points_on_different_hardware_are_annotated_not_refused():
-    """`build_backends` pins the candidate to litert-lm's CPU backend and lets
-    the reference resolve its own device, so on a GPU box the two differ and
+    """By default the candidate runs on litert-lm's CPU backend and the
+    reference resolves its own device, so on a GPU box the two differ and
     the conversion cost carries a hardware difference. Refusing would leave
     such a machine unable to verify at all; the number is kept and told what
     is in it.
@@ -1721,14 +1731,22 @@ class _FakeRunner:
 class _FakeEngine:
     def __init__(self, path, backend=None, **kwargs):
         self.path = path
+        self.backend = backend
         self.kwargs = kwargs
         self.runners: list[_FakeRunner] = []
         self.raise_on: dict[str, BaseException] = {}
+        # The fake module, so a test can see whether an engine is open at the
+        # moment something else runs.
+        self.module = None
 
     def __enter__(self):
+        if self.module is not None:
+            self.module.engine_open = True
         return self
 
     def __exit__(self, *exc):
+        if self.module is not None:
+            self.module.engine_open = False
         return False
 
     def create_session(self, **kwargs):
@@ -1743,26 +1761,54 @@ def _fake_litert_lm(monkeypatch, raise_on=None):
     engines: list[_FakeEngine] = []
 
     class _Backend:
+        name = "?"
+
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+
+    class _Cpu(_Backend):
+        name = "cpu"
+
+    class _Gpu(_Backend):
+        name = "gpu"
+
+    class _ActivationDataType:
+        # 0 in the real enum, and so here: code that drops it for being falsy
+        # has to fail a test.
+        FLOAT32 = 0
+
+        @classmethod
+        def from_str(cls, value):
+            return {"fp32": cls.FLOAT32}.get(value.lower())
 
     def make_engine(path, backend=None, **kwargs):
         engine = _FakeEngine(path, backend, **kwargs)
         engine.raise_on = raise_on or {}
+        engine.module = module
         engines.append(engine)
         return engine
 
     module = types.ModuleType("litert_lm")
+    module.engine_open = False
     module.Engine = make_engine
+    module.ActivationDataType = _ActivationDataType
     interfaces = types.ModuleType("litert_lm.interfaces")
-    interfaces.CPU = _Backend
-    interfaces.GPU = _Backend
+    interfaces.CPU = _Cpu
+    interfaces.GPU = _Gpu
     monkeypatch.setitem(sys.modules, "litert_lm", module)
     monkeypatch.setitem(sys.modules, "litert_lm.interfaces", interfaces)
     return engines
 
 
-def _run_script(tmp_path, prompts, runtime_rendered=True, raise_on=None, monkeypatch=None):
+def _run_script(
+    tmp_path,
+    prompts,
+    runtime_rendered=True,
+    raise_on=None,
+    monkeypatch=None,
+    engine=None,
+    report=None,
+):
     engines = _fake_litert_lm(monkeypatch, raise_on)
     spec = tmp_path / "spec.json"
     out = tmp_path / "out.jsonl"
@@ -1772,8 +1818,9 @@ def _run_script(tmp_path, prompts, runtime_rendered=True, raise_on=None, monkeyp
                 "model": str(tmp_path / "m.litertlm"),
                 "prompts": prompts,
                 "runtime_rendered": runtime_rendered,
-                "backend": "cpu",
+                **(engine if engine is not None else runtime_engine_spec("cpu")),
                 "out": str(out),
+                **({"report": str(report)} if report is not None else {}),
             }
         ),
         encoding="utf-8",
@@ -1925,3 +1972,687 @@ def test_a_device_kept_by_the_do_not_erase_rule_is_not_reported_as_read_back(mon
     described = backend.describe()
     assert described["backend"] == "cuda"
     assert described[BACKEND_OBSERVED] is False
+
+
+# -- the GPU backend -----------------------------------------------------------
+#
+# What the parent asks for and what the script builds from it. The engine
+# echoes back the backend it was given and names no device, so these are the
+# only places the choice can be checked before a real GPU run.
+
+
+def test_a_gpu_run_states_the_activation_type_and_a_cpu_run_does_not():
+    """fp32 on every GPU run, whatever the bundle carries.
+
+    The bundle's `prefer_activation_type` is only a default; a bundle without
+    it leaves the GPU text executor in F16, which floods `<pad>` while the
+    engine reports success. On the CPU backend nothing is passed, as it never
+    has been.
+    """
+    assert runtime_engine_spec("gpu") == {"backend": "gpu", "activation_data_type": "fp32"}
+    assert runtime_engine_spec("cpu") == {"backend": "cpu", "activation_data_type": None}
+
+
+def test_a_backend_nobody_listed_is_refused_before_anything_runs():
+    with pytest.raises(ValueError, match="npu"):
+        runtime_engine_spec("npu")
+
+
+def test_the_driver_builds_a_gpu_engine_with_fp32(tmp_path, monkeypatch):
+    rows, engines = _run_script(
+        tmp_path, ["one"], monkeypatch=monkeypatch, engine=runtime_engine_spec("gpu")
+    )
+
+    assert rows[0]["text"] == "answer to one"
+    (engine,) = engines
+    assert engine.backend.name == "gpu"
+    # `is 0`, via the enum: FLOAT32's value is 0 and must still reach the engine.
+    assert "activation_data_type" in engine.kwargs
+    assert engine.kwargs["activation_data_type"] == 0
+
+
+def test_the_driver_passes_no_activation_type_on_cpu(tmp_path, monkeypatch):
+    _, engines = _run_script(tmp_path, ["one"], monkeypatch=monkeypatch)
+
+    (engine,) = engines
+    assert engine.backend.name == "cpu"
+    assert "activation_data_type" not in engine.kwargs
+
+
+def test_an_activation_type_the_runtime_does_not_know_ends_the_run(tmp_path, monkeypatch):
+    """A typo must not quietly become the F16 default.
+
+    `from_str` answers None for a name it does not know, and an engine given
+    None builds as if nothing were asked -- on a GPU, exactly the state this
+    key exists to prevent.
+    """
+    with pytest.raises(SystemExit, match="fp23"):
+        _run_script(
+            tmp_path,
+            ["one"],
+            monkeypatch=monkeypatch,
+            engine={"backend": "gpu", "activation_data_type": "fp23"},
+        )
+
+
+def test_the_runtime_backend_describes_what_it_asked_for(tmp_path):
+    gpu = _litertlm(tmp_path, backend_flag="gpu").describe()
+    assert (gpu["backend"], gpu["activation_data_type"], gpu[BACKEND_OBSERVED]) == (
+        "gpu",
+        "fp32",
+        False,
+    )
+    cpu = _litertlm(tmp_path).describe()
+    assert (cpu["backend"], cpu["activation_data_type"]) == ("cpu", None)
+
+
+# -- whether the GPU was used, asked of the kernel ----------------------------
+#
+# litert-lm echoes the backend it was given. The kernel says more: on macOS a
+# GPU engine owns a GPU user client from the moment it is built, recorded
+# against the pid that created it, and the client's GPU time grows while it
+# generates. Measured 2026-09-25 on an M4 Pro with litert-lm 0.16.1: one client
+# after a GPU engine was built, its GPU time grown from 6.5-6.9 million to
+# 174-181 million after one reply, in three runs; none for a CPU engine.
+
+
+def _reading(
+    looked=True, client="pid 4242, python3.12", gpu_time=None, platform="darwin", clients=None
+):
+    """One reading; `clients` defaults to a single client holding `gpu_time`."""
+    if clients is None and looked:
+        clients = {"0x2": gpu_time} if client is not None else {}
+    return {
+        "platform": platform,
+        "looked": looked,
+        "gpu_client": client,
+        "gpu_time": gpu_time,
+        "gpu_clients": clients,
+    }
+
+
+def _run_report(at_engine, after_generation, bundle_activation="fp32"):
+    return {
+        "at_engine": at_engine,
+        "after_generation": after_generation,
+        "bundle_activation": bundle_activation,
+    }
+
+
+_WORKED = _run_report(_reading(gpu_time=1_000), _reading(gpu_time=5_000_000))
+_OPENED_IDLE = _run_report(_reading(gpu_time=1_000), _reading(gpu_time=1_000))
+_NO_CLIENT = _run_report(_reading(client=None), _reading(client=None))
+_NOT_LOOKED = _run_report(
+    _reading(looked=False, client=None, platform="linux"),
+    _reading(looked=False, client=None, platform="linux"),
+    bundle_activation=None,
+)
+_KILLED_AFTER_ENGINE = _run_report(_reading(gpu_time=1_000), None)
+# 0x1 closed after the engine reading and 0x2 did not grow: whatever 0x1 did
+# before it closed was never read, so "no growth" is not established.
+_SWAPPED = _run_report(
+    _reading(gpu_time=200, clients={"0x1": 100, "0x2": 100}),
+    _reading(gpu_time=100, clients={"0x2": 100}),
+)
+_NEW_CLIENT = _run_report(
+    _reading(gpu_time=100, clients={"0x1": 100}),
+    _reading(gpu_time=150, clients={"0x1": 100, "0x2": 50}),
+)
+# The engine reading failed: the client's 10 may all be engine construction.
+_ENGINE_UNREAD = _run_report(
+    _reading(looked=False, client=None, clients=None), _reading(gpu_time=10, clients={"0x2": 10})
+)
+_BASELINE_UNTIMED = _run_report(
+    _reading(gpu_time=None, clients={"0x2": None}), _reading(gpu_time=10, clients={"0x2": 10})
+)
+_CLOSED_BY_END = _run_report(_reading(gpu_time=10), _reading(client=None))
+_NO_CLIENT_THEN_KILLED = _run_report(_reading(client=None), None)
+_SECOND_WORKED = _run_report(
+    _reading(gpu_time=200, clients={"0x1": 100, "0x2": 100}),
+    _reading(gpu_time=300, clients={"0x1": 100, "0x2": 200}),
+)
+
+_LISTING = "\n".join(
+    [
+        "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1>",
+        '    |   "IOUserClientCreator" = "pid 11478, Google Chrome He"',
+        '    |   "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=999999})',
+        "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x2>",
+        '    |   "IOUserClientCreator" = "pid 4242, python3.12"',
+        '    |   "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=40},'
+        '{"API"="Metal","accumulatedGPUTime"=2})',
+    ]
+)
+
+
+def test_only_this_processs_client_and_its_gpu_time_count():
+    """Every process's GPU clients are in one listing -- a browser, a chat app.
+    The pid is the evidence, and a prefix of another pid is not this pid."""
+    client_of = _litertlm_script()["gpu_client_of"]
+    assert client_of(_LISTING, 4242) == ("pid 4242, python3.12", {"0x2": 42})
+    assert client_of(_LISTING, 424) == (None, {})
+    assert client_of(_LISTING, 11) == (None, {})
+
+
+def test_every_client_of_this_process_is_read_by_its_own_id():
+    """A process may hold more than one GPU client; each is kept apart so the
+    two readings can be compared client by client."""
+    second = (
+        _LISTING
+        + "\n"
+        + "\n".join(
+            [
+                "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x3>",
+                '    |   "IOUserClientCreator" = "pid 4242, python3.12"',
+                '    |   "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=1000})',
+            ]
+        )
+    )
+    assert _litertlm_script()["gpu_client_of"](second, 4242) == (
+        "pid 4242, python3.12",
+        {"0x2": 42, "0x3": 1000},
+    )
+
+
+def test_an_empty_app_usage_is_zero_time_and_a_missing_one_is_unread():
+    """Real `ioreg -l` prints `"AppUsage" = ()` for a client that has done no
+    GPU work yet (65 of 88 clients on an M4 Pro): that is a reading of zero.
+    Read as unread, a GPU engine whose client started idle could never be
+    observed working."""
+    listing = "\n".join(
+        [
+            "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x100000f52, active>",
+            '    |   "IOUserClientCreator" = "pid 4242, python3.12"',
+            '    |   "AppUsage" = ()',
+            "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x100000f53, active>",
+            '    |   "IOUserClientCreator" = "pid 4242, python3.12"',
+        ]
+    )
+    client_of = _litertlm_script()["gpu_client_of"]
+    assert client_of(listing, 4242)[1] == {"0x100000f52": 0, "0x100000f53": None}
+
+
+def test_a_client_with_no_registry_id_is_not_compared():
+    """Its fallback key is its position in one listing, which moves between
+    readings: counted from zero, any time on it would read as new work."""
+    listing = "\n".join(
+        [
+            "+-o AGXDeviceUserClient  <class AGXDeviceUserClient>",
+            '    |   "IOUserClientCreator" = "pid 4242, python3.12"',
+            '    |   "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=900})',
+        ]
+    )
+    assert _litertlm_script()["gpu_client_of"](listing, 4242)[1] == {"#1": None}
+
+
+def test_an_idle_client_that_starts_working_is_observed():
+    report = _run_report(
+        _reading(gpu_time=0, clients={"0x1": 0}), _reading(gpu_time=5000, clients={"0x1": 5000})
+    )
+    assert gpu_observed("gpu", report) is True
+    idle = _run_report(
+        _reading(gpu_time=0, clients={"0x1": 0}), _reading(gpu_time=0, clients={"0x1": 0})
+    )
+    assert gpu_unused("gpu", idle) is True
+
+
+def test_a_bool_in_a_report_is_not_gpu_time():
+    report = _run_report(
+        _reading(gpu_time=0, clients={"0x1": 0}), _reading(gpu_time=True, clients={"0x1": True})
+    )
+    assert gpu_observed("gpu", report) is False
+
+
+def test_a_platform_nobody_observed_is_not_looked_at(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    report = _litertlm_script()["device_report"]()
+    assert report == _reading(looked=False, client=None, platform="linux")
+
+
+def test_on_macos_the_kernel_is_asked_about_this_pid(monkeypatch):
+    """The darwin branch, with values: which class is asked for, and that the
+    answer is read for this process and not its parent."""
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(argv)
+        listing = _LISTING.replace("4242", str(os.getpid()))
+        return subprocess.CompletedProcess(argv, 0, listing.encode(), b"")
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    report = _litertlm_script()["device_report"]()
+
+    assert seen == [["/usr/sbin/ioreg", "-r", "-c", "IOGPUDeviceUserClient", "-l"]]
+    assert report["looked"] is True
+    assert report["gpu_client"] == f"pid {os.getpid()}, python3.12"
+    assert report["gpu_time"] == 42
+    assert report["gpu_clients"] == {"0x2": 42}
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError("no ioreg"),
+        subprocess.TimeoutExpired(cmd="ioreg", timeout=30),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"),
+        MemoryError(),
+    ],
+)
+def test_a_kernel_query_that_fails_says_so_and_never_ends_the_run(monkeypatch, failure):
+    """A diagnostic that raised here would end the run before its first
+    prompt, losing the measurement to find out where it ran."""
+
+    def fake_run(argv, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    report = _litertlm_script()["device_report"]()
+
+    assert report["looked"] is False
+    assert type(failure).__name__ in report["error"]
+
+
+def test_a_kernel_query_that_exits_non_zero_did_not_look(monkeypatch):
+    """Recorded as looked-and-found-none it would read as "the GPU was not
+    used", which the kernel never said."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, b"", b"denied")
+    )
+    report = _litertlm_script()["device_report"]()
+    assert report["looked"] is False
+    assert "denied" in report["error"]
+
+
+@pytest.mark.parametrize("listing", [b"", b"+-o Root  <class IORegistryEntry>\n"])
+def test_a_listing_with_no_gpu_client_of_anyone_did_not_look(monkeypatch, listing):
+    """Exit 0 and no client at all is not "no client of ours": the class
+    asked for is not there to be asked. Read as looked it would say the GPU
+    was not used."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, listing, b"")
+    )
+    report = _litertlm_script()["device_report"]()
+    assert report["looked"] is False
+    assert "no GPU client of any process" in report["error"]
+
+
+def _fake_builder(monkeypatch, sections):
+    """A `litert_lm_builder` whose header holds `sections`, each a list of
+    (key, value) items as the builder writes them -- `model_type` among them,
+    and a key may repeat. A str value is a StringValue, anything else another
+    type. `get_model_type` reads the items the way the real one does
+    (`litertlm_peek.get_model_type`, 0.16.1), not a side attribute."""
+    string_type = 1
+
+    class _Value:
+        def __init__(self, raw):
+            self.Bytes, self.Pos = {1: raw}, 1
+
+    class _Item:
+        def __init__(self, key, value):
+            self._key, self._value = key.encode(), value
+
+        def Key(self):
+            return self._key
+
+        def ValueType(self):
+            return string_type if isinstance(self._value, str) else string_type + 1
+
+        def Value(self):
+            return _Value(self._value.encode() if isinstance(self._value, str) else b"")
+
+    class _Section:
+        def __init__(self, items):
+            self._items = [_Item(k, v) for k, v in items]
+
+        def ItemsLength(self):
+            return len(self._items)
+
+        def Items(self, j):
+            return self._items[j]
+
+    class _Sections:
+        def __init__(self, sections):
+            self._sections = [_Section(items) for items in sections]
+
+        def ObjectsLength(self):
+            return len(self._sections)
+
+        def Objects(self, i):
+            return self._sections[i]
+
+    class _StringValue:
+        def Init(self, buf, pos):
+            self._raw = buf[pos]
+
+        def Value(self):
+            return self._raw
+
+    def get_model_type(section):
+        for j in range(section.ItemsLength()):
+            item = section.Items(j)
+            if item.Key() == b"model_type" and item.ValueType() == string_type:
+                value = _StringValue()
+                value.Init(item.Value().Bytes, item.Value().Pos)
+                return value.Value().decode("utf-8")
+        return None
+
+    header = types.SimpleNamespace(SectionMetadata=lambda: _Sections(sections))
+    peek = types.SimpleNamespace(
+        read_litertlm_header=lambda path, out: header, get_model_type=get_model_type
+    )
+    schema = types.SimpleNamespace(
+        VData=types.SimpleNamespace(StringValue=string_type), StringValue=_StringValue
+    )
+    package = types.ModuleType("litert_lm_builder")
+    package.litertlm_peek = peek
+    package.litertlm_header_schema_py_generated = schema
+    monkeypatch.setitem(sys.modules, "litert_lm_builder", package)
+    monkeypatch.setitem(sys.modules, "litert_lm_builder.litertlm_peek", peek)
+    monkeypatch.setitem(
+        sys.modules, "litert_lm_builder.litertlm_header_schema_py_generated", schema
+    )
+
+
+def _pd(*items):
+    """A prefill-decode section with these extra items."""
+    return [("model_type", "tf_lite_prefill_decode"), *items]
+
+
+_KEY = "prefer_activation_type"
+
+
+@pytest.mark.parametrize(
+    ("sections", "declared"),
+    [
+        ([_pd((_KEY, "fp32"))], "fp32"),
+        ([_pd(("other", "x"))], None),
+        ([[("model_type", "tf_lite_embedder"), (_KEY, "fp16")], _pd()], None),
+        # The key without a model_type item is in no prefill-decode section.
+        ([[(_KEY, "fp32")]], None),
+        ([_pd((_KEY, "fp32"))] * 2, "fp32"),
+    ],
+)
+def test_the_bundle_key_is_read_from_its_prefill_decode_sections(monkeypatch, sections, declared):
+    _fake_builder(monkeypatch, sections)
+    assert _litertlm_script()["bundle_activation"]("m.litertlm") == declared
+
+
+@pytest.mark.parametrize(
+    "sections",
+    [
+        # The first section is not the bundle's answer when a later one differs.
+        [_pd((_KEY, "fp32")), _pd((_KEY, "fp32_fp16"))],
+        [_pd((_KEY, "fp32")), _pd()],
+        # An empty value is a declaration of "", not an absent key.
+        [_pd((_KEY, "fp32")), _pd((_KEY, ""))],
+        # Within one section: `additional_metadata` may repeat the key.
+        [_pd((_KEY, "fp32"), (_KEY, "fp16"))],
+        # Not a string: unreadable, not "declares none".
+        [_pd((_KEY, 7)), _pd((_KEY, "fp32"))],
+    ],
+)
+def test_a_bundle_key_that_is_not_one_answer_is_unreadable(monkeypatch, sections):
+    _fake_builder(monkeypatch, sections)
+    report = _litertlm_script()["run_report"]({"model": "m.litertlm"}, None)
+    assert report["bundle_activation"] is None
+    assert report["bundle_activation_error"].startswith("ValueError")
+
+
+@pytest.mark.parametrize(
+    ("backend", "report", "observed", "unused"),
+    [
+        ("gpu", _WORKED, True, False),
+        ("gpu", _OPENED_IDLE, False, True),  # opened the GPU, did no work there
+        ("gpu", _NO_CLIENT, False, True),  # asked, looked, no client for this pid
+        ("gpu", _NOT_LOOKED, False, False),  # asked, not looked: not established
+        ("gpu", _KILLED_AFTER_ENGINE, False, False),  # opened, work not established
+        ("gpu", _SWAPPED, False, False),  # a client closed: its work is not established
+        ("gpu", _NEW_CLIENT, True, False),  # a client opened while generating did work
+        ("gpu", _SECOND_WORKED, True, False),  # an idle first client does not hide it
+        ("gpu", _ENGINE_UNREAD, False, False),  # no baseline: the time may predate decoding
+        ("gpu", _BASELINE_UNTIMED, False, False),  # a client with no time at the engine
+        ("gpu", _CLOSED_BY_END, False, False),  # a client that worked may have closed
+        ("gpu", _NO_CLIENT_THEN_KILLED, False, False),  # one reading proves nothing
+        ("gpu", None, False, False),  # no report at all
+        ("cpu", _WORKED, False, False),  # a CPU run is never read as a GPU one
+    ],
+)
+def test_the_gpu_is_observed_only_when_it_did_work(backend, report, observed, unused):
+    assert gpu_observed(backend, report) is observed
+    assert gpu_unused(backend, report) is unused
+
+
+def test_the_runtime_backend_reports_what_its_process_did(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _writes_results([{"index": 0, "text": "a"}], device=_WORKED)
+    )
+    backend = _litertlm(tmp_path, backend_flag="gpu")
+    backend.generate(["one"])
+
+    described = backend.describe()
+    assert described[BACKEND_OBSERVED] is True
+    assert described["gpu_unused"] is False
+    assert described["bundle_activation"] == "fp32"
+    assert described["device_report"] == _WORKED
+
+
+def test_a_gpu_request_the_kernel_shows_unused_is_said_to_be_unused(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _writes_results([{"index": 0, "text": "a"}], device=_NO_CLIENT)
+    )
+    backend = _litertlm(tmp_path, backend_flag="gpu")
+    backend.generate(["one"])
+
+    assert backend.describe()[BACKEND_OBSERVED] is False
+    assert backend.describe()["gpu_unused"] is True
+
+
+def test_a_reading_is_not_carried_into_a_run_that_wrote_none(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _writes_results([{"index": 0, "text": "a"}], device=_WORKED)
+    )
+    backend = _litertlm(tmp_path, backend_flag="gpu")
+    backend.generate(["one"])
+    assert backend.backend_observed is True
+
+    monkeypatch.setattr(envs.StageEnv, "run", _writes_results([{"index": 0, "text": "a"}]))
+    backend.generate(["two"])
+
+    assert backend.backend_observed is False
+    assert backend.describe()["device_report"] is None
+
+
+def test_a_run_that_returns_early_does_not_keep_the_last_reading(monkeypatch, tmp_path):
+    """The reset matters only on an early return; an empty prompt list is one."""
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _writes_results([{"index": 0, "text": "a"}], device=_WORKED)
+    )
+    backend = _litertlm(tmp_path, backend_flag="gpu")
+    backend.generate(["one"])
+    assert backend.backend_observed is True
+
+    assert backend.generate([]) == []
+    assert backend.backend_observed is False
+
+
+def test_a_run_killed_after_its_engine_opened_the_gpu_is_not_called_a_gpu_run(
+    monkeypatch, tmp_path
+):
+    """The script writes its first reading before the first prompt, so a
+    killed run still says where it was -- but only a second reading can show
+    work, and a killed run never took one."""
+
+    def times_out(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        if "report" not in spec:
+            # The one-prompt preflight a GPU split starts with: it answers.
+            Path(spec["out"]).write_text(json.dumps({"index": 0, "text": "a"}) + "\n")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        Path(spec["report"]).write_text(json.dumps(_KILLED_AFTER_ENGINE), encoding="utf-8")
+        Path(spec["out"]).write_text(json.dumps({"index": 0, "text": "a"}) + "\n")
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout, stderr="killed")
+
+    monkeypatch.setattr(envs.StageEnv, "run", times_out)
+    backend = _litertlm(tmp_path, backend_flag="gpu")
+    backend.generate(["one", "two"])
+
+    assert backend.describe()["device_report"] == _KILLED_AFTER_ENGINE
+    assert backend.backend_observed is False
+    assert backend.describe()["gpu_unused"] is False
+
+
+@pytest.mark.parametrize("written", ["{", "[]", '"a string"'])
+def test_a_report_that_cannot_be_read_establishes_nothing(monkeypatch, tmp_path, written):
+    """Truncated by a kill mid-write, or not an object: either way nothing was
+    established, neither may escape `generate`, and the manifest says why."""
+
+    def writes(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        Path(spec["report"]).write_text(written, encoding="utf-8")
+        Path(spec["out"]).write_text(json.dumps({"index": 0, "text": "a"}) + "\n")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(envs.StageEnv, "run", writes)
+    backend = _litertlm(tmp_path, backend_flag="gpu")
+    backend.generate(["one"])
+
+    described = backend.describe()
+    assert set(described["device_report"]) == {"unreadable"}
+    assert described[BACKEND_OBSERVED] is False
+    assert described["gpu_unused"] is False
+    assert "unreadable" in described["bundle_activation_error"]
+    assert backend.backend_observed is False
+
+
+def test_the_driver_takes_a_reading_before_and_after_generating(tmp_path, monkeypatch):
+    """Both readings, each taken while the engine exists: the first so a
+    killed run still says where it was, the second because only growth shows
+    work. Found by review: a reading moved above `Engine()` passed every
+    test."""
+    readings = []
+
+    def fake_report():
+        live = bool(sys.modules["litert_lm"].engine_open)
+        readings.append(live)
+        return _reading(gpu_time=len(readings))
+
+    report = tmp_path / "device.json"
+    ns_main = _litertlm_script()
+    ns_main["device_report"] = fake_report
+    ns_main["bundle_activation"] = lambda path: "fp32"
+    engines = _fake_litert_lm(monkeypatch)
+    spec = tmp_path / "spec.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "model": str(tmp_path / "m.litertlm"),
+                "prompts": ["one"],
+                "runtime_rendered": True,
+                **runtime_engine_spec("gpu"),
+                "out": str(tmp_path / "out.jsonl"),
+                "report": str(report),
+            }
+        ),
+        encoding="utf-8",
+    )
+    ns_main["main"](str(spec))
+
+    assert readings == [True, True]
+    written = json.loads(report.read_text(encoding="utf-8"))
+    assert written["at_engine"]["gpu_time"] == 1
+    assert written["after_generation"]["gpu_time"] == 2
+    assert written["bundle_activation"] == "fp32"
+    assert engines
+
+
+def test_a_gpu_that_never_answers_is_reported_in_one_prompts_time(monkeypatch, tmp_path):
+    """Not in the split's: 300 s per prompt makes a 600-row run wait fifty hours
+    for what one prompt shows, and the reason has to name the GPU, because
+    that silence is the measured behaviour of a GPU engine with no GPU."""
+    budgets = []
+
+    def silent(self, args, timeout=3600, **kwargs):
+        budgets.append(timeout)
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+
+    monkeypatch.setattr(envs.StageEnv, "run", silent)
+    backend = _litertlm(tmp_path, backend_flag="gpu", timeout_s=7)
+    generations = backend.generate([f"p{i}" for i in range(600)])
+
+    assert budgets == [7], "one prompt's budget, and the split never started"
+    assert all(not g.ran for g in generations)
+    assert "gpu backend gave no answer to one prompt in 7s" in generations[0].harness_error
+
+
+def test_a_silent_gpu_keeps_the_runtimes_last_words_and_claims_nothing_about_the_bundle(
+    monkeypatch, tmp_path
+):
+    """The preflight's timeout keeps the child's stderr, as the split's does;
+    and with no report written, the bundle's key was never read -- "declares
+    none" would be a claim about a bundle nobody opened."""
+
+    def silent(self, args, timeout=3600, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout, stderr=b"opencl: no device")
+
+    monkeypatch.setattr(envs.StageEnv, "run", silent)
+    backend = _litertlm(tmp_path, backend_flag="gpu", timeout_s=7)
+    generations = backend.generate(["a", "b"])
+
+    assert "opencl: no device" in generations[0].harness_error
+    described = backend.describe()
+    assert described["bundle_activation"] is None
+    assert described["bundle_activation_error"] == "the run wrote no device report"
+
+
+@pytest.mark.parametrize(
+    ("content", "why"),
+    [('{"at_engine": ', "JSONDecodeError"), ("[1, 2]", "a JSON list, not an object")],
+)
+def test_an_unreadable_device_report_says_so_in_the_manifest(tmp_path, content, why):
+    """Not only in a log line: read as "no report" it would be indistinguishable
+    from a run that never started."""
+    path = tmp_path / "device.json"
+    path.write_text(content, encoding="utf-8")
+    report = _read_device_report(path)
+
+    assert why in report["unreadable"]
+    assert gpu_observed("gpu", report) is False
+    assert gpu_unused("gpu", report) is False
+    assert "unreadable" in bundle_activation_error_of(report)
+
+
+def test_a_report_without_a_bundle_reading_is_not_a_bundle_that_declares_none():
+    assert bundle_activation_error_of({"at_engine": None}) == (
+        "the run's device report carries no reading of the bundle"
+    )
+    assert bundle_activation_error_of({"bundle_activation": None}) is None
+
+
+def test_a_cpu_split_starts_without_a_preflight(monkeypatch, tmp_path):
+    calls = []
+
+    def once(self, args, timeout=3600, **kwargs):
+        calls.append(timeout)
+        return _writes_results([{"index": 0, "text": "a"}, {"index": 1, "text": "b"}])(
+            self, args, timeout
+        )
+
+    monkeypatch.setattr(envs.StageEnv, "run", once)
+    _litertlm(tmp_path, timeout_s=7).generate(["one", "two"])
+
+    assert calls == [14]
+
+
+def test_a_timed_out_split_names_its_backend(monkeypatch, tmp_path):
+    def silent(self, args, timeout=3600, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+
+    monkeypatch.setattr(envs.StageEnv, "run", silent)
+    generations = _litertlm(tmp_path, timeout_s=7).generate(["one", "two"])
+
+    assert "on the cpu backend" in generations[0].harness_error

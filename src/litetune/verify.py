@@ -57,6 +57,7 @@ from litetune.evaluate import (
     load_split,
 )
 from litetune.events import EventStream
+from litetune.export import GPU_ACTIVATION
 from litetune.liveness import (
     DEFAULT_THRESHOLDS,
     LivenessResult,
@@ -217,6 +218,14 @@ class VerifyRequest:
     # checkpoint is refused rather than measured, and so is a run given none
     # for a checkpoint that recorded some.
     declarations: Path | None = None
+    # The litert-lm backend the candidate is asked for, `cpu` or `gpu`. The
+    # reference is untouched by this: it resolves its own torch device. On
+    # `gpu` the activation type is stated on every run (see
+    # `evaluate.runtime_engine_spec`), so a bundle without the GPU activation
+    # key is measured rather than refused. Whether the GPU then did work is
+    # asked of the kernel by the driver script, not read off this field; see
+    # `device_report` in `evaluate.RUNTIME_ENGINE_SOURCE`.
+    backend: str = "cpu"
 
 
 @dataclass(frozen=True)
@@ -544,10 +553,68 @@ def _candidate_backend(request: VerifyRequest, declarations: list | None) -> Gen
     chosen, _ = _tool_path_reason(request, declarations)
     if chosen:
         return ToolPathBackend(
-            model=request.model, declarations=list(declarations or []), decode=request.decode
+            model=request.model,
+            declarations=list(declarations or []),
+            decode=request.decode,
+            backend_flag=request.backend,
         )
     return LiteRtLmBackend(
-        model=request.model, decode=request.decode, declared_prompt_mode=request.prompt_mode
+        model=request.model,
+        decode=request.decode,
+        declared_prompt_mode=request.prompt_mode,
+        backend_flag=request.backend,
+    )
+
+
+def _limit_gpu_reading(run: Any, engine: dict[str, Any]) -> None:
+    """The two things a GPU run can be wrong about that no score shows.
+
+    Both are limitations rather than refusals, by decision: the number is a
+    real measurement, and what it is a measurement *of* is said beside it.
+    """
+    unused = engine.get("gpu_unused") is True
+    if unused:
+        # "A process", not "the": on the tool path each decoding mode runs in
+        # its own, and one mode doing no GPU work is enough to say this.
+        run.limitation(
+            "the GPU backend was asked for, and the kernel showed no GPU work from a process "
+            "that generated this run's answers: by that reading the GPU was not used there, "
+            "and not every number here is a GPU number"
+        )
+    # The bundle notes stay either way: what an app gets from the bundle is
+    # true whatever this run did, and on the tool path the other mode may have
+    # run on the GPU with the override. Only what the number is *for* changes:
+    # beside "not used" it cannot be called the bundle plus the override.
+    measured = (
+        "Where this run used the GPU it did so with that override, not with the bundle as "
+        "shipped"
+        if unused
+        else "This number is for the bundle plus that override, not for the bundle as shipped"
+    )
+    declared = engine.get("bundle_activation")
+    unread = engine.get("bundle_activation_error")
+    if declared == GPU_ACTIVATION:
+        return
+    if unread:
+        run.limitation(
+            f"litetune passed {GPU_ACTIVATION} activations itself and could not read what the "
+            f"bundle declares ({unread}), so whether an app that loads it without an override "
+            "gets the same activations is not established"
+        )
+        return
+    if declared is None:
+        run.limitation(
+            f"litetune passed {GPU_ACTIVATION} activations itself; the bundle declares none. An "
+            "app that loads it on a GPU without an override gets the runtime's F16 default, "
+            "measured as <pad> floods on an M4 Pro's Metal (40 of 40 rows) and on a Galaxy S24 "
+            f"(14 of 20). {measured} -- `convert` writes the key, and a bundle it could not "
+            "repack is named in its report"
+        )
+        return
+    run.limitation(
+        f"litetune passed {GPU_ACTIVATION} activations itself; the bundle declares "
+        f"{declared!r}. An app that loads it without an override gets {declared!r}, which "
+        "this run did not measure"
     )
 
 
@@ -1117,10 +1184,18 @@ def run_verify(
     measured_on = (
         f"measured on the {backend} backend of {engine}"
         if established
-        else f"asked {engine} for its {backend} backend; nothing read back which device "
+        else f"asked {engine} for its {backend} backend; nothing established which device "
         "served the run"
     )
-    if not established or (engine.lower(), backend.lower()) != GPU_MEASURED:
+    if not established and (engine.lower(), backend.lower()) == GPU_MEASURED:
+        # Asked for the very executor the other caveat compares against: the
+        # doubt is not which executor it predicts but whether it ran there.
+        run.limitation(
+            f"{measured_on}, so this may not be a GPU number. litetune asks the kernel on "
+            "macOS only, and there only a reading that shows GPU work establishes it; "
+            "README.md's limitations section says what the reading is"
+        )
+    elif not established or (engine.lower(), backend.lower()) != GPU_MEASURED:
         run.limitation(
             f"{measured_on}. litert-lm's GPU backend is a different executor and this "
             "number does not predict it; README.md's limitations section carries what one "
@@ -1128,7 +1203,19 @@ def run_verify(
             "mean anything"
         )
     else:
-        run.limitation(measured_on)
+        # Not dropped but replaced: what the caveat warned about is still true
+        # of every GPU but this one. The kernel's reading shows work on this
+        # host's GPU, through this runtime, with the activations litetune
+        # chose -- which predicts neither a phone's GPU, a different backend of
+        # the same runtime, nor an app that leaves the bundle's key to decide.
+        run.limitation(
+            f"{measured_on}: the kernel showed the candidate's process doing work on this "
+            "host's GPU while it generated. That is litert-lm's GPU backend here, with fp32 "
+            "activations passed by litetune; a phone's GPU is a different backend of the same "
+            "runtime, and an app there gets the activations the bundle declares"
+        )
+    if backend.lower() == "gpu":
+        _limit_gpu_reading(run, candidate.engine)
 
     # Check 5 (divergence) is deferred: the caller decides whether it applies,
     # and generating the reference before the candidate is known alive would pay

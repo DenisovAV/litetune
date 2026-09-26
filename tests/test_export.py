@@ -1141,7 +1141,8 @@ def test_a_failed_repack_is_a_limitation_on_a_passed_export(toolchain, request_f
     assert export.ok
     assert export.gpu_activation is None
     assert (
-        "CPU-only (GPU activations not set): the repack script exited 1: "
+        "GPU activations not set: an app that passes none gets F16 on the GPU: "
+        "the repack script exited 1: "
         "RuntimeError: unpack: boom" in export.check.detail
     )
     assert export.gpu_activation_note and "unpack: boom" in export.gpu_activation_note
