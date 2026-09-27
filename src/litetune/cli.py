@@ -1255,6 +1255,21 @@ def cpu_from_verify(manifest: dict[str, Any]) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def cpu_features_from_verify(manifest: dict[str, Any]) -> str | None:
+    """The recorded instruction-set features of that CPU, space-separated, or None.
+
+    The model name alone does not identify a CPU: one Intel name has been seen
+    both with AVX-512 and without it (MEASUREMENTS.md, "Which runtime a number
+    was taken on").
+    """
+    engine = _candidate_engine(manifest)
+    cpu = engine.get("cpu") if engine.get("engine") == "litert-lm" else None
+    flags = cpu.get("flags") if isinstance(cpu, dict) else None
+    if not isinstance(flags, list) or not all(isinstance(f, str) for f in flags):
+        return None
+    return " ".join(flags)
+
+
 def runtime_from_verify(manifest: dict[str, Any]) -> str | None:
     """The litert-lm version a verify manifest's candidate was measured on, or None.
 
@@ -1295,6 +1310,9 @@ def _runtime_established(
     cpu = cpu_from_verify(manifest) if manifest else None
     if cpu is not None:
         established["cpu"] = cpu
+        features = cpu_features_from_verify(manifest)
+        if features is not None:
+            established["cpu_features"] = features
     if not manifest or _candidate_engine(manifest).get("engine") != "litert-lm":
         # No measurement of a litert-lm candidate to attribute: the pins stand,
         # and there is no runtime a note could be about.
