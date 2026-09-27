@@ -49,13 +49,15 @@ as 1.52 nats on a single token, and across the two runtimes one did, by as much
 as 1.33.
 So a litert-lm number belongs to a runtime version *and* a CPU, and two compare
 only when both match. The model name is not enough to say two CPUs match: the
-A100 instance the tool-path section runs on reports the same
+machine the tool-path section's 0.17.1 runs used reports the same
 `Intel(R) Xeon(R) CPU @ 2.20GHz` as the Intel builds above but has AVX-512,
-which they did not, so a CPU is its name and its features together. Since this release a `verify` manifest records
+which the one Intel build that recorded its features did not, so a CPU is its
+name and its features together. Since this release a `verify` manifest records
 the CPU its candidate ran on beside the runtime, wherever the driver could read
 it. The sections below
-name their runtime and not their CPU, and those taken on machines drawn from a
-pool may have landed on different CPU models.
+name their runtime and, apart from the tool-path section's 0.17.1 runs, not
+their CPU, and those taken on machines drawn from a pool may have landed on
+different CPU models.
 
 The same holds for what litetune scores. litetune's driver scripts on one
 machine -- twelve prompts in both prompt modes on the three bundles,
@@ -1044,8 +1046,9 @@ phone model, one run per cell, greedy decoding.
 `google/mobile-actions` (5794 trained, 640 held out), in `runtime_rendered`
 with the dataset's seven tool declarations, converted `dynamic_wi8_afp32`, and
 measured the way an application calls it: `create_conversation(tools=...)`, the
-runtime rendering the declarations and parsing the call itself. Both sides on
-CPU. One run, 2026-09-17; a second, every stage from `prepare` on with the code
+runtime rendering the declarations and parsing the call itself. The candidate
+on litert-lm's CPU backend, the float reference on cuda -- as every run of this
+section's manifests records. One run, 2026-09-17; a second, every stage from `prepare` on with the code
 that reads a reply the way the runtime does, gave the same number in every cell
 on 2026-09-19.
 
@@ -1065,24 +1068,29 @@ picked the right tool on all 640.
 
 The runtime flutter_gemma ships from `flutter_gemma_litertlm` 1.8.0, measured
 2026-09-27 with the checkpoint, the held-out split and the bundle the
-2026-09-19 run left on disk, so nothing was retrained; on the same machine
-type, reference on cuda as then. The 0.16.1 column is that run's. The CPU the
-0.17.1 runs computed on is recorded -- `Intel(R) Xeon(R) CPU @ 2.20GHz`, with
-AVX-512, 12 vCPU -- and the 0.16.1 run's is not.
+2026-09-19 run produced, so nothing was retrained: one A100-SXM4-40GB with 12
+vCPU as then, reference on cuda as then. The 0.16.1 column is that run's. The
+CPU the 0.17.1 runs computed on is recorded -- `Intel(R) Xeon(R) CPU @ 2.20GHz`,
+with AVX-512 -- and the 0.16.1 run's is not, so the two columns are not shown
+to share a CPU and, by the rule above, compare only loosely.
 
 | | 0.16.1 | 0.17.1, the same bundle | 0.17.1, re-converted |
 |---|---|---|---|
 | Float reference | 0.9250 | 0.9250 | 0.9250 |
-| Tool path, grammar off | 0.9125 | 0.9109 ±0.0221 | 0.9109 ±0.0221 |
-| Tool path, grammar on | 0.9125 | 0.9109 ±0.0221 | 0.9109 ±0.0221 |
+| Tool path, grammar off | 0.9125 ±0.0219 | 0.9109 ±0.0221 | 0.9109 ±0.0221 |
+| Tool path, grammar on | 0.9125 ±0.0219 | 0.9109 ±0.0221 | 0.9109 ±0.0221 |
 | Cost of conversion | **+0.0125** ±0.0087 *(8 discordant)* | **+0.0141** ±0.0092 *(9 discordant)* | **+0.0141** ±0.0092 *(9 discordant)* |
 | Effect of the grammar | 0.0000 | 0.0000 | 0.0000 |
 
-The runtime moved one row of 640, and the conversion cost still resolves. The
+583 of 640 right against 584, and the conversion cost still resolves. How much
+of that one-row net difference is the runtime and how much the CPU is not
+established, since the 0.16.1 run did not record its CPU. The
 re-converted bundle -- `litert-torch-nightly==0.10.0.dev20260926` with its
-quantizer, LiteRT and converter pinned -- differs from the old one byte for
-byte at the same size, and scored the same on every row in both modes. The tool
-name was right on all 640 in every run; the rendering check matched all 640.
+quantizer, LiteRT and converter pinned -- is the same size as the old one with a
+different SHA-256, and gave the same score in both modes, with the same number
+of rows discordant against the reference; the manifests keep scores, not rows,
+so whether they are the same rows is not recorded. The tool name was right on
+all 640 in every run; the rendering check matched all 640.
 
 ### What it took to get there
 

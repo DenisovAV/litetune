@@ -159,8 +159,8 @@ Pythons builds two sets.
 
 ### Which runtime each version measures on
 
-A number from `verify` belongs to the runtime *and* the CPU model that produced
-it. On one CPU model litert-lm 0.17.1 and 0.16.1 gave the same per-token scores on
+A number from `verify` belongs to the runtime *and* the CPU that produced it --
+its model name and its instruction-set features together. On one CPU model litert-lm 0.17.1 and 0.16.1 gave the same per-token scores on
 1 of 36 prompt-bundle scorings, and one runtime on an Intel and an AMD server CPU
 on none, while
 each runtime on one CPU model reproduced every score to the bit -- 0.17.1 on the

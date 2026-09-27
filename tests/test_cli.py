@@ -2040,7 +2040,12 @@ def test_a_bundle_names_the_runtime_its_measurements_were_taken_on_not_its_own_p
 
     established, notes = _runtime_established(manifest, {"litert-lm": "0.17.1", "numpy": "2.0.2"})
 
-    assert established == {"litert-lm": "0.16.1", "numpy": "2.0.2", "cpu": "AMD EPYC 7B12"}
+    assert established == {
+        "litert-lm": "0.16.1",
+        "numpy": "2.0.2",
+        "cpu": "AMD EPYC 7B12",
+        "cpu_features": "avx2 fma",
+    }
     (note,) = notes
     assert "taken on litert-lm 0.16.1, and this litetune pins 0.17.1" in note
 
@@ -2055,7 +2060,11 @@ def test_the_manifests_runtime_pin_stands_in_when_it_read_no_version():
 def test_a_manifest_that_names_no_runtime_is_said_to_name_none():
     established, notes = _runtime_established(_manifest_measured_on({}), {"litert-lm": "0.17.1"})
 
-    assert established == {"litert-lm": "0.17.1", "cpu": "AMD EPYC 7B12"}
+    assert established == {
+        "litert-lm": "0.17.1",
+        "cpu": "AMD EPYC 7B12",
+        "cpu_features": "avx2 fma",
+    }
     (note,) = notes
     assert "does not record which litert-lm" in note
 
@@ -2064,7 +2073,7 @@ def test_a_bundle_measured_on_its_own_pin_says_nothing_more():
     manifest = _manifest_measured_on({"runtime_version": "0.17.1"})
 
     assert _runtime_established(manifest, {"litert-lm": "0.17.1"}) == (
-        {"litert-lm": "0.17.1", "cpu": "AMD EPYC 7B12"},
+        {"litert-lm": "0.17.1", "cpu": "AMD EPYC 7B12", "cpu_features": "avx2 fma"},
         (),
     )
     assert _runtime_established({}, {"litert-lm": "0.17.1"}) == ({"litert-lm": "0.17.1"}, ())
@@ -2129,3 +2138,23 @@ def test_the_version_the_driver_read_wins_over_the_pin():
     )
 
     assert runtime_from_verify(manifest) == "0.16.1"
+
+
+def test_a_bundle_names_the_cpus_features_beside_its_name():
+    """One Intel name has been seen with AVX-512 and without it, so the name
+    alone does not say two bundles were measured on the same CPU."""
+    manifest = _manifest_measured_on(
+        {
+            "runtime_version": "0.17.1",
+            "cpu": {"model": "Intel(R) Xeon(R) CPU @ 2.20GHz", "flags": ["avx2", "avx512f"]},
+        }
+    )
+
+    established, _ = _runtime_established(manifest, {"litert-lm": "0.17.1"})
+
+    assert established["cpu"] == "Intel(R) Xeon(R) CPU @ 2.20GHz"
+    assert established["cpu_features"] == "avx2 avx512f"
+    no_flags = _manifest_measured_on(
+        {"runtime_version": "0.17.1", "cpu": {"model": "Apple M4 Pro"}}
+    )
+    assert "cpu_features" not in _runtime_established(no_flags, {"litert-lm": "0.17.1"})[0]
