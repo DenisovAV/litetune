@@ -376,7 +376,7 @@ def _score_tool_path(
     - **Grammar off: compared with the reference, and what an application gets
       by default.** The float reference is `transformers` generating greedily
       with no grammar, so the conversion cost is measured against the tool path
-      with the runtime's grammar off too. LiteRT-LM v0.16.1 leaves it off
+      with the runtime's grammar off too. LiteRT-LM v0.17.1 leaves it off
       unless the caller enables it, so this is also the default.
       Measured 2026-09-17 on FunctionGemma x mobile-actions at n=640: reference
       0.9234, grammar off 0.9172, grammar on 0.7422. The first version compared
@@ -540,6 +540,53 @@ def _runtime_version_limitation(run: Any, backend: ToolPathBackend) -> None:
             f"{backend.runtime_version or 'a version it could not name'}, where they were not "
             "checked, so calling the grammar-off run the default is an assumption here, and a "
             "reply the runtime words differently leaves its mode unmeasured rather than scored"
+        )
+
+
+def _limit_runtime_named(run: Any, engine: dict[str, Any]) -> None:
+    """Say so when a litert-lm run cannot name its runtime, or ran another than its pin.
+
+    Two runtimes are not to be assumed to give the same answers: 0.16.1 and 0.17.1
+    did not (MEASUREMENTS.md, "Which runtime
+    a number was taken on"), so a number that cannot say which one produced it
+    cannot be compared with any other, and the pin beside it is not evidence.
+    """
+    if str(engine.get("engine") or "") != "litert-lm":
+        return
+    ran = engine.get("runtime_version")
+    requirements = engine.get("requirements")
+    pinned = next(
+        (
+            r.partition("==")[2].strip()
+            for r in (requirements if isinstance(requirements, list) else ())
+            if isinstance(r, str) and r.partition("==")[0].strip() == "litert-lm"
+        ),
+        None,
+    )
+    if not isinstance(ran, str) or not ran:
+        pin = f"; litert-lm {pinned} was pinned" if pinned else ""
+        run.limitation(
+            "the candidate's runtime did not report which litert-lm it was, so which runtime "
+            f"produced these numbers is not recorded{pin}; two litert-lm versions are not to "
+            "be assumed to give the same answers, and 0.16.1 and 0.17.1 did not"
+        )
+    elif pinned and ran != pinned:
+        run.limitation(
+            f"the candidate ran on litert-lm {ran}, not the pinned {pinned}, so these numbers are "
+            f"{ran}'s; two litert-lm versions are not to be assumed to give the same answers, "
+            "and 0.16.1 and 0.17.1 did not"
+        )
+    cpu = engine.get("cpu")
+    if not isinstance(cpu, dict) or not (cpu.get("model") or cpu.get("models")):
+        run.limitation(
+            "which CPU model the candidate computed on is not recorded, so these numbers cannot "
+            "be matched to another run's: one litert-lm on an Intel and an AMD server CPU gave "
+            "different per-token scores, and two CPU models are not to be assumed to agree"
+        )
+    elif cpu.get("models"):
+        run.limitation(
+            f"the candidate could run on more than one kind of core ({', '.join(cpu['models'])}), "
+            "so which CPU model computed these numbers is not recorded"
         )
 
 
@@ -1216,6 +1263,7 @@ def run_verify(
         )
     if backend.lower() == "gpu":
         _limit_gpu_reading(run, candidate.engine)
+    _limit_runtime_named(run, candidate.engine)
 
     # Check 5 (divergence) is deferred: the caller decides whether it applies,
     # and generating the reference before the candidate is known alive would pay

@@ -128,7 +128,15 @@ def _fake_litert_lm(runtime: FakeRuntime) -> Any:
     return module
 
 
-def _run(runtime: FakeRuntime, tmp_path: Path, monkeypatch, **spec_extra) -> tuple[int, Path]:
+def _run(
+    runtime: FakeRuntime,
+    tmp_path: Path,
+    monkeypatch,
+    tokenizers: frozenset[str] | Exception = frozenset({"SP_Tokenizer"}),
+    **spec_extra,
+) -> tuple[int, Path]:
+    """Run the real script against a fake runtime; `tokenizers` is what the
+    bundle's header is read to carry, or what reading it raises."""
     fake = _fake_litert_lm(runtime)
     monkeypatch.setitem(sys.modules, "litert_lm", fake)
     monkeypatch.setitem(sys.modules, "litert_lm.interfaces", fake.interfaces)
@@ -150,7 +158,15 @@ def _run(runtime: FakeRuntime, tmp_path: Path, monkeypatch, **spec_extra) -> tup
     spec.update(spec_extra)
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["toolpath.py", str(spec_path)])
-    code = _exec(_TOOL_PATH_SCRIPT, "toolpath_script_under_test")["main"]()
+    script = _exec(_TOOL_PATH_SCRIPT, "toolpath_script_under_test")
+
+    def read_header(path):
+        if isinstance(tokenizers, Exception):
+            raise tokenizers
+        return set(tokenizers)
+
+    script["tokenizer_sections"] = read_header
+    code = script["main"]()
     return code, out
 
 
@@ -208,6 +224,53 @@ def test_the_decoding_mode_reaches_the_runtime(tmp_path, monkeypatch, constraine
     assert args["constrained_decoding_config"] == {"enable": constrained}
 
 
+def test_the_grammar_mode_is_refused_on_a_bundle_with_no_sentencepiece_tokenizer(
+    tmp_path, monkeypatch, capsys
+):
+    """v0.17.1 builds the grammar only from a SentencePiece tokenizer and, where
+    there is none, logs a warning and decodes without it; v0.16.1 refused. The
+    rows would be grammar-off output reported as grammar on."""
+    runtime = FakeRuntime(replies=[_reply("set_colour", {})])
+
+    code, out = _run(
+        runtime,
+        tmp_path,
+        monkeypatch,
+        tokenizers=frozenset({"HF_Tokenizer_Zlib"}),
+        constrained=True,
+    )
+
+    assert code == SCRIPT["CREATE_REFUSED"]
+    assert not out.exists()
+    assert runtime.conversations == [], "refused before any conversation"
+    assert "no SentencePiece tokenizer (HF_Tokenizer_Zlib)" in capsys.readouterr().err
+
+
+def test_the_grammar_off_mode_does_not_need_a_sentencepiece_tokenizer(tmp_path, monkeypatch):
+    runtime = FakeRuntime(replies=[_reply("set_colour", {})])
+
+    code, out = _run(
+        runtime,
+        tmp_path,
+        monkeypatch,
+        tokenizers=frozenset({"HF_Tokenizer_Zlib"}),
+        constrained=False,
+    )
+
+    assert code == 0 and out.exists()
+
+
+def test_a_header_that_cannot_be_read_does_not_pass_as_grammar_on(tmp_path, monkeypatch, capsys):
+    runtime = FakeRuntime(replies=[_reply("set_colour", {})])
+
+    code, _ = _run(
+        runtime, tmp_path, monkeypatch, tokenizers=OSError("truncated"), constrained=True
+    )
+
+    assert code == SCRIPT["CREATE_REFUSED"]
+    assert "OSError: truncated" in capsys.readouterr().err
+
+
 # -- what it writes ----------------------------------------------------------
 
 
@@ -222,7 +285,7 @@ def test_a_structured_call_comes_back_with_its_argument_types(tmp_path, monkeypa
     Flattening them here would throw away the thing the tool path has that the
     text path does not.
     """
-    # A number comes back as a double: `fc_parser.rs` reads every NUMBER as f64.
+    # What v0.16.1 handed over for `hour:7`, a double; the row keeps the type.
     runtime = FakeRuntime(replies=[_reply("set_alarm", {"hour": 7.0, "loud": True})])
 
     _, out = _run(runtime, tmp_path, monkeypatch)
@@ -235,6 +298,17 @@ def test_a_structured_call_comes_back_with_its_argument_types(tmp_path, monkeypa
         "error": None,
         "kind": None,
     }
+
+
+def test_an_integer_the_runtime_hands_over_stays_an_integer(tmp_path, monkeypatch):
+    """What v0.17.1 hands over for `hour:7`: an int, and the row keeps it one."""
+    runtime = FakeRuntime(replies=[_reply("set_alarm", {"hour": 7})])
+
+    _, out = _run(runtime, tmp_path, monkeypatch)
+
+    (row,) = _rows_written(out)
+    assert row["calls"] == [{"name": "set_alarm", "arguments": {"hour": 7}}]
+    assert type(row["calls"][0]["arguments"]["hour"]) is int
 
 
 def test_every_call_in_a_reply_is_kept(tmp_path, monkeypatch):
@@ -260,13 +334,13 @@ def test_the_runtimes_version_is_written_beside_the_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(
         importlib.metadata,
         "version",
-        lambda name: "0.16.1" if name == "litert-lm" else real(name),
+        lambda name: "0.17.1" if name == "litert-lm" else real(name),
     )
     runtime = FakeRuntime(replies=[_reply("set_colour", {})])
 
     _, out = _run(runtime, tmp_path, monkeypatch)
 
-    assert json.loads(out.read_text(encoding="utf-8"))["runtime_version"] == "0.16.1"
+    assert json.loads(out.read_text(encoding="utf-8"))["runtime_version"] == "0.17.1"
 
 
 def test_a_reply_with_no_call_is_a_result_not_a_failure(tmp_path, monkeypatch):
@@ -299,7 +373,7 @@ def test_every_prompt_gets_a_row_in_order(tmp_path, monkeypatch):
 
 # -- how it fails ------------------------------------------------------------
 
-# What the binding raises for every failed reply, in LiteRT-LM v0.16.1.
+# What the binding raises for every failed reply, in LiteRT-LM v0.17.1.
 SEND_FAILED = RuntimeError("litert_lm_conversation_send_message failed")
 # What the runtime logs when its parser refuses a reply (`parser_utils.cc`,
 # `c/conversation.cc`): the model's code block and full response in it.
@@ -309,7 +383,7 @@ PARSE_FAILURE_LOG = (
     "full response: SECRET card 4111\nerror: Failed to parse FC tool calls\n"
 )
 SCRIPT = _exec(_TOOL_PATH_SCRIPT, "toolpath_script_under_test")
-PINNED = ("litert-lm==0.16.1",)
+PINNED = ("litert-lm==0.17.1",)
 
 
 def started(mark: str, row: int) -> str:
@@ -593,7 +667,7 @@ def test_the_script_marks_each_reply_in_the_log_with_the_mark_the_parent_reads(
 def test_a_row_reason_is_quoted_only_on_the_runtime_whose_log_was_read(tmp_path, monkeypatch):
     runtime = FakeRuntime(replies=[SEND_FAILED], logs={0: "E0918 x.cc:1] INTERNAL: SECRET\n"})
 
-    _, out = _run(runtime, tmp_path, monkeypatch, log_read_from="0.16.1")
+    _, out = _run(runtime, tmp_path, monkeypatch, log_read_from="0.17.1")
 
     (row,) = _rows_written(out)
     assert row["kind"] == "other"
@@ -653,7 +727,11 @@ class CannedEnv:
     fail: str | None = None
     # Fail only these modes, when `fail` is set; every mode otherwise.
     fail_modes: tuple[str, ...] = ("constrained", "unconstrained")
-    runtime_version: str | None = "0.16.1"
+    runtime_version: str | None = "0.17.1"
+    # What `envs.RUNTIME` pins, which the backend records beside what ran.
+    requirements: tuple[str, ...] = PINNED
+    # A mode that reports another runtime than `runtime_version`, by mode.
+    runtime_by_mode: dict[str, str | None] = field(default_factory=dict)
     # The device report each mode's script writes, by mode; absent means the
     # script wrote none.
     device_by_mode: dict[str, dict] = field(default_factory=dict)
@@ -670,7 +748,10 @@ class CannedEnv:
         mode = "constrained" if spec["constrained"] else "unconstrained"
         if self.fail is not None and mode in self.fail_modes:
             return types.SimpleNamespace(returncode=self.fail_code, stderr=self.fail)
-        written = {"runtime_version": self.runtime_version, "rows": self.by_mode[mode]}
+        written = {
+            "runtime_version": self.runtime_by_mode.get(mode, self.runtime_version),
+            "rows": self.by_mode[mode],
+        }
         if mode in self.device_by_mode:
             written["device"] = self.device_by_mode[mode]
         Path(spec["out"]).write_text(json.dumps(written), encoding="utf-8")
@@ -735,7 +816,7 @@ def test_the_score_is_the_call_the_runtime_returned(tmp_path):
 
 
 def test_an_integer_the_runtime_returns_as_a_double_scores_as_that_integer(tmp_path):
-    """LiteRT-LM v0.16.1 hands `hour:7` back as `7.0`. Scored as the string
+    """LiteRT-LM v0.16.1 handed `hour:7` back as `7.0` (v0.17.1 keeps it `7`). Scored as the string
     `"7.0"`, every correct integer argument was wrong on the tool path while the
     reference, parsing `hour:7` itself, got it right -- a conversion cost made
     of nothing but a type. mobile-actions has string arguments only, so the
@@ -754,6 +835,21 @@ def test_an_integer_the_runtime_returns_as_a_double_scores_as_that_integer(tmp_p
     assert modes["constrained"]["score"]["exact_match"]["value"] == pytest.approx(1.0)
     assert modes["unconstrained"]["score"]["exact_match"]["value"] == pytest.approx(1.0)
     assert result.manifest["attribution"]["conversion_cost"]["value"] == pytest.approx(0.0)
+
+
+def test_an_integer_the_runtime_returns_as_an_integer_scores_as_that_integer(tmp_path):
+    """v0.17.1's shape of the same answer."""
+    rows_ = [
+        {"prompt": f"wake me at {h}", "target": {"name": "set_alarm", "args": {"hour": h}}}
+        for h in range(8)
+    ]
+    returned = [_row(h, calls=[{"name": "set_alarm", "arguments": {"hour": h}}]) for h in range(8)]
+
+    result = _verify(tmp_path, rows_, {"constrained": returned, "unconstrained": returned})
+
+    modes = result.manifest["tool_path"]["modes"]
+    assert modes["constrained"]["score"]["exact_match"]["value"] == pytest.approx(1.0)
+    assert modes["unconstrained"]["score"]["exact_match"]["value"] == pytest.approx(1.0)
 
 
 def test_both_decoding_modes_are_reported(tmp_path):
@@ -946,7 +1042,7 @@ def test_the_runtime_version_is_in_the_manifest(tmp_path):
         tmp_path, rows_, {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)}
     )
 
-    assert result.manifest["measurements"]["candidate"]["engine"]["runtime_version"] == "0.16.1"
+    assert result.manifest["measurements"]["candidate"]["engine"]["runtime_version"] == "0.17.1"
 
 
 def test_the_declarations_reach_the_runtime_in_both_modes(tmp_path):
@@ -1318,7 +1414,7 @@ def test_a_runtime_other_than_the_one_the_default_was_read_from_is_said(tmp_path
 
     same = _verify(tmp_path, rows_, {"constrained": both, "unconstrained": both})
     other = _verify(
-        tmp_path, rows_, {"constrained": both, "unconstrained": both}, runtime_version="0.17.1"
+        tmp_path, rows_, {"constrained": both, "unconstrained": both}, runtime_version="0.18.0"
     )
     unnamed = _verify(
         tmp_path, rows_, {"constrained": both, "unconstrained": both}, runtime_version=None
@@ -1326,7 +1422,7 @@ def test_a_runtime_other_than_the_one_the_default_was_read_from_is_said(tmp_path
 
     assert not any("this run used" in x for x in same.manifest["limitations"])
     said = next(x for x in other.manifest["limitations"] if "this run used" in x)
-    assert "litert-lm 0.16.1's source; this run used 0.17.1" in said
+    assert "litert-lm 0.17.1's source; this run used 0.18.0" in said
     # The kinds of a missing reply are read from that version's log sentences too.
     assert "log sentences" in said
     assert "leaves its mode unmeasured rather than scored" in said
@@ -1878,3 +1974,116 @@ def test_a_second_tool_path_run_is_judged_on_its_own_readings(tmp_path):
 
     assert backend.backend_observed is True
     assert len(backend.describe()["device_reports"]) == 2
+
+
+def test_the_tool_path_names_its_pin_beside_the_runtime_that_ran(tmp_path):
+    """Found in review: without the pin, verify could not say that a tool-path
+    run used another runtime than the one pinned."""
+    rows_ = labelled_rows(8)
+    both = _rows(rows_, 8)
+    other = _verify(
+        tmp_path, rows_, {"constrained": both, "unconstrained": both}, runtime_version="0.16.1"
+    )
+
+    engine = other.manifest["measurements"]["candidate"]["engine"]
+    assert "litert-lm==0.17.1" in engine["requirements"]
+    assert any(
+        "ran on litert-lm 0.16.1, not the pinned 0.17.1" in x for x in other.manifest["limitations"]
+    )
+
+
+def test_the_tool_path_names_the_cpu_its_modes_ran_on(tmp_path):
+    cpu = {"machine": "x86_64", "model": "Intel(R) Xeon(R) CPU @ 2.20GHz", "flags": ["avx2"]}
+    report = {**_WORKED, "cpu": cpu}
+    backend = _gpu_run(tmp_path, {"constrained": report, "unconstrained": _WORKED})
+
+    assert backend.describe()["cpu"] == cpu
+
+
+def test_a_mode_that_could_not_read_its_cpu_does_not_hide_the_one_that_could(tmp_path):
+    cpu = {"machine": "x86_64", "model": "AMD EPYC 7B12", "flags": ["avx2"]}
+    unread = {"machine": None, "model": None, "flags": None, "error": "PermissionError: no"}
+    backend = _gpu_run(
+        tmp_path,
+        {"constrained": {**_WORKED, "cpu": unread}, "unconstrained": {**_WORKED, "cpu": cpu}},
+    )
+
+    assert backend.describe()["cpu"] == cpu
+
+
+def _fake_builder_with(monkeypatch, sections: list[str]):
+    """A litert_lm_builder whose header lists these section type names."""
+    names = {i: n for i, n in enumerate(sorted(set(sections) | {"TFLiteModel"}))}
+    codes = {n: i for i, n in names.items()}
+
+    class _Section:
+        def __init__(self, code):
+            self.code = code
+
+        def DataType(self):  # noqa: N802 -- the flatbuffer's spelling
+            return self.code
+
+    class _Sections:
+        def __init__(self):
+            self.items = [_Section(codes[n]) for n in sections] + [_Section(99)]
+
+        def ObjectsLength(self):  # noqa: N802
+            return len(self.items)
+
+        def Objects(self, i):  # noqa: N802
+            return self.items[i]
+
+    def to_string(code):
+        if code not in names:
+            raise ValueError(f"Unknown AnySectionDataType value: {code}")
+        return names[code]
+
+    core = types.SimpleNamespace(any_section_data_type_to_string=to_string)
+    peek = types.SimpleNamespace(
+        read_litertlm_header=lambda path, out: types.SimpleNamespace(SectionMetadata=_Sections)
+    )
+    package = types.ModuleType("litert_lm_builder")
+    setattr(package, "litertlm_core", core)  # noqa: B010 -- a stand-in module
+    setattr(package, "litertlm_peek", peek)  # noqa: B010
+    monkeypatch.setitem(sys.modules, "litert_lm_builder", package)
+    monkeypatch.setitem(sys.modules, "litert_lm_builder.litertlm_core", core)
+    monkeypatch.setitem(sys.modules, "litert_lm_builder.litertlm_peek", peek)
+
+
+@pytest.mark.parametrize(
+    ("sections", "refused"),
+    [
+        (["SP_Tokenizer"], False),
+        (["SP_Tokenizer", "HF_Tokenizer_Zlib"], False),
+        (["HF_Tokenizer_Zlib"], True),
+        ([], True),
+    ],
+)
+def test_the_real_header_read_decides_the_grammar_mode(monkeypatch, sections, refused):
+    """Found by mutation: every other test replaces `tokenizer_sections`, so a
+    wrong section name refused every SentencePiece bundle with all green. An
+    unknown section type (99) is skipped, not fatal."""
+    _fake_builder_with(monkeypatch, sections)
+    script = _exec(_TOOL_PATH_SCRIPT, "toolpath_header_read")
+
+    reason = script["grammar_refusal"]({"constrained": True, "model": "bundle.litertlm"})
+
+    assert (reason is not None) is refused
+
+
+def test_modes_that_ran_different_runtimes_are_not_given_one(tmp_path):
+    """Found in review: the backend kept the last mode's runtime and the first
+    mode's CPU and published both modes' scores under that pair. Two processes
+    need not agree; where they do not, no single runtime is claimed."""
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        runtime_by_mode={"unconstrained": "0.16.1", "constrained": "0.17.1"},
+    )
+    backend = ToolPathBackend(model=tmp_path / "m.litertlm", declarations=DECLS, env=env)
+    backend.generate([r["prompt"] for r in rows_])
+
+    described = backend.describe()
+    assert backend.runtime_version is None, "verify's runtime limitation reads this"
+    assert described["runtime_version"] is None
+    assert described["runtime_versions_by_mode"] == ["0.16.1", "0.17.1"]

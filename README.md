@@ -157,6 +157,32 @@ died halfway leaves a directory that looks like a working one from the outside,
 and because the cache key includes the interpreter — running litetune under two
 Pythons builds two sets.
 
+### Which runtime each version measures on
+
+A number from `verify` belongs to the runtime *and* the CPU model that produced
+it. On one CPU model litert-lm 0.17.1 and 0.16.1 gave the same per-token scores on
+1 of 36 prompt-bundle scorings, and one runtime on an Intel and an AMD server CPU
+on none, while
+each runtime on one CPU model reproduced every score to the bit -- 0.17.1 on the
+Intel model with 1, 4, 8, 16 or 32 threads alike ([MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on)).
+So each litetune release pins one runtime, and from the next release every
+`verify` manifest records the litert-lm version and the CPU its candidate ran on
+where the driver could read them, and says so when it could not read the version; 0.1.x recorded the version on the
+tool path only and the CPU nowhere.
+
+| litetune | candidate runtime | conversion | training and float reference |
+|---|---|---|---|
+| 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
+| unreleased (`main`) | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
+
+To reproduce a published number, install the release that took it: every
+section of MEASUREMENTS.md that `verify` produced was taken with 0.1.x, so
+`pip install litetune==0.1.9`. The phone sections ran a runtime of their own and
+name it. Up to 0.1.9 the conversion environment pinned `litert-torch-nightly`
+but not the quantizer and converter packages it requires, so it took whichever
+were newest the day it was built; `convert` recorded what it got in its report's
+`toolchain.resolved`.
+
 ---
 
 ## Your data
@@ -392,14 +418,18 @@ order and `nullable`, so it renders what was trained only for a tool declared
 with no `parameters` at all. Constrained decoding there is
 `ExperimentalFlags.enableConversationConstrainedDecoding`, off by default and
 global to the process, read when a conversation is created. Automatic tool
-calling is on by default in Kotlin too; turn it off to be handed the call. The
-runtime reads every number in a call as a double, so an integer argument
-arrives as `7.0`: read it as a number and convert it.
+calling is on by default in Kotlin too; turn it off to be handed the call. Up
+to LiteRT-LM 0.16.1 the runtime reads every number in a call as a double, so an
+integer argument arrives as `7.0`; from 0.17.1 an integer that fits in 64 bits
+arrives as one (`fc_parser.rs`). Read it as a number either way.
 
-flutter_gemma 1.8.3 does not use this path for FunctionGemma: it renders the
-declarations in Dart, and the `flutter_gemma_litertlm` engine (1.6.4) hands the
-runtime tools only for Gemma 4 (`lib/src/ffi/ffi_inference_model.dart`). A model
-trained here is not served by it the way it was measured.
+flutter_gemma uses this path for FunctionGemma on a `.litertlm` from core 1.8.4
+with `flutter_gemma_litertlm` 1.7.1: it hands the runtime the declarations
+(`_nativeToolsJson` in `lib/src/ffi/ffi_inference_model.dart`) and creates the
+conversation with constrained decoding on (`lib/src/ffi/litert_lm_client.dart`),
+so the grammar-on number is its path. `flutter_gemma_litertlm` 1.8.0 ships
+LiteRT-LM 0.17.1, the runtime this litetune measures on. Earlier releases render
+FunctionGemma's declarations in Dart and are not served the way it is measured.
 
 **`verify` picks the path from the model, not from a flag.** With declarations
 and a family whose runtime renders them, it asks the runtime for a structured

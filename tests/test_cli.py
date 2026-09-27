@@ -17,7 +17,14 @@ from conftest import FakeBackend, correct_texts, labelled_rows, mark_provisioned
 
 from litetune import envs
 from litetune import verify as verify_module
-from litetune.cli import build_parser, main, measurements_from_verify, summarise
+from litetune.cli import (
+    _runtime_established,
+    build_parser,
+    main,
+    measurements_from_verify,
+    runtime_from_verify,
+    summarise,
+)
 from litetune.prompt_mode import PromptMode
 from litetune.verify import BackendPair, Status
 
@@ -2012,3 +2019,113 @@ def test_the_verify_declarations_help_says_which_checkpoints_need_them():
 
     assert "runtime_rendered checkpoint recorded declarations" in action.help
     assert "A prerendered checkpoint's prompts carry the tool list already" in action.help
+
+
+# -- which runtime a bundle's numbers came from -------------------------------
+
+
+_CPU = {"machine": "x86_64", "model": "AMD EPYC 7B12", "flags": ["avx2", "fma"], "count": 32}
+
+
+def _manifest_measured_on(engine: dict) -> dict:
+    engine = {"engine": "litert-lm", "cpu": _CPU, **engine}
+    return {"measurements": {"candidate": {"available": True, "engine": engine}}}
+
+
+def test_a_bundle_names_the_runtime_its_measurements_were_taken_on_not_its_own_pin():
+    """A 0.1.9 manifest was measured on litert-lm 0.16.1; packed by a litetune
+    pinning 0.17.1 it used to record 0.17.1, and the two do not give the same
+    answers."""
+    manifest = _manifest_measured_on({"runtime_version": "0.16.1"})
+
+    established, notes = _runtime_established(manifest, {"litert-lm": "0.17.1", "numpy": "2.0.2"})
+
+    assert established == {"litert-lm": "0.16.1", "numpy": "2.0.2", "cpu": "AMD EPYC 7B12"}
+    (note,) = notes
+    assert "taken on litert-lm 0.16.1, and this litetune pins 0.17.1" in note
+
+
+def test_the_manifests_runtime_pin_stands_in_when_it_read_no_version():
+    """A 0.1.9 text-path manifest recorded only its requirements."""
+    manifest = _manifest_measured_on({"requirements": ["litert-lm==0.16.1", "numpy==2.0.2"]})
+
+    assert runtime_from_verify(manifest) == "0.16.1"
+
+
+def test_a_manifest_that_names_no_runtime_is_said_to_name_none():
+    established, notes = _runtime_established(_manifest_measured_on({}), {"litert-lm": "0.17.1"})
+
+    assert established == {"litert-lm": "0.17.1", "cpu": "AMD EPYC 7B12"}
+    (note,) = notes
+    assert "does not record which litert-lm" in note
+
+
+def test_a_bundle_measured_on_its_own_pin_says_nothing_more():
+    manifest = _manifest_measured_on({"runtime_version": "0.17.1"})
+
+    assert _runtime_established(manifest, {"litert-lm": "0.17.1"}) == (
+        {"litert-lm": "0.17.1", "cpu": "AMD EPYC 7B12"},
+        (),
+    )
+    assert _runtime_established({}, {"litert-lm": "0.17.1"}) == ({"litert-lm": "0.17.1"}, ())
+
+
+def test_a_candidate_that_is_not_litert_lm_is_not_read_as_a_litert_lm_version():
+    """Found in review: a transformers candidate's own version was recorded as
+    the litert-lm the bundle was established against."""
+    manifest = {
+        "measurements": {
+            "candidate": {"engine": {"engine": "transformers", "runtime_version": "4.57.0"}}
+        }
+    }
+
+    assert runtime_from_verify(manifest) is None
+    assert _runtime_established(manifest, {"litert-lm": "0.17.1"}) == ({"litert-lm": "0.17.1"}, ())
+
+
+def test_a_current_manifest_that_could_not_read_its_runtime_is_not_stamped_with_the_pin():
+    """Found in review: the key present and null means the driver was asked
+    and could not say; the pin beside it is what was asked for, not what ran."""
+    manifest = _manifest_measured_on(
+        {"runtime_version": None, "requirements": ["litert-lm==0.17.1"]}
+    )
+
+    assert runtime_from_verify(manifest) is None
+    established, notes = _runtime_established(manifest, {"litert-lm": "0.17.1"})
+    (note,) = notes
+    assert "does not record which litert-lm" in note
+
+
+def test_a_bundle_names_the_cpu_its_numbers_were_computed_on():
+    """The CPU model changes the arithmetic as much as the runtime version does,
+    so it is established alongside it -- and said when it is missing."""
+    with_cpu = _manifest_measured_on({"runtime_version": "0.17.1"})
+    established, notes = _runtime_established(with_cpu, {"litert-lm": "0.17.1"})
+    assert established["cpu"] == "AMD EPYC 7B12" and notes == ()
+
+    without = _manifest_measured_on({"runtime_version": "0.17.1", "cpu": None})
+    established, notes = _runtime_established(without, {"litert-lm": "0.17.1"})
+    assert "cpu" not in established
+    (note,) = notes
+    assert "does not record which CPU model" in note
+
+
+def test_a_pin_only_manifest_is_said_to_be_pinned_not_read():
+    """Found in review: a 0.1.9 manifest's pin was stated as the runtime the
+    numbers were taken on, with no word that it was only what was asked for."""
+    manifest = _manifest_measured_on({"requirements": ["litert-lm==0.17.1"]})
+
+    established, notes = _runtime_established(manifest, {"litert-lm": "0.17.1"})
+
+    assert established["litert-lm"] == "0.17.1"
+    (note,) = notes
+    assert "records its runtime pin" in note
+
+
+def test_the_version_the_driver_read_wins_over_the_pin():
+    """What ran, not what was asked for; found by mutation, no fixture had both."""
+    manifest = _manifest_measured_on(
+        {"runtime_version": "0.16.1", "requirements": ["litert-lm==0.17.1"]}
+    )
+
+    assert runtime_from_verify(manifest) == "0.16.1"

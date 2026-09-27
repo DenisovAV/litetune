@@ -47,7 +47,7 @@ Z95 = 1.959963985
 # took only the new shape would fail to read both ends of the very comparison it
 # exists to make.
 #
-# The tokens follow the runtime's. LiteRT-LM v0.16.1 reads a call with the ANTLR
+# The tokens follow the runtime's. LiteRT-LM v0.17.1 reads a call with the ANTLR
 # lexer `AntlrFcLexer.g4`: an identifier is `[a-zA-Z_][a-zA-Z0-9_.-]*` but never
 # one of the words its earlier rules take (`call`, `true`, `false`, `null`, or an
 # exponent like `e5` or `e-3`, which lexes as a number); an escape is any of three
@@ -66,9 +66,10 @@ Z95 = 1.959963985
 # scored with. `runtime_calls` is the runtime's reading of a reply, for
 # everything held to the tool path: only between the call markers, each block
 # one whole call, by the lexer's own rules -- arrays and objects included, a
-# character no rule matches skipped as antlr4rust's lexer skips it, and every
-# number a double. A third comparison, `comparable_form`, is the text path's
-# for two decoders' outputs; see there.
+# character no rule matches skipped as antlr4rust's lexer skips it, and a
+# number an integer where it fits an i64 and a double otherwise. A third
+# comparison, `comparable_form`, is the text path's for two decoders' outputs;
+# see there.
 
 IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_.\-]*"
 # Words matching IDENTIFIER that the lexer reads as something else, because the
@@ -115,7 +116,7 @@ def _bare_value(text: str) -> Any:
     """The value of a token `_BARE_RE` matched, for `parse_call`. Cannot raise.
 
     An integer stays exact, as the text path always read it; `runtime_calls`
-    reads every number as the double the runtime hands over.
+    reads a number as the runtime hands it over.
     """
     if text in ("true", "false", "null"):
         return json.loads(text)
@@ -165,9 +166,10 @@ def _same_value(x: Any, y: Any) -> bool:
     spelling. The same holds for `true` and `null` against the strings
     `"true"` and `"null"`, which `_stringify` makes equal as it always did. A
     number is compared by its value with a number or with a string written as
-    one: the runtime hands every number back as a double (`fc_parser.rs` reads
-    a `NUMBER` with `text.parse::<f64>()` in v0.16.1), and `hour:7` returning
-    as `7.0` is the answer `7`. Two strings are compared as strings, so `"1.0"`
+    one: the runtime has handed numbers back as doubles (`fc_parser.rs` read
+    every `NUMBER` with `text.parse::<f64>()` up to v0.16.1; v0.17.1 keeps an
+    integer that fits an i64), and `hour:7` returning as `7.0` is the answer
+    `7` either way. Two strings are compared as strings, so `"1.0"`
     and `"1"` stay two answers; a list or an object item by item.
 
     Not an equivalence -- `"3"` and `"3.0"` both match `3` and not each other --
@@ -199,7 +201,8 @@ def _same_json(x: Any, y: Any) -> bool:
     """The same JSON value: the same type, with numbers compared by value.
 
     What an application is handed. A number the runtime returns as a double is
-    the integer it equals, because every number comes back a double; a string
+    the integer it equals, because a runtime up to v0.16.1 returned every
+    number as a double and v0.17.1 still does past an i64; a string
     is never a number, a boolean never a number, and whitespace is part of a
     string.
     """
@@ -411,9 +414,11 @@ class _CallReader:
 
     Bails on the first error, as the runtime's `BailErrorStrategy` does. A
     string loses `<escape>` and `<|"|>` at its ends and keeps `<ctrl46>`; a
-    number is a double, `null` where it is not finite (`json!` of an infinite
-    `f64`), and a failure where Rust cannot parse it (`e5`); an object keeps
-    the first of two equal keys.
+    number is an integer where `text.parse::<i64>()` takes it and otherwise a
+    double (`fc_parser.rs`, v0.17.1 -- v0.16.1 read every number as a double),
+    `null` where the double is not finite (`json!` of an infinite `f64`), and a
+    failure where Rust cannot parse it (`e5`); an object keeps the first of two
+    equal keys.
     """
 
     def __init__(self, tokens: list[tuple[str, str]]):
@@ -492,6 +497,11 @@ class _CallReader:
             if not re.search(r"[0-9]", re.split("[eE]", text)[0]):
                 # `'-'? EXP` lexes, and `text.parse::<f64>()` refuses it.
                 raise _NotACall
+            if re.fullmatch(r"-?[0-9]+", text) and len(text) <= 20:
+                # What `parse::<i64>` takes; past its range it falls through.
+                whole = int(text)
+                if -(2**63) <= whole < 2**63:
+                    return whole
             number = float(text)
             return number if math.isfinite(number) else None
         raise _NotACall
@@ -508,7 +518,7 @@ def _whole_call(block: str) -> ToolCall | None:
 def runtime_calls(text: str) -> list[ToolCall] | None:
     """The calls LiteRT-LM returns for a reply, or `None` where it returns no reply.
 
-    `parser_utils.cc` (v0.16.1) consumes `(.*?)<start_function_call>(.*?)
+    `parser_utils.cc` (v0.17.1, unchanged since v0.16.1) consumes `(.*?)<start_function_call>(.*?)
     <end_function_call>` from the reply until it no longer matches: what comes
     before each pair is text, an empty pair is skipped, and a start marker with
     no end after it is text like the rest. Each block between a pair has to be

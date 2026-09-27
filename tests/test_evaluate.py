@@ -618,7 +618,7 @@ def test_backend_reports_which_engine_produced_the_numbers(tmp_path):
     described = _litertlm(tmp_path).describe()
     assert described["engine"] == "litert-lm"
     assert described["backend"] == "cpu"
-    assert "litert-lm==0.16.1" in described["requirements"]
+    assert "litert-lm==0.17.1" in described["requirements"]
 
 
 # -- transformers -----------------------------------------------------------
@@ -2441,6 +2441,23 @@ def test_the_runtime_backend_reports_what_its_process_did(monkeypatch, tmp_path)
     assert described["device_report"] == _WORKED
 
 
+def test_the_manifest_names_the_runtime_that_ran_not_only_the_pin(monkeypatch, tmp_path):
+    """Runtimes do not reproduce one another's answers, so a result has to say
+    which one produced it; the pin says only what was asked for."""
+    ran = {**_WORKED, "runtime_version": "0.17.1"}
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _writes_results([{"index": 0, "text": "a"}], device=ran)
+    )
+    backend = _litertlm(tmp_path, backend_flag="cpu")
+    backend.generate(["one"])
+    assert backend.describe()["runtime_version"] == "0.17.1"
+
+    silent = _litertlm(tmp_path, backend_flag="cpu")
+    monkeypatch.setattr(envs.StageEnv, "run", _writes_results([{"index": 0, "text": "a"}]))
+    silent.generate(["one"])
+    assert silent.describe()["runtime_version"] is None
+
+
 def test_a_gpu_request_the_kernel_shows_unused_is_said_to_be_unused(monkeypatch, tmp_path):
     monkeypatch.setattr(
         envs.StageEnv, "run", _writes_results([{"index": 0, "text": "a"}], device=_NO_CLIENT)
@@ -2543,8 +2560,9 @@ def test_the_driver_takes_a_reading_before_and_after_generating(tmp_path, monkey
 
     report = tmp_path / "device.json"
     ns_main = _litertlm_script()
-    ns_main["device_report"] = fake_report
-    ns_main["bundle_activation"] = lambda path: "fp32"
+    monkeypatch.setitem(ns_main, "device_report", fake_report)
+    monkeypatch.setitem(ns_main, "bundle_activation", lambda path: "fp32")
+    monkeypatch.setitem(ns_main, "runtime_version", lambda: "0.17.1")
     engines = _fake_litert_lm(monkeypatch)
     spec = tmp_path / "spec.json"
     spec.write_text(
@@ -2567,6 +2585,7 @@ def test_the_driver_takes_a_reading_before_and_after_generating(tmp_path, monkey
     assert written["at_engine"]["gpu_time"] == 1
     assert written["after_generation"]["gpu_time"] == 2
     assert written["bundle_activation"] == "fp32"
+    assert written["runtime_version"] == "0.17.1"
     assert engines
 
 
@@ -2656,3 +2675,191 @@ def test_a_timed_out_split_names_its_backend(monkeypatch, tmp_path):
     generations = _litertlm(tmp_path, timeout_s=7).generate(["one", "two"])
 
     assert "on the cpu backend" in generations[0].harness_error
+
+
+# -- which CPU a number was computed on ---------------------------------------
+
+_X86_CPUINFO = """processor\t: 0
+vendor_id\t: AuthenticAMD
+model name\t: AMD EPYC 7B12
+flags\t\t: fpu sse2 avx avx2 fma f16c bmi2
+"""
+_ARM_CPUINFO = """processor\t: 0
+Features\t: fp asimd evtstrm aes crc32 atomics fphp asimdhp
+CPU implementer\t: 0x41
+"""
+
+
+@pytest.mark.parametrize(
+    ("cpuinfo", "model", "flags"),
+    [
+        (_X86_CPUINFO, "AMD EPYC 7B12", ["avx", "avx2", "f16c", "fma"]),
+        (
+            _ARM_CPUINFO,
+            None,
+            ["aes", "asimd", "asimdhp", "atomics", "crc32", "evtstrm", "fp", "fphp"],
+        ),
+    ],
+)
+def test_the_driver_names_the_cpu_it_computes_on(monkeypatch, cpuinfo, model, flags):
+    """The arithmetic depends on the CPU model: one runtime and one bundle gave
+    per-token scores equal to the bit on one Intel model and different on
+    every prompt on an AMD one."""
+    import builtins
+    import io
+
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/proc/cpuinfo":
+            return io.StringIO(cpuinfo)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(builtins, "open", fake_open)
+    report = _litertlm_script()["cpu_report"]()
+
+    assert report["model"] == model
+    assert report["flags"] == flags
+    assert "error" not in report
+
+
+def test_a_cpu_that_cannot_be_read_does_not_end_the_run(monkeypatch):
+    import builtins
+
+    def refuse(path, *args, **kwargs):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(builtins, "open", refuse)
+    report = _litertlm_script()["cpu_report"]()
+
+    assert report["model"] is None
+    assert "PermissionError" in report["error"]
+
+
+def test_the_manifest_names_the_cpu_beside_the_runtime(monkeypatch, tmp_path):
+    cpu = {"machine": "x86_64", "model": "AMD EPYC 7B12", "flags": ["avx2"], "count": 32}
+    ran = {**_WORKED, "runtime_version": "0.17.1", "cpu": cpu}
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _writes_results([{"index": 0, "text": "a"}], device=ran)
+    )
+    backend = _litertlm(tmp_path, backend_flag="cpu")
+    backend.generate(["one"])
+
+    assert backend.describe()["cpu"] == cpu
+
+
+def test_the_run_report_carries_the_cpu(monkeypatch):
+    ns = _litertlm_script()
+    monkeypatch.setitem(ns, "bundle_activation", lambda path: "fp32")
+    monkeypatch.setitem(ns, "runtime_version", lambda: "0.17.1")
+    monkeypatch.setitem(ns, "cpu_report", lambda: {"model": "Intel(R) Xeon(R) CPU @ 2.20GHz"})
+
+    report = ns["run_report"]({"model": "m.litertlm"}, None)
+
+    assert report["cpu"] == {"model": "Intel(R) Xeon(R) CPU @ 2.20GHz"}
+
+
+_TWO_CORE_TYPES = """processor\t: 0
+model name\t: Big Core
+flags\t\t: avx2 avx512f
+
+processor\t: 1
+model name\t: Little Core
+flags\t\t: avx2
+"""
+
+
+def _with_cpuinfo(monkeypatch, text):
+    import builtins
+    import io
+
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/proc/cpuinfo":
+            return io.StringIO(text)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+
+def test_the_cpu_named_is_one_this_process_may_run_on(monkeypatch):
+    """Found in review: a container pinned off processor 0 on a host with two
+    core types was reported as the core it could not use."""
+    _with_cpuinfo(monkeypatch, _TWO_CORE_TYPES)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {1}, raising=False)
+
+    report = _litertlm_script()["cpu_report"]()
+
+    assert report["model"] == "Little Core"
+    assert report["flags"] == ["avx2"]
+
+
+def test_an_arm_model_listed_outside_the_per_cpu_blocks_is_found(monkeypatch):
+    _with_cpuinfo(monkeypatch, _ARM_CPUINFO + "\nHardware\t: Qualcomm Technologies, Inc SM8650\n")
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0}, raising=False)
+
+    report = _litertlm_script()["cpu_report"]()
+
+    assert report["model"] == "Qualcomm Technologies, Inc SM8650"
+
+
+def test_a_machine_that_will_not_name_itself_does_not_end_the_run(monkeypatch):
+    """Found in review: `platform.machine()` ran outside the guard, and a
+    sandbox that denies `uname` ended the driver before its first prompt."""
+    import platform
+
+    def denied():
+        raise PermissionError("uname")
+
+    monkeypatch.setattr(platform, "machine", denied)
+    report = _litertlm_script()["cpu_report"]()
+
+    assert report["machine"] is None
+    assert "PermissionError" in report["error"]
+
+
+def test_a_cpu_query_that_times_out_on_macos_does_not_end_the_run(monkeypatch):
+    """Found by mutation: every guard test raised an OSError, so narrowing the
+    guard to OSError kept them green while a sysctl timeout ended the driver."""
+
+    def slow(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(subprocess, "run", slow)
+    report = _litertlm_script()["cpu_report"]()
+
+    assert report["model"] is None
+    assert "TimeoutExpired" in report["error"]
+
+
+def test_an_arm_server_names_its_core_by_implementer_and_part(monkeypatch):
+    """arm64 Linux servers print no model line; the implementer and part are
+    what name the core, and dropping them made two ARM parts one."""
+    graviton = (
+        "processor\t: 0\nFeatures\t: fp asimd\nCPU implementer\t: 0x41\n"
+        "CPU architecture: 8\nCPU variant\t: 0x1\nCPU part\t: 0xd40\nCPU revision\t: 1\n"
+    )
+    _with_cpuinfo(monkeypatch, graviton)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0}, raising=False)
+
+    report = _litertlm_script()["cpu_report"]()
+
+    assert report["model"] == "implementer 0x41 part 0xd40 variant 0x1 revision 1"
+
+
+def test_cores_of_two_kinds_open_to_the_process_are_not_named_as_one(monkeypatch):
+    """Found in review: with both core types allowed the first was named, though
+    either may have computed the number."""
+    _with_cpuinfo(monkeypatch, _TWO_CORE_TYPES)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1}, raising=False)
+
+    report = _litertlm_script()["cpu_report"]()
+
+    assert report["model"] is None
+    assert report["models"] == ["Big Core", "Little Core"]
+    assert report["flags"] is None

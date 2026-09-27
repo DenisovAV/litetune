@@ -125,8 +125,9 @@ def test_a_value_that_is_neither_escaped_nor_a_scalar_is_not_a_call():
 
 
 def test_a_number_the_runtime_hands_back_as_a_double_is_the_integer_it_equals():
-    """LiteRT-LM v0.16.1 reads every `NUMBER` as an f64, so a call the model
-    wrote as `hour:7` reaches the caller as `7.0`. Compared as `"7.0"` against a
+    """LiteRT-LM up to v0.16.1 read every `NUMBER` as an f64, so a call the model
+    wrote as `hour:7` reached the caller as `7.0`; v0.17.1 still does past an
+    i64. Compared as `"7.0"` against a
     target of `7`, every correct integer on the tool path scored wrong, and the
     difference landed in the conversion cost."""
     assert ToolCall("set_alarm", {"hour": 7.0}) == ToolCall("set_alarm", {"hour": 7})
@@ -149,7 +150,7 @@ def test_a_number_the_runtime_hands_back_as_a_double_is_the_integer_it_equals():
     ],
 )
 def test_a_number_the_runtimes_lexer_refuses_is_not_a_call(text):
-    """Held to the grammar the runtime reads (`AntlrFcLexer.g4`, v0.16.1), and
+    """Held to the grammar the runtime reads (`AntlrFcLexer.g4`, v0.17.1), and
     never raised: `007` used to reach `json.loads` and crash `verify` from the
     divergence check, which runs outside every guard."""
     assert parse_call(text) is None
@@ -324,15 +325,33 @@ def test_a_reply_is_read_as_the_runtime_reads_it(text, calls):
     assert runtime_calls(text) == calls
 
 
-def test_the_runtime_reads_every_number_as_a_double():
-    """`fc_parser.rs` parses a `NUMBER` with `text.parse::<f64>()`, so an integer
-    past 2**53 reaches an application as the nearest double -- and a target of
-    its exact digits is not what it is handed."""
-    (call,) = runtime_calls(f"{START}call:f{{n:9007199254740993,m:7}}{END}")
+def test_the_runtime_reads_an_integer_as_an_integer_and_the_rest_as_a_double():
+    """`fc_parser.rs` at v0.17.1 tries `text.parse::<i64>()` before `f64`, so an
+    integer reaches an application exact, 2**53 + 1 included; one past an i64,
+    and anything with a fraction or an exponent, is the nearest double."""
+    (call,) = runtime_calls(
+        f"{START}call:f{{n:9007199254740993,m:7,k:-3,big:9223372036854775808,r:2.5,e:1e3}}{END}"
+    )
 
-    assert call.raw == {"n": 9007199254740992.0, "m": 7.0}
-    assert [type(v) for v in call.raw.values()] == [float, float]
-    assert call != ToolCall("f", {"n": 9007199254740993, "m": 7})
+    assert call.raw == {
+        "n": 9007199254740993,
+        "m": 7,
+        "k": -3,
+        "big": 9223372036854775808.0,
+        "r": 2.5,
+        "e": 1000.0,
+    }
+    assert [type(v) for v in call.raw.values()] == [int, int, int, float, float, float]
+    assert call == ToolCall(
+        "f", {"n": 9007199254740993, "m": 7, "k": -3, "big": 2**63, "r": 2.5, "e": 1000}
+    )
+    # `-0` parses as the i64 0, as Rust's `parse::<i64>` reads it.
+    (zero,) = runtime_calls(f"{START}call:f{{z:-0}}{END}")
+    assert zero.raw == {"z": 0} and type(zero.raw["z"]) is int
+    # The last i64 stays exact; one past it does not.
+    (edge,) = runtime_calls(f"{START}call:f{{a:9223372036854775807,b:-9223372036854775808}}{END}")
+    assert edge.raw == {"a": 2**63 - 1, "b": -(2**63)}
+    assert [type(v) for v in edge.raw.values()] == [int, int]
 
 
 def test_a_number_past_pythons_digit_limit_is_read_as_the_runtime_reads_it():
