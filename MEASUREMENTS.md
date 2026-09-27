@@ -47,8 +47,11 @@ score to the bit, across machines and, on 0.17.1 on the Intel model, with 1, 4,
 8, 16 or 32 threads alike; across the two models not one scoring did, by as much
 as 1.52 nats on a single token, and across the two runtimes one did, by as much
 as 1.33.
-So a litert-lm number belongs to a runtime version *and* a CPU model, and two
-compare only when both match. Since this release a `verify` manifest records
+So a litert-lm number belongs to a runtime version *and* a CPU, and two compare
+only when both match. The model name is not enough to say two CPUs match: the
+A100 instance the tool-path section runs on reports the same
+`Intel(R) Xeon(R) CPU @ 2.20GHz` as the Intel builds above but has AVX-512,
+which they did not, so a CPU is its name and its features together. Since this release a `verify` manifest records
 the CPU its candidate ran on beside the runtime, wherever the driver could read
 it. The sections below
 name their runtime and not their CPU, and those taken on machines drawn from a
@@ -1057,6 +1060,29 @@ on 2026-09-19.
 The rendering check compared all 640 prompts, declarations included, and found
 identical token ids on both sides. Every loss is in the arguments: the model
 picked the right tool on all 640.
+
+### The same checkpoint on litert-lm 0.17.1
+
+The runtime flutter_gemma ships from `flutter_gemma_litertlm` 1.8.0, measured
+2026-09-27 with the checkpoint, the held-out split and the bundle the
+2026-09-19 run left on disk, so nothing was retrained; on the same machine
+type, reference on cuda as then. The 0.16.1 column is that run's. The CPU the
+0.17.1 runs computed on is recorded -- `Intel(R) Xeon(R) CPU @ 2.20GHz`, with
+AVX-512, 12 vCPU -- and the 0.16.1 run's is not.
+
+| | 0.16.1 | 0.17.1, the same bundle | 0.17.1, re-converted |
+|---|---|---|---|
+| Float reference | 0.9250 | 0.9250 | 0.9250 |
+| Tool path, grammar off | 0.9125 | 0.9109 ±0.0221 | 0.9109 ±0.0221 |
+| Tool path, grammar on | 0.9125 | 0.9109 ±0.0221 | 0.9109 ±0.0221 |
+| Cost of conversion | **+0.0125** ±0.0087 *(8 discordant)* | **+0.0141** ±0.0092 *(9 discordant)* | **+0.0141** ±0.0092 *(9 discordant)* |
+| Effect of the grammar | 0.0000 | 0.0000 | 0.0000 |
+
+The runtime moved one row of 640, and the conversion cost still resolves. The
+re-converted bundle -- `litert-torch-nightly==0.10.0.dev20260926` with its
+quantizer, LiteRT and converter pinned -- differs from the old one byte for
+byte at the same size, and scored the same on every row in both modes. The tool
+name was right on all 640 in every run; the rendering check matched all 640.
 
 ### What it took to get there
 
