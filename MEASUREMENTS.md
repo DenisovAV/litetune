@@ -52,7 +52,7 @@ only when both match. The model name is not enough to say two CPUs match: the
 machine the tool-path section's 0.17.1 runs used reports the same
 `Intel(R) Xeon(R) CPU @ 2.20GHz` as the Intel builds above but has AVX-512,
 which the one Intel build that recorded its features did not, so a CPU is its
-name and its features together. Since this release a `verify` manifest records
+name and its features together. From 0.2.0 a `verify` manifest records
 the CPU its candidate ran on beside the runtime, wherever the driver could read
 it. The sections below
 name their runtime and, apart from the 0.17.1 runs, not
