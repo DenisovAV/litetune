@@ -567,8 +567,8 @@ incompatible dependencies and cannot share an interpreter.
 
 ## Results
 
-Every converted-model figure here was taken on litert-lm 0.16.1, the runtime
-litetune 0.1.x pins; unreleased `main` pins 0.17.1.
+Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
+runtime litetune 0.1.x pins; unreleased `main` pins 0.17.1.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
 0.17.1 re-measurements beside the originals where there are any.
 
