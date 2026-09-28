@@ -93,9 +93,9 @@ place of them.
 
 Re-measured on 0.17.1 so far: the four banking77 eight-bit pairs, below, and
 FunctionGemma's tool path, in *The same checkpoint on litert-lm 0.17.1*.
-Everything else -- the headline FunctionGemma runs, Gemma 4, the four-bit
-recipes -- is a 0.16.1 number that has not been re-measured, and the phone runs
-name a runtime of their own.
+Nothing else has been: the headline FunctionGemma runs, Gemma 4's conversion
+costs and the four-bit recipes are `verify` numbers taken on 0.16.1, and the
+phone runs ran on the device.
 
 ### The banking77 sections on litert-lm 0.17.1
 

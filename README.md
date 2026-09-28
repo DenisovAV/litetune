@@ -711,7 +711,8 @@ withdrawn after re-measurement.
 
 - **Most of them are litert-lm 0.16.1's.** The banking77 eight-bit pairs and
   FunctionGemma's tool path were re-measured on 0.17.1, pinned after 0.1.x;
-  the headline FunctionGemma runs, Gemma 4 and every four-bit recipe were not.
+  the headline FunctionGemma runs, Gemma 4's conversion costs, every four-bit
+  recipe and the phone runs were not.
   [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) says
   which is which.
 - **Measured on six models, all six fine-tuned here.**
@@ -766,7 +767,7 @@ withdrawn after re-measurement.
   CPU run that produced it (run A in [MEASUREMENTS.md](MEASUREMENTS.md); runs
   B and C scored 0.9016 and 0.8969, both just outside that interval). So the
   reference number predicted the phone to within about 0.03. One device, one
-  recipe.
+  recipe, and not re-measured since the runtime moved to 0.17.1.
 - **On a GPU box, the reference and the candidate can run on different
   hardware, and it is recorded rather than refused.** The candidate runs on
   the `litert-lm` backend `--backend` names, `cpu` by default, and the
