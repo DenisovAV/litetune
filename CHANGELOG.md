@@ -3,6 +3,16 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.2.0 — 2026-09-28
+- **Re-run `verify` for any model you ship on litert-lm 0.17.1, as flutter_gemma_litertlm 1.8.0 does — 0.1.x measured on 0.16.1, and the two runtimes do not give the same answers (#55).**
+- `verify` runs the candidate on litert-lm 0.17.1, and `convert` pins litert-torch-nightly 0.10.0.dev20260926 with litert-lm-builder 0.17.1 and the quantizer, LiteRT and converter packages it requires (#55).
+- Every `verify` manifest records the litert-lm version its candidate ran on and the host's CPU (only on the CPU backend is that what computed the answers), and says so when it could not read either (#55).
+- `bundle` records in `established_against` the runtime and CPU its verify manifest recorded, with the CPU's features where the manifest has them (#55, #56).
+- The tool path refuses grammar-on decoding for a bundle without a SentencePiece tokenizer, which litert-lm 0.17.1 would decode without the grammar (#55).
+- `tune` accepts a tool call whose integer argument fits in 64 bits but not in a double, as litert-lm 0.17.1 returns it exact (#55).
+- FunctionGemma's tool path and the four banking77 eight-bit pairs are re-measured on litert-lm 0.17.1, beside their 0.16.1 numbers (#56, #57).
+- The published numbers say which runtime they were taken on; the four-bit recipes and Gemma 4 are not yet re-measured (#55, #58).
+
 ## 0.1.9 — 2026-09-26
 - `verify --backend gpu` measures the converted model on litert-lm's GPU backend, passing fp32 activations itself and naming it when the bundle alone would get something else (#53).
 - On macOS a GPU run is recorded as measured on the GPU only when the kernel shows its process doing GPU work; elsewhere, and when the reading is not conclusive, the manifest says the GPU was asked for (#53).
