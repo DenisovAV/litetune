@@ -175,13 +175,14 @@ tool path only and the CPU nowhere.
 | 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
 | unreleased (`main`) | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
 
-To reproduce a published number, install the release that took it: every
-section of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken
-with 0.1.x, so `pip install litetune==0.1.9`; the ones taken on 0.17.1 name the
-unreleased commit they ran. The phone sections ran a runtime of their own and
-name it. Up to 0.1.9 the conversion environment pinned `litert-torch-nightly`
-but not the quantizer and converter packages it requires, so it took whichever
-were newest the day it was built; `convert` recorded what it got in its report's
+To reproduce a published number, install the release that took it: every section
+of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
+0.1.x, so `pip install litetune==0.1.9`. The ones taken on 0.17.1 ran unreleased
+`main` at a commit each names, and say whether their bundle was converted by
+0.1.x or by `main`. The phone sections ran a runtime of their own and name it.
+Up to 0.1.9 the conversion environment pinned `litert-torch-nightly` but not the
+quantizer and converter packages it requires, so it took whichever were newest
+the day it was built; `convert` recorded what it got in its report's
 `toolchain.resolved`.
 
 ---
@@ -566,8 +567,10 @@ incompatible dependencies and cannot share an interpreter.
 
 ## Results
 
-Every table here was taken on litert-lm 0.16.1; [MEASUREMENTS.md](MEASUREMENTS.md)
-has each beside its 0.17.1 re-measurement where there is one.
+Every converted-model figure here was taken on litert-lm 0.16.1, the runtime
+litetune 0.1.x pins; unreleased `main` pins 0.17.1.
+[MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
+0.17.1 re-measurements beside the originals where there are any.
 
 `functiongemma-270m-it`, LoRA on `google/mobile-actions`, scored on 640 examples
 the model never trained on:
@@ -615,12 +618,13 @@ terminator bug fixed in 0.1.5 — see [MEASUREMENTS.md](MEASUREMENTS.md).
 The first family measured here that litetune had no rule for. It exported with
 no flag from litetune, and the rule it has now records that none is needed. The
 weight-only figure clears its interval here where the dynamic one does not, and
-where neither of Gemma 3's did — on 12 disagreements out of 600. On litert-lm
-0.17.1 it does not: +0.0050 on 5. Training and
-the float reference ran on a GPU and the converted models on a CPU, so this cost
-carries a hardware difference as well as a conversion one — as the Gemma 3 one
-does too; every manifest in both runs records it — see
-[MEASUREMENTS.md](MEASUREMENTS.md).
+where neither of gemma-3-270m's did — on 12 disagreements out of 600. Training
+and the float reference ran on a GPU and the converted models on a CPU, so this
+cost carries a hardware difference as well as a conversion one — as the Gemma 3
+one does too; every manifest in both runs records it — see
+[MEASUREMENTS.md](MEASUREMENTS.md). On litert-lm 0.17.1 the same bundle's
+weight-only cost is +0.0050 on 5 disagreements and does not resolve; which
+verdict holds is not established.
 
 **[MEASUREMENTS.md](MEASUREMENTS.md)** has the intervals, three runs of the same
 configuration and what they disagree about, and which published claims were
