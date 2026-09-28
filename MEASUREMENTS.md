@@ -55,7 +55,7 @@ which the one Intel build that recorded its features did not, so a CPU is its
 name and its features together. Since this release a `verify` manifest records
 the CPU its candidate ran on beside the runtime, wherever the driver could read
 it. The sections below
-name their runtime and, apart from the tool-path section's 0.17.1 runs, not
+name their runtime and, apart from the 0.17.1 runs, not
 their CPU, and those taken on machines drawn from a pool may have landed on
 different CPU models.
 
@@ -455,6 +455,27 @@ It also means the training gain here is unattributable in principle, not just
 unmeasured: there is no base figure to subtract, and manufacturing one from a
 degenerate run would be the mistake `attribution` exists to refuse.
 
+### gemma-3-270m on litert-lm 0.17.1
+
+The same bundles, tuned checkpoint and 600 held-out rows, verified again on
+2026-09-28 with litetune at commit 0744a1e (unreleased; it reports itself as
+0.1.9) on litert-lm 0.17.1, same scorer, prompt mode and greedy decoding;
+nothing retrained or re-converted. The candidate's CPU is recorded --
+`Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512, 12 vCPU; the reference ran on
+cuda -- and the 0.16.1 runs' CPU is not, so the rows are not shown to share a
+CPU and compare only loosely (see *Which runtime a number was taken on*).
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Fine-tuned, 0.16.1 | **0.6717** ±0.0376 | 0.6717 ±0.0376 | 0.6683 ±0.0377 |
+| Fine-tuned, 0.17.1 | **0.6717** ±0.0376 | 0.6783 ±0.0374 | 0.6750 ±0.0375 |
+| Cost of conversion, 0.17.1 | — | −0.0067 ±0.0179 *(unresolved, 30 discordant)* | −0.0033 ±0.0113 *(unresolved, 12 discordant)* |
+
+Neither cost resolves, as on 0.16.1; the reference is the same to four places,
+and each recipe is discordant with it on fewer rows (30 and 12, against 34 and
+16).
+
+
 ## A third family, and the marker the vocabulary did not know
 
 The two sections above measure models this project fine-tuned. This one opens
@@ -728,6 +749,28 @@ absent there because that cost does resolve.
   `weight_only_wi8_afp32` carries no such line, and its table entry above says
   why — +0.0167 ±0.0113, resolved on 12 discordant.
 
+### Qwen3-0.6B on litert-lm 0.17.1
+
+The same bundles, tuned checkpoint and 600 held-out rows, verified again on
+2026-09-28 with litetune at commit 0744a1e (unreleased; it reports itself as
+0.1.9) on litert-lm 0.17.1, same scorer, prompt mode and greedy decoding;
+nothing retrained or re-converted. The candidate's CPU is recorded --
+`Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512, 12 vCPU; the reference ran on
+cuda -- and the 0.16.1 runs' CPU is not, so the rows are not shown to share a
+CPU and compare only loosely (see *Which runtime a number was taken on*).
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Fine-tuned, 0.16.1 | **0.6983** ±0.0367 | 0.6917 ±0.0370 | 0.6817 ±0.0373 |
+| Fine-tuned, 0.17.1 | **0.6983** ±0.0367 | 0.6983 ±0.0367 | 0.6933 ±0.0369 |
+| Cost of conversion, 0.17.1 | — | +0.0000 ±0.0103 *(unresolved, 10 discordant)* | +0.0050 ±0.0073 *(unresolved, 5 discordant)* |
+
+**The `weight_only_wi8_afp32` cost that resolved on 0.16.1 does not on 0.17.1**:
++0.0167 on 12 discordant rows there, +0.0050 on 5 here. Each recipe is
+discordant with the reference on fewer rows than on 0.16.1 (10 and 5, against
+20 and 12).
+
+
 ## The same family, four times the size
 
 `google/gemma-3-1b-it` @ `dcc83ea8`, the other size `models.py` scopes the
@@ -793,6 +836,27 @@ observation, not a resolved difference: litetune computes no interval for a
 difference between two models, and all three references ran on a different
 device from their candidates.
 
+### gemma-3-1b on litert-lm 0.17.1
+
+The same bundles, tuned checkpoint and 600 held-out rows, verified again on
+2026-09-28 with litetune at commit 0744a1e (unreleased; it reports itself as
+0.1.9) on litert-lm 0.17.1, same scorer, prompt mode and greedy decoding;
+nothing retrained or re-converted. The candidate's CPU is recorded --
+`Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512, 12 vCPU; the reference ran on
+cuda -- and the 0.16.1 runs' CPU is not, so the rows are not shown to share a
+CPU and compare only loosely (see *Which runtime a number was taken on*).
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Fine-tuned, 0.16.1 | **0.7533** ±0.0345 | 0.7450 ±0.0349 | 0.7367 ±0.0352 |
+| Fine-tuned, 0.17.1 | **0.7533** ±0.0345 | 0.7433 ±0.0350 | 0.7533 ±0.0345 |
+| Cost of conversion, 0.17.1 | — | +0.0100 ±0.0113 *(unresolved, 12 discordant)* | +0.0000 ±0.0065 *(unresolved, 4 discordant)* |
+
+**The `weight_only_wi8_afp32` cost that resolved on 0.16.1 does not on 0.17.1**:
++0.0167 on 14 discordant rows there, +0.0000 on 4 here. `dynamic_wi8_afp32`
+stays unresolved, on 12 discordant rows against 23.
+
+
 ## A fifth family, and the first where channelwise four bits answered
 
 `Qwen/Qwen2.5-0.5B-Instruct` @ `7ae55760`, 494,032,768 parameters, and a
@@ -837,8 +901,8 @@ Sizes are 647,312,304 and 647,492,736 bytes.
 ### What this run established that the table does not show
 
 **Neither eight-bit cost resolves here, and on the two models before it one
-did.** Qwen3-0.6B and gemma-3-1b both had `weight_only_wi8_afp32` resolve at
-+0.0167 while `dynamic_wi8_afp32` did not; this model puts both inside their
+did.** On litert-lm 0.16.1 Qwen3-0.6B and gemma-3-1b both had
+`weight_only_wi8_afp32` resolve at +0.0167 (on 0.17.1 neither does) while `dynamic_wi8_afp32` did not; this model puts both inside their
 intervals. The reason is in the discordant column rather than in the accuracy:
 conversion changed the answer on 16 rows under one recipe and 10 under the
 other, and a paired test on 600 examples cannot separate a difference that small
@@ -869,6 +933,26 @@ recorded `turn_terminator: {ids: [151645, 198], source: "chat_template", text:
 "<|im_end|>\n"}`, and on the reference `terminators_trimmed` read 600 of 600,
 one marker each. On litert-lm it read 0 of 600 — the runtime hands back the text
 without its stop token, which the fourth family's section describes.
+
+### Qwen2.5-0.5B on litert-lm 0.17.1
+
+The same bundles, tuned checkpoint and 600 held-out rows, verified again on
+2026-09-28 with litetune at commit 0744a1e (unreleased; it reports itself as
+0.1.9) on litert-lm 0.17.1, same scorer, prompt mode and greedy decoding;
+nothing retrained or re-converted. The candidate's CPU is recorded --
+`Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512, 12 vCPU; the reference ran on
+cuda -- and the 0.16.1 runs' CPU is not, so the rows are not shown to share a
+CPU and compare only loosely (see *Which runtime a number was taken on*).
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Fine-tuned, 0.16.1 | **0.7700** ±0.0337 | 0.7600 ±0.0342 | 0.7600 ±0.0342 |
+| Fine-tuned, 0.17.1 | **0.7700** ±0.0337 | 0.7700 ±0.0337 | 0.7717 ±0.0336 |
+| Cost of conversion, 0.17.1 | — | +0.0000 ±0.0092 *(unresolved, 8 discordant)* | −0.0017 ±0.0057 *(unresolved, 3 discordant)* |
+
+Neither cost resolves, as on 0.16.1, and each recipe is discordant with the
+reference on fewer rows (8 and 3, against 16 and 10).
+
 
 ## What four bits cost
 
