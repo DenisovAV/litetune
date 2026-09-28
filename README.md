@@ -299,7 +299,11 @@ The recipes are
 applied by `litert-torch export_hf` during `convert`, and `--recipe` passes a
 name litetune does not know straight through to it. litetune defines exactly one
 of its own, shipped as a quantizer recipe file inside the package; what it adds
-to the rest is a measurement of what each costs on your task:
+to the rest is a measurement of what each costs on your task. The costs below
+were taken on litert-lm 0.16.1, the runtime 0.1.x pins. The four-bit ones have
+not been re-measured on 0.17.1, the runtime litetune pins after 0.1.x, and a
+runtime change is not to be assumed to leave a number where it was: see
+[MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on).
 
 | recipe | |
 |---|---|
@@ -311,11 +315,11 @@ to the rest is a measurement of what each costs on your task:
 | `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550, +0.0917, +0.0883 and +0.3200 on the same four |
 
 `--recipe` has no default. A sweep of one is not a comparison. **At four bits,
-every model measured here lost accuracy the sample resolves, and how much does
-not follow from its family or its parameter count: 3.50 points on
-Qwen3-0.6B, 7.67 on Qwen2.5-0.5B, 8.83 on Gemma 3 1B and 34.83 on the 270M** — see
-[MEASUREMENTS.md](MEASUREMENTS.md) for the intervals, the refusals and what
-those numbers do not establish.
+on litert-lm 0.16.1, every model measured here lost accuracy the sample
+resolves, and how much does not follow from its family or its parameter count:
+3.50 points on Qwen3-0.6B, 7.67 on Qwen2.5-0.5B, 8.83 on Gemma 3 1B and 34.83 on
+the 270M** — see [MEASUREMENTS.md](MEASUREMENTS.md) for the intervals, the
+refusals and what those numbers do not establish.
 
 ### Other flags that decide something
 
@@ -705,6 +709,12 @@ withdrawn after re-measurement.
 
 **Limits on the numbers**
 
+- **Most of them are litert-lm 0.16.1's.** The banking77 eight-bit pairs and
+  FunctionGemma's tool path were re-measured on 0.17.1, pinned after 0.1.x;
+  the headline FunctionGemma runs, Gemma 4's conversion costs, every four-bit
+  recipe and the phone runs were not.
+  [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) says
+  which is which.
 - **Measured on six models, all six fine-tuned here.**
   `functiongemma-270m-it` with the tool-call scorer, and `gemma-3-270m-it`,
   `gemma-3-1b-it`, `Qwen3-0.6B`, `Qwen2.5-0.5B-Instruct` and
@@ -757,7 +767,7 @@ withdrawn after re-measurement.
   CPU run that produced it (run A in [MEASUREMENTS.md](MEASUREMENTS.md); runs
   B and C scored 0.9016 and 0.8969, both just outside that interval). So the
   reference number predicted the phone to within about 0.03. One device, one
-  recipe.
+  recipe, and not re-measured since the runtime moved to 0.17.1.
 - **On a GPU box, the reference and the candidate can run on different
   hardware, and it is recorded rather than refused.** The candidate runs on
   the `litert-lm` backend `--backend` names, `cpu` by default, and the

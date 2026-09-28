@@ -91,6 +91,12 @@ So two numbers compare only when they name the same runtime. The sections below
 keep their 0.16.1 numbers; one taken on 0.17.1 goes beside them and never in
 place of them.
 
+Re-measured on 0.17.1 so far: the four banking77 eight-bit pairs, below, and
+FunctionGemma's tool path, in *The same checkpoint on litert-lm 0.17.1*.
+Nothing else has been: the headline FunctionGemma runs, Gemma 4's conversion
+costs and the four-bit recipes are `verify` numbers taken on 0.16.1, and the
+phone runs ran on the device.
+
 ### The banking77 sections on litert-lm 0.17.1
 
 The four banking77 eight-bit pairs were verified again on 2026-09-28 with
