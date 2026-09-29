@@ -193,9 +193,9 @@ class WhyItExists extends StatelessComponent {
       name: 'Qwen2.5 0.5B',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
-          '0.5B parameters, text only. It is the one checkpoint here whose '
-          'channelwise four-bit export produced a score at all, where the '
-          'others either refused or came apart, and that score cost it '
+          '0.5B parameters, text only. It is the one checkpoint here on '
+          'which channelwise four bits produced a score at all, where the '
+          'others either refused or came apart, and each such score cost it '
           'about a third of its accuracy.',
       hubId: 'Qwen/Qwen2.5-0.5B-Instruct',
       revision: '7ae55760',

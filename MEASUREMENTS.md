@@ -6,8 +6,8 @@ examples; exact match means the tool name **and** every argument value. Each
 section after them is another family: `gemma-3-270m-it` with the second scorer,
 `gemma-4-E2B-it`, converted from its base weights and then fine-tuned,
 `Qwen3-0.6B`, the first that is not a Gemma, `gemma-3-1b-it`, the other size one export rule claims, and
-`Qwen2.5-0.5B-Instruct`, the one checkpoint here whose channelwise four-bit
-export produced a score. The last returns to `functiongemma-270m-it`, measured
+`Qwen2.5-0.5B-Instruct`, the one checkpoint here on which channelwise four bits
+produced a score. The last returns to `functiongemma-270m-it`, measured
 through the runtime's tool path the way an application calls it.
 
 This file exists so the README can be a usage guide. It is the longer story:
