@@ -1218,7 +1218,7 @@ every one that reached the reference records it on cuda. The two runs differ in 
 so a difference between them is not attributed to the runtime. The transport
 matters here in one more way: on 0.16.1 litetune cut each prompt at 300 s, and
 since #50 a split shares 300 s per prompt, so one slow prompt no longer refuses
-a run.
+a run by itself; it can still use up the rest of the split's budget.
 
 | | 0.16.1 | 0.17.1: exact match | 0.17.1: cost of conversion |
 |---|---|---|---|
@@ -1247,10 +1247,10 @@ Every block-wise cost resolves again, and every recipe that refused on 0.16.1
 refuses again but one: **`weight_only_wi4_afp32` on Qwen2.5-0.5B finished all
 600 generations and costs +0.2500**, a third of the model's accuracy, beside
 `dynamic_wi4_afp32`'s +0.2683, each paired against the float twin and not
-against the other. On 0.16.1 it was refused because one prompt exceeded the
-300 s per-prompt limit, which the 0.17.1 transport no longer applies, so this is
-not the runtime finishing what 0.16.1 could not; whether any of the 600 took
-longer than 300 s is not recorded.
+against the other. On 0.16.1 it was refused because one prompt exceeded the 300
+s per-prompt limit, which the 0.17.1 transport no longer enforces per prompt,
+only across the split, so this is not the runtime finishing what 0.16.1 could
+not; whether any of the 600 took longer than 300 s is not recorded.
 
 The refusals otherwise read as follows. Qwen3's and gemma-3-1b's
 `weight_only_wi4_afp32` gates, which on 0.16.1 ran four of five prompts and cut
