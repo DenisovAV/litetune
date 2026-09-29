@@ -93,10 +93,11 @@ place of them.
 
 Re-measured on 0.17.1 so far: the four banking77 eight-bit pairs, below; the
 four-bit recipes on the same four checkpoints, in *Four bits on litert-lm
-0.17.1*; and FunctionGemma's tool path, in *The same checkpoint on litert-lm
-0.17.1*. Nothing else has been: the headline FunctionGemma runs and Gemma 4's
-conversion costs are `verify` numbers taken on 0.16.1, and the phone runs ran on
-the device.
+0.17.1*; the tuned Gemma 4 E2B's two eight-bit bundles, in *Gemma 4 E2B on
+litert-lm 0.17.1*; and FunctionGemma's tool path, in *The same checkpoint on
+litert-lm 0.17.1*. Nothing else has been: the headline FunctionGemma runs and
+the conversions of Gemma 4's base weights are `verify` numbers taken on 0.16.1,
+and the phone runs ran on the device.
 
 ### The banking77 sections on litert-lm 0.17.1
 
@@ -645,10 +646,12 @@ litetune 0.1.8; runtime `litert-lm==0.16.1`, `numpy==2.0.2`; reference
 | Fine-tuned, seven projections | **0.7883** ±0.0327 | 0.7667 ±0.0338 | 0.7700 ±0.0337 |
 | Cost of conversion | — | **+0.0217** ±0.0142 *(resolved, 19 discordant)* | **+0.0183** ±0.0108 *(resolved, 11 discordant)* |
 
-Sizes are 5,071,853,520 and 5,072,115,888 bytes.
+On litert-lm 0.16.1. The same bundles on 0.17.1 are [at the end of this
+section](#gemma-4-e2b-on-litert-lm-0171). Sizes are 5,071,853,520 and
+5,072,115,888 bytes.
 
-**Both eight-bit costs resolve, which no earlier section here has had happen
-together.** Each recipe has resolved before on its own: `dynamic_wi8_afp32` in
+**On 0.16.1 both eight-bit costs resolve, which no earlier section here has had
+happen together.** Each recipe has resolved before on its own: `dynamic_wi8_afp32` in
 run A of the FunctionGemma triple, on both phone backends for Qwen3-0.6B, and on
 the tool path; `weight_only_wi8_afp32` in FunctionGemma's run B, on Qwen3-0.6B
 and on gemma-3-1b (on 0.16.1; on 0.17.1 neither does). What has not happened
@@ -676,6 +679,30 @@ chosen when a real repack of a 455 MB bundle finished in seconds; a 5 GB
 bundle is the case it was not sized against. That does not
 touch the number above, which was measured on CPU, but the bundle as shipped
 is not the one to hand a GPU.
+
+### Gemma 4 E2B on litert-lm 0.17.1
+
+The two bundles above, each SHA-256 equal to the one `convert` recorded on
+2026-09-22, verified again on 2026-09-29 with litetune 0.2.0 (commit dfb4544) on
+litert-lm 0.17.1, against the same checkpoint on the same 600 rows, and
+otherwise as [The banking77 sections on litert-lm
+0.17.1](#the-banking77-sections-on-litert-lm-0171) describes. Both manifests
+record the candidate on `Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512 and 12
+vCPU, and the reference on cuda. The two runs differ in runtime, transport and
+possibly CPU, so a difference between them is not attributed to the runtime.
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| 0.16.1 run | **0.7883** ±0.0327 | 0.7667 ±0.0338 | 0.7700 ±0.0337 |
+| 0.17.1 run | **0.7883** ±0.0327 | 0.7800 ±0.0331 | 0.7833 ±0.0330 |
+| Cost of conversion, 0.17.1 run | — | +0.0083 ±0.0108 *(unresolved, 11 discordant)* | +0.0050 ±0.0057 *(unresolved, 3 discordant)* |
+
+Both costs resolved on 0.16.1 and neither does here: +0.0217 on 19 discordant
+rows, sixteen one way, and +0.0183 on 11, all eleven one way, there; +0.0083 on
+11, eight one way, and +0.0050 on 3, all three one way, here. That is two runs'
+verdicts, not a measured change in a cost, and neither run is withdrawn. The
+float reference is the same to four places. The conversions of the base weights
+at the top of this section were not re-measured.
 
 ## A fourth family, and the first that is not Gemma
 

@@ -710,10 +710,11 @@ withdrawn after re-measurement.
 
 **Limits on the numbers**
 
-- **Many of them are litert-lm 0.16.1's.** The banking77 eight-bit pairs, the
-  four-bit recipes on the four banking77 checkpoints and FunctionGemma's tool
-  path were re-measured on 0.17.1, pinned after 0.1.x; the headline
-  FunctionGemma runs, Gemma 4's conversion costs and the phone runs were not.
+- **Some of them are litert-lm 0.16.1's.** The banking77 eight-bit pairs, the
+  four-bit recipes on the four banking77 checkpoints, the tuned Gemma 4 E2B's
+  eight-bit pair and FunctionGemma's tool path were re-measured on 0.17.1,
+  pinned after 0.1.x; the headline FunctionGemma runs, the conversions of
+  Gemma 4's base weights and the phone runs were not.
   [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) says
   which is which.
 - **Measured on six models, all six fine-tuned here.**
