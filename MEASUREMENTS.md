@@ -1031,7 +1031,7 @@ float twin. Sizes are the `.litertlm` the export wrote.
 | gemma-3-1b-it | bytes | exact match | cost of conversion | discordant |
 |---|---|---|---|---|
 | float twin | — | **0.7533** ±0.0345 | — | — |
-| `dynamic_wi4_afp32` | 680,203,568 | *refused after scoring* | — | — |
+| `dynamic_wi4_afp32` | 680,203,568 | *refused past the gate* | — | — |
 | `weight_only_wi4_afp32` | 680,465,936 | *refused at the gate* | — | — |
 | `dynamic_wi4b32_afp32` | 741,578,240 | 0.6650 ±0.0378 | **+0.0883** ±0.0287 *(resolved)* | 77 of 600 |
 | `dynamic_wi4b32_emb8_afp32` | 879,990,064 | 0.6650 ±0.0378 | **+0.0883** ±0.0290 *(resolved)* | 79 of 600 |
@@ -1044,7 +1044,8 @@ float twin. Sizes are the `.litertlm` the export wrote.
 | `dynamic_wi4b32_afp32` | 359,203,968 | 0.6933 ±0.0369 | **+0.0767** ±0.0257 *(resolved)* | 62 of 600 |
 | `dynamic_wi4b32_emb8_afp32` | 422,409,136 | 0.6783 ±0.0374 | **+0.0917** ±0.0271 *(resolved)* | 69 of 600 |
 
-On litert-lm 0.16.1. The same bundles on 0.17.1 are [at the end of this
+The tables and the paragraphs below, down to *On a phone*, are litert-lm
+0.16.1's. The same bundles on 0.17.1 are [at the end of this
 section](#four-bits-on-litert-lm-0171).
 
 **Channelwise four bits reached a score on one model of four.** On the other
@@ -1076,8 +1077,8 @@ accuracy — the recipe is not rehabilitated by having finally produced a number
 `weight_only_wi4_afp32` got further here than on any earlier model and still
 produced nothing: its gate opened, 599 of 600 generations ran, one exceeded the
 300 s per-prompt limit, and `verify` returned `failed_harness` and exit 4 rather
-than scoring the rows that did finish. Across four models the same two recipes
-have now produced a refusal at the gate, a refusal past the gate, a run that
+than scoring the rows that did finish. On 0.16.1, across four models, the same
+two recipes produced a refusal at the gate, a refusal past the gate, a run that
 generated 599 of 600 and was refused for the one it did not, and one resolved
 cost — which is four ways of learning that what these recipes do is a property
 of the checkpoint they are given.
@@ -1144,10 +1145,11 @@ the other. Each was paired against its float twin and never against the other,
 and the intervals overlap on all four models — with int8 embeddings Qwen3 reads
 worse (+0.0550 against +0.0350), Qwen2.5 worse as well (+0.0917 against
 +0.0767), gemma-3-270m better (+0.3200 against +0.3483) and gemma-3-1b
-identically (+0.0883 either way), and none of those differences is one this
-design can settle. Nor does it say anything about models larger than these
-four, or about 4-bit weights produced some other way, such as by
-quantization-aware training. One run each, one runtime.
+identically (+0.0883 either way), all on 0.16.1, and none of those differences
+is one this design can settle. Nor does it say anything about models larger than
+these four, or about 4-bit weights produced some other way, such as by
+quantization-aware training. One run each on 0.16.1; the 0.17.1 run below is not
+paired with it.
 
 **On a phone, the backend changes the answer.** The Qwen3-0.6B artifacts above
 were run on a Galaxy S24 (`SC-51E`, SM8650, Android 36) through Firebase Test
@@ -1175,13 +1177,19 @@ phone model, one run per cell, greedy decoding.
 
 ### Four bits on litert-lm 0.17.1
 
-The same sixteen bundles -- each SHA-256 equal to the one `convert` recorded --
-verified again from 2026-09-28 to 2026-09-29 with litetune at commit 0744a1e on
-litert-lm 0.17.1, behind the same five-prompt gate with its 900 s budget, and
-otherwise as [The banking77 sections on litert-lm
+The same sixteen bundles, verified again from 2026-09-28 to 2026-09-29 with
+litetune at commit 0744a1e on litert-lm 0.17.1, behind the same five-prompt gate
+with its 900 s budget, and otherwise as [The banking77 sections on litert-lm
 0.17.1](#the-banking77-sections-on-litert-lm-0171) describes for the eight-bit
-pairs. The two runs differ in runtime, transport and possibly CPU, so a
-difference between them is not attributed to the runtime.
+pairs. Thirteen of the sixteen wrote a manifest, and each SHA-256 there equals
+the one `convert` recorded when 0.1.6, 0.1.7 or 0.1.8 built the bundle; the
+three whose gate ran out of time wrote none. Every manifest records the
+candidate on `Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512 and 12 vCPU, and the
+reference on cuda. The two runs differ in runtime, transport and possibly CPU,
+so a difference between them is not attributed to the runtime. The transport
+matters here in one more way: on 0.16.1 litetune cut each prompt at 300 s, and
+since #50 a split shares 300 s per prompt, so one slow prompt no longer refuses
+a run.
 
 | | 0.16.1 | 0.17.1: exact match | 0.17.1: cost of conversion |
 |---|---|---|---|
@@ -1193,7 +1201,7 @@ difference between them is not attributed to the runtime.
 | gemma-3-270m, `weight_only_wi4_afp32` | refused at the gate | *refused at the gate*: five prompts not done in 900 s | — |
 | gemma-3-270m, `dynamic_wi4b32_afp32` | **+0.3483** (237) | 0.3067 ±0.0369 | **+0.3650** ±0.0518 *(resolved, 251 discordant)* |
 | gemma-3-270m, `dynamic_wi4b32_emb8_afp32` | **+0.3200** (218) | 0.2650 ±0.0353 | **+0.4067** ±0.0529 *(resolved, 262 discordant)* |
-| gemma-3-1b, `dynamic_wi4_afp32` | refused after scoring | *refused after scoring*: repeated itself on 65 of 600 | — |
+| gemma-3-1b, `dynamic_wi4_afp32` | refused past the gate | *refused past the gate*: repeated itself on 65 of 600 | — |
 | gemma-3-1b, `weight_only_wi4_afp32` | refused at the gate | *refused at the gate*: five prompts not done in 900 s | — |
 | gemma-3-1b, `dynamic_wi4b32_afp32` | **+0.0883** (77) | 0.6700 ±0.0376 | **+0.0833** ±0.0296 *(resolved, 82 discordant)* |
 | gemma-3-1b, `dynamic_wi4b32_emb8_afp32` | **+0.0883** (79) | 0.6750 ±0.0375 | **+0.0783** ±0.0283 *(resolved, 75 discordant)* |
@@ -1206,20 +1214,32 @@ The 0.16.1 column is each cost with its discordant rows, from the tables above;
 every one of them resolved. The float references are the same to four places as
 there.
 
-Every block-wise cost resolves again, and the recipes that refused still refuse,
-with one exception: **`weight_only_wi4_afp32` on Qwen2.5-0.5B reached a score**,
-all 600 generations finishing where on 0.16.1 one exceeded the 300 s per-prompt
-limit, and it costs +0.2500, beside `dynamic_wi4_afp32`'s +0.2683 on the same
-model. Two refusals changed their reason: gemma-3-270m's `dynamic_wi4_afp32`
-repeated itself on all five gate prompts, worst ratio 0.9945, where on 0.16.1 it
-leaked `<bos>`, and Qwen3's on two of five, worst 0.9829, where on 0.16.1 it was
-one. gemma-3-1b's `dynamic_wi4_afp32` repeated itself on 65 of 600 in both runs.
+Every block-wise cost resolves again, and every recipe that refused on 0.16.1
+refuses again but one: **`weight_only_wi4_afp32` on Qwen2.5-0.5B finished all
+600 generations and costs +0.2500**, a third of the model's accuracy, beside
+`dynamic_wi4_afp32`'s +0.2683, each paired against the float twin and not
+against the other. On 0.16.1 it was refused because one prompt exceeded the
+300 s per-prompt limit, which the 0.17.1 transport no longer applies, so this is
+not the runtime finishing what 0.16.1 could not; whether any of the 600 took
+longer than 300 s is not recorded.
 
-On gemma-3-270m the two block-wise recipes swapped places: int8 embeddings cost
-+0.3200 against +0.3483 on 0.16.1 and +0.4067 against +0.3650 here. Each run's
-two figures are paired against the float twin and never against each other, and
-the two runs are two runs' verdicts, so which recipe costs the 270M less is not
-established by either.
+The refusals otherwise read as follows. Qwen3's and gemma-3-1b's
+`weight_only_wi4_afp32` gates, which on 0.16.1 ran four of five prompts and cut
+one at 300 s, wrote nothing within the gate's 900 s budget, as gemma-3-270m's
+did in both runs. gemma-3-270m's `dynamic_wi4_afp32` was refused for repetition
+on all five gate prompts, worst ratio 0.9945, where on 0.16.1 it was refused for
+a leaked `<bos>`; liveness stops at the first check that fails and the leak
+check runs first, so whether it also repeated on 0.16.1 is not known. Qwen3's
+repeated itself on two of five, worst 0.9829, against one on 0.16.1, and
+gemma-3-1b's on 65 of 600 in both runs.
+
+On gemma-3-270m the two block-wise costs reversed order: with int8 embeddings
++0.3200 against +0.3483 on 0.16.1, and +0.4067 against +0.3650 here. Within
+each run both were paired against the float twin and never against each other,
+so neither run orders them, and which recipe costs the 270M less is not
+established. The int8-embeddings bundle scored 0.2650 here against 0.3517 on
+0.16.1, 52 rows fewer against an unchanged float score; the rows were not kept,
+so that is not a paired test, and it is not attributed.
 
 ## The same model through the runtime's tool path
 

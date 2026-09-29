@@ -301,20 +301,19 @@ applied by `litert-torch export_hf` during `convert`, and `--recipe` passes a
 name litetune does not know straight through to it. litetune defines exactly one
 of its own, shipped as a quantizer recipe file inside the package; what it adds
 to the rest is a measurement of what each costs on your task. The costs below
-were taken on litert-lm 0.16.1, the runtime 0.1.x pins. Re-measured on 0.17.1,
-the runtime litetune pins after 0.1.x, every block-wise cost resolves again and
-every channelwise refusal stands but one: `weight_only_wi4_afp32` reached a
-score on Qwen2.5-0.5B, a cost of +0.2500. See
-[MEASUREMENTS.md](MEASUREMENTS.md#four-bits-on-litert-lm-0171) for both runs.
+were taken on litert-lm 0.16.1, the runtime 0.1.x pins, and the four-bit rows
+give 0.17.1's beside them, the runtime litetune pins after 0.1.x. The two runs
+differ in runtime, transport and possibly CPU; see
+[MEASUREMENTS.md](MEASUREMENTS.md#four-bits-on-litert-lm-0171) for both.
 
 | recipe | |
 |---|---|
 | `dynamic_wi8_afp32` | the toolchain's default; its own docstring warns quality "may suffer" |
 | `weight_only_wi8_afp32` | dequantizes before compute, so slower by an unmeasured amount |
-| `dynamic_wi4_afp32` | 4-bit channelwise. Refused on three of the four models measured — a leaked `<bos>` on gemma-3-270m, degenerate repetition on Qwen3 and, past the gate, on 65 of 600 rows on gemma-3-1b. On Qwen2.5-0.5B it ran all 600 and cost +0.2567, a third of the model's accuracy |
-| `weight_only_wi4_afp32` | 4-bit channelwise, dequantised before compute. Refused on all four, and always the same way: prompts that never finished. On Qwen2.5-0.5B the gate opened and one generation of 600 still timed out, so there is no score |
-| `dynamic_wi4b32_afp32` | 4-bit in blocks of 32. Reached a score on all four; cost +0.0350 on a tuned Qwen3-0.6B, +0.0767 on a tuned Qwen2.5-0.5B, +0.0883 on a tuned gemma-3-1b and +0.3483 on a tuned gemma-3-270m |
-| `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550, +0.0917, +0.0883 and +0.3200 on the same four |
+| `dynamic_wi4_afp32` | 4-bit channelwise. On 0.16.1 refused on three of the four models measured — a leaked `<bos>` on gemma-3-270m, degenerate repetition on Qwen3 and, past the gate, on 65 of 600 rows on gemma-3-1b — and on Qwen2.5-0.5B it ran all 600 and cost +0.2567, a third of the model's accuracy. On 0.17.1 the same three refused, all for repetition, and Qwen2.5-0.5B cost +0.2683 |
+| `weight_only_wi4_afp32` | 4-bit channelwise, dequantised before compute. On 0.16.1 refused on all four, and always the same way: prompts that never finished; on Qwen2.5-0.5B the gate opened and one generation of 600 still hit litetune's 300 s per-prompt limit. On 0.17.1 the other three refused again, and Qwen2.5-0.5B, with that limit gone from the transport, cost +0.2500, a third of its accuracy |
+| `dynamic_wi4b32_afp32` | 4-bit in blocks of 32. Reached a score on all four; cost +0.0350 on a tuned Qwen3-0.6B, +0.0767 on a tuned Qwen2.5-0.5B, +0.0883 on a tuned gemma-3-1b and +0.3483 on a tuned gemma-3-270m on 0.16.1, and +0.0283, +0.0767, +0.0833 and +0.3650 on 0.17.1 |
+| `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550, +0.0917, +0.0883 and +0.3200 on the same four on 0.16.1, and +0.0500, +0.0833, +0.0783 and +0.4067 on 0.17.1 |
 
 `--recipe` has no default. A sweep of one is not a comparison. **At four bits,
 on litert-lm 0.16.1, every model measured here lost accuracy the sample
@@ -712,9 +711,9 @@ withdrawn after re-measurement.
 **Limits on the numbers**
 
 - **Many of them are litert-lm 0.16.1's.** The banking77 eight-bit pairs, the
-  four-bit recipes and FunctionGemma's tool path were re-measured on 0.17.1,
-  pinned after 0.1.x; the headline FunctionGemma runs, Gemma 4's conversion
-  costs and the phone runs were not.
+  four-bit recipes on the four banking77 checkpoints and FunctionGemma's tool
+  path were re-measured on 0.17.1, pinned after 0.1.x; the headline
+  FunctionGemma runs, Gemma 4's conversion costs and the phone runs were not.
   [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) says
   which is which.
 - **Measured on six models, all six fine-tuned here.**
