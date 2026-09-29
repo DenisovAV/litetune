@@ -95,9 +95,9 @@ Re-measured on 0.17.1 so far: the four banking77 eight-bit pairs, below; the
 four-bit recipes on the same four checkpoints, in *Four bits on litert-lm
 0.17.1*; the tuned Gemma 4 E2B's two eight-bit bundles, in *Gemma 4 E2B on
 litert-lm 0.17.1*; and FunctionGemma's tool path, in *The same checkpoint on
-litert-lm 0.17.1*. Nothing else has been: the headline FunctionGemma runs and
-the conversions of Gemma 4's base weights are `verify` numbers taken on 0.16.1,
-and the phone runs ran on the device.
+litert-lm 0.17.1*. The rest has not been; among it the headline FunctionGemma
+runs, the conversions of Gemma 4's base weights and the runs on untuned bases
+are `verify` numbers taken on 0.16.1, and the phone runs ran on the device.
 
 ### The banking77 sections on litert-lm 0.17.1
 
@@ -133,7 +133,9 @@ litetune computes no interval between two runs, and the manifests keep scores,
 not rows, so the paired test between the two candidates cannot be computed.
 Every candidate is discordant with its reference on fewer rows on 0.17.1, eight
 of eight; that too is an observation without an interval, and the reference
-was re-run as well. Each section has its pair in full.
+was re-run as well. Each section has its pair in full. The tuned Gemma 4 E2B's
+pair, on the same split, was re-measured separately, in *Gemma 4 E2B on
+litert-lm 0.17.1*.
 
 ## The headline numbers
 
@@ -651,12 +653,12 @@ section](#gemma-4-e2b-on-litert-lm-0171). Sizes are 5,071,853,520 and
 5,072,115,888 bytes.
 
 **On 0.16.1 both eight-bit costs resolve, which no earlier section here has had
-happen together.** Each recipe has resolved before on its own: `dynamic_wi8_afp32` in
-run A of the FunctionGemma triple, on both phone backends for Qwen3-0.6B, and on
-the tool path; `weight_only_wi8_afp32` in FunctionGemma's run B, on Qwen3-0.6B
-and on gemma-3-1b (on 0.16.1; on 0.17.1 neither does). What has not happened
-before is both in one run -- the closest is the FunctionGemma triple, where run
-A resolved one recipe and run B the other.
+happen together.** Each recipe has resolved before on its own:
+`dynamic_wi8_afp32` in run A of the FunctionGemma triple, on both phone backends
+for Qwen3-0.6B, and on the tool path; `weight_only_wi8_afp32` in FunctionGemma's
+run B, on Qwen3-0.6B and on gemma-3-1b (on 0.16.1; on 0.17.1 neither does). What
+has not happened before is both in one run -- the closest is the FunctionGemma
+triple, where run A resolved one recipe and run B the other.
 
 **What that does not establish.** This checkpoint is roughly five times the
 largest measured before it, and it is tempting to read the resolution off the
@@ -702,7 +704,7 @@ rows, sixteen one way, and +0.0183 on 11, all eleven one way, there; +0.0083 on
 11, eight one way, and +0.0050 on 3, all three one way, here. That is two runs'
 verdicts, not a measured change in a cost, and neither run is withdrawn. The
 float reference is the same to four places. The conversions of the base weights
-at the top of this section were not re-measured.
+in this family's first table were not re-measured.
 
 ## A fourth family, and the first that is not Gemma
 
