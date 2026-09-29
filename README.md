@@ -173,7 +173,7 @@ tool path only and the CPU nowhere.
 | litetune | candidate runtime | conversion | training and float reference |
 |---|---|---|---|
 | 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
-| 0.2.0 | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
+| 0.2.0 – 0.2.1 | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
@@ -311,7 +311,7 @@ differ in runtime, transport and possibly CPU; see
 | `dynamic_wi8_afp32` | the toolchain's default; its own docstring warns quality "may suffer" |
 | `weight_only_wi8_afp32` | dequantizes before compute, so slower by an unmeasured amount |
 | `dynamic_wi4_afp32` | 4-bit channelwise. On 0.16.1 refused on three of the four models measured — a leaked `<bos>` on gemma-3-270m, degenerate repetition on Qwen3 and, past the gate, on 65 of 600 rows on gemma-3-1b — and on Qwen2.5-0.5B it ran all 600 and cost +0.2567, a third of the model's accuracy. On 0.17.1 the same three refused, all for repetition, and Qwen2.5-0.5B cost +0.2683 |
-| `weight_only_wi4_afp32` | 4-bit channelwise, dequantised before compute. On 0.16.1 refused on all four, and always the same way: prompts that never finished; on Qwen2.5-0.5B the gate opened and one generation of 600 still hit litetune's 300 s per-prompt limit. On 0.17.1 the other three refused again, and Qwen2.5-0.5B, with that limit gone from the transport, cost +0.2500, a third of its accuracy |
+| `weight_only_wi4_afp32` | 4-bit channelwise, dequantised before compute. On 0.16.1 refused on all four, and always the same way: prompts that never finished; on Qwen2.5-0.5B the gate opened and one generation of 600 still hit litetune's 300 s per-prompt limit. On 0.17.1 the other three refused again, and Qwen2.5-0.5B, with that limit gone from the transport, cost +0.2500 against its float 0.7700 |
 | `dynamic_wi4b32_afp32` | 4-bit in blocks of 32. Reached a score on all four; cost +0.0350 on a tuned Qwen3-0.6B, +0.0767 on a tuned Qwen2.5-0.5B, +0.0883 on a tuned gemma-3-1b and +0.3483 on a tuned gemma-3-270m on 0.16.1, and +0.0283, +0.0767, +0.0833 and +0.3650 on 0.17.1 |
 | `dynamic_wi4b32_emb8_afp32` | litetune's own: those weights with int8 embeddings. +0.0550, +0.0917, +0.0883 and +0.3200 on the same four on 0.16.1, and +0.0500, +0.0833, +0.0783 and +0.4067 on 0.17.1 |
 

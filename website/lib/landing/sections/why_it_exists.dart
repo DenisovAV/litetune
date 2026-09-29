@@ -195,8 +195,8 @@ class WhyItExists extends StatelessComponent {
       what:
           '0.5B parameters, text only. It is the one checkpoint here on '
           'which channelwise four bits produced a score at all, where the '
-          'others either refused or came apart, and each such score cost it '
-          'about a third of its accuracy.',
+          'others either refused or came apart, and those scores cost it '
+          '+0.2683 and +0.2500 against its float 0.7700 on litert-lm 0.17.1.',
       hubId: 'Qwen/Qwen2.5-0.5B-Instruct',
       revision: '7ae55760',
       anchor:

@@ -3,6 +3,11 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.2.1 — 2026-09-29
+- The four-bit recipes on the four banking77 checkpoints are re-measured on litert-lm 0.17.1, beside their 0.16.1 numbers (#60).
+- The tuned Gemma 4 E2B's eight-bit pair is re-measured on litert-lm 0.17.1, beside its 0.16.1 numbers (#61).
+- The site's Qwen2.5-0.5B card no longer calls its channelwise four-bit scores usable (#60).
+
 ## 0.2.0 — 2026-09-28
 - **Re-run `verify` for any model you ship on litert-lm 0.17.1, as flutter_gemma_litertlm 1.8.0 does — 0.1.x measured on 0.16.1, and the two runtimes do not give the same answers (#55).**
 - `verify` runs the candidate on litert-lm 0.17.1, and `convert` pins litert-torch-nightly 0.10.0.dev20260926 with litert-lm-builder 0.17.1 and the quantizer, LiteRT and converter packages it requires (#55).
