@@ -1218,7 +1218,7 @@ every one that reached the reference records it on cuda. The two runs differ in 
 so a difference between them is not attributed to the runtime. The transport
 matters here in one more way: on 0.16.1 litetune cut each prompt at 300 s, and
 since #50 a split shares 300 s per prompt, so one slow prompt no longer refuses
-a run.
+a run by itself; it can still use up the rest of the split's budget.
 
 | | 0.16.1 | 0.17.1: exact match | 0.17.1: cost of conversion |
 |---|---|---|---|
