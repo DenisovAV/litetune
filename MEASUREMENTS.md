@@ -1184,8 +1184,8 @@ with its 900 s budget, and otherwise as [The banking77 sections on litert-lm
 pairs. Thirteen of the sixteen wrote a manifest, and each SHA-256 there equals
 the one `convert` recorded when 0.1.6, 0.1.7 or 0.1.8 built the bundle; the
 three whose gate ran out of time wrote none. Every manifest records the
-candidate on `Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512 and 12 vCPU, and the
-reference on cuda. The two runs differ in runtime, transport and possibly CPU,
+candidate on `Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512 and 12 vCPU, and
+every one that reached the reference records it on cuda. The two runs differ in runtime, transport and possibly CPU,
 so a difference between them is not attributed to the runtime. The transport
 matters here in one more way: on 0.16.1 litetune cut each prompt at 300 s, and
 since #50 a split shares 300 s per prompt, so one slow prompt no longer refuses
