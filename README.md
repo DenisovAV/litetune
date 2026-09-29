@@ -301,10 +301,11 @@ applied by `litert-torch export_hf` during `convert`, and `--recipe` passes a
 name litetune does not know straight through to it. litetune defines exactly one
 of its own, shipped as a quantizer recipe file inside the package; what it adds
 to the rest is a measurement of what each costs on your task. The costs below
-were taken on litert-lm 0.16.1, the runtime 0.1.x pins. The four-bit ones have
-not been re-measured on 0.17.1, the runtime litetune pins after 0.1.x, and a
-runtime change is not to be assumed to leave a number where it was: see
-[MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on).
+were taken on litert-lm 0.16.1, the runtime 0.1.x pins. Re-measured on 0.17.1,
+the runtime litetune pins after 0.1.x, every block-wise cost resolves again and
+every channelwise refusal stands but one: `weight_only_wi4_afp32` reached a
+score on Qwen2.5-0.5B, a cost of +0.2500. See
+[MEASUREMENTS.md](MEASUREMENTS.md#four-bits-on-litert-lm-0171) for both runs.
 
 | recipe | |
 |---|---|
@@ -710,10 +711,10 @@ withdrawn after re-measurement.
 
 **Limits on the numbers**
 
-- **Most of them are litert-lm 0.16.1's.** The banking77 eight-bit pairs and
-  FunctionGemma's tool path were re-measured on 0.17.1, pinned after 0.1.x;
-  the headline FunctionGemma runs, Gemma 4's conversion costs, every four-bit
-  recipe and the phone runs were not.
+- **Many of them are litert-lm 0.16.1's.** The banking77 eight-bit pairs, the
+  four-bit recipes and FunctionGemma's tool path were re-measured on 0.17.1,
+  pinned after 0.1.x; the headline FunctionGemma runs, Gemma 4's conversion
+  costs and the phone runs were not.
   [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) says
   which is which.
 - **Measured on six models, all six fine-tuned here.**

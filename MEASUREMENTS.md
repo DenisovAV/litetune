@@ -91,11 +91,12 @@ So two numbers compare only when they name the same runtime. The sections below
 keep their 0.16.1 numbers; one taken on 0.17.1 goes beside them and never in
 place of them.
 
-Re-measured on 0.17.1 so far: the four banking77 eight-bit pairs, below, and
-FunctionGemma's tool path, in *The same checkpoint on litert-lm 0.17.1*.
-Nothing else has been: the headline FunctionGemma runs, Gemma 4's conversion
-costs and the four-bit recipes are `verify` numbers taken on 0.16.1, and the
-phone runs ran on the device.
+Re-measured on 0.17.1 so far: the four banking77 eight-bit pairs, below; the
+four-bit recipes on the same four checkpoints, in *Four bits on litert-lm
+0.17.1*; and FunctionGemma's tool path, in *The same checkpoint on litert-lm
+0.17.1*. Nothing else has been: the headline FunctionGemma runs and Gemma 4's
+conversion costs are `verify` numbers taken on 0.16.1, and the phone runs ran on
+the device.
 
 ### The banking77 sections on litert-lm 0.17.1
 
@@ -1043,6 +1044,9 @@ float twin. Sizes are the `.litertlm` the export wrote.
 | `dynamic_wi4b32_afp32` | 359,203,968 | 0.6933 ±0.0369 | **+0.0767** ±0.0257 *(resolved)* | 62 of 600 |
 | `dynamic_wi4b32_emb8_afp32` | 422,409,136 | 0.6783 ±0.0374 | **+0.0917** ±0.0271 *(resolved)* | 69 of 600 |
 
+On litert-lm 0.16.1. The same bundles on 0.17.1 are [at the end of this
+section](#four-bits-on-litert-lm-0171).
+
 **Channelwise four bits reached a score on one model of four.** On the other
 three the harness never got that far. It gates a bundle on five prompts before
 spending an hour on 600 — litetune has no gate of its own — and both channelwise
@@ -1066,8 +1070,8 @@ gate, not of `verify`, which is what found it.
 
 **On Qwen2.5-0.5B both channelwise recipes cleared the gate, and one of them
 answered.** `dynamic_wi4_afp32` ran all 600 rows: 0.5133 against the float
-twin's 0.7700, a cost of **+0.2567** that resolves on 178 changed rows. That is
-the first channelwise figure in this file, and it is a third of the model's
+twin's 0.7700, a cost of **+0.2567** that resolves on 178 discordant rows. That
+is the first channelwise figure in this file, and it is a third of the model's
 accuracy — the recipe is not rehabilitated by having finally produced a number.
 `weight_only_wi4_afp32` got further here than on any earlier model and still
 produced nothing: its gate opened, 599 of 600 generations ran, one exceeded the
@@ -1078,24 +1082,25 @@ generated 599 of 600 and was refused for the one it did not, and one resolved
 cost — which is four ways of learning that what these recipes do is a property
 of the checkpoint they are given.
 
-**Dequantising before compute rescued nothing, on any of the four.**
+**On 0.16.1, dequantising before compute rescued nothing, on any of the four.**
 `weight_only_wi4_afp32` does exactly that, and it is the one recipe in this file
-that has never produced a score: it failed the gate on gemma-3-270m, Qwen3-0.6B
-and gemma-3-1b, and on Qwen2.5-0.5B it cleared the gate and then lost a single
-generation to the timeout. `dynamic_wi4_afp32`, which keeps activations in
-integers, is the one that eventually answered. So integer activations are not
-what separates a working bundle from a broken one here — if anything the
-evidence runs the other way, and on three of the four checkpoints neither recipe
-produced an answer at all. A five-prompt diagnostic through both int8 and both channelwise bundles of
-gemma-3-270m and Qwen3-0.6B — the two block-wise recipes were never in it —
-says the same from the other side: at 8 bits both models emit the reference's label
-and stop, the terminator scoring at or above −0.001 in log-probability; at 4 bits
-channelwise, Qwen3 matches one of five labels exactly and on another emits the
-right label and then does not stop — its terminator scores −0.64 to −4.17 — while
-gemma produces no label at all, scoring the reference answer at −32 to −107
-against −0.03 to −0.47 at 8 bits. Those last figures are the diagnostic's
-`score_total` with the terminator token's own log-probability taken off, which is
-why they are not the raw totals in `*__diag-int4.json`.
+that never produced a score on 0.16.1 (on 0.17.1 it did, on Qwen2.5-0.5B,
+below): it failed the gate on gemma-3-270m, Qwen3-0.6B and gemma-3-1b, and on
+Qwen2.5-0.5B it cleared the gate and then lost a single generation to the
+timeout. `dynamic_wi4_afp32`, which keeps activations in integers, is the one
+that eventually answered. So integer activations are not what separates a
+working bundle from a broken one here — if anything the evidence runs the other
+way, and on three of the four checkpoints neither recipe produced an answer at
+all. A five-prompt diagnostic through both int8 and both channelwise bundles of
+gemma-3-270m and Qwen3-0.6B — the two block-wise recipes were never in it — says
+the same from the other side: at 8 bits both models emit the reference's label
+and stop, the terminator scoring at or above −0.001 in log-probability; at 4
+bits channelwise, Qwen3 matches one of five labels exactly and on another emits
+the right label and then does not stop — its terminator scores −0.64 to −4.17 —
+while gemma produces no label at all, scoring the reference answer at −32 to
+−107 against −0.03 to −0.47 at 8 bits. Those last figures are the diagnostic's
+`score_total` with the terminator token's own log-probability taken off, which
+is why they are not the raw totals in `*__diag-int4.json`.
 
 **Blocks of 32 fix the breakage and still cost accuracy.** A scale per 32 weights
 instead of one per output channel passes the gate on all four models and scores
@@ -1167,6 +1172,54 @@ What the phone run does not establish: the difference between it and the cloud
 CPU number for the same file (0.6817 against 0.6917) is two numbers, not a paired
 test, because the cloud candidate's per-row generations were never shipped. One
 phone model, one run per cell, greedy decoding.
+
+### Four bits on litert-lm 0.17.1
+
+The same sixteen bundles -- each SHA-256 equal to the one `convert` recorded --
+verified again from 2026-09-28 to 2026-09-29 with litetune at commit 0744a1e on
+litert-lm 0.17.1, behind the same five-prompt gate with its 900 s budget, and
+otherwise as [The banking77 sections on litert-lm
+0.17.1](#the-banking77-sections-on-litert-lm-0171) describes for the eight-bit
+pairs. The two runs differ in runtime, transport and possibly CPU, so a
+difference between them is not attributed to the runtime.
+
+| | 0.16.1 | 0.17.1: exact match | 0.17.1: cost of conversion |
+|---|---|---|---|
+| Qwen3-0.6B, `dynamic_wi4_afp32` | refused at the gate | *refused at the gate*: repeated itself on 2 of 5 | — |
+| Qwen3-0.6B, `weight_only_wi4_afp32` | refused at the gate | *refused at the gate*: five prompts not done in 900 s | — |
+| Qwen3-0.6B, `dynamic_wi4b32_afp32` | **+0.0350** (57) | 0.6700 ±0.0376 | **+0.0283** ±0.0242 *(resolved, 55 discordant)* |
+| Qwen3-0.6B, `dynamic_wi4b32_emb8_afp32` | **+0.0550** (67) | 0.6483 ±0.0382 | **+0.0500** ±0.0244 *(resolved, 56 discordant)* |
+| gemma-3-270m, `dynamic_wi4_afp32` | refused at the gate | *refused at the gate*: repeated itself on 5 of 5 | — |
+| gemma-3-270m, `weight_only_wi4_afp32` | refused at the gate | *refused at the gate*: five prompts not done in 900 s | — |
+| gemma-3-270m, `dynamic_wi4b32_afp32` | **+0.3483** (237) | 0.3067 ±0.0369 | **+0.3650** ±0.0518 *(resolved, 251 discordant)* |
+| gemma-3-270m, `dynamic_wi4b32_emb8_afp32` | **+0.3200** (218) | 0.2650 ±0.0353 | **+0.4067** ±0.0529 *(resolved, 262 discordant)* |
+| gemma-3-1b, `dynamic_wi4_afp32` | refused after scoring | *refused after scoring*: repeated itself on 65 of 600 | — |
+| gemma-3-1b, `weight_only_wi4_afp32` | refused at the gate | *refused at the gate*: five prompts not done in 900 s | — |
+| gemma-3-1b, `dynamic_wi4b32_afp32` | **+0.0883** (77) | 0.6700 ±0.0376 | **+0.0833** ±0.0296 *(resolved, 82 discordant)* |
+| gemma-3-1b, `dynamic_wi4b32_emb8_afp32` | **+0.0883** (79) | 0.6750 ±0.0375 | **+0.0783** ±0.0283 *(resolved, 75 discordant)* |
+| Qwen2.5-0.5B, `dynamic_wi4_afp32` | **+0.2567** (178) | 0.5017 ±0.0400 | **+0.2683** ±0.0451 *(resolved, 191 discordant)* |
+| Qwen2.5-0.5B, `weight_only_wi4_afp32` | one generation never finished | 0.5200 ±0.0400 | **+0.2500** ±0.0431 *(resolved, 174 discordant)* |
+| Qwen2.5-0.5B, `dynamic_wi4b32_afp32` | **+0.0767** (62) | 0.6933 ±0.0369 | **+0.0767** ±0.0253 *(resolved, 60 discordant)* |
+| Qwen2.5-0.5B, `dynamic_wi4b32_emb8_afp32` | **+0.0917** (69) | 0.6867 ±0.0371 | **+0.0833** ±0.0257 *(resolved, 62 discordant)* |
+
+The 0.16.1 column is each cost with its discordant rows, from the tables above;
+every one of them resolved. The float references are the same to four places as
+there.
+
+Every block-wise cost resolves again, and the recipes that refused still refuse,
+with one exception: **`weight_only_wi4_afp32` on Qwen2.5-0.5B reached a score**,
+all 600 generations finishing where on 0.16.1 one exceeded the 300 s per-prompt
+limit, and it costs +0.2500, beside `dynamic_wi4_afp32`'s +0.2683 on the same
+model. Two refusals changed their reason: gemma-3-270m's `dynamic_wi4_afp32`
+repeated itself on all five gate prompts, worst ratio 0.9945, where on 0.16.1 it
+leaked `<bos>`, and Qwen3's on two of five, worst 0.9829, where on 0.16.1 it was
+one. gemma-3-1b's `dynamic_wi4_afp32` repeated itself on 65 of 600 in both runs.
+
+On gemma-3-270m the two block-wise recipes swapped places: int8 embeddings cost
++0.3200 against +0.3483 on 0.16.1 and +0.4067 against +0.3650 here. Each run's
+two figures are paired against the float twin and never against each other, and
+the two runs are two runs' verdicts, so which recipe costs the 270M less is not
+established by either.
 
 ## The same model through the runtime's tool path
 
