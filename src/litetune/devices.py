@@ -178,13 +178,24 @@ def host_record(
 #   (vm.page_free_count + vm.page_speculative_count
 #    + vm.page_pageable_external_count + vm.page_purgeable_count) * hw.pagesize
 #
-# the sum XNU's jetsam counts as available (osfmk/vm/vm_page.h, around lines
-# 1533-1539, in the XNU source the review read; not checked against a copy
-# here). It is not `kern.memorystatus_level`, which an earlier draft used: that
-# is XNU's pressure level, computed from active + inactive + free + speculative
-# pages over the total (vm_pageout.c, `vm_pressure_response`, and vm_page.h's
-# `AVAILABLE_NON_COMPRESSED_MEMORY`, same reading), so it counts other
-# processes' active memory as available. Read on 2026-10-02 on a 24 GiB Mac
+# pages nothing else is holding on to: free, speculative, file-backed pageable
+# and purgeable. It is modelled on, and not the same as, what XNU's jetsam
+# counts as available. In the copy of osfmk/vm/vm_page.h the review read
+# (lines 1531-1539), jetsam's `VM_CHECK_MEMORYSTATUS` sums
+# `vm_page_pageable_external_count + vm_page_free_count` and the secluded
+# pages over target, and adds `vm_page_purgeable_count` only when dynamic
+# paging is off; it counts no speculative pages. Jetsam is an embedded option
+# (XNU config/MASTER: "enable jetsam - used on embedded"), so macOS computes
+# none of this itself. The sum here adds speculative pages and counts
+# purgeable ones whether or not dynamic paging is on; both choices are this
+# policy's, not XNU's.
+#
+# It is not `kern.memorystatus_level`, which an earlier draft used. On macOS
+# that is XNU's pressure level: `vm_pressure_response` in vm_pageout.c sets it
+# to available pages over total pages, and without jetsam the available count
+# is `AVAILABLE_NON_COMPRESSED_MEMORY` -- active + inactive + free +
+# speculative (vm_page.h lines 1528 and 1549 in the same copy). So it counts
+# other processes' active memory as available. Read on 2026-10-02 on a 24 GiB Mac
 # (macOS 26.5.1, arm64): `kern.memorystatus_level` 32, which the old formula
 # made 7.68 GiB available and a 4.68 GiB budget, while the sum above came to
 # 2.87 GiB, `kern.memorystatus_vm_pressure_level` was 2 and `vm.swapusage`
