@@ -2149,6 +2149,11 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     elif probe.cuda_build_without_a_device or probe.cpu_on_macos:
         result.limitation(probe.detail)
     if probe.source == devices.DEVICE_VARIABLE:
+        # The operator's override is on the record as well as in the stream:
+        # a run that skipped an accelerator the probe found reads differently
+        # from one on a machine without any, and `device_probe.detail` keeps
+        # what the probe said either way.
+        result.limitation(probe.detail)
         events.note(probe.detail, device=device, source=probe.source)
     result.host = devices.host_record(probe)
     dtype = decide_dtype(request.dtype, device)

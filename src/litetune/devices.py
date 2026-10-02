@@ -101,11 +101,13 @@ def read_sysctl(name: str) -> str:
         done = subprocess.run(
             [SYSCTL, "-n", name],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=SYSCTL_TIMEOUT_S,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+        # A value that is not UTF-8 is a value this could not read, the same
+        # as one sysctl did not print.
         raise HostReadError(f"sysctl {name}: {type(exc).__name__}: {exc}") from exc
     if done.returncode != 0:
         raise HostReadError(
@@ -126,7 +128,10 @@ def host_record(
     """Operating system, version, machine and chip, for a report.
 
     The first three are what the probe's interpreter answered, so they are
-    `None` where the probe could not answer. The chip is read here, in the
+    `None` where the probe could not answer. The version is macOS's product
+    version on a Mac and `platform.release()` elsewhere -- on Linux the
+    kernel's release, not the distribution's -- and `os_version_source` says
+    which. The chip is read here, in the
     parent, and only on macOS -- `machdep.cpu.brand_string`, the key
     `evaluate.cpu_report` reads for the runtime side. A chip that cannot be
     read is recorded with the reason, not left out: this is a description,
@@ -137,6 +142,7 @@ def host_record(
     record: dict[str, Any] = {
         "os": probe.os,
         "os_version": probe.os_version,
+        "os_version_source": probe.os_version_source,
         "machine": probe.machine,
         "chip": None,
     }

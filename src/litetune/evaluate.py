@@ -2129,9 +2129,20 @@ class HuggingFaceBackend:
             logger.warning("%s", detail)
             if events is not None:
                 events.note(detail, environment=self.env.name)
-            self.last_probe = envs.DeviceProbe(device=None, detail=detail, attempted=False)
+            # LITETUNE_DEVICE still applies: with nothing to ask, "cpu" is the
+            # only answer there is, and a library caller that runs this
+            # environment itself must not have its child fall back to CUDA.
+            unprobed = envs.DeviceProbe(device=None, detail=detail, attempted=False)
+            self._take_probe(devices.apply_device_setting(unprobed, setting), events)
             return None
-        probe = devices.apply_device_setting(envs.resolve_device(self.env, events=events), setting)
+        self._take_probe(
+            devices.apply_device_setting(envs.resolve_device(self.env, events=events), setting),
+            events,
+        )
+        return None
+
+    def _take_probe(self, probe: envs.DeviceProbe, events: EventStream | None) -> None:
+        """Record a probe's answer, with LITETUNE_DEVICE applied, as this call's."""
         self.last_probe = probe
         self.host = devices.host_record(probe)
         if probe.source == devices.DEVICE_VARIABLE and events is not None:
@@ -2139,7 +2150,6 @@ class HuggingFaceBackend:
         if probe.answered:
             self.probed_device = probe.device
             self.device = probe.device
-        return None
 
     def _read_run_report(self, report: Path) -> str | None:
         """The device the generation script itself says it used, or `None`.

@@ -4253,6 +4253,24 @@ def test_litetune_device_cpu_puts_a_mac_on_its_cpu_and_says_who_chose_it(
     assert not any("is_available()" in t for t in result.limitations)
 
 
+def test_litetune_device_cpu_on_a_cuda_box_is_the_operators_choice_not_a_missing_gpu(
+    trainer, request_for, monkeypatch
+):
+    trainer.probe_device = "cuda"
+    trainer.probe_cuda_build = "12.4"
+    trainer.probe_device_count = 1
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+
+    result = run_tune(request_for())
+
+    assert trainer.configs[0]["device"] == "cpu"
+    assert not any("cannot reach a GPU" in t for t in result.limitations), result.limitations
+    assert any(
+        t.startswith("LITETUNE_DEVICE=cpu places this run on the CPU") and "reports cuda" in t
+        for t in result.limitations
+    ), result.limitations
+
+
 def test_litetune_device_auto_leaves_the_probe_to_decide(trainer, request_for, monkeypatch):
     _mps_trainer(trainer)
     monkeypatch.setenv("LITETUNE_DEVICE", "auto")
@@ -4303,6 +4321,7 @@ def test_the_report_and_the_script_carry_the_host(trainer, request_for):
     host = {
         "os": "Darwin",
         "os_version": "15.0",
+        "os_version_source": "platform.mac_ver()",
         "machine": "arm64",
         # Read in the parent, on macOS only; conftest's sysctl answers this.
         "chip": "Apple M-test" if sys.platform == "darwin" else None,

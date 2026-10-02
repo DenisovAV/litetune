@@ -42,17 +42,19 @@ them.
 `tune` and `verify`'s float reference resolve the device once per run, by
 asking the stage environment's own torch, in this order: CUDA if
 `torch.cuda.is_available()`, then Apple's GPU through Metal (`mps`) if
-`torch.backends.mps.is_available()`, then the CPU. A Mac that lands on the CPU
-says why in the report — what torch answered for `is_built()` and
-`is_available()`, without guessing at a cause — and every run records the
-operating system, its version, the machine and, on macOS, the chip. `convert`
+`torch.backends.mps.is_available()`, then the CPU. When a Mac lands on the CPU
+the report carries what torch answered for `is_built()` and `is_available()`
+and names no cause beyond them, since `is_available()` gives none. Every run
+records the operating system, its version — macOS's product version on a Mac,
+`platform.release()` elsewhere, which on Linux is the kernel's — the machine
+and, on macOS only, the chip. `convert`
 always runs on CPU, deliberately — export is a pure format conversion, and
 pinning it keeps the measured export time reproducible on a runner with no
 GPU at all. There is no `--device` flag; set `LITETUNE_DEVICE=cpu` in the shell
 you launch from to put `tune` and the reference on the CPU whatever the
 machine has. Unset, or `auto`, is the order above; any other value is refused
-before anything runs, and the report records when the device came from the
-variable. The converted model's backend is chosen separately, by `verify
+before anything runs, and when the device came from the variable the report
+says so among its limitations, beside what the probe found. The converted model's backend is chosen separately, by `verify
 --backend` (`cpu` unless you say `gpu`), and `LITETUNE_DEVICE` does not reach
 it. CPU alone is workable at 270M and the first thing you will want to change
 above about 1B.

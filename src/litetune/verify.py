@@ -1393,7 +1393,11 @@ def run_verify(
                 else "so the reference run has no device on record"
             )
             run.limitation(f"{probe.detail}, {tail}")
-        elif probe.cuda_build_without_a_device or probe.cpu_on_macos:
+        elif (
+            probe.cuda_build_without_a_device
+            or probe.cpu_on_macos
+            or probe.source == DEVICE_VARIABLE
+        ):
             run.limitation(probe.detail)
         if pair.reference.mps_refusal is not None:
             run.limitation(pair.reference.mps_refusal)

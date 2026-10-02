@@ -43,6 +43,7 @@ def _probe(device: str | None = "mps", **fields) -> envs.DeviceProbe:
         "mps_recommended_max_memory": 16 * GIB if device == "mps" else None,
         "os": "Darwin",
         "os_version": "15.0",
+        "os_version_source": "platform.mac_ver()",
         "machine": "arm64",
     }
     defaults.update(fields)
@@ -93,6 +94,17 @@ def test_cpu_replaces_an_mps_answer_and_says_who_chose_it():
     assert not forced.cpu_on_macos
 
 
+def test_cpu_on_a_working_cuda_box_is_not_a_cuda_build_without_a_device():
+    cuda = _probe("cuda", cuda_build="12.4", device_count=1, os="Linux")
+    assert not cuda.cuda_build_without_a_device
+    forced = apply_device_setting(cuda, "cpu")
+    assert forced.device == "cpu"
+    assert forced.cuda_build == "12.4"
+    assert not forced.cuda_build_without_a_device
+    # The probe's own CPU answer on the same build still is one.
+    assert _probe("cpu", cuda_build="12.4", device_count=0).cuda_build_without_a_device
+
+
 def test_cpu_establishes_a_device_where_the_probe_could_not():
     unanswered = envs.DeviceProbe(device=None, detail="the device probe could not answer: boom")
     forced = apply_device_setting(unanswered, "cpu")
@@ -111,9 +123,19 @@ def test_the_host_record_takes_the_os_from_the_probe_and_the_chip_from_sysctl():
     assert record == {
         "os": "Darwin",
         "os_version": "15.0",
+        "os_version_source": "platform.mac_ver()",
         "machine": "arm64",
         "chip": "Apple M-test",
     }
+
+
+def test_off_macos_the_version_is_the_release_and_says_so():
+    probe = _probe(
+        "cpu", os="Linux", os_version="6.8.0-45-generic", os_version_source="platform.release()"
+    )
+    record = host_record(probe, platform="linux", sysctl=fake_sysctl({}))
+    assert record["os_version"] == "6.8.0-45-generic"
+    assert record["os_version_source"] == "platform.release()"
 
 
 def test_the_chip_is_read_only_on_macos():
@@ -143,6 +165,7 @@ def test_read_sysctl_returns_the_stripped_value(monkeypatch):
     argv, kwargs = seen[0]
     assert argv == ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"]
     assert kwargs["timeout"] == devices.SYSCTL_TIMEOUT_S
+    assert kwargs["encoding"] == "utf-8"
 
 
 @pytest.mark.parametrize(
@@ -152,6 +175,7 @@ def test_read_sysctl_returns_the_stripped_value(monkeypatch):
         (subprocess.CompletedProcess([], 0, "  \n", ""), None, "printed nothing"),
         (None, FileNotFoundError("sysctl"), "FileNotFoundError"),
         (None, subprocess.TimeoutExpired("sysctl", 10), "TimeoutExpired"),
+        (None, UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "UnicodeDecode"),
     ],
 )
 def test_read_sysctl_raises_rather_than_answering_nothing(monkeypatch, result, raises, words):

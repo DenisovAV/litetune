@@ -517,6 +517,16 @@ def test_macos_with_a_torch_built_without_mps_says_so(probe_env, monkeypatch):
     assert "built without MPS" in probe.detail
 
 
+def test_macos_that_reported_only_availability_says_what_it_did_not_report(probe_env, monkeypatch):
+    answer = json.loads(_json_answer("cpu", mps_available=False, os="Darwin", os_version="14.2"))
+    del answer["mps_built"]
+    _answers(monkeypatch, stdout=json.dumps(answer))
+    probe = envs.resolve_device(probe_env)
+    assert probe.cpu_on_macos
+    assert "did not report whether this torch has MPS" in probe.detail
+    assert "(is_built: None, is_available: False)" in probe.detail
+
+
 def test_a_cpu_off_macos_carries_no_mps_explanation(probe_env, monkeypatch):
     _answers(monkeypatch, stdout=_json_answer("cpu"))
     probe = envs.resolve_device(probe_env)
@@ -661,7 +671,15 @@ def test_an_unanswered_probe_reaches_the_event_stream(probe_env, monkeypatch):
     assert [e for e in seen if e.kind == "note" and "could not answer" in e.data["message"]]
 
 
-def _fake_probe_torch(monkeypatch, *, cuda: bool, mps_built: bool, mps_available: bool):
+def _fake_probe_torch(
+    monkeypatch,
+    *,
+    cuda: bool,
+    mps_built: bool,
+    mps_available: bool,
+    recommended: object = 7 * 1024**3,
+    mac_version: str = "15.1",
+):
     import types
 
     fake = types.ModuleType("torch")
@@ -673,17 +691,20 @@ def _fake_probe_torch(monkeypatch, *, cuda: bool, mps_built: bool, mps_available
         mps=types.SimpleNamespace(is_built=lambda: mps_built, is_available=lambda: mps_available)
     )
 
-    def recommended() -> int:
-        # Asking initialises the MPS device, so the probe asks only on an
-        # "mps" answer; a fake that cannot answer otherwise pins that.
+    def recommended_max_memory() -> object:
+        # The probe asks only on an "mps" answer; a fake that cannot answer
+        # otherwise pins that.
         if not mps_available:
             raise RuntimeError("MPS is not available")
-        return 7 * 1024**3
+        return recommended
 
-    fake.mps = types.SimpleNamespace(recommended_max_memory=recommended)  # type: ignore[attr-defined]
+    fake.mps = types.SimpleNamespace(  # type: ignore[attr-defined]
+        recommended_max_memory=recommended_max_memory
+    )
     monkeypatch.setitem(sys.modules, "torch", fake)
-    monkeypatch.setattr("platform.system", lambda: "Darwin")
-    monkeypatch.setattr("platform.mac_ver", lambda: ("15.1", ("", "", ""), "arm64"))
+    monkeypatch.setattr("platform.system", lambda: "Darwin" if mac_version else "Linux")
+    monkeypatch.setattr("platform.mac_ver", lambda: (mac_version, ("", "", ""), "arm64"))
+    monkeypatch.setattr("platform.release", lambda: "6.8.0-45-generic")
     monkeypatch.setattr("platform.machine", lambda: "arm64")
 
 
@@ -712,8 +733,58 @@ def test_the_probe_source_reports_the_build_and_the_count(monkeypatch, capsys):
         "mps_recommended_max_memory": None,
         "os": "Darwin",
         "os_version": "15.1",
+        "os_version_source": "platform.mac_ver()",
         "machine": "arm64",
     }
+
+
+def test_the_probe_source_reports_the_release_off_macos_and_says_so(monkeypatch, capsys):
+    _fake_probe_torch(monkeypatch, cuda=False, mps_built=False, mps_available=False, mac_version="")
+
+    answer = _run_probe_source(capsys)
+    assert answer["os"] == "Linux"
+    assert answer["os_version"] == "6.8.0-45-generic"
+    assert answer["os_version_source"] == "platform.release()"
+
+
+def _probe_round_trip(monkeypatch, capsys, probe_env) -> envs.DeviceProbe:
+    """The real probe source's stdout, fed to the real parser."""
+    stdout = json.dumps(_run_probe_source(capsys)) + "\n"
+    _answers(monkeypatch, stdout=stdout)
+    return envs.resolve_device(probe_env)
+
+
+def test_the_probe_round_trips_an_mps_answer_into_a_memory_policy(monkeypatch, capsys, probe_env):
+    """What the probe prints is what `resolve_device` keeps and the policy
+    divides by. A float from `recommended_max_memory()` stands for any number
+    that is not an `int`: `_typed` drops it, so the probe's own `int()` is what
+    keeps the answer from reaching the policy as `None`."""
+    from conftest import FAKE_SYSCTL, fake_sysctl
+
+    from litetune import devices
+
+    _fake_probe_torch(
+        monkeypatch, cuda=False, mps_built=True, mps_available=True, recommended=7.0 * 1024**3
+    )
+    probe = _probe_round_trip(monkeypatch, capsys, probe_env)
+
+    assert probe.device == "mps"
+    assert type(probe.mps_recommended_max_memory) is int
+    assert probe.mps_recommended_max_memory == 7 * 1024**3
+    policy = devices.prepare_mps(probe, {}, sysctl=fake_sysctl(FAKE_SYSCTL))
+    assert policy.recommended_max_memory == 7 * 1024**3
+    assert policy.budget == 7 * 1024**3
+
+
+def test_the_probe_round_trips_a_mac_on_its_cpu(monkeypatch, capsys, probe_env):
+    _fake_probe_torch(monkeypatch, cuda=False, mps_built=True, mps_available=False)
+    probe = _probe_round_trip(monkeypatch, capsys, probe_env)
+
+    assert probe.device == "cpu"
+    assert probe.cpu_on_macos
+    assert probe.mps_recommended_max_memory is None
+    assert "macOS 15.1 (arm64)" in probe.detail
+    assert probe.os_version_source == "platform.mac_ver()"
 
 
 def test_the_probe_source_says_cuda_when_torch_can_reach_one(monkeypatch, capsys):

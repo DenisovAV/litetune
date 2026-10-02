@@ -206,6 +206,7 @@ PROBE_FIELDS = (
     "mps_recommended_max_memory",
     "os",
     "os_version",
+    "os_version_source",
     "machine",
 )
 
@@ -226,7 +227,8 @@ def probe_answer(device: str | None = "cpu", **fields: Any) -> str:
         "mps_available": False,
         "mps_recommended_max_memory": None,
         "os": "Linux",
-        "os_version": "",
+        "os_version": "6.8.0-test",
+        "os_version_source": "platform.release()",
         "machine": "x86_64",
     }
     if device == "mps":
@@ -236,6 +238,7 @@ def probe_answer(device: str | None = "cpu", **fields: Any) -> str:
             mps_recommended_max_memory=16 * 1024**3,
             os="Darwin",
             os_version="15.0",
+            os_version_source="platform.mac_ver()",
             machine="arm64",
         )
     unknown = set(fields) - set(PROBE_FIELDS)

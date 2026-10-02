@@ -2128,6 +2128,32 @@ def test_the_reference_engine_records_the_host_and_the_mps_memory(
     assert memory["variables"]["PYTORCH_MPS_LOW_WATERMARK_RATIO"]["value"] == "0.650000"
 
 
+def test_litetune_device_cpu_on_the_reference_is_on_the_record(write_split, monkeypatch, tmp_path):
+    _ready_train_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    rows = text_rows(5)
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _fake_reference_run(rows, probe_stdout=probe_answer("cuda", cuda_build="12.4")),
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    limitations = result.manifest["limitations"]
+    assert any(
+        t.startswith("LITETUNE_DEVICE=cpu places this run on the CPU") for t in limitations
+    ), limitations
+    # A CUDA build the operator moved to the CPU is not one that cannot reach a GPU.
+    assert not any("cannot reach a GPU" in t for t in limitations), limitations
+
+
 def test_the_operators_mps_fallback_reaches_the_manifest(write_split, monkeypatch, tmp_path):
     _ready_train_env(monkeypatch, tmp_path)
     monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "1")

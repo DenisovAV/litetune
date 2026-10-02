@@ -3024,3 +3024,59 @@ def test_neither_fallback_chooses_mps_where_torch_could():
 
     assert generate["generation_device"](torch) == "cpu"
     assert train["training_device"](torch) == "cpu"
+
+
+def test_litetune_device_cpu_reaches_a_reference_whose_environment_was_not_probed(
+    monkeypatch, tmp_path
+):
+    """The library path: an environment that is not provisioned is not
+    probed, and LITETUNE_DEVICE=cpu still decides where the child runs."""
+    from litetune.events import EventStream
+
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "unprovisioned"))
+    specs: list = []
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        assert args[1] != "-c", "an unprovisioned environment was probed"
+        spec = json.loads(Path(args[2]).read_text())
+        specs.append(spec)
+        Path(spec["out"]).write_text(
+            json.dumps({"index": 0, "text": call_text("a")}) + "\n", encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"], events=events)
+
+    assert specs[0]["device"] == "cpu"
+    described = backend.describe()
+    assert described["device_source"] == "LITETUNE_DEVICE"
+    assert "not provisioned" in backend.last_probe.detail
+    assert [
+        e
+        for e in seen
+        if e.kind == "note" and e.data["message"].startswith("LITETUNE_DEVICE=cpu places this run")
+    ]
+
+
+def test_litetune_device_cpu_on_a_probed_reference_is_noted(monkeypatch):
+    from litetune.events import EventStream
+
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    _reference_env(monkeypatch, "mps")
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    HuggingFaceBackend(model="org/model", auto_provision=False).generate(["a"], events=events)
+
+    notes = [e.data for e in seen if e.kind == "note"]
+    assert [
+        n for n in notes if n["message"].startswith("LITETUNE_DEVICE=cpu") and n["device"] == "cpu"
+    ]

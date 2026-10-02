@@ -2029,10 +2029,10 @@ DEVICE_PROBE_TIMEOUT_S = 30
 # will use "mps" -- so an answer outside this tuple is not a device.
 DEVICES = ("cuda", "mps", "cpu")
 
-# Sub-second: import torch, ask it a handful of questions, print one JSON line.
-# Nothing else this package runs inside a stage environment is this cheap,
-# which is what makes asking it *before* the real, expensive subprocess
-# worthwhile.
+# Import torch, ask it a handful of questions, print one JSON line: no model,
+# no data. Nothing else this package runs inside a stage environment does this
+# little, which is what makes asking it *before* the real, expensive
+# subprocess worthwhile.
 #
 # `is_available()` alone cannot tell "this machine has no GPU" from "this
 # torch cannot reach the one it has": a CPU-only wheel, a container started
@@ -2045,11 +2045,16 @@ DEVICES = ("cuda", "mps", "cpu")
 # back: `is_built()` is whether this wheel carries the backend at all, and
 # `is_available()` whether it can use it on this machine. The operating
 # system comes back from the same interpreter so a report can name where an
-# unavailable MPS was asked about. `recommended_max_memory()` is Metal's
+# unavailable MPS was asked about: its version is `platform.mac_ver()[0]` on
+# macOS, and elsewhere, where that is empty, `platform.release()` -- the
+# kernel release on Linux, not a distribution version -- with
+# `os_version_source` saying which. `recommended_max_memory()` is Metal's
 # working-set size, the figure torch's MPS allocator scales its watermark
 # ratios by (torch/include/ATen/mps/MPSAllocator.h, the comments on
-# `m_high_watermark_ratio`); it is asked only on an "mps" answer, because
-# asking initialises the MPS device.
+# `m_high_watermark_ratio`); it is asked only on an "mps" answer, the one
+# answer the memory policy is computed for. It is printed through `int()`
+# because `_typed` below keeps only an `int`, and an answer that arrived as a
+# float would leave the policy without its denominator.
 _DEVICE_PROBE_CODE = (
     "import json, platform, torch; "
     "mps_built = bool(torch.backends.mps.is_built()); "
@@ -2062,9 +2067,11 @@ _DEVICE_PROBE_CODE = (
     "'mps_built': mps_built, "
     "'mps_available': mps_available, "
     "'mps_recommended_max_memory': "
-    "torch.mps.recommended_max_memory() if device == 'mps' else None, "
+    "int(torch.mps.recommended_max_memory()) if device == 'mps' else None, "
     "'os': platform.system(), "
-    "'os_version': platform.mac_ver()[0], "
+    "'os_version': platform.mac_ver()[0] or platform.release(), "
+    "'os_version_source': 'platform.mac_ver()' if platform.mac_ver()[0] "
+    "else 'platform.release()', "
     "'machine': platform.machine()}))"
 )
 
@@ -2105,10 +2112,12 @@ class DeviceProbe:
     # answer. `devices.mps_memory_policy` budgets against it.
     mps_recommended_max_memory: int | None = None
     # Where the probe ran, from the same interpreter: `platform.system()`,
-    # `platform.mac_ver()[0]` (`None` off macOS, where it is empty) and
+    # the version -- `platform.mac_ver()[0]` on macOS, `platform.release()`
+    # elsewhere, with `os_version_source` naming which -- and
     # `platform.machine()`.
     os: str | None = None
     os_version: str | None = None
+    os_version_source: str | None = None
     machine: str | None = None
     # Who chose `device`: "probe" when it is this environment's torch's answer,
     # or `devices.DEVICE_VARIABLE` when the operator set it. `None` where no
@@ -2121,8 +2130,13 @@ class DeviceProbe:
 
     @property
     def cuda_build_without_a_device(self) -> bool:
-        """A CUDA build that reports no usable device: torch cannot reach one."""
-        return self.device == "cpu" and bool(self.cuda_build)
+        """A CUDA build that reports no usable device: torch cannot reach one.
+
+        Only where the probe itself chose the CPU: under `LITETUNE_DEVICE=cpu`
+        a CUDA build on a working GPU box answers "cpu" too, and that is the
+        operator's choice, not torch failing to reach a device.
+        """
+        return self.device == "cpu" and bool(self.cuda_build) and self.source == "probe"
 
     @property
     def cpu_on_macos(self) -> bool:
@@ -2145,6 +2159,7 @@ class DeviceProbe:
             "mps_recommended_max_memory": self.mps_recommended_max_memory,
             "os": self.os,
             "os_version": self.os_version,
+            "os_version_source": self.os_version_source,
             "machine": self.machine,
         }
 
@@ -2250,6 +2265,7 @@ def resolve_device(
         mps_recommended_max_memory=_typed(answer, "mps_recommended_max_memory", int),
         os=_typed(answer, "os", str) or None,
         os_version=_typed(answer, "os_version", str) or None,
+        os_version_source=_typed(answer, "os_version_source", str) or None,
         machine=_typed(answer, "machine", str) or None,
         source="probe",
     )
