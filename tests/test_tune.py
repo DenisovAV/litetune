@@ -4502,6 +4502,44 @@ def test_batches_round_the_width_up_and_mask_the_padding(script_namespace):
     assert len(ids[0]) == 33
 
 
+@pytest.mark.parametrize(
+    ("max_length", "longest", "width"),
+    [
+        # Not a multiple of 32: rounding 70 up to 96 would pass 70.
+        (70, 70, 70),
+        (70, 69, 70),
+        (70, 64, 64),
+        (70, 65, 70),
+        # A multiple of 32: the cap and the rounding agree.
+        (64, 64, 64),
+        (64, 63, 64),
+        (64, 33, 64),
+    ],
+)
+def test_the_rounded_width_never_passes_max_seq_length(
+    script_namespace, max_length, longest, width
+):
+    batches = script_namespace["batches"]
+    examples = [([1] * longest, [1] * longest), ([2] * 3, [2] * 3)]
+
+    ((ids, attention, labels),) = list(batches(examples, 2, 0, _ListTorch, 32, max_length))
+
+    assert len(ids[0]) == len(ids[1]) == width
+    assert attention[1] == [1] * 3 + [0] * (width - 3)
+    assert labels[1][3:] == [-100] * (width - 3)
+
+
+def test_the_real_script_caps_the_mps_width_at_max_seq_length(request_for, stub_env):
+    # Every batch of `train_data` is 11 stub tokens at its longest off mps, so
+    # 11 is the tightest legal limit -- and not a multiple of 32.
+    request = request_for(max_seq_length=11)
+    proc = run_real_script(request, stub_env, device="mps")
+    assert proc.returncode == 0, proc.stderr
+
+    widths = _forward_widths(stub_env)
+    assert widths and all(width <= 11 for width in widths), widths
+
+
 def test_the_real_script_records_the_peak_mps_memory_not_the_last(request_for, stub_env):
     request = request_for()
     proc = run_real_script(request, stub_env, device="mps")

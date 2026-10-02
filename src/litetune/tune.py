@@ -575,8 +575,10 @@ IGNORE_INDEX = -100
 # one batch width per 32 tokens of length instead of one per distinct longest
 # row. The intent is that torch's MPS allocator and graph cache meet the same
 # shapes again; the effect is not measured here. The padding is masked out of
-# the loss like any other, and the width may pass `max_seq_length` by up to
-# 31 positions, all of them padding. On cuda and the CPU nothing changes.
+# the loss like any other, and the width never passes `max_seq_length`: where
+# rounding up would, the width is `max_seq_length` itself, which no row
+# exceeds (`build_examples` refuses one that does). On cuda and the CPU
+# nothing changes.
 PAD_MULTIPLE_ON_MPS = 32
 '''
     + RENDERING_SOURCE
@@ -772,17 +774,21 @@ def epoch_schedule(epochs, n_examples, batch_size):
     return schedule
 
 
-def batches(examples, size, pad_id, torch, pad_to_multiple_of=None):
+def batches(examples, size, pad_id, torch, pad_to_multiple_of=None, max_length=None):
     """Pad to the longest member of each batch. Padding is masked out of the loss.
 
     With `pad_to_multiple_of`, the width is rounded up to the next multiple of
-    it -- `PAD_MULTIPLE_ON_MPS` on mps, `None` everywhere else.
+    it -- `PAD_MULTIPLE_ON_MPS` on mps, `None` everywhere else -- and then
+    capped at `max_length`, so the rounding never makes a batch wider than
+    the run's `max_seq_length`.
     """
     for start in range(0, len(examples), size):
         chunk = examples[start : start + size]
         width = max(len(ids) for ids, _ in chunk)
         if pad_to_multiple_of:
             width = -(-width // pad_to_multiple_of) * pad_to_multiple_of
+            if max_length is not None:
+                width = min(width, max_length)
         input_ids = [ids + [pad_id] * (width - len(ids)) for ids, _ in chunk]
         labels = [lab + [IGNORE_INDEX] * (width - len(lab)) for _, lab in chunk]
         attention = [[1] * len(ids) + [0] * (width - len(ids)) for ids, _ in chunk]
@@ -979,7 +985,7 @@ def main() -> int:
         running = 0.0
         steps = 0
         for input_ids, attention, labels in batches(
-            examples, spec["batch_size"], pad_id, torch, pad_multiple
+            examples, spec["batch_size"], pad_id, torch, pad_multiple, spec["max_seq_length"]
         ):
             if steps >= limit:
                 break
