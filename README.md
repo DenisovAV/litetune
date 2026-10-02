@@ -65,8 +65,10 @@ budget is the smaller of Metal's recommended working set
 (`torch.mps.recommended_max_memory()`) and the available memory less 3 GiB,
 where available is the free and the pageable external page counts
 (`vm.page_free_count`, `vm.page_pageable_external_count`) times `hw.pagesize`
-— XNU's jetsam measure as it applies to a Mac, which counts neither other
-apps' memory nor pages that would have to go to swap; `PYTORCH_MPS_HIGH_WATERMARK_RATIO` is the budget over the
+— litetune's own conservative measure, built from two of the counters XNU's
+jetsam path sums (`VM_CHECK_MEMORYSTATUS` in osfmk/vm/vm_page.h), not a figure
+macOS reports; it counts neither other apps' memory nor pages that would have
+to go to swap; `PYTORCH_MPS_HIGH_WATERMARK_RATIO` is the budget over the
 working set, `PYTORCH_MPS_LOW_WATERMARK_RATIO` is 0.8 of that, and
 `PYTORCH_ENABLE_MPS_FALLBACK=0` — torch's own default, written out — makes
 an operation MPS does not implement raise instead of running on the CPU. A

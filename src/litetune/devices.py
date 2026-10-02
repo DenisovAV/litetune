@@ -177,16 +177,16 @@ def host_record(
 #   (vm.page_free_count + vm.page_pageable_external_count) * hw.pagesize
 #
 # free pages and file-backed pages the kernel can drop without writing them to
-# swap. That is XNU's jetsam measure of available memory as it applies to a
-# Mac. In the copy of osfmk/vm/vm_page.h the review read (lines 1531-1539),
-# jetsam's `VM_CHECK_MEMORYSTATUS` sums `vm_page_pageable_external_count +
-# vm_page_free_count`, the secluded pages over target, and
-# `vm_page_purgeable_count` only when dynamic paging is off. Secluded pages
-# are an embedded feature and macOS pages dynamically through its compressor,
-# so on a Mac the two terms above are what that sum comes to; speculative
-# pages it never counts. Jetsam itself is an embedded option (XNU
-# config/MASTER: "enable jetsam - used on embedded"), so macOS does not
-# compute this sum: litetune does, from the same counters.
+# swap. It is litetune's own conservative measure, built from two of the
+# counters XNU's jetsam path sums, and not a figure macOS reports. In the copy
+# of osfmk/vm/vm_page.h the review read (lines 1531-1539, apple-oss-distributions
+# xnu main), jetsam's `VM_CHECK_MEMORYSTATUS` sums `vm_page_pageable_external_count
+# + vm_page_free_count`, the secluded pages over target, and
+# `vm_page_purgeable_count` only when dynamic paging is off; it counts no
+# speculative pages. The sum here keeps the two terms that depend on no
+# configuration and leaves the two conditional ones out. Jetsam itself is an
+# embedded option (XNU config/MASTER: "enable jetsam - used on embedded"), and
+# on macOS the kernel reports `AVAILABLE_NON_COMPRESSED_MEMORY` instead (below).
 #
 # It is not `kern.memorystatus_level`, which an earlier draft used. On macOS
 # that is XNU's pressure level: `vm_pressure_response` in vm_pageout.c sets it
@@ -437,19 +437,24 @@ def mps_oom_advice(memory: MpsMemory | None) -> str:
         return cpu
     if memory.budget_source == "litetune":
         return (
-            f"the {memory.budget / GIB:.1f} GiB budget litetune set from the memory this Mac had "
-            f"available when the run started was not enough; quit what is holding memory and "
+            f"torch's MPS allocator ran out of memory under the {memory.budget / GIB:.1f} GiB "
+            f"budget litetune set from the memory this Mac had available when the run started; "
+            f"torch reports that limit, physical memory running out and fragmentation with the "
+            f"same message, so which one it was is not known; quit what is holding memory and "
             f"run again, or {cpu}"
         )
     high = memory.variables[HIGH_WATERMARK]
     if memory.effective_high == "unlimited":
         return (
             f"{HIGH_WATERMARK}={high} was set in this environment, so torch's MPS allocator had "
-            f"no upper limit, and the memory still ran out; quit what is holding memory, or {cpu}"
+            f"no upper limit, and it still reported running out of memory; quit what is holding "
+            f"memory, or {cpu}"
         )
     return (
-        f"the high watermark ratio was set in this environment ({HIGH_WATERMARK}={high}), not "
-        f"by litetune; raise or unset it, or {cpu}"
+        f"torch's MPS allocator ran out of memory under the high watermark ratio set in this "
+        f"environment ({HIGH_WATERMARK}={high}), not by litetune, or under physical memory or "
+        f"fragmentation, which torch reports with the same message; raise or unset it, quit "
+        f"what is holding memory, or {cpu}"
     )
 
 
