@@ -79,15 +79,16 @@ beside the limit in force, and says so when your `0.0` removed the limit or
 your non-zero fallback let operations run on the CPU. A budget litetune
 computes under 1 GiB is refused rather than started, and so is a Mac whose
 `kern.memorystatus_vm_pressure_level` is not 1 (normal): quit what is holding
-memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in
-float32 unless you pass `--dtype`, pads each batch to a multiple of 32 tokens,
-and records the largest MPS memory counters it sampled; an MPS out-of-memory error is reported as the
-machine's, not the recipe's, and so are an operation MPS does not implement,
-bfloat16 refused before macOS 14 and a watermark ratio torch rejected — each
-with `LITETUNE_DEVICE=cpu` as the way forward. Nothing in this repository has been measured on
-MPS yet — no speed, no score, no comparison with the same run on CUDA or the
-CPU. Bring your own checkpoint and skip the first two steps, or bring a
-`.litertlm` and its float checkpoint and run only `verify`.
+memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in float32
+unless you pass `--dtype`, pads each batch to a multiple of 32 tokens (never
+past `--max-seq-length`), and records the largest MPS memory counters it
+sampled. An MPS out-of-memory error is reported as the machine's, not the
+recipe's, and so are an operation MPS does not implement, bfloat16 refused
+before macOS 14 and a watermark ratio torch rejected — each with
+`LITETUNE_DEVICE=cpu` as the way forward. Nothing in this repository has been
+measured on MPS yet — no speed, no score, no comparison with the same run on
+CUDA or the CPU. Bring your own checkpoint and skip the first two steps, or
+bring a `.litertlm` and its float checkpoint and run only `verify`.
 
 > **Alpha.** Measured end to end on six models: `google/functiongemma-270m-it`
 > with the tool-call scorer, and `google/gemma-3-270m-it`,
@@ -823,15 +824,16 @@ withdrawn after re-measurement.
   B and C scored 0.9016 and 0.8969, both just outside that interval). So the
   reference number predicted the phone to within about 0.03. One device, one
   recipe, and not re-measured since the runtime moved to 0.17.1.
-- **On a GPU box, the reference and the candidate can run on different
-  hardware, and it is recorded rather than refused.** The candidate runs on
-  the `litert-lm` backend `--backend` names, `cpu` by default, and the
-  reference resolves its own device; where the reference lands on `cuda` or `mps`, the two sides differ
-  in hardware as well as in conversion. `harness.device_mismatch` in the
-  manifest names both devices and both engines, and the same text is carried
-  into the run's limitations, so the conversion-cost number does not silently
-  carry a hardware difference too. Refusing the comparison instead would
-  leave such a machine unable to verify at all.
+- **On a GPU box or a Mac on `mps`, the reference and the candidate can run
+  on different hardware, and it is recorded rather than refused.** The
+  candidate runs on the `litert-lm` backend `--backend` names, `cpu` by
+  default, and the reference resolves its own device; where the reference
+  lands on `cuda` or `mps`, the two sides differ in hardware as well as in
+  conversion. `harness.device_mismatch` in the manifest names both devices and
+  both engines, and the same text is carried into the run's limitations, so
+  the conversion-cost number does not silently carry a hardware difference
+  too. To put the reference on the CPU beside a CPU candidate, set
+  `LITETUNE_DEVICE=cpu`.
 - **The GPU number is 20 rows.** Same device, same bundle, GPU backend: 20/20
   tool names and 15/20 exact (CPU: 20/20, 14/20) at 1.8× the CPU speed — with
   `prefer_activation_type = fp32` in the bundle. Without it the GPU text

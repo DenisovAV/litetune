@@ -2360,10 +2360,11 @@ def device_mismatch(a: MeasurementPoint, b: MeasurementPoint) -> str | None:
     the decision rather than an oversight. The candidate runs on the litert-lm
     backend `verify --backend` names, `cpu` by default, and the reference
     resolves its own device, so on a machine where the reference resolves to
-    cuda the two sides differ
-    in hardware as well as in conversion, and the "cost of conversion" carries
-    both. Refusing that comparison would leave a GPU box unable to verify at
-    all, which is worse than a number that says what else is in it.
+    cuda or mps the two sides differ in hardware as well as in conversion, and
+    the "cost of conversion" carries both. Refusing that comparison would make
+    a GPU box or a Mac move its reference to the CPU before it could verify at
+    all; `LITETUNE_DEVICE=cpu` does that for an operator who wants it, and a
+    number that says what else is in it is the default.
 
     Read from `engine["backend"]`, which each backend fills with the device it
     read back or the flag it passed -- `BACKEND_OBSERVED` says which, and

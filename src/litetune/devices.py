@@ -6,8 +6,7 @@ three things the parent adds to that answer, each of them before a training or
 reference-generation process is started rather than inside it:
 
 - the operator's `LITETUNE_DEVICE`, which can force the CPU and is refused for
-  any value it does not know -- an environment variable rather than a CLI flag,
-  so the README's "there is no `--device` flag" stays true of the commands;
+  any value it does not know;
 - the host facts a report records beside the device: operating system, its
   version, the machine, and on macOS the chip;
 - the memory policy for a child that will use MPS, which sets torch's MPS
@@ -167,9 +166,9 @@ def host_record(
 # `default_low_watermark_ratio_unified`, torch 2.5.1 as `envs.TRAIN` pins it).
 # So the parent sets both ratios from the memory the machine has available
 # when the run starts, in the child's environment, before the child exists.
-# The header records the low limit as fixed "at the time we initialize the
-# allocator"; where the variables are read is MPSAllocator.mm, which the wheel
-# does not ship.
+# The header describes the low limit as the "low watermark size limit (in
+# Bytes) at the time we initialize the allocator"; where the variables are read
+# is MPSAllocator.mm, which the wheel does not ship.
 #
 # budget = min(R, available - headroom)
 #
