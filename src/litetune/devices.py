@@ -22,7 +22,6 @@ MPS for itself would run without it.
 from __future__ import annotations
 
 import logging
-import math
 import re
 import subprocess
 import sys
@@ -232,10 +231,11 @@ def host_record(
 # the low ratio must be within [0, high] -- [0, 2.0] when high is 0.0 -- and
 # that the fallback is read with `std::stoi` is from upstream source at
 # v2.5.1 as the review read it (aten/src/ATen/mps/MPSAllocator.mm and
-# MPSFallback.mm), which the wheel does not ship. `strtod` reads "0.5x" as 0.5 and "most" as 0.0 -- no
-# limit at all -- so only a plain decimal is accepted here, a form on which
-# `strtod` and Python's `float` agree; `std::stoi` likewise reads "1x" as 1
-# and throws on "x", so only a plain integer is.
+# MPSFallback.mm), which the wheel does not ship. `strtod` reads "0.5x" as
+# 0.5 and "most" as 0.0 -- no limit at all -- so only a plain decimal is
+# accepted here, a form on which `strtod` and Python's `float` agree;
+# `std::stoi` likewise reads "1x" as 1 and throws on "x", so only a plain
+# integer is.
 #
 # None of this has been measured on a training run. It bounds what the
 # allocator may take; whether a given model then fits is the run's to find out.
@@ -435,7 +435,7 @@ def mps_oom_advice(memory: MpsMemory | None) -> str:
     """What to do about an MPS out-of-memory ending, worded by who set the limit."""
     cpu = f"set {DEVICE_VARIABLE}=cpu to run on the CPU"
     if memory is None:
-        return cpu[0].upper() + cpu[1:]
+        return cpu
     if memory.budget_source == "litetune":
         return (
             f"the {memory.budget / GIB:.1f} GiB budget litetune set from the memory this Mac had "
@@ -462,8 +462,10 @@ def _decimal(name: str, text: str, upper: float) -> float:
             "litetune could not check it before the run. Unset it, or set a number between 0 "
             f"and {upper}"
         )
+    # `_DECIMAL` admits no "inf" or "nan"; a decimal too large for a float
+    # reads as inf, which the range below refuses.
     value = float(text)
-    if not (math.isfinite(value) and 0.0 <= value <= upper):
+    if not 0.0 <= value <= upper:
         raise MpsMemoryRefused(
             f"{name}={text} is set in this environment and is outside 0 to {upper}, the range "
             "litetune accepts for it. Unset it, or set a number in that range"
