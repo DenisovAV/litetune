@@ -178,10 +178,11 @@ def host_record(
 #
 # free pages and file-backed pages the kernel can drop without writing them to
 # swap. It is litetune's own conservative measure, built from two of the
-# counters XNU's jetsam path sums, and not a figure macOS reports. In the copy
-# of osfmk/vm/vm_page.h the review read (lines 1531-1539, apple-oss-distributions
-# xnu main), jetsam's `VM_CHECK_MEMORYSTATUS` sums `vm_page_pageable_external_count
-# + vm_page_free_count`, the secluded pages over target, and
+# counters XNU's jetsam path sums, and not a figure macOS reports. In
+# osfmk/vm/vm_page.h (apple-oss-distributions/xnu, read 2026-10-02; cited by
+# macro name because line numbers move between revisions), the
+# `CONFIG_JETSAM` branch of `VM_CHECK_MEMORYSTATUS` sums
+# `vm_page_pageable_external_count + vm_page_free_count`, the secluded pages over target, and
 # `vm_page_purgeable_count` only when dynamic paging is off; it counts no
 # speculative pages. The sum here keeps the two terms that depend on no
 # configuration and leaves the two conditional ones out. Jetsam itself is an
@@ -192,7 +193,8 @@ def host_record(
 # that is XNU's pressure level: `vm_pressure_response` in vm_pageout.c sets it
 # to available pages over total pages, and without jetsam the available count
 # is `AVAILABLE_NON_COMPRESSED_MEMORY` -- active + inactive + free +
-# speculative (vm_page.h lines 1528 and 1549 in the same copy). So it counts
+# speculative (the `AVAILABLE_NON_COMPRESSED_MEMORY` macro and the
+# `XNU_TARGET_OS_OSX` branch of `VM_CHECK_MEMORYSTATUS` in vm_page.h). So it counts
 # other processes' active memory as available. Read on 2026-10-02 at 09:19 UTC
 # on a 24 GiB Mac (macOS 26.5.1, arm64): `kern.memorystatus_level` 54, which
 # the old formula made 12.96 GiB available and a 9.96 GiB budget, while the

@@ -244,8 +244,9 @@ def test_reading_this_macs_counters_leaves_speculative_and_purgeable_pages_out()
 def test_a_memory_reading_takes_exactly_the_two_counts():
     with pytest.raises(ValueError):
         devices.memory_reading(PAGE, {"vm.page_free_count": 1}, 1)
-    # Speculative and purgeable pages are not XNU's jetsam measure on a Mac,
-    # so a reading that carries them is refused rather than summed.
+    # Speculative pages are never in jetsam's sum and purgeable ones only when
+    # dynamic paging is off; this measure leaves both out, so a reading that
+    # carries them is refused rather than summed.
     with pytest.raises(ValueError):
         devices.memory_reading(
             PAGE,
