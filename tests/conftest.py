@@ -133,6 +133,44 @@ def _isolated_env_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "litetune-envs"))
 
 
+@pytest.fixture(autouse=True)
+def _no_host_device_settings(monkeypatch):
+    """Keep the operator's device settings out of every test, and sysctl too.
+
+    `LITETUNE_DEVICE` and the three MPS variables are read from the
+    environment `tune` and `verify` run in, so a developer who exported one
+    would change what the suite asserts. `devices.read_sysctl` would start a
+    real `sysctl` and answer about this machine; the fake answers the same
+    figures everywhere. A test that wants other figures passes its own.
+    """
+    from litetune import devices
+
+    for name in (devices.DEVICE_VARIABLE, *devices.MPS_VARIABLES):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(FAKE_SYSCTL))
+
+
+# What `fake_sysctl` answers by default: a 32 GiB Mac with half of it available.
+FAKE_SYSCTL = {
+    "hw.memsize": str(32 * 1024**3),
+    "kern.memorystatus_level": "50",
+    "vm.swapusage": "total = 0.00M  used = 0.00M  free = 0.00M",
+    "machdep.cpu.brand_string": "Apple M-test",
+}
+
+
+def fake_sysctl(values: dict[str, str]):
+    """A `devices.Sysctl` that answers from `values` and raises for anything else."""
+    from litetune.devices import HostReadError
+
+    def read(name: str) -> str:
+        if name not in values:
+            raise HostReadError(f"sysctl {name} exited 1: unknown oid {name!r}")
+        return values[name]
+
+    return read
+
+
 # Every field `envs._DEVICE_PROBE_CODE` prints, in one place. `tune`'s
 # `FakeTrainer`, the probe fakes in `test_evaluate.py` and `test_verify.py`, and
 # `test_cli.py`'s `FakeToolchain` all answer the probe through this, and
