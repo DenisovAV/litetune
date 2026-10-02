@@ -1931,7 +1931,7 @@ class HuggingFaceBackend:
             "device_probe": self.last_probe.as_dict() if self.last_probe is not None else None,
             "host": self.host,
             # Budget, Metal's recommended working set, both watermark ratios
-            # and who set them, the free-memory level and swap use at the
+            # and who set them, the memory reading and swap use at the
             # start. `None` off mps.
             "mps_memory": self.mps_memory.as_dict() if self.mps_memory is not None else None,
             "requirements": list(self.env.requirements),

@@ -150,13 +150,34 @@ def _no_host_device_settings(monkeypatch):
     monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(FAKE_SYSCTL))
 
 
-# What `fake_sysctl` answers by default: a 32 GiB Mac with half of it available.
+# What `fake_sysctl` answers by default: a Mac at normal memory pressure with
+# 16 GiB available in 16 KiB pages -- 4 free, 1 speculative, 10 pageable
+# external and 1 purgeable.
 FAKE_SYSCTL = {
-    "hw.memsize": str(32 * 1024**3),
-    "kern.memorystatus_level": "50",
+    "hw.pagesize": "16384",
+    "vm.page_free_count": str(4 * 65536),
+    "vm.page_speculative_count": str(65536),
+    "vm.page_pageable_external_count": str(10 * 65536),
+    "vm.page_purgeable_count": str(65536),
+    "kern.memorystatus_vm_pressure_level": "1",
     "vm.swapusage": "total = 0.00M  used = 0.00M  free = 0.00M",
     "machdep.cpu.brand_string": "Apple M-test",
 }
+
+
+def sysctl_available(available_bytes: int, pressure: int = 1) -> dict[str, str]:
+    """`FAKE_SYSCTL` with `available_bytes` available, all of it free pages."""
+    pages = available_bytes // int(FAKE_SYSCTL["hw.pagesize"])
+    return dict(
+        FAKE_SYSCTL,
+        **{
+            "vm.page_free_count": str(pages),
+            "vm.page_speculative_count": "0",
+            "vm.page_pageable_external_count": "0",
+            "vm.page_purgeable_count": "0",
+            "kern.memorystatus_vm_pressure_level": str(pressure),
+        },
+    )
 
 
 def fake_sysctl(values: dict[str, str]):

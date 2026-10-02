@@ -2924,7 +2924,7 @@ def test_an_mps_reference_starts_under_the_memory_policy_and_records_it(monkeypa
     assert described["device_source"] == "probe"
     assert described["device_probe"]["mps_available"] is True
     assert described["mps_memory"]["budget_bytes"] == 13 * 1024**3
-    assert described["mps_memory"]["memorystatus_level"] == 50
+    assert described["mps_memory"]["available_bytes"] == 16 * 1024**3
     assert described["host"]["os"] == "Darwin"
     assert described["host"]["os_version"] == "15.0"
     assert described["host"]["machine"] == "arm64"
@@ -2942,16 +2942,12 @@ def test_a_reference_off_mps_gets_no_memory_policy(monkeypatch):
 
 
 def test_an_mps_reference_without_the_memory_is_not_started(monkeypatch):
-    from conftest import FAKE_SYSCTL, fake_sysctl
+    from conftest import fake_sysctl, sysctl_available
 
     from litetune import devices
 
     calls = _reference_env(monkeypatch, "mps")
-    monkeypatch.setattr(
-        devices,
-        "read_sysctl",
-        fake_sysctl(dict(FAKE_SYSCTL, **{"kern.memorystatus_level": "5"})),
-    )
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
 
     backend = HuggingFaceBackend(model="org/model", auto_provision=False)
     (generation,) = backend.generate(["a"])

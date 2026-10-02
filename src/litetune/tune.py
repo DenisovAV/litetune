@@ -467,7 +467,7 @@ def decide_dtype(declared: str | None, device: str | None) -> DtypeDecision:
 # raises past the high watermark ("beyond that, the allocations would fail
 # with OOM error", torch/include/ATen/mps/MPSAllocator.h); the string itself is
 # in torch 2.5.1's libtorch_cpu, as `envs.TRAIN` pins it. With the memory
-# policy in `devices` that watermark is set from what the Mac had free, so
+# policy in `devices` that watermark is set from what the Mac had available, so
 # this is the ending of a run whose model needed more than the policy allowed.
 _GPU_FAILURE_RE = re.compile(
     r"(OutOfMemoryError"
@@ -494,8 +494,9 @@ DEVICE_CHECK = "training device"
 # Said beside an out-of-memory ending on mps, where the two ways forward are
 # the ones the memory policy's own refusal names.
 MPS_OOM_ADVICE = (
-    "the MPS memory budget was set from the memory this Mac had free when the run started; free "
-    f"memory and run again, or set {devices.DEVICE_VARIABLE}=cpu to train on the CPU"
+    "the MPS memory budget was set from the memory this Mac had available when the run "
+    "started; quit what is holding memory and run again, or set "
+    f"{devices.DEVICE_VARIABLE}=cpu to train on the CPU"
 )
 
 NOT_VERIFIED = (
@@ -1071,7 +1072,7 @@ def main() -> int:
                 "host": spec.get("host"),
                 # The MPS memory policy this run started under -- budget, the
                 # recommended working set, both watermark ratios and who set
-                # them, the free-memory level and swap use at the start. `None`
+                # them, the memory reading and swap use at the start. `None`
                 # off mps.
                 "mps_memory": spec.get("mps_memory"),
                 "pad_to_multiple_of": pad_multiple,

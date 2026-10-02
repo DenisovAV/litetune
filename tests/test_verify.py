@@ -2121,14 +2121,15 @@ def test_the_reference_engine_records_the_host_and_the_mps_memory(
     memory = engine["mps_memory"]
     assert memory["budget_bytes"] == 13 * 1024**3
     assert memory["recommended_max_memory_bytes"] == 16 * 1024**3
-    assert memory["memorystatus_level"] == 50
+    assert memory["available_bytes"] == 16 * 1024**3
+    assert memory["pressure_level"] == 1
     assert memory["swapusage"] is not None
     assert memory["variables"]["PYTORCH_MPS_HIGH_WATERMARK_RATIO"]["value"] == "0.812500"
     assert memory["variables"]["PYTORCH_MPS_LOW_WATERMARK_RATIO"]["value"] == "0.650000"
 
 
 def test_a_reference_refused_for_memory_reaches_the_manifest(write_split, monkeypatch, tmp_path):
-    from conftest import FAKE_SYSCTL, fake_sysctl
+    from conftest import fake_sysctl, sysctl_available
 
     from litetune import devices
 
@@ -2137,9 +2138,7 @@ def test_a_reference_refused_for_memory_reaches_the_manifest(write_split, monkey
     monkeypatch.setattr(
         envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer("mps"))
     )
-    monkeypatch.setattr(
-        devices, "read_sysctl", fake_sysctl(dict(FAKE_SYSCTL, **{"kern.memorystatus_level": "5"}))
-    )
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
 
     result = verify(
         write_split,

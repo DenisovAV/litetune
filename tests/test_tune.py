@@ -23,7 +23,13 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import pytest
-from conftest import FAKE_SYSCTL, fake_sysctl, fake_torch, mark_provisioned, probe_answer
+from conftest import (
+    fake_sysctl,
+    fake_torch,
+    mark_provisioned,
+    probe_answer,
+    sysctl_available,
+)
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -4105,7 +4111,7 @@ def test_an_mps_run_starts_its_child_under_the_memory_policy(trainer, request_fo
 
     env = _training_call(trainer).env
     assert env is not None
-    # conftest's sysctl: 50% of 32 GiB, less 3 GiB, against the probe's 16.
+    # conftest's sysctl: 16 GiB available, less 3 GiB, against the probe's 16.
     assert env == {
         "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.812500",
         "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.650000",
@@ -4115,7 +4121,8 @@ def test_an_mps_run_starts_its_child_under_the_memory_policy(trainer, request_fo
     recorded = result.as_dict()["mps_memory"]
     assert recorded["budget_bytes"] == 13 * 1024**3
     assert recorded["recommended_max_memory_bytes"] == 16 * 1024**3
-    assert recorded["memorystatus_level"] == 50
+    assert recorded["available_bytes"] == 16 * 1024**3
+    assert recorded["pressure_level"] == 1
     assert recorded["swapusage"].startswith("total =")
     # And the script is handed the same record, to write into metrics.json.
     assert trainer.configs[0]["mps_memory"] == recorded
@@ -4154,20 +4161,14 @@ def test_an_mps_run_without_the_memory_is_refused_before_it_starts(
     from litetune import devices
 
     _mps_trainer(trainer)
-    monkeypatch.setattr(
-        devices,
-        "read_sysctl",
-        # 40% of 8 GiB available, less 3 GiB: 0.2 GiB.
-        fake_sysctl(
-            dict(FAKE_SYSCTL, **{"hw.memsize": str(8 * 1024**3), "kern.memorystatus_level": "40"})
-        ),
-    )
+    # 3.2 GiB available, less 3 GiB: 0.2 GiB.
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(32 * 1024**3 // 10)))
 
     result = run_tune(request_for())
 
     refused = check_named(result, DEVICE_CHECK)
     assert refused.outcome is Outcome.UNCHECKED
-    assert "Free memory" in refused.detail
+    assert "Quit what is holding memory" in refused.detail
     assert "LITETUNE_DEVICE=cpu" in refused.detail
     assert result.outcome is Outcome.UNCHECKED
     # The probe ran; the training script did not.
@@ -4269,7 +4270,7 @@ def test_an_mps_out_of_memory_is_the_machine_and_says_what_to_do(trainer, reques
     assert check.outcome is Outcome.UNCHECKED
     assert check.observed["matched"] == "MPS backend out of memory"
     assert "LITETUNE_DEVICE=cpu" in check.detail
-    assert "free memory" in check.detail
+    assert "quit what is holding memory" in check.detail
 
 
 def test_a_cuda_out_of_memory_carries_no_mps_advice(trainer, request_for):

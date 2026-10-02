@@ -58,16 +58,19 @@ it. CPU alone is workable at 270M and the first thing you will want to change
 above about 1B.
 
 Before a training or reference run starts on `mps`, litetune sets torch's MPS
-allocator limits from what the Mac has free at that moment. The budget is the
-smaller of Metal's recommended working set
-(`torch.mps.recommended_max_memory()`) and the available memory
-(`kern.memorystatus_level` percent of `hw.memsize`) less 3 GiB;
-`PYTORCH_MPS_HIGH_WATERMARK_RATIO` is the budget over the working set,
-`PYTORCH_MPS_LOW_WATERMARK_RATIO` is 0.8 of that, and
+allocator limits from the memory the Mac has available at that moment. The
+budget is the smaller of Metal's recommended working set
+(`torch.mps.recommended_max_memory()`) and the available memory less 3 GiB,
+where available is the free, speculative, pageable external and purgeable page
+counts (`vm.page_free_count`, `vm.page_speculative_count`,
+`vm.page_pageable_external_count`, `vm.page_purgeable_count`) times
+`hw.pagesize`; `PYTORCH_MPS_HIGH_WATERMARK_RATIO` is the budget over the
+working set, `PYTORCH_MPS_LOW_WATERMARK_RATIO` is 0.8 of that, and
 `PYTORCH_ENABLE_MPS_FALLBACK=0` makes an operation MPS does not implement
 raise instead of running on the CPU. A value you set for any of the three is
 kept and recorded as yours. A budget under 1 GiB is refused rather than
-started: free memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in
+started, and so is a Mac whose `kern.memorystatus_vm_pressure_level` is not 1
+(normal): quit what is holding memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in
 float32 unless you pass `--dtype`, pads each batch to a multiple of 32 tokens,
 and records peak MPS memory; an MPS out-of-memory error is reported as the
 machine's, not the recipe's. Nothing in this repository has been measured on
