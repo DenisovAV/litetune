@@ -30,6 +30,7 @@ from litetune.evaluate import (
 )
 from litetune.prompt_mode import PromptMode
 from litetune.verify import (
+    DEVICE_CHECK,
     BackendPair,
     ReferenceRole,
     Status,
@@ -2051,3 +2052,105 @@ def test_a_litert_lm_run_that_cannot_name_its_cpu_says_so(write_split):
 
     mixed = _limitations_for(write_split, {**engine, "cpu": {"models": ["Big", "Little"]}})
     assert any("more than one kind of core (Big, Little)" in n for n in mixed)
+
+
+# -- the reference's device: LITETUNE_DEVICE, macOS, MPS memory ---------------
+
+
+def test_an_unknown_litetune_device_refuses_verify_before_anything_is_measured(
+    write_split, monkeypatch
+):
+    monkeypatch.setenv("LITETUNE_DEVICE", "mps")
+    rows = labelled_rows(16)
+    candidate = FakeBackend(texts=correct_texts(rows))
+    reference = FakeBackend(model="org/reference", texts=correct_texts(rows))
+
+    result = verify(write_split, rows, candidate=candidate, reference=reference)
+
+    assert result.status is Status.FAILED_HARNESS
+    (check,) = result.manifest["checks"]
+    assert check["name"] == DEVICE_CHECK
+    assert check["outcome"] == "could_not_check"
+    assert "auto, cpu" in check["detail"]
+    assert candidate.prompts_seen == [] and reference.prompts_seen == []
+
+
+def test_a_reference_mac_on_its_cpu_says_what_torch_said(write_split, monkeypatch, tmp_path):
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    answer = probe_answer(
+        "cpu", mps_built=True, mps_available=False, os="Darwin", os_version="12.7"
+    )
+    monkeypatch.setattr(envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=answer))
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert any(
+        "macOS 12.7" in text and "is_available() is False" in text
+        for text in result.manifest["limitations"]
+    ), result.manifest["limitations"]
+
+
+def test_the_reference_engine_records_the_host_and_the_mps_memory(
+    write_split, monkeypatch, tmp_path
+):
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer("mps"))
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    engine = result.manifest["measurements"]["reference"]["engine"]
+    assert engine["device_source"] == "probe"
+    assert engine["host"]["os"] == "Darwin"
+    assert engine["host"]["machine"] == "arm64"
+    memory = engine["mps_memory"]
+    assert memory["budget_bytes"] == 13 * 1024**3
+    assert memory["recommended_max_memory_bytes"] == 16 * 1024**3
+    assert memory["memorystatus_level"] == 50
+    assert memory["swapusage"] is not None
+    assert memory["variables"]["PYTORCH_MPS_HIGH_WATERMARK_RATIO"]["value"] == "0.812500"
+    assert memory["variables"]["PYTORCH_MPS_LOW_WATERMARK_RATIO"]["value"] == "0.650000"
+
+
+def test_a_reference_refused_for_memory_reaches_the_manifest(write_split, monkeypatch, tmp_path):
+    from conftest import FAKE_SYSCTL, fake_sysctl
+
+    from litetune import devices
+
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer("mps"))
+    )
+    monkeypatch.setattr(
+        devices, "read_sysctl", fake_sysctl(dict(FAKE_SYSCTL, **{"kern.memorystatus_level": "5"}))
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert result.status is Status.FAILED_HARNESS
+    assert any(
+        "not started on mps" in text and "LITETUNE_DEVICE=cpu" in text
+        for text in result.manifest["limitations"]
+    ), result.manifest["limitations"]

@@ -33,6 +33,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -41,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from litetune import envs
+from litetune import devices, envs
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.export import GPU_ACTIVATION
@@ -1720,7 +1721,10 @@ def generation_device(torch, given=None):
     The fallback is not dead code. It is what runs whenever the parent has no
     answer to give: a probe that could not run, and an environment that was
     never probed. Without it the float reference would sit on the CPU of a GPU
-    box because a sub-second probe failed.
+    box because a sub-second probe failed. It never chooses mps: the parent
+    sets the MPS memory policy before starting a child that will use mps
+    (`devices.prepare_mps`), and a child that chose mps itself would run
+    without one.
     """
     if given is not None:
         return given
@@ -1848,6 +1852,16 @@ class HuggingFaceBackend:
     # `detail` and `cuda_build_without_a_device` off it to record the same
     # limitation `tune.py` records for its own probe.
     last_probe: envs.DeviceProbe | None = None
+    # Operating system, version, machine and chip, recorded beside the probe
+    # by `_ensure_env` (`devices.host_record`). `None` until a probe ran.
+    host: dict[str, Any] | None = None
+    # The MPS memory policy this call's generation started under, or `None`
+    # when it did not run on mps. Overwritten every call, like `last_probe`.
+    mps_memory: devices.MpsMemory | None = None
+    # Why this call's generation did not start on mps, when the memory policy
+    # refused it. `verify` records it as a limitation; the generations carry
+    # it as their harness error.
+    mps_refusal: str | None = None
 
     name = "transformers"
     # `generate()` receives max_new_tokens and the stop condition, so here the
@@ -1911,6 +1925,15 @@ class HuggingFaceBackend:
             # `backend` with a reference's is not comparing two different
             # questions.
             "backend_vocabulary": "torch device",
+            # Who chose the device -- the probe, or LITETUNE_DEVICE -- and the
+            # probe's whole answer, including what torch said about MPS.
+            "device_source": self.last_probe.source if self.last_probe is not None else None,
+            "device_probe": self.last_probe.as_dict() if self.last_probe is not None else None,
+            "host": self.host,
+            # Budget, Metal's recommended working set, both watermark ratios
+            # and who set them, the free-memory level and swap use at the
+            # start. `None` off mps.
+            "mps_memory": self.mps_memory.as_dict() if self.mps_memory is not None else None,
             "requirements": list(self.env.requirements),
             "decode_declared": self.decode.as_dict(),
             "decode_passed_to_runtime": self.decode_enforced,
@@ -1942,6 +1965,24 @@ class HuggingFaceBackend:
         # is for.
         device_for_run = self.last_probe.device if self.last_probe is not None else None
 
+        # The MPS memory policy, in the parent, before the child exists: the
+        # watermarks reach torch's allocator through the child's environment
+        # (`devices`, "The MPS memory policy"). A reference that cannot be
+        # given a budget is not started on mps with the allocator's defaults
+        # instead.
+        child_env: dict[str, str] | None = None
+        if device_for_run == "mps" and self.last_probe is not None:
+            try:
+                self.mps_memory = devices.prepare_mps(self.last_probe, os.environ)
+            except devices.MpsMemoryRefused as exc:
+                logger.error("the reference was not started on mps: %s", exc)
+                self.device = None
+                self.mps_refusal = f"the reference generation was not started on mps: {exc}"
+                return [
+                    Generation(i, p, harness_error=self.mps_refusal) for i, p in enumerate(prompts)
+                ]
+            child_env = self.mps_memory.child_env
+
         with tempfile.TemporaryDirectory(prefix="litetune-hf-") as tmp:
             work = Path(tmp)
             script = work / "generate.py"
@@ -1972,7 +2013,9 @@ class HuggingFaceBackend:
                     total=len(prompts),
                 )
             try:
-                proc = self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
+                proc = self.env.run(
+                    ["python", str(script), str(spec)], timeout=self.timeout_s, env=child_env
+                )
             except subprocess.TimeoutExpired as expired:
                 logger.warning("transformers generation timed out after %ss", self.timeout_s)
                 reason = f"no result after {self.timeout_s}s (timeout)"
@@ -2038,6 +2081,22 @@ class HuggingFaceBackend:
         because then no run happened at all.
         """
         self.last_probe = None
+        self.host = None
+        self.mps_memory = None
+        self.mps_refusal = None
+        # Before provisioning, which costs minutes: a LITETUNE_DEVICE litetune
+        # does not accept stops this reference from running at all, rather
+        # than being read as "auto" and placing it on the accelerator it was
+        # set to avoid. `verify` refuses the same value before it measures
+        # anything; this is the same rule for a caller that drives the backend
+        # itself.
+        try:
+            setting = devices.device_setting(os.environ)
+        except devices.DeviceSettingError as exc:
+            logger.error("%s", exc)
+            self.device = None
+            self.probed_device = None
+            return str(exc)
         if self.auto_provision:
             try:
                 self.env.provision(events=events)
@@ -2072,8 +2131,11 @@ class HuggingFaceBackend:
                 events.note(detail, environment=self.env.name)
             self.last_probe = envs.DeviceProbe(device=None, detail=detail, attempted=False)
             return None
-        probe = envs.resolve_device(self.env, events=events)
+        probe = devices.apply_device_setting(envs.resolve_device(self.env, events=events), setting)
         self.last_probe = probe
+        self.host = devices.host_record(probe)
+        if probe.source == devices.DEVICE_VARIABLE and events is not None:
+            events.note(probe.detail, environment=self.env.name, device=probe.device)
         if probe.answered:
             self.probed_device = probe.device
             self.device = probe.device
