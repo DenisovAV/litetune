@@ -390,12 +390,25 @@ BFLOAT16_CPU_HINT = (
 # never on either of these.
 ACCELERATORS = ("cuda", "mps")
 
-# What `tune` trains in on mps when `--dtype` was not given. bfloat16 is the
-# default everywhere else; on MPS it has not been measured here, in speed or in
-# what it trains, and float32 is the dtype the float reference loads at. An
-# explicit `--dtype bfloat16` on mps is honoured and recorded as declared.
+# What `tune` trains in on mps when `--dtype` was not given: float32, the dtype
+# the float reference loads at. Neither dtype has been measured on MPS here, in
+# speed or in what it trains, so this is not a finding that float32 is better
+# there; it is the one dtype the rest of the pipeline already uses. bfloat16
+# is the default everywhere else. An explicit `--dtype bfloat16` on mps is
+# honoured and recorded as declared.
 MPS_DEFAULT_DTYPE = "float32"
-MPS_DTYPE_SOURCE = "default for mps: bfloat16 on MPS unmeasured"
+MPS_DTYPE_SOURCE = (
+    "default for mps: float32, the dtype the float reference loads at; neither dtype has been "
+    "measured on MPS"
+)
+
+
+# What `dtype_source` says when no dtype was decided: the run stopped before
+# the device -- which the default depends on -- was known, or was refused on
+# mps before anything trained. `dtype` is null beside either, never the
+# general default for a run that never reached one.
+DTYPE_UNDECIDED = "undecided: the run stopped before the device was known"
+DTYPE_UNDECIDED_MPS_REFUSED = "undecided: training was not attempted on mps"
 
 
 @dataclass(frozen=True)
@@ -1466,10 +1479,25 @@ class TuneRequest:
             "mps_memory": dict(mps_memory) if mps_memory is not None else None,
         }
 
-    def as_dict(self, device: str | None = None) -> dict[str, Any]:
+    def as_dict(
+        self,
+        device: str | None = None,
+        dtype: DtypeDecision | None = None,
+        dtype_undecided: str = DTYPE_UNDECIDED,
+    ) -> dict[str, Any]:
         record = self.config(self.output_dir / "metrics.json", device=device)
-        # The request records what the caller said; the decision is the result's
-        # and is reported at the top level of `TuneResult.as_dict`.
+        # The request records what the caller said, with two exceptions it is
+        # handed rather than recomputes. The dtype is the result's decision,
+        # which depends on the device: `dtype` and `dtype_source` are that
+        # decision, or null and why there was none, and what the caller said is
+        # `dtype_declared` (`None` for not declared). Recomputed here from a
+        # device of `None`, a run refused before its probe recorded the
+        # general default as though it had trained in it.
+        record["dtype_declared"] = self.dtype
+        record["dtype"] = dtype.dtype if dtype is not None else None
+        record["dtype_source"] = dtype.source if dtype is not None else dtype_undecided
+        # The mode decision is the result's too, and is reported at the top
+        # level of `TuneResult.as_dict`.
         record.pop("prompt_mode_decision")
         # Same division: the request says which file the caller named, and the
         # digest of what was in it belongs to the result. Leaving it here would
@@ -1744,6 +1772,10 @@ class TuneResult:
     # The MPS memory policy the run started under (`devices.MpsMemory`), or
     # `None` when the run was not on mps.
     mps_memory: devices.MpsMemory | None = None
+    # The dtype this run trains in, decided once the device is known and the
+    # run is going ahead. `None` before that, with `dtype_undecided` saying why.
+    dtype: DtypeDecision | None = None
+    dtype_undecided: str = DTYPE_UNDECIDED
 
     @property
     def outcome(self) -> Outcome:
@@ -1805,7 +1837,9 @@ class TuneResult:
             "device_probe": self.device_probe.as_dict() if self.device_probe else None,
             "host": self.host,
             "mps_memory": self.mps_memory.as_dict() if self.mps_memory else None,
-            "request": self.request.as_dict(device=self.device),
+            "request": self.request.as_dict(
+                device=self.device, dtype=self.dtype, dtype_undecided=self.dtype_undecided
+            ),
             "metrics": self.metrics.as_dict() if self.metrics else None,
             "model_dir": str(self.model_dir) if self.model_dir else None,
             "adapter_dir": str(self.adapter_dir) if self.adapter_dir else None,
@@ -1899,10 +1933,9 @@ def _dtype_limitations(result: TuneResult, dtype: DtypeDecision) -> None:
     if dtype.source == MPS_DTYPE_SOURCE:
         result.limitation(
             f"this run trains in {MPS_DEFAULT_DTYPE} because it is on mps and no --dtype was "
-            f"given. The default elsewhere is {DEFAULT_DTYPE!r}; bfloat16 on MPS has not been "
-            "measured here, in speed or in what it trains, so on mps the default is float32, "
-            "which is also the dtype evaluation's float reference loads at. --dtype bfloat16 "
-            "trains in it on mps and is recorded as declared"
+            f"given: the dtype evaluation's float reference loads at. The default elsewhere is "
+            f"{DEFAULT_DTYPE!r}. Neither dtype has been measured on MPS here, in speed or in "
+            "what it trains. --dtype bfloat16 trains in it on mps and is recorded as declared"
         )
 
 
@@ -2213,10 +2246,6 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         result.limitation(probe.detail)
         events.note(probe.detail, device=device, source=probe.source)
     result.host = devices.host_record(probe)
-    dtype = decide_dtype(request.dtype, device)
-    _dtype_limitations(result, dtype)
-    if dtype.source == MPS_DTYPE_SOURCE:
-        events.note(f"training in {dtype.dtype} on mps: {dtype.source}", dtype=dtype.dtype)
 
     # -- how much of this Mac may the run take? -----------------------------
     # Set here, in the parent, because the watermarks reach torch's MPS
@@ -2236,6 +2265,9 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             result.checks.add(refused)
             events.check(refused)
             result.limitation(f"training was not attempted: {exc}")
+            # Nothing trained, so no dtype did either: float32 on record here
+            # would read as the dtype of a run that never ran.
+            result.dtype_undecided = DTYPE_UNDECIDED_MPS_REFUSED
             events.stage_finished(result.outcome.value, attempted=False)
             return result
         child_env = result.mps_memory.child_env
@@ -2247,6 +2279,16 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             result.mps_memory.summary(),
             **{k: v for k, v in result.mps_memory.variables.items() if v is not None},
         )
+
+    # -- what will it train in? --------------------------------------------
+    # Decided here, once the device is known and nothing is left to refuse
+    # the run before it starts: the dtype's limitations describe a run that
+    # trains, and a run refused on mps above does not.
+    dtype = decide_dtype(request.dtype, device)
+    result.dtype = dtype
+    _dtype_limitations(result, dtype)
+    if dtype.source == MPS_DTYPE_SOURCE:
+        events.note(f"training in {dtype.dtype} on mps: {dtype.source}", dtype=dtype.dtype)
 
     if dtype.dtype == DEFAULT_DTYPE and device not in ACCELERATORS:
         # Before the wait, not after it: DEFAULT_TIMEOUT_S is sized for

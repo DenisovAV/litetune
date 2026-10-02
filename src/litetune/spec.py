@@ -320,9 +320,13 @@ class BaseModel:
 
     id: str
     revision: str
-    # `bfloat16`, matching `tune.DEFAULT_DTYPE` and the CLI. Three defaults
-    # disagreeing about the one parameter the design is emphatic on is how a
-    # spec file ends up training in a precision nobody chose.
+    # `bfloat16`, matching `tune.DEFAULT_DTYPE`. The CLI's `--dtype` no longer
+    # has a default of its own: left out, `tune.decide_dtype` picks one once
+    # the device is known, float32 on mps. This one stays, because it is
+    # hashed into the spec and changing it re-runs training. Nothing maps it
+    # into `TuneRequest.dtype` today; a mapping that did would record
+    # bfloat16 as declared, on mps too, since `decide_dtype` defaults only a
+    # dtype nobody declared.
     dtype: str = "bfloat16"
     attn_implementation: str = "eager"
 

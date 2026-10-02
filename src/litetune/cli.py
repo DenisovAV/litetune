@@ -474,14 +474,15 @@ def _add_tune(sub) -> None:
     #
     # No default here: leaving it out is "not declared", and the default is
     # decided once the device is known (`tune.decide_dtype`) -- bfloat16, or
-    # float32 on mps, where bfloat16 is unmeasured. The report records which.
+    # on mps float32, the dtype the float reference loads at; neither has been
+    # measured on MPS. The report records which, and what was declared.
     tune.add_argument(
         "--dtype",
         choices=sorted(DTYPES),
         help=(
-            "default bfloat16, or float32 when training on Apple's GPU (mps), where bfloat16 "
-            "has not been measured. The report records whether the dtype was declared or "
-            "defaulted"
+            "default bfloat16, or float32 when training on Apple's GPU (mps): the dtype the "
+            "float reference loads at; neither dtype has been measured on MPS. The report "
+            "records what was declared and what the run trained in"
         ),
     )
     tune.add_argument("--attn-implementation", default="eager")

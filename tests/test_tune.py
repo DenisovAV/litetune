@@ -50,6 +50,8 @@ from litetune.tune import (
     DEFAULT_ATTN_IMPLEMENTATION,
     DEFAULT_DTYPE,
     DEVICE_CHECK,
+    DTYPE_UNDECIDED,
+    DTYPE_UNDECIDED_MPS_REFUSED,
     ENV_CHECK,
     EXPECTED_SUPERVISED_FRACTION,
     FORCE_PROMPT_MODE_FLAG,
@@ -2648,6 +2650,35 @@ def test_a_killed_run_on_cuda_carries_no_dtype_hint(trainer, request_for):
     assert "--dtype float32" not in check_named(result, TRAINING_CHECK).detail
 
 
+def test_a_timeout_on_mps_carries_no_dtype_hint(trainer, request_for):
+    """M1: mps is not the CPU, and an explicit bfloat16 there is not the
+    bfloat16-on-the-CPU run the hint is about."""
+    _mps_trainer(trainer)
+    trainer.raises = subprocess.TimeoutExpired(cmd="python", timeout=10)
+
+    result = run_tune(request_for(dtype="bfloat16"))
+
+    check = check_named(result, TRAINING_CHECK)
+    assert "no result after" in check.detail
+    assert "--dtype float32" not in check.detail
+
+
+@pytest.mark.parametrize("reported", [None, "mps"])
+def test_a_killed_run_on_mps_carries_no_dtype_hint(trainer, request_for, reported):
+    """M2: whether or not the script got as far as reporting its device."""
+    _mps_trainer(trainer)
+    trainer.device = reported
+    trainer.write_metrics = reported is not None
+    trainer.returncode = -9
+
+    result = run_tune(request_for(dtype="bfloat16"))
+
+    check = check_named(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED
+    assert "--dtype float32" not in check.detail
+    assert not any("--dtype float32" in t for t in result.limitations)
+
+
 def test_the_script_trains_on_cuda_when_there_is_one(script_namespace):
     """The fallback, reached when the parent has no answer to give: a probe
     that could not run, or an environment nobody probed. Without it a GPU box
@@ -4053,7 +4084,7 @@ def _training_call(trainer: FakeTrainer) -> Call:
 @pytest.mark.parametrize(
     ("declared", "device", "dtype", "source"),
     [
-        (None, "mps", "float32", "default for mps: bfloat16 on MPS unmeasured"),
+        (None, "mps", "float32", MPS_DTYPE_SOURCE),
         (None, "cuda", "bfloat16", "default"),
         (None, "cpu", "bfloat16", "default"),
         # No device established: the script falls back to cuda or the CPU,
@@ -4086,6 +4117,60 @@ def test_an_mps_run_trains_in_float32_by_default_and_says_why(trainer, request_f
     assert not any("optimiser's moments are bfloat16" in t for t in result.limitations)
     assert not any("not the 'bfloat16' default" in t for t in result.limitations)
     assert not [m for m in notes(seen) if "bfloat16 on the CPU" in m]
+
+
+_DTYPE_LIMITATION_WORDS = (
+    "optimiser's moments are bfloat16",
+    "not the 'bfloat16' default",
+    "on mps and no --dtype was given",
+)
+
+
+@pytest.mark.parametrize("declared", [None, "float32"])
+def test_a_run_refused_before_its_device_was_known_records_no_dtype(
+    trainer, request_for, monkeypatch, declared
+):
+    monkeypatch.setenv("LITETUNE_DEVICE", "gpu")
+
+    result = run_tune(request_for(dtype=declared))
+
+    record = result.as_dict()["request"]
+    assert record["dtype"] is None
+    assert record["dtype_source"] == DTYPE_UNDECIDED
+    assert record["dtype_declared"] == declared
+    assert result.dtype is None
+    # No dtype trained, so nothing is said about one.
+    assert not [t for t in result.limitations for w in _DTYPE_LIMITATION_WORDS if w in t]
+
+
+def test_an_mps_run_refused_for_memory_records_no_dtype_and_says_it_did_not_train(
+    trainer, request_for, monkeypatch
+):
+    from litetune import devices
+
+    _mps_trainer(trainer)
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+
+    result = run_tune(request_for())
+
+    record = result.as_dict()["request"]
+    assert (record["dtype"], record["dtype_source"]) == (None, DTYPE_UNDECIDED_MPS_REFUSED)
+    assert record["dtype_declared"] is None
+    assert not [t for t in result.limitations for w in _DTYPE_LIMITATION_WORDS if w in t]
+    # M12: the refusal is in the limitations as well as the check.
+    assert any(
+        t.startswith("training was not attempted: the MPS memory budget is")
+        for t in result.limitations
+    ), result.limitations
+
+
+def test_a_run_that_trains_records_the_decision_beside_what_was_declared(trainer, request_for):
+    _mps_trainer(trainer)
+
+    record = run_tune(request_for()).as_dict()["request"]
+
+    assert record["dtype_declared"] is None
+    assert (record["dtype"], record["dtype_source"]) == ("float32", MPS_DTYPE_SOURCE)
 
 
 def test_an_explicit_bfloat16_on_mps_is_honoured_and_recorded_as_declared(trainer, request_for):
