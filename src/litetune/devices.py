@@ -231,8 +231,8 @@ def host_record(
 # comment on `m_high_watermark_ratio`. That both are read with `strtod`, that
 # the low ratio must be within [0, high] -- [0, 2.0] when high is 0.0 -- and
 # that the fallback is read with `std::stoi` is from upstream source at
-# v2.5.1 (aten/src/ATen/mps/MPSAllocator.mm and MPSFallback.mm), which the
-# wheel does not ship. `strtod` reads "0.5x" as 0.5 and "most" as 0.0 -- no
+# v2.5.1 as the review read it (aten/src/ATen/mps/MPSAllocator.mm and
+# MPSFallback.mm), which the wheel does not ship. `strtod` reads "0.5x" as 0.5 and "most" as 0.0 -- no
 # limit at all -- so only a plain decimal is accepted here, a form on which
 # `strtod` and Python's `float` agree; `std::stoi` likewise reads "1x" as 1
 # and throws on "x", so only a plain integer is.
