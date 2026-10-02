@@ -66,11 +66,18 @@ counts (`vm.page_free_count`, `vm.page_speculative_count`,
 `vm.page_pageable_external_count`, `vm.page_purgeable_count`) times
 `hw.pagesize`; `PYTORCH_MPS_HIGH_WATERMARK_RATIO` is the budget over the
 working set, `PYTORCH_MPS_LOW_WATERMARK_RATIO` is 0.8 of that, and
-`PYTORCH_ENABLE_MPS_FALLBACK=0` makes an operation MPS does not implement
-raise instead of running on the CPU. A value you set for any of the three is
-kept and recorded as yours. A budget under 1 GiB is refused rather than
-started, and so is a Mac whose `kern.memorystatus_vm_pressure_level` is not 1
-(normal): quit what is holding memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in
+`PYTORCH_ENABLE_MPS_FALLBACK=0` — torch's own default, written out — makes
+an operation MPS does not implement raise instead of running on the CPU. A
+value you set for any of the three is kept and recorded as yours, after a
+check: the ratios must be plain decimals from 0 to 2.0, the low one no higher
+than the high one, and the fallback a plain integer; anything else is refused
+before the run starts. A high ratio you set is the limit, so the 1 GiB floor
+below does not apply to it; the report records litetune's computed budget
+beside the limit in force, and says so when your `0.0` removed the limit or
+your non-zero fallback let operations run on the CPU. A budget litetune
+computes under 1 GiB is refused rather than started, and so is a Mac whose
+`kern.memorystatus_vm_pressure_level` is not 1 (normal): quit what is holding
+memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in
 float32 unless you pass `--dtype`, pads each batch to a multiple of 32 tokens,
 and records peak MPS memory; an MPS out-of-memory error is reported as the
 machine's, not the recipe's. Nothing in this repository has been measured on

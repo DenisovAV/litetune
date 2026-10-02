@@ -2119,13 +2119,35 @@ def test_the_reference_engine_records_the_host_and_the_mps_memory(
     assert engine["host"]["os"] == "Darwin"
     assert engine["host"]["machine"] == "arm64"
     memory = engine["mps_memory"]
-    assert memory["budget_bytes"] == 13 * 1024**3
+    assert memory["computed_budget_bytes"] == 13 * 1024**3
     assert memory["recommended_max_memory_bytes"] == 16 * 1024**3
     assert memory["available_bytes"] == 16 * 1024**3
     assert memory["pressure_level"] == 1
     assert memory["swapusage"] is not None
     assert memory["variables"]["PYTORCH_MPS_HIGH_WATERMARK_RATIO"]["value"] == "0.812500"
     assert memory["variables"]["PYTORCH_MPS_LOW_WATERMARK_RATIO"]["value"] == "0.650000"
+
+
+def test_the_operators_mps_fallback_reaches_the_manifest(write_split, monkeypatch, tmp_path):
+    _ready_train_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    rows = text_rows(5)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer("mps"))
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert any(
+        "PYTORCH_ENABLE_MPS_FALLBACK=1" in text and "`device: mps` does not mean every" in text
+        for text in result.manifest["limitations"]
+    ), result.manifest["limitations"]
 
 
 def test_a_reference_refused_for_memory_reaches_the_manifest(write_split, monkeypatch, tmp_path):

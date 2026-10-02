@@ -297,14 +297,172 @@ def test_an_operators_low_ratio_above_the_high_one_is_refused():
         _policy({LOW_WATERMARK: "1.4"})
 
 
-def test_an_operators_ratio_that_is_not_a_number_is_refused():
-    with pytest.raises(MpsMemoryRefused, match="not a number"):
-        _policy({HIGH_WATERMARK: "most of it"})
+@pytest.mark.parametrize("name", [HIGH_WATERMARK, LOW_WATERMARK])
+@pytest.mark.parametrize(
+    "value",
+    # `strtod` would read the first as 0.5 and the rest as 0.0 -- no limit --
+    # or as inf and nan; Python's `float` reads "0_5" as 5 and " 1" as 1.
+    ["0.5x", "most of it", "", "inf", "nan", "-0.5", "0_5", " 1", "0x1p-1", "1,5"],
+)
+def test_an_operators_ratio_that_is_not_a_plain_decimal_is_refused(name, value):
+    with pytest.raises(MpsMemoryRefused) as raised:
+        _policy({name: value})
+    message = str(raised.value)
+    assert repr(value) in message or value in message
+    assert "could not check" in message or "outside 0 to 2.0" in message
+    # Nothing is claimed about what torch would make of it.
+    assert "torch" not in message
+
+
+@pytest.mark.parametrize("value", ["2.0001", "3", "1e1", "1e999"])
+def test_a_high_ratio_above_two_is_refused(value):
+    with pytest.raises(MpsMemoryRefused, match="outside 0 to 2.0"):
+        _policy({HIGH_WATERMARK: value})
+
+
+@pytest.mark.parametrize("value", ["2", "2.0", "1.5", ".5", "5e-1", "0.000", "0"])
+def test_a_high_ratio_in_range_is_taken_as_it_is(value):
+    policy = _policy({HIGH_WATERMARK: value})
+    assert policy.variables[HIGH_WATERMARK] == value
+    assert policy.budget_source == "user"
+
+
+def test_an_invalid_high_ratio_is_refused_before_a_low_one_is_derived_from_it():
+    with pytest.raises(MpsMemoryRefused, match=HIGH_WATERMARK):
+        _policy({HIGH_WATERMARK: "5"})
+
+
+def test_the_operators_high_ratio_owns_the_limit_and_skips_the_budget_floor():
+    # 2 GiB available would be refused for a budget litetune computed.
+    policy = _policy({HIGH_WATERMARK: "0.5"}, available=2 * GIB)
+    assert policy.budget_source == "user"
+    assert policy.budget == -1 * GIB
+    record = policy.as_dict()
+    assert record["budget_source"] == "user"
+    assert record["computed_budget_bytes"] == -1 * GIB
+    assert record["effective_high_bytes"] == 8 * GIB
+    assert record["effective_low_bytes"] == int(0.4 * 16 * GIB)
+    assert policy.limitations == []
+
+
+def test_pressure_is_refused_even_under_the_operators_high_ratio():
+    with pytest.raises(MpsMemoryRefused, match="pressure_level is 2"):
+        _policy({HIGH_WATERMARK: "0.5"}, pressure=2)
+
+
+@pytest.mark.parametrize("value", ["0", "0.0", "0.000"])
+def test_a_high_ratio_of_zero_is_unlimited_and_said_so(value):
+    policy = _policy({HIGH_WATERMARK: value})
+    record = policy.as_dict()
+    assert record["effective_high_bytes"] == "unlimited"
+    # No low ratio is derived from no limit: torch's own default applies.
+    assert policy.variables[LOW_WATERMARK] is None
+    assert LOW_WATERMARK not in policy.child_env
+    assert record["variables"][LOW_WATERMARK] == {"value": None, "set_by": None}
+    assert "torch's default" in record["effective_low_bytes"]
+    (said,) = policy.limitations
+    assert f"{HIGH_WATERMARK}={value}" in said
+    assert "no upper limit" in said
+
+
+def test_under_an_unlimited_high_ratio_a_low_one_up_to_two_is_accepted():
+    policy = _policy({HIGH_WATERMARK: "0.0", LOW_WATERMARK: "1.9"})
+    assert policy.variables[LOW_WATERMARK] == "1.9"
+    assert policy.as_dict()["effective_low_bytes"] == int(1.9 * 16 * GIB)
+    with pytest.raises(MpsMemoryRefused):
+        _policy({HIGH_WATERMARK: "0.0", LOW_WATERMARK: "2.1"})
+
+
+def test_the_operators_own_valid_low_ratio_is_recorded_as_theirs_and_not_resent():
+    policy = _policy({LOW_WATERMARK: "0.5"})
+    assert policy.budget_source == "litetune"
+    assert policy.variables[LOW_WATERMARK] == "0.5"
+    assert LOW_WATERMARK not in policy.child_env
+    assert policy.child_env == {HIGH_WATERMARK: "0.812500", MPS_FALLBACK: "0"}
+    recorded = policy.as_dict()["variables"][LOW_WATERMARK]
+    assert recorded == {"value": "0.5", "set_by": "user"}
+    assert policy.as_dict()["effective_low_bytes"] == 8 * GIB
+
+
+def test_a_low_ratio_of_zero_is_recorded_as_disabled():
+    assert _policy({LOW_WATERMARK: "0"}).as_dict()["effective_low_bytes"] == "disabled"
+
+
+def test_a_low_ratio_above_litetunes_high_one_names_litetune_as_its_author():
+    with pytest.raises(MpsMemoryRefused) as raised:
+        _policy({LOW_WATERMARK: "0.9"})
+    assert "which litetune computed from the available memory" in str(raised.value)
+
+
+def test_a_low_ratio_above_the_operators_high_one_names_the_environment():
+    with pytest.raises(MpsMemoryRefused) as raised:
+        _policy({HIGH_WATERMARK: "0.5", LOW_WATERMARK: "0.6"})
+    assert "(set in this environment)" in str(raised.value)
+
+
+@pytest.mark.parametrize("value", ["1", "2", "-1", "+1", "01"])
+def test_an_operators_nonzero_fallback_is_allowed_and_said(value):
+    policy = _policy({MPS_FALLBACK: value})
+    assert policy.fallback_enabled
+    (said,) = policy.limitations
+    assert f"{MPS_FALLBACK}={value}" in said
+    assert "ran on the CPU" in said
+    assert "`device: mps` does not mean every operation" in said
+
+
+@pytest.mark.parametrize("value", ["0", "00", "-0"])
+def test_an_operators_zero_fallback_is_theirs_and_says_nothing(value):
+    policy = _policy({MPS_FALLBACK: value})
+    assert not policy.fallback_enabled
+    assert policy.limitations == []
+    assert policy.as_dict()["variables"][MPS_FALLBACK] == {"value": value, "set_by": "user"}
+
+
+@pytest.mark.parametrize("value", ["yes", "1x", "", " 1", "1.0", "2147483648", "true"])
+def test_an_operators_fallback_that_is_not_an_integer_is_refused(value):
+    with pytest.raises(MpsMemoryRefused, match="not a plain integer"):
+        _policy({MPS_FALLBACK: value})
+
+
+def test_litetunes_fallback_is_zero_and_says_nothing():
+    policy = _policy()
+    assert policy.variables[MPS_FALLBACK] == "0"
+    assert not policy.fallback_enabled
+    assert policy.limitations == []
+
+
+def test_the_summary_and_the_oom_advice_say_who_set_the_limit():
+    ours = _policy()
+    assert "set by litetune" in ours.summary()
+    advice = devices.mps_oom_advice(ours)
+    assert "budget litetune set from the memory this Mac had available" in advice
+    assert "LITETUNE_DEVICE=cpu" in advice
+
+    theirs = _policy({HIGH_WATERMARK: "0.5"})
+    assert "set in this environment" in theirs.summary()
+    advice = devices.mps_oom_advice(theirs)
+    assert "not by litetune" in advice
+    assert "budget litetune set" not in advice
+    assert "LITETUNE_DEVICE=cpu" in advice
+
+    unlimited = _policy({HIGH_WATERMARK: "0"})
+    assert "no limit" in unlimited.summary()
+    assert "no upper limit" in devices.mps_oom_advice(unlimited)
+
+    # Nobody set a policy: nothing is claimed about one.
+    advice = devices.mps_oom_advice(None)
+    assert "LITETUNE_DEVICE=cpu" in advice
+    assert "litetune set" not in advice
+    for text in (devices.mps_oom_advice(ours), devices.mps_oom_advice(theirs), advice):
+        assert "PYTORCH_ENABLE_MPS_FALLBACK" not in text
 
 
 def test_the_record_carries_every_input_and_both_ratios():
     record = _policy().as_dict()
-    assert record["budget_bytes"] == 13 * GIB
+    assert record["budget_source"] == "litetune"
+    assert record["computed_budget_bytes"] == 13 * GIB
+    assert record["effective_high_bytes"] == int(0.8125 * 16 * GIB)
+    assert record["effective_low_bytes"] == int(0.65 * 16 * GIB)
     assert record["recommended_max_memory_bytes"] == 16 * GIB
     assert record["available_bytes"] == 16 * GIB
     assert record["available_measure"] == (

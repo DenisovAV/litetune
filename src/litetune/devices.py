@@ -23,6 +23,8 @@ MPS for itself would run without it.
 from __future__ import annotations
 
 import logging
+import math
+import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
@@ -196,9 +198,28 @@ def host_record(
 # default is above any high ratio this policy produces, and libtorch_cpu in
 # that wheel carries the message "invalid low watermark ratio".
 #
-# `PYTORCH_ENABLE_MPS_FALLBACK=0`: an operator MPS does not implement must
-# raise, not run on the CPU, which would leave a run recorded as "mps" that
-# computed part of itself somewhere else.
+# `PYTORCH_ENABLE_MPS_FALLBACK=0` is torch's own default made explicit:
+# libtorch_cpu's message for an operator MPS does not implement says "you can
+# set the environment variable `PYTORCH_ENABLE_MPS_FALLBACK=1` to use the CPU
+# as a fallback for this op", so unset, it raises. Written out so the record
+# says which it was rather than leaving it to the environment.
+#
+# The operator may set any of the three, and what they set is theirs: passed
+# through, never overridden, and recorded as theirs. A high ratio they set is
+# the limit, so the 1 GiB floor on the computed budget does not apply to it;
+# the computed budget is still recorded beside it. Each value is checked
+# before anything starts, and one litetune cannot read is refused as a fact
+# about the configuration, not passed on. The ranges are torch 2.5.1's. The
+# upper bound of 2.0 on the high ratio is `default_high_watermark_upper_bound`
+# in the shipped MPSAllocator.h, and 0.0 meaning "no limit" is that header's
+# comment on `m_high_watermark_ratio`. That both are read with `strtod`, that
+# the low ratio must be within [0, high] -- [0, 2.0] when high is 0.0 -- and
+# that the fallback is read with `std::stoi` is from upstream source at
+# v2.5.1 (aten/src/ATen/mps/MPSAllocator.mm and MPSFallback.mm), which the
+# wheel does not ship. `strtod` reads "0.5x" as 0.5 and "most" as 0.0 -- no
+# limit at all -- so only a plain decimal is accepted here, a form on which
+# `strtod` and Python's `float` agree; `std::stoi` likewise reads "1x" as 1
+# and throws on "x", so only a plain integer is.
 #
 # None of this has been measured on a training run. It bounds what the
 # allocator may take; whether a given model then fits is the run's to find out.
@@ -211,6 +232,11 @@ LOW_WATERMARK = "PYTORCH_MPS_LOW_WATERMARK_RATIO"
 MPS_FALLBACK = "PYTORCH_ENABLE_MPS_FALLBACK"
 MPS_VARIABLES = (HIGH_WATERMARK, LOW_WATERMARK, MPS_FALLBACK)
 _RATIO_FORMAT = "{:.6f}"
+HIGH_RATIO_UPPER_BOUND = 2.0
+_DECIMAL = re.compile(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+_INTEGER = re.compile(r"[+-]?[0-9]+")
+# `std::stoi` returns an `int`; a value outside a 32-bit one throws.
+_INT_MIN, _INT_MAX = -(2**31), 2**31 - 1
 
 PAGE_SIZE = "hw.pagesize"
 # The four page counts whose sum is the available memory, in the order above.
@@ -267,9 +293,13 @@ class MpsMemory:
 
     recommended_max_memory: int
     reading: MemoryReading
+    # min(R, available - headroom), computed whoever set the high ratio. When
+    # the operator set it, this is what litetune would have set, not the limit.
     budget: int
-    # The value of each of `MPS_VARIABLES` that reaches the child.
-    variables: Mapping[str, str]
+    # The value of each of `MPS_VARIABLES` that reaches the child. `None` for a
+    # low ratio nobody sets: under an operator's high ratio of 0.0 litetune
+    # derives none, and torch's own default applies.
+    variables: Mapping[str, str | None]
     # Which of them the operator had already set. Those are passed through as
     # they were, never overridden, and recorded as theirs.
     user_set: tuple[str, ...] = ()
@@ -279,11 +309,83 @@ class MpsMemory:
     @property
     def child_env(self) -> dict[str, str]:
         """What litetune adds to the child's environment: everything not the operator's."""
-        return {k: v for k, v in self.variables.items() if k not in self.user_set}
+        return {k: v for k, v in self.variables.items() if k not in self.user_set and v is not None}
+
+    @property
+    def budget_source(self) -> str:
+        """Who set the limit in force: "user" when the operator set the high ratio."""
+        return "user" if HIGH_WATERMARK in self.user_set else "litetune"
+
+    def _ratio(self, name: str) -> float | None:
+        value = self.variables.get(name)
+        return float(value) if value is not None else None
+
+    @property
+    def effective_high(self) -> int | str:
+        """The high limit in bytes, ratio x R truncated, or "unlimited" at 0.0."""
+        high = self._ratio(HIGH_WATERMARK)
+        if high is None:
+            # `mps_memory_policy` always sets one; a hand-built record may not.
+            raise ValueError(f"this MPS policy carries no {HIGH_WATERMARK}")
+        return "unlimited" if high == 0.0 else int(high * self.recommended_max_memory)
+
+    @property
+    def effective_low(self) -> int | str:
+        """The low limit in bytes; "disabled" at 0.0; torch's default when nobody set one."""
+        low = self._ratio(LOW_WATERMARK)
+        if low is None:
+            return "not set: torch's default low ratio applies"
+        # MPSAllocator.h: "setting 0.0 disables adaptive commit and garbage
+        # collection".
+        return "disabled" if low == 0.0 else int(low * self.recommended_max_memory)
+
+    @property
+    def fallback_enabled(self) -> bool:
+        return int(self.variables[MPS_FALLBACK] or "0") != 0
+
+    @property
+    def limitations(self) -> list[str]:
+        """What a report must say about this policy beyond its record."""
+        said = []
+        if self.effective_high == "unlimited":
+            said.append(
+                f"{HIGH_WATERMARK}={self.variables[HIGH_WATERMARK]} was set in this environment, "
+                "which disables torch's MPS memory limit (MPSAllocator.h: \"disables high "
+                'watermark limit (may cause system failure if system-wide OOM occurs)"). '
+                "This run's MPS allocations had no upper limit, from litetune or from torch; "
+                f"litetune's computed budget, {self.budget / GIB:.2f} GiB, was not applied"
+            )
+        if self.fallback_enabled:
+            said.append(
+                f"{MPS_FALLBACK}={self.variables[MPS_FALLBACK]} was set in this environment, so "
+                "any operation MPS does not implement ran on the CPU instead of raising (torch's "
+                'own message offers the variable "to use the CPU as a fallback for this op"). '
+                "`device: mps` does not mean every operation of this run ran on MPS"
+            )
+        return said
+
+    def summary(self) -> str:
+        """One line for the event stream, worded by who set the limit."""
+        if self.budget_source == "litetune":
+            return (
+                f"MPS memory budget {self.budget / GIB:.1f} GiB of the "
+                f"{self.recommended_max_memory / GIB:.1f} GiB Metal recommends, set by litetune "
+                "from the memory available now"
+            )
+        limit = self.effective_high
+        said = "no limit" if isinstance(limit, str) else f"{limit / GIB:.1f} GiB"
+        return (
+            f"MPS high watermark set in this environment ({HIGH_WATERMARK}="
+            f"{self.variables[HIGH_WATERMARK]}): {said}; litetune's computed budget would have "
+            f"been {self.budget / GIB:.1f} GiB"
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "budget_bytes": self.budget,
+            "budget_source": self.budget_source,
+            "computed_budget_bytes": self.budget,
+            "effective_high_bytes": self.effective_high,
+            "effective_low_bytes": self.effective_low,
             "recommended_max_memory_bytes": self.recommended_max_memory,
             "available_bytes": self.reading.available_bytes,
             "available_measure": AVAILABLE_MEASURE,
@@ -296,7 +398,13 @@ class MpsMemory:
             "variables": {
                 name: {
                     "value": value,
-                    "set_by": "user" if name in self.user_set else "litetune",
+                    "set_by": (
+                        "user"
+                        if name in self.user_set
+                        else "litetune"
+                        if value is not None
+                        else None
+                    ),
                 }
                 for name, value in self.variables.items()
             },
@@ -307,14 +415,54 @@ class MpsMemory:
 AVAILABLE_MEASURE = f"({' + '.join(AVAILABLE_PAGES)}) * {PAGE_SIZE}"
 
 
-def _ratio(name: str, value: str) -> float:
-    try:
-        return float(value)
-    except ValueError:
+def mps_oom_advice(memory: MpsMemory | None) -> str:
+    """What to do about an MPS out-of-memory ending, worded by who set the limit."""
+    cpu = f"set {DEVICE_VARIABLE}=cpu to run on the CPU"
+    if memory is None:
+        return cpu[0].upper() + cpu[1:]
+    if memory.budget_source == "litetune":
+        return (
+            f"the {memory.budget / GIB:.1f} GiB budget litetune set from the memory this Mac had "
+            f"available when the run started was not enough; quit what is holding memory and "
+            f"run again, or {cpu}"
+        )
+    high = memory.variables[HIGH_WATERMARK]
+    if memory.effective_high == "unlimited":
+        return (
+            f"{HIGH_WATERMARK}={high} was set in this environment, so torch's MPS allocator had "
+            f"no upper limit, and the memory still ran out; quit what is holding memory, or {cpu}"
+        )
+    return (
+        f"the high watermark ratio was set in this environment ({HIGH_WATERMARK}={high}), not "
+        f"by litetune; raise or unset it, or {cpu}"
+    )
+
+
+def _decimal(name: str, text: str, upper: float) -> float:
+    """`text` as a ratio between 0 and `upper`, or a refusal naming why it is not one."""
+    if not _DECIMAL.fullmatch(text):
         raise MpsMemoryRefused(
-            f"{name}={value!r} is set in this environment and is not a number; torch's MPS "
-            "allocator would refuse it when the run starts. Unset it, or set a ratio"
-        ) from None
+            f"{name}={text!r} is set in this environment and is not a plain decimal number, so "
+            "litetune could not check it before the run. Unset it, or set a number between 0 "
+            f"and {upper}"
+        )
+    value = float(text)
+    if not (math.isfinite(value) and 0.0 <= value <= upper):
+        raise MpsMemoryRefused(
+            f"{name}={text} is set in this environment and is outside 0 to {upper}, the range "
+            "litetune accepts for it. Unset it, or set a number in that range"
+        )
+    return value
+
+
+def _fallback(text: str) -> int:
+    if not _INTEGER.fullmatch(text) or not _INT_MIN <= int(text) <= _INT_MAX:
+        raise MpsMemoryRefused(
+            f"{MPS_FALLBACK}={text!r} is set in this environment and is not a plain integer, "
+            "so litetune could not tell whether it turns the CPU fallback on. Unset it, or set "
+            "0 or 1"
+        )
+    return int(text)
 
 
 def _pressure_refusal(level: int) -> str:
@@ -338,8 +486,8 @@ def mps_memory_policy(
     """The watermark ratios for a child about to use MPS. Pure: every input is passed in.
 
     Raises `MpsMemoryRefused` when the kernel reports memory pressure, when
-    the budget is under `MPS_MIN_BUDGET_BYTES`, or when a ratio the operator
-    set cannot be one torch accepts.
+    litetune sets the limit and the budget is under `MPS_MIN_BUDGET_BYTES`, or
+    when a value the operator set is not one litetune can check.
     """
     if recommended_max_memory <= 0:
         raise MpsMemoryRefused(
@@ -350,35 +498,51 @@ def mps_memory_policy(
         raise MpsMemoryRefused(_pressure_refusal(reading.pressure_level))
     available = reading.available_bytes
     budget = min(recommended_max_memory, available - MPS_HEADROOM_BYTES)
-    if budget < MPS_MIN_BUDGET_BYTES:
-        raise MpsMemoryRefused(
-            f"the MPS memory budget is {budget / GIB:.2f} GiB, under the "
-            f"{MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB litetune starts an MPS run with: this Mac "
-            f"has {available / GIB:.2f} GiB available ({AVAILABLE_MEASURE}), less "
-            f"{MPS_HEADROOM_BYTES / GIB:.0f} GiB left to everything else, against the "
-            f"{recommended_max_memory / GIB:.1f} GiB Metal recommends. Quit what is holding "
-            f"memory and run again, or set {DEVICE_VARIABLE}=cpu to run on the CPU"
-        )
-
     user_set = tuple(name for name in MPS_VARIABLES if name in environ)
-    high_text = environ.get(HIGH_WATERMARK, _RATIO_FORMAT.format(budget / recommended_max_memory))
-    high = _ratio(HIGH_WATERMARK, high_text)
+
+    # The high ratio first: the low one is checked against it, and is never
+    # derived from one that has not been checked.
+    if HIGH_WATERMARK in environ:
+        high_text = environ[HIGH_WATERMARK]
+        high = _decimal(HIGH_WATERMARK, high_text, HIGH_RATIO_UPPER_BOUND)
+    else:
+        if budget < MPS_MIN_BUDGET_BYTES:
+            raise MpsMemoryRefused(
+                f"the MPS memory budget is {budget / GIB:.2f} GiB, under the "
+                f"{MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB litetune starts an MPS run with: this Mac "
+                f"has {available / GIB:.2f} GiB available ({AVAILABLE_MEASURE}), less "
+                f"{MPS_HEADROOM_BYTES / GIB:.0f} GiB left to everything else, against the "
+                f"{recommended_max_memory / GIB:.1f} GiB Metal recommends. Quit what is holding "
+                f"memory and run again, or set {DEVICE_VARIABLE}=cpu to run on the CPU"
+            )
+        high_text = _RATIO_FORMAT.format(budget / recommended_max_memory)
+        high = float(high_text)
+
+    low_text: str | None
     if LOW_WATERMARK in environ:
         low_text = environ[LOW_WATERMARK]
-        low = _ratio(LOW_WATERMARK, low_text)
-        if low > high:
+        low = _decimal(LOW_WATERMARK, low_text, HIGH_RATIO_UPPER_BOUND)
+        ceiling = high if high > 0.0 else HIGH_RATIO_UPPER_BOUND
+        if low > ceiling:
             owner = (
                 "set in this environment"
                 if HIGH_WATERMARK in user_set
-                else "computed from the available memory"
+                else "which litetune computed from the available memory"
             )
             raise MpsMemoryRefused(
                 f"{LOW_WATERMARK}={low_text} is set in this environment and is above the high "
-                f"watermark ratio {high_text} ({owner}); torch's MPS allocator takes a low ratio "
-                f"only between 0 and the high one. Unset it, or set it at or below {high_text}"
+                f"watermark ratio {high_text} ({owner}); litetune accepts a low ratio only "
+                f"between 0 and the high one. Unset it, or set it at or below {high_text}"
             )
+    elif high == 0.0:
+        # No limit to be a share of: whatever litetune derived would be its
+        # own choice of a soft limit the operator did not ask for.
+        low_text = None
     else:
         low_text = _RATIO_FORMAT.format(high * MPS_LOW_OVER_HIGH)
+
+    fallback_text = environ.get(MPS_FALLBACK, "0")
+    _fallback(fallback_text)
     return MpsMemory(
         recommended_max_memory=recommended_max_memory,
         reading=reading,
@@ -386,7 +550,7 @@ def mps_memory_policy(
         variables={
             HIGH_WATERMARK: high_text,
             LOW_WATERMARK: low_text,
-            MPS_FALLBACK: environ.get(MPS_FALLBACK, "0"),
+            MPS_FALLBACK: fallback_text,
         },
         user_set=user_set,
         swapusage=swapusage,

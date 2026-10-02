@@ -4119,7 +4119,7 @@ def test_an_mps_run_starts_its_child_under_the_memory_policy(trainer, request_fo
     }
     assert result.mps_memory is not None
     recorded = result.as_dict()["mps_memory"]
-    assert recorded["budget_bytes"] == 13 * 1024**3
+    assert recorded["computed_budget_bytes"] == 13 * 1024**3
     assert recorded["recommended_max_memory_bytes"] == 16 * 1024**3
     assert recorded["available_bytes"] == 16 * 1024**3
     assert recorded["pressure_level"] == 1
@@ -4153,6 +4153,64 @@ def test_the_operators_mps_variables_are_kept_and_recorded_as_theirs(
     variables = result.as_dict()["mps_memory"]["variables"]
     assert variables["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == {"value": "0.5", "set_by": "user"}
     assert variables["PYTORCH_ENABLE_MPS_FALLBACK"] == {"value": "1", "set_by": "user"}
+    # The operator's fallback is allowed, and the report says what it means.
+    assert any(
+        "PYTORCH_ENABLE_MPS_FALLBACK=1" in t and "`device: mps` does not mean every" in t
+        for t in result.limitations
+    ), result.limitations
+
+
+def test_the_operators_high_ratio_owns_the_limit_on_a_mac_short_of_memory(
+    trainer, request_for, monkeypatch
+):
+    from litetune import devices
+
+    _mps_trainer(trainer)
+    monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")
+    # 2 GiB available: litetune's own budget would be refused.
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+
+    result = run_tune(request_for())
+
+    assert check_named(result, TRAINING_CHECK).outcome is Outcome.PASSED
+    recorded = result.as_dict()["mps_memory"]
+    assert recorded["budget_source"] == "user"
+    assert recorded["computed_budget_bytes"] == -1 * 1024**3
+    assert recorded["effective_high_bytes"] == 8 * 1024**3
+    assert _training_call(trainer).env == {
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.400000",
+        "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+    }
+
+
+def test_an_operators_unreadable_fallback_refuses_the_run_before_it_starts(
+    trainer, request_for, monkeypatch
+):
+    _mps_trainer(trainer)
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "yes")
+
+    result = run_tune(request_for())
+
+    refused = check_named(result, DEVICE_CHECK)
+    assert refused.outcome is Outcome.UNCHECKED
+    assert "not a plain integer" in refused.detail
+    assert all(FakeTrainer.is_probe(c.argv) for c in trainer.calls)
+
+
+def test_an_mps_out_of_memory_under_the_operators_ratio_does_not_blame_litetunes_budget(
+    trainer, request_for, monkeypatch
+):
+    _mps_trainer(trainer)
+    monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = "RuntimeError: MPS backend out of memory (MPS allocated: 7.90 GB)"
+
+    detail = check_named(run_tune(request_for()), TRAINING_CHECK).detail
+
+    assert "not by litetune" in detail
+    assert "budget litetune set" not in detail
+    assert "LITETUNE_DEVICE=cpu" in detail
 
 
 def test_an_mps_run_without_the_memory_is_refused_before_it_starts(

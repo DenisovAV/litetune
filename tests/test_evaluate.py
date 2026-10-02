@@ -2923,7 +2923,7 @@ def test_an_mps_reference_starts_under_the_memory_policy_and_records_it(monkeypa
     assert described["backend"] == "mps"
     assert described["device_source"] == "probe"
     assert described["device_probe"]["mps_available"] is True
-    assert described["mps_memory"]["budget_bytes"] == 13 * 1024**3
+    assert described["mps_memory"]["computed_budget_bytes"] == 13 * 1024**3
     assert described["mps_memory"]["available_bytes"] == 16 * 1024**3
     assert described["host"]["os"] == "Darwin"
     assert described["host"]["os_version"] == "15.0"

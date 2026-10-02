@@ -491,14 +491,6 @@ MERGE_CHECK = "merged checkpoint written"
 ENV_CHECK = "training environment"
 DEVICE_CHECK = "training device"
 
-# Said beside an out-of-memory ending on mps, where the two ways forward are
-# the ones the memory policy's own refusal names.
-MPS_OOM_ADVICE = (
-    "the MPS memory budget was set from the memory this Mac had available when the run "
-    "started; quit what is holding memory and run again, or set "
-    f"{devices.DEVICE_VARIABLE}=cpu to train on the CPU"
-)
-
 NOT_VERIFIED = (
     "training completed and nothing has been measured. A falling loss curve is not evidence: the "
     "run that scored 0.0625 against a 0.5625 base reached a lower training loss than the run that "
@@ -2185,10 +2177,13 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             events.stage_finished(result.outcome.value, attempted=False)
             return result
         child_env = result.mps_memory.child_env
+        # An operator's high ratio of 0.0 and an operator's CPU fallback are
+        # theirs to set, and each changes what `device: mps` can be read as.
+        for text in result.mps_memory.limitations:
+            result.limitation(text)
         events.note(
-            f"MPS memory budget {result.mps_memory.budget / devices.GIB:.1f} GiB of the "
-            f"{result.mps_memory.recommended_max_memory / devices.GIB:.1f} GiB Metal recommends",
-            **dict(result.mps_memory.variables),
+            result.mps_memory.summary(),
+            **{k: v for k, v in result.mps_memory.variables.items() if v is not None},
         )
 
     if dtype.dtype == DEFAULT_DTYPE and device not in ACCELERATORS:
@@ -2409,10 +2404,10 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         # them says nothing at all about whether this method on this data
         # would have worked. Same judgement as the killed branch above,
         # arriving through stderr rather than through a signal.
-        # The MPS ending carries the two ways forward the memory policy's own
-        # refusal names; every other ending reads as it always has.
+        # The MPS ending carries the ways forward, worded by who set the limit
+        # that ran out; every other ending reads as it always has.
         advice = (
-            f" ({MPS_OOM_ADVICE})"
+            f" ({devices.mps_oom_advice(result.mps_memory)})"
             if gpu_failure.group(0).lower() == "mps backend out of memory"
             else ""
         )
