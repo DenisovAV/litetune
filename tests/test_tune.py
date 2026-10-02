@@ -4350,6 +4350,58 @@ def test_an_mps_out_of_memory_is_the_machine_and_says_what_to_do(trainer, reques
     assert "quit what is holding memory" in check.detail
 
 
+def test_an_mps_out_of_memory_behind_the_error_class_still_gets_its_advice(trainer, request_for):
+    """The classifier matches `OutOfMemoryError` first on this line; the
+    advice is found by its own search, not read off that match."""
+    _mps_trainer(trainer)
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = (
+        "torch.OutOfMemoryError: MPS backend out of memory (MPS allocated: 9.10 GB, other "
+        "allocations: 1.20 GB, max allowed: 10.40 GB). Tried to allocate 256.00 MB on private pool."
+    )
+
+    check = check_named(run_tune(request_for()), TRAINING_CHECK)
+
+    assert check.outcome is Outcome.UNCHECKED
+    assert check.observed["matched"] == "OutOfMemoryError"
+    assert "budget litetune set from the memory this Mac had available" in check.detail
+    assert "LITETUNE_DEVICE=cpu" in check.detail
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Assembled the way torch 2.5.1 raises it from two adjacent pieces.
+        "NotImplementedError: The operator 'aten::_some_op' is not currently implemented for "
+        "the MPS device. If you want this op to be added in priority during the prototype phase "
+        "of this feature, please comment on https://github.com/pytorch/pytorch/issues/77764. As "
+        "a temporary fix, you can set the environment variable `PYTORCH_ENABLE_MPS_FALLBACK=1` "
+        "to use the CPU as a fallback for this op.",
+        "TypeError: MPS BFloat16 is only supported on MacOS 14 or newer",
+        "RuntimeError: invalid high watermark ratio 2.5",
+        "RuntimeError: invalid low watermark ratio 1.4",
+    ],
+)
+def test_an_mps_device_fact_is_the_machines_and_points_at_the_cpu(trainer, request_for, line):
+    _mps_trainer(trainer)
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = f"Traceback (most recent call last):\n{line}"
+
+    result = run_tune(request_for())
+
+    check = check_named(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED, check.detail
+    assert "says nothing about the method or the data (set LITETUNE_DEVICE=cpu" in check.detail
+    # The advice is litetune's; torch's own suggestion stays only in the
+    # stderr tail it quotes.
+    advice = check.detail.split("to train on the CPU): ")[0]
+    assert advice != check.detail
+    assert "PYTORCH_ENABLE_MPS_FALLBACK" not in advice
+    assert "budget" not in advice
+
+
 def test_a_cuda_out_of_memory_carries_no_mps_advice(trainer, request_for):
     trainer.probe_device = "cuda"
     trainer.returncode = 1

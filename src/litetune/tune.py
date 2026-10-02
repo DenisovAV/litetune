@@ -467,8 +467,24 @@ def decide_dtype(declared: str | None, device: str | None) -> DtypeDecision:
 # raises past the high watermark ("beyond that, the allocations would fail
 # with OOM error", torch/include/ATen/mps/MPSAllocator.h); the string itself is
 # in torch 2.5.1's libtorch_cpu, as `envs.TRAIN` pins it. With the memory
-# policy in `devices` that watermark is set from what the Mac had available, so
-# this is the ending of a run whose model needed more than the policy allowed.
+# policy in `devices` that watermark is set from what the Mac had available, or
+# by the operator, so this is the ending of a run whose model needed more than
+# the limit in force allowed.
+#
+# The other four MPS entries are this torch on this Mac, not the recipe, and
+# every one of them is in that libtorch_cpu: an operator with no MPS kernel
+# ("' is not currently implemented " and "for the MPS device." are two adjacent
+# pieces of one message, joined when it is raised, so the phrase below is what
+# stderr carries); bfloat16 refused before macOS 14; and a watermark ratio the
+# allocator rejected. The way forward for each is the CPU, and never
+# `PYTORCH_ENABLE_MPS_FALLBACK=1`, which torch's own message suggests: litetune
+# writes 0 so that a run recorded as mps ran on MPS.
+_MPS_DEVICE_FACTS = (
+    r"is not currently implemented for the MPS device",
+    r"MPS BFloat16 is only supported on MacOS 14",
+    r"invalid high watermark ratio",
+    r"invalid low watermark ratio",
+)
 _GPU_FAILURE_RE = re.compile(
     r"(OutOfMemoryError"
     r"|CUDA out of memory"
@@ -481,9 +497,17 @@ _GPU_FAILURE_RE = re.compile(
     r"|DefaultCPUAllocator: not enough memory"
     r"|CUBLAS_STATUS_ALLOC_FAILED"
     r"|CUDNN_STATUS_ALLOC_FAILED"
-    r"|MPS backend out of memory)",
+    r"|MPS backend out of memory"
+    r"|" + "|".join(_MPS_DEVICE_FACTS) + ")",
     re.IGNORECASE,
 )
+
+# Which advice an MPS ending gets is its own search, not the classifier's
+# leftmost match: `torch.OutOfMemoryError: MPS backend out of memory` matches
+# `OutOfMemoryError` first, and reading the advice off that would drop it.
+_MPS_OOM_RE = re.compile(r"MPS backend out of memory", re.IGNORECASE)
+_MPS_DEVICE_FACT_RE = re.compile("|".join(_MPS_DEVICE_FACTS), re.IGNORECASE)
+MPS_DEVICE_ADVICE = f"set {devices.DEVICE_VARIABLE}=cpu to train on the CPU"
 
 TRAINING_CHECK = "training run"
 MASKING_CHECK = "loss is masked to the completion"
@@ -1858,6 +1882,15 @@ def _dtype_limitations(result: TuneResult, dtype: DtypeDecision) -> None:
         )
 
 
+def _mps_advice(stderr: str, memory: devices.MpsMemory | None) -> str:
+    """ " (what to do)" for an MPS ending in `stderr`, or "" for any other ending."""
+    if _MPS_OOM_RE.search(stderr or ""):
+        return f" ({devices.mps_oom_advice(memory)})"
+    if _MPS_DEVICE_FACT_RE.search(stderr or ""):
+        return f" ({MPS_DEVICE_ADVICE})"
+    return ""
+
+
 def _directory_is_populated(path: Path) -> bool:
     return path.is_dir() and any(path.iterdir())
 
@@ -2409,13 +2442,10 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         # them says nothing at all about whether this method on this data
         # would have worked. Same judgement as the killed branch above,
         # arriving through stderr rather than through a signal.
-        # The MPS ending carries the ways forward, worded by who set the limit
-        # that ran out; every other ending reads as it always has.
-        advice = (
-            f" ({devices.mps_oom_advice(result.mps_memory)})"
-            if gpu_failure.group(0).lower() == "mps backend out of memory"
-            else ""
-        )
+        # An MPS ending carries the ways forward -- out of memory worded by
+        # who set the limit that ran out -- and every other ending reads as it
+        # always has.
+        advice = _mps_advice(result.stderr, result.mps_memory)
         accelerator = Check.unchecked(
             TRAINING_CHECK,
             f"training exited {proc.returncode} on a machine failure "

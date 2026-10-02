@@ -82,7 +82,9 @@ computes under 1 GiB is refused rather than started, and so is a Mac whose
 memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in
 float32 unless you pass `--dtype`, pads each batch to a multiple of 32 tokens,
 and records peak MPS memory; an MPS out-of-memory error is reported as the
-machine's, not the recipe's. Nothing in this repository has been measured on
+machine's, not the recipe's, and so are an operation MPS does not implement,
+bfloat16 refused before macOS 14 and a watermark ratio torch rejected — each
+with `LITETUNE_DEVICE=cpu` as the way forward. Nothing in this repository has been measured on
 MPS yet — no speed, no score, no comparison with the same run on CUDA or the
 CPU. Bring your own checkpoint and skip the first two steps, or bring a
 `.litertlm` and its float checkpoint and run only `verify`.
