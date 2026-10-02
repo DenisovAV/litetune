@@ -1404,6 +1404,8 @@ def run_verify(
         if pair.reference.mps_memory is not None:
             for text in pair.reference.mps_memory.limitations:
                 run.limitation(text)
+        if pair.reference.mps_environment_mismatch is not None:
+            run.limitation(pair.reference.mps_environment_mismatch)
     # Same vocabulary, opposite baseline: `generate` on the transformers side
     # halts at the first eos, so a generation that stopped on its own carries
     # at least one terminator -- but not every generation is guaranteed to

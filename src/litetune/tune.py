@@ -580,8 +580,12 @@ IGNORE_INDEX = -100
 # exceeds (`build_examples` refuses one that does). On cuda and the CPU
 # nothing changes.
 PAD_MULTIPLE_ON_MPS = 32
+
+# Where each step reads torch's MPS counters on mps (`sample_mps_memory`).
+MPS_SAMPLE_POINTS = ("after forward", "after backward", "after optimiser step")
 '''
     + RENDERING_SOURCE
+    + devices.MPS_SCRIPT_SOURCE
     + r'''
 
 
@@ -973,11 +977,10 @@ def main() -> int:
     schedule = epoch_schedule(spec["epochs"], len(examples), spec["batch_size"])
     on_mps = device == "mps"
     pad_multiple = PAD_MULTIPLE_ON_MPS if on_mps else None
-    # Peaks of torch's own two MPS counters, sampled after every optimiser
-    # step: `current_allocated_memory()` is what tensors occupy,
-    # `driver_allocated_memory()` everything Metal holds for this process,
-    # cached blocks included. `None` off mps, where neither exists.
-    mps_peak = {"current_allocated": 0, "driver_allocated": 0} if on_mps else None
+    # The largest of torch's two MPS counters over the samples taken at
+    # `MPS_SAMPLE_POINTS` in every step. `None` off mps, where neither
+    # exists, and when no step ran.
+    mps_samples = new_mps_samples(MPS_SAMPLE_POINTS) if on_mps else None
 
     epochs = []
     for number, portion, limit in schedule:
@@ -997,15 +1000,14 @@ def main() -> int:
                 attention_mask=attention.to(device),
                 labels=labels.to(device),
             )
+            if mps_samples is not None:
+                sample_mps_memory(torch, mps_samples)
             out.loss.backward()
+            if mps_samples is not None:
+                sample_mps_memory(torch, mps_samples)
             optimiser.step()
-            if mps_peak is not None:
-                mps_peak["current_allocated"] = max(
-                    mps_peak["current_allocated"], torch.mps.current_allocated_memory()
-                )
-                mps_peak["driver_allocated"] = max(
-                    mps_peak["driver_allocated"], torch.mps.driver_allocated_memory()
-                )
+            if mps_samples is not None:
+                sample_mps_memory(torch, mps_samples)
             optimiser.zero_grad(set_to_none=True)
             running += float(out.loss.detach())
             # The loss has been read. Holding `out` to the next iteration would
@@ -1098,7 +1100,10 @@ def main() -> int:
                 # off mps.
                 "mps_memory": spec.get("mps_memory"),
                 "pad_to_multiple_of": pad_multiple,
-                "mps_peak_memory": mps_peak,
+                "mps_memory_sampled_max": finished_mps_samples(mps_samples),
+                # The three MPS variables as this process read them, for the
+                # parent to compare with what it sent and passed on.
+                "mps_environment": environment_seen(),
                 # Whether the SentencePiece model made it back beside the
                 # checkpoint. Recorded, not assumed: the difference between
                 # `SP_Tokenizer` and an HF section is invisible in every
@@ -1561,9 +1566,16 @@ class TrainingMetrics:
     # The batch-width multiple the script padded to: 32 on mps, `None`
     # elsewhere and from a script that predates the field.
     pad_to_multiple_of: int | None = None
-    # Peaks of torch's MPS counters over the run's steps, in bytes. `None` off
-    # mps.
-    mps_peak_memory: Mapping[str, int] | None = None
+    # The largest of torch's two MPS counters, in bytes, over the samples
+    # taken after the forward pass, the backward pass and the optimiser step
+    # of every step, with `sampled_at` naming those points and `samples`
+    # counting them -- not a peak, which nothing between samples observed.
+    # `None` off mps and when no step ran.
+    mps_memory_sampled_max: Mapping[str, Any] | None = None
+    # The three MPS variables as the script read them (`None` for one unset),
+    # for the parent to compare with what it sent. `None` from a script that
+    # predates the field.
+    mps_environment: Mapping[str, str | None] | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -1602,7 +1614,8 @@ class TrainingMetrics:
             dtype=data.get("dtype"),
             dtype_source=data.get("dtype_source"),
             pad_to_multiple_of=data.get("pad_to_multiple_of"),
-            mps_peak_memory=data.get("mps_peak_memory"),
+            mps_memory_sampled_max=data.get("mps_memory_sampled_max"),
+            mps_environment=data.get("mps_environment"),
             raw=dict(data),
         )
 
@@ -1624,8 +1637,13 @@ class TrainingMetrics:
             "dtype": self.dtype,
             "dtype_source": self.dtype_source,
             "pad_to_multiple_of": self.pad_to_multiple_of,
-            "mps_peak_memory": (
-                dict(self.mps_peak_memory) if self.mps_peak_memory is not None else None
+            "mps_memory_sampled_max": (
+                dict(self.mps_memory_sampled_max)
+                if self.mps_memory_sampled_max is not None
+                else None
+            ),
+            "mps_environment": (
+                dict(self.mps_environment) if self.mps_environment is not None else None
             ),
             "epochs": [e.as_dict() for e in self.epochs],
             "final_loss": self.final_loss,
@@ -2382,6 +2400,15 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     metrics_device = result.metrics.device if result.metrics is not None else None
     if metrics_device is not None:
         events.note(f"trained on {metrics_device}", device=metrics_device)
+    # What the script read for the MPS variables against what the policy
+    # records reaching it. Only where a policy was set: off mps the variables
+    # bound nothing this report claims.
+    if result.mps_memory is not None and result.metrics is not None:
+        mismatch = devices.environment_mismatch(
+            result.mps_memory, result.metrics.mps_environment, "training script"
+        )
+        if mismatch is not None:
+            result.limitation(mismatch)
     if metrics_device == "cpu" and dtype.dtype == DEFAULT_DTYPE:
         result.limitation(f"this run trained bfloat16 on the CPU: {BFLOAT16_CPU_HINT}")
 

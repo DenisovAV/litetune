@@ -1703,8 +1703,12 @@ _HF_GENERATE_SCRIPT = (
 import json
 import sys
 from pathlib import Path
+
+# Where generation reads torch's MPS counters on mps (`sample_mps_memory`).
+MPS_SAMPLE_POINTS = ("after each generate call",)
 '''
     + RENDERING_SOURCE
+    + devices.MPS_SCRIPT_SOURCE
     + r'''
 
 
@@ -1756,10 +1760,15 @@ def main() -> int:
     # watching a run; `_assemble` discards stderr on a clean exit, so on the
     # path that matters it reaches nobody. This file is what the parent reads
     # back, and it is written before generation starts so that a run killed
-    # part-way still says where it was running.
-    Path(spec["run_report"]).write_text(json.dumps({"device": device}), encoding="utf-8")
+    # part-way still says where it was running -- and which MPS variables it
+    # read, for the parent to compare with what it sent.
+    report = {"device": device, "mps_environment": environment_seen()}
+    Path(spec["run_report"]).write_text(json.dumps(report), encoding="utf-8")
     print(f"reference generation on {device}", file=sys.stderr, flush=True)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    # The largest of torch's two MPS counters, read once after each generate
+    # call. `None` off mps and when nothing was generated.
+    mps_samples = new_mps_samples(MPS_SAMPLE_POINTS) if device == "mps" else None
 
     with Path(spec["out"]).open("w", encoding="utf-8") as sink:
         for i, prompt in enumerate(spec["prompts"]):
@@ -1775,12 +1784,16 @@ def main() -> int:
                     max_new_tokens=spec["max_tokens"],
                     pad_token_id=pad_id,
                 )
+            if mps_samples is not None:
+                sample_mps_memory(torch, mps_samples)
             # skip_special_tokens=False on purpose: the liveness tier checks for
             # padding-token leakage, and decoding it away would erase the
             # evidence it looks for.
             completion = tok.decode(ids[0][enc["input_ids"].shape[-1] :], skip_special_tokens=False)
             sink.write(json.dumps({"index": i, "text": completion}) + "\n")
             sink.flush()
+    report["mps_memory_sampled_max"] = finished_mps_samples(mps_samples)
+    Path(spec["run_report"]).write_text(json.dumps(report), encoding="utf-8")
     return 0
 
 
@@ -1862,6 +1875,14 @@ class HuggingFaceBackend:
     # refused it. `verify` records it as a limitation; the generations carry
     # it as their harness error.
     mps_refusal: str | None = None
+    # From this call's run report: the largest of torch's MPS counters, read
+    # after each generate call on mps (`None` off mps, or with no report), and
+    # the three MPS variables as the generation script read them.
+    mps_memory_sampled_max: dict[str, Any] | None = None
+    mps_environment_seen: dict[str, Any] | None = None
+    # Set when what the script read differs from what the memory policy
+    # records reaching it (`devices.environment_mismatch`); `verify` records it.
+    mps_environment_mismatch: str | None = None
 
     name = "transformers"
     # `generate()` receives max_new_tokens and the stop condition, so here the
@@ -1934,6 +1955,10 @@ class HuggingFaceBackend:
             # and who set them, the memory reading and swap use at the
             # start. `None` off mps.
             "mps_memory": self.mps_memory.as_dict() if self.mps_memory is not None else None,
+            # Why this call did not start on mps, when the policy refused it.
+            "mps_refusal": self.mps_refusal,
+            "mps_memory_sampled_max": self.mps_memory_sampled_max,
+            "mps_environment_seen": self.mps_environment_seen,
             "requirements": list(self.env.requirements),
             "decode_declared": self.decode.as_dict(),
             "decode_passed_to_runtime": self.decode_enforced,
@@ -2043,8 +2068,20 @@ class HuggingFaceBackend:
             # The script's own answer wins over the probe's prediction. The
             # temp directory goes away at the end of this block, so it is read
             # here rather than anywhere later.
-            observed = self._read_run_report(report)
+            run_report = self._read_run_report(report)
 
+        observed = run_report.get("device") if run_report is not None else None
+        if not isinstance(observed, str):
+            observed = None
+        if run_report is not None:
+            sampled = run_report.get("mps_memory_sampled_max")
+            self.mps_memory_sampled_max = sampled if isinstance(sampled, dict) else None
+            seen = run_report.get("mps_environment")
+            self.mps_environment_seen = seen if isinstance(seen, dict) else None
+            if self.mps_memory is not None:
+                self.mps_environment_mismatch = devices.environment_mismatch(
+                    self.mps_memory, seen, "reference generation script"
+                )
         if observed is not None:
             if self.device is not None and observed != self.device:
                 logger.warning(
@@ -2084,6 +2121,9 @@ class HuggingFaceBackend:
         self.host = None
         self.mps_memory = None
         self.mps_refusal = None
+        self.mps_memory_sampled_max = None
+        self.mps_environment_seen = None
+        self.mps_environment_mismatch = None
         # Before provisioning, which costs minutes: a LITETUNE_DEVICE litetune
         # does not accept stops this reference from running at all, rather
         # than being read as "auto" and placing it on the accelerator it was
@@ -2151,8 +2191,10 @@ class HuggingFaceBackend:
             self.probed_device = probe.device
             self.device = probe.device
 
-    def _read_run_report(self, report: Path) -> str | None:
-        """The device the generation script itself says it used, or `None`.
+    def _read_run_report(self, report: Path) -> dict[str, Any] | None:
+        """What the generation script wrote about its own run, or `None`.
+
+        Its `device` is the one the script itself says it used.
 
         The probe before the run is a prediction; this is the observation.
         They differ whenever the script took its own fallback -- an unanswered
@@ -2163,15 +2205,18 @@ class HuggingFaceBackend:
         around and needed this purpose-built report to get the same fact.
         """
         try:
-            device = json.loads(report.read_text(encoding="utf-8"))["device"]
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            data = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             # A script that died before writing this, an older one that never
             # wrote it, or one whose write was cut short mid-byte -- the same
             # decode failure `_read_results` below already accounts for. Not
             # an error: the prediction stands and says so.
             logger.warning("generation script wrote no usable run report: %s", exc)
             return None
-        return device if isinstance(device, str) else None
+        if not isinstance(data, dict):
+            logger.warning("generation script's run report is not a JSON object")
+            return None
+        return data
 
 
 # ---------------------------------------------------------------------------

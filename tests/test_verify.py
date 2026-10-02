@@ -1079,14 +1079,19 @@ def test_two_points_on_the_same_device_carry_no_such_note(write_split):
     assert "device_mismatch" not in result.manifest["harness"]
 
 
-def _fake_reference_run(rows, *, probe_stdout: str, probe_returncode: int = 0):
+def _fake_reference_run(
+    rows, *, probe_stdout: str, probe_returncode: int = 0, run_report: dict | None = None
+):
     """A `StageEnv.run` double answering both calls a real `HuggingFaceBackend`
-    makes: the device probe (`-c`), then the generation script."""
+    makes: the device probe (`-c`), then the generation script. `run_report`,
+    when given, is what the script writes about its own run."""
 
     def fake_run(self, args, timeout=3600, **kwargs):
         if args[1] == "-c":
             return subprocess.CompletedProcess(args, probe_returncode, probe_stdout, "")
         spec = json.loads(Path(args[2]).read_text())
+        if run_report is not None:
+            Path(spec["run_report"]).write_text(json.dumps(run_report), encoding="utf-8")
         Path(spec["out"]).write_text(
             "\n".join(
                 json.dumps({"index": i, "text": rows[i]["target"] + "<end_of_turn>\n<eos>"})
@@ -2152,6 +2157,40 @@ def test_litetune_device_cpu_on_the_reference_is_on_the_record(write_split, monk
     ), limitations
     # A CUDA build the operator moved to the CPU is not one that cannot reach a GPU.
     assert not any("cannot reach a GPU" in t for t in limitations), limitations
+
+
+def test_a_reference_that_saw_other_mps_variables_reaches_the_manifest(
+    write_split, monkeypatch, tmp_path
+):
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    seen = {
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": None,
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": None,
+        "PYTORCH_ENABLE_MPS_FALLBACK": None,
+    }
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _fake_reference_run(
+            rows,
+            probe_stdout=probe_answer("mps"),
+            run_report={"device": "mps", "mps_environment": seen},
+        ),
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert any(
+        "reference generation script did not see the MPS variables" in text
+        for text in result.manifest["limitations"]
+    ), result.manifest["limitations"]
 
 
 def test_the_operators_mps_fallback_reaches_the_manifest(write_split, monkeypatch, tmp_path):

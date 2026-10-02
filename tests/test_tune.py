@@ -16,6 +16,7 @@ one thing in this tool that failed silently and cost nine times the base score.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -129,6 +130,8 @@ class FakeTrainer:
     # Any other field the probe prints -- `mps_available`, `os` and the rest --
     # by the names `conftest.probe_answer` takes.
     probe_fields: dict = field(default_factory=dict)
+    # Fields the fake script adds to its metrics on top of the usual ones.
+    metrics_extra: dict = field(default_factory=dict)
 
     @staticmethod
     def is_probe(args) -> bool:
@@ -197,6 +200,7 @@ class FakeTrainer:
                 payload["device"] = self.device
             if self.drop_fraction:
                 payload.pop("supervised_token_fraction")
+            payload.update(self.metrics_extra)
             Path(config["metrics_out"]).write_text(json.dumps(payload), encoding="utf-8")
         return subprocess.CompletedProcess(args, self.returncode, self.stdout, self.stderr)
 
@@ -1351,6 +1355,7 @@ class _AdamW:
 
     def step(self):
         self.steps += 1
+        _log({"event": "optimiser_step"})
 
     def zero_grad(self, set_to_none=False):
         pass
@@ -1409,7 +1414,7 @@ class _Loss:
         self.value = value
 
     def backward(self):
-        pass
+        _log({"event": "backward"})
 
     def detach(self):
         return self
@@ -1567,6 +1572,7 @@ def run_real_script(
     stub_modules: list[str] | None = None,
     hide_matched: bool = False,
     device: str | None = None,
+    extra_env: dict[str, str] | None = None,
     **config_kwargs,
 ) -> subprocess.CompletedProcess:
     """Runs `_TRAIN_SCRIPT` for real, against the stub modules `stub_env` wrote.
@@ -1606,6 +1612,7 @@ def run_real_script(
             "LITETUNE_STUB_CUDA": "1" if cuda else "0",
             **({"LITETUNE_STUB_MODULES": ",".join(stub_modules)} if stub_modules else {}),
             **({"LITETUNE_STUB_HIDE_MATCHED": "1"} if hide_matched else {}),
+            **(extra_env or {}),
         },
     )
 
@@ -4128,6 +4135,38 @@ def test_an_mps_run_starts_its_child_under_the_memory_policy(trainer, request_fo
     assert trainer.configs[0]["mps_memory"] == recorded
 
 
+def test_an_mps_run_leaves_the_parents_environment_as_it_was(trainer, request_for):
+    _mps_trainer(trainer)
+    before = dict(os.environ)
+
+    run_tune(request_for())
+
+    assert dict(os.environ) == before
+
+
+def test_two_runs_in_one_process_each_read_the_memory_they_start_with(
+    trainer, request_for, monkeypatch
+):
+    """M7: the second run computes its own budget, and records it as
+    litetune's, rather than inheriting the first run's variables as the
+    operator's."""
+    from litetune import devices
+
+    _mps_trainer(trainer)
+    first = run_tune(request_for())
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(10 * 1024**3)))
+    second = run_tune(request_for())
+
+    budgets = [r.as_dict()["mps_memory"]["computed_budget_bytes"] for r in (first, second)]
+    assert budgets == [13 * 1024**3, 7 * 1024**3]
+    for result in (first, second):
+        variables = result.as_dict()["mps_memory"]["variables"]
+        assert {v["set_by"] for v in variables.values()} == {"litetune"}
+    envs_sent = [c.env for c in trainer.calls if not FakeTrainer.is_probe(c.argv)]
+    assert envs_sent[0]["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.812500"
+    assert envs_sent[1]["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.437500"
+
+
 def test_a_run_off_mps_gets_no_memory_policy(trainer, request_for):
     trainer.probe_device = "cuda"
 
@@ -4428,14 +4467,16 @@ def test_the_metrics_carry_the_new_fields_through_to_the_report():
             "dtype": "float32",
             "dtype_source": MPS_DTYPE_SOURCE,
             "pad_to_multiple_of": 32,
-            "mps_peak_memory": {"current_allocated": 1, "driver_allocated": 2},
+            "mps_memory_sampled_max": {"current_allocated_bytes": 1, "samples": 3},
+            "mps_environment": {"PYTORCH_ENABLE_MPS_FALLBACK": "0"},
         }
     )
     record = metrics.as_dict()
     assert record["dtype"] == "float32"
     assert record["dtype_source"] == MPS_DTYPE_SOURCE
     assert record["pad_to_multiple_of"] == 32
-    assert record["mps_peak_memory"] == {"current_allocated": 1, "driver_allocated": 2}
+    assert record["mps_memory_sampled_max"] == {"current_allocated_bytes": 1, "samples": 3}
+    assert record["mps_environment"] == {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}
 
 
 # -- the script on mps --------------------------------------------------------
@@ -4469,7 +4510,7 @@ def test_the_real_script_pads_to_the_longest_row_off_mps(request_for, stub_env, 
     assert widths and all(width < 32 for width in widths), widths
     recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
     assert recorded["pad_to_multiple_of"] is None
-    assert recorded["mps_peak_memory"] is None
+    assert recorded["mps_memory_sampled_max"] is None
     events = {e["event"] for e in stub_log(stub_env)}
     assert not events & {"mps_current_allocated", "mps_driver_allocated", "mps_empty_cache"}
 
@@ -4540,17 +4581,112 @@ def test_the_real_script_caps_the_mps_width_at_max_seq_length(request_for, stub_
     assert widths and all(width <= 11 for width in widths), widths
 
 
-def test_the_real_script_records_the_peak_mps_memory_not_the_last(request_for, stub_env):
+def test_the_real_script_records_the_largest_mps_samples_and_where_they_were_taken(
+    request_for, stub_env
+):
     request = request_for()
     proc = run_real_script(request, stub_env, device="mps")
     assert proc.returncode == 0, proc.stderr
 
     recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
-    samples = [e for e in stub_log(stub_env) if e["event"] == "mps_current_allocated"]
-    # One sample per step, and more steps than the stub's sequence is long,
-    # so the last sample is not the largest.
-    assert len(samples) == len(_forward_widths(stub_env)) == 5
-    assert recorded["mps_peak_memory"] == {"current_allocated": 900, "driver_allocated": 2000}
+    log = [e["event"] for e in stub_log(stub_env)]
+    steps = log.count("forward")
+    assert steps == 5
+    # Three samples a step, at the three points, in that order.
+    sample = ["mps_current_allocated", "mps_driver_allocated"]
+    first = log.index("forward")
+    assert log[first : first + 9] == [
+        "forward",
+        *sample,
+        "backward",
+        *sample,
+        "optimiser_step",
+        *sample,
+    ], log[first : first + 9]
+    assert log.count("mps_current_allocated") == 3 * steps
+    # The stub's sequences peak in the middle, so the last sample is not the
+    # largest: the record is the maximum over the samples.
+    assert recorded["mps_memory_sampled_max"] == {
+        "current_allocated_bytes": 900,
+        "driver_allocated_bytes": 2000,
+        "samples": 15,
+        "sampled_at": ["after forward", "after backward", "after optimiser step"],
+    }
+
+
+def test_the_real_script_records_no_samples_when_no_step_ran(script_namespace):
+    record = script_namespace["new_mps_samples"](["after forward"])
+    assert script_namespace["finished_mps_samples"](record) is None
+    assert script_namespace["finished_mps_samples"](None) is None
+
+
+def test_the_real_script_reports_the_mps_variables_it_saw(request_for, stub_env):
+    request = request_for()
+    proc = run_real_script(
+        request,
+        stub_env,
+        device="mps",
+        extra_env={
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.5",
+            "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["mps_environment"] == {
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.5",
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": None,
+        "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+    }
+
+
+def test_a_child_that_saw_what_was_sent_adds_no_limitation(trainer, request_for):
+    _mps_trainer(trainer)
+    trainer.metrics_extra["mps_environment"] = {
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.812500",
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.650000",
+        "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+    }
+
+    result = run_tune(request_for())
+
+    assert not any("did not see the MPS variables" in t for t in result.limitations)
+
+
+@pytest.mark.parametrize(
+    "seen",
+    [
+        {
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO": None,
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO": None,
+            "PYTORCH_ENABLE_MPS_FALLBACK": None,
+        },
+        {
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "1.7",
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.650000",
+            "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+        },
+        "not a mapping",
+    ],
+)
+def test_a_child_that_saw_something_else_is_a_limitation(trainer, request_for, seen):
+    _mps_trainer(trainer)
+    trainer.metrics_extra["mps_environment"] = seen
+
+    result = run_tune(request_for())
+
+    (said,) = [t for t in result.limitations if "did not see the MPS variables" in t]
+    assert "training script" in said
+    assert "0.812500" in said
+
+
+def test_a_child_that_reported_nothing_is_no_observation(trainer, request_for):
+    _mps_trainer(trainer)
+
+    result = run_tune(request_for())
+
+    assert not any("did not see the MPS variables" in t for t in result.limitations)
 
 
 def test_the_real_script_empties_the_mps_cache_before_it_saves(request_for, stub_env):

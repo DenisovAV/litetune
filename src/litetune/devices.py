@@ -627,3 +627,78 @@ def prepare_mps(
         swapusage=swapusage,
         swapusage_error=swapusage_error,
     )
+
+
+# ---------------------------------------------------------------------------
+# What the child saw and what it used
+# ---------------------------------------------------------------------------
+#
+# Source concatenated into both scripts that can run on mps --
+# `tune._TRAIN_SCRIPT` and `evaluate._HF_GENERATE_SCRIPT` -- because neither
+# may import litetune: each runs in a stage environment that has only torch.
+#
+# `environment_seen` is what the child itself read for the three MPS
+# variables, so the parent can compare it with what it sent and what the
+# child inherited (`environment_mismatch`) instead of assuming the two agree.
+#
+# The memory record holds the largest of torch's two MPS counters over the
+# samples taken, and names where they were taken: `current_allocated_memory()`
+# is what tensors occupy, `driver_allocated_memory()` everything Metal holds
+# for the process, cached blocks included. Between samples the counters were
+# not read, so this is the largest value seen at those points, not a peak.
+MPS_SCRIPT_SOURCE = (
+    f"\nMPS_VARIABLES = {MPS_VARIABLES!r}\n"
+    + r'''
+
+def environment_seen():
+    """The three MPS variables as this process sees them; `None` for an unset one."""
+    import os
+
+    return {name: os.environ.get(name) for name in MPS_VARIABLES}
+
+
+def new_mps_samples(sampled_at):
+    return {
+        "current_allocated_bytes": 0,
+        "driver_allocated_bytes": 0,
+        "samples": 0,
+        "sampled_at": list(sampled_at),
+    }
+
+
+def sample_mps_memory(torch, record):
+    """Fold one reading of torch's two MPS counters into `record`'s maxima."""
+    record["current_allocated_bytes"] = max(
+        record["current_allocated_bytes"], int(torch.mps.current_allocated_memory())
+    )
+    record["driver_allocated_bytes"] = max(
+        record["driver_allocated_bytes"], int(torch.mps.driver_allocated_memory())
+    )
+    record["samples"] += 1
+
+
+def finished_mps_samples(record):
+    """The record, or `None` when there is none or nothing was sampled."""
+    return record if record is not None and record["samples"] else None
+'''
+)
+
+
+def environment_mismatch(memory: MpsMemory, seen: Any, who: str) -> str | None:
+    """A limitation when the child did not see the MPS variables the policy records.
+
+    `seen` is the child's own `environment_seen()`. `None` -- no report, from
+    a child that stopped before writing one -- is no observation and returns
+    `None`; anything else that is not exactly what reached the child by the
+    policy's account is a mismatch.
+    """
+    if seen is None:
+        return None
+    expected = {name: memory.variables.get(name) for name in MPS_VARIABLES}
+    if isinstance(seen, Mapping) and dict(seen) == expected:
+        return None
+    return (
+        f"the {who} did not see the MPS variables litetune sent or the environment passed "
+        f"on: expected {expected}, it reported {seen!r}. The memory limit it ran under is not "
+        "the one recorded in mps_memory"
+    )

@@ -546,6 +546,45 @@ def test_swap_that_cannot_be_read_is_recorded_not_refused():
     assert "vm.swapusage" in (policy.swapusage_error or "")
 
 
+# -- what the child saw ---------------------------------------------------------
+
+
+def test_a_child_that_saw_the_policy_is_no_mismatch():
+    policy = _policy({HIGH_WATERMARK: "0.0"})
+    seen = {HIGH_WATERMARK: "0.0", LOW_WATERMARK: None, MPS_FALLBACK: "0"}
+    assert devices.environment_mismatch(policy, seen, "child") is None
+
+
+def test_no_report_is_no_observation():
+    assert devices.environment_mismatch(_policy(), None, "child") is None
+
+
+@pytest.mark.parametrize(
+    "seen",
+    [
+        {HIGH_WATERMARK: "0.812500", LOW_WATERMARK: "0.650000"},
+        {HIGH_WATERMARK: "0.812500", LOW_WATERMARK: "0.650000", MPS_FALLBACK: "1"},
+        ["not", "a", "mapping"],
+    ],
+)
+def test_anything_else_a_child_saw_is_a_mismatch(seen):
+    said = devices.environment_mismatch(_policy(), seen, "training script")
+    assert said is not None
+    assert said.startswith("the training script did not see the MPS variables")
+
+
+def test_the_shared_script_source_reports_the_three_variables(monkeypatch):
+    namespace: dict = {}
+    # `exec` on this package's own constant, not on external input.
+    exec(compile(devices.MPS_SCRIPT_SOURCE, "mps_script_source.py", "exec"), namespace)
+    monkeypatch.setenv(MPS_FALLBACK, "0")
+    assert namespace["environment_seen"]() == {
+        HIGH_WATERMARK: None,
+        LOW_WATERMARK: None,
+        MPS_FALLBACK: "0",
+    }
+
+
 # -- this Mac's own sysctl ------------------------------------------------------
 # The only tests here that start a process: `/usr/sbin/sysctl -n`, read-only,
 # for exactly the keys the policy reads. They pin that the keys exist and

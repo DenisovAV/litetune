@@ -81,7 +81,7 @@ computes under 1 GiB is refused rather than started, and so is a Mac whose
 `kern.memorystatus_vm_pressure_level` is not 1 (normal): quit what is holding
 memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in
 float32 unless you pass `--dtype`, pads each batch to a multiple of 32 tokens,
-and records peak MPS memory; an MPS out-of-memory error is reported as the
+and records the largest MPS memory counters it sampled; an MPS out-of-memory error is reported as the
 machine's, not the recipe's, and so are an operation MPS does not implement,
 bfloat16 refused before macOS 14 and a watermark ratio torch rejected — each
 with `LITETUNE_DEVICE=cpu` as the way forward. Nothing in this repository has been measured on
@@ -597,12 +597,20 @@ written by a version of litetune that predates it, never a guessed value. It is
 the durable answer to where a given checkpoint was trained. Beside it,
 `device_probe` says who chose the device (the probe, or `LITETUNE_DEVICE`) and
 what torch reported, `host` names the operating system, its version, the
-machine and the chip, and `dtype_source` says whether the dtype was declared
-or the default for that device. On `mps` the file also carries `mps_memory` —
-the budget, the recommended working set, both watermark ratios and who set
-them, the free-memory level and swap use at the start —
-`pad_to_multiple_of`, and `mps_peak_memory`. The reference side records the
-same probe, host and memory policy in the verify manifest's reference engine.
+machine and, on macOS, the chip, `dtype_source` says whether the dtype was
+declared or the default for that device, and `mps_environment` holds the three
+MPS variables as the training script read them. `mps_memory`,
+`pad_to_multiple_of` and `mps_memory_sampled_max` are null off `mps`. On `mps`,
+`mps_memory` records who set the limit, litetune's computed budget beside the
+limits in force, the recommended working set, both watermark ratios and who
+set them, the memory reading and swap use at the start;
+`mps_memory_sampled_max` is the largest of torch's
+`current_allocated_memory()` and `driver_allocated_memory()` over samples taken
+after each forward pass, backward pass and optimiser step — the largest value
+at those points, not a peak — and a script that did not see the variables
+litetune sent is a limitation. The reference side records the same probe,
+host and memory policy in the verify manifest's reference engine, with the
+counters sampled after each generate call.
 
 **Minimum `transformers` per family.** Gemma 4 and Qwen3.5 fail at tokenizer
 load on every 4.x release, and Gemma 4 needs 5.5.0 for `AutoConfig` to recognise

@@ -1251,6 +1251,7 @@ def _run_hf_generate_script(
     given=None,
     stop_generation: bool = False,
     runtime_rendered: bool = False,
+    prompts: tuple[str, ...] = ("hi",),
 ) -> dict:
     """Runs `_HF_GENERATE_SCRIPT`'s real `main()` against faked `torch` and
     `transformers`, and returns what the fakes captured.
@@ -1372,6 +1373,21 @@ def _run_hf_generate_script(
     # in this suite, reused rather than a fourth hand-rolled `is_available`.
     fake_torch_module.cuda = fake_torch(cuda=cuda).cuda
 
+    class FakeMps:
+        """torch.mps's two counters, answering a sequence that peaks first."""
+
+        current = iter((700, 100, 300))
+        driver = iter((900, 200, 400))
+
+        def current_allocated_memory(self) -> int:
+            captured["mps_samples"] = captured.get("mps_samples", 0) + 1
+            return next(self.current)
+
+        def driver_allocated_memory(self) -> int:
+            return next(self.driver)
+
+    fake_torch_module.mps = FakeMps()
+
     fake_transformers: Any = types.ModuleType("transformers")
     fake_transformers.AutoModelForCausalLM = FakeAutoModelForCausalLM
     fake_transformers.AutoTokenizer = FakeAutoTokenizer
@@ -1386,7 +1402,7 @@ def _run_hf_generate_script(
         json.dumps(
             {
                 "model": "org/m",
-                "prompts": ["hi"],
+                "prompts": list(prompts),
                 "max_tokens": 8,
                 "runtime_rendered": runtime_rendered,
                 "attn_implementation": "eager",
@@ -1493,7 +1509,37 @@ def test_the_reference_script_writes_its_device_where_the_parent_can_read_it(tmp
     """Structured, not only printed to stderr -- `assemble_generations` discards stderr
     on a clean exit, which is the path that matters."""
     captured = _run_hf_generate_script(tmp_path, monkeypatch, cuda=True)
-    assert captured["run_report"] == {"device": "cuda"}
+    assert captured["run_report"]["device"] == "cuda"
+    # Off mps nothing is sampled, and the counters are never asked.
+    assert captured["run_report"]["mps_memory_sampled_max"] is None
+    assert "mps_samples" not in captured
+
+
+def test_the_reference_script_samples_mps_memory_after_each_generate_call(tmp_path, monkeypatch):
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, given="mps", prompts=("a", "b", "c"))
+    assert captured["mps_samples"] == 3
+    assert captured["run_report"]["mps_memory_sampled_max"] == {
+        "current_allocated_bytes": 700,
+        "driver_allocated_bytes": 900,
+        "samples": 3,
+        "sampled_at": ["after each generate call"],
+    }
+
+
+def test_the_reference_script_reports_the_mps_variables_it_saw(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, given="mps")
+    assert captured["run_report"]["mps_environment"] == {
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.5",
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": None,
+        "PYTORCH_ENABLE_MPS_FALLBACK": None,
+    }
+
+
+def test_a_reference_run_killed_part_way_still_reports_what_it_saw(tmp_path, monkeypatch):
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, given="mps", stop_generation=True)
+    assert captured["run_report"]["device"] == "mps"
+    assert "mps_environment" in captured["run_report"]
 
 
 def test_the_reference_script_prefers_what_the_parent_already_resolved(tmp_path, monkeypatch):
@@ -2873,7 +2919,9 @@ def test_cores_of_two_kinds_open_to_the_process_are_not_named_as_one(monkeypatch
 # ---------------------------------------------------------------------------
 
 
-def _reference_env(monkeypatch, probe: str = "mps", **probe_fields) -> list[dict]:
+def _reference_env(
+    monkeypatch, probe: str = "mps", report_extra: dict | None = None, **probe_fields
+) -> list[dict]:
     """A ready `envs.TRAIN` whose probe answers `probe`, and a log of every call.
 
     Each entry is the argv, the `env` overrides `StageEnv.run` was handed, and
@@ -2893,7 +2941,7 @@ def _reference_env(monkeypatch, probe: str = "mps", **probe_fields) -> list[dict
             json.dumps({"index": 0, "text": call_text("a")}) + "\n", encoding="utf-8"
         )
         Path(spec["run_report"]).write_text(
-            json.dumps({"device": spec["device"]}), encoding="utf-8"
+            json.dumps({"device": spec["device"], **(report_extra or {})}), encoding="utf-8"
         )
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
@@ -3080,3 +3128,94 @@ def test_litetune_device_cpu_on_a_probed_reference_is_noted(monkeypatch):
     assert [
         n for n in notes if n["message"].startswith("LITETUNE_DEVICE=cpu") and n["device"] == "cpu"
     ]
+
+
+_SENT = {
+    "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.812500",
+    "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.650000",
+    "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+}
+
+
+def test_an_mps_reference_records_its_samples_and_what_it_saw(monkeypatch):
+    sampled = {"current_allocated_bytes": 5, "driver_allocated_bytes": 6, "samples": 1}
+    _reference_env(
+        monkeypatch,
+        "mps",
+        report_extra={"mps_environment": _SENT, "mps_memory_sampled_max": sampled},
+    )
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    described = backend.describe()
+    assert described["mps_memory_sampled_max"] == sampled
+    assert described["mps_environment_seen"] == _SENT
+    assert backend.mps_environment_mismatch is None
+
+
+def test_an_mps_reference_that_saw_other_variables_is_a_mismatch(monkeypatch):
+    seen = dict(_SENT, PYTORCH_MPS_HIGH_WATERMARK_RATIO=None)
+    _reference_env(monkeypatch, "mps", report_extra={"mps_environment": seen})
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    assert backend.mps_environment_mismatch is not None
+    assert "reference generation script" in backend.mps_environment_mismatch
+
+
+def test_a_reused_backend_forgets_a_refusal_once_the_memory_is_back(monkeypatch):
+    """M3: `mps_refusal` is this call's, not the backend's history."""
+    from conftest import FAKE_SYSCTL, fake_sysctl, sysctl_available
+
+    from litetune import devices
+
+    calls = _reference_env(monkeypatch, "mps")
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    (refused,) = backend.generate(["a"])
+    assert refused.harness_error is not None
+    assert backend.describe()["mps_refusal"] == refused.harness_error
+
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(FAKE_SYSCTL))
+    (ran,) = backend.generate(["a"])
+
+    assert ran.harness_error is None
+    assert backend.mps_refusal is None
+    assert backend.describe()["mps_refusal"] is None
+    assert backend.describe()["mps_memory"]["computed_budget_bytes"] == 13 * 1024**3
+    assert len(_generation_calls(calls)) == 1
+
+
+def test_a_reused_backend_forgets_its_mps_policy_once_litetune_device_is_cpu(monkeypatch):
+    """M4: `mps_memory` and the samples are this call's too."""
+    sampled = {"current_allocated_bytes": 5, "driver_allocated_bytes": 6, "samples": 1}
+    calls = _reference_env(
+        monkeypatch,
+        "mps",
+        report_extra={"mps_environment": _SENT, "mps_memory_sampled_max": sampled},
+    )
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+    assert backend.mps_memory is not None
+
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    backend.generate(["a"])
+
+    described = backend.describe()
+    assert described["backend"] == "cpu"
+    assert described["mps_memory"] is None
+    assert described["mps_refusal"] is None
+    assert _generation_calls(calls)[-1]["env"] is None
+
+
+def test_an_mps_reference_leaves_the_parents_environment_as_it_was(monkeypatch):
+    import os
+
+    _reference_env(monkeypatch, "mps")
+    before = dict(os.environ)
+
+    HuggingFaceBackend(model="org/model", auto_provision=False).generate(["a"])
+
+    assert dict(os.environ) == before
