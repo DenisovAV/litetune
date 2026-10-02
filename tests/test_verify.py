@@ -12,7 +12,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import FakeBackend, call_text, correct_texts, labelled_rows, mark_provisioned
+from conftest import (
+    FakeBackend,
+    call_text,
+    correct_texts,
+    labelled_rows,
+    mark_provisioned,
+    probe_answer,
+)
 
 from litetune import envs
 from litetune.evaluate import (
@@ -1131,8 +1138,8 @@ def test_a_reference_cuda_build_with_no_device_reaches_the_manifest(
     from a laptop with no GPU."""
     _ready_train_env(monkeypatch, tmp_path)
     rows = text_rows(5)
-    probe_answer = json.dumps({"device": "cpu", "cuda_build": "12.4", "device_count": 0})
-    monkeypatch.setattr(envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer))
+    answer = probe_answer("cpu", cuda_build="12.4", device_count=0)
+    monkeypatch.setattr(envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=answer))
 
     result = verify(
         write_split,

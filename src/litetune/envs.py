@@ -34,7 +34,7 @@ import sys
 import time
 import venv
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import IO, Any, cast
@@ -2024,7 +2024,12 @@ class StageEnv:
 # afterwards.
 DEVICE_PROBE_TIMEOUT_S = 30
 
-# Sub-second: import torch, ask it three questions, print one JSON line.
+# The devices a probe may answer, in the order it prefers them. The parent acts
+# on each differently -- `devices.mps_memory_policy` runs before any child that
+# will use "mps" -- so an answer outside this tuple is not a device.
+DEVICES = ("cuda", "mps", "cpu")
+
+# Sub-second: import torch, ask it a handful of questions, print one JSON line.
 # Nothing else this package runs inside a stage environment is this cheap,
 # which is what makes asking it *before* the real, expensive subprocess
 # worthwhile.
@@ -2034,12 +2039,33 @@ DEVICE_PROBE_TIMEOUT_S = 30
 # without `--gpus` and a driver too old for the runtime all answer False. So
 # the build's CUDA version and the device count come back too, and
 # `DeviceProbe` says which of the two it saw.
+#
+# CUDA first, then Apple's Metal (MPS), then the CPU, by what this torch can
+# reach. MPS has the same two-sided question, so both of torch's answers come
+# back: `is_built()` is whether this wheel carries the backend at all, and
+# `is_available()` whether it can use it on this machine. The operating
+# system comes back from the same interpreter so a report can name where an
+# unavailable MPS was asked about. `recommended_max_memory()` is Metal's
+# working-set size, the figure torch's MPS allocator scales its watermark
+# ratios by (torch/include/ATen/mps/MPSAllocator.h, the comments on
+# `m_high_watermark_ratio`); it is asked only on an "mps" answer, because
+# asking initialises the MPS device.
 _DEVICE_PROBE_CODE = (
-    "import json, torch; "
+    "import json, platform, torch; "
+    "mps_built = bool(torch.backends.mps.is_built()); "
+    "mps_available = bool(torch.backends.mps.is_available()); "
+    "device = 'cuda' if torch.cuda.is_available() else 'mps' if mps_available else 'cpu'; "
     "print(json.dumps({"
-    "'device': 'cuda' if torch.cuda.is_available() else 'cpu', "
+    "'device': device, "
     "'cuda_build': torch.version.cuda, "
-    "'device_count': torch.cuda.device_count()}))"
+    "'device_count': torch.cuda.device_count(), "
+    "'mps_built': mps_built, "
+    "'mps_available': mps_available, "
+    "'mps_recommended_max_memory': "
+    "torch.mps.recommended_max_memory() if device == 'mps' else None, "
+    "'os': platform.system(), "
+    "'os_version': platform.mac_ver()[0], "
+    "'machine': platform.machine()}))"
 )
 
 
@@ -2047,7 +2073,7 @@ _DEVICE_PROBE_CODE = (
 class DeviceProbe:
     """What one environment's own torch answered about its accelerator.
 
-    `device` is the part a caller acts on: `"cuda"`, `"cpu"`, or `None`. `None`
+    `device` is the part a caller acts on: one of `DEVICES`, or `None`. `None`
     is not a device and must not be read as one -- `tune.TrainingMetrics.device`
     defaults to `None` for the same reason ("absent is absent, not 'cpu'").
     `detail` says which `None` it is, because they are different facts: the
@@ -2070,6 +2096,24 @@ class DeviceProbe:
     # from a CPU-only build, which is the machine having none.
     cuda_build: str | None = None
     device_count: int | None = None
+    # `torch.backends.mps.is_built()` and `.is_available()`, as torch said
+    # them. `None` is "not reported" -- a probe that could not answer, or one
+    # from before these were asked -- and is not "False".
+    mps_built: bool | None = None
+    mps_available: bool | None = None
+    # `torch.mps.recommended_max_memory()` in bytes, asked only on an "mps"
+    # answer. `devices.mps_memory_policy` budgets against it.
+    mps_recommended_max_memory: int | None = None
+    # Where the probe ran, from the same interpreter: `platform.system()`,
+    # `platform.mac_ver()[0]` (`None` off macOS, where it is empty) and
+    # `platform.machine()`.
+    os: str | None = None
+    os_version: str | None = None
+    machine: str | None = None
+    # Who chose `device`: "probe" when it is this environment's torch's answer,
+    # or `devices.DEVICE_VARIABLE` when the operator set it. `None` where no
+    # device was chosen at all.
+    source: str | None = None
 
     @property
     def answered(self) -> bool:
@@ -2080,12 +2124,28 @@ class DeviceProbe:
         """A CUDA build that reports no usable device: torch cannot reach one."""
         return self.device == "cpu" and bool(self.cuda_build)
 
+    @property
+    def cpu_on_macos(self) -> bool:
+        """macOS, and the probe answered the CPU: MPS was not built or not available.
+
+        Only where the probe itself chose: a CPU the operator asked for through
+        `LITETUNE_DEVICE` needs no explaining.
+        """
+        return self.device == "cpu" and self.os == "Darwin" and self.source == "probe"
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "device": self.device,
             "detail": self.detail,
+            "source": self.source,
             "cuda_build": self.cuda_build,
             "device_count": self.device_count,
+            "mps_built": self.mps_built,
+            "mps_available": self.mps_available,
+            "mps_recommended_max_memory": self.mps_recommended_max_memory,
+            "os": self.os,
+            "os_version": self.os_version,
+            "machine": self.machine,
         }
 
 
@@ -2106,11 +2166,11 @@ def _unanswered(env: StageEnv, reason: str, events=None) -> DeviceProbe:
 def resolve_device(
     env: StageEnv, timeout: int = DEVICE_PROBE_TIMEOUT_S, events=None
 ) -> DeviceProbe:
-    """Ask this environment's own torch whether it has CUDA.
+    """Ask this environment's own torch whether it has CUDA, then MPS.
 
     Not a guess and not a default: if the probe cannot be started, is killed,
-    times out, exits non-zero, or answers with anything other than exactly
-    "cuda" or "cpu", `DeviceProbe.device` is `None` rather than a quiet "cpu",
+    times out, exits non-zero, or answers with anything other than exactly one
+    of `DEVICES`, `DeviceProbe.device` is `None` rather than a quiet "cpu",
     and `DeviceProbe.detail` carries which of those happened. A caller that
     gets `None` back still has to run something; the training and generation
     scripts fall back to asking `torch.cuda.is_available()` themselves in that
@@ -2171,29 +2231,84 @@ def resolve_device(
         return _unanswered(
             env, f"its last stdout line is not an answer ({exc}): {lines[-1][:200]!r}", events
         )
-    if device not in ("cuda", "cpu"):
-        return _unanswered(env, f"it answered {device!r}, which is neither device", events)
+    if device not in DEVICES:
+        return _unanswered(
+            env, f"it answered {device!r}, which is not one of {list(DEVICES)}", events
+        )
 
+    # The fields after the first three are read with `.get`: an answer without
+    # them is still an answer about the device, and what it did not say is
+    # recorded as `None` rather than guessed. Each is kept only if it has the
+    # type torch returns, so a malformed one cannot reach the memory policy.
     probe = DeviceProbe(
         device=device,
         detail=f"this environment's torch reports {device}",
         cuda_build=cuda_build if isinstance(cuda_build, str) else None,
         device_count=device_count if isinstance(device_count, int) else None,
+        mps_built=_typed(answer, "mps_built", bool),
+        mps_available=_typed(answer, "mps_available", bool),
+        mps_recommended_max_memory=_typed(answer, "mps_recommended_max_memory", int),
+        os=_typed(answer, "os", str) or None,
+        os_version=_typed(answer, "os_version", str) or None,
+        machine=_typed(answer, "machine", str) or None,
+        source="probe",
     )
     if probe.cuda_build_without_a_device:
-        probe = DeviceProbe(
-            device=device,
+        probe = replace(
+            probe,
             detail=(
                 f"this environment's torch is a CUDA {probe.cuda_build} build reporting "
                 f"{probe.device_count} devices, so it will run on the CPU: torch cannot reach a "
                 "GPU here, which is not the same observation as this machine having none"
             ),
-            cuda_build=probe.cuda_build,
-            device_count=probe.device_count,
         )
         if events is not None:
             events.note(probe.detail, environment=env.name, device=device)
+    elif probe.cpu_on_macos:
+        # Said rather than left for a reader to wonder why a Mac trained on its
+        # CPU. torch's two answers are reported as it gave them and no cause is
+        # named: `is_available()` returns a boolean, and which of the reasons
+        # it can be False for applied here is not something it says.
+        probe = replace(probe, detail=_macos_cpu_detail(probe))
+        if events is not None:
+            events.note(probe.detail, environment=env.name, device=device)
     return probe
+
+
+def _typed(answer: Mapping[str, Any], key: str, kind: type) -> Any:
+    """`answer[key]` when it is a `kind`, else `None`.
+
+    `bool` is a subclass of `int`, so an `int` field that arrived as `true` is
+    refused explicitly rather than read as 1 byte.
+    """
+    value = answer.get(key)
+    if kind is int and isinstance(value, bool):
+        return None
+    return value if isinstance(value, kind) else None
+
+
+def _macos_cpu_detail(probe: DeviceProbe) -> str:
+    where = " ".join(
+        part
+        for part in (
+            f"macOS {probe.os_version}" if probe.os_version else "macOS",
+            f"({probe.machine})" if probe.machine else "",
+        )
+        if part
+    )
+    if probe.mps_built is False:
+        said = "torch.backends.mps.is_built() is False: this torch was built without MPS"
+    elif probe.mps_built and probe.mps_available is False:
+        said = (
+            "torch.backends.mps.is_built() is True and is_available() is False: this torch "
+            "has MPS and cannot use it here, and does not say why"
+        )
+    else:
+        said = (
+            "the probe did not report whether this torch has MPS "
+            f"(is_built: {probe.mps_built}, is_available: {probe.mps_available})"
+        )
+    return f"this environment's torch reports cpu on {where}, so it will run on the CPU: {said}"
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FakeBackend, call_text, fake_torch, labelled_rows, mark_provisioned
+from conftest import (
+    FakeBackend,
+    call_text,
+    fake_torch,
+    labelled_rows,
+    mark_provisioned,
+    probe_answer,
+)
 
 from litetune import envs, toolpath
 from litetune.evaluate import (
@@ -771,7 +778,7 @@ def _generating_env(monkeypatch, *, probe: str | None, script_device: str | None
             return subprocess.CompletedProcess(
                 args,
                 0,
-                json.dumps({"device": probe, "cuda_build": None, "device_count": 0}),
+                probe_answer(probe),
                 "",
             )
         spec = json.loads(Path(args[2]).read_text())
@@ -895,9 +902,7 @@ def test_a_timeout_clears_the_device_it_never_confirmed(monkeypatch):
 
     def fake_run(self, args, timeout=3600, **kwargs):
         if args[1] == "-c":
-            return subprocess.CompletedProcess(
-                args, 0, json.dumps({"device": "cuda", "cuda_build": None, "device_count": 1}), ""
-            )
+            return subprocess.CompletedProcess(args, 0, probe_answer("cuda", device_count=1), "")
         raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
 
     monkeypatch.setattr(envs.StageEnv, "run", fake_run)
@@ -914,9 +919,7 @@ def test_a_script_that_could_not_start_clears_the_device_it_never_confirmed(monk
 
     def fake_run(self, args, timeout=3600, **kwargs):
         if args[1] == "-c":
-            return subprocess.CompletedProcess(
-                args, 0, json.dumps({"device": "cuda", "cuda_build": None, "device_count": 1}), ""
-            )
+            return subprocess.CompletedProcess(args, 0, probe_answer("cuda", device_count=1), "")
         raise FileNotFoundError("python")
 
     monkeypatch.setattr(envs.StageEnv, "run", fake_run)

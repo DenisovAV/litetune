@@ -13,6 +13,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -130,6 +131,59 @@ def _isolated_env_cache(monkeypatch, tmp_path):
     guarantees they start from a machine with none.
     """
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "litetune-envs"))
+
+
+# Every field `envs._DEVICE_PROBE_CODE` prints, in one place. `tune`'s
+# `FakeTrainer`, the probe fakes in `test_evaluate.py` and `test_verify.py`, and
+# `test_cli.py`'s `FakeToolchain` all answer the probe through this, and
+# `test_envs.py` pins it against what the probe source itself prints -- so a
+# field added to the probe reaches every fake at once instead of one at a time.
+PROBE_FIELDS = (
+    "device",
+    "cuda_build",
+    "device_count",
+    "mps_built",
+    "mps_available",
+    "mps_recommended_max_memory",
+    "os",
+    "os_version",
+    "machine",
+)
+
+
+def probe_answer(device: str | None = "cpu", **fields: Any) -> str:
+    """One line of JSON, the way the device probe prints it.
+
+    A "cpu" or "cuda" answer comes from a Linux x86-64 machine without MPS
+    unless a field says otherwise, which is what every probe fake answered
+    before MPS was asked about. An "mps" answer comes from an arm64 Mac with
+    16 GiB of recommended working set.
+    """
+    answer: dict[str, Any] = {
+        "device": device,
+        "cuda_build": None,
+        "device_count": 0,
+        "mps_built": False,
+        "mps_available": False,
+        "mps_recommended_max_memory": None,
+        "os": "Linux",
+        "os_version": "",
+        "machine": "x86_64",
+    }
+    if device == "mps":
+        answer.update(
+            mps_built=True,
+            mps_available=True,
+            mps_recommended_max_memory=16 * 1024**3,
+            os="Darwin",
+            os_version="15.0",
+            machine="arm64",
+        )
+    unknown = set(fields) - set(PROBE_FIELDS)
+    if unknown:
+        raise TypeError(f"the probe prints no {sorted(unknown)}")
+    answer.update(fields)
+    return json.dumps(answer)
 
 
 @pytest.fixture

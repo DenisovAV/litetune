@@ -17,6 +17,7 @@ import time
 import types
 
 import pytest
+from conftest import PROBE_FIELDS, probe_answer
 
 from litetune import envs
 from litetune.envs import EXPORT, RUNTIME, TRAIN, StageEnv, UnpinnedRequirement
@@ -381,10 +382,8 @@ def _answers(monkeypatch, *, stdout="", returncode=0, stderr="", raises=None):
     monkeypatch.setattr(StageEnv, "run", fake_run)
 
 
-def _json_answer(device="cpu", cuda_build=None, device_count=0) -> str:
-    import json
-
-    return json.dumps({"device": device, "cuda_build": cuda_build, "device_count": device_count})
+def _json_answer(device="cpu", cuda_build=None, device_count=0, **fields) -> str:
+    return probe_answer(device, cuda_build=cuda_build, device_count=device_count, **fields)
 
 
 def test_the_probe_asks_this_environments_own_torch(probe_env, monkeypatch):
@@ -425,11 +424,104 @@ def test_a_banner_before_the_answer_does_not_destroy_it(probe_env, monkeypatch):
     assert envs.resolve_device(probe_env).device == "cuda"
 
 
-def test_an_answer_that_is_neither_device_is_not_a_device(probe_env, monkeypatch):
-    _answers(monkeypatch, stdout=_json_answer("mps"))
+def test_an_answer_that_is_no_known_device_is_not_a_device(probe_env, monkeypatch):
+    _answers(monkeypatch, stdout=_json_answer("xpu"))
     probe = envs.resolve_device(probe_env)
     assert probe.device is None
+    assert "'xpu'" in probe.detail
+    # The refusal names what would have been accepted.
     assert "'mps'" in probe.detail
+
+
+def test_an_mps_answer_is_a_device_and_carries_what_torch_said(probe_env, monkeypatch):
+    _answers(
+        monkeypatch,
+        stdout=_json_answer("mps", mps_recommended_max_memory=12345, os_version="15.3"),
+    )
+    probe = envs.resolve_device(probe_env)
+    assert probe.device == "mps"
+    assert probe.answered
+    assert probe.source == "probe"
+    assert probe.mps_built is True
+    assert probe.mps_available is True
+    assert probe.mps_recommended_max_memory == 12345
+    assert (probe.os, probe.os_version, probe.machine) == ("Darwin", "15.3", "arm64")
+    assert probe.as_dict()["mps_recommended_max_memory"] == 12345
+    assert probe.as_dict()["source"] == "probe"
+
+
+def test_an_answer_without_the_newer_fields_is_still_an_answer(probe_env, monkeypatch):
+    """A probe line with only the first three fields names a device; what it
+    did not say is `None`, not `False`."""
+    _answers(
+        monkeypatch, stdout=json.dumps({"device": "cuda", "cuda_build": "12.4", "device_count": 1})
+    )
+    probe = envs.resolve_device(probe_env)
+    assert probe.device == "cuda"
+    assert probe.mps_built is None
+    assert probe.mps_available is None
+    assert probe.os is None
+
+
+def test_a_mistyped_field_is_dropped_not_trusted(probe_env, monkeypatch):
+    """`true` where bytes belong is not one byte: the memory policy divides by it."""
+    _answers(
+        monkeypatch,
+        stdout=_json_answer("mps", mps_recommended_max_memory=True, mps_built="yes", os=7),
+    )
+    probe = envs.resolve_device(probe_env)
+    assert probe.device == "mps"
+    assert probe.mps_recommended_max_memory is None
+    assert probe.mps_built is None
+    assert probe.os is None
+
+
+def test_macos_on_the_cpu_says_what_torch_said_about_mps(probe_env, monkeypatch):
+    """A Mac that trains on its CPU is told so, with torch's two answers --
+    and no guess at which of the reasons `is_available()` can be False for
+    applied."""
+    from litetune.events import EventStream
+
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+    _answers(
+        monkeypatch,
+        stdout=_json_answer(
+            "cpu",
+            mps_built=True,
+            mps_available=False,
+            os="Darwin",
+            os_version="12.7",
+            machine="arm64",
+        ),
+    )
+    probe = envs.resolve_device(probe_env, events=events)
+    assert probe.device == "cpu"
+    assert probe.cpu_on_macos
+    assert "macOS 12.7 (arm64)" in probe.detail
+    assert "is_built() is True and is_available() is False" in probe.detail
+    assert "does not say why" in probe.detail
+    assert [e for e in seen if e.kind == "note" and e.data["message"] == probe.detail]
+
+
+def test_macos_with_a_torch_built_without_mps_says_so(probe_env, monkeypatch):
+    _answers(
+        monkeypatch,
+        stdout=_json_answer(
+            "cpu", mps_built=False, mps_available=False, os="Darwin", os_version="15.0"
+        ),
+    )
+    probe = envs.resolve_device(probe_env)
+    assert probe.cpu_on_macos
+    assert "built without MPS" in probe.detail
+
+
+def test_a_cpu_off_macos_carries_no_mps_explanation(probe_env, monkeypatch):
+    _answers(monkeypatch, stdout=_json_answer("cpu"))
+    probe = envs.resolve_device(probe_env)
+    assert not probe.cpu_on_macos
+    assert probe.detail == "this environment's torch reports cpu"
 
 
 def test_unparseable_stdout_is_not_a_device(probe_env, monkeypatch):
@@ -569,6 +661,38 @@ def test_an_unanswered_probe_reaches_the_event_stream(probe_env, monkeypatch):
     assert [e for e in seen if e.kind == "note" and "could not answer" in e.data["message"]]
 
 
+def _fake_probe_torch(monkeypatch, *, cuda: bool, mps_built: bool, mps_available: bool):
+    import types
+
+    fake = types.ModuleType("torch")
+    fake.version = types.SimpleNamespace(cuda="12.4" if cuda else None)  # type: ignore[attr-defined]
+    fake.cuda = types.SimpleNamespace(  # type: ignore[attr-defined]
+        is_available=lambda: cuda, device_count=lambda: 2 if cuda else 0
+    )
+    fake.backends = types.SimpleNamespace(  # type: ignore[attr-defined]
+        mps=types.SimpleNamespace(is_built=lambda: mps_built, is_available=lambda: mps_available)
+    )
+
+    def recommended() -> int:
+        # Asking initialises the MPS device, so the probe asks only on an
+        # "mps" answer; a fake that cannot answer otherwise pins that.
+        if not mps_available:
+            raise RuntimeError("MPS is not available")
+        return 7 * 1024**3
+
+    fake.mps = types.SimpleNamespace(recommended_max_memory=recommended)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.mac_ver", lambda: ("15.1", ("", "", ""), "arm64"))
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+
+
+def _run_probe_source(capsys) -> dict:
+    # `exec` on this package's own constant, not on external input.
+    exec(compile(envs._DEVICE_PROBE_CODE, "device_probe.py", "exec"), {})
+    return json.loads(capsys.readouterr().out.strip())
+
+
 def test_the_probe_source_reports_the_build_and_the_count(monkeypatch, capsys):
     """`_DEVICE_PROBE_CODE` is a string of source that runs in another
     interpreter, so the only way to pin what it prints is to run it here
@@ -577,42 +701,59 @@ def test_the_probe_source_reports_the_build_and_the_count(monkeypatch, capsys):
     reach the one it has" -- dropping either leaves `is_available()` alone,
     which answers False for both.
     """
-    import json
-    import sys
-    import types
+    _fake_probe_torch(monkeypatch, cuda=False, mps_built=False, mps_available=False)
 
-    fake = types.ModuleType("torch")
-    fake.version = types.SimpleNamespace(cuda="12.4")
-    fake.cuda = types.SimpleNamespace(is_available=lambda: False, device_count=lambda: 0)
-    monkeypatch.setitem(sys.modules, "torch", fake)
-
-    # `exec` on this package's own constant, not on external input.
-    exec(compile(envs._DEVICE_PROBE_CODE, "device_probe.py", "exec"), {})
-
-    assert json.loads(capsys.readouterr().out.strip()) == {
+    assert _run_probe_source(capsys) == {
         "device": "cpu",
-        "cuda_build": "12.4",
+        "cuda_build": None,
         "device_count": 0,
+        "mps_built": False,
+        "mps_available": False,
+        "mps_recommended_max_memory": None,
+        "os": "Darwin",
+        "os_version": "15.1",
+        "machine": "arm64",
     }
 
 
 def test_the_probe_source_says_cuda_when_torch_can_reach_one(monkeypatch, capsys):
-    import json
-    import sys
-    import types
+    """CUDA first, even where MPS would answer too."""
+    _fake_probe_torch(monkeypatch, cuda=True, mps_built=True, mps_available=True)
 
-    fake = types.ModuleType("torch")
-    fake.version = types.SimpleNamespace(cuda="12.4")
-    fake.cuda = types.SimpleNamespace(is_available=lambda: True, device_count=lambda: 2)
-    monkeypatch.setitem(sys.modules, "torch", fake)
+    answer = _run_probe_source(capsys)
+    assert answer["device"] == "cuda"
+    assert answer["cuda_build"] == "12.4"
+    assert answer["device_count"] == 2
+    assert answer["mps_recommended_max_memory"] is None
 
-    exec(compile(envs._DEVICE_PROBE_CODE, "device_probe.py", "exec"), {})
 
-    assert json.loads(capsys.readouterr().out.strip()) == {
-        "device": "cuda",
-        "cuda_build": "12.4",
-        "device_count": 2,
-    }
+def test_the_probe_source_says_mps_when_there_is_no_cuda(monkeypatch, capsys):
+    _fake_probe_torch(monkeypatch, cuda=False, mps_built=True, mps_available=True)
+
+    answer = _run_probe_source(capsys)
+    assert answer["device"] == "mps"
+    assert answer["mps_built"] is True
+    assert answer["mps_available"] is True
+    assert answer["mps_recommended_max_memory"] == 7 * 1024**3
+
+
+def test_the_probe_source_says_cpu_when_mps_is_built_and_unavailable(monkeypatch, capsys):
+    _fake_probe_torch(monkeypatch, cuda=False, mps_built=True, mps_available=False)
+
+    answer = _run_probe_source(capsys)
+    assert answer["device"] == "cpu"
+    assert (answer["mps_built"], answer["mps_available"]) == (True, False)
+
+
+def test_every_probe_fake_answers_the_fields_the_probe_prints(monkeypatch, capsys):
+    """`conftest.probe_answer` is what every probe fake in the suite answers
+    with. Pinned against the probe source itself, so a field added to one and
+    not the other fails here rather than in whichever fake drifted."""
+    _fake_probe_torch(monkeypatch, cuda=False, mps_built=False, mps_available=False)
+
+    assert tuple(_run_probe_source(capsys)) == PROBE_FIELDS
+    assert tuple(json.loads(probe_answer("cpu"))) == PROBE_FIELDS
+    assert tuple(json.loads(probe_answer("mps"))) == PROBE_FIELDS
 
 
 def test_no_probe_at_all_is_a_distinct_state():

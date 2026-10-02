@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import pytest
-from conftest import fake_torch, mark_provisioned
+from conftest import fake_torch, mark_provisioned, probe_answer
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -71,6 +71,9 @@ IGNORE_INDEX = -100
 class Call:
     argv: list[str]
     timeout: int
+    # The `env` overrides `StageEnv.run` was handed: where the MPS memory
+    # policy reaches the child, and nothing else in `run_tune` passes any.
+    env: dict | None = None
 
 
 @dataclass
@@ -114,6 +117,9 @@ class FakeTrainer:
     probe_returncode: int = 0
     probe_stderr: str = ""
     probe_raises: BaseException | None = None
+    # Any other field the probe prints -- `mps_available`, `os` and the rest --
+    # by the names `conftest.probe_answer` takes.
+    probe_fields: dict = field(default_factory=dict)
 
     @staticmethod
     def is_probe(args) -> bool:
@@ -125,19 +131,18 @@ class FakeTrainer:
         stdout = self.probe_stdout
         if stdout is None:
             stdout = (
-                json.dumps(
-                    {
-                        "device": self.probe_device,
-                        "cuda_build": self.probe_cuda_build,
-                        "device_count": self.probe_device_count,
-                    }
+                probe_answer(
+                    self.probe_device,
+                    cuda_build=self.probe_cuda_build,
+                    device_count=self.probe_device_count,
+                    **self.probe_fields,
                 )
                 + "\n"
             )
         return subprocess.CompletedProcess(args, self.probe_returncode, stdout, self.probe_stderr)
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
-        self.calls.append(Call(argv=list(args), timeout=timeout))
+        self.calls.append(Call(argv=list(args), timeout=timeout, env=kwargs.get("env")))
         if self.is_probe(args):
             # Ahead of `raises`, which describes the training run: a test that
             # makes training time out is not also asking the probe to.

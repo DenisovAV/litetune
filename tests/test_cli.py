@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import FakeBackend, correct_texts, labelled_rows, mark_provisioned
+from conftest import FakeBackend, correct_texts, labelled_rows, mark_provisioned, probe_answer
 
 from litetune import envs
 from litetune import verify as verify_module
@@ -489,6 +489,11 @@ class FakeToolchain:
         self.calls.append(list(args))
         if args[0] == "pip":
             return subprocess.CompletedProcess(args, 0, self.pip_stdout, "")
+        if args[:2] == ["python", "-c"]:
+            # The device probe, answered the way every other probe fake in the
+            # suite answers it. Without this a probe reaching this fake would
+            # be parsed as an export's flags and raise `KeyError`.
+            return subprocess.CompletedProcess(args, 0, probe_answer("cpu") + "\n", "")
         if args[0] == "python" and str(args[1]).endswith("repack.py"):
             # This fake has no export environment to run the repack script in:
             # the repack reports that and the export stays a passed, CPU-only one.
