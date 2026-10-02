@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -45,7 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from litetune import envs, models
+from litetune import devices, envs, models
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.declarations import (
     DeclarationsError,
@@ -383,6 +384,50 @@ BFLOAT16_CPU_HINT = (
     "the report records the departure from the default dtype either way"
 )
 
+# The devices a run is on when it is not on the CPU. The bfloat16-on-the-CPU
+# hint above is about the CPU; it is said wherever the device is the CPU or
+# was never established -- the script's own fallback never picks mps -- and
+# never on either of these.
+ACCELERATORS = ("cuda", "mps")
+
+# What `tune` trains in on mps when `--dtype` was not given. bfloat16 is the
+# default everywhere else; on MPS it has not been measured here, in speed or in
+# what it trains, and float32 is the dtype the float reference loads at. An
+# explicit `--dtype bfloat16` on mps is honoured and recorded as declared.
+MPS_DEFAULT_DTYPE = "float32"
+MPS_DTYPE_SOURCE = "default for mps: bfloat16 on MPS unmeasured"
+
+
+@dataclass(frozen=True)
+class DtypeDecision:
+    """The dtype a run trains in, and whether it was declared or defaulted."""
+
+    dtype: str
+    source: str
+
+    @property
+    def declared(self) -> bool:
+        return self.source == "declared"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"dtype": self.dtype, "source": self.source}
+
+
+def decide_dtype(declared: str | None, device: str | None) -> DtypeDecision:
+    """The declared dtype, or the default for `device`. Pure.
+
+    `device` is what the parent established before the run: the probe's
+    answer, or `LITETUNE_DEVICE`'s. `None` -- no device established -- takes
+    the general default, because the script's own fallback then picks cuda or
+    the CPU and never mps.
+    """
+    if declared is not None:
+        return DtypeDecision(declared, "declared")
+    if device == "mps":
+        return DtypeDecision(MPS_DEFAULT_DTYPE, MPS_DTYPE_SOURCE)
+    return DtypeDecision(DEFAULT_DTYPE, "default")
+
+
 # Training stderr that names the accelerator rather than the method or the
 # data. A `torch.OutOfMemoryError` exits 1 like any other uncaught exception,
 # and `Check.failed` on that exit is a verdict about the recipe drawn from a
@@ -417,6 +462,13 @@ BFLOAT16_CPU_HINT = (
 # prefix: the same reasoning that keeps `CUDA error: device-side assert
 # triggered` off this list applies here too, and a bare `not enough memory`
 # risks matching a message this list was never meant to speak for.
+#
+# `MPS backend out of memory` is how torch's MPS allocator opens the error it
+# raises past the high watermark ("beyond that, the allocations would fail
+# with OOM error", torch/include/ATen/mps/MPSAllocator.h); the string itself is
+# in torch 2.5.1's libtorch_cpu, as `envs.TRAIN` pins it. With the memory
+# policy in `devices` that watermark is set from what the Mac had free, so
+# this is the ending of a run whose model needed more than the policy allowed.
 _GPU_FAILURE_RE = re.compile(
     r"(OutOfMemoryError"
     r"|CUDA out of memory"
@@ -428,7 +480,8 @@ _GPU_FAILURE_RE = re.compile(
     r"|invalid device ordinal"
     r"|DefaultCPUAllocator: not enough memory"
     r"|CUBLAS_STATUS_ALLOC_FAILED"
-    r"|CUDNN_STATUS_ALLOC_FAILED)",
+    r"|CUDNN_STATUS_ALLOC_FAILED"
+    r"|MPS backend out of memory)",
     re.IGNORECASE,
 )
 
@@ -436,6 +489,14 @@ TRAINING_CHECK = "training run"
 MASKING_CHECK = "loss is masked to the completion"
 MERGE_CHECK = "merged checkpoint written"
 ENV_CHECK = "training environment"
+DEVICE_CHECK = "training device"
+
+# Said beside an out-of-memory ending on mps, where the two ways forward are
+# the ones the memory policy's own refusal names.
+MPS_OOM_ADVICE = (
+    "the MPS memory budget was set from the memory this Mac had free when the run started; free "
+    f"memory and run again, or set {devices.DEVICE_VARIABLE}=cpu to train on the CPU"
+)
 
 NOT_VERIFIED = (
     "training completed and nothing has been measured. A falling loss curve is not evidence: the "
@@ -492,6 +553,14 @@ from pathlib import Path
 # torch's own ignore index. Positions set to this contribute no gradient, and
 # they are the whole mechanism by which the prompt is excluded from the loss.
 IGNORE_INDEX = -100
+
+# On mps each batch is padded up to a multiple of this, so a run sees at most
+# one batch width per 32 tokens of length instead of one per distinct longest
+# row. The intent is that torch's MPS allocator and graph cache meet the same
+# shapes again; the effect is not measured here. The padding is masked out of
+# the loss like any other, and the width may pass `max_seq_length` by up to
+# 31 positions, all of them padding. On cuda and the CPU nothing changes.
+PAD_MULTIPLE_ON_MPS = 32
 '''
     + RENDERING_SOURCE
     + r'''
@@ -554,6 +623,11 @@ def training_device(torch, given=None):
     not stop a training run that otherwise would. Recorded in the metrics
     either way, so a GPU box that trained on the CPU says so rather than
     looking exactly like a laptop.
+
+    The fallback never chooses mps, even on a Mac where it would answer: the
+    parent sets the MPS memory policy before it starts a child that will use
+    mps (`devices.prepare_mps`), and a child that picked mps for itself would
+    run without one.
     """
     if given is not None:
         return given
@@ -681,11 +755,17 @@ def epoch_schedule(epochs, n_examples, batch_size):
     return schedule
 
 
-def batches(examples, size, pad_id, torch):
-    """Pad to the longest member of each batch. Padding is masked out of the loss."""
+def batches(examples, size, pad_id, torch, pad_to_multiple_of=None):
+    """Pad to the longest member of each batch. Padding is masked out of the loss.
+
+    With `pad_to_multiple_of`, the width is rounded up to the next multiple of
+    it -- `PAD_MULTIPLE_ON_MPS` on mps, `None` everywhere else.
+    """
     for start in range(0, len(examples), size):
         chunk = examples[start : start + size]
         width = max(len(ids) for ids, _ in chunk)
+        if pad_to_multiple_of:
+            width = -(-width // pad_to_multiple_of) * pad_to_multiple_of
         input_ids = [ids + [pad_id] * (width - len(ids)) for ids, _ in chunk]
         labels = [lab + [IGNORE_INDEX] * (width - len(lab)) for _, lab in chunk]
         attention = [[1] * len(ids) + [0] * (width - len(ids)) for ids, _ in chunk]
@@ -868,6 +948,13 @@ def main() -> int:
     )
 
     schedule = epoch_schedule(spec["epochs"], len(examples), spec["batch_size"])
+    on_mps = device == "mps"
+    pad_multiple = PAD_MULTIPLE_ON_MPS if on_mps else None
+    # Peaks of torch's own two MPS counters, sampled after every optimiser
+    # step: `current_allocated_memory()` is what tensors occupy,
+    # `driver_allocated_memory()` everything Metal holds for this process,
+    # cached blocks included. `None` off mps, where neither exists.
+    mps_peak = {"current_allocated": 0, "driver_allocated": 0} if on_mps else None
 
     epochs = []
     for number, portion, limit in schedule:
@@ -875,7 +962,7 @@ def main() -> int:
         running = 0.0
         steps = 0
         for input_ids, attention, labels in batches(
-            examples, spec["batch_size"], pad_id, torch
+            examples, spec["batch_size"], pad_id, torch, pad_multiple
         ):
             if steps >= limit:
                 break
@@ -889,8 +976,19 @@ def main() -> int:
             )
             out.loss.backward()
             optimiser.step()
+            if mps_peak is not None:
+                mps_peak["current_allocated"] = max(
+                    mps_peak["current_allocated"], torch.mps.current_allocated_memory()
+                )
+                mps_peak["driver_allocated"] = max(
+                    mps_peak["driver_allocated"], torch.mps.driver_allocated_memory()
+                )
             optimiser.zero_grad(set_to_none=True)
             running += float(out.loss.detach())
+            # The loss has been read. Holding `out` to the next iteration would
+            # keep this step's logits alive while the next step allocates its
+            # own; dropping it changes no number.
+            del out
             steps += 1
         epochs.append(
             {
@@ -900,6 +998,11 @@ def main() -> int:
                 "steps": steps,
             }
         )
+
+    if on_mps:
+        # What the allocator cached for the loop goes back before the merge and
+        # the save allocate theirs.
+        torch.mps.empty_cache()
 
     model_dir = Path(spec["model_dir"])
     adapter_dir = Path(spec["adapter_dir"]) if spec.get("adapter_dir") else None
@@ -952,11 +1055,27 @@ def main() -> int:
                 "method": spec["method"],
                 "learning_rate": spec["learning_rate"],
                 "dtype": spec["dtype"],
+                # Whether that dtype was asked for or is the default for this
+                # device, which on mps is not the default anywhere else.
+                "dtype_source": spec.get("dtype_source"),
                 "attn_implementation": spec["attn_implementation"],
                 # Where it ran. A CUDA box and a laptop produce the same
                 # checkpoint; they do not take the same time, and a report
                 # that cannot say which it was cannot explain the difference.
                 "device": device,
+                # What the parent found before this started, and who chose the
+                # device: the probe, or LITETUNE_DEVICE. `None` when the parent
+                # had no answer to give and `training_device` fell back.
+                "device_probe": spec.get("device_probe"),
+                # Operating system, version, machine and chip, read by the parent.
+                "host": spec.get("host"),
+                # The MPS memory policy this run started under -- budget, the
+                # recommended working set, both watermark ratios and who set
+                # them, the free-memory level and swap use at the start. `None`
+                # off mps.
+                "mps_memory": spec.get("mps_memory"),
+                "pad_to_multiple_of": pad_multiple,
+                "mps_peak_memory": mps_peak,
                 # Whether the SentencePiece model made it back beside the
                 # checkpoint. Recorded, not assumed: the difference between
                 # `SP_Tokenizer` and an HF section is invisible in every
@@ -1121,6 +1240,10 @@ class TuneRequest:
     between `bfloat16` and `float32`. Both fields are recorded on every run
     for the same underlying reason: a mismatch here produces output that
     looks fine and is not.
+
+    `dtype` is `None` when the caller did not choose one, and the default is
+    then decided per device once the device is known (`decide_dtype`):
+    `bfloat16`, except on mps, where it is `float32`.
     """
 
     model: str
@@ -1140,7 +1263,10 @@ class TuneRequest:
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_targets: Sequence[str] = DEFAULT_LORA_TARGETS
-    dtype: str = DEFAULT_DTYPE
+    # `None` is "not declared", as with `learning_rate`: the dtype is then the
+    # default for the device the run lands on, which is not known until the
+    # probe has answered -- see `decide_dtype`.
+    dtype: str | None = None
     attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION
     # Which of the two prompt conventions this run trains the model into, and
     # the *only* place the answer is decided. It is a training parameter, not a
@@ -1224,6 +1350,9 @@ class TuneRequest:
         declarations_sha256: str | None = None,
         declarations: list | None = None,
         lora_container: str | None = None,
+        device_probe: Mapping[str, Any] | None = None,
+        host: Mapping[str, Any] | None = None,
+        mps_memory: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Everything the generated script needs. Also what the report records.
 
@@ -1241,8 +1370,14 @@ class TuneRequest:
         `declarations_sha256` is computed in this process, not in the script:
         the training environment has no litetune to compute it with, and the
         digest has to be the one `bundle` compares its contract against.
+
+        The dtype is decided here from `device`, by `decide_dtype`, so the
+        script and the report are given the same one. `device_probe`, `host`
+        and `mps_memory` are what the parent found and set before the run;
+        the script copies them into `metrics.json` unchanged.
         """
         mode = decision.mode if decision is not None else self.prompt_mode
+        dtype = decide_dtype(self.dtype, device)
         return {
             "model": self.model,
             "revision": self.revision,
@@ -1262,7 +1397,8 @@ class TuneRequest:
             # prompt mode, so a run says what it is about to adapt while there
             # is still something to do about it.
             "lora_container": lora_container,
-            "dtype": self.dtype,
+            "dtype": dtype.dtype,
+            "dtype_source": dtype.source,
             "attn_implementation": self.attn_implementation,
             "prompt_mode": mode.value if mode is not None else None,
             # How the mode was decided and on what evidence. The script writes it
@@ -1297,6 +1433,9 @@ class TuneRequest:
             "adapter_dir": str(self.adapter_dir) if self.adapter_dir else None,
             "metrics_out": str(metrics_out),
             "device": device,
+            "device_probe": dict(device_probe) if device_probe is not None else None,
+            "host": dict(host) if host is not None else None,
+            "mps_memory": dict(mps_memory) if mps_memory is not None else None,
         }
 
     def as_dict(self, device: str | None = None) -> dict[str, Any]:
@@ -1321,6 +1460,11 @@ class TuneRequest:
         # every tower. It is the result's fact and is reported at the top
         # level of `TuneResult.as_dict`.
         record.pop("lora_container", None)
+        # What the parent found and set before the run: the result's, reported
+        # at the top level of `TuneResult.as_dict`, like the container.
+        record.pop("device_probe")
+        record.pop("host")
+        record.pop("mps_memory")
         record["declarations"] = str(self.declarations) if self.declarations else None
         record["force_prompt_mode"] = self.force_prompt_mode
         record["learning_rate_source"] = (
@@ -1387,6 +1531,16 @@ class TrainingMetrics:
     lora_match_note: str | None = None
     # `None` when the script predates the field. Absent is absent, not "cpu".
     device: str | None = None
+    # The dtype the script loaded the model in, and whether it was declared or
+    # the default for the device. `None` from a script that predates them.
+    dtype: str | None = None
+    dtype_source: str | None = None
+    # The batch-width multiple the script padded to: 32 on mps, `None`
+    # elsewhere and from a script that predates the field.
+    pad_to_multiple_of: int | None = None
+    # Peaks of torch's MPS counters over the run's steps, in bytes. `None` off
+    # mps.
+    mps_peak_memory: Mapping[str, int] | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -1422,6 +1576,10 @@ class TrainingMetrics:
             ),
             lora_match_note=data.get("lora_match_note"),
             device=data.get("device"),
+            dtype=data.get("dtype"),
+            dtype_source=data.get("dtype_source"),
+            pad_to_multiple_of=data.get("pad_to_multiple_of"),
+            mps_peak_memory=data.get("mps_peak_memory"),
             raw=dict(data),
         )
 
@@ -1440,6 +1598,12 @@ class TrainingMetrics:
             "lora_modules": (None if self.lora_modules is None else list(self.lora_modules)),
             "lora_match_note": self.lora_match_note,
             "device": self.device,
+            "dtype": self.dtype,
+            "dtype_source": self.dtype_source,
+            "pad_to_multiple_of": self.pad_to_multiple_of,
+            "mps_peak_memory": (
+                dict(self.mps_peak_memory) if self.mps_peak_memory is not None else None
+            ),
             "epochs": [e.as_dict() for e in self.epochs],
             "final_loss": self.final_loss,
         }
@@ -1529,6 +1693,16 @@ class TuneResult:
     # checkpoint litetune has no rules for -- which are three different things,
     # and the limitations say which.
     lora_container: str | None = None
+    # The probe's whole answer, with `LITETUNE_DEVICE` applied: `device` above
+    # is its one actionable field, and this is where the report says who chose
+    # it and what torch said about MPS. `None` when the run stopped before the
+    # probe.
+    device_probe: envs.DeviceProbe | None = None
+    # Operating system, version, machine and chip (`devices.host_record`).
+    host: dict[str, Any] | None = None
+    # The MPS memory policy the run started under (`devices.MpsMemory`), or
+    # `None` when the run was not on mps.
+    mps_memory: devices.MpsMemory | None = None
 
     @property
     def outcome(self) -> Outcome:
@@ -1585,6 +1759,11 @@ class TuneResult:
             # choose it, the family's rules do. See the pop in
             # `TuneRequest.as_dict`.
             "lora_container": self.lora_container,
+            # Top-level for the reason the container is: the parent found
+            # these, the caller did not choose them.
+            "device_probe": self.device_probe.as_dict() if self.device_probe else None,
+            "host": self.host,
+            "mps_memory": self.mps_memory.as_dict() if self.mps_memory else None,
             "request": self.request.as_dict(device=self.device),
             "metrics": self.metrics.as_dict() if self.metrics else None,
             "model_dir": str(self.model_dir) if self.model_dir else None,
@@ -1624,6 +1803,68 @@ def _emit_epochs(events: EventStream, metrics: TrainingMetrics) -> None:
         )
 
 
+def _dtype_limitations(result: TuneResult, dtype: DtypeDecision) -> None:
+    """What the report says about the dtype, once the device has decided it.
+
+    After the probe rather than at the top of `run_tune`, where these used to
+    be: an undeclared dtype is not known until the device is (`decide_dtype`).
+    """
+    if dtype.dtype == DEFAULT_DTYPE:
+        # Named because it is a real cost of the bfloat16 default: the
+        # parameters are bfloat16, so AdamW's moments are bfloat16 too. A
+        # mixed-precision setup would keep an fp32 master copy and update more
+        # precisely. bfloat16 over float16 *is* decided, in this repo:
+        # spec.py's `DTYPES` excludes float16 because a fine-tune in it
+        # overflows where bfloat16 does not, and cli.py's `--dtype` argument
+        # (`choices=sorted(DTYPES)`) pins the same choice to a 270M model
+        # whose loss goes to NaN in float16 while bfloat16 holds.
+        # bfloat16 versus float32, the other member of `DTYPES`, is not
+        # decided the same way -- what is established is that neither
+        # downstream path is known to match this default: evaluate.py's
+        # float reference loads with `torch_dtype=torch.float32` regardless
+        # of what trained the checkpoint under test, and export.py passes no
+        # dtype to the exporter at all, so what dtype the exported
+        # checkpoint actually loads in is not established here either.
+        result.limitation(
+            "training runs with bfloat16 parameters, so the optimiser's moments are bfloat16 as "
+            "well; updates are coarser than a mixed-precision run with an fp32 master copy. "
+            "bfloat16 over float16 is decided, not a guess: a fine-tune in float16 overflows "
+            "where bfloat16 does not, and a 270M model's loss goes to NaN in float16 while "
+            "bfloat16 holds. bfloat16 versus float32, the other dtype this tool supports, is not "
+            "established the same way: evaluation's float reference loads at an unconditional "
+            "float32 regardless of the training dtype, so a run at the default dtype still "
+            "carries a dtype difference against the reference it is scored on; export passes no "
+            "dtype to the exporter at all, so what dtype the exported checkpoint actually loads "
+            "in is not established here either"
+        )
+    if dtype.declared and dtype.dtype != DEFAULT_DTYPE:
+        # Unlike attention, there is no pair here for a non-default dtype to
+        # match or miss: evaluate.py's float reference always loads at
+        # float32, and export.py passes no dtype at all. So this limitation
+        # states the departure and stops there. What it must not claim is
+        # which dtype the published numbers were taken at: MEASUREMENTS.md
+        # gives a dtype for exactly one of them -- the second-family
+        # banking77 run, trained in float32 "because bfloat16 on this CPU
+        # runs on a single core" -- and says nothing about the dtype of the
+        # headline table.
+        result.limitation(
+            f"this run trains with dtype {dtype.dtype!r}, not the {DEFAULT_DTYPE!r} default. "
+            "evaluate.py's float reference loads at an unconditional float32 regardless of the "
+            "training dtype, and export.py passes no dtype to the exporter at all, so there is "
+            "no single dtype the export and evaluation paths are known to use for this run to "
+            "match or miss. Which dtype a published number was taken at is recorded per run in "
+            "MEASUREMENTS.md and is not a property of this default"
+        )
+    if dtype.source == MPS_DTYPE_SOURCE:
+        result.limitation(
+            f"this run trains in {MPS_DEFAULT_DTYPE} because it is on mps and no --dtype was "
+            f"given. The default elsewhere is {DEFAULT_DTYPE!r}; bfloat16 on MPS has not been "
+            "measured here, in speed or in what it trains, so on mps the default is float32, "
+            "which is also the dtype evaluation's float reference loads at. --dtype bfloat16 "
+            "trains in it on mps and is recorded as declared"
+        )
+
+
 def _directory_is_populated(path: Path) -> bool:
     return path.is_dir() and any(path.iterdir())
 
@@ -1655,34 +1896,6 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     # docstring on the field said `None` for it before the code did.
     result.lora_container = lora_container if request.method == "lora" else None
     result.limitation(NOT_VERIFIED)
-    if request.dtype == DEFAULT_DTYPE:
-        # Named because it is a real cost of the bfloat16 default: the
-        # parameters are bfloat16, so AdamW's moments are bfloat16 too. A
-        # mixed-precision setup would keep an fp32 master copy and update more
-        # precisely. bfloat16 over float16 *is* decided, in this repo:
-        # spec.py's `DTYPES` excludes float16 because a fine-tune in it
-        # overflows where bfloat16 does not, and cli.py's `--dtype` argument
-        # (`choices=sorted(DTYPES)`) pins the same choice to a 270M model
-        # whose loss goes to NaN in float16 while bfloat16 holds.
-        # bfloat16 versus float32, the other member of `DTYPES`, is not
-        # decided the same way -- what is established is that neither
-        # downstream path is known to match this default: evaluate.py's
-        # float reference loads with `torch_dtype=torch.float32` regardless
-        # of what trained the checkpoint under test, and export.py passes no
-        # dtype to the exporter at all, so what dtype the exported
-        # checkpoint actually loads in is not established here either.
-        result.limitation(
-            "training runs with bfloat16 parameters, so the optimiser's moments are bfloat16 as "
-            "well; updates are coarser than a mixed-precision run with an fp32 master copy. "
-            "bfloat16 over float16 is decided, not a guess: a fine-tune in float16 overflows "
-            "where bfloat16 does not, and a 270M model's loss goes to NaN in float16 while "
-            "bfloat16 holds. bfloat16 versus float32, the other dtype this tool supports, is not "
-            "established the same way: evaluation's float reference loads at an unconditional "
-            "float32 regardless of the training dtype, so a run at the default dtype still "
-            "carries a dtype difference against the reference it is scored on; export passes no "
-            "dtype to the exporter at all, so what dtype the exported checkpoint actually loads "
-            "in is not established here either"
-        )
     if request.attn_implementation != DEFAULT_ATTN_IMPLEMENTATION:
         result.limitation(
             f"this run trains with attention {request.attn_implementation!r}, not "
@@ -1691,24 +1904,6 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             "checkpoint served under a different implementation than it was trained with "
             "produces output that is fluent, wrong, and passes every check that does not "
             "involve held-out labels"
-        )
-    if request.dtype != DEFAULT_DTYPE:
-        # Unlike attention, there is no pair here for a non-default dtype to
-        # match or miss: evaluate.py's float reference always loads at
-        # float32, and export.py passes no dtype at all. So this limitation
-        # states the departure and stops there. What it must not claim is
-        # which dtype the published numbers were taken at: MEASUREMENTS.md
-        # gives a dtype for exactly one of them -- the second-family
-        # banking77 run, trained in float32 "because bfloat16 on this CPU
-        # runs on a single core" -- and says nothing about the dtype of the
-        # headline table.
-        result.limitation(
-            f"this run trains with dtype {request.dtype!r}, not the {DEFAULT_DTYPE!r} default. "
-            "evaluate.py's float reference loads at an unconditional float32 regardless of the "
-            "training dtype, and export.py passes no dtype to the exporter at all, so there is "
-            "no single dtype the export and evaluation paths are known to use for this run to "
-            "match or miss. Which dtype a published number was taken at is recorded per run in "
-            "MEASUREMENTS.md and is not a property of this default"
         )
     if request.rate_is_default:
         events.note(
@@ -1823,6 +2018,24 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         result.checks.add(read)
         events.check(read)
 
+    # -- did the operator ask for a device litetune knows? ---------------------
+    # Before the environment, like the refusals above: a misspelt
+    # LITETUNE_DEVICE is a fact about this invocation, and reading it as
+    # "auto" would put the run on the accelerator it was set to avoid. Not a
+    # verdict on the method or the data, so not checked rather than failed.
+    try:
+        setting = devices.device_setting(os.environ)
+    except devices.DeviceSettingError as exc:
+        return _refused(
+            result,
+            events,
+            Check.unchecked(
+                DEVICE_CHECK,
+                f"training was not attempted: {exc}",
+                observed={devices.DEVICE_VARIABLE: os.environ.get(devices.DEVICE_VARIABLE)},
+            ),
+        )
+
     # -- can this run at all? ---------------------------------------------
     with guard(ENV_CHECK) as sink:
         if request.auto_provision:
@@ -1928,9 +2141,10 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     # provisioning made `litetune tune --no-provision` (cli.py's flag) over an
     # environment that was already there report no device at all for a run
     # that had one.
-    probe = envs.resolve_device(request.env, events=events)
+    probe = devices.apply_device_setting(envs.resolve_device(request.env, events=events), setting)
     device = probe.device
     result.device = device
+    result.device_probe = probe
     if not probe.answered:
         # `logging` alone reaches nothing the report carries, and a `None`
         # device with nothing beside it is indistinguishable from a device
@@ -1939,14 +2153,49 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             f"{probe.detail}, so this run's device was not established before it started. The "
             "training script decided for itself and reports what it chose in its metrics"
         )
-    elif probe.cuda_build_without_a_device:
+    elif probe.cuda_build_without_a_device or probe.cpu_on_macos:
         result.limitation(probe.detail)
-    if request.dtype == DEFAULT_DTYPE and device != "cuda":
+    if probe.source == devices.DEVICE_VARIABLE:
+        events.note(probe.detail, device=device, source=probe.source)
+    result.host = devices.host_record(probe)
+    dtype = decide_dtype(request.dtype, device)
+    _dtype_limitations(result, dtype)
+    if dtype.source == MPS_DTYPE_SOURCE:
+        events.note(f"training in {dtype.dtype} on mps: {dtype.source}", dtype=dtype.dtype)
+
+    # -- how much of this Mac may the run take? -----------------------------
+    # Set here, in the parent, because the watermarks reach torch's MPS
+    # allocator through the child's environment (`devices`, "The MPS memory
+    # policy"). A run that cannot be given a budget is not started on mps with
+    # the allocator's defaults instead; it is refused with the two ways forward.
+    child_env: dict[str, str] | None = None
+    if device == "mps":
+        try:
+            result.mps_memory = devices.prepare_mps(probe, os.environ)
+        except devices.MpsMemoryRefused as exc:
+            refused = Check.unchecked(
+                DEVICE_CHECK,
+                f"training was not attempted on mps: {exc}",
+                observed={"device": device, "host": result.host},
+            )
+            result.checks.add(refused)
+            events.check(refused)
+            result.limitation(f"training was not attempted: {exc}")
+            events.stage_finished(result.outcome.value, attempted=False)
+            return result
+        child_env = result.mps_memory.child_env
+        events.note(
+            f"MPS memory budget {result.mps_memory.budget / devices.GIB:.1f} GiB of the "
+            f"{result.mps_memory.recommended_max_memory / devices.GIB:.1f} GiB Metal recommends",
+            **dict(result.mps_memory.variables),
+        )
+
+    if dtype.dtype == DEFAULT_DTYPE and device not in ACCELERATORS:
         # Before the wait, not after it: DEFAULT_TIMEOUT_S is sized for
         # exactly the run this combination produces, and the operator who set
         # it running should not have to wait to hear why.
         #
-        # `!= "cuda"` rather than `== "cpu"`: an unanswered probe is precisely
+        # Off `ACCELERATORS` rather than `== "cpu"`: an unanswered probe is precisely
         # the run that has nothing else to explain its six hours with, and the
         # script's own fallback resolves to cpu on every machine without a
         # reachable GPU. The wording says which of the two this is, because
@@ -1959,7 +2208,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         events.note(
             f"{where}: {BFLOAT16_CPU_HINT}",
             device=device,
-            dtype=request.dtype,
+            dtype=dtype.dtype,
         )
 
     # -- run it ------------------------------------------------------------
@@ -1982,6 +2231,9 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
                 declarations_sha256=result.declarations_sha256,
                 declarations=declarations,
                 lora_container=lora_container,
+                device_probe=probe.as_dict(),
+                host=result.host,
+                mps_memory=result.mps_memory.as_dict() if result.mps_memory else None,
             ),
             indent=2,
         ),
@@ -1999,7 +2251,9 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     )
     started = time.perf_counter()
     try:
-        proc = request.env.run(["python", str(script), str(config_path)], timeout=request.timeout_s)
+        proc = request.env.run(
+            ["python", str(script), str(config_path)], timeout=request.timeout_s, env=child_env
+        )
     except subprocess.TimeoutExpired:
         seconds = time.perf_counter() - started
         logger.warning("training timed out after %ss", request.timeout_s)
@@ -2009,7 +2263,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             f"no result after {request.timeout_s}s (timeout): the run did not finish, which says "
             "nothing about the method or the data"
         )
-        if request.dtype == DEFAULT_DTYPE and device != "cuda":
+        if dtype.dtype == DEFAULT_DTYPE and device not in ACCELERATORS:
             # DEFAULT_TIMEOUT_S is sized for exactly this: the run whose
             # ending the slowdown caused should be the one told it exists.
             # Nothing here is read from the metrics: this ending returns
@@ -2088,7 +2342,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     metrics_device = result.metrics.device if result.metrics is not None else None
     if metrics_device is not None:
         events.note(f"trained on {metrics_device}", device=metrics_device)
-    if metrics_device == "cpu" and request.dtype == DEFAULT_DTYPE:
+    if metrics_device == "cpu" and dtype.dtype == DEFAULT_DTYPE:
         result.limitation(f"this run trained bfloat16 on the CPU: {BFLOAT16_CPU_HINT}")
 
     reading = read_returncode(proc.returncode)
@@ -2111,7 +2365,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         # to check for one first. So a CI runner cancelling a bf16-on-CPU
         # training run would be told to find more memory while the one fact
         # this run did establish stayed unsaid.
-        if request.dtype == DEFAULT_DTYPE and observed_device != "cuda":
+        if dtype.dtype == DEFAULT_DTYPE and observed_device not in ACCELERATORS:
             # What the script reported wins over what the probe predicted, and
             # an unanswered probe does not silence the hint: see the note
             # before the run. As there, the wording distinguishes a device
@@ -2154,11 +2408,18 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         # them says nothing at all about whether this method on this data
         # would have worked. Same judgement as the killed branch above,
         # arriving through stderr rather than through a signal.
+        # The MPS ending carries the two ways forward the memory policy's own
+        # refusal names; every other ending reads as it always has.
+        advice = (
+            f" ({MPS_OOM_ADVICE})"
+            if gpu_failure.group(0).lower() == "mps backend out of memory"
+            else ""
+        )
         accelerator = Check.unchecked(
             TRAINING_CHECK,
             f"training exited {proc.returncode} on a machine failure "
-            f"({gpu_failure.group(0)}), which says nothing about the method or the data: "
-            f"{_tail(result.stderr) or 'no stderr'}",
+            f"({gpu_failure.group(0)}), which says nothing about the method or the data"
+            f"{advice}: {_tail(result.stderr) or 'no stderr'}",
             observed={
                 "returncode": proc.returncode,
                 "seconds": round(result.seconds, 3),

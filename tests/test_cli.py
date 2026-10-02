@@ -297,6 +297,39 @@ def test_tune_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     assert seen["request"].declarations == decls
 
 
+@pytest.mark.parametrize(("flags", "expected"), [([], None), (["--dtype", "bfloat16"], "bfloat16")])
+def test_tune_tells_a_declared_dtype_from_the_default(monkeypatch, tmp_path, flags, expected):
+    """No `--dtype` is "not declared", which `tune` resolves per device --
+    float32 on mps -- and an explicit `--dtype bfloat16` is declared even
+    though it names the general default. A parser default of "bfloat16" made
+    the two indistinguishable."""
+    from litetune import cli
+    from litetune.checks import CheckSet
+    from litetune.tune import TuneResult
+
+    seen = {}
+
+    def fake_run_tune(request, events=None):
+        seen["request"] = request
+        return TuneResult(request=request, checks=CheckSet(name="train"))
+
+    monkeypatch.setattr(cli, "run_tune", fake_run_tune)
+    main(
+        [
+            "tune",
+            "--model",
+            "m",
+            "--data",
+            str(tmp_path / "d.jsonl"),
+            "--output-dir",
+            str(tmp_path / "run"),
+            *flags,
+        ]
+    )
+
+    assert seen["request"].dtype == expected
+
+
 @pytest.mark.parametrize(
     "stage, argv",
     [("verify", _VERIFY_ARGV), ("prepare", _PREPARE_ARGV), ("tune", ["tune", "--model", "m"])],
