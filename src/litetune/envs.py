@@ -2076,6 +2076,24 @@ _DEVICE_PROBE_CODE = (
 )
 
 
+# The probe's own MPS watermark ratios, both 0.0: no limit, which torch 2.5.1
+# accepts for any pairing (`setHighWatermarkRatio` and `setLowWatermarkRatio`
+# in aten/src/ATen/mps/MPSAllocator.mm at v2.5.1). Asking
+# `recommended_max_memory()` constructs the MPS allocator, and its
+# constructor reads the two variables from the environment, so a probe run in
+# the operator's environment fails wherever the operator set only a high
+# ratio under torch's default low one: measured on this project's Mac on
+# 2026-10-02, PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.5 alone raised "invalid low
+# watermark ratio 1.4" there, the probe answered nothing, and the run fell
+# back to the CPU. The probe allocates nothing, so a limit means nothing to
+# it; the operator's values are still read by `devices.prepare_mps` and
+# checked, and still reach the training and reference processes.
+_PROBE_ENV = {
+    "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.0",
+    "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.0",
+}
+
+
 @dataclass(frozen=True)
 class DeviceProbe:
     """What one environment's own torch answered about its accelerator.
@@ -2197,7 +2215,7 @@ def resolve_device(
     never explained is indistinguishable from a device nobody asked about.
     """
     try:
-        proc = env.run(["python", "-c", _DEVICE_PROBE_CODE], timeout=timeout)
+        proc = env.run(["python", "-c", _DEVICE_PROBE_CODE], timeout=timeout, env=_PROBE_ENV)
     except subprocess.TimeoutExpired as exc:
         # Distinguished from the start-failure wording below: a hang read as
         # "did not run" looks identical to a process that never started at
