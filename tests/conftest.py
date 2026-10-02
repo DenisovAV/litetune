@@ -151,11 +151,11 @@ def _no_host_device_settings(monkeypatch):
 
 
 # What `fake_sysctl` answers by default: a Mac at normal memory pressure with
-# 16 GiB available in 16 KiB pages -- 4 free, 1 speculative, 10 pageable
-# external and 1 purgeable.
+# 16 GiB available in 16 KiB pages -- 6 free and 10 pageable external -- and
+# a speculative and a purgeable GiB the sum must not count.
 FAKE_SYSCTL = {
     "hw.pagesize": "16384",
-    "vm.page_free_count": str(4 * 65536),
+    "vm.page_free_count": str(6 * 65536),
     "vm.page_speculative_count": str(65536),
     "vm.page_pageable_external_count": str(10 * 65536),
     "vm.page_purgeable_count": str(65536),

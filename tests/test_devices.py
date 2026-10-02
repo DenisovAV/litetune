@@ -198,16 +198,14 @@ PAGE = 16384
 
 
 def _reading(available: int = 16 * GIB, pressure: int = 1) -> devices.MemoryReading:
-    """`available` bytes, spread over the four counts so each one is summed."""
+    """`available` bytes, spread over the two counts so each one is summed."""
     pages = available // PAGE
-    quarter = pages // 4
+    half = pages // 2
     return devices.memory_reading(
         page_size=PAGE,
         pages={
-            "vm.page_free_count": quarter,
-            "vm.page_speculative_count": quarter,
-            "vm.page_pageable_external_count": quarter,
-            "vm.page_purgeable_count": pages - 3 * quarter,
+            "vm.page_free_count": half,
+            "vm.page_pageable_external_count": pages - half,
         },
         pressure_level=pressure,
     )
@@ -222,23 +220,43 @@ def _policy(environ=None, recommended=16 * GIB, available=16 * GIB, pressure=1):
     )
 
 
-def test_available_memory_is_the_four_page_counts_times_the_page_size():
+def test_available_memory_is_the_free_and_pageable_external_counts_times_the_page_size():
     reading = devices.memory_reading(
         page_size=PAGE,
-        pages={
-            "vm.page_free_count": 1,
-            "vm.page_speculative_count": 10,
-            "vm.page_pageable_external_count": 100,
-            "vm.page_purgeable_count": 1000,
-        },
+        pages={"vm.page_free_count": 1, "vm.page_pageable_external_count": 100},
         pressure_level=1,
     )
-    assert reading.available_bytes == 1111 * PAGE
+    assert reading.available_bytes == 101 * PAGE
 
 
-def test_a_memory_reading_takes_exactly_the_four_counts():
+def test_reading_this_macs_counters_leaves_speculative_and_purgeable_pages_out():
+    # FAKE_SYSCTL answers a speculative and a purgeable GiB beside 16 GiB of
+    # free and pageable external pages; only the 16 are available.
+    reading = devices.read_memory(fake_sysctl(FAKE_SYSCTL))
+    assert reading.available_bytes == 16 * GIB
+    assert set(reading.as_dict()) == {
+        devices.PAGE_SIZE,
+        *devices.AVAILABLE_PAGES,
+        devices.PRESSURE_LEVEL,
+    }
+
+
+def test_a_memory_reading_takes_exactly_the_two_counts():
     with pytest.raises(ValueError):
         devices.memory_reading(PAGE, {"vm.page_free_count": 1}, 1)
+    # Speculative and purgeable pages are not XNU's jetsam measure on a Mac,
+    # so a reading that carries them is refused rather than summed.
+    with pytest.raises(ValueError):
+        devices.memory_reading(
+            PAGE,
+            {
+                "vm.page_free_count": 1,
+                "vm.page_pageable_external_count": 1,
+                "vm.page_speculative_count": 1,
+                "vm.page_purgeable_count": 1,
+            },
+            1,
+        )
 
 
 def test_the_budget_is_the_available_memory_less_the_headroom_when_that_is_smaller():
@@ -490,8 +508,7 @@ def test_the_record_carries_every_input_and_both_ratios():
     assert record["recommended_max_memory_bytes"] == 16 * GIB
     assert record["available_bytes"] == 16 * GIB
     assert record["available_measure"] == (
-        "(vm.page_free_count + vm.page_speculative_count + vm.page_pageable_external_count "
-        "+ vm.page_purgeable_count) * hw.pagesize"
+        "(vm.page_free_count + vm.page_pageable_external_count) * hw.pagesize"
     )
     reading = record["memory_reading"]
     assert reading["hw.pagesize"] == PAGE

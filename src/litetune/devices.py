@@ -174,31 +174,32 @@ def host_record(
 # where R is `torch.mps.recommended_max_memory()` from the probe and
 # `available` is
 #
-#   (vm.page_free_count + vm.page_speculative_count
-#    + vm.page_pageable_external_count + vm.page_purgeable_count) * hw.pagesize
+#   (vm.page_free_count + vm.page_pageable_external_count) * hw.pagesize
 #
-# pages nothing else is holding on to: free, speculative, file-backed pageable
-# and purgeable. It is modelled on, and not the same as, what XNU's jetsam
-# counts as available. In the copy of osfmk/vm/vm_page.h the review read
-# (lines 1531-1539), jetsam's `VM_CHECK_MEMORYSTATUS` sums
-# `vm_page_pageable_external_count + vm_page_free_count` and the secluded
-# pages over target, and adds `vm_page_purgeable_count` only when dynamic
-# paging is off; it counts no speculative pages. Jetsam is an embedded option
-# (XNU config/MASTER: "enable jetsam - used on embedded"), so macOS computes
-# none of this itself. The sum here adds speculative pages and counts
-# purgeable ones whether or not dynamic paging is on; both choices are this
-# policy's, not XNU's.
+# free pages and file-backed pages the kernel can drop without writing them to
+# swap. That is XNU's jetsam measure of available memory as it applies to a
+# Mac. In the copy of osfmk/vm/vm_page.h the review read (lines 1531-1539),
+# jetsam's `VM_CHECK_MEMORYSTATUS` sums `vm_page_pageable_external_count +
+# vm_page_free_count`, the secluded pages over target, and
+# `vm_page_purgeable_count` only when dynamic paging is off. Secluded pages
+# are an embedded feature and macOS pages dynamically through its compressor,
+# so on a Mac the two terms above are what that sum comes to; speculative
+# pages it never counts. Jetsam itself is an embedded option (XNU
+# config/MASTER: "enable jetsam - used on embedded"), so macOS does not
+# compute this sum: litetune does, from the same counters.
 #
 # It is not `kern.memorystatus_level`, which an earlier draft used. On macOS
 # that is XNU's pressure level: `vm_pressure_response` in vm_pageout.c sets it
 # to available pages over total pages, and without jetsam the available count
 # is `AVAILABLE_NON_COMPRESSED_MEMORY` -- active + inactive + free +
 # speculative (vm_page.h lines 1528 and 1549 in the same copy). So it counts
-# other processes' active memory as available. Read on 2026-10-02 on a 24 GiB Mac
-# (macOS 26.5.1, arm64): `kern.memorystatus_level` 32, which the old formula
-# made 7.68 GiB available and a 4.68 GiB budget, while the sum above came to
-# 2.87 GiB, `kern.memorystatus_vm_pressure_level` was 2 and `vm.swapusage`
-# showed 23993 of 25600 MB in use. Every key above answered `sysctl -n` there.
+# other processes' active memory as available. Read on 2026-10-02 at 09:19 UTC
+# on a 24 GiB Mac (macOS 26.5.1, arm64): `kern.memorystatus_level` 54, which
+# the old formula made 12.96 GiB available and a 9.96 GiB budget, while the
+# sum above came to 3.23 GiB (7818 free and 203553 pageable external 16 KiB
+# pages) -- under the 1 GiB floor once the headroom is taken -- with
+# `kern.memorystatus_vm_pressure_level` at 1 and `vm.swapusage` showing
+# 25687 of 26624 MB in use. Every key above answered `sysctl -n` there.
 #
 # A Mac the kernel already reports under memory pressure is refused outright,
 # whatever the sum says: `kern.memorystatus_vm_pressure_level` answers 1, 2 or 4
@@ -255,12 +256,10 @@ _INTEGER = re.compile(r"[+-]?[0-9]+")
 _INT_MIN, _INT_MAX = -(2**31), 2**31 - 1
 
 PAGE_SIZE = "hw.pagesize"
-# The four page counts whose sum is the available memory, in the order above.
+# The two page counts whose sum is the available memory, in the order above.
 AVAILABLE_PAGES = (
     "vm.page_free_count",
-    "vm.page_speculative_count",
     "vm.page_pageable_external_count",
-    "vm.page_purgeable_count",
 )
 PRESSURE_LEVEL = "kern.memorystatus_vm_pressure_level"
 PRESSURE_NORMAL = 1

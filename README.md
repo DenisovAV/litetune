@@ -63,10 +63,10 @@ Before a training or reference run starts on `mps`, litetune sets torch's MPS
 allocator limits from the memory the Mac has available at that moment. The
 budget is the smaller of Metal's recommended working set
 (`torch.mps.recommended_max_memory()`) and the available memory less 3 GiB,
-where available is the free, speculative, pageable external and purgeable page
-counts (`vm.page_free_count`, `vm.page_speculative_count`,
-`vm.page_pageable_external_count`, `vm.page_purgeable_count`) times
-`hw.pagesize`; `PYTORCH_MPS_HIGH_WATERMARK_RATIO` is the budget over the
+where available is the free and the pageable external page counts
+(`vm.page_free_count`, `vm.page_pageable_external_count`) times `hw.pagesize`
+— XNU's jetsam measure as it applies to a Mac, which counts neither other
+apps' memory nor pages that would have to go to swap; `PYTORCH_MPS_HIGH_WATERMARK_RATIO` is the budget over the
 working set, `PYTORCH_MPS_LOW_WATERMARK_RATIO` is 0.8 of that, and
 `PYTORCH_ENABLE_MPS_FALLBACK=0` — torch's own default, written out — makes
 an operation MPS does not implement raise instead of running on the CPU. A
