@@ -462,6 +462,14 @@ def _add_tune(sub) -> None:
     )
     tune.add_argument("--epochs", type=float, default=1.0)
     tune.add_argument("--batch-size", type=int, default=8)
+    tune.add_argument(
+        "--micro-batch-size",
+        type=int,
+        help=(
+            "examples per forward pass while accumulating one optimiser batch; defaults to "
+            "--batch-size on CPU/CUDA and 1 on MPS"
+        ),
+    )
     tune.add_argument("--max-seq-length", type=int, default=1024)
     tune.add_argument("--seed", type=int, default=0)
     tune.add_argument("--lora-rank", type=int, default=16)
@@ -471,7 +479,20 @@ def _add_tune(sub) -> None:
     # because a 270M model's loss goes to NaN in it while bfloat16 holds. The
     # spec file was closed and this line was not, so the path everyone actually
     # uses stayed open to the one value the design refuses.
-    tune.add_argument("--dtype", default="bfloat16", choices=sorted(DTYPES))
+    #
+    # No default here: leaving it out is "not declared", and the default is
+    # decided once the device is known (`tune.decide_dtype`) -- bfloat16, or
+    # on mps float32, the dtype the float reference loads at; neither has been
+    # measured on MPS. The report records which, and what was declared.
+    tune.add_argument(
+        "--dtype",
+        choices=sorted(DTYPES),
+        help=(
+            "default bfloat16, or float32 when training on Apple's GPU (mps): the dtype the "
+            "float reference loads at; neither dtype has been measured on MPS. The report "
+            "records what was declared and what the run trained in"
+        ),
+    )
     tune.add_argument("--attn-implementation", default="eager")
     tune.add_argument("--timeout-s", type=int, default=TuneRequest.timeout_s)
     tune.add_argument(
@@ -981,6 +1002,7 @@ def _tune(args: argparse.Namespace) -> int:
         learning_rate=args.learning_rate,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        micro_batch_size=args.micro_batch_size,
         max_seq_length=args.max_seq_length,
         seed=args.seed,
         lora_rank=args.lora_rank,

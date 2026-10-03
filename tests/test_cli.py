@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import FakeBackend, correct_texts, labelled_rows, mark_provisioned
+from conftest import FakeBackend, correct_texts, labelled_rows, mark_provisioned, probe_answer
 
 from litetune import envs
 from litetune import verify as verify_module
@@ -297,6 +297,39 @@ def test_tune_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     assert seen["request"].declarations == decls
 
 
+@pytest.mark.parametrize(("flags", "expected"), [([], None), (["--dtype", "bfloat16"], "bfloat16")])
+def test_tune_tells_a_declared_dtype_from_the_default(monkeypatch, tmp_path, flags, expected):
+    """No `--dtype` is "not declared", which `tune` resolves per device --
+    float32 on mps -- and an explicit `--dtype bfloat16` is declared even
+    though it names the general default. A parser default of "bfloat16" made
+    the two indistinguishable."""
+    from litetune import cli
+    from litetune.checks import CheckSet
+    from litetune.tune import TuneResult
+
+    seen = {}
+
+    def fake_run_tune(request, events=None):
+        seen["request"] = request
+        return TuneResult(request=request, checks=CheckSet(name="train"))
+
+    monkeypatch.setattr(cli, "run_tune", fake_run_tune)
+    main(
+        [
+            "tune",
+            "--model",
+            "m",
+            "--data",
+            str(tmp_path / "d.jsonl"),
+            "--output-dir",
+            str(tmp_path / "run"),
+            *flags,
+        ]
+    )
+
+    assert seen["request"].dtype == expected
+
+
 @pytest.mark.parametrize(
     "stage, argv",
     [("verify", _VERIFY_ARGV), ("prepare", _PREPARE_ARGV), ("tune", ["tune", "--model", "m"])],
@@ -489,6 +522,11 @@ class FakeToolchain:
         self.calls.append(list(args))
         if args[0] == "pip":
             return subprocess.CompletedProcess(args, 0, self.pip_stdout, "")
+        if args[:2] == ["python", "-c"]:
+            # The device probe, answered the way every other probe fake in the
+            # suite answers it. Without this a probe reaching this fake would
+            # be parsed as an export's flags and raise `KeyError`.
+            return subprocess.CompletedProcess(args, 0, probe_answer("cpu") + "\n", "")
         if args[0] == "python" and str(args[1]).endswith("repack.py"):
             # This fake has no export environment to run the repack script in:
             # the repack reports that and the export stays a passed, CPU-only one.

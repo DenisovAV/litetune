@@ -47,9 +47,11 @@ import '../../theme/brand.dart';
 ///
 /// The acceleration row names NPU because the runtime has one — Snapdragon on
 /// Android, Intel on Windows — while the qualifier keeps litetune's own claim
-/// narrow: it measures on CPU, except training and the float reference, which
-/// use a GPU when the host has one and record which backend actually produced
-/// each result. Naming a capability of the runtime and claiming a measurement
+/// narrow: training and the float reference use CUDA or Apple's GPU through
+/// Metal (MPS) when the host has one, while conversion stays on CPU. An MPS
+/// run is budgeted from memory available at its start and is refused under
+/// system memory pressure. Every result records which backend actually
+/// produced it. Naming a capability of the runtime and claiming a measurement
 /// of it are different sentences; only the second would be unsupported.
 ///
 /// That row stays by decision, and this paragraph is here so it is not
@@ -92,9 +94,11 @@ class Formats extends StatelessComponent {
           ),
           span(classes: 'qualifier', [
             Component.text(
-              ' — litetune measures on CPU, except training and the float '
-              'reference, which use a GPU when the host has one; every result '
-              'records which backend produced it, or records it as unknown',
+              ' — training and the float reference use CUDA or Apple GPU '
+              'through Metal (MPS) when available; on MPS litetune budgets '
+              'from available memory and refuses to start under system memory '
+              'pressure. Conversion stays on CPU, and every result records '
+              'which backend produced it or records it as unknown',
             ),
           ]),
         ]),

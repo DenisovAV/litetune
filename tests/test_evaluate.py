@@ -18,7 +18,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FakeBackend, call_text, fake_torch, labelled_rows, mark_provisioned
+from conftest import (
+    FakeBackend,
+    call_text,
+    fake_torch,
+    labelled_rows,
+    mark_provisioned,
+    probe_answer,
+)
 
 from litetune import envs, toolpath
 from litetune.evaluate import (
@@ -771,7 +778,7 @@ def _generating_env(monkeypatch, *, probe: str | None, script_device: str | None
             return subprocess.CompletedProcess(
                 args,
                 0,
-                json.dumps({"device": probe, "cuda_build": None, "device_count": 0}),
+                probe_answer(probe),
                 "",
             )
         spec = json.loads(Path(args[2]).read_text())
@@ -895,9 +902,7 @@ def test_a_timeout_clears_the_device_it_never_confirmed(monkeypatch):
 
     def fake_run(self, args, timeout=3600, **kwargs):
         if args[1] == "-c":
-            return subprocess.CompletedProcess(
-                args, 0, json.dumps({"device": "cuda", "cuda_build": None, "device_count": 1}), ""
-            )
+            return subprocess.CompletedProcess(args, 0, probe_answer("cuda", device_count=1), "")
         raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
 
     monkeypatch.setattr(envs.StageEnv, "run", fake_run)
@@ -909,14 +914,42 @@ def test_a_timeout_clears_the_device_it_never_confirmed(monkeypatch):
     assert backend.describe()["backend"] == UNKNOWN_BACKEND
 
 
+def test_a_timeout_keeps_the_mps_observation_written_before_generation(monkeypatch):
+    """A timeout after placement must not erase the child's run report.
+
+    The generation script writes this report before its first prompt. Reading
+    it only after a clean return made a part-way MPS run look as though its
+    backend had never been observed and discarded the allocator environment
+    that had already reached the child.
+    """
+    _ready_env()
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        if args[1] == "-c":
+            return subprocess.CompletedProcess(args, 0, probe_answer("mps"), "")
+        spec = json.loads(Path(args[2]).read_text())
+        Path(spec["run_report"]).write_text(
+            json.dumps({"device": "mps", "mps_environment": _SENT}), encoding="utf-8"
+        )
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    (generation,) = backend.generate(["a"])
+
+    assert generation.harness_error is not None
+    assert backend.describe()["backend"] == "mps"
+    assert backend.backend_observed
+    assert backend.mps_environment_seen == _SENT
+    assert backend.mps_environment_mismatch is None
+
+
 def test_a_script_that_could_not_start_clears_the_device_it_never_confirmed(monkeypatch):
     _ready_env()
 
     def fake_run(self, args, timeout=3600, **kwargs):
         if args[1] == "-c":
-            return subprocess.CompletedProcess(
-                args, 0, json.dumps({"device": "cuda", "cuda_build": None, "device_count": 1}), ""
-            )
+            return subprocess.CompletedProcess(args, 0, probe_answer("cuda", device_count=1), "")
         raise FileNotFoundError("python")
 
     monkeypatch.setattr(envs.StageEnv, "run", fake_run)
@@ -1248,6 +1281,7 @@ def _run_hf_generate_script(
     given=None,
     stop_generation: bool = False,
     runtime_rendered: bool = False,
+    prompts: tuple[str, ...] = ("hi",),
 ) -> dict:
     """Runs `_HF_GENERATE_SCRIPT`'s real `main()` against faked `torch` and
     `transformers`, and returns what the fakes captured.
@@ -1369,6 +1403,21 @@ def _run_hf_generate_script(
     # in this suite, reused rather than a fourth hand-rolled `is_available`.
     fake_torch_module.cuda = fake_torch(cuda=cuda).cuda
 
+    class FakeMps:
+        """torch.mps's two counters, answering a sequence that peaks first."""
+
+        current = iter((700, 100, 300))
+        driver = iter((900, 200, 400))
+
+        def current_allocated_memory(self) -> int:
+            captured["mps_samples"] = captured.get("mps_samples", 0) + 1
+            return next(self.current)
+
+        def driver_allocated_memory(self) -> int:
+            return next(self.driver)
+
+    fake_torch_module.mps = FakeMps()
+
     fake_transformers: Any = types.ModuleType("transformers")
     fake_transformers.AutoModelForCausalLM = FakeAutoModelForCausalLM
     fake_transformers.AutoTokenizer = FakeAutoTokenizer
@@ -1383,7 +1432,7 @@ def _run_hf_generate_script(
         json.dumps(
             {
                 "model": "org/m",
-                "prompts": ["hi"],
+                "prompts": list(prompts),
                 "max_tokens": 8,
                 "runtime_rendered": runtime_rendered,
                 "attn_implementation": "eager",
@@ -1490,7 +1539,37 @@ def test_the_reference_script_writes_its_device_where_the_parent_can_read_it(tmp
     """Structured, not only printed to stderr -- `assemble_generations` discards stderr
     on a clean exit, which is the path that matters."""
     captured = _run_hf_generate_script(tmp_path, monkeypatch, cuda=True)
-    assert captured["run_report"] == {"device": "cuda"}
+    assert captured["run_report"]["device"] == "cuda"
+    # Off mps nothing is sampled, and the counters are never asked.
+    assert captured["run_report"]["mps_memory_sampled_max"] is None
+    assert "mps_samples" not in captured
+
+
+def test_the_reference_script_samples_mps_memory_after_each_generate_call(tmp_path, monkeypatch):
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, given="mps", prompts=("a", "b", "c"))
+    assert captured["mps_samples"] == 3
+    assert captured["run_report"]["mps_memory_sampled_max"] == {
+        "current_allocated_bytes": 700,
+        "driver_allocated_bytes": 900,
+        "samples": 3,
+        "sampled_at": ["after each generate call"],
+    }
+
+
+def test_the_reference_script_reports_the_mps_variables_it_saw(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, given="mps")
+    assert captured["run_report"]["mps_environment"] == {
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.5",
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": None,
+        "PYTORCH_ENABLE_MPS_FALLBACK": None,
+    }
+
+
+def test_a_reference_run_killed_part_way_still_reports_what_it_saw(tmp_path, monkeypatch):
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, given="mps", stop_generation=True)
+    assert captured["run_report"]["device"] == "mps"
+    assert "mps_environment" in captured["run_report"]
 
 
 def test_the_reference_script_prefers_what_the_parent_already_resolved(tmp_path, monkeypatch):
@@ -2863,3 +2942,310 @@ def test_cores_of_two_kinds_open_to_the_process_are_not_named_as_one(monkeypatch
     assert report["model"] is None
     assert report["models"] == ["Big Core", "Little Core"]
     assert report["flags"] is None
+
+
+# ---------------------------------------------------------------------------
+# The reference on Apple's GPU, and LITETUNE_DEVICE
+# ---------------------------------------------------------------------------
+
+
+def _reference_env(
+    monkeypatch, probe: str = "mps", report_extra: dict | None = None, **probe_fields
+) -> list[dict]:
+    """A ready `envs.TRAIN` whose probe answers `probe`, and a log of every call.
+
+    Each entry is the argv, the `env` overrides `StageEnv.run` was handed, and
+    the spec the generation script was given.
+    """
+    _ready_env()
+    calls: list[dict] = []
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        call: dict = {"argv": list(args), "env": kwargs.get("env"), "spec": None}
+        calls.append(call)
+        if args[1] == "-c":
+            return subprocess.CompletedProcess(args, 0, probe_answer(probe, **probe_fields), "")
+        spec = json.loads(Path(args[2]).read_text())
+        call["spec"] = spec
+        Path(spec["out"]).write_text(
+            json.dumps({"index": 0, "text": call_text("a")}) + "\n", encoding="utf-8"
+        )
+        Path(spec["run_report"]).write_text(
+            json.dumps({"device": spec["device"], **(report_extra or {})}), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    return calls
+
+
+def _generation_calls(calls: list[dict]) -> list[dict]:
+    return [c for c in calls if c["argv"][1] != "-c"]
+
+
+def test_an_mps_reference_starts_under_the_memory_policy_and_records_it(monkeypatch):
+    calls = _reference_env(monkeypatch, "mps")
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    (generation,) = backend.generate(["a"])
+
+    assert generation.harness_error is None
+    (run,) = _generation_calls(calls)
+    assert run["spec"]["device"] == "mps"
+    assert run["env"] == {
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.812500",
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.650000",
+        "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+    }
+    described = backend.describe()
+    assert described["backend"] == "mps"
+    assert described["device_source"] == "probe"
+    assert described["device_probe"]["mps_available"] is True
+    assert described["mps_memory"]["computed_budget_bytes"] == 13 * 1024**3
+    assert described["mps_memory"]["available_bytes"] == 16 * 1024**3
+    assert described["host"]["os"] == "Darwin"
+    assert described["host"]["os_version"] == "15.0"
+    assert described["host"]["machine"] == "arm64"
+
+
+def test_a_reference_off_mps_gets_no_memory_policy(monkeypatch):
+    calls = _reference_env(monkeypatch, "cuda")
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    (run,) = _generation_calls(calls)
+    assert run["env"] is None
+    assert backend.describe()["mps_memory"] is None
+
+
+def test_an_mps_reference_without_the_memory_is_not_started(monkeypatch):
+    from conftest import fake_sysctl, sysctl_available
+
+    from litetune import devices
+
+    calls = _reference_env(monkeypatch, "mps")
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    (generation,) = backend.generate(["a"])
+
+    assert _generation_calls(calls) == []
+    assert generation.harness_error is not None
+    assert "LITETUNE_DEVICE=cpu" in generation.harness_error
+    assert backend.mps_refusal == generation.harness_error
+    assert backend.describe()["backend"] == UNKNOWN_BACKEND
+
+
+def test_litetune_device_cpu_puts_the_reference_on_the_cpu(monkeypatch):
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    calls = _reference_env(monkeypatch, "mps")
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    (run,) = _generation_calls(calls)
+    assert run["spec"]["device"] == "cpu"
+    assert run["env"] is None
+    described = backend.describe()
+    assert described["backend"] == "cpu"
+    assert described["device_source"] == "LITETUNE_DEVICE"
+    assert described["mps_memory"] is None
+
+
+def test_an_unknown_litetune_device_stops_the_reference_before_anything_runs(monkeypatch):
+    monkeypatch.setenv("LITETUNE_DEVICE", "gpu")
+    calls = _reference_env(monkeypatch, "mps")
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    (generation,) = backend.generate(["a"])
+
+    assert calls == []
+    assert generation.harness_error is not None
+    assert "auto, cpu" in generation.harness_error
+
+
+def test_the_reference_records_the_chip_on_macos(monkeypatch):
+    _reference_env(monkeypatch, "cpu")
+    import types
+
+    from litetune import devices
+
+    # The parent's platform, read when the record is made; this suite also
+    # runs off macOS.
+    monkeypatch.setattr(devices, "sys", types.SimpleNamespace(platform="darwin"))
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    assert backend.describe()["host"]["chip"] == "Apple M-test"
+
+
+def test_neither_fallback_chooses_mps_where_torch_could():
+    """The scripts' own fallbacks run only without the parent's answer, and so
+    without the memory policy: they must not put the run on mps."""
+    import types
+
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+    from litetune.tune import _TRAIN_SCRIPT
+
+    torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False),
+        backends=types.SimpleNamespace(
+            mps=types.SimpleNamespace(is_built=lambda: True, is_available=lambda: True)
+        ),
+    )
+    generate: dict = {"__name__": "hf_script_under_test"}
+    exec(compile(_HF_GENERATE_SCRIPT, "hf_generate.py", "exec"), generate)  # noqa: S102
+    train: dict = {"__name__": "train_script_under_test"}
+    exec(compile(_TRAIN_SCRIPT, "train_script.py", "exec"), train)  # noqa: S102
+
+    assert generate["generation_device"](torch) == "cpu"
+    assert train["training_device"](torch) == "cpu"
+
+
+def test_litetune_device_cpu_reaches_a_reference_whose_environment_was_not_probed(
+    monkeypatch, tmp_path
+):
+    """The library path: an environment that is not provisioned is not
+    probed, and LITETUNE_DEVICE=cpu still decides where the child runs."""
+    from litetune.events import EventStream
+
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "unprovisioned"))
+    specs: list = []
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        assert args[1] != "-c", "an unprovisioned environment was probed"
+        spec = json.loads(Path(args[2]).read_text())
+        specs.append(spec)
+        Path(spec["out"]).write_text(
+            json.dumps({"index": 0, "text": call_text("a")}) + "\n", encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"], events=events)
+
+    assert specs[0]["device"] == "cpu"
+    described = backend.describe()
+    assert described["device_source"] == "LITETUNE_DEVICE"
+    assert "not provisioned" in backend.last_probe.detail
+    assert [
+        e
+        for e in seen
+        if e.kind == "note" and e.data["message"].startswith("LITETUNE_DEVICE=cpu places this run")
+    ]
+
+
+def test_litetune_device_cpu_on_a_probed_reference_is_noted(monkeypatch):
+    from litetune.events import EventStream
+
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    _reference_env(monkeypatch, "mps")
+    seen: list = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    HuggingFaceBackend(model="org/model", auto_provision=False).generate(["a"], events=events)
+
+    notes = [e.data for e in seen if e.kind == "note"]
+    assert [
+        n for n in notes if n["message"].startswith("LITETUNE_DEVICE=cpu") and n["device"] == "cpu"
+    ]
+
+
+_SENT = {
+    "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.812500",
+    "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.650000",
+    "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+}
+
+
+def test_an_mps_reference_records_its_samples_and_what_it_saw(monkeypatch):
+    sampled = {"current_allocated_bytes": 5, "driver_allocated_bytes": 6, "samples": 1}
+    _reference_env(
+        monkeypatch,
+        "mps",
+        report_extra={"mps_environment": _SENT, "mps_memory_sampled_max": sampled},
+    )
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    described = backend.describe()
+    assert described["mps_memory_sampled_max"] == sampled
+    assert described["mps_environment_seen"] == _SENT
+    assert backend.mps_environment_mismatch is None
+
+
+def test_an_mps_reference_that_saw_other_variables_is_a_mismatch(monkeypatch):
+    seen = dict(_SENT, PYTORCH_MPS_HIGH_WATERMARK_RATIO=None)
+    _reference_env(monkeypatch, "mps", report_extra={"mps_environment": seen})
+
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+
+    assert backend.mps_environment_mismatch is not None
+    assert "reference generation script" in backend.mps_environment_mismatch
+
+
+def test_a_reused_backend_forgets_a_refusal_once_the_memory_is_back(monkeypatch):
+    """M3: `mps_refusal` is this call's, not the backend's history."""
+    from conftest import FAKE_SYSCTL, fake_sysctl, sysctl_available
+
+    from litetune import devices
+
+    calls = _reference_env(monkeypatch, "mps")
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    (refused,) = backend.generate(["a"])
+    assert refused.harness_error is not None
+    assert backend.describe()["mps_refusal"] == refused.harness_error
+
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(FAKE_SYSCTL))
+    (ran,) = backend.generate(["a"])
+
+    assert ran.harness_error is None
+    assert backend.mps_refusal is None
+    assert backend.describe()["mps_refusal"] is None
+    assert backend.describe()["mps_memory"]["computed_budget_bytes"] == 13 * 1024**3
+    assert len(_generation_calls(calls)) == 1
+
+
+def test_a_reused_backend_forgets_its_mps_policy_once_litetune_device_is_cpu(monkeypatch):
+    """M4: `mps_memory` and the samples are this call's too."""
+    sampled = {"current_allocated_bytes": 5, "driver_allocated_bytes": 6, "samples": 1}
+    calls = _reference_env(
+        monkeypatch,
+        "mps",
+        report_extra={"mps_environment": _SENT, "mps_memory_sampled_max": sampled},
+    )
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    backend.generate(["a"])
+    assert backend.mps_memory is not None
+
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    backend.generate(["a"])
+
+    described = backend.describe()
+    assert described["backend"] == "cpu"
+    assert described["mps_memory"] is None
+    assert described["mps_refusal"] is None
+    assert _generation_calls(calls)[-1]["env"] is None
+
+
+def test_an_mps_reference_leaves_the_parents_environment_as_it_was(monkeypatch):
+    import os
+
+    _reference_env(monkeypatch, "mps")
+    before = dict(os.environ)
+
+    HuggingFaceBackend(model="org/model", auto_provision=False).generate(["a"])
+
+    assert dict(os.environ) == before

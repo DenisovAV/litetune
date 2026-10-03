@@ -13,6 +13,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -130,6 +131,121 @@ def _isolated_env_cache(monkeypatch, tmp_path):
     guarantees they start from a machine with none.
     """
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "litetune-envs"))
+
+
+@pytest.fixture(autouse=True)
+def _no_host_device_settings(monkeypatch):
+    """Keep the operator's device settings out of every test, and sysctl too.
+
+    `LITETUNE_DEVICE` and the three MPS variables are read from the
+    environment `tune` and `verify` run in, so a developer who exported one
+    would change what the suite asserts. `devices.read_sysctl` would start a
+    real `sysctl` and answer about this machine; the fake answers the same
+    figures everywhere. A test that wants other figures passes its own.
+    """
+    from litetune import devices
+
+    for name in (devices.DEVICE_VARIABLE, *devices.MPS_VARIABLES):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(FAKE_SYSCTL))
+
+
+# What `fake_sysctl` answers by default: a Mac at normal memory pressure with
+# 16 GiB available in 16 KiB pages -- 6 free and 10 pageable external -- and
+# a speculative and a purgeable GiB the sum must not count.
+FAKE_SYSCTL = {
+    "hw.pagesize": "16384",
+    "vm.page_free_count": str(6 * 65536),
+    "vm.page_speculative_count": str(65536),
+    "vm.page_pageable_external_count": str(10 * 65536),
+    "vm.page_purgeable_count": str(65536),
+    "kern.memorystatus_vm_pressure_level": "1",
+    "vm.swapusage": "total = 0.00M  used = 0.00M  free = 0.00M",
+    "machdep.cpu.brand_string": "Apple M-test",
+}
+
+
+def sysctl_available(available_bytes: int, pressure: int = 1) -> dict[str, str]:
+    """`FAKE_SYSCTL` with `available_bytes` available, all of it free pages."""
+    pages = available_bytes // int(FAKE_SYSCTL["hw.pagesize"])
+    return dict(
+        FAKE_SYSCTL,
+        **{
+            "vm.page_free_count": str(pages),
+            "vm.page_speculative_count": "0",
+            "vm.page_pageable_external_count": "0",
+            "vm.page_purgeable_count": "0",
+            "kern.memorystatus_vm_pressure_level": str(pressure),
+        },
+    )
+
+
+def fake_sysctl(values: dict[str, str]):
+    """A `devices.Sysctl` that answers from `values` and raises for anything else."""
+    from litetune.devices import HostReadError
+
+    def read(name: str) -> str:
+        if name not in values:
+            raise HostReadError(f"sysctl {name} exited 1: unknown oid {name!r}")
+        return values[name]
+
+    return read
+
+
+# Every field `envs._DEVICE_PROBE_CODE` prints, in one place. `tune`'s
+# `FakeTrainer`, the probe fakes in `test_evaluate.py` and `test_verify.py`, and
+# `test_cli.py`'s `FakeToolchain` all answer the probe through this, and
+# `test_envs.py` pins it against what the probe source itself prints -- so a
+# field added to the probe reaches every fake at once instead of one at a time.
+PROBE_FIELDS = (
+    "device",
+    "cuda_build",
+    "device_count",
+    "mps_built",
+    "mps_available",
+    "mps_recommended_max_memory",
+    "os",
+    "os_version",
+    "os_version_source",
+    "machine",
+)
+
+
+def probe_answer(device: str | None = "cpu", **fields: Any) -> str:
+    """One line of JSON, the way the device probe prints it.
+
+    A "cpu" or "cuda" answer comes from a Linux x86-64 machine without MPS
+    unless a field says otherwise, which is what every probe fake answered
+    before MPS was asked about. An "mps" answer comes from an arm64 Mac with
+    16 GiB of recommended working set.
+    """
+    answer: dict[str, Any] = {
+        "device": device,
+        "cuda_build": None,
+        "device_count": 0,
+        "mps_built": False,
+        "mps_available": False,
+        "mps_recommended_max_memory": None,
+        "os": "Linux",
+        "os_version": "6.8.0-test",
+        "os_version_source": "platform.release()",
+        "machine": "x86_64",
+    }
+    if device == "mps":
+        answer.update(
+            mps_built=True,
+            mps_available=True,
+            mps_recommended_max_memory=16 * 1024**3,
+            os="Darwin",
+            os_version="15.0",
+            os_version_source="platform.mac_ver()",
+            machine="arm64",
+        )
+    unknown = set(fields) - set(PROBE_FIELDS)
+    if unknown:
+        raise TypeError(f"the probe prints no {sorted(unknown)}")
+    answer.update(fields)
+    return json.dumps(answer)
 
 
 @pytest.fixture

@@ -12,7 +12,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import FakeBackend, call_text, correct_texts, labelled_rows, mark_provisioned
+from conftest import (
+    FakeBackend,
+    call_text,
+    correct_texts,
+    labelled_rows,
+    mark_provisioned,
+    probe_answer,
+)
 
 from litetune import envs
 from litetune.evaluate import (
@@ -23,6 +30,7 @@ from litetune.evaluate import (
 )
 from litetune.prompt_mode import PromptMode
 from litetune.verify import (
+    DEVICE_CHECK,
     BackendPair,
     ReferenceRole,
     Status,
@@ -1071,14 +1079,19 @@ def test_two_points_on_the_same_device_carry_no_such_note(write_split):
     assert "device_mismatch" not in result.manifest["harness"]
 
 
-def _fake_reference_run(rows, *, probe_stdout: str, probe_returncode: int = 0):
+def _fake_reference_run(
+    rows, *, probe_stdout: str, probe_returncode: int = 0, run_report: dict | None = None
+):
     """A `StageEnv.run` double answering both calls a real `HuggingFaceBackend`
-    makes: the device probe (`-c`), then the generation script."""
+    makes: the device probe (`-c`), then the generation script. `run_report`,
+    when given, is what the script writes about its own run."""
 
     def fake_run(self, args, timeout=3600, **kwargs):
         if args[1] == "-c":
             return subprocess.CompletedProcess(args, probe_returncode, probe_stdout, "")
         spec = json.loads(Path(args[2]).read_text())
+        if run_report is not None:
+            Path(spec["run_report"]).write_text(json.dumps(run_report), encoding="utf-8")
         Path(spec["out"]).write_text(
             "\n".join(
                 json.dumps({"index": i, "text": rows[i]["target"] + "<end_of_turn>\n<eos>"})
@@ -1131,8 +1144,8 @@ def test_a_reference_cuda_build_with_no_device_reaches_the_manifest(
     from a laptop with no GPU."""
     _ready_train_env(monkeypatch, tmp_path)
     rows = text_rows(5)
-    probe_answer = json.dumps({"device": "cpu", "cuda_build": "12.4", "device_count": 0})
-    monkeypatch.setattr(envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer))
+    answer = probe_answer("cpu", cuda_build="12.4", device_count=0)
+    monkeypatch.setattr(envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=answer))
 
     result = verify(
         write_split,
@@ -2044,3 +2057,186 @@ def test_a_litert_lm_run_that_cannot_name_its_cpu_says_so(write_split):
 
     mixed = _limitations_for(write_split, {**engine, "cpu": {"models": ["Big", "Little"]}})
     assert any("more than one kind of core (Big, Little)" in n for n in mixed)
+
+
+# -- the reference's device: LITETUNE_DEVICE, macOS, MPS memory ---------------
+
+
+def test_an_unknown_litetune_device_refuses_verify_before_anything_is_measured(
+    write_split, monkeypatch
+):
+    monkeypatch.setenv("LITETUNE_DEVICE", "mps")
+    rows = labelled_rows(16)
+    candidate = FakeBackend(texts=correct_texts(rows))
+    reference = FakeBackend(model="org/reference", texts=correct_texts(rows))
+
+    result = verify(write_split, rows, candidate=candidate, reference=reference)
+
+    assert result.status is Status.FAILED_HARNESS
+    (check,) = result.manifest["checks"]
+    assert check["name"] == DEVICE_CHECK
+    assert check["outcome"] == "could_not_check"
+    assert "auto, cpu" in check["detail"]
+    assert candidate.prompts_seen == [] and reference.prompts_seen == []
+
+
+def test_a_reference_mac_on_its_cpu_says_what_torch_said(write_split, monkeypatch, tmp_path):
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    answer = probe_answer(
+        "cpu", mps_built=True, mps_available=False, os="Darwin", os_version="12.7"
+    )
+    monkeypatch.setattr(envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=answer))
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert any(
+        "macOS 12.7" in text and "is_available() is False" in text
+        for text in result.manifest["limitations"]
+    ), result.manifest["limitations"]
+
+
+def test_the_reference_engine_records_the_host_and_the_mps_memory(
+    write_split, monkeypatch, tmp_path
+):
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer("mps"))
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    engine = result.manifest["measurements"]["reference"]["engine"]
+    assert engine["device_source"] == "probe"
+    assert engine["host"]["os"] == "Darwin"
+    assert engine["host"]["machine"] == "arm64"
+    memory = engine["mps_memory"]
+    assert memory["computed_budget_bytes"] == 13 * 1024**3
+    assert memory["recommended_max_memory_bytes"] == 16 * 1024**3
+    assert memory["available_bytes"] == 16 * 1024**3
+    assert memory["pressure_level"] == 1
+    assert memory["swapusage"] is not None
+    assert memory["variables"]["PYTORCH_MPS_HIGH_WATERMARK_RATIO"]["value"] == "0.812500"
+    assert memory["variables"]["PYTORCH_MPS_LOW_WATERMARK_RATIO"]["value"] == "0.650000"
+
+
+def test_litetune_device_cpu_on_the_reference_is_on_the_record(write_split, monkeypatch, tmp_path):
+    _ready_train_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    rows = text_rows(5)
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _fake_reference_run(rows, probe_stdout=probe_answer("cuda", cuda_build="12.4")),
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    limitations = result.manifest["limitations"]
+    assert any(
+        t.startswith("LITETUNE_DEVICE=cpu places this run on the CPU") for t in limitations
+    ), limitations
+    # A CUDA build the operator moved to the CPU is not one that cannot reach a GPU.
+    assert not any("cannot reach a GPU" in t for t in limitations), limitations
+
+
+def test_a_reference_that_saw_other_mps_variables_reaches_the_manifest(
+    write_split, monkeypatch, tmp_path
+):
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    seen = {
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": None,
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": None,
+        "PYTORCH_ENABLE_MPS_FALLBACK": None,
+    }
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _fake_reference_run(
+            rows,
+            probe_stdout=probe_answer("mps"),
+            run_report={"device": "mps", "mps_environment": seen},
+        ),
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert any(
+        "reference generation script did not see the MPS variables" in text
+        for text in result.manifest["limitations"]
+    ), result.manifest["limitations"]
+
+
+def test_the_operators_mps_fallback_reaches_the_manifest(write_split, monkeypatch, tmp_path):
+    _ready_train_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    rows = text_rows(5)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer("mps"))
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert any(
+        "PYTORCH_ENABLE_MPS_FALLBACK=1" in text and "`device: mps` does not mean every" in text
+        for text in result.manifest["limitations"]
+    ), result.manifest["limitations"]
+
+
+def test_a_reference_refused_for_memory_reaches_the_manifest(write_split, monkeypatch, tmp_path):
+    from conftest import fake_sysctl, sysctl_available
+
+    from litetune import devices
+
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer("mps"))
+    )
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert result.status is Status.FAILED_HARNESS
+    assert any(
+        "not started on mps" in text and "LITETUNE_DEVICE=cpu" in text
+        for text in result.manifest["limitations"]
+    ), result.manifest["limitations"]

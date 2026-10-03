@@ -16,6 +16,7 @@ one thing in this tool that failed silently and cost nine times the base score.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -23,7 +24,13 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import pytest
-from conftest import fake_torch, mark_provisioned
+from conftest import (
+    fake_sysctl,
+    fake_torch,
+    mark_provisioned,
+    probe_answer,
+    sysctl_available,
+)
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -42,17 +49,24 @@ from litetune.tune import (
     DECLARATIONS_CHECK,
     DEFAULT_ATTN_IMPLEMENTATION,
     DEFAULT_DTYPE,
+    DEVICE_CHECK,
+    DTYPE_UNDECIDED,
+    DTYPE_UNDECIDED_MPS_REFUSED,
     ENV_CHECK,
     EXPECTED_SUPERVISED_FRACTION,
     FORCE_PROMPT_MODE_FLAG,
     LEARNING_RATES,
     MASKING_CHECK,
     MERGE_CHECK,
+    MPS_DTYPE_SOURCE,
+    MPS_MICRO_BATCH_SOURCE,
     PROMPT_MODE_CHECK,
     TRAINING_CHECK,
     TrainingMetrics,
     TuneError,
     TuneRequest,
+    decide_dtype,
+    decide_micro_batch_size,
     decide_prompt_mode,
     masking_check,
     run_tune,
@@ -71,6 +85,9 @@ IGNORE_INDEX = -100
 class Call:
     argv: list[str]
     timeout: int
+    # The `env` overrides `StageEnv.run` was handed: where the MPS memory
+    # policy reaches the child, and nothing else in `run_tune` passes any.
+    env: dict | None = None
 
 
 @dataclass
@@ -114,6 +131,11 @@ class FakeTrainer:
     probe_returncode: int = 0
     probe_stderr: str = ""
     probe_raises: BaseException | None = None
+    # Any other field the probe prints -- `mps_available`, `os` and the rest --
+    # by the names `conftest.probe_answer` takes.
+    probe_fields: dict = field(default_factory=dict)
+    # Fields the fake script adds to its metrics on top of the usual ones.
+    metrics_extra: dict = field(default_factory=dict)
 
     @staticmethod
     def is_probe(args) -> bool:
@@ -125,19 +147,18 @@ class FakeTrainer:
         stdout = self.probe_stdout
         if stdout is None:
             stdout = (
-                json.dumps(
-                    {
-                        "device": self.probe_device,
-                        "cuda_build": self.probe_cuda_build,
-                        "device_count": self.probe_device_count,
-                    }
+                probe_answer(
+                    self.probe_device,
+                    cuda_build=self.probe_cuda_build,
+                    device_count=self.probe_device_count,
+                    **self.probe_fields,
                 )
                 + "\n"
             )
         return subprocess.CompletedProcess(args, self.probe_returncode, stdout, self.probe_stderr)
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
-        self.calls.append(Call(argv=list(args), timeout=timeout))
+        self.calls.append(Call(argv=list(args), timeout=timeout, env=kwargs.get("env")))
         if self.is_probe(args):
             # Ahead of `raises`, which describes the training run: a test that
             # makes training time out is not also asking the probe to.
@@ -183,6 +204,7 @@ class FakeTrainer:
                 payload["device"] = self.device
             if self.drop_fraction:
                 payload.pop("supervised_token_fraction")
+            payload.update(self.metrics_extra)
             Path(config["metrics_out"]).write_text(json.dumps(payload), encoding="utf-8")
         return subprocess.CompletedProcess(args, self.returncode, self.stdout, self.stderr)
 
@@ -656,6 +678,35 @@ def test_the_script_masks_padding_out_of_the_loss(script_namespace):
     # Padding contributes no gradient either, or the shorter rows in a batch
     # would teach the model to emit pad tokens.
     assert labels == [[IGNORE_INDEX, 2, 3], [IGNORE_INDEX, 5, IGNORE_INDEX]]
+
+
+def test_microbatch_loss_weights_count_shifted_supervised_tokens(script_namespace):
+    """Unequal completions keep the full batch's token-mean loss.
+
+    Averaging the two microbatch means would give each a weight of one half;
+    the full batch gives the one-token completion one quarter and the
+    three-token completion three quarters. Position zero is excluded because
+    causal LM loss shifts labels before cross-entropy.
+    """
+    micro_batches = script_namespace["micro_batches"]
+    examples = [
+        ([1, 2, 3], [7, IGNORE_INDEX, 9]),
+        ([4, 5, 6, 7], [8, 5, 6, 7]),
+    ]
+
+    weighted = list(micro_batches(examples, 1))
+
+    assert [chunk for chunk, _ in weighted] == [[examples[0]], [examples[1]]]
+    assert [weight for _, weight in weighted] == [0.25, 0.75]
+    assert sum(weight for _, weight in weighted) == pytest.approx(1.0)
+
+
+def test_an_effective_batch_without_targets_is_refused(script_namespace):
+    micro_batches = script_namespace["micro_batches"]
+    examples = [([1, 2], [5, IGNORE_INDEX])]
+
+    with pytest.raises(ValueError, match="no supervised shifted tokens"):
+        list(micro_batches(examples, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -1296,6 +1347,35 @@ class _Cuda:
 cuda = _Cuda()
 
 
+class _Mps:
+    # torch.mps's three calls the training script makes on mps. The two
+    # counters answer a sequence that peaks in the middle, so a script that
+    # recorded the last sample instead of the largest is visible -- over the
+    # five steps `train_data` makes, the last samples are 300 and 1000, the
+    # largest 900 and 2000. Each call is logged, so a script that sampled them
+    # off mps is visible too.
+    CURRENT = (300, 900, 100, 200)
+    DRIVER = (1000, 2000, 1500, 1200)
+
+    def __init__(self):
+        self.samples = 0
+
+    def current_allocated_memory(self):
+        _log({"event": "mps_current_allocated"})
+        self.samples += 1
+        return self.CURRENT[(self.samples - 1) % len(self.CURRENT)]
+
+    def driver_allocated_memory(self):
+        _log({"event": "mps_driver_allocated"})
+        return self.DRIVER[(self.samples - 1) % len(self.DRIVER)]
+
+    def empty_cache(self):
+        _log({"event": "mps_empty_cache"})
+
+
+mps = _Mps()
+
+
 class _AdamW:
     def __init__(self, params, lr):
         self.params = list(params)
@@ -1308,6 +1388,7 @@ class _AdamW:
 
     def step(self):
         self.steps += 1
+        _log({"event": "optimiser_step"})
 
     def zero_grad(self, set_to_none=False):
         pass
@@ -1366,7 +1447,11 @@ class _Loss:
         self.value = value
 
     def backward(self):
-        pass
+        _log({"event": "backward"})
+
+    def __mul__(self, weight):
+        _log({"event": "loss_weight", "weight": weight})
+        return _Loss(self.value * weight)
 
     def detach(self):
         return self
@@ -1376,8 +1461,14 @@ class _Loss:
 
 
 class _Output:
-    def __init__(self, loss):
+    def __init__(self, loss, step):
         self.loss = loss
+        self.step = step
+
+    def __del__(self):
+        # When the script lets go of a step's outputs, against the next
+        # step's forward call in the same log.
+        _log({"event": "released", "step": self.step})
 
 
 class _Config:
@@ -1397,6 +1488,7 @@ class _Model:
     def __init__(self, tag):
         self.tag = tag
         self.config = _Config()
+        self.forwards = 0
 
     def parameters(self):
         return [_Parameter(1000)]
@@ -1421,7 +1513,8 @@ class _Model:
             "attention_mask_device": getattr(attention_mask, "device", None),
             "labels_device": getattr(labels, "device", None),
         })
-        return _Output(_Loss(1.45))
+        self.forwards += 1
+        return _Output(_Loss(1.45), self.forwards)
 
     def save_pretrained(self, path):
         Path(path).mkdir(parents=True, exist_ok=True)
@@ -1515,6 +1608,9 @@ def run_real_script(
     lora_container: str | None = None,
     stub_modules: list[str] | None = None,
     hide_matched: bool = False,
+    device: str | None = None,
+    extra_env: dict[str, str] | None = None,
+    **config_kwargs,
 ) -> subprocess.CompletedProcess:
     """Runs `_TRAIN_SCRIPT` for real, against the stub modules `stub_env` wrote.
 
@@ -1536,6 +1632,8 @@ def run_real_script(
                 declarations_sha256=declarations_sha256,
                 declarations=declarations,
                 lora_container=lora_container,
+                device=device,
+                **config_kwargs,
             )
         ),
         encoding="utf-8",
@@ -1551,6 +1649,7 @@ def run_real_script(
             "LITETUNE_STUB_CUDA": "1" if cuda else "0",
             **({"LITETUNE_STUB_MODULES": ",".join(stub_modules)} if stub_modules else {}),
             **({"LITETUNE_STUB_HIDE_MATCHED": "1"} if hide_matched else {}),
+            **(extra_env or {}),
         },
     )
 
@@ -1579,6 +1678,34 @@ def test_the_real_script_writes_metrics_this_module_can_read(request_for, stub_e
     assert metrics.supervised_token_fraction < 0.4
     assert [e.epoch for e in metrics.epochs] == [1, 2]
     assert metrics.final_loss == pytest.approx(1.45)
+    assert metrics.batch_size == 8
+    assert metrics.micro_batch_size == 8
+    assert metrics.gradient_accumulation_steps == 1
+    log = stub_log(stub_env)
+    assert sum(e["event"] == "forward" for e in log) == 10
+    assert sum(e["event"] == "optimiser_step" for e in log) == 10
+
+
+def test_the_real_mps_script_accumulates_without_changing_the_optimiser_batch(
+    request_for, stub_env
+):
+    request = request_for(batch_size=8)
+    proc = run_real_script(request, stub_env, device="mps")
+    assert proc.returncode == 0, proc.stderr
+
+    log = stub_log(stub_env)
+    assert [e["rows"] for e in log if e["event"] == "forward"] == [1] * 40
+    assert sum(e["event"] == "optimiser_step" for e in log) == 5
+    weights = [e["weight"] for e in log if e["event"] == "loss_weight"]
+    assert len(weights) == 40
+    assert all(weight == pytest.approx(1 / 8) for weight in weights)
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["batch_size"] == 8
+    assert recorded["micro_batch_size"] == 1
+    assert recorded["micro_batch_size_source"] == MPS_MICRO_BATCH_SOURCE
+    assert recorded["gradient_accumulation_steps"] == 8
+    assert recorded["epochs"][0]["steps"] == 5
+    assert recorded["epochs"][0]["loss"] == pytest.approx(1.45)
 
 
 def test_a_scoped_lora_run_reaches_the_text_tower_and_nothing_beside_it(request_for, stub_env):
@@ -2584,6 +2711,35 @@ def test_a_killed_run_on_cuda_carries_no_dtype_hint(trainer, request_for):
     result = run_tune(request_for(dtype="bfloat16"))
 
     assert "--dtype float32" not in check_named(result, TRAINING_CHECK).detail
+
+
+def test_a_timeout_on_mps_carries_no_dtype_hint(trainer, request_for):
+    """M1: mps is not the CPU, and an explicit bfloat16 there is not the
+    bfloat16-on-the-CPU run the hint is about."""
+    _mps_trainer(trainer)
+    trainer.raises = subprocess.TimeoutExpired(cmd="python", timeout=10)
+
+    result = run_tune(request_for(dtype="bfloat16"))
+
+    check = check_named(result, TRAINING_CHECK)
+    assert "no result after" in check.detail
+    assert "--dtype float32" not in check.detail
+
+
+@pytest.mark.parametrize("reported", [None, "mps"])
+def test_a_killed_run_on_mps_carries_no_dtype_hint(trainer, request_for, reported):
+    """M2: whether or not the script got as far as reporting its device."""
+    _mps_trainer(trainer)
+    trainer.device = reported
+    trainer.write_metrics = reported is not None
+    trainer.returncode = -9
+
+    result = run_tune(request_for(dtype="bfloat16"))
+
+    check = check_named(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED
+    assert "--dtype float32" not in check.detail
+    assert not any("--dtype float32" in t for t in result.limitations)
 
 
 def test_the_script_trains_on_cuda_when_there_is_one(script_namespace):
@@ -3970,3 +4126,825 @@ def test_a_refused_completion_says_why(tmp_path, request_for, trainer, args, com
 
     (refused,) = [c for c in result.checks.checks if c.name == CALLS_CHECK]
     assert why in refused.detail
+
+
+# ---------------------------------------------------------------------------
+# Apple's GPU (mps), LITETUNE_DEVICE, and the dtype that follows the device
+# ---------------------------------------------------------------------------
+
+
+def _mps_trainer(trainer: FakeTrainer) -> FakeTrainer:
+    """A probe that answers mps, the way an arm64 Mac's torch does."""
+    trainer.probe_device = "mps"
+    return trainer
+
+
+def _training_call(trainer: FakeTrainer) -> Call:
+    (call,) = [c for c in trainer.calls if not FakeTrainer.is_probe(c.argv)]
+    return call
+
+
+@pytest.mark.parametrize(
+    ("declared", "device", "dtype", "source"),
+    [
+        (None, "mps", "float32", MPS_DTYPE_SOURCE),
+        (None, "cuda", "bfloat16", "default"),
+        (None, "cpu", "bfloat16", "default"),
+        # No device established: the script falls back to cuda or the CPU,
+        # never mps, so the general default holds.
+        (None, None, "bfloat16", "default"),
+        ("bfloat16", "mps", "bfloat16", "declared"),
+        ("float32", "mps", "float32", "declared"),
+        ("float32", "cpu", "float32", "declared"),
+        ("bfloat16", "cuda", "bfloat16", "declared"),
+    ],
+)
+def test_the_dtype_is_declared_or_the_default_for_the_device(declared, device, dtype, source):
+    decision = decide_dtype(declared, device)
+    assert (decision.dtype, decision.source) == (dtype, source)
+
+
+@pytest.mark.parametrize(
+    ("declared", "batch_size", "device", "size", "source"),
+    [
+        (None, 8, "mps", 1, MPS_MICRO_BATCH_SOURCE),
+        (None, 8, "cuda", 8, "default: one forward per optimiser batch"),
+        (None, 8, "cpu", 8, "default: one forward per optimiser batch"),
+        (None, 8, None, 8, "default: one forward per optimiser batch"),
+        (2, 8, "mps", 2, "declared"),
+        (2, 8, "cuda", 2, "declared"),
+    ],
+)
+def test_the_microbatch_is_declared_or_the_default_for_the_device(
+    declared, batch_size, device, size, source
+):
+    decision = decide_micro_batch_size(declared, batch_size, device)
+    assert (decision.size, decision.source) == (size, source)
+
+
+@pytest.mark.parametrize("micro_batch_size", [0, -1, 9])
+def test_an_invalid_microbatch_is_refused(request_for, micro_batch_size):
+    with pytest.raises(TuneError, match="micro_batch_size"):
+        request_for(batch_size=8, micro_batch_size=micro_batch_size)
+
+
+@pytest.mark.parametrize(("device", "expected"), [("cpu", 8), ("cuda", 8)])
+def test_cpu_and_cuda_keep_one_forward_per_optimiser_batch(trainer, request_for, device, expected):
+    trainer.probe_device = device
+
+    result = run_tune(request_for(batch_size=expected))
+
+    config = trainer.configs[0]
+    assert config["micro_batch_size"] == expected
+    assert config["gradient_accumulation_steps"] == 1
+    assert result.as_dict()["request"]["micro_batch_size_declared"] is None
+
+
+def test_mps_defaults_to_one_example_per_forward_and_records_the_accumulation(trainer, request_for):
+    _mps_trainer(trainer)
+
+    result, seen = run_with_events(request_for(batch_size=8))
+
+    config = trainer.configs[0]
+    assert config["micro_batch_size"] == 1
+    assert config["micro_batch_size_source"] == MPS_MICRO_BATCH_SOURCE
+    assert config["gradient_accumulation_steps"] == 8
+    assert [m for m in notes(seen) if m.startswith("optimiser batch 8 as microbatches of 1")]
+    request_record = result.as_dict()["request"]
+    assert request_record["micro_batch_size"] == 1
+    assert request_record["micro_batch_size_declared"] is None
+
+
+def test_a_declared_microbatch_is_kept_on_mps(trainer, request_for):
+    _mps_trainer(trainer)
+
+    result = run_tune(request_for(batch_size=8, micro_batch_size=2))
+
+    config = trainer.configs[0]
+    assert config["micro_batch_size"] == 2
+    assert config["micro_batch_size_source"] == "declared"
+    assert config["gradient_accumulation_steps"] == 4
+    assert result.as_dict()["request"]["micro_batch_size_declared"] == 2
+
+
+def test_an_mps_run_trains_in_float32_by_default_and_says_why(trainer, request_for):
+    _mps_trainer(trainer)
+    result, seen = run_with_events(request_for())
+
+    config = trainer.configs[-1]
+    assert config["device"] == "mps"
+    assert config["dtype"] == "float32"
+    assert config["dtype_source"] == MPS_DTYPE_SOURCE
+    record = result.as_dict()["request"]
+    assert (record["dtype"], record["dtype_source"]) == ("float32", MPS_DTYPE_SOURCE)
+    assert any("on mps and no --dtype was given" in t for t in result.limitations)
+    # Neither bfloat16 limitation: this run is not in bfloat16, and it did not
+    # declare a departure from a default either.
+    assert not any("optimiser's moments are bfloat16" in t for t in result.limitations)
+    assert not any("not the 'bfloat16' default" in t for t in result.limitations)
+    assert not [m for m in notes(seen) if "bfloat16 on the CPU" in m]
+
+
+_DTYPE_LIMITATION_WORDS = (
+    "optimiser's moments are bfloat16",
+    "not the 'bfloat16' default",
+    "on mps and no --dtype was given",
+)
+
+
+@pytest.mark.parametrize("declared", [None, "float32"])
+def test_a_run_refused_before_its_device_was_known_records_no_dtype(
+    trainer, request_for, monkeypatch, declared
+):
+    monkeypatch.setenv("LITETUNE_DEVICE", "gpu")
+
+    result = run_tune(request_for(dtype=declared))
+
+    record = result.as_dict()["request"]
+    assert record["dtype"] is None
+    assert record["dtype_source"] == DTYPE_UNDECIDED
+    assert record["dtype_declared"] == declared
+    assert result.dtype is None
+    # No dtype trained, so nothing is said about one.
+    assert not [t for t in result.limitations for w in _DTYPE_LIMITATION_WORDS if w in t]
+
+
+def test_an_mps_run_refused_for_memory_records_no_dtype_and_says_it_did_not_train(
+    trainer, request_for, monkeypatch
+):
+    from litetune import devices
+
+    _mps_trainer(trainer)
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+
+    result = run_tune(request_for())
+
+    record = result.as_dict()["request"]
+    assert (record["dtype"], record["dtype_source"]) == (None, DTYPE_UNDECIDED_MPS_REFUSED)
+    assert record["dtype_declared"] is None
+    assert not [t for t in result.limitations for w in _DTYPE_LIMITATION_WORDS if w in t]
+    # M12: the refusal is in the limitations as well as the check.
+    assert any(
+        t.startswith("training was not attempted: the MPS memory budget is")
+        for t in result.limitations
+    ), result.limitations
+
+
+def test_a_run_that_trains_records_the_decision_beside_what_was_declared(trainer, request_for):
+    _mps_trainer(trainer)
+
+    record = run_tune(request_for()).as_dict()["request"]
+
+    assert record["dtype_declared"] is None
+    assert (record["dtype"], record["dtype_source"]) == ("float32", MPS_DTYPE_SOURCE)
+
+
+def test_an_explicit_bfloat16_on_mps_is_honoured_and_recorded_as_declared(trainer, request_for):
+    _mps_trainer(trainer)
+
+    result, seen = run_with_events(request_for(dtype="bfloat16"))
+
+    assert trainer.configs[0]["dtype"] == "bfloat16"
+    assert trainer.configs[0]["dtype_source"] == "declared"
+    assert not any("on mps and no --dtype was given" in t for t in result.limitations)
+    # mps is not the CPU: the CPU hint is not this run's.
+    assert not [m for m in notes(seen) if "bfloat16 on the CPU" in m]
+
+
+def test_a_cpu_run_without_a_declared_dtype_keeps_the_bfloat16_default(trainer, request_for):
+    trainer.probe_device = "cpu"
+
+    result, seen = run_with_events(request_for())
+
+    assert trainer.configs[0]["dtype"] == "bfloat16"
+    assert trainer.configs[0]["dtype_source"] == "default"
+    assert [m for m in notes(seen) if m.startswith("training will run bfloat16 on the CPU")]
+    assert any("optimiser's moments are bfloat16" in t for t in result.limitations)
+
+
+def test_an_mps_run_starts_its_child_under_the_memory_policy(trainer, request_for):
+    _mps_trainer(trainer)
+
+    result = run_tune(request_for())
+
+    env = _training_call(trainer).env
+    assert env is not None
+    # conftest's sysctl: 16 GiB available, less 3 GiB, against the probe's 16.
+    assert env == {
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.812500",
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.650000",
+        "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+    }
+    assert result.mps_memory is not None
+    recorded = result.as_dict()["mps_memory"]
+    assert recorded["computed_budget_bytes"] == 13 * 1024**3
+    assert recorded["recommended_max_memory_bytes"] == 16 * 1024**3
+    assert recorded["available_bytes"] == 16 * 1024**3
+    assert recorded["pressure_level"] == 1
+    assert recorded["swapusage"].startswith("total =")
+    # And the script is handed the same record, to write into metrics.json.
+    assert trainer.configs[0]["mps_memory"] == recorded
+
+
+def test_an_mps_run_leaves_the_parents_environment_as_it_was(trainer, request_for):
+    _mps_trainer(trainer)
+    before = dict(os.environ)
+
+    run_tune(request_for())
+
+    assert dict(os.environ) == before
+
+
+def test_two_runs_in_one_process_each_read_the_memory_they_start_with(
+    trainer, request_for, monkeypatch
+):
+    """M7: the second run computes its own budget, and records it as
+    litetune's, rather than inheriting the first run's variables as the
+    operator's."""
+    from litetune import devices
+
+    _mps_trainer(trainer)
+    first = run_tune(request_for())
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(10 * 1024**3)))
+    second = run_tune(request_for())
+
+    budgets = [r.as_dict()["mps_memory"]["computed_budget_bytes"] for r in (first, second)]
+    assert budgets == [13 * 1024**3, 7 * 1024**3]
+    for result in (first, second):
+        variables = result.as_dict()["mps_memory"]["variables"]
+        assert {v["set_by"] for v in variables.values()} == {"litetune"}
+    envs_sent = [c.env for c in trainer.calls if not FakeTrainer.is_probe(c.argv)]
+    assert envs_sent[0]["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.812500"
+    assert envs_sent[1]["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.437500"
+
+
+def test_a_run_off_mps_gets_no_memory_policy(trainer, request_for):
+    trainer.probe_device = "cuda"
+
+    result = run_tune(request_for())
+
+    assert _training_call(trainer).env is None
+    assert result.mps_memory is None
+    assert trainer.configs[0]["mps_memory"] is None
+
+
+def test_the_operators_mps_variables_are_kept_and_recorded_as_theirs(
+    trainer, request_for, monkeypatch
+):
+    _mps_trainer(trainer)
+    monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+    result = run_tune(request_for())
+
+    # Not passed as overrides: the operator's value reaches the child through
+    # the environment it inherits, unchanged.
+    assert _training_call(trainer).env == {"PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.400000"}
+    variables = result.as_dict()["mps_memory"]["variables"]
+    assert variables["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == {"value": "0.5", "set_by": "user"}
+    assert variables["PYTORCH_ENABLE_MPS_FALLBACK"] == {"value": "1", "set_by": "user"}
+    # The operator's fallback is allowed, and the report says what it means.
+    assert any(
+        "PYTORCH_ENABLE_MPS_FALLBACK=1" in t and "`device: mps` does not mean every" in t
+        for t in result.limitations
+    ), result.limitations
+
+
+def test_the_operators_high_ratio_owns_the_limit_on_a_mac_short_of_memory(
+    trainer, request_for, monkeypatch
+):
+    from litetune import devices
+
+    _mps_trainer(trainer)
+    monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")
+    # 2 GiB available: litetune's own budget would be refused.
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+
+    result = run_tune(request_for())
+
+    assert check_named(result, TRAINING_CHECK).outcome is Outcome.PASSED
+    recorded = result.as_dict()["mps_memory"]
+    assert recorded["budget_source"] == "user"
+    assert recorded["computed_budget_bytes"] == -1 * 1024**3
+    assert recorded["effective_high_bytes"] == 8 * 1024**3
+    assert _training_call(trainer).env == {
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.400000",
+        "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+    }
+
+
+def test_an_operators_unreadable_fallback_refuses_the_run_before_it_starts(
+    trainer, request_for, monkeypatch
+):
+    _mps_trainer(trainer)
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "yes")
+
+    result = run_tune(request_for())
+
+    refused = check_named(result, DEVICE_CHECK)
+    assert refused.outcome is Outcome.UNCHECKED
+    assert "not a plain integer" in refused.detail
+    assert all(FakeTrainer.is_probe(c.argv) for c in trainer.calls)
+
+
+def test_an_mps_out_of_memory_under_the_operators_ratio_does_not_blame_litetunes_budget(
+    trainer, request_for, monkeypatch
+):
+    _mps_trainer(trainer)
+    monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = "RuntimeError: MPS backend out of memory (MPS allocated: 7.90 GB)"
+
+    detail = check_named(run_tune(request_for()), TRAINING_CHECK).detail
+
+    assert "not by litetune" in detail
+    assert "budget litetune set" not in detail
+    assert "LITETUNE_DEVICE=cpu" in detail
+
+
+def test_an_mps_run_without_the_memory_is_refused_before_it_starts(
+    trainer, request_for, monkeypatch
+):
+    from litetune import devices
+
+    _mps_trainer(trainer)
+    # 3.2 GiB available, less 3 GiB: 0.2 GiB.
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(32 * 1024**3 // 10)))
+
+    result = run_tune(request_for())
+
+    refused = check_named(result, DEVICE_CHECK)
+    assert refused.outcome is Outcome.UNCHECKED
+    assert "Quit what is holding memory" in refused.detail
+    assert "LITETUNE_DEVICE=cpu" in refused.detail
+    assert result.outcome is Outcome.UNCHECKED
+    # The probe ran; the training script did not.
+    assert all(FakeTrainer.is_probe(c.argv) for c in trainer.calls)
+
+
+def test_litetune_device_cpu_puts_a_mac_on_its_cpu_and_says_who_chose_it(
+    trainer, request_for, monkeypatch
+):
+    _mps_trainer(trainer)
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+
+    result, seen = run_with_events(request_for())
+
+    config = trainer.configs[0]
+    assert config["device"] == "cpu"
+    assert config["device_probe"]["source"] == "LITETUNE_DEVICE"
+    assert config["dtype"] == "bfloat16"
+    assert config["mps_memory"] is None
+    assert _training_call(trainer).env is None
+    assert result.as_dict()["device_probe"]["source"] == "LITETUNE_DEVICE"
+    assert [m for m in notes(seen) if m.startswith("LITETUNE_DEVICE=cpu")]
+    # A CPU the operator chose is not a Mac's CPU to explain.
+    assert not any("is_available()" in t for t in result.limitations)
+
+
+def test_litetune_device_cpu_on_a_cuda_box_is_the_operators_choice_not_a_missing_gpu(
+    trainer, request_for, monkeypatch
+):
+    trainer.probe_device = "cuda"
+    trainer.probe_cuda_build = "12.4"
+    trainer.probe_device_count = 1
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+
+    result = run_tune(request_for())
+
+    assert trainer.configs[0]["device"] == "cpu"
+    assert not any("cannot reach a GPU" in t for t in result.limitations), result.limitations
+    assert any(
+        t.startswith("LITETUNE_DEVICE=cpu places this run on the CPU") and "reports cuda" in t
+        for t in result.limitations
+    ), result.limitations
+
+
+def test_litetune_device_auto_leaves_the_probe_to_decide(trainer, request_for, monkeypatch):
+    _mps_trainer(trainer)
+    monkeypatch.setenv("LITETUNE_DEVICE", "auto")
+
+    run_tune(request_for())
+
+    assert trainer.configs[0]["device"] == "mps"
+    assert trainer.configs[0]["device_probe"]["source"] == "probe"
+
+
+@pytest.mark.parametrize("value", ["mps", "gpu", "CPU", ""])
+def test_an_unknown_litetune_device_is_refused_before_anything_runs(
+    trainer, request_for, monkeypatch, value
+):
+    monkeypatch.setenv("LITETUNE_DEVICE", value)
+
+    result = run_tune(request_for())
+
+    refused = check_named(result, DEVICE_CHECK)
+    assert refused.outcome is Outcome.UNCHECKED
+    assert "auto, cpu" in refused.detail
+    assert result.outcome is Outcome.UNCHECKED
+    assert trainer.calls == []
+
+
+def test_a_mac_training_on_its_cpu_is_told_what_torch_said(trainer, request_for):
+    trainer.probe_device = "cpu"
+    trainer.probe_fields = {
+        "mps_built": True,
+        "mps_available": False,
+        "os": "Darwin",
+        "os_version": "12.7",
+        "machine": "arm64",
+    }
+
+    result = run_tune(request_for())
+
+    assert any(
+        "macOS 12.7 (arm64)" in t and "is_available() is False" in t for t in result.limitations
+    ), result.limitations
+
+
+def test_the_report_and_the_script_carry_the_host(trainer, request_for):
+    _mps_trainer(trainer)
+
+    result = run_tune(request_for())
+
+    host = {
+        "os": "Darwin",
+        "os_version": "15.0",
+        "os_version_source": "platform.mac_ver()",
+        "machine": "arm64",
+        # Read in the parent, on macOS only; conftest's sysctl answers this.
+        "chip": "Apple M-test" if sys.platform == "darwin" else None,
+    }
+    assert result.as_dict()["host"] == host
+    assert trainer.configs[0]["host"] == host
+    assert trainer.configs[0]["device_probe"]["mps_recommended_max_memory"] == 16 * 1024**3
+
+
+def test_an_mps_out_of_memory_is_the_machine_and_says_what_to_do(trainer, request_for):
+    _mps_trainer(trainer)
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = (
+        "Traceback (most recent call last):\n"
+        "RuntimeError: MPS backend out of memory (MPS allocated: 9.10 GB, other allocations: "
+        "1.20 GB, max allowed: 10.40 GB). Tried to allocate 256.00 MB on private pool."
+    )
+
+    result = run_tune(request_for())
+
+    check = check_named(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED
+    assert check.observed["matched"] == "MPS backend out of memory"
+    assert "LITETUNE_DEVICE=cpu" in check.detail
+    assert "quit what is holding memory" in check.detail
+
+
+def test_an_mps_out_of_memory_behind_the_error_class_still_gets_its_advice(trainer, request_for):
+    """The classifier matches `OutOfMemoryError` first on this line; the
+    advice is found by its own search, not read off that match."""
+    _mps_trainer(trainer)
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = (
+        "torch.OutOfMemoryError: MPS backend out of memory (MPS allocated: 9.10 GB, other "
+        "allocations: 1.20 GB, max allowed: 10.40 GB). Tried to allocate 256.00 MB on private pool."
+    )
+
+    check = check_named(run_tune(request_for()), TRAINING_CHECK)
+
+    assert check.outcome is Outcome.UNCHECKED
+    assert check.observed["matched"] == "OutOfMemoryError"
+    assert "budget litetune set from the memory this Mac had available" in check.detail
+    assert "LITETUNE_DEVICE=cpu" in check.detail
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Assembled the way torch 2.5.1 raises it from two adjacent pieces.
+        "NotImplementedError: The operator 'aten::_some_op' is not currently implemented for "
+        "the MPS device. If you want this op to be added in priority during the prototype phase "
+        "of this feature, please comment on https://github.com/pytorch/pytorch/issues/77764. As "
+        "a temporary fix, you can set the environment variable `PYTORCH_ENABLE_MPS_FALLBACK=1` "
+        "to use the CPU as a fallback for this op.",
+        "TypeError: MPS BFloat16 is only supported on MacOS 14 or newer",
+        "RuntimeError: invalid high watermark ratio 2.5",
+        "RuntimeError: invalid low watermark ratio 1.4",
+    ],
+)
+def test_an_mps_device_fact_is_the_machines_and_points_at_the_cpu(trainer, request_for, line):
+    _mps_trainer(trainer)
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = f"Traceback (most recent call last):\n{line}"
+
+    result = run_tune(request_for())
+
+    check = check_named(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED, check.detail
+    assert "says nothing about the method or the data (set LITETUNE_DEVICE=cpu" in check.detail
+    # The advice is litetune's; torch's own suggestion stays only in the
+    # stderr tail it quotes.
+    advice = check.detail.split("to train on the CPU): ")[0]
+    assert advice != check.detail
+    assert "PYTORCH_ENABLE_MPS_FALLBACK" not in advice
+    assert "budget" not in advice
+
+
+def test_a_cuda_out_of_memory_carries_no_mps_advice(trainer, request_for):
+    trainer.probe_device = "cuda"
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = "torch.OutOfMemoryError: CUDA out of memory."
+
+    result = run_tune(request_for())
+
+    check = check_named(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED
+    assert "LITETUNE_DEVICE" not in check.detail
+
+
+def test_the_metrics_carry_the_new_fields_through_to_the_report():
+    metrics = TrainingMetrics.from_dict(
+        {
+            "n_examples": 1,
+            "supervised_tokens": 1,
+            "total_tokens": 10,
+            "masked_tokens": 9,
+            "supervised_token_fraction": 0.1,
+            "epochs": [],
+            "device": "mps",
+            "dtype": "float32",
+            "dtype_source": MPS_DTYPE_SOURCE,
+            "pad_to_multiple_of": 32,
+            "mps_memory_sampled_max": {"current_allocated_bytes": 1, "samples": 3},
+            "mps_environment": {"PYTORCH_ENABLE_MPS_FALLBACK": "0"},
+        }
+    )
+    record = metrics.as_dict()
+    assert record["dtype"] == "float32"
+    assert record["dtype_source"] == MPS_DTYPE_SOURCE
+    assert record["pad_to_multiple_of"] == 32
+    assert record["mps_memory_sampled_max"] == {"current_allocated_bytes": 1, "samples": 3}
+    assert record["mps_environment"] == {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}
+
+
+# -- the script on mps --------------------------------------------------------
+
+
+def _forward_widths(stub_env) -> list[int]:
+    return [e["width"] for e in stub_log(stub_env) if e["event"] == "forward"]
+
+
+def test_the_real_script_pads_batches_to_a_multiple_of_32_on_mps(request_for, stub_env):
+    request = request_for()
+    proc = run_real_script(request, stub_env, device="mps")
+    assert proc.returncode == 0, proc.stderr
+
+    widths = _forward_widths(stub_env)
+    assert widths
+    assert all(width % 32 == 0 for width in widths), widths
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["pad_to_multiple_of"] == 32
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_the_real_script_pads_to_the_longest_row_off_mps(request_for, stub_env, device):
+    request = request_for()
+    proc = run_real_script(request, stub_env, device=device)
+    assert proc.returncode == 0, proc.stderr
+
+    widths = _forward_widths(stub_env)
+    # The rows in `train_data` are well under 32 tokens long, so any rounding
+    # at all would show as a width of 32.
+    assert widths and all(width < 32 for width in widths), widths
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["pad_to_multiple_of"] is None
+    assert recorded["mps_memory_sampled_max"] is None
+    events = {e["event"] for e in stub_log(stub_env)}
+    assert not events & {"mps_current_allocated", "mps_driver_allocated", "mps_empty_cache"}
+
+
+class _ListTorch:
+    """`torch`, reduced to what `batches` calls: a tensor that is its list."""
+
+    long = "long"
+
+    @staticmethod
+    def tensor(values, dtype=None):
+        return values
+
+
+def test_batches_round_the_width_up_and_mask_the_padding(script_namespace):
+    examples = [([1, 2, 3], [-100, 2, 3]), ([4] * 33, [4] * 33)]
+    batches = script_namespace["batches"]
+
+    ((ids, attention, labels),) = list(batches(examples, 2, 0, _ListTorch, 32))
+
+    assert len(ids[0]) == len(ids[1]) == 64
+    assert ids[0][3:] == [0] * 61
+    assert attention[0] == [1, 1, 1] + [0] * 61
+    assert labels[0][3:] == [-100] * 61
+    # Exactly a multiple stays where it is.
+    ((ids, _, _),) = list(batches([([1] * 32, [1] * 32)], 1, 0, _ListTorch, 32))
+    assert len(ids[0]) == 32
+    # And without a multiple, the longest row decides, as it always has.
+    ((ids, _, _),) = list(batches(examples, 2, 0, _ListTorch))
+    assert len(ids[0]) == 33
+
+
+@pytest.mark.parametrize(
+    ("max_length", "longest", "width"),
+    [
+        # Not a multiple of 32: rounding 70 up to 96 would pass 70.
+        (70, 70, 70),
+        (70, 69, 70),
+        (70, 64, 64),
+        (70, 65, 70),
+        # A multiple of 32: the cap and the rounding agree.
+        (64, 64, 64),
+        (64, 63, 64),
+        (64, 33, 64),
+    ],
+)
+def test_the_rounded_width_never_passes_max_seq_length(
+    script_namespace, max_length, longest, width
+):
+    batches = script_namespace["batches"]
+    examples = [([1] * longest, [1] * longest), ([2] * 3, [2] * 3)]
+
+    ((ids, attention, labels),) = list(batches(examples, 2, 0, _ListTorch, 32, max_length))
+
+    assert len(ids[0]) == len(ids[1]) == width
+    assert attention[1] == [1] * 3 + [0] * (width - 3)
+    assert labels[1][3:] == [-100] * (width - 3)
+
+
+def test_the_real_script_caps_the_mps_width_at_max_seq_length(request_for, stub_env):
+    # Every batch of `train_data` is 11 stub tokens at its longest off mps, so
+    # 11 is the tightest legal limit -- and not a multiple of 32.
+    request = request_for(max_seq_length=11)
+    proc = run_real_script(request, stub_env, device="mps")
+    assert proc.returncode == 0, proc.stderr
+
+    widths = _forward_widths(stub_env)
+    assert widths and all(width <= 11 for width in widths), widths
+
+
+def test_the_real_script_records_the_largest_mps_samples_and_where_they_were_taken(
+    request_for, stub_env
+):
+    request = request_for()
+    proc = run_real_script(request, stub_env, device="mps")
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    log = [e["event"] for e in stub_log(stub_env)]
+    forwards = log.count("forward")
+    optimiser_steps = log.count("optimiser_step")
+    # Forty examples run one at a time, but the effective batch is still eight:
+    # five optimiser steps, exactly as before accumulation.
+    assert (forwards, optimiser_steps) == (40, 5)
+    # Forward and backward are sampled per microbatch; optimiser state is
+    # sampled once per effective batch.
+    sample = ["mps_current_allocated", "mps_driver_allocated"]
+    first = log.index("forward")
+    assert log[first : first + 8] == [
+        "forward",
+        *sample,
+        "loss_weight",
+        "backward",
+        *sample,
+        "released",
+    ], log[first : first + 8]
+    assert log.count("mps_current_allocated") == 2 * forwards + optimiser_steps
+    # The stub's sequences peak in the middle, so the last sample is not the
+    # largest: the record is the maximum over the samples.
+    assert recorded["mps_memory_sampled_max"] == {
+        "current_allocated_bytes": 900,
+        "driver_allocated_bytes": 2000,
+        "samples": 85,
+        "sampled_at": ["after forward", "after backward", "after optimiser step"],
+    }
+
+
+def test_the_real_script_records_no_samples_when_no_step_ran(script_namespace):
+    record = script_namespace["new_mps_samples"](["after forward"])
+    assert script_namespace["finished_mps_samples"](record) is None
+    assert script_namespace["finished_mps_samples"](None) is None
+
+
+def test_the_real_script_reports_the_mps_variables_it_saw(request_for, stub_env):
+    request = request_for()
+    proc = run_real_script(
+        request,
+        stub_env,
+        device="mps",
+        extra_env={
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.5",
+            "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["mps_environment"] == {
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.5",
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": None,
+        "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+    }
+
+
+def test_a_child_that_saw_what_was_sent_adds_no_limitation(trainer, request_for):
+    _mps_trainer(trainer)
+    trainer.metrics_extra["mps_environment"] = {
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.812500",
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.650000",
+        "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+    }
+
+    result = run_tune(request_for())
+
+    assert not any("did not see the MPS variables" in t for t in result.limitations)
+
+
+@pytest.mark.parametrize(
+    "seen",
+    [
+        {
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO": None,
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO": None,
+            "PYTORCH_ENABLE_MPS_FALLBACK": None,
+        },
+        {
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "1.7",
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.650000",
+            "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+        },
+        "not a mapping",
+    ],
+)
+def test_a_child_that_saw_something_else_is_a_limitation(trainer, request_for, seen):
+    _mps_trainer(trainer)
+    trainer.metrics_extra["mps_environment"] = seen
+
+    result = run_tune(request_for())
+
+    (said,) = [t for t in result.limitations if "did not see the MPS variables" in t]
+    assert "training script" in said
+    assert "0.812500" in said
+
+
+def test_a_child_that_reported_nothing_is_no_observation(trainer, request_for):
+    _mps_trainer(trainer)
+
+    result = run_tune(request_for())
+
+    assert not any("did not see the MPS variables" in t for t in result.limitations)
+
+
+def test_the_real_script_empties_the_mps_cache_before_it_saves(request_for, stub_env):
+    request = request_for(method="lora")
+    proc = run_real_script(request, stub_env, device="mps")
+    assert proc.returncode == 0, proc.stderr
+
+    order = [e["event"] for e in stub_log(stub_env)]
+    assert order.count("mps_empty_cache") == 1
+    last_forward = max(i for i, e in enumerate(order) if e == "forward")
+    first_save = order.index("save")
+    assert last_forward < order.index("mps_empty_cache") < first_save
+
+
+def test_the_real_script_lets_go_of_each_steps_outputs_before_the_next(request_for, stub_env):
+    """`del out` after the loss is read: the step's outputs are released
+    before the next forward call, not when the name is rebound after it."""
+    request = request_for()
+    proc = run_real_script(request, stub_env, device="cpu")
+    assert proc.returncode == 0, proc.stderr
+
+    log = [e for e in stub_log(stub_env) if e["event"] in ("forward", "released")]
+    forwards = [i for i, e in enumerate(log) if e["event"] == "forward"]
+    assert len(forwards) > 1
+    for step, (at, following) in enumerate(zip(forwards, forwards[1:], strict=False), start=1):
+        between = log[at + 1 : following]
+        assert {"event": "released", "step": step} in between, log
+
+
+def test_the_real_script_writes_what_the_parent_found_into_the_metrics(request_for, stub_env):
+    request = request_for()
+    probe = {"device": "mps", "source": "probe"}
+    host = {"os": "Darwin", "os_version": "15.0", "machine": "arm64", "chip": "Apple M-test"}
+    memory = {"budget_bytes": 1}
+    proc = run_real_script(
+        request, stub_env, device="mps", device_probe=probe, host=host, mps_memory=memory
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["device"] == "mps"
+    assert recorded["device_probe"] == probe
+    assert recorded["host"] == host
+    assert recorded["mps_memory"] == memory
+    assert recorded["dtype"] == "float32"
+    assert recorded["dtype_source"] == MPS_DTYPE_SOURCE

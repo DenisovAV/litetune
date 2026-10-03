@@ -33,6 +33,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -41,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from litetune import envs
+from litetune import devices, envs
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.export import GPU_ACTIVATION
@@ -1702,8 +1703,12 @@ _HF_GENERATE_SCRIPT = (
 import json
 import sys
 from pathlib import Path
+
+# Where generation reads torch's MPS counters on mps (`sample_mps_memory`).
+MPS_SAMPLE_POINTS = ("after each generate call",)
 '''
     + RENDERING_SOURCE
+    + devices.MPS_SCRIPT_SOURCE
     + r'''
 
 
@@ -1720,7 +1725,10 @@ def generation_device(torch, given=None):
     The fallback is not dead code. It is what runs whenever the parent has no
     answer to give: a probe that could not run, and an environment that was
     never probed. Without it the float reference would sit on the CPU of a GPU
-    box because a sub-second probe failed.
+    box because a sub-second probe failed. It never chooses mps: the parent
+    sets the MPS memory policy before starting a child that will use mps
+    (`devices.prepare_mps`), and a child that chose mps itself would run
+    without one.
     """
     if given is not None:
         return given
@@ -1752,10 +1760,15 @@ def main() -> int:
     # watching a run; `_assemble` discards stderr on a clean exit, so on the
     # path that matters it reaches nobody. This file is what the parent reads
     # back, and it is written before generation starts so that a run killed
-    # part-way still says where it was running.
-    Path(spec["run_report"]).write_text(json.dumps({"device": device}), encoding="utf-8")
+    # part-way still says where it was running -- and which MPS variables it
+    # read, for the parent to compare with what it sent.
+    report = {"device": device, "mps_environment": environment_seen()}
+    Path(spec["run_report"]).write_text(json.dumps(report), encoding="utf-8")
     print(f"reference generation on {device}", file=sys.stderr, flush=True)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    # The largest of torch's two MPS counters, read once after each generate
+    # call. `None` off mps and when nothing was generated.
+    mps_samples = new_mps_samples(MPS_SAMPLE_POINTS) if device == "mps" else None
 
     with Path(spec["out"]).open("w", encoding="utf-8") as sink:
         for i, prompt in enumerate(spec["prompts"]):
@@ -1771,12 +1784,16 @@ def main() -> int:
                     max_new_tokens=spec["max_tokens"],
                     pad_token_id=pad_id,
                 )
+            if mps_samples is not None:
+                sample_mps_memory(torch, mps_samples)
             # skip_special_tokens=False on purpose: the liveness tier checks for
             # padding-token leakage, and decoding it away would erase the
             # evidence it looks for.
             completion = tok.decode(ids[0][enc["input_ids"].shape[-1] :], skip_special_tokens=False)
             sink.write(json.dumps({"index": i, "text": completion}) + "\n")
             sink.flush()
+    report["mps_memory_sampled_max"] = finished_mps_samples(mps_samples)
+    Path(spec["run_report"]).write_text(json.dumps(report), encoding="utf-8")
     return 0
 
 
@@ -1848,6 +1865,24 @@ class HuggingFaceBackend:
     # `detail` and `cuda_build_without_a_device` off it to record the same
     # limitation `tune.py` records for its own probe.
     last_probe: envs.DeviceProbe | None = None
+    # Operating system, version, machine and chip, recorded beside the probe
+    # by `_ensure_env` (`devices.host_record`). `None` until a probe ran.
+    host: dict[str, Any] | None = None
+    # The MPS memory policy this call's generation started under, or `None`
+    # when it did not run on mps. Overwritten every call, like `last_probe`.
+    mps_memory: devices.MpsMemory | None = None
+    # Why this call's generation did not start on mps, when the memory policy
+    # refused it. `verify` records it as a limitation; the generations carry
+    # it as their harness error.
+    mps_refusal: str | None = None
+    # From this call's run report: the largest of torch's MPS counters, read
+    # after each generate call on mps (`None` off mps, or with no report), and
+    # the three MPS variables as the generation script read them.
+    mps_memory_sampled_max: dict[str, Any] | None = None
+    mps_environment_seen: dict[str, Any] | None = None
+    # Set when what the script read differs from what the memory policy
+    # records reaching it (`devices.environment_mismatch`); `verify` records it.
+    mps_environment_mismatch: str | None = None
 
     name = "transformers"
     # `generate()` receives max_new_tokens and the stop condition, so here the
@@ -1911,6 +1946,19 @@ class HuggingFaceBackend:
             # `backend` with a reference's is not comparing two different
             # questions.
             "backend_vocabulary": "torch device",
+            # Who chose the device -- the probe, or LITETUNE_DEVICE -- and the
+            # probe's whole answer, including what torch said about MPS.
+            "device_source": self.last_probe.source if self.last_probe is not None else None,
+            "device_probe": self.last_probe.as_dict() if self.last_probe is not None else None,
+            "host": self.host,
+            # Budget, Metal's recommended working set, both watermark ratios
+            # and who set them, the memory reading and swap use at the
+            # start. `None` off mps.
+            "mps_memory": self.mps_memory.as_dict() if self.mps_memory is not None else None,
+            # Why this call did not start on mps, when the policy refused it.
+            "mps_refusal": self.mps_refusal,
+            "mps_memory_sampled_max": self.mps_memory_sampled_max,
+            "mps_environment_seen": self.mps_environment_seen,
             "requirements": list(self.env.requirements),
             "decode_declared": self.decode.as_dict(),
             "decode_passed_to_runtime": self.decode_enforced,
@@ -1942,6 +1990,24 @@ class HuggingFaceBackend:
         # is for.
         device_for_run = self.last_probe.device if self.last_probe is not None else None
 
+        # The MPS memory policy, in the parent, before the child exists: the
+        # watermarks reach torch's allocator through the child's environment
+        # (`devices`, "The MPS memory policy"). A reference that cannot be
+        # given a budget is not started on mps with the allocator's defaults
+        # instead.
+        child_env: dict[str, str] | None = None
+        if device_for_run == "mps" and self.last_probe is not None:
+            try:
+                self.mps_memory = devices.prepare_mps(self.last_probe, os.environ)
+            except devices.MpsMemoryRefused as exc:
+                logger.error("the reference was not started on mps: %s", exc)
+                self.device = None
+                self.mps_refusal = f"the reference generation was not started on mps: {exc}"
+                return [
+                    Generation(i, p, harness_error=self.mps_refusal) for i, p in enumerate(prompts)
+                ]
+            child_env = self.mps_memory.child_env
+
         with tempfile.TemporaryDirectory(prefix="litetune-hf-") as tmp:
             work = Path(tmp)
             script = work / "generate.py"
@@ -1972,15 +2038,20 @@ class HuggingFaceBackend:
                     total=len(prompts),
                 )
             try:
-                proc = self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
+                proc = self.env.run(
+                    ["python", str(script), str(spec)], timeout=self.timeout_s, env=child_env
+                )
             except subprocess.TimeoutExpired as expired:
                 logger.warning("transformers generation timed out after %ss", self.timeout_s)
                 reason = f"no result after {self.timeout_s}s (timeout)"
-                # The run report is written after the last prompt, so a killed
-                # run has none and the device stays unconfirmed. A prediction
-                # left standing here would be reported by `describe()` as the
-                # backend a run used when nothing confirmed it.
-                self.device = None
+                # The child writes its first run report immediately after
+                # placing the model, before generation. Keep that observation
+                # and its MPS environment when the timeout happened later; if
+                # placement never completed there is no report, and the probe's
+                # prediction must not be presented as an observed backend.
+                run_report = self._read_run_report(report)
+                if run_report is None or not self._take_run_report(run_report):
+                    self.device = None
                 # This script flushes after every row too, and until now every
                 # one of them was thrown away here: a reference run killed at
                 # prompt 600 of 640 lost all 599 it had already written, which
@@ -2000,8 +2071,25 @@ class HuggingFaceBackend:
             # The script's own answer wins over the probe's prediction. The
             # temp directory goes away at the end of this block, so it is read
             # here rather than anywhere later.
-            observed = self._read_run_report(report)
+            run_report = self._read_run_report(report)
 
+        if run_report is not None:
+            self._take_run_report(run_report)
+        return assemble_generations(prompts, texts, proc, faults)
+
+    def _take_run_report(self, run_report: Mapping[str, Any]) -> bool:
+        """Record child observations; say whether it confirmed a device."""
+        observed = run_report.get("device")
+        if not isinstance(observed, str):
+            observed = None
+        sampled = run_report.get("mps_memory_sampled_max")
+        self.mps_memory_sampled_max = sampled if isinstance(sampled, dict) else None
+        seen = run_report.get("mps_environment")
+        self.mps_environment_seen = seen if isinstance(seen, dict) else None
+        if self.mps_memory is not None:
+            self.mps_environment_mismatch = devices.environment_mismatch(
+                self.mps_memory, seen, "reference generation script"
+            )
         if observed is not None:
             if self.device is not None and observed != self.device:
                 logger.warning(
@@ -2012,7 +2100,7 @@ class HuggingFaceBackend:
                 )
             self.device = observed
             self.device_observed = True
-        return assemble_generations(prompts, texts, proc, faults)
+        return observed is not None
 
     def _ensure_env(self, events: EventStream | None) -> str | None:
         """Provision the environment when asked to, then ask it its device.
@@ -2038,6 +2126,25 @@ class HuggingFaceBackend:
         because then no run happened at all.
         """
         self.last_probe = None
+        self.host = None
+        self.mps_memory = None
+        self.mps_refusal = None
+        self.mps_memory_sampled_max = None
+        self.mps_environment_seen = None
+        self.mps_environment_mismatch = None
+        # Before provisioning, which costs minutes: a LITETUNE_DEVICE litetune
+        # does not accept stops this reference from running at all, rather
+        # than being read as "auto" and placing it on the accelerator it was
+        # set to avoid. `verify` refuses the same value before it measures
+        # anything; this is the same rule for a caller that drives the backend
+        # itself.
+        try:
+            setting = devices.device_setting(os.environ)
+        except devices.DeviceSettingError as exc:
+            logger.error("%s", exc)
+            self.device = None
+            self.probed_device = None
+            return str(exc)
         if self.auto_provision:
             try:
                 self.env.provision(events=events)
@@ -2070,17 +2177,32 @@ class HuggingFaceBackend:
             logger.warning("%s", detail)
             if events is not None:
                 events.note(detail, environment=self.env.name)
-            self.last_probe = envs.DeviceProbe(device=None, detail=detail, attempted=False)
+            # LITETUNE_DEVICE still applies: with nothing to ask, "cpu" is the
+            # only answer there is, and a library caller that runs this
+            # environment itself must not have its child fall back to CUDA.
+            unprobed = envs.DeviceProbe(device=None, detail=detail, attempted=False)
+            self._take_probe(devices.apply_device_setting(unprobed, setting), events)
             return None
-        probe = envs.resolve_device(self.env, events=events)
+        self._take_probe(
+            devices.apply_device_setting(envs.resolve_device(self.env, events=events), setting),
+            events,
+        )
+        return None
+
+    def _take_probe(self, probe: envs.DeviceProbe, events: EventStream | None) -> None:
+        """Record a probe's answer, with LITETUNE_DEVICE applied, as this call's."""
         self.last_probe = probe
+        self.host = devices.host_record(probe)
+        if probe.source == devices.DEVICE_VARIABLE and events is not None:
+            events.note(probe.detail, environment=self.env.name, device=probe.device)
         if probe.answered:
             self.probed_device = probe.device
             self.device = probe.device
-        return None
 
-    def _read_run_report(self, report: Path) -> str | None:
-        """The device the generation script itself says it used, or `None`.
+    def _read_run_report(self, report: Path) -> dict[str, Any] | None:
+        """What the generation script wrote about its own run, or `None`.
+
+        Its `device` is the one the script itself says it used.
 
         The probe before the run is a prediction; this is the observation.
         They differ whenever the script took its own fallback -- an unanswered
@@ -2091,15 +2213,18 @@ class HuggingFaceBackend:
         around and needed this purpose-built report to get the same fact.
         """
         try:
-            device = json.loads(report.read_text(encoding="utf-8"))["device"]
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            data = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             # A script that died before writing this, an older one that never
             # wrote it, or one whose write was cut short mid-byte -- the same
             # decode failure `_read_results` below already accounts for. Not
             # an error: the prediction stands and says so.
             logger.warning("generation script wrote no usable run report: %s", exc)
             return None
-        return device if isinstance(device, str) else None
+        if not isinstance(data, dict):
+            logger.warning("generation script's run report is not a JSON object")
+            return None
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -2243,10 +2368,11 @@ def device_mismatch(a: MeasurementPoint, b: MeasurementPoint) -> str | None:
     the decision rather than an oversight. The candidate runs on the litert-lm
     backend `verify --backend` names, `cpu` by default, and the reference
     resolves its own device, so on a machine where the reference resolves to
-    cuda the two sides differ
-    in hardware as well as in conversion, and the "cost of conversion" carries
-    both. Refusing that comparison would leave a GPU box unable to verify at
-    all, which is worse than a number that says what else is in it.
+    cuda or mps the two sides differ in hardware as well as in conversion, and
+    the "cost of conversion" carries both. Refusing that comparison would make
+    a GPU box or a Mac move its reference to the CPU before it could verify at
+    all; `LITETUNE_DEVICE=cpu` does that for an operator who wants it, and a
+    number that says what else is in it is the default.
 
     Read from `engine["backend"]`, which each backend fills with the device it
     read back or the flag it passed -- `BACKEND_OBSERVED` says which, and

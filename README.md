@@ -39,19 +39,63 @@ each example was right, so it does not know or care which task you brought.
 `litetune env` shows the environments the stages cached, and `--clean` removes
 them.
 
-`tune` and `verify`'s float reference resolve the device once per run and use
-CUDA if `torch.cuda.is_available()` reports one, CPU otherwise; `convert`
+`tune` and `verify`'s float reference resolve the device once per run, by
+asking the stage environment's own torch, in this order: CUDA if
+`torch.cuda.is_available()`, then Apple's GPU through Metal (`mps`) if
+`torch.backends.mps.is_available()`, then the CPU. When a Mac lands on the CPU
+the report carries what torch answered for `is_built()` and `is_available()`
+and names no cause beyond them, since `is_available()` gives none. Every run
+records the operating system, its version — macOS's product version on a Mac,
+`platform.release()` elsewhere, which on Linux is the kernel's — the machine
+and, on macOS only, the chip. `convert`
 always runs on CPU, deliberately — export is a pure format conversion, and
 pinning it keeps the measured export time reproducible on a runner with no
-GPU at all. There is no `--device` flag; to force CPU on `tune` or `verify`
-regardless of what the box has, set `CUDA_VISIBLE_DEVICES=""` in the shell
-you launch it from — the stage subprocess inherits the environment. The
-converted model's backend is chosen separately, by `verify --backend`
-(`cpu` unless you say `gpu`); whether litert-lm's GPU backend also honours
-that variable has not been measured. CPU alone
-is workable at 270M and the first thing you will want to change above about
-1B. Bring your own checkpoint and skip the first two steps, or bring a
-`.litertlm` and its float checkpoint and run only `verify`.
+GPU at all. There is no `--device` flag; set `LITETUNE_DEVICE=cpu` in the shell
+you launch from to put `tune` and the reference on the CPU whatever the
+machine has. Unset, or `auto`, is the order above; any other value is refused
+before anything runs, and when the device came from the variable the report
+says so among its limitations, beside what the probe found. The converted model's backend is chosen separately, by `verify
+--backend` (`cpu` unless you say `gpu`), and `LITETUNE_DEVICE` does not reach
+it. CPU alone is workable at 270M and the first thing you will want to change
+above about 1B.
+
+Before a training or reference run starts on `mps`, litetune sets torch's MPS
+allocator limits from the memory the Mac has available at that moment. The
+budget is the smaller of Metal's recommended working set
+(`torch.mps.recommended_max_memory()`) and the available memory less 3 GiB,
+where available is the free and the pageable external page counts
+(`vm.page_free_count`, `vm.page_pageable_external_count`) times `hw.pagesize`
+— litetune's own conservative measure, built from two of the counters XNU's
+jetsam path sums (`VM_CHECK_MEMORYSTATUS` in osfmk/vm/vm_page.h), not a figure
+macOS reports; it counts neither other apps' memory nor pages that would have
+to go to swap; `PYTORCH_MPS_HIGH_WATERMARK_RATIO` is the budget over the
+working set, `PYTORCH_MPS_LOW_WATERMARK_RATIO` is 0.8 of that, and
+`PYTORCH_ENABLE_MPS_FALLBACK=0` — torch's own default, written out — makes
+an operation MPS does not implement raise instead of running on the CPU. A
+value you set for any of the three is kept and recorded as yours, after a
+check: the ratios must be plain decimals from 0 to 2.0, the low one no higher
+than the high one, and the fallback a plain integer; anything else is refused
+before the run starts. A high ratio you set is the limit, so the 1 GiB floor
+below does not apply to it; the report records litetune's computed budget
+beside the limit in force, and says so when your `0.0` removed the limit or
+your non-zero fallback let operations run on the CPU. A budget litetune
+computes under 1 GiB is refused rather than started, and so is a Mac whose
+`kern.memorystatus_vm_pressure_level` is not 1 (normal): quit what is holding
+memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in float32
+unless you pass `--dtype`, pads each batch to a multiple of 32 tokens (never
+past `--max-seq-length`), and defaults to one example per forward pass while
+accumulating the gradients for the `--batch-size` optimiser batch. CPU and
+CUDA keep the previous default of one forward per optimiser batch. Pass
+`--micro-batch-size` to choose another split on any device; it cannot exceed
+`--batch-size`. The report records both sizes and the number of accumulation
+steps. litetune also records the largest MPS memory counters it sampled. An
+MPS out-of-memory error is reported as the machine's, not the recipe's, and so
+are an operation MPS does not implement, bfloat16 refused before macOS 14 and
+a watermark ratio torch rejected — each with `LITETUNE_DEVICE=cpu` as the way
+forward. Nothing in this repository has been measured on MPS yet — no speed,
+no score, no comparison with the same run on CUDA or the CPU. Bring your own
+checkpoint and skip the first two steps, or bring a `.litertlm` and its float
+checkpoint and run only `verify`.
 
 > **Alpha.** Measured end to end on six models: `google/functiongemma-270m-it`
 > with the tool-call scorer, and `google/gemma-3-270m-it`,
@@ -328,7 +372,8 @@ refusals and what those numbers do not establish.
 |---|---|
 | `--prompt-mode` | Optional, never defaulted. `prerendered` means the prompt already carries its control tokens — your app renders the tool declarations into it — and the runtime must not template it again; `runtime_rendered` means the prompt is bare text and the runtime applies the model's chat template. Without the flag `tune` reads the mode off the training prompts (control tokens in at least 90% of them: `prerendered`; in at most 10%: `runtime_rendered`) and refuses a split in between. A declared mode the prompts contradict is refused unless you add `--force-prompt-mode`. `tune` records the mode beside the checkpoint; `verify` reads it through `--reference` and `bundle` through `--train-metrics`, and each refuses a different value — the wrong mode produces a fluent wrong answer, not an error. |
 | `--adapter` | For a LoRA run, pass `<tune output>/adapter`, from outside `--output-dir`. Without it the bundle carries only the merged weights. |
-| `--dtype` | Training precision for `tune`. Default `bfloat16`. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records the banking77 runs' dtype — bfloat16, trained on a GPU where this flag's reason does not apply — and says nothing about the headline table's, so the report records yours. |
+| `--dtype` | Training precision for `tune`. Default `bfloat16`, except on `mps`, where it is `float32`, the dtype the float reference loads at — neither dtype has been measured on MPS; pass `--dtype bfloat16` to train in it there. The report's `request` records what you passed (`dtype_declared`), what the run trained in (`dtype`) and why (`dtype_source`); a run that stopped before its device was known, or was refused on `mps`, records `dtype: null` and an `undecided` source. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records the banking77 runs' dtype — bfloat16, trained on a GPU where this flag's reason does not apply — and says nothing about the headline table's, so the report records yours. |
+| `--micro-batch-size` | Examples in one training forward. `--batch-size` remains the optimiser batch: losses are weighted by their number of supervised tokens, gradients accumulate across its microbatches, and the optimiser still steps once per effective batch. The default is 1 on MPS to bound unified-memory use and the full `--batch-size` on CPU and CUDA, preserving their previous path. |
 | `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused: they resolve to different weights on different days while the bundle reads identically. |
 | `--scorer` | What counts as correct, on `verify`. `tool-call` (default) or `exact-text`. It has to match the shape of your targets; nothing else in the pipeline changes. The manifest records which one ran, because two manifests scored differently are not comparable. |
 | `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. It applies to prompts your application renders. When the runtime renders the declarations, litetune settles the order itself — see [Tool calling through the runtime](#tool-calling-through-the-runtime). See [MEASUREMENTS.md](MEASUREMENTS.md). |
@@ -556,9 +601,27 @@ copies the file back and records in `metrics.json` whether it managed to.
 
 **`metrics.json` records which device trained the checkpoint.** `tune`
 resolves the device once, before training starts, and writes it to `device` as
-`"cuda"` or `"cpu"` — the field is absent only in a `metrics.json` written by a
-version of litetune that predates it, never a guessed value. It is the durable
-answer to where a given checkpoint was trained.
+`"cuda"`, `"mps"` or `"cpu"` — the field is absent only in a `metrics.json`
+written by a version of litetune that predates it, never a guessed value. It is
+the durable answer to where a given checkpoint was trained. Beside it,
+`device_probe` says who chose the device (the probe, or `LITETUNE_DEVICE`) and
+what torch reported, `host` names the operating system, its version, the
+machine and, on macOS, the chip, `dtype_source` says whether the dtype was
+declared or the default for that device. `batch_size`, `micro_batch_size`,
+`micro_batch_size_source` and `gradient_accumulation_steps` record the
+effective optimiser batch and how its forwards were split. `mps_environment`
+holds the three MPS variables as the training script read them. `mps_memory`,
+`pad_to_multiple_of` and `mps_memory_sampled_max` are null off `mps`. On `mps`,
+`mps_memory` records who set the limit, litetune's computed budget beside the
+limits in force, the recommended working set, both watermark ratios and who
+set them, the memory reading and swap use at the start;
+`mps_memory_sampled_max` is the largest of torch's
+`current_allocated_memory()` and `driver_allocated_memory()` over samples taken
+after each forward pass, backward pass and optimiser step — the largest value
+at those points, not a peak — and a script that did not see the variables
+litetune sent is a limitation. The reference side records the same probe,
+host and memory policy in the verify manifest's reference engine, with the
+counters sampled after each generate call.
 
 **Minimum `transformers` per family.** Gemma 4 and Qwen3.5 fail at tokenizer
 load on every 4.x release, and Gemma 4 needs 5.5.0 for `AutoConfig` to recognise
@@ -771,15 +834,16 @@ withdrawn after re-measurement.
   B and C scored 0.9016 and 0.8969, both just outside that interval). So the
   reference number predicted the phone to within about 0.03. One device, one
   recipe, and not re-measured since the runtime moved to 0.17.1.
-- **On a GPU box, the reference and the candidate can run on different
-  hardware, and it is recorded rather than refused.** The candidate runs on
-  the `litert-lm` backend `--backend` names, `cpu` by default, and the
-  reference resolves its own device; where the reference lands on `cuda`, the two sides differ
-  in hardware as well as in conversion. `harness.device_mismatch` in the
-  manifest names both devices and both engines, and the same text is carried
-  into the run's limitations, so the conversion-cost number does not silently
-  carry a hardware difference too. Refusing the comparison instead would
-  leave such a machine unable to verify at all.
+- **On a GPU box or a Mac on `mps`, the reference and the candidate can run
+  on different hardware, and it is recorded rather than refused.** The
+  candidate runs on the `litert-lm` backend `--backend` names, `cpu` by
+  default, and the reference resolves its own device; where the reference
+  lands on `cuda` or `mps`, the two sides differ in hardware as well as in
+  conversion. `harness.device_mismatch` in the manifest names both devices and
+  both engines, and the same text is carried into the run's limitations, so
+  the conversion-cost number does not silently carry a hardware difference
+  too. To put the reference on the CPU beside a CPU candidate, set
+  `LITETUNE_DEVICE=cpu`.
 - **The GPU number is 20 rows.** Same device, same bundle, GPU backend: 20/20
   tool names and 15/20 exact (CPU: 20/20, 14/20) at 1.8× the CPU speed — with
   `prefer_activation_type = fp32` in the bundle. Without it the GPU text

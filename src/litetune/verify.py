@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -40,6 +41,7 @@ from typing import Any
 from litetune import envs, metrics, models
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
+from litetune.devices import DEVICE_VARIABLE, DeviceSettingError, device_setting
 from litetune.evaluate import (
     GREEDY,
     UNKNOWN_BACKEND,
@@ -701,6 +703,7 @@ def build_backends(request: VerifyRequest, declarations: list | None = None) -> 
 
 SCORER_CHECK = "the scorer reads what the candidate returns"
 CONTRACT_CHECK = "prompt-rendering mode is known"
+DEVICE_CHECK = "reference device setting"
 DECLARATIONS_CHECK = "declarations match the checkpoint's record"
 
 INFERRED_PROMPT_MODE = (
@@ -977,6 +980,24 @@ def run_verify(
     envs.forget_reported_drops()
     events.stage_started("verify", model=str(request.model), reference=request.reference)
     run = _Run(request=request, events=events)
+
+    # -- did the operator ask for a device litetune knows? ---------------------
+    # First, because it costs nothing and everything after it costs minutes: a
+    # LITETUNE_DEVICE litetune does not accept would otherwise surface only
+    # once the candidate has been measured and the reference is about to start.
+    # Read as "auto" instead, it would place the reference on the accelerator
+    # it was set to avoid.
+    try:
+        device_setting(os.environ)
+    except DeviceSettingError as exc:
+        run.record(
+            Check.unchecked(
+                DEVICE_CHECK,
+                f"verification was not attempted: {exc}",
+                observed={DEVICE_VARIABLE: os.environ.get(DEVICE_VARIABLE)},
+            )
+        )
+        return run.finish(Status.FAILED_HARNESS)
 
     # -- the split ---------------------------------------------------------
     with guard("held-out data") as sink:
@@ -1372,8 +1393,19 @@ def run_verify(
                 else "so the reference run has no device on record"
             )
             run.limitation(f"{probe.detail}, {tail}")
-        elif probe.cuda_build_without_a_device:
+        elif (
+            probe.cuda_build_without_a_device
+            or probe.cpu_on_macos
+            or probe.source == DEVICE_VARIABLE
+        ):
             run.limitation(probe.detail)
+        if pair.reference.mps_refusal is not None:
+            run.limitation(pair.reference.mps_refusal)
+        if pair.reference.mps_memory is not None:
+            for text in pair.reference.mps_memory.limitations:
+                run.limitation(text)
+        if pair.reference.mps_environment_mismatch is not None:
+            run.limitation(pair.reference.mps_environment_mismatch)
     # Same vocabulary, opposite baseline: `generate` on the transformers side
     # halts at the first eos, so a generation that stopped on its own carries
     # at least one terminator -- but not every generation is guaranteed to
