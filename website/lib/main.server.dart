@@ -19,10 +19,10 @@ import 'main.server.options.dart';
 
 const String _description =
     'litetune fine-tunes a small language model, converts it into a .litertlm '
-    'file that runs on a phone through LiteRT-LM, and measures what the '
-    'conversion cost on your own task before you ship it.';
+    'file for LiteRT-LM, and compares the converted model with its float '
+    'reference on held-out data before you ship it.';
 
-const String _title = 'litetune — fine-tune, convert, and check what it cost';
+const String _title = 'litetune — fine-tune, convert, and check the result';
 
 const String _changelogDescription =
     'Every litetune release, newest first. A release that makes an earlier '
@@ -31,8 +31,8 @@ const String _changelogDescription =
 const String _changelogTitle = 'Changelog — litetune';
 
 const String _measurementsDescription =
-    'Every number litetune has measured, with the interval, the sample size '
-    'and the refusals beside it -- and what each run does not establish.';
+    'Published model-quality and runtime measurements, with intervals, sample '
+    'sizes, refusals and the limits of what each run establishes.';
 
 const String _measurementsTitle = 'Measurements — litetune';
 

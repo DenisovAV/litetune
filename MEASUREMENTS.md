@@ -455,7 +455,7 @@ Mac's CPU and says nothing about this one.
 
 Four, paraphrased:
 
-- Measured on litert-lm's CPU backend. The wording these manifests carry is the
+- The candidate ran on litert-lm's CPU backend. The wording these manifests carry is the
   corrected one: litert-lm's GPU backend is a different executor and this number
   does not predict it, pointing at README's limitations section rather than
   quoting figures. The earlier wording, which this run predates, said published
@@ -679,7 +679,7 @@ the recipe's export timeout had less left), and the original was kept. That
 ceiling is documented as a bound on a stalled tool rather than a budget,
 chosen when a real repack of a 455 MB bundle finished in seconds; a 5 GB
 bundle is the case it was not sized against. That does not
-touch the number above, which was measured on CPU, but the bundle as shipped
+touch the number above, whose candidate ran on CPU, but the bundle as shipped
 is not the one to hand a GPU.
 
 ### Gemma 4 E2B on litert-lm 0.17.1
@@ -802,7 +802,7 @@ the base step: the guard ahead of it stopped the container and recorded
 earlier run met the same thing from the other side: a five-prompt `verify`
 given 900 seconds that did not finish. So training gain is unattributed here
 too. One run.
-Conversions measured on CPU in this run. The same artifacts were later run on a
+The converted candidates ran on CPU in this run. The same artifacts were later run on a
 phone, on both its CPU and its GPU — see *What four bits cost*. No NPU figure
 for this family.
 
@@ -811,7 +811,7 @@ for this family.
 Four on `dynamic_wi8_afp32`, three on `weight_only_wi8_afp32`: the last is
 absent there because that cost resolves on 0.16.1.
 
-- Measured on litert-lm's CPU backend; its GPU backend is a different executor
+- The candidate ran on litert-lm's CPU backend; its GPU backend is a different executor
   and this number does not predict it.
 - The candidate ran on CPU and the reference on CUDA, so the difference carries
   a hardware difference as well as a conversion one. Reported rather than

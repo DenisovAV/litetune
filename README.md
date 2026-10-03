@@ -1,7 +1,7 @@
 # litetune
 
-**Fine-tune a small model, convert it to run on a phone, and know what the
-conversion cost you.**
+**Fine-tune a small model, convert it for LiteRT-LM on native devices, and
+compare the result with the model it came from.**
 
 Getting from a Hugging Face checkpoint to a model that works inside your app is
 a long road — LoRA, merge, export to `.litertlm`, bundle metadata — and a
@@ -30,10 +30,10 @@ is one right string. Everything after scoring — the paired comparison, the
 intervals, whether a difference resolves, the exit code — reads only whether
 each example was right, so it does not know or care which task you brought.
 
-- **prepare** — split the data, and reject rows that cannot be scored
+- **prepare** — validate the data and make a reproducible train/held-out split
 - **tune** — LoRA or full fine-tuning, with the wiring the export needs
 - **convert** — checkpoint to `.litertlm`, across quantization recipes
-- **verify** — measure what the conversion cost, before you ship
+- **verify** — compare the converted model with its float reference before you ship
 - **bundle** — package the artifact with what was measured about it
 
 `litetune env` shows the environments the stages cached, and `--clean` removes
@@ -47,10 +47,10 @@ the report carries what torch answered for `is_built()` and `is_available()`
 and names no cause beyond them, since `is_available()` gives none. Every run
 records the operating system, its version — macOS's product version on a Mac,
 `platform.release()` elsewhere, which on Linux is the kernel's — the machine
-and, on macOS only, the chip. `convert`
-always runs on CPU, deliberately — export is a pure format conversion, and
-pinning it keeps the measured export time reproducible on a runner with no
-GPU at all. There is no `--device` flag; set `LITETUNE_DEVICE=cpu` in the shell
+and, on macOS only, the chip. `convert` currently uses litert-torch's CPU
+export path; the upstream command exposes no host-device flag, and litetune
+hides CUDA and HIP devices so that path also works on a runner with no GPU.
+Set `LITETUNE_DEVICE=cpu` in the shell
 you launch from to put `tune` and the reference on the CPU whatever the
 machine has. Unset, or `auto`, is the order above; any other value is refused
 before anything runs, and when the device came from the variable the report
@@ -103,7 +103,8 @@ its float checkpoint and run only `verify`.
 > with the tool-call scorer, and `google/gemma-3-270m-it`,
 > `google/gemma-3-1b-it`, `Qwen/Qwen3-0.6B`, `Qwen/Qwen2.5-0.5B-Instruct` and
 > `google/gemma-4-E2B-it` with `exact-text` on the same 77-way intent task —
-> every conversion scored on CPU, two of them also on a phone's CPU and GPU,
+> every headline candidate evaluated on LiteRT-LM's CPU backend, and two Qwen3
+> artifacts also evaluated on a phone's CPU and GPU,
 > all in [MEASUREMENTS.md](MEASUREMENTS.md).
 > Qwen3.5 exports and needs no flags from litetune, only a `transformers`
 > floor, and has no quality number. Gemma 4 exports once you name the variant
@@ -267,8 +268,8 @@ a tool call whose declarations the runtime renders, below in
 tells the two apart by the control tokens in the prompts, and refuses a file
 that mixes them unless you declare which one it is.
 
-`prepare` splits one raw file into `train.jsonl` and `heldout.jsonl` and rejects
-what it cannot score: malformed JSON, and rows with no `prompt`. Given
+`prepare` splits one raw file into `train.jsonl` and `heldout.jsonl`; it refuses
+malformed JSON and rows with no `prompt`. Given
 `--tokenizer` it also reports the token-length distribution, so a row too long
 for the sequence limit fails before you rent a GPU rather than after.
 
@@ -286,13 +287,13 @@ Five commands, in order. Each is separate because each fails differently, and a
 single `run` would hide which one you are in.
 
 ```bash
-# 1. Split, and reject rows that cannot be scored. Seconds.
+# 1. Validate and split the data. Seconds.
 #    Without --tokenizer it cannot measure token lengths, so it splits the file
 #    and exits 4 — "could not check" — rather than implying the rows all fit.
 litetune prepare --data raw.jsonl --output-dir data --context-length 1024 \
                  --tokenizer google/functiongemma-270m-it
 
-# 2. Fine-tune. Runs on CUDA if the box has one, otherwise CPU. Declare the
+# 2. Fine-tune. Chooses CUDA, then MPS on a Mac, then CPU. Declare the
 #    prompt mode rather than leave it to be read off the prompts: these carry
 #    FunctionGemma's control tokens, so prerendered. It is recorded beside the
 #    checkpoint, where steps 4 and 5 take it from. On a CPU add --dtype float32:
@@ -304,7 +305,7 @@ litetune tune --model google/functiongemma-270m-it --data data/train.jsonl \
 litetune convert --model tuned/model --output-dir artifacts \
                  --recipe dynamic_wi8_afp32 --recipe weight_only_wi8_afp32
 
-# 4. Measure what the conversion cost, against the float twin.
+# 4. Compare the converted model with its float twin.
 #    `convert` names the artifact; look the filename up rather than build it.
 #    The prompt mode is read from the record step 2 left beside tuned/model,
 #    and a --prompt-mode that disagrees with it is refused.
