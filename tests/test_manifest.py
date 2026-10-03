@@ -173,14 +173,14 @@ def test_a_stage_that_did_not_run_has_no_workspace_and_says_so():
 def test_the_manifest_is_json_and_round_trips(tmp_path):
     manifest = RunManifest(run_id="r1", spec_hash="abc", environments={"export": "id-1"})
     manifest.add(record("train", RunStatus.PASSED, metrics={"loss": 0.31}))
-    manifest.limitation("measured on CPU; users run on a phone")
+    manifest.limitation("the candidate ran on CPU; users run it on a phone")
     storage = LocalStorage(tmp_path)
     key = manifest.write(storage)
     reloaded = json.loads(storage.read_text(key))
     assert key == "runs/r1/manifest.json"
     assert reloaded["status"] == "passed"
     assert reloaded["stages"][0]["metrics"] == {"loss": 0.31}
-    assert reloaded["limitations"] == ["measured on CPU; users run on a phone"]
+    assert reloaded["limitations"] == ["the candidate ran on CPU; users run it on a phone"]
 
 
 def test_an_unavailable_field_survives_serialisation():

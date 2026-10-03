@@ -44,19 +44,12 @@ typedef MeasuredRun = ({
 /// across. What is worth saying about a single run is worth a sentence in
 /// `MEASUREMENTS.md`, which the link below the cards goes to.
 ///
-/// The note under the cards says "at eight bits" because four bits did not
-/// come out small: `MEASUREMENTS.md`'s "What four bits cost" has Gemma 3 270M
-/// at +0.3483 and +0.3200 under the two block-wise recipes, both resolved.
-/// Without the qualifier the note would say the opposite of that table. It
-/// says "on CPU" because the same file records the Qwen3 bundles on a
-/// phone as well, where the backend changes the answer: the GPU costs
-/// +0.0483 on the 8-bit bundle where the phone's CPU costs +0.0167. And it
-/// says what the cost does *not* follow from rather than what it does: the
-/// same four-bit recipes cost the 1B 8.83 points against the 270M's 34.83 --
-/// one Gemma 3 rule, two answers -- and the four costs do not order by
-/// parameter count either: 3.50 on Qwen3-0.6B, 7.67 on Qwen2.5-0.5B, 8.83 on
-/// the 1B, 34.83 on the 270M. What does determine it is not something these
-/// runs separate, which is the whole reason a card carries no verdict.
+/// The note under the cards keeps the two execution sides separate: every
+/// headline candidate ran on LiteRT-LM's CPU backend, while some float
+/// references ran on CUDA. Four-bit results cover four models rather than all
+/// six. The separate Qwen3 phone run is named because its CPU and GPU results
+/// resolve in opposite directions between the eight-bit and mixed four-bit
+/// recipes; a blanket "four bits cost more" would therefore be false.
 ///
 /// The size is in the card name because `models.py` scopes the `gemma-3-text`
 /// family to the 270M and the 1B, and both are now measured -- two cards that
@@ -96,6 +89,14 @@ typedef MeasuredRun = ({
 class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
+  static const measurementSummary =
+      'Across the six headline runs, every converted candidate ran on '
+      "LiteRT-LM's CPU backend; some float references ran on CUDA. The "
+      'eight-bit gap was small on all six and often unresolved. Four models '
+      'also have blockwise four-bit results with the candidates on LiteRT-LM\'s '
+      'CPU backend, where the gap was larger. A separate Qwen3 phone run shows '
+      'that the backend can change the answer. ';
+
   @override
   Component build(BuildContext context) {
     return section(classes: 'row', [
@@ -121,12 +122,7 @@ class WhyItExists extends StatelessComponent {
               for (final model in measured) _card(model),
             ]),
             p(classes: 'measured-note', [
-              Component.text(
-                'Measured on CPU, the conversion cost came out small at eight bits '
-                'on all six, and at these sample sizes it often does not resolve '
-                'at all. Four bits cost more, and how much more does not follow '
-                'from the family or the parameter count. ',
-              ),
+              Component.text(measurementSummary),
               a(href: '/measurements', [
                 Component.text('The numbers, and what they do not establish'),
               ]),
@@ -158,9 +154,9 @@ class WhyItExists extends StatelessComponent {
       how: 'exact-text scoring, 600 held-out rows',
       what:
           '270M parameters, text only — the smallest checkpoint '
-          'measured here. It still learns a task from a few thousand '
-          'examples, which makes it the one to try first when the job '
-          'is classification or routing rather than conversation.',
+          'measured here. In the banking77 run it was fine-tuned on 2,400 '
+          'examples and evaluated as a 77-way intent classifier, rather than '
+          'as a conversational model.',
       hubId: 'google/gemma-3-270m-it',
       revision: 'ac82b4e8',
       anchor: 'a-second-family-and-the-second-scorer',
@@ -169,10 +165,10 @@ class WhyItExists extends StatelessComponent {
       name: 'Gemma 3 1B',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
-          '1B parameters, text only. Four times the 270M and covered by '
-          'the same export rule, so it is the size to move to when the '
-          'smaller one stops holding the task: same pipeline, same '
-          'flags, more room.',
+          '1B parameters, text only. It was measured on the same banking77 '
+          'split and through the same export rule as the 270M, providing a '
+          'second size in one family without assuming that size predicts the '
+          'conversion cost.',
       hubId: 'google/gemma-3-1b-it',
       revision: 'dcc83ea8',
       anchor: 'the-same-family-four-times-the-size',
@@ -190,7 +186,7 @@ class WhyItExists extends StatelessComponent {
       anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
     ),
     (
-      name: 'Qwen2.5 0.5B',
+      name: 'Qwen2.5 0.5B Instruct',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
           '0.5B parameters, text only. It is the one checkpoint here on '

@@ -1,4 +1,4 @@
-"""Fine-tune a small model, convert it to run on a phone, and know what the conversion cost you.
+"""Fine-tune a small model, convert it for LiteRT-LM, and compare it with its source model.
 
 Deliberately thin. Re-exporting the stage modules would pull `yaml`, the job
 spec and the whole graph into `import litetune`, and the fast import is worth

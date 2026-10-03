@@ -6,12 +6,12 @@ import '../../theme/brand.dart';
 /// What comes out of the pipeline, and what it is compatible with.
 ///
 /// Three rows carry a qualifier in muted text rather than a claim: the
-/// platforms row says web is a text-only preview, the acceleration row says
-/// which stages the measurement runs on CPU for, and the models row says what
-/// has been measured end to end, which is less than what exports. The last
-/// two are in the README's limitations section and the first is in its
-/// opening; a compatibility table that quietly drops any of them would be the
-/// exact failure the tool was built to catch.
+/// platforms row says web is a text-only preview, the acceleration row keeps
+/// LiteRT-LM's runtime capabilities separate from the backends litetune can
+/// measure, and the models row says what has been measured end to end, which
+/// is less than what exports. The last two are in the README's limitations
+/// section and the first is in its opening; a compatibility table that quietly
+/// drops any of them would be the exact failure the tool was built to catch.
 ///
 /// The models row is cut to what was actually run, where cutting is what it
 /// takes. The
@@ -45,29 +45,27 @@ import '../../theme/brand.dart';
 /// models built on other architectures, match no rule and export under the
 /// unknown-family note.
 ///
-/// The acceleration row names NPU because the runtime has one — Snapdragon on
-/// Android, Intel on Windows — while the qualifier keeps litetune's own claim
-/// narrow: training and the float reference use CUDA or Apple's GPU through
-/// Metal (MPS) when the host has one, while conversion stays on CPU. An MPS
-/// run is budgeted from memory available at its start and is refused under
-/// system memory pressure. Every result records which backend actually
-/// produced it. Naming a capability of the runtime and claiming a measurement
-/// of it are different sentences; only the second would be unsupported.
-///
-/// That row stays by decision, and this paragraph is here so it is not
-/// re-opened as an oversight — it has been raised three times. Since it was
-/// written both NPUs were measured, and neither reads as well as the row
-/// sounds: `convert` compiles for no NPU at all, a Snapdragon bundle has to be
-/// built by hand and scores worse there than on the CPU, and an Intel one
-/// keeps only the first prefill chunk. The row names what the runtime does and
-/// what `convert` is meant to reach; the README's limitations carry the
-/// distance between that and today, and they are the page to correct first
-/// when any of it changes. The line to hold: this row may run ahead of
-/// `convert` by the compile step, and by nothing else. If a reader could take
-/// it as a measurement of the bundle litetune hands them, it has crossed that
-/// line and should be cut.
+/// The acceleration row names NPU only as a platform-specific LiteRT-LM
+/// capability. litetune does not compile or verify an NPU bundle: the
+/// Snapdragon artifact in MEASUREMENTS.md was built by hand, and the Intel
+/// run has a multi-chunk limitation. Keeping those facts out of the runtime
+/// sentence stops a reader taking it as a promise about the bundle `convert`
+/// hands them.
 class Formats extends StatelessComponent {
   const Formats({super.key});
+
+  static const acceleration =
+      'LiteRT-LM runs compatible bundles on CPU and GPU, with '
+      'platform-specific NPU support';
+
+  static const accelerationQualifier =
+      ' — litetune can use CUDA or Apple GPU (MPS) for training and the float '
+      'reference. Conversion currently uses the CPU export path; verify '
+      'measures the converted model on CPU or GPU';
+
+  static const measuredQualifier =
+      ' — measured end to end on FunctionGemma, Gemma 3 270M, Gemma 3 1B, '
+      'Qwen3 0.6B, Qwen2.5 0.5B Instruct and Gemma 4 E2B so far';
 
   @override
   Component build(BuildContext context) {
@@ -88,31 +86,15 @@ class Formats extends StatelessComponent {
           ]),
         ]),
         _row('Acceleration', [
-          Component.text(
-            'CPU everywhere; GPU through OpenCL, Metal, Vulkan or DirectX 12; '
-            'NPU on Snapdragon and Intel',
-          ),
-          span(classes: 'qualifier', [
-            Component.text(
-              ' — training and the float reference use CUDA or Apple GPU '
-              'through Metal (MPS) when available; on MPS litetune budgets '
-              'from available memory and refuses to start under system memory '
-              'pressure. Conversion stays on CPU, and every result records '
-              'which backend produced it or records it as unknown',
-            ),
-          ]),
+          Component.text(acceleration),
+          span(classes: 'qualifier', [Component.text(accelerationQualifier)]),
         ]),
         _row('Models', [
           Component.text(
             'Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3 0.6B, '
             'Qwen2.5 0.5B Instruct, Qwen3.5, FunctionGemma',
           ),
-          span(classes: 'qualifier', [
-            Component.text(
-              ' — measured end to end on FunctionGemma, Gemma 3 270M, '
-              'Gemma 3 1B, Qwen3 0.6B and Qwen2.5 0.5B so far',
-            ),
-          ]),
+          span(classes: 'qualifier', [Component.text(measuredQualifier)]),
         ]),
       ]),
     ]);

@@ -12,6 +12,10 @@ import '../../theme/brand.dart';
 class WhereToRun extends StatelessComponent {
   const WhereToRun({super.key});
 
+  static const galleryNote =
+      "Google's Android, iOS and macOS app for running local models on the "
+      'device. Import the file to try it without writing an app first.';
+
   @override
   Component build(BuildContext context) {
     return section(classes: 'row', [
@@ -28,9 +32,7 @@ class WhereToRun extends StatelessComponent {
         _card(
           href: 'https://github.com/google-ai-edge/gallery',
           name: 'Google AI Edge Gallery',
-          note:
-              "Google's Android app for running local models on the device. "
-              'Side-load the file to try it without writing an app first.',
+          note: galleryNote,
         ),
       ]),
     ]);

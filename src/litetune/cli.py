@@ -181,8 +181,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="litetune",
         description=(
-            "Fine-tune a small model, convert it to run on a phone, and know what the "
-            "conversion cost you."
+            "Fine-tune a small model, convert it for LiteRT-LM on native devices, and "
+            "compare it with the model it came from."
         ),
     )
     # A real `--version`, because argparse's prefix matching gave it away.

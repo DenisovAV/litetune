@@ -27,16 +27,20 @@ import 'runtimes.dart';
 class Hero extends StatelessComponent {
   const Hero({super.key});
 
+  static const description =
+      'litetune fine-tunes a small language model, converts it into a file '
+      'that runs through LiteRT-LM on supported native devices — phone, '
+      'desktop, embedded board, robot — and checks that the converted model '
+      'still does the job.';
+
+  static const compatibility =
+      'Apache-2.0 · Python 3.10–3.12 · full pipeline on Linux x86_64 and '
+      'Apple Silicon macOS · Windows except convert · alpha';
+
   @override
   Component build(BuildContext context) {
     return section(classes: 'hero', [
-      h1(classes: 'hero-h1', [
-        Component.text(
-          'litetune fine-tunes a small language model, converts it into a file '
-          'that runs wherever your app does — phone, desktop, embedded board, '
-          'robot — and checks that the converted model still does the job.',
-        ),
-      ]),
+      h1(classes: 'hero-h1', [Component.text(description)]),
       const RuntimesStrip(),
       div(classes: 'hero-install-row', [
         div(classes: 'install', [
@@ -52,11 +56,7 @@ class Hero extends StatelessComponent {
           ]),
         ]),
       ]),
-      p(classes: 'hero-meta', [
-        Component.text(
-          'Apache-2.0 · Python 3.10–3.12 · macOS and Linux · alpha',
-        ),
-      ]),
+      p(classes: 'hero-meta', [Component.text(compatibility)]),
     ]);
   }
 

@@ -12,20 +12,23 @@ import '../../theme/brand.dart';
 class WhatItDoes extends StatelessComponent {
   const WhatItDoes({super.key});
 
+  static const prepareDescription =
+      'validates your data and makes a reproducible train/held-out split';
+
+  static const convertDescription =
+      'turns the result into a file LiteRT-LM can load';
+
   @override
   Component build(BuildContext context) {
     return section(classes: 'row', [
       div(classes: 'label', [Component.text('What it does')]),
       div(classes: 'defs', [
-        _step('prepare', 'splits your data and drops the rows it cannot score'),
+        _step('prepare', prepareDescription),
         _step(
           'tune',
           'fine-tunes it, with the settings the export step will need',
         ),
-        _step(
-          'convert',
-          'turns the result into the file the phone runtime loads',
-        ),
+        _step('convert', convertDescription),
         _step('verify', 'compares that file with the model it came from'),
         _step('bundle', 'packages it together with what the comparison found'),
       ]),

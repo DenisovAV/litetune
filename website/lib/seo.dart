@@ -7,6 +7,10 @@ import 'package:jaspr/jaspr.dart';
 /// hosting-provider URL, so indexing settles on the custom domain.
 const String kSiteOrigin = 'https://litetune.dev';
 
+/// Platforms on which at least one litetune stage is supported. The landing
+/// page separately names where the complete five-stage pipeline runs.
+const String kOperatingSystems = 'macOS, Linux, Windows';
+
 /// Google Fonts for the two Plex faces the page uses.
 ///
 /// Preconnect first: the stylesheet at fonts.googleapis.com immediately pulls
@@ -102,7 +106,7 @@ List<Component> seoHead({
             '@type': 'SoftwareApplication',
             'name': 'litetune',
             'applicationCategory': 'DeveloperApplication',
-            'operatingSystem': 'macOS, Linux',
+            'operatingSystem': kOperatingSystems,
             'description': applicationDescription ?? description,
             'url': kSiteOrigin,
             'license': 'https://www.apache.org/licenses/LICENSE-2.0',
