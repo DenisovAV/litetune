@@ -3,6 +3,10 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.3.0 — 2026-10-03
+- **Re-run a timed-out `verify` only if you rely on its reference-backend provenance: 0.2.1 and earlier could record `unknown` after the float-reference model had already reached a device; generated answers and scores are unaffected (#63).**
+- `tune` and `verify`'s float reference can use Apple GPUs through Metal/MPS with unified-memory safeguards; `tune --micro-batch-size` exposes gradient accumulation, and `LITETUNE_DEVICE=cpu` forces CPU execution (#63).
+
 ## 0.2.1 — 2026-09-29
 - The four-bit recipes on the four banking77 checkpoints are re-measured on litert-lm 0.17.1, beside their 0.16.1 numbers (#60).
 - The tuned Gemma 4 E2B's eight-bit pair is re-measured on litert-lm 0.17.1, beside its 0.16.1 numbers (#61).
