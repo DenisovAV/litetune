@@ -391,15 +391,15 @@ BFLOAT16_CPU_HINT = (
 ACCELERATORS = ("cuda", "mps")
 
 # What `tune` trains in on mps when `--dtype` was not given: float32, the dtype
-# the float reference loads at. Neither dtype has been measured on MPS here, in
-# speed or in what it trains, so this is not a finding that float32 is better
-# there; it is the one dtype the rest of the pipeline already uses. bfloat16
-# is the default everywhere else. An explicit `--dtype bfloat16` on mps is
-# honoured and recorded as declared.
+# the float reference loads at. Only that default has had a guarded MPS training
+# run, and neither dtype has an MPS model-quality result, so this is not a
+# finding that float32 is better there; it is the one dtype the rest of the
+# pipeline already uses. bfloat16 is the default everywhere else. An explicit
+# `--dtype bfloat16` on mps is honoured and recorded as declared.
 MPS_DEFAULT_DTYPE = "float32"
 MPS_DTYPE_SOURCE = (
-    "default for mps: float32, the dtype the float reference loads at; neither dtype has been "
-    "measured on MPS"
+    "default for mps: float32, the dtype the float reference loads at; only that default has "
+    "had a guarded MPS training run, and neither dtype has an MPS quality result"
 )
 
 # Keep `batch_size` as the optimiser batch -- and therefore keep the recipe's
@@ -2040,8 +2040,9 @@ def _dtype_limitations(result: TuneResult, dtype: DtypeDecision) -> None:
         result.limitation(
             f"this run trains in {MPS_DEFAULT_DTYPE} because it is on mps and no --dtype was "
             f"given: the dtype evaluation's float reference loads at. The default elsewhere is "
-            f"{DEFAULT_DTYPE!r}. Neither dtype has been measured on MPS here, in speed or in "
-            "what it trains. --dtype bfloat16 trains in it on mps and is recorded as declared"
+            f"{DEFAULT_DTYPE!r}. Only the float32 default has had a guarded MPS training run, "
+            "and neither dtype has an MPS model-quality result. --dtype bfloat16 trains in it "
+            "on mps and is recorded as declared"
         )
 
 
