@@ -609,15 +609,60 @@ def test_the_shared_script_source_reports_the_three_variables(monkeypatch):
 # answer integers on the macOS running the suite, which no fake can.
 
 
+def _is_sysctl_permission_denied(exc: HostReadError) -> bool:
+    detail = str(exc).lower()
+    return "operation not permitted" in detail or "permission denied" in detail
+
+
+def _host_sysctl_or_skip(key: str) -> str:
+    """Read a real key, unless this macOS sandbox denies sysctl altogether."""
+    try:
+        return real_read_sysctl(key)
+    except HostReadError as exc:
+        if _is_sysctl_permission_denied(exc):
+            pytest.skip(f"this macOS environment denies read-only sysctl: {exc}")
+        raise
+
+
+@pytest.mark.parametrize(
+    ("detail", "denied"),
+    [
+        ("sysctl exited 1: Operation not permitted", True),
+        ("sysctl exited 1: Permission denied", True),
+        ("sysctl exited 1: unknown oid", False),
+    ],
+)
+def test_only_a_permission_error_makes_the_host_sysctl_check_unavailable(detail, denied):
+    assert _is_sysctl_permission_denied(HostReadError(detail)) is denied
+
+
+def test_the_host_sysctl_check_skips_only_a_permission_denial(monkeypatch):
+    def denied(_key):
+        raise HostReadError("sysctl exited 1: Operation not permitted")
+
+    monkeypatch.setattr(sys.modules[__name__], "real_read_sysctl", denied)
+    with pytest.raises(pytest.skip.Exception, match="denies read-only sysctl"):
+        _host_sysctl_or_skip(devices.PAGE_SIZE)
+
+
+def test_the_host_sysctl_check_does_not_hide_a_missing_key(monkeypatch):
+    def missing(_key):
+        raise HostReadError("sysctl exited 1: unknown oid")
+
+    monkeypatch.setattr(sys.modules[__name__], "real_read_sysctl", missing)
+    with pytest.raises(HostReadError, match="unknown oid"):
+        _host_sysctl_or_skip(devices.PAGE_SIZE)
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="sysctl's memory keys are macOS's")
 @pytest.mark.parametrize("key", devices.MEMORY_SYSCTLS)
 def test_this_macs_sysctl_answers_every_key_the_policy_reads(key):
-    assert int(real_read_sysctl(key)) >= 0
+    assert int(_host_sysctl_or_skip(key)) >= 0
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="sysctl's memory keys are macOS's")
 def test_this_macs_memory_reads_into_a_reading():
-    reading = devices.read_memory(real_read_sysctl)
+    reading = devices.read_memory(_host_sysctl_or_skip)
     assert reading.page_size > 0
     assert reading.available_bytes >= 0
     assert reading.pressure_level in devices.PRESSURE_NAMES

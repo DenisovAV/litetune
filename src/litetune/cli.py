@@ -462,6 +462,14 @@ def _add_tune(sub) -> None:
     )
     tune.add_argument("--epochs", type=float, default=1.0)
     tune.add_argument("--batch-size", type=int, default=8)
+    tune.add_argument(
+        "--micro-batch-size",
+        type=int,
+        help=(
+            "examples per forward pass while accumulating one optimiser batch; defaults to "
+            "--batch-size on CPU/CUDA and 1 on MPS"
+        ),
+    )
     tune.add_argument("--max-seq-length", type=int, default=1024)
     tune.add_argument("--seed", type=int, default=0)
     tune.add_argument("--lora-rank", type=int, default=16)
@@ -994,6 +1002,7 @@ def _tune(args: argparse.Namespace) -> int:
         learning_rate=args.learning_rate,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        micro_batch_size=args.micro_batch_size,
         max_seq_length=args.max_seq_length,
         seed=args.seed,
         lora_rank=args.lora_rank,

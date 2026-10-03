@@ -83,14 +83,19 @@ computes under 1 GiB is refused rather than started, and so is a Mac whose
 `kern.memorystatus_vm_pressure_level` is not 1 (normal): quit what is holding
 memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in float32
 unless you pass `--dtype`, pads each batch to a multiple of 32 tokens (never
-past `--max-seq-length`), and records the largest MPS memory counters it
-sampled. An MPS out-of-memory error is reported as the machine's, not the
-recipe's, and so are an operation MPS does not implement, bfloat16 refused
-before macOS 14 and a watermark ratio torch rejected — each with
-`LITETUNE_DEVICE=cpu` as the way forward. Nothing in this repository has been
-measured on MPS yet — no speed, no score, no comparison with the same run on
-CUDA or the CPU. Bring your own checkpoint and skip the first two steps, or
-bring a `.litertlm` and its float checkpoint and run only `verify`.
+past `--max-seq-length`), and defaults to one example per forward pass while
+accumulating the gradients for the `--batch-size` optimiser batch. CPU and
+CUDA keep the previous default of one forward per optimiser batch. Pass
+`--micro-batch-size` to choose another split on any device; it cannot exceed
+`--batch-size`. The report records both sizes and the number of accumulation
+steps. litetune also records the largest MPS memory counters it sampled. An
+MPS out-of-memory error is reported as the machine's, not the recipe's, and so
+are an operation MPS does not implement, bfloat16 refused before macOS 14 and
+a watermark ratio torch rejected — each with `LITETUNE_DEVICE=cpu` as the way
+forward. Nothing in this repository has been measured on MPS yet — no speed,
+no score, no comparison with the same run on CUDA or the CPU. Bring your own
+checkpoint and skip the first two steps, or bring a `.litertlm` and its float
+checkpoint and run only `verify`.
 
 > **Alpha.** Measured end to end on six models: `google/functiongemma-270m-it`
 > with the tool-call scorer, and `google/gemma-3-270m-it`,
@@ -368,6 +373,7 @@ refusals and what those numbers do not establish.
 | `--prompt-mode` | Optional, never defaulted. `prerendered` means the prompt already carries its control tokens — your app renders the tool declarations into it — and the runtime must not template it again; `runtime_rendered` means the prompt is bare text and the runtime applies the model's chat template. Without the flag `tune` reads the mode off the training prompts (control tokens in at least 90% of them: `prerendered`; in at most 10%: `runtime_rendered`) and refuses a split in between. A declared mode the prompts contradict is refused unless you add `--force-prompt-mode`. `tune` records the mode beside the checkpoint; `verify` reads it through `--reference` and `bundle` through `--train-metrics`, and each refuses a different value — the wrong mode produces a fluent wrong answer, not an error. |
 | `--adapter` | For a LoRA run, pass `<tune output>/adapter`, from outside `--output-dir`. Without it the bundle carries only the merged weights. |
 | `--dtype` | Training precision for `tune`. Default `bfloat16`, except on `mps`, where it is `float32`, the dtype the float reference loads at — neither dtype has been measured on MPS; pass `--dtype bfloat16` to train in it there. The report's `request` records what you passed (`dtype_declared`), what the run trained in (`dtype`) and why (`dtype_source`); a run that stopped before its device was known, or was refused on `mps`, records `dtype: null` and an `undecided` source. On the one CPU measured, bfloat16 matmuls ran single-threaded, and `--dtype float32` trains on every core instead of one. It is not a mismatch with the rest of the pipeline — export passes no dtype at all, and the float reference always loads at float32 whatever this flag says. What it changes is comparability with a particular published run: [MEASUREMENTS.md](MEASUREMENTS.md) records the banking77 runs' dtype — bfloat16, trained on a GPU where this flag's reason does not apply — and says nothing about the headline table's, so the report records yours. |
+| `--micro-batch-size` | Examples in one training forward. `--batch-size` remains the optimiser batch: losses are weighted by their number of supervised tokens, gradients accumulate across its microbatches, and the optimiser still steps once per effective batch. The default is 1 on MPS to bound unified-memory use and the full `--batch-size` on CPU and CUDA, preserving their previous path. |
 | `--base-model-revision` | Takes a commit sha. `main` and other moving refs are refused: they resolve to different weights on different days while the bundle reads identically. |
 | `--scorer` | What counts as correct, on `verify`. `tool-call` (default) or `exact-text`. It has to match the shape of your targets; nothing else in the pipeline changes. The manifest records which one ran, because two manifests scored differently are not comparable. |
 | `--wire-convention` | Which property order your tool declarations were rendered in. Optional; unset is recorded as unknown rather than guessed. It applies to prompts your application renders. When the runtime renders the declarations, litetune settles the order itself — see [Tool calling through the runtime](#tool-calling-through-the-runtime). See [MEASUREMENTS.md](MEASUREMENTS.md). |
@@ -601,8 +607,10 @@ the durable answer to where a given checkpoint was trained. Beside it,
 `device_probe` says who chose the device (the probe, or `LITETUNE_DEVICE`) and
 what torch reported, `host` names the operating system, its version, the
 machine and, on macOS, the chip, `dtype_source` says whether the dtype was
-declared or the default for that device, and `mps_environment` holds the three
-MPS variables as the training script read them. `mps_memory`,
+declared or the default for that device. `batch_size`, `micro_batch_size`,
+`micro_batch_size_source` and `gradient_accumulation_steps` record the
+effective optimiser batch and how its forwards were split. `mps_environment`
+holds the three MPS variables as the training script read them. `mps_memory`,
 `pad_to_multiple_of` and `mps_memory_sampled_max` are null off `mps`. On `mps`,
 `mps_memory` records who set the limit, litetune's computed budget beside the
 limits in force, the recommended working set, both watermark ratios and who

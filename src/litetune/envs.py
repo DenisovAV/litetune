@@ -2076,21 +2076,23 @@ _DEVICE_PROBE_CODE = (
 )
 
 
-# The probe's own MPS watermark ratios, both 0.0: no limit, which torch 2.5.1
-# accepts for any pairing (`setHighWatermarkRatio` and `setLowWatermarkRatio`
-# in aten/src/ATen/mps/MPSAllocator.mm at v2.5.1). Asking
+# The probe's own MPS settings: both watermark ratios are 0.0 (no limit),
+# which torch 2.5.1 accepts for any pairing (`setHighWatermarkRatio` and
+# `setLowWatermarkRatio` in aten/src/ATen/mps/MPSAllocator.mm at v2.5.1), and
+# fallback is the valid default 0. Asking
 # `recommended_max_memory()` constructs the MPS allocator, and its
-# constructor reads the two variables from the environment, so a probe run in
-# the operator's environment fails wherever the operator set only a high
-# ratio under torch's default low one: measured on this project's Mac on
-# 2026-10-02, PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.5 alone raised "invalid low
-# watermark ratio 1.4" there, the probe answered nothing, and the run fell
-# back to the CPU. The probe allocates nothing, so a limit means nothing to
-# it; the operator's values are still read by `devices.prepare_mps` and
-# checked, and still reach the training and reference processes.
+# constructor reads the ratios, while MPS fallback initialization parses its
+# variable as an integer. A probe run in the operator's raw environment can
+# therefore fail before it identifies the device: a high ratio below torch's
+# default low one is invalid, and so is a malformed fallback value. The probe
+# allocates nothing and runs no unsupported operation, so neither setting has
+# work to do there. The operator's values remain in the host environment for
+# `devices.prepare_mps` to validate and for the training and reference
+# processes to receive after validation.
 _PROBE_ENV = {
     "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.0",
     "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.0",
+    "PYTORCH_ENABLE_MPS_FALLBACK": "0",
 }
 
 

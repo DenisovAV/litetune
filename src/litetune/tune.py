@@ -402,6 +402,15 @@ MPS_DTYPE_SOURCE = (
     "measured on MPS"
 )
 
+# Keep `batch_size` as the optimiser batch -- and therefore keep the recipe's
+# update count and learning-rate meaning -- but feed that batch through MPS
+# one example at a time to bound the logits and activation memory of a forward.
+# CPU and CUDA keep one forward per optimiser batch, exactly as before. A
+# caller can declare another value when it has measured the memory/speed
+# trade-off on its own device.
+MPS_DEFAULT_MICRO_BATCH_SIZE = 1
+MPS_MICRO_BATCH_SOURCE = "default for mps: one example per forward to bound unified memory"
+
 
 # What `dtype_source` says when no dtype was decided: the run stopped before
 # the device -- which the default depends on -- was known, or was refused on
@@ -439,6 +448,25 @@ def decide_dtype(declared: str | None, device: str | None) -> DtypeDecision:
     if device == "mps":
         return DtypeDecision(MPS_DEFAULT_DTYPE, MPS_DTYPE_SOURCE)
     return DtypeDecision(DEFAULT_DTYPE, "default")
+
+
+@dataclass(frozen=True)
+class MicroBatchDecision:
+    """How many examples one forward receives, and who chose that number."""
+
+    size: int
+    source: str
+
+
+def decide_micro_batch_size(
+    declared: int | None, batch_size: int, device: str | None
+) -> MicroBatchDecision:
+    """Keep the old full-batch path everywhere except an undeclared MPS run."""
+    if declared is not None:
+        return MicroBatchDecision(declared, "declared")
+    if device == "mps":
+        return MicroBatchDecision(MPS_DEFAULT_MICRO_BATCH_SIZE, MPS_MICRO_BATCH_SOURCE)
+    return MicroBatchDecision(batch_size, "default: one forward per optimiser batch")
 
 
 # Training stderr that names the accelerator rather than the method or the
@@ -562,10 +590,12 @@ def _tail(text: str, limit: int = _DETAIL_TAIL) -> str:
 # in one place: the entire finding this module exists for is that a training
 # loop can look completely healthy while computing the loss on the wrong tokens.
 #
-# The schedule is a constant learning rate with no warmup and no accumulation.
-# That is a deliberate floor rather than a tuned recipe: it applies identically
-# to both methods, so a full-against-LoRA comparison is not confounded by it,
-# and every parameter that does vary is in the config file beside this script.
+# The schedule is a constant learning rate with no warmup. `batch_size` is the
+# optimiser batch on every device; MPS may split it into smaller forwards and
+# accumulate their token-weighted losses before the one optimiser step. That
+# preserves the recipe's update count rather than solving memory pressure by
+# silently changing its batch. Every parameter that varies is in the config
+# file beside this script.
 
 _TRAIN_SCRIPT = (
     r'''
@@ -816,6 +846,27 @@ def batches(examples, size, pad_id, torch, pad_to_multiple_of=None, max_length=N
         )
 
 
+def supervised_shifted_tokens(examples):
+    """Targets transformers' causal loss averages over for these examples.
+
+    The model shifts labels left before cross-entropy, so position zero never
+    contributes even when it is not masked. Padding is added later and is
+    always IGNORE_INDEX, therefore counting the unpadded labels here gives the
+    same denominator without allocating a full device batch.
+    """
+    return sum(label != IGNORE_INDEX for _, labels in examples for label in labels[1:])
+
+
+def micro_batches(examples, size):
+    """Yield microbatches and their share of the effective batch's token loss."""
+    total = supervised_shifted_tokens(examples)
+    if total <= 0:
+        raise ValueError("an optimiser batch has no supervised shifted tokens")
+    for start in range(0, len(examples), size):
+        chunk = examples[start : start + size]
+        yield chunk, supervised_shifted_tokens(chunk) / total
+
+
 def carry_back_sentencepiece(tok, model_dir, model_id, revision):
     """Put `tokenizer.model` back beside the checkpoint. Returns what happened, as a string.
 
@@ -1000,33 +1051,51 @@ def main() -> int:
         random.shuffle(examples)
         running = 0.0
         steps = 0
-        for input_ids, attention, labels in batches(
-            examples, spec["batch_size"], pad_id, torch, pad_multiple, spec["max_seq_length"]
-        ):
+        for batch_start in range(0, len(examples), spec["batch_size"]):
             if steps >= limit:
                 break
-            # The mask is applied here and nowhere else: transformers computes a
-            # shifted cross-entropy that skips every IGNORE_INDEX position, so
-            # the prompt contributes no gradient.
-            out = model(
-                input_ids=input_ids.to(device),
-                attention_mask=attention.to(device),
-                labels=labels.to(device),
-            )
-            if mps_samples is not None:
-                sample_mps_memory(torch, mps_samples)
-            out.loss.backward()
-            if mps_samples is not None:
-                sample_mps_memory(torch, mps_samples)
+            effective_batch = examples[batch_start : batch_start + spec["batch_size"]]
+            batch_loss = 0.0
+            for micro_batch, loss_weight in micro_batches(
+                effective_batch, spec["micro_batch_size"]
+            ):
+                ((input_ids, attention, labels),) = batches(
+                    micro_batch,
+                    len(micro_batch),
+                    pad_id,
+                    torch,
+                    pad_multiple,
+                    spec["max_seq_length"],
+                )
+                # The mask is applied here and nowhere else: transformers computes a
+                # shifted cross-entropy that skips every IGNORE_INDEX position, so
+                # the prompt contributes no gradient. A split batch has to weight
+                # each mean by its share of those tokens; averaging microbatch means
+                # would give a short completion the same vote as a long one.
+                out = model(
+                    input_ids=input_ids.to(device),
+                    attention_mask=attention.to(device),
+                    labels=labels.to(device),
+                )
+                if mps_samples is not None:
+                    sample_mps_memory(torch, mps_samples)
+                batch_loss += float(out.loss.detach()) * loss_weight
+                if len(micro_batch) == len(effective_batch):
+                    # The old CPU/CUDA path: do not insert even a multiply by one
+                    # into an unchanged run.
+                    out.loss.backward()
+                else:
+                    (out.loss * loss_weight).backward()
+                if mps_samples is not None:
+                    sample_mps_memory(torch, mps_samples)
+                # Do not keep this microbatch's logits alive while the next one
+                # allocates its own -- that is the memory peak this split removes.
+                del out
             optimiser.step()
             if mps_samples is not None:
                 sample_mps_memory(torch, mps_samples)
             optimiser.zero_grad(set_to_none=True)
-            running += float(out.loss.detach())
-            # The loss has been read. Holding `out` to the next iteration would
-            # keep this step's logits alive while the next step allocates its
-            # own; dropping it changes no number.
-            del out
+            running += batch_loss
             steps += 1
         epochs.append(
             {
@@ -1092,6 +1161,14 @@ def main() -> int:
                 "base_model_revision": spec.get("revision"),
                 "method": spec["method"],
                 "learning_rate": spec["learning_rate"],
+                # `batch_size` is the optimiser batch. On MPS it is split into
+                # the recorded microbatches so the recipe keeps the same update
+                # count without putting every example's logits in unified
+                # memory at once.
+                "batch_size": spec["batch_size"],
+                "micro_batch_size": spec["micro_batch_size"],
+                "micro_batch_size_source": spec.get("micro_batch_size_source"),
+                "gradient_accumulation_steps": spec["gradient_accumulation_steps"],
                 "dtype": spec["dtype"],
                 # Whether that dtype was asked for or is the default for this
                 # device, which on mps is not the default anywhere else.
@@ -1298,6 +1375,10 @@ class TuneRequest:
     learning_rate: float | None = None
     epochs: float = 1.0
     batch_size: int = 8
+    # The optimiser batch above stays the recipe's batch. `None` preserves one
+    # forward per batch on CPU/CUDA and selects the bounded default of
+    # one example per forward on MPS; see `decide_micro_batch_size`.
+    micro_batch_size: int | None = None
     max_seq_length: int = 1024
     seed: int = 0
     lora_rank: int = 16
@@ -1358,6 +1439,14 @@ class TuneRequest:
             raise TuneError(f"epochs must be positive, got {self.epochs}")
         if self.batch_size < 1:
             raise TuneError(f"batch_size must be at least 1, got {self.batch_size}")
+        if self.micro_batch_size is not None:
+            if self.micro_batch_size < 1:
+                raise TuneError(f"micro_batch_size must be at least 1, got {self.micro_batch_size}")
+            if self.micro_batch_size > self.batch_size:
+                raise TuneError(
+                    f"micro_batch_size {self.micro_batch_size} exceeds optimiser batch_size "
+                    f"{self.batch_size}; it cannot split that batch"
+                )
         if self.max_seq_length < 1:
             raise TuneError(f"max_seq_length must be at least 1, got {self.max_seq_length}")
         object.__setattr__(self, "data", Path(self.data))
@@ -1419,6 +1508,7 @@ class TuneRequest:
         """
         mode = decision.mode if decision is not None else self.prompt_mode
         dtype = decide_dtype(self.dtype, device)
+        micro_batch = decide_micro_batch_size(self.micro_batch_size, self.batch_size, device)
         return {
             "model": self.model,
             "revision": self.revision,
@@ -1427,6 +1517,9 @@ class TuneRequest:
             "learning_rate": self.rate,
             "epochs": self.epochs,
             "batch_size": self.batch_size,
+            "micro_batch_size": micro_batch.size,
+            "micro_batch_size_source": micro_batch.source,
+            "gradient_accumulation_steps": -(-self.batch_size // micro_batch.size),
             "max_seq_length": self.max_seq_length,
             "seed": self.seed,
             "lora_rank": self.lora_rank,
@@ -1496,6 +1589,7 @@ class TuneRequest:
         record["dtype_declared"] = self.dtype
         record["dtype"] = dtype.dtype if dtype is not None else None
         record["dtype_source"] = dtype.source if dtype is not None else dtype_undecided
+        record["micro_batch_size_declared"] = self.micro_batch_size
         # The mode decision is the result's too, and is reported at the top
         # level of `TuneResult.as_dict`.
         record.pop("prompt_mode_decision")
@@ -1573,6 +1667,10 @@ class TrainingMetrics:
     masked_tokens: int
     supervised_token_fraction: float | None
     epochs: tuple[EpochMetrics, ...]
+    batch_size: int | None = None
+    micro_batch_size: int | None = None
+    micro_batch_size_source: str | None = None
+    gradient_accumulation_steps: int | None = None
     trainable_parameters: int | None = None
     base_parameters: int | None = None
     # What peft was asked for, and what that request matched. `None` on a full
@@ -1630,6 +1728,10 @@ class TrainingMetrics:
             masked_tokens=int(data["masked_tokens"]),
             supervised_token_fraction=None if fraction is None else float(fraction),
             epochs=epochs,
+            batch_size=data.get("batch_size"),
+            micro_batch_size=data.get("micro_batch_size"),
+            micro_batch_size_source=data.get("micro_batch_size_source"),
+            gradient_accumulation_steps=data.get("gradient_accumulation_steps"),
             trainable_parameters=data.get("trainable_parameters"),
             base_parameters=data.get("base_parameters"),
             lora_target_modules=data.get("lora_target_modules"),
@@ -1655,6 +1757,10 @@ class TrainingMetrics:
             "total_tokens": self.total_tokens,
             "supervised_token_fraction": self.supervised_token_fraction,
             "expected_supervised_token_fraction": EXPECTED_SUPERVISED_FRACTION,
+            "batch_size": self.batch_size,
+            "micro_batch_size": self.micro_batch_size,
+            "micro_batch_size_source": self.micro_batch_size_source,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "trainable_parameters": self.trainable_parameters,
             "base_parameters": self.base_parameters,
             "lora_target_modules": self.lora_target_modules,
@@ -2289,6 +2395,16 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     _dtype_limitations(result, dtype)
     if dtype.source == MPS_DTYPE_SOURCE:
         events.note(f"training in {dtype.dtype} on mps: {dtype.source}", dtype=dtype.dtype)
+
+    micro_batch = decide_micro_batch_size(request.micro_batch_size, request.batch_size, device)
+    if micro_batch.size < request.batch_size:
+        events.note(
+            f"optimiser batch {request.batch_size} as microbatches of {micro_batch.size}: "
+            f"{micro_batch.source}",
+            batch_size=request.batch_size,
+            micro_batch_size=micro_batch.size,
+            gradient_accumulation_steps=-(-request.batch_size // micro_batch.size),
+        )
 
     if dtype.dtype == DEFAULT_DTYPE and device not in ACCELERATORS:
         # Before the wait, not after it: DEFAULT_TIMEOUT_S is sized for

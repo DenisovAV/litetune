@@ -59,12 +59,14 @@ from litetune.tune import (
     MASKING_CHECK,
     MERGE_CHECK,
     MPS_DTYPE_SOURCE,
+    MPS_MICRO_BATCH_SOURCE,
     PROMPT_MODE_CHECK,
     TRAINING_CHECK,
     TrainingMetrics,
     TuneError,
     TuneRequest,
     decide_dtype,
+    decide_micro_batch_size,
     decide_prompt_mode,
     masking_check,
     run_tune,
@@ -676,6 +678,35 @@ def test_the_script_masks_padding_out_of_the_loss(script_namespace):
     # Padding contributes no gradient either, or the shorter rows in a batch
     # would teach the model to emit pad tokens.
     assert labels == [[IGNORE_INDEX, 2, 3], [IGNORE_INDEX, 5, IGNORE_INDEX]]
+
+
+def test_microbatch_loss_weights_count_shifted_supervised_tokens(script_namespace):
+    """Unequal completions keep the full batch's token-mean loss.
+
+    Averaging the two microbatch means would give each a weight of one half;
+    the full batch gives the one-token completion one quarter and the
+    three-token completion three quarters. Position zero is excluded because
+    causal LM loss shifts labels before cross-entropy.
+    """
+    micro_batches = script_namespace["micro_batches"]
+    examples = [
+        ([1, 2, 3], [7, IGNORE_INDEX, 9]),
+        ([4, 5, 6, 7], [8, 5, 6, 7]),
+    ]
+
+    weighted = list(micro_batches(examples, 1))
+
+    assert [chunk for chunk, _ in weighted] == [[examples[0]], [examples[1]]]
+    assert [weight for _, weight in weighted] == [0.25, 0.75]
+    assert sum(weight for _, weight in weighted) == pytest.approx(1.0)
+
+
+def test_an_effective_batch_without_targets_is_refused(script_namespace):
+    micro_batches = script_namespace["micro_batches"]
+    examples = [([1, 2], [5, IGNORE_INDEX])]
+
+    with pytest.raises(ValueError, match="no supervised shifted tokens"):
+        list(micro_batches(examples, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -1418,6 +1449,10 @@ class _Loss:
     def backward(self):
         _log({"event": "backward"})
 
+    def __mul__(self, weight):
+        _log({"event": "loss_weight", "weight": weight})
+        return _Loss(self.value * weight)
+
     def detach(self):
         return self
 
@@ -1643,6 +1678,34 @@ def test_the_real_script_writes_metrics_this_module_can_read(request_for, stub_e
     assert metrics.supervised_token_fraction < 0.4
     assert [e.epoch for e in metrics.epochs] == [1, 2]
     assert metrics.final_loss == pytest.approx(1.45)
+    assert metrics.batch_size == 8
+    assert metrics.micro_batch_size == 8
+    assert metrics.gradient_accumulation_steps == 1
+    log = stub_log(stub_env)
+    assert sum(e["event"] == "forward" for e in log) == 10
+    assert sum(e["event"] == "optimiser_step" for e in log) == 10
+
+
+def test_the_real_mps_script_accumulates_without_changing_the_optimiser_batch(
+    request_for, stub_env
+):
+    request = request_for(batch_size=8)
+    proc = run_real_script(request, stub_env, device="mps")
+    assert proc.returncode == 0, proc.stderr
+
+    log = stub_log(stub_env)
+    assert [e["rows"] for e in log if e["event"] == "forward"] == [1] * 40
+    assert sum(e["event"] == "optimiser_step" for e in log) == 5
+    weights = [e["weight"] for e in log if e["event"] == "loss_weight"]
+    assert len(weights) == 40
+    assert all(weight == pytest.approx(1 / 8) for weight in weights)
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["batch_size"] == 8
+    assert recorded["micro_batch_size"] == 1
+    assert recorded["micro_batch_size_source"] == MPS_MICRO_BATCH_SOURCE
+    assert recorded["gradient_accumulation_steps"] == 8
+    assert recorded["epochs"][0]["steps"] == 5
+    assert recorded["epochs"][0]["loss"] == pytest.approx(1.45)
 
 
 def test_a_scoped_lora_run_reaches_the_text_tower_and_nothing_beside_it(request_for, stub_env):
@@ -4101,6 +4164,69 @@ def test_the_dtype_is_declared_or_the_default_for_the_device(declared, device, d
     assert (decision.dtype, decision.source) == (dtype, source)
 
 
+@pytest.mark.parametrize(
+    ("declared", "batch_size", "device", "size", "source"),
+    [
+        (None, 8, "mps", 1, MPS_MICRO_BATCH_SOURCE),
+        (None, 8, "cuda", 8, "default: one forward per optimiser batch"),
+        (None, 8, "cpu", 8, "default: one forward per optimiser batch"),
+        (None, 8, None, 8, "default: one forward per optimiser batch"),
+        (2, 8, "mps", 2, "declared"),
+        (2, 8, "cuda", 2, "declared"),
+    ],
+)
+def test_the_microbatch_is_declared_or_the_default_for_the_device(
+    declared, batch_size, device, size, source
+):
+    decision = decide_micro_batch_size(declared, batch_size, device)
+    assert (decision.size, decision.source) == (size, source)
+
+
+@pytest.mark.parametrize("micro_batch_size", [0, -1, 9])
+def test_an_invalid_microbatch_is_refused(request_for, micro_batch_size):
+    with pytest.raises(TuneError, match="micro_batch_size"):
+        request_for(batch_size=8, micro_batch_size=micro_batch_size)
+
+
+@pytest.mark.parametrize(("device", "expected"), [("cpu", 8), ("cuda", 8)])
+def test_cpu_and_cuda_keep_one_forward_per_optimiser_batch(trainer, request_for, device, expected):
+    trainer.probe_device = device
+
+    result = run_tune(request_for(batch_size=expected))
+
+    config = trainer.configs[0]
+    assert config["micro_batch_size"] == expected
+    assert config["gradient_accumulation_steps"] == 1
+    assert result.as_dict()["request"]["micro_batch_size_declared"] is None
+
+
+def test_mps_defaults_to_one_example_per_forward_and_records_the_accumulation(trainer, request_for):
+    _mps_trainer(trainer)
+
+    result, seen = run_with_events(request_for(batch_size=8))
+
+    config = trainer.configs[0]
+    assert config["micro_batch_size"] == 1
+    assert config["micro_batch_size_source"] == MPS_MICRO_BATCH_SOURCE
+    assert config["gradient_accumulation_steps"] == 8
+    assert [m for m in notes(seen) if m.startswith("optimiser batch 8 as microbatches of 1")]
+    request_record = result.as_dict()["request"]
+    assert request_record["micro_batch_size"] == 1
+    assert request_record["micro_batch_size_declared"] is None
+
+
+def test_a_declared_microbatch_is_kept_on_mps(trainer, request_for):
+    _mps_trainer(trainer)
+
+    result = run_tune(request_for(batch_size=8, micro_batch_size=2))
+
+    config = trainer.configs[0]
+    assert config["micro_batch_size"] == 2
+    assert config["micro_batch_size_source"] == "declared"
+    assert config["gradient_accumulation_steps"] == 4
+    assert result.as_dict()["request"]["micro_batch_size_declared"] == 2
+
+
 def test_an_mps_run_trains_in_float32_by_default_and_says_why(trainer, request_for):
     _mps_trainer(trainer)
     result, seen = run_with_events(request_for())
@@ -4675,26 +4801,30 @@ def test_the_real_script_records_the_largest_mps_samples_and_where_they_were_tak
 
     recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
     log = [e["event"] for e in stub_log(stub_env)]
-    steps = log.count("forward")
-    assert steps == 5
-    # Three samples a step, at the three points, in that order.
+    forwards = log.count("forward")
+    optimiser_steps = log.count("optimiser_step")
+    # Forty examples run one at a time, but the effective batch is still eight:
+    # five optimiser steps, exactly as before accumulation.
+    assert (forwards, optimiser_steps) == (40, 5)
+    # Forward and backward are sampled per microbatch; optimiser state is
+    # sampled once per effective batch.
     sample = ["mps_current_allocated", "mps_driver_allocated"]
     first = log.index("forward")
-    assert log[first : first + 9] == [
+    assert log[first : first + 8] == [
         "forward",
         *sample,
+        "loss_weight",
         "backward",
         *sample,
-        "optimiser_step",
-        *sample,
-    ], log[first : first + 9]
-    assert log.count("mps_current_allocated") == 3 * steps
+        "released",
+    ], log[first : first + 8]
+    assert log.count("mps_current_allocated") == 2 * forwards + optimiser_steps
     # The stub's sequences peak in the middle, so the last sample is not the
     # largest: the record is the maximum over the samples.
     assert recorded["mps_memory_sampled_max"] == {
         "current_allocated_bytes": 900,
         "driver_allocated_bytes": 2000,
-        "samples": 15,
+        "samples": 85,
         "sampled_at": ["after forward", "after backward", "after optimiser step"],
     }
 

@@ -386,16 +386,17 @@ def _json_answer(device="cpu", cuda_build=None, device_count=0, **fields) -> str
     return probe_answer(device, cuda_build=cuda_build, device_count=device_count, **fields)
 
 
-def test_the_probe_runs_with_both_mps_ratios_at_no_limit_whatever_the_operator_set(
-    probe_env, monkeypatch
-):
+def test_the_probe_runs_with_neutral_mps_settings_whatever_the_operator_set(probe_env, monkeypatch):
     """Asking `recommended_max_memory()` builds torch's MPS allocator, which
     reads the two ratios; a high ratio set alone under torch's default low one
     made it raise on this project's Mac and the run fell to the CPU. The probe
-    therefore gets both at 0.0, which torch accepts in any pairing, while the
-    operator's own value stays in the host environment for the policy to read.
+    therefore gets both at 0.0, which torch accepts in any pairing. MPS
+    fallback initialization parses its variable as an integer, so the probe
+    gets the valid default there too. The operator's own values stay in the
+    host environment for the policy to validate.
     """
     monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "not-an-integer")
     seen: list = []
 
     def fake_run(self, args, timeout=3600, env=None, **kwargs):
@@ -406,10 +407,15 @@ def test_the_probe_runs_with_both_mps_ratios_at_no_limit_whatever_the_operator_s
 
     assert envs.resolve_device(probe_env).device == "mps"
     assert seen == [
-        {"PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.0", "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.0"}
+        {
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.0",
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.0",
+            "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+        }
     ]
     assert envs._child_env(seen[0])["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.0"
     assert os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.5"
+    assert os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] == "not-an-integer"
 
 
 def test_the_probe_asks_this_environments_own_torch(probe_env, monkeypatch):
