@@ -914,6 +914,36 @@ def test_a_timeout_clears_the_device_it_never_confirmed(monkeypatch):
     assert backend.describe()["backend"] == UNKNOWN_BACKEND
 
 
+def test_a_timeout_keeps_the_mps_observation_written_before_generation(monkeypatch):
+    """A timeout after placement must not erase the child's run report.
+
+    The generation script writes this report before its first prompt. Reading
+    it only after a clean return made a part-way MPS run look as though its
+    backend had never been observed and discarded the allocator environment
+    that had already reached the child.
+    """
+    _ready_env()
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        if args[1] == "-c":
+            return subprocess.CompletedProcess(args, 0, probe_answer("mps"), "")
+        spec = json.loads(Path(args[2]).read_text())
+        Path(spec["run_report"]).write_text(
+            json.dumps({"device": "mps", "mps_environment": _SENT}), encoding="utf-8"
+        )
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+    (generation,) = backend.generate(["a"])
+
+    assert generation.harness_error is not None
+    assert backend.describe()["backend"] == "mps"
+    assert backend.backend_observed
+    assert backend.mps_environment_seen == _SENT
+    assert backend.mps_environment_mismatch is None
+
+
 def test_a_script_that_could_not_start_clears_the_device_it_never_confirmed(monkeypatch):
     _ready_env()
 

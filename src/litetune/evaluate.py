@@ -2044,11 +2044,14 @@ class HuggingFaceBackend:
             except subprocess.TimeoutExpired as expired:
                 logger.warning("transformers generation timed out after %ss", self.timeout_s)
                 reason = f"no result after {self.timeout_s}s (timeout)"
-                # The run report is written after the last prompt, so a killed
-                # run has none and the device stays unconfirmed. A prediction
-                # left standing here would be reported by `describe()` as the
-                # backend a run used when nothing confirmed it.
-                self.device = None
+                # The child writes its first run report immediately after
+                # placing the model, before generation. Keep that observation
+                # and its MPS environment when the timeout happened later; if
+                # placement never completed there is no report, and the probe's
+                # prediction must not be presented as an observed backend.
+                run_report = self._read_run_report(report)
+                if run_report is None or not self._take_run_report(run_report):
+                    self.device = None
                 # This script flushes after every row too, and until now every
                 # one of them was thrown away here: a reference run killed at
                 # prompt 600 of 640 lost all 599 it had already written, which
@@ -2070,18 +2073,23 @@ class HuggingFaceBackend:
             # here rather than anywhere later.
             run_report = self._read_run_report(report)
 
-        observed = run_report.get("device") if run_report is not None else None
+        if run_report is not None:
+            self._take_run_report(run_report)
+        return assemble_generations(prompts, texts, proc, faults)
+
+    def _take_run_report(self, run_report: Mapping[str, Any]) -> bool:
+        """Record child observations; say whether it confirmed a device."""
+        observed = run_report.get("device")
         if not isinstance(observed, str):
             observed = None
-        if run_report is not None:
-            sampled = run_report.get("mps_memory_sampled_max")
-            self.mps_memory_sampled_max = sampled if isinstance(sampled, dict) else None
-            seen = run_report.get("mps_environment")
-            self.mps_environment_seen = seen if isinstance(seen, dict) else None
-            if self.mps_memory is not None:
-                self.mps_environment_mismatch = devices.environment_mismatch(
-                    self.mps_memory, seen, "reference generation script"
-                )
+        sampled = run_report.get("mps_memory_sampled_max")
+        self.mps_memory_sampled_max = sampled if isinstance(sampled, dict) else None
+        seen = run_report.get("mps_environment")
+        self.mps_environment_seen = seen if isinstance(seen, dict) else None
+        if self.mps_memory is not None:
+            self.mps_environment_mismatch = devices.environment_mismatch(
+                self.mps_memory, seen, "reference generation script"
+            )
         if observed is not None:
             if self.device is not None and observed != self.device:
                 logger.warning(
@@ -2092,7 +2100,7 @@ class HuggingFaceBackend:
                 )
             self.device = observed
             self.device_observed = True
-        return assemble_generations(prompts, texts, proc, faults)
+        return observed is not None
 
     def _ensure_env(self, events: EventStream | None) -> str | None:
         """Provision the environment when asked to, then ask it its device.
