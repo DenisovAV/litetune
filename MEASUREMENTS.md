@@ -1359,8 +1359,9 @@ measurement could see, because the text scorer finds `call:` anywhere:
   only the prompt. A `runtime_rendered` bundle ships its declarations in the
   order the model learned; an application that builds its own list has to keep
   that order.
-- flutter_gemma 1.8.3 renders FunctionGemma's declarations in Dart and does
-  not pass them to the runtime, so this is not how it serves this model.
+- Flutter Edge AI passes FunctionGemma `.litertlm` declarations to LiteRT-LM
+  as structured data and reads the runtime's parsed tool calls, so this is the
+  same native tool path it uses for this model.
 - No row was refused by the runtime in either mode, in either run. A row the
   runtime gives no reply to is scored as a wrong answer when its parser refused
   it or the prompt reached the token limit, and leaves the mode unmeasured for
