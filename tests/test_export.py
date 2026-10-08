@@ -1045,11 +1045,12 @@ def test_the_activation_type_is_written_into_the_prefill_decode_section(toolchai
 
 
 def test_an_artifact_given_by_a_relative_path_is_repacked_too(toolchain, tmp_path, monkeypatch):
-    """`convert --output-dir artifacts/dyn` on Cloud Build and Vertex: the work
+    """`convert --output-dir artifacts/dyn` on Python 3.10 or 3.11: the work
     directory came out relative, the script wrote `data_path`s relative to the
     current directory, and the builder resolved each against the TOML's own
     directory -- `artifacts/dyn/.model-repack-X/artifacts/dyn/.model-repack-X/...`
-    -- so every Linux cloud conversion shipped a bundle without the GPU key.
+    -- so every conversion to a relative output directory shipped a bundle
+    without the GPU key.
 
     Only below Python 3.12: `tempfile.mkdtemp(dir="rel")` returned
     `rel/tmp...` on 3.10.19 and 3.11.14 and an absolute path on 3.12.15
@@ -1061,8 +1062,10 @@ def test_an_artifact_given_by_a_relative_path_is_repacked_too(toolchain, tmp_pat
     from litetune.export import GPU_ACTIVATION, set_gpu_activation
 
     real_mkdtemp = tempfile.mkdtemp
+    calls = []
 
     def mkdtemp_before_3_12(suffix=None, prefix=None, dir=None):
+        calls.append(dir)
         made = real_mkdtemp(suffix, prefix, dir)
         return made if dir is None or os.path.isabs(dir) else os.path.relpath(made)
 
@@ -1076,6 +1079,9 @@ def test_an_artifact_given_by_a_relative_path_is_repacked_too(toolchain, tmp_pat
         Path("artifacts/dyn/model.litertlm"), _fake_env(toolchain, tmp_path)
     )
 
+    # The simulation reached the call; without this the test would pass
+    # unguarded on 3.12 if `mkdtemp` were ever bound some other way.
+    assert calls, "set_gpu_activation never called tempfile.mkdtemp"
     assert (value, note) == (GPU_ACTIVATION, None)
     assert (out / "model.litertlm").read_bytes()[:8] == b"LITERTLM", "the original was replaced"
     assert not [p for p in out.iterdir() if p.name.startswith(".")], "work dir gone"

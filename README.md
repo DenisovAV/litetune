@@ -221,7 +221,7 @@ tool path only and the CPU nowhere.
 |---|---|---|---|
 | 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
 | 0.2.0 – 0.3.0 | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
-| 0.4.0 | `litert-lm==0.18.0` | `litert-lm-builder==0.18.0`; the exporter and its packages unchanged | unchanged |
+| unreleased (`main`) | `litert-lm==0.18.0` | `litert-lm==0.18.0` and `litert-lm-builder==0.18.0`; `litert-torch-nightly` and the LiteRT, quantizer and converter pins unchanged | unchanged |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
@@ -483,10 +483,10 @@ flutter_gemma uses this path for FunctionGemma on a `.litertlm` from core 1.8.4
 with `flutter_gemma_litertlm` 1.7.1: it hands the runtime the declarations
 (`_nativeToolsJson` in `lib/src/ffi/ffi_inference_model.dart`) and creates the
 conversation with constrained decoding on (`lib/src/ffi/litert_lm_client.dart`),
-so the grammar-on number is its path. `flutter_gemma_litertlm` 1.8.0 ships
-LiteRT-LM 0.17.1; `flutter_edge_ai_litertlm` 1.10.0 ships 0.18.0, the runtime this
-litetune measures on. Earlier releases render
+so the grammar-on number is its path; releases before core 1.8.4 render
 FunctionGemma's declarations in Dart and are not served the way it is measured.
+`flutter_gemma_litertlm` 1.8.0 ships LiteRT-LM 0.17.1; `flutter_edge_ai_litertlm`
+1.10.0, its renamed successor, ships 0.18.0, the runtime this litetune measures on.
 
 **`verify` picks the path from the model, not from a flag.** With declarations
 and a family whose runtime renders them, it asks the runtime for a structured
@@ -641,7 +641,7 @@ incompatible dependencies and cannot share an interpreter.
 ## Results
 
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
-runtime litetune 0.1.x pins; 0.2.0 pins 0.17.1 and 0.4.0 pins 0.18.0.
+runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and `main` pins 0.18.0.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
 0.17.1 re-measurements beside the originals where there are any.
 

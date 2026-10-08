@@ -180,8 +180,12 @@ def text_of(reply):
     answered in prose instead of calling anything is a result worth seeing, and
     a row with no call and no text cannot be told apart from a row that failed.
     """
+    content = reply.get("content") or []
+    if isinstance(content, str):
+        # A v0.18.0 `Message` keeps a string `content` as the string.
+        return content
     parts = []
-    for item in reply.get("content") or []:
+    for item in content:
         if isinstance(item, dict) and isinstance(item.get("text"), str):
             parts.append(item["text"])
         elif isinstance(item, str):
@@ -196,6 +200,15 @@ def calls_of(reply):
     {...}}`. All of them, not the first: an application acts on each call it
     is handed, so a second one the target does not ask for is part of the
     answer.
+
+    From litert-lm 0.18.0 `send_message` returns a `Message`, whose `tool_calls`
+    are rebuilt from parsed calls: arguments that are not an object come back
+    as `{}`, a call whose `function` is not a mapping is dropped
+    (`_messages.py`, `_parse_json_fields`). So the parent's check of a row's
+    shape (`ToolPathRow.read`) no longer sees a malformed call from the
+    runtime. The runtime's FunctionGemma parser writes an object for every
+    call, `{}` when none was written (`fc_parser.rs`, `enter_functionCall`), so
+    the one family measured on this path cannot produce one.
     """
     calls = []
     for entry in reply.get("tool_calls") or []:

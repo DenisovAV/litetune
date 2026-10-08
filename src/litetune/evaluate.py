@@ -85,7 +85,7 @@ CPU_BACKEND = "cpu"
 # `rendering.py`) pass a `Backend` in and read no device out, and the only
 # field any of them reads afterwards is a token count off `BenchmarkInfo`
 # (`rendering.py`). Whether the runtime could answer at all is a question
-# about the litert-lm `envs.RUNTIME` pins, which is installed there and not here --
+# about the litert-lm that `envs.RUNTIME` pins, which is installed there and not here --
 # so it is a question a reader has to take to that package, and one this
 # comment does not answer for them.
 #
@@ -1565,9 +1565,11 @@ def text_from_conversation(conversation, prompt):
     and at the end of the stream. Up to v0.17.1 it was called before every text
     item, empty ones included, so an empty text item between two pieces of one
     channel closed and reopened it. A chunk is a `Message` from v0.18.0, a dict
-    whose `content` may stay a plain string; both shapes are read here. The one
-    branch not mirrored is the bare `click.echo()` the CLI emits instead when no
-    channel was open at the end, which is a trailing newline the scorer strips.
+    whose `content` may stay a plain string, and whose list may hold a bare
+    string, which `Message` reads as a text part (`_messages.py`,
+    `_parse_json_fields`); all three shapes are read here. The one branch not
+    mirrored is the bare `click.echo()` the CLI emits instead when no channel
+    was open at the end, which is a trailing newline the scorer strips.
     """
     parts = []
     active = [None]
@@ -1583,9 +1585,10 @@ def text_from_conversation(conversation, prompt):
             text = content
         else:
             text = "".join(
-                item.get("text", "")
+                item if isinstance(item, str) else item.get("text", "")
                 for item in content
-                if isinstance(item, dict) and item.get("type") == "text"
+                if isinstance(item, str)
+                or (isinstance(item, dict) and item.get("type") == "text")
             )
         if text:
             close()
@@ -1653,7 +1656,8 @@ def main(spec_path):
                     # One prompt, not the rest of the split. The runtime
                     # raises `RuntimeError` when a prefill or a decode call
                     # fails (`litert_lm/session.py:72` and `:101` at v0.17.1 and
-                    # v0.18.0) and when a send fails (`conversation.py:327`), and
+                    # v0.18.0) and when a streamed send fails (`conversation.py:421`,
+                    # or the stream's own error re-raised at `:433`, v0.18.0), and
                     # without this the first of those ends the process: every
                     # later prompt comes back as "the script exited 1".
                     #

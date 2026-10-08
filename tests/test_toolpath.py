@@ -392,6 +392,21 @@ SCRIPT = _exec(_TOOL_PATH_SCRIPT, "toolpath_script_under_test")
 PINNED = (f"litert-lm=={GRAMMAR_OFF_BY_DEFAULT_IN}",)
 
 
+@pytest.mark.parametrize(
+    ("reply", "text"),
+    [
+        ({"content": [{"type": "text", "text": "an"}, {"type": "text", "text": "swer"}]}, "answer"),
+        # A v0.18.0 `Message` keeps a string `content` as the string; read one
+        # item at a time it would only have come out right by accident.
+        ({"content": "answer"}, "answer"),
+        ({"content": ["an", "swer"]}, "answer"),
+        ({"tool_calls": []}, ""),
+    ],
+)
+def test_the_prose_beside_a_call_is_read_in_every_shape_the_binding_returns(reply, text):
+    assert SCRIPT["text_of"](reply) == text
+
+
 def started(mark: str, row: int) -> str:
     return f"\n{mark} {SCRIPT['STARTED']} {row}\n"
 

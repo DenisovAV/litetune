@@ -22,7 +22,7 @@ for conversion (with `litert-lm-builder==0.16.1` from 0.1.4), and `torch==2.5.1`
 sections below name the runtime they ran on where they record one; the phone
 sections ran a runtime of their own.
 
-litetune after 0.1.9 pins `litert-lm==0.17.1`, and that runtime does not give
+litetune 0.2.0 – 0.3.0 pin `litert-lm==0.17.1`, and that runtime does not give
 0.16.1's answers. Nor does one CPU give another's. Measured 2026-09-27 on
 Linux x86-64, CPU backend, through litetune's own driver scripts, each version
 in its own environment and each run on its own copy of the bundles, with no

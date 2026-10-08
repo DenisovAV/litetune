@@ -2360,11 +2360,11 @@ RUNTIME = StageEnv(
     python_ceiling=(3, 12),
     ceiling_pin="numpy==2.0.2",
     requirements=(
-        # 0.18.0, the runtime flutter_edge_ai_litertlm 1.10.0 ships
-        # (native-v0.18.0). Runtimes are not assumed to reproduce each other's
-        # answers -- 0.17.1 did not reproduce 0.16.1's (MEASUREMENTS.md, "Which
-        # runtime a number was taken on") -- so every number records the one it
-        # ran on.
+        # 0.18.0, the runtime flutter_edge_ai_litertlm 1.10.0 ships (its
+        # CHANGELOG: "LiteRT-LM v0.18.0 (`native-v0.18.0-a`)"). Runtimes are not
+        # assumed to reproduce each other's answers -- 0.17.1 did not reproduce
+        # 0.16.1's (MEASUREMENTS.md, "Which runtime a number was taken on") --
+        # so every number records the one it ran on.
         "litert-lm==0.18.0",
         "numpy==2.0.2",  # last of the 2.0 line; `<2.1` is a bound, not a pin
     ),
