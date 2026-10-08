@@ -289,6 +289,29 @@ CHANNEL_CASES = [
         [{"channels": {"thought": ""}}],
         "[thought]  [/thought]",
     ),
+    (
+        # v0.18.0's run.py closes a channel only before a chunk whose text is
+        # not empty (`text = str(chunk)`); v0.17.1 closed it before every text
+        # item, so this printed `[thought] a [/thought]` and reopened it.
+        "an empty text item inside a channel",
+        [
+            {"channels": {"thought": "a"}},
+            {"content": [{"type": "text", "text": ""}]},
+            {"channels": {"thought": "b"}},
+        ],
+        "[thought] ab [/thought]",
+    ),
+    (
+        "two text items in one chunk",
+        [{"content": [{"type": "text", "text": "an"}, {"type": "text", "text": "swer"}]}],
+        "answer",
+    ),
+    (
+        # A v0.18.0 `Message` keeps a string `content` as the string.
+        "content given as a string",
+        [{"content": "answer"}],
+        "answer",
+    ),
 ]
 
 
@@ -625,7 +648,7 @@ def test_backend_reports_which_engine_produced_the_numbers(tmp_path):
     described = _litertlm(tmp_path).describe()
     assert described["engine"] == "litert-lm"
     assert described["backend"] == "cpu"
-    assert "litert-lm==0.17.1" in described["requirements"]
+    assert "litert-lm==0.18.0" in described["requirements"]
 
 
 # -- transformers -----------------------------------------------------------

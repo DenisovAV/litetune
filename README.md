@@ -221,6 +221,7 @@ tool path only and the CPU nowhere.
 |---|---|---|---|
 | 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
 | 0.2.0 – 0.3.0 | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
+| 0.4.0 | `litert-lm==0.18.0` | `litert-lm-builder==0.18.0`; the exporter and its packages unchanged | unchanged |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
@@ -349,7 +350,7 @@ name litetune does not know straight through to it. litetune defines exactly one
 of its own, shipped as a quantizer recipe file inside the package; what it adds
 to the rest is a measurement of what each costs on your task. The costs below
 were taken on litert-lm 0.16.1, the runtime 0.1.x pins, and the four-bit rows
-give 0.17.1's beside them, the runtime litetune pins after 0.1.x. The two runs
+give 0.17.1's beside them, the runtime litetune 0.2.0 – 0.3.0 pin. The two runs
 differ in runtime, transport and possibly CPU; see
 [MEASUREMENTS.md](MEASUREMENTS.md#four-bits-on-litert-lm-0171) for both.
 
@@ -483,7 +484,8 @@ with `flutter_gemma_litertlm` 1.7.1: it hands the runtime the declarations
 (`_nativeToolsJson` in `lib/src/ffi/ffi_inference_model.dart`) and creates the
 conversation with constrained decoding on (`lib/src/ffi/litert_lm_client.dart`),
 so the grammar-on number is its path. `flutter_gemma_litertlm` 1.8.0 ships
-LiteRT-LM 0.17.1, the runtime this litetune measures on. Earlier releases render
+LiteRT-LM 0.17.1; `flutter_edge_ai_litertlm` 1.10.0 ships 0.18.0, the runtime this
+litetune measures on. Earlier releases render
 FunctionGemma's declarations in Dart and are not served the way it is measured.
 
 **`verify` picks the path from the model, not from a flag.** With declarations
@@ -639,7 +641,7 @@ incompatible dependencies and cannot share an interpreter.
 ## Results
 
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
-runtime litetune 0.1.x pins; 0.2.0 pins 0.17.1.
+runtime litetune 0.1.x pins; 0.2.0 pins 0.17.1 and 0.4.0 pins 0.18.0.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
 0.17.1 re-measurements beside the originals where there are any.
 

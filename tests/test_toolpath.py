@@ -21,7 +21,13 @@ import pytest
 
 from litetune.evaluate import BACKEND_OBSERVED, runtime_engine_spec
 from litetune.metrics import ToolCall
-from litetune.toolpath import _TOOL_PATH_SCRIPT, ToolPathError, ToolPathProbe, ToolPathRow
+from litetune.toolpath import (
+    _TOOL_PATH_SCRIPT,
+    GRAMMAR_OFF_BY_DEFAULT_IN,
+    ToolPathError,
+    ToolPathProbe,
+    ToolPathRow,
+)
 
 TOOLS = [
     {
@@ -383,7 +389,7 @@ PARSE_FAILURE_LOG = (
     "full response: SECRET card 4111\nerror: Failed to parse FC tool calls\n"
 )
 SCRIPT = _exec(_TOOL_PATH_SCRIPT, "toolpath_script_under_test")
-PINNED = ("litert-lm==0.17.1",)
+PINNED = (f"litert-lm=={GRAMMAR_OFF_BY_DEFAULT_IN}",)
 
 
 def started(mark: str, row: int) -> str:
@@ -727,7 +733,7 @@ class CannedEnv:
     fail: str | None = None
     # Fail only these modes, when `fail` is set; every mode otherwise.
     fail_modes: tuple[str, ...] = ("constrained", "unconstrained")
-    runtime_version: str | None = "0.17.1"
+    runtime_version: str | None = GRAMMAR_OFF_BY_DEFAULT_IN
     # What `envs.RUNTIME` pins, which the backend records beside what ran.
     requirements: tuple[str, ...] = PINNED
     # A mode that reports another runtime than `runtime_version`, by mode.
@@ -1042,7 +1048,10 @@ def test_the_runtime_version_is_in_the_manifest(tmp_path):
         tmp_path, rows_, {"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)}
     )
 
-    assert result.manifest["measurements"]["candidate"]["engine"]["runtime_version"] == "0.17.1"
+    assert (
+        result.manifest["measurements"]["candidate"]["engine"]["runtime_version"]
+        == GRAMMAR_OFF_BY_DEFAULT_IN
+    )
 
 
 def test_the_declarations_reach_the_runtime_in_both_modes(tmp_path):
@@ -1414,7 +1423,7 @@ def test_a_runtime_other_than_the_one_the_default_was_read_from_is_said(tmp_path
 
     same = _verify(tmp_path, rows_, {"constrained": both, "unconstrained": both})
     other = _verify(
-        tmp_path, rows_, {"constrained": both, "unconstrained": both}, runtime_version="0.18.0"
+        tmp_path, rows_, {"constrained": both, "unconstrained": both}, runtime_version="0.17.1"
     )
     unnamed = _verify(
         tmp_path, rows_, {"constrained": both, "unconstrained": both}, runtime_version=None
@@ -1422,7 +1431,7 @@ def test_a_runtime_other_than_the_one_the_default_was_read_from_is_said(tmp_path
 
     assert not any("this run used" in x for x in same.manifest["limitations"])
     said = next(x for x in other.manifest["limitations"] if "this run used" in x)
-    assert "litert-lm 0.17.1's source; this run used 0.18.0" in said
+    assert f"litert-lm {GRAMMAR_OFF_BY_DEFAULT_IN}'s source; this run used 0.17.1" in said
     # The kinds of a missing reply are read from that version's log sentences too.
     assert "log sentences" in said
     assert "leaves its mode unmeasured rather than scored" in said
@@ -1986,9 +1995,10 @@ def test_the_tool_path_names_its_pin_beside_the_runtime_that_ran(tmp_path):
     )
 
     engine = other.manifest["measurements"]["candidate"]["engine"]
-    assert "litert-lm==0.17.1" in engine["requirements"]
+    assert f"litert-lm=={GRAMMAR_OFF_BY_DEFAULT_IN}" in engine["requirements"]
     assert any(
-        "ran on litert-lm 0.16.1, not the pinned 0.17.1" in x for x in other.manifest["limitations"]
+        f"ran on litert-lm 0.16.1, not the pinned {GRAMMAR_OFF_BY_DEFAULT_IN}" in x
+        for x in other.manifest["limitations"]
     )
 
 

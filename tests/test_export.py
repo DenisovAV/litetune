@@ -47,8 +47,8 @@ ai-edge-litert-nightly==2.3.0.dev20260925
 ai-edge-quantizer-nightly==0.10.0.dev20260926
 flatbuffers==24.3.25
 litert-converter==0.4.0
-litert-lm==0.17.1
-litert-lm-builder==0.17.1
+litert-lm==0.18.0
+litert-lm-builder==0.18.0
 litert-torch-nightly==0.10.0.dev20260926
 numpy==2.0.2
 transformers==5.16.1
@@ -594,7 +594,7 @@ def test_resolved_toolchain_versions_are_recorded(toolchain, request_for):
     assert result.toolchain.resolved["flatbuffers"] == "24.3.25"
     assert result.toolchain.missing == ()
     # The declared pins travel with what they resolved to; neither implies the other.
-    assert "litert-lm==0.17.1" in result.toolchain.declared
+    assert "litert-lm==0.18.0" in result.toolchain.declared
     assert result.as_dict()["toolchain"]["available"] is True
 
 
@@ -727,8 +727,8 @@ def test_parse_pip_freeze_records_the_whole_resolved_set():
         "ai-edge-quantizer-nightly": "0.10.0.dev20260926",
         "flatbuffers": "24.3.25",
         "litert-converter": "0.4.0",
-        "litert-lm": "0.17.1",
-        "litert-lm-builder": "0.17.1",
+        "litert-lm": "0.18.0",
+        "litert-lm-builder": "0.18.0",
         "litert-torch-nightly": "0.10.0.dev20260926",
         "numpy": "2.0.2",
         "transformers": "5.16.1",

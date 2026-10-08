@@ -17,11 +17,11 @@ The transformers reference produces text and nothing else, and `verify` reads
 it with `metrics.runtime_calls`, which follows the runtime's reading of a reply.
 The runtime's Python binding reports every failed reply as one
 `RuntimeError("litert_lm_conversation_send_message failed")` (`conversation.py`,
-v0.17.1) and writes the reason to its log, so the script reads the log around
+v0.17.1 and v0.18.0) and writes the reason to its log, so the script reads the log around
 each reply to record the reason with the row.
 
 **Constrained decoding is a choice the caller makes, and both are measured.**
-LiteRT-LM v0.17.1 leaves it off unless the caller enables it
+LiteRT-LM v0.17.1 and v0.18.0 leave it off unless the caller enables it
 (`ConstrainedDecodingConfig(enable=True)`; the binding sets nothing otherwise),
 so the unconstrained number is what an application gets by default. With it on
 the runtime holds the model to the declared grammar -- which can carry a model
@@ -106,7 +106,7 @@ from pathlib import Path
     + r'''
 
 # The binding's one signal that the runtime gave no reply (`conversation.py`,
-# litert-lm 0.17.1). Anything else `send_message` raises is not an answer from
+# litert-lm 0.17.1 and 0.18.0). Anything else `send_message` raises is not an answer from
 # the model -- an API change, memory, a closed conversation -- and ends the run
 # as a harness failure rather than being scored, in either decoding mode.
 NO_REPLY = "send_message failed"
@@ -131,7 +131,7 @@ def tokenizer_sections(path):
 
     Read for the grammar: LiteRT-LM builds its constraint only from a
     SentencePiece tokenizer, and where there is none v0.16.1 refused the
-    conversation while v0.17.1 logs a warning and decodes unconstrained
+    conversation while v0.17.1 and v0.18.0 log a warning and decode unconstrained
     (`gemma3_data_processor.cc`, `function_gemma_data_processor.cc`). Raises
     when the header cannot be read.
     """
@@ -246,7 +246,7 @@ def reason_of(log, quote=True):
     A parse failure's message carries the model's code block and full response
     (`parser_utils.cc`), and that must not travel into a manifest a bundle
     ships, so a parse failure is its kind alone. The two kinds are told apart
-    by the runtime's own sentences, both in `liblitert-lm` 0.17.1
+    by the runtime's own sentences, both in `liblitert-lm` 0.18.0 as in 0.17.1
     (`parser_utils.cc`, `tasks.cc`). Any other reason is the runtime's last
     error line, or its last line -- only where `quote` says the runtime is
     the version those sentences were read from: on another, a parse failure
@@ -635,7 +635,7 @@ def _refuse_a_mode_with_unread_reasons(rows: list[ToolPathRow]) -> None:
 # constrained decoding is off unless the caller enables it -- and whose log
 # sentences `reason_of` reads a missing reply's kind from. `verify` says when a
 # run used another.
-GRAMMAR_OFF_BY_DEFAULT_IN = "0.17.1"
+GRAMMAR_OFF_BY_DEFAULT_IN = "0.18.0"
 
 DISAGREEING_MODES = (
     "the two decoding modes did not agree: {constrained:.4f} with the runtime's grammar on and "

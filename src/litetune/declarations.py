@@ -381,7 +381,8 @@ def _refuse_unreadable_name(name: str, where: str) -> None:
     if not readable_name(name):
         raise DeclarationsError(
             f"{where}, which the runtime's call parser does not read as a name: its lexer "
-            f"takes {NAME_RULE} (AntlrFcLexer.g4, LiteRT-LM v0.17.1), so no call can come back "
+            f"takes {NAME_RULE} (AntlrFcLexer.g4, LiteRT-LM v0.18.0, unchanged since v0.17.1), "
+            "so no call can come back "
             "under that name. Rename it here and in the declarations your application sends"
         )
 

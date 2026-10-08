@@ -378,7 +378,7 @@ def _score_tool_path(
     - **Grammar off: compared with the reference, and what an application gets
       by default.** The float reference is `transformers` generating greedily
       with no grammar, so the conversion cost is measured against the tool path
-      with the runtime's grammar off too. LiteRT-LM v0.17.1 leaves it off
+      with the runtime's grammar off too. LiteRT-LM v0.17.1 and v0.18.0 leave it off
       unless the caller enables it, so this is also the default.
       Measured 2026-09-17 on FunctionGemma x mobile-actions at n=640: reference
       0.9234, grammar off 0.9172, grammar on 0.7422. The first version compared

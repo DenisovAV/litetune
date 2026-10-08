@@ -47,7 +47,7 @@ Z95 = 1.959963985
 # took only the new shape would fail to read both ends of the very comparison it
 # exists to make.
 #
-# The tokens follow the runtime's. LiteRT-LM v0.17.1 reads a call with the ANTLR
+# The tokens follow the runtime's. LiteRT-LM v0.18.0 (as v0.17.1) reads a call with the ANTLR
 # lexer `AntlrFcLexer.g4`: an identifier is `[a-zA-Z_][a-zA-Z0-9_.-]*` but never
 # one of the words its earlier rules take (`call`, `true`, `false`, `null`, or an
 # exponent like `e5` or `e-3`, which lexes as a number); an escape is any of three
@@ -167,7 +167,7 @@ def _same_value(x: Any, y: Any) -> bool:
     `"true"` and `"null"`, which `_stringify` makes equal as it always did. A
     number is compared by its value with a number or with a string written as
     one: the runtime has handed numbers back as doubles (`fc_parser.rs` read
-    every `NUMBER` with `text.parse::<f64>()` up to v0.16.1; v0.17.1 keeps an
+    every `NUMBER` with `text.parse::<f64>()` up to v0.16.1; v0.17.1 and v0.18.0 keep an
     integer that fits an i64), and `hour:7` returning as `7.0` is the answer
     `7` either way. Two strings are compared as strings, so `"1.0"`
     and `"1"` stay two answers; a list or an object item by item.
@@ -202,7 +202,7 @@ def _same_json(x: Any, y: Any) -> bool:
 
     What an application is handed. A number the runtime returns as a double is
     the integer it equals, because a runtime up to v0.16.1 returned every
-    number as a double and v0.17.1 still does past an i64; a string
+    number as a double and v0.17.1 and v0.18.0 still do past an i64; a string
     is never a number, a boolean never a number, and whitespace is part of a
     string.
     """
@@ -415,7 +415,7 @@ class _CallReader:
     Bails on the first error, as the runtime's `BailErrorStrategy` does. A
     string loses `<escape>` and `<|"|>` at its ends and keeps `<ctrl46>`; a
     number is an integer where `text.parse::<i64>()` takes it and otherwise a
-    double (`fc_parser.rs`, v0.17.1 -- v0.16.1 read every number as a double),
+    double (`fc_parser.rs`, v0.17.1 and v0.18.0 -- v0.16.1 read every number as a double),
     `null` where the double is not finite (`json!` of an infinite `f64`), and a
     failure where Rust cannot parse it (`e5`); an object keeps the first of two
     equal keys.
@@ -518,7 +518,7 @@ def _whole_call(block: str) -> ToolCall | None:
 def runtime_calls(text: str) -> list[ToolCall] | None:
     """The calls LiteRT-LM returns for a reply, or `None` where it returns no reply.
 
-    `parser_utils.cc` (v0.17.1, unchanged since v0.16.1) consumes `(.*?)<start_function_call>(.*?)
+    `parser_utils.cc` (v0.18.0, unchanged since v0.16.1) consumes `(.*?)<start_function_call>(.*?)
     <end_function_call>` from the reply until it no longer matches: what comes
     before each pair is text, an empty pair is skipped, and a start marker with
     no end after it is text like the rest. Each block between a pair has to be
