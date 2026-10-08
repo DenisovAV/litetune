@@ -343,42 +343,76 @@ def test_a_family_with_no_rules_has_its_flags_left_alone(tmp_path):
     assert "no per-model rules" in " ".join(plan.notes)
 
 
-def test_a_qwen3_export_carries_no_flags_and_no_longer_says_the_family_is_unknown():
-    """The rule records a check, not a workaround.
+QWEN_TEMPLATES = [
+    ("Qwen/Qwen3-0.6B", "qwen-3", "qwen3-0.6b.jinja", "c1899de289a04d12100db370d81485cdf75e47ca"),
+    (
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "qwen-2.5",
+        "qwen2.5-0.5b-instruct.jinja",
+        "7ae557604adf67be50417f59c2c2f167def9a775",
+    ),
+]
 
-    Measured 2026-09-14: both int8 recipes exported with no flag from litetune,
-    and the bundle declared `llm_model_type { qwen3 {} }`. So the plan adds
-    nothing, and the one thing the entry changes is that the unknown-family
-    note is gone.
-    """
-    plan = plan_export("Qwen/Qwen3-0.6B", ("--some_flag=1",), ("dynamic_wi8_afp32",))
+
+@pytest.mark.parametrize(("model", "family", "template", "revision"), QWEN_TEMPLATES)
+def test_a_qwen_export_carries_its_packaged_template_and_no_type_override(
+    model, family, template, revision
+):
+    """The exporter types both Qwen checkpoints from their own `config.json`
+    (measured 2026-09-14 and 2026-09-20), so no type override. What LiteRT-LM
+    0.18.0 needs is a template that reads content as a list of parts: on it a
+    Qwen3 bundle carrying the checkpoint's template rendered an empty user turn
+    with no error (2026-10-08). So the plan adds exactly that one flag, and says
+    why."""
+    plan = plan_export(model, ("--some_flag=1",), ("dynamic_wi8_afp32",))
     assert plan.rules is not None
-    assert plan.rules.family == "qwen-3"
-    assert plan.flags == ("--some_flag=1",)
-    assert plan.added == ()
-    assert plan.checks == ()
+    assert plan.rules.family == family
+    assert plan.flags[0] == "--some_flag=1"
+    assert len(plan.flags) == 2
+    assert plan.flags[1] == f"--jinja_chat_template_override={models.packaged_template(template)}"
+    assert plan.added == (plan.flags[1],)
+    assert not any("--litert_lm_model_type_override" in f for f in plan.flags)
     assert plan.usable
     assert models.UNKNOWN_FAMILY not in plan.notes
+    assert any("0.18.0" in note and "list of" in note for note in plan.notes)
 
 
-def test_a_qwen25_export_carries_no_flags_and_is_typed_by_its_own_config():
-    """The one family here the exporter types correctly without being told.
+@pytest.mark.parametrize(("model", "family", "template", "revision"), QWEN_TEMPLATES)
+def test_a_packaged_qwen_template_is_the_checkpoints_own_behind_the_block(
+    model, family, template, revision
+):
+    """The file names where its template came from, under which licence, and
+    carries litetune's block exactly as `text_parts.jinja` has it, in front of
+    the checkpoint's template. Whether the two render what `transformers` does is
+    the rendering check `verify` runs on the runtime; this pins what was packaged."""
+    import pathlib
 
-    Measured 2026-09-20 on Qwen/Qwen2.5-0.5B-Instruct: six bundles, no flag
-    added by litetune, conversion costs in MEASUREMENTS.md. The bundle is
-    typed from `config.json`'s `model_type: "qwen2"`, which
-    `litert_lm_builder.py` matches as `case 'qwen2' | 'qwen2p5'` -- so unlike
-    the gemma3_text families there is nothing for an override to disambiguate,
-    and unlike an unknown family there is nothing left unsaid.
-    """
-    plan = plan_export("Qwen/Qwen2.5-0.5B-Instruct", ("--some_flag=1",), ("dynamic_wi8_afp32",))
-    assert plan.rules is not None
-    assert plan.rules.family == "qwen-2.5"
-    assert plan.flags == ("--some_flag=1",)
-    assert plan.added == ()
-    assert plan.checks == ()
-    assert plan.usable
-    assert models.UNKNOWN_FAMILY not in plan.notes
+    text = pathlib.Path(models.packaged_template(template)).read_text(encoding="utf-8")
+    block = pathlib.Path(models.packaged_template("text_parts.jinja")).read_text(encoding="utf-8")
+    header, rest = text.split("-#}\n", 1)
+    assert model in header and revision in header and "Apache-2.0" in header
+    assert "NOT WRITTEN HERE" in header
+    assert rest.startswith(block), "the block comes first, verbatim"
+    # The checkpoint's template starts right after the block, with no newline
+    # added between them that the template did not have.
+    assert rest[len(block) :].startswith("{%-")
+
+
+def test_the_text_parts_block_can_print_nothing():
+    """Put in front of a template, the block must not add a character to the
+    prompt: every line is a statement or a comment, each trimming the
+    whitespace around it, and it ends on a comment that leaves the template's
+    first character alone."""
+    import pathlib
+    import re
+
+    block = pathlib.Path(models.packaged_template("text_parts.jinja")).read_text(encoding="utf-8")
+    lines = block.split("\n")
+    assert lines[0].startswith("{#- litetune:") and lines[0].endswith("-#}")
+    assert lines[-1].startswith("{#- litetune: end") and lines[-1].endswith(" #}")
+    for line in lines[1:-1]:
+        assert re.fullmatch(r"\{%-.*-%\}", line), line
+    assert "{{" not in block
 
 
 def test_the_qwen25_rule_claims_only_the_checkpoint_that_was_run():

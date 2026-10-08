@@ -11,13 +11,19 @@ tokens neither template shows.
 So the check compares token ids. For every prompt, a script in `envs.RUNTIME`
 renders it with `Conversation.render_message_to_string` -- in LiteRT-LM v0.18.0
 (as in v0.17.1) that returns `GetSingleTurnText`, the function `SendMessage` renders with --
-and turns the result into ids the way a first-turn prefill does. What that function renders
-moved in v0.18.0: a model whose processor had no single-turn renderer of its own
-(FunctionGemma's, Qwen3's) fell back to the full history in v0.17.1 and goes through the
-shared single-turn renderer in v0.18.0 (`conversation.cc`, `GetSingleTurnText`), and a
-string `content` reaches the template as a list of text parts (`data_utils.cc`,
-`NormalizeContent`). Whether a template renders the same either way is what the id
-comparison below says, model by model. A script in the reference's
+and turns the result into ids the way a first-turn prefill does. A template renders
+single-turn only when its text contains `is_appending_to_prefill`
+(`minijinja_template.rs`), and none that litetune packages or fetches does (checked
+2026-10-08), so those render from the full history on both versions. What v0.18.0 did
+change is what the
+template is handed: each message's content as a list of parts, `[{"type": "text",
+"text": ...}]` (`model_data_processor.h`, `MessageToTemplateInput`, calling
+`NormalizeMessageContent` in `data_utils.cc`), where v0.17.1's Qwen processor handed a
+single text part over as the string (`qwen3_data_processor.cc`). A template that reads
+`content` as a string then renders without the user's text and raises nothing --
+measured on a Qwen3 bundle on 2026-10-08 -- which is why the Qwen families ship a
+packaged template (`models._TEXT_PARTS_REASON`), and why this comparison runs on every
+model rather than on the ones a reading of the source flagged. A script in the reference's
 environment produces the ids the reference generates from, through the same
 `prompt_mode.RENDERING_SOURCE` training and the generation script use. The lists
 must be equal. On the first few prompts the runtime also sends the message, and the
