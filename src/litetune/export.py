@@ -908,6 +908,12 @@ def set_gpu_activation(
     The exporter offers no flag for this value, and the one flag it does offer
     (`--experimental_use_mixed_precision`) changes the graph as well.
     """
+    # Absolute before anything is derived from it. Below Python 3.12
+    # `tempfile.mkdtemp(dir=...)` returns a relative path for a relative `dir`,
+    # the script then wrote relative `data_path`s, and the builder resolved each
+    # against the TOML's own directory -- a doubled path, and a repack that
+    # failed on every `convert --output-dir artifacts/...` run on 3.10 or 3.11.
+    artifact = Path(artifact).resolve()
     if artifact.stat().st_size == 0:
         # Nothing to repack, and the sweep's size comparison downstream is
         # what reports a zero-byte export; this must not turn it into 8 bytes.
