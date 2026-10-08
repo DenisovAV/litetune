@@ -188,14 +188,15 @@ def render_call(call: ToolCall) -> str:
     `call:tool_name{x:1}`, and the same rule holds in a tool response, where
     `temperature:20` sits next to `unit:<escape>C<escape>`. The parser reads the
     two differently -- `fc_parser.rs` returns an escaped value as a string and a
-    bare number as a double -- so escaping everything, which this did until the
-    format was read, taught the model to send a number the caller receives as a
-    string.
+    bare number as a number (an integer where it fits an i64, a double otherwise,
+    from v0.17.1; a double always up to v0.16.1) -- so escaping everything, which
+    this did until the format was read, taught the model to send a number the
+    caller receives as a string.
 
     **Only what the runtime can read back is written.** A name or key its
     lexer does not read as a name, a string holding an escape, the end-of-call
-    marker or a stop token (`CONTROL_TEXT`), and a number a double cannot hold
-    or its grammar cannot spell are refused, with the row named, rather than
+    marker or a stop token (`CONTROL_TEXT`), and a number the runtime cannot hand
+    back exactly or its grammar cannot spell are refused, with the row named, rather than
     trained: each would be a call that cannot come back as written -- and an
     end marker inside a string would let a dataset row write a second call into
     the training text.
@@ -251,15 +252,21 @@ def _render_argument(key: str, value: Any) -> str:
     if value is None or isinstance(value, bool):
         return f"{key}:{json.dumps(value)}"
     if isinstance(value, int):
-        try:
-            exact = float(value) == value
-        except OverflowError:
-            exact = False
+        # `fc_parser.rs` tries `parse::<i64>()` first (v0.17.1 and v0.18.0) and
+        # falls back to `parse::<f64>()`, so only an integer past an i64 comes
+        # back as a double.
+        exact = -(2**63) <= value < 2**63
+        if not exact:
+            try:
+                exact = float(value) == value
+            except OverflowError:
+                exact = False
         if not exact:
             raise ValueError(
-                f"the argument {key!r} is {value}, which a double cannot hold exactly, and the "
-                "runtime reads every number as a double (fc_parser.rs): the caller would receive "
-                "a different number than the one trained. Send it as a string"
+                f"the argument {key!r} is {value}, which a double cannot hold exactly, and past "
+                "a 64-bit integer the runtime reads a number as a double (fc_parser.rs, "
+                "litert-lm 0.17.1 and 0.18.0): the caller would receive a different number "
+                "than the one trained. Send it as a string"
             )
         return f"{key}:{value}"
     if isinstance(value, float):
