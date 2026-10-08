@@ -70,6 +70,8 @@ from litetune.prepare import (
 from litetune.prompt_mode import PromptMode, parse_prompt_mode
 from litetune.recipes import DEFINED_RECIPES
 from litetune.spec import DTYPES, SpecError, mutable_ref_refusal, weak_revision_limitations
+from litetune.towers import TOWER_SECTIONS, TowersError, drop_towers
+from litetune.towers import summarise as summarise_towers
 from litetune.tune import METHODS, TuneError, TuneRequest, TuneResult, run_tune, write_report
 from litetune.verify import EXIT_CODES, ReferenceRole, Status, VerifyRequest, run_verify
 
@@ -107,6 +109,7 @@ REFUSALS = (
     BundleError,
     TuneError,
     PrepareError,
+    TowersError,
     # A declarations file the runtime or the reference template would render
     # differently is refused with the property named; printed as a traceback,
     # the sentence that says what to change was buried under it.
@@ -211,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_tune(sub)
     _add_convert(sub)
     _add_bundle(sub)
+    _add_towers(sub)
 
     env = sub.add_parser(
         "env",
@@ -686,6 +690,37 @@ def _add_bundle(sub) -> None:
         ),
     )
     bundle.add_argument("--json", action="store_true", help="write the report to stdout")
+
+
+def _add_towers(sub) -> None:
+    towers = sub.add_parser(
+        "towers",
+        help="write a .litertlm without its vision or audio sections",
+        description=(
+            "A Gemma 4 bundle carries its vision and audio towers as sections of their own. "
+            "This writes a copy without the ones named, chosen by section type, and reads the "
+            "copy back: every other section, the metadata and the tokenizer byte for byte. "
+            "What the model answers is not checked here; run `litetune verify` on the result. "
+            "Exit codes: 0 written, 4 refused or not written."
+        ),
+    )
+    towers.add_argument("--model", required=True, type=Path, help="the .litertlm to read")
+    towers.add_argument(
+        "--drop",
+        action="append",
+        required=True,
+        choices=sorted(TOWER_SECTIONS),
+        help="a tower to drop; repeat for both",
+    )
+    towers.add_argument(
+        "--output", required=True, type=Path, help="the new .litertlm; must not exist yet"
+    )
+    towers.add_argument(
+        "--no-provision",
+        action="store_true",
+        help="fail instead of provisioning the runtime environment the builder runs in",
+    )
+    towers.add_argument("--json", action="store_true", help="write the report to stdout")
 
 
 # ---------------------------------------------------------------------------
@@ -1177,6 +1212,18 @@ def _convert(args: argparse.Namespace) -> int:
     return OUTCOME_EXIT_CODES[result.outcome]
 
 
+def _towers(args: argparse.Namespace) -> int:
+    result = drop_towers(
+        args.model,
+        args.output,
+        args.drop,
+        events=_stream(),
+        auto_provision=not args.no_provision,
+    )
+    delivered = _report(result.as_dict(), lambda: summarise_towers(result), args.json)
+    return EXIT_CODES[Status.PASSED] if delivered else EXIT_CODES[Status.ERROR]
+
+
 def _artifact_line(export: RecipeExport) -> str:
     """One produced artifact. Companion files are named, not folded into one number.
 
@@ -1602,6 +1649,7 @@ HANDLERS = {
     "tune": _tune,
     "convert": _convert,
     "bundle": _bundle,
+    "towers": _towers,
     "env": _env,
 }
 

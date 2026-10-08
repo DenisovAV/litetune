@@ -825,6 +825,53 @@ verdicts, not a measured change in a cost, and neither run is withdrawn. The
 float reference is the same to four places. The conversions of the base weights
 in this family's first table were not re-measured.
 
+### Gemma 4 E2B without its towers
+
+Google's `gemma-4-E2B-it.litertlm` (`litert-community/gemma-4-E2B-it-litert-lm`
+at `b3ca0d2f`, sha256 `181938105e0eefd1…`), measured on 2026-10-09 with
+litert-lm 0.18.0's Python API on the CPU backend, on a 32-vCPU AMD EPYC 7B12.
+Nothing here is a tuned model or a litetune export; it is the bundle Google
+ships, and the question is only what dropping its towers changes.
+
+Its six tower sections -- `audio_encoder_hw`, `audio_adapter`, `end_of_audio`,
+`vision_encoder`, `vision_adapter`, `end_of_vision` -- are 332,387,932 of its
+2,588,147,712 bytes, 12.8 %. With them dropped by litert-lm-builder 0.18.0 (the
+method `litetune towers` uses: unpack, drop by type, pack, unpack again, every
+kept section's bytes compared), the file is 2,255,690,576 bytes -- 332,457,136
+smaller, the rest being the padding between sections -- and
+`litert-lm describe` lists text as its only input modality, on CPU and GPU.
+
+Eight prompts, greedy, 128 output tokens, a fresh conversation each:
+
+| | answers equal to the full bundle's | engine load | peak RSS |
+|---|---|---|---|
+| full bundle | — | 3.85 s | 1,623 MB |
+| without its towers | **8 of 8** | 3.88 s | 1,620 MB |
+| full bundle, opened with vision and audio backends | 8 of 8 | 0.31 s | 1,646 MB |
+
+So the saving is download and storage, not memory: a text engine on the full
+bundle does not load the towers. Why the third load was faster is not
+established; it ran after the other two on the same machine.
+
+An image (a red 256×256 PNG) and an audio clip (one second of a 440 Hz tone),
+each with a question, engine opened without and with the matching backend:
+
+| bundle | input | backend | result |
+|---|---|---|---|
+| full | image | — | the send raises `litert_lm_conversation_send_message failed` |
+| full | image | vision | "Red" |
+| full | audio | — | the send raises the same error |
+| full | audio | audio | "The sound is a high-pitched, sustained tone with a slightly wavering quality." |
+| without towers | image | — | the send raises the same error |
+| without towers | image | vision | the engine is not created: `Failed to create LiteRT-LM engine` |
+| without towers | audio | — | the send raises the same error |
+| without towers | audio | audio | the engine is created, the conversation is not: `Failed to create conversation` |
+
+The full bundle answering both is the control. Without its towers every media
+input raised an error and none produced text; where it raised depends on the
+modality and on how the engine was opened. Only the Python binding on one x86-64
+CPU was observed -- not the Kotlin, Swift or C bindings, and not a phone.
+
 ## A fourth family, and the first that is not Gemma
 
 Every section above measures a Gemma: FunctionGemma and Gemma 3 fine-tuned

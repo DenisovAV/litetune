@@ -525,6 +525,29 @@ the record, so the file `tune` read has to reach `verify` and `bundle`
 unchanged. `prepare` without `--base-model` still renders FunctionGemma's
 format, and the report says that it assumed it.
 
+### A Gemma 4 bundle without its towers
+
+A Gemma 4 `.litertlm` carries its vision and audio towers as sections of their
+own. An application that only sends text can ship without them:
+
+```bash
+litetune towers --model gemma-4-E2B-it.litertlm --drop vision --drop audio \
+                --output gemma-4-E2B-it-text.litertlm
+```
+
+Sections are chosen by type — `section_type` `TFLiteModel` and a `model_type`
+from litert-lm-builder 0.18.0's own list for that tower — and a type litetune
+does not know is kept. The metadata, the tokenizer and every other section are
+read back from the new file byte for byte; a tower the bundle does not carry,
+an output that already exists, and a rebuild that does not read back are
+refused. On Google's Gemma 4 E2B bundle the six tower sections are 332,387,932
+bytes and the file shrank from 2,588,147,712 to 2,255,690,576, and on litert-lm 0.18.0's CPU backend the result answered
+eight greedy prompts exactly as the full bundle did, at the same peak memory: a
+text engine does not load the towers. Image or audio input to the result raises
+an error rather than producing text
+([MEASUREMENTS.md](MEASUREMENTS.md#gemma-4-e2b-without-its-towers)). What your
+model answers is `verify`'s to say.
+
 ---
 
 ## What it knows that a shell script does not
@@ -985,6 +1008,9 @@ measurement, and a typo should not produce one.
 `bundle` carries a verdict rather than producing one, so it returns whatever
 `--status` or `--verify-manifest` gave it. With neither it returns 2: bundling
 re-measures nothing.
+
+`towers` measures nothing either: it exits 0 when it wrote the new bundle and 4
+when it refused or could not.
 
 Wiring `|| exit 1` on anything non-zero throws all of this away.
 
