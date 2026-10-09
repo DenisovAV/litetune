@@ -643,7 +643,8 @@ incompatible dependencies and cannot share an interpreter.
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
 runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and `main` pins 0.18.0.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
-0.17.1 re-measurements beside the originals where there are any.
+0.17.1 re-measurements beside the originals where there are any, and the same
+again on 0.18.0.
 
 `functiongemma-270m-it`, LoRA on `google/mobile-actions`, scored on 640 examples
 the model never trained on:

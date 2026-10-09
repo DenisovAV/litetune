@@ -95,7 +95,9 @@ Re-measured on 0.17.1 so far: the four banking77 eight-bit pairs, below; the
 four-bit recipes on the same four checkpoints, in *Four bits on litert-lm
 0.17.1*; the tuned Gemma 4 E2B's two eight-bit bundles, in *Gemma 4 E2B on
 litert-lm 0.17.1*; and FunctionGemma's tool path, in *The same checkpoint on
-litert-lm 0.17.1*. The rest has not been; among it the headline FunctionGemma
+litert-lm 0.17.1*. Each of those was taken again on litert-lm 0.18.0, the runtime
+`main` pins, in *The 0.17.1 re-measurements again on litert-lm 0.18.0*, after the
+banking77 sections. The rest has not been; among it the headline FunctionGemma
 runs, the conversions of Gemma 4's base weights and the runs on untuned bases
 are `verify` numbers taken on 0.16.1, and the phone runs ran on the device.
 
@@ -136,6 +138,110 @@ of eight; that too is an observation without an interval, and the reference
 was re-run as well. Each section has its pair in full. The tuned Gemma 4 E2B's
 pair, on the same split, was re-measured separately, in *Gemma 4 E2B on
 litert-lm 0.17.1*.
+
+### The 0.17.1 re-measurements again on litert-lm 0.18.0
+
+Verified again from 2026-10-08 to 2026-10-09 on litert-lm 0.18.0 with litetune at
+commit c7ee2da, and the Qwen bundles converted again and verified at 02844df, which
+adds the packaged Qwen templates and the review's fixes (both unreleased; both report
+0.3.0), on the machine type the 0.17.1 runs used: every manifest that measured a candidate
+records it on `Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512 and 12 vCPU, and the
+reference on cuda. Nothing was retrained.
+
+Two kinds of bundle were run. The bundles the 0.17.1 runs measured, unchanged -- each
+SHA-256 equals the 0.17.1 manifest's -- so the runtime is the one thing that moved.
+And, for FunctionGemma and the two Qwen sections, bundles converted again from the
+same checkpoints by this litetune, whose conversion stack is the same exporter with
+litert-lm-builder 0.18.0.
+
+**Every number that reached the quality tier is the 0.17.1 number again**: the same
+candidate and reference exact match and the same cost with the same count of
+discordant rows, to four places. The manifests keep scores, not rows, so the rows
+themselves are not shown to be the same; equal totals and equal discordant counts on
+600 or 640 rows are what is claimed.
+
+| model, recipe | reference | 0.17.1 | 0.18.0, the same bundle | 0.18.0, converted again |
+|---|---|---|---|---|
+| gemma-3-270m, `weight_only_wi8_afp32` | 0.6717 | 0.6750, −0.0033 (12) | 0.6750, −0.0033 (12) |  |
+| gemma-3-270m, `dynamic_wi8_afp32` | 0.6717 | 0.6783, −0.0067 (30) | 0.6783, −0.0067 (30) |  |
+| gemma-3-1b, `weight_only_wi8_afp32` | 0.7533 | 0.7533, 0.0000 (4) | 0.7533, 0.0000 (4) |  |
+| gemma-3-1b, `dynamic_wi8_afp32` | 0.7533 | 0.7433, +0.0100 (12) | 0.7433, +0.0100 (12) |  |
+| qwen2.5-0.5b, `weight_only_wi8_afp32` | 0.7700 | 0.7717, −0.0017 (3) | not verified: the first send raised | 0.7717, −0.0017 (3) |
+| qwen2.5-0.5b, `dynamic_wi8_afp32` | 0.7700 | 0.7700, 0.0000 (8) | not verified: the first send raised | 0.7700, 0.0000 (8) |
+| qwen3-0.6b, `weight_only_wi8_afp32` | 0.6983 | 0.6933, +0.0050 (5) | refused: the render check failed | 0.6933, +0.0050 (5) |
+| qwen3-0.6b, `dynamic_wi8_afp32` | 0.6983 | 0.6983, 0.0000 (10) | refused: the render check failed | 0.6983, 0.0000 (10) |
+| gemma-3-270m, `dynamic_wi4b32_emb8_afp32` | 0.6717 | 0.2650, +0.4067 (262, resolved) | 0.2650, +0.4067 (262, resolved) |  |
+| gemma-3-270m, `dynamic_wi4b32_afp32` | 0.6717 | 0.3067, +0.3650 (251, resolved) | 0.3067, +0.3650 (251, resolved) |  |
+| gemma-3-1b, `dynamic_wi4b32_emb8_afp32` | 0.7533 | 0.6750, +0.0783 (75, resolved) | 0.6750, +0.0783 (75, resolved) |  |
+| gemma-3-1b, `dynamic_wi4b32_afp32` | 0.7533 | 0.6700, +0.0833 (82, resolved) | 0.6700, +0.0833 (82, resolved) |  |
+| qwen2.5-0.5b, `dynamic_wi4b32_emb8_afp32` | 0.7700 | 0.6867, +0.0833 (62, resolved) | not verified: the first send raised | 0.6867, +0.0833 (62, resolved) |
+| qwen2.5-0.5b, `dynamic_wi4b32_afp32` | 0.7700 | 0.6933, +0.0767 (60, resolved) | not verified: the first send raised | 0.6933, +0.0767 (60, resolved) |
+| qwen2.5-0.5b, `weight_only_wi4_afp32` | 0.7700 | 0.5200, +0.2500 (174, resolved) | not verified: the first send raised | 0.5200, +0.2500 (174, resolved) |
+| qwen2.5-0.5b, `dynamic_wi4_afp32` | 0.7700 | 0.5017, +0.2683 (191, resolved) | not verified: the first send raised | 0.5017, +0.2683 (191, resolved) |
+| qwen3-0.6b, `dynamic_wi4b32_emb8_afp32` | 0.6983 | 0.6483, +0.0500 (56, resolved) | refused: the render check failed | 0.6483, +0.0500 (56, resolved) |
+| qwen3-0.6b, `dynamic_wi4b32_afp32` | 0.6983 | 0.6700, +0.0283 (55, resolved) | refused: the render check failed | 0.6700, +0.0283 (55, resolved) |
+| gemma-4-e2b, `weight_only_wi8_afp32` | 0.7883 | 0.7833, +0.0050 (3) | 0.7833, +0.0050 (3) | |
+| gemma-4-e2b, `dynamic_wi8_afp32` | 0.7883 | 0.7800, +0.0083 (11) | 0.7800, +0.0083 (11) | |
+
+Each cell is the candidate's exact match on banking77's 600 test rows and the
+conversion cost, with the count of discordant rows. The four-bit recipes refused on
+0.17.1 were refused on 0.18.0 for the same reason and with the same counts. At the
+five-prompt gate: gemma-3-270m `dynamic_wi4_afp32` (repeated itself on 5 of 5), Qwen3
+`dynamic_wi4_afp32`, converted again (2 of 5), and `weight_only_wi4_afp32` on
+gemma-3-270m, gemma-3-1b and Qwen3, converted again (five prompts not done in 900 s).
+Past the gate: gemma-3-1b `dynamic_wi4_afp32` (repeated itself on 65 of 600).
+
+**The old Qwen bundles do not survive 0.18.0**, and the two fail differently. From
+v0.18.0 the runtime hands a bundle's template every message's content as a list of
+parts (LiteRT-LM #3544); both Qwen checkpoints' templates read it as a string.
+Rendered by the runtime on its own, one prompt through a Qwen3 bundle converted by
+0.3.0 came back `<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n` on 0.18.0 --
+the user's text gone, and no error -- against the whole prompt on 0.17.1. `verify`
+refused every Qwen3 bundle, the eight-bit ones on all 600 prompts and the four-bit
+ones at their five-prompt gate: *600 of 600 prompts differ; the runtime renders 8
+tokens and the reference 43*. Through each Qwen2.5 bundle, eight-bit and four-bit,
+`verify` stopped at the same check: the runtime's first send raised
+`litert_lm_conversation_send_message failed`. Bundles converted by this litetune
+carry the checkpoint's own template behind a block that turns a list of text parts
+back into the string (`templates/qwen3-0.6b.jinja`, `qwen2.5-0.5b-instruct.jinja`).
+Every one of those verified in full rendered the same token ids as the reference for
+all 600 prompts and scored what the 0.17.1 bundle scored. **A Qwen bundle converted
+by litetune 0.3.0 or earlier has to be converted again for an application on
+LiteRT-LM 0.18.0.**
+
+FunctionGemma's tool path, both grammar modes, 640 rows: the bundle converted on
+2026-09-19 and the same checkpoint converted again at c7ee2da -- litert-lm-builder
+0.18.0, the GPU activation key written, a relative `--output-dir` on Python 3.11 --
+both score 0.9109 ±0.0221 against 0.9250 for the float reference, cost **+0.0141**
+±0.0092 *(resolved, 9 discordant)*, as on 0.17.1.
+
+**litert-lm-builder 0.18.0 reads and writes back a bundle the 0.17.1 runs measured.**
+The gemma-3-270m `dynamic_wi8_afp32` bundle converted on 2026-09-15, unpacked and
+packed again by builder 0.18.0, came out at the same 455,759,152 bytes. `litert-lm-peek`
+lists every section of it at the same offsets with the same metadata; what differs is
+the uuid and creation timestamp, which `pack` writes new, and the file's LiteRT-LM
+version, 1.6.0 before and 1.7.0 after. Verified on 0.18.0, the repacked bundle scores
+0.6783, −0.0067 (30), the original's numbers.
+
+**On a phone the GPU key is still needed.** The September probe again on a Galaxy S24
+(`SC-51E`) through Firebase Test Lab with `litertlm-android` 0.18.0, the same 20
+native-tool-path FunctionGemma prompts and the same two bundles:
+
+| bundle, backend | runtime | `<pad>` in the text | no text and no call | right tool | exact call |
+|---|---|---|---|---|---|
+| without the key, GPU | 0.16.1 (2026-09-05) | 14 of 20 | 0 | 3 | 2 |
+| without the key, GPU | **0.18.0** | 0 | **8 of 20** | **9** | **6** |
+| `fp32` key, GPU | 0.16.1 | 0 | 0 | 20 | 15 |
+| `fp32` key, GPU | **0.18.0** | 0 | 0 | **20** | **15** |
+| `fp32` key, CPU | 0.16.1 | 0 | 0 | 20 | 14 |
+| `fp32` key, CPU | **0.18.0** | 0 | 0 | **20** | **14** |
+
+Without the key the F16 failure no longer prints `<pad>`: eight rows come back with
+no text and no call after 6.4 to 7.2 s each, which is the time the September flood took
+to reach the same 1,024-token cap; that the runtime now drops those tokens from the
+text is an inference from the timing, not read from source. With the key the totals
+are September's on both backends, though 4 of 20 GPU rows and 5 of 20 CPU rows return
+different calls.
 
 ## The headline numbers
 
