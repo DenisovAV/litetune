@@ -566,7 +566,7 @@ The bundle's own sections stay byte for byte. The donor must carry each whole
 tower. Every `token_str` and token id the kept metadata names must be the same
 piece at the same id in both tokenizers. `--metadata-from-donor` takes the
 donor's LlmMetadata whole, and the report names the fields that differ from the
-bundle's; it is required when the bundle's own names no token for a tower's
+bundle's, among those the builder's text form of the metadata carries; it is required when the bundle's own names no token for a tower's
 input, as the text-only build's did not. Without it, the bundle's image and
 audio settings must equal the donor's. Not checked: whether the donor's adapters
 project into the width the bundle's text model embeds at. This is not an

@@ -31,16 +31,17 @@ from, and the TOML `unpack` writes for it must equal what was asked -- the syste
 output path only then, and never over a file already there.
 
 **Adding is the other direction**, and the less certain one: LiteRT-LM does not
-offer it as an operation. Checked: the donor carries the whole tower (encoder,
-adapter and end marker); the kept LlmMetadata names the token each added
-tower's input starts with -- a text-only build's names none, so the donor's
-metadata is taken only when the caller asks (`metadata_from_donor`), and the
-fields that differ are reported; every `token_str` and token id that metadata
-names is the same piece at the same id in both tokenizers, read from their
-SentencePiece protobufs; and, when the bundle keeps its own metadata, its image
-and audio settings equal the donor's. Not checked: other strings in the metadata,
-the template included, and whether the donor's adapters project into the width
-the bundle's text model embeds at, which only the graphs' signatures say.
+offer it as an operation. Checked: the donor carries the whole tower, one graph
+each for its encoder, adapter and end marker; the kept LlmMetadata names the
+token each added tower's input starts with -- a text-only build's names none, so
+the donor's metadata is taken only when the caller asks (`metadata_from_donor`),
+and the fields that differ in the builder's text form of it are reported; every
+`token_str` and token id that metadata names is the same piece at the same id in
+both tokenizers, read from their SentencePiece protobufs; and, when the bundle
+keeps its own metadata, its image and audio settings equal the donor's. Not
+checked: other strings in the metadata, the template included, and whether the
+donor's adapters project into the width the bundle's text model embeds at, which
+only the graphs' signatures say.
 
 **It runs in the runtime environment**, not the export one: `litert-lm==0.18.0`
 requires `litert-lm-builder==0.18.0`, so `envs.RUNTIME` already carries the
@@ -304,6 +305,8 @@ def fields(buf):
         if wire == 0:
             value, i = varint(buf, i)
         elif wire == 1:
+            if i + 8 > len(buf):
+                raise ValueError("a 64-bit field runs past the end of the message")
             value, i = buf[i:i + 8], i + 8
         elif wire == 2:
             n, i = varint(buf, i)
@@ -311,6 +314,8 @@ def fields(buf):
                 raise ValueError("a length-delimited field runs past the end of the message")
             value, i = buf[i:i + n], i + n
         elif wire == 5:
+            if i + 4 > len(buf):
+                raise ValueError("a 32-bit field runs past the end of the message")
             value, i = buf[i:i + 4], i + 4
         else:
             raise ValueError(f"protobuf wire type {wire} is not one a tokenizer uses")
@@ -324,7 +329,8 @@ def pieces(path):
     try:
         for number, wire, value in fields(Path(path).read_bytes()):
             if number == 1 and wire == 2:
-                out.append(next((v for n, w, v in fields(value) if n == 1 and w == 2), None))
+                piece = list(fields(value))  # all of it, so a truncated piece is refused
+                out.append(next((v for n, w, v in piece if n == 1 and w == 2), None))
     except (IndexError, ValueError) as exc:
         raise Refused(f"{Path(path).name} is not a SentencePiece model: {exc}") from None
     if not out:
@@ -421,6 +427,14 @@ def token_unions(tree, field=None):
             yield from token_unions(value, name)
 
 
+def grouped(tree):
+    """Each field name's values, in order."""
+    out = {}
+    for name, value in tree:
+        out.setdefault(name, []).append(value)
+    return out
+
+
 def named(tree, field):
     """Whether the metadata names a token in `field`: a TokenUnion there that is
     not empty."""
@@ -478,10 +492,15 @@ def add(spec, work):
                       + " sections; drop them first")
     taken = [s for s in donor["section"] if is_tower(s, names, towers)]
     for t in names:
-        have = {model_type(s) for s in taken if is_tower(s, names, towers) == t}
-        missing = sorted(set(required[t]) - have)
+        # Weights alone are not a graph the runtime can run.
+        graphs = [model_type(s) for s in taken
+                  if is_tower(s, names, towers) == t and s.get("section_type") == "TFLiteModel"]
+        missing = sorted(set(required[t]) - set(graphs))
         if missing:
             raise Refused(f"the donor's {t} tower lacks {', '.join(missing)}")
+        twice = sorted({g for g in graphs if graphs.count(g) > 1})
+        if twice:
+            raise Refused(f"the donor carries more than one {', '.join(twice)} graph")
 
     own_meta, donor_meta = only(recipient, "LlmMetadata", "the bundle"), only(
         donor, "LlmMetadata", "the donor")
@@ -529,9 +548,10 @@ def add(spec, work):
         if mine != theirs:
             raise Refused(f"the bundle's LlmMetadata sets {mine} where the donor's, which its "
                           f"towers were built for, sets {theirs}")
-    changes = sorted({n for n, _ in own_tree} ^ {n for n, _ in donor_tree} | {
-        n for n, v in own_tree if dict(own_tree).get(n) != dict(donor_tree).get(n)
-    }) if use_donor_meta else []
+    # A repeated field (stop_tokens) is compared as the whole list of its values.
+    mine_all, theirs_all = grouped(own_tree), grouped(donor_tree)
+    changes = sorted(n for n in mine_all.keys() | theirs_all.keys()
+                     if mine_all.get(n) != theirs_all.get(n)) if use_donor_meta else []
 
     # The result, and where each of its sections' bytes come from.
     composed, sources = copy.deepcopy(recipient), list(own_sources)
@@ -742,24 +762,21 @@ def _publish(rebuilt: Path, output: Path) -> None:
     """Put the verified bundle at `output`, never over a file already there.
 
     A hard link fails if the name exists, which the check before the rebuild
-    could not promise for the minutes the rebuild takes; where links are not
-    supported, an exclusive create does the same.
+    could not promise for the minutes the rebuild takes, and the file appears
+    whole. Where the filesystem has no hard links this refuses rather than
+    copies: a copy would sit at `output` half written, and nothing could remove
+    it safely if writing it failed.
     """
     try:
         os.link(rebuilt, output)
-        return
     except FileExistsError:
         raise TowersError(
             f"{output} appeared while the bundle was rebuilt; nothing was written over it"
         ) from None
-    except OSError:
-        pass
-    try:
-        with rebuilt.open("rb") as src, output.open("xb") as dst:
-            shutil.copyfileobj(src, dst, 1 << 24)
-    except FileExistsError:
+    except OSError as exc:
         raise TowersError(
-            f"{output} appeared while the bundle was rebuilt; nothing was written over it"
+            f"could not link the rebuilt bundle to {output} ({exc}); give an output path on "
+            "a filesystem that supports hard links"
         ) from None
 
 
@@ -847,7 +864,7 @@ def add_towers(
         notes.insert(
             0,
             "LlmMetadata was taken from the donor, whole and byte for byte. Its fields that "
-            f"differ from the bundle's own: {changed}.",
+            f"differ from the bundle's own, as the builder's text form shows them: {changed}.",
         )
     return TowersResult(
         operation="add",

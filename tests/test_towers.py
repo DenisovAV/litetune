@@ -694,6 +694,20 @@ def test_an_output_written_during_the_rebuild_is_not_overwritten(toolchain, tmp_
     assert no_scratch(tmp_path)
 
 
+def test_a_filesystem_without_hard_links_is_refused_and_nothing_left(
+    toolchain, tmp_path, monkeypatch
+):
+    def no_link(src, dst):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("litetune.towers.os.link", no_link)
+    out = tmp_path / "out.litertlm"
+    with pytest.raises(TowersError, match="Operation not permitted.*supports hard links"):
+        drop_towers(gemma4(tmp_path), out, ["vision"])
+    assert not out.exists()
+    assert no_scratch(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("knob", "reason"),
     [
@@ -828,6 +842,19 @@ def test_towers_are_added_with_the_donors_metadata_and_nothing_else_moves(toolch
     assert no_scratch(tmp_path)
 
 
+def test_a_repeated_field_that_differs_anywhere_is_reported(toolchain, tmp_path):
+    """Both end on the same `stop_tokens`; the first ones differ."""
+
+    def stops(first: int) -> str:
+        extra = f"stop_tokens {{\n  token_ids {{\n    ids: {first}\n  }}\n}}\n"
+        return GEMMA4_META.replace("stop_tokens {\n", extra + "stop_tokens {\n", 1)
+
+    result = add_towers(sm8850(tmp_path, meta=stops(2)), tmp_path / "o", ["vision"],
+                        donor(tmp_path, meta=stops(0)), metadata_from_donor=True)  # fmt: skip
+    assert result.metadata_changes == ("stop_tokens",)
+    assert any("as the builder's text form shows them: stop_tokens." in n for n in result.notes)
+
+
 def test_the_bundles_own_metadata_is_what_is_kept_without_the_flag(toolchain, tmp_path):
     own = GEMMA4_META + "max_num_tokens: 4096\n"
     model = sm8850(tmp_path, meta=own)
@@ -923,6 +950,21 @@ def test_a_tokenizer_that_is_not_one_is_refused(toolchain, tmp_path):
         add_towers(model, tmp_path / "o", ["vision"], donor(tmp_path), metadata_from_donor=True)
 
 
+@pytest.mark.parametrize(
+    "cut",
+    [
+        b"\x15\0\0",  # field 2, a 32-bit score, with 2 of its 4 bytes
+        b"\x11\0\0\0",  # field 2 as a 64-bit value, with 3 of its 8 bytes
+    ],
+)
+def test_a_tokenizer_cut_inside_a_fixed_width_field_is_refused(toolchain, tmp_path, cut):
+    tokenizer = sentencepiece(PIECES[:-1]) + b"\x0a" + bytes([len(cut) + 5]) + b"\x0a\x03<x>" + cut
+    files = {"LlmMetadataProto.pbtext": BARE_META.encode(), "SP_Tokenizer.spiece": tokenizer}
+    model = make_bundle(tmp_path / "m.litertlm", SM8850_TOML, files)
+    with pytest.raises(TowersError, match="is not a SentencePiece model: a (32|64)-bit field"):
+        add_towers(model, tmp_path / "o", ["vision"], donor(tmp_path), metadata_from_donor=True)
+
+
 def test_an_escaped_token_string_is_read_as_the_token(toolchain, tmp_path):
     pieces = PIECES[:-1] + ["<it's>"]
     # `MessageToString` writes an apostrophe as `\'`.
@@ -949,6 +991,24 @@ def test_a_tower_already_there_or_incomplete_in_the_donor_is_refused(toolchain, 
     )
     with pytest.raises(TowersError, match="donor's audio tower lacks audio_adapter, end_of_audio"):
         add_towers(sm8850(tmp_path), tmp_path / "b", ["audio"], donor(tmp_path, partial),
+                   metadata_from_donor=True)  # fmt: skip
+
+
+def test_a_donor_tower_needs_each_graph_once_not_weights_alone(toolchain, tmp_path):
+    adapter = (
+        'model_type = "vision_adapter"\nbackend_constraint = "cpu"\nsection_type = "TFLiteModel"'
+    )
+    assert GEMMA4_E2B_TOML.count(adapter) == 1
+    weights_only = GEMMA4_E2B_TOML.replace(adapter, adapter.replace("TFLiteModel", "TFLiteWeights"))
+    with pytest.raises(TowersError, match="donor's vision tower lacks vision_adapter"):
+        add_towers(sm8850(tmp_path), tmp_path / "a", ["vision"], donor(tmp_path, weights_only),
+                   metadata_from_donor=True)  # fmt: skip
+    twice = GEMMA4_E2B_TOML + (
+        '\n[[section]]\nmodel_type = "end_of_vision"\nsection_type = "TFLiteModel"\n'
+        'data_path = "Section12_TFLiteModel_tf_lite_end_of_vision_2.tflite"\n'
+    )
+    with pytest.raises(TowersError, match="more than one end_of_vision graph"):
+        add_towers(sm8850(tmp_path), tmp_path / "b", ["vision"], donor(tmp_path, twice),
                    metadata_from_donor=True)  # fmt: skip
 
 
