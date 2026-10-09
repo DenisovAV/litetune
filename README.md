@@ -527,45 +527,51 @@ format, and the report says that it assumed it.
 
 ### Gemma 4 towers: drop them, or take them from another bundle
 
-A Gemma 4 `.litertlm` carries its vision and audio towers as sections of their
-own. An application that only sends text can ship without them:
+Google's Gemma 4 E2B CPU/GPU bundle carries its vision and audio towers as six
+sections of their own. An application that only sends text can ship without
+them:
 
 ```bash
 litetune towers --model gemma-4-E2B-it.litertlm --drop vision --drop audio \
                 --output gemma-4-E2B-it-text.litertlm
 ```
 
-Sections are chosen by type — `section_type` `TFLiteModel` and a `model_type`
-from litert-lm-builder 0.18.0's own list for that tower — and a type litetune
-does not know is kept. The metadata, the tokenizer and every other section are
-read back from the new file byte for byte; a tower the bundle does not carry,
-an output that already exists, and a rebuild that does not read back are
-refused. On Google's Gemma 4 E2B bundle the six tower sections are 332,387,932
-bytes and the file shrank from 2,588,147,712 to 2,255,690,576, and on litert-lm 0.18.0's CPU backend the result answered
-eight greedy prompts exactly as the full bundle did, at the same peak memory: a
-text engine does not load the towers. Image or audio input to the result raises
-an error rather than producing text
+A section belongs to a tower by its `section_type` (a TFLite graph or its
+weights) together with a `model_type` from litert-lm-builder 0.18.0's own list
+for that tower; every other section is kept. The new file is read back before it
+is written to `--output`: every section, the metadata included, byte for byte
+against the section it came from. What the builder cannot write back (a TTS or
+ASR metadata section, a model type it does not know), a tower the bundle does
+not carry and an existing output are refused. The work directory beside
+`--output` needs three to four times the bundle's size.
+
+On Google's bundle the six tower sections are 332,387,932 of 2,588,147,712
+bytes. A bundle stripped of them the same way answered eight greedy prompts on
+litert-lm 0.18.0's CPU backend exactly as the full bundle did, at a peak RSS
+within 3 MB of it, and every image or audio input to it through the Python API
+raised an error rather than producing text
 ([MEASUREMENTS.md](MEASUREMENTS.md#gemma-4-e2b-without-its-towers)). What your
 model answers is `verify`'s to say.
 
-The other way round, towers from one bundle into another — Gemma 4 E2B's into a
-text-only build compiled for a Qualcomm NPU:
+The other way round, towers from one bundle into another — Google's E2B towers
+into a text-only build compiled for a Qualcomm NPU:
 
 ```bash
-litetune towers --model gemma4_2b_SM8850.litertlm --add vision --add audio \
+litetune towers --model gemma-4-E2B-it-npu.litertlm --add vision --add audio \
                 --from gemma-4-E2B-it.litertlm --metadata-from-donor \
-                --output gemma4_2b_SM8850-towers.litertlm
+                --output gemma-4-E2B-it-npu-towers.litertlm
 ```
 
-The bundle's own sections stay byte for byte. Every token string and id the
-kept metadata names must be the same token in both tokenizers, or it is
-refused. `--metadata-from-donor` takes the donor's LlmMetadata — its prompt
-template, stop tokens and media fields — and is required when the bundle's own
-names no token for a tower's input, as a text-only build's does not. Not
-checked: that the donor's adapters project into the width the bundle's text
-model embeds at. This is not a supported operation of LiteRT-LM; it was
-measured once, on one SM8850 phone, where the result answered an image and an
-audio turn and its text answers did not change
+The bundle's own sections stay byte for byte. The donor must carry each whole
+tower. Every `token_str` and token id the kept metadata names must be the same
+piece at the same id in both tokenizers. `--metadata-from-donor` takes the
+donor's LlmMetadata whole, and the report names the fields that differ from the
+bundle's; it is required when the bundle's own names no token for a tower's
+input, as the text-only build's did not. Without it, the bundle's image and
+audio settings must equal the donor's. Not checked: whether the donor's adapters
+project into the width the bundle's text model embeds at. This is not an
+operation LiteRT-LM offers; it was measured once, on one SM8850 phone, where the
+result answered an image and an audio turn and its text answers did not change
 ([MEASUREMENTS.md](MEASUREMENTS.md#towers-grafted-into-an-sm8850-npu-bundle)).
 
 ---

@@ -835,13 +835,18 @@ ships, and the question is only what dropping its towers changes.
 
 Its six tower sections -- `audio_encoder_hw`, `audio_adapter`, `end_of_audio`,
 `vision_encoder`, `vision_adapter`, `end_of_vision` -- are 332,387,932 of its
-2,588,147,712 bytes, 12.8 %. With them dropped by litert-lm-builder 0.18.0 (the
-method `litetune towers` uses: unpack, drop by type, pack, unpack again, every
-kept section's bytes compared), the file is 2,255,690,576 bytes -- 332,457,136
-smaller, the rest being the padding between sections -- and
-`litert-lm describe` lists text as its only input modality, on CPU and GPU.
+2,588,147,712 bytes, 12.8 %. They were dropped with litert-lm-builder 0.18.0 by a
+script that unpacked the bundle, dropped them by type, packed and unpacked again,
+and compared every kept section as unpacked. The result is 2,255,690,576 bytes,
+and `litert-lm describe` lists text as its only input modality, on CPU and GPU.
+That script compared the metadata in the text form
+`unpack` writes, and the text form had lost 2 bytes of it: `gemma4` field 13,
+which 0.18.0's proto reserves and 0.17.1's marks as ignored from 0.17.0 on.
+`litetune towers` copies the metadata as raw bytes instead; the same drop with it
+keeps all 12,192 bytes and gives a file of the same length.
 
-Eight prompts, greedy, 128 output tokens, a fresh conversation each:
+Eight prompts, greedy, 128 output tokens, a fresh conversation each, each bundle
+in its own process:
 
 | | answers equal to the full bundle's | engine load | peak RSS |
 |---|---|---|---|
@@ -849,12 +854,13 @@ Eight prompts, greedy, 128 output tokens, a fresh conversation each:
 | without its towers | **8 of 8** | 3.88 s | 1,620 MB |
 | full bundle, opened with vision and audio backends | 8 of 8 | 0.31 s | 1,646 MB |
 
-So the saving is download and storage, not memory: a text engine on the full
-bundle does not load the towers. Why the third load was faster is not
-established; it ran after the other two on the same machine.
+On this CPU backend the saving is download and storage, not memory: the peak RSS
+is within 3 MB. Why the third load was faster is not established; it ran after
+the other two on the same machine.
 
-An image (a red 256×256 PNG) and an audio clip (one second of a 440 Hz tone),
-each with a question, engine opened without and with the matching backend:
+An image (a red 256×256 PNG, "What colour is this image? Answer in one word.")
+and an audio clip (one second of a 440 Hz tone, "Describe this sound in one
+sentence."), engine opened without and with the matching backend:
 
 | bundle | input | backend | result |
 |---|---|---|---|
@@ -874,43 +880,47 @@ CPU was observed -- not the Kotlin, Swift or C bindings, and not a phone.
 
 ### Towers grafted into an SM8850 NPU bundle
 
-A Gemma 4 E2B bundle compiled for the SM8850 NPU (`gemma4_2b_SM8850.litertlm`,
-2,585,963,920 bytes, sha256 `6722c5096eb37961…`; not on Hugging Face) carries text
-only: an `aux` section, the embedders and an NPU `prefill_decode`, a tokenizer, and
-LlmMetadata that names no model type and no media token. Its tokenizer has the same
-id as Google's CPU/GPU bundle's for every text, image and audio token, and differs
-from id 258,884 on, where the CPU/GPU one has `<|video|>`.
+A text-only Gemma 4 E2B build compiled for the SM8850 NPU, not published in
+`litert-community/gemma-4-E2B-it-litert-lm`, carries an `aux` section, the
+embedders, an NPU `prefill_decode`, a tokenizer, and LlmMetadata that names no
+model type and no media token. Its tokenizer gives every text, image and audio
+token the same id as the CPU/GPU bundle's, and differs from id 258,884 on, where
+the CPU/GPU one has `<|video|>`.
 
-`litetune towers --model gemma4_2b_SM8850.litertlm --add vision --add audio --from
-gemma-4-E2B-it.litertlm --metadata-from-donor` (the donor at `b3ca0d2f`) wrote
-2,918,406,772 bytes: the bundle's sections byte for byte, the CPU/GPU bundle's
-LlmMetadata and six tower sections; the 8 tokens that metadata names agreed in both
-tokenizers. Without `--metadata-from-donor` it refused.
+`litetune towers --add vision --add audio --metadata-from-donor` with the CPU/GPU
+bundle above as the donor wrote 2,918,406,772 bytes: the build's own sections,
+the donor's LlmMetadata (all 12,192 bytes) and its six tower sections, each byte
+for byte; the 8 token strings and ids the donor's metadata names agreed in both
+tokenizers, and the report named the metadata fields that differ
+from the build's own. Without `--metadata-from-donor` it refused.
 
 Run on 2026-10-09 on a Galaxy S26 (`Build.SOC_MODEL` SM8850) through Firebase Test
-Lab, with LiteRT-LM v0.18.0's C API, the text model on the NPU and the towers on the
-CPU, greedy:
+Lab, through LiteRT-LM v0.18.0's C API (the `libLiteRtLm.so` of flutter_gemma's
+`native-v0.18.0-a` release), the text model on the NPU and the towers on the CPU,
+greedy. CPU time / wall is the process's CPU time over wall time across a run's
+prompts, engine load excluded: 0.59 to 0.65 in the text-only runs below, 2.81 in
+the run that also ran the towers on the CPU.
 
 | input | bundle | result | engine load | CPU time / wall |
 |---|---|---|---|---|
-| eight text prompts | as received | eight coherent answers | 1.45 s | 0.65 |
-| eight text prompts | with towers, engine opened without media backends | **8 of 8 identical** to the bundle as received | 2.40 s | 0.62 |
-| the red PNG, "What colour is this image?" | with towers, vision on CPU | **"Red"** | 7.13 s (with the audio question's engine) | 2.08 |
-| the 440 Hz tone, "Describe this sound" | with towers, audio on CPU | **"The sound is a high-pitched, sustained tone that fades slowly."** | | |
-| "What is the capital of Portugal?" | with towers | "The capital of Portugal is Lisbon." | | |
+| eight text prompts | as built | eight coherent answers | 1.45 s | 0.65 |
+| eight text prompts | with towers, engine opened without media backends | **8 of 8 identical** to the build's | 2.25 s | 0.59 |
+| the red PNG, "What colour is this image? Answer in one word." | with towers | **"Red"** | 6.91 s, one engine with both media backends | 2.81 |
+| the 440 Hz tone, "Describe this sound in one sentence." | with towers | **"The sound is a high-pitched, sustained tone that fades slowly."** | | |
+| "What is the capital of Portugal? Answer in one sentence." | with towers | "The capital of Portugal is Lisbon." | | |
 
-The three media-run questions went to one engine opened with both media backends.
-The same composition built by hand from the towers of Google's own SM8750 NPU bundle
-instead gave the same three answers, word for word.
-
-The text model ran as `LiteRT NPU Compiled Model` on the HTP backend (logcat); the
-towers on XNNPACK. One image, one tone and eight text prompts on one phone: this
-shows the grafted bundle loads and answers both modalities on the device it was
-built for, and that its text answers did not change. It is not a measurement of
-image or audio quality. The runtime needed Qualcomm's QNN runtime 2.51.0
-(`com.qualcomm.qti:qnn-runtime` on Maven Central): with QAIRT 2.47.0 libraries the
-v0.18.0 dispatch refused, `Qnn System library version 1.11.0 is mismatched. The
-minimum supported version is 1.14.0.`
+The text model ran as `LiteRT NPU Compiled Model` on the HTP backend (logcat of the
+media run); the towers on XNNPACK. The same composition built with
+litert-lm-builder 0.18.0 directly, and one with the towers of Google's own SM8750
+NPU bundle instead, gave the same three answers word for word. One image, one tone
+and eight text prompts on one phone: this shows the grafted bundle loads and
+answers both modalities on the device it was built for, and that its text answers
+did not change. It is not a measurement of image or audio quality. It ran with
+Qualcomm's QNN runtime 2.51.0 (`com.qualcomm.qti:qnn-runtime` on Maven Central),
+with a logcat warning, `Qnn backend library version 5.51.0 is used. The version
+LiteRT using is 5.50.0.`; with QAIRT 2.47.0
+libraries the v0.18.0 dispatch refused, `Qnn System library version 1.11.0 is
+mismatched. The minimum supported version is 1.14.0.`
 
 ## A fourth family, and the first that is not Gemma
 

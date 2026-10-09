@@ -697,12 +697,14 @@ def _add_towers(sub) -> None:
         "towers",
         help="write a .litertlm without its vision or audio sections, or with another's",
         description=(
-            "A Gemma 4 bundle carries its vision and audio towers as sections of their own. "
-            "--drop writes a copy without the ones named, chosen by section type; --add "
-            "writes a copy with the ones named taken from --from, after checking that every "
-            "token the kept metadata names is the same token in both tokenizers. Either way "
-            "the copy is read back: every section byte for byte. What the model answers is "
-            "not checked here; run `litetune verify` on the result. "
+            "Google's Gemma 4 E2B CPU/GPU bundle carries its vision and audio towers as "
+            "sections of their own. --drop writes a copy without the ones named, chosen by "
+            "section type and model type; --add writes a copy with the ones named taken from "
+            "--from, after checking that every token string and id the kept metadata names "
+            "is the same piece at the same id in both tokenizers. Either way the copy is read "
+            "back, every section byte for byte, before it is put at --output. The work "
+            "directory beside --output needs three to four times the bundle's size. What the "
+            "model answers is not checked here; run `litetune verify` on the result. "
             "Exit codes: 0 written, 4 refused or not written."
         ),
     )

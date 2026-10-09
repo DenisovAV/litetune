@@ -1,53 +1,53 @@
 """`towers`: a bundle without the vision or audio sections it carries, or with
 another bundle's.
 
-A Gemma 4 `.litertlm` carries its vision and audio towers as their own sections
-beside the text model, and an application that only ever sends text pays for
-them in download size. Measured on Google's `gemma-4-E2B-it.litertlm`
-(`litert-community/gemma-4-E2B-it-litert-lm` at `b3ca0d2f`): the six tower
-sections are 332,387,932 of its 2,588,147,712 bytes, and with them dropped the
-bundle answered eight greedy prompts with the same text on litert-lm 0.18.0's
-CPU backend, with the same peak RSS -- a text engine does not load them
-(MEASUREMENTS.md, *Gemma 4 E2B without its towers*).
+Google's Gemma 4 E2B CPU/GPU bundle (`litert-community/gemma-4-E2B-it-litert-lm`,
+`gemma-4-E2B-it.litertlm` at `b3ca0d2f`) carries its vision and audio towers as six
+sections of their own beside the text model: 332,387,932 of its 2,588,147,712
+bytes. Stripped of them, it answered eight greedy prompts with the same text on
+litert-lm 0.18.0's CPU backend, at a peak RSS within 3 MB of the full bundle's
+(MEASUREMENTS.md, *Gemma 4 E2B without its towers*). An application that only
+sends text ships the difference for nothing.
 
-**Sections are chosen by type, from an allowlist, and nothing else.** A
-section is dropped only when its `section_type` is `TFLiteModel` *and* its
-`model_type` is one this module names for the tower asked for -- the values
-`litert-lm-builder`'s `TfLiteModelType` uses at 0.18.0 (`litertlm_builder.py`).
-`section_type` alone would match the text model too. A `model_type` this module
-does not know is kept, never guessed at: a later builder may add one, and a
-section dropped by a guess is a bundle that fails on a device.
+**Sections are chosen by type, from an allowlist, and nothing else.** A section
+belongs to a tower when its `section_type` is `TFLiteModel` or `TFLiteWeights` (a
+graph and its externalized weights) *and* its `model_type` is one this module
+names for that tower -- values from litert-lm-builder 0.18.0's `TfLiteModelType`
+(`litertlm_builder.py`); the script refuses a builder that lacks one. A
+`section_type` alone would match the text model too. Any other section is kept.
 
-**The result is checked by reading it back.** The new bundle is unpacked again
-and must equal the input minus exactly the dropped sections -- the system
-`uuid` and `creation_timestamp` aside, which `pack` regenerates, and the
-`SectionN_` index in each file name, which `unpack` renumbers -- and every kept
-section's bytes must hash the same. `LlmMetadata` and the tokenizer are kept as
-they were: the template inside is text metadata, and without it the runtime
-derives a different one.
+**What the builder cannot write back is refused, not lost.** `unpack` leaves out
+of its TOML the section types `pack` does not take (TTS and ASR metadata), and
+`pack` raises for a `model_type` outside its enum; the header's section count
+and every type are checked first. `unpack` also writes LlmMetadata as text
+through the builder's own proto, which loses a field that proto does not declare
+-- 2 bytes of Google's E2B metadata, `gemma4` field 13, reserved in 0.18.0 -- so
+the metadata goes back in as its raw bytes, which `pack` copies unparsed.
 
-**Adding is the other direction**, and the less certain one: a donor's tower
-sections go into a bundle that has none, which LiteRT-LM does not offer as an
-operation. The bundle's own sections are kept byte for byte. Two things decide
-whether a tower's output lands where the text model expects it, and both are
-checked: the metadata must name the token each input starts with -- a
-text-only build's does not, so the donor's metadata is taken only when the
-caller says so (`metadata_from_donor`), because it also replaces the prompt
-template and stop tokens -- and every token string and id that metadata names
-must be the same token in both tokenizers, read straight from their
-SentencePiece protobufs. A third is not checked: that the donor's adapters
-project into the width the bundle's text model embeds at, which only the graphs'
-signatures say. The device run in MEASUREMENTS.md is what it rests on.
+**The result is checked by reading it back.** Every section of the new file must
+hash the same, as raw bytes at its header offsets, as the section it was taken
+from, and the TOML `unpack` writes for it must equal what was asked -- the system
+`uuid` and `creation_timestamp` aside, which `pack` regenerates. It is put at the
+output path only then, and never over a file already there.
+
+**Adding is the other direction**, and the less certain one: LiteRT-LM does not
+offer it as an operation. Checked: the donor carries the whole tower (encoder,
+adapter and end marker); the kept LlmMetadata names the token each added
+tower's input starts with -- a text-only build's names none, so the donor's
+metadata is taken only when the caller asks (`metadata_from_donor`), and the
+fields that differ are reported; every `token_str` and token id that metadata
+names is the same piece at the same id in both tokenizers, read from their
+SentencePiece protobufs; and, when the bundle keeps its own metadata, its image
+and audio settings equal the donor's. Not checked: other strings in the metadata,
+the template included, and whether the donor's adapters project into the width
+the bundle's text model embeds at, which only the graphs' signatures say.
 
 **It runs in the runtime environment**, not the export one: `litert-lm==0.18.0`
 requires `litert-lm-builder==0.18.0`, so `envs.RUNTIME` already carries the
-builder, and the export environment would add a converter this never calls.
+builder, and the export environment would add a converter this never calls. The
+scratch directory beside the output holds the unpacked input, a donor and the
+result at once: three to four times the bundle's size.
 
-**Refused rather than done:** a tower to drop that the bundle does not carry; a
-tower to add that it already carries or the donor does not; metadata that names
-no input token for an added tower, unless the donor's is asked for; tokenizers
-that disagree on a token the metadata names; an output path that already exists
-(the input is never overwritten); and a rebuild that does not read back as asked.
 What the model answers is not checked here; `litetune verify` does that.
 """
 
@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -78,7 +79,14 @@ TOWER_SECTIONS: dict[str, tuple[str, ...]] = {
     "audio": ("audio_frontend", "audio_encoder_hw", "audio_adapter", "end_of_audio"),
 }
 
-# Unpack, pack and unpack again of a 2.6 GB bundle took 15 s on an M4 Pro.
+# What a donor's tower must carry to be taken: Google's Gemma 4 E2B bundles carry
+# all three of each, and an `audio_frontend` is taken when there is one.
+TOWER_REQUIRED: dict[str, tuple[str, ...]] = {
+    "vision": ("vision_encoder", "vision_adapter", "end_of_vision"),
+    "audio": ("audio_encoder_hw", "audio_adapter", "end_of_audio"),
+}
+
+# A rebuild unpacks, packs and unpacks again, once more for a donor.
 TOWERS_TIMEOUT_S = 1800
 
 
@@ -87,17 +95,18 @@ class TowersError(Exception):
 
 
 _TOWERS_SCRIPT = r'''
-"""Drop named TFLiteModel sections from a bundle, or add them from another;
-verify by reading the result back.
+"""Drop named tower sections from a bundle, or add them from another; leave the
+result, read back and verified, in the work directory for the parent to publish.
 
-Reads JSON {mode: "drop"|"add", artifact, output, work, towers: {name:
-[model_type, ...]}, names: [name, ...], donor, metadata_from_donor} from
-argv[1]. Writes JSON to argv[2]:
+Reads JSON {mode: "drop"|"add", artifact, work, towers: {name: [model_type, ...]},
+required: {name: [model_type, ...]}, names: [name, ...], donor,
+metadata_from_donor} from argv[1]. Writes JSON to argv[2]:
   {"sections": [...], "dropped": [...], "added": [...], "metadata_source": ...,
-   "tokens_checked": <int>, "written": <bool>, "reason": <str|null>}
+   "tokens_checked": <int>, "rebuilt": <path|null>, "reason": <str|null>}
 """
 import copy
 import hashlib
+import io
 import json
 import os
 import re
@@ -110,8 +119,17 @@ except ModuleNotFoundError:  # Python < 3.11: the builder itself depends on toml
     import tomli as tomllib
 
 from litert_lm_builder import litertlm_builder as lb
+from litert_lm_builder import litertlm_peek
 
 VOLATILE = {"uuid", "creation_timestamp"}
+# Sections a tower's graphs and their externalized weights live in.
+GRAPH_TYPES = ("TFLiteModel", "TFLiteWeights")
+# The LlmMetadata field that names the token a tower's input starts with.
+TOWER_TOKEN = {"vision": "start_of_image_token", "audio": "start_of_audio_token"}
+
+
+class Refused(Exception):
+    """A reason this script will not write the bundle asked for."""
 
 
 def load(path):
@@ -131,10 +149,6 @@ def toml_string(text):
             out.append('\\"')
         elif ch == "\\":
             out.append("\\\\")
-        elif ch == "\n":
-            out.append("\\n")
-        elif ch == "\t":
-            out.append("\\t")
         elif o < 0x20 or o == 0x7F:
             out.append(f"\\u{o:04X}")
         else:
@@ -178,42 +192,97 @@ def write_toml(doc, path):
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
-def file_name(path):
-    """A section's file name without the index `unpack` gives it."""
-    return re.sub(r"^Section\d+_", "", os.path.basename(path))
-
-
 def comparable(doc):
+    """The TOML without what `pack` regenerates and without file names, which say
+    nothing about content; the content is compared as raw bytes (`spans`)."""
     sm = doc.get("system_metadata", {})
     entries = [e for e in sm.get("entries", []) if e.get("key") not in VOLATILE]
     sections = copy.deepcopy(doc.get("section", []))
     for s in sections:
-        if "data_path" in s:
-            s["data_path"] = file_name(s["data_path"])
+        s.pop("data_path", None)
     return {"system_metadata": {"entries": entries}, "section": sections}
 
 
-def digest(path):
+def spans(path):
+    """Each section's (begin, end) byte offsets, from the file's own header."""
+    header = litertlm_peek.read_litertlm_header(str(path), io.StringIO())
+    listed = header.SectionMetadata()
+    count = listed.ObjectsLength() if listed else 0
+    return [(listed.Objects(i).BeginOffset(), listed.Objects(i).EndOffset())
+            for i in range(count)]
+
+
+def read_span(path, span):
+    begin, end = span
+    with open(path, "rb") as f:
+        f.seek(begin)
+        return f.read(end - begin)
+
+
+def digest(path, span):
+    begin, end = span
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 24), b""):
+        f.seek(begin)
+        left = end - begin
+        while left:
+            block = f.read(min(left, 1 << 24))
+            if not block:
+                break
             h.update(block)
+            left -= len(block)
     return h.hexdigest()
 
 
-def describe(section, directory):
-    path = Path(directory) / os.path.basename(section["data_path"])
+def describe(section, span):
     return {
         "section_type": section.get("section_type"),
         "model_type": model_type(section) or None,
-        "bytes": path.stat().st_size,
+        "bytes": span[1] - span[0],
     }
 
 
-def report(sections=(), dropped=(), written=False, reason=None, **extra):
-    return {"sections": list(sections), "dropped": list(dropped), "written": written,
-            "reason": reason, **extra}
+def unpacked(path, directory, where):
+    """The bundle's TOML and each section's place in the file, ready for `pack`
+    -- refused if the builder could not write it back whole.
 
+    `unpack` dumps every section but puts in its TOML only the types `pack`
+    takes: a TTS or ASR metadata section is left out, and a repack would drop it
+    without a word. `pack` raises for a `model_type` outside its enum. And
+    `unpack` writes LlmMetadata as text through the builder's own proto, so a
+    field that proto does not declare is gone from the text: the section's raw
+    bytes are written beside it as a binary `.pb`, which `pack` copies unparsed.
+    """
+    lb.unpack(str(path), str(directory))
+    doc = load(Path(directory) / "model.toml")
+    places = spans(path)
+    count = len(places)
+    if count != len(doc.get("section", [])):
+        raise Refused(
+            f"{where} has {count} sections and litert-lm-builder unpacks "
+            f"{len(doc.get('section', []))} of them into a form it can write back; the rest "
+            "(TTS or ASR metadata) would be lost"
+        )
+    for s in doc.get("section", []):
+        if s.get("section_type") in GRAPH_TYPES:
+            try:
+                lb.TfLiteModelType.get_enum_from_tf_free_value(str(s.get("model_type", "")))
+            except Exception:  # noqa: BLE001 - the builder's own refusal, restated
+                raise Refused(
+                    f"{where} has a {s['section_type']} section of model_type "
+                    f"{s.get('model_type')!r}, which litert-lm-builder cannot write back"
+                ) from None
+    for s, place in zip(doc["section"], places):
+        if s.get("section_type") == "LlmMetadata":
+            raw = Path(directory) / "LlmMetadataProto.pb"
+            raw.write_bytes(read_span(path, place))
+            s["data_path"] = str(raw)
+        else:
+            s["data_path"] = str(Path(directory) / os.path.basename(s["data_path"]))
+    return doc, [(str(path), place) for place in places]
+
+
+# -- protobuf, read by hand: the runtime environment has no sentencepiece --------
 
 def varint(buf, i):
     shift = value = 0
@@ -238,6 +307,8 @@ def fields(buf):
             value, i = buf[i:i + 8], i + 8
         elif wire == 2:
             n, i = varint(buf, i)
+            if i + n > len(buf):
+                raise ValueError("a length-delimited field runs past the end of the message")
             value, i = buf[i:i + n], i + n
         elif wire == 5:
             value, i = buf[i:i + 4], i + 4
@@ -247,118 +318,260 @@ def fields(buf):
 
 
 def pieces(path):
-    """A SentencePiece model's pieces by id: `ModelProto` field 1, each piece's
-    field 1. Read from the protobuf directly; the runtime environment has no
-    sentencepiece."""
+    """A SentencePiece model's pieces by id, as bytes: `ModelProto` field 1, each
+    piece's field 1."""
     out = []
-    for number, wire, value in fields(Path(path).read_bytes()):
-        if number == 1 and wire == 2:
-            out.append(next((v.decode("utf-8", "replace") for n, w, v in fields(value)
-                             if n == 1 and w == 2), None))
+    try:
+        for number, wire, value in fields(Path(path).read_bytes()):
+            if number == 1 and wire == 2:
+                out.append(next((v for n, w, v in fields(value) if n == 1 and w == 2), None))
+    except (IndexError, ValueError) as exc:
+        raise Refused(f"{Path(path).name} is not a SentencePiece model: {exc}") from None
+    if not out:
+        raise Refused(f"{Path(path).name} holds no SentencePiece pieces")
     return out
 
 
-def unquote(text):
-    return text.replace('\\"', '"').replace("\\\\", "\\")
+ESCAPES = {"n": b"\n", "r": b"\r", "t": b"\t", "a": b"\a", "b": b"\b", "f": b"\f",
+           "v": b"\v", "\\": b"\\", "'": b"'", '"': b'"', "?": b"?"}
 
 
-def named_tokens(pbtext):
-    """The token strings and ids an LlmMetadata text proto names."""
-    strings = [unquote(m) for m in re.findall(r'token_str:\s*"((?:[^"\\]|\\.)*)"', pbtext)]
-    ids = [int(m) for m in re.findall(r"\bids:\s*(\d+)", pbtext)]
-    return strings, ids
+def unescape(body):
+    """A protobuf text-format string body, C-escaped as `MessageToString` writes
+    it (octal bytes for non-ASCII), back to text."""
+    out, i = bytearray(), 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out += ch.encode("utf-8")
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt in ESCAPES:
+            out += ESCAPES[nxt]
+            i += 2
+        elif nxt in "01234567":
+            m = re.match(r"[0-7]{1,3}", body[i + 1:])
+            out.append(int(m.group(0), 8) & 0xFF)
+            i += 1 + len(m.group(0))
+        elif nxt in "xX":
+            m = re.match(r"[0-9a-fA-F]{1,2}", body[i + 2:])
+            out.append(int(m.group(0), 16))
+            i += 2 + len(m.group(0))
+        else:
+            raise ValueError(f"unknown escape \\{nxt}")
+    return out.decode("utf-8", "replace")
 
 
-# The LlmMetadata field that names the token a tower's input starts with.
-TOWER_TOKEN = {"vision": "start_of_image_token", "audio": "start_of_audio_token"}
+TOKEN = re.compile(
+    r'\s+|#[^\n]*|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\''
+    r"|[{}:<>\[\],;]|[^\s{}:<>\[\],;\"']+"
+)
+
+
+def pbtext(text):
+    """Protobuf text format to a tree: a message is a list of (name, value), a
+    value a message or a string. Enough of the grammar for LlmMetadata."""
+    tokens = [t for t in TOKEN.findall(text) if t.strip() and not t.startswith("#")]
+    pos = 0
+
+    def message(end):
+        nonlocal pos
+        out = []
+        while pos < len(tokens) and tokens[pos] != end:
+            name = tokens[pos]
+            pos += 1
+            if pos < len(tokens) and tokens[pos] == ":":
+                pos += 1
+            if tokens[pos] in "{<":
+                close = "}" if tokens[pos] == "{" else ">"
+                pos += 1
+                out.append((name, message(close)))
+                pos += 1
+            elif tokens[pos][0] in "\"'":
+                parts = []
+                while pos < len(tokens) and tokens[pos][0] in "\"'":
+                    parts.append(unescape(tokens[pos][1:-1]))
+                    pos += 1
+                out.append((name, "".join(parts)))
+            else:
+                out.append((name, tokens[pos]))
+                pos += 1
+            if pos < len(tokens) and tokens[pos] in ",;":
+                pos += 1
+        return out
+
+    tree = message(None)
+    if pos != len(tokens):
+        raise ValueError("unbalanced braces in LlmMetadata text")
+    return tree
+
+
+def token_unions(tree, field=None):
+    """(field name, token strings, token ids) for every TokenUnion in the tree."""
+    names = [n for n, _ in tree]
+    if "token_str" in names or "token_ids" in names:
+        strings = [v for n, v in tree if n == "token_str" and isinstance(v, str) and v]
+        ids = [int(i) for n, v in tree if n == "token_ids" and isinstance(v, list)
+               for m, i in v if m == "ids"]
+        yield field, strings, ids
+        return
+    for name, value in tree:
+        if isinstance(value, list):
+            yield from token_unions(value, name)
+
+
+def named(tree, field):
+    """Whether the metadata names a token in `field`: a TokenUnion there that is
+    not empty."""
+    return any(f == field and (s or i) for f, s, i in token_unions(tree))
+
+
+# Fields of a model type's metadata that a tower is built for.
+MEDIA_FIELDS = {
+    "vision": ("patch_width", "patch_height", "max_num_patches", "pooling_kernel_size",
+               "merge_patches"),
+    "audio": ("skip_mel_spectrogram_extraction",),
+}
+
+
+def media_fields(tree, names):
+    """{field: value} for the media settings of the metadata's model type."""
+    model = dict(tree).get("llm_model_type")
+    if not isinstance(model, list) or not model:
+        return {}
+    _, settings = model[0]
+    if not isinstance(settings, list):
+        return {}
+    wanted = {f for t in names for f in MEDIA_FIELDS[t]}
+    return {n: v for n, v in settings if n in wanted}
+
+
+def report(sections=(), dropped=(), rebuilt=None, reason=None, **extra):
+    return {"sections": list(sections), "dropped": list(dropped), "rebuilt": rebuilt,
+            "reason": reason, **extra}
+
+
+def is_tower(section, names, towers):
+    if section.get("section_type") not in GRAPH_TYPES:
+        return None
+    return next((t for t in names if model_type(section) in towers[t]), None)
+
+
+def only(doc, section_type, where):
+    found = [s for s in doc["section"] if s.get("section_type") == section_type]
+    if len(found) != 1:
+        raise Refused(f"{where} has {len(found)} {section_type} sections, not one")
+    return found[0]
 
 
 def add(spec, work):
-    names, towers = spec["names"], spec["towers"]
+    names, towers, required = spec["names"], spec["towers"], spec["required"]
     recipient_dir, donor_dir = work / "before", work / "donor"
-    lb.unpack(spec["artifact"], str(recipient_dir))
-    lb.unpack(spec["donor"], str(donor_dir))
-    recipient = load(recipient_dir / "model.toml")
-    donor = load(donor_dir / "model.toml")
-    sections = [describe(s, recipient_dir) for s in recipient.get("section", [])]
+    recipient, own_sources = unpacked(spec["artifact"], recipient_dir, "the bundle")
+    donor, donor_sources = unpacked(spec["donor"], donor_dir, "the donor")
+    sections = [describe(s, src[1]) for s, src in zip(recipient["section"], own_sources)]
 
-    def tower_of(section):
-        if section.get("section_type") != "TFLiteModel":
-            return None
-        return next((t for t in names if model_type(section) in towers[t]), None)
-
-    present = sorted({tower_of(s) for s in recipient["section"] if tower_of(s)})
+    present = sorted({is_tower(s, names, towers) for s in recipient["section"]} - {None})
     if present:
-        return report(sections, reason="the bundle already carries " + " and ".join(present)
+        raise Refused("the bundle already carries " + " and ".join(present)
                       + " sections; drop them first")
-    taken = [s for s in donor["section"] if tower_of(s)]
-    absent = [t for t in names if not any(tower_of(s) == t for s in taken)]
-    if absent:
-        return report(sections, reason="the donor carries no " + " or ".join(absent)
-                      + " section to take")
+    taken = [s for s in donor["section"] if is_tower(s, names, towers)]
+    for t in names:
+        have = {model_type(s) for s in taken if is_tower(s, names, towers) == t}
+        missing = sorted(set(required[t]) - have)
+        if missing:
+            raise Refused(f"the donor's {t} tower lacks {', '.join(missing)}")
 
-    def only(doc, section_type, where):
-        found = [s for s in doc["section"] if s.get("section_type") == section_type]
-        if len(found) != 1:
-            raise SystemExit(f"{where} has {len(found)} {section_type} sections")
-        return found[0]
-
-    own_meta = only(recipient, "LlmMetadata", "the bundle")
-    donor_meta = only(donor, "LlmMetadata", "the donor")
-    own_path = recipient_dir / os.path.basename(own_meta["data_path"])
-    own_text = own_path.read_text(encoding="utf-8")
-    unnamed = [t for t in names if TOWER_TOKEN[t] not in own_text]
+    own_meta, donor_meta = only(recipient, "LlmMetadata", "the bundle"), only(
+        donor, "LlmMetadata", "the donor")
+    own_tree = pbtext((recipient_dir / "LlmMetadataProto.pbtext").read_text(encoding="utf-8"))
+    unnamed = [t for t in names if not named(own_tree, TOWER_TOKEN[t])]
     if unnamed and not spec["metadata_from_donor"]:
-        return report(sections, reason=(
+        raise Refused(
             "the bundle's LlmMetadata names no " + " or ".join(TOWER_TOKEN[t] for t in unnamed)
             + ", so the runtime would not know where an input begins; take the donor's with "
-            "--metadata-from-donor, which also replaces its prompt template and stop tokens"))
+            "--metadata-from-donor, which also replaces its prompt template and stop tokens")
     use_donor_meta = bool(spec["metadata_from_donor"])
-    meta_dir, meta = (donor_dir, donor_meta) if use_donor_meta else (recipient_dir, own_meta)
-    meta_text = (meta_dir / os.path.basename(meta["data_path"])).read_text(encoding="utf-8")
+    if use_donor_meta:
+        tree = pbtext((donor_dir / "LlmMetadataProto.pbtext").read_text(encoding="utf-8"))
+        lacking = [t for t in names if not named(tree, TOWER_TOKEN[t])]
+        if lacking:
+            raise Refused("the donor's LlmMetadata names no "
+                          + " or ".join(TOWER_TOKEN[t] for t in lacking) + " either")
+    else:
+        tree = own_tree
 
-    # Every token the metadata names must be the same token in the tokenizer that
-    # is kept (the bundle's) and in the one the towers were built with (the donor's).
-    own_tok = only(recipient, "SP_Tokenizer", "the bundle")["data_path"]
-    donor_tok = only(donor, "SP_Tokenizer", "the donor")["data_path"]
-    own_pieces = pieces(recipient_dir / os.path.basename(own_tok))
-    donor_pieces = pieces(donor_dir / os.path.basename(donor_tok))
-    strings, ids = named_tokens(meta_text)
+    # Every token the kept metadata names must be the same token in the kept
+    # tokenizer (the bundle's) and the one the towers were built with (the donor's).
+    own_pieces = pieces(only(recipient, "SP_Tokenizer", "the bundle")["data_path"])
+    donor_pieces = pieces(only(donor, "SP_Tokenizer", "the donor")["data_path"])
+    unions = list(token_unions(tree))
+    strings = sorted({s for _, ss, _ in unions for s in ss})
+    ids = sorted({i for _, _, ii in unions for i in ii})
     for text in strings:
-        a = own_pieces.index(text) if text in own_pieces else None
-        b = donor_pieces.index(text) if text in donor_pieces else None
+        piece = text.encode("utf-8")
+        a = own_pieces.index(piece) if piece in own_pieces else None
+        b = donor_pieces.index(piece) if piece in donor_pieces else None
         if a is None or a != b:
-            return report(sections, reason=f"{text!r} is id {a} in the bundle's tokenizer and "
-                          f"{b} in the donor's")
+            raise Refused(f"{text!r} is id {a} in the bundle's tokenizer and {b} in the donor's")
     for i in ids:
-        a = own_pieces[i] if i < len(own_pieces) else None
-        b = donor_pieces[i] if i < len(donor_pieces) else None
+        a = own_pieces[i] if 0 <= i < len(own_pieces) else None
+        b = donor_pieces[i] if 0 <= i < len(donor_pieces) else None
         if a is None or a != b:
-            return report(sections, reason=f"id {i} is {a!r} in the bundle's tokenizer and "
-                          f"{b!r} in the donor's")
+            raise Refused(f"id {i} is {a!r} in the bundle's tokenizer and {b!r} in the donor's")
 
-    composed = copy.deepcopy(recipient)
-    for s in composed["section"]:
-        s["data_path"] = str(recipient_dir / os.path.basename(s["data_path"]))
+    donor_tree = tree if use_donor_meta else pbtext(
+        (donor_dir / "LlmMetadataProto.pbtext").read_text(encoding="utf-8"))
+    if not use_donor_meta:
+        # The towers were built for the donor's image and audio settings.
+        mine, theirs = media_fields(own_tree, names), media_fields(donor_tree, names)
+        if mine != theirs:
+            raise Refused(f"the bundle's LlmMetadata sets {mine} where the donor's, which its "
+                          f"towers were built for, sets {theirs}")
+    changes = sorted({n for n, _ in own_tree} ^ {n for n, _ in donor_tree} | {
+        n for n, v in own_tree if dict(own_tree).get(n) != dict(donor_tree).get(n)
+    }) if use_donor_meta else []
+
+    # The result, and where each of its sections' bytes come from.
+    composed, sources = copy.deepcopy(recipient), list(own_sources)
     if use_donor_meta:
         at = next(i for i, s in enumerate(composed["section"])
                   if s.get("section_type") == "LlmMetadata")
-        replacement = copy.deepcopy(donor_meta)
-        replacement["data_path"] = str(donor_dir / os.path.basename(donor_meta["data_path"]))
-        composed["section"][at] = replacement
+        theirs = donor["section"].index(donor_meta)
+        composed["section"][at] = copy.deepcopy(donor_meta)
+        sources[at] = donor_sources[theirs]
     added = []
     for s in taken:
-        moved = copy.deepcopy(s)
-        moved["data_path"] = str(donor_dir / os.path.basename(s["data_path"]))
-        composed["section"].append(moved)
-        added.append(dict(describe(s, donor_dir), tower=tower_of(s)))
-    return rebuild(spec, work, composed, sections, (), added=added,
+        i = donor["section"].index(s)
+        composed["section"].append(copy.deepcopy(s))
+        sources.append(donor_sources[i])
+        added.append(dict(describe(s, donor_sources[i][1]), tower=is_tower(s, names, towers)))
+    return rebuild(work, composed, sources, sections, (), added=added,
                    metadata_source="donor" if use_donor_meta else "bundle",
-                   tokens_checked=len(strings) + len(ids))
+                   metadata_changes=changes, tokens_checked=len(strings) + len(ids))
 
 
-def rebuild(spec, work, doc, sections, dropped, **extra):
-    """Pack `doc`, read it back, and replace the output only if it reads back as asked."""
+def drop(spec, work):
+    names, towers = spec["names"], spec["towers"]
+    before, sources = unpacked(spec["artifact"], work / "before", "the bundle")
+    pairs = list(zip(before["section"], sources))
+    sections = [describe(s, src[1]) for s, src in pairs]
+    dropped = [dict(describe(s, src[1]), tower=is_tower(s, names, towers))
+               for s, src in pairs if is_tower(s, names, towers)]
+    absent = [t for t in names if not any(d["tower"] == t for d in dropped)]
+    if absent:
+        raise Refused("the bundle carries no " + " or ".join(absent) + " section to drop")
+    kept = copy.deepcopy(before)
+    kept_pairs = [(s, src) for s, src in pairs if not is_tower(s, names, towers)]
+    kept["section"] = [copy.deepcopy(s) for s, _ in kept_pairs]
+    return rebuild(work, kept, [src for _, src in kept_pairs], sections, dropped)
+
+
+def rebuild(work, doc, sources, sections, dropped, **extra):
+    """Pack `doc` and leave it for the parent only if it reads back as asked: the
+    same TOML apart from what `pack` regenerates, and every section's raw bytes in
+    the new file equal to the bytes it was taken from (`sources`)."""
     toml_path = work / "result.toml"
     write_toml(doc, toml_path)
     rebuilt = work / "rebuilt.litertlm"
@@ -367,49 +580,29 @@ def rebuild(spec, work, doc, sections, dropped, **extra):
     lb.unpack(str(rebuilt), str(after_dir))
     after = load(after_dir / "model.toml")
     if comparable(after) != comparable(doc):
-        return report(sections, dropped, reason="the rebuild does not read back as asked", **extra)
-    if [digest(s["data_path"]) for s in doc["section"]] != [
-        digest(after_dir / os.path.basename(s["data_path"])) for s in after["section"]
+        raise Refused("the rebuild does not read back as asked")
+    places = spans(rebuilt)
+    if len(places) != len(sources) or [digest(rebuilt, p) for p in places] != [
+        digest(path, span) for path, span in sources
     ]:
-        return report(sections, dropped,
-                      reason="a section's bytes changed in the rebuild", **extra)
-    os.replace(rebuilt, spec["output"])
-    return report([describe(s, after_dir) for s in after["section"]], dropped, written=True,
-                  **extra)
+        raise Refused("a section's bytes changed in the rebuild")
+    return report([describe(s, p) for s, p in zip(after["section"], places)], dropped,
+                  rebuilt=str(rebuilt), **extra)
 
 
 def main(spec):
     work = Path(spec["work"])
-    if spec["mode"] == "add":
-        return add(spec, work)
-    artifact = spec["artifact"]
-    wanted = {t: set(spec["towers"][t]) for t in spec["names"]}
-
-    before_dir = work / "before"
-    lb.unpack(artifact, str(before_dir))
-    before = load(before_dir / "model.toml")
-    sections = [describe(s, before_dir) for s in before.get("section", [])]
-
-    def tower_of(section):
-        if section.get("section_type") != "TFLiteModel":
-            return None
-        return next((t for t, types in wanted.items() if model_type(section) in types), None)
-
-    dropped = [
-        dict(describe(s, before_dir), tower=tower_of(s))
-        for s in before.get("section", [])
-        if tower_of(s)
-    ]
-    absent = [t for t in spec["names"] if not any(d["tower"] == t for d in dropped)]
-    if absent:
-        return report(sections, reason="the bundle carries no " + " or ".join(absent)
-                      + " section to drop")
-
-    kept = copy.deepcopy(before)
-    kept["section"] = [s for s in kept["section"] if not tower_of(s)]
-    for s in kept["section"]:
-        s["data_path"] = str(before_dir / os.path.basename(s["data_path"]))
-    return rebuild(spec, work, kept, sections, dropped)
+    try:
+        # The tower types were read from builder 0.18.0; a builder that renamed one
+        # would drop half a tower without a word.
+        known = {m.value.lower().removeprefix("tf_lite_") for m in lb.TfLiteModelType}
+        unknown = sorted({t for ts in spec["towers"].values() for t in ts} - known)
+        if unknown:
+            raise Refused(f"this litert-lm-builder has no model type {', '.join(unknown)}; "
+                          "the tower lists were read from 0.18.0's")
+        return (add if spec["mode"] == "add" else drop)(spec, work)
+    except Refused as exc:
+        return report(reason=str(exc))
 
 
 if __name__ == "__main__":
@@ -434,6 +627,7 @@ class TowersResult:
     added: tuple[dict[str, Any], ...] = ()
     donor: Path | None = None
     metadata_source: str | None = None
+    metadata_changes: tuple[str, ...] = ()
     tokens_checked: int | None = None
     notes: tuple[str, ...] = field(default=())
 
@@ -449,6 +643,7 @@ class TowersResult:
             "added": list(self.added),
             "donor": None if self.donor is None else str(self.donor),
             "metadata_source": self.metadata_source,
+            "metadata_changes": list(self.metadata_changes),
             "tokens_checked": self.tokens_checked,
             "bytes_before": self.bytes_before,
             "bytes_after": self.bytes_after,
@@ -461,11 +656,12 @@ VERIFY_NOTE = "What the model answers was not checked here: run `litetune verify
 
 # Measured on one phone, and the reason `--add` exists at all.
 ADD_NOTE = (
-    "Not checked here: that the donor's adapters project into the width the bundle's text "
-    "model embeds at, which only the graphs' signatures say. Measured once: Google's "
-    "SM8850 Gemma 4 E2B bundle with the towers and metadata of its CPU/GPU bundle "
-    "answered an image and an audio turn on an SM8850 NPU (MEASUREMENTS.md, *Towers "
-    "grafted into an SM8850 NPU bundle*). Run it on the device it is for."
+    "Not checked here: whether the donor's adapters project into the width the bundle's "
+    "text model embeds at, which only the graphs' signatures say. Measured once: a Gemma 4 "
+    "E2B build for SM8850 given the towers and LlmMetadata of Google's CPU/GPU bundle "
+    "answered an image and an audio turn on an SM8850 phone, the text model on the NPU and "
+    "the towers on the CPU (MEASUREMENTS.md, *Towers grafted into an SM8850 NPU bundle*). "
+    "Run it on the device it is for."
 )
 
 
@@ -527,10 +723,12 @@ def _rebuild(
             logger.warning("towers rebuild of %s failed:\n%s", model, stderr[-2000:])
             raise TowersError(f"the rebuild script exited {proc.returncode}: {last}")
         report: dict[str, Any] = json.loads(result.read_text(encoding="utf-8"))
-        if not report.get("written") or not output.is_file():
+        rebuilt = report.get("rebuilt")
+        if report.get("reason") or not rebuilt or not Path(rebuilt).is_file():
             raise TowersError(
                 f"{report.get('reason') or 'the rebuild wrote nothing'}; nothing was written"
             )
+        _publish(Path(rebuilt), output)
         return report
     finally:
         if work is not None:
@@ -538,6 +736,31 @@ def _rebuild(
             shutil.rmtree(work, onerror=lambda _fn, path, _exc: leaked.append(str(path)))
             if leaked:
                 logger.warning("%d scratch file(s) left under %s", len(leaked), work)
+
+
+def _publish(rebuilt: Path, output: Path) -> None:
+    """Put the verified bundle at `output`, never over a file already there.
+
+    A hard link fails if the name exists, which the check before the rebuild
+    could not promise for the minutes the rebuild takes; where links are not
+    supported, an exclusive create does the same.
+    """
+    try:
+        os.link(rebuilt, output)
+        return
+    except FileExistsError:
+        raise TowersError(
+            f"{output} appeared while the bundle was rebuilt; nothing was written over it"
+        ) from None
+    except OSError:
+        pass
+    try:
+        with rebuilt.open("rb") as src, output.open("xb") as dst:
+            shutil.copyfileobj(src, dst, 1 << 24)
+    except FileExistsError:
+        raise TowersError(
+            f"{output} appeared while the bundle was rebuilt; nothing was written over it"
+        ) from None
 
 
 def drop_towers(
@@ -550,7 +773,11 @@ def drop_towers(
     auto_provision: bool = True,
     timeout: int = TOWERS_TIMEOUT_S,
 ) -> TowersResult:
-    """Write `output`: `model` without the sections of `towers`. Raises `TowersError`."""
+    """Write `output`: `model` without the sections of `towers`.
+
+    Raises `TowersError` for a request it refuses or a rebuild it would not keep,
+    and `FileNotFoundError` when `model` is not there.
+    """
     names = _names(towers, "drop")
     model, output = Path(model).absolute(), Path(output).absolute()
     spec = {
@@ -588,12 +815,14 @@ def add_towers(
     auto_provision: bool = True,
     timeout: int = TOWERS_TIMEOUT_S,
 ) -> TowersResult:
-    """Write `output`: `model` with `donor`'s sections of `towers`. Raises `TowersError`.
+    """Write `output`: `model` with `donor`'s sections of `towers`.
 
     The bundle's own sections are kept byte for byte, and so is its LlmMetadata
-    unless `metadata_from_donor` -- needed when the bundle's metadata names no token
-    for a tower's input, and refused without it. Either way every token string and
-    id the kept metadata names must be the same token in both tokenizers.
+    unless `metadata_from_donor` takes the donor's, byte for byte -- needed when the
+    bundle's metadata names no token for a tower's input, and refused without it.
+    Either way every `token_str` and token id the kept metadata names must be the
+    same piece at the same id in both tokenizers. Raises `TowersError` for a request
+    it refuses or a rebuild it would not keep, `FileNotFoundError` for a missing file.
     """
     names = _names(towers, "add")
     model, output = Path(model).absolute(), Path(output).absolute()
@@ -604,6 +833,7 @@ def add_towers(
         "mode": "add",
         "names": list(names),
         "towers": {t: list(TOWER_SECTIONS[t]) for t in names},
+        "required": {t: list(TOWER_REQUIRED[t]) for t in names},
         "donor": str(donor),
         "metadata_from_donor": metadata_from_donor,
     }
@@ -613,10 +843,11 @@ def add_towers(
     )  # fmt: skip
     notes = [VERIFY_NOTE.format(name=output.name), ADD_NOTE]
     if report.get("metadata_source") == "donor":
+        changed = ", ".join(report.get("metadata_changes") or ()) or "nothing"
         notes.insert(
             0,
-            "LlmMetadata was taken from the donor: its prompt template, stop tokens and media "
-            "fields replace the bundle's.",
+            "LlmMetadata was taken from the donor, whole and byte for byte. Its fields that "
+            f"differ from the bundle's own: {changed}.",
         )
     return TowersResult(
         operation="add",
@@ -628,6 +859,7 @@ def add_towers(
         added=tuple(report.get("added") or ()),
         donor=donor,
         metadata_source=report.get("metadata_source"),
+        metadata_changes=tuple(report.get("metadata_changes") or ()),
         tokens_checked=report.get("tokens_checked"),
         bytes_before=model.stat().st_size,
         bytes_after=output.stat().st_size,
