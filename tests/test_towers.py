@@ -144,10 +144,11 @@ section_type = "TFLiteModel"
 data_path = "Section5_TFLiteModel_tf_lite_prefill_decode.tflite"
 """
 
-# The builder: a bundle is MAGIC + JSON {"toml": ..., "files": {name: text}}.
+# The builder: a bundle is MAGIC + JSON {"toml": ..., "files": {name: base64 bytes}}.
 # Knobs are formatted in as Python literals; braces that belong to the module
 # are doubled for `str.format`.
 FAKE_BUILDER = """
+import base64
 import json
 import os
 import re
@@ -183,7 +184,7 @@ def unpack(litertlm_path, output_dir, jinja_prompt_template_path=None):
         if not name.endswith(".pbtext"):
             name = "Section%d_%s" % (i, name)
         content = doc["files"][re.sub(r"^Section\\d+_", "", os.path.basename(m.group(2)))]
-        (out / name).write_text(content, encoding="utf-8")
+        (out / name).write_bytes(base64.b64decode(content))
         return m.group(1) + name + m.group(3)
     toml = re.sub(r'(data_path\\s*=\\s*")([^"]+)(")', rename, toml)
     (out / "model.toml").write_text(toml, encoding="utf-8")
@@ -198,10 +199,11 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
     files = {{}}
     for raw in _section_files(toml):
         path = Path(raw) if os.path.isabs(raw) else toml_path.parent / raw
-        content = path.read_text(encoding="utf-8")
+        content = path.read_bytes()
         if PACK_ALTERS_BYTES and "prefill_decode" in raw:
-            content += "!"
-        files[re.sub(r"^Section\\d+_", "", os.path.basename(raw))] = content
+            content += b"!"
+        name = re.sub(r"^Section\\d+_", "", os.path.basename(raw))
+        files[name] = base64.b64encode(content).decode()
     toml = re.sub(r'(data_path\\s*=\\s*")([^"]+)(")',
                   lambda m: m.group(1) + os.path.basename(m.group(2)) + m.group(3), toml)
     toml = re.sub(r'value = "[0-9a-f-]{{36}}"', 'value = "%s"' % _uuid.uuid4(), toml)
@@ -212,22 +214,28 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
 """
 
 
-def bundle_bytes(toml: str) -> bytes:
-    """A bundle in the fake's format: each section's file holds its own name."""
+def bundle_bytes(toml: str, files: dict[str, bytes] | None = None) -> bytes:
+    """A bundle in the fake's format: each section's file holds its own name,
+    unless `files` gives it other bytes (by name, without the `SectionN_` index)."""
+    import base64
     import re
 
     names = [
         re.sub(r"^Section\d+_", "", os.path.basename(p))
         for p in re.findall(r'data_path\s*=\s*"([^"]+)"', toml)
     ]
-    return (
-        b"LITERTLM"
-        + json.dumps({"toml": toml, "files": {n: f"bytes of {n}" for n in names}}).encode()
-    )
+    content = {n: (files or {}).get(n, f"bytes of {n}".encode()) for n in names}
+    encoded = {n: base64.b64encode(b).decode() for n, b in content.items()}
+    return b"LITERTLM" + json.dumps({"toml": toml, "files": encoded}).encode()
 
 
 def read_bundle(path: Path) -> dict:
-    return json.loads(path.read_bytes()[len(b"LITERTLM") :].decode("utf-8"))
+    """The fake bundle with its files decoded back to text where they are text."""
+    import base64
+
+    doc = json.loads(path.read_bytes()[len(b"LITERTLM") :].decode("utf-8"))
+    doc["files"] = {n: base64.b64decode(v).decode("latin-1") for n, v in doc["files"].items()}
+    return doc
 
 
 @dataclass
@@ -377,8 +385,8 @@ def test_an_existing_output_is_refused_before_anything_runs(toolchain, tmp_path)
 @pytest.mark.parametrize(
     ("knob", "reason"),
     [
-        ("pack_adds_key", "does not read back as the input minus those sections"),
-        ("pack_alters_bytes", "a kept section's bytes changed"),
+        ("pack_adds_key", "does not read back as asked"),
+        ("pack_alters_bytes", "a section's bytes changed"),
     ],
 )
 def test_a_rebuild_that_does_not_read_back_is_not_kept(toolchain, tmp_path, knob, reason):
@@ -444,3 +452,204 @@ def test_the_command_refuses_with_exit_4(toolchain, tmp_path, capsys):
 
     assert code == 4
     assert "carries no audio section" in capsys.readouterr().err
+
+
+# -- adding towers from another bundle ------------------------------------------
+
+PIECES = ["<pad>", "<eos>", "<bos>", "a", "b", "<|image>", "<|audio>", "<|video|>"]
+
+# Gemma 4 metadata as the CPU/GPU bundle's pbtext spells it, cut to the fields
+# that name tokens: start and stop tokens by id, media tokens by string.
+GEMMA4_META = """start_token {
+  token_ids {
+    ids: 2
+  }
+}
+stop_tokens {
+  token_ids {
+    ids: 1
+  }
+}
+llm_model_type {
+  gemma4 {
+    start_of_image_token {
+      token_str: "<|image>"
+    }
+    start_of_audio_token {
+      token_str: "<|audio>"
+    }
+  }
+}
+"""
+
+# The SM8850 bundle's: ids and the old user/model prefixes, no media token.
+BARE_META = """start_token {
+  token_ids {
+    ids: 2
+  }
+}
+stop_tokens {
+  token_ids {
+    ids: 1
+  }
+}
+"""
+
+
+def sentencepiece(pieces: list[str]) -> bytes:
+    """A SentencePiece ModelProto: field 1 per piece (piece, score, type), then an
+    empty trainer spec, as the real file carries one."""
+
+    def varint(n: int) -> bytes:
+        out = b""
+        while True:
+            byte = n & 0x7F
+            n >>= 7
+            out += bytes([byte | (0x80 if n else 0)])
+            if not n:
+                return out
+
+    def field(number: int, wire: int, payload: bytes) -> bytes:
+        key = varint(number << 3 | wire)
+        return key + (varint(len(payload)) + payload if wire == 2 else payload)
+
+    body = b""
+    for text in pieces:
+        piece = field(1, 2, text.encode()) + field(2, 5, b"\0\0\0\0") + field(3, 0, varint(1))
+        body += field(1, 2, piece)
+    return body + field(2, 2, b"")
+
+
+def _bundle(path: Path, toml: str, meta: str, pieces: list[str]) -> Path:
+    path.write_bytes(
+        bundle_bytes(
+            toml,
+            {
+                "LlmMetadataProto.pbtext": meta.encode(),
+                "SP_Tokenizer.spiece": sentencepiece(pieces),
+            },
+        )
+    )
+    return path
+
+
+def _sm8850(tmp_path: Path, meta: str = BARE_META, pieces: list[str] | None = None) -> Path:
+    # The SM8850 tokenizer lacks `<|video|>`.
+    return _bundle(tmp_path / "sm8850.litertlm", SM8850_TOML, meta, pieces or PIECES[:-1])
+
+
+def _donor(tmp_path: Path, toml: str = GEMMA4_E2B_TOML, pieces: list[str] | None = None) -> Path:
+    return _bundle(tmp_path / "donor.litertlm", toml, GEMMA4_META, pieces or PIECES)
+
+
+def test_towers_are_added_with_the_donors_metadata_and_nothing_else_moves(toolchain, tmp_path):
+    from litetune.towers import add_towers
+
+    model, donor = _sm8850(tmp_path), _donor(tmp_path)
+    before = model.read_bytes()
+    out = tmp_path / "out.litertlm"
+
+    result = add_towers(model, out, ["vision", "audio"], donor, metadata_from_donor=True)
+
+    doc = read_bundle(out)
+    assert _types(doc) == [
+        "aux", "embedder", "per_layer_embedder", "prefill_decode",
+        "audio_encoder_hw", "audio_adapter", "end_of_audio",
+        "vision_encoder", "vision_adapter", "end_of_vision",
+    ]  # fmt: skip
+    old = read_bundle(model)["files"]
+    for name in ("aux.tflite", "prefill_decode.tflite", "SP_Tokenizer.spiece"):
+        key = next(k for k in old if k.endswith(name))
+        assert doc["files"][key] == old[key], f"{name} is the bundle's own, byte for byte"
+    assert doc["files"]["LlmMetadataProto.pbtext"] == GEMMA4_META
+    assert 'backend_constraint = "npu"' in doc["toml"], "the NPU section keeps its keys"
+    assert 'backend_constraint = "cpu"' in doc["toml"], "a donor section keeps its keys"
+    assert result.metadata_source == "donor"
+    assert result.tokens_checked == 4
+    assert {d["tower"] for d in result.added} == {"vision", "audio"}
+    assert model.read_bytes() == before
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".")]
+
+
+def test_a_bundle_whose_metadata_names_no_media_token_needs_the_donors(toolchain, tmp_path):
+    from litetune.towers import add_towers
+
+    out = tmp_path / "out.litertlm"
+    with pytest.raises(TowersError, match="names no start_of_image_token"):
+        add_towers(_sm8850(tmp_path), out, ["vision"], _donor(tmp_path))
+    assert not out.exists()
+
+
+def test_a_bundle_that_names_the_token_keeps_its_own_metadata(toolchain, tmp_path):
+    from litetune.towers import add_towers
+
+    out = tmp_path / "out.litertlm"
+    result = add_towers(_sm8850(tmp_path, meta=GEMMA4_META), out, ["vision"], _donor(tmp_path))
+
+    assert result.metadata_source == "bundle"
+    assert "audio_encoder_hw" not in _types(read_bundle(out))
+
+
+@pytest.mark.parametrize(
+    ("donor_pieces", "reason"),
+    [
+        # A media token at another id: the tower's input would start elsewhere.
+        (["<pad>", "<eos>", "<bos>", "a", "b", "<|audio>", "<|image>"], "'<|image>' is id 5"),
+        # A stop token's id naming another piece.
+        (["<pad>", "<end>", "<bos>", "a", "b", "<|image>", "<|audio>"], "id 1 is '<eos>'"),
+    ],
+)
+def test_tokenizers_that_disagree_on_a_named_token_are_refused(
+    toolchain, tmp_path, donor_pieces, reason
+):
+    from litetune.towers import add_towers
+
+    out = tmp_path / "out.litertlm"
+    with pytest.raises(TowersError, match=reason):
+        add_towers(
+            _sm8850(tmp_path),
+            out,
+            ["vision", "audio"],
+            _donor(tmp_path, pieces=donor_pieces),
+            metadata_from_donor=True,
+        )
+    assert not out.exists()
+
+
+def test_a_tower_already_there_or_missing_from_the_donor_is_refused(toolchain, tmp_path):
+    from litetune.towers import add_towers
+
+    with pytest.raises(TowersError, match="already carries vision"):
+        add_towers(
+            _bundle(tmp_path / "full.litertlm", GEMMA4_E2B_TOML, GEMMA4_META, PIECES),
+            tmp_path / "a.litertlm",
+            ["vision"],
+            _donor(tmp_path),
+        )
+    no_audio = GEMMA4_E2B_TOML.replace('model_type = "audio_', 'model_type = "other_').replace(
+        'model_type = "end_of_audio"', 'model_type = "other_end"'
+    )
+    with pytest.raises(TowersError, match="donor carries no audio"):
+        add_towers(
+            _sm8850(tmp_path),
+            tmp_path / "b.litertlm",
+            ["audio"],
+            _donor(tmp_path, toml=no_audio),
+            metadata_from_donor=True,
+        )
+
+
+def test_the_command_adds_with_from_and_refuses_without_it(toolchain, tmp_path, capsys):
+    model, donor = _sm8850(tmp_path), _donor(tmp_path)
+    out = tmp_path / "out.litertlm"
+    base = ["towers", "--model", str(model), "--add", "vision", "--output", str(out)]
+
+    assert main(base) == 4
+    assert "--from another bundle" in capsys.readouterr().err
+    assert main([*base, "--from", str(donor), "--metadata-from-donor", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["operation"] == "add" and report["metadata_source"] == "donor"
+    # A bundle that does carry vision, so only the stray --from can refuse it.
+    drop_with_donor = ["towers", "--model", str(donor), "--drop", "vision", "--from", str(donor)]
+    assert main([*drop_with_donor, "--output", str(tmp_path / "x")]) == 4
+    assert "go with --add, not --drop" in capsys.readouterr().err

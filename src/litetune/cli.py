@@ -70,7 +70,7 @@ from litetune.prepare import (
 from litetune.prompt_mode import PromptMode, parse_prompt_mode
 from litetune.recipes import DEFINED_RECIPES
 from litetune.spec import DTYPES, SpecError, mutable_ref_refusal, weak_revision_limitations
-from litetune.towers import TOWER_SECTIONS, TowersError, drop_towers
+from litetune.towers import TOWER_SECTIONS, TowersError, add_towers, drop_towers
 from litetune.towers import summarise as summarise_towers
 from litetune.tune import METHODS, TuneError, TuneRequest, TuneResult, run_tune, write_report
 from litetune.verify import EXIT_CODES, ReferenceRole, Status, VerifyRequest, run_verify
@@ -695,22 +695,45 @@ def _add_bundle(sub) -> None:
 def _add_towers(sub) -> None:
     towers = sub.add_parser(
         "towers",
-        help="write a .litertlm without its vision or audio sections",
+        help="write a .litertlm without its vision or audio sections, or with another's",
         description=(
             "A Gemma 4 bundle carries its vision and audio towers as sections of their own. "
-            "This writes a copy without the ones named, chosen by section type, and reads the "
-            "copy back: every other section, the metadata and the tokenizer byte for byte. "
-            "What the model answers is not checked here; run `litetune verify` on the result. "
+            "--drop writes a copy without the ones named, chosen by section type; --add "
+            "writes a copy with the ones named taken from --from, after checking that every "
+            "token the kept metadata names is the same token in both tokenizers. Either way "
+            "the copy is read back: every section byte for byte. What the model answers is "
+            "not checked here; run `litetune verify` on the result. "
             "Exit codes: 0 written, 4 refused or not written."
         ),
     )
     towers.add_argument("--model", required=True, type=Path, help="the .litertlm to read")
-    towers.add_argument(
+    what = towers.add_mutually_exclusive_group(required=True)
+    what.add_argument(
         "--drop",
         action="append",
-        required=True,
         choices=sorted(TOWER_SECTIONS),
         help="a tower to drop; repeat for both",
+    )
+    what.add_argument(
+        "--add",
+        action="append",
+        choices=sorted(TOWER_SECTIONS),
+        help="a tower to add from --from; repeat for both",
+    )
+    towers.add_argument(
+        "--from",
+        dest="donor",
+        type=Path,
+        help="with --add: the .litertlm whose tower sections are taken",
+    )
+    towers.add_argument(
+        "--metadata-from-donor",
+        action="store_true",
+        help=(
+            "with --add: take the donor's LlmMetadata -- its prompt template, stop tokens and "
+            "media fields -- instead of the bundle's. Needed when the bundle's names no token "
+            "for the tower's input; refused without it then"
+        ),
     )
     towers.add_argument(
         "--output", required=True, type=Path, help="the new .litertlm; must not exist yet"
@@ -1213,13 +1236,25 @@ def _convert(args: argparse.Namespace) -> int:
 
 
 def _towers(args: argparse.Namespace) -> int:
-    result = drop_towers(
-        args.model,
-        args.output,
-        args.drop,
-        events=_stream(),
-        auto_provision=not args.no_provision,
-    )
+    events, provision = _stream(), not args.no_provision
+    if args.add:
+        if args.donor is None:
+            raise TowersError("--add takes its towers --from another bundle; name it")
+        result = add_towers(
+            args.model,
+            args.output,
+            args.add,
+            args.donor,
+            metadata_from_donor=args.metadata_from_donor,
+            events=events,
+            auto_provision=provision,
+        )
+    else:
+        if args.donor is not None or args.metadata_from_donor:
+            raise TowersError("--from and --metadata-from-donor go with --add, not --drop")
+        result = drop_towers(
+            args.model, args.output, args.drop, events=events, auto_provision=provision
+        )
     delivered = _report(result.as_dict(), lambda: summarise_towers(result), args.json)
     return EXIT_CODES[Status.PASSED] if delivered else EXIT_CODES[Status.ERROR]
 

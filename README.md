@@ -525,7 +525,7 @@ the record, so the file `tune` read has to reach `verify` and `bundle`
 unchanged. `prepare` without `--base-model` still renders FunctionGemma's
 format, and the report says that it assumed it.
 
-### A Gemma 4 bundle without its towers
+### Gemma 4 towers: drop them, or take them from another bundle
 
 A Gemma 4 `.litertlm` carries its vision and audio towers as sections of their
 own. An application that only sends text can ship without them:
@@ -547,6 +547,26 @@ text engine does not load the towers. Image or audio input to the result raises
 an error rather than producing text
 ([MEASUREMENTS.md](MEASUREMENTS.md#gemma-4-e2b-without-its-towers)). What your
 model answers is `verify`'s to say.
+
+The other way round, towers from one bundle into another — Gemma 4 E2B's into a
+text-only build compiled for a Qualcomm NPU:
+
+```bash
+litetune towers --model gemma4_2b_SM8850.litertlm --add vision --add audio \
+                --from gemma-4-E2B-it.litertlm --metadata-from-donor \
+                --output gemma4_2b_SM8850-towers.litertlm
+```
+
+The bundle's own sections stay byte for byte. Every token string and id the
+kept metadata names must be the same token in both tokenizers, or it is
+refused. `--metadata-from-donor` takes the donor's LlmMetadata — its prompt
+template, stop tokens and media fields — and is required when the bundle's own
+names no token for a tower's input, as a text-only build's does not. Not
+checked: that the donor's adapters project into the width the bundle's text
+model embeds at. This is not a supported operation of LiteRT-LM; it was
+measured once, on one SM8850 phone, where the result answered an image and an
+audio turn and its text answers did not change
+([MEASUREMENTS.md](MEASUREMENTS.md#towers-grafted-into-an-sm8850-npu-bundle)).
 
 ---
 

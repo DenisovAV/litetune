@@ -872,6 +872,46 @@ input raised an error and none produced text; where it raised depends on the
 modality and on how the engine was opened. Only the Python binding on one x86-64
 CPU was observed -- not the Kotlin, Swift or C bindings, and not a phone.
 
+### Towers grafted into an SM8850 NPU bundle
+
+A Gemma 4 E2B bundle compiled for the SM8850 NPU (`gemma4_2b_SM8850.litertlm`,
+2,585,963,920 bytes, sha256 `6722c5096eb37961…`; not on Hugging Face) carries text
+only: an `aux` section, the embedders and an NPU `prefill_decode`, a tokenizer, and
+LlmMetadata that names no model type and no media token. Its tokenizer has the same
+id as Google's CPU/GPU bundle's for every text, image and audio token, and differs
+from id 258,884 on, where the CPU/GPU one has `<|video|>`.
+
+`litetune towers --model gemma4_2b_SM8850.litertlm --add vision --add audio --from
+gemma-4-E2B-it.litertlm --metadata-from-donor` (the donor at `b3ca0d2f`) wrote
+2,918,406,772 bytes: the bundle's sections byte for byte, the CPU/GPU bundle's
+LlmMetadata and six tower sections; the 8 tokens that metadata names agreed in both
+tokenizers. Without `--metadata-from-donor` it refused.
+
+Run on 2026-10-09 on a Galaxy S26 (`Build.SOC_MODEL` SM8850) through Firebase Test
+Lab, with LiteRT-LM v0.18.0's C API, the text model on the NPU and the towers on the
+CPU, greedy:
+
+| input | bundle | result | engine load | CPU time / wall |
+|---|---|---|---|---|
+| eight text prompts | as received | eight coherent answers | 1.45 s | 0.65 |
+| eight text prompts | with towers, engine opened without media backends | **8 of 8 identical** to the bundle as received | 2.40 s | 0.62 |
+| the red PNG, "What colour is this image?" | with towers, vision on CPU | **"Red"** | 7.13 s (with the audio question's engine) | 2.08 |
+| the 440 Hz tone, "Describe this sound" | with towers, audio on CPU | **"The sound is a high-pitched, sustained tone that fades slowly."** | | |
+| "What is the capital of Portugal?" | with towers | "The capital of Portugal is Lisbon." | | |
+
+The three media-run questions went to one engine opened with both media backends.
+The same composition built by hand from the towers of Google's own SM8750 NPU bundle
+instead gave the same three answers, word for word.
+
+The text model ran as `LiteRT NPU Compiled Model` on the HTP backend (logcat); the
+towers on XNNPACK. One image, one tone and eight text prompts on one phone: this
+shows the grafted bundle loads and answers both modalities on the device it was
+built for, and that its text answers did not change. It is not a measurement of
+image or audio quality. The runtime needed Qualcomm's QNN runtime 2.51.0
+(`com.qualcomm.qti:qnn-runtime` on Maven Central): with QAIRT 2.47.0 libraries the
+v0.18.0 dispatch refused, `Qnn System library version 1.11.0 is mismatched. The
+minimum supported version is 1.14.0.`
+
 ## A fourth family, and the first that is not Gemma
 
 Every section above measures a Gemma: FunctionGemma and Gemma 3 fine-tuned
