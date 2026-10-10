@@ -573,7 +573,8 @@ as a string, the token each added tower's input starts with, and every
 the same id in both tokenizers. `--metadata-from-donor` replaces the bundle's
 whole LlmMetadata with the donor's -- its prompt template, its stop tokens, its
 model type, which selects the runtime's model-specific code paths, and every
-other field the two differ in, each listed in the report as old → new. It is
+other field the two differ in, each the builder's text form shows listed in the
+report as old → new. It is
 refused when the two differ in `max_num_tokens` or `kv_cache_init_value`, which
 LiteRT-LM's NPU executor reads, or in the settings of a tower the bundle keeps,
 and required when the bundle's own metadata is not Gemma 4's or names no such

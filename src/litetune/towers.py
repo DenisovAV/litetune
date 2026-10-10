@@ -55,8 +55,10 @@ settings the added towers were built for are the donor's. A text-only build's
 metadata names no media token, so the donor's is taken only when the caller asks
 (`metadata_from_donor`), whole, and refused where it would change what LiteRT-LM's
 NPU executor reads or the settings of a tower the bundle keeps; the report lists
-each field that changes. Not checked: other strings in the metadata, the
-template included.
+each field that changes as the builder's text form shows it, which leaves out a
+field the builder's proto does not declare (Google's E2B metadata carries one,
+`gemma4` field 13). Not checked: other strings in the metadata, the template
+included.
 
 **It runs in the runtime environment**, not the export one: `litert-lm==0.18.0`
 requires `litert-lm-builder==0.18.0`, so `envs.RUNTIME` already carries the
@@ -177,6 +179,12 @@ TOWER_TOKEN = {"vision": "start_of_image_token", "audio": "start_of_audio_token"
 GEMMA4_TOKENS = ("start_of_image_token", "end_of_image_token", "start_of_audio_token",
                  "end_of_audio_token")
 # The `Gemma4` fields a tower's input is prepared by (llm_model_type.proto:249-305).
+# Each is compared as the runtime reads it: a field left at the proto's own default
+# (0, false) keeps the processor's built-in value, any other value replaces it
+# (model_data_processor_factory.cc:246-262; gemma4_data_processor_config.h:39-62).
+MEDIA_DEFAULTS = {"patch_width": "16", "patch_height": "16", "max_num_patches": "2520",
+                  "pooling_kernel_size": "3", "merge_patches": "false",
+                  "skip_mel_spectrogram_extraction": "false"}
 MEDIA_FIELDS = {
     "vision": ("patch_width", "patch_height", "max_num_patches", "pooling_kernel_size",
                "merge_patches"),
@@ -629,7 +637,11 @@ def media(tree, towers):
     """The model type and its media settings for `towers`, as set."""
     case, settings = model_settings(tree)
     wanted = {f for t in towers for f in MEDIA_FIELDS[t]}
-    return case, {n: str(v) for n, v in settings if n in wanted}
+    found = {n: str(v) for n, v in settings if n in wanted}
+    return case, {
+        f: MEDIA_DEFAULTS[f] if found.get(f, "0") in ("0", "false") else found[f]
+        for f in sorted(wanted)
+    }
 
 
 def shown_media(found):
@@ -769,9 +781,12 @@ def text_width(path):
     token's values in (embedding_lookup_multi_modal.cc:120-123). The signature is
     the first on CPU and GPU (litert_compiled_model_executor_utils.cc:1179-1183,
     embedding_lookup_text.cc:350-360) and `decode_embedder` on the NPU
-    (npu/llm_litert_npu_embedder.cc:525-529); both are read when both are there."""
+    (npu/llm_litert_npu_embedder.cc:525-529); both are read when both are there.
+    Output 0 of each, the one the runtime reads (`output_buffers_[0]`,
+    embedding_lookup_text.cc:378-400)."""
     signatures = output_shapes(path)
     used = signatures[:1] + [s for s in signatures[1:] if s[0] == "decode_embedder"]
+    used = [(key, shapes[:1]) for key, shapes in used]
 
     def width(shape):
         if len(shape) < 3:
@@ -1113,9 +1128,9 @@ VERIFY_NOTE = "What the model answers was not checked here: run `litetune verify
 # Measured on one phone, and the reason `--add` exists at all.
 ADD_NOTE = (
     "Measured once: a Gemma 4 E2B build for SM8850 given the towers and LlmMetadata of "
-    "Google's CPU/GPU bundle answered an image and an audio turn on an SM8850 phone, the "
-    "text model on the NPU and the towers on the CPU (MEASUREMENTS.md, *Towers grafted into "
-    "an SM8850 NPU bundle*). Run it on the device it is for."
+    "Google's CPU/GPU bundle answered an image and an audio turn on an SM8850 phone, its "
+    "prefill_decode graph on the NPU and the towers on the CPU (MEASUREMENTS.md, *Towers "
+    "grafted into an SM8850 NPU bundle*). Run it on the device it is for."
 )
 
 
@@ -1324,7 +1339,8 @@ def add_towers(
         if changes:
             told = (
                 "Its fields that differ from the bundle's own, as the builder's text form shows "
-                f"them: {'; '.join(changes)}."
+                f"them: {'; '.join(changes)}. A field the builder's proto does not declare is "
+                "not among them."
             )
         elif report["metadata_raw_differs"]:
             told = (
@@ -1370,7 +1386,8 @@ def summarise(result: TowersResult) -> list[str]:
             "bundle's embedder does"
         )
         lines.append(
-            f"tokenizers agree on all {result.tokens_checked} tokens the metadata names; "
+            f"tokenizers agree on the {result.tokens_checked} token strings and ids the "
+            "metadata names as tokens; "
             f"LlmMetadata from the {result.metadata_source}"
         )
     lines.append(

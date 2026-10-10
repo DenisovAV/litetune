@@ -1624,6 +1624,26 @@ def test_each_media_setting_the_towers_were_not_built_for_is_refused(
         add_towers(sm8850(tmp_path, meta=own), tmp_path / "o", [tower], donor(tmp_path))
 
 
+@pytest.mark.parametrize(
+    "setting",
+    ["patch_width: 16", "patch_height: 16", "max_num_patches: 2520", "pooling_kernel_size: 3"],
+)
+def test_a_setting_spelled_out_at_the_runtimes_own_value_is_not_a_difference(
+    toolchain, tmp_path, setting
+):
+    """The runtime keeps its built-in value where a field is left at the proto's
+    default (model_data_processor_factory.cc:246-262), so one side setting
+    `patch_width: 16` and the other leaving it unset hand the towers the same
+    images (gemma4_data_processor_config.h:39-62)."""
+    name = setting.split(":")[0]
+    unset = re.sub(rf"    {name}: \S+\n", "", GEMMA4_META)
+    spelled = unset.replace("  }\n}\nunknown_field", f"    {setting}\n  }}\n}}\nunknown_field")
+    assert name not in unset and setting in spelled
+    result = add_towers(sm8850(tmp_path, meta=spelled), tmp_path / "o", ["vision"],
+                        donor(tmp_path, meta=unset))  # fmt: skip
+    assert result.metadata_source == "bundle"
+
+
 def test_only_the_added_towers_settings_are_compared(toolchain, tmp_path):
     own = GEMMA4_META.replace("max_num_patches: 2520", "max_num_patches: 1024")
     result = add_towers(sm8850(tmp_path, meta=own), tmp_path / "o", ["audio"], donor(tmp_path))
@@ -1677,7 +1697,7 @@ def test_donor_metadata_over_a_tower_the_bundle_keeps_must_match_it(toolchain, t
         TowersError,
         match="the bundle keeps its audio tower, built for gemma4 with "
         "skip_mel_spectrogram_extraction: true, and --metadata-from-donor would set gemma4 "
-        "with none of them",
+        "with skip_mel_spectrogram_extraction: false",
     ):
         add_towers(model, tmp_path / "o", ["vision"], donor(tmp_path), metadata_from_donor=True)
     result = add_towers(model, tmp_path / "o2", ["vision"], donor(tmp_path, meta=keeps_audio),
@@ -1828,6 +1848,15 @@ def test_an_embedder_signature_the_runtime_does_not_run_is_not_read(toolchain, t
     assert result.embedding_width == WIDTH
 
 
+def test_only_the_output_the_runtime_reads_gives_the_embedders_width(toolchain, tmp_path):
+    """The runtime reads output 0 (`output_buffers_[0]`, embedding_lookup_text.cc:378-400);
+    a second output of another width is not the embedding."""
+    graph = tflite(("prefill", [[1, 8, WIDTH], [1, 8, 4]]))
+    result = add_towers(sm8850(tmp_path, graphs={"embedder": graph}), tmp_path / "o",
+                        ["vision"], donor(tmp_path), metadata_from_donor=True)  # fmt: skip
+    assert result.embedding_width == WIDTH
+
+
 def test_the_embedders_width_is_the_product_of_its_dims_after_the_second(toolchain, tmp_path):
     graph = tflite(("prefill", [[1, 8, 4, 4]]))
     result = add_towers(sm8850(tmp_path, graphs={"embedder": graph}), tmp_path / "o",
@@ -1912,7 +1941,7 @@ def test_add_wiring_and_its_refusals(toolchain, tmp_path, capsys):
     assert "added vision: 3 sections (vision_encoder, vision_adapter, end_of_vision)" in text
     assert "added audio: 3 sections" in text
     assert "each added adapter writes 16 values per token, as the bundle's embedder does" in text
-    assert "tokenizers agree on all 4 tokens" in text
+    assert "tokenizers agree on the 4 token strings and ids the metadata names as tokens" in text
     assert "written by litert-lm-builder 0.18.0" in text
     drop = ["towers", "--model", str(giver), "--drop", "vision", "--output", str(tmp_path / "x")]
     assert main([*drop, "--from", str(giver)]) == 4
