@@ -9,9 +9,21 @@ two engines can render the same template differently, and a tokenizer can add
 tokens neither template shows.
 
 So the check compares token ids. For every prompt, a script in `envs.RUNTIME`
-renders it with `Conversation.render_message_to_string` -- in LiteRT-LM v0.17.1
-that returns `GetSingleTurnText`, the function `SendMessage` renders with --
-and turns the result into ids the way a first-turn prefill does. A script in the reference's
+renders it with `Conversation.render_message_to_string` -- in LiteRT-LM v0.18.0
+(as in v0.17.1) that returns `GetSingleTurnText`, the function `SendMessage` renders with --
+and turns the result into ids the way a first-turn prefill does. A template renders
+single-turn only when its text contains `is_appending_to_prefill`
+(`minijinja_template.rs`), and none that litetune packages or fetches does (checked
+2026-10-08), so those render from the full history on both versions. What v0.18.0 did
+change is what the
+template is handed: each message's content as a list of parts, `[{"type": "text",
+"text": ...}]` (`model_data_processor.h`, `MessageToTemplateInput`, calling
+`NormalizeMessageContent` in `data_utils.cc`), where v0.17.1's Qwen processor handed a
+single text part over as the string (`qwen3_data_processor.cc`). A template that reads
+`content` as a string then renders without the user's text and raises nothing --
+measured on a Qwen3 bundle on 2026-10-08 -- which is why the Qwen families ship a
+packaged template (`models._text_parts_reason`), and why this comparison runs on every
+model rather than on the ones a reading of the source flagged. A script in the reference's
 environment produces the ids the reference generates from, through the same
 `prompt_mode.RENDERING_SOURCE` training and the generation script use. The lists
 must be equal. On the first few prompts the runtime also sends the message, and the
@@ -60,7 +72,7 @@ def prefill_ids(engine, text):
     `Engine.tokenize` calls the tokenizer directly. Prefill first strips a
     leading BOS string and inserts the BOS id in its place, because the
     tokenizer does not read that string as the token (LiteRT-LM
-    runtime/core/session_utils.cc, StringToProcessedInputText, v0.17.1). This
+    runtime/core/session_utils.cc, StringToProcessedInputText, v0.18.0 as v0.17.1). This
     mirrors that step, and a mirror can be wrong: the prefill count the parent
     compares is what would say so.
     """
@@ -76,7 +88,7 @@ def runtime_ids(engine, rendered):
     """What a first turn gives the model: the session's BOS, then the rendered text.
 
     A session prepends the BOS string on its first turn, outside the rendered
-    text (runtime/core/session_utils.cc, ApplyPromptTemplates, v0.17.1), and
+    text (runtime/core/session_utils.cc, ApplyPromptTemplates, v0.18.0 as v0.17.1), and
     prefill turns that string into the BOS id. Measured on a gemma-3-270m export
     on 2026-09-15: `render_message_to_string` gave 46 ids, the conversation
     prefilled 47, and the transformers template renders 47 with one <bos>. A
@@ -152,6 +164,12 @@ def main():
                     }
                 )
         for row in rows[: spec["prefill_sample"]]:
+            if not row["rendered"]:
+                # The binding returns "" when the template fails, and sending
+                # the prompt fails the same way: the comparison reports it as
+                # unrendered, and the parent does not count it as sent.
+                row["prefill_skipped"] = True
+                continue
             with engine.create_conversation(**conversation_args) as conversation:
                 conversation.send_message(spec["prompts"][row["index"]])
                 row["prefill_tokens"] = conversation.get_benchmark_info().last_prefill_token_count
@@ -205,7 +223,12 @@ class RenderingMismatch:
     index: int
     prompt: str
     # `ids`: the rendered id lists differ. `prefill`: they agree, and the count
-    # the runtime prefilled when the prompt was sent does not.
+    # the runtime prefilled when the prompt was sent does not. `unrendered`: the
+    # runtime's rendering is empty where the reference's is not -- what the
+    # binding returns for the C API's null when the template fails, and also for
+    # a template that renders nothing (`conversation.py`,
+    # `render_message_to_string`, v0.18.0) -- not a rendering of only the
+    # tokens the session adds.
     kind: str
     runtime_tokens: int
     reference_tokens: int
@@ -213,6 +236,10 @@ class RenderingMismatch:
     prefill_tokens: int | None
     runtime_tail: str
     reference_tail: str
+    # The reference's rendering holds the prompt's text and the runtime's does
+    # not: the shape of a template that reads `content` as a string on a
+    # runtime that hands it a list of parts.
+    prompt_missing: bool = False
 
     def describe(self) -> str:
         if self.kind == "prefill":
@@ -221,10 +248,20 @@ class RenderingMismatch:
                 f"was sent, where its rendering and the reference both have "
                 f"{self.reference_tokens}"
             )
+        if self.kind == "unrendered":
+            return (
+                f"prompt {self.index}: the runtime's rendering is empty, which its binding returns "
+                "both when the bundle's template fails and when it renders nothing"
+            )
+        missing = (
+            "; the runtime's rendering does not contain the prompt's text"
+            if self.prompt_missing
+            else ""
+        )
         return (
             f"prompt {self.index}: the runtime renders {self.runtime_tokens} tokens and the "
             f"reference {self.reference_tokens}, first differing at position "
-            f"{self.first_difference}"
+            f"{self.first_difference}{missing}"
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -238,6 +275,7 @@ class RenderingMismatch:
             "prefill_tokens": self.prefill_tokens,
             "runtime_rendered_tail": self.runtime_tail,
             "reference_rendered_tail": self.reference_tail,
+            "prompt_missing": self.prompt_missing,
         }
 
 
@@ -255,6 +293,9 @@ class RenderingComparison:
     # none of them.
     prefill_sent: int = 0
     mismatches: tuple[RenderingMismatch, ...] = field(default_factory=tuple)
+    # Prompts in the prefill sample the runtime script did not send because
+    # their rendering was empty; not counted in `prefill_sent`.
+    prefill_skipped: int = 0
 
     @property
     def agrees(self) -> bool:
@@ -276,18 +317,30 @@ class RenderingComparison:
                 "half of the check did not run",
                 observed=self.as_dict(),
             )
+        if self.agrees and self.prefill_skipped and not self.prefill_sent:
+            # An empty rendering is what the binding returns both for a failed
+            # template and for one that renders nothing, so a sample that was
+            # skipped whole is a check that did not run, not one that passed.
+            return Check.unchecked(
+                RENDERING_CHECK,
+                f"identical token ids for all {self.compared} prompts, but none of the "
+                f"{self.prefill_skipped} prompts sampled for a prefill count was sent, their "
+                "rendering being empty, so that half of the check did not run",
+                observed=self.as_dict(),
+            )
         if self.agrees:
             # `sampled` counts the prompts that answered with a count, which is
             # not the number that were sent: the runtime can leave
             # `last_prefill_token_count` unset for some of them. Naming one
             # number with the other's word is the mistake this whole check is
             # about, so say both.
-            half = (
-                f"and the runtime's prefill count equal to the reference's on {sampled} of the "
-                f"{self.prefill_sent} prompts it was sent"
-                if self.prefill_sent
-                else "and no prefill count asked for"
-            )
+            if self.prefill_sent:
+                half = (
+                    f"and the runtime's prefill count equal to the reference's on {sampled} of "
+                    f"the {self.prefill_sent} prompts it was sent"
+                )
+            else:
+                half = "and no prefill count asked for"
             return Check.passed(
                 RENDERING_CHECK,
                 f"identical token ids for all {self.compared} prompts, {half}",
@@ -298,8 +351,28 @@ class RenderingComparison:
             RENDERING_CHECK,
             f"{len(self.mismatches)} of {self.compared} prompts differ; {first.describe()}. The "
             "two sides would score different prompts, so no difference between them could be "
-            "attributed to conversion",
+            f"attributed to conversion{self._lost_prompt_note()}",
             observed=self.as_dict(),
+        )
+
+    def _lost_prompt_note(self) -> str:
+        """Name the one cause this check has seen lose a prompt, when it may be this.
+
+        Measured 2026-10-08 on litert-lm 0.18.0: Qwen bundles carrying their
+        checkpoint's template rendered the user's text away (Qwen3) or failed
+        (Qwen2.5), because from 0.18.0 the runtime hands a template each
+        message's content as a list of parts (`models._text_parts_reason`).
+        """
+        lost = [m for m in self.mismatches if m.prompt_missing or m.kind == "unrendered"]
+        if not lost:
+            return ""
+        return (
+            f". On {len(lost)} of them the runtime's rendering is empty or lacks the prompt's "
+            "text. One known cause: from LiteRT-LM 0.18.0 the runtime hands the bundle's "
+            "template each message's content as a list of parts, and a template that reads it "
+            "as a string loses the text or fails. A Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle "
+            "converted by litetune 0.3.0 or earlier with no template of the caller's is such a "
+            "bundle, and converting it again with this litetune packs a template that reads both"
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -307,6 +380,7 @@ class RenderingComparison:
             "applied": True,
             "prompts_compared": self.compared,
             "prefill_sent": self.prefill_sent,
+            "prefill_skipped": self.prefill_skipped,
             "prefill_sampled": [dict(row) for row in self.prefill],
             "mismatches": len(self.mismatches),
             # The first few, which is what a reader needs to find the cause; the
@@ -360,12 +434,17 @@ def compare_renderings(
                     "reference_tokens": len(reference_ids),
                 }
             )
+        ours_rendered = str(ours.get("rendered", ""))
+        theirs_rendered = str(theirs.get("rendered", ""))
         kind = None
-        if runtime_ids != reference_ids:
+        if not ours_rendered and theirs_rendered:
+            kind = "unrendered"
+        elif runtime_ids != reference_ids:
             kind = "ids"
         elif sent is not None and int(sent) != len(reference_ids):
             kind = "prefill"
         if kind is not None:
+            text = prompt.strip()
             mismatches.append(
                 RenderingMismatch(
                     index=index,
@@ -375,8 +454,12 @@ def compare_renderings(
                     reference_tokens=len(reference_ids),
                     first_difference=_first_difference(runtime_ids, reference_ids),
                     prefill_tokens=None if sent is None else int(sent),
-                    runtime_tail=str(ours.get("rendered", ""))[-_TAIL:],
-                    reference_tail=str(theirs.get("rendered", ""))[-_TAIL:],
+                    runtime_tail=ours_rendered[-_TAIL:],
+                    reference_tail=theirs_rendered[-_TAIL:],
+                    prompt_missing=kind == "ids"
+                    and bool(text)
+                    and text in theirs_rendered
+                    and text not in ours_rendered,
                 )
             )
     return RenderingComparison(
@@ -384,6 +467,7 @@ def compare_renderings(
         prefill=tuple(prefill),
         prefill_sent=prefill_sent,
         mismatches=tuple(mismatches),
+        prefill_skipped=sum(1 for row in runtime_rows if row.get("prefill_skipped")),
     )
 
 
@@ -436,18 +520,15 @@ class RenderingProbe:
             },
             events,
         )
-        return compare_renderings(
-            prompts,
-            runtime_rows,
-            reference_rows,
-            # What the runtime script's own slice sends, not the sample asked
-            # for: it prefills `rows[: prefill_sample]` over one row per prompt,
-            # so slicing the prompts the same way answers it for every value the
-            # field can hold -- a sample larger than the split, zero, a negative
-            # one -- instead of restating the configured number as a fact about
-            # what the runtime was given.
-            prefill_sent=len(prompts[: self.prefill_sample]),
-        )
+        # What the runtime script's own slice sends, not the sample asked for:
+        # it prefills `rows[: prefill_sample]` over one row per prompt, so
+        # slicing the prompts the same way answers it for every value the field
+        # can hold -- a sample larger than the split, zero, a negative one --
+        # instead of restating the configured number as a fact about what the
+        # runtime was given. Less the rows it skipped because they did not render.
+        skipped = {int(row["index"]) for row in runtime_rows if row.get("prefill_skipped")}
+        sent = [i for i in range(len(prompts))[: self.prefill_sample] if i not in skipped]
+        return compare_renderings(prompts, runtime_rows, reference_rows, prefill_sent=len(sent))
 
     def _run(
         self,

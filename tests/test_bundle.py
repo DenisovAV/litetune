@@ -186,7 +186,7 @@ def test_both_modes_round_trip_and_carry_their_meaning():
 def test_versions_from_reads_the_pins_a_mode_was_established_against():
     versions = versions_from(envs.RUNTIME, envs.TRAIN)
 
-    assert versions["litert-lm"] == "0.17.1"
+    assert versions["litert-lm"] == "0.18.0"
     assert versions["transformers"] == "5.16.1"
 
 

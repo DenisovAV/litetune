@@ -381,7 +381,8 @@ def _refuse_unreadable_name(name: str, where: str) -> None:
     if not readable_name(name):
         raise DeclarationsError(
             f"{where}, which the runtime's call parser does not read as a name: its lexer "
-            f"takes {NAME_RULE} (AntlrFcLexer.g4, LiteRT-LM v0.17.1), so no call can come back "
+            f"takes {NAME_RULE} (AntlrFcLexer.g4, LiteRT-LM v0.18.0, unchanged since v0.17.1), "
+            "so no call can come back "
             "under that name. Rename it here and in the declarations your application sends"
         )
 
@@ -476,8 +477,10 @@ def _refuse_extra_keys(
 
 # Which Python values a JSON-typed argument may hold. A bool is an int in
 # Python and never a number in JSON Schema, so it is excluded by name.
-# An integral float is an integer here: the runtime returns every number as a
-# double, and `prepare.render_call` writes an integral float as its integer.
+# An integral float is an integer here: `prepare.render_call` writes it as the
+# integer it equals, and the runtime hands that back as the same value -- from
+# v0.17.1 an i64 where it fits one and a double past it, up to v0.16.1 always a
+# double (`fc_parser.rs`).
 _HOLDS = {
     "string": lambda v: isinstance(v, str),
     "integer": lambda v: (

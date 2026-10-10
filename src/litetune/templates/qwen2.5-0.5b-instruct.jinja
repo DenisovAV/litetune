@@ -1,0 +1,102 @@
+{#-
+  Qwen2.5 0.5B Instruct prompt template for LiteRT-LM.
+
+  NOT WRITTEN HERE, apart from the block between the two `litetune` comments
+  below. Everything after that block is the `chat_template` of `Qwen/Qwen2.5-0.5B-Instruct` at
+  revision 7ae557604adf67be50417f59c2c2f167def9a775 (`tokenizer_config.json`), byte for byte. It is covered
+  by that repository's licence, Apache-2.0.
+
+  Why the block is there. From LiteRT-LM v0.18.0 the runtime hands a template
+  every message's content as a list of parts, `[{"type": "text", "text":
+  ...}]` (`ModelDataProcessor::MessageToTemplateInput`,
+  `model_data_processor.h`, calling `NormalizeMessageContent`, `data_utils.cc`;
+  LiteRT-LM #3544). In v0.17.1 the Qwen processor handed the template a single
+  text part as the string (`qwen3_data_processor.cc`). This template reads
+  `content` as a string, so on v0.18.0 every send fails (measured 2026-10-08 on
+  litert-lm 0.18.0): `'\n' + message.content` adds a list to a string, which
+  MiniJinja 2.14.0 -- the version LiteRT-LM v0.18.0 builds with (`Cargo.toml`)
+  -- refuses with `tried to use + operator on unsupported types string and
+  sequence`. The block turns a message whose parts are all text back into that
+  string and leaves every other message as it came, so for a conversation of
+  text the rest of the template sees what `transformers` gives it and what
+  this model was trained on, on either runtime. A message with any other part
+  -- an image, or a tool response sent as a `tool_response` part -- stays a
+  list, which this template does not read as text.
+
+  Keep the part after the block identical to the checkpoint's template: a
+  difference there is a prompt the model was not trained against. `verify`
+  compares the runtime's rendered token ids with the reference's for every
+  prompt, which is the check that says so.
+-#}
+{#- litetune: from here to the next litetune comment. A message whose content is a list of text parts gets their text back as one string; any other message is left as it came, as MiniJinja reads it (Jinja2 gives a message with no content an empty string). -#}
+{%- set litetune = namespace(messages=[]) -%}
+{%- for message in messages -%}
+{%- set parts = namespace(text="", only_text=true) -%}
+{%- if message.content is string or message.content is not sequence -%}
+{%- set parts.only_text = false -%}
+{%- else -%}
+{%- for part in message.content -%}
+{%- if part is mapping and part.type == "text" and part.text is string -%}
+{%- set parts.text = parts.text ~ part.text -%}
+{%- else -%}
+{%- set parts.only_text = false -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- set litetune.messages = litetune.messages + [dict(message, content=parts.text) if parts.only_text else message] -%}
+{%- endfor -%}
+{%- set messages = litetune.messages -%}
+{#- litetune: end of the block; the checkpoint's template follows unchanged. #}{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0]['role'] == 'system' %}
+        {{- messages[0]['content'] }}
+    {%- else %}
+        {{- 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' }}
+    {%- endif %}
+    {{- "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0]['role'] == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' }}
+    {%- else %}
+        {{- '<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- for message in messages %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) or (message.role == "assistant" and not message.tool_calls) %}
+        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {{- '<|im_start|>' + message.role }}
+        {%- if message.content %}
+            {{- '\n' + message.content }}
+        {%- endif %}
+        {%- for tool_call in message.tool_calls %}
+            {%- if tool_call.function is defined %}
+                {%- set tool_call = tool_call.function %}
+            {%- endif %}
+            {{- '\n<tool_call>\n{"name": "' }}
+            {{- tool_call.name }}
+            {{- '", "arguments": ' }}
+            {{- tool_call.arguments | tojson }}
+            {{- '}\n</tool_call>' }}
+        {%- endfor %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- message.content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}

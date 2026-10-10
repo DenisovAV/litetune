@@ -70,6 +70,9 @@ dev = [
     # The repack script runs inside the export env, which has tomli via
     # litert-lm-builder; the tests run that script with the host interpreter.
     "tomli==2.4.1; python_version < '3.11'",
+    # The tests render the packaged templates with the MiniJinja LiteRT-LM
+    # renders them with: v0.18.0 builds 2.14.0 (`Cargo.toml`, `=2.14.0`).
+    "minijinja==2.14.0",
 ]
 
 [project.scripts]
@@ -110,6 +113,11 @@ warn_redundant_casts = true
 # `warn_unused_ignores` then reports -- so the exemption is stated once here.
 [[tool.mypy.overrides]]
 module = "tomllib"
+ignore_missing_imports = true
+
+# `minijinja` (a dev dependency, the renderer LiteRT-LM uses) ships no stubs.
+[[tool.mypy.overrides]]
+module = "minijinja"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

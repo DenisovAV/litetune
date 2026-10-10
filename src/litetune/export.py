@@ -908,6 +908,13 @@ def set_gpu_activation(
     The exporter offers no flag for this value, and the one flag it does offer
     (`--experimental_use_mixed_precision`) changes the graph as well.
     """
+    # Absolute before anything is derived from it. Below Python 3.12
+    # `tempfile.mkdtemp(dir=...)` returns a relative path for a relative `dir`,
+    # the script then wrote relative `data_path`s, and the builder resolved each
+    # against the TOML's own directory -- a doubled path, and a repack that
+    # failed on every `convert --output-dir artifacts/...` run on 3.10 or 3.11.
+    # `absolute`, not `resolve`: a symlink stays the file that is replaced.
+    artifact = Path(artifact).absolute()
     if artifact.stat().st_size == 0:
         # Nothing to repack, and the sweep's size comparison downstream is
         # what reports a zero-byte export; this must not turn it into 8 bytes.
@@ -1575,9 +1582,10 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
         named = ", ".join(f"{e.recipe} ({e.gpu_activation_note})" for e in unset)
         result.limitations.append(
             f"{GPU_ACTIVATION_KEY} could not be written into {named}. On the GPU "
-            "backend the runtime will compute activations in F16, which measured as `<pad>` "
-            "floods and wrong tool names on a Snapdragon Galaxy S24 (3/20 vs 20/20 on CPU, "
-            "n=20). An app that loads these bundles without an activation override gets that "
+            "backend the runtime will compute activations in F16, which measured on a "
+            "Snapdragon Galaxy S24 as `<pad>` floods and wrong tool names on litert-lm 0.16.1 "
+            "(3/20 vs 20/20 on CPU, n=20) and as 8/20 replies with no text and no call on "
+            "0.18.0. An app that loads these bundles without an activation override gets that "
             "default until they are repacked; "
             "`verify --backend gpu` "
             "passes fp32 itself and can still measure them on a GPU"

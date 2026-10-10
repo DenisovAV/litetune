@@ -2360,10 +2360,12 @@ RUNTIME = StageEnv(
     python_ceiling=(3, 12),
     ceiling_pin="numpy==2.0.2",
     requirements=(
-        # 0.17.1, the runtime flutter_gemma_litertlm 1.8.0 ships. It does not
-        # reproduce 0.16.1's answers (see MEASUREMENTS.md, "Which runtime a
-        # number was taken on"), so every number records the one it ran on.
-        "litert-lm==0.17.1",
+        # 0.18.0, the runtime flutter_edge_ai_litertlm 1.10.0 ships (its
+        # CHANGELOG: "LiteRT-LM v0.18.0 (`native-v0.18.0-a`)"). Runtimes are not
+        # assumed to reproduce each other's answers -- 0.17.1 did not reproduce
+        # 0.16.1's (MEASUREMENTS.md, "Which runtime a number was taken on") --
+        # so every number records the one it ran on.
+        "litert-lm==0.18.0",
         "numpy==2.0.2",  # last of the 2.0 line; `<2.1` is a bound, not a pin
     ),
     # litert-lm dlopen()s a native library that links vulkan unconditionally,
@@ -2378,13 +2380,13 @@ EXPORT = StageEnv(
     ceiling_pin="numpy==2.0.2",
     requirements=(
         "litert-torch-nightly==0.10.0.dev20260926",
-        "litert-lm==0.17.1",
+        "litert-lm==0.18.0",
         # Provides `litert-lm-builder` and `litert-lm-peek`, which `export`
         # runs to write the GPU activation type into each bundle and to read
         # the result back. Pinned by name: `litert-lm` happens to require
         # this exact version today and `litert-torch` accepts any, so without
         # this line the builder floats the moment the other two pins move.
-        "litert-lm-builder==0.17.1",
+        "litert-lm-builder==0.18.0",
         # `litert-torch-nightly` requires the first two by name only and the
         # third as `>=0.0.0.dev0`, so up to 0.1.9 each install took whatever
         # was newest that day: the same pin could convert with a different

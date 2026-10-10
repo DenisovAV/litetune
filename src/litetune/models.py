@@ -453,7 +453,35 @@ def functiongemma_template() -> str:
     export depend on a mutable ref and a network round trip, which is the same
     objection this package raises to `--base-model-revision main`.
     """
-    return str(files("litetune") / "templates" / "functiongemma.jinja")
+    return packaged_template("functiongemma.jinja")
+
+
+def packaged_template(name: str) -> str:
+    """Path to a prompt template that ships inside this package."""
+    return str(files("litetune") / "templates" / name)
+
+
+# Sourced from the runtime and measured on it. From LiteRT-LM v0.18.0
+# `ModelDataProcessor::MessageToTemplateInput` (`model_data_processor.h`) hands
+# the template every message's content as a list of parts, through
+# `NormalizeMessageContent` (`data_utils.cc`, LiteRT-LM #3544), and the Qwen
+# processor's own override, which handed a single text part over as the string
+# in v0.17.1 (`qwen3_data_processor.cc`), is gone. Both Qwen checkpoints'
+# templates read `content` as a string.
+def _text_parts_reason(checkpoint: str, revision: str, others: str) -> str:
+    """Why a Qwen rule packs its own template, naming the one it packs."""
+    return (
+        "LiteRT-LM from 0.18.0 hands a bundle's template each message's content as a list of "
+        "parts, and this checkpoint's own template reads it as a string. Measured 2026-10-08 on "
+        "litert-lm 0.18.0: a Qwen3 0.6B bundle carrying its checkpoint's template rendered "
+        "'<|im_start|>user\\n<|im_end|>' -- the user's text gone, no error -- where 0.17.1 "
+        "rendered it; with Qwen2.5's template every send failed, because it adds the list to a "
+        "string, which the runtime's MiniJinja refuses. The packaged template is the chat "
+        f"template of {checkpoint} at revision {revision[:7]}, unchanged, behind a block that "
+        f"turns a list of text parts back into the string. {others} gets this one all the "
+        "same; verify's rendering check compares the single turn it renders, not multi-turn, "
+        "reasoning or tool handling"
+    )
 
 
 _FUNCTION_TEMPLATE_REASON = (
@@ -605,29 +633,62 @@ RULES: tuple[ModelRules, ...] = (
     ModelRules(
         family="qwen-3",
         lora_container_reason=_NO_CONTAINER_UPSTREAM,
-        # Nothing to add, and that is what this entry records. `qwen3` is on the
-        # exporter's own type list (the model-type trap, above), so a config
-        # that says `model_type: "qwen3"` is typed correctly with no override.
-        # Measured 2026-09-14 on Qwen/Qwen3-0.6B: both int8 recipes exported
-        # with no flag from litetune, and the conversion cost is in
-        # MEASUREMENTS.md. What the artifact's own `llm_model_type` reads is not
-        # recorded here: that observation appears in no manifest or log of any
-        # run, and was struck from the documents for the same reason.
+        # No type override. `qwen3` is on the exporter's own type list (the
+        # model-type trap, above), so a config that says `model_type: "qwen3"`
+        # is typed correctly with none. Measured 2026-09-14 on Qwen/Qwen3-0.6B:
+        # both int8 recipes exported with no flag from litetune, and the
+        # conversion cost is in MEASUREMENTS.md. The template override below is
+        # LiteRT-LM 0.18.0's, not the exporter's: see `_text_parts_reason`. What
+        # the artifact's own `llm_model_type` reads is not recorded here: that
+        # observation appears in no manifest or log of any run, and was struck
+        # from the documents for the same reason.
         #
         # By size, not `qwen-?3`: that also claims the other sizes and the
         # Qwen 3 models built on other architectures, none of which this
         # project has run. No `min_transformers` either -- none was measured.
         # Sizes are added here as they are.
-        patterns=(r"qwen-?3-0-6b",),
+        #
+        # Which checkpoints, exactly: the rule packs Qwen/Qwen3-0.6B's own
+        # template, so it claims only checkpoints that template was checked
+        # against. Qwen/Qwen3-0.6B itself; Qwen3-0.6B-Base, whose own template
+        # raises on the parts 0.18.0 hands it while the packaged one renders a
+        # single turn as Base's renders the string (MiniJinja 2.14.0, review of
+        # 2026-10-10); either as a Hub id, as a local snapshot of the Hub
+        # repository (`.../models--Qwen--Qwen3-0.6B/snapshots/<sha>`, which
+        # `tune` records verbatim when it trained from one), and with the
+        # `model_type` and architecture `hint_for` appends for a checkpoint
+        # `tune` wrote. A derivative, a repack or a mirror under another
+        # organisation is not claimed: its template is its own, and on 0.18.0
+        # the unknown-family note and verify's rendering check are what speak
+        # for it. Like every rule here this matches the hint's text, not
+        # structured provenance: a local path that spells the repository name is
+        # claimed, and no revision is compared -- another revision of the
+        # repository gets c1899de's template, which the reason says.
+        patterns=(
+            r"(?:^|-)qwen-qwen3-0-6b(?:-base)?(?:-snapshots-[0-9a-f]{40})?"
+            r"(?:$|-qwen3-qwen3forcausallm$)",
+        ),
+        required_flags=(
+            RequiredFlag(
+                name="--jinja_chat_template_override",
+                value=packaged_template("qwen3-0.6b.jinja"),
+                reason=_text_parts_reason(
+                    "Qwen/Qwen3-0.6B",
+                    "c1899de289a04d12100db370d81485cdf75e47ca",
+                    "Qwen3-0.6B-Base, whose own template is a different one, or another revision",
+                ),
+            ),
+        ),
     ),
     ModelRules(
         family="qwen-2.5",
         lora_container_reason=_NO_CONTAINER_UPSTREAM,
-        # Nothing to add here either, and this entry says so with a run behind
+        # No type override either, and this entry says so with a run behind
         # it. `config.json` declares `model_type: "qwen2"`, which
         # `litert_lm_builder.py` matches as `case 'qwen2' | 'qwen2p5'`, so no
         # override: unlike the gemma3_text families there is no ambiguity for
-        # one to resolve. Qwen 3 is typed from its own config in the same way,
+        # one to resolve. The template override is LiteRT-LM 0.18.0's, as for
+        # Qwen 3. Qwen 3 is typed from its own config in the same way,
         # one case up; what is particular here is only that the runtime's type
         # is named for the later generation than the config asks for.
         #
@@ -659,7 +720,25 @@ RULES: tuple[ModelRules, ...] = (
         #
         # No `min_transformers` -- the pinned 5.16.1 loaded it, and nothing
         # here establishes a floor, which is not the same as there being none.
-        patterns=(r"qwen-?2-5-0-5b-instruct(?:$|-qwen2\b)",),
+        #
+        # Since the rule packs this checkpoint's template (LiteRT-LM 0.18.0),
+        # it claims the Hub id, a local snapshot of it and what `tune` wrote
+        # from either -- not an id under another organisation.
+        patterns=(
+            r"(?:^|-)qwen-qwen2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{40})?"
+            r"(?:$|-qwen2-qwen2forcausallm$)",
+        ),
+        required_flags=(
+            RequiredFlag(
+                name="--jinja_chat_template_override",
+                value=packaged_template("qwen2.5-0.5b-instruct.jinja"),
+                reason=_text_parts_reason(
+                    "Qwen/Qwen2.5-0.5B-Instruct",
+                    "7ae557604adf67be50417f59c2c2f167def9a775",
+                    "Another revision, whose template may differ,",
+                ),
+            ),
+        ),
     ),
     ModelRules(
         family="gemma3-text-unidentified",
@@ -902,10 +981,18 @@ def rules_for_hint(hint: ModelHint) -> ModelRules | None:
     return None
 
 
+# The second sentence is LiteRT-LM v0.18.0's, not a rule's: #3544 took the
+# string unwrapping out of the generic processor as well as the Qwen one
+# (`generic_data_processor.cc` in v0.17.1; `NormalizeMessageContent` in v0.18.0),
+# so it reaches a family no rule names.
 UNKNOWN_FAMILY = (
     "litetune has no per-model rules for this checkpoint. That is not a statement that none apply: "
     "the rules it does hold were paid for one model family at a time, and a family it has not met "
-    "is a family whose required export flags and minimum toolchain versions are simply unknown here"
+    "is a family whose required export flags and minimum toolchain versions are simply unknown "
+    "here. One change applies to every family: from LiteRT-LM 0.18.0 the runtime hands the "
+    "bundle's template each message's content as a list of parts, and a template written for a "
+    "string may render the prompt wrongly or fail -- run verify, whose rendering check is what "
+    "shows it"
 )
 
 

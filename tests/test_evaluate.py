@@ -236,8 +236,9 @@ class _ScriptedConversation:
 # than produced, because the CLI is not installed in the environment this suite
 # runs in -- so the pin is on `litert_lm_cli/commands/run.py` at the version
 # `envs.RUNTIME` pins, read at lines 50-53 (`close_channel` writes
-# `" [/name]"` and a newline) and 108-125 (it is called before every text item,
-# on a switch between channels, and at end of stream).
+# `" [/name]"` and a newline) and 108-123 (it prints `str(chunk)` first, and
+# calls it before that text when the text is not empty, on a switch between
+# channels, and at end of stream).
 #
 # The composition in the driver script is the one part of it that is not a
 # direct call into litert-lm, so it is the one part that can be wrong by
@@ -288,6 +289,85 @@ CHANNEL_CASES = [
         "a channel that carried nothing",
         [{"channels": {"thought": ""}}],
         "[thought]  [/thought]",
+    ),
+    (
+        # v0.18.0's run.py closes a channel only before a chunk whose text is
+        # not empty (`text = str(chunk)`); v0.17.1 closed it before every text
+        # item, so this printed `[thought] a [/thought]` and reopened it.
+        "an empty text item inside a channel",
+        [
+            {"channels": {"thought": "a"}},
+            {"content": [{"type": "text", "text": ""}]},
+            {"channels": {"thought": "b"}},
+        ],
+        "[thought] ab [/thought]",
+    ),
+    (
+        "two text items in one chunk",
+        [{"content": [{"type": "text", "text": "an"}, {"type": "text", "text": "swer"}]}],
+        "answer",
+    ),
+    (
+        # A v0.18.0 `Message` keeps a string `content` as the string.
+        "content given as a string",
+        [{"content": "answer"}],
+        "answer",
+    ),
+    (
+        # ...and reads a bare string inside a `content` list as a text part.
+        "a bare string inside a content list",
+        [{"content": ["an", "swer"]}],
+        "answer",
+    ),
+    (
+        # run.py prints any `str(chunk)` that is not empty; a newline is text.
+        "a text chunk that is only a newline",
+        [{"content": [{"type": "text", "text": t}]} for t in ("a", "\n", "b")],
+        "a\nb",
+    ),
+    (
+        "a newline between two pieces of one channel",
+        [
+            {"channels": {"thought": "a"}},
+            {"content": [{"type": "text", "text": "\n"}]},
+            {"channels": {"thought": "b"}},
+        ],
+        "[thought] a [/thought]\n\n[thought] b [/thought]",
+    ),
+    (
+        # run.py prints a chunk's text before its channels.
+        "text and a channel in one chunk",
+        [
+            {"channels": {"thought": "a"}},
+            {"content": [{"type": "text", "text": "X"}], "channels": {"thought": "b"}},
+        ],
+        "[thought] a [/thought]\nX[thought] b [/thought]",
+    ),
+    (
+        # `Contents.__str__` joins the text parts only.
+        "a part that is not text is not printed",
+        [{"content": [{"type": "image", "text": "no"}, {"type": "text", "text": "answer"}]}],
+        "answer",
+    ),
+    (
+        # `Message` reads a text part with no `text` as empty text.
+        "a text part with no text prints nothing",
+        [{"content": [{"type": "text"}, {"type": "text", "text": "answer"}]}],
+        "answer",
+    ),
+    (
+        "a null content prints nothing",
+        [{"content": None}, {"content": [{"type": "text", "text": "answer"}]}],
+        "answer",
+    ),
+    (
+        # `Message` keeps only a string or a list as content.
+        "a content that is an object prints nothing",
+        [
+            {"content": {"type": "text", "text": "no"}},
+            {"content": [{"type": "text", "text": "answer"}]},
+        ],
+        "answer",
     ),
 ]
 
@@ -625,7 +705,7 @@ def test_backend_reports_which_engine_produced_the_numbers(tmp_path):
     described = _litertlm(tmp_path).describe()
     assert described["engine"] == "litert-lm"
     assert described["backend"] == "cpu"
-    assert "litert-lm==0.17.1" in described["requirements"]
+    assert "litert-lm==0.18.0" in described["requirements"]
 
 
 # -- transformers -----------------------------------------------------------

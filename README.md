@@ -221,13 +221,16 @@ tool path only and the CPU nowhere.
 |---|---|---|---|
 | 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
 | 0.2.0 – 0.3.0 | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
+| unreleased (`main`) | `litert-lm==0.18.0` | `litert-lm==0.18.0` and `litert-lm-builder==0.18.0`; `litert-torch-nightly` and the LiteRT, quantizer and converter pins unchanged | unchanged |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
 0.1.x, so `pip install litetune==0.1.9`. The ones taken on 0.17.1 ran `main`
 before 0.2.0, at a commit each names, on the runtime 0.2.0 pins, and say whether
-their bundle was converted by 0.1.x or by that commit. The phone sections ran on
-the device.
+their bundle was converted by 0.1.x or by that commit. The section taken on 0.18.0
+ran the code of pull request #67 before it was merged, on the runtime `main` pins
+now, and says which bundles it converted again. The phone sections ran on the
+device.
 Up to 0.1.9 the conversion environment pinned `litert-torch-nightly` but not the
 quantizer and converter packages it requires, so it took whichever were newest
 the day it was built; `convert` recorded what it got in its report's
@@ -349,7 +352,7 @@ name litetune does not know straight through to it. litetune defines exactly one
 of its own, shipped as a quantizer recipe file inside the package; what it adds
 to the rest is a measurement of what each costs on your task. The costs below
 were taken on litert-lm 0.16.1, the runtime 0.1.x pins, and the four-bit rows
-give 0.17.1's beside them, the runtime litetune pins after 0.1.x. The two runs
+give 0.17.1's beside them, the runtime litetune 0.2.0 – 0.3.0 pin. The two runs
 differ in runtime, transport and possibly CPU; see
 [MEASUREMENTS.md](MEASUREMENTS.md#four-bits-on-litert-lm-0171) for both.
 
@@ -482,9 +485,10 @@ flutter_gemma uses this path for FunctionGemma on a `.litertlm` from core 1.8.4
 with `flutter_gemma_litertlm` 1.7.1: it hands the runtime the declarations
 (`_nativeToolsJson` in `lib/src/ffi/ffi_inference_model.dart`) and creates the
 conversation with constrained decoding on (`lib/src/ffi/litert_lm_client.dart`),
-so the grammar-on number is its path. `flutter_gemma_litertlm` 1.8.0 ships
-LiteRT-LM 0.17.1, the runtime this litetune measures on. Earlier releases render
+so the grammar-on number is its path; releases before core 1.8.4 render
 FunctionGemma's declarations in Dart and are not served the way it is measured.
+`flutter_gemma_litertlm` 1.8.0 ships LiteRT-LM 0.17.1; `flutter_edge_ai_litertlm`
+1.10.0, its renamed successor, ships 0.18.0, the runtime this litetune measures on.
 
 **`verify` picks the path from the model, not from a flag.** With declarations
 and a family whose runtime renders them, it asks the runtime for a structured
@@ -536,6 +540,8 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 | `gemma-3-text` | `--litert_lm_model_type_override=gemma3` |
 | `gemma-4-e2b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm` |
 | `gemma-4-e4b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E4B-it-litert-lm` |
+| `qwen-3` (`Qwen/Qwen3-0.6B`) | `--jinja_chat_template_override=<the checkpoint's own template behind litetune's text-parts block>` |
+| `qwen-2.5` (`Qwen/Qwen2.5-0.5B-Instruct`) | `--jinja_chat_template_override=<the checkpoint's own template behind litetune's text-parts block>` |
 
 **A LoRA scope keyed on model identity.** On a multimodal checkpoint the
 vision and audio towers use the same projection names as the text layers, so
@@ -586,6 +592,27 @@ ships a template the runtime can run and passes it on export. Measured on the
 same checkpoint: with the override the runtime answers
 `[tool_call] set_alarm{hour:7}`; without it, `INTERNAL: Failed to apply
 template`.
+
+**From LiteRT-LM 0.18.0 a template is handed a list of parts.** The runtime gives
+the bundle's template each message's content as `[{"type": "text", "text": ...}]`
+where 0.17.1 gave it the string, and a template written for a string may print the
+list, drop the user's text or fail: measured on 2026-10-08, a Qwen3 0.6B bundle
+rendered `<|im_start|>user\n<|im_end|>` with no error and every send to a Qwen2.5
+0.5B Instruct bundle failed. For those two checkpoints litetune packs the
+checkpoint's own template, unchanged, behind a block that turns a list of text parts
+back into the string (a fine-tune of Qwen3-0.6B-Base gets Qwen3-0.6B's, whose single
+turn renders as Base's does; their multi-turn handling differs); a tool response
+LiteRT-LM sends as a `tool_response` part stays a list, as on 0.17.1, and neither
+template reads it as text, so tool use with these bundles is not covered. **A bundle
+of a checkpoint these two rules claim -- `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-0.6B-Base`
+and `Qwen/Qwen2.5-0.5B-Instruct`, as Hub ids, local snapshots or what `tune` made
+from them -- converted by litetune 0.3.0 or earlier without a template of your own
+carries the checkpoint's template alone and needs converting again**, which packs
+the template of the revision the rule names (`c1899de` for Qwen3 0.6B, `7ae5576` for
+Qwen2.5 0.5B Instruct) whatever revision the checkpoint is; `verify` refuses one at
+its rendering check and names this as a possible cause. Any other family's template
+is not rewritten: `convert` says so in its note on a checkpoint it has no rules for,
+and `verify`'s rendering check is what shows whether it reads a list.
 
 **The terminator comes from the chat template, not from `eos_token_id`.** They
 are not always the same token, and a model trained to emit the wrong one never
@@ -639,9 +666,10 @@ incompatible dependencies and cannot share an interpreter.
 ## Results
 
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
-runtime litetune 0.1.x pins; 0.2.0 pins 0.17.1.
+runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and `main` pins 0.18.0.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
-0.17.1 re-measurements beside the originals where there are any.
+0.17.1 re-measurements beside the originals where there are any, and the same
+again on 0.18.0.
 
 `functiongemma-270m-it`, LoRA on `google/mobile-actions`, scored on 640 examples
 the model never trained on:
@@ -687,7 +715,8 @@ terminator bug fixed in 0.1.5 — see [MEASUREMENTS.md](MEASUREMENTS.md).
 | Cost of conversion | — | +0.0067 *(within noise)* | +0.0167 |
 
 The first family measured here that litetune had no rule for. It exported with
-no flag from litetune, and the rule it has now records that none is needed. The
+no flag from litetune; from LiteRT-LM 0.18.0 its rule adds the checkpoint's
+packaged template, for the runtime rather than the exporter. The
 weight-only figure clears its interval here where the dynamic one does not, and
 where neither of gemma-3-270m's did — on 12 disagreements out of 600. Training
 and the float reference ran on a GPU and the converted models on a CPU, so this
@@ -779,7 +808,8 @@ withdrawn after re-measurement.
 - **Some of them are litert-lm 0.16.1's.** The four banking77 eight-bit pairs,
   the four-bit recipes on the same four checkpoints, the tuned Gemma 4 E2B's
   eight-bit pair and FunctionGemma's tool path were re-measured on 0.17.1,
-  pinned after 0.1.x; among what was not are the headline FunctionGemma runs,
+  which 0.2.0 – 0.3.0 pin, and again on 0.18.0; among what was not are the
+  headline FunctionGemma runs,
   the conversions of Gemma 4's base weights, the runs on untuned bases and the
   phone runs.
   [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) says

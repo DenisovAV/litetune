@@ -47,8 +47,8 @@ ai-edge-litert-nightly==2.3.0.dev20260925
 ai-edge-quantizer-nightly==0.10.0.dev20260926
 flatbuffers==24.3.25
 litert-converter==0.4.0
-litert-lm==0.17.1
-litert-lm-builder==0.17.1
+litert-lm==0.18.0
+litert-lm-builder==0.18.0
 litert-torch-nightly==0.10.0.dev20260926
 numpy==2.0.2
 transformers==5.16.1
@@ -594,7 +594,7 @@ def test_resolved_toolchain_versions_are_recorded(toolchain, request_for):
     assert result.toolchain.resolved["flatbuffers"] == "24.3.25"
     assert result.toolchain.missing == ()
     # The declared pins travel with what they resolved to; neither implies the other.
-    assert "litert-lm==0.17.1" in result.toolchain.declared
+    assert "litert-lm==0.18.0" in result.toolchain.declared
     assert result.as_dict()["toolchain"]["available"] is True
 
 
@@ -727,8 +727,8 @@ def test_parse_pip_freeze_records_the_whole_resolved_set():
         "ai-edge-quantizer-nightly": "0.10.0.dev20260926",
         "flatbuffers": "24.3.25",
         "litert-converter": "0.4.0",
-        "litert-lm": "0.17.1",
-        "litert-lm-builder": "0.17.1",
+        "litert-lm": "0.18.0",
+        "litert-lm-builder": "0.18.0",
         "litert-torch-nightly": "0.10.0.dev20260926",
         "numpy": "2.0.2",
         "transformers": "5.16.1",
@@ -1042,6 +1042,73 @@ def test_the_activation_type_is_written_into_the_prefill_decode_section(toolchai
     (embedder,) = [t for t in _sections(_toml_in(artifact)) if '"embedder"' in t]
     assert 'key = "prefer_activation_type"' in prefill and f'value = "{GPU_ACTIVATION}"' in prefill
     assert "prefer_activation_type" not in embedder, "the key belongs to prefill_decode only"
+
+
+def test_an_artifact_given_by_a_relative_path_is_repacked_too(toolchain, tmp_path, monkeypatch):
+    """`convert --output-dir artifacts/dyn` on Python 3.10 or 3.11: the work
+    directory came out relative, the script wrote `data_path`s relative to the
+    current directory, and the builder resolved each against the TOML's own
+    directory -- `artifacts/dyn/.model-repack-X/artifacts/dyn/.model-repack-X/...`
+    -- so every conversion to a relative output directory shipped a bundle
+    without the GPU key.
+
+    Only below Python 3.12: `tempfile.mkdtemp(dir="rel")` returned
+    `rel/tmp...` on 3.10.19 and 3.11.14 and an absolute path on 3.12.15
+    (measured 2026-10-08). The relative return is put back here so the case
+    is tested on every Python litetune supports."""
+    import tempfile
+
+    from litetune import export
+    from litetune.export import GPU_ACTIVATION, set_gpu_activation
+
+    real_mkdtemp = tempfile.mkdtemp
+    calls = []
+
+    def mkdtemp_before_3_12(suffix=None, prefix=None, dir=None):
+        calls.append(dir)
+        made = real_mkdtemp(suffix, prefix, dir)
+        return made if dir is None or os.path.isabs(dir) else os.path.relpath(made)
+
+    monkeypatch.setattr(export.tempfile, "mkdtemp", mkdtemp_before_3_12)
+    out = tmp_path / "artifacts" / "dyn"
+    out.mkdir(parents=True)
+    _artifact(out)
+    monkeypatch.chdir(tmp_path)
+
+    value, note = set_gpu_activation(
+        Path("artifacts/dyn/model.litertlm"), _fake_env(toolchain, tmp_path)
+    )
+
+    # The simulation reached the call; without this the test would pass
+    # unguarded on 3.12 if `mkdtemp` were ever bound some other way.
+    assert calls, "set_gpu_activation never called tempfile.mkdtemp"
+    assert (value, note) == (GPU_ACTIVATION, None)
+    assert (out / "model.litertlm").read_bytes()[:8] == b"LITERTLM", "the original was replaced"
+    assert not [p for p in out.iterdir() if p.name.startswith(".")], "work dir gone"
+
+
+def test_a_symlinked_artifact_is_replaced_and_its_target_left_alone(toolchain, tmp_path):
+    """`absolute()`, not `resolve()`: the path is made absolute without
+    following a link, so the file replaced is the one the caller named and the
+    link's target, which may sit outside the output directory, is untouched."""
+    from litetune.export import GPU_ACTIVATION, set_gpu_activation
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    target = _artifact(elsewhere)
+    before = target.read_bytes()
+    out = tmp_path / "out"
+    out.mkdir()
+    link = out / "model.litertlm"
+    os.symlink(target, link)
+
+    value, note = set_gpu_activation(link, _fake_env(toolchain, tmp_path))
+
+    assert (value, note) == (GPU_ACTIVATION, None)
+    assert not link.is_symlink(), "the link itself is the file replaced"
+    assert "prefer_activation_type" in _toml_in(link)
+    assert target.read_bytes() == before, "the link's target is left alone"
+    assert not [p for p in elsewhere.iterdir() if p.name.startswith(".")]
 
 
 def test_a_bundle_that_already_declares_an_activation_type_is_left_alone(toolchain, tmp_path):

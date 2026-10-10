@@ -85,7 +85,7 @@ CPU_BACKEND = "cpu"
 # `rendering.py`) pass a `Backend` in and read no device out, and the only
 # field any of them reads afterwards is a token count off `BenchmarkInfo`
 # (`rendering.py`). Whether the runtime could answer at all is a question
-# about litert-lm 0.17.1, which is installed in `envs.RUNTIME` and not here --
+# about the litert-lm that `envs.RUNTIME` pins, which is installed there and not here --
 # so it is a question a reader has to take to that package, and one this
 # comment does not answer for them.
 #
@@ -994,7 +994,7 @@ def runtime_engine_spec(backend: str) -> dict[str, Any]:
     The activation type is stated on every GPU run rather than left to the
     bundle. The bundle's `prefer_activation_type` is only a default: the
     runtime's `--activation-data-type` overrides it (`litert_lm_cli/common.py:216`
-    at v0.16.1 and v0.17.1, where the option is hidden and called experimental and "may
+    at v0.16.1, v0.17.1 and v0.18.0, where the option is hidden and called experimental and "may
     not always work"; that it overrides in both directions is from
     LiteRT-LM#2992). A bundle that says nothing leaves the GPU text executor
     in F16 while the engine reports success: `<pad>` on 40 of 40 rows on an
@@ -1558,13 +1558,19 @@ def text_from_conversation(conversation, prompt):
     reasoning at all.
 
     So this mirrors `litert_lm_cli/commands/run.py` as a state machine rather
-    than approximating it. Read at the v0.16.1 tag, and unchanged but for a type
-    checker's comment at v0.17.1, the version `envs.RUNTIME` pins:
-    `close_channel` (run.py:50-53) writes `" [/name]"` and a newline,
-    and run.py:108-125 calls it before every text item, on a switch between
-    channels, and at the end of the stream. The one branch not mirrored is the
-    bare `click.echo()` the CLI emits instead when no channel was open at the
-    end, which is a trailing newline the scorer strips.
+    than approximating it, at v0.18.0, the version `envs.RUNTIME` pins:
+    `close_channel` (run.py:50-53) writes `" [/name]"` and a newline, and
+    run.py:108-123 calls it before a chunk whose text is not empty (`text =
+    str(chunk)`, the chunk's text parts joined), on a switch between channels,
+    and at the end of the stream. Up to v0.17.1 it was called before every text
+    item, empty ones included, so an empty text item between two pieces of one
+    channel closed and reopened it. A chunk is a `Message` from v0.18.0, a dict
+    whose `content` may stay a plain string, and whose list may hold a bare
+    string, which `Message` reads as a text part (`_messages.py`,
+    `_parse_json_fields`); all three shapes are read here, and a `content` that is
+    an object prints nothing, as it does there. The one branch not
+    mirrored is the bare `click.echo()` the CLI emits instead when no channel
+    was open at the end, which is a trailing newline the scorer strips.
     """
     parts = []
     active = [None]
@@ -1575,10 +1581,23 @@ def text_from_conversation(conversation, prompt):
             active[0] = None
 
     for chunk in conversation.send_message_async(prompt):
-        for item in chunk.get("content", []) or []:
-            if item.get("type") == "text":
-                close()
-                parts.append(item.get("text", ""))
+        content = chunk.get("content", []) or []
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, dict):
+            # `Message` reads only a string or a list as content, so the CLI
+            # prints nothing for an object; iterating it here would join its keys.
+            text = ""
+        else:
+            text = "".join(
+                item if isinstance(item, str) else item.get("text", "")
+                for item in content
+                if isinstance(item, str)
+                or (isinstance(item, dict) and item.get("type") == "text")
+            )
+        if text:
+            close()
+            parts.append(text)
         for name, content in (chunk.get("channels", {}) or {}).items():
             if active[0] != name:
                 close()
@@ -1600,7 +1619,7 @@ def main(spec_path):
         # `cache_dir_value_from_cache_mode` (common.py) maps both `None` and
         # "disk" to the empty string, and `Engine.__init__` reaches
         # `litert_lm_engine_settings_set_cache_dir` only when `cache_dir is not
-        # None` (engine.py:149-151 at v0.17.1). Leaving it out would not be the
+        # None` (engine.py:149-151 at v0.17.1 and v0.18.0). Leaving it out would not be the
         # CLI's behaviour but a fourth state beside disk, memory and none.
         # Which of the three that fourth state resolves to is decided in the
         # C++ the binding calls, not in anything readable from here.
@@ -1641,8 +1660,9 @@ def main(spec_path):
                 except Exception as exc:  # noqa: BLE001
                     # One prompt, not the rest of the split. The runtime
                     # raises `RuntimeError` when a prefill or a decode call
-                    # fails (`litert_lm/session.py:72` and `:101` at v0.17.1)
-                    # and when a send fails (`conversation.py:328`), and
+                    # fails (`litert_lm/session.py:72` and `:101` at v0.17.1 and
+                    # v0.18.0) and when a streamed send fails (`conversation.py:421`,
+                    # or the stream's own error re-raised at `:433`, v0.18.0), and
                     # without this the first of those ends the process: every
                     # later prompt comes back as "the script exited 1".
                     #

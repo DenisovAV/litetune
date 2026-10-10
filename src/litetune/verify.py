@@ -378,7 +378,7 @@ def _score_tool_path(
     - **Grammar off: compared with the reference, and what an application gets
       by default.** The float reference is `transformers` generating greedily
       with no grammar, so the conversion cost is measured against the tool path
-      with the runtime's grammar off too. LiteRT-LM v0.17.1 leaves it off
+      with the runtime's grammar off too. LiteRT-LM v0.17.1 and v0.18.0 leave it off
       unless the caller enables it, so this is also the default.
       Measured 2026-09-17 on FunctionGemma x mobile-actions at n=640: reference
       0.9234, grammar off 0.9172, grammar on 0.7422. The first version compared
@@ -656,8 +656,9 @@ def _limit_gpu_reading(run: Any, engine: dict[str, Any]) -> None:
             f"litetune passed {GPU_ACTIVATION} activations itself; the bundle declares none. An "
             "app that loads it on a GPU without an override gets the runtime's F16 default, "
             "measured as <pad> floods on an M4 Pro's Metal (40 of 40 rows) and on a Galaxy S24 "
-            f"(14 of 20). {measured} -- `convert` writes the key, and a bundle it could not "
-            "repack is named in its report"
+            "(14 of 20) on litert-lm 0.16.1, and on the same S24 on 0.18.0 as replies with no "
+            f"text and no call (8 of 20). {measured} -- `convert` writes the key, and a bundle "
+            "it could not repack is named in its report"
         )
         return
     run.limitation(

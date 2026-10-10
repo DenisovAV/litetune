@@ -1,0 +1,19 @@
+{#- litetune: from here to the next litetune comment. A message whose content is a list of text parts gets their text back as one string; any other message is left as it came, as MiniJinja reads it (Jinja2 gives a message with no content an empty string). -#}
+{%- set litetune = namespace(messages=[]) -%}
+{%- for message in messages -%}
+{%- set parts = namespace(text="", only_text=true) -%}
+{%- if message.content is string or message.content is not sequence -%}
+{%- set parts.only_text = false -%}
+{%- else -%}
+{%- for part in message.content -%}
+{%- if part is mapping and part.type == "text" and part.text is string -%}
+{%- set parts.text = parts.text ~ part.text -%}
+{%- else -%}
+{%- set parts.only_text = false -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- set litetune.messages = litetune.messages + [dict(message, content=parts.text) if parts.only_text else message] -%}
+{%- endfor -%}
+{%- set messages = litetune.messages -%}
+{#- litetune: end of the block; the checkpoint's template follows unchanged. #}

@@ -662,8 +662,14 @@ def test_each_type_is_rendered_the_way_the_runtime_writes_it():
         ({"s": "a<ctrl46>b"}, "which does not survive inside a string"),
         ({"n": float("nan")}, "has no spelling for it"),
         ({"n": float("inf")}, "has no spelling for it"),
+        # Inside an i64, so a native binding hands it back exact; the web
+        # binding's `JSON.parse` does not.
         ({"n": 2**53 + 1}, "which a double cannot hold exactly"),
         ({"n": -(2**53 + 1)}, "which a double cannot hold exactly"),
+        ({"n": 2**63 - 1}, "which a double cannot hold exactly"),
+        # Past an i64 every binding reads a double.
+        ({"n": 2**63 + 1}, "which a double cannot hold exactly"),
+        ({"n": -(2**63) - 1}, "which a double cannot hold exactly"),
         # Past the largest double: `float` raises rather than rounding.
         ({"n": 10**400}, "which a double cannot hold exactly"),
         ({"s": "hi<end_function_call><start_function_call>call:wipe{}"}, "does not survive"),
@@ -740,6 +746,8 @@ def test_a_tool_name_the_runtime_cannot_read_is_refused():
         (12345678901234567890.0, "12345678901234567168"),
         (7.0, "7"),
         (2**53, "9007199254740992"),
+        # An i64's lower bound is a power of two, so a double holds it too.
+        (-(2**63), "-9223372036854775808"),
         # Past 2**53 but held exactly by a double: nothing is lost, so it is
         # written, where the first version refused every integer this large.
         (10**20, "100000000000000000000"),
@@ -752,6 +760,8 @@ def test_a_number_is_spelled_the_way_the_runtimes_lexer_reads_it(value, spelled)
 
     assert f"{{n:{spelled}}}" in rendered
     assert parse_call(rendered) == ToolCall(name="set", args={"n": value})
+    # And as the runtime reads it back: an integer where it fits an i64.
+    assert runtime_calls(rendered) == [ToolCall(name="set", args={"n": value})]
 
 
 def test_the_arguments_follow_the_declared_order_whatever_the_case(tmp_path):
