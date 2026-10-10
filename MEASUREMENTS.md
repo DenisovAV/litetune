@@ -829,7 +829,7 @@ in this family's first table were not re-measured.
 
 Google's `gemma-4-E2B-it.litertlm` (`litert-community/gemma-4-E2B-it-litert-lm`
 at `b3ca0d2f`, sha256 `181938105e0eefd1…`), measured with litert-lm 0.18.0's
-Python API on the CPU backend, on an AMD EPYC 7B12 (Cloud Build). Nothing here is
+Python API on the CPU backend, on an AMD EPYC 7B12. Nothing here is
 a tuned model or a litetune export; it is the bundle Google ships, and the
 question is only what dropping its towers changes.
 
@@ -901,40 +901,45 @@ metadata names no model type.
 
 Run on 2026-10-10 on a Galaxy S26 (`Build.SOC_MODEL` SM8850) through Firebase Test
 Lab, through LiteRT-LM v0.18.0's C API (the `libLiteRtLm.so` of flutter_gemma's
-`native-v0.18.0-a` release), its `prefill_decode` graph on the NPU and the towers
-on the CPU, greedy:
+`native-v0.18.0-a` release), its `prefill_decode` graph on the NPU and the
+embedders, the `aux` graphs and the towers on the CPU, greedy. The route is
+flutter_gemma's: its `libLiteRtLm.so` and Qualcomm dispatch library, with QNN
+2.51.0; the Maven `litertlm-android` AAR's `Backend.NPU` was not tried. Engine load
+below is timed to the end of the first prompt's reply, as the harness times it:
 
-| input | result | engine load |
+| input | result | engine load and first reply |
 |---|---|---|
 | eight text prompts, engine opened without media backends | **8 of 8 identical** to the build's own, as received (2026-10-09) | 1.33 s |
-| the red PNG, "What colour is this image? Answer in one word." | **"Red"** | 8.25 s, one engine with both media backends |
+| the red PNG, "What colour is this image? Answer in one word." | **"Red"** | 8.25 s, the first reply being this one, one engine with both media backends |
 | the 440 Hz tone, "Describe this sound in one sentence." | **"The sound is a high-pitched, sustained tone that fades slowly."** | |
 | "What is the capital of Portugal? Answer in one sentence." | "The capital of Portugal is Lisbon." | |
 | the red PNG and the tone in one turn, "What colour is the image, and what does the sound sound like? Answer in one sentence." | "The image is red, and the sound is not audible." | 8.36 s |
 
-The turn with both inputs is answered for the image and not the tone, and that is
-the model's, not the graft's: Google's unmodified CPU/GPU bundle on the same phone,
-text and towers on the CPU, answered it word for word the same, and Google's own
-SM8750 NPU bundle on a Galaxy S25 answered "The image is red, and there is no sound
-in the image."
+The turn with both inputs is answered for the image and not the tone, as Google's
+own bundles answer it through the same runtime and harness: Google's unmodified
+CPU/GPU bundle on the same phone model, text and towers on the CPU, answered it word
+for word the same, from the same 314 prefill tokens, and Google's own SM8750 NPU
+bundle on a Galaxy S25 answered "The image is red, and there is no sound in the
+image."
 
 In each run's logcat the Qualcomm dispatch library is loaded, the QNN backend is
 `Htp(2)`, `libQnnHtpV81Skel.so` is opened over FastRPC, four `Found qnn graph` lines
 name the compiled graphs, and LiteRT-LM logs `Detected NPU prefill size` and runs
 `LiteRT NPU Compiled Model`; the towers' XNNPACK caches appear only in the media
-runs. LiteRT-LM logs no error. The QNN DSP backend logs the same 292 error-priority
-lines in every one of these runs, and in a run of the build given only the donor's
-metadata (2026-10-09) -- memory handles it could not deregister, and a FastRPC
-domain query that failed -- and every generation completed. The same composition
-built on 2026-10-09 with litert-lm-builder 0.18.0 directly, and one with the towers
-of Google's own SM8750 NPU bundle instead, gave the same three media answers word
-for word. One image, one tone and eight text prompts on one phone: this shows the
-grafted bundle loads and answers both modalities on the device it was built for, and
-that its text answers did not change. It is not a measurement of image or audio
-quality. It ran with Qualcomm's QNN runtime 2.51.0 (`com.qualcomm.qti:qnn-runtime`
-on Maven Central), with a logcat warning, `Qnn backend library version 5.51.0 is
-used. The version LiteRT using is 5.50.0.`; with the QAIRT 2.47.0 libraries the
-engine was not created on the same phone.
+runs. LiteRT-LM logs no error. Every run also logs 292 error-priority lines that
+stop nothing: QNN logs 280, memory handles it could not deregister, while the engine
+is deleted after the last reply -- as Google's own SM8750 bundle does on its phone
+-- and FastRPC logs 12 while it opens the DSP session, before the skel loads. The
+same composition built on 2026-10-09 with litert-lm-builder 0.18.0 directly, and one
+with the towers of Google's own SM8750 NPU bundle instead, gave the same three media
+answers word for word. One image, one tone and eight text prompts on one phone: this
+shows the grafted bundle loads and answers both modalities on the device it was
+built for, and that its text answers did not change. It is not a measurement of
+image or audio quality. It ran with Qualcomm's QNN runtime 2.51.0
+(`com.qualcomm.qti:qnn-runtime` on Maven Central), with a logcat warning, `Qnn
+backend library version 5.51.0 is used. The version LiteRT using is 5.50.0.`; with
+the QAIRT 2.47.0 libraries the engine was not created on the same phone, though the
+bundle's context binary is 2.47.0.
 
 ## A fourth family, and the first that is not Gemma
 

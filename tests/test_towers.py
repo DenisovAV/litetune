@@ -323,8 +323,8 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
             data += b"!"
         contents.append(data)
         s["data_path"] = os.path.basename(s["data_path"])
-        if PACK_ADDS_KEY and s.get("model_type") == "embedder":
-            s["extra"] = "x"
+        if PACK_ALTERS_VALUE and s.get("model_type") == "embedder":
+            s["backend_constraint"] = "gpu"
     # `populate_system_metadata`: both regenerated, appended at the end.
     entries = [e for e in doc["system_metadata"]["entries"]
                if e["key"] not in ("uuid", "creation_timestamp")]
@@ -340,9 +340,26 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
 FAKE_PEEK = (
     FAKE_FORMAT
     + r"""
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+
+class _Item:
+    def __init__(self, key):
+        self.key = key
+
+    def Key(self):
+        return None if self.key is None else self.key.encode("utf-8")
+
+
 class _Object:
-    def __init__(self, span):
+    def __init__(self, span, section):
         self.span = span
+        self.section = section
+        self.keys = [k for k in section if k in ("model_type", "backend_constraint")] + [
+            e.get("key") for e in section.get("additional_metadata", [])]
 
     def BeginOffset(self):
         return self.span[0]
@@ -350,29 +367,55 @@ class _Object:
     def EndOffset(self):
         return self.span[1]
 
+    def ItemsLength(self):
+        return len(self.keys)
+
+    def Items(self, j):
+        return _Item(self.keys[j])
+
 
 class _Listed:
-    def __init__(self, spans):
+    def __init__(self, spans, sections):
         self.spans = spans
+        self.sections = sections
 
     def ObjectsLength(self):
         return len(self.spans)
 
     def Objects(self, i):
-        return _Object(self.spans[i])
+        return _Object(self.spans[i], self.sections[i] if i < len(self.sections) else {})
+
+
+class _System:
+    def __init__(self, entries):
+        self.entries = entries
+
+    def EntriesLength(self):
+        return len(self.entries)
+
+    def Entries(self, i):
+        return _Item(self.entries[i].get("key"))
 
 
 class _Header:
-    def __init__(self, spans):
+    def __init__(self, spans, doc):
         self.spans = spans
+        self.doc = doc
 
     def SectionMetadata(self):
-        return _Listed(self.spans)
+        return _Listed(self.spans, self.doc.get("section", []))
+
+    def SystemMetadata(self):
+        return _System(self.doc.get("system_metadata", {}).get("entries", []))
+
+
+def get_model_type(section_object):
+    return section_object.section.get("model_type")
 
 
 def read_litertlm_header(file_path, output_stream):
     header, _ = read(file_path)
-    return _Header(header["sections"])
+    return _Header(header["sections"], tomllib.loads(header["toml"]))
 """
 )
 
@@ -441,7 +484,7 @@ class FakeToolchain:
     """`StageEnv.run`: the towers script, run for real against the fake builder."""
 
     pack_fails: bool = False
-    pack_adds_key: bool = False
+    pack_alters_value: bool = False
     pack_alters_bytes: bool = False
     known_types: list[str] = field(default_factory=lambda: list(BUILDER_TYPES))
     builder_version: str = "0.18.0"
@@ -471,7 +514,7 @@ class FakeToolchain:
         settings = (
             f"KNOWN_TYPES = {self.known_types!r}\n"
             f"PACK_FAILS = {self.pack_fails}\n"
-            f"PACK_ADDS_KEY = {self.pack_adds_key}\n"
+            f"PACK_ALTERS_VALUE = {self.pack_alters_value}\n"
             f"PACK_ALTERS_BYTES = {self.pack_alters_bytes}\n"
             f"SHRINK_INPUT = {self.shrink_input!r}\n"
         )
@@ -830,7 +873,7 @@ def test_a_toml_key_the_script_would_not_write_back_is_refused(toolchain, tmp_pa
     toml = extra + GEMMA4_E2B_TOML
     if key == "system_metadata.other":
         toml = toml.replace("entries = [", "other = 1\nentries = [", 1)
-    with pytest.raises(TowersError, match=f"TOML for the bundle has {re.escape(key)}, which"):
+    with pytest.raises(TowersError, match=f"TOML for the bundle has {re.escape(repr(key))}, which"):
         drop_towers(gemma4(tmp_path, toml), tmp_path / "o", ["vision"])
 
 
@@ -956,7 +999,7 @@ def test_a_link_that_fails_for_another_reason_gives_no_filesystem_advice(
 @pytest.mark.parametrize(
     ("knob", "reason"),
     [
-        ("pack_adds_key", r"does not read back as asked: section 2 \(TFLiteModel embedder\)"),
+        ("pack_alters_value", r"does not read back as asked: section 2 \(TFLiteModel embedder\)"),
         ("pack_alters_bytes", r"the bytes of section 4 \(TFLiteModel prefill_decode\) changed"),
     ],
 )
@@ -1002,7 +1045,7 @@ def test_a_toml_key_pack_adds_is_refused_on_the_read_back(toolchain, tmp_path, m
             '    write(output_path, "stray = 1\\n" + _toml(doc), contents)\n',
         ),
     )
-    with pytest.raises(TowersError, match="TOML for the rebuilt bundle has stray"):
+    with pytest.raises(TowersError, match="TOML for the rebuilt bundle has 'stray'"):
         drop_towers(gemma4(tmp_path), tmp_path / "o", ["vision"])
 
 
@@ -1827,7 +1870,7 @@ def test_an_adapter_that_does_not_write_the_embedders_width_is_refused(
     [
         # The NPU runs `decode_embedder`, the CPU and GPU the first signature.
         (embedder(WIDTH, decode=8), r"the embedder's outputs give \[8, 16\]"),
-        (tflite(("prefill", [[1, WIDTH]])), r"an output has the shape \[1, 16\], fewer than 3"),
+        (tflite(("prefill", [[1, WIDTH]])), r"an output has 2 dims, not 3 to 8"),
         (b"bytes of an NPU graph", "an offset points outside its 21 bytes"),
     ],
 )

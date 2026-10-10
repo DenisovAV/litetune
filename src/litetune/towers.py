@@ -23,7 +23,14 @@ the file (`litertlm_peek.py:112-119, 300-305`): a file cut short would be copied
 short, and a header that claims more than the file holds would be read in one
 call of that size. The script reads the header's end and every section's offsets
 itself first, and refuses a file whose header or sections do not lie inside it,
-or whose sections overlap.
+or whose sections overlap. `unpack` also writes by the header: a section's
+`model_type` goes into a file name and every item key into its TOML unquoted
+(`litertlm_peek.py:150-169, 499, 514`), so both are checked first too -- a type
+the builder's enum knows, a key of letters, digits and `_` -- and a header listing
+more than `MAX_SECTIONS` sections is refused before `unpack` writes a file for each.
+What the script itself parses from the inputs is bounded: a varint to 10 bytes, a
+TFLite graph to a number of reads linear in its size, an embedder's output to 3 to
+8 dims.
 
 **What the builder cannot write back is refused, not lost.** `unpack` leaves out
 of its TOML the sections whose type `pack` does not take -- TTS and ASR metadata,
@@ -168,6 +175,10 @@ from litert_lm_builder import litertlm_core
 from litert_lm_builder import litertlm_peek
 
 VOLATILE = {"uuid", "creation_timestamp"}
+# Google's Gemma 4 E2B bundle has 12; a header listing more than this is refused
+# before `unpack` writes a file for each.
+MAX_SECTIONS = 256
+ITEM_KEY = re.compile(r"[A-Za-z0-9_]+")
 # Sections a tower's graphs and their externalized weights live in.
 GRAPH_TYPES = ("TFLiteModel", "TFLiteWeights")
 # The graph whose output LiteRT-LM copies into the text model's embeddings.
@@ -275,14 +286,29 @@ def write_toml(doc, path):
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
+SECTION_KEYS = {"section_type", "model_type", "backend_constraint", "data_path",
+                "additional_metadata"}
+ENTRY_KEYS = {"key", "value_type", "value"}
+
+
 def check_keys(doc, where):
-    """Refuse a TOML key `write_toml` would not write back."""
+    """Refuse a TOML key `write_toml` would not write back, or would write bare
+    without being one `unpack` writes."""
     stray = sorted(set(doc) - {"system_metadata", "section"})
     stray += sorted(f"system_metadata.{k}"
                     for k in set(doc.get("system_metadata", {})) - {"entries"})
+    entries = [("system_metadata.entries", e)
+               for e in doc.get("system_metadata", {}).get("entries", [])]
+    for i, s in enumerate(doc.get("section", [])):
+        stray += sorted(f"section {i}: {k}" for k in set(s) - SECTION_KEYS)
+        entries += [(f"section {i}: additional_metadata", e)
+                    for e in s.get("additional_metadata") or []]
+    for at, e in entries:
+        stray += sorted(f"{at}: {k}" for k in set(e) - ENTRY_KEYS)
     if stray:
-        raise Refused(f"litert-lm-builder's TOML for {where} has {', '.join(stray)}, which "
-                      "this script does not write back")
+        raise Refused(f"litert-lm-builder's TOML for {where} has "
+                      f"{', '.join(ascii(k) for k in stray)}, which this script does not "
+                      "write back")
 
 
 def comparable(doc):
@@ -313,10 +339,29 @@ def spans(path, where):
     if not litertlm_core.HEADER_BEGIN_BYTE_OFFSET <= header_end <= size:
         raise Refused(f"{where}: its header ends at byte {header_end}, outside its {size} bytes")
     try:
-        listed = litertlm_peek.read_litertlm_header(str(path), io.StringIO()).SectionMetadata()
+        header = litertlm_peek.read_litertlm_header(str(path), io.StringIO())
+        listed = header.SectionMetadata()
         count = listed.ObjectsLength() if listed else 0
-        places = [(listed.Objects(i).BeginOffset(), listed.Objects(i).EndOffset())
-                  for i in range(count)]
+        if count > MAX_SECTIONS:
+            raise Refused(f"{where}: its header lists {count} sections, more than {MAX_SECTIONS}")
+        objects = [listed.Objects(i) for i in range(count)]
+        places = [(o.BeginOffset(), o.EndOffset()) for o in objects]
+        # `unpack` writes item keys into its TOML unquoted (litertlm_peek.py:499, 514)
+        # and a model_type into a file name (litertlm_peek.py:150-169, 298-301).
+        system = header.SystemMetadata()
+        keys = [system.Entries(i).Key() for i in range(system.EntriesLength() if system else 0)]
+        for i, o in enumerate(objects):
+            keys += [o.Items(j).Key() for j in range(o.ItemsLength())]
+            kind = litertlm_peek.get_model_type(o)
+            if kind is not None:
+                try:
+                    lb.TfLiteModelType.get_enum_from_tf_free_value(kind)
+                except ValueError:
+                    raise Refused(f"{where}: section {i} has model_type {kind!r}, which "
+                                  "litert-lm-builder cannot write back") from None
+        bad = [k for k in keys if k is None or not ITEM_KEY.fullmatch(k.decode("utf-8", "replace"))]
+        if bad:
+            raise Refused(f"{where}: its header has the item key {bad[0]!r}")
     except (ValueError, IndexError, struct.error) as exc:
         raise Refused(f"{where}: its header could not be read: {exc}") from None
     for i, (begin, end) in enumerate(places):
@@ -416,6 +461,8 @@ def unpacked(path, directory, where, places):
 def varint(buf, i):
     shift = value = 0
     while True:
+        if shift > 63:
+            raise ValueError("a varint runs past 10 bytes")
         byte = buf[i]
         i += 1
         value |= (byte & 0x7F) << shift
@@ -686,8 +733,14 @@ class Flat:
 
     def __init__(self, buf):
         self.buf = buf
+        # Linear in the graph's size: tables shared between signatures can make a
+        # walk that rereads them quadratic.
+        self.left = 64 + 4 * len(buf)
 
     def at(self, fmt, pos):
+        self.left -= 1
+        if self.left < 0:
+            raise ValueError("the graph needs more reads than its size allows")
         if not 0 <= pos <= len(self.buf) - struct.calcsize(fmt):
             raise ValueError(f"an offset points outside its {len(self.buf)} bytes")
         return struct.unpack_from(fmt, self.buf, pos)[0]
@@ -780,7 +833,7 @@ def text_width(path):
     prefill input must match (:207-216) and which LiteRT-LM copies each media
     token's values in (embedding_lookup_multi_modal.cc:120-123). The signature is
     the first on CPU and GPU (litert_compiled_model_executor_utils.cc:1179-1183,
-    embedding_lookup_text.cc:350-360) and `decode_embedder` on the NPU
+    embedding_lookup_text.cc:350-360) and `decode_embedder` with the NPU backend
     (npu/llm_litert_npu_embedder.cc:525-529); both are read when both are there.
     Output 0 of each, the one the runtime reads (`output_buffers_[0]`,
     embedding_lookup_text.cc:378-400)."""
@@ -789,8 +842,8 @@ def text_width(path):
     used = [(key, shapes[:1]) for key, shapes in used]
 
     def width(shape):
-        if len(shape) < 3:
-            raise ValueError(f"an output has the shape {shape}, fewer than 3 dims")
+        if not 3 <= len(shape) <= 8:
+            raise ValueError(f"an output has {len(shape)} dims, not 3 to 8")
         return math.prod(shape[2:])
 
     return one_width(used, width, "the embedder")
@@ -1129,7 +1182,8 @@ VERIFY_NOTE = "What the model answers was not checked here: run `litetune verify
 ADD_NOTE = (
     "Measured once: a Gemma 4 E2B build for SM8850 given the towers and LlmMetadata of "
     "Google's CPU/GPU bundle answered an image and an audio turn on an SM8850 phone, its "
-    "prefill_decode graph on the NPU and the towers on the CPU (MEASUREMENTS.md, *Towers "
+    "prefill_decode graph on the NPU and its embedders and towers on the CPU, through "
+    "flutter_gemma's LiteRT-LM 0.18.0 C API with QNN 2.51.0 (MEASUREMENTS.md, *Towers "
     "grafted into an SM8850 NPU bundle*). Run it on the device it is for."
 )
 

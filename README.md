@@ -582,10 +582,12 @@ and required when the bundle's own metadata is not Gemma 4's or names no such
 token, as the text-only build's did not. Without it, the bundle's settings for
 the added towers must equal the donor's. With `--add` the work directory needs
 the donor's size on top. This is not an operation LiteRT-LM offers; it was
-measured on one SM8850 phone, where what this command wrote answered an image and
-an audio turn and its text answers did not change; a turn carrying both was
-answered for the image alone, as Google's own bundles answer it
-([MEASUREMENTS.md](MEASUREMENTS.md#towers-grafted-into-an-sm8850-npu-bundle)).
+measured on one SM8850 phone, through flutter_gemma's LiteRT-LM 0.18.0 C API and
+Qualcomm dispatch with QNN 2.51.0 (not the `litertlm-android` AAR's `Backend.NPU`,
+which was not tried), where what this command wrote answered an image and an
+audio turn and its text answers did not change; a turn carrying both was
+answered for the image alone, as Google's own bundles answer it through the same
+runtime ([MEASUREMENTS.md](MEASUREMENTS.md#towers-grafted-into-an-sm8850-npu-bundle)).
 
 ---
 
@@ -842,8 +844,11 @@ withdrawn after re-measurement.
   `Failed to create engine`; the logcat line is `Context binary (2.47.0) is
   newer than the current SDK (2.44.0)`. The `native-v0.16.0` runtime tarball
   from the same project carries 2.47 and loads Google's 2.44-built bundles as
-  well as ours; it is the runtime behind the S25 numbers in this file. The
-  Maven `litertlm-android` 0.16.1 AAR cannot reach the
+  well as ours; it is the runtime behind the S25 numbers in this file. On
+  LiteRT-LM 0.18.0 through `native-v0.18.0-a`'s dispatch, a 2.47 context binary
+  was not enough: QAIRT 2.47 libraries created no engine on an SM8850 phone, and
+  QNN 2.51.0's did (MEASUREMENTS.md, *Towers grafted into an SM8850 NPU bundle*).
+  The Maven `litertlm-android` 0.16.1 AAR cannot reach the
   Qualcomm NPU with any public dispatch library
   ([LiteRT#6889](https://github.com/google-ai-edge/LiteRT/issues/6889)).
 - **An Intel NPU keeps only the first prefill chunk, and not for the Qualcomm
