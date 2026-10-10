@@ -221,15 +221,15 @@ tool path only and the CPU nowhere.
 |---|---|---|---|
 | 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
 | 0.2.0 – 0.3.0 | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
-| unreleased (`main`) | `litert-lm==0.18.0` | `litert-lm==0.18.0` and `litert-lm-builder==0.18.0`; `litert-torch-nightly` and the LiteRT, quantizer and converter pins unchanged | unchanged |
+| 0.4.0 | `litert-lm==0.18.0` | `litert-lm==0.18.0` and `litert-lm-builder==0.18.0`; `litert-torch-nightly` and the LiteRT, quantizer and converter pins unchanged | unchanged |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
 0.1.x, so `pip install litetune==0.1.9`. The ones taken on 0.17.1 ran `main`
 before 0.2.0, at a commit each names, on the runtime 0.2.0 pins, and say whether
 their bundle was converted by 0.1.x or by that commit. The section taken on 0.18.0
-ran the code of pull request #67 before it was merged, on the runtime `main` pins
-now, and says which bundles it converted again. The phone sections ran on the
+ran the code of pull request #67 before it was merged, on the runtime 0.4.0 pins,
+and says which bundles it converted again. The phone sections ran on the
 device.
 Up to 0.1.9 the conversion environment pinned `litert-torch-nightly` but not the
 quantizer and converter packages it requires, so it took whichever were newest
@@ -730,7 +730,7 @@ incompatible dependencies and cannot share an interpreter.
 ## Results
 
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
-runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and `main` pins 0.18.0.
+runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and 0.4.0 pins 0.18.0.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
 0.17.1 re-measurements beside the originals where there are any, and the same
 again on 0.18.0.
