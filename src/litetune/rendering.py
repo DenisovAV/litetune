@@ -317,6 +317,17 @@ class RenderingComparison:
                 "half of the check did not run",
                 observed=self.as_dict(),
             )
+        if self.agrees and self.prefill_skipped and not self.prefill_sent:
+            # An empty rendering is what the binding returns both for a failed
+            # template and for one that renders nothing, so a sample that was
+            # skipped whole is a check that did not run, not one that passed.
+            return Check.unchecked(
+                RENDERING_CHECK,
+                f"identical token ids for all {self.compared} prompts, but none of the "
+                f"{self.prefill_skipped} prompts sampled for a prefill count was sent, their "
+                "rendering being empty, so that half of the check did not run",
+                observed=self.as_dict(),
+            )
         if self.agrees:
             # `sampled` counts the prompts that answered with a count, which is
             # not the number that were sent: the runtime can leave
@@ -327,11 +338,6 @@ class RenderingComparison:
                 half = (
                     f"and the runtime's prefill count equal to the reference's on {sampled} of "
                     f"the {self.prefill_sent} prompts it was sent"
-                )
-            elif self.prefill_skipped:
-                half = (
-                    f"and no prefill count: none of the {self.prefill_skipped} prompts sampled "
-                    "for one could be sent, their rendering being empty"
                 )
             else:
                 half = "and no prefill count asked for"

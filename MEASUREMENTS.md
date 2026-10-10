@@ -214,8 +214,10 @@ verified in full rendered the same token ids as the reference for all 600 prompt
 scored what the 0.17.1 bundle scored. Up to 0.3.0 neither Qwen rule adds a template
 (`models.py` at v0.3.0), so a bundle litetune 0.3.0 or earlier converted without a
 template passed by the caller carries the checkpoint's template alone, as these did. **A
-Qwen bundle converted by litetune 0.3.0 or earlier has to be converted again for an
-application on LiteRT-LM 0.18.0.**
+Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle converted by litetune 0.3.0 or earlier
+without a template of the caller's has to be converted again for an application on
+LiteRT-LM 0.18.0.** Other Qwen checkpoints get no template from litetune; whether theirs
+reads a list is what verify's rendering check shows.
 
 FunctionGemma's tool path, both grammar modes, 640 rows: the bundle converted on
 2026-09-19 and the same checkpoint converted again at c7ee2da -- litert-lm-builder

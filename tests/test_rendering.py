@@ -695,9 +695,10 @@ def test_a_sample_that_could_not_be_sent_is_not_called_unasked():
         [{"index": 0, "ids": [2], "rendered": "", "prefill_tokens": None}],
         prefill_sent=0,
     )
-    detail = comparison.check().detail
-    assert "no prefill count asked for" not in detail
-    assert "none of the 1 prompts sampled" in detail
+    check = comparison.check()
+    assert check.outcome.value == "could_not_check"
+    assert "no prefill count asked for" not in check.detail
+    assert "none of the 1 prompts sampled for a prefill count was sent" in check.detail
 
 
 def test_a_script_that_fails_says_where_and_why(monkeypatch, tmp_path):

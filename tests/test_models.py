@@ -472,7 +472,10 @@ def _runtime_render(source: str, messages: list[dict], **context: object) -> str
     )
     env.add_function("raise_exception", raise_exception)
     env.add_function("strftime_now", lambda fmt: time.strftime(fmt))
-    env.add_filter("tojson", lambda value: json.dumps(value, separators=(", ", ": ")))
+    # serde_json with a formatter that spaces after `,` and `:`, writing UTF-8.
+    env.add_filter(
+        "tojson", lambda value: json.dumps(value, separators=(", ", ": "), ensure_ascii=False)
+    )
     env.add_filter("lstrip", lambda s, chars=None: s.lstrip(chars))
     env.add_filter("rstrip", lambda s, chars=None: s.rstrip(chars))
     return env.render_str(
@@ -660,18 +663,37 @@ def test_an_unknown_family_is_told_about_the_list_of_parts():
     assert "list of parts" in models.report(model)["reason"]
 
 
-def test_the_qwen3_rule_says_whose_template_it_packs_and_what_verify_does_not_check():
-    """The pattern claims Qwen3-0.6B-Base and repacks too, on purpose: on 0.18.0
-    Base's own template raises on a list of parts, and the packaged one renders
-    a single turn as Base's renders the string. So the reason has to say that
-    the template is Qwen/Qwen3-0.6B's at one revision, and what the rendering
-    check leaves unchecked."""
-    for claimed in ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-0.6B-Base"):
+_SNAPSHOT = "/home/u/.cache/huggingface/hub/models--Qwen--{}/snapshots/" + "c1899de2" * 5
+
+
+def test_the_qwen3_rule_claims_the_checkpoints_its_template_was_checked_against():
+    """The rule packs Qwen/Qwen3-0.6B's own template. It claims that checkpoint
+    and its base -- whose own template raises on 0.18.0's parts while the
+    packaged one renders a single turn as Base's does -- as Hub ids and as local
+    snapshots; anything else carries a template of its own and is not claimed."""
+    for claimed in (
+        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3-0.6B-Base",
+        _SNAPSHOT.format("Qwen3-0.6B"),
+        _SNAPSHOT.format("Qwen3-0.6B-Base"),
+    ):
         assert identify(claimed).family == "qwen-3", claimed
+    for unclaimed in (
+        "someorg/Qwen3-0.6B",
+        "someorg/Qwen3-0.6B-sql-assistant",
+        "someorg/Qwen3-0.6B-Qwen3-GGUF",
+        "Qwen/Qwen3-0.6B-FP8",
+        "Qwen/Qwen3-0.6B-GGUF",
+        "unsloth/Qwen3-0.6B-unsloth-bnb-4bit",
+    ):
+        assert identify(unclaimed) is None, unclaimed
+
+
+def test_the_qwen3_rule_says_whose_template_it_packs_and_what_verify_does_not_check():
     plan = plan_export("Qwen/Qwen3-0.6B-Base", (), ("dynamic_wi8_afp32",))
     reason = " ".join(plan.notes)
     assert "Qwen/Qwen3-0.6B at revision c1899de" in reason
-    assert "a base model's" in reason
+    assert "Qwen3-0.6B-Base, whose own template is a different one" in reason
     assert "not multi-turn, reasoning or tool handling" in reason
 
 
@@ -694,8 +716,11 @@ def test_the_qwen25_rule_claims_only_the_checkpoint_that_was_run():
         "Qwen/Qwen2.5-0.5B-Instruct-AWQ",
         "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4",
         "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit",
+        "someorg/Qwen2.5-0.5B-Instruct",
+        "someorg/Qwen2.5-0.5B-Instruct-qwen2-GGUF",
     ):
         assert identify(unclaimed) is None, unclaimed
+    assert identify(_SNAPSHOT.format("Qwen2.5-0.5B-Instruct")).family == "qwen-2.5"
 
 
 def test_the_qwen25_rule_still_matches_the_checkpoint_tune_wrote(tmp_path):

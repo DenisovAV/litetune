@@ -468,7 +468,7 @@ def packaged_template(name: str) -> str:
 # processor's own override, which handed a single text part over as the string
 # in v0.17.1 (`qwen3_data_processor.cc`), is gone. Both Qwen checkpoints'
 # templates read `content` as a string.
-def _text_parts_reason(checkpoint: str, revision: str) -> str:
+def _text_parts_reason(checkpoint: str, revision: str, others: str) -> str:
     """Why a Qwen rule packs its own template, naming the one it packs."""
     return (
         "LiteRT-LM from 0.18.0 hands a bundle's template each message's content as a list of "
@@ -478,10 +478,9 @@ def _text_parts_reason(checkpoint: str, revision: str) -> str:
         "rendered it; with Qwen2.5's template every send failed, because it adds the list to a "
         "string, which the runtime's MiniJinja refuses. The packaged template is the chat "
         f"template of {checkpoint} at revision {revision[:7]}, unchanged, behind a block that "
-        "turns a list of text parts back into the string. A checkpoint this rule claims whose "
-        "own template differs -- a base model's, another revision's, a derivative's -- gets "
-        "this one all the same; verify's rendering check compares the single turn it renders, "
-        "not multi-turn, reasoning or tool handling"
+        f"turns a list of text parts back into the string. {others} gets this one all the "
+        "same; verify's rendering check compares the single turn it renders, not multi-turn, "
+        "reasoning or tool handling"
     )
 
 
@@ -649,20 +648,31 @@ RULES: tuple[ModelRules, ...] = (
         # project has run. No `min_transformers` either -- none was measured.
         # Sizes are added here as they are.
         #
-        # Not anchored at the end, unlike qwen-2.5's: the rule packs
-        # Qwen/Qwen3-0.6B's template, and on LiteRT-LM 0.18.0 that is the better
-        # of the two outcomes for a checkpoint named after it. Measured with the
-        # runtime's MiniJinja 2.14.0 (review of 2026-10-10): Qwen3-0.6B-Base's own
-        # template raises on the parts 0.18.0 hands it, and the packaged one
-        # renders a single turn exactly as Base's renders the string. Their
-        # multi-turn, reasoning and tool handling differ, which the reason says.
-        patterns=(r"qwen-?3-0-6b",),
+        # Which checkpoints, exactly: the rule packs Qwen/Qwen3-0.6B's own
+        # template, so it claims only checkpoints that template was checked
+        # against. Qwen/Qwen3-0.6B itself; Qwen3-0.6B-Base, whose own template
+        # raises on the parts 0.18.0 hands it while the packaged one renders a
+        # single turn as Base's renders the string (MiniJinja 2.14.0, review of
+        # 2026-10-10); either as a Hub id, as a local snapshot of the Hub
+        # repository (`.../models--Qwen--Qwen3-0.6B/snapshots/<sha>`, which
+        # `tune` records verbatim when it trained from one), and with the
+        # `model_type` and architecture `hint_for` appends for a checkpoint
+        # `tune` wrote. A derivative, a repack or a mirror under another
+        # organisation is not claimed: its template is its own, and on 0.18.0
+        # the unknown-family note and verify's rendering check are what speak
+        # for it.
+        patterns=(
+            r"(?:^|-)qwen-qwen3-0-6b(?:-base)?(?:-snapshots-[0-9a-f]{40})?"
+            r"(?:$|-qwen3-qwen3forcausallm$)",
+        ),
         required_flags=(
             RequiredFlag(
                 name="--jinja_chat_template_override",
                 value=packaged_template("qwen3-0.6b.jinja"),
                 reason=_text_parts_reason(
-                    "Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca"
+                    "Qwen/Qwen3-0.6B",
+                    "c1899de289a04d12100db370d81485cdf75e47ca",
+                    "Qwen3-0.6B-Base, whose own template is a different one, or another revision",
                 ),
             ),
         ),
@@ -707,13 +717,22 @@ RULES: tuple[ModelRules, ...] = (
         #
         # No `min_transformers` -- the pinned 5.16.1 loaded it, and nothing
         # here establishes a floor, which is not the same as there being none.
-        patterns=(r"qwen-?2-5-0-5b-instruct(?:$|-qwen2\b)",),
+        #
+        # Since the rule packs this checkpoint's template (LiteRT-LM 0.18.0),
+        # it claims the Hub id, a local snapshot of it and what `tune` wrote
+        # from either -- not an id under another organisation.
+        patterns=(
+            r"(?:^|-)qwen-qwen2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{40})?"
+            r"(?:$|-qwen2-qwen2forcausallm$)",
+        ),
         required_flags=(
             RequiredFlag(
                 name="--jinja_chat_template_override",
                 value=packaged_template("qwen2.5-0.5b-instruct.jinja"),
                 reason=_text_parts_reason(
-                    "Qwen/Qwen2.5-0.5B-Instruct", "7ae557604adf67be50417f59c2c2f167def9a775"
+                    "Qwen/Qwen2.5-0.5B-Instruct",
+                    "7ae557604adf67be50417f59c2c2f167def9a775",
+                    "Another revision, whose template may differ,",
                 ),
             ),
         ),
