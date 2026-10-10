@@ -4,10 +4,10 @@ another bundle's.
 Google's Gemma 4 E2B CPU/GPU bundle (`litert-community/gemma-4-E2B-it-litert-lm`,
 `gemma-4-E2B-it.litertlm` at `b3ca0d2f`) carries its vision and audio towers as six
 sections of their own beside the text model: 332,387,932 of its 2,588,147,712
-bytes. Stripped of them, it answered eight greedy prompts with the same text on
-litert-lm 0.18.0's CPU backend, at a peak RSS within 3 MB of the full bundle's
-(MEASUREMENTS.md, *Gemma 4 E2B without its towers*). An application that only
-sends text ships the difference for nothing.
+bytes. What `drop_towers` wrote from it answered eight greedy prompts with the
+same text on litert-lm 0.18.0's CPU backend, at a peak RSS within 1 MB of the full
+bundle's (MEASUREMENTS.md, *Gemma 4 E2B without its towers*). An application that
+only sends text ships the difference for nothing.
 
 **Sections are chosen by type, from an allowlist, and nothing else.** A section
 belongs to a tower when its `section_type` is `TFLiteModel` or `TFLiteWeights` (a

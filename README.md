@@ -548,10 +548,11 @@ output are refused. The work directory beside `--output` needs about the
 bundle's size plus the result's.
 
 On Google's bundle the six tower sections are 332,387,932 of 2,588,147,712
-bytes. A bundle stripped of them the same way answered eight greedy prompts on
-litert-lm 0.18.0's CPU backend exactly as the full bundle did, at a peak RSS
-within 3 MB of it, and every image or audio input to it through the Python API
-raised an error rather than producing text
+bytes. The bundle `litetune towers --drop vision --drop audio` wrote from it
+answered eight greedy prompts on litert-lm 0.18.0's CPU backend exactly as the
+full bundle did, at a peak RSS within 1 MB of it, and every image or audio input
+to it through the Python API raised an error rather than producing text; opened
+with a vision backend, its engine is not created at all
 ([MEASUREMENTS.md](MEASUREMENTS.md#gemma-4-e2b-without-its-towers)). What your
 model answers is `verify`'s to say.
 
@@ -580,8 +581,10 @@ LiteRT-LM's NPU executor reads, or in the settings of a tower the bundle keeps,
 and required when the bundle's own metadata is not Gemma 4's or names no such
 token, as the text-only build's did not. Without it, the bundle's settings for
 the added towers must equal the donor's. With `--add` the work directory needs
-the donor's size on top. This is not an operation LiteRT-LM offers; it was measured once, on one SM8850 phone, where the
-result answered an image and an audio turn and its text answers did not change
+the donor's size on top. This is not an operation LiteRT-LM offers; it was
+measured on one SM8850 phone, where what this command wrote answered an image and
+an audio turn and its text answers did not change; a turn carrying both was
+answered for the image alone, as Google's own bundles answer it
 ([MEASUREMENTS.md](MEASUREMENTS.md#towers-grafted-into-an-sm8850-npu-bundle)).
 
 ---
