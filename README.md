@@ -540,10 +540,12 @@ A section belongs to a tower by its `section_type` (a TFLite graph or its
 weights) together with a `model_type` from litert-lm-builder 0.18.0's own list
 for that tower; every other section is kept. The new file is read back before it
 is written to `--output`: every section, the metadata included, byte for byte
-against the section it came from. What the builder cannot write back (a TTS or
-ASR metadata section, a model type it does not know), a tower the bundle does
-not carry and an existing output are refused. The work directory beside
-`--output` needs three to four times the bundle's size.
+against the section it came from. A file its own header does not fit -- cut
+short, or naming sections outside it or overlapping -- what the builder cannot
+write back (a section `unpack` leaves out, such as TTS or ASR metadata, or a
+model type it does not know), a tower the bundle does not carry and an existing
+output are refused. The work directory beside `--output` needs about the
+bundle's size plus the result's.
 
 On Google's bundle the six tower sections are 332,387,932 of 2,588,147,712
 bytes. A bundle stripped of them the same way answered eight greedy prompts on
@@ -563,14 +565,21 @@ litetune towers --model gemma-4-E2B-it-npu.litertlm --add vision --add audio \
 ```
 
 The bundle's own sections stay byte for byte. The donor must carry each whole
-tower. Every `token_str` and token id the kept metadata names must be the same
-piece at the same id in both tokenizers. `--metadata-from-donor` takes the
-donor's LlmMetadata whole, and the report names the fields that differ from the
-bundle's, among those the builder's text form of the metadata carries; it is required when the bundle's own names no token for a tower's
-input, as the text-only build's did not. Without it, the bundle's image and
-audio settings must equal the donor's. Not checked: whether the donor's adapters
-project into the width the bundle's text model embeds at. This is not an
-operation LiteRT-LM offers; it was measured once, on one SM8850 phone, where the
+tower, and each adapter it gives must write as many values per token as the
+bundle's embedder, as the graphs' signatures say: LiteRT-LM copies the one into
+the other without comparing them. The metadata kept must be Gemma 4's and name,
+as a string, the token each added tower's input starts with, and every
+`token_str` and token id it names must be the same piece, of the same type, at
+the same id in both tokenizers. `--metadata-from-donor` replaces the bundle's
+whole LlmMetadata with the donor's -- its prompt template, its stop tokens, its
+model type, which selects the runtime's model-specific code paths, and every
+other field the two differ in, each listed in the report as old → new. It is
+refused when the two differ in `max_num_tokens` or `kv_cache_init_value`, which
+LiteRT-LM's NPU executor reads, or in the settings of a tower the bundle keeps,
+and required when the bundle's own metadata is not Gemma 4's or names no such
+token, as the text-only build's did not. Without it, the bundle's settings for
+the added towers must equal the donor's. With `--add` the work directory needs
+the donor's size on top. This is not an operation LiteRT-LM offers; it was measured once, on one SM8850 phone, where the
 result answered an image and an audio turn and its text answers did not change
 ([MEASUREMENTS.md](MEASUREMENTS.md#towers-grafted-into-an-sm8850-npu-bundle)).
 
@@ -1036,7 +1045,8 @@ measurement, and a typo should not produce one.
 re-measures nothing.
 
 `towers` measures nothing either: it exits 0 when it wrote the new bundle and 4
-when it refused or could not.
+when it refused or could not, or when it wrote the bundle but could not deliver
+the `--json` report.
 
 Wiring `|| exit 1` on anything non-zero throws all of this away.
 

@@ -700,12 +700,15 @@ def _add_towers(sub) -> None:
             "Google's Gemma 4 E2B CPU/GPU bundle carries its vision and audio towers as "
             "sections of their own. --drop writes a copy without the ones named, chosen by "
             "section type and model type; --add writes a copy with the ones named taken from "
-            "--from, after checking that every token string and id the kept metadata names "
-            "is the same piece at the same id in both tokenizers. Either way the copy is read "
-            "back, every section byte for byte, before it is put at --output. The work "
-            "directory beside --output needs three to four times the bundle's size. What the "
-            "model answers is not checked here; run `litetune verify` on the result. "
-            "Exit codes: 0 written, 4 refused or not written."
+            "--from, after checking that each added adapter writes as many values per token "
+            "as the bundle's embedder, that the metadata kept is Gemma 4's and names each "
+            "added tower's start token, and that every token string and id it names is the "
+            "same piece, of the same type, at the same id in both tokenizers. Either way the "
+            "copy is read back, every section byte for byte, before it is put at --output. "
+            "The work directory beside --output needs about the bundle's size plus the "
+            "result's, and the donor's size on top with --add. What the model answers is not "
+            "checked here; run `litetune verify` on the result. Exit codes: 0 written, 4 "
+            "refused or not written, or written but its --json report could not be delivered."
         ),
     )
     towers.add_argument("--model", required=True, type=Path, help="the .litertlm to read")
@@ -732,9 +735,13 @@ def _add_towers(sub) -> None:
         "--metadata-from-donor",
         action="store_true",
         help=(
-            "with --add: take the donor's LlmMetadata -- its prompt template, stop tokens and "
-            "media fields -- instead of the bundle's. Needed when the bundle's names no token "
-            "for the tower's input; refused without it then"
+            "with --add: replace the bundle's whole LlmMetadata with the donor's, byte for "
+            "byte. That changes its prompt template, its stop tokens and its model type, which "
+            "selects the runtime's model-specific code paths, and every other field the two "
+            "differ in; the report lists each. Refused when the two differ in max_num_tokens "
+            "or kv_cache_init_value, which LiteRT-LM's NPU executor reads, or in the settings "
+            "of a tower the bundle keeps. Needed when the bundle's own metadata is not Gemma "
+            "4's or names no start token for a tower's input"
         ),
     )
     towers.add_argument(
@@ -1258,6 +1265,8 @@ def _towers(args: argparse.Namespace) -> int:
             args.model, args.output, args.drop, events=events, auto_provision=provision
         )
     delivered = _report(result.as_dict(), lambda: summarise_towers(result), args.json)
+    if not delivered:
+        logger.error("%s was written, but its --json report could not be delivered", result.output)
     return EXIT_CODES[Status.PASSED] if delivered else EXIT_CODES[Status.ERROR]
 
 

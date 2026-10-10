@@ -101,6 +101,9 @@ python_version = "3.10"
 files = ["src/litetune", "tests"]
 warn_unused_ignores = true
 warn_redundant_casts = true
+# An equality, identity or container check between types that cannot overlap --
+# a `str` against a `Path` -- is reported instead of quietly being False.
+strict_equality = true
 # `check_untyped_defs` is deliberately off: turning it on surfaces ~50 findings
 # in test bodies, almost all `assert x is not None` narrowings the tests know
 # and mypy does not. Worth doing, not worth doing badly in a hurry. So the
