@@ -526,6 +526,15 @@ def _packaged(template: str) -> tuple[str, str]:
     return text, text[text.index(_BLOCK_END) + len(_BLOCK_END) :]
 
 
+def test_the_render_harness_writes_tojson_as_the_runtime_does():
+    """serde_json writes UTF-8 and spaces after `,` and `:` (`minijinja_template.rs`)."""
+    rendered = _runtime_render(
+        "{{ messages[0].content | tojson }}",
+        [{"role": "user", "content": {"city": "München", "n": [1, 2]}}],
+    )
+    assert rendered == '{"city": "München", "n": [1, 2]}'
+
+
 @pytest.mark.parametrize("template", [*sorted(_CHECKPOINT_TEMPLATE_SHA256), "text_parts.jinja"])
 def test_a_packaged_template_uses_nothing_the_render_harness_gets_wrong(template):
     """`_runtime_render` cannot reproduce the runtime's `none` test, and its

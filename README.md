@@ -607,11 +607,12 @@ template reads it as text, so tool use with these bundles is not covered. **A bu
 of a checkpoint these two rules claim -- `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-0.6B-Base`
 and `Qwen/Qwen2.5-0.5B-Instruct`, as Hub ids, local snapshots or what `tune` made
 from them -- converted by litetune 0.3.0 or earlier without a template of your own
-carries the checkpoint's template alone and needs converting again**; `verify`
-refuses one at its rendering check and names this as a possible cause. Any other
-family's template is not rewritten: `convert` says so in its note on a checkpoint it
-has no rules for, and `verify`'s rendering check is what shows whether it reads a
-list.
+carries the checkpoint's template alone and needs converting again**, which packs
+the template of the revision the rule names (`c1899de` for Qwen3 0.6B, `7ae5576` for
+Qwen2.5 0.5B Instruct) whatever revision the checkpoint is; `verify` refuses one at
+its rendering check and names this as a possible cause. Any other family's template
+is not rewritten: `convert` says so in its note on a checkpoint it has no rules for,
+and `verify`'s rendering check is what shows whether it reads a list.
 
 **The terminator comes from the chat template, not from `eos_token_id`.** They
 are not always the same token, and a model trained to emit the wrong one never

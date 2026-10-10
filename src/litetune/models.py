@@ -660,7 +660,10 @@ RULES: tuple[ModelRules, ...] = (
         # `tune` wrote. A derivative, a repack or a mirror under another
         # organisation is not claimed: its template is its own, and on 0.18.0
         # the unknown-family note and verify's rendering check are what speak
-        # for it.
+        # for it. Like every rule here this matches the hint's text, not
+        # structured provenance: a local path that spells the repository name is
+        # claimed, and no revision is compared -- another revision of the
+        # repository gets c1899de's template, which the reason says.
         patterns=(
             r"(?:^|-)qwen-qwen3-0-6b(?:-base)?(?:-snapshots-[0-9a-f]{40})?"
             r"(?:$|-qwen3-qwen3forcausallm$)",
