@@ -30,7 +30,7 @@ the builder's enum knows, a key of letters, digits and `_` -- and a header listi
 more than `MAX_SECTIONS` sections is refused before `unpack` writes a file for each.
 What the script itself parses from the inputs is bounded: a varint to 10 bytes, a
 TFLite graph to a number of reads linear in its size, an embedder's output to 3 to
-8 dims.
+8 dims, a tokenizer to `MAX_TOKENIZER_BYTES`, `MAX_PIECES` and `MAX_PIECE_FIELDS`.
 
 **What the builder cannot write back is refused, not lost.** `unpack` leaves out
 of its TOML the sections whose type `pack` does not take -- TTS and ASR metadata,
@@ -178,6 +178,12 @@ VOLATILE = {"uuid", "creation_timestamp"}
 # Google's Gemma 4 E2B bundle has 12; a header listing more than this is refused
 # before `unpack` writes a file for each.
 MAX_SECTIONS = 256
+# Gemma 4's SentencePiece model is 4.7 MB and 262,144 pieces; a tokenizer past
+# these is refused rather than read whole.
+MAX_TOKENIZER_BYTES = 64 << 20
+MAX_PIECES = 1 << 20
+# A piece holds three fields -- piece, score, type (sentencepiece_model.proto).
+MAX_PIECE_FIELDS = 16
 ITEM_KEY = re.compile(r"[A-Za-z0-9_]+")
 # Sections a tower's graphs and their externalized weights live in.
 GRAPH_TYPES = ("TFLiteModel", "TFLiteWeights")
@@ -500,14 +506,29 @@ def fields(buf):
 def pieces(path):
     """A SentencePiece model's (piece, type) by id, the piece as bytes:
     `ModelProto` field 1, each piece's field 1 and field 3."""
+    size = os.path.getsize(path)
+    if size > MAX_TOKENIZER_BYTES:
+        raise Refused(f"{Path(path).name} is {size} bytes, more than {MAX_TOKENIZER_BYTES} a "
+                      "tokenizer is read to")
     out = []
     try:
         for number, wire, value in fields(Path(path).read_bytes()):
             if number == 1 and wire == 2:
-                piece = list(fields(value))  # all of it, so a truncated piece is refused
-                text = next((v for n, w, v in piece if n == 1 and w == 2), None)
-                kind = next((v for n, w, v in piece if n == 3 and w == 0), 1)
-                out.append((text, kind))
+                if len(out) == MAX_PIECES:
+                    raise Refused(f"{Path(path).name} holds more than {MAX_PIECES} pieces")
+                # All of it is walked, so a truncated piece is refused, and none of it
+                # kept but the first piece string and the first type.
+                text, kind, seen = None, None, 0
+                for n, w, v in fields(value):
+                    seen += 1
+                    if seen > MAX_PIECE_FIELDS:
+                        raise Refused(f"{Path(path).name} has a piece of more than "
+                                      f"{MAX_PIECE_FIELDS} fields")
+                    if text is None and n == 1 and w == 2:
+                        text = v
+                    if kind is None and n == 3 and w == 0:
+                        kind = v
+                out.append((text, 1 if kind is None else kind))
     except (IndexError, ValueError) as exc:
         raise Refused(f"{Path(path).name} is not a SentencePiece model: {exc}") from None
     if not out:
@@ -1182,7 +1203,8 @@ VERIFY_NOTE = "What the model answers was not checked here: run `litetune verify
 ADD_NOTE = (
     "Measured once: a Gemma 4 E2B build for SM8850 given the towers and LlmMetadata of "
     "Google's CPU/GPU bundle answered an image and an audio turn on an SM8850 phone, its "
-    "prefill_decode graph on the NPU and its embedders and towers on the CPU, through "
+    "prefill_decode graph on the NPU and its embedders, aux graphs and towers on the CPU, "
+    "through "
     "flutter_gemma's LiteRT-LM 0.18.0 C API with QNN 2.51.0 (MEASUREMENTS.md, *Towers "
     "grafted into an SM8850 NPU bundle*). Run it on the device it is for."
 )

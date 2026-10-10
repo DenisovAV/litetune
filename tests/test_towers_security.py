@@ -231,3 +231,28 @@ def test_a_stray_key_reaches_the_terminal_escaped(tmp_path):
     with pytest.raises(TowersError) as refused:
         drop_towers(gemma4(tmp_path, toml), tmp_path / "o", ["vision"])
     assert "\x1b" not in str(refused.value), repr(str(refused.value))
+
+
+def test_a_tokenizer_past_the_size_cap_is_refused_unread(script, tmp_path):
+    path = tmp_path / "big.spiece"
+    path.write_bytes(b"\x0a\x03\x0a\x01a")
+    script["pieces"].__globals__["MAX_TOKENIZER_BYTES"] = 4
+    with pytest.raises(script["Refused"], match="more than 4 a tokenizer is read to"):
+        script["pieces"](path)
+
+
+def test_a_tokenizer_with_more_pieces_than_the_cap_is_refused(script, tmp_path):
+    path = tmp_path / "many.spiece"
+    path.write_bytes(b"\x0a\x00" * 3)
+    script["pieces"].__globals__["MAX_PIECES"] = 2
+    with pytest.raises(script["Refused"], match="holds more than 2 pieces"):
+        script["pieces"](path)
+
+
+def test_a_piece_with_more_fields_than_a_piece_has_is_refused(script, tmp_path):
+    """One piece of many empty fields would pass the piece count and be held whole."""
+    inner = b"\x22\x00" * 17
+    path = tmp_path / "wide.spiece"
+    path.write_bytes(b"\x0a" + bytes([len(inner)]) + inner)
+    with pytest.raises(script["Refused"], match="a piece of more than 16 fields"):
+        script["pieces"](path)

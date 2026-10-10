@@ -904,8 +904,9 @@ Lab, through LiteRT-LM v0.18.0's C API (the `libLiteRtLm.so` of flutter_gemma's
 `native-v0.18.0-a` release), its `prefill_decode` graph on the NPU and the
 embedders, the `aux` graphs and the towers on the CPU, greedy. The route is
 flutter_gemma's: its `libLiteRtLm.so` and Qualcomm dispatch library, with QNN
-2.51.0; the Maven `litertlm-android` AAR's `Backend.NPU` was not tried. Engine load
-below is timed to the end of the first prompt's reply, as the harness times it:
+2.51.0; the Maven `litertlm-android` AAR's `Backend.NPU` was not tried. The harness
+on the phone records the model file's length, not its hash. Engine load below is
+timed to the end of the first prompt's reply, as the harness times it:
 
 | input | result | engine load and first reply |
 |---|---|---|
