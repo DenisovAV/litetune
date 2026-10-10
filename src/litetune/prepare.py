@@ -266,7 +266,7 @@ def _render_argument(key: str, value: Any) -> str:
             raise ValueError(
                 f"the argument {key!r} is {value}, which a double cannot hold exactly, and "
                 "LiteRT-LM's web binding reads every number as a double (JSON.parse, litert-lm "
-                "0.18.0): the caller would receive a different number than the one trained. "
+                "0.18.0): a web app would receive a different number than the one trained. "
                 "Send it as a string"
             )
         return f"{key}:{value}"

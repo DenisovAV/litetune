@@ -446,9 +446,15 @@ _BLOCK_END = "{#- litetune: end of the block; the checkpoint's template follows 
 
 def _runtime_render(source: str, messages: list[dict], **context: object) -> str:
     """Render as LiteRT-LM v0.18.0 does: MiniJinja 2.14.0 (`Cargo.toml`, the
-    version pinned in this project's dev extras), with the environment
-    `create_env` builds in `runtime/components/rust/minijinja_template.rs`."""
+    version pinned in this project's dev extras), with the settings, functions
+    and filters `create_env` gives it in `runtime/components/rust/minijinja_template.rs`.
+
+    Not its `none` test, which the runtime makes true only for an undefined
+    value: the Python binding hands a test `None` for both undefined and null,
+    so the difference cannot be reproduced here. The packaged templates use
+    neither `none` nor `strftime_now`, which a test below holds."""
     import re
+    import time
 
     import minijinja
 
@@ -458,9 +464,14 @@ def _runtime_render(source: str, messages: list[dict], **context: object) -> str
     def raise_exception(message: str) -> str:
         raise RuntimeError(message)
 
-    env = minijinja.Environment(keep_trailing_newline=True, trim_blocks=True, lstrip_blocks=True)
+    # `pycompat=False`: the Python binding answers `.startswith()` and friends
+    # by default, the runtime's `Environment::new()` does not -- which is why
+    # it rewrites them first, and why the rewrite above is under test here.
+    env = minijinja.Environment(
+        keep_trailing_newline=True, trim_blocks=True, lstrip_blocks=True, pycompat=False
+    )
     env.add_function("raise_exception", raise_exception)
-    env.add_function("strftime_now", lambda fmt: "")
+    env.add_function("strftime_now", lambda fmt: time.strftime(fmt))
     env.add_filter("tojson", lambda value: json.dumps(value, separators=(", ", ": ")))
     env.add_filter("lstrip", lambda s, chars=None: s.lstrip(chars))
     env.add_filter("rstrip", lambda s, chars=None: s.rstrip(chars))
@@ -487,6 +498,13 @@ _CONVERSATIONS = [
         {"role": "assistant", "content": "b"},
         {"role": "user", "content": "c"},
     ],
+    # An assistant turn that carries its reasoning: Qwen3's template splits and
+    # strips it, which only the runtime's rewrite makes MiniJinja accept.
+    [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "<think>\nhmm\n</think>\n\nb"},
+        {"role": "user", "content": "c"},
+    ],
 ]
 
 # sha256 of each checkpoint's `chat_template` in `tokenizer_config.json` at the
@@ -503,6 +521,18 @@ def _packaged(template: str) -> tuple[str, str]:
     """The packaged file, and the checkpoint's template after the block."""
     text = Path(models.packaged_template(template)).read_text(encoding="utf-8")
     return text, text[text.index(_BLOCK_END) + len(_BLOCK_END) :]
+
+
+@pytest.mark.parametrize("template", [*sorted(_CHECKPOINT_TEMPLATE_SHA256), "text_parts.jinja"])
+def test_a_packaged_template_uses_nothing_the_render_harness_gets_wrong(template):
+    """`_runtime_render` cannot reproduce the runtime's `none` test, and its
+    `strftime_now` is Python's: a template that used either would be checked
+    under different semantics from the device's."""
+    import re
+
+    text = Path(models.packaged_template(template)).read_text(encoding="utf-8")
+    assert not re.search(r"\bis\s+(?:not\s+)?none\b", text)
+    assert "strftime_now" not in text
 
 
 @pytest.mark.parametrize("template", sorted(_CHECKPOINT_TEMPLATE_SHA256))
@@ -566,20 +596,83 @@ def test_the_text_parts_block_gives_text_parts_back_as_one_string(content, seen)
     assert json.loads(rendered) == seen
 
 
-def test_the_qwen3_rule_claims_only_the_checkpoint_that_was_run():
-    """The rule packs Qwen/Qwen3-0.6B's own template, so a pattern that also
-    claims the base model -- whose chat template is a different one -- or a
-    repack hands them a template that is not theirs, under a note saying it is
-    the checkpoint's own."""
-    assert identify("Qwen/Qwen3-0.6B").family == "qwen-3"
-    for unclaimed in (
-        "Qwen/Qwen3-0.6B-Base",
-        "Qwen/Qwen3-0.6B-FP8",
-        "Qwen/Qwen3-0.6B-GGUF",
-        "unsloth/Qwen3-0.6B-unsloth-bnb-4bit",
-        "someorg/Qwen3-0.6B-sql-assistant",
-    ):
-        assert identify(unclaimed) is None, unclaimed
+def _block_sees(content):
+    block = Path(models.packaged_template("text_parts.jinja")).read_text(encoding="utf-8")
+    rendered = _runtime_render(
+        block + "{{ messages[0].content | tojson }}", [{"role": "user", "content": content}]
+    )
+    return json.loads(rendered)
+
+
+def test_a_part_that_is_not_text_is_not_read_as_text_even_with_a_text_field():
+    content = [
+        {"type": "image", "path": "x.png", "text": "caption"},
+        {"type": "text", "text": "see"},
+    ]
+    assert _block_sees(content) == content
+
+
+def test_a_text_part_whose_text_is_not_a_string_is_left_as_it_came():
+    content = [{"type": "text", "text": 7}]
+    assert _block_sees(content) == content
+
+
+_TOOL_CONVERSATION = [
+    {"role": "user", "content": "Wake me at 7"},
+    {
+        "role": "assistant",
+        "content": "Setting it.",
+        "tool_calls": [
+            {"type": "function", "function": {"name": "set_alarm", "arguments": {"hour": 7}}}
+        ],
+    },
+    {"role": "tool", "content": "done"},
+    {"role": "user", "content": "thanks"},
+]
+
+
+@pytest.mark.parametrize("template", sorted(_CHECKPOINT_TEMPLATE_SHA256))
+def test_an_assistant_turn_in_parts_keeps_its_tool_calls(template):
+    """What v0.18.0 keeps in history for a reply with a call: text parts and
+    `tool_calls` (`ResponseTextToMessage`, `data_utils.cc`). The block hands
+    every other key of the message on. (The tool's own reply is a string here;
+    sent as a `tool_response` part it stays a list, which README says.)"""
+    full, body = _packaged(template)
+    trained_on = _runtime_render(body, _TOOL_CONVERSATION)
+    assert "set_alarm" in trained_on
+    assert _runtime_render(full, _as_parts(_TOOL_CONVERSATION)) == trained_on
+
+
+@pytest.mark.parametrize(("model", "family", "template", "revision"), QWEN_TEMPLATES)
+def test_the_reason_names_the_template_it_packs(model, family, template, revision):
+    plan = plan_export(model, (), ("dynamic_wi8_afp32",))
+    assert plan.rules is not None
+    (flag,) = plan.rules.required_flags
+    assert f"chat template of {model} at revision {revision[:7]}, unchanged" in flag.reason
+    assert "not multi-turn, reasoning or tool handling" in flag.reason
+
+
+def test_an_unknown_family_is_told_about_the_list_of_parts():
+    model = "Qwen/Qwen2.5-1.5B-Instruct"
+    notes = " ".join(plan_export(model, (), ("dynamic_wi8_afp32",)).notes)
+    assert "no per-model rules" in notes
+    assert "from LiteRT-LM 0.18.0" in notes and "list of parts" in notes and "run verify" in notes
+    assert "list of parts" in models.report(model)["reason"]
+
+
+def test_the_qwen3_rule_says_whose_template_it_packs_and_what_verify_does_not_check():
+    """The pattern claims Qwen3-0.6B-Base and repacks too, on purpose: on 0.18.0
+    Base's own template raises on a list of parts, and the packaged one renders
+    a single turn as Base's renders the string. So the reason has to say that
+    the template is Qwen/Qwen3-0.6B's at one revision, and what the rendering
+    check leaves unchecked."""
+    for claimed in ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-0.6B-Base"):
+        assert identify(claimed).family == "qwen-3", claimed
+    plan = plan_export("Qwen/Qwen3-0.6B-Base", (), ("dynamic_wi8_afp32",))
+    reason = " ".join(plan.notes)
+    assert "Qwen/Qwen3-0.6B at revision c1899de" in reason
+    assert "a base model's" in reason
+    assert "not multi-turn, reasoning or tool handling" in reason
 
 
 def test_the_qwen25_rule_claims_only_the_checkpoint_that_was_run():

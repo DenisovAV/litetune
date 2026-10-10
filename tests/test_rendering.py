@@ -137,8 +137,8 @@ def test_a_rendering_that_lost_the_prompt_names_the_018_cause():
     assert comparison.as_dict()["first_mismatches"][0]["prompt_missing"] is True
     detail = comparison.check().detail
     assert "does not contain the prompt's text" in detail
-    assert "from LiteRT-LM 0.18.0" in detail
-    assert "converting again" in detail
+    assert "One known cause: from LiteRT-LM 0.18.0" in detail
+    assert "converting it again" in detail
 
 
 def test_a_rendering_the_runtime_could_not_make_is_not_a_short_one():
@@ -153,9 +153,115 @@ def test_a_rendering_the_runtime_could_not_make_is_not_a_short_one():
     (mismatch,) = comparison.mismatches
     assert mismatch.kind == "unrendered"
     detail = comparison.check().detail
-    assert "the runtime rendered nothing" in detail
+    assert "the runtime's rendering is empty" in detail
     assert "renders 1 tokens" not in detail
-    assert "converting again" in detail
+    assert "converting it again" in detail
+
+
+def test_a_prompt_neither_side_shows_verbatim_is_not_called_lost():
+    """Both sides rewrite the text (lower-case) and differ elsewhere (a BOS):
+    the runtime did not lose the prompt, so no cause is named."""
+    comparison = compare_renderings(
+        ["What is 2+2?"],
+        [{"index": 0, "ids": [1, 2], "rendered": "user: what is 2+2?", "prefill_tokens": None}],
+        [
+            {
+                "index": 0,
+                "ids": [0, 1, 2],
+                "rendered": "<s>user: what is 2+2?",
+                "prefill_tokens": None,
+            }
+        ],
+        prefill_sent=0,
+    )
+    (mismatch,) = comparison.mismatches
+    assert not mismatch.prompt_missing
+    assert "converting it again" not in comparison.check().detail
+
+
+def test_a_prompt_with_surrounding_whitespace_is_still_found_lost():
+    """A template that trims content puts the stripped text in the reference."""
+    comparison = compare_renderings(
+        ["  what is 2+2?\n"],
+        [
+            {
+                "index": 0,
+                "ids": [1, 3],
+                "rendered": "<|im_start|>user\n<|im_end|>\n",
+                "prefill_tokens": None,
+            }
+        ],
+        [
+            {
+                "index": 0,
+                "ids": [1, 9, 3],
+                "rendered": "<|im_start|>user\nwhat is 2+2?<|im_end|>\n",
+                "prefill_tokens": None,
+            }
+        ],
+        prefill_sent=0,
+    )
+    (mismatch,) = comparison.mismatches
+    assert mismatch.prompt_missing
+
+
+def test_the_note_counts_the_lost_prompts_not_every_mismatch():
+    comparison = compare_renderings(
+        ["what is 2+2?", "classify: it was fine"],
+        [
+            {"index": 0, "ids": [1, 2], "rendered": "user: what is 2+2?", "prefill_tokens": None},
+            {"index": 1, "ids": [1], "rendered": "user: ", "prefill_tokens": None},
+        ],
+        [
+            {
+                "index": 0,
+                "ids": [0, 1, 2],
+                "rendered": "<s>user: what is 2+2?",
+                "prefill_tokens": None,
+            },
+            {
+                "index": 1,
+                "ids": [0, 1, 9],
+                "rendered": "<s>user: classify: it was fine",
+                "prefill_tokens": None,
+            },
+        ],
+        prefill_sent=0,
+    )
+    detail = comparison.check().detail
+    assert "2 of 2 prompts differ" in detail
+    assert "On 1 of them the runtime's rendering is empty or lacks the prompt's text" in detail
+
+
+@pytest.mark.parametrize("sample", [0, 1, 2, -1, 100])
+def test_the_probe_counts_what_the_script_sent_when_a_prompt_is_skipped(
+    sample, tmp_path, monkeypatch
+):
+    """The real runtime script, a first prompt the template cannot render, and
+    every sample shape: what the probe records as sent is what was sent."""
+    engine = FakeEngine(bos=2)
+    engine.unrenderable = {"a"}
+    prompts = ["a", "bb", "ccc"]
+    script_rows = _run_script(
+        _RUNTIME_SCRIPT,
+        tmp_path,
+        monkeypatch,
+        {"litert_lm": _fake_litert_lm(engine)},
+        {"model": "m.litertlm", "prompts": prompts, "prefill_sample": sample},
+    )
+
+    def run(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        if "prefill_sample" in spec:
+            written = script_rows
+        else:
+            written = [{"index": r["index"], "ids": r["ids"], "rendered": "x"} for r in script_rows]
+        Path(spec["out"]).write_text(json.dumps(written), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    probe = _probe(monkeypatch, tmp_path, run)
+    probe.prefill_sample = sample
+    assert probe.observe(prompts).prefill_sent == len(engine.sent)
 
 
 def test_ids_of_the_same_length_are_still_compared_id_by_id():
@@ -576,7 +682,22 @@ def test_a_skipped_prompt_is_not_counted_as_sent(monkeypatch, tmp_path):
     comparison = _probe(monkeypatch, tmp_path, run).observe(["hi", "there"])
 
     assert comparison.prefill_sent == 1
+    assert comparison.prefill_skipped == 1
     assert [m.kind for m in comparison.mismatches] == ["unrendered"]
+
+
+def test_a_sample_that_could_not_be_sent_is_not_called_unasked():
+    """Both renderings empty agree, and the whole prefill sample was skipped:
+    the pass must not say no prefill count was asked for."""
+    comparison = compare_renderings(
+        PROMPTS[:1],
+        [{"index": 0, "ids": [2], "rendered": "", "prefill_tokens": None, "prefill_skipped": True}],
+        [{"index": 0, "ids": [2], "rendered": "", "prefill_tokens": None}],
+        prefill_sent=0,
+    )
+    detail = comparison.check().detail
+    assert "no prefill count asked for" not in detail
+    assert "none of the 1 prompts sampled" in detail
 
 
 def test_a_script_that_fails_says_where_and_why(monkeypatch, tmp_path):

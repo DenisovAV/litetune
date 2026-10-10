@@ -212,9 +212,10 @@ block that turns a list of text parts back into the string
 (`templates/qwen3-0.6b.jinja`, `qwen2.5-0.5b-instruct.jinja`). Every one of those
 verified in full rendered the same token ids as the reference for all 600 prompts and
 scored what the 0.17.1 bundle scored. Up to 0.3.0 neither Qwen rule adds a template
-(`models.py` at v0.3.0), so a bundle litetune 0.3.0 or earlier converted carries the
-checkpoint's template alone, as these did. **A Qwen bundle converted by litetune 0.3.0
-or earlier has to be converted again for an application on LiteRT-LM 0.18.0.**
+(`models.py` at v0.3.0), so a bundle litetune 0.3.0 or earlier converted without a
+template passed by the caller carries the checkpoint's template alone, as these did. **A
+Qwen bundle converted by litetune 0.3.0 or earlier has to be converted again for an
+application on LiteRT-LM 0.18.0.**
 
 FunctionGemma's tool path, both grammar modes, 640 rows: the bundle converted on
 2026-09-19 and the same checkpoint converted again at c7ee2da -- litert-lm-builder

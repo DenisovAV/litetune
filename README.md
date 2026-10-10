@@ -593,18 +593,23 @@ same checkpoint: with the override the runtime answers
 `[tool_call] set_alarm{hour:7}`; without it, `INTERNAL: Failed to apply
 template`.
 
-**From LiteRT-LM 0.18.0 a template is handed a list of parts.** The runtime
-gives the bundle's template each message's content as `[{"type": "text", "text":
-...}]` where 0.17.1 gave it the string, and a template that reads a string
-drops the user's text or fails: measured on 2026-10-08, a Qwen3 0.6B bundle
-rendered `<|im_start|>user\n<|im_end|>` with no error and every send to a
-Qwen2.5 0.5B Instruct bundle failed. For those two checkpoints litetune packs
-the checkpoint's own template, unchanged, behind a block that turns a list of
-text parts back into the string. **A Qwen bundle converted by litetune 0.3.0 or
-earlier carries the checkpoint's template alone and needs converting again**;
-`verify` refuses one at its rendering check and says why. Any other family's
-template is not rewritten: `convert` says so in its note on a checkpoint it has
-no rules for, and `verify`'s rendering check is what shows whether it reads a
+**From LiteRT-LM 0.18.0 a template is handed a list of parts.** The runtime gives
+the bundle's template each message's content as `[{"type": "text", "text": ...}]`
+where 0.17.1 gave it the string, and a template written for a string may print the
+list, drop the user's text or fail: measured on 2026-10-08, a Qwen3 0.6B bundle
+rendered `<|im_start|>user\n<|im_end|>` with no error and every send to a Qwen2.5
+0.5B Instruct bundle failed. For those two checkpoints litetune packs the
+checkpoint's own template, unchanged, behind a block that turns a list of text parts
+back into the string (a fine-tune of Qwen3-0.6B-Base gets Qwen3-0.6B's, whose single
+turn renders as Base's does; their multi-turn handling differs); a tool response
+LiteRT-LM sends as a `tool_response` part stays a list, as on 0.17.1, and neither
+template reads it as text, so tool use with these bundles is not covered. **A bundle
+of a checkpoint these two rules claim -- Qwen3 0.6B, base or instruct, and Qwen2.5
+0.5B Instruct -- converted by litetune 0.3.0 or earlier without a template of your
+own carries the checkpoint's template alone and needs converting again**; `verify`
+refuses one at its rendering check and names this as a possible cause. Any other
+family's template is not rewritten: `convert` says so in its note on a checkpoint it
+has no rules for, and `verify`'s rendering check is what shows whether it reads a
 list.
 
 **The terminator comes from the chat template, not from `eos_token_id`.** They

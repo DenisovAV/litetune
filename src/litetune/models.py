@@ -478,8 +478,10 @@ def _text_parts_reason(checkpoint: str, revision: str) -> str:
         "rendered it; with Qwen2.5's template every send failed, because it adds the list to a "
         "string, which the runtime's MiniJinja refuses. The packaged template is the chat "
         f"template of {checkpoint} at revision {revision[:7]}, unchanged, behind a block that "
-        "turns a list of text parts back into the string. A checkpoint whose own template "
-        "differs from that one gets it all the same: verify's rendering check is what shows it"
+        "turns a list of text parts back into the string. A checkpoint this rule claims whose "
+        "own template differs -- a base model's, another revision's, a derivative's -- gets "
+        "this one all the same; verify's rendering check compares the single turn it renders, "
+        "not multi-turn, reasoning or tool handling"
     )
 
 
@@ -647,14 +649,14 @@ RULES: tuple[ModelRules, ...] = (
         # project has run. No `min_transformers` either -- none was measured.
         # Sizes are added here as they are.
         #
-        # And anchored, for the reason the qwen-2.5 rule below gives: since the
-        # rule packs Qwen/Qwen3-0.6B's own template, an unanchored pattern
-        # would hand that template to `Qwen3-0.6B-Base`, whose chat template is
-        # a different one, and to every repack and derivative whose name starts
-        # the same way. The tail is the end of the hint or the `model_type`
-        # `hint_for` appends for a local checkpoint
-        # (`...-qwen3-0-6b-qwen3-qwen3forcausallm`).
-        patterns=(r"qwen-?3-0-6b(?:$|-qwen3\b)",),
+        # Not anchored at the end, unlike qwen-2.5's: the rule packs
+        # Qwen/Qwen3-0.6B's template, and on LiteRT-LM 0.18.0 that is the better
+        # of the two outcomes for a checkpoint named after it. Measured with the
+        # runtime's MiniJinja 2.14.0 (review of 2026-10-10): Qwen3-0.6B-Base's own
+        # template raises on the parts 0.18.0 hands it, and the packaged one
+        # renders a single turn exactly as Base's renders the string. Their
+        # multi-turn, reasoning and tool handling differ, which the reason says.
+        patterns=(r"qwen-?3-0-6b",),
         required_flags=(
             RequiredFlag(
                 name="--jinja_chat_template_override",
@@ -965,9 +967,9 @@ UNKNOWN_FAMILY = (
     "litetune has no per-model rules for this checkpoint. That is not a statement that none apply: "
     "the rules it does hold were paid for one model family at a time, and a family it has not met "
     "is a family whose required export flags and minimum toolchain versions are simply unknown "
-    "here. One is known for every family: from LiteRT-LM 0.18.0 the runtime hands the bundle's "
-    "template each message's content as a list of parts, and a template that reads it as a "
-    "string renders the user's text away or fails -- run verify, whose rendering check is what "
+    "here. One change applies to every family: from LiteRT-LM 0.18.0 the runtime hands the "
+    "bundle's template each message's content as a list of parts, and a template written for a "
+    "string may render the prompt wrongly or fail -- run verify, whose rendering check is what "
     "shows it"
 )
 

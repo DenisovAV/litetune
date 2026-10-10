@@ -224,10 +224,11 @@ class RenderingMismatch:
     prompt: str
     # `ids`: the rendered id lists differ. `prefill`: they agree, and the count
     # the runtime prefilled when the prompt was sent does not. `unrendered`: the
-    # runtime returned no rendering at all, which is what the binding hands back
-    # when the template fails (`conversation.py`, `render_message_to_string`,
-    # v0.18.0: an empty string for the C API's null) -- not a rendering of only
-    # the tokens the session adds.
+    # runtime's rendering is empty where the reference's is not -- what the
+    # binding returns for the C API's null when the template fails, and also for
+    # a template that renders nothing (`conversation.py`,
+    # `render_message_to_string`, v0.18.0) -- not a rendering of only the
+    # tokens the session adds.
     kind: str
     runtime_tokens: int
     reference_tokens: int
@@ -249,8 +250,8 @@ class RenderingMismatch:
             )
         if self.kind == "unrendered":
             return (
-                f"prompt {self.index}: the runtime rendered nothing, which is what its binding "
-                "returns when the bundle's template fails"
+                f"prompt {self.index}: the runtime's rendering is empty, which its binding returns "
+                "both when the bundle's template fails and when it renders nothing"
             )
         missing = (
             "; the runtime's rendering does not contain the prompt's text"
@@ -292,6 +293,9 @@ class RenderingComparison:
     # none of them.
     prefill_sent: int = 0
     mismatches: tuple[RenderingMismatch, ...] = field(default_factory=tuple)
+    # Prompts in the prefill sample the runtime script did not send because
+    # their rendering was empty; not counted in `prefill_sent`.
+    prefill_skipped: int = 0
 
     @property
     def agrees(self) -> bool:
@@ -319,12 +323,18 @@ class RenderingComparison:
             # `last_prefill_token_count` unset for some of them. Naming one
             # number with the other's word is the mistake this whole check is
             # about, so say both.
-            half = (
-                f"and the runtime's prefill count equal to the reference's on {sampled} of the "
-                f"{self.prefill_sent} prompts it was sent"
-                if self.prefill_sent
-                else "and no prefill count asked for"
-            )
+            if self.prefill_sent:
+                half = (
+                    f"and the runtime's prefill count equal to the reference's on {sampled} of "
+                    f"the {self.prefill_sent} prompts it was sent"
+                )
+            elif self.prefill_skipped:
+                half = (
+                    f"and no prefill count: none of the {self.prefill_skipped} prompts sampled "
+                    "for one could be sent, their rendering being empty"
+                )
+            else:
+                half = "and no prefill count asked for"
             return Check.passed(
                 RENDERING_CHECK,
                 f"identical token ids for all {self.compared} prompts, {half}",
@@ -351,11 +361,12 @@ class RenderingComparison:
         if not lost:
             return ""
         return (
-            f". On {len(lost)} of them the runtime's rendering lost the prompt or failed: from "
-            "LiteRT-LM 0.18.0 the runtime hands the bundle's template each message's content as "
-            "a list of parts, and a template that reads it as a string does exactly this. A "
-            "Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle converted by an earlier litetune needs "
-            "converting again; this one packs a template that reads both"
+            f". On {len(lost)} of them the runtime's rendering is empty or lacks the prompt's "
+            "text. One known cause: from LiteRT-LM 0.18.0 the runtime hands the bundle's "
+            "template each message's content as a list of parts, and a template that reads it "
+            "as a string loses the text or fails. A Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle "
+            "converted by litetune 0.3.0 or earlier with no template of the caller's is such a "
+            "bundle, and converting it again with this litetune packs a template that reads both"
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -363,6 +374,7 @@ class RenderingComparison:
             "applied": True,
             "prompts_compared": self.compared,
             "prefill_sent": self.prefill_sent,
+            "prefill_skipped": self.prefill_skipped,
             "prefill_sampled": [dict(row) for row in self.prefill],
             "mismatches": len(self.mismatches),
             # The first few, which is what a reader needs to find the cause; the
@@ -449,6 +461,7 @@ def compare_renderings(
         prefill=tuple(prefill),
         prefill_sent=prefill_sent,
         mismatches=tuple(mismatches),
+        prefill_skipped=sum(1 for row in runtime_rows if row.get("prefill_skipped")),
     )
 
 
