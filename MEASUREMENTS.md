@@ -96,7 +96,7 @@ four-bit recipes on the same four checkpoints, in *Four bits on litert-lm
 0.17.1*; the tuned Gemma 4 E2B's two eight-bit bundles, in *Gemma 4 E2B on
 litert-lm 0.17.1*; and FunctionGemma's tool path, in *The same checkpoint on
 litert-lm 0.17.1*. Each of those was taken again on litert-lm 0.18.0, the runtime
-`main` pins, in *The 0.17.1 re-measurements again on litert-lm 0.18.0*, after the
+0.4.0 pins, in *The 0.17.1 re-measurements again on litert-lm 0.18.0*, after the
 banking77 sections. The rest has not been; among it the headline FunctionGemma
 runs, the conversions of Gemma 4's base weights and the runs on untuned bases
 are `verify` numbers taken on 0.16.1, and the phone runs ran on the device.

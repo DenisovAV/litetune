@@ -3,6 +3,14 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.4.0 — 2026-10-11
+- **Convert a Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle again for an app on LiteRT-LM 0.18.0, as flutter_edge_ai_litertlm 1.10.0 ships: 0.18.0 hands the template a list of parts, which their checkpoint templates do not read, and the user's text is lost or every send fails (#67).**
+- **Convert again any bundle `convert` wrote to a relative `--output-dir` on Python 3.10 or 3.11: it has no GPU activation key, which its report named, and on a GPU backend it answers wrong (#67).**
+- `verify` runs the candidate on litert-lm 0.18.0 and `convert` packs with litert-lm-builder 0.18.0; every published number re-measured on it equals its 0.17.1 number, Qwen's on bundles converted again (#67).
+- The Qwen3 0.6B and Qwen2.5 0.5B Instruct rules pack the checkpoint's own chat template behind a block that reads 0.18.0's parts, and `verify` names a rendering that came back empty or without the prompt (#67).
+- `litetune towers` drops a Gemma 4 bundle's vision and audio towers, or adds them from another bundle (#68).
+- The site and README say which device, backend and runtime each number was measured on (#65), and FunctionGemma's measurement notes describe Flutter Edge AI's native tool path (#66).
+
 ## 0.3.0 — 2026-10-03
 - **Re-run a timed-out `verify` only if you rely on its reference-backend provenance: 0.1.5 through 0.2.1 could record `unknown` after the float-reference model had already reached a device; generated answers and scores are unaffected (#63).**
 - `tune` and `verify`'s float reference can use Apple GPUs through Metal/MPS with unified-memory safeguards; `tune --micro-batch-size` exposes gradient accumulation, and `LITETUNE_DEVICE=cpu` forces CPU execution (#63).
