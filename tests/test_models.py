@@ -72,8 +72,9 @@ def test_families_are_recognised(model, family):
         # declare `model_type: gemma3_text`, which the exporter does not
         # recognise, so without an override both bundle as `generic_model`.
         # Qwen3-0.6B sat here until its export and conversion cost were
-        # measured, and Qwen2.5-0.5B-Instruct until 2026-09-20. Both rules add
-        # nothing; the rest of both families stays below.
+        # measured, and Qwen2.5-0.5B-Instruct until 2026-09-20. Both rules now
+        # add the checkpoint's packaged template; the rest of both families
+        # stays below.
         "Qwen/Qwen2.5-1.5B-Instruct",
         "Qwen/Qwen2.5-0.5B",
         # Claimed by size, and only the size that was measured. The TTS model is
@@ -411,8 +412,174 @@ def test_the_text_parts_block_can_print_nothing():
     assert lines[0].startswith("{#- litetune:") and lines[0].endswith("-#}")
     assert lines[-1].startswith("{#- litetune: end") and lines[-1].endswith(" #}")
     for line in lines[1:-1]:
-        assert re.fullmatch(r"\{%-.*-%\}", line), line
+        # One statement per line: `.*` alone would also accept
+        # `{%- if x -%}TEXT{%- endif -%}`, which prints TEXT.
+        assert re.fullmatch(r"\{%-(?:(?!%\}).)*-%\}", line), line
     assert "{{" not in block
+
+
+# What LiteRT-LM v0.18.0 does to a template before rendering it, in order:
+# `EditTemplateForMinijinja` (`runtime/components/prompt_template.cc`) rewrites
+# Python method calls MiniJinja lacks into filters and tests, with RE2's
+# non-greedy `.*?`, which Python's `re` reads the same way.
+_MINIJINJA_EDITS = (
+    (r"\.startswith\((.*?)\)", r" is startingwith \1"),
+    (r"\.endswith\((.*?)\)", r" is endingwith \1"),
+    (r"\.replace\((.*?),(.*?)\)", r" | replace(\1,\2)"),
+    (r"\.split\((.*?)\)\[0\]", r" | split(\1) | first"),
+    (r"\.split\((.*?)\)\[-1\]", r" | split(\1) | last"),
+    (r"\.split\((.*?)\)", r" | split(\1)"),
+    (r"\.join\((.*?)\)", r" | join(\1)"),
+    (r"\.lstrip\(\)", " | lstrip"),
+    (r"\.lstrip\((.*?)\)", r" | lstrip(\1)"),
+    (r"\.rstrip\(\)", " | rstrip"),
+    (r"\.rstrip\((.*?)\)", r" | rstrip(\1)"),
+    (r"\.strip\(\)", " | trim"),
+    (r"\.strip\((.*?)\)", r" | trim(\1)"),
+    (r"\.items\(\)", " | items"),
+    (r"{% generation %}", ""),
+    (r"{% endgeneration %}", ""),
+)
+
+_BLOCK_END = "{#- litetune: end of the block; the checkpoint's template follows unchanged. #}"
+
+
+def _runtime_render(source: str, messages: list[dict], **context: object) -> str:
+    """Render as LiteRT-LM v0.18.0 does: MiniJinja 2.14.0 (`Cargo.toml`, the
+    version pinned in this project's dev extras), with the environment
+    `create_env` builds in `runtime/components/rust/minijinja_template.rs`."""
+    import re
+
+    import minijinja
+
+    for pattern, replacement in _MINIJINJA_EDITS:
+        source = re.sub(pattern, replacement, source)
+
+    def raise_exception(message: str) -> str:
+        raise RuntimeError(message)
+
+    env = minijinja.Environment(keep_trailing_newline=True, trim_blocks=True, lstrip_blocks=True)
+    env.add_function("raise_exception", raise_exception)
+    env.add_function("strftime_now", lambda fmt: "")
+    env.add_filter("tojson", lambda value: json.dumps(value, separators=(", ", ": ")))
+    env.add_filter("lstrip", lambda s, chars=None: s.lstrip(chars))
+    env.add_filter("rstrip", lambda s, chars=None: s.rstrip(chars))
+    return env.render_str(
+        source,
+        messages=messages,
+        add_generation_prompt=context.get("add_generation_prompt", True),
+        bos_token="",
+        eos_token="",
+    )
+
+
+def _as_parts(messages: list[dict]) -> list[dict]:
+    """What v0.18.0 hands the template: each content a list of text parts
+    (`NormalizeMessageContent`, `data_utils.cc`)."""
+    return [dict(m, content=[{"type": "text", "text": m["content"]}]) for m in messages]
+
+
+_CONVERSATIONS = [
+    [{"role": "user", "content": "What is my balance?"}],
+    [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hi"}],
+    [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+    ],
+]
+
+# sha256 of each checkpoint's `chat_template` in `tokenizer_config.json` at the
+# revision the packaged file names, read from the Hugging Face cache.
+_CHECKPOINT_TEMPLATE_SHA256 = {
+    "qwen3-0.6b.jinja": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+    "qwen2.5-0.5b-instruct.jinja": (
+        "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
+    ),
+}
+
+
+def _packaged(template: str) -> tuple[str, str]:
+    """The packaged file, and the checkpoint's template after the block."""
+    text = Path(models.packaged_template(template)).read_text(encoding="utf-8")
+    return text, text[text.index(_BLOCK_END) + len(_BLOCK_END) :]
+
+
+@pytest.mark.parametrize("template", sorted(_CHECKPOINT_TEMPLATE_SHA256))
+def test_the_template_after_the_block_is_the_checkpoints_byte_for_byte(template):
+    import hashlib
+
+    _, body = _packaged(template)
+    assert hashlib.sha256(body.encode("utf-8")).hexdigest() == _CHECKPOINT_TEMPLATE_SHA256[template]
+
+
+@pytest.mark.parametrize("template", sorted(_CHECKPOINT_TEMPLATE_SHA256))
+@pytest.mark.parametrize("conversation", _CONVERSATIONS)
+def test_a_packaged_template_renders_parts_as_the_checkpoints_renders_strings(
+    template, conversation
+):
+    """The point of the block, rendered the way the runtime renders: given the
+    list of parts 0.18.0 hands over, the packaged template prints what the
+    checkpoint's template prints for the string `transformers` and 0.17.1 hand
+    over -- and the string still renders the same through it."""
+    full, body = _packaged(template)
+    trained_on = _runtime_render(body, conversation)
+    assert _runtime_render(full, _as_parts(conversation)) == trained_on
+    assert _runtime_render(full, conversation) == trained_on
+
+
+@pytest.mark.parametrize("template", sorted(_CHECKPOINT_TEMPLATE_SHA256))
+def test_without_the_block_the_parts_lose_the_users_text(template):
+    """The check above can fail: the checkpoint's template alone, given parts,
+    is the 0.18.0 behaviour measured on 2026-10-08 -- Qwen3 renders an empty
+    user turn, Qwen2.5 raises -- and neither prints the user's text."""
+    _, body = _packaged(template)
+    conversation = _CONVERSATIONS[0]
+    try:
+        rendered = _runtime_render(body, _as_parts(conversation))
+    except Exception as error:  # noqa: BLE001 -- MiniJinja's own error type
+        assert "unsupported types string and sequence" in str(error)
+    else:
+        assert conversation[0]["content"] not in rendered
+        assert "<|im_start|>user\n<|im_end|>" in rendered
+
+
+@pytest.mark.parametrize(
+    ("content", "seen"),
+    [
+        ("a string", "a string"),
+        ([{"type": "text", "text": "one"}], "one"),
+        ([{"type": "text", "text": "one "}, {"type": "text", "text": "two"}], "one two"),
+        ([], ""),
+        # A part that is not text: the whole message is left as it came.
+        (
+            [{"type": "text", "text": "see"}, {"type": "image", "path": "x.png"}],
+            [{"type": "text", "text": "see"}, {"type": "image", "path": "x.png"}],
+        ),
+        (None, None),
+    ],
+)
+def test_the_text_parts_block_gives_text_parts_back_as_one_string(content, seen):
+    block = Path(models.packaged_template("text_parts.jinja")).read_text(encoding="utf-8")
+    probe = block + "{{ messages[0].content | tojson }}"
+    rendered = _runtime_render(probe, [{"role": "user", "content": content}])
+    assert json.loads(rendered) == seen
+
+
+def test_the_qwen3_rule_claims_only_the_checkpoint_that_was_run():
+    """The rule packs Qwen/Qwen3-0.6B's own template, so a pattern that also
+    claims the base model -- whose chat template is a different one -- or a
+    repack hands them a template that is not theirs, under a note saying it is
+    the checkpoint's own."""
+    assert identify("Qwen/Qwen3-0.6B").family == "qwen-3"
+    for unclaimed in (
+        "Qwen/Qwen3-0.6B-Base",
+        "Qwen/Qwen3-0.6B-FP8",
+        "Qwen/Qwen3-0.6B-GGUF",
+        "unsloth/Qwen3-0.6B-unsloth-bnb-4bit",
+        "someorg/Qwen3-0.6B-sql-assistant",
+    ):
+        assert identify(unclaimed) is None, unclaimed
 
 
 def test_the_qwen25_rule_claims_only_the_checkpoint_that_was_run():

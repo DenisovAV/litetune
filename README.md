@@ -227,8 +227,10 @@ To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
 0.1.x, so `pip install litetune==0.1.9`. The ones taken on 0.17.1 ran `main`
 before 0.2.0, at a commit each names, on the runtime 0.2.0 pins, and say whether
-their bundle was converted by 0.1.x or by that commit. The phone sections ran on
-the device.
+their bundle was converted by 0.1.x or by that commit. The section taken on 0.18.0
+ran the code of pull request #67 before it was merged, on the runtime `main` pins
+now, and says which bundles it converted again. The phone sections ran on the
+device.
 Up to 0.1.9 the conversion environment pinned `litert-torch-nightly` but not the
 quantizer and converter packages it requires, so it took whichever were newest
 the day it was built; `convert` recorded what it got in its report's
@@ -538,6 +540,8 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 | `gemma-3-text` | `--litert_lm_model_type_override=gemma3` |
 | `gemma-4-e2b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm` |
 | `gemma-4-e4b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E4B-it-litert-lm` |
+| `qwen-3` (`Qwen/Qwen3-0.6B`) | `--jinja_chat_template_override=<the checkpoint's own template behind litetune's text-parts block>` |
+| `qwen-2.5` (`Qwen/Qwen2.5-0.5B-Instruct`) | `--jinja_chat_template_override=<the checkpoint's own template behind litetune's text-parts block>` |
 
 **A LoRA scope keyed on model identity.** On a multimodal checkpoint the
 vision and audio towers use the same projection names as the text layers, so
@@ -588,6 +592,20 @@ ships a template the runtime can run and passes it on export. Measured on the
 same checkpoint: with the override the runtime answers
 `[tool_call] set_alarm{hour:7}`; without it, `INTERNAL: Failed to apply
 template`.
+
+**From LiteRT-LM 0.18.0 a template is handed a list of parts.** The runtime
+gives the bundle's template each message's content as `[{"type": "text", "text":
+...}]` where 0.17.1 gave it the string, and a template that reads a string
+drops the user's text or fails: measured on 2026-10-08, a Qwen3 0.6B bundle
+rendered `<|im_start|>user\n<|im_end|>` with no error and every send to a
+Qwen2.5 0.5B Instruct bundle failed. For those two checkpoints litetune packs
+the checkpoint's own template, unchanged, behind a block that turns a list of
+text parts back into the string. **A Qwen bundle converted by litetune 0.3.0 or
+earlier carries the checkpoint's template alone and needs converting again**;
+`verify` refuses one at its rendering check and says why. Any other family's
+template is not rewritten: `convert` says so in its note on a checkpoint it has
+no rules for, and `verify`'s rendering check is what shows whether it reads a
+list.
 
 **The terminator comes from the chat template, not from `eos_token_id`.** They
 are not always the same token, and a model trained to emit the wrong one never
@@ -690,7 +708,8 @@ terminator bug fixed in 0.1.5 — see [MEASUREMENTS.md](MEASUREMENTS.md).
 | Cost of conversion | — | +0.0067 *(within noise)* | +0.0167 |
 
 The first family measured here that litetune had no rule for. It exported with
-no flag from litetune, and the rule it has now records that none is needed. The
+no flag from litetune; from LiteRT-LM 0.18.0 its rule adds the checkpoint's
+packaged template, for the runtime rather than the exporter. The
 weight-only figure clears its interval here where the dynamic one does not, and
 where neither of gemma-3-270m's did — on 12 disagreements out of 600. Training
 and the float reference ran on a GPU and the converted models on a CPU, so this
@@ -782,7 +801,8 @@ withdrawn after re-measurement.
 - **Some of them are litert-lm 0.16.1's.** The four banking77 eight-bit pairs,
   the four-bit recipes on the same four checkpoints, the tuned Gemma 4 E2B's
   eight-bit pair and FunctionGemma's tool path were re-measured on 0.17.1,
-  pinned after 0.1.x; among what was not are the headline FunctionGemma runs,
+  which 0.2.0 – 0.3.0 pin, and again on 0.18.0; among what was not are the
+  headline FunctionGemma runs,
   the conversions of Gemma 4's base weights, the runs on untuned bases and the
   phone runs.
   [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) says

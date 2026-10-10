@@ -1087,6 +1087,30 @@ def test_an_artifact_given_by_a_relative_path_is_repacked_too(toolchain, tmp_pat
     assert not [p for p in out.iterdir() if p.name.startswith(".")], "work dir gone"
 
 
+def test_a_symlinked_artifact_is_replaced_and_its_target_left_alone(toolchain, tmp_path):
+    """`absolute()`, not `resolve()`: the path is made absolute without
+    following a link, so the file replaced is the one the caller named and the
+    link's target, which may sit outside the output directory, is untouched."""
+    from litetune.export import GPU_ACTIVATION, set_gpu_activation
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    target = _artifact(elsewhere)
+    before = target.read_bytes()
+    out = tmp_path / "out"
+    out.mkdir()
+    link = out / "model.litertlm"
+    os.symlink(target, link)
+
+    value, note = set_gpu_activation(link, _fake_env(toolchain, tmp_path))
+
+    assert (value, note) == (GPU_ACTIVATION, None)
+    assert not link.is_symlink(), "the link itself is the file replaced"
+    assert "prefer_activation_type" in _toml_in(link)
+    assert target.read_bytes() == before, "the link's target is left alone"
+    assert not [p for p in elsewhere.iterdir() if p.name.startswith(".")]
+
+
 def test_a_bundle_that_already_declares_an_activation_type_is_left_alone(toolchain, tmp_path):
     from litetune.export import set_gpu_activation
 

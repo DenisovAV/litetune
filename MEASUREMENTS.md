@@ -141,18 +141,22 @@ litert-lm 0.17.1*.
 
 ### The 0.17.1 re-measurements again on litert-lm 0.18.0
 
-Verified again from 2026-10-08 to 2026-10-09 on litert-lm 0.18.0 with litetune at
-commit c7ee2da, and the Qwen bundles converted again and verified at 02844df, which
-adds the packaged Qwen templates and the review's fixes (both unreleased; both report
-0.3.0), on the machine type the 0.17.1 runs used: every manifest that measured a candidate
-records it on `Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512 and 12 vCPU, and the
-reference on cuda. Nothing was retrained.
+Verified again from 2026-10-08 to 2026-10-09 on litert-lm 0.18.0 with the code of pull
+request #67 before it was merged: commit c7ee2da (the runs recorded 5ddb043, the same
+tree before a rebase), and for the Qwen bundles converted again and verified, 02844df,
+which includes the packaged Qwen templates (both report 0.3.0). They ran on the machine
+type the 0.17.1 runs used: every manifest that measured a candidate records it on
+`Intel(R) Xeon(R) CPU @ 2.20GHz` with AVX-512 and 12 vCPU, and the reference on cuda.
+Nothing was retrained.
 
 Two kinds of bundle were run. The bundles the 0.17.1 runs measured, unchanged -- each
-SHA-256 equals the 0.17.1 manifest's -- so the runtime is the one thing that moved.
-And, for FunctionGemma and the two Qwen sections, bundles converted again from the
-same checkpoints by this litetune, whose conversion stack is the same exporter with
-litert-lm-builder 0.18.0.
+that has a manifest on both runtimes carries the SHA-256 the 0.17.1 manifest records --
+so the runtime is the one thing that moved. And, for FunctionGemma and the two Qwen
+sections, bundles converted again from the same checkpoints by this litetune, with
+`litert-torch-nightly` 0.10.0.dev20260926, `ai-edge-quantizer-nightly`
+0.10.0.dev20260926 and litert-lm-builder 0.18.0, where the bundles they are compared
+with were converted in September with 0.10.0.dev20260826, 0.10.0.dev20260914 and 0.16.1:
+for those the conversion stack moved as well as the runtime, and for Qwen the template.
 
 **Every number that reached the quality tier is the 0.17.1 number again**: the same
 candidate and reference exact match and the same cost with the same count of
@@ -192,22 +196,25 @@ gemma-3-270m, gemma-3-1b and Qwen3, converted again (five prompts not done in 90
 Past the gate: gemma-3-1b `dynamic_wi4_afp32` (repeated itself on 65 of 600).
 
 **The old Qwen bundles do not survive 0.18.0**, and the two fail differently. From
-v0.18.0 the runtime hands a bundle's template every message's content as a list of
-parts (LiteRT-LM #3544); both Qwen checkpoints' templates read it as a string.
-Rendered by the runtime on its own, one prompt through a Qwen3 bundle converted by
-0.3.0 came back `<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n` on 0.18.0 --
-the user's text gone, and no error -- against the whole prompt on 0.17.1. `verify`
-refused every Qwen3 bundle, the eight-bit ones on all 600 prompts and the four-bit
-ones at their five-prompt gate: *600 of 600 prompts differ; the runtime renders 8
-tokens and the reference 43*. Through each Qwen2.5 bundle, eight-bit and four-bit,
-`verify` stopped at the same check: the runtime's first send raised
-`litert_lm_conversation_send_message failed`. Bundles converted by this litetune
-carry the checkpoint's own template behind a block that turns a list of text parts
-back into the string (`templates/qwen3-0.6b.jinja`, `qwen2.5-0.5b-instruct.jinja`).
-Every one of those verified in full rendered the same token ids as the reference for
-all 600 prompts and scored what the 0.17.1 bundle scored. **A Qwen bundle converted
-by litetune 0.3.0 or earlier has to be converted again for an application on
-LiteRT-LM 0.18.0.**
+v0.18.0 the runtime hands a bundle's template every message's content as a list of parts
+(LiteRT-LM #3544); both Qwen checkpoints' templates read it as a string. `verify`
+refused every Qwen3 bundle -- converted in September by litetune a few unreleased
+commits after 0.1.6, with litert-lm-builder 0.16.1 -- at its rendering check, the
+eight-bit ones on all 600 prompts (*600 of 600 prompts differ; prompt 0: the runtime
+renders 8 tokens and the reference 43*) and the four-bit ones on all five prompts of
+their gate. The runtime's rendering it recorded ends
+`<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n` -- the user's text gone, and no
+error -- where on 0.17.1 the same bundles rendered the reference's ids for all 600
+prompts. Through each Qwen2.5 bundle, eight-bit and four-bit, `verify` stopped at the
+same check: the runtime's first send raised `litert_lm_conversation_send_message
+failed`. Bundles converted by this litetune carry the checkpoint's own template behind a
+block that turns a list of text parts back into the string
+(`templates/qwen3-0.6b.jinja`, `qwen2.5-0.5b-instruct.jinja`). Every one of those
+verified in full rendered the same token ids as the reference for all 600 prompts and
+scored what the 0.17.1 bundle scored. Up to 0.3.0 neither Qwen rule adds a template
+(`models.py` at v0.3.0), so a bundle litetune 0.3.0 or earlier converted carries the
+checkpoint's template alone, as these did. **A Qwen bundle converted by litetune 0.3.0
+or earlier has to be converted again for an application on LiteRT-LM 0.18.0.**
 
 FunctionGemma's tool path, both grammar modes, 640 rows: the bundle converted on
 2026-09-19 and the same checkpoint converted again at c7ee2da -- litert-lm-builder
@@ -227,7 +234,7 @@ version, 1.6.0 before and 1.7.0 after. Verified on 0.18.0, the repacked bundle s
 (`SC-51E`) through Firebase Test Lab with `litertlm-android` 0.18.0, the same 20
 native-tool-path FunctionGemma prompts and the same two bundles:
 
-| bundle, backend | runtime | `<pad>` in the text | no text and no call | right tool | exact call |
+| bundle, backend | runtime | `<pad>` in the text | no text and no call | right tool | first call exact |
 |---|---|---|---|---|---|
 | without the key, GPU | 0.16.1 (2026-09-05) | 14 of 20 | 0 | 3 | 2 |
 | without the key, GPU | **0.18.0** | 0 | **8 of 20** | **9** | **6** |
@@ -236,12 +243,14 @@ native-tool-path FunctionGemma prompts and the same two bundles:
 | `fp32` key, CPU | 0.16.1 | 0 | 0 | 20 | 14 |
 | `fp32` key, CPU | **0.18.0** | 0 | 0 | **20** | **14** |
 
-Without the key the F16 failure no longer prints `<pad>`: eight rows come back with
-no text and no call after 6.4 to 7.2 s each, which is the time the September flood took
-to reach the same 1,024-token cap; that the runtime now drops those tokens from the
-text is an inference from the timing, not read from source. With the key the totals
-are September's on both backends, though 4 of 20 GPU rows and 5 of 20 CPU rows return
-different calls.
+Without the key the F16 failure no longer prints `<pad>`: eight rows come back with no
+text and no call after 6.4 to 7.2 s each, where 13 of September's 14 flood rows took
+14.5 to 19.1 s. Why the rows now come back empty is not established. Both runs without
+the key also end two rows in a send error, where the runtime could not parse the call
+the model wrote; no column of the table counts them. With the key the totals are
+September's on both backends, though 4 of 20 GPU rows and 5 of 20 CPU rows return
+different calls. *First call exact* compares a reply's first call only; comparing every
+call, the `fp32` GPU rows are 13 of 20 exact on 0.18.0 and 14 in September.
 
 ## The headline numbers
 
@@ -866,13 +875,14 @@ different device from their candidates, so both carry that difference.
 
 ### What this run established that the table does not show
 
-**The family needs no rule, and now has one that says so.** Both recipes
-exported with no flag from litetune, and the tuned checkpoint's `config.json`
-names `model_type: qwen3`. That is
-the model-type trap `models.py` describes, seen from the other side: `qwen3` is
-on the exporter's own list, so the config's `model_type` selects the right type
-with no override. `models.py` records it as `qwen-3`, scoped to 0.6B, the one
-size run.
+**The exporter needs no flag for the family.** Both recipes exported with no flag
+from litetune, and the tuned checkpoint's `config.json` names `model_type: qwen3`.
+That is the model-type trap `models.py` describes, seen from the other side: `qwen3`
+is on the exporter's own list, so the config's `model_type` selects the right type
+with no override. `models.py` records it as `qwen-3`, scoped to 0.6B, the one size
+run; from LiteRT-LM 0.18.0 that rule adds the checkpoint's packaged template, for
+the runtime rather than the exporter (*The 0.17.1 re-measurements again on
+litert-lm 0.18.0*).
 
 **The terminator is the template's close, and it is also the tokenizer's
 eos.** `generation_config.eos_token_id` is `[151645, 151643]` — `<|im_end|>`

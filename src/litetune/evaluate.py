@@ -1567,7 +1567,8 @@ def text_from_conversation(conversation, prompt):
     channel closed and reopened it. A chunk is a `Message` from v0.18.0, a dict
     whose `content` may stay a plain string, and whose list may hold a bare
     string, which `Message` reads as a text part (`_messages.py`,
-    `_parse_json_fields`); all three shapes are read here. The one branch not
+    `_parse_json_fields`); all three shapes are read here, and a `content` that is
+    an object prints nothing, as it does there. The one branch not
     mirrored is the bare `click.echo()` the CLI emits instead when no channel
     was open at the end, which is a trailing newline the scorer strips.
     """
@@ -1583,6 +1584,10 @@ def text_from_conversation(conversation, prompt):
         content = chunk.get("content", []) or []
         if isinstance(content, str):
             text = content
+        elif isinstance(content, dict):
+            # `Message` reads only a string or a list as content, so the CLI
+            # prints nothing for an object; iterating it here would join its keys.
+            text = ""
         else:
             text = "".join(
                 item if isinstance(item, str) else item.get("text", "")

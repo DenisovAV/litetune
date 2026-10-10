@@ -478,8 +478,9 @@ def _refuse_extra_keys(
 # Which Python values a JSON-typed argument may hold. A bool is an int in
 # Python and never a number in JSON Schema, so it is excluded by name.
 # An integral float is an integer here: `prepare.render_call` writes it as the
-# integer it equals, and the runtime hands that back as the same value -- an
-# i64 where it fits one from v0.17.1, a double up to v0.16.1.
+# integer it equals, and the runtime hands that back as the same value -- from
+# v0.17.1 an i64 where it fits one and a double past it, up to v0.16.1 always a
+# double (`fc_parser.rs`).
 _HOLDS = {
     "string": lambda v: isinstance(v, str),
     "integer": lambda v: (

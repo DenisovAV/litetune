@@ -10,20 +10,25 @@
   every message's content as a list of parts, `[{"type": "text", "text":
   ...}]` (`ModelDataProcessor::MessageToTemplateInput`,
   `model_data_processor.h`, calling `NormalizeMessageContent`, `data_utils.cc`;
-  LiteRT-LM #3544). v0.17.1 handed this processor a single text part as the
-  string. This template reads `content` as a string, so on v0.18.0 it renders
-  an empty user turn and raises nothing: `<|im_start|>user\n<|im_end|>` (measured
-  2026-10-08 on litert-lm 0.18.0, a bundle litetune 0.3.0 converted). The block turns a message whose parts are all text back into that
-  string and leaves every other message as it came, so the rest of the
-  template sees what `transformers` gives it and what this model was trained
-  on, on either runtime.
+  LiteRT-LM #3544). In v0.17.1 the Qwen processor handed the template a single
+  text part as the string (`qwen3_data_processor.cc`). This template reads
+  `content` as a string, so on v0.18.0 it renders an empty user turn and raises
+  nothing: `<|im_start|>user\n<|im_end|>` (measured 2026-10-08 on litert-lm
+  0.18.0, with a bundle converted on 2026-09-15 by litetune a few unreleased
+  commits after 0.1.6, with litert-lm-builder 0.16.1). The block turns a
+  message whose parts are all text back into that string and leaves every
+  other message as it came, so for a conversation of
+  text the rest of the template sees what `transformers` gives it and what
+  this model was trained on, on either runtime. A message with any other part
+  -- an image, or a tool response sent as a `tool_response` part -- stays a
+  list, which this template does not read as text.
 
   Keep the part after the block identical to the checkpoint's template: a
   difference there is a prompt the model was not trained against. `verify`
   compares the runtime's rendered token ids with the reference's for every
   prompt, which is the check that says so.
 -#}
-{#- litetune: from here to the next litetune comment. A message whose content is a list of text parts gets their text back as one string; any other message is left as it came. -#}
+{#- litetune: from here to the next litetune comment. A message whose content is a list of text parts gets their text back as one string; any other message is left as it came, as MiniJinja reads it (Jinja2 gives a message with no content an empty string). -#}
 {%- set litetune = namespace(messages=[]) -%}
 {%- for message in messages -%}
 {%- set parts = namespace(text="", only_text=true) -%}

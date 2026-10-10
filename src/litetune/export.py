@@ -1582,9 +1582,10 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
         named = ", ".join(f"{e.recipe} ({e.gpu_activation_note})" for e in unset)
         result.limitations.append(
             f"{GPU_ACTIVATION_KEY} could not be written into {named}. On the GPU "
-            "backend the runtime will compute activations in F16, which measured as `<pad>` "
-            "floods and wrong tool names on a Snapdragon Galaxy S24 (3/20 vs 20/20 on CPU, "
-            "n=20). An app that loads these bundles without an activation override gets that "
+            "backend the runtime will compute activations in F16, which measured on a "
+            "Snapdragon Galaxy S24 as `<pad>` floods and wrong tool names on litert-lm 0.16.1 "
+            "(3/20 vs 20/20 on CPU, n=20) and as 8/20 replies with no text and no call on "
+            "0.18.0. An app that loads these bundles without an activation override gets that "
             "default until they are repacked; "
             "`verify --backend gpu` "
             "passes fp32 itself and can still measure them on a GPU"

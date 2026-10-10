@@ -233,7 +233,7 @@ def test_the_decoding_mode_reaches_the_runtime(tmp_path, monkeypatch, constraine
 def test_the_grammar_mode_is_refused_on_a_bundle_with_no_sentencepiece_tokenizer(
     tmp_path, monkeypatch, capsys
 ):
-    """v0.17.1 builds the grammar only from a SentencePiece tokenizer and, where
+    """v0.17.1 and v0.18.0 build the grammar only from a SentencePiece tokenizer and, where
     there is none, logs a warning and decodes without it; v0.16.1 refused. The
     rows would be grammar-off output reported as grammar on."""
     runtime = FakeRuntime(replies=[_reply("set_colour", {})])
@@ -307,7 +307,7 @@ def test_a_structured_call_comes_back_with_its_argument_types(tmp_path, monkeypa
 
 
 def test_an_integer_the_runtime_hands_over_stays_an_integer(tmp_path, monkeypatch):
-    """What v0.17.1 hands over for `hour:7`: an int, and the row keeps it one."""
+    """What v0.17.1 and v0.18.0 hand over for `hour:7`: an int, and the row keeps it one."""
     runtime = FakeRuntime(replies=[_reply("set_alarm", {"hour": 7})])
 
     _, out = _run(runtime, tmp_path, monkeypatch)
@@ -399,6 +399,8 @@ PINNED = (f"litert-lm=={GRAMMAR_OFF_BY_DEFAULT_IN}",)
         # A v0.18.0 `Message` keeps a string `content` as the string; read one
         # item at a time it would only have come out right by accident.
         ({"content": "answer"}, "answer"),
+        # Kept as it came, whitespace included.
+        ({"content": " answer\n"}, " answer\n"),
         ({"content": ["an", "swer"]}, "answer"),
         ({"tool_calls": []}, ""),
     ],
@@ -749,7 +751,8 @@ class CannedEnv:
     # Fail only these modes, when `fail` is set; every mode otherwise.
     fail_modes: tuple[str, ...] = ("constrained", "unconstrained")
     runtime_version: str | None = GRAMMAR_OFF_BY_DEFAULT_IN
-    # What `envs.RUNTIME` pins, which the backend records beside what ran.
+    # The runtime pin, built from `GRAMMAR_OFF_BY_DEFAULT_IN` (equal to what
+    # `envs.RUNTIME` pins, which a test holds), recorded beside what ran.
     requirements: tuple[str, ...] = PINNED
     # A mode that reports another runtime than `runtime_version`, by mode.
     runtime_by_mode: dict[str, str | None] = field(default_factory=dict)

@@ -126,8 +126,8 @@ def test_a_value_that_is_neither_escaped_nor_a_scalar_is_not_a_call():
 
 def test_a_number_the_runtime_hands_back_as_a_double_is_the_integer_it_equals():
     """LiteRT-LM up to v0.16.1 read every `NUMBER` as an f64, so a call the model
-    wrote as `hour:7` reached the caller as `7.0`; v0.17.1 still does past an
-    i64. Compared as `"7.0"` against a
+    wrote as `hour:7` reached the caller as `7.0`; v0.17.1 and v0.18.0 still do
+    past an i64. Compared as `"7.0"` against a
     target of `7`, every correct integer on the tool path scored wrong, and the
     difference landed in the conversion cost."""
     assert ToolCall("set_alarm", {"hour": 7.0}) == ToolCall("set_alarm", {"hour": 7})
@@ -150,7 +150,7 @@ def test_a_number_the_runtime_hands_back_as_a_double_is_the_integer_it_equals():
     ],
 )
 def test_a_number_the_runtimes_lexer_refuses_is_not_a_call(text):
-    """Held to the grammar the runtime reads (`AntlrFcLexer.g4`, v0.17.1), and
+    """Held to the grammar the runtime reads (`AntlrFcLexer.g4`, v0.17.1 and v0.18.0), and
     never raised: `007` used to reach `json.loads` and crash `verify` from the
     divergence check, which runs outside every guard."""
     assert parse_call(text) is None
@@ -326,7 +326,7 @@ def test_a_reply_is_read_as_the_runtime_reads_it(text, calls):
 
 
 def test_the_runtime_reads_an_integer_as_an_integer_and_the_rest_as_a_double():
-    """`fc_parser.rs` at v0.17.1 tries `text.parse::<i64>()` before `f64`, so an
+    """`fc_parser.rs` at v0.17.1 and v0.18.0 tries `text.parse::<i64>()` before `f64`, so an
     integer reaches an application exact, 2**53 + 1 included; one past an i64,
     and anything with a fraction or an exponent, is the nearest double."""
     (call,) = runtime_calls(

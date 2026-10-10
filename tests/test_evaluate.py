@@ -349,6 +349,26 @@ CHANNEL_CASES = [
         [{"content": [{"type": "image", "text": "no"}, {"type": "text", "text": "answer"}]}],
         "answer",
     ),
+    (
+        # `Message` reads a text part with no `text` as empty text.
+        "a text part with no text prints nothing",
+        [{"content": [{"type": "text"}, {"type": "text", "text": "answer"}]}],
+        "answer",
+    ),
+    (
+        "a null content prints nothing",
+        [{"content": None}, {"content": [{"type": "text", "text": "answer"}]}],
+        "answer",
+    ),
+    (
+        # `Message` keeps only a string or a list as content.
+        "a content that is an object prints nothing",
+        [
+            {"content": {"type": "text", "text": "no"}},
+            {"content": [{"type": "text", "text": "answer"}]},
+        ],
+        "answer",
+    ),
 ]
 
 

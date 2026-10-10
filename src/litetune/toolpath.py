@@ -202,13 +202,15 @@ def calls_of(reply):
     answer.
 
     From litert-lm 0.18.0 `send_message` returns a `Message`, whose `tool_calls`
-    are rebuilt from parsed calls: arguments that are not an object come back
-    as `{}`, a call whose `function` is not a mapping is dropped
-    (`_messages.py`, `_parse_json_fields`). So the parent's check of a row's
-    shape (`ToolPathRow.read`) no longer sees a malformed call from the
-    runtime. The runtime's FunctionGemma parser writes an object for every
-    call, `{}` when none was written (`fc_parser.rs`, `enter_functionCall`), so
-    the one family measured on this path cannot produce one.
+    are rebuilt from the call's fields (`_messages.py`, `_parse_json_fields`):
+    arguments given as a JSON string holding an object come back as that
+    object and any other non-object as `{}`, a missing name as `""`, and a call
+    whose `function` is not a mapping is dropped. A name that is not a string
+    passes through, and the parent's check of a row's shape
+    (`ToolPathRow.read`) still refuses it. What keeps a malformed call out of a
+    measurement is the runtime's parser, not `Message`: FunctionGemma's writes
+    a string name and an object for every call, `{}` when none was written
+    (`fc_parser.rs`, `enter_functionCall`).
     """
     calls = []
     for entry in reply.get("tool_calls") or []:

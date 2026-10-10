@@ -195,9 +195,9 @@ def render_call(call: ToolCall) -> str:
 
     **Only what the runtime can read back is written.** A name or key its
     lexer does not read as a name, a string holding an escape, the end-of-call
-    marker or a stop token (`CONTROL_TEXT`), and a number the runtime cannot hand
-    back exactly or its grammar cannot spell are refused, with the row named, rather than
-    trained: each would be a call that cannot come back as written -- and an
+    marker or a stop token (`CONTROL_TEXT`), and a number some runtime would not
+    hand back exactly or its grammar cannot spell are refused, with the row named,
+    rather than trained: each would be a call that cannot come back as written -- and an
     end marker inside a string would let a dataset row write a second call into
     the training text.
 
@@ -252,21 +252,22 @@ def _render_argument(key: str, value: Any) -> str:
     if value is None or isinstance(value, bool):
         return f"{key}:{json.dumps(value)}"
     if isinstance(value, int):
-        # `fc_parser.rs` tries `parse::<i64>()` first (v0.17.1 and v0.18.0) and
-        # falls back to `parse::<f64>()`, so only an integer past an i64 comes
-        # back as a double.
-        exact = -(2**63) <= value < 2**63
-        if not exact:
-            try:
-                exact = float(value) == value
-            except OverflowError:
-                exact = False
+        # The bound is a double's, not an i64's. `fc_parser.rs` tries
+        # `parse::<i64>()` first (v0.18.0), so a native binding hands back an
+        # integer inside an i64 exactly -- but LiteRT-LM's web binding reads the
+        # reply with `JSON.parse` (`js/packages/core/src/conversation.ts`,
+        # v0.18.0), which makes it a double, and a bundle does not know which
+        # binding it will run under.
+        try:
+            exact = float(value) == value
+        except OverflowError:
+            exact = False
         if not exact:
             raise ValueError(
-                f"the argument {key!r} is {value}, which a double cannot hold exactly, and past "
-                "a 64-bit integer the runtime reads a number as a double (fc_parser.rs, "
-                "litert-lm 0.17.1 and 0.18.0): the caller would receive a different number "
-                "than the one trained. Send it as a string"
+                f"the argument {key!r} is {value}, which a double cannot hold exactly, and "
+                "LiteRT-LM's web binding reads every number as a double (JSON.parse, litert-lm "
+                "0.18.0): the caller would receive a different number than the one trained. "
+                "Send it as a string"
             )
         return f"{key}:{value}"
     if isinstance(value, float):

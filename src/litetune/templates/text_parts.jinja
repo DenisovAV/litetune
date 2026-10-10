@@ -1,4 +1,4 @@
-{#- litetune: from here to the next litetune comment. A message whose content is a list of text parts gets their text back as one string; any other message is left as it came. -#}
+{#- litetune: from here to the next litetune comment. A message whose content is a list of text parts gets their text back as one string; any other message is left as it came, as MiniJinja reads it (Jinja2 gives a message with no content an empty string). -#}
 {%- set litetune = namespace(messages=[]) -%}
 {%- for message in messages -%}
 {%- set parts = namespace(text="", only_text=true) -%}

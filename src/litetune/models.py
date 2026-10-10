@@ -468,15 +468,19 @@ def packaged_template(name: str) -> str:
 # processor's own override, which handed a single text part over as the string
 # in v0.17.1 (`qwen3_data_processor.cc`), is gone. Both Qwen checkpoints'
 # templates read `content` as a string.
-_TEXT_PARTS_REASON = (
-    "LiteRT-LM from 0.18.0 hands a bundle's template each message's content as a list of "
-    "parts, and this checkpoint's own template reads it as a string. Measured 2026-10-08 on "
-    "litert-lm 0.18.0: a Qwen3 0.6B bundle carrying its checkpoint's template rendered "
-    "'<|im_start|>user\\n<|im_end|>' -- the user's text gone, no error -- where 0.17.1 "
-    "rendered it; Qwen2.5's template adds the list to a string, which the runtime's MiniJinja "
-    "refuses. The packaged template is the checkpoint's own, unchanged, behind a block that "
-    "turns a list of text parts back into the string"
-)
+def _text_parts_reason(checkpoint: str, revision: str) -> str:
+    """Why a Qwen rule packs its own template, naming the one it packs."""
+    return (
+        "LiteRT-LM from 0.18.0 hands a bundle's template each message's content as a list of "
+        "parts, and this checkpoint's own template reads it as a string. Measured 2026-10-08 on "
+        "litert-lm 0.18.0: a Qwen3 0.6B bundle carrying its checkpoint's template rendered "
+        "'<|im_start|>user\\n<|im_end|>' -- the user's text gone, no error -- where 0.17.1 "
+        "rendered it; with Qwen2.5's template every send failed, because it adds the list to a "
+        "string, which the runtime's MiniJinja refuses. The packaged template is the chat "
+        f"template of {checkpoint} at revision {revision[:7]}, unchanged, behind a block that "
+        "turns a list of text parts back into the string. A checkpoint whose own template "
+        "differs from that one gets it all the same: verify's rendering check is what shows it"
+    )
 
 
 _FUNCTION_TEMPLATE_REASON = (
@@ -633,7 +637,7 @@ RULES: tuple[ModelRules, ...] = (
         # is typed correctly with none. Measured 2026-09-14 on Qwen/Qwen3-0.6B:
         # both int8 recipes exported with no flag from litetune, and the
         # conversion cost is in MEASUREMENTS.md. The template override below is
-        # LiteRT-LM 0.18.0's, not the exporter's: see `_TEXT_PARTS_REASON`. What
+        # LiteRT-LM 0.18.0's, not the exporter's: see `_text_parts_reason`. What
         # the artifact's own `llm_model_type` reads is not recorded here: that
         # observation appears in no manifest or log of any run, and was struck
         # from the documents for the same reason.
@@ -642,12 +646,22 @@ RULES: tuple[ModelRules, ...] = (
         # Qwen 3 models built on other architectures, none of which this
         # project has run. No `min_transformers` either -- none was measured.
         # Sizes are added here as they are.
-        patterns=(r"qwen-?3-0-6b",),
+        #
+        # And anchored, for the reason the qwen-2.5 rule below gives: since the
+        # rule packs Qwen/Qwen3-0.6B's own template, an unanchored pattern
+        # would hand that template to `Qwen3-0.6B-Base`, whose chat template is
+        # a different one, and to every repack and derivative whose name starts
+        # the same way. The tail is the end of the hint or the `model_type`
+        # `hint_for` appends for a local checkpoint
+        # (`...-qwen3-0-6b-qwen3-qwen3forcausallm`).
+        patterns=(r"qwen-?3-0-6b(?:$|-qwen3\b)",),
         required_flags=(
             RequiredFlag(
                 name="--jinja_chat_template_override",
                 value=packaged_template("qwen3-0.6b.jinja"),
-                reason=_TEXT_PARTS_REASON,
+                reason=_text_parts_reason(
+                    "Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca"
+                ),
             ),
         ),
     ),
@@ -696,7 +710,9 @@ RULES: tuple[ModelRules, ...] = (
             RequiredFlag(
                 name="--jinja_chat_template_override",
                 value=packaged_template("qwen2.5-0.5b-instruct.jinja"),
-                reason=_TEXT_PARTS_REASON,
+                reason=_text_parts_reason(
+                    "Qwen/Qwen2.5-0.5B-Instruct", "7ae557604adf67be50417f59c2c2f167def9a775"
+                ),
             ),
         ),
     ),
@@ -941,10 +957,18 @@ def rules_for_hint(hint: ModelHint) -> ModelRules | None:
     return None
 
 
+# The second sentence is LiteRT-LM v0.18.0's, not a rule's: #3544 took the
+# string unwrapping out of the generic processor as well as the Qwen one
+# (`generic_data_processor.cc` in v0.17.1; `NormalizeMessageContent` in v0.18.0),
+# so it reaches a family no rule names.
 UNKNOWN_FAMILY = (
     "litetune has no per-model rules for this checkpoint. That is not a statement that none apply: "
     "the rules it does hold were paid for one model family at a time, and a family it has not met "
-    "is a family whose required export flags and minimum toolchain versions are simply unknown here"
+    "is a family whose required export flags and minimum toolchain versions are simply unknown "
+    "here. One is known for every family: from LiteRT-LM 0.18.0 the runtime hands the bundle's "
+    "template each message's content as a list of parts, and a template that reads it as a "
+    "string renders the user's text away or fails -- run verify, whose rendering check is what "
+    "shows it"
 )
 
 
