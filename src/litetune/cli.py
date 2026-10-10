@@ -70,6 +70,8 @@ from litetune.prepare import (
 from litetune.prompt_mode import PromptMode, parse_prompt_mode
 from litetune.recipes import DEFINED_RECIPES
 from litetune.spec import DTYPES, SpecError, mutable_ref_refusal, weak_revision_limitations
+from litetune.towers import TOWER_SECTIONS, TowersError, add_towers, drop_towers
+from litetune.towers import summarise as summarise_towers
 from litetune.tune import METHODS, TuneError, TuneRequest, TuneResult, run_tune, write_report
 from litetune.verify import EXIT_CODES, ReferenceRole, Status, VerifyRequest, run_verify
 
@@ -107,6 +109,7 @@ REFUSALS = (
     BundleError,
     TuneError,
     PrepareError,
+    TowersError,
     # A declarations file the runtime or the reference template would render
     # differently is refused with the property named; printed as a traceback,
     # the sentence that says what to change was buried under it.
@@ -211,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_tune(sub)
     _add_convert(sub)
     _add_bundle(sub)
+    _add_towers(sub)
 
     env = sub.add_parser(
         "env",
@@ -686,6 +690,70 @@ def _add_bundle(sub) -> None:
         ),
     )
     bundle.add_argument("--json", action="store_true", help="write the report to stdout")
+
+
+def _add_towers(sub) -> None:
+    towers = sub.add_parser(
+        "towers",
+        help="write a .litertlm without its vision or audio sections, or with another's",
+        description=(
+            "Google's Gemma 4 E2B CPU/GPU bundle carries its vision and audio towers as "
+            "sections of their own. --drop writes a copy without the ones named, chosen by "
+            "section type and model type; --add writes a copy with the ones named taken from "
+            "--from, after checking that each added adapter writes as many values per token "
+            "as the bundle's embedder, that the metadata kept is Gemma 4's and names each "
+            "added tower's start token, and that every token string and id it names is the "
+            "same piece, of the same type, at the same id in both tokenizers. Either way the "
+            "copy is read back, every section byte for byte, before it is put at --output. "
+            "The work directory beside --output needs about the bundle's size plus the "
+            "result's, and the donor's size on top with --add. What the model answers is not "
+            "checked here; run `litetune verify` on the result. Exit codes: 0 written, 4 "
+            "refused or not written, or written but its --json report could not be delivered."
+        ),
+    )
+    towers.add_argument("--model", required=True, type=Path, help="the .litertlm to read")
+    what = towers.add_mutually_exclusive_group(required=True)
+    what.add_argument(
+        "--drop",
+        action="append",
+        choices=sorted(TOWER_SECTIONS),
+        help="a tower to drop; repeat for both",
+    )
+    what.add_argument(
+        "--add",
+        action="append",
+        choices=sorted(TOWER_SECTIONS),
+        help="a tower to add from --from; repeat for both",
+    )
+    towers.add_argument(
+        "--from",
+        dest="donor",
+        type=Path,
+        help="with --add: the .litertlm whose tower sections are taken",
+    )
+    towers.add_argument(
+        "--metadata-from-donor",
+        action="store_true",
+        help=(
+            "with --add: replace the bundle's whole LlmMetadata with the donor's, byte for "
+            "byte. That changes its prompt template, its stop tokens and its model type, which "
+            "selects the runtime's model-specific code paths, and every other field the two "
+            "differ in; the report lists each the builder's text form shows. Refused when the "
+            "two differ in max_num_tokens "
+            "or kv_cache_init_value, which LiteRT-LM's NPU executor reads, or in the settings "
+            "of a tower the bundle keeps. Needed when the bundle's own metadata is not Gemma "
+            "4's or names no start token for a tower's input"
+        ),
+    )
+    towers.add_argument(
+        "--output", required=True, type=Path, help="the new .litertlm; must not exist yet"
+    )
+    towers.add_argument(
+        "--no-provision",
+        action="store_true",
+        help="fail instead of provisioning the runtime environment the builder runs in",
+    )
+    towers.add_argument("--json", action="store_true", help="write the report to stdout")
 
 
 # ---------------------------------------------------------------------------
@@ -1177,6 +1245,32 @@ def _convert(args: argparse.Namespace) -> int:
     return OUTCOME_EXIT_CODES[result.outcome]
 
 
+def _towers(args: argparse.Namespace) -> int:
+    events, provision = _stream(), not args.no_provision
+    if args.add:
+        if args.donor is None:
+            raise TowersError("--add takes its towers --from another bundle; name it")
+        result = add_towers(
+            args.model,
+            args.output,
+            args.add,
+            args.donor,
+            metadata_from_donor=args.metadata_from_donor,
+            events=events,
+            auto_provision=provision,
+        )
+    else:
+        if args.donor is not None or args.metadata_from_donor:
+            raise TowersError("--from and --metadata-from-donor go with --add, not --drop")
+        result = drop_towers(
+            args.model, args.output, args.drop, events=events, auto_provision=provision
+        )
+    delivered = _report(result.as_dict(), lambda: summarise_towers(result), args.json)
+    if not delivered:
+        logger.error("%s was written, but its --json report could not be delivered", result.output)
+    return EXIT_CODES[Status.PASSED] if delivered else EXIT_CODES[Status.ERROR]
+
+
 def _artifact_line(export: RecipeExport) -> str:
     """One produced artifact. Companion files are named, not folded into one number.
 
@@ -1602,6 +1696,7 @@ HANDLERS = {
     "tune": _tune,
     "convert": _convert,
     "bundle": _bundle,
+    "towers": _towers,
     "env": _env,
 }
 

@@ -525,6 +525,70 @@ the record, so the file `tune` read has to reach `verify` and `bundle`
 unchanged. `prepare` without `--base-model` still renders FunctionGemma's
 format, and the report says that it assumed it.
 
+### Gemma 4 towers: drop them, or take them from another bundle
+
+Google's Gemma 4 E2B CPU/GPU bundle carries its vision and audio towers as six
+sections of their own. An application that only sends text can ship without
+them:
+
+```bash
+litetune towers --model gemma-4-E2B-it.litertlm --drop vision --drop audio \
+                --output gemma-4-E2B-it-text.litertlm
+```
+
+A section belongs to a tower by its `section_type` (a TFLite graph or its
+weights) together with a `model_type` from litert-lm-builder 0.18.0's own list
+for that tower; every other section is kept. The new file is read back before it
+is written to `--output`: every section, the metadata included, byte for byte
+against the section it came from. A file its own header does not fit -- cut
+short, or naming sections outside it or overlapping -- what the builder cannot
+write back (a section `unpack` leaves out, such as TTS or ASR metadata, or a
+model type it does not know), a tower the bundle does not carry and an existing
+output are refused. The work directory beside `--output` needs about the
+bundle's size plus the result's.
+
+On Google's bundle the six tower sections are 332,387,932 of 2,588,147,712
+bytes. The bundle `litetune towers --drop vision --drop audio` wrote from it
+answered eight greedy prompts on litert-lm 0.18.0's CPU backend exactly as the
+full bundle did, at a peak RSS within 1 MB of it, and every image or audio input
+to it through the Python API raised an error rather than producing text; opened
+with a vision backend, its engine is not created at all
+([MEASUREMENTS.md](MEASUREMENTS.md#gemma-4-e2b-without-its-towers)). What your
+model answers is `verify`'s to say.
+
+The other way round, towers from one bundle into another — Google's E2B towers
+into a text-only build compiled for a Qualcomm NPU:
+
+```bash
+litetune towers --model gemma-4-E2B-it-npu.litertlm --add vision --add audio \
+                --from gemma-4-E2B-it.litertlm --metadata-from-donor \
+                --output gemma-4-E2B-it-npu-towers.litertlm
+```
+
+The bundle's own sections stay byte for byte. The donor must carry each whole
+tower, and each adapter it gives must write as many values per token as the
+bundle's embedder, as the graphs' signatures say: LiteRT-LM copies the one into
+the other without comparing them. The metadata kept must be Gemma 4's and name,
+as a string, the token each added tower's input starts with, and every
+`token_str` and token id it names must be the same piece, of the same type, at
+the same id in both tokenizers. `--metadata-from-donor` replaces the bundle's
+whole LlmMetadata with the donor's -- its prompt template, its stop tokens, its
+model type, which selects the runtime's model-specific code paths, and every
+other field the two differ in, each the builder's text form shows listed in the
+report as old → new. It is
+refused when the two differ in `max_num_tokens` or `kv_cache_init_value`, which
+LiteRT-LM's NPU executor reads, or in the settings of a tower the bundle keeps,
+and required when the bundle's own metadata is not Gemma 4's or names no such
+token, as the text-only build's did not. Without it, the bundle's settings for
+the added towers must equal the donor's. With `--add` the work directory needs
+the donor's size on top. This is not an operation LiteRT-LM offers; it was
+measured on one SM8850 phone, through flutter_gemma's LiteRT-LM 0.18.0 C API and
+Qualcomm dispatch with QNN 2.51.0 (not the `litertlm-android` AAR's `Backend.NPU`,
+which was not tried), where what this command wrote answered an image and an
+audio turn and its text answers did not change; a turn carrying both was
+answered for the image alone, as Google's own bundles answer it through the same
+runtime ([MEASUREMENTS.md](MEASUREMENTS.md#towers-grafted-into-an-sm8850-npu-bundle)).
+
 ---
 
 ## What it knows that a shell script does not
@@ -780,8 +844,11 @@ withdrawn after re-measurement.
   `Failed to create engine`; the logcat line is `Context binary (2.47.0) is
   newer than the current SDK (2.44.0)`. The `native-v0.16.0` runtime tarball
   from the same project carries 2.47 and loads Google's 2.44-built bundles as
-  well as ours; it is the runtime behind the S25 numbers in this file. The
-  Maven `litertlm-android` 0.16.1 AAR cannot reach the
+  well as ours; it is the runtime behind the S25 numbers in this file. On
+  LiteRT-LM 0.18.0 through `native-v0.18.0-a`'s dispatch, a 2.47 context binary
+  was not enough: QAIRT 2.47 libraries created no engine on an SM8850 phone, and
+  QNN 2.51.0's did (MEASUREMENTS.md, *Towers grafted into an SM8850 NPU bundle*).
+  The Maven `litertlm-android` 0.16.1 AAR cannot reach the
   Qualcomm NPU with any public dispatch library
   ([LiteRT#6889](https://github.com/google-ai-edge/LiteRT/issues/6889)).
 - **An Intel NPU keeps only the first prefill chunk, and not for the Qualcomm
@@ -985,6 +1052,10 @@ measurement, and a typo should not produce one.
 `bundle` carries a verdict rather than producing one, so it returns whatever
 `--status` or `--verify-manifest` gave it. With neither it returns 2: bundling
 re-measures nothing.
+
+`towers` measures nothing either: it exits 0 when it wrote the new bundle and 4
+when it refused or could not, or when it wrote the bundle but could not deliver
+the `--json` report.
 
 Wiring `|| exit 1` on anything non-zero throws all of this away.
 
