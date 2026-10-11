@@ -219,6 +219,35 @@ def test_an_unsupported_interpreter_is_refused_before_pip_runs(monkeypatch, tmp_
     assert started == [], "the refusal must come before pip, not after it"
 
 
+def test_environments_link_their_interpreter_outside_windows(monkeypatch, tmp_path):
+    """A copied interpreter cannot run where it finds libpython relative to itself.
+
+    `EnvBuilder` defaults to copying, unlike `python -m venv`. uv's CPython for
+    macOS links `@rpath/libpython3.11.dylib`; a copy in the environment's `bin/`
+    looked for it in the environment's `lib/`, `ensurepip` died in dyld, and
+    every stage was `could not check`. The real-build test below is what fails
+    under such an interpreter; this one pins the choice on every runner.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    built: list[dict] = []
+    real_init = envs.venv.EnvBuilder.__init__
+
+    def recording_init(self, *args, **kwargs):
+        built.append(dict(kwargs))
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(envs.venv.EnvBuilder, "__init__", recording_init)
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
+    monkeypatch.setattr(
+        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
+    )
+    StageEnv(name="linked", requirements=("pyyaml==6.0.2",)).provision()
+
+    assert len(built) == 1
+    assert built[0]["symlinks"] is (os.name != "nt")
+    assert built[0]["with_pip"] is True
+
+
 def test_a_provisioned_environment_can_run_its_console_scripts(monkeypatch, tmp_path):
     """A virtualenv is not relocatable, and every check we had was blind to it.
 

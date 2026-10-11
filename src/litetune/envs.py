@@ -1889,7 +1889,18 @@ class StageEnv:
                 # `EnvBuilder.create` spawns `ensurepip` as its own subprocess
                 # and takes no timeout, so the budget covers what follows it and
                 # not this. Named rather than left as a silent hole.
-                venv.EnvBuilder(with_pip=True, clear=True).create(self.path)
+                #
+                # Symlinks outside Windows, as `python -m venv` makes by default.
+                # `EnvBuilder` itself defaults to copying the interpreter, and a
+                # copy cannot run where the interpreter finds its libpython by a
+                # path relative to itself: uv's CPython 3.11.14 for macOS links
+                # `@rpath/libpython3.11.dylib`, which the copy looks for in the
+                # environment's own `lib/`, so `ensurepip` died in dyld and every
+                # stage was `could not check`. Windows keeps copies, which is
+                # what venv supports there.
+                venv.EnvBuilder(with_pip=True, clear=True, symlinks=os.name != "nt").create(
+                    self.path
+                )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError(

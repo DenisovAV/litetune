@@ -33,6 +33,22 @@ jobs:
       # check a killed process group -- but nothing reaches the network.
       - run: pytest -q
 
+  # Stage environments are virtualenvs of whatever interpreter litetune runs
+  # under, and nothing above runs on macOS or on a uv-managed Python. uv's
+  # CPython for macOS finds libpython by a path relative to the interpreter, so
+  # an environment that copied the interpreter died in dyld and every stage was
+  # `could not check`. test_envs.py builds a real environment from the running
+  # interpreter, which is the check that fails there.
+  macos-uv-python:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv --managed-python --python 3.12
+      - run: uv pip install -e ".[dev]"
+      - run: .venv/bin/python -c "import sys; print(sys.version, sys._base_executable)"
+      - run: .venv/bin/pytest -q tests/test_envs.py
+
   # An editable install is not the artifact anyone receives. `src/` layout plus
   # a dynamic hatch version plus `license-files` is exactly the surface where
   # `pip install -e .` passes and a wheel does not.
