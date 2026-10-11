@@ -377,9 +377,54 @@ def mark_provisioned(env) -> Path:
 
 # What `export._COMPOSE_SCRIPT` imports in place of the export environment's
 # transformers: an `AutoTokenizer` whose tokenizer carries `_TEMPLATE` as its
-# `chat_template`, and which writes each path it is asked to load to `_LOADS`.
+# `chat_template`, writes each path it is asked to load to `_LOADS`, and renders
+# with `apply_chat_template` the way transformers 5.16.1 does for a string
+# template and `tokenize=False`: Jinja2's `ImmutableSandboxedEnvironment` with
+# `trim_blocks`, `lstrip_blocks` and the loop-controls extension, its own
+# `tojson`, `raise_exception` and `strftime_now`, and the messages handed to
+# `render` as given (`utils/chat_template_utils.py:478-495` and `:581-587`;
+# `tokenization_utils_base.py:3085-3117`). The `{% generation %}` tracker it
+# also registers is left out: no template rendered here uses it.
 _FAKE_TRANSFORMERS = """
 import json
+from datetime import datetime
+
+import jinja2
+import jinja2.ext
+from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+
+def _raise_exception(message):
+    raise jinja2.exceptions.TemplateError(message)
+
+
+def _tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+    return json.dumps(
+        x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys
+    )
+
+
+class _Tokenizer:
+    special_tokens_map = {}
+
+    def apply_chat_template(
+        self, conversation, chat_template=None, tokenize=True, add_generation_prompt=False
+    ):
+        assert tokenize is False, "only the text path is faked"
+        env = ImmutableSandboxedEnvironment(
+            trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols]
+        )
+        env.filters["tojson"] = _tojson
+        env.globals["raise_exception"] = _raise_exception
+        env.globals["strftime_now"] = lambda fmt: datetime.now().strftime(fmt)
+        template = chat_template if chat_template is not None else self.chat_template
+        return env.from_string(template).render(
+            messages=conversation,
+            tools=None,
+            documents=None,
+            add_generation_prompt=add_generation_prompt,
+            **self.special_tokens_map,
+        )
 
 
 class AutoTokenizer:
@@ -387,23 +432,49 @@ class AutoTokenizer:
     def from_pretrained(path):
         with open(_LOADS, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(path) + "\\n")
-        tokenizer = type("Tokenizer", (), {})()
+        tokenizer = _Tokenizer()
         tokenizer.chat_template = _TEMPLATE
         return tokenizer
 """
 
+# And `huggingface_hub`, for the `chat_template.json` a Hub id falls back to:
+# `_HUB` maps a file name to its text, and any other is missing, as
+# `hf_hub_download` raises for a file the repository does not have.
+_FAKE_HUB = """
+import os
+
+
+class EntryNotFoundError(Exception):
+    pass
+
+
+def hf_hub_download(repo_id, filename):
+    if filename not in _HUB:
+        raise EntryNotFoundError(f"{filename} is not in {repo_id}")
+    path = os.path.join(_DIR, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(_HUB[filename])
+    return path
+"""
+
 
 def run_compose_script(
-    args: Sequence[str], timeout: int, chat_template: object, version: str = "5.16.1"
+    args: Sequence[str],
+    timeout: int,
+    chat_template: object,
+    version: str = "5.16.1",
+    hub_files: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
     """`export._COMPOSE_SCRIPT`, run for real with the host interpreter.
 
     The script's own reading of the template -- a dict, an empty one, the
-    bytes it writes -- is exercised; only `transformers` is a fake, through a
-    package of that name first on `PYTHONPATH`. Returns the completed process
-    and the paths `AutoTokenizer.from_pretrained` was given, in order. The
-    toolchain fakes in the test files each call this for the one command it
-    answers.
+    `chat_template.json` fallback, the bytes it writes, the probe it renders --
+    is exercised; only `transformers` and `huggingface_hub` are fakes, through
+    packages of those names first on `PYTHONPATH`. Rendering is real Jinja2,
+    which the dev extras pin at the export environment's version. Returns the
+    completed process and the paths `AutoTokenizer.from_pretrained` was given,
+    in order. The toolchain fakes in the test files each call this for the one
+    command it answers.
     """
     script, spec, result = str(args[1]), str(args[2]), str(args[3])
     shim = Path(spec).parent / "shim"
@@ -415,12 +486,19 @@ def run_compose_script(
         + _FAKE_TRANSFORMERS,
         encoding="utf-8",
     )
+    (shim / "huggingface_hub.py").write_text(
+        f"_HUB = {dict(hub_files or {})!r}\n_DIR = {str(shim)!r}\n" + _FAKE_HUB,
+        encoding="utf-8",
+    )
+    # The caller's path after the shim's, so a Jinja2 that is not installed in
+    # this interpreter can be supplied on PYTHONPATH as well.
+    path = os.pathsep.join(filter(None, [str(shim), os.environ.get("PYTHONPATH", "")]))
     proc = subprocess.run(
         [sys.executable, script, spec, result],
         capture_output=True,
         text=True,
         timeout=timeout,
-        env={**os.environ, "PYTHONPATH": str(shim)},
+        env={**os.environ, "PYTHONPATH": path},
     )
     seen = loads.read_text(encoding="utf-8").splitlines() if loads.is_file() else []
     return proc, [json.loads(line) for line in seen]

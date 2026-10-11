@@ -362,6 +362,8 @@ class RenderingComparison:
         checkpoint's template rendered the user's text away (Qwen3) or failed
         (Qwen2.5), because from 0.18.0 the runtime hands a template each
         message's content as a list of parts (`models._TEXT_PARTS_REASON`).
+        The names litetune 0.4.0 claimed are its two Qwen patterns
+        (`models.py` at v0.4.0).
         """
         lost = [m for m in self.mismatches if m.prompt_missing or m.kind == "unrendered"]
         if not lost:
@@ -371,9 +373,12 @@ class RenderingComparison:
             "text. One known cause: from LiteRT-LM 0.18.0 the runtime hands the bundle's "
             "template each message's content as a list of parts, and a template that reads it "
             "as a string loses the text or fails. A Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle "
-            "converted by litetune 0.3.0 or earlier with no template of the caller's is such a "
-            "bundle, and converting it again with this litetune puts a block that reads a list "
-            "of parts in front of its checkpoint's own template"
+            "with no template of the caller's is such a bundle when litetune 0.3.0 or earlier "
+            "converted it, or litetune 0.4.0 under a name 0.4.0 did not claim (it claimed only "
+            "Qwen/Qwen3-0.6B, Qwen/Qwen3-0.6B-Base and Qwen/Qwen2.5-0.5B-Instruct, their local "
+            "snapshots, paths ending in those names and what `tune` made from them); converting "
+            "it again with this litetune puts a block that reads a list of parts in front of its "
+            "checkpoint's own template"
         )
 
     def as_dict(self) -> dict[str, Any]:

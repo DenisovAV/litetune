@@ -6,6 +6,7 @@ would, with only the two backends faked. Every other subcommand is driven the
 same way: no network, no accelerator, no toolchain.
 """
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -526,6 +527,7 @@ class FakeToolchain:
     pip_stdout: str = "transformers==5.5.0\n"
     # What the checkpoint's tokenizer carries, for the chat template script.
     chat_template: object = "{%- for m in messages %}{{ m.content }}{% endfor %}"
+    embedded: dict[str, str | None] = field(default_factory=dict)
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(list(args))
@@ -541,6 +543,13 @@ class FakeToolchain:
         if args[0] == "python" and str(args[1]).endswith("repack.py"):
             # This fake has no export environment to run the repack script in:
             # the repack reports that and the export stays a passed, CPU-only one.
+            # The template reading the script takes first is answered from what
+            # the exporter below embedded, as `test_export.py`'s fake builder does.
+            spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+            if spec.get("template_out"):
+                template = self.embedded.get(spec["artifact"])
+                reading = {"sections": 1, "present": template is not None, "template": template}
+                Path(spec["template_out"]).write_text(json.dumps(reading), encoding="utf-8")
             return subprocess.CompletedProcess(
                 args, 1, "", "ModuleNotFoundError: No module named 'litert_lm_builder'"
             )
@@ -548,6 +557,11 @@ class FakeToolchain:
         out_dir = Path(flags["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "model.litertlm").write_bytes(b"\0" * 4096)
+        # The override's text, as `package_model` reads it (`litert_lm_builder.py:430`).
+        override = Path(flags.get("jinja_chat_template_override") or "")
+        known = override.name != "" and override.is_file()
+        template = override.read_text(encoding="utf-8") if known else None
+        self.embedded[str((out_dir / "model.litertlm").absolute())] = template
         return subprocess.CompletedProcess(args, 0, "", "")
 
     @property
@@ -688,8 +702,14 @@ def test_convert_hands_a_qwen_export_the_composed_template(toolchain, tmp_path, 
     captured = capsys.readouterr()
     assert code == 0
     (argv,) = toolchain.exports
-    assert f"--jinja_chat_template_override={out / 'litetune-chat-template.jinja'}" in argv
+    (composed,) = out.glob("_litetune-chat-template-*.jinja")
+    assert f"--jinja_chat_template_override={composed}" in argv
     assert "added --jinja_chat_template_override" in captured.out
+    # The file the marker stood for, and the template's digest, on plain output.
+    template = str(toolchain.chat_template).encode("utf-8")
+    line = next(ln for ln in captured.out.splitlines() if "chat template:" in ln)
+    assert str(composed) in line
+    assert hashlib.sha256(template).hexdigest()[:12] in line
 
 
 def test_convert_of_a_qwen_checkpoint_with_no_template_exits_failed(toolchain, tmp_path, capsys):
@@ -710,6 +730,20 @@ def test_convert_of_a_qwen_checkpoint_with_no_template_exits_failed(toolchain, t
     assert toolchain.exports == []
     assert "the tokenizer carries no chat template" in captured.out
     assert "not attempted: dynamic_wi8_afp32" in captured.out
+    # The advice, as typed, is a command line `convert` accepts.
+    assert "pass --flag=--jinja_chat_template_override=<file>" in captured.out
+    assert build_parser().parse_args(
+        [
+            "convert",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--recipe",
+            "r",
+            "--flag=--jinja_chat_template_override=x.jinja",
+        ]
+    ).flag == ["--jinja_chat_template_override=x.jinja"]
 
 
 def test_convert_json_writes_the_report_to_stdout(toolchain, tmp_path, capsys):

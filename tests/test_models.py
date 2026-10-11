@@ -657,7 +657,9 @@ def test_the_reason_says_the_checkpoints_own_template_is_kept(model, family):
     assert plan.rules is not None
     (flag,) = plan.rules.required_flags
     assert "reads the checkpoint's own chat template as the exporter reads it" in flag.reason
-    assert "every checkpoint this rule claims keeps its own template" in flag.reason
+    assert "keeps its own template, or nothing is exported" in flag.reason
+    assert "reads each bundle's template back" in flag.reason
+    assert "transformers' Jinja2 rather than the runtime" in flag.reason
     assert "not multi-turn, reasoning or tool handling" in flag.reason
     assert "revision" not in flag.reason
 
@@ -673,22 +675,61 @@ def test_an_unknown_family_is_told_about_the_list_of_parts():
 _SNAPSHOT = "/home/u/.cache/huggingface/hub/models--Qwen--{}/snapshots/" + "c1899de2" * 5
 
 
-def test_the_qwen3_rule_claims_its_size_under_any_name():
+# Repacks named for their format, which the export environment cannot load as
+# a full-precision model or which hold no PyTorch weights (`models.py`, the
+# qwen-3 rule).
+_QWEN3_REPACKS = (
+    "Qwen/Qwen3-0.6B-FP8",
+    "Qwen/Qwen3-0.6B-MLX-4bit",
+    "unsloth/Qwen3-0.6B-unsloth-bnb-4bit",
+    "Qwen/Qwen3-0.6B-GGUF",
+    "onnx-community/Qwen3-0.6B-ONNX",
+    "someorg/Qwen3-0.6B-Qwen3-GGUF",
+    "Qwen/Qwen3-0.6B-GPTQ-Int8",
+    "mlx-community/Qwen3-0.6B-4bit",
+)
+
+
+def test_the_qwen3_rule_claims_a_name_that_still_contains_its_size():
     """The template is composed from the checkpoint's own, so the base model, a
-    local snapshot and a fine-tune under another organisation each keep theirs:
-    the rule claims them all, as it did before litetune 0.4.0 packed one
-    revision's template and narrowed it."""
+    local snapshot and a copy or fine-tune under another organisation that kept
+    the name each keep theirs: the rule claims them all, as it did before
+    litetune 0.4.0 packed one revision's template and narrowed it. A name is all
+    a Hub id is matched on, so a fine-tune renamed past the size is not
+    claimed; nor is a repack named for its format."""
     for claimed in (
         "Qwen/Qwen3-0.6B",
         "Qwen/Qwen3-0.6B-Base",
         _SNAPSHOT.format("Qwen3-0.6B"),
         _SNAPSHOT.format("Qwen3-0.6B-Base"),
+        "unsloth/Qwen3-0.6B",
         "someorg/Qwen3-0.6B",
         "someorg/Qwen3-0.6B-sql-assistant",
+        # What a name cannot show: a format not spelled after the size.
+        "mlx-community/Qwen3-0.6B-bf16",
     ):
         assert identify(claimed).family == "qwen-3", claimed
         plan = plan_export(claimed, (), ("dynamic_wi8_afp32",))
         assert f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}" in plan.flags
+    for unclaimed in (*_QWEN3_REPACKS, "acme/banking77-assistant", "Qwen/Qwen3-1.7B"):
+        assert identify(unclaimed) is None, unclaimed
+
+
+def test_the_qwen3_rule_still_matches_the_checkpoint_tune_wrote(tmp_path):
+    """`hint_for` folds the sidecar's base model and the config's `model_type`
+    and architecture into one text, and none of those is a repack's marker."""
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": "Qwen/Qwen3-0.6B"}), encoding="utf-8"
+    )
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}),
+        encoding="utf-8",
+    )
+    hint = models.hint_for(str(checkpoint)).text
+    assert hint == "qwen-qwen3-0-6b-qwen3-qwen3forcausallm"
+    assert identify(str(checkpoint)).family == "qwen-3"
 
 
 def test_the_qwen25_rule_claims_the_checkpoint_that_was_run_and_not_its_repacks():
@@ -707,15 +748,22 @@ def test_the_qwen25_rule_claims_the_checkpoint_that_was_run_and_not_its_repacks(
         _SNAPSHOT.format("Qwen2.5-0.5B-Instruct"),
         # Any organisation: the template composed is the checkpoint's own.
         "someorg/Qwen2.5-0.5B-Instruct",
+        # What a name cannot show: an ONNX export under the bare name.
+        "onnx-community/Qwen2.5-0.5B-Instruct",
     ):
         assert identify(claimed).family == "qwen-2.5", claimed
     for unclaimed in (
         "Qwen/Qwen2-5B",
+        "Qwen/Qwen2.5-0.5B",
         "Qwen/Qwen2.5-1.5B-Instruct",
         "Qwen/Qwen2.5-7B-Instruct",
         "Qwen/Qwen2.5-0.5B-Instruct-AWQ",
         "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4",
+        "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
         "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit",
+        "me/Qwen2.5-0.5B-Instruct-banking77",
+        # The `model_type` tail is also where a repack's suffix can begin.
+        "someorg/Qwen2.5-0.5B-Instruct-qwen2-GGUF",
     ):
         assert identify(unclaimed) is None, unclaimed
 
@@ -865,6 +913,7 @@ class FakeToolchain:
     calls: list[list[str]] = field(default_factory=list)
     # What the checkpoint's tokenizer carries, for the chat template script.
     chat_template: object = "{%- for m in messages %}{{ m.content }}{% endfor %}"
+    embedded: dict[str, str | None] = field(default_factory=dict)
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(list(args))
@@ -873,6 +922,13 @@ class FakeToolchain:
         if args[0] == "python" and str(args[1]).endswith("repack.py"):
             # This fake has no export environment to run the repack script in:
             # the repack reports that and the export stays a passed, CPU-only one.
+            # The template reading the script takes first is answered from what
+            # the exporter below embedded, as `test_export.py`'s fake builder does.
+            spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+            if spec.get("template_out"):
+                template = self.embedded.get(spec["artifact"])
+                reading = {"sections": 1, "present": template is not None, "template": template}
+                Path(spec["template_out"]).write_text(json.dumps(reading), encoding="utf-8")
             return subprocess.CompletedProcess(
                 args, 1, "", "ModuleNotFoundError: No module named 'litert_lm_builder'"
             )
@@ -882,6 +938,11 @@ class FakeToolchain:
         out_dir = Path(flags["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "model.litertlm").write_bytes(b"\0" * 4096)
+        # The override's text, as `package_model` reads it (`litert_lm_builder.py:430`).
+        override = Path(flags.get("jinja_chat_template_override") or "")
+        known = override.name != "" and override.is_file()
+        template = override.read_text(encoding="utf-8") if known else None
+        self.embedded[str((out_dir / "model.litertlm").absolute())] = template
         return subprocess.CompletedProcess(args, 0, "", "")
 
     @property
@@ -932,12 +993,98 @@ def test_convert_composes_the_template_a_qwen_rule_asks_for(toolchain, tmp_path)
         )
     )
     assert result.outcome is Outcome.PASSED
-    composed = tmp_path / "out" / "litetune-chat-template.jinja"
+    assert result.chat_template is not None
+    composed = result.chat_template.path
+    assert composed.parent == tmp_path / "out"
     block = Path(models.packaged_template(models.TEXT_PARTS_BLOCK)).read_bytes()
     assert composed.read_bytes() == block + str(toolchain.chat_template).encode("utf-8")
     (argv,) = toolchain.exports
     assert f"--jinja_chat_template_override={composed}" in argv
     assert not any(models.COMPOSED_TEMPLATE in a for a in argv)
+
+
+# -- how the exporter reads a flag's name, and what a value-bearing flag needs --
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "--jinja-chat-template-override=/my/own.jinja",
+        "-jinja_chat_template_override=/my/own.jinja",
+        "--jinja_chat_template_override=/my/own.jinja",
+    ],
+)
+def test_a_callers_template_is_recognised_in_every_spelling_the_exporter_reads(spelling):
+    """Fire strips the leading hyphens and reads `-` as `_` (`fire/core.py:868`,
+    `:875`): every spelling sets the one keyword, so each is the caller's own
+    template and nothing is composed beside it."""
+    plan = plan_export("Qwen/Qwen3-0.6B", (spelling,), ("dynamic_wi8_afp32",))
+    assert plan.flags == (spelling,)
+    assert plan.added == ()
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "--litert-lm-model-type-override=gemma4",
+        "-litert_lm_model_type_override=gemma4",
+        "--litert_lm_model_type_override=gemma4",
+    ],
+)
+def test_the_gemma4_type_override_is_refused_in_every_spelling(spelling):
+    with pytest.raises(FlagRefused, match="does the opposite"):
+        plan_export(GEMMA4_E2B, (spelling,), ())
+
+
+def test_a_forbidden_value_is_compared_as_a_value():
+    """`function_gemma` is not `gemma4`, whatever the spelling of the name."""
+    plan = plan_export(GEMMA4_E2B, ("--litert-lm-model-type-override=function_gemma",), ())
+    assert "--litert-lm-model-type-override=function_gemma" in plan.flags
+
+
+@pytest.mark.parametrize("model", ["Qwen/Qwen3-0.6B", GEMMA4_E2B])
+def test_an_empty_value_does_not_satisfy_a_flag_that_needs_one(model):
+    """The exporter reads an empty override as none (`litert_lm_builder.py:414`)
+    and embeds the tokenizer's template, so the rule would hold in name only."""
+    with pytest.raises(FlagRefused, match="needs a value"):
+        plan_export(model, ("--jinja_chat_template_override=",), ())
+
+
+def test_a_callers_template_on_a_composing_rule_is_said_to_have_no_block():
+    plan = plan_export("Qwen/Qwen3-0.6B", ("--jinja_chat_template_override=/my/own.jinja",), ())
+    (note,) = [text for text in plan.limitations if "no text-parts block" in text]
+    assert "--jinja_chat_template_override=/my/own.jinja" in note
+    assert "LiteRT-LM 0.18.0" in note and "verify's rendering check" in note
+
+
+def test_a_callers_template_on_another_rule_carries_no_such_note():
+    plan = plan_export(GEMMA4_E2B, ("--jinja_chat_template_override=me/mine",), ())
+    assert not any("no text-parts block" in text for text in plan.limitations)
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["--litert_lm_llm_metadata_override=meta.pbtext", "--litert-lm-llm-metadata-override=x"],
+)
+def test_a_metadata_override_is_refused_where_the_template_is_composed(spelling):
+    """The exporter puts the override in place of the metadata it builds
+    (`litert_lm_builder.py:438-456`), the only way the composed template reaches
+    the bundle (`:314-318`)."""
+    with pytest.raises(FlagRefused, match="in place of the LlmMetadata it builds"):
+        plan_export("Qwen/Qwen3-0.6B", (spelling,), ())
+
+
+def test_a_metadata_override_beside_the_callers_own_template_is_theirs():
+    """Nothing is composed then, so there is nothing for the override to drop."""
+    flags = ("--litert_lm_llm_metadata_override=meta.pbtext", "--jinja_chat_template_override=t")
+    plan = plan_export("Qwen/Qwen3-0.6B", flags, ())
+    assert plan.flags == flags
+
+
+def test_the_gemma4_advice_is_a_command_line_convert_accepts():
+    plan = plan_export("google/gemma-4-it", (), ())
+    (unchecked,) = [c for c in plan.checks if c.outcome is Outcome.UNCHECKED]
+    assert "--flag=--jinja_chat_template_override=<repo>" in unchecked.detail
 
 
 def test_convert_refuses_to_export_when_the_template_override_is_undeterminable(

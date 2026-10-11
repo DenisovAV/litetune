@@ -662,23 +662,57 @@ the bundle's template each message's content as `[{"type": "text", "text": ...}]
 where 0.17.1 gave it the string, and a template written for a string may print the
 list, drop the user's text or fail: measured on 2026-10-08, a Qwen3 0.6B bundle
 rendered `<|im_start|>user\n<|im_end|>` with no error and every send to a Qwen2.5
-0.5B Instruct bundle failed. For a checkpoint either rule claims -- one whose name
+0.5B Instruct bundle failed. For a checkpoint either rule claims -- a name that
 contains Qwen3-0.6B, Base included, or ends in Qwen2.5-0.5B-Instruct, under any
-organisation, and what `tune` made from either -- `convert` reads the checkpoint's own
-chat template the way the exporter reads it, through `transformers.AutoTokenizer` in the
-export environment, writes it unchanged behind a block that turns a list of text
-parts back into the string, to `litetune-chat-template.jinja` in the output
-directory, and hands that file to every recipe. A checkpoint whose tokenizer carries
-no chat template is refused rather than exported without the block, and a template
-you pass with `--flag=--jinja_chat_template_override=...` is used as given. A tool
-response LiteRT-LM sends as a `tool_response` part stays a list, as on 0.17.1, and
-neither Qwen3-0.6B's nor Qwen2.5-0.5B-Instruct's template reads it as text, so tool
-use with these bundles is not covered. **A bundle of a checkpoint these two rules
-claim, converted by litetune 0.3.0 or earlier without a template of your own,
-carries the checkpoint's template alone and needs converting again**; `verify`
-refuses one at its rendering check and names this as a possible cause. Any other
-family's template is not rewritten: `convert` says so in its note on a checkpoint it
-has no rules for, and `verify`'s rendering check is what shows whether it reads a list.
+organisation, a local snapshot of either and what `tune` made from either, but not
+a repack named for its format, such as `-FP8`, `-GGUF` or `-bnb-4bit` -- `convert`
+reads the checkpoint's own chat template the way the exporter reads it, through
+`transformers.AutoTokenizer` in the export environment and, when the tokenizer has
+none, the checkpoint's `chat_template.json`. It writes that template unchanged behind
+a block that turns a list of text parts back into the string, to
+`_litetune-chat-template-<digest>.jinja` in the output directory, hands that file to
+every recipe, and reads each bundle's template back: a bundle that does not carry
+exactly that text is a failed recipe. A tokenizer with several named templates gets
+its `default` composed; the exporter left alone embeds none of them as a template,
+but unpacks the dict as the three prompt parts it builds when it is not using Jinja
+(`litert_lm_builder.py`, `build_llm_metadata`). `convert` refuses, and exports nothing, for a checkpoint with no template, one
+that is only whitespace, one with a carriage return (the exporter reads the file in
+text mode, which would turn it into a newline), and one the block is not for: before
+any export it renders one user message through transformers' Jinja2, as a string
+through the template alone and as parts through the block, and the two must print
+the same. That is transformers' renderer, not LiteRT-LM's MiniJinja; `verify`'s
+rendering check is what checks the runtime. A template you pass yourself with
+`--flag=--jinja_chat_template_override=<file>` is used as given, with no block, so
+on LiteRT-LM 0.18.0 it has to read a list of parts itself, and `convert` says so in
+a note. A tool response LiteRT-LM sends as a `tool_response` part stays a list, as
+on 0.17.1, and neither Qwen3-0.6B's nor Qwen2.5-0.5B-Instruct's template reads it as
+text, so tool use with these bundles is not covered.
+
+**A bundle of a checkpoint these two rules claim needs converting again**, unless it
+was converted with a template of your own, when:
+
+- litetune 0.3.0 or earlier converted it: it carries the checkpoint's template
+  alone;
+- litetune 0.4.0 converted it under a name 0.4.0 did not claim: 0.4.0 claimed only
+  `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-0.6B-Base` and `Qwen/Qwen2.5-0.5B-Instruct` -- as
+  Hub ids, local snapshots, paths ending in one of those names and what `tune` made
+  from them -- so another organisation's copy, or a fine-tune under its own name,
+  carries its template alone too;
+- litetune 0.4.0 converted it for a checkpoint whose own template is not the one
+  0.4.0 packed. 0.4.0 gave every checkpoint it claimed the template of
+  `Qwen/Qwen3-0.6B` at `c1899de` or `Qwen/Qwen2.5-0.5B-Instruct` at `7ae5576` behind
+  the block, whatever its own was: Qwen3-0.6B-Base and its fine-tunes got
+  Qwen3-0.6B's, and another revision of either repository got the packed one
+  whether or not its own differs.
+
+`verify` refuses a bundle of the first two kinds at its rendering check and names
+this as a possible cause. It need not refuse the third: it compares single turns,
+and 0.4.0's README recorded that Qwen3-0.6B's template renders a single turn as
+Qwen3-0.6B-Base's does, their multi-turn handling being what differs.
+
+Any other family's template is not rewritten: `convert` says so in its note on a
+checkpoint it has no rules for, and `verify`'s rendering check is what shows whether
+it reads a list.
 
 **The terminator comes from the chat template, not from `eos_token_id`.** They
 are not always the same token, and a model trained to emit the wrong one never

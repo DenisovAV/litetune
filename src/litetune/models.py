@@ -74,6 +74,21 @@ class FlagRefused(ValueError):
 # Flags
 # ---------------------------------------------------------------------------
 
+TEMPLATE_FLAG = "--jinja_chat_template_override"
+METADATA_OVERRIDE_FLAG = "--litert_lm_llm_metadata_override"
+
+
+def flag_key(flag: str) -> str:
+    """The keyword an exporter flag sets, as the exporter's command line reads it.
+
+    `litert-torch export_hf` hands its arguments to Fire (`litert_torch/cli.py`),
+    which strips every leading hyphen and then reads `-` in the name as `_`
+    (`fire/core.py:868` and `:875`, fire 0.7.1). So `--a-b=1`, `-a_b=1` and
+    `--a_b=1` set one keyword, and a rule that compared spellings would let the
+    first two past it.
+    """
+    return flag.split("=", 1)[0].lstrip("-").replace("-", "_")
+
 
 @dataclass(frozen=True)
 class RequiredFlag:
@@ -97,16 +112,21 @@ class RequiredFlag:
             return None
         return self.name if self.value is None else f"{self.name}={self.value}"
 
+    @property
+    def takes_value(self) -> bool:
+        """Whether the flag means anything without a value after `=`."""
+        return self.value is not None or bool(self.value_unknown)
+
     def satisfied_by(self, flags: Sequence[str]) -> str | None:
         """The caller's own form of this flag, if they passed one.
 
-        Matched on the flag *name*, so a caller who supplied their own value has
-        satisfied the requirement with it. Their value wins: litetune knows this
-        flag is needed, and does not know better than the caller which template
-        their checkpoint was trained against.
+        Matched on the flag *name*, as `flag_key` reads it, so a caller who
+        supplied their own value has satisfied the requirement with it. Their
+        value wins: litetune knows this flag is needed, and does not know better
+        than the caller which template their checkpoint was trained against.
         """
         for flag in flags:
-            if flag == self.name or flag.startswith(f"{self.name}="):
+            if flag_key(flag) == flag_key(self.name):
                 return flag
         return None
 
@@ -128,9 +148,9 @@ class ForbiddenFlag:
     reason: str
 
     def matches(self, flag: str) -> bool:
-        if self.value is None:
-            return flag == self.name or flag.startswith(f"{self.name}=")
-        return flag == f"{self.name}={self.value}"
+        if flag_key(flag) != flag_key(self.name):
+            return False
+        return self.value is None or flag.partition("=")[2] == self.value
 
     @property
     def rendered(self) -> str:
@@ -259,7 +279,7 @@ _TEMPLATE_VARIANT_UNKNOWN = (
     "the override names a per-variant repository (E2B and E4B have different ones) and this model "
     "id does not say which variant it is, so litetune will not guess: the wrong chat template is "
     "the exact failure this flag exists to prevent, and it fails silently. Name the variant in the "
-    "model id, or pass --jinja_chat_template_override=<repo> yourself"
+    "model id, or pass --flag=--jinja_chat_template_override=<repo> to convert yourself"
 )
 
 # Measured: the flag leaves `generic_model` set *and* skips the Gemma 4 metadata
@@ -371,12 +391,10 @@ _GEMMA4_NOT_GOOGLES_ARTIFACT = (
 def _gemma4(family: str, patterns: tuple[str, ...], override_repo: str | None) -> ModelRules:
     """One Gemma 4 variant. The variants differ only in the template repository."""
     template = (
-        RequiredFlag(
-            name="--jinja_chat_template_override", value=override_repo, reason=_TEMPLATE_REASON
-        )
+        RequiredFlag(name=TEMPLATE_FLAG, value=override_repo, reason=_TEMPLATE_REASON)
         if override_repo is not None
         else RequiredFlag(
-            name="--jinja_chat_template_override",
+            name=TEMPLATE_FLAG,
             reason=_TEMPLATE_REASON,
             value_unknown=_TEMPLATE_VARIANT_UNKNOWN,
         )
@@ -488,8 +506,14 @@ carries it and cannot be composed exports nothing.
 # `transformers.AutoTokenizer.from_pretrained` on the model it converts
 # (`export_lib.py`, `litert_lm_builder.py` `package_model`).
 # `export.compose_chat_template` loads the tokenizer the same way, in the same
-# environment. Where the two part: a tokenizer carrying several named templates,
-# of which litetune takes "default", and one carrying none, which it refuses.
+# environment, and falls back to `chat_template.json` as `export_lib.py:390-402`
+# does. Where the two part: a tokenizer carrying several named templates, of
+# which litetune takes "default" where the exporter would unpack the dict as the
+# three prompt parts it builds without Jinja (`litert_lm_builder.py:320`); and
+# what it refuses -- no template after that fallback, one that is only
+# whitespace, one with a carriage return (the exporter reads the override file
+# in text mode, `litert_lm_builder.py:430`, so it could not arrive unchanged),
+# and one the block is not for.
 _TEXT_PARTS_REASON = (
     "LiteRT-LM from 0.18.0 hands a bundle's template each message's content as a list of "
     "parts, and the chat templates of Qwen3 0.6B and Qwen2.5 0.5B Instruct read it as a "
@@ -499,9 +523,13 @@ _TEXT_PARTS_REASON = (
     "it adds the list to a string, which the runtime's MiniJinja refuses. At export litetune "
     "reads the checkpoint's own chat template as the exporter reads it, through transformers' "
     "AutoTokenizer on the model being converted, and hands the exporter that template, "
-    "unchanged, behind a block that turns a list of text parts back into the string -- so "
-    "every checkpoint this rule claims keeps its own template. verify's rendering check "
-    "compares the single turn it renders, not multi-turn, reasoning or tool handling"
+    "unchanged, behind a block that turns a list of text parts back into the string, then "
+    "reads each bundle's template back -- so a checkpoint this rule claims keeps its own "
+    "template, or nothing is exported. It refuses a template the block is not for: one that, "
+    "rendered by transformers' Jinja2 rather than the runtime, does not print a one-message "
+    "conversation given as parts behind the block as it prints the same message as a string. "
+    "verify's rendering check is what checks the runtime, and it compares the single turn it "
+    "renders, not multi-turn, reasoning or tool handling"
 )
 
 
@@ -574,6 +602,14 @@ _MODEL_TYPE_REASON = (
 )
 
 
+# Formats a Hub repack names after the model it repacks, as a whole token of
+# the normalised name: FP8, MLX, GGUF, ONNX, AWQ, GPTQ, bitsandbytes (`bnb`)
+# and an n-bit build (`4bit`). `_NOT_A_REPACK` refuses a match that continues,
+# past any number of other tokens, into one of them.
+_REPACK_MARKERS = r"(?:fp8|mlx|gguf|onnx|awq|gptq|bnb|\d+bit)"
+_NOT_A_REPACK = rf"(?!(?:-[a-z0-9]+)*?-{_REPACK_MARKERS}(?:-|$))"
+
+
 RULES: tuple[ModelRules, ...] = (
     _gemma4(
         "gemma-4-e2b",
@@ -600,7 +636,7 @@ RULES: tuple[ModelRules, ...] = (
                 reason=_MODEL_TYPE_REASON,
             ),
             RequiredFlag(
-                name="--jinja_chat_template_override",
+                name=TEMPLATE_FLAG,
                 value=functiongemma_template(),
                 reason=_FUNCTION_TEMPLATE_REASON,
             ),
@@ -669,18 +705,40 @@ RULES: tuple[ModelRules, ...] = (
         # project has run. No `min_transformers` either -- none was measured.
         # Sizes are added here as they are.
         #
-        # Not by organisation, variant or revision, because the template is no
-        # longer one revision's. `COMPOSED_TEMPLATE` is composed at export from
-        # whatever chat template the converted checkpoint's own tokenizer
-        # carries, so Qwen3-0.6B-Base, another revision of either repository and
-        # a fine-tune published under another name each keep their own template,
-        # with the block in front. litetune 0.4.0 packed Qwen/Qwen3-0.6B's
-        # template at c1899de instead, and so narrowed this pattern to the
-        # checkpoints that one template had been checked against.
-        patterns=(r"qwen-?3-0-6b",),
+        # Not by organisation, variant or revision, but by name, as every rule
+        # here matches: a Hub id is matched on its spelling alone, and
+        # `hint_for` reads `config.json` and `tune`'s sidecar only for a local
+        # directory. So a name that still contains Qwen3-0.6B is claimed --
+        # Qwen3-0.6B-Base, a copy or a fine-tune under another organisation
+        # that kept the name, a local snapshot -- and a fine-tune renamed past
+        # it is not. Base, which no run here measured, has been claimed since
+        # this pattern was first written by size alone. Claiming a checkpoint
+        # no longer hands it another's template, as litetune 0.4.0 did when it
+        # packed Qwen/Qwen3-0.6B's at c1899de for every checkpoint it claimed,
+        # and so narrowed this pattern to the checkpoints that one template had
+        # been checked against: `COMPOSED_TEMPLATE` is composed from the
+        # converted checkpoint's own template, and `export.compose_chat_template`
+        # refuses one the block is not for.
+        #
+        # Not a repack the exporter cannot load: a name that continues past the
+        # size into one of `_REPACK_MARKERS` names already-quantized or
+        # non-PyTorch weights (`Qwen/Qwen3-0.6B-FP8`, `Qwen/Qwen3-0.6B-MLX-4bit`,
+        # `unsloth/Qwen3-0.6B-unsloth-bnb-4bit`, `Qwen/Qwen3-0.6B-GGUF`,
+        # `onnx-community/Qwen3-0.6B-ONNX`). The export environment's
+        # transformers 5.16.1 loads neither FP8 nor bitsandbytes weights without
+        # accelerate, which that environment does not install
+        # (`quantizer_finegrained_fp8.py:31-32`, `quantizer_bnb_4bit.py:57-64`),
+        # and refuses a quantization config with no `quant_method`, as MLX
+        # writes it (`quantizers/auto.py:158-166`). Claiming those would trade
+        # the unknown-family note for an exporter error. A name cannot show a
+        # format it does not spell after the size: an MLX or ONNX build
+        # published under the bare model name is still claimed, whatever its
+        # repository holds, and if that is not weights transformers loads the
+        # exporter fails at its model load.
+        patterns=(rf"qwen-?3-0-6b{_NOT_A_REPACK}",),
         required_flags=(
             RequiredFlag(
-                name="--jinja_chat_template_override",
+                name=TEMPLATE_FLAG,
                 value=COMPOSED_TEMPLATE,
                 reason=_TEXT_PARTS_REASON,
             ),
@@ -705,12 +763,13 @@ RULES: tuple[ModelRules, ...] = (
         # printed its unknown-family note on every convert, which was the
         # honest state and is what this rule replaces.
         #
-        # By size *and* variant, for the reason the qwen-3 rule above gives:
-        # `Qwen2.5-0.5B-Instruct` was run and `Qwen2.5-0.5B` was not. They are
-        # two checkpoints, and this file's own history is that a rule written
-        # on the strength of a neighbouring one goes unexercised for weeks --
-        # the gemma-3-text rule claimed the 1B for three weeks before anything
-        # exported it.
+        # By size *and* variant: `Qwen2.5-0.5B-Instruct` was run and
+        # `Qwen2.5-0.5B` was not. They are two checkpoints, and this file's own
+        # history is that a rule written on the strength of a neighbouring one
+        # goes unexercised for weeks -- the gemma-3-text rule claimed the 1B for
+        # three weeks before anything exported it. (The qwen-3 rule claims its
+        # base model, which it has done since its pattern was first written by
+        # size alone; this rule has never claimed this one's.)
         #
         # The tail is what makes that true. `identify` searches rather than
         # matches, so a bare `qwen-?2-5-0-5b-instruct` also claims
@@ -722,7 +781,14 @@ RULES: tuple[ModelRules, ...] = (
         # pattern ends either at the end of the hint text or at the
         # `model_type` `hint_for` appends for a local checkpoint: this run's
         # merged model read `qwen-qwen2-5-0-5b-instruct-qwen2-qwen2forcausallm`
-        # and must keep matching, a repack must not.
+        # and must keep matching, a repack must not. What follows that
+        # `model_type` is held to `_NOT_A_REPACK` as well, the qwen-3 rule's
+        # guard, because `-qwen2` can also begin a repack's own suffix
+        # (`someorg/Qwen2.5-0.5B-Instruct-qwen2-GGUF`). A name cannot show a
+        # format it does not spell after the model name: an ONNX export
+        # published under the bare name, `onnx-community/Qwen2.5-0.5B-Instruct`,
+        # is claimed whatever its repository holds, and if that is not weights
+        # transformers loads the exporter fails at its model load.
         #
         # No `min_transformers` -- the pinned 5.16.1 loaded it, and nothing
         # here establishes a floor, which is not the same as there being none.
@@ -737,10 +803,12 @@ RULES: tuple[ModelRules, ...] = (
         # (`.../models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/<sha>`, which
         # `tune` records verbatim when it trained from one) normalises to the
         # name followed by `-snapshots-<sha>`, which the tail alone refuses.
-        patterns=(r"qwen-?2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{40})?(?:$|-qwen2\b)",),
+        patterns=(
+            rf"qwen-?2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{{40}})?(?:$|-qwen2\b){_NOT_A_REPACK}",
+        ),
         required_flags=(
             RequiredFlag(
-                name="--jinja_chat_template_override",
+                name=TEMPLATE_FLAG,
                 value=COMPOSED_TEMPLATE,
                 reason=_TEXT_PARTS_REASON,
             ),
@@ -1191,8 +1259,16 @@ def plan_export(
     added: list[str] = []
     notes: list[str] = []
     checks: list[Check] = []
+    limitations = list(rules.limitations)
+    composes = False
     for required in rules.required_flags:
         supplied = required.satisfied_by(flags)
+        if supplied is not None and required.takes_value and not supplied.partition("=")[2]:
+            raise FlagRefused(
+                f"{model}: litetune refuses {supplied!r}. {_EMPTY_VALUE.format(name=required.name)}"
+            )
+        if supplied is not None and required.value == COMPOSED_TEMPLATE:
+            limitations.append(_CALLER_TEMPLATE.format(flag=supplied))
         if supplied is not None:
             wanted = required.rendered
             detail = f"{supplied} was supplied by the caller"
@@ -1225,6 +1301,7 @@ def plan_export(
             )
             continue
 
+        composes = composes or required.value == COMPOSED_TEMPLATE
         flags.append(rendered)
         added.append(rendered)
         notes.append(f"added {rendered}: {required.reason}")
@@ -1235,6 +1312,13 @@ def plan_export(
                 observed={"flag": rendered, "family": rules.family, "added": True},
             )
         )
+
+    if composes:
+        for flag in flags:
+            if flag_key(flag) == flag_key(METADATA_OVERRIDE_FLAG):
+                raise FlagRefused(
+                    f"{model}: litetune refuses {flag!r}. {_METADATA_OVERRIDE_REASON}"
+                )
 
     recommendations: list[str] = []
     if rules.recommended_recipes and recipes:
@@ -1254,8 +1338,36 @@ def plan_export(
         checks=tuple(checks),
         notes=tuple(notes),
         recommendations=tuple(recommendations),
-        limitations=tuple(rules.limitations),
+        limitations=tuple(limitations),
     )
+
+
+# The exporter tests both value-bearing overrides litetune requires for truth
+# and proceeds as if they were absent when empty: the template at
+# `litert_lm_builder.py:414`, the model type at `:380`.
+_EMPTY_VALUE = (
+    "{name} needs a value, and the exporter reads an empty one as no override at all, so the "
+    "rule would be satisfied in name only. Give it a value, or leave it out for litetune to add"
+)
+
+_CALLER_TEMPLATE = (
+    "{flag} was passed by the caller and used as given: litetune put no text-parts block in front "
+    "of it. From LiteRT-LM 0.18.0 the runtime hands the template each message's content as a list "
+    "of parts, and a template that reads it as a string loses the prompt; verify's rendering check "
+    "is what shows it"
+)
+
+# `package_model` takes a metadata override in place of the LlmMetadata it
+# would build (`litert_lm_builder.py:438-456`, then `add_llm_metadata` at
+# `:487`), and `build_llm_metadata` is the only place a chat template is
+# written into it (`:314-318`).
+_METADATA_OVERRIDE_REASON = (
+    "The exporter puts a metadata override in the bundle in place of the LlmMetadata it builds, "
+    "and the chat template litetune composes reaches the bundle only through the metadata it "
+    "builds: the bundle would carry the override's template, or none, without the text-parts "
+    "block. Leave the override out; a template of your own goes in "
+    f"--flag={TEMPLATE_FLAG}=<file>, and on LiteRT-LM 0.18.0 it has to read a list of parts itself"
+)
 
 
 def refuse_forbidden_flags(model: str, flags: Sequence[str]) -> None:

@@ -152,7 +152,8 @@ Nothing was retrained.
 Two kinds of bundle were run. The bundles the 0.17.1 runs measured, unchanged -- each
 that has a manifest on both runtimes carries the SHA-256 the 0.17.1 manifest records --
 so the runtime is the one thing that moved. And, for FunctionGemma and the two Qwen
-sections, bundles converted again from the same checkpoints by this litetune, with
+sections, bundles converted again from the same checkpoints by that code (c7ee2da, and
+02844df for the Qwen bundles), with
 `litert-torch-nightly` 0.10.0.dev20260926, `ai-edge-quantizer-nightly`
 0.10.0.dev20260926 and litert-lm-builder 0.18.0, where the bundles they are compared
 with were converted in September with 0.10.0.dev20260826, 0.10.0.dev20260914 and 0.16.1:
@@ -217,12 +218,22 @@ scored what the 0.17.1 bundle scored. Up to 0.3.0 neither Qwen rule adds a templ
 template passed by the caller carries the checkpoint's template alone, as these did. **A
 Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle converted by litetune 0.3.0 or earlier
 without a template of the caller's has to be converted again for an application on
-LiteRT-LM 0.18.0**; what was measured is the checkpoints at the revisions the templates
-name. litetune after 0.4.0 no longer packages those two files: at export it puts the
-same block in front of whatever chat template the converted checkpoint's own tokenizer
-carries, and no bundle composed that way has been verified here. Other Qwen
-checkpoints -- other sizes, and Qwen2.5 0.5B without Instruct -- get no block from
-litetune; whether theirs reads a list is what verify's rendering check shows.
+LiteRT-LM 0.18.0**, as do some litetune 0.4.0 converted (the README's *From LiteRT-LM
+0.18.0 a template is handed a list of parts* says which); what was measured is the
+checkpoints at the revisions the templates name. litetune after 0.4.0 no longer
+packages those two files: at export it puts the same block in front of whatever chat
+template the converted checkpoint's own tokenizer carries. On 2026-10-11 the four
+eight-bit bundles converted at 928af7b from the two tuned checkpoints each carried
+that composed file as their `jinja_prompt_template`, and the template `convert` read
+from each checkpoint had the sha256 of the checkpoint template inside 02844df's file
+for it (a55ee1b1… for Qwen3, cd8e9439… for Qwen2.5). Against 02844df's bundles their
+template differs only in Jinja comments, and the rest of their metadata only in the
+order of the stop tokens, which the exporter builds from a Python set
+(`litert_lm_builder.py:216-254`) and which already differed between two bundles
+02844df converted. `verify` figures for the composed bundles are not recorded here.
+Which checkpoints get the block is the qwen-3 and qwen-2.5 patterns' to say
+(`models.py`); one they do not claim gets none, and whether its template reads a list
+is what verify's rendering check shows.
 
 FunctionGemma's tool path, both grammar modes, 640 rows: the bundle converted on
 2026-09-19 and the same checkpoint converted again at c7ee2da -- litert-lm-builder
