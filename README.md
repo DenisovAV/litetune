@@ -1070,7 +1070,7 @@ Run the checks with `pytest`, `ruff check`, `ruff format --check` and `mypy src`
 
 `scripts/ci-local.sh` runs what CI runs on Linux, on the platform CI runs it
 on: the three interpreters in Linux containers, then the wheel job. CI's macOS
-job needs a Mac with uv; the script's header gives its three commands. It needs podman or
+job needs a Mac with uv 0.10.6; the script's header gives its commands. It needs podman or
 `ENGINE=docker`, and writes nothing to your working tree. Worth the minute
 before sending anything that touches processes, signals or paths — a green
 suite on macOS and a red CI run happened on the same commit twice, because

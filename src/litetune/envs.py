@@ -1858,8 +1858,7 @@ class StageEnv:
         if self.python.is_symlink() and not self.python.exists():
             return (
                 f"has an interpreter link {self.python} to {os.readlink(self.python)}, which no "
-                "longer exists (the interpreter that built it was removed or upgraded); it is "
-                "built again on the next run that may provision"
+                "longer exists (the interpreter that built it was removed or upgraded)"
             )
         return f"is not provisioned at {self.path}"
 
@@ -1893,7 +1892,7 @@ class StageEnv:
                 return self.path
             if events:
                 rebuilt = (
-                    f"; it {self.unready_detail}"
+                    f"; it {self.unready_detail}, so it is built again"
                     if self.python.is_symlink() and not self.python.exists()
                     else ""
                 )
