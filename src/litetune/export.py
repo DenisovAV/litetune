@@ -1460,7 +1460,7 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
             sink.append(
                 Check.unchecked(
                     "export environment",
-                    f"environment {request.env.name!r} is not provisioned at {request.env.path}",
+                    f"environment {request.env.name!r} {request.env.unready_detail}",
                     observed={"name": request.env.name, "identity": request.env.identity},
                 )
             )
