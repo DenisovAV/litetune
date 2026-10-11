@@ -15,18 +15,24 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import mark_provisioned
+from conftest import mark_provisioned, run_compose_script
 
-from litetune import envs
+from litetune import envs, models
 from litetune.checks import Outcome
 from litetune.events import Event, EventStream
 from litetune.export import (
+    _COMPOSE_SCRIPT,
+    CHAT_TEMPLATE_CHECK,
+    COMPOSED_TEMPLATE_FLAG,
+    COMPOSED_TEMPLATE_NAME,
     KNOWN_RECIPES,
     MEASURED_RECIPES,
+    TEMPLATE_FLAG,
     TOOLCHAIN_DEFAULT_RECIPE,
     ExportRequest,
     NoRecipesRequested,
@@ -53,6 +59,12 @@ litert-torch-nightly==0.10.0.dev20260926
 numpy==2.0.2
 transformers==5.16.1
 """
+
+
+# The chat template of Qwen/Qwen3-0.6B at c1899de, as its tokenizer carries it.
+QWEN3_TEMPLATE = (
+    Path(__file__).parent / "fixtures" / "qwen3-0.6b-c1899de.chat_template.jinja"
+).read_text(encoding="utf-8")
 
 
 @dataclass
@@ -100,6 +112,17 @@ class FakeToolchain:
     repack_pack_drifts: bool = False  # pack adds an unrequested key
     repack_pack_misplaces: bool = False  # pack puts the key on the embedder
     repack_script_returncode: int = 0  # a crashed interpreter
+    # The chat template script's knobs: what the checkpoint's tokenizer carries,
+    # and each way the script can fail to say.
+    chat_template: object = QWEN3_TEMPLATE
+    template_returncode: int | None = None  # the child's code, in place of running it
+    template_stderr: str = ""
+    template_no_result: bool = False  # exits 0 having written no result
+    template_raises: BaseException | None = None
+    template_overwrite: bytes | None = None  # written over its file once it has run
+    template_result: str | None = None  # written as its result, in place of running it
+    template_exit_after: int | None = None  # the code it ends with, after it has run
+    template_loads: list[str] = field(default_factory=list)
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(Call(argv=list(args), timeout=timeout, kwargs=dict(kwargs)))
@@ -107,6 +130,8 @@ class FakeToolchain:
             return subprocess.CompletedProcess(args, self.pip_returncode, self.pip_stdout, "")
         if args[0] == "python" and str(args[1]).endswith("repack.py"):
             return self._repack(args, timeout)
+        if args[0] == "python" and str(args[1]).endswith("compose_template.py"):
+            return self._compose(args, timeout)
         assert args[:2] == ["litert-torch", "export_hf"], args
         flags = dict(a.removeprefix("--").split("=", 1) for a in args[2:] if "=" in a)
         run = self.runs.get(flags["quantization_recipe"], self.default)
@@ -124,7 +149,36 @@ class FakeToolchain:
 
     @property
     def repacks(self) -> list[Call]:
-        return [c for c in self.calls if c.argv[0] == "python"]
+        return [c for c in self.calls if c.argv[0] == "python" and c.argv[1].endswith("repack.py")]
+
+    @property
+    def compositions(self) -> list[Call]:
+        return [
+            c
+            for c in self.calls
+            if c.argv[0] == "python" and c.argv[1].endswith("compose_template.py")
+        ]
+
+    def _compose(self, args, timeout: int) -> subprocess.CompletedProcess:
+        if self.template_raises is not None:
+            raise self.template_raises
+        if self.template_returncode is not None:
+            return subprocess.CompletedProcess(
+                args, self.template_returncode, "", self.template_stderr
+            )
+        if self.template_no_result:
+            return subprocess.CompletedProcess(args, 0, "", self.template_stderr)
+        if self.template_result is not None:
+            Path(args[3]).write_text(self.template_result, encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        proc, loads = run_compose_script(args, timeout, self.chat_template)
+        self.template_loads.extend(loads)
+        if self.template_overwrite is not None:
+            out = Path(json.loads(Path(args[2]).read_text(encoding="utf-8"))["out"])
+            out.write_bytes(self.template_overwrite)
+        if self.template_exit_after is not None:
+            return subprocess.CompletedProcess(args, self.template_exit_after, "", "")
+        return proc
 
     def _repack(self, args, timeout: int) -> subprocess.CompletedProcess:
         if self.repack_script_returncode:
@@ -1664,3 +1718,280 @@ def test_an_owned_recipe_that_cannot_be_read_is_not_exported_in_anothers_place(
     assert not any(f"--quantization_recipe={target}" in argv for argv in exported)
     assert any("--quantization_recipe=dynamic_wi8_afp32" in argv for argv in exported)
     assert next(e for e in result.exports if e.recipe == "dynamic_wi8_afp32").ok
+
+
+# ---------------------------------------------------------------------------
+# The checkpoint's own chat template, behind the text-parts block
+# ---------------------------------------------------------------------------
+
+QWEN3 = "Qwen/Qwen3-0.6B"
+QWEN25_TEMPLATE = (
+    Path(__file__).parent / "fixtures" / "qwen2.5-0.5b-instruct-7ae5576.chat_template.jinja"
+).read_text(encoding="utf-8")
+_BLOCK = Path(models.packaged_template(models.TEXT_PARTS_BLOCK)).read_bytes()
+
+
+@pytest.fixture
+def qwen_request(tmp_path):
+    def _build(model=QWEN3, recipes=MEASURED_RECIPES, **kwargs) -> ExportRequest:
+        return ExportRequest(model=model, output_dir=tmp_path / "out", recipes=recipes, **kwargs)
+
+    return _build
+
+
+def _template_flags(argv: Sequence[str]) -> list[str]:
+    return [a for a in argv if a.startswith(f"{TEMPLATE_FLAG}=")]
+
+
+def _chat_template_check(result):
+    (check,) = [c for c in result.checks.checks if c.name == CHAT_TEMPLATE_CHECK]
+    return check
+
+
+@pytest.mark.parametrize(
+    ("model", "carried"),
+    [
+        (QWEN3, QWEN3_TEMPLATE),
+        ("Qwen/Qwen2.5-0.5B-Instruct", QWEN25_TEMPLATE),
+        # A fine-tune under another name: claimed by the qwen-3 rule, and its
+        # own template is the one composed.
+        ("someorg/Qwen3-0.6B-sql-assistant", "{%- for m in messages %}{{ m.content }}{% endfor %}"),
+    ],
+    ids=["qwen3", "qwen2.5", "fine-tune"],
+)
+def test_a_qwen_export_carries_its_checkpoints_template_behind_the_block(
+    toolchain, qwen_request, tmp_path, model, carried
+):
+    """What every recipe's exporter is handed in place of the marker: one file,
+    written once for the sweep, holding the block and then the template the
+    checkpoint's own tokenizer carries."""
+    toolchain.chat_template = carried
+    request = qwen_request(model)
+    result = run_export(request)
+
+    assert result.outcome is Outcome.PASSED
+    composed = tmp_path / "out" / COMPOSED_TEMPLATE_NAME
+    assert composed.read_bytes() == _BLOCK + carried.encode("utf-8")
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.PASSED
+    sha256 = hashlib.sha256(carried.encode("utf-8")).hexdigest()
+    assert check.observed["template_sha256"] == sha256
+    assert check.observed["composed"] == str(composed)
+    assert check.observed["transformers"] == "5.16.1"
+    assert str(composed) in check.detail and sha256[:12] in check.detail
+    # Read once, from what the exporter is given as --model, in the stage's time.
+    (composition,) = toolchain.compositions
+    assert composition.timeout == request.timeout_s
+    assert toolchain.template_loads == [model]
+    assert len(toolchain.exports) == 2
+    for call in toolchain.exports:
+        assert _template_flags(call.argv) == [f"{TEMPLATE_FLAG}={composed}"]
+    for export in result.exports:
+        assert f"{TEMPLATE_FLAG}={composed}" in export.argv
+    assert not any(models.COMPOSED_TEMPLATE in a for c in toolchain.calls for a in c.argv)
+
+
+def test_the_composed_file_is_the_block_and_the_template_byte_for_byte(
+    toolchain, qwen_request, tmp_path
+):
+    """Nothing between the two and nothing translated: a CRLF, a non-ASCII
+    character and the missing final newline all reach the file as they were."""
+    toolchain.chat_template = "{#- é -#}\r\n{%- for m in messages %}{{ m.content }}\n{% endfor %}"
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    assert result.outcome is Outcome.PASSED
+    written = (tmp_path / "out" / COMPOSED_TEMPLATE_NAME).read_bytes()
+    assert written == _BLOCK + toolchain.chat_template.encode("utf-8")
+    observed = _chat_template_check(result).observed
+    assert observed["template_characters"] == len(toolchain.chat_template)
+    assert observed["composed_sha256"] == hashlib.sha256(written).hexdigest()
+
+
+def test_named_templates_compose_the_one_named_default(toolchain, qwen_request, tmp_path):
+    """transformers keeps several named templates as a dict and, given no
+    tools, applies "default" (`get_chat_template`)."""
+    toolchain.chat_template = {"tool_use": "{{ 'tools' }}", "default": "{{ 'plain' }}"}
+    result = run_export(qwen_request())
+
+    assert result.outcome is Outcome.PASSED
+    written = (tmp_path / "out" / COMPOSED_TEMPLATE_NAME).read_bytes()
+    assert written == _BLOCK + b"{{ 'plain' }}"
+    assert _chat_template_check(result).observed["template_names"] == ["default", "tool_use"]
+
+
+@pytest.mark.parametrize(
+    ("carried", "says"),
+    [
+        (None, "the tokenizer carries no chat template"),
+        ("", "the tokenizer carries no chat template"),
+        (
+            {"tool_use": "{{ 'a' }}", "rag": "{{ 'b' }}"},
+            "carries 2 named chat templates (rag, tool_use) and none named 'default'",
+        ),
+        ({"default": "", "tool_use": "{{ 'a' }}"}, "chat template named 'default' is empty"),
+        (["not", "a", "template"], "the tokenizer's chat template is a list, not text"),
+    ],
+)
+def test_a_checkpoint_with_no_template_to_compose_refuses_and_exports_nothing(
+    toolchain, qwen_request, tmp_path, carried, says
+):
+    """A fact about the checkpoint, so `failed`; never an export without the
+    block, and never one with the marker in it."""
+    toolchain.chat_template = carried
+    result = run_export(qwen_request())
+
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.FAILED
+    assert says in check.detail
+    assert f"Pass {TEMPLATE_FLAG}=<file>" in check.detail
+    assert result.outcome is Outcome.FAILED
+    assert toolchain.exports == []
+    assert result.exports == [] and result.failed == []
+    assert result.not_attempted == tuple(MEASURED_RECIPES)
+    assert any(text.startswith("none of") and says in text for text in result.limitations)
+    assert not (tmp_path / "out" / COMPOSED_TEMPLATE_NAME).exists()
+
+
+def test_with_no_template_the_refusal_says_what_the_exporter_would_embed(toolchain, qwen_request):
+    """`export_lib.py` tries `chat_template.json`, and `package_model` embeds an
+    empty template when there is still none."""
+    toolchain.chat_template = None
+    detail = _chat_template_check(run_export(qwen_request())).detail
+    assert "chat_template.json in the repository" in detail
+    assert "otherwise embed an empty template" in detail
+
+
+@pytest.mark.parametrize(
+    ("knobs", "says"),
+    [
+        (
+            {
+                "template_returncode": 1,
+                "template_stderr": "Traceback (most recent call last):\n"
+                "OSError: Qwen/Qwen3-0.6B does not appear to have a file named tokenizer.json\n",
+            },
+            "exited 1: OSError: Qwen/Qwen3-0.6B does not appear to have a file named",
+        ),
+        ({"template_returncode": -9}, "killed by SIGKILL"),
+        # Killed after its result and file were written: still no answer.
+        ({"template_exit_after": -9}, "killed by SIGKILL"),
+        ({"template_no_result": True}, "exited 0 and wrote no result"),
+        ({"template_raises": subprocess.TimeoutExpired("python", 5)}, "gave no result after"),
+        ({"template_result": "{not json"}, "wrote a result that is not JSON"),
+        ({"template_result": "[]"}, "wrote list, not a report"),
+        ({"template_result": '{"found": "maybe"}'}, "reported 'maybe', which is not one of"),
+        ({"template_overwrite": b"{{ messages }}"}, "does not hold the text-parts block"),
+    ],
+)
+def test_a_script_that_cannot_say_refuses_with_the_reason(
+    toolchain, qwen_request, tmp_path, knobs, says
+):
+    """Nothing here is a fact about the checkpoint, so `could not check`; and no
+    recipe ran, so none is recorded as failed."""
+    for name, value in knobs.items():
+        setattr(toolchain, name, value)
+    result = run_export(qwen_request())
+
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.UNCHECKED
+    assert says in check.detail
+    assert result.outcome is Outcome.UNCHECKED
+    assert toolchain.exports == []
+    assert result.failed == []
+    assert result.not_attempted == tuple(MEASURED_RECIPES)
+    assert any(text.startswith("none of") and says in text for text in result.limitations)
+    assert not (tmp_path / "out" / COMPOSED_TEMPLATE_NAME).exists()
+
+
+def test_a_composed_file_from_an_earlier_run_is_not_read_as_this_runs(
+    toolchain, qwen_request, tmp_path
+):
+    """The file is removed before the script runs, so one that reports a
+    template it did not write is caught however good the old file looks."""
+    stale = tmp_path / "out" / COMPOSED_TEMPLATE_NAME
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(_BLOCK + QWEN3_TEMPLATE.encode("utf-8"))
+    toolchain.template_result = json.dumps(
+        {
+            "transformers": "5.16.1",
+            "found": "text",
+            "names": None,
+            "type": None,
+            "sha256": hashlib.sha256(QWEN3_TEMPLATE.encode("utf-8")).hexdigest(),
+            "characters": len(QWEN3_TEMPLATE),
+        }
+    )
+    result = run_export(qwen_request())
+
+    assert _chat_template_check(result).outcome is Outcome.UNCHECKED
+    assert toolchain.exports == []
+
+
+def test_a_callers_own_template_is_passed_through_and_nothing_is_composed(
+    toolchain, qwen_request, tmp_path
+):
+    """`RequiredFlag.satisfied_by`: the caller's value wins, and then there is
+    nothing to compose."""
+    own = tmp_path / "mine.jinja"
+    own.write_text("{{ messages }}", encoding="utf-8")
+    result = run_export(qwen_request(extra_flags=(f"{TEMPLATE_FLAG}={own}",)))
+
+    assert result.outcome is Outcome.PASSED
+    assert toolchain.compositions == []
+    assert not any(c.name == CHAT_TEMPLATE_CHECK for c in result.checks.checks)
+    for call in toolchain.exports:
+        assert _template_flags(call.argv) == [f"{TEMPLATE_FLAG}={own}"]
+    assert not (tmp_path / "out" / COMPOSED_TEMPLATE_NAME).exists()
+
+
+def test_a_recipe_that_raises_records_the_argv_it_was_given(
+    monkeypatch, toolchain, qwen_request, tmp_path
+):
+    """The sweep's backstop rebuilds the argv for its record, and that one too
+    carries the composed file rather than raising on the marker."""
+    monkeypatch.setattr(
+        "litetune.export._sha256",
+        lambda path: (_ for _ in ()).throw(OSError("input/output error")),
+    )
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    (export,) = result.exports
+    assert export.check.outcome is Outcome.UNCHECKED
+    composed = tmp_path / "out" / COMPOSED_TEMPLATE_NAME
+    assert _template_flags(export.argv) == [f"{TEMPLATE_FLAG}={composed}"]
+
+
+def test_a_family_with_a_packaged_template_composes_nothing(toolchain, request_for):
+    result = run_export(request_for(("dynamic_wi8_afp32",)))
+
+    assert result.outcome is Outcome.PASSED
+    assert toolchain.compositions == []
+    assert not any(c.name == CHAT_TEMPLATE_CHECK for c in result.checks.checks)
+
+
+def test_the_marker_never_reaches_an_exporter_argv(qwen_request):
+    """It describes a file, and the exporter would look it up as a repository."""
+    request = qwen_request()
+    assert request.composes_chat_template
+    assert COMPOSED_TEMPLATE_FLAG in request.extra_flags
+    with pytest.raises(ValueError, match="no composed template was given"):
+        request.argv("dynamic_wi8_afp32")
+    argv = request.argv("dynamic_wi8_afp32", Path("/composed/t.jinja"))
+    assert _template_flags(argv) == [f"{TEMPLATE_FLAG}=/composed/t.jinja"]
+    assert not any(models.COMPOSED_TEMPLATE in a for a in argv)
+
+
+def test_the_composed_path_is_absolute_for_a_relative_output_dir(tmp_path, monkeypatch):
+    """The exporter tells a file from a repository with `os.path.exists`."""
+    monkeypatch.chdir(tmp_path)
+    request = ExportRequest(model=QWEN3, output_dir=Path("rel"), recipes=("dynamic_wi8_afp32",))
+    assert request.chat_template_path.is_absolute()
+    assert request.chat_template_path == Path.cwd() / "rel" / COMPOSED_TEMPLATE_NAME
+
+
+def test_the_chat_template_script_is_python_that_imports_nothing_from_litetune():
+    """It runs in the export environment, which does not install litetune."""
+    import re
+
+    compile(_COMPOSE_SCRIPT, "compose_template.py", "exec")
+    assert not re.search(r"^\s*(?:import|from)\s+litetune\b", _COMPOSE_SCRIPT, re.MULTILINE)

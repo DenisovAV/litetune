@@ -21,11 +21,11 @@ template is handed: each message's content as a list of parts, `[{"type": "text"
 `NormalizeMessageContent` in `data_utils.cc`), where v0.17.1's Qwen processor handed a
 single text part over as the string (`qwen3_data_processor.cc`). A template that reads
 `content` as a string then renders without the user's text and raises nothing --
-measured on a Qwen3 bundle on 2026-10-08 -- which is why the Qwen families ship a
-packaged template (`models._text_parts_reason`), and why this comparison runs on every
-model rather than on the ones a reading of the source flagged. A script in the reference's
-environment produces the ids the reference generates from, through the same
-`prompt_mode.RENDERING_SOURCE` training and the generation script use. The lists
+measured on a Qwen3 bundle on 2026-10-08 -- which is why the Qwen rules put a block in
+front of the checkpoint's own template (`models._TEXT_PARTS_REASON`), and why this
+comparison runs on every model rather than on the ones a reading of the source flagged. A
+script in the reference's environment produces the ids the reference generates from, through
+the same `prompt_mode.RENDERING_SOURCE` training and the generation script use. The lists
 must be equal. On the first few prompts the runtime also sends the message, and the
 prefill count it reports must equal the reference's id count: that catches a
 wrong mirror of the prefill step, and tokens the runtime adds outside the
@@ -361,7 +361,7 @@ class RenderingComparison:
         Measured 2026-10-08 on litert-lm 0.18.0: Qwen bundles carrying their
         checkpoint's template rendered the user's text away (Qwen3) or failed
         (Qwen2.5), because from 0.18.0 the runtime hands a template each
-        message's content as a list of parts (`models._text_parts_reason`).
+        message's content as a list of parts (`models._TEXT_PARTS_REASON`).
         """
         lost = [m for m in self.mismatches if m.prompt_missing or m.kind == "unrendered"]
         if not lost:
@@ -372,7 +372,8 @@ class RenderingComparison:
             "template each message's content as a list of parts, and a template that reads it "
             "as a string loses the text or fails. A Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle "
             "converted by litetune 0.3.0 or earlier with no template of the caller's is such a "
-            "bundle, and converting it again with this litetune packs a template that reads both"
+            "bundle, and converting it again with this litetune puts a block that reads a list "
+            "of parts in front of its checkpoint's own template"
         )
 
     def as_dict(self) -> dict[str, Any]:

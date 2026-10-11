@@ -13,7 +13,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import FakeBackend, correct_texts, labelled_rows, mark_provisioned, probe_answer
+from conftest import (
+    FakeBackend,
+    correct_texts,
+    labelled_rows,
+    mark_provisioned,
+    probe_answer,
+    run_compose_script,
+)
 
 from litetune import envs
 from litetune import verify as verify_module
@@ -517,11 +524,15 @@ class FakeToolchain:
 
     calls: list[list[str]] = field(default_factory=list)
     pip_stdout: str = "transformers==5.5.0\n"
+    # What the checkpoint's tokenizer carries, for the chat template script.
+    chat_template: object = "{%- for m in messages %}{{ m.content }}{% endfor %}"
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(list(args))
         if args[0] == "pip":
             return subprocess.CompletedProcess(args, 0, self.pip_stdout, "")
+        if args[0] == "python" and str(args[1]).endswith("compose_template.py"):
+            return run_compose_script(args, timeout, self.chat_template)[0]
         if args[:2] == ["python", "-c"]:
             # The device probe, answered the way every other probe fake in the
             # suite answers it. Without this a probe reaching this fake would
@@ -659,6 +670,46 @@ def test_convert_will_not_guess_a_gemma4_template_and_exits_could_not_check(
     assert code == 4
     assert toolchain.exports == []
     assert "not attempted" in captured.out
+
+
+def test_convert_hands_a_qwen_export_the_composed_template(toolchain, tmp_path, capsys):
+    out = tmp_path / "out"
+    code = main(
+        [
+            "convert",
+            "--model",
+            "Qwen/Qwen3-0.6B",
+            "--output-dir",
+            str(out),
+            "--recipe",
+            "dynamic_wi8_afp32",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    (argv,) = toolchain.exports
+    assert f"--jinja_chat_template_override={out / 'litetune-chat-template.jinja'}" in argv
+    assert "added --jinja_chat_template_override" in captured.out
+
+
+def test_convert_of_a_qwen_checkpoint_with_no_template_exits_failed(toolchain, tmp_path, capsys):
+    toolchain.chat_template = None
+    code = main(
+        [
+            "convert",
+            "--model",
+            "Qwen/Qwen3-0.6B",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--recipe",
+            "dynamic_wi8_afp32",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert toolchain.exports == []
+    assert "the tokenizer carries no chat template" in captured.out
+    assert "not attempted: dynamic_wi8_afp32" in captured.out
 
 
 def test_convert_json_writes_the_report_to_stdout(toolchain, tmp_path, capsys):

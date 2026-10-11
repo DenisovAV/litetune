@@ -207,9 +207,10 @@ their gate. The runtime's rendering it recorded ends
 error -- where on 0.17.1 the same bundles rendered the reference's ids for all 600
 prompts. Through each Qwen2.5 bundle, eight-bit and four-bit, `verify` stopped at the
 same check: the runtime's first send raised `litert_lm_conversation_send_message
-failed`. Bundles converted by this litetune carry the checkpoint's own template behind a
-block that turns a list of text parts back into the string
-(`templates/qwen3-0.6b.jinja`, `qwen2.5-0.5b-instruct.jinja`). Every one of those
+failed`. The bundles converted again carry the checkpoint's own template behind a
+block that turns a list of text parts back into the string: `templates/qwen3-0.6b.jinja`
+and `qwen2.5-0.5b-instruct.jinja` as 02844df packaged them, which differ from the two
+files litetune 0.4.0 packaged in Jinja comments only. Every one of those
 verified in full rendered the same token ids as the reference for all 600 prompts and
 scored what the 0.17.1 bundle scored. Up to 0.3.0 neither Qwen rule adds a template
 (`models.py` at v0.3.0), so a bundle litetune 0.3.0 or earlier converted without a
@@ -217,8 +218,11 @@ template passed by the caller carries the checkpoint's template alone, as these 
 Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle converted by litetune 0.3.0 or earlier
 without a template of the caller's has to be converted again for an application on
 LiteRT-LM 0.18.0**; what was measured is the checkpoints at the revisions the templates
-name. Other Qwen checkpoints get no template from litetune; whether theirs reads a list
-is what verify's rendering check shows.
+name. litetune after 0.4.0 no longer packages those two files: at export it puts the
+same block in front of whatever chat template the converted checkpoint's own tokenizer
+carries, and no bundle composed that way has been verified here. Other Qwen
+checkpoints -- other sizes, and Qwen2.5 0.5B without Instruct -- get no block from
+litetune; whether theirs reads a list is what verify's rendering check shows.
 
 FunctionGemma's tool path, both grammar modes, 640 rows: the bundle converted on
 2026-09-19 and the same checkpoint converted again at c7ee2da -- litert-lm-builder
@@ -1001,8 +1005,8 @@ from litetune, and the tuned checkpoint's `config.json` names `model_type: qwen3
 That is the model-type trap `models.py` describes, seen from the other side: `qwen3`
 is on the exporter's own list, so the config's `model_type` selects the right type
 with no override. `models.py` records it as `qwen-3`, scoped to 0.6B, the one size
-run; from LiteRT-LM 0.18.0 that rule adds the checkpoint's packaged template, for
-the runtime rather than the exporter (*The 0.17.1 re-measurements again on
+run; from LiteRT-LM 0.18.0 that rule puts a block in front of the checkpoint's own
+template, for the runtime rather than the exporter (*The 0.17.1 re-measurements again on
 litert-lm 0.18.0*).
 
 **The terminator is the template's close, and it is also the tokenizer's

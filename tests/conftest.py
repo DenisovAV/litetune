@@ -3,13 +3,18 @@
 No network, no accelerator, no model load, no subprocess. `FakeBackend`
 satisfies `evaluate.GenerationBackend` structurally -- it inherits nothing,
 which is the reason that interface is a Protocol: a mock would accept a typo in
-a method name and this will not.
+a method name and this will not. The one subprocess is `run_compose_script`,
+which the convert tests' toolchain fakes share: it runs litetune's own script in
+the host interpreter, against a fake `transformers`.
 """
 
 from __future__ import annotations
 
 import builtins
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -368,3 +373,54 @@ def mark_provisioned(env) -> Path:
     env.python.touch()
     (env.path / ".litetune-ready").write_text(env.identity, encoding="utf-8")
     return env.path
+
+
+# What `export._COMPOSE_SCRIPT` imports in place of the export environment's
+# transformers: an `AutoTokenizer` whose tokenizer carries `_TEMPLATE` as its
+# `chat_template`, and which writes each path it is asked to load to `_LOADS`.
+_FAKE_TRANSFORMERS = """
+import json
+
+
+class AutoTokenizer:
+    @staticmethod
+    def from_pretrained(path):
+        with open(_LOADS, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(path) + "\\n")
+        tokenizer = type("Tokenizer", (), {})()
+        tokenizer.chat_template = _TEMPLATE
+        return tokenizer
+"""
+
+
+def run_compose_script(
+    args: Sequence[str], timeout: int, chat_template: object, version: str = "5.16.1"
+) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """`export._COMPOSE_SCRIPT`, run for real with the host interpreter.
+
+    The script's own reading of the template -- a dict, an empty one, the
+    bytes it writes -- is exercised; only `transformers` is a fake, through a
+    package of that name first on `PYTHONPATH`. Returns the completed process
+    and the paths `AutoTokenizer.from_pretrained` was given, in order. The
+    toolchain fakes in the test files each call this for the one command it
+    answers.
+    """
+    script, spec, result = str(args[1]), str(args[2]), str(args[3])
+    shim = Path(spec).parent / "shim"
+    package = shim / "transformers"
+    package.mkdir(parents=True, exist_ok=True)
+    loads = shim / "loads.jsonl"
+    (package / "__init__.py").write_text(
+        f"__version__ = {version!r}\n_TEMPLATE = {chat_template!r}\n_LOADS = {str(loads)!r}\n"
+        + _FAKE_TRANSFORMERS,
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, script, spec, result],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env={**os.environ, "PYTHONPATH": str(shim)},
+    )
+    seen = loads.read_text(encoding="utf-8").splitlines() if loads.is_file() else []
+    return proc, [json.loads(line) for line in seen]

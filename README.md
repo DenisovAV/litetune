@@ -604,8 +604,8 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 | `gemma-3-text` | `--litert_lm_model_type_override=gemma3` |
 | `gemma-4-e2b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm` |
 | `gemma-4-e4b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E4B-it-litert-lm` |
-| `qwen-3` (`Qwen/Qwen3-0.6B`) | `--jinja_chat_template_override=<the checkpoint's own template behind litetune's text-parts block>` |
-| `qwen-2.5` (`Qwen/Qwen2.5-0.5B-Instruct`) | `--jinja_chat_template_override=<the checkpoint's own template behind litetune's text-parts block>` |
+| `qwen-3` (Qwen3 0.6B) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
+| `qwen-2.5` (Qwen2.5 0.5B Instruct) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
 
 **A LoRA scope keyed on model identity.** On a multimodal checkpoint the
 vision and audio towers use the same projection names as the text layers, so
@@ -662,21 +662,23 @@ the bundle's template each message's content as `[{"type": "text", "text": ...}]
 where 0.17.1 gave it the string, and a template written for a string may print the
 list, drop the user's text or fail: measured on 2026-10-08, a Qwen3 0.6B bundle
 rendered `<|im_start|>user\n<|im_end|>` with no error and every send to a Qwen2.5
-0.5B Instruct bundle failed. For those two checkpoints litetune packs the
-checkpoint's own template, unchanged, behind a block that turns a list of text parts
-back into the string (a fine-tune of Qwen3-0.6B-Base gets Qwen3-0.6B's, whose single
-turn renders as Base's does; their multi-turn handling differs); a tool response
-LiteRT-LM sends as a `tool_response` part stays a list, as on 0.17.1, and neither
-template reads it as text, so tool use with these bundles is not covered. **A bundle
-of a checkpoint these two rules claim -- `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-0.6B-Base`
-and `Qwen/Qwen2.5-0.5B-Instruct`, as Hub ids, local snapshots or what `tune` made
-from them -- converted by litetune 0.3.0 or earlier without a template of your own
-carries the checkpoint's template alone and needs converting again**, which packs
-the template of the revision the rule names (`c1899de` for Qwen3 0.6B, `7ae5576` for
-Qwen2.5 0.5B Instruct) whatever revision the checkpoint is; `verify` refuses one at
-its rendering check and names this as a possible cause. Any other family's template
-is not rewritten: `convert` says so in its note on a checkpoint it has no rules for,
-and `verify`'s rendering check is what shows whether it reads a list.
+0.5B Instruct bundle failed. For a checkpoint either rule claims -- one whose name
+contains Qwen3-0.6B, Base included, or ends in Qwen2.5-0.5B-Instruct, under any
+organisation, and what `tune` made from either -- `convert` reads the checkpoint's own
+chat template the way the exporter reads it, through `transformers.AutoTokenizer` in the
+export environment, writes it unchanged behind a block that turns a list of text
+parts back into the string, to `litetune-chat-template.jinja` in the output
+directory, and hands that file to every recipe. A checkpoint whose tokenizer carries
+no chat template is refused rather than exported without the block, and a template
+you pass with `--flag=--jinja_chat_template_override=...` is used as given. A tool
+response LiteRT-LM sends as a `tool_response` part stays a list, as on 0.17.1, and
+neither Qwen3-0.6B's nor Qwen2.5-0.5B-Instruct's template reads it as text, so tool
+use with these bundles is not covered. **A bundle of a checkpoint these two rules
+claim, converted by litetune 0.3.0 or earlier without a template of your own,
+carries the checkpoint's template alone and needs converting again**; `verify`
+refuses one at its rendering check and names this as a possible cause. Any other
+family's template is not rewritten: `convert` says so in its note on a checkpoint it
+has no rules for, and `verify`'s rendering check is what shows whether it reads a list.
 
 **The terminator comes from the chat template, not from `eos_token_id`.** They
 are not always the same token, and a model trained to emit the wrong one never
@@ -779,8 +781,8 @@ terminator bug fixed in 0.1.5 — see [MEASUREMENTS.md](MEASUREMENTS.md).
 | Cost of conversion | — | +0.0067 *(within noise)* | +0.0167 |
 
 The first family measured here that litetune had no rule for. It exported with
-no flag from litetune; from LiteRT-LM 0.18.0 its rule adds the checkpoint's
-packaged template, for the runtime rather than the exporter. The
+no flag from litetune; from LiteRT-LM 0.18.0 its rule puts a block in front of the
+checkpoint's own template, for the runtime rather than the exporter. The
 weight-only figure clears its interval here where the dynamic one does not, and
 where neither of gemma-3-270m's did — on 12 disagreements out of 600. Training
 and the float reference ran on a GPU and the converted models on a CPU, so this
