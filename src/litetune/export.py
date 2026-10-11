@@ -463,8 +463,13 @@ class ExportRequest:
         object.__setattr__(self, "output_dir", Path(self.output_dir))
 
         requested = list(self.extra_flags)
+        # `convert`'s own option is the caller's setting, so it enters the table
+        # the plan reads like any `--flag=`: an opt-out a family cannot export
+        # without is then refused by the plan, not overridden by its rule.
         if self.externalize_embedder is True:
             requested.append(EXTERNALIZE_FLAG)
+        elif self.externalize_embedder is False:
+            requested.append(f"--no{EXTERNALIZE_FLAG.lstrip('-')}")
         # Raises `models.FlagRefused` for a flag that must never be passed for
         # this family, and adds the ones it cannot export without. A plan whose
         # required flags could not be resolved is *kept*, not raised on: it is
@@ -495,11 +500,11 @@ class ExportRequest:
         # `--noexternalize_embedder` or `--externalize-embedder=False` is theirs,
         # and the default is added only where nothing set it.
         setting = plan.setting(EXTERNALIZE_FLAG)
-        if setting is not None:
+        if setting is not None and setting.token in plan.added:
+            externalized, source = True, "family rule"
+        elif setting is not None:
             externalized = bool(setting.value)
             source = "caller" if externalized else "caller opted out"
-        elif self.externalize_embedder is False:
-            externalized, source = False, "caller opted out"
         else:
             flags.append(EXTERNALIZE_FLAG)
             externalized, source = True, "litetune default"
@@ -515,7 +520,7 @@ class ExportRequest:
 
     @property
     def externalize_source(self) -> str:
-        """Who decided `--externalize_embedder`: the caller, or this default."""
+        """Who decided `--externalize_embedder`: the caller, the family's rule, or this default."""
         return self._externalize_source  # type: ignore[attr-defined]
 
     @property

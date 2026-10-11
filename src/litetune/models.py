@@ -1500,6 +1500,14 @@ def plan_export(
         supplied = required.satisfied_by(table)
         if supplied is not None and required.takes_value:
             _refuse_unusable_value(model, supplied, required.name)
+        if supplied is not None and not required.takes_value and not supplied.value:
+            # A switch the family cannot export without, turned off by the
+            # caller: their value would win below, and the export would fail or
+            # be wrong for the reason the rule gives.
+            raise FlagRefused(
+                f"{model}: litetune refuses {supplied.token!r}: this family needs "
+                f"{required.name}. {required.reason}"
+            )
         if supplied is not None and required.value == COMPOSED_TEMPLATE:
             limitations.append(_CALLER_TEMPLATE.format(flag=supplied.shown))
         if supplied is not None:

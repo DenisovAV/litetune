@@ -2778,6 +2778,69 @@ def test_externalize_embedder_is_read_off_the_parsed_flags(request_for, flag, so
     assert ("--externalize_embedder" in argv) is (flag == "--externalize_embedder")
 
 
+def test_the_cli_opt_out_is_the_callers_setting(request_for):
+    """`convert --no-externalize-embedder` enters the plan's table as the caller's
+    own setting, so the exporter gets the opt-out and nothing litetune adds."""
+    request = request_for(MEASURED_RECIPES, externalize_embedder=False)
+    argv = request.argv("dynamic_wi8_afp32")
+    assert request.externalize_source == "caller opted out"
+    assert request.as_dict()["externalize_embedder"] is False
+    assert "--noexternalize_embedder" in argv
+    assert "--externalize_embedder" not in argv
+
+
+GEMMA4 = "google/gemma-4-E2B-it"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "flags"),
+    [
+        ({"externalize_embedder": False}, ()),
+        ({}, ("--noexternalize_embedder",)),
+        ({}, ("--externalize-embedder=False",)),
+        ({}, ("--externalize_embedder", "--externalize_embedder=0")),
+    ],
+)
+def test_gemma4_refuses_an_embedder_opt_out(tmp_path, kwargs, flags):
+    """Gemma 4 does not export without `--externalize_embedder`: a caller's
+    opt-out, from `convert`'s own option or a `--flag=` Fire reads as False, is
+    refused with that reason instead of being overridden by the rule."""
+    with pytest.raises(models.FlagRefused, match="this family needs --externalize_embedder") as exc:
+        ExportRequest(
+            model=GEMMA4,
+            output_dir=tmp_path / "out",
+            recipes=MEASURED_RECIPES,
+            extra_flags=flags,
+            **kwargs,
+        )
+    assert "External embedder is required for Gemma4" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "flags", "source"),
+    [
+        ({}, (), "family rule"),
+        ({"externalize_embedder": True}, (), "caller"),
+        ({}, ("--externalize-embedder",), "caller"),
+    ],
+)
+def test_gemma4_names_who_set_the_embedder_flag(tmp_path, kwargs, flags, source):
+    """The flag Gemma 4's rule adds is reported as the rule's, not the caller's,
+    and the exporter gets it exactly once."""
+    request = ExportRequest(
+        model=GEMMA4,
+        output_dir=tmp_path / "out",
+        recipes=MEASURED_RECIPES,
+        extra_flags=flags,
+        **kwargs,
+    )
+    argv = request.argv("dynamic_wi8_afp32")
+    assert request.externalize_source == source
+    assert request.as_dict()["externalize_embedder"] is True
+    assert sum(models.flag_key(a) == "externalize_embedder" for a in argv) == 1
+    assert ("--externalize_embedder" in request.plan.added) is (source == "family rule")
+
+
 def test_the_argv_sets_each_keyword_once_and_none_of_litetunes_three(request_for):
     """`ExportRequest.argv` checks what the plan promises."""
     request = request_for(MEASURED_RECIPES)
