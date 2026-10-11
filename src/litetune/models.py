@@ -9,10 +9,9 @@ Three kinds of knowledge live here:
 
 **Export flags a family requires.** Gemma 4 will not export without
 `--externalize_embedder`, and will export *wrongly* -- silently -- without
-`--jinja_chat_template_override`. litetune adds them and says so;
-`--litert_lm_model_type_override=gemma4` is refused rather than dropped,
-because a flag that quietly does the opposite of its name is worse than an
-error.
+`--jinja_chat_template_override`. litetune adds them and says so; a
+`--litert_lm_model_type_override` is refused rather than dropped, because a flag
+that quietly does the opposite of its name is worse than an error.
 
 **The minimum `transformers` a family needs.** A version too old does not
 produce a subtly worse model, it raises `AttributeError: 'list' object has no
@@ -79,30 +78,108 @@ TEMPLATE_FLAG = "--jinja_chat_template_override"
 METADATA_OVERRIDE_FLAG = "--litert_lm_llm_metadata_override"
 
 
-def flag_key(flag: str) -> str:
-    """The keyword an exporter flag sets, as the exporter's command line reads it.
+def flag_key(name: str) -> str:
+    """The keyword a flag name sets on the exporter's command line.
 
     `litert-torch export_hf` hands its arguments to Fire (`litert_torch/cli.py`),
     which strips every leading hyphen and then reads `-` in the name as `_`
-    (`fire/core.py:868` and `:875`, fire 0.7.1). So `--a-b=1`, `-a_b=1` and
-    `--a_b=1` set one keyword, and a rule that compared spellings would let the
-    first two past it.
+    (`fire/core.py:868` and `:875`, fire 0.7.1).
     """
-    return flag.split("=", 1)[0].lstrip("-").replace("-", "_")
+    return name.split("=", 1)[0].lstrip("-").replace("-", "_")
 
 
-def effective_flag(flags: Sequence[str], name: str) -> str | None:
-    """The occurrence of `name` the exporter acts on: the last one.
+@dataclass(frozen=True)
+class ExporterFlag:
+    """One keyword the exporter's command line sets, as Fire reads it."""
 
-    Fire assigns each keyword as it meets it, so a later occurrence replaces an
-    earlier one (`fire/core.py:925`, `kwargs[keyword] = value`). A rule that
-    read the first would vouch for a value the exporter never sees.
+    name: str  # Fire's keyword: leading hyphens stripped, `-` read as `_`
+    value: object  # what Fire hands the exporter for it
+    token: str  # the argument that sets it, handed to the exporter unchanged
+
+    @property
+    def shown(self) -> str:
+        """The flag as it takes effect: its keyword and the value the exporter gets."""
+        value = self.value if isinstance(self.value, str) else repr(self.value)
+        return f"--{self.name}={value}"
+
+
+# The keywords litetune passes itself, from `convert`'s own options. Fire keeps
+# the last of a repeated keyword (`fire/core.py:925`), so a caller's token for
+# one would replace litetune's in the exporter's argv while the report named
+# litetune's.
+OWNED_FLAGS = {"model": "--model", "output_dir": "--output-dir", "quantization_recipe": "--recipe"}
+
+# litert-torch's `export` (`export_hf/export.py:79-142`, litert-torch-nightly
+# 0.10.0.dev20260926) takes `**kwargs`, so Fire accepts every keyword
+# (`fire/core.py:881-884`). A valueless `--no<name>` then sets <name> to False
+# unless `no<name>` is itself a parameter (`:902-912`); none of `export`'s
+# parameters begins with "no".
+_EXPORT_PARAMETERS_NAMED_NO: frozenset[str] = frozenset()
+
+
+def _is_fire_flag(token: str) -> bool:
+    """Fire's `_IsFlag` (`fire/core.py:936-956`): two hyphens, or one and a letter."""
+    return token.startswith("--") or re.match(r"-[a-zA-Z]", token) is not None
+
+
+def parse_exporter_flags(model: str, tokens: Sequence[str]) -> dict[str, ExporterFlag]:
+    """The keywords `tokens` set on the exporter, by Fire's rules; raises `FlagRefused`.
+
+    Each token is read as Fire's `_ParseKeywordArgs` reads it (`fire/core.py:
+    816-934`): `--name=text` sets `name` to `exporter_value(text)`; a valueless
+    `--name` sets it to True, or `--no<name>` sets `<name>` to False. The last
+    token for a keyword is the one in effect, and the only one kept: the table
+    is what litetune reasons about and, one token per keyword, what the
+    exporter is given, so the two cannot disagree. Refused, each with what to
+    pass instead, are the tokens Fire would read some other way -- a positional
+    argument, a bare `--` and everything after it, a value in the next
+    argument -- and the keywords litetune sets itself.
     """
-    found = None
-    for flag in flags:
-        if flag_key(flag) == flag_key(name):
-            found = flag
-    return found
+    table: dict[str, ExporterFlag] = {}
+    for index, token in enumerate(tokens):
+        if token == "--":
+            raise FlagRefused(_DOUBLE_DASH.format(model=model))
+        if not _is_fire_flag(token):
+            raise FlagRefused(_POSITIONAL.format(model=model, token=token))
+        stripped = token.lstrip("-")
+        if "=" in token:
+            key, text = stripped.split("=", 1)
+            key = key.replace("-", "_")
+            value: object = exporter_value(text)
+        else:
+            key = stripped.replace("-", "_")
+            following = tokens[index + 1] if index + 1 < len(tokens) else None
+            if following is not None and not _is_fire_flag(following):
+                raise FlagRefused(_split_value(model, token, f"--{key}"))
+            if key not in _EXPORT_PARAMETERS_NAMED_NO and key.startswith("no"):
+                key, value = key[2:], False
+            else:
+                value = True
+        if not key:
+            raise FlagRefused(f"{model}: litetune refuses {token!r}: it names no keyword")
+        if key in OWNED_FLAGS:
+            raise FlagRefused(
+                f"{model}: litetune refuses {token!r}: litetune passes --{key} to the exporter "
+                f"itself, from convert's {OWNED_FLAGS[key]}, and Fire would let this one replace "
+                f"it (`fire/core.py:925`). Use {OWNED_FLAGS[key]}"
+            )
+        table.pop(key, None)
+        table[key] = ExporterFlag(key, value, token)
+    return table
+
+
+_DOUBLE_DASH = (
+    "{model}: litetune refuses '--': Fire hands every argument after a bare '--' to its own "
+    "options and drops what they do not name (`fire/parser.py:39-56`, `fire/core.py:121-124`), "
+    "so litetune's own flags after it would never reach the exporter"
+)
+
+_POSITIONAL = (
+    "{model}: litetune refuses {token!r}: Fire reads an argument that begins with neither two "
+    "hyphens nor a hyphen and a letter as a positional one (`fire/core.py:936-956`), and the "
+    "exporter would take it for its first parameter not yet given. Pass an exporter flag as "
+    "--flag=--name=value"
+)
 
 
 def exporter_value(text: str) -> object:
@@ -166,17 +243,17 @@ class RequiredFlag:
         """Whether the flag means anything without a value after `=`."""
         return self.value is not None or bool(self.value_unknown)
 
-    def satisfied_by(self, flags: Sequence[str]) -> str | None:
-        """The caller's own form of this flag, if they passed one.
+    def satisfied_by(self, table: dict[str, ExporterFlag]) -> ExporterFlag | None:
+        """The caller's own setting of this flag, if they passed one.
 
-        Matched on the flag *name*, as `flag_key` reads it, so a caller who
-        supplied their own value has satisfied the requirement with it. Their
-        value wins: litetune knows this flag is needed, and does not know better
-        than the caller which template their checkpoint was trained against.
-        When the name appears more than once, the last is the one the exporter
-        acts on (`effective_flag`), and so the one returned.
+        Looked up by keyword in `parse_exporter_flags`' table, so a caller who
+        supplied their own value, in any spelling Fire reads as this keyword,
+        has satisfied the requirement with the value the exporter will get.
+        Their value wins: litetune knows this flag is needed, and does not know
+        better than the caller which template their checkpoint was trained
+        against.
         """
-        return effective_flag(flags, self.name)
+        return table.get(flag_key(self.name))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -195,11 +272,12 @@ class ForbiddenFlag:
     value: str | None
     reason: str
 
-    def matches(self, flag: str) -> bool:
-        """Whether `flag` is this one, its value compared as the exporter reads it."""
-        if flag_key(flag) != flag_key(self.name):
+    def matches(self, flag: ExporterFlag) -> bool:
+        """Whether `flag` sets this one, to this value or, with none named, to any
+        the exporter acts on (a falsy override is none to it)."""
+        if flag.name != flag_key(self.name):
             return False
-        return self.value is None or exporter_value(flag.partition("=")[2]) == self.value
+        return bool(flag.value) if self.value is None else flag.value == self.value
 
     @property
     def rendered(self) -> str:
@@ -344,12 +422,19 @@ _TEMPLATE_VARIANT_UNKNOWN = (
     "model id, or pass --flag=--jinja_chat_template_override=<repo> to convert yourself"
 )
 
-# Measured: the flag leaves `generic_model` set *and* skips the Gemma 4 metadata
-# builder, so it produces a generic-model artifact with no Gemma 4 metadata.
+# Measured when litetune 0.1.0a1 pinned an earlier litert-torch nightly: the
+# value `gemma4` left `generic_model` set *and* skipped the Gemma 4 metadata
+# builder. In litert-torch-nightly 0.10.0.dev20260926, pinned now, `gemma4` does
+# select the gemma4 type (`litert_lm_builder.py:368-371`), but the
+# model-specific metadata builder -- Gemma 4's, for a Gemma 4 config
+# (`model_ext/metadata_builder.py:32-35`) -- runs only when there is no override
+# at all (`litert_lm_builder.py:379-387`). So every value the exporter acts on is
+# refused, not only `gemma4`.
 _TYPE_OVERRIDE_REASON = (
-    "--litert_lm_model_type_override=gemma4 does the opposite of what its name suggests: it leaves "
-    "generic_model set *and* skips the Gemma 4 metadata builder, so the artifact is written as a "
-    "generic model with none of the metadata the flag appears to request. litetune refuses it "
+    "--litert_lm_model_type_override does the opposite of what it suggests on Gemma 4: whatever "
+    "its value, the exporter then skips the Gemma 4 metadata builder, which it runs only when "
+    "there is no override, so the artifact has none of the Gemma 4 metadata. With gemma4 it was "
+    "measured, on an earlier exporter, to leave generic_model set as well. litetune refuses it "
     "rather than dropping it silently, because a dropped flag reads as an applied one"
 )
 
@@ -471,7 +556,7 @@ def _gemma4(family: str, patterns: tuple[str, ...], override_repo: str | None) -
         forbidden_flags=(
             ForbiddenFlag(
                 name="--litert_lm_model_type_override",
-                value="gemma4",
+                value=None,
                 reason=_TYPE_OVERRIDE_REASON,
             ),
         ),
@@ -588,8 +673,9 @@ _TEXT_PARTS_REASON = (
     "AutoTokenizer on the model being converted, and hands the exporter that template, "
     "unchanged, behind a block that turns a list of text parts back into the string, then "
     "reads each bundle's template back -- so a checkpoint this rule claims keeps its own "
-    "template, or no bundle is handed over: one that does not carry it is renamed with a "
-    "'.refused' suffix. It refuses a template the block is not for: one that, "
+    "template, or no bundle is handed over: one that does not carry it fails its recipe, and "
+    "litetune tries to rename it with a '.refused' suffix, naming the path it ends up at. It "
+    "refuses a template the block is not for: one that, "
     "rendered by transformers' Jinja2 rather than the runtime, does not print a one-message "
     "conversation given as parts behind the block as it prints the same message as a string. "
     "verify's rendering check is what checks the runtime, and it compares the single turn it "
@@ -1046,6 +1132,65 @@ def same_family(a: str | None, b: str | None) -> bool:
     return left is not None and right is not None and left.family == right.family
 
 
+# transformers 5.16.1's `AUTO_QUANTIZATION_CONFIG_MAPPING` (`quantizers/auto.py:
+# 107-134`): the methods it loads as pre-quantized.
+_PRE_QUANTIZED_METHODS = frozenset(
+    {
+        "awq",
+        "bitsandbytes_4bit",
+        "bitsandbytes_8bit",
+        "eetq",
+        "gptq",
+        "aqlm",
+        "quanto",
+        "quark",
+        "fouroversix",
+        "fp_quant",
+        "hqq",
+        "compressed-tensors",
+        "fbgemm_fp8",
+        "higgs",
+        "torchao",
+        "bitnet",
+        "vptq",
+        "spqr",
+        "fp8",
+        "nvfp4",
+        "mxfp8",
+        "auto-round",
+        "mxfp4",
+        "metal",
+        "sinq",
+        "gemma",
+    }
+)
+
+
+def _pre_quantized(config: dict[str, Any]) -> bool:
+    """Whether transformers 5.16.1 loads this `config.json`'s weights as pre-quantized.
+
+    `get_hf_quantizer` (`quantizers/auto.py:334-340`) takes the config's
+    `quantization_config`, or else its text config's -- the config itself when
+    it has no sub-config -- and counts it only when `supports_quant_method`
+    (`:282-299`) knows its method: `load_in_4bit`/`load_in_8bit` name
+    bitsandbytes, an unknown method is skipped with a warning and the weights
+    load as they are. A config with no method -- `{}` among them, since an empty
+    one falls through to the text config, which for a plain config is itself,
+    and is then not None -- makes transformers raise, which is the exporter's
+    failure to report, not a repack to turn away.
+    """
+    text_config = config.get("text_config")
+    params = config.get("quantization_config") or (
+        text_config.get("quantization_config") if isinstance(text_config, dict) else None
+    )
+    if not isinstance(params, dict) or not params:
+        return False
+    method: object = params.get("quant_method")
+    if params.get("load_in_8bit", False) or params.get("load_in_4bit", False):
+        method = "bitsandbytes_4bit" if params.get("load_in_4bit", False) else "bitsandbytes_8bit"
+    return isinstance(method, str) and method in _PRE_QUANTIZED_METHODS
+
+
 def hint_for(model: str) -> ModelHint:
     """The text `identify` matches against: the model id, plus a local checkpoint."""
     path = Path(model)
@@ -1095,10 +1240,7 @@ def hint_for(model: str) -> ModelHint:
             values.extend(str(item) for item in value)
     extra = tuple(values)
     text = "-".join([normalised, *(_normalise(v) for v in extra)])
-    text_config = data.get("text_config")
-    quantized = data.get("quantization_config") is not None or (
-        isinstance(text_config, dict) and text_config.get("quantization_config") is not None
-    )
+    quantized = _pre_quantized(data)
     return ModelHint(
         model=model,
         text=text,
@@ -1282,6 +1424,12 @@ class ExportPlan:
     notes: tuple[str, ...] = ()
     recommendations: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
+    # What `flags` set, keyword by keyword, as `parse_exporter_flags` reads them.
+    table: tuple[ExporterFlag, ...] = ()
+
+    def setting(self, name: str) -> ExporterFlag | None:
+        """What the exporter will get for this flag, if the plan sets it."""
+        return next((f for f in self.table if f.name == flag_key(name)), None)
 
     @property
     def outcome(self) -> Outcome:
@@ -1317,25 +1465,31 @@ def plan_export(
 ) -> ExportPlan:
     """Work out the flags this model's export must carry.
 
-    Raises `FlagRefused` for a flag that must never be passed. Everything else
-    is reported: a flag litetune added is named with its reason, and a required
-    flag whose value it cannot determine makes the plan unusable rather than
-    guessed at.
+    Raises `FlagRefused` for a flag that must never be passed, or that the
+    exporter would read otherwise than litetune can say (`parse_exporter_flags`).
+    Everything else is reported: a flag litetune added is named with its reason,
+    and a required flag whose value it cannot determine makes the plan unusable
+    rather than guessed at. Every decision reads the parsed table, and `flags`
+    is that table, one token per keyword: what the exporter is given.
     """
     hint = hint_for(model)
     rules = rules_for_hint(hint)
-    flags = list(dict.fromkeys(requested_flags))
+    table = parse_exporter_flags(model, requested_flags)
 
     if rules is None:
         return ExportPlan(
             model=model,
             hint=hint,
             rules=None,
-            flags=tuple(flags),
+            flags=tuple(f.token for f in table.values()),
             notes=(UNKNOWN_FAMILY,),
+            table=tuple(table.values()),
         )
 
-    _refuse_forbidden(model, rules, flags)
+    for forbidden in rules.forbidden_flags:
+        setting = table.get(flag_key(forbidden.name))
+        if setting is not None and forbidden.matches(setting):
+            raise FlagRefused(f"{model}: litetune refuses {setting.token!r}. {forbidden.reason}")
 
     added: list[str] = []
     notes: list[str] = []
@@ -1343,27 +1497,31 @@ def plan_export(
     limitations = list(rules.limitations)
     composes = False
     for required in rules.required_flags:
-        supplied = required.satisfied_by(flags)
+        supplied = required.satisfied_by(table)
         if supplied is not None and required.takes_value:
             _refuse_unusable_value(model, supplied, required.name)
         if supplied is not None and required.value == COMPOSED_TEMPLATE:
-            limitations.append(_CALLER_TEMPLATE.format(flag=supplied))
+            limitations.append(_CALLER_TEMPLATE.format(flag=supplied.shown))
         if supplied is not None:
             wanted = required.rendered
-            detail = f"{supplied} was supplied by the caller"
-            if wanted is not None and supplied != wanted:
+            detail = f"{supplied.shown} was supplied by the caller"
+            if wanted is not None and supplied.shown != wanted:
                 # Their value, not litetune's: the caller may have trained
                 # against a template litetune has never seen. Recorded, because
                 # a difference here is invisible in the artifact.
                 detail = (
-                    f"{supplied} was supplied by the caller; litetune would have used {wanted}. "
-                    "The caller's value was kept"
+                    f"{supplied.shown} was supplied by the caller; litetune would have used "
+                    f"{wanted}. The caller's value was kept"
                 )
             checks.append(
                 Check.passed(
                     EXPORT_FLAGS_CHECK,
                     f"{rules.family}: {detail}",
-                    observed={"flag": supplied, "family": rules.family},
+                    observed={
+                        "flag": supplied.shown,
+                        "token": supplied.token,
+                        "family": rules.family,
+                    },
                 )
             )
             continue
@@ -1381,7 +1539,7 @@ def plan_export(
             continue
 
         composes = composes or required.value == COMPOSED_TEMPLATE
-        flags.append(rendered)
+        table.update(parse_exporter_flags(model, [rendered]))
         added.append(rendered)
         notes.append(f"added {rendered}: {required.reason}")
         checks.append(
@@ -1396,12 +1554,10 @@ def plan_export(
     # either way the template reaches the bundle only through the metadata the
     # exporter builds, and an override of its own takes that metadata's place.
     if any(required.value == COMPOSED_TEMPLATE for required in rules.required_flags):
-        override = effective_flag(flags, METADATA_OVERRIDE_FLAG)
-        if override is not None and (
-            "=" not in override or exporter_value(override.split("=", 1)[1])
-        ):
+        override = table.get(flag_key(METADATA_OVERRIDE_FLAG))
+        if override is not None and override.value:
             reason = _METADATA_OVERRIDE_REASON if composes else _METADATA_OVERRIDE_OWN_REASON
-            raise FlagRefused(f"{model}: litetune refuses {override!r}. {reason}")
+            raise FlagRefused(f"{model}: litetune refuses {override.token!r}. {reason}")
 
     recommendations: list[str] = []
     if rules.recommended_recipes and recipes:
@@ -1416,37 +1572,22 @@ def plan_export(
         model=model,
         hint=hint,
         rules=rules,
-        flags=tuple(flags),
+        flags=tuple(f.token for f in table.values()),
         added=tuple(added),
         checks=tuple(checks),
         notes=tuple(notes),
         recommendations=tuple(recommendations),
         limitations=tuple(limitations),
+        table=tuple(table.values()),
     )
 
 
-def _refuse_forbidden(model: str, rules: ModelRules, flags: Sequence[str]) -> None:
-    """Raise `FlagRefused` for a forbidden flag in the form the exporter acts on."""
-    for forbidden in rules.forbidden_flags:
-        flag = effective_flag(flags, forbidden.name)
-        if flag is None:
-            continue
-        if forbidden.value is not None and "=" not in flag:
-            # A value in the next argument may be the forbidden one.
-            raise FlagRefused(_split_value(model, flag, forbidden.name))
-        if forbidden.matches(flag):
-            raise FlagRefused(f"{model}: litetune refuses {flag!r}. {forbidden.reason}")
-
-
-def _refuse_unusable_value(model: str, flag: str, name: str) -> None:
+def _refuse_unusable_value(model: str, flag: ExporterFlag, name: str) -> None:
     """Raise `FlagRefused` for a value-bearing flag the exporter would get no value from."""
-    if "=" not in flag:
-        raise FlagRefused(_split_value(model, flag, name))
-    value = exporter_value(flag.split("=", 1)[1])
-    if not (isinstance(value, str) and value):
+    if not (isinstance(flag.value, str) and flag.value):
         raise FlagRefused(
-            f"{model}: litetune refuses {flag!r}. The exporter reads its value as {value!r}, "
-            f"{_UNUSABLE_VALUE.format(name=name)}"
+            f"{model}: litetune refuses {flag.token!r}. The exporter reads its value as "
+            f"{flag.value!r}, {_UNUSABLE_VALUE.format(name=name)}"
         )
 
 
@@ -1454,8 +1595,8 @@ def _split_value(model: str, flag: str, name: str) -> str:
     return (
         f"{model}: litetune refuses {flag!r} without a value in the same argument. Fire, which "
         "reads the exporter's command line, takes the next argument as its value when that "
-        "argument is not a flag and True otherwise (`fire/core.py:876-921`), and litetune checks "
-        f"a value only where it can see it: pass --flag={name}=<value>"
+        "argument is not a flag (`fire/core.py:876-921`), and litetune passes each flag on as "
+        f"one argument: pass --flag={name}=<value>"
     )
 
 
@@ -1499,10 +1640,14 @@ _METADATA_OVERRIDE_OWN_REASON = (
 
 def refuse_forbidden_flags(model: str, flags: Sequence[str]) -> None:
     """Raise `FlagRefused` if any flag must never be passed for this model."""
+    table = parse_exporter_flags(model, flags)
     rules = identify(model)
     if rules is None:
         return
-    _refuse_forbidden(model, rules, flags)
+    for forbidden in rules.forbidden_flags:
+        setting = table.get(flag_key(forbidden.name))
+        if setting is not None and forbidden.matches(setting):
+            raise FlagRefused(f"{model}: litetune refuses {setting.token!r}. {forbidden.reason}")
 
 
 # ---------------------------------------------------------------------------

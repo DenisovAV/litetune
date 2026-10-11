@@ -32,6 +32,8 @@ from litetune.export import (
     COMPOSED_TEMPLATE_PREFIX,
     KNOWN_RECIPES,
     MEASURED_RECIPES,
+    NO_ARTIFACT,
+    NOT_VERIFIED,
     PROBE_TEXT,
     TOOLCHAIN_DEFAULT_RECIPE,
     ExportRequest,
@@ -137,8 +139,11 @@ class FakeToolchain:
     hub_fault: str = ""  # how the Hub download fails instead, when it does
     render_raises: str = ""  # an ImportError the fake renderer raises, as transformers can
     # The end offsets the fake bundle's header gives its sections; by default
-    # one section ending at the end of the file.
+    # one section ending at the end of the file. `repack_header_raises` makes
+    # the header reader raise that message, as the real one does on a wrong magic.
     repack_section_ends: list[int] | None = None
+    repack_header_raises: str = ""
+    bundle_header_end: int | None = None  # what the exporter fake writes at byte 24
     # What the exporter embeds as the bundle's template, and how a test changes it.
     embedded: dict[str, str | None] = field(default_factory=dict)
     template_embedded: Callable[[str | None], str | None] | None = None
@@ -167,7 +172,11 @@ class FakeToolchain:
         if self.template_embedded is not None:
             template = self.template_embedded(template)
         for name, size in run.writes:
-            (out_dir / name).write_bytes(b"\0" * size)
+            body = bytearray(size)
+            if self.bundle_header_end is not None and size >= 32:
+                # Where a bundle names its header's end (`litertlm_core.py`: byte 24).
+                body[24:32] = self.bundle_header_end.to_bytes(8, "little")
+            (out_dir / name).write_bytes(bytes(body))
             self.embedded[str((out_dir / name).absolute())] = template
         return subprocess.CompletedProcess(args, run.returncode, run.stdout, run.stderr)
 
@@ -243,8 +252,12 @@ class FakeToolchain:
             encoding="utf-8",
         )
         (shim / "litertlm_peek.py").write_text(
-            f"SECTION_ENDS = {self.repack_section_ends!r}\n" + FAKE_PEEK_HEADER, encoding="utf-8"
+            f"SECTION_ENDS = {self.repack_section_ends!r}\n"
+            f"HEADER_RAISES = {self.repack_header_raises!r}\n" + FAKE_PEEK_HEADER,
+            encoding="utf-8",
         )
+        # The real layout constant (`litertlm_core.py`): where a bundle names its header's end.
+        (shim / "litertlm_core.py").write_text("HEADER_END_LOCATION_BYTE_OFFSET = 24\n")
         # The builder's own proto and protobuf's text format, which the script
         # imports to read the LlmMetadata text `unpack` wrote.
         for package, module, source in (
@@ -449,6 +462,8 @@ class _Header:
 
 
 def read_litertlm_header(path, output_stream):
+    if HEADER_RAISES:
+        raise ValueError(HEADER_RAISES)
     return _Header(SECTION_ENDS if SECTION_ENDS is not None else [os.path.getsize(path)])
 """
 
@@ -2220,10 +2235,25 @@ def test_an_empty_string_template_falls_back_as_the_exporter_does(toolchain, qwe
     assert _chat_template_check(result).observed["template_source"] == "chat_template.json"
 
 
-def test_a_local_chat_template_json_that_cannot_be_opened_is_could_not_check(toolchain, tmp_path):
-    """Not a missing file: the file system would not let it be read."""
+@pytest.mark.parametrize(
+    ("make", "says"),
+    [
+        (lambda path: path.mkdir(), "could not be used (IsADirectoryError"),
+        (
+            lambda path: path.write_bytes(b'{"chat_template": "\xe9"}'),
+            "could not be used (UnicodeDecodeError",
+        ),
+    ],
+    ids=["a-directory", "not-utf-8"],
+)
+def test_what_a_local_checkpoint_holds_at_chat_template_json_is_its_own(
+    toolchain, tmp_path, make, says
+):
+    """The exporter reads the path and goes on with no template whatever it finds
+    there (`export_lib.py:396-404`): a fact about the checkpoint, not the machine."""
     checkpoint = tmp_path / "Qwen3-0.6B"
-    (checkpoint / "chat_template.json").mkdir(parents=True)
+    checkpoint.mkdir()
+    make(checkpoint / "chat_template.json")
     toolchain.chat_template = None
     result = run_export(
         ExportRequest(
@@ -2231,8 +2261,31 @@ def test_a_local_chat_template_json_that_cannot_be_opened_is_could_not_check(too
         )
     )
     check = _chat_template_check(result)
+    assert check.outcome is Outcome.FAILED
+    assert says in check.detail
+
+
+def test_a_local_chat_template_json_the_machine_will_not_open_is_could_not_check(
+    toolchain, tmp_path
+):
+    """Not a missing file and not the checkpoint's: the file system would not let it be read."""
+    checkpoint = tmp_path / "Qwen3-0.6B"
+    checkpoint.mkdir()
+    locked = checkpoint / "chat_template.json"
+    locked.write_text("{}", encoding="utf-8")
+    locked.chmod(0)
+    toolchain.chat_template = None
+    try:
+        result = run_export(
+            ExportRequest(
+                model=str(checkpoint), output_dir=tmp_path / "out", recipes=("dynamic_wi8_afp32",)
+            )
+        )
+    finally:
+        locked.chmod(0o644)
+    check = _chat_template_check(result)
     assert check.outcome is Outcome.UNCHECKED
-    assert "could not be looked up (IsADirectoryError" in check.detail
+    assert "could not be looked up (PermissionError" in check.detail
 
 
 # -- the probe: each condition on its own ------------------------------------
@@ -2563,6 +2616,42 @@ def test_a_bundle_cut_short_fails_whatever_the_family(toolchain, tmp_path, model
     assert result.outcome is Outcome.FAILED
 
 
+@pytest.mark.parametrize("model", [QWEN3, "google/functiongemma-270m-it"])
+@pytest.mark.parametrize(
+    ("knobs", "size", "says"),
+    [
+        (
+            {"repack_header_raises": "Invalid magic number: b'xxxxxxxx'"},
+            4096,
+            "its header cannot be read (ValueError: Invalid magic number",
+        ),
+        (
+            {"bundle_header_end": 1 << 20},
+            4096,
+            "its header ends at byte 1,048,576, past the end of the 4,096-byte file",
+        ),
+        ({}, 20, "the 20-byte file is cut short inside its header"),
+    ],
+    ids=["bad-magic", "header-past-the-end", "cut-inside-the-header"],
+)
+def test_a_bundle_whose_header_is_unsound_fails_whatever_the_family(
+    toolchain, tmp_path, model, knobs, size, says
+):
+    """The builder writes the header last (`litertlm_builder.py` `_build_sections`),
+    so a bundle cut short or never finished may have none to read."""
+    for name, value in knobs.items():
+        setattr(toolchain, name, value)
+    toolchain.default = RecipeRun(writes=(("model.litertlm", size),))
+    result = run_export(
+        ExportRequest(model=model, output_dir=tmp_path / "out", recipes=("dynamic_wi8_afp32",))
+    )
+    (export,) = result.exports
+    assert export.check.outcome is Outcome.FAILED
+    assert says in export.check.detail
+    assert (tmp_path / "out" / "dynamic_wi8_afp32" / "model.litertlm.refused").is_file()
+    assert NOT_VERIFIED not in result.limitations, "no artifact for it to be about"
+
+
 def test_a_bundle_whose_sections_end_at_its_size_is_whole(toolchain, qwen_request):
     toolchain.repack_section_ends = [1024, 4096]
     (export,) = run_export(qwen_request(recipes=("dynamic_wi8_afp32",))).exports
@@ -2668,6 +2757,52 @@ def test_a_recipe_that_raises_records_the_argv_it_was_given(monkeypatch, toolcha
     assert result.chat_template is not None
     path = result.chat_template.path
     assert _template_flags(export.argv) == [f"{models.TEMPLATE_FLAG}={path}"]
+
+
+@pytest.mark.parametrize(
+    ("flag", "source", "carried"),
+    [
+        ("--noexternalize_embedder", "caller opted out", False),
+        ("--externalize-embedder=False", "caller opted out", False),
+        ("--externalize_embedder", "caller", True),
+    ],
+)
+def test_externalize_embedder_is_read_off_the_parsed_flags(request_for, flag, source, carried):
+    """A caller's own setting, in any spelling Fire reads, is theirs: the default
+    is added only where nothing set it."""
+    request = request_for(MEASURED_RECIPES, extra_flags=(flag,))
+    argv = request.argv("dynamic_wi8_afp32")
+    assert request.externalize_source == source
+    assert request.as_dict()["externalize_embedder"] is carried
+    assert flag in argv
+    assert ("--externalize_embedder" in argv) is (flag == "--externalize_embedder")
+
+
+def test_the_argv_sets_each_keyword_once_and_none_of_litetunes_three(request_for):
+    """`ExportRequest.argv` checks what the plan promises."""
+    request = request_for(MEASURED_RECIPES)
+    duplicated = (*request.extra_flags, "--externalize-embedder")
+    object.__setattr__(request, "extra_flags", duplicated)
+    with pytest.raises(ValueError, match="more than once"):
+        request.argv("dynamic_wi8_afp32")
+    object.__setattr__(request, "extra_flags", (*duplicated[:-1], "--model=other"))
+    with pytest.raises(ValueError, match="Use --model"):
+        request.argv("dynamic_wi8_afp32")
+
+
+def test_a_refusal_before_export_claims_no_artifact(toolchain, qwen_request):
+    toolchain.chat_template = None
+    result = run_export(qwen_request())
+    assert result.artifacts == []
+    assert NOT_VERIFIED not in result.limitations
+    assert result.as_dict()["unverified_reason"] == NO_ARTIFACT
+
+
+def test_an_export_with_an_artifact_says_it_is_not_verified(toolchain, request_for):
+    result = run_export(request_for(("dynamic_wi8_afp32",)))
+    assert result.artifacts
+    assert result.limitations[0] == NOT_VERIFIED
+    assert result.as_dict()["unverified_reason"] == NOT_VERIFIED
 
 
 def test_a_composing_plan_given_no_template_is_recorded_not_raised(qwen_request):

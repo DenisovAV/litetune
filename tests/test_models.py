@@ -786,6 +786,36 @@ def test_a_local_checkpoint_with_a_quantization_config_is_not_claimed(tmp_path, 
     assert identify(checkpoint) is None
 
 
+@pytest.mark.parametrize(
+    ("quantization", "quantized"),
+    [
+        ({"quant_method": "gptq", "bits": 4}, True),
+        ({"load_in_8bit": True}, True),
+        # transformers skips a method it does not know and loads the weights as
+        # they are (`quantizers/auto.py:292-298`) ...
+        ({"quant_method": "unknown"}, False),
+        # ... and raises on a config with none, `{}` included: the exporter's
+        # failure to report, not a repack (`:287-290`, `:334-340`).
+        ({}, False),
+        ({"bits": 4}, False),
+        ("not a mapping", False),
+        ({"quant_method": ["gptq"]}, False),
+    ],
+    ids=["gptq", "bnb-8bit", "unknown", "empty", "no-method", "not-a-mapping", "unhashable"],
+)
+def test_a_local_checkpoint_is_a_repack_only_as_transformers_would_load_it(
+    tmp_path, quantization, quantized
+):
+    config = {
+        "model_type": "qwen3",
+        "architectures": ["Qwen3ForCausalLM"],
+        "quantization_config": quantization,
+    }
+    checkpoint = _local_checkpoint(tmp_path, config, "Qwen/Qwen3-0.6B")
+    assert models.hint_for(checkpoint).quantized is quantized
+    assert (identify(checkpoint) is None) is quantized
+
+
 def test_a_qwen25_checkpoint_whose_config_names_its_source_is_claimed(tmp_path):
     """`hint_for` folds `_name_or_path` in between `model_type` and the
     architecture, so the tail must match at the `model_type`."""
@@ -1102,10 +1132,18 @@ def test_the_gemma4_type_override_is_refused_in_every_spelling(spelling):
         plan_export(GEMMA4_E2B, (spelling,), ())
 
 
-def test_a_forbidden_value_is_compared_as_a_value():
-    """`function_gemma` is not `gemma4`, whatever the spelling of the name."""
-    plan = plan_export(GEMMA4_E2B, ("--litert-lm-model-type-override=function_gemma",), ())
-    assert "--litert-lm-model-type-override=function_gemma" in plan.flags
+@pytest.mark.parametrize("value", ["gemma4", "function_gemma", "generic", "1"])
+def test_every_model_type_override_is_refused_for_gemma4(value):
+    """Any override the exporter acts on skips the Gemma 4 metadata builder: it
+    runs only when there is none (`litert_lm_builder.py:379-387`)."""
+    with pytest.raises(FlagRefused, match="does the opposite"):
+        plan_export(GEMMA4_E2B, (f"--litert-lm-model-type-override={value}",), ())
+
+
+def test_a_falsy_model_type_override_is_none_to_the_exporter():
+    """`if not litert_lm_model_type_override` (`litert_lm_builder.py:380`): no override."""
+    plan = plan_export(GEMMA4_E2B, ("--litert_lm_model_type_override=''",), ())
+    assert "--litert_lm_model_type_override=''" in plan.flags
 
 
 @pytest.mark.parametrize("model", ["Qwen/Qwen3-0.6B", GEMMA4_E2B, "google/gemma-4-it"])
@@ -1130,19 +1168,17 @@ def test_a_value_fire_reads_as_no_string_is_refused(value):
         plan_export("Qwen/Qwen3-0.6B", (f"--jinja_chat_template_override={value}",), ())
 
 
-@pytest.mark.parametrize(
-    "flags",
-    [
-        ("--jinja_chat_template_override",),
-        ("--jinja_chat_template_override", "mine.jinja"),
-    ],
-    ids=["bare", "two-token"],
-)
-def test_a_value_in_the_next_argument_is_refused_with_the_form_to_use(flags):
-    """Fire takes the next argument as the value, or True when there is none
-    (`fire/core.py:876-921`); litetune checks a value only in the same argument."""
+def test_a_value_in_the_next_argument_is_refused_with_the_form_to_use():
+    """Fire takes the next argument as the value when it is not a flag
+    (`fire/core.py:876-921`); litetune passes each flag on as one argument."""
     with pytest.raises(FlagRefused, match="pass --flag=--jinja_chat_template_override=<value>"):
-        plan_export("Qwen/Qwen3-0.6B", flags, ())
+        plan_export("Qwen/Qwen3-0.6B", ("--jinja_chat_template_override", "mine.jinja"), ())
+
+
+def test_a_valueless_template_flag_is_true_to_the_exporter_and_refused():
+    """With no next argument, or a flag next, Fire reads it as True (`:902-912`)."""
+    with pytest.raises(FlagRefused, match="reads its value as True"):
+        plan_export("Qwen/Qwen3-0.6B", ("--jinja_chat_template_override",), ())
 
 
 @pytest.mark.parametrize(
@@ -1186,19 +1222,137 @@ def test_a_quoted_forbidden_value_is_refused_as_the_bare_one(flag):
 
 
 def test_a_forbidden_flag_is_judged_by_its_last_occurrence():
-    refused = (
-        "--litert_lm_model_type_override=function_gemma",
-        "--litert-lm-model-type-override=gemma4",
-    )
+    refused = ("--litert_lm_model_type_override=''", "--litert-lm-model-type-override=gemma4")
     with pytest.raises(FlagRefused, match="does the opposite"):
         plan_export(GEMMA4_E2B, refused, ())
+    # The other way round the last is empty, which is no override to the
+    # exporter, and it is the one argument passed on.
     kept = tuple(reversed(refused))
-    assert plan_export(GEMMA4_E2B, kept, ()).flags[:2] == kept
+    flags = plan_export(GEMMA4_E2B, kept, ()).flags
+    assert "--litert_lm_model_type_override=''" in flags
+    assert "--litert-lm-model-type-override=gemma4" not in flags
 
 
 def test_a_forbidden_flag_with_its_value_in_the_next_argument_is_refused():
     with pytest.raises(FlagRefused, match="pass --flag=--litert_lm_model_type_override=<value>"):
         plan_export(GEMMA4_E2B, ("--litert_lm_model_type_override", "gemma4"), ())
+
+
+# -- one parse of the caller's exporter flags, as Fire reads them ------------
+
+
+QWEN3 = "Qwen/Qwen3-0.6B"
+
+
+@pytest.mark.parametrize(
+    ("flags", "says"),
+    [
+        (("jinja_chat_template_override=/mine.jinja",), "as a positional one"),
+        (("-",), "as a positional one"),
+        (("-1",), "as a positional one"),
+        (("--jinja_chat_template_override=/x.jinja", "--", "--y=1"), "after a bare '--'"),
+        (("--=x",), "it names no keyword"),
+        (("--model=Qwen/Qwen2.5-0.5B-Instruct",), "Use --model"),
+        (("-output-dir=/tmp/elsewhere",), "Use --output-dir"),
+        (("--quantization_recipe=dynamic_wi4_afp32",), "Use --recipe"),
+        (("--jinja_chat_template_override", "mine.jinja"), "pass --flag="),
+    ],
+    ids=[
+        "no-hyphen",
+        "dash",
+        "negative-number",
+        "double-dash",
+        "no-name",
+        "model",
+        "output-dir",
+        "recipe",
+        "two-token",
+    ],
+)
+def test_a_flag_fire_would_read_otherwise_is_refused(flags, says):
+    """Fire's `_IsFlag` (`fire/core.py:936-956`), its bare `--` (`fire/parser.py:39-56`)
+    and its last-one-wins assignment (`:925`), which would let a caller's token
+    replace litetune's own `--model`, `--output_dir` or `--quantization_recipe`."""
+    for model in (QWEN3, "meta-llama/Llama-3.2-1B"):
+        with pytest.raises(FlagRefused, match=re.escape(says)):
+            plan_export(model, flags, ())
+
+
+@pytest.mark.parametrize(
+    ("flags", "effective"),
+    [
+        (
+            (
+                "--jinja_chat_template_override=/a.jinja",
+                "--jinja-chat-template-override=/b.jinja",
+                "--jinja_chat_template_override=/a.jinja",
+            ),
+            "--jinja_chat_template_override=/a.jinja",
+        ),
+        (
+            (
+                "--jinja_chat_template_override=/b.jinja",
+                "--jinja_chat_template_override=/a.jinja",
+                "--jinja-chat-template-override=/b.jinja",
+            ),
+            "--jinja-chat-template-override=/b.jinja",
+        ),
+    ],
+    ids=["a-b-a", "b-a-b"],
+)
+def test_the_exporter_is_given_one_argument_per_keyword_the_last(flags, effective):
+    """What litetune reasons about is what the exporter is handed: the token in
+    effect, once."""
+    plan = plan_export(QWEN3, flags, ())
+    assert plan.flags == (effective,)
+
+
+@pytest.mark.parametrize(
+    ("flags", "outcome"),
+    [
+        (
+            ("--jinja_chat_template_override=/good.jinja", "--nojinja_chat_template_override"),
+            "False",
+        ),
+        (("--nojinja_chat_template_override", "--jinja_chat_template_override=/good.jinja"), None),
+    ],
+    ids=["no-last", "file-last"],
+)
+def test_a_valueless_no_prefix_sets_the_keyword_to_false(flags, outcome):
+    """`--no<name>` alone is `<name>=False` to Fire, given `export`'s `**kwargs`
+    (`fire/core.py:881-884`, `:902-912`); the exporter reads False as no override."""
+    if outcome is not None:
+        with pytest.raises(FlagRefused, match=f"reads its value as {outcome}"):
+            plan_export(QWEN3, flags, ())
+        return
+    plan = plan_export(QWEN3, flags, ())
+    assert plan.flags == ("--jinja_chat_template_override=/good.jinja",)
+    assert plan.added == ()
+
+
+def test_a_no_prefix_with_a_value_is_a_keyword_of_its_own():
+    """Only a valueless `--no<name>` is read as a negation (`fire/core.py:902-912`)."""
+    plan = plan_export(QWEN3, ("--nojinja_chat_template_override=/x.jinja",), ())
+    assert plan.setting("--nojinja_chat_template_override").value == "/x.jinja"
+    assert f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}" in plan.added
+
+
+def test_a_hyphenated_no_prefix_negates_the_keyword_fire_makes_of_it():
+    """Fire reads `-` as `_` before it looks for `no`, so `--no-x` sets `_x`."""
+    plan = plan_export(QWEN3, ("--no-jinja-chat-template-override",), ())
+    assert plan.setting("_jinja_chat_template_override").value is False
+    assert f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}" in plan.added
+
+
+def test_a_value_is_reported_as_the_exporter_will_get_it():
+    """`#` starts a comment to Fire's literal parse: the exporter is given `mine`."""
+    plan = plan_export(QWEN3, ("--jinja_chat_template_override=mine#v2.jinja",), ())
+    assert any(
+        "--jinja_chat_template_override=mine was passed" in text for text in plan.limitations
+    )
+    (check,) = plan.checks
+    assert check.observed["flag"] == "--jinja_chat_template_override=mine"
+    assert check.observed["token"] == "--jinja_chat_template_override=mine#v2.jinja"
 
 
 def test_the_value_fire_hands_the_exporter():

@@ -187,6 +187,8 @@ TOOLCHAIN_TIMEOUT_S = 60
 # exported ran anywhere else.
 CPU_ONLY_ENV = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": ""}
 
+NO_ARTIFACT = "no artifact was produced, so there is nothing to verify"
+
 NOT_VERIFIED = (
     "export produced this artifact and nothing has been run against it: liveness is not "
     "established and quality is unmeasured. A file of the right size that loads without "
@@ -462,7 +464,7 @@ class ExportRequest:
 
         requested = list(self.extra_flags)
         if self.externalize_embedder is True:
-            requested.append("--externalize_embedder")
+            requested.append(EXTERNALIZE_FLAG)
         # Raises `models.FlagRefused` for a flag that must never be passed for
         # this family, and adds the ones it cannot export without. A plan whose
         # required flags could not be resolved is *kept*, not raised on: it is
@@ -489,17 +491,21 @@ class ExportRequest:
         object.__setattr__(self, "_identity_conflict", conflict)
         plan = models.plan_export(identity, requested, self.recipes)
         flags = list(plan.flags)
-        source = "caller"
-        if self.externalize_embedder is None:
-            source = "litetune default"
-            if not any(
-                f == EXTERNALIZE_FLAG or f.startswith(f"{EXTERNALIZE_FLAG}=") for f in flags
-            ):
-                flags.append(EXTERNALIZE_FLAG)
+        # Read off the plan's table, as the exporter will read it: a caller's
+        # `--noexternalize_embedder` or `--externalize-embedder=False` is theirs,
+        # and the default is added only where nothing set it.
+        setting = plan.setting(EXTERNALIZE_FLAG)
+        if setting is not None:
+            externalized = bool(setting.value)
+            source = "caller" if externalized else "caller opted out"
         elif self.externalize_embedder is False:
-            source = "caller opted out"
+            externalized, source = False, "caller opted out"
+        else:
+            flags.append(EXTERNALIZE_FLAG)
+            externalized, source = True, "litetune default"
         object.__setattr__(self, "extra_flags", tuple(flags))
         object.__setattr__(self, "_externalize_source", source)
+        object.__setattr__(self, "_externalized", externalized)
         object.__setattr__(self, "_plan", plan)
 
     @property
@@ -561,6 +567,10 @@ class ExportRequest:
         leftover = [f for f in flags if models.COMPOSED_TEMPLATE in f]
         if leftover:
             raise ValueError(f"{self.model}: {leftover} would hand the exporter the marker")
+        # One argument per keyword, none of them litetune's own three: the plan
+        # is built so, and this is where a change that broke it would show.
+        if len(models.parse_exporter_flags(self.model, flags)) != len(flags):
+            raise ValueError(f"{self.model}: {flags} set a keyword more than once")
         return [
             "litert-torch",
             "export_hf",
@@ -581,7 +591,7 @@ class ExportRequest:
             "base_model": self.base_model,
             "output_dir": str(self.output_dir),
             "recipes": list(self.recipes),
-            "externalize_embedder": EXTERNALIZE_FLAG in self.extra_flags,
+            "externalize_embedder": self._externalized,  # type: ignore[attr-defined]
             "externalize_embedder_source": self.externalize_source,
             "flags": list(self.extra_flags),
             "model_rules": self.plan.as_dict(),
@@ -840,6 +850,9 @@ def chat_template_json(model):
             text = handle.read()
     except FileNotFoundError as exc:
         return None, lookup("absent", where, exc)
+    except (IsADirectoryError, NotADirectoryError, UnicodeDecodeError) as exc:
+        # What the checkpoint holds at that path, not what the machine allows.
+        return None, lookup("unusable", where, exc)
     except OSError as exc:
         return None, lookup("unreachable", where, exc)
     try:
@@ -1332,6 +1345,7 @@ import copy
 import io
 import json
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -1341,6 +1355,7 @@ except ModuleNotFoundError:  # Python < 3.11: the builder itself depends on toml
     import tomli as tomllib
 
 from litert_lm_builder import litertlm_builder as lb
+from litert_lm_builder import litertlm_core
 from litert_lm_builder import litertlm_peek
 
 VOLATILE = {"uuid", "creation_timestamp"}
@@ -1467,14 +1482,30 @@ def report(declared=None, written=False, reason=None, broken=None):
 
 
 def past_the_end(path):
-    """The first section the header places past the end of the file, or None.
+    """Why the bundle is not whole, or None.
 
     `unpack` reads each section with one `read` of its length, which returns
     short at the end of a file and raises nothing (`litertlm_peek.py`), so a cut
     bundle would unpack, repack into a well-formed shorter one, and read back
-    whole. The header is read with the builder's own reader."""
-    header = litertlm_peek.read_litertlm_header(path, io.StringIO())
+    whole. So the header is checked first, with the builder's own reader and
+    its own layout (`litertlm_core.py`): a file too short to name where its
+    header ends, a header that ends past the file, one the reader refuses (a
+    wrong magic number, a cut header), and then each section's end."""
     size = os.path.getsize(path)
+    with open(path, "rb") as handle:
+        handle.seek(litertlm_core.HEADER_END_LOCATION_BYTE_OFFSET)
+        raw = handle.read(8)
+    if len(raw) < 8:
+        return f"the {size:,}-byte file is cut short inside its header"
+    header_end = struct.unpack("<Q", raw)[0]
+    if header_end > size:
+        return f"its header ends at byte {header_end:,}, past the end of the {size:,}-byte file"
+    try:
+        header = litertlm_peek.read_litertlm_header(path, io.StringIO())
+    except OSError:
+        raise
+    except Exception as exc:  # the builder's own reader refuses it
+        return f"its header cannot be read ({type(exc).__name__}: {exc})"
     sections = header.SectionMetadata()
     count = sections.ObjectsLength() if sections else 0
     for index in range(count):
@@ -1482,7 +1513,7 @@ def past_the_end(path):
         if end > size:
             return (
                 f"section {index} of {count} ends at byte {end:,}, past the end of the "
-                f"{size:,}-byte file: the bundle is cut short"
+                f"{size:,}-byte file"
             )
     return None
 
@@ -2201,7 +2232,7 @@ class ExportResult:
         return {
             "schema": EXPORT_SCHEMA,
             "verified": False,
-            "unverified_reason": NOT_VERIFIED,
+            "unverified_reason": NOT_VERIFIED if self.artifacts else NO_ARTIFACT,
             "outcome": self.outcome.value,
             "request": self.request.as_dict(),
             "toolchain": self.toolchain.as_dict(),
@@ -2229,8 +2260,6 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
         checks=CheckSet(name=f"export:{request.model}"),
         toolchain=Toolchain.unknown("not read yet", request.env.requirements),
     )
-    result.limitations.append(NOT_VERIFIED)
-
     # Two answers to "what is this", and no way to choose. Refused before any
     # work: exporting under either one produces a bundle whose family flags may
     # be wrong, and the check would say `passed` about it.
@@ -2505,6 +2534,10 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
             "passes fp32 itself and can still measure them on a GPU"
         )
 
+    if result.artifacts:
+        # Said only where there is an artifact for it to be about: a run that
+        # refused before exporting, or exported nothing usable, has none.
+        result.limitations.insert(0, NOT_VERIFIED)
     events.stage_finished(
         result.outcome.value,
         exported=len(result.succeeded),
