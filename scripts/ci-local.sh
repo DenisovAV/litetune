@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Run what CI runs, on the platform CI runs it on.
+# Run what CI runs on Linux, on the platform CI runs it on. CI's macOS job
+# (`macos-uv-python`) needs a Mac with uv: `uv venv --managed-python --python
+# 3.11.14 && uv pip install -e ".[dev]" && .venv/bin/pytest -q tests/test_envs.py`.
 #
 # This exists because a green local suite and a red CI run happened at the same
 # time, twice, on the same commit. The cause was not a flaky runner: `os.waitid`
@@ -97,4 +99,4 @@ case "${1:-all}" in
   wheel) wheel_job ;;
   *)     check_job "$1" ;;
 esac
-echo "==> everything CI runs, run here"
+echo "==> everything CI runs on Linux, run here (macos-uv-python: see the header)"

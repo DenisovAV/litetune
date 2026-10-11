@@ -2246,7 +2246,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             sink.append(
                 Check.unchecked(
                     ENV_CHECK,
-                    f"environment {request.env.name!r} is not provisioned at {request.env.path}",
+                    f"environment {request.env.name!r} {request.env.unready_detail}",
                     observed={"name": request.env.name, "identity": request.env.identity},
                 )
             )

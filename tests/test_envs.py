@@ -219,33 +219,116 @@ def test_an_unsupported_interpreter_is_refused_before_pip_runs(monkeypatch, tmp_
     assert started == [], "the refusal must come before pip, not after it"
 
 
-def test_environments_link_their_interpreter_outside_windows(monkeypatch, tmp_path):
+class _OsAs:
+    """`os` as envs sees it, with only `name` changed; pathlib keeps the real one."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+
+@pytest.mark.parametrize(("name", "linked"), [("posix", True), ("nt", False)])
+def test_environments_link_their_interpreter_outside_windows(monkeypatch, tmp_path, name, linked):
     """A copied interpreter cannot run where it finds libpython relative to itself.
 
-    `EnvBuilder` defaults to copying, unlike `python -m venv`. uv's CPython for
-    macOS links `@rpath/libpython3.11.dylib`; a copy in the environment's `bin/`
-    looked for it in the environment's `lib/`, `ensurepip` died in dyld, and
-    every stage was `could not check`. The real-build test below is what fails
-    under such an interpreter; this one pins the choice on every runner.
+    `EnvBuilder` defaults to copying, unlike `python -m venv`. The CPython
+    3.11.14 uv 0.10.6 installs on macOS links `@rpath/libpython3.11.dylib`; a
+    copy in the environment's `bin/` looked for it in the environment's `lib/`,
+    `ensurepip` died in dyld, and no environment could be built. Windows
+    keeps copies, venv's default there. Both halves are pinned here, on any
+    runner, by what the builder does rather than how it was called.
     """
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    built: list[dict] = []
-    real_init = envs.venv.EnvBuilder.__init__
+    built: list[tuple[bool, bool]] = []
 
-    def recording_init(self, *args, **kwargs):
-        built.append(dict(kwargs))
-        real_init(self, *args, **kwargs)
+    def recording_create(self, path):
+        built.append((self.symlinks, self.with_pip))
+        _fake_venv(self, path)
 
-    monkeypatch.setattr(envs.venv.EnvBuilder, "__init__", recording_init)
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", recording_create)
+    monkeypatch.setattr(
+        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
+    )
+    monkeypatch.setattr(envs, "os", _OsAs(name))
+    StageEnv(name="linked", requirements=("pyyaml==6.0.2",)).provision()
+
+    assert built == [(linked, True)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="venv links the interpreter only outside Windows")
+@pytest.mark.parametrize("symlinks", [True, False])
+def test_a_linked_environment_links_the_interpreters_own_file(monkeypatch, tmp_path, symlinks):
+    """Under 3.10 inside a virtualenv, `sys._base_executable` is that
+    virtualenv's own `bin/python`; linking it would hang every stage
+    environment off litetune's. The link goes to the file a copy would have
+    been taken from, and `pyvenv.cfg`'s `home` with it."""
+    real = tmp_path / "base" / "bin" / "python3.x"
+    real.parent.mkdir(parents=True)
+    real.touch()
+    outer = tmp_path / "outer" / "bin" / "python"
+    outer.parent.mkdir(parents=True)
+    outer.symlink_to(real)
+    monkeypatch.setattr(envs.sys, "_base_executable", str(outer), raising=False)
+
+    context = envs._StageEnvBuilder(symlinks=symlinks).ensure_directories(tmp_path / "env")
+
+    expected = os.path.realpath(real) if symlinks else str(outer)
+    assert context.executable == expected
+    assert context.python_dir == os.path.dirname(expected)
+
+
+def test_a_failed_virtualenv_build_says_why(monkeypatch, tmp_path):
+    """`ensurepip` runs with its output captured, so the reason -- here the
+    dyld line this module's builder exists to avoid -- was only on the
+    exception, and a CalledProcessError passed every `except (RuntimeError,
+    OSError)` that callers of `provision` have."""
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    said = b"dyld[1]: Library not loaded: @rpath/libpython3.11.dylib\n"
+
+    def failing_create(self, path):
+        _fake_venv(self, path)
+        raise subprocess.CalledProcessError(-6, ["python3.11", "-m", "ensurepip"], output=said)
+
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", failing_create)
+    monkeypatch.setattr(
+        envs,
+        "_run_guarded",
+        lambda *a, **k: pytest.fail("nothing is installed after a failed build"),
+    )
+    env = StageEnv(name="failing", requirements=("pyyaml==6.0.2",))
+    with pytest.raises(RuntimeError, match=r"Library not loaded: @rpath/libpython3\.11\.dylib"):
+        env.provision()
+    assert not env.ready
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the interpreter is a link only outside Windows")
+def test_a_dangling_interpreter_is_not_ready_and_says_so(monkeypatch, tmp_path):
+    """An environment links the interpreter that built it. Remove that one and
+    the tree is complete but cannot run: not ready, said as that rather than as
+    an environment nobody provisioned, and built again when allowed."""
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    env = StageEnv(name="orphaned", requirements=("pyyaml==6.0.2",))
+    gone = tmp_path / "removed-python"
+    gone.touch()
+    env.python.parent.mkdir(parents=True)
+    env.python.symlink_to(gone)
+    (env.path / ".litetune-ready").write_text(env.identity, encoding="utf-8")
+    gone.unlink()
+
+    assert not env.ready
+    assert f"{gone}, which no longer exists" in env.unready_detail
+
+    notes: list[str] = []
     monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
     monkeypatch.setattr(
         envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
     )
-    StageEnv(name="linked", requirements=("pyyaml==6.0.2",)).provision()
-
-    assert len(built) == 1
-    assert built[0]["symlinks"] is (os.name != "nt")
-    assert built[0]["with_pip"] is True
+    env.provision(events=types.SimpleNamespace(note=lambda text, **_: notes.append(text)))
+    assert env.ready
+    assert any("which no longer exists" in n for n in notes), notes
+    assert env.unready_detail == f"is not provisioned at {env.path}"
 
 
 def test_a_provisioned_environment_can_run_its_console_scripts(monkeypatch, tmp_path):
@@ -308,7 +391,9 @@ def test_a_provisioned_environment_can_run_its_console_scripts(monkeypatch, tmp_
         [str(script), "--version"], capture_output=True, text=True, timeout=120
     )
     assert done.returncode == 0, done.stderr
-    assert "pip" in done.stdout
+    # pip reports where it was imported from: the environment's own
+    # site-packages, not the interpreter the environment links to.
+    assert any(str(p) in done.stdout for p in (path, path.resolve())), done.stdout
 
 
 def test_the_cache_is_inventoried_with_sizes_and_readiness(monkeypatch, tmp_path):

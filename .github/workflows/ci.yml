@@ -34,19 +34,29 @@ jobs:
       - run: pytest -q
 
   # Stage environments are virtualenvs of whatever interpreter litetune runs
-  # under, and nothing above runs on macOS or on a uv-managed Python. uv's
-  # CPython for macOS finds libpython by a path relative to the interpreter, so
-  # an environment that copied the interpreter died in dyld and every stage was
-  # `could not check`. test_envs.py builds a real environment from the running
-  # interpreter, which is the check that fails there.
+  # under, and nothing above runs on macOS or on a uv-managed Python. The
+  # CPython 3.11.14 uv 0.10.6 installs on macOS finds libpython by a path
+  # relative to the interpreter (`@rpath/libpython3.11.dylib`), so an
+  # environment that copied the interpreter died in dyld and no environment
+  # could be built. test_envs.py builds a real environment from the running
+  # interpreter, which is the check that fails there. uv and the interpreter are
+  # pinned, and the link is asserted before the tests: an interpreter that does
+  # not load libpython that way would pass with the bug back, so the job refuses
+  # to run on one.
   macos-uv-python:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uv venv --managed-python --python 3.12
+        with:
+          version: "0.10.6"
+      - run: uv venv --managed-python --python 3.11.14
       - run: uv pip install -e ".[dev]"
-      - run: .venv/bin/python -c "import sys; print(sys.version, sys._base_executable)"
+      - name: the interpreter loads libpython relative to itself
+        run: |
+          base="$(.venv/bin/python -c 'import sys; print(sys._base_executable)')"
+          echo "$base"
+          otool -L "$base" | tee /dev/stderr | grep -q '@rpath/libpython3.11.dylib'
       - run: .venv/bin/pytest -q tests/test_envs.py
 
   # An editable install is not the artifact anyone receives. `src/` layout plus

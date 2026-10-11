@@ -1271,7 +1271,7 @@ def _rebuild(
     if auto_provision:
         env.provision(events=events)
     if not env.ready:
-        raise TowersError(f"environment {env.name!r} is not provisioned at {env.path}")
+        raise TowersError(f"environment {env.name!r} {env.unready_detail}")
     output.parent.mkdir(parents=True, exist_ok=True)
 
     # Beside the output, because `_publish` hard-links the result into place and

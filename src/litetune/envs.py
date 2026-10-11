@@ -277,6 +277,27 @@ def forget_reported_drops() -> None:
     _REPORTED_DROPS.clear()
 
 
+class _StageEnvBuilder(venv.EnvBuilder):
+    """`venv.EnvBuilder`, linking the interpreter's own file when it links.
+
+    `venv` links `sys._base_executable` as given. Under Python 3.10 inside a
+    virtualenv -- litetune installed with pip, pipx or uv -- that is the
+    virtualenv's own `bin/python` (`venv/__init__.py` in 3.10 sets it to
+    `sys.executable` there), so every stage environment would hang off
+    litetune's, and recreating that one would leave them all dangling. The
+    resolved file is what a copy would have been taken from: `shutil.copyfile`
+    follows links.
+    """
+
+    def ensure_directories(self, env_dir):
+        context = super().ensure_directories(env_dir)
+        if self.symlinks:
+            context.executable = os.path.realpath(context.executable)
+            # `pyvenv.cfg`'s `home` is written from this.
+            context.python_dir = os.path.dirname(context.executable)
+        return context
+
+
 def _interpreter_in(root: Path) -> Path:
     """Where `venv` puts the interpreter inside `root`.
 
@@ -1825,6 +1846,23 @@ class StageEnv:
         """
         return (self.path / ".litetune-ready").is_file() and self.python.exists()
 
+    @property
+    def unready_detail(self) -> str:
+        """Why this environment is not ready, as the rest of a sentence about it.
+
+        An environment's interpreter is a link to the one that built it, outside
+        Windows, so removing or upgrading that interpreter leaves a complete
+        tree that is not ready. Said as that, rather than as an environment
+        nobody provisioned.
+        """
+        if self.python.is_symlink() and not self.python.exists():
+            return (
+                f"has an interpreter link {self.python} to {os.readlink(self.python)}, which no "
+                "longer exists (the interpreter that built it was removed or upgraded); it is "
+                "built again on the next run that may provision"
+            )
+        return f"is not provisioned at {self.path}"
+
     def provision(
         self, events=None, force: bool = False, timeout: int = PROVISION_TIMEOUT_S
     ) -> Path:
@@ -1854,8 +1892,14 @@ class StageEnv:
             if self.ready and not force:
                 return self.path
             if events:
+                rebuilt = (
+                    f"; it {self.unready_detail}"
+                    if self.python.is_symlink() and not self.python.exists()
+                    else ""
+                )
                 events.note(
                     f"provisioning environment {self.name!r} ({len(self.requirements)} pinned)"
+                    f"{rebuilt}"
                 )
             # A virtualenv cannot be built somewhere and moved here. `venv`
             # writes the absolute path of the interpreter *at creation time*
@@ -1890,17 +1934,36 @@ class StageEnv:
                 # and takes no timeout, so the budget covers what follows it and
                 # not this. Named rather than left as a silent hole.
                 #
-                # Symlinks outside Windows, as `python -m venv` makes by default.
-                # `EnvBuilder` itself defaults to copying the interpreter, and a
-                # copy cannot run where the interpreter finds its libpython by a
-                # path relative to itself: uv's CPython 3.11.14 for macOS links
-                # `@rpath/libpython3.11.dylib`, which the copy looks for in the
-                # environment's own `lib/`, so `ensurepip` died in dyld and every
-                # stage was `could not check`. Windows keeps copies, which is
-                # what venv supports there.
-                venv.EnvBuilder(with_pip=True, clear=True, symlinks=os.name != "nt").create(
-                    self.path
-                )
+                # Symlinks outside Windows, as `python -m venv` makes them by
+                # default. `EnvBuilder` itself defaults to copying the
+                # interpreter, and a copy cannot run where the interpreter finds
+                # its libpython by a path relative to itself: the CPython 3.11.14
+                # uv 0.10.6 installs on macOS links `@rpath/libpython3.11.dylib`,
+                # which the copy looks for in the environment's own `lib/`, so
+                # `ensurepip` died in dyld and no environment could be built
+                # (python-build-standalone#381). venv falls back to a copy where
+                # it cannot make the link, and then the error below says why.
+                # Windows keeps
+                # copies, as `python -m venv` does there: the `python.exe` it
+                # copies is venv's redirector, which starts the base interpreter
+                # from that interpreter's own directory.
+                try:
+                    _StageEnvBuilder(with_pip=True, clear=True, symlinks=os.name != "nt").create(
+                        self.path
+                    )
+                except subprocess.CalledProcessError as exc:
+                    # `ensurepip` runs with its output captured, and the reason
+                    # -- a dyld line, "No module named ensurepip" -- is only in
+                    # `exc.output`, which nothing read. A RuntimeError is also
+                    # what every caller of `provision` catches.
+                    said = exc.output or b""
+                    if isinstance(said, bytes):
+                        said = said.decode("utf-8", "replace")
+                    raise RuntimeError(
+                        f"could not build the virtualenv for environment {self.name!r} from "
+                        f"{getattr(sys, '_base_executable', sys.executable)}: {exc}. It said:\n"
+                        f"{said[-2000:]}"
+                    ) from exc
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError(
