@@ -223,14 +223,20 @@ LiteRT-LM 0.18.0**, as do some litetune 0.4.0 converted (the README's *From Lite
 checkpoints at the revisions the templates name. litetune after 0.4.0 no longer
 packages those two files: at export it puts the same block in front of whatever chat
 template the converted checkpoint's own tokenizer carries. On 2026-10-11 the four
-eight-bit bundles converted at 928af7b from the two tuned checkpoints each carried
-that composed file as their `jinja_prompt_template`, and the template `convert` read
-from each checkpoint had the sha256 of the checkpoint template inside 02844df's file
-for it (a55ee1b1… for Qwen3, cd8e9439… for Qwen2.5). Against 02844df's bundles their
-template differs only in Jinja comments, and the rest of their metadata only in the
-order of the stop tokens, which the exporter builds from a Python set
-(`litert_lm_builder.py:216-254`) and which already differed between two bundles
-02844df converted. `verify` figures for the composed bundles are not recorded here.
+eight-bit bundles converted from the two tuned checkpoints by the litetune that does
+this -- its code before it was rebased onto the stage-environment change (#70) --
+each carried that composed file as their `jinja_prompt_template`, read back from the
+bundle by `convert` itself, and the template `convert` read from each checkpoint had
+the sha256 of the checkpoint template inside 02844df's file for it (a55ee1b1… for
+Qwen3, cd8e9439… for Qwen2.5). Against 02844df's bundles their template differs only
+in Jinja comments, and the rest of their metadata only in the order of the stop
+tokens, which the exporter builds from a Python set (`litert_lm_builder.py:216-254`)
+and which already differed between two bundles 02844df converted. Verified on
+litert-lm 0.18.0, each rendered the reference's token ids for all 600 prompts and
+scored what 02844df's bundle of the same recipe scored: Qwen2.5 0.7700, 0.0000 (8)
+and 0.7717, −0.0017 (3), Qwen3 0.6983, 0.0000 (10) and 0.6933, +0.0050 (5), for
+`dynamic_wi8_afp32` and `weight_only_wi8_afp32`; the same four results came back at
+each of the branch's five commits.
 Which checkpoints get the block is the qwen-3 and qwen-2.5 patterns' to say
 (`models.py`); one they do not claim gets none, and whether its template reads a list
 is what verify's rendering check shows.
