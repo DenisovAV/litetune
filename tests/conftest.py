@@ -384,7 +384,11 @@ def mark_provisioned(env) -> Path:
 # `tojson`, `raise_exception` and `strftime_now`, and the messages handed to
 # `render` as given (`utils/chat_template_utils.py:478-495` and `:581-587`;
 # `tokenization_utils_base.py:3085-3117`). The `{% generation %}` tracker it
-# also registers is left out: no template rendered here uses it.
+# also registers is left out: no template rendered here uses it. The template
+# also sees the tokenizer's special tokens (`:3107`), Qwen's here: `eos_token`
+# and `pad_token` as both checkpoints' `tokenizer_config.json` set them, BOS and
+# UNK unset. `_RAISE` makes `apply_chat_template` raise as transformers does
+# without a usable jinja2 (`chat_template_utils.py:426-428`).
 _FAKE_TRANSFORMERS = """
 import json
 from datetime import datetime
@@ -405,12 +409,14 @@ def _tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False
 
 
 class _Tokenizer:
-    special_tokens_map = {}
+    special_tokens_map = {"eos_token": "<|im_end|>", "pad_token": "<|endoftext|>"}
 
     def apply_chat_template(
         self, conversation, chat_template=None, tokenize=True, add_generation_prompt=False
     ):
         assert tokenize is False, "only the text path is faked"
+        if _RAISE:
+            raise ImportError(_RAISE)
         env = ImmutableSandboxedEnvironment(
             trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols]
         )
@@ -437,24 +443,41 @@ class AutoTokenizer:
         return tokenizer
 """
 
-# And `huggingface_hub`, for the `chat_template.json` a Hub id falls back to:
-# `_HUB` maps a file name to its text, and any other is missing, as
-# `hf_hub_download` raises for a file the repository does not have.
+# And `huggingface_hub` 1.33.0, for the `chat_template.json` a Hub id falls
+# back to: `_HUB` maps a file name to its text, and any other is missing, which
+# `hf_hub_download` raises as `RemoteEntryNotFoundError`; `_HUB_FAULT` names the
+# error it raises instead when the Hub cannot be reached, as it raises
+# `LocalEntryNotFoundError` (`file_download.py:1961`), or any other.
 _FAKE_HUB = """
 import os
 
-
-class EntryNotFoundError(Exception):
-    pass
+from huggingface_hub.errors import LocalEntryNotFoundError, RemoteEntryNotFoundError
 
 
 def hf_hub_download(repo_id, filename):
+    if _HUB_FAULT == "LocalEntryNotFoundError":
+        raise LocalEntryNotFoundError("cannot reach the Hub and the file is not cached")
+    if _HUB_FAULT:
+        raise ConnectionResetError(_HUB_FAULT)
     if filename not in _HUB:
-        raise EntryNotFoundError(f"{filename} is not in {repo_id}")
+        raise RemoteEntryNotFoundError(f"404: {filename} is not in {repo_id}")
     path = os.path.join(_DIR, filename)
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(_HUB[filename])
     return path
+"""
+
+_FAKE_HUB_ERRORS = """
+class EntryNotFoundError(Exception):
+    pass
+
+
+class RemoteEntryNotFoundError(OSError, EntryNotFoundError):
+    pass
+
+
+class LocalEntryNotFoundError(FileNotFoundError, EntryNotFoundError):
+    pass
 """
 
 
@@ -464,6 +487,8 @@ def run_compose_script(
     chat_template: object,
     version: str = "5.16.1",
     hub_files: dict[str, str] | None = None,
+    hub_fault: str = "",
+    render_raises: str = "",
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
     """`export._COMPOSE_SCRIPT`, run for real with the host interpreter.
 
@@ -483,11 +508,15 @@ def run_compose_script(
     loads = shim / "loads.jsonl"
     (package / "__init__.py").write_text(
         f"__version__ = {version!r}\n_TEMPLATE = {chat_template!r}\n_LOADS = {str(loads)!r}\n"
-        + _FAKE_TRANSFORMERS,
+        f"_RAISE = {render_raises!r}\n" + _FAKE_TRANSFORMERS,
         encoding="utf-8",
     )
-    (shim / "huggingface_hub.py").write_text(
-        f"_HUB = {dict(hub_files or {})!r}\n_DIR = {str(shim)!r}\n" + _FAKE_HUB,
+    hub = shim / "huggingface_hub"
+    hub.mkdir(exist_ok=True)
+    (hub / "errors.py").write_text(_FAKE_HUB_ERRORS, encoding="utf-8")
+    (hub / "__init__.py").write_text(
+        f"_HUB = {dict(hub_files or {})!r}\n_DIR = {str(shim)!r}\n_HUB_FAULT = {hub_fault!r}\n"
+        + _FAKE_HUB,
         encoding="utf-8",
     )
     # The caller's path after the shim's, so a Jinja2 that is not installed in

@@ -665,26 +665,33 @@ rendered `<|im_start|>user\n<|im_end|>` with no error and every send to a Qwen2.
 0.5B Instruct bundle failed. For a checkpoint either rule claims -- a name that
 contains Qwen3-0.6B, Base included, or ends in Qwen2.5-0.5B-Instruct, under any
 organisation, a local snapshot of either and what `tune` made from either, but not
-a repack named for its format, such as `-FP8`, `-GGUF` or `-bnb-4bit` -- `convert`
+a Hub repack named for its format, such as `-FP8`, `-GGUF` or `-bnb-4bit`, nor a
+local checkpoint whose `config.json` has a `quantization_config` -- `convert`
 reads the checkpoint's own chat template the way the exporter reads it, through
 `transformers.AutoTokenizer` in the export environment and, when the tokenizer has
 none, the checkpoint's `chat_template.json`. It writes that template unchanged behind
 a block that turns a list of text parts back into the string, to
 `_litetune-chat-template-<digest>.jinja` in the output directory, hands that file to
 every recipe, and reads each bundle's template back: a bundle that does not carry
-exactly that text is a failed recipe. A tokenizer with several named templates gets
-its `default` composed; the exporter left alone embeds none of them as a template,
-but unpacks the dict as the three prompt parts it builds when it is not using Jinja
-(`litert_lm_builder.py`, `build_llm_metadata`). `convert` refuses, and exports nothing, for a checkpoint with no template, one
-that is only whitespace, one with a carriage return (the exporter reads the file in
-text mode, which would turn it into a newline), and one the block is not for: before
+exactly that text is a failed recipe, and is renamed to `model.litertlm.refused` so
+that nothing takes it for one that passed. A tokenizer with several named templates
+gets its `default` composed; the exporter left alone hands the dict to code that
+unpacks it into three prompt parts (`litert_lm_builder.py:320`), which raises unless
+there are exactly three. `convert` refuses, and exports nothing, for a checkpoint
+with no template, one that is only whitespace, one with a carriage return (the
+exporter reads the file in text mode, which would turn it into a newline), and one
+the block is not for: before
 any export it renders one user message through transformers' Jinja2, as a string
 through the template alone and as parts through the block, and the two must print
 the same. That is transformers' renderer, not LiteRT-LM's MiniJinja; `verify`'s
 rendering check is what checks the runtime. A template you pass yourself with
 `--flag=--jinja_chat_template_override=<file>` is used as given, with no block, so
 on LiteRT-LM 0.18.0 it has to read a list of parts itself, and `convert` says so in
-a note. A tool response LiteRT-LM sends as a `tool_response` part stays a list, as
+a note. A metadata override (`--litert_lm_llm_metadata_override`) is refused for
+these checkpoints, with your template or litetune's: the exporter puts it in place of
+the metadata it builds, which is the only way a template reaches the bundle. Each
+flag is read as the exporter reads it, the last of a repeated name winning, so give
+a value in the same argument (`--flag=--name=value`). A tool response LiteRT-LM sends as a `tool_response` part stays a list, as
 on 0.17.1, and neither Qwen3-0.6B's nor Qwen2.5-0.5B-Instruct's template reads it as
 text, so tool use with these bundles is not covered.
 

@@ -37,6 +37,7 @@ family, different answer. It is decided by `tune`, carried by
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -90,6 +91,54 @@ def flag_key(flag: str) -> str:
     return flag.split("=", 1)[0].lstrip("-").replace("-", "_")
 
 
+def effective_flag(flags: Sequence[str], name: str) -> str | None:
+    """The occurrence of `name` the exporter acts on: the last one.
+
+    Fire assigns each keyword as it meets it, so a later occurrence replaces an
+    earlier one (`fire/core.py:925`, `kwargs[keyword] = value`). A rule that
+    read the first would vouch for a value the exporter never sees.
+    """
+    found = None
+    for flag in flags:
+        if flag_key(flag) == flag_key(name):
+            found = flag
+    return found
+
+
+def exporter_value(text: str) -> object:
+    """The value Fire hands the exporter for `--name=<text>`.
+
+    Fire's `DefaultParseValue` (`fire/parser.py:59-76`): `_LiteralEval`
+    (`:79-116`) reads the text as a Python literal after turning every bare
+    name but `True`, `False` and `None` into a string (`_Replacement`,
+    `:119-132`), refuses a binary operation, and on a syntax or value error the
+    text stays the string it was. So `None` is None, `0` is 0, `''` and `""` are
+    empty, `"gemma4"` is `gemma4`, and a path is itself. Written out here rather
+    than imported: litetune does not depend on Fire.
+    """
+    try:
+        root = ast.parse(text, mode="eval")
+        if isinstance(root.body, ast.BinOp):
+            raise ValueError(text)
+        for node in ast.walk(root):
+            for field, child in ast.iter_fields(node):
+                if isinstance(child, list):
+                    for index, item in enumerate(child):
+                        if isinstance(item, ast.Name):
+                            child[index] = _bare_word(item)
+                elif isinstance(child, ast.Name):
+                    setattr(node, field, _bare_word(child))
+        return ast.literal_eval(root)
+    except (SyntaxError, ValueError):
+        return text
+
+
+def _bare_word(node: ast.Name) -> ast.expr:
+    if node.id in ("True", "False", "None"):
+        return node
+    return ast.Constant(node.id)
+
+
 @dataclass(frozen=True)
 class RequiredFlag:
     """A flag this family's export must carry, and why.
@@ -124,11 +173,10 @@ class RequiredFlag:
         supplied their own value has satisfied the requirement with it. Their
         value wins: litetune knows this flag is needed, and does not know better
         than the caller which template their checkpoint was trained against.
+        When the name appears more than once, the last is the one the exporter
+        acts on (`effective_flag`), and so the one returned.
         """
-        for flag in flags:
-            if flag_key(flag) == flag_key(self.name):
-                return flag
-        return None
+        return effective_flag(flags, self.name)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -148,9 +196,10 @@ class ForbiddenFlag:
     reason: str
 
     def matches(self, flag: str) -> bool:
+        """Whether `flag` is this one, its value compared as the exporter reads it."""
         if flag_key(flag) != flag_key(self.name):
             return False
-        return self.value is None or flag.partition("=")[2] == self.value
+        return self.value is None or exporter_value(flag.partition("=")[2]) == self.value
 
     @property
     def rendered(self) -> str:
@@ -219,14 +268,27 @@ class ModelRules:
     # claimed by the wrong family and exported with the wrong flags, green.
     config_only: bool = False
 
+    # Whether a repack -- already-quantized or non-PyTorch weights -- is turned
+    # away rather than claimed. The evidence differs by where the checkpoint
+    # is: a directory's own `config.json` says whether its weights are
+    # quantized, so the names in its hint (the path, the sidecar's base, the
+    # config's `_name_or_path`, which may name the repack a full-precision merge
+    # came from) are not consulted for it; a Hub id has only its name, which is
+    # read for one of `_REPACK_MARKERS` after the match.
+    repack_guard: bool = False
+
     def matches(self, text: str) -> bool:
         return any(re.search(pattern, text) for pattern in self.patterns)
 
     def matches_hint(self, hint: ModelHint) -> bool:
-        if not self.config_only:
+        if self.config_only:
+            # The path is precisely the evidence this rule declares worthless.
+            return any(self.matches(_normalise(value)) for value in hint.from_config)
+        if not self.repack_guard:
             return self.matches(hint.text)
-        # The path is precisely the evidence this rule declares worthless.
-        return any(self.matches(_normalise(value)) for value in hint.from_config)
+        if hint.local:
+            return not hint.quantized and self.matches(hint.text)
+        return any(re.search(pattern + _NOT_A_REPACK, hint.text) for pattern in self.patterns)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -508,8 +570,9 @@ carries it and cannot be composed exports nothing.
 # `export.compose_chat_template` loads the tokenizer the same way, in the same
 # environment, and falls back to `chat_template.json` as `export_lib.py:390-402`
 # does. Where the two part: a tokenizer carrying several named templates, of
-# which litetune takes "default" where the exporter would unpack the dict as the
-# three prompt parts it builds without Jinja (`litert_lm_builder.py:320`); and
+# which litetune takes "default" where the exporter would unpack the dict into
+# three prompt parts (`litert_lm_builder.py:320`), raising unless it holds
+# exactly three; and
 # what it refuses -- no template after that fallback, one that is only
 # whitespace, one with a carriage return (the exporter reads the override file
 # in text mode, `litert_lm_builder.py:430`, so it could not arrive unchanged),
@@ -525,7 +588,8 @@ _TEXT_PARTS_REASON = (
     "AutoTokenizer on the model being converted, and hands the exporter that template, "
     "unchanged, behind a block that turns a list of text parts back into the string, then "
     "reads each bundle's template back -- so a checkpoint this rule claims keeps its own "
-    "template, or nothing is exported. It refuses a template the block is not for: one that, "
+    "template, or no bundle is handed over: one that does not carry it is renamed with a "
+    "'.refused' suffix. It refuses a template the block is not for: one that, "
     "rendered by transformers' Jinja2 rather than the runtime, does not print a one-message "
     "conversation given as parts behind the block as it prints the same message as a string. "
     "verify's rendering check is what checks the runtime, and it compares the single turn it "
@@ -720,9 +784,10 @@ RULES: tuple[ModelRules, ...] = (
         # converted checkpoint's own template, and `export.compose_chat_template`
         # refuses one the block is not for.
         #
-        # Not a repack the exporter cannot load: a name that continues past the
-        # size into one of `_REPACK_MARKERS` names already-quantized or
-        # non-PyTorch weights (`Qwen/Qwen3-0.6B-FP8`, `Qwen/Qwen3-0.6B-MLX-4bit`,
+        # Not a repack the exporter cannot load (`repack_guard`). For a Hub id
+        # that is read from the name: one that continues past the size into one
+        # of `_REPACK_MARKERS` names already-quantized or non-PyTorch weights
+        # (`Qwen/Qwen3-0.6B-FP8`, `Qwen/Qwen3-0.6B-MLX-4bit`,
         # `unsloth/Qwen3-0.6B-unsloth-bnb-4bit`, `Qwen/Qwen3-0.6B-GGUF`,
         # `onnx-community/Qwen3-0.6B-ONNX`). The export environment's
         # transformers 5.16.1 loads neither FP8 nor bitsandbytes weights without
@@ -734,8 +799,12 @@ RULES: tuple[ModelRules, ...] = (
         # format it does not spell after the size: an MLX or ONNX build
         # published under the bare model name is still claimed, whatever its
         # repository holds, and if that is not weights transformers loads the
-        # exporter fails at its model load.
-        patterns=(rf"qwen-?3-0-6b{_NOT_A_REPACK}",),
+        # exporter fails at its model load. For a local directory it is read
+        # from the checkpoint: a `quantization_config` in its `config.json`. A
+        # full-precision merge whose config's `_name_or_path` names the bnb
+        # repack it was tuned from is claimed, which a name read would refuse.
+        patterns=(r"qwen-?3-0-6b",),
+        repack_guard=True,
         required_flags=(
             RequiredFlag(
                 name=TEMPLATE_FLAG,
@@ -781,10 +850,10 @@ RULES: tuple[ModelRules, ...] = (
         # pattern ends either at the end of the hint text or at the
         # `model_type` `hint_for` appends for a local checkpoint: this run's
         # merged model read `qwen-qwen2-5-0-5b-instruct-qwen2-qwen2forcausallm`
-        # and must keep matching, a repack must not. What follows that
-        # `model_type` is held to `_NOT_A_REPACK` as well, the qwen-3 rule's
-        # guard, because `-qwen2` can also begin a repack's own suffix
-        # (`someorg/Qwen2.5-0.5B-Instruct-qwen2-GGUF`). A name cannot show a
+        # and must keep matching, a repack must not. A Hub id is also held to
+        # the qwen-3 rule's `repack_guard` after the tail, because `-qwen2` can
+        # begin a repack's own suffix (`someorg/Qwen2.5-0.5B-Instruct-qwen2-GGUF`);
+        # a local directory to its own `config.json`, as there. A name cannot show a
         # format it does not spell after the model name: an ONNX export
         # published under the bare name, `onnx-community/Qwen2.5-0.5B-Instruct`,
         # is claimed whatever its repository holds, and if that is not weights
@@ -803,9 +872,8 @@ RULES: tuple[ModelRules, ...] = (
         # (`.../models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/<sha>`, which
         # `tune` records verbatim when it trained from one) normalises to the
         # name followed by `-snapshots-<sha>`, which the tail alone refuses.
-        patterns=(
-            rf"qwen-?2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{{40}})?(?:$|-qwen2\b){_NOT_A_REPACK}",
-        ),
+        patterns=(r"qwen-?2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{40})?(?:$|-qwen2\b)",),
+        repack_guard=True,
         required_flags=(
             RequiredFlag(
                 name=TEMPLATE_FLAG,
@@ -882,6 +950,12 @@ class ModelHint:
     # `recorded=False` with no error: one is a fault to fix, the other is just a
     # checkpoint from before this existed.
     provenance_error: str | None = None
+    # A directory on this machine, whose own files say what it holds; a Hub id
+    # has only its name. `quantized` is what the directory's `config.json` says:
+    # a `quantization_config`, which is what makes transformers load the weights
+    # as pre-quantized (`quantizers/auto.py:334-338`, transformers 5.16.1).
+    local: bool = False
+    quantized: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -891,6 +965,8 @@ class ModelHint:
             "config_error": self.config_error,
             "identity_recorded": self.recorded,
             "provenance_error": self.provenance_error,
+            "local": self.local,
+            "quantized": self.quantized,
         }
 
 
@@ -976,7 +1052,7 @@ def hint_for(model: str) -> ModelHint:
     normalised = _normalise(model)
     config = path / CONFIG_NAME
     if not (path.is_dir() and config.is_file()):
-        return ModelHint(model=model, text=normalised)
+        return ModelHint(model=model, text=normalised, local=path.is_dir())
 
     # Before config.json: what produced the checkpoint knows what it was, and
     # config.json only knows what architecture it is -- which is not enough,
@@ -998,6 +1074,7 @@ def hint_for(model: str) -> ModelHint:
             config_error=f"{type(exc).__name__}: {exc}",
             recorded=bool(recorded_base),
             provenance_error=provenance_error,
+            local=True,
         )
     if not isinstance(data, dict):
         return ModelHint(
@@ -1006,6 +1083,7 @@ def hint_for(model: str) -> ModelHint:
             config_error=f"{config} does not contain a JSON object",
             recorded=bool(recorded_base),
             provenance_error=provenance_error,
+            local=True,
         )
 
     values: list[str] = []
@@ -1017,12 +1095,18 @@ def hint_for(model: str) -> ModelHint:
             values.extend(str(item) for item in value)
     extra = tuple(values)
     text = "-".join([normalised, *(_normalise(v) for v in extra)])
+    text_config = data.get("text_config")
+    quantized = data.get("quantization_config") is not None or (
+        isinstance(text_config, dict) and text_config.get("quantization_config") is not None
+    )
     return ModelHint(
         model=model,
         text=text,
         from_config=extra,
         recorded=bool(recorded_base),
         provenance_error=provenance_error,
+        local=True,
+        quantized=quantized,
     )
 
 
@@ -1251,10 +1335,7 @@ def plan_export(
             notes=(UNKNOWN_FAMILY,),
         )
 
-    for forbidden in rules.forbidden_flags:
-        for flag in flags:
-            if forbidden.matches(flag):
-                raise FlagRefused(f"{model}: litetune refuses {flag!r}. {forbidden.reason}")
+    _refuse_forbidden(model, rules, flags)
 
     added: list[str] = []
     notes: list[str] = []
@@ -1263,10 +1344,8 @@ def plan_export(
     composes = False
     for required in rules.required_flags:
         supplied = required.satisfied_by(flags)
-        if supplied is not None and required.takes_value and not supplied.partition("=")[2]:
-            raise FlagRefused(
-                f"{model}: litetune refuses {supplied!r}. {_EMPTY_VALUE.format(name=required.name)}"
-            )
+        if supplied is not None and required.takes_value:
+            _refuse_unusable_value(model, supplied, required.name)
         if supplied is not None and required.value == COMPOSED_TEMPLATE:
             limitations.append(_CALLER_TEMPLATE.format(flag=supplied))
         if supplied is not None:
@@ -1313,12 +1392,16 @@ def plan_export(
             )
         )
 
-    if composes:
-        for flag in flags:
-            if flag_key(flag) == flag_key(METADATA_OVERRIDE_FLAG):
-                raise FlagRefused(
-                    f"{model}: litetune refuses {flag!r}. {_METADATA_OVERRIDE_REASON}"
-                )
+    # On a rule that composes, whether it did or the caller brought a template:
+    # either way the template reaches the bundle only through the metadata the
+    # exporter builds, and an override of its own takes that metadata's place.
+    if any(required.value == COMPOSED_TEMPLATE for required in rules.required_flags):
+        override = effective_flag(flags, METADATA_OVERRIDE_FLAG)
+        if override is not None and (
+            "=" not in override or exporter_value(override.split("=", 1)[1])
+        ):
+            reason = _METADATA_OVERRIDE_REASON if composes else _METADATA_OVERRIDE_OWN_REASON
+            raise FlagRefused(f"{model}: litetune refuses {override!r}. {reason}")
 
     recommendations: list[str] = []
     if rules.recommended_recipes and recipes:
@@ -1342,19 +1425,55 @@ def plan_export(
     )
 
 
+def _refuse_forbidden(model: str, rules: ModelRules, flags: Sequence[str]) -> None:
+    """Raise `FlagRefused` for a forbidden flag in the form the exporter acts on."""
+    for forbidden in rules.forbidden_flags:
+        flag = effective_flag(flags, forbidden.name)
+        if flag is None:
+            continue
+        if forbidden.value is not None and "=" not in flag:
+            # A value in the next argument may be the forbidden one.
+            raise FlagRefused(_split_value(model, flag, forbidden.name))
+        if forbidden.matches(flag):
+            raise FlagRefused(f"{model}: litetune refuses {flag!r}. {forbidden.reason}")
+
+
+def _refuse_unusable_value(model: str, flag: str, name: str) -> None:
+    """Raise `FlagRefused` for a value-bearing flag the exporter would get no value from."""
+    if "=" not in flag:
+        raise FlagRefused(_split_value(model, flag, name))
+    value = exporter_value(flag.split("=", 1)[1])
+    if not (isinstance(value, str) and value):
+        raise FlagRefused(
+            f"{model}: litetune refuses {flag!r}. The exporter reads its value as {value!r}, "
+            f"{_UNUSABLE_VALUE.format(name=name)}"
+        )
+
+
+def _split_value(model: str, flag: str, name: str) -> str:
+    return (
+        f"{model}: litetune refuses {flag!r} without a value in the same argument. Fire, which "
+        "reads the exporter's command line, takes the next argument as its value when that "
+        "argument is not a flag and True otherwise (`fire/core.py:876-921`), and litetune checks "
+        f"a value only where it can see it: pass --flag={name}=<value>"
+    )
+
+
 # The exporter tests both value-bearing overrides litetune requires for truth
-# and proceeds as if they were absent when empty: the template at
-# `litert_lm_builder.py:414`, the model type at `:380`.
-_EMPTY_VALUE = (
-    "{name} needs a value, and the exporter reads an empty one as no override at all, so the "
-    "rule would be satisfied in name only. Give it a value, or leave it out for litetune to add"
+# and proceeds as if they were absent when falsy: the template at
+# `litert_lm_builder.py:414`, the model type at `:380`. A value that is not a
+# string is no path, repository or model type either.
+_UNUSABLE_VALUE = (
+    "which is not a value {name} can take: the exporter would read a falsy one as no override "
+    "at all, so the rule would be satisfied in name only. Give it a value, or leave it out for "
+    "litetune to add"
 )
 
 _CALLER_TEMPLATE = (
     "{flag} was passed by the caller and used as given: litetune put no text-parts block in front "
     "of it. From LiteRT-LM 0.18.0 the runtime hands the template each message's content as a list "
-    "of parts, and a template that reads it as a string loses the prompt; verify's rendering check "
-    "is what shows it"
+    "of parts, and a template that reads it as a string loses the prompt or fails every send; "
+    "verify's rendering check is what shows it"
 )
 
 # `package_model` takes a metadata override in place of the LlmMetadata it
@@ -1369,16 +1488,21 @@ _METADATA_OVERRIDE_REASON = (
     f"--flag={TEMPLATE_FLAG}=<file>, and on LiteRT-LM 0.18.0 it has to read a list of parts itself"
 )
 
+_METADATA_OVERRIDE_OWN_REASON = (
+    "The exporter puts a metadata override in the bundle in place of the LlmMetadata it builds, "
+    f"and the template given with {TEMPLATE_FLAG} reaches the bundle only through the metadata it "
+    "builds: the bundle would carry the override's template, or none, and not the one passed. "
+    "Pass one or the other; a template written into the override has to read LiteRT-LM 0.18.0's "
+    "list of parts itself"
+)
+
 
 def refuse_forbidden_flags(model: str, flags: Sequence[str]) -> None:
     """Raise `FlagRefused` if any flag must never be passed for this model."""
     rules = identify(model)
     if rules is None:
         return
-    for forbidden in rules.forbidden_flags:
-        for flag in flags:
-            if forbidden.matches(flag):
-                raise FlagRefused(f"{model}: litetune refuses {flag!r}. {forbidden.reason}")
+    _refuse_forbidden(model, rules, flags)
 
 
 # ---------------------------------------------------------------------------
