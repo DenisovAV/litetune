@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import buildable_here, mark_provisioned, run_compose_script
+from conftest import buildable_here, machine, mark_provisioned, run_compose_script
 
 from litetune import envs, models
 from litetune.checks import Check, Outcome
@@ -864,10 +864,12 @@ class _AnyTemplate:
     """Matches the template flag whatever absolute path it carries."""
 
     def __eq__(self, other: object) -> bool:
+        # By path parts, not by a `/` suffix: the path is the platform's own,
+        # and on Windows its separator is `\`.
         return (
             isinstance(other, str)
             and other.startswith("--jinja_chat_template_override=")
-            and other.endswith("templates/functiongemma.jinja")
+            and Path(other.partition("=")[2]).parts[-2:] == ("templates", "functiongemma.jinja")
         )
 
     def __repr__(self) -> str:
@@ -1145,8 +1147,7 @@ def test_convert_refused_on_this_machine_writes_nothing_into_the_checkpoint(monk
         )
 
     before = snapshot()
-    monkeypatch.setattr(envs.wheels, "host_platform", lambda: "win_amd64")
-    monkeypatch.setattr(envs.sys, "version_info", (3, 12, 0, "final", 0))
+    monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
     result = convert()
 
     assert snapshot() == before, "the checkpoint is left as it was handed in"
@@ -1157,7 +1158,7 @@ def test_convert_refused_on_this_machine_writes_nothing_into_the_checkpoint(monk
     assert detail.startswith("environment 'export' cannot be provisioned on win_amd64")
     assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in detail
 
-    monkeypatch.setattr(envs.wheels, "host_platform", lambda: "linux_x86_64")
+    monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("linux_x86_64", (3, 12)))
     convert()
     assert json.loads(config.read_text(encoding="utf-8"))["vocab_file"] == str(
         (model / "tokenizer.model").resolve()
@@ -1174,7 +1175,7 @@ def test_a_ready_export_environment_is_used_on_any_machine(toolchain, request_fo
     from litetune.envs import StageEnv
 
     monkeypatch.setattr(StageEnv, "refusal", _REAL_REFUSAL)
-    monkeypatch.setattr(envs.wheels, "host_platform", lambda: "win_amd64")
+    monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
     mark_provisioned(envs.EXPORT)
 
     result = run_export(request_for(("weight_only_wi8_afp32",)))
@@ -1938,7 +1939,9 @@ def test_the_report_carries_the_owned_recipe_and_its_rules(toolchain, request_fo
     (owned_call,) = [
         c.argv for c in toolchain.exports if any(a.endswith(f"{OWNED}.json") for a in c.argv)
     ]
-    assert any(a.endswith(f"/{OWNED}") for a in owned_call if a.startswith("--output_dir="))
+    assert any(
+        Path(a.partition("=")[2]).name == OWNED for a in owned_call if a.startswith("--output_dir=")
+    )
 
 
 def test_an_owned_recipe_is_not_flagged_as_passed_through(toolchain, request_for):
@@ -2328,6 +2331,36 @@ def test_an_empty_string_template_falls_back_as_the_exporter_does(toolchain, qwe
     result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
     assert result.outcome is Outcome.PASSED
     assert _chat_template_check(result).observed["template_source"] == "chat_template.json"
+
+
+def test_a_directory_at_chat_template_json_is_the_checkpoints_whatever_open_raises(
+    tmp_path, monkeypatch
+):
+    """On Windows, opening a directory is not an `IsADirectoryError`.
+
+    The first windows-latest run read a directory there as "unreachable" --
+    the machine's -- because `open` raised something else. The script asks
+    whether it is a directory instead, so the answer does not depend on the
+    platform's error; here `open` is made to raise as it did there.
+    """
+    import builtins
+    import types
+
+    monkeypatch.setitem(sys.modules, "transformers", types.ModuleType("transformers"))
+    script: dict = {"__name__": "compose_template"}
+    exec(compile(_COMPOSE_SCRIPT, "compose_template.py", "exec"), script)
+    checkpoint = tmp_path / "model"
+    (checkpoint / "chat_template.json").mkdir(parents=True)
+
+    def refuses(*args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(args[0]))
+
+    monkeypatch.setattr(builtins, "open", refuses)
+    template, lookup = script["chat_template_json"](str(checkpoint))
+
+    assert template is None
+    assert lookup["outcome"] == "unusable"
+    assert lookup["error"].startswith("IsADirectoryError")
 
 
 @pytest.mark.parametrize(
@@ -3000,8 +3033,10 @@ def test_the_marker_never_reaches_an_exporter_argv(qwen_request):
     assert COMPOSED_TEMPLATE_FLAG in request.extra_flags
     with pytest.raises(ValueError, match="no composed template was given"):
         request.argv("dynamic_wi8_afp32")
-    argv = request.argv("dynamic_wi8_afp32", Path("/composed/t.jinja"))
-    assert _template_flags(argv) == [f"{models.TEMPLATE_FLAG}=/composed/t.jinja"]
+    composed = Path("/composed/t.jinja")
+    argv = request.argv("dynamic_wi8_afp32", composed)
+    # The path as this platform spells it: `\composed\t.jinja` on Windows.
+    assert _template_flags(argv) == [f"{models.TEMPLATE_FLAG}={composed}"]
     assert not any(models.COMPOSED_TEMPLATE in a for a in argv)
 
 

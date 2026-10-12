@@ -18,9 +18,9 @@ import time
 import types
 
 import pytest
-from conftest import PROBE_FIELDS, mark_provisioned, probe_answer
+from conftest import PROBE_FIELDS, machine, mark_provisioned, probe_answer
 
-from litetune import envs
+from litetune import envs, wheels
 from litetune.envs import EXPORT, RUNTIME, TRAIN, StageEnv, UnpinnedRequirement
 
 
@@ -241,16 +241,17 @@ def test_the_install_does_not_start_once_the_budget_is_gone(tmp_path, monkeypatc
     assert (env.path / "payload").read_text(encoding="utf-8") == "the existing environment"
 
 
-def _host(monkeypatch, platform: str, python: tuple[int, int]) -> None:
-    """Make envs see another machine: a wheel platform and a Python version.
+def _host(monkeypatch, name: str, python: tuple[int, int]) -> wheels.Host:
+    """Make envs see another machine: `conftest.MACHINES[name]` running CPython `python`.
 
-    `wheels.host_platform` is where the platform is read, and `sys.version_info`
-    is what `identity` and the refusals read the version from; a tuple is enough
-    for both. Nothing else about the host changes, which is what lets a POSIX
-    runner ask what Windows would be told.
+    `wheels.current_host` is the one place envs asks what this machine is --
+    its Python and the tags pip would accept on it -- which is what lets a
+    POSIX runner ask what Windows, an older macOS or the next Python would be
+    told.
     """
-    monkeypatch.setattr(envs.wheels, "host_platform", lambda: platform)
-    monkeypatch.setattr(envs.sys, "version_info", (*python, 0, "final", 0))
+    host = machine(name, python)
+    monkeypatch.setattr(envs.wheels, "current_host", lambda: host)
+    return host
 
 
 def _tripwires(monkeypatch) -> list[str]:
@@ -279,7 +280,7 @@ def test_an_unsupported_interpreter_is_refused_before_pip_runs(monkeypatch, tmp_
     with pytest.raises(
         RuntimeError,
         match=r"pins numpy==2\.0\.2, which publishes wheels for "
-        r"linux_x86_64 for python3\.9 to python3\.12 only",
+        r"manylinux_2_35_x86_64 for python3\.9 to python3\.12 only",
     ):
         StageEnv(name="probe", requirements=("numpy==2.0.2",)).provision()
     assert reached == [], "the refusal must come before the venv and before pip"
@@ -418,6 +419,197 @@ def test_an_unready_environment_says_what_pypi_lacks_and_where_pip_was_pointed(
     assert "PIP_FIND_LINKS" in detail
 
 
+# Kept at import, before the autouse fixture in conftest replaces it.
+_REAL_PIP_CONFIGURATION = envs._pip_configuration
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("PIP_INDEX_URL", "https://pypi.org/simple"),
+        ("PIP_INDEX_URL", "https://pypi.org/simple/"),
+        ("PIP_INDEX_URL", "HTTPS://PyPI.org/simple"),
+        ("PIP_EXTRA_INDEX_URL", "https://pypi.org/simple"),
+    ],
+)
+def test_pypi_named_as_the_index_is_still_pypi(monkeypatch, tmp_path, variable, value):
+    """pip's default index is `https://pypi.org/simple` (`PyPI.simple_url`).
+
+    Any non-empty variable used to lift the refusal, so naming PyPI itself --
+    which changes nothing about where pip looks -- let pip download and fail.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv(variable, value)
+    reached = _tripwires(monkeypatch)
+    _host(monkeypatch, "win_amd64", (3, 12))
+
+    with pytest.raises(RuntimeError, match="litert-converter==0.4.0 publishes no wheel"):
+        EXPORT.provision()
+    assert reached == []
+
+
+def test_a_list_of_extra_indexes_is_read_item_by_item(monkeypatch, tmp_path):
+    """pip splits a list-valued option on whitespace; PyPI among them is no other source."""
+    monkeypatch.setenv(
+        "PIP_EXTRA_INDEX_URL", "https://pypi.org/simple https://download.pytorch.org/whl/cu124"
+    )
+    _host(monkeypatch, "win_amd64", (3, 13))
+
+    others, unread = envs._other_sources()
+
+    assert others == ["PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124"]
+    assert unread is None
+
+
+@pytest.mark.parametrize(
+    ("setting", "refused"),
+    [
+        (
+            ("pip config global.extra-index-url", "extra-index-url", "https://example.invalid/s"),
+            False,
+        ),
+        (("pip config install.index-url", "index-url", "https://mirror.invalid/simple"), False),
+        (("pip config global.find-links", "find-links", "/wheels"), False),
+        # A page of links is not an index, whatever it names.
+        (("pip config global.find-links", "find-links", "https://pypi.org/simple"), False),
+        (("pip config global.index-url", "index-url", "https://pypi.org/simple"), True),
+    ],
+)
+def test_pips_own_configuration_counts_like_its_environment(
+    monkeypatch, tmp_path, setting, refused
+):
+    """An index set in `pip.conf`, `pip.ini` or `PIP_CONFIG_FILE` is one pip uses.
+
+    Reading only the three variables refused a Windows user whose configured
+    index carries the converter; reading pip's configuration and finding PyPI
+    there changes nothing.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setattr(envs, "_pip_configuration", lambda: ([setting], None))
+    _host(monkeypatch, "win_amd64", (3, 12))
+
+    refusal = EXPORT.refusal()
+
+    assert (refusal is not None) is refused
+    if not refused:
+        assert setting[2] in EXPORT.unready_detail
+
+
+def test_a_configuration_pip_could_not_report_is_not_taken_for_pypi(monkeypatch, tmp_path):
+    """No `pip` to ask, or one that fails: whether it points past PyPI is unknown.
+
+    So the gap is said and pip is asked, rather than refusing on a guess.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        envs, "_pip_configuration", lambda: ([], "`pip config list` exited 1: No module named pip")
+    )
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
+    monkeypatch.setattr(
+        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
+    )
+    _host(monkeypatch, "win_amd64", (3, 13))
+    notes: list[str] = []
+
+    assert TRAIN.refusal() is None
+    TRAIN.provision(events=types.SimpleNamespace(note=lambda text, **_: notes.append(text)))
+
+    (said,) = [n for n in notes if "torch==2.5.1" in n]
+    assert "pip's own configuration could not be read" in said
+    assert "No module named pip" in said
+
+
+def test_pip_config_list_is_read_as_pip_prints_it():
+    """`section.option=repr(value)`, the environment's under `:env:`.
+
+    Only the sections `pip install` reads -- `global`, `install`, `:env:` --
+    and only the three source options; a value on several lines is one string.
+    """
+    printed = (
+        "download.index-url='https://ignored.invalid/simple'\n"
+        "global.extra-index-url='\\nhttps://a.invalid/simple\\nhttps://b.invalid/simple'\n"
+        "global.timeout='60'\n"
+        "install.find-links='/wheels'\n"
+        ":env:.index-url='https://pypi.org/simple'\n"
+    )
+
+    assert envs._parse_pip_config(printed) == [
+        (
+            "pip config global.extra-index-url",
+            "extra-index-url",
+            "\nhttps://a.invalid/simple\nhttps://b.invalid/simple",
+        ),
+        ("pip config install.find-links", "find-links", "/wheels"),
+        ("pip config :env:.index-url", "index-url", "https://pypi.org/simple"),
+    ]
+
+
+@pytest.mark.parametrize("line", ["no equals sign", "global.index-url=not a repr"])
+def test_a_pip_config_line_this_cannot_read_is_said_rather_than_skipped(line):
+    with pytest.raises((ValueError, SyntaxError)):
+        envs._parse_pip_config(line)
+
+
+def test_pip_config_list_is_asked_of_the_interpreter_running_litetune(monkeypatch):
+    """The one a stage environment is built from, through the stages' own guard."""
+    asked: list[list[str]] = []
+
+    def answer(argv, timeout, env=None):
+        asked.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "global.find-links='/w'\n", "")
+
+    monkeypatch.setattr(envs, "_run_guarded", answer)
+
+    assert _REAL_PIP_CONFIGURATION() == (
+        [("pip config global.find-links", "find-links", "/w")],
+        None,
+    )
+    assert asked == [[sys.executable, "-m", "pip", "config", "list"]]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "said"),
+    [
+        (subprocess.CompletedProcess([], 1, "", "No module named pip\n"), "exited 1: No module"),
+        (OSError("no such interpreter"), "OSError: no such interpreter"),
+        (subprocess.CompletedProcess([], 0, "garbled", ""), "unrecognised"),
+    ],
+    ids=["exit", "oserror", "unreadable"],
+)
+def test_a_pip_that_cannot_answer_says_why(monkeypatch, outcome, said):
+    def answer(argv, timeout, env=None):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(envs, "_run_guarded", answer)
+
+    settings, unread = _REAL_PIP_CONFIGURATION()
+
+    assert settings == []
+    assert unread is not None and said in unread
+
+
+def test_the_real_pip_reports_a_configured_index(monkeypatch, tmp_path):
+    """The format above, checked against the pip this suite runs with.
+
+    `PIP_CONFIG_FILE` names a file pip loads after the global and user ones
+    (pip's configuration documentation); whatever else this machine has
+    configured, this index must come back.
+    """
+    pytest.importorskip("pip")
+    config = tmp_path / "pip.ini"
+    config.write_text("[global]\nextra-index-url = https://example.invalid/simple\n")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+
+    settings, unread = _REAL_PIP_CONFIGURATION()
+
+    assert unread is None
+    assert ("extra-index-url", "https://example.invalid/simple") in [
+        (option, value) for _, option, value in settings
+    ]
+
+
 def test_convert_is_refused_on_windows_before_anything_is_installed(monkeypatch, tmp_path):
     """`litert-converter==0.4.0` publishes no Windows wheel and no source distribution.
 
@@ -452,7 +644,7 @@ def test_what_runs_on_windows_x64_is_not_refused(monkeypatch, tmp_path, env):
     """
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
     for minor in (10, 11, 12):
-        assert env.unprovisionable(platform="win_amd64", python=(3, minor)) is None
+        assert env.unprovisionable(machine("win_amd64", (3, minor))) is None
 
 
 @pytest.mark.parametrize(
@@ -474,37 +666,67 @@ def test_an_architecture_with_no_wheel_is_refused_by_the_package(
     """
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
     reached = _tripwires(monkeypatch)
-    _host(monkeypatch, platform, (3, 12))
+    host = _host(monkeypatch, platform, (3, 12))
 
     with pytest.raises(RuntimeError) as caught:
         RUNTIME.provision()
 
     message = str(caught.value)
-    assert message.startswith(f"environment 'runtime' cannot be provisioned on {platform}: ")
+    assert message.startswith(f"environment 'runtime' cannot be provisioned on {host.platform}: ")
     for clause in named:
-        assert f"{clause} publishes no wheel for {platform}" in message, message
+        assert f"{clause} publishes no wheel for {host.platform}" in message, message
     assert reached == []
 
 
+@pytest.mark.parametrize(
+    ("name", "refused"),
+    [
+        ("macosx_11_arm64", True),
+        ("macosx_12_arm64", False),
+        ("linux_x86_64_glibc_2_26", True),
+        ("linux_x86_64_glibc_2_27", False),
+        ("musl_x86_64", True),
+    ],
+)
+def test_a_wheel_is_matched_by_its_whole_tag_not_its_architecture(
+    monkeypatch, tmp_path, name, refused
+):
+    """`litert-lm-api==0.18.0` is `macosx_12_0_arm64` and `manylinux_2_27_x86_64`.
+
+    Read down to the architecture, macOS 11 and glibc 2.26 passed the check
+    while pip, which reads the whole tag, has no wheel for either; and musl
+    passed as if it were glibc. Matched as pip matches, each is refused by the
+    package that stops it, and the first version that has it is not.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    _host(monkeypatch, name, (3, 12))
+
+    refusal = RUNTIME.refusal()
+
+    assert (refusal is not None) is refused
+    if refused:
+        assert refusal is not None and "litert-lm-api==0.18.0" in refusal
+
+
 def test_a_machine_nobody_has_can_be_asked_about(monkeypatch):
-    """The platform and the Python are both parameters, and both are used.
+    """The host is a parameter, and it is the one used.
 
     Asked on a 3.12 host about 3.13, the answer is about 3.13: this is how a
     POSIX runner pins what Windows, or the next Python, would be told.
     """
-    monkeypatch.setattr(envs.sys, "version_info", (3, 12, 0, "final", 0))
+    _host(monkeypatch, "win_amd64", (3, 12))
 
-    message = TRAIN.unprovisionable(platform="win_amd64", python=(3, 13))
+    message = TRAIN.unprovisionable(machine("win_amd64", (3, 13)))
 
     assert message is not None
     assert message.startswith("cannot be provisioned on python3.13 on win_amd64: ")
     assert "torch==2.5.1" in message
-    assert TRAIN.unprovisionable(platform="win_amd64", python=(3, 12)) is None
+    assert TRAIN.unprovisionable() is None, "and the default is the host envs sees"
 
 
 def test_a_wheel_missing_for_the_platform_outranks_one_missing_for_the_python(monkeypatch):
     """Naming a Python version where no Python would do sends the reader to change it."""
-    message = TRAIN.unprovisionable(platform="win_arm64", python=(3, 13))
+    message = TRAIN.unprovisionable(machine("win_arm64", (3, 13)))
 
     assert message is not None
     assert message.startswith("cannot be provisioned on win_arm64:")
@@ -3539,6 +3761,9 @@ def test_the_interrupt_bound_is_per_pipe_and_consecutive(monkeypatch):
     )
 
 
+# select() over pipes: on Windows `select` takes sockets only, so the pipe this
+# test registers is never read -- the first windows-latest run, `kept_got == ''`.
+@pytest.mark.posix
 def test_a_drain_whose_text_is_discarded_keeps_what_did_register(monkeypatch):
     """All-or-nothing is for drains whose output is read.
 

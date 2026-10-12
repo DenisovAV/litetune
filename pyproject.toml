@@ -45,6 +45,13 @@ classifiers = [
 # solve a problem they do not have.
 dependencies = [
     "pyyaml~=6.0",
+    # The tags a wheel must match to install here, computed as pip computes
+    # them: `packaging.tags` is what pip's own `get_supported` is built from
+    # (pip/_internal/utils/compatibility_tags.py), vendored. pip's copy is
+    # private, so `litetune/wheels.py` uses the library. 26.x is the line pip
+    # 26.2.1 vendors (26.2) and the newest on PyPI (26.3, requires-python >=3.9,
+    # https://pypi.org/pypi/packaging/json).
+    "packaging~=26.0",
 ]
 
 [project.urls]

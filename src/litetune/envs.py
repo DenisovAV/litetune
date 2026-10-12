@@ -19,6 +19,7 @@ is useless if its *definition* resolves differently on different days, so
 
 from __future__ import annotations
 
+import ast
 import codecs
 import contextlib
 import errno
@@ -33,6 +34,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 import venv
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -1668,17 +1670,144 @@ def _msvcrt_attempt(handle, locking: Callable[[int, int, int], None], mode: int)
     return True
 
 
-# The variables that point pip at files PyPI's lists do not cover: another
-# index in place of PyPI, one beside it, or a directory or page of archives.
-# PyTorch's own index, which the README names for a CUDA `tune` on Windows, is
-# the case in point. Set from a pip configuration file instead, they are not
-# seen here, and the table refuses as it would for PyPI.
-_INDEX_VARIABLES = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS")
+# Where `pip install` looks for distributions besides PyPI: the options, and
+# the environment variables pip reads them from (`PIP_` and the option's name).
+# A value that is PyPI itself is not another source: pip's default index is
+# `https://pypi.org/simple` (`PyPI.simple_url`, pip/_internal/models/index.py,
+# pip 26.2.1), so an index set to that, however it is spelled, still means the
+# files these lists describe.
+_SOURCE_VARIABLES = (
+    ("PIP_INDEX_URL", "index-url"),
+    ("PIP_EXTRA_INDEX_URL", "extra-index-url"),
+    ("PIP_FIND_LINKS", "find-links"),
+)
+_SOURCE_OPTIONS = frozenset(option for _, option in _SOURCE_VARIABLES)
+# The sections `pip install` reads options from, in its order: `global`, the
+# command's own, then the environment (`_get_ordered_configuration_items`,
+# pip/_internal/cli/parser.py, pip 26.2.1).
+_INSTALL_SECTIONS = frozenset({"global", "install", ":env:"})
+_PIP_CONFIG_TIMEOUT_S = 60
 
 
-def _custom_indexes() -> list[str]:
-    """The `_INDEX_VARIABLES` set to something in this environment."""
-    return [name for name in _INDEX_VARIABLES if os.environ.get(name)]
+def _is_pypi(url: str) -> bool:
+    """Whether an index URL is pip's default, PyPI's simple API."""
+    # `urlsplit` lowercases the scheme itself; the host it leaves as given.
+    parts = urllib.parse.urlsplit(url.strip())
+    return (
+        parts.scheme == "https"
+        and parts.netloc.lower() == "pypi.org"
+        and parts.path.rstrip("/") == "/simple"
+        and not parts.query
+        and not parts.fragment
+    )
+
+
+def _parse_pip_config(text: str) -> list[tuple[str, str, str]]:
+    """`(where, option, value)` for each source option in `pip config list`'s output.
+
+    pip prints every loaded setting as `section.option=repr(value)`
+    (`list_values`, pip/_internal/commands/configuration.py, pip 26.2.1), the
+    environment's under the section `:env:`. Raises `ValueError` on a line it
+    cannot read: a format this does not know is not evidence of PyPI alone.
+    """
+    found: list[tuple[str, str, str]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        key, sep, shown = line.partition("=")
+        section, dot, option = key.rpartition(".")
+        if not sep or not dot:
+            raise ValueError(f"unrecognised `pip config list` line: {line!r}")
+        if section not in _INSTALL_SECTIONS or option not in _SOURCE_OPTIONS:
+            continue
+        value = ast.literal_eval(shown)
+        if not isinstance(value, str):
+            raise ValueError(f"unrecognised `pip config list` value: {line!r}")
+        found.append((f"pip config {key}", option, value))
+    return found
+
+
+def _pip_configuration() -> tuple[list[tuple[str, str, str]], str | None]:
+    """The source options pip's own configuration sets, and why it could not be read, if not.
+
+    `python -m pip config list`, pip's own command for its configuration,
+    which prints every setting pip loaded: its global, user and site files,
+    `PIP_CONFIG_FILE`'s, and the environment's under `:env:`
+    (`Configuration.load`, pip/_internal/configuration.py, pip 26.2.1). Run
+    with the interpreter running litetune, which a stage environment is built
+    from, in the environment a stage's pip gets: the global and user files are
+    the same ones, and the site file is this interpreter's own rather than the
+    new environment's, which has none -- a difference that can only add a
+    source, and so only turn a refusal into a note.
+    """
+    argv = [sys.executable, "-m", "pip", "config", "list"]
+    try:
+        proc = _run_guarded(argv, _PIP_CONFIG_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+    if proc.returncode != 0:
+        said = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return [], f"`pip config list` exited {proc.returncode}: {said[-1] if said else 'nothing'}"
+    try:
+        return _parse_pip_config(proc.stdout), None
+    except (ValueError, SyntaxError) as exc:
+        return [], str(exc)
+
+
+def _other_sources() -> tuple[list[str], str | None]:
+    """Where pip would look besides PyPI, and why pip's configuration was unreadable, if it was.
+
+    Every setting is taken as given, wherever it is set: which of several
+    files or sections pip would let win is not modelled, and a source counted
+    that pip would not use can only turn a refusal into a note.
+    """
+    settings = [(name, option, os.environ.get(name, "")) for name, option in _SOURCE_VARIABLES]
+    configured, unread = _pip_configuration()
+    others: dict[str, str] = {}
+    for where, option, value in settings + configured:
+        # List-valued options are split on whitespace, as pip splits them
+        # (`_update_defaults`, pip/_internal/cli/parser.py).
+        for item in value.split():
+            if option == "find-links" or not _is_pypi(item):
+                others.setdefault(item, f"{where}={item}")
+    return list(others.values()), unread
+
+
+@dataclass(frozen=True)
+class _HostVerdict:
+    """Whether this machine can build an environment, and whether that is enforced."""
+
+    # The rest of a sentence about the environment, or None when nothing stops it.
+    reason: str | None = None
+    # Why a reason found in PyPI's lists is said and not enforced, or "".
+    caveat: str = ""
+
+
+def _host_verdict(env: StageEnv) -> _HostVerdict:
+    """The Python floor, then PyPI's lists unless pip is pointed past PyPI."""
+    host = wheels.current_host()
+    if host.python < STAGE_PYTHON_MIN:
+        return _HostVerdict(
+            f"needs at least python{STAGE_PYTHON_MIN[0]}.{STAGE_PYTHON_MIN[1]}; this is "
+            f"python{host.python[0]}.{host.python[1]}"
+        )
+    reason = env.unprovisionable(host)
+    if reason is None:
+        return _HostVerdict()
+    others, unread = _other_sources()
+    if others:
+        caveat = (
+            f"pip is also pointed at {', '.join(others)}, which those lists do not cover and "
+            "which may carry what PyPI does not -- pip says so if it does not"
+        )
+    elif unread:
+        caveat = (
+            f"pip's own configuration could not be read ({unread}), so whether it points past "
+            "PyPI is not known -- pip says so if it finds nothing"
+        )
+    else:
+        caveat = ""
+    return _HostVerdict(reason, caveat)
 
 
 def _refuse_unsupported_host(env: StageEnv, events=None) -> None:
@@ -1690,20 +1819,17 @@ def _refuse_unsupported_host(env: StageEnv, events=None) -> None:
     x86-64, and `export` at `numpy==2.0.2` everywhere. A message naming the
     wrong pin sends the reader to fix the wrong thing.
 
-    Where pip is pointed past PyPI the gap is said and not enforced: the table
-    is PyPI's, and the other index may carry the wheel. pip is then asked, and
-    `_provisioning_failed` reads its answer if it has none either.
+    Where pip is pointed past PyPI, or its configuration cannot be read, the
+    gap is said and not enforced: the table is PyPI's. pip is then asked, and
+    `_provisioning_failed` reads its answer if it has nothing either.
     """
-    refusal = env.refusal()
-    if refusal:
-        raise RuntimeError(refusal)
-    indexes = _custom_indexes()
-    reason = env.unprovisionable() if indexes else None
-    if reason:
+    verdict = _host_verdict(env)
+    if verdict.reason and not verdict.caveat:
+        raise RuntimeError(f"environment {env.name!r} {verdict.reason}")
+    if verdict.reason:
         note = (
-            f"by PyPI's file lists, environment {env.name!r} {reason}. Provisioning anyway: "
-            f"{', '.join(indexes)} points pip at an index those lists do not cover, which may "
-            "carry what PyPI does not, and pip says so if it does not"
+            f"by PyPI's file lists, environment {env.name!r} {verdict.reason}. Provisioning "
+            f"anyway: {verdict.caveat}"
         )
         if events:
             events.note(note)
@@ -1711,21 +1837,21 @@ def _refuse_unsupported_host(env: StageEnv, events=None) -> None:
             logger.warning("%s", note)
 
 
-def _host_refusal(
-    requirements: Sequence[str], platform: str, python: tuple[int, int]
-) -> str | None:
-    """Why `requirements` cannot be installed on `platform` and `python`; None if nothing says so.
+def _host_refusal(requirements: Sequence[str], host: wheels.Host) -> str | None:
+    """Why `requirements` cannot be installed on `host`; None if nothing says so.
 
     A pin with no wheel for the platform at all is said first and alone: no
     interpreter on this machine would install it, so naming a Python version
     would send the reader to change the wrong thing.
     """
-    found = wheels.gaps(requirements, platform, python[1])
+    found = wheels.gaps(requirements, host)
     if not found:
         return None
     missing = [gap for gap in found if gap.platform_missing]
     if missing:
-        text = f"cannot be provisioned on {platform}: " + "; ".join(g.describe() for g in missing)
+        text = f"cannot be provisioned on {host.platform}: " + "; ".join(
+            g.describe() for g in missing
+        )
         converter = next(
             (
                 g.release.requirement
@@ -1738,7 +1864,8 @@ def _host_refusal(
             text += ". " + _CONVERTER_UNAVAILABLE.format(package=converter)
         return text
     return (
-        f"cannot be provisioned on python{python[0]}.{python[1]} on {platform}: it pins "
+        f"cannot be provisioned on python{host.python[0]}.{host.python[1]} on "
+        f"{host.platform}: it pins "
         + "; and ".join(g.describe() for g in found)
         + ". Stage environments are built from the interpreter running litetune; run litetune "
         "under one of those (Colab's default works), or install it into a virtualenv on one"
@@ -1935,52 +2062,38 @@ class StageEnv:
             )
         # With `--no-provision`, "not provisioned" alone sends the reader to drop
         # the flag, and the run after that refuses for this reason instead.
-        reason = self.unprovisionable()
-        if reason and _custom_indexes():
+        verdict = _host_verdict(self)
+        if verdict.reason and verdict.caveat:
             return (
-                f"is not provisioned at {self.path}; by PyPI's file lists it {reason}, though "
-                f"{', '.join(_custom_indexes())} points pip at an index those lists do not cover"
+                f"is not provisioned at {self.path}; by PyPI's file lists it {verdict.reason}, "
+                f"though {verdict.caveat}"
             )
-        if reason:
-            return f"is not provisioned at {self.path}, and {reason}"
+        if verdict.reason:
+            return f"is not provisioned at {self.path}, and {verdict.reason}"
         return f"is not provisioned at {self.path}"
 
     def refusal(self) -> str | None:
         """What `provision` refuses to build this environment here with, or None.
 
         A whole sentence about the environment: the Python floor first, then
-        PyPI's file lists -- which a custom index (`_INDEX_VARIABLES`) turns
-        into a warning `provision` gives instead. Public so a stage can ask
-        before it does anything else: `export` asks before it writes into the
-        checkpoint it was handed.
+        PyPI's file lists -- which pip pointed past PyPI, or a pip whose
+        configuration cannot be read, turns into a note `provision` gives
+        instead. Public so a stage can ask before it does anything else:
+        `export` asks before it writes into the checkpoint it was handed.
         """
-        current = (sys.version_info[0], sys.version_info[1])
-        if current < STAGE_PYTHON_MIN:
-            return (
-                f"environment {self.name!r} needs at least python"
-                f"{STAGE_PYTHON_MIN[0]}.{STAGE_PYTHON_MIN[1]}; this is python"
-                f"{current[0]}.{current[1]}"
-            )
-        if _custom_indexes():
-            return None
-        reason = self.unprovisionable(python=current)
-        return f"environment {self.name!r} {reason}" if reason else None
+        verdict = _host_verdict(self)
+        if verdict.reason and not verdict.caveat:
+            return f"environment {self.name!r} {verdict.reason}"
+        return None
 
-    def unprovisionable(
-        self, platform: str | None = None, python: tuple[int, int] | None = None
-    ) -> str | None:
-        """Why pip cannot build this environment here, by PyPI's file lists, or None.
+    def unprovisionable(self, host: wheels.Host | None = None) -> str | None:
+        """Why pip cannot build this environment on `host`, by PyPI's file lists, or None.
 
-        The rest of a sentence about the environment. `platform` and `python`
-        default to the interpreter running this, which is what the environment
-        is built from; they are parameters so that a machine nobody has can
-        still be asked about.
+        The rest of a sentence about the environment. `host` defaults to the
+        interpreter running this, which is what the environment is built from;
+        it is a parameter so that a machine nobody has can still be asked about.
         """
-        return _host_refusal(
-            self.requirements,
-            platform or wheels.host_platform(),
-            python or (sys.version_info[0], sys.version_info[1]),
-        )
+        return _host_refusal(self.requirements, host or wheels.current_host())
 
     def system_requirements_on(self, platform: str | None = None) -> tuple[str, ...]:
         """The system packages to name on `platform`, a `sys.platform` value (this one by default).

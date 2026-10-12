@@ -1,11 +1,10 @@
 """Which machines a stage environment's pins can be installed on, as PyPI lists them.
 
 `StageEnv.provision` builds an environment with pip, from the interpreter
-running litetune. Where a pin publishes no wheel for that interpreter's
-platform or Python version, pip finds nothing to install, or falls back to a
-source build and fails minutes later without naming the version -- so the
-environments are checked before pip is asked, against the files each pin
-actually publishes.
+running litetune. Where a pin publishes no wheel that interpreter can install,
+pip finds nothing to install, or falls back to a source build and fails minutes
+later without naming the version -- so the environments are checked before pip
+is asked, against the files each pin actually publishes.
 
 **The facts are data, with their source.** Each `Release` below is what PyPI's
 JSON API returned for one pinned release, read on 2026-10-12: its file names
@@ -13,6 +12,15 @@ JSON API returned for one pinned release, read on 2026-10-12: its file names
 requirements its metadata names without a marker (`info.requires_dist`), which
 pip can only satisfy with exactly that version. Nothing here is inferred from a
 project's other releases: a wheel is in the list or it is not.
+
+**A wheel is matched the way pip matches it.** Its file name's tags are read
+with `packaging.utils.parse_wheel_filename` and compared with the
+interpreter's compatible tags, `packaging.tags.sys_tags()` -- the same
+`cpython_tags` and `compatible_tags` pip's own `get_supported` joins
+(`pip/_internal/utils/compatibility_tags.py`, pip 26.2.1). So the minimum
+macOS in `macosx_12_0_arm64`, the glibc in `manylinux_2_27_x86_64`, musl,
+free-threaded builds and `abi3` all count, as they do for pip. Reducing a tag
+to its architecture admitted macOS 11 and glibc 2.26, where pip has no wheel.
 
 **Keyed by the pinned release, which is what makes a table tolerable.** #45 read
 the converter's absence off pip's output rather than the platform, so that the
@@ -26,23 +34,20 @@ read here, and for that #45's reading of pip's output still stands behind it.
 
 **What is not read, so that nothing is refused on a guess.** Requirements the
 pins leave open or put behind a marker, which pip resolves itself and whose
-failures reach the reader through pip's own output; the glibc and macOS
-versions inside a platform tag; musl; interpreters other than CPython, which
-are judged as if they were one; and any index but PyPI -- this is PyPI's file
-list, not `PIP_EXTRA_INDEX_URL`'s.
+failures reach the reader through pip's own output; and any index but PyPI --
+this is PyPI's file list, and `envs` says so rather than refusing where pip is
+pointed elsewhere.
 """
 
 from __future__ import annotations
 
-import platform as platform_module
 import re
-import struct
-import sysconfig
-from collections.abc import Iterable, Mapping
+import sys
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-# A wheel built for no platform in particular: `py3-none-any`.
-ANY = "any"
+from packaging.tags import Tag, compatible_tags, cpython_tags, platform_tags, sys_tags
+from packaging.utils import parse_wheel_filename
 
 
 def canonical(name: str) -> str:
@@ -57,89 +62,42 @@ def canonical(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-# Platform tags, read the way PEP 425 and its successors spell them, and kept in
-# that spelling: a refusal that says `win_arm64` names what a reader will find
-# in the file list on PyPI. Each manylinux generation is the same architecture
-# as far as this question goes; a universal2 macOS wheel is both of its halves.
-_MANYLINUX = re.compile(r"manylinux(?:1|2010|2014|_\d+_\d+)_(\w+)")
-_MUSLLINUX = re.compile(r"musllinux_\d+_\d+_(\w+)")
-_MACOSX = re.compile(r"macosx_\d+_\d+_(\w+)")
-_MACOSX_FORMATS = {"arm64": ("arm64",), "x86_64": ("x86_64",), "universal2": ("arm64", "x86_64")}
-_ANDROID = re.compile(r"android_\d+_(\w+)")
-_WINDOWS = frozenset({"win32", "win_amd64", "win_arm64"})
-
-
-def _platforms(tag: str) -> frozenset[str]:
-    """The platforms one wheel's platform tag installs on.
-
-    Raises on a tag this does not know, rather than reading it as nothing: a pin
-    moved to a release with an unfamiliar tag must fail the test that reads
-    every file on record, not refuse a machine the wheel was built for.
-    """
-    found: set[str] = set()
-    for part in tag.split("."):
-        if part == ANY or part in _WINDOWS:
-            found.add(part)
-        elif m := _MANYLINUX.fullmatch(part):
-            found.add(f"linux_{m.group(1)}")
-        elif m := _MUSLLINUX.fullmatch(part):
-            found.add(f"musllinux_{m.group(1)}")
-        elif (m := _MACOSX.fullmatch(part)) and m.group(1) in _MACOSX_FORMATS:
-            found.update(f"macosx_{arch}" for arch in _MACOSX_FORMATS[m.group(1)])
-        elif m := _ANDROID.fullmatch(part):
-            found.add(f"android_{m.group(1)}")
-        else:
-            raise ValueError(f"unrecognised platform tag {part!r} in {tag!r}")
-    return frozenset(found)
-
-
 @dataclass(frozen=True)
-class _Wheel:
-    """What one wheel file installs on."""
+class Host:
+    """An interpreter as pip sees it: the tags of every wheel it would install."""
 
-    platforms: frozenset[str]
-    # CPython 3 minor versions it is built for. Empty with `every_python` set
-    # for a `py3` wheel, which any Python 3 installs: `litert-lm-api` ships its
-    # native library that way, as `py3-none-<platform>`.
-    minors: frozenset[int]
-    every_python: bool
+    python: tuple[int, int]
+    # Most specific first, in pip's order: `platforms[0]` is what a refusal calls
+    # this machine -- `win_amd64`, `macosx_15_0_arm64`, `manylinux_2_39_x86_64`.
+    platforms: tuple[str, ...]
+    tags: frozenset[Tag]
+
+    @property
+    def platform(self) -> str:
+        return self.platforms[0]
+
+    @classmethod
+    def of(cls, platforms: Sequence[str], python: tuple[int, int]) -> Host:
+        """A regular CPython build of `python` that accepts `platforms`: a machine nobody has here.
+
+        The tags `get_supported` would compute for it -- `cpython_tags` with the
+        build's own ABI, then `compatible_tags` -- which is how a POSIX runner
+        asks what Windows, an older macOS or the next Python would be told.
+        """
+        interpreter = f"cp{python[0]}{python[1]}"
+        tags = frozenset(cpython_tags(python, [interpreter], platforms)) | frozenset(
+            compatible_tags(python, interpreter, platforms)
+        )
+        return cls(python, tuple(platforms), tags)
 
 
-_CPYTHON = re.compile(r"cp3(\d+)")
-# The ABIs a regular CPython build installs: none, its own, and its own with the
-# `m` suffix older releases carried. `abi3` is refused below until a pin needs it
-# and somebody reads what it means.
-_ABI = re.compile(r"none|cp3\d+m?")
-# A free-threaded build's ABI, `cp313t`: a wheel for it installs on that build
-# and not on the regular one beside it (`sentencepiece==0.2.1` ships both). A
-# free-threaded host is not modelled, so these wheels count for nothing.
-_FREE_THREADED = re.compile(r"cp3\d+t")
-
-
-def _wheel(filename: str) -> _Wheel | None:
-    """Read a wheel file name's tags. None for a wheel no regular CPython build installs."""
-    if not filename.endswith(".whl"):
-        raise ValueError(f"{filename} is not a wheel")
-    python, abi, tag = filename[: -len(".whl")].split("-")[-3:]
-    minors: set[int] = set()
-    every_python = False
-    cpython = False
-    for part in python.split("."):
-        if part == "py3":
-            every_python = cpython = True
-        elif m := _CPYTHON.fullmatch(part):
-            minors.add(int(m.group(1)))
-            cpython = True
-        elif part == "py2" or part.startswith("pp"):
-            # Python 2, or PyPy: nothing a stage environment is built from.
-            continue
-        else:
-            raise ValueError(f"unrecognised python tag {part!r} in {filename}")
-    if not cpython or _FREE_THREADED.fullmatch(abi):
-        return None
-    if not _ABI.fullmatch(abi):
-        raise ValueError(f"unrecognised ABI tag {abi!r} in {filename}")
-    return _Wheel(_platforms(tag), frozenset(minors), every_python)
+def current_host() -> Host:
+    """The interpreter running this, which is the one a stage environment is built from."""
+    return Host(
+        (sys.version_info[0], sys.version_info[1]),
+        tuple(platform_tags()),
+        frozenset(sys_tags()),
+    )
 
 
 @dataclass(frozen=True)
@@ -158,22 +116,34 @@ class Release:
         """Whether a source distribution was published, which pip would try to build."""
         return any(not name.endswith(".whl") for name in self.files)
 
-    def _wheels(self) -> list[_Wheel]:
-        return [w for name in self.files if name.endswith(".whl") if (w := _wheel(name))]
+    def wheels(self) -> list[frozenset[Tag]]:
+        """Each wheel's tags, as `parse_wheel_filename` reads its file name."""
+        return [parse_wheel_filename(name)[3] for name in self.files if name.endswith(".whl")]
 
     def platforms(self) -> list[str]:
-        """Every platform some wheel of this release installs on, sorted."""
-        return sorted({p for w in self._wheels() for p in w.platforms})
+        """Every platform tag some wheel of this release names, sorted."""
+        return sorted({tag.platform for tags in self.wheels() for tag in tags})
 
-    def minors_on(self, platform: str) -> frozenset[int] | None:
-        """The Python 3 minors with a wheel for `platform`; None for every one of them."""
-        minors: set[int] = set()
-        for w in self._wheels():
-            if platform in w.platforms or ANY in w.platforms:
-                if w.every_python:
-                    return None
-                minors |= w.minors
-        return frozenset(minors)
+    def installs_on(self, host: Host) -> bool:
+        return any(tags & host.tags for tags in self.wheels())
+
+    def minors_on(self, host: Host) -> frozenset[int]:
+        """The Python 3 minors a regular build on `host`'s platforms has a wheel for.
+
+        Asked the way the match itself is: for each minor some wheel names, the
+        tags `Host.of` gives that minor on these platforms.
+        """
+        named = {
+            int(m.group(1))
+            for tags in self.wheels()
+            for tag in tags
+            if (m := re.fullmatch(r"(?:cp|py)3(\d+)", tag.interpreter))
+        }
+        return frozenset(
+            minor
+            for minor in named
+            if any(tags & Host.of(host.platforms, (3, minor)).tags for tags in self.wheels())
+        )
 
 
 @dataclass(frozen=True)
@@ -181,9 +151,9 @@ class Gap:
     """A pin with no wheel for a host: for its platform at all, or for its Python."""
 
     release: Release
-    platform: str
-    # The Python 3 minors `release` has wheels for on `platform`. Empty when it
-    # has none there for any Python, which is a different sentence.
+    host: Host
+    # The Python 3 minors `release` has wheels for on `host`'s platforms. Empty
+    # when it has none there for any Python, which is a different sentence.
     minors: frozenset[int]
     # The pin that brought this one in, when it is not one of the environment's own.
     required_by: str | None = None
@@ -204,11 +174,11 @@ class Gap:
                 else "no source distribution either, so pip has nothing to install"
             )
             return (
-                f"{name} publishes no wheel for {self.platform} and {builds} -- its wheels are "
-                f"for {', '.join(self.release.platforms())} ({self.release.source})"
+                f"{name} publishes no wheel for {self.host.platform} and {builds} -- its wheels "
+                f"are for {', '.join(self.release.platforms())} ({self.release.source})"
             )
         return (
-            f"{name}, which publishes wheels for {self.platform} for {_span(self.minors)} "
+            f"{name}, which publishes wheels for {self.host.platform} for {_span(self.minors)} "
             f"only ({self.release.source})"
         )
 
@@ -230,11 +200,10 @@ def _key(requirement: str) -> str | None:
 
 def gaps(
     requirements: Iterable[str],
-    platform: str,
-    minor: int,
+    host: Host,
     published: Mapping[str, Release] | None = None,
 ) -> list[Gap]:
-    """Every pin with no wheel for `platform` and CPython 3.`minor`.
+    """Every pin with no wheel `host` installs.
 
     Follows each release's own exact requirements, so a pin whose wheel exists
     but whose `==` dependency's does not is caught and named as that
@@ -253,43 +222,10 @@ def gaps(
         seen.add(key)
         release = table[key]
         pending.extend((r, release.requirement) for r in release.requires)
-        minors = release.minors_on(platform)
-        if minors is None or minor in minors:
+        if release.installs_on(host):
             continue
-        found.append(Gap(release, platform, minors, required_by=parent))
+        found.append(Gap(release, host, release.minors_on(host), required_by=parent))
     return found
-
-
-def platform_key(system: str, sysconfig_platform: str, mac_arch: str, is_32bit: bool) -> str:
-    """The platform a wheel must be built for to install on an interpreter.
-
-    The same inputs pip reads, in the same order (`packaging.tags.platform_tags`
-    as pip 26.2.1 vendors it): on macOS the CPU from `platform.mac_ver()`,
-    `i386` for a 32-bit interpreter; on Linux `sysconfig.get_platform()`, moved
-    to its 32-bit name for a 32-bit interpreter on a 64-bit kernel, which is
-    what puts 32-bit Python on x86-64 Linux on `linux_i686`; everywhere else
-    `sysconfig.get_platform()` itself, which on Windows is `win_amd64`,
-    `win_arm64` or `win32` for the interpreter's build, whatever the machine.
-    `.` and `-` become `_`, as in a wheel's tag.
-    """
-    if system == "Darwin":
-        if is_32bit:
-            return "macosx_ppc" if mac_arch.startswith("ppc") else "macosx_i386"
-        return f"macosx_{mac_arch}"
-    key = re.sub(r"[-. ]", "_", sysconfig_platform)
-    if system == "Linux" and is_32bit:
-        key = {"linux_x86_64": "linux_i686", "linux_aarch64": "linux_armv8l"}.get(key, key)
-    return key
-
-
-def host_platform() -> str:
-    """`platform_key` for the interpreter running this."""
-    return platform_key(
-        platform_module.system(),
-        sysconfig.get_platform(),
-        platform_module.mac_ver()[2],
-        struct.calcsize("P") == 4,
-    )
 
 
 # ---------------------------------------------------------------------------

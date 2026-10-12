@@ -1614,7 +1614,9 @@ def test_functiongemma_carries_a_template_the_runtime_can_execute():
     plan = plan_export("google/functiongemma-270m-it", (), ("dynamic_wi8_afp32",))
     override = [f for f in plan.flags if f.startswith("--jinja_chat_template_override=")]
     assert len(override) == 1
-    assert override[0].endswith("templates/functiongemma.jinja")
+    # By path parts: the path is the platform's own, `\`-separated on Windows.
+    packaged = Path(override[0].partition("=")[2])
+    assert packaged.parts[-2:] == ("templates", "functiongemma.jinja")
     assert any(
         "--jinja_chat_template_override" in f for f in plan.added
     ), "litetune added this, and the report has to say so"

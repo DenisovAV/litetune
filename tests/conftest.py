@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from packaging.tags import mac_platforms
 
 from litetune.evaluate import (
     BACKEND_OBSERVED,
@@ -31,6 +32,7 @@ from litetune.evaluate import (
     GenerationBackend,
 )
 from litetune.prompt_mode import PromptMode
+from litetune.wheels import Host
 
 
 def call_text(name: str, **args: str) -> str:
@@ -375,6 +377,64 @@ def mark_provisioned(env) -> Path:
     return env.path
 
 
+def _manylinux(arch: str, glibc_minor: int) -> list[str]:
+    """The platform tags a glibc 2.`glibc_minor` Linux on `arch` accepts, most specific first.
+
+    In the order `packaging._manylinux.platform_tags` yields them (packaging
+    26.3): each glibc from this one down to 2.17 -- 2.5 on x86 -- with the legacy
+    alias beside the version it names, then the bare `linux_` tag pip adds.
+    """
+    oldest = 4 if arch in ("x86_64", "i686") else 16
+    legacy = {17: "manylinux2014", 12: "manylinux2010", 5: "manylinux1"}
+    tags: list[str] = []
+    for minor in range(glibc_minor, oldest, -1):
+        tags.append(f"manylinux_2_{minor}_{arch}")
+        if minor in legacy:
+            tags.append(f"{legacy[minor]}_{arch}")
+    return [*tags, f"linux_{arch}"]
+
+
+# Machines nobody has here, by name, as the platform tags pip would accept on
+# each: `packaging.tags.mac_platforms` for macOS, `_manylinux` above and
+# `_musllinux.platform_tags`'s order for Linux, the bare tag for Windows.
+MACHINES: dict[str, list[str]] = {
+    "linux_x86_64": _manylinux("x86_64", 35),
+    "linux_aarch64": _manylinux("aarch64", 35),
+    "linux_x86_64_glibc_2_26": _manylinux("x86_64", 26),
+    "linux_x86_64_glibc_2_27": _manylinux("x86_64", 27),
+    "musl_x86_64": [f"musllinux_1_{m}_x86_64" for m in (2, 1, 0)] + ["linux_x86_64"],
+    "macosx_arm64": list(mac_platforms((14, 0), "arm64")),
+    "macosx_11_arm64": list(mac_platforms((11, 0), "arm64")),
+    "macosx_12_arm64": list(mac_platforms((12, 0), "arm64")),
+    "macosx_x86_64": list(mac_platforms((14, 0), "x86_64")),
+    "win_amd64": ["win_amd64"],
+    "win_arm64": ["win_arm64"],
+    "win32": ["win32"],
+}
+
+
+def machine(name: str, python: tuple[int, int]) -> Host:
+    """A regular CPython `python` on the machine `MACHINES` names."""
+    return Host.of(MACHINES[name], python)
+
+
+@pytest.fixture(autouse=True)
+def _pip_points_at_pypi_alone(monkeypatch):
+    """The machine running the suite does not choose the index a test sees.
+
+    A refusal is enforced only where pip is pointed at PyPI alone, and that is
+    read from `PIP_INDEX_URL` and its two siblings and from pip's own
+    configuration. A developer's `pip.conf`, or a CI image's, would otherwise
+    decide which tests refuse; and asking the real pip is a subprocess. Tests
+    about either set them themselves.
+    """
+    from litetune import envs
+
+    for name, _ in envs._SOURCE_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(envs, "_pip_configuration", lambda: ([], None))
+
+
 def buildable_here(monkeypatch) -> None:
     """Let a faked `provision` stand for the whole of provisioning.
 
@@ -536,12 +596,19 @@ def run_compose_script(
     # The caller's path after the shim's, so a Jinja2 that is not installed in
     # this interpreter can be supplied on PYTHONPATH as well.
     path = os.pathsep.join(filter(None, [str(shim), os.environ.get("PYTHONPATH", "")]))
+    # The environment `StageEnv.run` gives a stage, with the shim on the path:
+    # in UTF-8 mode among the rest, so the script reads the checkpoint's files
+    # as it does in the export environment. With the host's own environment it
+    # read them in the ANSI code page on Windows, where a byte that is not
+    # UTF-8 decodes to something -- the first windows-latest run.
+    from litetune.envs import _child_env
+
     proc = subprocess.run(
         [sys.executable, script, spec, result],
         capture_output=True,
         text=True,
         timeout=timeout,
-        env={**os.environ, "PYTHONPATH": path},
+        env=_child_env({"PYTHONPATH": path}),
     )
     seen = loads.read_text(encoding="utf-8").splitlines() if loads.is_file() else []
     return proc, [json.loads(line) for line in seen]

@@ -802,6 +802,7 @@ rendered three ways -- "string": the template, the content a string;
 "parts_alone": the template, the content that list -- each {"text": ...} or
 {"error": ...}, with "environment": true for an error of the environment's.
 """
+import errno
 import hashlib
 import json
 import os
@@ -851,6 +852,13 @@ def chat_template_json(model):
             return None, lookup("unreachable", None, exc)
     else:
         where = os.path.join(model, "chat_template.json")
+    if os.path.isdir(where):
+        # Asked, not inferred from the error: on Windows opening a directory
+        # raises an OSError other than IsADirectoryError -- the first
+        # windows-latest run read it as the machine's, "unreachable" -- and a
+        # directory there is the checkpoint's, whatever the platform calls it.
+        exc = IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), where)
+        return None, lookup("unusable", where, exc)
     try:
         with open(where, "rt") as handle:
             text = handle.read()

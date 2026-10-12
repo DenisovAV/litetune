@@ -135,11 +135,19 @@ brew install DenisovAV/tap/litetune
 
 **Linux, macOS on Apple Silicon or Windows on x64**, Python 3.10–3.12 — with
 `convert` needing Linux x86_64 or an Apple Silicon Mac, for the reason below.
-Each stage checks, before pip runs, that every pin it installs publishes a wheel
-for your platform and Python, and refuses by naming the one that does not: the
-runtime's native library `litert-lm-api` and `torch==2.5.1` publish none for
+The pinned wheels set the minimums: glibc 2.27 on Linux for every stage that
+builds an environment (`litert-lm-api`, `litert-converter` and
+`sentencepiece==0.2.1` are `manylinux_2_27`), macOS 12 for `convert`, `verify`
+and `towers` (`litert-lm-api` is `macosx_12_0_arm64`) and macOS 11 for `tune`;
+musl Linux, Alpine's, has none of them. Each stage checks, before pip runs, that
+every pin it installs publishes a wheel this interpreter accepts — the whole
+tag, matched as pip matches it — and refuses by naming the one that does not:
+the runtime's native library `litert-lm-api` and `torch==2.5.1` publish none for
 Intel Macs, 32-bit Python or Windows on ARM64, so no stage that builds an
-environment runs there. On Linux you also need
+environment runs there. Where pip is pointed at another index or archive —
+`PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL` or `PIP_FIND_LINKS`, or the same settings
+in a pip configuration file — the check says what PyPI lacks and lets pip look.
+On Linux you also need
 `libvulkan1` —
 `litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, and
 without it every invocation, `--help` included, dies in under a second:
