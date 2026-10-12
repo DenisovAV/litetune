@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import mark_provisioned, run_compose_script
+from conftest import buildable_here, machine, mark_provisioned, run_compose_script
 
 from litetune import envs, models
 from litetune.checks import Check, Outcome
@@ -37,6 +37,7 @@ from litetune.export import (
     PROBE_TEXT,
     TOOLCHAIN_DEFAULT_RECIPE,
     ExportRequest,
+    ExportResult,
     NoRecipesRequested,
     SizeComparison,
     Uncompared,
@@ -68,6 +69,9 @@ transformers==5.16.1
 QWEN3_TEMPLATE = (
     Path(__file__).parent / "fixtures" / "qwen3-0.6b-c1899de.chat_template.jinja"
 ).read_text(encoding="utf-8")
+
+# Kept at import, before any fixture replaces it, for the test that needs it back.
+_REAL_REFUSAL = envs.StageEnv.refusal
 
 
 @dataclass
@@ -508,6 +512,7 @@ def toolchain(monkeypatch, tmp_path) -> FakeToolchain:
 
     fake = FakeToolchain()
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
+    buildable_here(monkeypatch)
     monkeypatch.setattr(envs.StageEnv, "run", fake)
     return fake
 
@@ -860,10 +865,12 @@ class _AnyTemplate:
     """Matches the template flag whatever absolute path it carries."""
 
     def __eq__(self, other: object) -> bool:
+        # By path parts, not by a `/` suffix: the path is the platform's own,
+        # and on Windows its separator is `\`.
         return (
             isinstance(other, str)
             and other.startswith("--jinja_chat_template_override=")
-            and other.endswith("templates/functiongemma.jinja")
+            and Path(other.partition("=")[2]).parts[-2:] == ("templates", "functiongemma.jinja")
         )
 
     def __repr__(self) -> str:
@@ -976,6 +983,15 @@ def test_parse_pip_freeze_keeps_unpinnable_entries_verbatim():
     assert frozen["foo"].startswith("foo @ https://")
 
 
+def test_a_frozen_direct_url_keeps_its_hash_and_loses_its_credential():
+    """pip writes the archive's hash in the fragment; it is provenance, not a secret."""
+    frozen = parse_pip_freeze(
+        "pkg @ https://u:p4ss@h.invalid/pkg-1-py3-none-any.whl?sig=T0KEN#sha256=ab12\n"
+    )
+
+    assert frozen["pkg"] == "pkg @ https://***@h.invalid/pkg-1-py3-none-any.whl?***#sha256=ab12"
+
+
 def test_requirement_names_drop_the_pins():
     assert requirement_names(("litert-lm==0.16.1", "numpy==2.0.2")) == ("litert-lm", "numpy")
     assert requirement_names(("https://example.invalid/wheel.whl",)) == ()
@@ -1000,6 +1016,19 @@ def test_an_unexpected_error_mid_export_is_could_not_check_not_a_crash(
     assert result.exports[0].check.outcome is Outcome.UNCHECKED
     assert result.outcome is Outcome.UNCHECKED
     assert result.failed == []
+
+
+@pytest.mark.parametrize(("platform", "debian"), [("linux", ["libvulkan1"]), ("darwin", [])])
+def test_the_request_names_a_debian_package_only_on_linux(tmp_path, monkeypatch, platform, debian):
+    """A `--json` report from a Mac listed `libvulkan1`, a Debian name."""
+    # The `sys` envs reads, which is the one `sys` -- named so it stays that.
+    monkeypatch.setattr(envs.sys, "platform", platform)
+    request = ExportRequest(
+        model="google/functiongemma-270m-it",
+        output_dir=tmp_path / "out",
+        recipes=("dynamic_wi8_afp32",),
+    )
+    assert request.as_dict()["environment"]["system_requirements"] == debian
 
 
 def test_the_result_survives_the_trip_through_a_manifest(toolchain, request_for):
@@ -1089,6 +1118,180 @@ def test_a_bpe_checkpoint_needs_no_repair_and_is_not_an_error(tmp_path):
     )
 
     assert repair_vocab_file(model) == (True, None)
+
+
+def _stale_vocab_checkpoint(tmp_path) -> Path:
+    """A checkpoint whose `tokenizer_config.json` names a `vocab_file` elsewhere."""
+    model = _checkpoint(tmp_path)
+    (model / "tokenizer.model").write_bytes(b"sp")
+    (model / "tokenizer_config.json").write_text(
+        json.dumps({"vocab_file": "/tmp/elsewhere/tokenizer.model"}), encoding="utf-8"
+    )
+    return model
+
+
+def _files_of(model: Path) -> dict[str, tuple[bytes, int]]:
+    return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in sorted(model.iterdir())}
+
+
+def _convert_checkpoint(model: Path, tmp_path) -> ExportResult:
+    return run_export(
+        ExportRequest(
+            model=str(model),
+            base_model="google/gemma-3-270m-it",
+            output_dir=tmp_path / "out",
+            recipes=("dynamic_wi8_afp32",),
+        )
+    )
+
+
+def test_convert_refused_on_this_machine_writes_nothing_into_the_checkpoint(
+    toolchain, monkeypatch, tmp_path
+):
+    """Windows has no `litert-converter` wheel, and `export` says so before anything else.
+
+    The `vocab_file` repair rewrites `tokenizer_config.json` in the checkpoint
+    it was handed, and it used to run -- with the plan drawn first -- before
+    provisioning refused, so a run that could never convert here still edited
+    the caller's input. The same checkpoint where the environment stands is
+    repaired, which is what makes "nothing was written" mean something.
+    """
+    monkeypatch.setattr(envs.StageEnv, "refusal", _REAL_REFUSAL)
+    provisioned: list[str] = []
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "provision",
+        lambda self, events=None, force=False: provisioned.append(1) or mark_provisioned(self),
+    )
+    model = _stale_vocab_checkpoint(tmp_path)
+    before = _files_of(model)
+
+    monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
+    result = _convert_checkpoint(model, tmp_path)
+
+    assert _files_of(model) == before, "the checkpoint is left as it was handed in"
+    assert provisioned == [], "and nothing was asked to provision"
+    assert result.outcome is Outcome.UNCHECKED
+    assert result.not_attempted == ("dynamic_wi8_afp32",)
+    detail = result.checks.first_unchecked.detail
+    assert detail.startswith("environment 'export' cannot be provisioned on win_amd64")
+    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in detail
+
+    monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("linux_x86_64", (3, 12)))
+    _convert_checkpoint(model, tmp_path)
+    config = json.loads((model / "tokenizer_config.json").read_text(encoding="utf-8"))
+    assert provisioned == [1]
+    assert config["vocab_file"] == str(
+        (model / "tokenizer.model").resolve()
+    ), "where the environment stands, the same checkpoint is repaired"
+
+
+def _pip_fails(monkeypatch) -> None:
+    """The real `provision`, with a virtualenv that builds and a pip that finds nothing."""
+    monkeypatch.setattr(
+        envs.venv.EnvBuilder, "create", lambda self, path: Path(path).mkdir(parents=True)
+    )
+    monkeypatch.setattr(
+        envs,
+        "_run_guarded",
+        lambda *a, **k: subprocess.CompletedProcess(
+            a[0], 1, "", "ERROR: No matching distribution found for litert-converter==0.4.0\n"
+        ),
+    )
+
+
+@pytest.mark.parametrize("how", ["provision-raises", "opted-out-and-pip-fails"])
+def test_a_convert_that_could_not_provision_writes_nothing_into_the_checkpoint(
+    monkeypatch, tmp_path, how
+):
+    """The repair waits for a usable environment, on every platform.
+
+    With `LITETUNE_ALLOW_MISSING_WHEELS=1` on Windows the refusal is a note and
+    pip is asked; when pip has nothing either, the checkpoint must be as it was.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    if how == "provision-raises":
+        monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("linux_x86_64", (3, 12)))
+
+        def provision(self, events=None, force=False):
+            raise RuntimeError("could not provision environment 'export'")
+
+        monkeypatch.setattr(envs.StageEnv, "provision", provision)
+    else:
+        monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
+        monkeypatch.setenv(envs.ALLOW_MISSING_WHEELS, "1")
+        _pip_fails(monkeypatch)
+    model = _stale_vocab_checkpoint(tmp_path)
+    before = _files_of(model)
+
+    result = _convert_checkpoint(model, tmp_path)
+
+    assert _files_of(model) == before
+    assert result.outcome is Outcome.UNCHECKED
+    assert result.not_attempted == ("dynamic_wi8_afp32",)
+    assert "could not provision" in result.checks.first_unchecked.detail
+
+
+_PRIVATE_WHEEL = "https://user:s3cret@packages.invalid/pkg-1-py3-none-any.whl?sig=T0KEN#sha256=ab12"
+_PRIVATE_SHOWN = "https://***@packages.invalid/pkg-1-py3-none-any.whl?***#sha256=ab12"
+
+
+@pytest.mark.parametrize("ready", [False, True], ids=["unready", "ready"])
+def test_a_report_carries_no_credential_from_a_requirement(
+    toolchain, request_for, monkeypatch, ready
+):
+    """The manifest is what a user pastes into an issue.
+
+    A direct URL is an accepted pin, and every place the report lists what an
+    environment pins -- the request, the toolchain's declaration, the
+    environment check -- shows it without its user information or query, and
+    with its hash.
+    """
+    private = envs.StageEnv(name="export", requirements=(_PRIVATE_WHEEL,))
+    if ready:
+        mark_provisioned(private)
+
+    result = run_export(request_for(("weight_only_wi8_afp32",), env=private, auto_provision=False))
+    report = json.dumps(result.as_dict(), default=str)
+
+    assert "s3cret" not in report and "T0KEN" not in report
+    assert report.count(_PRIVATE_SHOWN) >= (3 if ready else 2), report
+
+
+def test_a_pip_freeze_that_failed_is_quoted_without_credentials(monkeypatch, tmp_path):
+    """What `pip freeze` printed when it reported nothing reaches the manifest."""
+    from litetune.export import resolve_toolchain
+
+    def run(self, args, timeout=3600, **kwargs):
+        said = "Looking in indexes: https://u:p4ssw0rd@corp.invalid/simple?token=T0KEN"
+        return subprocess.CompletedProcess(args, 1, "", said)
+
+    monkeypatch.setattr(envs.StageEnv, "run", run)
+
+    toolchain = resolve_toolchain(envs.StageEnv(name="x", requirements=("a==1",)))
+
+    reason = toolchain.unresolved_reason or ""
+    assert "corp.invalid" in reason
+    assert "p4ssw0rd" not in reason and "T0KEN" not in reason
+
+
+def test_a_ready_export_environment_is_used_on_any_machine(toolchain, request_for, monkeypatch):
+    """The refusal is for an environment that would have to be built here.
+
+    One already standing -- built from another index, or by hand -- is used,
+    as `provision` uses it; refusing it on PyPI's account would refuse a
+    machine that has what it needs.
+    """
+    from litetune.envs import StageEnv
+
+    monkeypatch.setattr(StageEnv, "refusal", _REAL_REFUSAL)
+    monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
+    mark_provisioned(envs.EXPORT)
+
+    result = run_export(request_for(("weight_only_wi8_afp32",)))
+
+    assert result.not_attempted == ()
+    assert toolchain.exports, "the recipe ran"
 
 
 def test_run_export_repairs_the_path_and_says_so(toolchain, request_for, tmp_path, monkeypatch):
@@ -1191,10 +1394,13 @@ def test_the_plan_is_keyed_on_the_identity_while_argv_still_names_the_path(tmp_p
     assert f"--model={checkpoint}" in request.argv("dynamic_wi8_afp32")
 
 
-def test_an_unreadable_sidecar_reaches_the_report(tmp_path):
+def test_an_unreadable_sidecar_reaches_the_report(tmp_path, monkeypatch):
     """Recorded in the hint is not enough: nobody reads a hint."""
     from litetune.export import ExportRequest, run_export
 
+    # About the sidecar, not this machine: on Windows or 3.13 `export` would be
+    # refused before the sidecar is read.
+    buildable_here(monkeypatch)
     checkpoint = _checkpoint(tmp_path)
     (checkpoint / "litetune.json").write_text('{"base_model": "goo', encoding="utf-8")
 
@@ -1224,7 +1430,7 @@ def _fake_env(toolchain, tmp_path):
     """A StageEnv whose `run` is the fake; the repack only needs `run`."""
     from litetune import envs
 
-    return envs.StageEnv(name="export", python_ceiling=(3, 12), requirements=())
+    return envs.StageEnv(name="export", requirements=())
 
 
 def _artifact(tmp_path, size=16384) -> Path:
@@ -1843,7 +2049,9 @@ def test_the_report_carries_the_owned_recipe_and_its_rules(toolchain, request_fo
     (owned_call,) = [
         c.argv for c in toolchain.exports if any(a.endswith(f"{OWNED}.json") for a in c.argv)
     ]
-    assert any(a.endswith(f"/{OWNED}") for a in owned_call if a.startswith("--output_dir="))
+    assert any(
+        Path(a.partition("=")[2]).name == OWNED for a in owned_call if a.startswith("--output_dir=")
+    )
 
 
 def test_an_owned_recipe_is_not_flagged_as_passed_through(toolchain, request_for):
@@ -2235,6 +2443,36 @@ def test_an_empty_string_template_falls_back_as_the_exporter_does(toolchain, qwe
     assert _chat_template_check(result).observed["template_source"] == "chat_template.json"
 
 
+def test_a_directory_at_chat_template_json_is_the_checkpoints_whatever_open_raises(
+    tmp_path, monkeypatch
+):
+    """On Windows, opening a directory is not an `IsADirectoryError`.
+
+    The first windows-latest run read a directory there as "unreachable" --
+    the machine's -- because `open` raised something else. The script asks
+    whether it is a directory instead, so the answer does not depend on the
+    platform's error; here `open` is made to raise as it did there.
+    """
+    import builtins
+    import types
+
+    monkeypatch.setitem(sys.modules, "transformers", types.ModuleType("transformers"))
+    script: dict = {"__name__": "compose_template"}
+    exec(compile(_COMPOSE_SCRIPT, "compose_template.py", "exec"), script)
+    checkpoint = tmp_path / "model"
+    (checkpoint / "chat_template.json").mkdir(parents=True)
+
+    def refuses(*args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(args[0]))
+
+    monkeypatch.setattr(builtins, "open", refuses)
+    template, lookup = script["chat_template_json"](str(checkpoint))
+
+    assert template is None
+    assert lookup["outcome"] == "unusable"
+    assert lookup["error"].startswith("IsADirectoryError")
+
+
 @pytest.mark.parametrize(
     ("make", "says"),
     [
@@ -2265,6 +2503,9 @@ def test_what_a_local_checkpoint_holds_at_chat_template_json_is_its_own(
     assert says in check.detail
 
 
+# `chmod(0)` is what makes the file unreadable, and on Windows it only sets the
+# read-only flag (`os.chmod`, Python's documentation): a POSIX permission bit.
+@pytest.mark.posix
 def test_a_local_chat_template_json_the_machine_will_not_open_is_could_not_check(
     toolchain, tmp_path
 ):
@@ -2385,9 +2626,18 @@ def test_the_transformers_version_is_the_one_the_script_saw(toolchain, qwen_requ
             },
             "exited 1: OSError: Qwen/Qwen3-0.6B does not appear to have a file named",
         ),
-        ({"template_returncode": -9}, "chat template was killed by SIGKILL"),
+        # The signal's name is POSIX's: Windows has no SIGKILL to name.
+        pytest.param(
+            {"template_returncode": -9},
+            "chat template was killed by SIGKILL",
+            marks=pytest.mark.posix,
+        ),
         # Killed after its result and file were written: still no answer.
-        ({"template_exit_after": -9}, "chat template was killed by SIGKILL"),
+        pytest.param(
+            {"template_exit_after": -9},
+            "chat template was killed by SIGKILL",
+            marks=pytest.mark.posix,
+        ),
         ({"template_no_result": True}, "exited 0 and wrote no result"),
         ({"template_raises": subprocess.TimeoutExpired("python", 5)}, "gave no result after"),
         ({"template_result": "{not json"}, "wrote a result that is not JSON"),
@@ -2893,8 +3143,10 @@ def test_the_marker_never_reaches_an_exporter_argv(qwen_request):
     assert COMPOSED_TEMPLATE_FLAG in request.extra_flags
     with pytest.raises(ValueError, match="no composed template was given"):
         request.argv("dynamic_wi8_afp32")
-    argv = request.argv("dynamic_wi8_afp32", Path("/composed/t.jinja"))
-    assert _template_flags(argv) == [f"{models.TEMPLATE_FLAG}=/composed/t.jinja"]
+    composed = Path("/composed/t.jinja")
+    argv = request.argv("dynamic_wi8_afp32", composed)
+    # The path as this platform spells it: `\composed\t.jinja` on Windows.
+    assert _template_flags(argv) == [f"{models.TEMPLATE_FLAG}={composed}"]
     assert not any(models.COMPOSED_TEMPLATE in a for a in argv)
 
 
@@ -2958,3 +3210,19 @@ def _exec_script(source: str) -> dict:
         else:
             sys.modules["transformers"] = saved
     return namespace
+
+
+def test_requirement_names_skip_a_pin_whose_marker_is_false_here():
+    """`resolve_toolchain` reads what is installed; a pin for another Python is
+    not installed here and is not reported missing."""
+    other = "3.99" if sys.version_info[:2] != (3, 99) else "3.98"
+    names = requirement_names(
+        [f'onlythere==1.0; python_version == "{other}"', "here==2.0", "pkg @ https://h/p.whl"]
+    )
+    # A named direct URL keeps its name, which `pip show` answers to.
+    assert names == ("here", "pkg")
+
+
+def test_requirement_names_read_a_pin_as_pip_does():
+    """Leading whitespace is no part of a name to pip (`packaging.Requirement`)."""
+    assert requirement_names([" pkg==1.0", "other[extra]==2.0"]) == ("pkg", "other")

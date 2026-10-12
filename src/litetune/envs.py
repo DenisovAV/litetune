@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -32,13 +33,15 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 import venv
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import IO, Any, cast
 
+from litetune import wheels
 from litetune.exits import read_returncode
 
 
@@ -81,9 +84,14 @@ def _cache_root() -> Path:
 
 
 # A requirement is pinned if it fixes an exact version. `>=` is not a pin: it
-# admits tomorrow's release, which is precisely the failure mode above.
+# admits tomorrow's release, which is precisely the failure mode above. Read as
+# pip reads it (`wheels.pin`), so a marker is neither part of the version nor a
+# pin of its own: `torch>=2.0; python_version == "3.12"` holds an `==` and
+# floats, where `sentencepiece==0.2.0; python_version < "3.13"` is a pin.
 def _is_pinned(requirement: str) -> bool:
-    return "==" in requirement or requirement.startswith(("http://", "https://", "file://"))
+    if requirement.startswith(("http://", "https://", "file://")):
+        return True
+    return wheels.pin(requirement) is not None
 
 
 # A pip install of torch is minutes, not seconds; a stalled one is forever.
@@ -183,30 +191,22 @@ _CHILD_TEXT = (("PYTHONUTF8", "1"), ("PYTHONIOENCODING", "utf-8:surrogateescape"
 # the package name it was looking for. `pip install` prints one of these and
 # exits 1 without touching the network again, so the message a user gets for a
 # package that exists but is not built for their platform reads the same as one
-# for a package that does not exist at all.
-def _canonical(name: str) -> str:
-    """A distribution name in the one spelling that compares equal.
-
-    `litert_converter`, `litert.converter` and `LiteRT-Converter` are the same
-    project: PyPA's name specification normalises runs of `-`, `_` and `.` to a
-    single `-` and lowercases. pip prints whichever spelling the requirement
-    used, so a comparison against a literal has to normalise or it silently
-    misses.
-    """
-    return re.sub(r"[-_.]+", "-", name).lower()
-
+# for a package that does not exist at all. Names are compared through
+# `wheels.canonical`, since pip prints whichever spelling the requirement used.
+_canonical = wheels.canonical
 
 _NO_DISTRIBUTION = re.compile(
     r"(?:Could not find a version that satisfies the requirement|"
     r"No matching distribution found for)\s+([A-Za-z0-9._-]+)"
 )
 
-# What to say when the missing distribution is the converter. Read off pip's
-# output rather than `sys.platform`, on purpose: the day `litert-converter`
-# publishes a wheel for a platform it does not build for today, this stops
-# firing on its own. A check on the platform would go on refusing until
-# somebody edited it, which is the failure mode of every hardcoded
-# compatibility table.
+# What to say when the missing distribution is the converter, whether
+# `wheels` found it missing before pip was asked or pip found it missing
+# itself. The first is a list of the files the *pinned* release publishes, so a
+# wheel published under a later version changes nothing until the pin moves --
+# not a table of platforms that goes on refusing after upstream ships. pip's
+# answer is still read, for what that list cannot see: a wheel added to the
+# pinned release later, or one on an index other than PyPI.
 _CONVERTER_PACKAGES = ("litert-converter",)
 _CONVERTER_UNAVAILABLE = (
     "{package} has no distribution for this machine, and `convert` cannot run without it: it is "
@@ -335,7 +335,10 @@ def _group_of(proc: subprocess.Popen) -> int | None:
     cannot be, but a wrong answer here SIGKILLs the session running litetune,
     so the invariant is checked rather than trusted.
     """
-    if os.name == "nt" or not hasattr(os, "killpg"):
+    # `sys.platform` rather than `os.name`: the same answer, and the one the type
+    # checker narrows on, so `mypy --platform win32` does not report the calls
+    # below as missing there.
+    if sys.platform == "win32" or not hasattr(os, "killpg"):
         return None
     # A host that ignores SIGCHLD has the kernel reap children the moment they
     # exit, and `Popen` never learns: `returncode` stays None while the pid --
@@ -404,7 +407,9 @@ def _signal_tree(proc: subprocess.Popen, pgid: int | None, sig: int | None) -> R
     on its own, so it is the ordinary case and not a failure, but it is also
     not evidence that anything was signalled.
     """
-    if pgid is not None and sig is not None:
+    # `pgid` is always None on Windows (`_group_of`); the platform is named as
+    # well so the type checker knows `killpg` is not reached there.
+    if sys.platform != "win32" and pgid is not None and sig is not None:
         try:
             os.killpg(pgid, sig)
             return Reach.GROUP
@@ -574,7 +579,9 @@ def _wait_without_reaping(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return True
-        if waitid is not None:
+        # Neither probe exists on Windows, where the grace is slept out; the
+        # platform is named so the type checker does not look for them there.
+        if sys.platform != "win32" and waitid is not None:
             try:
                 if waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
                     # Exited, and still reapable: the pid stays pinned, so the
@@ -591,7 +598,7 @@ def _wait_without_reaping(
                 # promises; returning here would silently make the grace zero.
                 logger.debug("cannot watch pid %d without reaping it: %s", proc.pid, exc)
                 waitid = None
-        elif pgid is not None:
+        elif sys.platform != "win32" and pgid is not None:
             try:
                 os.killpg(pgid, 0)
             except ProcessLookupError:
@@ -1514,11 +1521,15 @@ def _as_text(chunk: str | bytes | None, encoding: str = "utf-8") -> str:
 
 
 def _describe(proc: subprocess.Popen) -> str:
-    """The first word of a subprocess's command line, for a log message."""
+    """The first word of a subprocess's command line, for a log message.
+
+    Redacted: a command line given as one string is returned whole, and one
+    could name an index with its credentials in it.
+    """
     args = proc.args
     if isinstance(args, str | bytes | os.PathLike):
-        return os.fsdecode(args)
-    return os.fsdecode(next(iter(args), "the stage subprocess"))
+        return redact_text(os.fsdecode(args))
+    return redact_text(os.fsdecode(next(iter(args), "the stage subprocess")))
 
 
 def _child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -1596,75 +1607,299 @@ def _child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
 
 
 # The stage environments are built from the *host* interpreter, so its version
-# is theirs -- and each has its own ceiling, set by whichever of its pins stops
-# publishing wheels first. Past that, pip falls back to a source build and fails
-# after minutes of compiler output that never names the version.
+# and its platform are theirs -- and a pin that publishes no wheel for either
+# leaves pip to fall back to a source build, which fails after minutes of
+# compiler output that never names the version, or to find nothing at all.
 #
 # One shared ceiling was tried and was wrong: it refused `train` on 3.13 for a
 # `numpy==2.0.2` limit that `train` does not have, in a project whose README
-# said `tune` works there. The constraint belongs to the pin, so it is recorded
-# with the pin.
+# said `tune` works there. A ceiling per environment was the next step, and
+# `train`'s 3.13 was a Linux fact: `torch==2.5.1` has a cp313 wheel for
+# manylinux x86_64 alone (and `sentencepiece==0.2.0` has none anywhere, which is
+# why `train` pins 0.2.1 on 3.13). So the limits are not recorded here at all.
+# They are read off what each pin that applies publishes, for this platform, in
+# `wheels`.
 STAGE_PYTHON_MIN = (3, 10)
 
 
 def _try_lock(handle) -> bool | None:
-    """One non-blocking attempt. True taken, False held elsewhere, None no locking.
+    """One non-blocking attempt. True taken, False held elsewhere, None no locking here.
 
     Imported here rather than at module scope: `fcntl` does not exist on
     Windows, and an unconditional import made `import litetune.envs` -- and so
-    the whole CLI -- fail there. This module has always had `os.name == "nt"`
-    branches, so that platform is in scope.
-    """
-    try:
-        import fcntl
+    the whole CLI -- fail there.
 
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except BlockingIOError:
-            return False
-        except OSError:
-            # Advisory locking is unavailable on some network filesystems.
-            return None
-    except ImportError:
-        pass
+    A platform check first rather than a try/except, so the type checker
+    narrows: under `--platform win32` it would otherwise report `fcntl` has no
+    `flock`, and on a POSIX host that `msvcrt` has no `locking`.
+    """
     if sys.platform == "win32":
-        # A platform check rather than a try/except, so the type checker narrows
-        # instead of reporting `msvcrt` has no attributes on a POSIX host.
         try:
             import msvcrt
+        except ImportError:
+            return None
+        return _msvcrt_attempt(handle, msvcrt.locking, msvcrt.LK_NBLCK)
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    except OSError:
+        # Advisory locking is unavailable on some network filesystems.
+        return None
 
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            return True
-        except OSError:
-            return False
-    return None
 
+def _msvcrt_attempt(handle, locking: Callable[[int, int, int], None], mode: int) -> bool | None:
+    """One `msvcrt.locking` attempt on the first byte, read the way its C runtime says.
 
-def _refuse_unsupported_interpreter(env: StageEnv) -> None:
-    """Say which interpreter is needed, before pip spends minutes not saying it.
-
-    Named per environment, because the ceilings differ: `numpy==2.0.2` stops at
-    cp312 and `torch==2.5.1` at cp313, so `convert` and `verify` refuse a
-    3.13 host that `tune` is fine on. A message naming the wrong pin sends the
-    reader to fix the wrong thing.
+    `_locking` sets `errno` to `EACCES` for "Locking violation (file already
+    locked or unlocked)", and to `EBADF` or `EINVAL` for a descriptor or an
+    argument it cannot use (Microsoft's `_locking` reference,
+    learn.microsoft.com/en-us/cpp/c-runtime-library/reference/locking);
+    `msvcrt.locking` raises `OSError` from that `errno`. Only the first means a
+    holder exists. Reading every `OSError` as one made a lock `_locking` could
+    not take at all wait the whole provisioning budget for another process,
+    then blame that process -- which did not exist. The rest now say "no
+    locking", as `flock` refusing does on a network filesystem: the run goes
+    ahead unserialised, and `_provision_lock` says so. Which `errno` a given
+    network share answers with is not established here; one that answers
+    `EACCES` still reads as held.
     """
-    current = sys.version_info[:2]
-    if current < STAGE_PYTHON_MIN:
-        raise RuntimeError(
-            f"environment {env.name!r} needs at least python"
-            f"{STAGE_PYTHON_MIN[0]}.{STAGE_PYTHON_MIN[1]}; this is python"
-            f"{current[0]}.{current[1]}"
+    try:
+        locking(handle.fileno(), mode, 1)
+    except OSError as exc:
+        if exc.errno == errno.EACCES:
+            return False
+        logger.debug("cannot lock %s: %s", getattr(handle, "name", handle), exc)
+        return None
+    return True
+
+
+# A URL inside free text: a pip message, an error naming a setting.
+_URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
+
+
+def redact_url(url: str, *, keep_fragment: bool = False) -> str:
+    """`url` as it may be shown: its user information and query replaced.
+
+    A URL pip prints, or one in a requirement, can carry credentials as user
+    information -- `https://user:token@host/simple`, or a token alone in the
+    user's place -- and some carry a token in the query. The fragment goes too
+    unless `keep_fragment`: in a requirement or a `pip freeze` line it is the
+    archive's `#sha256=` or `#subdirectory=`, which is provenance, not a
+    credential. A path, with no network location, is shown as it is.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        # Not even splittable: show nothing past the scheme.
+        return f"{url.partition(':')[0]}://***"
+    if not parts.netloc:
+        return url
+    netloc = parts.netloc
+    if "@" in netloc:
+        netloc = "***@" + netloc.rpartition("@")[2]
+    query = "***" if parts.query else ""
+    if not parts.fragment:
+        fragment = ""
+    elif keep_fragment:
+        fragment = "&".join(
+            item if _PROVENANCE_FRAGMENT.fullmatch(item) else "***"
+            for item in parts.fragment.split("&")
         )
-    if env.python_ceiling is None or current <= env.python_ceiling:
-        return
-    ceiling = env.python_ceiling
-    raise RuntimeError(
-        f"environment {env.name!r} cannot be provisioned on python"
-        f"{current[0]}.{current[1]}: it pins {env.ceiling_pin}, which publishes wheels up to "
-        f"python{ceiling[0]}.{ceiling[1]}, and stage environments are built from the "
-        "interpreter running litetune. Run litetune under one of those (Colab's default "
-        "works), or install it into a virtualenv on one."
+    else:
+        fragment = "***"
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+
+
+# The fragment keys pip reads from a link, kept because they are provenance:
+# a hash (`Link.hashes`, `_HASHES_RE` in pip/_internal/models/link.py, pip
+# 26.2.1), `subdirectory` and `egg` (`Link.subdirectory_fragment`,
+# `Link._egg_fragment`). A hash value is hex and a name or a path is not a
+# credential; any other key, or a hash key with a value that is not hex, is
+# shown as `***`, because a fragment is free text and can carry a token.
+_PROVENANCE_FRAGMENT = re.compile(
+    r"(?:(?:sha1|sha224|sha256|sha384|sha512|md5)=[0-9a-fA-F]+|subdirectory=[^&]*|egg=[^&]*)"
+)
+
+
+def redact_text(text: str, *, keep_fragment: bool = False) -> str:
+    """`text` with every URL in it `redact_url`-ed."""
+    return _URL_IN_TEXT.sub(lambda m: redact_url(m.group(0), keep_fragment=keep_fragment), text)
+
+
+def shown_requirements(requirements: Iterable[str]) -> list[str]:
+    """Requirements as a report or a message shows them.
+
+    The one serializer for every place a requirement is read rather than used:
+    a direct URL loses its user information and query and keeps its fragment.
+    What is installed, and what an identity hashes, is the string as given.
+    """
+    return [redact_text(r, keep_fragment=True) for r in requirements]
+
+
+# The one way to provision past PyPI's file lists: someone installing from
+# another index or a wheelhouse that carries a wheel PyPI does not says so.
+# Nothing here infers it from pip's settings any more: that inference read
+# `PIP_INDEX_URL` and `pip config list`, and every way it could be wrong --
+# no pip in litetune's own interpreter, which a uv install has; `PIP_VERBOSE`
+# or `PIP_QUIET` changing what `pip config list` prints; a relative path; PyPI
+# spelled `pypi.org:443` -- either switched the check off in silence or
+# refused a working index.
+ALLOW_MISSING_WHEELS = "LITETUNE_ALLOW_MISSING_WHEELS"
+
+
+def _missing_wheels_allowed() -> bool:
+    return os.environ.get(ALLOW_MISSING_WHEELS) == "1"
+
+
+_OPT_OUT = (
+    "That is by PyPI's file lists. Installing from another index or a wheelhouse that has the "
+    f"wheel, set {ALLOW_MISSING_WHEELS}=1: this becomes a note, and pip is asked"
+)
+
+
+@dataclass(frozen=True)
+class _HostVerdict:
+    """Whether this machine can build an environment, and whether that is enforced."""
+
+    # The rest of a sentence about the environment, or None when nothing stops it.
+    reason: str | None = None
+    # Whether `reason` comes from PyPI's file lists, which the opt-out turns into
+    # a note, rather than from the Python floor, which it does not.
+    from_wheels: bool = False
+
+    @property
+    def refused(self) -> bool:
+        return self.reason is not None and not (self.from_wheels and _missing_wheels_allowed())
+
+
+def _host_verdict(env: StageEnv) -> _HostVerdict:
+    """The Python floor, then PyPI's file lists."""
+    host = wheels.current_host()
+    if host.python < STAGE_PYTHON_MIN:
+        return _HostVerdict(
+            f"needs at least python{STAGE_PYTHON_MIN[0]}.{STAGE_PYTHON_MIN[1]}; this is "
+            f"python{host.python[0]}.{host.python[1]}"
+        )
+    reason = env.unprovisionable(host)
+    return _HostVerdict(reason, from_wheels=True) if reason else _HostVerdict()
+
+
+def _refusal_text(env: StageEnv, verdict: _HostVerdict) -> str:
+    text = f"environment {env.name!r} {verdict.reason}"
+    return f"{text}. {_OPT_OUT}" if verdict.from_wheels else text
+
+
+def _refuse_unsupported_host(env: StageEnv, events=None) -> None:
+    """Say which pin cannot be installed here, before pip spends minutes not saying it.
+
+    Named per environment and per pin, because what stops one differs: on
+    Windows `export` stops at `litert-converter`, which `runtime` does not pin;
+    on Python 3.13 `train` stops at `torch==2.5.1` everywhere but Linux on
+    x86-64, and `export` at `numpy==2.0.2` everywhere. A message naming the
+    wrong pin sends the reader to fix the wrong thing.
+
+    With `LITETUNE_ALLOW_MISSING_WHEELS=1` a gap in PyPI's lists is said and
+    not enforced, and pip is asked; `_provisioning_failed` reads its answer if
+    it has nothing either.
+    """
+    verdict = _host_verdict(env)
+    if verdict.refused:
+        raise RuntimeError(_refusal_text(env, verdict))
+    if verdict.reason:
+        note = (
+            f"by PyPI's file lists, environment {env.name!r} {verdict.reason}. Provisioning "
+            f"anyway, as {ALLOW_MISSING_WHEELS}=1 asks -- pip says so if what it is pointed at "
+            "has nothing either"
+        )
+        if events:
+            events.note(note)
+        else:
+            logger.warning("%s", note)
+
+
+def _platform_named(platform: str) -> str:
+    """A platform tag, with what it means said where the tag alone misleads.
+
+    `win32` reads as "Windows" and is a 32-bit Python; `win_arm64` is the
+    interpreter's build, not the machine's: `sysconfig.get_platform()` answers
+    from the build (`Lib/sysconfig.py`), so an x64 Python on an ARM64 machine is
+    `win_amd64`, and Windows 11 on Arm runs x64 apps under emulation
+    (learn.microsoft.com/en-us/windows/arm/apps-on-arm-x86-emulation).
+    """
+    if platform == "win32" or platform.endswith("_i686"):
+        return f"{platform} (a 32-bit Python; install the 64-bit one)"
+    if platform == "win_arm64":
+        return (
+            f"{platform} (an ARM64 Python; an x64 Python, which Windows 11 on Arm runs under "
+            "emulation, installs win_amd64 wheels)"
+        )
+    return platform
+
+
+def _pythons_that_work(requirements: Sequence[str], host: wheels.Host) -> list[int]:
+    """The Python 3 minors, from the floor up, for which every applying pin has a wheel here.
+
+    Asked of each minor a pinned wheel names, on `host`'s own platforms: a pin
+    chosen by a marker can be missing for one Python and present for another,
+    so "no wheel for this platform" is not always "no Python works here".
+    Called only for a host with a gap, so its own minor never comes back.
+    """
+    return [
+        minor
+        for minor in wheels.named_minors()
+        if minor >= STAGE_PYTHON_MIN[1]
+        and not wheels.gaps(requirements, wheels.Host.of(host.platforms, (3, minor)))
+    ]
+
+
+def _host_refusal(requirements: Sequence[str], host: wheels.Host) -> str | None:
+    """Why `requirements` cannot be installed on `host`; None if nothing says so.
+
+    A pin with no wheel for the platform is said first: no version of it this
+    environment asks for would install there. Either way the Pythons that would
+    work on this platform are named, where there are any.
+    """
+    found = wheels.gaps(requirements, host)
+    if not found:
+        return None
+    working = _pythons_that_work(requirements, host)
+    elsewhere = (
+        ". On this platform every pin has its wheel for "
+        + ", ".join(f"python3.{m}" for m in working)
+        + " -- run litetune under one of those"
+        if working
+        else ""
+    )
+    missing = [gap for gap in found if gap.platform_missing]
+    if missing:
+        text = (
+            f"cannot be provisioned on {_platform_named(host.platform)}: "
+            + "; ".join(g.describe() for g in missing)
+            + elsewhere
+        )
+        converter = next(
+            (
+                g.release.requirement
+                for g in missing
+                if _canonical(g.release.requirement.partition("==")[0]) in _CONVERTER_PACKAGES
+            ),
+            None,
+        )
+        if converter:
+            text += ". " + _CONVERTER_UNAVAILABLE.format(package=converter)
+        return text
+    return (
+        f"cannot be provisioned on python{host.python[0]}.{host.python[1]} on "
+        f"{_platform_named(host.platform)}: it pins "
+        + "; and ".join(g.describe() for g in found)
+        + ". Stage environments are built from the interpreter running litetune"
+        + elsewhere
     )
 
 
@@ -1791,29 +2026,37 @@ class StageEnv:
 
     name: str
     requirements: tuple[str, ...]
-    # System packages this environment needs that pip cannot provide. Recorded
-    # so a missing one produces a named diagnosis rather than a dlopen error.
+    # System packages this environment needs on Linux that pip cannot provide,
+    # as Debian names them -- the only spelling this project has checked.
+    # Recorded so a missing one produces a named diagnosis rather than a dlopen
+    # error; named only on Linux (`system_requirements_on`).
     system_requirements: tuple[str, ...] = field(default=())
-    # The highest Python this environment's pins publish wheels for, and which
-    # pin sets it. `None` means no pin here has a known ceiling. Recorded rather
-    # than derived: pip only tells you by failing to build from source, minutes
-    # in, without naming the version.
-    python_ceiling: tuple[int, int] | None = None
-    ceiling_pin: str = ""
 
     def __post_init__(self) -> None:
         unpinned = [r for r in self.requirements if not _is_pinned(r)]
         if unpinned:
             raise UnpinnedRequirement(
-                f"environment {self.name!r} has unpinned requirements: {unpinned}. "
+                f"environment {self.name!r} has unpinned requirements: "
+                f"{shown_requirements(unpinned)}. "
                 "Pin them with '==': an unchanged definition that resolves "
                 "differently over time silently changes pipeline behaviour."
             )
 
     @property
     def identity(self) -> str:
-        """Content hash of the definition. Participates in stage cache keys."""
-        payload = "\n".join((sys.version.split()[0], *sorted(self.requirements)))
+        """Content hash of the definition, as it applies here. Participates in stage cache keys.
+
+        The requirements pip installs on this interpreter, each without its
+        marker: a pin whose marker is false here installs nothing and changes
+        nothing, so it changes no identity. An environment whose pins carry no
+        markers hashes exactly as it did before markers were read at all --
+        which is what keeps `train` on 3.10 to 3.12 the environment it was.
+        """
+        environment = wheels.marker_environment()
+        applied = [
+            wheels.without_marker(r) for r in self.requirements if wheels.applies(r, environment)
+        ]
+        payload = "\n".join((sys.version.split()[0], *sorted(applied)))
         return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
     @property
@@ -1860,7 +2103,49 @@ class StageEnv:
                 f"has an interpreter link {self.python} to {os.readlink(self.python)}, which no "
                 "longer exists (the interpreter that built it was removed or upgraded)"
             )
+        # With `--no-provision`, "not provisioned" alone sends the reader to drop
+        # the flag, and the run after that refuses for this reason instead.
+        verdict = _host_verdict(self)
+        if verdict.refused:
+            opt_out = f". {_OPT_OUT}" if verdict.from_wheels else ""
+            return f"is not provisioned at {self.path}, and {verdict.reason}{opt_out}"
+        if verdict.reason:
+            return (
+                f"is not provisioned at {self.path}; by PyPI's file lists it {verdict.reason}, "
+                f"though {ALLOW_MISSING_WHEELS}=1 lets pip try"
+            )
         return f"is not provisioned at {self.path}"
+
+    def refusal(self) -> str | None:
+        """What `provision` refuses to build this environment here with, or None.
+
+        A whole sentence about the environment: the Python floor first, then
+        PyPI's file lists -- which `LITETUNE_ALLOW_MISSING_WHEELS=1` turns into
+        a note `provision` gives instead. Public so a stage can ask before it
+        does anything else.
+        """
+        verdict = _host_verdict(self)
+        return _refusal_text(self, verdict) if verdict.refused else None
+
+    def unprovisionable(self, host: wheels.Host | None = None) -> str | None:
+        """Why pip cannot build this environment on `host`, by PyPI's file lists, or None.
+
+        The rest of a sentence about the environment. `host` defaults to the
+        interpreter running this, which is what the environment is built from;
+        it is a parameter so that a machine nobody has can still be asked about.
+        """
+        return _host_refusal(self.requirements, host or wheels.current_host())
+
+    def system_requirements_on(self, platform: str | None = None) -> tuple[str, ...]:
+        """The system packages to name on `platform`, a `sys.platform` value (this one by default).
+
+        `system_requirements` are Debian package names, so they are named on
+        Linux and nowhere else. Printed on macOS or Windows they read as an
+        instruction that cannot be followed, in the message already telling the
+        reader their install failed -- and what those platforms need instead is
+        not something this project has established.
+        """
+        return self.system_requirements if (platform or sys.platform).startswith("linux") else ()
 
     def provision(
         self, events=None, force: bool = False, timeout: int = PROVISION_TIMEOUT_S
@@ -1879,7 +2164,7 @@ class StageEnv:
         """
         if self.ready and not force:
             return self.path
-        _refuse_unsupported_interpreter(self)
+        _refuse_unsupported_host(self, events)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # One budget, not two. Passing `timeout` to both the wait and the
         # install let a caller who waited the full 1800s then get another
@@ -1958,6 +2243,9 @@ class StageEnv:
                     said = exc.output or b""
                     if isinstance(said, bytes):
                         said = said.decode("utf-8", "replace")
+                    # Redacted whole, then cut: ensurepip runs pip, and a cut
+                    # first can leave half a URL the pattern no longer finds.
+                    said = redact_text(said)
                     raise RuntimeError(
                         f"could not build the virtualenv for environment {self.name!r} from "
                         f"{getattr(sys, '_base_executable', sys.executable)}: {exc}. It said:\n"
@@ -1973,7 +2261,30 @@ class StageEnv:
                 # The same spelling `ready` and `run` use, from one function:
                 # two of them disagreeing on Windows is what made this worth
                 # naming at all.
-                cmd = [str(self.python), "-m", "pip", "install", "--quiet", *self.requirements]
+                # `-I`: isolated mode keeps the working directory off
+                # `sys.path` -- "-I option can be used to run the script in
+                # isolated mode where sys.path contains neither the current
+                # directory nor the user's site-packages directory" (`-m`,
+                # docs.python.org/3.10/using/cmdline.html). Run as plain `-m`
+                # from where litetune was started, a `pip.py` there ran in the
+                # environment's own pip's place: measured on uv's CPython
+                # 3.10.19, `-m pip` ran a planted one and `-I -m pip` the
+                # venv's. pip still runs in the caller's directory, so relative
+                # `PIP_FIND_LINKS`, `PIP_CONSTRAINT`, `PIP_CERT` and
+                # `PIP_CONFIG_FILE` keep their meaning. `-I` also ignores every
+                # `PYTHON*` variable, `_child_env`'s UTF-8 mode among them, so
+                # `-X utf8` says it on the command line instead.
+                cmd = [
+                    str(self.python),
+                    "-I",
+                    "-X",
+                    "utf8",
+                    "-m",
+                    "pip",
+                    "install",
+                    "--quiet",
+                    *self.requirements,
+                ]
                 try:
                     # Through the same guard the stages use, and for the same
                     # reason. `subprocess.run` kills its direct child, and
@@ -2024,7 +2335,7 @@ class StageEnv:
             events.note(f"environment {self.name!r} ready at {self.path}")
         return self.path
 
-    def _provisioning_failed(self, stderr: str) -> str:
+    def _provisioning_failed(self, stderr: str, platform: str | None = None) -> str:
         """Why the install failed, in the terms the reader can act on.
 
         A missing distribution is a different fact from a broken install, and
@@ -2033,18 +2344,22 @@ class StageEnv:
         resolution trace, so without this the reader gets 2000 characters of
         pip and has to find that line themselves.
         """
-        missing = _NO_DISTRIBUTION.search(stderr or "")
+        platform = platform or sys.platform
+        # pip names the index it consulted, and a credential in that URL would
+        # otherwise reach the report verbatim. Redacted whole, then cut: a cut
+        # first could leave half a URL the pattern no longer recognises.
+        stderr = redact_text(stderr or "")
+        missing = _NO_DISTRIBUTION.search(stderr)
         package = missing.group(1) if missing else None
         detail = (
             f"could not provision environment {self.name!r} on "
-            f"{sys.platform}/python{sys.version_info.major}.{sys.version_info.minor}. "
-            f"It pins {', '.join(self.requirements)}"
+            f"{platform}/python{sys.version_info.major}.{sys.version_info.minor}. "
+            f"It pins {', '.join(shown_requirements(self.requirements))}"
         )
-        if self.system_requirements:
-            # Named as what they are: Debian package names, which is the only
-            # spelling this project has checked. Printing them unqualified on
-            # macOS or Windows reads as an instruction that cannot be followed.
-            detail += " and needs the Debian package(s) " + ", ".join(self.system_requirements)
+        debian = self.system_requirements_on(platform)
+        if debian:
+            # Named as what they are, Debian package names, and only on Linux.
+            detail += " and needs the Debian package(s) " + ", ".join(debian)
         if package and _canonical(package) in _CONVERTER_PACKAGES:
             return (
                 f"{detail}. {_CONVERTER_UNAVAILABLE.format(package=package)}. pip said:\n"
@@ -2264,7 +2579,9 @@ NOT_PROBED = DeviceProbe(device=None, detail="no device probe was run")
 
 
 def _unanswered(env: StageEnv, reason: str, events=None) -> DeviceProbe:
-    detail = f"the device probe on environment {env.name!r} could not answer: {reason}"
+    # Every reason is redacted here as well, where it is logged, noted and
+    # recorded: some quote what the probe or its exception said.
+    detail = redact_text(f"the device probe on environment {env.name!r} could not answer: {reason}")
     logger.warning("%s", detail)
     if events is not None:
         events.note(detail, environment=env.name)
@@ -2318,7 +2635,9 @@ def resolve_device(
     if proc.returncode != 0:
         return _unanswered(
             env,
-            f"it exited {proc.returncode} ({(proc.stderr or '').strip()[-200:] or 'no stderr'})",
+            # Redacted whole, then cut, as `_provisioning_failed` does.
+            f"it exited {proc.returncode} "
+            f"({redact_text(proc.stderr or '').strip()[-200:] or 'no stderr'})",
             events,
         )
 
@@ -2337,7 +2656,9 @@ def resolve_device(
         device_count = answer["device_count"]
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         return _unanswered(
-            env, f"its last stdout line is not an answer ({exc}): {lines[-1][:200]!r}", events
+            env,
+            f"its last stdout line is not an answer ({exc}): {redact_text(lines[-1])[:200]!r}",
+            events,
         )
     if device not in DEVICES:
         return _unanswered(
@@ -2430,8 +2751,6 @@ def _macos_cpu_detail(probe: DeviceProbe) -> str:
 
 RUNTIME = StageEnv(
     name="runtime",
-    python_ceiling=(3, 12),
-    ceiling_pin="numpy==2.0.2",
     requirements=(
         # 0.18.0, the runtime flutter_edge_ai_litertlm 1.10.0 ships (its
         # CHANGELOG: "LiteRT-LM v0.18.0 (`native-v0.18.0-a`)"). Runtimes are not
@@ -2449,8 +2768,6 @@ RUNTIME = StageEnv(
 
 EXPORT = StageEnv(
     name="export",
-    python_ceiling=(3, 12),
-    ceiling_pin="numpy==2.0.2",
     requirements=(
         "litert-torch-nightly==0.10.0.dev20260926",
         "litert-lm==0.18.0",
@@ -2494,12 +2811,28 @@ EXPORT = StageEnv(
 # passed the full LoRA→merge→export→liveness path.
 TRAIN = StageEnv(
     name="train",
-    python_ceiling=(3, 13),
-    ceiling_pin="torch==2.5.1",
     requirements=(
         "torch==2.5.1",
         "transformers==5.16.1",
         "peft==0.20.0",
-        "sentencepiece==0.2.0",
+        # One sentencepiece per Python. 0.2.0 publishes no cp313 wheel at all
+        # (https://pypi.org/pypi/sentencepiece/0.2.0/json); 0.2.1 does, for Linux
+        # x86_64 and aarch64, macOS and Windows
+        # (https://pypi.org/pypi/sentencepiece/0.2.1/json) -- but its Linux
+        # wheels are `manylinux_2_27`, where 0.2.0's are `manylinux2014`, so
+        # 0.2.1 everywhere would raise `tune`'s glibc floor from 2.17 to 2.27 on
+        # the Pythons that already worked. 3.10 to 3.12 install what they always
+        # did, and keep their identity; 3.13 gets the release it has wheels for.
+        # Measured 2026-10-12: on Linux x86_64 under Python 3.13.16, 0.2.0
+        # stopped at "Failed building wheel for sentencepiece" (no cmake or
+        # pkg-config there) and 0.2.1 installed as a wheel; for all five
+        # measured families (gemma-3-270m, gemma-3-1b, qwen3-0.6b, qwen2.5-0.5b,
+        # functiongemma) the tuned checkpoints' tokenizers load the same class
+        # and give identical token ids on every data row (3000 to 6434 rows
+        # each) with sentencepiece blocked; and the same 8-step LoRA run gave
+        # identical loss and adapter sha256 on main under 3.12 and on this
+        # definition under 3.12 and 3.13.
+        'sentencepiece==0.2.0; python_version < "3.13"',
+        'sentencepiece==0.2.1; python_version >= "3.13"',
     ),
 )

@@ -46,6 +46,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
+from litetune import wheels
 from litetune.checks import Check, Outcome
 
 logger = logging.getLogger(__name__)
@@ -1744,11 +1745,13 @@ def declared_version(requirements: Sequence[str], distribution: str = "transform
     built. `export.resolve_toolchain` reads what is actually installed and is
     strictly better when a run has one.
     """
-    wanted = re.sub(r"[-_.]+", "-", distribution).lower()
+    wanted = wheels.canonical(distribution)
+    environment = wheels.marker_environment()
     for requirement in requirements:
-        name, sep, version = requirement.partition("==")
-        if not sep:
-            continue
-        if re.sub(r"[-_.]+", "-", name.strip()).lower() == wanted:
-            return version.strip()
+        # Read as pip reads it, and only where it applies: a marker is not
+        # part of the version, and a pin for another Python is not this one's.
+        pinned = wheels.pin(requirement)
+        if pinned and wheels.applies(requirement, environment):
+            if wheels.canonical(pinned[0]) == wanted:
+                return pinned[1]
     return None

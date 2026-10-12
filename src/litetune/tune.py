@@ -1623,7 +1623,7 @@ class TuneRequest:
         record["environment"] = {
             "name": self.env.name,
             "identity": self.env.identity,
-            "requirements": list(self.env.requirements),
+            "requirements": envs.shown_requirements(self.env.requirements),
         }
         return record
 
@@ -2238,7 +2238,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
                     observed={
                         "name": request.env.name,
                         "identity": request.env.identity,
-                        "requirements": list(request.env.requirements),
+                        "requirements": envs.shown_requirements(request.env.requirements),
                     },
                 )
             )

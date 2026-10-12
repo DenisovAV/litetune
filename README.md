@@ -133,8 +133,26 @@ Or through Homebrew, which brings its own Python 3.12:
 brew install DenisovAV/tap/litetune
 ```
 
-**Linux, macOS or Windows**, Python 3.10–3.12 — with `convert` needing Linux
-x86_64 or an Apple Silicon Mac, for the reason below. On Linux you also need
+**Linux, macOS on Apple Silicon or Windows on x64**, Python 3.10–3.12 — with
+`convert` needing Linux x86_64 or an Apple Silicon Mac, for the reason below.
+The pinned wheels set the minimums. On Linux: glibc 2.27 for `convert`,
+`verify` and `towers` (`litert-lm-api` and `litert-converter` are
+`manylinux_2_27`); for `tune`, glibc 2.17 on Python 3.10–3.12, where it pins
+`sentencepiece==0.2.0` (`manylinux2014`), and 2.27 on 3.13, where it pins
+`sentencepiece==0.2.1`, the first with cp313 wheels and `manylinux_2_27`. On
+macOS: 12 for `convert`, `verify` and `towers` (`litert-lm-api` is
+`macosx_12_0_arm64`) and 11 for `tune`. musl Linux, Alpine's, has none of them. Each stage checks, before pip runs, that
+every pin it installs publishes a wheel on PyPI that this interpreter accepts —
+the whole tag, matched as pip matches it — and refuses by naming the one that
+does not: the runtime's native library `litert-lm-api` and `torch==2.5.1`
+publish none for Intel Macs, 32-bit Python or an ARM64 Python on Windows, so no
+stage that builds an environment runs there. The tag is the interpreter's, not
+the machine's: an x64 Python on Windows 11 on Arm, which runs x64 programs under
+emulation, is checked as x64 and pip installs `win_amd64` wheels into it, as for
+any x64 install; litetune has not been run there. Installing from another index
+or a wheelhouse that has a wheel PyPI lacks, set
+`LITETUNE_ALLOW_MISSING_WHEELS=1`: the refusal becomes a note, and pip is asked.
+On Linux you also need
 `libvulkan1` —
 `litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, and
 without it every invocation, `--help` included, dies in under a second:
@@ -151,7 +169,8 @@ wheel that installs there — `win_amd64` for the ones with native code,
 `litert-lm-api` included, and `py3-none-any` for the rest. `convert` cannot,
 because [`litert-converter`](https://pypi.org/project/litert-converter/) — the
 MLIR converter `litert-torch` depends on — has never published a Windows wheel
-or a source distribution, so the install fails while pip is still resolving.
+or a source distribution, so `convert` refuses there before installing anything
+and says where it does run.
 Upstream tracks it as
 [litert-torch#968](https://github.com/google-ai-edge/litert-torch/issues/968),
 where a collaborator says Windows is planned and gives no date. Google's
@@ -180,9 +199,11 @@ the pins, which an index does not change, so a cached CPU environment would be
 reused in silence. Either way the run records what it got: `device` and
 `cuda_build` are in the training metrics.
 
-Python 3.13 runs `tune`, `prepare` and `bundle` but not `convert` or `verify`:
-each stage builds its own environment from the interpreter you launched, and
-`numpy==2.0.2` — pinned by the export toolchain — stops publishing wheels after
+Python 3.13 runs `bundle`, and `prepare` without `--tokenizer`, everywhere;
+`tune`, and `prepare --tokenizer`, on Linux x86_64 only; and `convert` and
+`verify` nowhere. Each stage builds its environment from the interpreter you
+launched: `torch==2.5.1` publishes its one cp313 wheel for manylinux x86_64,
+and `numpy==2.0.2`, pinned for `convert` and `verify`, publishes none past
 3.12. Past a ceiling the command refuses and names the pin that set it.
 
 Each of `tune`, `convert` and `verify` builds its environment on first use and

@@ -44,7 +44,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from litetune import envs
+from litetune import envs, jsonfile, wheels
 from litetune.checks import Check, CheckSet, Outcome
 from litetune.declarations import (
     DeclarationsError,
@@ -125,12 +125,15 @@ def versions_from(*stage_envs: envs.StageEnv) -> dict[str, str]:
     `export.resolve_toolchain` reads the resolved closure from a live
     environment and is strictly better; pass that when a run produced one.
     """
+    # The pins that apply to this interpreter, read as pip reads them: a marker
+    # is neither part of a version nor a second answer for the same name.
+    environment = wheels.marker_environment()
     versions: dict[str, str] = {}
     for env in stage_envs:
         for requirement in env.requirements:
-            name, sep, version = requirement.partition("==")
-            if sep:
-                versions[name.strip()] = version.strip()
+            pinned = wheels.pin(requirement)
+            if pinned and wheels.applies(requirement, environment):
+                versions[pinned[0]] = pinned[1]
     return versions
 
 
@@ -1076,6 +1079,38 @@ def _write_declarations_as_trained(
     )
 
 
+def _encoding_refusal(source: Path) -> str | None:
+    """Why the prerendered declarations at `source` cannot ship as they are, by encoding.
+
+    In `prerendered` the file ships byte for byte, and its digest is of those
+    bytes (`_digest_disagreement`), so `bundle` cannot re-encode it the way
+    `read_declarations` decodes a file for `prepare`. RFC 8259 section 8.1:
+    JSON exchanged between systems "MUST be encoded using UTF-8", and
+    implementations "MUST NOT add a byte order mark". A file Windows
+    PowerShell 5.1's `>` wrote is UTF-16 with a mark (`jsonfile`), and was
+    refused here as "not valid JSON", which named neither.
+
+    `None` for UTF-8 without a mark, and for a file that cannot be read: the
+    copy that follows reports that, as it did before.
+    """
+    try:
+        raw = source.read_bytes()
+    except OSError:
+        return None
+    marked = jsonfile.marked_encoding(raw)
+    if marked is None:
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            marked = f"not UTF-8 ({exc})"
+    if marked is None:
+        return None
+    return (
+        f"the declarations at {source} are {marked}. In prerendered mode the file ships as "
+        "given and the application reads its bytes, so save it as UTF-8 without a byte-order mark"
+    )
+
+
 def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
     """Put the tool declarations in, and check they are readable as declarations.
 
@@ -1127,6 +1162,9 @@ def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
         )
     if request.contract.runtime_renders_declarations:
         return _write_declarations_as_trained(request, result, source, destination, name)
+    not_as_given = _encoding_refusal(source)
+    if not_as_given is not None:
+        return Check.failed(name, not_as_given, observed={"declarations": str(source)})
     try:
         _copy_member(source, destination)
         parsed = json.loads(destination.read_text(encoding="utf-8"))

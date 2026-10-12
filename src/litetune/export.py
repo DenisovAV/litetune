@@ -37,7 +37,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from litetune import envs, models
+from packaging.requirements import InvalidRequirement, Requirement
+
+from litetune import envs, models, wheels
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.events import EventStream
 from litetune.exits import read_returncode
@@ -281,7 +283,7 @@ class Toolchain:
     def as_dict(self) -> dict[str, Any]:
         record: dict[str, Any] = {
             "available": self.available,
-            "declared": list(self.declared),
+            "declared": envs.shown_requirements(self.declared),
             "resolved": dict(self.resolved),
         }
         if self.missing:
@@ -296,15 +298,26 @@ def _canonical(name: str) -> str:
 
 
 def requirement_names(requirements: Sequence[str]) -> tuple[str, ...]:
-    """Distribution names from pinned requirement strings."""
+    """Distribution names from pinned requirement strings, those that apply here.
+
+    Read as pip reads them (`wheels.applies`): a requirement whose marker is
+    false for this interpreter is not installed, so naming it would report a
+    phantom "missing" entry.
+    """
     names: list[str] = []
+    environment = wheels.marker_environment()
     for requirement in requirements:
         if requirement.startswith(("http://", "https://", "file://")):
             # A direct URL carries no reliable distribution name; `pip show`
             # would report nothing for it, so it is left out rather than
             # producing a phantom "missing" entry.
             continue
-        name = re.split(r"[=<>!~\[;]", requirement, maxsplit=1)[0].strip()
+        if not wheels.applies(requirement, environment):
+            continue
+        try:
+            name = Requirement(requirement).name
+        except InvalidRequirement:
+            name = re.split(r"[=<>!~\[;@ ]", requirement.strip(), maxsplit=1)[0].strip()
         if name:
             names.append(name)
     return tuple(names)
@@ -332,7 +345,11 @@ def parse_pip_freeze(text: str) -> dict[str, str]:
     """
     versions: dict[str, str] = {}
     for raw in text.splitlines():
-        line = raw.strip()
+        # A direct URL is kept, and one can carry the credentials of the index
+        # it was fetched from; the record is a manifest. Its user information
+        # and query go; its fragment stays, since there pip writes the
+        # archive's `#sha256=`, which is the provenance this record is for.
+        line = envs.redact_text(raw.strip(), keep_fragment=True)
         if not line or line.startswith("#"):
             continue
         if "==" in line:
@@ -373,7 +390,7 @@ def resolve_toolchain(env: envs.StageEnv, timeout_s: int = TOOLCHAIN_TIMEOUT_S) 
     if not resolved:
         return Toolchain.unknown(
             f"pip freeze exited {proc.returncode} and reported no packages: "
-            f"{_tail(proc.stderr) or 'no stderr'}",
+            f"{_tail(envs.redact_text(proc.stderr or '')) or 'no stderr'}",
             declared,
         )
     seen = {_canonical(n) for n in resolved}
@@ -605,8 +622,9 @@ class ExportRequest:
                 "name": self.env.name,
                 "identity": self.env.identity,
                 "path": str(self.env.path),
-                "requirements": list(self.env.requirements),
-                "system_requirements": list(self.env.system_requirements),
+                "requirements": envs.shown_requirements(self.env.requirements),
+                # What this platform needs: Debian names are recorded on Linux only.
+                "system_requirements": list(self.env.system_requirements_on()),
             },
         }
 
@@ -801,6 +819,7 @@ rendered three ways -- "string": the template, the content a string;
 "parts_alone": the template, the content that list -- each {"text": ...} or
 {"error": ...}, with "environment": true for an error of the environment's.
 """
+import errno
 import hashlib
 import json
 import os
@@ -850,6 +869,13 @@ def chat_template_json(model):
             return None, lookup("unreachable", None, exc)
     else:
         where = os.path.join(model, "chat_template.json")
+    if os.path.isdir(where):
+        # Asked, not inferred from the error: on Windows opening a directory
+        # raises an OSError other than IsADirectoryError -- the first
+        # windows-latest run read it as the machine's, "unreachable" -- and a
+        # directory there is the checkpoint's, whatever the platform calls it.
+        exc = IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), where)
+        return None, lookup("unusable", where, exc)
     try:
         with open(where, "rt") as handle:
             text = handle.read()
@@ -2252,6 +2278,26 @@ class ExportResult:
         }
 
 
+def _nothing_attempted(
+    result: ExportResult, request: ExportRequest, detail: str, events: EventStream
+) -> ExportResult:
+    """End a run whose export environment was not usable.
+
+    Nothing was attempted, so nothing failed. Recording these recipes as
+    failures would be a verdict about the toolchain drawn from a fact about
+    this machine.
+    """
+    result.not_attempted = tuple(request.recipes)
+    result.toolchain = Toolchain.unknown(
+        f"the export environment was not usable, so its versions were never read: {detail}",
+        request.env.requirements,
+    )
+    result.comparison = Uncompared(f"no recipe was exported: {detail}")
+    result.limitations.append(f"none of {list(request.recipes)} was attempted: {detail}")
+    events.stage_finished(result.outcome.value, attempted=0)
+    return result
+
+
 def run_export(request: ExportRequest, events: EventStream | None = None) -> ExportResult:
     """Sweep the requested recipes. Returns a result; failures are recorded, not raised."""
     # This run's own record of which host variables it dropped, so a second
@@ -2265,6 +2311,24 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
         checks=CheckSet(name=f"export:{request.model}"),
         toolchain=Toolchain.unknown("not read yet", request.env.requirements),
     )
+    # -- can this machine build the toolchain at all? -----------------------
+    # First: a run that cannot convert here -- Windows, where `litert-converter`
+    # publishes no wheel -- is refused before anything is built or installed.
+    # `provision` asks the same question again for a caller that reaches it
+    # another way.
+    if not request.env.ready:
+        refusal = request.env.refusal()
+        if refusal:
+            environment = result.checks.add(
+                Check.unchecked(
+                    "export environment",
+                    refusal,
+                    observed={"name": request.env.name, "identity": request.env.identity},
+                )
+            )
+            events.check(environment)
+            return _nothing_attempted(result, request, environment.detail, events)
+
     # Two answers to "what is this", and no way to choose. Refused before any
     # work: exporting under either one produces a bundle whose family flags may
     # be wrong, and the check would say `passed` about it.
@@ -2283,12 +2347,6 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
         events.stage_finished(result.outcome.value, attempted=0)
         return result
 
-    # Before the toolchain is asked anything, and once for the sweep rather than
-    # once per recipe. A stale `vocab_file` fails the export outright, after the
-    # model has loaded, naming a path that never existed here.
-    #
-    # Reported and not merely logged: this writes to the *input* directory, and
-    # a tool that edits what you handed it must say so where you will see it.
     # A sidecar that exists and cannot be read is a fault, not an absence: the
     # family was then guessed from the path, which is what the sidecar exists to
     # stop. Said where it will be read, not only recorded in the hint.
@@ -2300,16 +2358,6 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
         )
         events.note(broken_record, model=request.model)
 
-    model_path = Path(request.model)
-    if model_path.is_dir():
-        ok, note = repair_vocab_file(model_path)
-        if note:
-            events.note(note, model=request.model)
-            result.limitations.append(note)
-        if not ok:
-            result.limitations.append(
-                "the export below is likely to fail at `export_tokenizer` for the reason above"
-            )
     if request.unknown_recipes:
         result.limitations.append(
             f"recipes {list(request.unknown_recipes)} are not among the ones litetune has "
@@ -2363,7 +2411,7 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
                     observed={
                         "name": request.env.name,
                         "identity": request.env.identity,
-                        "requirements": list(request.env.requirements),
+                        "requirements": envs.shown_requirements(request.env.requirements),
                     },
                 )
             )
@@ -2378,21 +2426,29 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
     environment = result.checks.add(sink[0])
     events.check(environment)
     if not environment.conclusive:
-        # Nothing was attempted, so nothing failed. Recording these recipes as
-        # failures would be a verdict about the toolchain drawn from a fact
-        # about this machine.
-        result.not_attempted = tuple(request.recipes)
-        result.toolchain = Toolchain.unknown(
-            f"the export environment was not usable, so its versions were never read: "
-            f"{environment.detail}",
-            request.env.requirements,
-        )
-        result.comparison = Uncompared(f"no recipe was exported: {environment.detail}")
-        result.limitations.append(
-            f"none of {list(request.recipes)} was attempted: {environment.detail}"
-        )
-        events.stage_finished(result.outcome.value, attempted=0)
-        return result
+        return _nothing_attempted(result, request, environment.detail, events)
+
+    # -- the checkpoint's own `vocab_file` ------------------------------------
+    # Once for the sweep, before the toolchain is asked anything: a stale
+    # `vocab_file` fails the export outright, after the model has loaded,
+    # naming a path that never existed here.
+    #
+    # Only now, with an environment that works. This writes to the *input*
+    # directory, and a run that ends before any export is attempted -- a
+    # refusal, a provision that failed, `LITETUNE_ALLOW_MISSING_WHEELS=1` whose
+    # pip then found nothing -- must leave the checkpoint as it was handed.
+    # Reported and not merely logged: a tool that edits what you handed it must
+    # say so where you will see it.
+    model_path = Path(request.model)
+    if model_path.is_dir():
+        ok, repaired = repair_vocab_file(model_path)
+        if repaired:
+            events.note(repaired, model=request.model)
+            result.limitations.append(repaired)
+        if not ok:
+            result.limitations.append(
+                "the export below is likely to fail at `export_tokenizer` for the reason above"
+            )
 
     # -- provenance --------------------------------------------------------
     with guard("toolchain versions") as sink:

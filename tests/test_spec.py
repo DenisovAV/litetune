@@ -185,6 +185,24 @@ def test_an_unpinned_toolchain_requirement_is_refused_by_field():
     assert "toolchain.export" in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        ["pkg @ https://u:s3cret@packages.invalid/pkg.whl?sig=T0KEN"],
+        "https://u:s3cret@packages.invalid/pkg.whl?sig=T0KEN",
+    ],
+    ids=["unpinned", "not-a-list"],
+)
+def test_a_refused_toolchain_requirement_is_quoted_without_its_credential(value):
+    """A spec is a file people share, and its refusal is what they paste back."""
+    with pytest.raises(SpecError) as exc:
+        make_spec(toolchain={"export": value})
+
+    said = str(exc.value)
+    assert "s3cret" not in said and "T0KEN" not in said
+    assert "https://***@packages.invalid/pkg.whl?***" in said
+
+
 def test_a_missing_toolchain_environment_is_named():
     with pytest.raises(SpecError) as exc:
         make_spec(toolchain={"train": "default", "export": "default", "runtime": None})
@@ -336,3 +354,14 @@ def test_the_spec_hash_covers_everything_including_the_uri():
     # The whole-spec hash identifies the job for the manifest; unlike a cache
     # key it records where the data came from too.
     assert make_spec().hash != make_spec(dataset={"uri": "s3://elsewhere.jsonl"}).hash
+
+
+def test_a_duplicate_authenticated_requirement_is_not_shown_raw():
+    """The duplicate-entry refusal shows requirements as every report does."""
+    secret = "https://user:s3cret@packages.invalid/pkg-1.whl?sig=T0KEN#sha256=ab"
+    from litetune import spec
+
+    with pytest.raises(spec.SpecError) as raised:
+        spec._as_str_list([secret, secret], "toolchain.requirements")
+    assert "s3cret" not in str(raised.value) and "T0KEN" not in str(raised.value)
+    assert "***@packages.invalid" in str(raised.value)

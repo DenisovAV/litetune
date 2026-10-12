@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from conftest import (
     FakeBackend,
+    buildable_here,
     correct_texts,
     labelled_rows,
     mark_provisioned,
@@ -996,6 +997,24 @@ def test_the_declared_pin_is_read_from_a_requirement_list():
     assert models.declared_version(("torch==2.5.1",)) is None
 
 
+def test_a_declared_version_is_read_without_its_marker_and_only_where_it_applies(monkeypatch):
+    """`sentencepiece==0.2.0; python_version < "3.13"` is the version 0.2.0 on
+    3.12 and no answer on 3.13; split on `==`, the marker became the version."""
+    from conftest import machine
+
+    from litetune import wheels
+
+    pins = (
+        'sentencepiece==0.2.0; python_version < "3.13"',
+        'sentencepiece==0.2.1; python_version >= "3.13"',
+    )
+    real = wheels.marker_environment
+    for minor, expected in ((12, "0.2.0"), (13, "0.2.1")):
+        asked = real(machine("linux_x86_64", (3, minor)))
+        monkeypatch.setattr(wheels, "marker_environment", lambda host=None, a=asked: a)
+        assert models.declared_version(pins, "sentencepiece") == expected
+
+
 # ---------------------------------------------------------------------------
 # The rules where the stages consult them
 # ---------------------------------------------------------------------------
@@ -1056,6 +1075,7 @@ def toolchain(monkeypatch, tmp_path) -> FakeToolchain:
 
     fake = FakeToolchain()
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
+    buildable_here(monkeypatch)
     monkeypatch.setattr(envs.StageEnv, "run", fake)
     return fake
 
@@ -1612,7 +1632,9 @@ def test_functiongemma_carries_a_template_the_runtime_can_execute():
     plan = plan_export("google/functiongemma-270m-it", (), ("dynamic_wi8_afp32",))
     override = [f for f in plan.flags if f.startswith("--jinja_chat_template_override=")]
     assert len(override) == 1
-    assert override[0].endswith("templates/functiongemma.jinja")
+    # By path parts: the path is the platform's own, `\`-separated on Windows.
+    packaged = Path(override[0].partition("=")[2])
+    assert packaged.parts[-2:] == ("templates", "functiongemma.jinja")
     assert any(
         "--jinja_chat_template_override" in f for f in plan.added
     ), "litetune added this, and the report has to say so"

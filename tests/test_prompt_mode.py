@@ -806,7 +806,10 @@ def test_a_prerendered_record_matches_only_the_same_bytes(tmp_path, write_split)
 
     entries = [{"type": "function", "function": {"name": "send_email", "description": "d"}}]
     trained = tmp_path / "trained.json"
-    trained.write_text(canonical_text(read_declarations_of(tmp_path, entries)), encoding="utf-8")
+    # `newline=""`, as `bundle` writes it: the bytes are what is hashed.
+    trained.write_text(
+        canonical_text(read_declarations_of(tmp_path, entries)), encoding="utf-8", newline=""
+    )
     assert hash_file(trained) == read_declarations(trained)[1]
     reformatted = tmp_path / "reformatted.json"
     reformatted.write_text(json.dumps(entries), encoding="utf-8")

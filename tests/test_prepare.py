@@ -733,6 +733,32 @@ def test_an_integer_past_the_largest_double_is_a_refused_row_not_a_crash(tmp_pat
         read_rows(data)
 
 
+@pytest.mark.parametrize(
+    ("encoding", "named"),
+    [
+        ("utf-16", "UTF-16"),
+        ("utf-32", "UTF-32"),
+        ("utf-8-sig", "UTF-8 with a byte-order mark"),
+        ("cp1252", "not UTF-8 ("),
+    ],
+)
+def test_a_dataset_not_in_utf8_is_refused_by_its_encoding(tmp_path, encoding, named):
+    """Windows PowerShell 5.1's `>` writes UTF-16 with a byte-order mark.
+
+    Read as UTF-8 that raised `UnicodeDecodeError`, which no `except` here
+    caught, and the run ended naming neither the file nor its encoding.
+    """
+    data = tmp_path / "raw.jsonl"
+    row = json.dumps({"prompt": "caf\u00e9", "completion": "x"}, ensure_ascii=False) + "\n"
+    data.write_bytes(row.encode(encoding))
+
+    with pytest.raises(PrepareError) as caught:
+        read_rows(data)
+
+    assert str(caught.value).startswith(f"{data} is {named}")
+    assert "save it as UTF-8" in str(caught.value)
+
+
 def test_a_tool_name_the_runtime_cannot_read_is_refused():
     for name in ("caf\u00e9", "call", "true"):
         with pytest.raises(ValueError, match="not one the runtime's call parser reads"):

@@ -558,13 +558,10 @@ def _limit_runtime_named(run: Any, engine: dict[str, Any]) -> None:
         return
     ran = engine.get("runtime_version")
     requirements = engine.get("requirements")
-    pinned = next(
-        (
-            r.partition("==")[2].strip()
-            for r in (requirements if isinstance(requirements, list) else ())
-            if isinstance(r, str) and r.partition("==")[0].strip() == "litert-lm"
-        ),
-        None,
+    # Read as pip reads a pin, and only where it applies (`models.declared_version`).
+    pinned = models.declared_version(
+        [r for r in (requirements if isinstance(requirements, list) else ()) if isinstance(r, str)],
+        "litert-lm",
     )
     if not isinstance(ran, str) or not ran:
         pin = f"; litert-lm {pinned} was pinned" if pinned else ""

@@ -6,18 +6,23 @@ would, with only the two backends faked. Every other subcommand is driven the
 same way: no network, no accelerator, no toolchain.
 """
 
+import codecs
 import hashlib
+import io
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 from conftest import (
     FakeBackend,
+    buildable_here,
     correct_texts,
     labelled_rows,
+    machine,
     mark_provisioned,
     probe_answer,
     run_compose_script,
@@ -579,6 +584,7 @@ def toolchain(monkeypatch, tmp_path) -> FakeToolchain:
 
     fake = FakeToolchain()
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
+    buildable_here(monkeypatch)
     monkeypatch.setattr(envs.StageEnv, "run", fake)
     return fake
 
@@ -768,6 +774,40 @@ def test_convert_json_writes_the_report_to_stdout(toolchain, tmp_path, capsys):
     assert report["model_rules"]["family"] == "functiongemma"
 
 
+def test_convert_on_windows_is_refused_by_the_converter_and_says_so(tmp_path, capsys, monkeypatch):
+    """What the `windows-latest` job runs against the installed wheel, on any machine here.
+
+    A directory with nothing but a `config.json`: the refusal comes before the
+    checkpoint is read for anything else, and before any environment is built.
+    """
+    monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
+    model = tmp_path / "tiny"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type": "gemma3_text"}', encoding="utf-8")
+
+    code = main(
+        [
+            "convert",
+            "--model",
+            str(model),
+            "--base-model",
+            "google/gemma-3-270m-it",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--recipe",
+            "dynamic_wi8_afp32",
+            "--json",
+        ]
+    )
+
+    report = capsys.readouterr().out
+    assert code == 4
+    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in report
+    assert json.loads(report)["outcome"] == "could_not_check"
+    assert sorted(p.name for p in model.iterdir()) == ["config.json"]
+    assert not (tmp_path / "out").exists()
+
+
 # -- tune -------------------------------------------------------------------
 
 
@@ -948,6 +988,128 @@ def test_prepare_json_carries_the_spec_fragment(tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["heldout"]["n"] == 4
     assert report["spec_fragment"]["eval"]["heldout_content_sha256"]
+
+
+def _redirected_stdout(monkeypatch, encoding: str) -> Callable[[], str]:
+    """stdout as Windows opens it for `> file`: the ANSI code page, `surrogateescape`.
+
+    "Non-character devices such as disk files and pipes use the system locale
+    encoding (i.e. the ANSI codepage)" (`sys.stdout`), and the error handler
+    there is `surrogateescape` (`PyConfig.stdio_errors`) -- Python's
+    documentation for both. Returns what reached the file, decoded.
+    """
+    written = io.BytesIO()
+    stream = io.TextIOWrapper(written, encoding=encoding, errors="surrogateescape")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    def read() -> str:
+        stream.flush()
+        return written.getvalue().decode(encoding)
+
+    return read
+
+
+def test_prepare_summary_survives_a_stdout_that_cannot_hold_its_arrow(
+    tmp_path, capsys, monkeypatch
+):
+    """`prepare > log.txt` on a cp1252 Windows: the `→` in the summary raised.
+
+    `UnicodeEncodeError` is a `ValueError`, which `_report` does not catch, so a
+    run that had written its split ended in "could not complete the run" --
+    with the same exit code as a run whose summary landed, which is why the
+    output is what is asserted here.
+    """
+    read = _redirected_stdout(monkeypatch, "cp1252")
+
+    code = main(
+        [
+            "prepare",
+            "--data",
+            str(_dataset(tmp_path)),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--context-length",
+            "1024",
+        ]
+    )
+
+    written = read()
+    assert "12 rows \\u2192 " in written
+    assert "token lengths: not measured — " in written, "what cp1252 holds is kept as it is"
+    assert code == 4, "the outcome is the stage's: no tokenizer, so nothing was measured"
+    assert "could not complete the run" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["verify", "convert"])
+def test_help_survives_a_stdout_that_cannot_hold_its_dash(monkeypatch, capsys, command):
+    """`litetune verify --help > help.txt` under cp932, Japanese Windows' code page.
+
+    argparse writes the help text itself, and it has `—` in it, which cp932
+    cannot encode: the run ended in `UnicodeEncodeError`. Written through the
+    escape the summaries use, the dash arrives as `\\u2014` and the rest as is.
+    """
+    read = _redirected_stdout(monkeypatch, "cp932")
+
+    code = main([command, "--help"])
+
+    written = read()
+    assert code == 0
+    assert f"usage: litetune {command}" in written
+    assert "\\u2014" in written
+    assert "\u2014" not in written
+    assert capsys.readouterr().err == ""
+
+
+def test_prepare_names_the_encoding_of_a_utf16_dataset(tmp_path, capsys):
+    """`prepare --data raw.jsonl` where PowerShell 5.1 wrote the file: a refusal, by name."""
+    data = _dataset(tmp_path)
+    data.write_bytes(data.read_text(encoding="utf-8").encode("utf-16"))
+
+    code = main(
+        [
+            "prepare",
+            "--data",
+            str(data),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--context-length",
+            "1024",
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert code == 4
+    assert f"{data} is UTF-16; save it as UTF-8 without a byte-order mark" in err
+    assert "could not complete the run" not in err
+
+
+def test_env_listing_survives_a_stdout_that_cannot_hold_what_it_names(tmp_path, monkeypatch):
+    """The header's `—`, and a directory name from the user's own disk."""
+    (tmp_path / "runtime-café").mkdir()
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    read = _redirected_stdout(monkeypatch, "ascii")
+
+    assert main(["env"]) == 0
+
+    written = read()
+    assert "\\u2014" in written
+    assert "runtime-caf\\xe9" in written
+
+
+def test_only_what_a_stream_cannot_encode_is_escaped():
+    from litetune.cli import _encodable
+
+    class Stream:
+        def __init__(self, encoding, errors="strict"):
+            self.encoding = encoding
+            self.errors = errors
+
+    assert _encodable("a → b — c", Stream("cp1252")) == "a \\u2192 b — c"
+    assert _encodable("a → b", Stream("utf-8")) == "a → b"
+    # A stream's own handler is honoured: under the POSIX locale stdout carries
+    # `surrogateescape`, and a path decoded with it writes back as its bytes.
+    assert _encodable("x\udcff", Stream("utf-8", "surrogateescape")) == "x\udcff"
+    assert _encodable("a → b", Stream(None)) == "a → b"
 
 
 def test_prepare_on_a_file_that_is_not_there_makes_no_claim(tmp_path, capsys):
@@ -1167,6 +1329,75 @@ def test_bundle_carries_a_verify_manifest_into_the_report(tmp_path, deliverable,
     # The third point was never taken, and the bundle says which one and why.
     assert [m["point"] for m in report["measurements_not_made"]] == ["base_float"]
     assert "measured on the cpu backend" in report["limitations"]
+
+
+def _as_powershell_writes_it(path: Path, payload: dict) -> Path:
+    """`verify --json > manifest.json` in Windows PowerShell 5.1: UTF-16LE, with a mark."""
+    path.write_bytes(codecs.BOM_UTF16_LE + json.dumps(payload).encode("utf-16-le"))
+    return path
+
+
+def test_a_manifest_windows_powershell_wrote_is_read(tmp_path, deliverable, capsys):
+    """Read as UTF-8 it raised `UnicodeDecodeError`, which the reader did not
+    catch, so `bundle` ended in "could not complete the run" naming no file."""
+    model, declarations = deliverable
+    manifest = _as_powershell_writes_it(tmp_path / "verify.json", {"status": "passed"})
+
+    code = main(
+        _bundle_argv(tmp_path, model, declarations, "--verify-manifest", str(manifest), "--json")
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "passed"
+
+
+def test_training_metrics_windows_powershell_wrote_are_read(tmp_path, deliverable):
+    model, declarations = deliverable
+    metrics = _as_powershell_writes_it(
+        tmp_path / "train.json",
+        {"turn_terminator": {"text": "<end_of_turn>", "source": "chat_template"}},
+    )
+
+    main(_bundle_argv(tmp_path, model, declarations, "--train-metrics", str(metrics)))
+
+    contract = json.loads((tmp_path / "bundle" / "contract.json").read_text(encoding="utf-8"))
+    assert "<end_of_turn>" in contract["stop_tokens"]
+
+
+@pytest.mark.parametrize("flag", ["--verify-manifest", "--train-metrics"])
+def test_a_record_that_is_not_text_is_refused_by_name(tmp_path, deliverable, capsys, flag):
+    from litetune import cli
+
+    model, declarations = deliverable
+    record = tmp_path / "record.json"
+    record.write_bytes('{"status": "passed", "note": "—"}'.encode("cp1252"))
+
+    code = main(_bundle_argv(tmp_path, model, declarations, flag, str(record)))
+
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_CODES[cli.Status.ERROR]
+    assert f"{record} is not text in UTF-8, or in UTF-16 or UTF-32 with a byte-order mark" in err
+    assert "could not complete the run" not in err
+
+
+def test_the_base_model_is_read_from_metrics_windows_powershell_wrote(tmp_path):
+    from litetune.cli import _read_base_model
+
+    metrics = _as_powershell_writes_it(tmp_path / "train.json", {"base_model": "org/model"})
+
+    assert _read_base_model(metrics) == "org/model"
+
+
+def test_metrics_that_are_not_text_are_refused_by_name(tmp_path):
+    from litetune.cli import _read_base_model
+    from litetune.evaluate import DataError
+
+    metrics = tmp_path / "train.json"
+    metrics.write_bytes('{"base_model": "é"}'.encode("cp1252"))
+
+    with pytest.raises(DataError, match="is not text in UTF-8") as caught:
+        _read_base_model(metrics)
+    assert str(metrics) in str(caught.value)
 
 
 def test_a_reference_that_was_the_untuned_base_is_filed_under_the_right_point():

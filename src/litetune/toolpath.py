@@ -819,7 +819,7 @@ class ToolPathBackend:
             "runtime_versions_by_mode": list(self.runtime_versions),
             # The pin beside what ran, as the text path records it, so verify
             # can say when the two differ.
-            "requirements": list(getattr(self.env, "requirements", ())),
+            "requirements": envs.shown_requirements(getattr(self.env, "requirements", ())),
         }
 
     def generate(

@@ -29,9 +29,9 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import IO, Any, NoReturn
 
-from litetune import envs, models
+from litetune import envs, jsonfile, models
 from litetune._version import __version__
 from litetune.bundle import (
     BundleError,
@@ -174,6 +174,16 @@ class _Parser(argparse.ArgumentParser):
     ran. A usage error is a request litetune will not run, which is what 4
     means everywhere else in this vocabulary.
     """
+
+    def _print_message(self, message: str, file: IO[str] | None = None) -> None:
+        # Every argparse write -- `--help`, `--version`, usage -- goes through
+        # here, and writes `message` as is: `litetune verify --help > help.txt`
+        # under the cp932 code page raised `UnicodeEncodeError` on a `—`. The
+        # same escape `_say_out` gives a summary; `file` is what argparse
+        # writes to, stderr where it names none.
+        if message:
+            message = _encodable(message, file if file is not None else sys.stderr)
+        super()._print_message(message, file)
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
@@ -777,7 +787,38 @@ def _write(payload: dict[str, Any], lines: Sequence[str], as_json: bool) -> None
         print(json.dumps(payload, indent=2, default=str))
         return
     for line in lines:
-        print(line)
+        _say_out(line)
+
+
+def _say_out(line: str) -> None:
+    """Print one line of a human summary, spelling what stdout cannot encode as an escape.
+
+    A summary carries `→` and `—`, and paths and labels from the user's own
+    data. Redirected to a file or a pipe on Windows, stdout is "the system
+    locale encoding (i.e. the ANSI codepage)" (`sys.stdout`, Python's
+    documentation), and its error handler there is `surrogateescape`
+    (`PyConfig.stdio_errors`), which round-trips undecodable bytes and nothing
+    else. So `prepare > log.txt` raised `UnicodeEncodeError` on the `→` -- a
+    `ValueError`, which `_report` does not catch -- and a run that had written
+    its split exited "could not check". The escape is what CPython's own
+    `sys.displayhook` writes in this case, and the handler `sys.stderr`
+    "always uses" (the same `PyConfig` entry), which is why the progress lines
+    on stderr never raised. `--json` needs none of this: `json.dumps` escapes
+    everything outside ASCII.
+    """
+    print(_encodable(line, sys.stdout))
+
+
+def _encodable(line: str, stream: object) -> str:
+    """`line`, with what `stream` cannot encode as a backslash escape."""
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return line
+    try:
+        line.encode(encoding, getattr(stream, "errors", None) or "strict")
+    except UnicodeEncodeError:
+        return line.encode(encoding, "backslashreplace").decode(encoding)
+    return line
 
 
 def _report(payload: dict[str, Any], render: Callable[[], Sequence[str]], as_json: bool) -> bool:
@@ -1156,12 +1197,12 @@ def _human(size: int) -> str:
 def _env(args: argparse.Namespace) -> int:
     entries = cached_environments()
     if not entries:
-        print(f"no cached environments under {env_cache_root()}")
+        _say_out(f"no cached environments under {env_cache_root()}")
         return EXIT_CODES[Status.PASSED]
 
     total = sum(e.bytes for e in entries)
     if not args.clean:
-        print(f"{env_cache_root()}  —  {_human(total)} in {len(entries)} environment(s)")
+        _say_out(f"{env_cache_root()}  —  {_human(total)} in {len(entries)} environment(s)")
         for entry in entries:
             # "Not for this interpreter" rather than "unused": the identity is a
             # hash of the pins *and* the running Python, so an environment built
@@ -1171,20 +1212,40 @@ def _env(args: argparse.Namespace) -> int:
                 entry.stage or f"not for python{sys.version_info.major}.{sys.version_info.minor}"
             )
             state = "ready" if entry.ready else "incomplete"
-            print(f"  {_human(entry.bytes):>9}  {state:<10} {belongs:<28} {entry.path.name}")
-        print("\nRe-run with --clean to remove them; the next stage that needs one rebuilds it.")
+            _say_out(f"  {_human(entry.bytes):>9}  {state:<10} {belongs:<28} {entry.path.name}")
+        _say_out("\nRe-run with --clean to remove them; the next stage that needs one rebuilds it.")
         return EXIT_CODES[Status.PASSED]
 
     freed, failures = remove_cached(entries)
-    print(f"removed {len(entries) - len(failures)} environment(s), freed {_human(freed)}")
+    _say_out(f"removed {len(entries) - len(failures)} environment(s), freed {_human(freed)}")
     for failure in failures:
-        print(f"  could not remove {failure}")
+        _say_out(f"  could not remove {failure}")
     return EXIT_CODES[Status.PASSED] if not failures else EXIT_CODES[Status.ERROR]
 
 
 # ---------------------------------------------------------------------------
 # convert
 # ---------------------------------------------------------------------------
+
+
+def _load_json(path: Path, error: type[ValueError]) -> Any:
+    """`path` parsed as JSON, or `error` naming the file and what was wrong with it.
+
+    Read as bytes and decoded by `jsonfile`, because the manifest a Windows
+    PowerShell 5.1 `>` writes is UTF-16 with a byte-order mark. Every refusal
+    names the file: the three readers this replaced let `UnicodeDecodeError`
+    through, which named nothing.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise error(f"could not read {path}: {exc}") from None
+    try:
+        return json.loads(jsonfile.decode(raw))
+    except UnicodeDecodeError as exc:
+        raise error(f"{path} {jsonfile.UNREADABLE} ({exc})") from None
+    except json.JSONDecodeError as exc:
+        raise error(f"{path} is not valid JSON: {exc}") from None
 
 
 def _read_base_model(metrics: Path | None) -> str | None:
@@ -1197,12 +1258,7 @@ def _read_base_model(metrics: Path | None) -> str | None:
     """
     if metrics is None:
         return None
-    try:
-        recorded = json.loads(metrics.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise DataError(f"{metrics} is not valid JSON: {exc}") from None
-    except OSError as exc:
-        raise DataError(f"could not read {metrics}: {exc}") from None
+    recorded = _load_json(metrics, DataError)
     if not isinstance(recorded, dict):
         raise DataError(f"{metrics} holds {type(recorded).__name__}, not training metrics")
     base = recorded.get("base_model")
@@ -1529,12 +1585,7 @@ def _bundle(args: argparse.Namespace) -> int:
 
     manifest: dict[str, Any] = {}
     if args.verify_manifest is not None:
-        try:
-            manifest = json.loads(args.verify_manifest.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise BundleInputError(f"{args.verify_manifest} is not valid JSON: {exc}") from None
-        except OSError as exc:
-            raise BundleInputError(f"could not read {args.verify_manifest}: {exc}") from None
+        manifest = _load_json(args.verify_manifest, BundleInputError)
         if not isinstance(manifest, dict):
             raise BundleInputError(
                 f"{args.verify_manifest} holds {type(manifest).__name__}, not a manifest object"
@@ -1562,12 +1613,7 @@ def _bundle(args: argparse.Namespace) -> int:
     terminator_note = None
     recorded: dict[str, Any] = {}
     if args.train_metrics is not None:
-        try:
-            loaded = json.loads(args.train_metrics.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise BundleInputError(f"{args.train_metrics} is not valid JSON: {exc}") from None
-        except OSError as exc:
-            raise BundleInputError(f"could not read {args.train_metrics}: {exc}") from None
+        loaded = _load_json(args.train_metrics, BundleInputError)
         if not isinstance(loaded, dict):
             raise BundleInputError(
                 f"{args.train_metrics} holds {type(loaded).__name__}, not training metrics"

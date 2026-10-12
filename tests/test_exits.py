@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import mark_provisioned
+from conftest import buildable_here, mark_provisioned
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -50,6 +50,7 @@ def test_a_non_zero_exit_is_still_the_program_answering():
     assert "exited 1" in reading.describe()
 
 
+@pytest.mark.posix
 def test_minus_nine_is_a_kill_and_names_the_oom_killer():
     reading = read_returncode(-SIGKILL)
     assert not reading.conclusive
@@ -115,6 +116,7 @@ def killing_toolchain(monkeypatch, tmp_path, request):
         return subprocess.CompletedProcess(args, kill_code, "", "")
 
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
+    buildable_here(monkeypatch)
     monkeypatch.setattr(envs.StageEnv, "run", fake_run)
 
 
