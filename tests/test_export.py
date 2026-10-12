@@ -3221,3 +3221,8 @@ def test_requirement_names_skip_a_pin_whose_marker_is_false_here():
     )
     # A named direct URL keeps its name, which `pip show` answers to.
     assert names == ("here", "pkg")
+
+
+def test_requirement_names_read_a_pin_as_pip_does():
+    """Leading whitespace is no part of a name to pip (`packaging.Requirement`)."""
+    assert requirement_names([" pkg==1.0", "other[extra]==2.0"]) == ("pkg", "other")

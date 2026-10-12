@@ -37,6 +37,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from packaging.requirements import InvalidRequirement, Requirement
+
 from litetune import envs, models, wheels
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.events import EventStream
@@ -312,7 +314,10 @@ def requirement_names(requirements: Sequence[str]) -> tuple[str, ...]:
             continue
         if not wheels.applies(requirement, environment):
             continue
-        name = re.split(r"[=<>!~\[;@ ]", requirement, maxsplit=1)[0].strip()
+        try:
+            name = Requirement(requirement).name
+        except InvalidRequirement:
+            name = re.split(r"[=<>!~\[;@ ]", requirement.strip(), maxsplit=1)[0].strip()
         if name:
             names.append(name)
     return tuple(names)
