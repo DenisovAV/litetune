@@ -50,6 +50,7 @@ def test_a_non_zero_exit_is_still_the_program_answering():
     assert "exited 1" in reading.describe()
 
 
+@pytest.mark.posix
 def test_minus_nine_is_a_kill_and_names_the_oom_killer():
     reading = read_returncode(-SIGKILL)
     assert not reading.conclusive

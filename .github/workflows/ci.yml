@@ -59,6 +59,47 @@ jobs:
           otool -L "$base" | tee /dev/stderr | grep -q '@rpath/libpython3.11.dylib'
       - run: .venv/bin/pytest -q tests/test_envs.py
 
+  # Windows x64, on Python 3.12, the newest the stage environments install on
+  # there (`litetune/wheels.py`). `convert` cannot run there -- `litert-converter`
+  # publishes no Windows wheel, and `provision` refuses before pip -- but the
+  # rest is meant to, and nothing above imports litetune on Windows at all.
+  # Tests that assert a POSIX mechanism (process groups and sessions, signal
+  # names and dispositions, select() over pipes, fcntl, a shebang, permission
+  # bits) carry the `posix` marker and are deselected; nothing else is
+  # skipped, so a failure here is a Windows bug or a test that assumed POSIX
+  # without saying so. Bare `mypy` checks this platform, which is the point:
+  # the guards in envs.py are written so that `--platform win32` narrows them.
+  # Bash (Git for Windows', run with `-eo pipefail`) rather than pwsh, whose
+  # wrapper makes "action statuses reflect the script's last exit code" --
+  # GitHub's workflow syntax reference.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The bytes the other jobs test, whatever this image's Git defaults are:
+      # `core.autocrlf=true` checks text out with CRLF (git-config), and a test
+      # that hashes a file would then be measuring the checkout. No
+      # `.gitattributes` in this repository says otherwise.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+      - run: mypy
+      - run: pytest -q -m "not posix"
+      - name: the wheel installs and runs from a clean environment
+        run: |
+          pip install build
+          python -m build --wheel
+          python -m venv ../fresh
+          ../fresh/Scripts/python.exe -m pip install dist/*.whl
+          ../fresh/Scripts/litetune.exe --help
+
   # An editable install is not the artifact anyone receives. `src/` layout plus
   # a dynamic hatch version plus `license-files` is exactly the surface where
   # `pip install -e .` passes and a wheel does not.

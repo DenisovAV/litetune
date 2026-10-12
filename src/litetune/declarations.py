@@ -57,6 +57,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from litetune import jsonfile
 from litetune.metrics import NAME_RULE, readable_name
 from litetune.storage import HASH_ALGORITHM, hash_file
 
@@ -72,14 +73,24 @@ def read_declarations(path: Path) -> tuple[list[Any], str]:
     does not carry what the runtime requires: see the module docstring.
     """
     try:
-        text = Path(path).read_text(encoding="utf-8")
+        raw = Path(path).read_bytes()
     except OSError as exc:
         raise DeclarationsError(
             f"the declarations at {path} could not be read: {type(exc).__name__}: {exc}"
         ) from exc
     try:
+        # Bytes, decoded by `jsonfile`: a file saved by Windows PowerShell 5.1
+        # is UTF-16 with a byte-order mark, and `read_text` raised on it here,
+        # outside the `except` that names the file.
+        text = jsonfile.decode(raw)
+    except UnicodeDecodeError as exc:
+        raise DeclarationsError(
+            f"the declarations at {path} {jsonfile.UNREADABLE} ({exc}); a runtime cannot "
+            "render a tool list it cannot read"
+        ) from exc
+    try:
         parsed = json.loads(text, object_pairs_hook=_refuse_repeated_keys)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except json.JSONDecodeError as exc:
         raise DeclarationsError(
             f"the declarations at {path} are not valid JSON ({exc}); a runtime cannot render a "
             "tool list it cannot parse"

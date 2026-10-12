@@ -7,6 +7,7 @@ silently.
 """
 
 import contextlib
+import errno
 import json
 import os
 import pathlib
@@ -17,7 +18,7 @@ import time
 import types
 
 import pytest
-from conftest import PROBE_FIELDS, probe_answer
+from conftest import PROBE_FIELDS, mark_provisioned, probe_answer
 
 from litetune import envs
 from litetune.envs import EXPORT, RUNTIME, TRAIN, StageEnv, UnpinnedRequirement
@@ -129,6 +130,78 @@ def test_waiting_for_another_provisioner_is_bounded(tmp_path):
         assert time.monotonic() - started < 5
 
 
+class _FakeMsvcrt:
+    """`msvcrt` as `_try_lock` uses it: `locking`, answering with a C `errno`.
+
+    `msvcrt.locking` raises `OSError` from the `errno` `_locking` set, so the
+    fake raises the same way, and records what it was asked.
+    """
+
+    LK_NBLCK = 2
+
+    def __init__(self, code: int | None = None):
+        self.code = code
+        self.calls: list[tuple[int, int, int]] = []
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        self.calls.append((fd, mode, nbytes))
+        if self.code is not None:
+            raise OSError(self.code, os.strerror(self.code))
+
+
+def _on_windows_with(monkeypatch, msvcrt) -> None:
+    """The `msvcrt` arm, reachable on any runner: the platform, and the module."""
+    monkeypatch.setattr(envs.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "msvcrt", msvcrt)
+
+
+def test_a_windows_lock_is_one_non_blocking_attempt_on_one_byte(tmp_path, monkeypatch):
+    fake = _FakeMsvcrt()
+    _on_windows_with(monkeypatch, fake)
+
+    with open(tmp_path / "env.lock", "w") as handle:
+        assert envs._try_lock(handle) is True
+        assert fake.calls == [(handle.fileno(), _FakeMsvcrt.LK_NBLCK, 1)]
+
+
+def test_a_windows_lock_held_by_another_process_is_waited_for(tmp_path, monkeypatch):
+    """`EACCES` is `_locking`'s "file already locked": a holder exists."""
+    _on_windows_with(monkeypatch, _FakeMsvcrt(errno.EACCES))
+
+    with pytest.raises(RuntimeError, match="still holding the lock"):
+        with envs._provision_lock(tmp_path / "env", timeout=0.6):
+            pass
+
+
+@pytest.mark.parametrize("code", [errno.EBADF, errno.EINVAL], ids=["EBADF", "EINVAL"])
+def test_a_windows_lock_that_cannot_be_taken_here_blames_no_holder(
+    tmp_path, monkeypatch, caplog, code
+):
+    """Every `OSError` used to read as "held elsewhere".
+
+    So a lone run whose lock `_locking` could not take waited out the whole
+    provisioning budget -- 1800 s -- and then blamed a process that did not exist. A
+    descriptor or argument `_locking` cannot use is "no locking here", which
+    proceeds unserialised at once and says so, as `flock` refusing does.
+    """
+    _on_windows_with(monkeypatch, _FakeMsvcrt(code))
+
+    started = time.monotonic()
+    with caplog.at_level("WARNING"):
+        with envs._provision_lock(tmp_path / "env", timeout=30):
+            pass
+
+    assert time.monotonic() - started < 5, "nobody holds it, so nobody is waited for"
+    assert "unserialised" in caplog.text
+
+
+def test_windows_without_msvcrt_is_unserialised_rather_than_a_crash(tmp_path, monkeypatch):
+    _on_windows_with(monkeypatch, None)
+
+    with open(tmp_path / "env.lock", "w") as handle:
+        assert envs._try_lock(handle) is None
+
+
 def test_the_install_does_not_start_once_the_budget_is_gone(tmp_path, monkeypatch):
     """`max(1.0, remaining)` started pip with a second after the budget expired.
 
@@ -168,6 +241,29 @@ def test_the_install_does_not_start_once_the_budget_is_gone(tmp_path, monkeypatc
     assert (env.path / "payload").read_text(encoding="utf-8") == "the existing environment"
 
 
+def _host(monkeypatch, platform: str, python: tuple[int, int]) -> None:
+    """Make envs see another machine: a wheel platform and a Python version.
+
+    `wheels.host_platform` is where the platform is read, and `sys.version_info`
+    is what `identity` and the refusals read the version from; a tuple is enough
+    for both. Nothing else about the host changes, which is what lets a POSIX
+    runner ask what Windows would be told.
+    """
+    monkeypatch.setattr(envs.wheels, "host_platform", lambda: platform)
+    monkeypatch.setattr(envs.sys, "version_info", (*python, 0, "final", 0))
+
+
+def _tripwires(monkeypatch) -> list[str]:
+    """Record whether provisioning got as far as building a venv or running pip."""
+    reached: list[str] = []
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", lambda *a, **k: reached.append("venv"))
+    # `_run_guarded`, not `subprocess.run`: the install runs on the same guarded
+    # path the stages use, and a tripwire left on the old function would report
+    # "the refusal came before pip" whatever pip did.
+    monkeypatch.setattr(envs, "_run_guarded", lambda *a, **k: reached.append("pip"))
+    return reached
+
+
 def test_an_unsupported_interpreter_is_refused_before_pip_runs(monkeypatch, tmp_path):
     """The stage environments inherit the host's Python, and the pins have a ceiling.
 
@@ -175,48 +271,201 @@ def test_an_unsupported_interpreter_is_refused_before_pip_runs(monkeypatch, tmp_
     back to a source build and fails after minutes of compiler output that never
     names the version. litetune itself runs fine on 3.13+; only what it
     provisions does not, and that distinction is invisible from the traceback.
-
-    The ceiling belongs to the environment, not to the package: `train` pins no
-    numpy and stops a version later. A shared constant refused `train` on 3.13
-    and blamed numpy for it, which sends the reader to fix a pin that is not
-    there. So the message must name the pin that actually set the limit.
     """
-    import venv
-
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    env = StageEnv(
-        name="probe",
-        requirements=("pyyaml==6.0.2",),
-        python_ceiling=(3, 12),
-        ceiling_pin="numpy==2.0.2",
-    )
+    reached = _tripwires(monkeypatch)
+    _host(monkeypatch, "linux_x86_64", (3, 13))
 
-    started = []
-    # `_run_guarded`, not `subprocess.run`: the install moved onto the same
-    # guarded path the stages use, and a tripwire left on the old function
-    # would report "the refusal came before pip" whatever pip did.
-    monkeypatch.setattr(envs, "_run_guarded", lambda *a, **k: started.append(a))
-    monkeypatch.setattr(envs.sys, "version_info", (3, 13, 0, "final", 0))
+    with pytest.raises(
+        RuntimeError,
+        match=r"pins numpy==2\.0\.2, which publishes wheels for "
+        r"linux_x86_64 for python3\.9 to python3\.12 only",
+    ):
+        StageEnv(name="probe", requirements=("numpy==2.0.2",)).provision()
+    assert reached == [], "the refusal must come before the venv and before pip"
 
-    with pytest.raises(RuntimeError, match=r"pins numpy==2\.0\.2.*up to python3\.12"):
-        env.provision()
-    assert started == [], "the refusal must come before pip"
 
-    # An environment whose pins reach further is not caught by another's limit.
-    reaches_further = StageEnv(
-        name="probe2",
-        requirements=("torch==2.5.1",),
-        python_ceiling=(3, 13),
-        ceiling_pin="torch==2.5.1",
-    )
-    monkeypatch.setattr(venv.EnvBuilder, "create", _fake_venv)
+def test_a_ceiling_is_a_fact_about_one_platform(monkeypatch, tmp_path):
+    """`torch==2.5.1` publishes a cp313 wheel for manylinux x86_64 and nowhere else.
+
+    One ceiling per environment made 3.13 a promise on every platform, so on
+    Windows the refusal that exists to prevent a failed pip did not fire, and
+    the error that came instead blamed the wrong toolchain. The same pin, the
+    same Python: allowed on Linux, refused on Windows by name.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
     monkeypatch.setattr(
         envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
     )
-    reaches_further.provision()
-    assert reaches_further.ready, "3.13 is inside torch's range and must be allowed"
+    torch_only = StageEnv(name="torch", requirements=("torch==2.5.1",))
 
-    assert started == [], "the refusal must come before pip, not after it"
+    _host(monkeypatch, "linux_x86_64", (3, 13))
+    torch_only.provision()
+    assert torch_only.ready, "3.13 is inside torch's range on Linux x86-64"
+
+    _host(monkeypatch, "win_amd64", (3, 13))
+    with pytest.raises(
+        RuntimeError,
+        match=r"torch==2\.5\.1, which publishes wheels for win_amd64 "
+        r"for python3\.9 to python3\.12 only",
+    ):
+        torch_only.provision(force=True)
+
+
+def test_train_names_every_pin_that_stops_it(monkeypatch, tmp_path):
+    """`sentencepiece==0.2.0` has no cp313 wheel on any platform.
+
+    So `train`'s 3.13 was never a fact: on Linux pip would have built
+    sentencepiece from source. On Windows two pins stop it, and naming one
+    sends the reader to move a pin and meet the other.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    reached = _tripwires(monkeypatch)
+
+    _host(monkeypatch, "linux_x86_64", (3, 13))
+    with pytest.raises(RuntimeError) as linux:
+        TRAIN.provision()
+    assert "sentencepiece==0.2.0" in str(linux.value)
+    assert "torch==2.5.1" not in str(linux.value), "torch has its wheel there"
+
+    _host(monkeypatch, "win_amd64", (3, 13))
+    with pytest.raises(RuntimeError) as windows:
+        TRAIN.provision()
+    assert "torch==2.5.1" in str(windows.value)
+    assert "sentencepiece==0.2.0" in str(windows.value)
+    assert reached == []
+
+
+def test_convert_is_refused_on_windows_before_anything_is_installed(monkeypatch, tmp_path):
+    """`litert-converter==0.4.0` publishes no Windows wheel and no source distribution.
+
+    pip used to be asked anyway, and failed while resolving. The refusal now
+    comes first, names the package and says where `convert` does run -- and
+    that `verify` takes the result back here.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    reached = _tripwires(monkeypatch)
+    _host(monkeypatch, "win_amd64", (3, 12))
+
+    with pytest.raises(RuntimeError) as caught:
+        EXPORT.provision()
+    message = str(caught.value)
+
+    assert reached == [], "nothing is built or installed for an environment that cannot be"
+    assert message.startswith("environment 'export' cannot be provisioned on win_amd64")
+    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in message
+    assert "no source distribution" in message
+    assert "https://pypi.org/pypi/litert-converter/0.4.0/json" in message
+    assert "WSL2" in message and "`verify` takes it" in message
+
+
+@pytest.mark.parametrize("env", [RUNTIME, TRAIN], ids=lambda e: e.name)
+def test_what_runs_on_windows_x64_is_not_refused(monkeypatch, tmp_path, env):
+    """`verify` and `tune` keep working where they work.
+
+    Every pin in `runtime` and `train`, and every exact pin behind them, has a
+    win_amd64 wheel for 3.10 to 3.12. A refusal here would turn a working
+    platform into a refused one, which is the same overclaim pointing the other
+    way.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    for minor in (10, 11, 12):
+        assert env.unprovisionable(platform="win_amd64", python=(3, minor)) is None
+
+
+@pytest.mark.parametrize(
+    ("platform", "named"),
+    [
+        ("win_arm64", ["litert-lm-api==0.18.0 (required by litert-lm==0.18.0)", "numpy==2.0.2"]),
+        ("win32", ["litert-lm-api==0.18.0 (required by litert-lm==0.18.0)"]),
+        ("macosx_x86_64", ["litert-lm-api==0.18.0 (required by litert-lm==0.18.0)"]),
+    ],
+)
+def test_an_architecture_with_no_wheel_is_refused_by_the_package(
+    monkeypatch, tmp_path, platform, named
+):
+    """Windows on ARM64, 32-bit Windows and Intel macOS have no `litert-lm-api` wheel.
+
+    It is the runtime's native library, pinned exactly by `litert-lm==0.18.0`,
+    so the environment's own list does not name it -- and a refusal that named
+    only what the environment pins would point at the wrong package.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    reached = _tripwires(monkeypatch)
+    _host(monkeypatch, platform, (3, 12))
+
+    with pytest.raises(RuntimeError) as caught:
+        RUNTIME.provision()
+
+    message = str(caught.value)
+    assert message.startswith(f"environment 'runtime' cannot be provisioned on {platform}: ")
+    for clause in named:
+        assert f"{clause} publishes no wheel for {platform}" in message, message
+    assert reached == []
+
+
+def test_a_machine_nobody_has_can_be_asked_about(monkeypatch):
+    """The platform and the Python are both parameters, and both are used.
+
+    Asked on a 3.12 host about 3.13, the answer is about 3.13: this is how a
+    POSIX runner pins what Windows, or the next Python, would be told.
+    """
+    monkeypatch.setattr(envs.sys, "version_info", (3, 12, 0, "final", 0))
+
+    message = TRAIN.unprovisionable(platform="linux_x86_64", python=(3, 13))
+
+    assert message is not None
+    assert message.startswith("cannot be provisioned on python3.13 on linux_x86_64: ")
+    assert "sentencepiece==0.2.0" in message
+    assert TRAIN.unprovisionable(platform="linux_x86_64", python=(3, 12)) is None
+
+
+def test_a_wheel_missing_for_the_platform_outranks_one_missing_for_the_python(monkeypatch):
+    """Naming a Python version where no Python would do sends the reader to change it."""
+    message = TRAIN.unprovisionable(platform="win_arm64", python=(3, 13))
+
+    assert message is not None
+    assert message.startswith("cannot be provisioned on win_arm64:")
+    assert "python3.13" not in message
+
+
+def test_an_environment_that_cannot_be_built_here_says_so_when_unready(monkeypatch, tmp_path):
+    """`--no-provision` reads `unready_detail`, and "not provisioned" alone sends
+    the reader to drop the flag, only to be refused for this reason instead."""
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+
+    _host(monkeypatch, "win_amd64", (3, 12))
+    assert "litert-converter==0.4.0 publishes no wheel" in EXPORT.unready_detail
+    assert EXPORT.unready_detail.startswith(f"is not provisioned at {EXPORT.path}, and cannot")
+
+    _host(monkeypatch, "linux_x86_64", (3, 12))
+    assert EXPORT.unready_detail == f"is not provisioned at {EXPORT.path}"
+
+
+def test_a_python_below_the_floor_is_still_refused_first(monkeypatch, tmp_path):
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    reached = _tripwires(monkeypatch)
+    _host(monkeypatch, "win_amd64", (3, 9))
+
+    with pytest.raises(RuntimeError, match=r"needs at least python3\.10; this is python3\.9"):
+        EXPORT.provision()
+    assert reached == []
+
+
+def test_a_ready_environment_is_used_whatever_the_table_says(monkeypatch, tmp_path):
+    """Built some other way -- from another index, by hand -- it is not refused.
+
+    The table says what PyPI lists; an environment already standing is evidence
+    of more than that.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    reached = _tripwires(monkeypatch)
+    _host(monkeypatch, "win_amd64", (3, 12))
+    mark_provisioned(EXPORT)
+
+    assert EXPORT.provision() == EXPORT.path
+    assert reached == []
 
 
 class _OsAs:
@@ -408,8 +657,10 @@ def test_the_cache_is_inventoried_with_sizes_and_readiness(monkeypatch, tmp_path
     big = tmp_path / "export-deadbeef"
     (big / "lib").mkdir(parents=True)
     (big / "lib" / "payload").write_bytes(b"x" * 5000)
-    (big / "bin").mkdir()
-    (big / "bin" / "python").touch()
+    # Where `venv` puts it on this platform: `bin/python` here is not an
+    # interpreter on Windows, and the entry would rightly not be ready.
+    envs._interpreter_in(big).parent.mkdir()
+    envs._interpreter_in(big).touch()
     (big / ".litetune-ready").write_text("deadbeef", encoding="utf-8")
 
     half = tmp_path / "runtime-cafe"
@@ -726,6 +977,7 @@ def test_a_probe_that_cannot_start_is_not_a_device(probe_env, monkeypatch):
     assert "FileNotFoundError" in probe.detail
 
 
+@pytest.mark.posix
 def test_an_invalid_byte_ahead_of_the_answer_does_not_crash_the_run(probe_env):
     """A garbled byte on the probe's stdout used to end the whole run.
 
@@ -1041,6 +1293,7 @@ def test_the_child_process_gets_the_host_environment_minus_the_reach(tmp_path, m
     assert seen["PATH"] == os.environ["PATH"], "the base is the host's, not an empty dict"
 
 
+@pytest.mark.posix
 def test_the_child_gets_a_session_of_its_own(tmp_path, monkeypatch):
     """`_kill_tree` SIGKILLs the child's process group.
 
@@ -1055,6 +1308,7 @@ def test_the_child_gets_a_session_of_its_own(tmp_path, monkeypatch):
     assert int(proc.stdout.strip()) != os.getsid(0)
 
 
+@pytest.mark.posix
 def test_a_signal_still_reads_as_a_signal_through_the_new_run(tmp_path, monkeypatch):
     """`Popen` replaced `subprocess.run`, and the whole check model rides on this.
 
@@ -1185,9 +1439,15 @@ class _FakeProc:
         self.pid = pid
         self.returncode = returncode
         self.direct_signals: list[int] = []
+        self.hard_killed = False
 
     def send_signal(self, sig):
         self.direct_signals.append(sig)
+
+    def kill(self):
+        # Where there is no SIGKILL to send -- Windows -- `_signal_tree` kills
+        # through `Popen.kill`, as `subprocess` does there.
+        self.hard_killed = True
 
     def poll(self):
         return self.returncode
@@ -1196,6 +1456,7 @@ class _FakeProc:
         raise subprocess.TimeoutExpired("fake", timeout)
 
 
+@pytest.mark.posix
 def test_a_stage_is_asked_to_stop_before_it_is_killed(monkeypatch):
     """SIGKILL alone would be a quiet downgrade of what this replaced.
 
@@ -1219,6 +1480,7 @@ def test_a_stage_is_asked_to_stop_before_it_is_killed(monkeypatch):
     assert sent == [signal.SIGTERM, signal.SIGKILL], "polite first, then certain"
 
 
+@pytest.mark.posix
 def test_a_group_that_cannot_be_killed_falls_back_to_the_child(monkeypatch):
     """`killpg` returns EPERM in some sandboxes and containers.
 
@@ -1244,6 +1506,7 @@ def test_a_group_that_cannot_be_killed_falls_back_to_the_child(monkeypatch):
     assert proc.direct_signals == [signal.SIGTERM, signal.SIGKILL]
 
 
+@pytest.mark.posix
 def test_a_process_that_already_left_counts_as_killed(monkeypatch):
     """Finishing between the timeout firing and the kill is the ordinary case."""
 
@@ -1255,6 +1518,7 @@ def test_a_process_that_already_left_counts_as_killed(monkeypatch):
     assert envs._kill_tree(_FakeProc(pid=4243), grace=0.01) is envs.Reach.ALREADY_GONE
 
 
+@pytest.mark.posix
 def test_a_reaped_process_is_never_signalled(monkeypatch):
     """Its pid is free for the kernel to hand to somebody else.
 
@@ -1270,6 +1534,7 @@ def test_a_reaped_process_is_never_signalled(monkeypatch):
     assert signalled == [] and proc.direct_signals == []
 
 
+@pytest.mark.posix
 def test_the_stage_refuses_to_kill_its_own_process_group(monkeypatch):
     """Otherwise a caller reaching past `start_new_session` takes the shell out.
 
@@ -1392,6 +1657,7 @@ def test_an_interpreter_with_no_marker_is_not_ready_either(tmp_path, monkeypatch
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix
 @pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX")
 def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch, request):
     """`subprocess.run(timeout=)` kills the direct child and nothing below it.
@@ -1453,7 +1719,9 @@ def test_a_timeout_kills_what_the_stage_spawned(tmp_path, monkeypatch, request):
 def _reap(pid: int) -> None:
     """Best effort, for a pid we never had a `Popen` for -- a grandchild."""
     with contextlib.suppress(OSError):
-        os.kill(pid, signal.SIGKILL)
+        # Only POSIX-marked tests call this; `getattr` keeps `mypy --platform
+        # win32` from reporting the name Windows does not have.
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def _reap_proc(proc: subprocess.Popen) -> None:
@@ -1475,6 +1743,7 @@ def _reap_proc(proc: subprocess.Popen) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix
 @pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="SIGHUP is POSIX")
 def test_a_signal_the_process_already_ignores_is_left_alone(monkeypatch):
     """`nohup` sets SIGHUP to SIG_IGN for one purpose: surviving the hangup.
@@ -1564,6 +1833,7 @@ def test_a_second_signal_does_not_buy_the_child_more_time(monkeypatch):
     ], "the second signal must kill outright rather than start another grace"
 
 
+@pytest.mark.posix
 def test_a_second_signal_cuts_the_first_grace_short(monkeypatch):
     """Killing outright is half of it; the first grace must also stop waiting.
 
@@ -1597,6 +1867,7 @@ def test_a_second_signal_cuts_the_first_grace_short(monkeypatch):
     assert asked == [False, True], "the grace was not told that a second signal arrived"
 
 
+@pytest.mark.posix
 def test_a_handler_whose_grace_was_interrupted_can_still_be_signalled(monkeypatch):
     """The route the `finally` around the handler's grace exists for.
 
@@ -1715,6 +1986,46 @@ def test_a_platform_without_sigkill_still_kills(monkeypatch):
     assert proc.hard_killed, "the hard kill must go through Popen.kill where there is no SIGKILL"
 
 
+def test_windows_never_reads_a_process_group(monkeypatch):
+    """`_group_of` answers None there before asking `getpgid` anything.
+
+    Written as a `sys.platform` check so the type checker narrows on it; this
+    is what keeps it a check rather than a comment.
+    """
+    asked: list[int] = []
+    monkeypatch.setattr(envs.sys, "platform", "win32")
+    monkeypatch.setattr(envs.os, "killpg", lambda *a: None, raising=False)
+    monkeypatch.setattr(envs.os, "getpgid", lambda pid: asked.append(pid) or 4242, raising=False)
+
+    assert envs._group_of(_FakeProc()) is None
+    assert asked == []
+
+
+def test_windows_signals_the_child_even_when_handed_a_group(monkeypatch):
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(envs.sys, "platform", "win32")
+    monkeypatch.setattr(
+        envs.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig)), raising=False
+    )
+    proc = _FakeProc()
+
+    assert envs._signal_tree(proc, 4242, signal.SIGTERM) is envs.Reach.CHILD_ONLY
+    assert signalled == []
+    assert proc.direct_signals == [signal.SIGTERM]
+
+
+def test_windows_sleeps_out_the_grace_without_probing(monkeypatch):
+    """Neither `waitid` nor a group probe exists there, so the grace is slept out."""
+    probed: list[str] = []
+    monkeypatch.setattr(envs.sys, "platform", "win32")
+    monkeypatch.setattr(envs.os, "waitid", lambda *a: probed.append("waitid"), raising=False)
+    monkeypatch.setattr(envs.os, "killpg", lambda *a: probed.append("killpg"), raising=False)
+
+    assert envs._wait_without_reaping(_FakeProc(), 4242, grace=0.05) is True
+    assert probed == []
+
+
+@pytest.mark.posix
 def test_the_stage_is_given_its_grace(monkeypatch):
     """Deleting the wait entirely leaves SIGTERM immediately followed by
     SIGKILL, which is behaviourally the SIGKILL-only shape the grace exists to
@@ -1734,6 +2045,7 @@ def test_the_stage_is_given_its_grace(monkeypatch):
     assert waited == [0.25], "the child must be given time between SIGTERM and SIGKILL"
 
 
+@pytest.mark.posix
 def test_the_group_is_killed_even_when_the_child_went_quietly(monkeypatch):
     """Its own exit does not cover what it spawned.
 
@@ -1757,6 +2069,7 @@ def test_the_group_is_killed_even_when_the_child_went_quietly(monkeypatch):
     assert sent == [signal.SIGTERM, signal.SIGKILL]
 
 
+@pytest.mark.posix
 def test_a_stage_that_cannot_be_signalled_at_all_says_so(monkeypatch):
     """The difference between the two halves of the leaked-process warning.
 
@@ -1774,6 +2087,7 @@ def test_a_stage_that_cannot_be_signalled_at_all_says_so(monkeypatch):
     assert envs._kill_tree(Untouchable(), grace=0.01) is envs.Reach.NOTHING
 
 
+@pytest.mark.posix
 def test_the_grace_is_usable_by_a_stage_that_has_something_to_say(tmp_path, monkeypatch):
     """The grace was only ever usable by a quiet stage, which is backwards.
 
@@ -1965,6 +2279,7 @@ def test_the_fallback_keeps_the_seed_when_communicate_assembles_nothing(monkeypa
     assert out == "said before" and err == ""
 
 
+@pytest.mark.posix
 def test_the_partial_output_of_a_wedged_stage_is_kept(monkeypatch):
     """The stderr of a timed-out stage is the one artifact that explains it.
 
@@ -2011,6 +2326,7 @@ def test_what_the_earlier_read_took_off_the_pipes_is_not_lost(monkeypatch):
     assert out == "said" and err == "complained"
 
 
+@pytest.mark.posix
 def test_the_exception_is_used_when_the_popen_kept_nothing(monkeypatch):
     """`_fileobj2output` is a CPython private, so it is asked for, not assumed.
 
@@ -2081,10 +2397,13 @@ def test_the_interpreter_is_where_venv_actually_puts_it(monkeypatch):
     posix = pathlib.Path("/x/bin/python")
     windows = pathlib.Path("/x/Scripts/python.exe")
 
+    # Both through `_OsAs`, which replaces the `os` envs sees and leaves the
+    # global one alone, so the same assertions hold on a Windows runner.
+    monkeypatch.setattr(envs, "os", _OsAs("posix"))
     assert envs._interpreter_in(root) == posix
     assert envs._console_script_in(root, "pip") is None  # nothing there to find
 
-    monkeypatch.setattr(envs.os, "name", "nt")
+    monkeypatch.setattr(envs, "os", _OsAs("nt"))
     assert envs._interpreter_in(root) == windows
 
 
@@ -2100,6 +2419,7 @@ def test_a_windows_console_script_is_found_by_its_exe(tmp_path, monkeypatch):
     assert envs._console_script_in(tmp_path, "litert-torch") == scripts / "litert-torch.exe"
 
 
+@pytest.mark.posix
 @pytest.mark.skipif(os.name == "nt", reason="SIGTERM dispositions are POSIX")
 def test_a_terminated_litetune_lets_the_stage_finish_its_sentence(tmp_path, request):
     """The grace is only worth having on the path `kill <litetune>` takes.
@@ -2160,6 +2480,8 @@ def test_a_terminated_litetune_lets_the_stage_finish_its_sentence(tmp_path, requ
     )
 
 
+@pytest.mark.posix
+@pytest.mark.skipif(os.name == "nt", reason="SIGTERM dispositions and fcntl are POSIX")
 def test_a_terminated_litetune_takes_the_stage_with_it(tmp_path, request):
     """`kill <litetune>` must not leave a six-hour torch run holding its memory.
 
@@ -2215,6 +2537,7 @@ def test_a_terminated_litetune_takes_the_stage_with_it(tmp_path, request):
     pytest.fail("the stage outlived the litetune process that was told to exit")
 
 
+@pytest.mark.posix
 @pytest.mark.skipif(os.name == "nt", reason="SIGINT delivery to a process group is POSIX")
 def test_an_interrupted_litetune_takes_the_stage_with_it(tmp_path, request):
     """The `except BaseException` arm of `run`, which nothing else reaches.
@@ -2275,6 +2598,7 @@ def test_an_interrupted_litetune_takes_the_stage_with_it(tmp_path, request):
     pytest.fail("the stage outlived the interrupted litetune process")
 
 
+@pytest.mark.posix
 def test_both_termination_signals_are_guarded(monkeypatch):
     """Dropping SIGHUP from the loop left the whole suite green.
 
@@ -2291,6 +2615,7 @@ def test_both_termination_signals_are_guarded(monkeypatch):
     assert {signal.SIGTERM, signal.SIGHUP} <= installed
 
 
+@pytest.mark.posix
 def test_the_drain_says_only_what_the_kill_established(monkeypatch, caplog):
     """The four sentences are the reason `Reach` exists; swapping them was green.
 
@@ -2316,6 +2641,7 @@ def test_the_drain_says_only_what_the_kill_established(monkeypatch, caplog):
         assert expected in caplog.text, f"{reach} must not be described as something else"
 
 
+@pytest.mark.posix
 def test_nothing_is_said_when_the_pipes_did_close(monkeypatch, caplog):
     """The warning is about pipes still held, and it is the thing that sends a
     reader hunting for a leaked process. A drain that reached the end of both
@@ -2337,6 +2663,7 @@ def test_nothing_is_said_when_the_pipes_did_close(monkeypatch, caplog):
     assert "are still open" not in caplog.text
 
 
+@pytest.mark.posix
 def test_the_wait_ends_when_the_group_does(tmp_path):
     """Nothing exercised this directly, and both obvious wrong versions passed.
 
@@ -2394,6 +2721,7 @@ def test_a_variable_the_caller_asked_for_is_not_reported_as_dropped(monkeypatch,
     assert "not passing PYTHONPATH" not in caplog.text
 
 
+@pytest.mark.posix
 @pytest.mark.skipif(os.name == "nt", reason="SIGTERM dispositions are POSIX")
 def test_the_grace_lets_a_stage_finish_what_it_started(tmp_path, monkeypatch):
     """The grace is only worth having if it has an effect, and nothing saw one.
@@ -2469,6 +2797,7 @@ def test_the_grace_is_given_even_where_only_the_child_could_be_signalled(monkeyp
     assert waited == [0.25]
 
 
+@pytest.mark.posix
 def test_a_delivered_sigterm_is_not_erased_by_a_refused_sigkill(monkeypatch):
     """`Reach` must carry the best reach, not the last attempt.
 
@@ -2496,6 +2825,7 @@ def test_a_delivered_sigterm_is_not_erased_by_a_refused_sigkill(monkeypatch):
     assert sent == [signal.SIGTERM]
 
 
+@pytest.mark.posix
 def test_a_host_that_reaps_for_us_gets_no_group_signal(monkeypatch):
     """A host that ignores SIGCHLD has the kernel reap children as they exit.
 
@@ -2521,6 +2851,7 @@ def test_a_host_that_reaps_for_us_gets_no_group_signal(monkeypatch):
     assert proc.direct_signals == [signal.SIGTERM, signal.SIGKILL]
 
 
+@pytest.mark.posix
 @pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX")
 def test_a_stage_reads_the_same_whether_it_finished_or_was_killed(tmp_path, monkeypatch):
     r"""Two paths describing one child must not disagree about what it said.
@@ -2541,6 +2872,7 @@ def test_a_stage_reads_the_same_whether_it_finished_or_was_killed(tmp_path, monk
     assert caught.value.output == finished.stdout
 
 
+@pytest.mark.posix
 def test_an_interrupted_read_does_not_end_the_stream(monkeypatch):
     """A single EINTR must not cost every byte after it.
 
@@ -2579,6 +2911,7 @@ def test_an_interrupted_read_does_not_end_the_stream(monkeypatch):
     )
 
 
+@pytest.mark.posix
 def test_an_interrupted_reap_still_gives_the_selector_back(monkeypatch):
     """The reap waits, and a wait can be interrupted.
 
@@ -2673,6 +3006,7 @@ def test_a_pipe_open_on_either_side_is_reported(monkeypatch, caplog):
         assert "are still open" in caplog.text, label
 
 
+@pytest.mark.posix
 def test_the_drain_gives_its_selector_descriptor_back():
     """`kqueue` and `epoll` each cost a descriptor of their own.
 
@@ -2778,6 +3112,7 @@ def test_the_fallback_reports_pipes_that_really_are_held(monkeypatch, caplog):
     assert "are still open" in caplog.text
 
 
+@pytest.mark.posix
 def test_the_interrupt_bound_counts_only_a_run_of_them(monkeypatch):
     """The bound is on *consecutive* interruptions, and the reset is what
     makes that word true.
@@ -2825,6 +3160,7 @@ def test_the_interrupt_bound_counts_only_a_run_of_them(monkeypatch):
     )
 
 
+@pytest.mark.posix
 def test_the_rescue_kill_does_not_signal_a_group_that_is_no_longer_ours(monkeypatch):
     """The rescue SIGKILL has to obey the same guard as the ordinary one.
 
@@ -2882,6 +3218,7 @@ def test_the_discarded_drain_is_not_seeded_either(monkeypatch):
     assert seen.get("seed") is False, "the discarded drain must not pay for a seed"
 
 
+@pytest.mark.posix
 def test_the_rescue_asks_returncode_and_does_not_poll(monkeypatch):
     """`returncode`, not `poll()`, and the difference is the whole hazard.
 
@@ -3023,6 +3360,7 @@ def test_one_pipe_refused_gives_up_on_both(monkeypatch):
     ), "the drain must not consume a pipe it is about to be overridden for"
 
 
+@pytest.mark.posix
 def test_interruptions_on_two_pipes_are_counted_apart(monkeypatch):
     """The other half of "per pipe", and the half nothing exercised.
 
@@ -3061,6 +3399,7 @@ def test_interruptions_on_two_pipes_are_counted_apart(monkeypatch):
     ), "five interruptions on each pipe were counted together and both pipes were given up on"
 
 
+@pytest.mark.posix
 def test_the_interrupt_bound_is_per_pipe_and_consecutive(monkeypatch):
     """One counter for two descriptors was wrong in both directions.
 
@@ -3158,6 +3497,7 @@ def test_a_drain_whose_text_is_discarded_keeps_what_did_register(monkeypatch):
     assert not read_got, "a drain whose text is read must still give up on both"
 
 
+@pytest.mark.posix
 def test_a_discarding_drain_still_gives_a_half_registered_stage_its_grace(tmp_path, monkeypatch):
     """The measurement the scoped all-or-nothing rule rests on, kept in the tree.
 
@@ -3331,6 +3671,7 @@ def test_a_drain_that_hands_over_does_not_wait_first(monkeypatch):
     assert fallback_asked, "and it still has to hand over to the fallback"
 
 
+@pytest.mark.posix
 def test_a_pipe_that_fails_to_read_is_let_go(monkeypatch, caplog):
     """An `os.read` that fails for good must end that pipe, not repeat.
 
@@ -3585,6 +3926,7 @@ def test_the_grace_is_pumped_with_the_one_that_sleeps(monkeypatch):
     ), "the grace was handed a pump that returns early, so the wait loop spins"
 
 
+@pytest.mark.posix
 def test_the_drain_kills_the_group_and_reaps_the_leader(tmp_path):
     """`_kill_and_drain` end to end on a real process tree, not a fake.
 
@@ -3722,6 +4064,7 @@ def test_a_pipe_that_only_ever_answers_eintr_is_let_go(monkeypatch):
     )
 
 
+@pytest.mark.posix
 def test_an_interrupted_grace_still_kills_the_group(monkeypatch):
     """The grace is the one interruptible part of the kill.
 
@@ -3751,6 +4094,7 @@ def test_an_interrupted_grace_still_kills_the_group(monkeypatch):
     ], "the interrupt escaped before the SIGKILL, so the group outlives us"
 
 
+@pytest.mark.posix
 def test_a_grandchild_is_collected_after_its_parent_has_exited(tmp_path, monkeypatch):
     """The case the whole module exists for, and it leaked.
 
@@ -4029,14 +4373,31 @@ def test_an_unrecognised_pip_failure_still_hands_over_what_pip_said():
 
 
 def test_a_system_package_is_named_as_the_debian_package_it_is():
-    """`libvulkan1` is a Debian name, printed on every platform.
-
-    Unqualified, it reads as an instruction a macOS or Windows reader cannot
-    follow, in the message that is already telling them their install failed.
-    """
-    message = envs.EXPORT._provisioning_failed("ERROR: something else went wrong")
+    """`libvulkan1` is a Debian name, and it is named as one."""
+    message = envs.EXPORT._provisioning_failed("ERROR: something else went wrong", "linux")
 
     assert "Debian package(s) libvulkan1" in message
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_a_debian_package_is_not_named_off_linux(platform):
+    """Printed on macOS or Windows, `libvulkan1` reads as an instruction the
+    reader cannot follow, in the message already telling them their install
+    failed -- and what those platforms need instead is not established here."""
+    message = envs.EXPORT._provisioning_failed("ERROR: something else went wrong", platform)
+
+    assert "libvulkan1" not in message
+    assert "Debian" not in message
+    assert envs.RUNTIME.system_requirements_on(platform) == ()
+    assert envs.RUNTIME.system_requirements_on("linux") == ("libvulkan1",)
+
+
+def test_the_debian_names_follow_the_running_platform_by_default(monkeypatch):
+    """What a manifest records is read from `sys.platform` when no platform is given."""
+    monkeypatch.setattr(envs.sys, "platform", "win32")
+    assert envs.EXPORT.system_requirements_on() == ()
+    monkeypatch.setattr(envs.sys, "platform", "linux")
+    assert envs.EXPORT.system_requirements_on() == ("libvulkan1",)
 
 
 def test_the_export_environment_pins_what_litert_torch_leaves_open():

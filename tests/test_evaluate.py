@@ -709,6 +709,15 @@ def test_backend_reports_which_engine_produced_the_numbers(tmp_path):
     assert "litert-lm==0.18.0" in described["requirements"]
 
 
+@pytest.mark.parametrize(("platform", "debian"), [("linux", ["libvulkan1"]), ("win32", [])])
+def test_a_manifest_names_a_debian_package_only_on_linux(tmp_path, monkeypatch, platform, debian):
+    """A `--json` manifest from a Mac or a Windows machine listed `libvulkan1`,
+    a Debian name nobody there can install."""
+    # The `sys` envs reads, which is the one `sys` -- named so it stays that.
+    monkeypatch.setattr(envs.sys, "platform", platform)
+    assert _litertlm(tmp_path).describe()["system_requirements"] == debian
+
+
 # -- transformers -----------------------------------------------------------
 
 

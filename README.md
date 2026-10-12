@@ -133,8 +133,13 @@ Or through Homebrew, which brings its own Python 3.12:
 brew install DenisovAV/tap/litetune
 ```
 
-**Linux, macOS or Windows**, Python 3.10–3.12 — with `convert` needing Linux
-x86_64 or an Apple Silicon Mac, for the reason below. On Linux you also need
+**Linux, macOS on Apple Silicon or Windows on x64**, Python 3.10–3.12 — with
+`convert` needing Linux x86_64 or an Apple Silicon Mac, for the reason below.
+Each stage checks, before pip runs, that every pin it installs publishes a wheel
+for your platform and Python, and refuses by naming the one that does not: the
+runtime's native library `litert-lm-api` and `torch==2.5.1` publish none for
+Intel Macs, 32-bit Python or Windows on ARM64, so no stage that builds an
+environment runs there. On Linux you also need
 `libvulkan1` —
 `litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, and
 without it every invocation, `--help` included, dies in under a second:
@@ -151,7 +156,8 @@ wheel that installs there — `win_amd64` for the ones with native code,
 `litert-lm-api` included, and `py3-none-any` for the rest. `convert` cannot,
 because [`litert-converter`](https://pypi.org/project/litert-converter/) — the
 MLIR converter `litert-torch` depends on — has never published a Windows wheel
-or a source distribution, so the install fails while pip is still resolving.
+or a source distribution, so `convert` refuses there before installing anything
+and says where it does run.
 Upstream tracks it as
 [litert-torch#968](https://github.com/google-ai-edge/litert-torch/issues/968),
 where a collaborator says Windows is planned and gives no date. Google's
@@ -180,10 +186,11 @@ the pins, which an index does not change, so a cached CPU environment would be
 reused in silence. Either way the run records what it got: `device` and
 `cuda_build` are in the training metrics.
 
-Python 3.13 runs `tune`, `prepare` and `bundle` but not `convert` or `verify`:
-each stage builds its own environment from the interpreter you launched, and
-`numpy==2.0.2` — pinned by the export toolchain — stops publishing wheels after
-3.12. Past a ceiling the command refuses and names the pin that set it.
+Python 3.13 runs `bundle`, and `prepare` without `--tokenizer`, but no stage
+that builds an environment: each builds from the interpreter you launched, and
+`numpy==2.0.2`, pinned for `convert` and `verify`, and `sentencepiece==0.2.0`,
+pinned for `tune`, publish no wheel past 3.12. Past a ceiling the command
+refuses and names the pin that set it.
 
 Each of `tune`, `convert` and `verify` builds its environment on first use and
 caches it. Measured on macOS:

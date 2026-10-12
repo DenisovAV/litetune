@@ -606,7 +606,8 @@ class ExportRequest:
                 "identity": self.env.identity,
                 "path": str(self.env.path),
                 "requirements": list(self.env.requirements),
-                "system_requirements": list(self.env.system_requirements),
+                # What this platform needs: Debian names are recorded on Linux only.
+                "system_requirements": list(self.env.system_requirements_on()),
             },
         }
 

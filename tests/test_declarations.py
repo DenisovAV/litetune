@@ -15,6 +15,7 @@ bundle and the published chat template on 2026-09-17.
 
 from __future__ import annotations
 
+import codecs
 import json
 from pathlib import Path
 
@@ -74,7 +75,8 @@ def test_the_digest_names_the_tool_list_not_the_file(tmp_path):
     assert digest == content_digest(parsed)
     assert digest.startswith("sha256:")
     shipped = tmp_path / "shipped.json"
-    shipped.write_text(canonical_text(parsed), encoding="utf-8")
+    # `newline=""`, as `bundle` writes it: the bytes are what is hashed.
+    shipped.write_text(canonical_text(parsed), encoding="utf-8", newline="")
     assert hash_file(shipped) == digest
     assert read_declarations(shipped)[1] == digest
     assert read_declarations(pretty)[1] == digest
@@ -124,6 +126,38 @@ def test_the_index_of_the_offending_tool_is_named(tmp_path):
 def test_a_file_that_is_not_json_says_so(tmp_path):
     with pytest.raises(DeclarationsError, match="not valid JSON"):
         read_declarations(_write(tmp_path, "{not json"))
+
+
+@pytest.mark.parametrize(
+    "mark, codec",
+    [(codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF8, "utf-8")],
+    ids=["utf-16-le", "utf-8-bom"],
+)
+def test_a_file_saved_by_windows_powershell_is_the_same_list(tmp_path, mark, codec):
+    """`Out-File` and `>` in Windows PowerShell 5.1 write UTF-16LE with a mark.
+
+    Read as UTF-8 it raised `UnicodeDecodeError` from `read_text`, outside the
+    `except` that names the file, so the run ended without saying which one.
+    The list it holds is the list, and so is its digest.
+    """
+    utf8 = _write(tmp_path, WRAPPED)
+    windows = tmp_path / "windows.json"
+    windows.write_bytes(mark + json.dumps(WRAPPED).encode(codec))
+
+    assert read_declarations(windows) == read_declarations(utf8)
+
+
+def test_a_file_that_is_not_text_is_refused_by_name(tmp_path):
+    path = tmp_path / "declarations.json"
+    path.write_bytes('[{"type": "function", "function": {"name": "é"}}]'.encode("cp1252"))
+
+    with pytest.raises(DeclarationsError) as caught:
+        read_declarations(path)
+
+    assert str(path) in str(caught.value)
+    assert "is not text in UTF-8, or in UTF-16 or UTF-32 with a byte-order mark" in str(
+        caught.value
+    )
 
 
 def test_a_file_that_is_not_there_says_so(tmp_path):
@@ -535,7 +569,7 @@ def test_prerendered_accepts_only_the_files_bytes(tmp_path):
     path = _write(tmp_path, WRAPPED)
     listed, digest = read_declarations(path)
     canonical = tmp_path / "canonical.json"
-    canonical.write_text(canonical_text(listed), encoding="utf-8")
+    canonical.write_text(canonical_text(listed), encoding="utf-8", newline="")
     record = hash_file(canonical)
     assert record == digest
 

@@ -10,14 +10,15 @@ readme = "README.md"
 # No upper bound, deliberately, and this was tried the other way first.
 #
 # The stage environments are built from the interpreter that runs litetune, and
-# their pinned `numpy==2.0.2` publishes no wheel above cp312 -- so `convert` and
-# `verify` cannot provision on 3.13+. But `prepare`, `tune` and `bundle` all
-# work there, and the whole test suite passes on 3.14. Declaring `<3.13` made
-# pip refuse to install a package whose majority still runs.
+# their pinned `numpy==2.0.2` and `sentencepiece==0.2.0` publish no wheel above
+# cp312 -- so `convert`, `verify` and `tune` cannot provision on 3.13+. But
+# `prepare` and `bundle` work there, and the whole test suite passes on 3.14.
+# Declaring `<3.13` made pip refuse to install a package that still runs.
 #
 # So the ceiling is enforced where it actually bites: `StageEnv.provision`
-# refuses with a message naming the interpreter, the range and the reason,
-# instead of letting pip spend minutes failing to build numpy from source.
+# refuses with a message naming the interpreter, the platform and the pin,
+# read from what each pin publishes on PyPI (`litetune/wheels.py`), instead
+# of letting pip spend minutes failing to build numpy from source.
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -130,3 +131,9 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `--strict-markers` so a misspelt `posix` fails collection instead of quietly
+# marking nothing -- which would put the test back into the Windows job.
+addopts = "--strict-markers"
+markers = [
+    "posix: asserts a POSIX mechanism -- process groups and sessions, signal names and dispositions, select() over pipes, fcntl, a shebang, permission bits -- and is deselected on the Windows job rather than skipped",
+]

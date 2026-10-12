@@ -1085,6 +1085,7 @@ def test_a_failed_builder_is_reported_with_its_last_line(toolchain, tmp_path):
         drop_towers(gemma4(tmp_path), tmp_path / "out.litertlm", ["audio"])
 
 
+@pytest.mark.posix
 def test_a_killed_rebuild_is_not_read_as_an_exit(toolchain, tmp_path):
     toolchain.returncode = -9
     with pytest.raises(TowersError, match=r"killed by SIGKILL \(return code -9\)"):

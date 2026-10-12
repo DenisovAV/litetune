@@ -1002,6 +1002,19 @@ def test_an_unexpected_error_mid_export_is_could_not_check_not_a_crash(
     assert result.failed == []
 
 
+@pytest.mark.parametrize(("platform", "debian"), [("linux", ["libvulkan1"]), ("darwin", [])])
+def test_the_request_names_a_debian_package_only_on_linux(tmp_path, monkeypatch, platform, debian):
+    """A `--json` report from a Mac listed `libvulkan1`, a Debian name."""
+    # The `sys` envs reads, which is the one `sys` -- named so it stays that.
+    monkeypatch.setattr(envs.sys, "platform", platform)
+    request = ExportRequest(
+        model="google/functiongemma-270m-it",
+        output_dir=tmp_path / "out",
+        recipes=("dynamic_wi8_afp32",),
+    )
+    assert request.as_dict()["environment"]["system_requirements"] == debian
+
+
 def test_the_result_survives_the_trip_through_a_manifest(toolchain, request_for):
     import json
 
@@ -1224,7 +1237,7 @@ def _fake_env(toolchain, tmp_path):
     """A StageEnv whose `run` is the fake; the repack only needs `run`."""
     from litetune import envs
 
-    return envs.StageEnv(name="export", python_ceiling=(3, 12), requirements=())
+    return envs.StageEnv(name="export", requirements=())
 
 
 def _artifact(tmp_path, size=16384) -> Path:
@@ -2265,6 +2278,9 @@ def test_what_a_local_checkpoint_holds_at_chat_template_json_is_its_own(
     assert says in check.detail
 
 
+# `chmod(0)` is what makes the file unreadable, and on Windows it only sets the
+# read-only flag (`os.chmod`, Python's documentation): a POSIX permission bit.
+@pytest.mark.posix
 def test_a_local_chat_template_json_the_machine_will_not_open_is_could_not_check(
     toolchain, tmp_path
 ):
@@ -2385,9 +2401,18 @@ def test_the_transformers_version_is_the_one_the_script_saw(toolchain, qwen_requ
             },
             "exited 1: OSError: Qwen/Qwen3-0.6B does not appear to have a file named",
         ),
-        ({"template_returncode": -9}, "chat template was killed by SIGKILL"),
+        # The signal's name is POSIX's: Windows has no SIGKILL to name.
+        pytest.param(
+            {"template_returncode": -9},
+            "chat template was killed by SIGKILL",
+            marks=pytest.mark.posix,
+        ),
         # Killed after its result and file were written: still no answer.
-        ({"template_exit_after": -9}, "chat template was killed by SIGKILL"),
+        pytest.param(
+            {"template_exit_after": -9},
+            "chat template was killed by SIGKILL",
+            marks=pytest.mark.posix,
+        ),
         ({"template_no_result": True}, "exited 0 and wrote no result"),
         ({"template_raises": subprocess.TimeoutExpired("python", 5)}, "gave no result after"),
         ({"template_result": "{not json"}, "wrote a result that is not JSON"),
