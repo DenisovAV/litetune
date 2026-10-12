@@ -1789,10 +1789,12 @@ KEPT_GENERATION_SETTINGS = (
 )
 
 # Left out of the call like the rest, and not reported, because none of them can
-# change what this call generates.
+# change what this call generates, when it stops, or what it returns.
 NO_EFFECT_ON_THE_CALL = (
     # The call passes `do_sample`, `num_beams` and `max_new_tokens`, and
-    # `max_new_tokens` replaces `max_length` (generation/utils.py:1726-1734).
+    # `max_new_tokens` replaces `max_length` (generation/utils.py:1726-1734); the
+    # checkpoint's `max_length` is otherwise read only for warnings (:2462-2466,
+    # :1669-1713).
     "do_sample",
     "num_beams",
     "max_new_tokens",
@@ -1816,19 +1818,18 @@ NO_EFFECT_ON_THE_CALL = (
     "early_stopping",
     "num_beam_groups",
     "diversity_penalty",
-    # Read by `_sample` (generation/utils.py:2829-2831) to collect scores and
-    # shape what `generate` returns, never to pick a token.
+    # Read by `_sample` (generation/utils.py:2829-2830) only to fill the dict
+    # output `return_dict_in_generate` asks for (:2836-2837, :2900-2904). That
+    # one is reported: it turns the returned tensor into that dict (:2946-2973).
     "output_scores",
     "output_logits",
-    "return_dict_in_generate",
-    # A log-softmax appended after every other processor (:1353-1355;
-    # logits_process.py:1811-1813), which keeps the largest logit the largest.
-    "renormalize_logits",
 )
 
-# A value that builds nothing, beside transformers' own defaults: a guidance
-# scale of 1 adds no processor (generation/utils.py:1144).
-NO_OP_VALUES = {"guidance_scale": 1}
+# Values that build nothing, beside transformers' own defaults: a guidance scale
+# of 1 adds no processor (generation/utils.py:1144), and only `True` appends the
+# log-softmax `renormalize_logits` names (:1354-1355), which can move the pick
+# when a logit is not finite.
+NO_OP_VALUES = {"guidance_scale": 1, "renormalize_logits": False}
 
 
 def greedy_generation_config(checkpoint):

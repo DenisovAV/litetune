@@ -1393,6 +1393,32 @@ _TRANSFORMERS_DEFAULTS: dict[str, Any] = {
     "diversity_penalty": 0.0,
 }
 
+# Every field a fresh 5.16.1 `GenerationConfig` serializes, all of them `None`
+# but the version: what `__init__` sets (generation/configuration_utils.py:
+# 392-497) as `to_dict` writes it out (:1172-1191).
+_GENERATION_CONFIG_FIELDS = tuple(
+    """
+    max_length max_new_tokens min_length min_new_tokens early_stopping max_time
+    stop_strings do_sample num_beams use_mtp use_cache cache_implementation
+    cache_config max_cache_len temperature top_k top_p min_p top_h typical_p
+    epsilon_cutoff eta_cutoff repetition_penalty encoder_repetition_penalty
+    length_penalty no_repeat_ngram_size bad_words_ids renormalize_logits
+    forced_bos_token_id forced_eos_token_id remove_invalid_values
+    exponential_decay_length_penalty suppress_tokens begin_suppress_tokens
+    sequence_bias token_healing guidance_scale watermarking_config
+    num_return_sequences output_attentions output_hidden_states output_scores
+    output_logits return_dict_in_generate pad_token_id bos_token_id eos_token_id
+    encoder_no_repeat_ngram_size decoder_start_token_id is_assistant
+    num_assistant_tokens num_assistant_tokens_schedule
+    assistant_confidence_threshold prompt_lookup_num_tokens
+    max_matching_ngram_size assistant_early_exit assistant_lookbehind
+    target_lookbehind assistant_ensemble_weight speculation_type compile_config
+    disable_compile continuous_batching_config low_memory penalty_alpha
+    dola_layers diversity_penalty num_beam_groups constraints force_words_ids
+    prefill_chunk_size _from_model_config transformers_version
+    """.split()
+)
+
 # 5.16.1's `METADATA_FIELDS` (generation/configuration_utils.py:46).
 _METADATA_FIELDS = (
     "_from_model_config",
@@ -1413,17 +1439,26 @@ class FakeGenerationConfig:
     """
 
     def __init__(self, **settings: Any) -> None:
+        for key in _GENERATION_CONFIG_FIELDS:
+            setattr(self, key, None)
         for key, value in settings.items():
             setattr(self, key, value)
 
     def to_json_string(self, use_diff: bool = True, ignore_metadata: bool = False) -> str:
-        # Without `use_diff` every field a fresh config has is there, `None` or
-        # not (`to_dict`, configuration_utils.py:1172-1191) -- here the fields
-        # in `_TRANSFORMERS_DEFAULTS`. With it, what equals a fresh config goes,
-        # which is every `None` (`to_diff_dict`, :1149-1170).
-        settings = {**dict.fromkeys(_TRANSFORMERS_DEFAULTS), **vars(self)}
+        # `to_dict` writes every field, and the running version over the one
+        # read from the file (configuration_utils.py:1172-1191). `use_diff`
+        # keeps what a fresh config does not have: a field set to anything but
+        # `None`, a field a fresh one lacks, and the version (`to_diff_dict`,
+        # :1149-1170).
+        settings = {**vars(self), "transformers_version": "5.16.1"}
         if use_diff:
-            settings = {key: value for key, value in settings.items() if value is not None}
+            settings = {
+                key: value
+                for key, value in settings.items()
+                if value is not None
+                or key not in _GENERATION_CONFIG_FIELDS
+                or key == "transformers_version"
+            }
         if ignore_metadata:
             settings = {k: v for k, v in settings.items() if k not in _METADATA_FIELDS}
         return json.dumps(settings, sort_keys=True)
@@ -1896,8 +1931,9 @@ def test_every_cache_setting_is_kept(tmp_path, monkeypatch):
 
 
 def test_a_setting_at_a_value_that_does_nothing_is_not_reported(tmp_path, monkeypatch):
-    """At transformers' own default, or at a guidance scale of 1, which builds
-    no processor (generation/utils.py:1144)."""
+    """At transformers' own default, at a guidance scale of 1, which builds no
+    processor (generation/utils.py:1144), or with `renormalize_logits` off,
+    which appends none (:1354)."""
     captured = _run_hf_generate_script(
         tmp_path,
         monkeypatch,
@@ -1906,17 +1942,20 @@ def test_a_setting_at_a_value_that_does_nothing_is_not_reported(tmp_path, monkey
             "repetition_penalty": 1.0,
             "no_repeat_ngram_size": 0,
             "guidance_scale": 1.0,
+            "renormalize_logits": False,
         },
     )
     assert captured["run_report"]["generation_settings_not_applied"] == {}
 
 
 # Settings a 5.16.1 generation config can carry that change what a greedy call
-# generates, each at a value that does: a logits processor built whatever
-# `do_sample` says (generation/utils.py:1144-1290, watermarking at :1346), a
-# stopping criterion (:1373-1391), a rewritten prompt (:2595), or a decoding
-# mode other than greedy (`get_generation_mode`, configuration_utils.py:548-598).
-# `constraints`, which holds objects, takes `force_words_ids`' branch (:548).
+# generates or returns, each at a value that does: a logits processor built
+# whatever `do_sample` says (generation/utils.py:1144-1290, watermarking at
+# :1346, the log-softmax at :1354-1355, which can move the pick on a logit that
+# is not finite), a stopping criterion (:1373-1391), a rewritten prompt (:2595),
+# a dict returned instead of a tensor (:2946-2973), or a decoding mode other than
+# greedy (`get_generation_mode`, configuration_utils.py:548-598). `constraints`,
+# which holds objects, takes `force_words_ids`' branch (:548).
 _SETTINGS_THAT_CHANGE_THE_CALL: dict[str, Any] = {
     "guidance_scale": 1.5,
     "sequence_bias": [[[7], -1.0]],
@@ -1944,22 +1983,27 @@ _SETTINGS_THAT_CHANGE_THE_CALL: dict[str, Any] = {
     "stop_strings": ["stop"],
     "is_assistant": True,
     "token_healing": True,
+    "renormalize_logits": True,
+    "return_dict_in_generate": True,
     # Not shown by the source to be without effect, so reported too: these two
     # reach the model's forward (generation/utils.py:1831-1834), and more than
-    # one sequence stops a greedy call (configuration_utils.py:789-795).
+    # one sequence stops a greedy call (configuration_utils.py:788-795).
     "output_attentions": True,
     "output_hidden_states": True,
     "num_return_sequences": 2,
 }
+
+# Set beside a case so that 5.16.1 accepts its config at all: it refuses more
+# than one returned sequence without sampling (configuration_utils.py:788-795).
+_COMPANIONS: dict[str, dict[str, Any]] = {"num_return_sequences": {"do_sample": True}}
 
 
 @pytest.mark.parametrize(("field", "value"), sorted(_SETTINGS_THAT_CHANGE_THE_CALL.items()))
 def test_no_setting_that_changes_the_call_reaches_it_unreported(
     tmp_path, monkeypatch, field, value
 ):
-    captured = _run_hf_generate_script(
-        tmp_path, monkeypatch, generation_config={"eos_token_id": 1, field: value}
-    )
+    checkpoint = {"eos_token_id": 1, **_COMPANIONS.get(field, {}), field: value}
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, generation_config=checkpoint)
     assert captured["generation"].get(field) == _TRANSFORMERS_DEFAULTS.get(field)
     assert captured["run_report"]["generation_settings_not_applied"] == {field: value}
 
@@ -1985,8 +2029,6 @@ _SETTINGS_WITHOUT_EFFECT: dict[str, Any] = {
     "diversity_penalty": 0.5,
     "output_scores": True,
     "output_logits": True,
-    "return_dict_in_generate": True,
-    "renormalize_logits": True,
 }
 
 
