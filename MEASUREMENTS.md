@@ -1222,6 +1222,17 @@ backend in the same container, 12 vCPU. litetune 0.1.8; training environment
 `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0`,
 `sentencepiece==0.2.0`; runtime `litert-lm==0.16.1`, `numpy==2.0.2`.
 
+The float reference in every Qwen2.5 run here, this section's and the
+re-measurements on 0.17.1 and 0.18.0, decoded with `repetition_penalty` 1.1:
+litetune up to 0.4.1 left the checkpoint's `generation_config` in force, and
+transformers merges it into a greedy `generate` call. litetune after 0.4.1
+decodes the reference greedily without it. On 2026-10-12, on litert-lm 0.18.0,
+the `dynamic_wi8_afp32` bundle verified against the same tuned checkpoint with
+the reference of 0.4.1 and with the one after it gave the same figures both
+times: candidate 0.7700, reference 0.7700, cost 0.0000 on 8 discordant rows,
+which are the 0.18.0 figures published above. The candidate never decoded with a
+penalty: LiteRT-LM applies none unless asked, and litetune does not ask.
+
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
 |---|---|---|---|
 | Base model | **0.0000** | 0.0000 | — |
