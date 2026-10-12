@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -64,6 +65,18 @@ the same 270M model is 286 MB without and 457 MB with.
 """
 
 TOOLCHAIN_DEFAULT_RECIPE = "dynamic_wi8_afp32"
+
+# The flag as a plan carries it when the template is to be composed at export.
+COMPOSED_TEMPLATE_FLAG = f"{models.TEMPLATE_FLAG}={models.COMPOSED_TEMPLATE}"
+# Beside the recipes' directories, named for its content: two converts into one
+# directory each get their own file, and one composed the same way is the same
+# file. The leading underscore is one `_RECIPE_NAME_RE` cannot produce, so no
+# recipe's directory can take the name.
+COMPOSED_TEMPLATE_PREFIX = "_litetune-chat-template-"
+CHAT_TEMPLATE_CHECK = "chat template"
+# The user's text in the probe `_COMPOSE_SCRIPT` renders: one token, so that a
+# template that trims or splits text has nothing to change in it.
+PROBE_TEXT = "litetune-probe-7d1c"
 
 KNOWN_RECIPES = (
     "dynamic_wi8_afp32",
@@ -173,6 +186,8 @@ TOOLCHAIN_TIMEOUT_S = 60
 # `--backend=gpu` never appears in `argv`, so nothing this module has ever
 # exported ran anywhere else.
 CPU_ONLY_ENV = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": ""}
+
+NO_ARTIFACT = "no artifact was produced, so there is nothing to verify"
 
 NOT_VERIFIED = (
     "export produced this artifact and nothing has been run against it: liveness is not "
@@ -448,8 +463,13 @@ class ExportRequest:
         object.__setattr__(self, "output_dir", Path(self.output_dir))
 
         requested = list(self.extra_flags)
+        # `convert`'s own option is the caller's setting, so it enters the table
+        # the plan reads like any `--flag=`: an opt-out a family cannot export
+        # without is then refused by the plan, not overridden by its rule.
         if self.externalize_embedder is True:
-            requested.append("--externalize_embedder")
+            requested.append(EXTERNALIZE_FLAG)
+        elif self.externalize_embedder is False:
+            requested.append(f"--no{EXTERNALIZE_FLAG.lstrip('-')}")
         # Raises `models.FlagRefused` for a flag that must never be passed for
         # this family, and adds the ones it cannot export without. A plan whose
         # required flags could not be resolved is *kept*, not raised on: it is
@@ -476,17 +496,21 @@ class ExportRequest:
         object.__setattr__(self, "_identity_conflict", conflict)
         plan = models.plan_export(identity, requested, self.recipes)
         flags = list(plan.flags)
-        source = "caller"
-        if self.externalize_embedder is None:
-            source = "litetune default"
-            if not any(
-                f == EXTERNALIZE_FLAG or f.startswith(f"{EXTERNALIZE_FLAG}=") for f in flags
-            ):
-                flags.append(EXTERNALIZE_FLAG)
-        elif self.externalize_embedder is False:
-            source = "caller opted out"
+        # Read off the plan's table, as the exporter will read it: a caller's
+        # `--noexternalize_embedder` or `--externalize-embedder=False` is theirs,
+        # and the default is added only where nothing set it.
+        setting = plan.setting(EXTERNALIZE_FLAG)
+        if setting is not None and setting.token in plan.added:
+            externalized, source = True, "family rule"
+        elif setting is not None:
+            externalized = bool(setting.value)
+            source = "caller" if externalized else "caller opted out"
+        else:
+            flags.append(EXTERNALIZE_FLAG)
+            externalized, source = True, "litetune default"
         object.__setattr__(self, "extra_flags", tuple(flags))
         object.__setattr__(self, "_externalize_source", source)
+        object.__setattr__(self, "_externalized", externalized)
         object.__setattr__(self, "_plan", plan)
 
     @property
@@ -496,7 +520,7 @@ class ExportRequest:
 
     @property
     def externalize_source(self) -> str:
-        """Who decided `--externalize_embedder`: the caller, or this default."""
+        """Who decided `--externalize_embedder`: the caller, the family's rule, or this default."""
         return self._externalize_source  # type: ignore[attr-defined]
 
     @property
@@ -508,14 +532,57 @@ class ExportRequest:
         """One output directory per recipe: the sweep's artifacts must not collide."""
         return self.output_dir / recipe
 
-    def argv(self, recipe: str) -> list[str]:
+    @property
+    def composes_chat_template(self) -> bool:
+        """Whether the plan asks for `models.COMPOSED_TEMPLATE`, which `run_export` writes."""
+        return COMPOSED_TEMPLATE_FLAG in self.extra_flags
+
+    def composed_template_path(self, composed_sha256: str) -> Path:
+        """Where a composed template with this digest is kept.
+
+        Absolute, so that the exporter's argv and the report name the file
+        however they are read later. Not for the exporter's sake: `StageEnv.run`
+        passes it no working directory (`envs.py` sets no `cwd`) and nothing in
+        litert-torch's `export_hf` or the builder calls `chdir`, so a relative
+        path would resolve the same way today.
+        """
+        name = f"{COMPOSED_TEMPLATE_PREFIX}{composed_sha256[:12]}.jinja"
+        return (self.output_dir / name).absolute()
+
+    def argv(self, recipe: str, chat_template: Path | None = None) -> list[str]:
+        """The exporter's command line, with the composed template in place of the marker.
+
+        A plan carrying `models.COMPOSED_TEMPLATE` needs `chat_template`, the
+        file `compose_chat_template` wrote, and without it this raises: the
+        marker is a description, and handed to the exporter it would be looked
+        up as a repository. So does a marker in any other shape than the one
+        the plan writes, which this would otherwise pass through.
+        """
+        flags = list(self.extra_flags)
+        if COMPOSED_TEMPLATE_FLAG in flags:
+            if chat_template is None:
+                raise ValueError(
+                    f"{self.model}: the plan asks for the checkpoint's own chat template behind "
+                    "litetune's text-parts block, and no composed template was given"
+                )
+            flags = [
+                f"{models.TEMPLATE_FLAG}={chat_template}" if f == COMPOSED_TEMPLATE_FLAG else f
+                for f in flags
+            ]
+        leftover = [f for f in flags if models.COMPOSED_TEMPLATE in f]
+        if leftover:
+            raise ValueError(f"{self.model}: {leftover} would hand the exporter the marker")
+        # One argument per keyword, none of them litetune's own three: the plan
+        # is built so, and this is where a change that broke it would show.
+        if len(models.parse_exporter_flags(self.model, flags)) != len(flags):
+            raise ValueError(f"{self.model}: {flags} set a keyword more than once")
         return [
             "litert-torch",
             "export_hf",
             f"--model={self.model}",
             f"--output_dir={self.dir_for(recipe)}",
             f"--quantization_recipe={toolchain_argument(recipe)}",
-            *self.extra_flags,
+            *flags,
         ]
 
     @property
@@ -529,7 +596,7 @@ class ExportRequest:
             "base_model": self.base_model,
             "output_dir": str(self.output_dir),
             "recipes": list(self.recipes),
-            "externalize_embedder": EXTERNALIZE_FLAG in self.extra_flags,
+            "externalize_embedder": self._externalized,  # type: ignore[attr-defined]
             "externalize_embedder_source": self.externalize_source,
             "flags": list(self.extra_flags),
             "model_rules": self.plan.as_dict(),
@@ -701,6 +768,561 @@ def repair_vocab_file(model_dir: Path) -> tuple[bool, str | None]:
     )
 
 
+# Runs inside envs.EXPORT, beside the exporter's own transformers, and reads the
+# template the way the exporter reads it when it is given no override:
+# litert-torch's `export_lib.py:389` loads
+# `transformers.AutoTokenizer.from_pretrained(model_path)`, `:390-402` falls
+# back to a `chat_template.json` when that tokenizer has no template, and with
+# its default `use_jinja_template`, `litert_lm_builder.py:432-433` embeds the
+# tokenizer's `chat_template` (litert-torch-nightly 0.10.0.dev20260926). It
+# renders the probe through the tokenizer's own `apply_chat_template`, which
+# hands the template the messages as given (transformers 5.16.1,
+# `chat_template_utils.py` `render_jinja_template`). It imports nothing from
+# litetune, which the export environment does not install; the block arrives in
+# the spec.
+_COMPOSE_SCRIPT = r'''
+"""Write litetune's text-parts block in front of a checkpoint's own chat template.
+
+Reads JSON {model, block, out, probe} from argv[1]. Writes JSON to argv[2]:
+  {"transformers": <str>, "found": <str>, "source": <str>, "fallback": <dict|null>,
+   "names": <list|null>, "type": <str|null>, "sha256": <str|null>,
+   "characters": <int|null>, "renders": <dict|null>}
+`found` is "text" when `out` now holds the block followed by the template, and
+otherwise says why it does not: "empty", "blank" (only whitespace),
+"carriage_return", "unnamed" (named templates, none of them "default"),
+"not_text", or "unreachable" (the chat_template.json lookup itself failed).
+`source` is where the template came from, "tokenizer" or "chat_template.json";
+`fallback` says what the chat_template.json lookup found, when the tokenizer had
+no template. `type` is the template's Python type for
+"empty" and "not_text". `sha256` and `characters` describe the template alone,
+as UTF-8. For "text", `renders` holds one user message whose text is `probe`,
+rendered three ways -- "string": the template, the content a string;
+"composed": block and template, the content a list of one text part;
+"parts_alone": the template, the content that list -- each {"text": ...} or
+{"error": ...}, with "environment": true for an error of the environment's.
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+import transformers
+
+
+def model_path_type(path_str):
+    """`get_model_path_type`, as litert-torch writes it (export_hf/core/utils.py)."""
+    if os.path.exists(path_str):
+        return "local"
+    if path_str.startswith((".", "/", "~")) or "\\" in path_str:
+        return "local_not_found"
+    if re.match(r"^(?:[\w\-\.]+\/)?[\w\-\.]+$", path_str):
+        return "repo_id"
+    return "unknown"
+
+
+def lookup(outcome, where, exc=None):
+    error = None if exc is None else f"{type(exc).__name__}: {exc}"
+    return {"path": where, "outcome": outcome, "error": error}
+
+
+def chat_template_json(model):
+    """The exporter's fallback (export_lib.py:390-402): the Hub file for a repo
+    id, `<model>/chat_template.json` for anything else, its "chat_template" key.
+
+    The exporter goes on with no template whatever fails there (:403-404);
+    this tells the failures apart. "absent": no such file -- a Hub 404
+    (`RemoteEntryNotFoundError`) or a missing local file. "unreachable": the
+    lookup itself failed -- `hf_hub_download` raises `LocalEntryNotFoundError`
+    when it cannot reach the Hub, and any other Hub or file-system error is the
+    environment's too. "unusable": a file the exporter could not use. "found"
+    or "no_key": what it holds."""
+    if model_path_type(model) == "repo_id":
+        import huggingface_hub
+        from huggingface_hub.errors import RemoteEntryNotFoundError
+
+        try:
+            where = huggingface_hub.hf_hub_download(model, filename="chat_template.json")
+        except RemoteEntryNotFoundError as exc:
+            return None, lookup("absent", None, exc)
+        except Exception as exc:  # the Hub's or the network's, not the checkpoint's
+            return None, lookup("unreachable", None, exc)
+    else:
+        where = os.path.join(model, "chat_template.json")
+    try:
+        with open(where, "rt") as handle:
+            text = handle.read()
+    except FileNotFoundError as exc:
+        return None, lookup("absent", where, exc)
+    except (IsADirectoryError, NotADirectoryError, UnicodeDecodeError) as exc:
+        # What the checkpoint holds at that path, not what the machine allows.
+        return None, lookup("unusable", where, exc)
+    except OSError as exc:
+        return None, lookup("unreachable", where, exc)
+    try:
+        data = json.loads(text)
+        found = "chat_template" in data
+        template = data["chat_template"] if found else None
+    except Exception as exc:  # what the exporter catches and goes on without
+        return None, lookup("unusable", where, exc)
+    return template, lookup("found" if found else "no_key", where)
+
+
+def render(tokenizer, template, content):
+    try:
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": content}],
+            chat_template=template,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except ImportError as exc:
+        # transformers raises this for a jinja2 that is missing or older than
+        # 3.1.0 (chat_template_utils.py:426-428, :473-476): the environment's.
+        return {"error": f"{type(exc).__name__}: {exc}", "environment": True}
+    except Exception as exc:  # the template's own failure is a finding, not the script's
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"text": text}
+
+
+def report(found, **fields):
+    """This script's whole result. The exit status says only whether the script
+    itself ran; every outcome the parent tells apart is in here."""
+    result = {
+        "transformers": transformers.__version__,
+        "found": found,
+        "source": "tokenizer",
+        "fallback": None,
+        "names": None,
+        "type": None,
+        "sha256": None,
+        "characters": None,
+        "renders": None,
+    }
+    result.update(fields)
+    return result
+
+
+def main(spec):
+    model = spec["model"]
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model)
+    template = getattr(tokenizer, "chat_template", None)
+    found = {"source": "tokenizer"}
+    if not template:
+        from_json, fallback = chat_template_json(model)
+        found["fallback"] = fallback
+        if fallback["outcome"] == "unreachable":
+            return report("unreachable", **found)
+        if fallback["outcome"] == "found":
+            template, found["source"] = from_json, "chat_template.json"
+    if isinstance(template, dict) and template:
+        # transformers keeps several named templates as a dict and, given no
+        # tools, applies the one named "default" (`get_chat_template`).
+        found["names"] = sorted(str(name) for name in template)
+        if "default" not in template:
+            return report("unnamed", **found)
+        template = template["default"]
+    if not template:
+        return report("empty", type=type(template).__name__, **found)
+    if not isinstance(template, str):
+        return report("not_text", type=type(template).__name__, **found)
+    if not template.strip():
+        return report("blank", characters=len(template), **found)
+    if "\r" in template:
+        return report("carriage_return", **found)
+    composed = spec["block"] + template
+    # Bytes, not text: a text-mode write turns each newline into the platform's.
+    Path(spec["out"]).write_bytes(composed.encode("utf-8"))
+    parts = [{"type": "text", "text": spec["probe"]}]
+    return report(
+        "text",
+        sha256=hashlib.sha256(template.encode("utf-8")).hexdigest(),
+        characters=len(template),
+        renders={
+            "string": render(tokenizer, template, spec["probe"]),
+            "composed": render(tokenizer, composed, parts),
+            "parts_alone": render(tokenizer, template, parts),
+        },
+        **found,
+    )
+
+
+if __name__ == "__main__":
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    Path(sys.argv[2]).write_text(json.dumps(main(spec)), encoding="utf-8")
+'''
+
+# What `_COMPOSE_SCRIPT` may report as `found`; anything else is a script this
+# litetune does not know how to read.
+_TEMPLATE_FINDINGS = (
+    "text",
+    "empty",
+    "blank",
+    "carriage_return",
+    "unnamed",
+    "not_text",
+    "unreachable",
+)
+
+# Without a template the exporter writes none: transformers leaves a tokenizer's
+# template None (`tokenization_utils_base.py:1078`), `package_model` passes that
+# on (`litert_lm_builder.py:433`) and `build_llm_metadata` writes a template only
+# when it has one (`:314-318`). LiteRT-LM v0.18.0 then makes its own default for
+# the model type (`engine_settings.cc:480-484`), which for qwen3, qwen2p5 and
+# generic_model prints each message's text between its `prompt_templates`
+# prefix and suffix (`model_type_utils.cc:359-384`) -- empty here, since
+# `prompt_templates` is filled only from a template too (`:319-330`).
+_NO_TEMPLATE_LEFT_ALONE = (
+    "Left alone, the exporter would embed no template, and LiteRT-LM 0.18.0 would put its own "
+    "default for the model type in its place, which prints the message text without the "
+    "checkpoint's role markers"
+)
+
+
+def _fallback_said(fallback: Any) -> str:
+    """What the `chat_template.json` lookup found, as a clause."""
+    if not isinstance(fallback, dict):
+        return ""
+    where, outcome, error = fallback.get("path"), fallback.get("outcome"), fallback.get("error")
+    if outcome == "absent" and where is None:
+        return ", and its repository has no chat_template.json"
+    if outcome == "absent":
+        return f", and there is no {where}"
+    if outcome == "no_key":
+        return f", and {where} has no chat_template key"
+    if outcome == "unusable":
+        return f", and {where} could not be used ({error})"
+    if outcome == "found":
+        return f", and the chat_template in {where} is null"
+    return ""
+
+
+def _whose(report: dict[str, Any]) -> str:
+    """Where the template the script judged came from, as the subject of a sentence."""
+    if report.get("source") == "chat_template.json":
+        fallback = report.get("fallback")
+        where = fallback.get("path") if isinstance(fallback, dict) else None
+        return f"the chat_template in {where or 'chat_template.json'}"
+    return "the tokenizer's chat template"
+
+
+def _template_refusal(model: str, report: dict[str, Any]) -> str | None:
+    """Why the checkpoint gives the block no template to go in front of.
+
+    None for "text", "unreachable", and any finding not named here: those are
+    the environment's, or a script this litetune cannot read, which is `could
+    not check`, never a fact about the checkpoint.
+    """
+    found, names, whose = report.get("found"), report.get("names"), _whose(report)
+    from_tokenizer = report.get("source") != "chat_template.json"
+    fallback = _fallback_said(report.get("fallback")) if from_tokenizer else ""
+    if found == "unnamed":
+        return (
+            f"{model}: {whose} holds {len(names or ())} named templates "
+            f"({', '.join(map(str, names or ()))}) and none named 'default', the one "
+            "transformers applies when it is given no tools"
+        )
+    if found == "empty" and names:
+        return f"{model}: {whose} named 'default' is empty"
+    if found == "empty" and report.get("type") == "NoneType":
+        fallback = _fallback_said(report.get("fallback"))
+        return (
+            f"{model}: the tokenizer carries no chat template{fallback}. {_NO_TEMPLATE_LEFT_ALONE}"
+        )
+    if found == "empty":
+        return f"{model}: {whose} is empty (a {report.get('type')}){fallback}"
+    if found == "blank":
+        return (
+            f"{model}: {whose} is {report.get('characters')} characters of whitespace, which would "
+            "render as itself for every conversation"
+        )
+    if found == "carriage_return":
+        return (
+            f"{model}: {whose} contains a carriage return. The exporter reads the composed file in "
+            "text mode, which turns each one into a newline, so the bundle would not carry the "
+            "checkpoint's template unchanged"
+        )
+    if found == "not_text":
+        return f"{model}: {whose} is a {report.get('type')}, not text"
+    return None
+
+
+def _template_advice() -> str:
+    """What a refusal tells the caller to do instead, as `convert` accepts it."""
+    return (
+        "litetune puts its text-parts block in front of the chat template the checkpoint's own "
+        "tokenizer carries, and exports nothing without the block. To choose the template "
+        f"yourself, pass --flag={models.TEMPLATE_FLAG}=<file>; it is used as given, so on "
+        "LiteRT-LM 0.18.0 it has to read a list of parts itself, which is what the block put in "
+        f"front of a template does: {models.packaged_template(models.TEXT_PARTS_BLOCK)}"
+    )
+
+
+def _quoted(text: str, limit: int = 160) -> str:
+    return repr(text if len(text) <= limit else text[:limit] + "...")
+
+
+def _probe_refusal(model: str, renders: Any) -> tuple[str | None, bool | None]:
+    """Why the block is not for this template, if it is not; and whether the
+    template alone already renders the parts as the string (None: unknown).
+
+    The rendering is transformers' Jinja2, not the runtime's MiniJinja: this
+    shows what the template means, and verify's rendering check is what shows
+    what LiteRT-LM makes of it.
+    """
+    if not isinstance(renders, dict) or not all(
+        isinstance(renders.get(k), dict) for k in ("string", "composed", "parts_alone")
+    ):
+        raise ValueError(f"the script reported renders this litetune cannot read: {renders!r}")
+    string, composed, alone = renders["string"], renders["composed"], renders["parts_alone"]
+    alone_same = alone.get("text") == string.get("text") if "text" in alone else False
+    if "text" not in string:
+        return (
+            f"{model}: the template raises on one user message given as a string "
+            f"({string.get('error')}) -- an error of the template's own, not of the environment",
+            None,
+        )
+    if PROBE_TEXT not in string["text"]:
+        return (
+            f"{model}: the template, given one user message as a string, does not print its "
+            f"text: it rendered {_quoted(string['text'])}",
+            alone_same,
+        )
+    if composed.get("text") != string["text"]:
+        shown = (
+            _quoted(composed["text"])
+            if "text" in composed
+            else f"an error ({composed.get('error')})"
+        )
+        return (
+            f"{model}: the text-parts block turns a list of text parts into the string a template "
+            "written for a string expects, and this template does not render that way. Rendered by "
+            "transformers' Jinja2 (not LiteRT-LM's MiniJinja), one user message given as a string "
+            f"printed {_quoted(string['text'])}, and the same message given as parts, behind the "
+            f"block, printed {shown}",
+            alone_same,
+        )
+    return None, alone_same
+
+
+@dataclass(frozen=True)
+class ComposedTemplate:
+    """The file every recipe's exporter is handed, and what it holds."""
+
+    path: Path
+    # The block and the checkpoint's template, as written; what each bundle's
+    # `jinja_prompt_template` is read back against.
+    text: str
+    template_sha256: str
+    composed_sha256: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "template_sha256": self.template_sha256,
+            "composed_sha256": self.composed_sha256,
+        }
+
+
+def compose_chat_template(request: ExportRequest) -> tuple[Check, ComposedTemplate | None]:
+    """Write `models.TEXT_PARTS_BLOCK` in front of the checkpoint's own chat template.
+
+    Returns the check and, when it passed, the file every recipe's exporter is
+    handed in place of `models.COMPOSED_TEMPLATE`. The template is read in the
+    export environment by `_COMPOSE_SCRIPT`, as the exporter would read it, and
+    written after the block unchanged to a name of this run's own; that file is
+    read back here and must be exactly the block followed by the template the
+    script reported, and the script's probe must show the block is for this
+    template. Only then is it renamed to its content-addressed name. A
+    checkpoint whose template cannot be composed is `failed`, a script that
+    could not say is `could not check`, and either way nothing is returned and
+    this run's file is gone. A file another run left, under any name, is never
+    touched.
+    """
+    output_dir = request.output_dir.absolute()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    handle, name = tempfile.mkstemp(
+        prefix=COMPOSED_TEMPLATE_PREFIX, suffix=".partial", dir=output_dir
+    )
+    os.close(handle)
+    partial = Path(name)
+    try:
+        return _compose_chat_template(request, partial)
+    finally:
+        # Renamed away when it was accepted; this run's own name either way.
+        partial.unlink(missing_ok=True)
+
+
+def _compose_chat_template(
+    request: ExportRequest, partial: Path
+) -> tuple[Check, ComposedTemplate | None]:
+    block_path = Path(models.packaged_template(models.TEXT_PARTS_BLOCK))
+    block = block_path.read_bytes()
+    observed: dict[str, Any] = {
+        "model": request.model,
+        "block": str(block_path),
+        "block_sha256": hashlib.sha256(block).hexdigest(),
+    }
+    with tempfile.TemporaryDirectory(prefix="litetune-template-") as tmp:
+        work = Path(tmp)
+        script = work / "compose_template.py"
+        script.write_text(_COMPOSE_SCRIPT, encoding="utf-8")
+        spec = work / "spec.json"
+        result = work / "result.json"
+        spec.write_text(
+            json.dumps(
+                {
+                    "model": request.model,
+                    "block": block.decode("utf-8"),
+                    "out": str(partial),
+                    "probe": PROBE_TEXT,
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            proc = request.env.run(
+                ["python", str(script), str(spec), str(result)], timeout=request.timeout_s
+            )
+        except subprocess.TimeoutExpired:
+            return Check.unchecked(
+                CHAT_TEMPLATE_CHECK,
+                f"the script reading {request.model}'s chat template gave no result after "
+                f"{request.timeout_s}s (timeout)",
+                observed=observed,
+            ), None
+        stderr = proc.stderr or ""
+        reading = read_returncode(proc.returncode)
+        if proc.returncode != 0 or not result.is_file():
+            # The script does not catch its own errors, so a failed tokenizer
+            # load arrives as a traceback whose last line is the reason.
+            last = next((ln for ln in reversed(stderr.splitlines()) if ln.strip()), "no stderr")
+            if proc.returncode == 0:
+                what = "exited 0 and wrote no result"
+            elif reading.conclusive:
+                what = reading.describe()
+            else:
+                what = f"was {reading.describe(f'{request.model} chat template')}"
+            logger.warning("chat template script for %s failed:\n%s", request.model, _tail(stderr))
+            return Check.unchecked(
+                CHAT_TEMPLATE_CHECK,
+                f"the script reading {request.model}'s chat template {what}: {last}",
+                observed=observed | {"exit": reading.as_dict(), "stderr_tail": _tail(stderr, 2000)},
+            ), None
+        try:
+            report = json.loads(result.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            return Check.unchecked(
+                CHAT_TEMPLATE_CHECK,
+                f"the script reading {request.model}'s chat template wrote a result that is not "
+                f"JSON: {exc}",
+                observed=observed,
+            ), None
+    if not isinstance(report, dict):
+        return Check.unchecked(
+            CHAT_TEMPLATE_CHECK,
+            f"the script reading {request.model}'s chat template wrote {type(report).__name__}, "
+            "not a report",
+            observed=observed,
+        ), None
+
+    observed |= {
+        "transformers": report.get("transformers"),
+        "template_source": report.get("source"),
+        "chat_template_json": report.get("fallback"),
+        "template_names": report.get("names"),
+        "template_sha256": report.get("sha256"),
+        "template_characters": report.get("characters"),
+    }
+    found = report.get("found")
+    if found not in _TEMPLATE_FINDINGS:
+        return Check.unchecked(
+            CHAT_TEMPLATE_CHECK,
+            f"the script reading {request.model}'s chat template reported {found!r}, which is "
+            f"not one of {list(_TEMPLATE_FINDINGS)}",
+            observed=observed,
+        ), None
+    if found == "unreachable":
+        fallback = report.get("fallback")
+        error = fallback.get("error") if isinstance(fallback, dict) else None
+        return Check.unchecked(
+            CHAT_TEMPLATE_CHECK,
+            f"{request.model}: the tokenizer carries no chat template, and the chat_template.json "
+            f"the exporter would fall back to could not be looked up ({error}). That is the "
+            "Hub's, the network's or the file system's, not a fact about the checkpoint",
+            observed=observed,
+        ), None
+    if found != "text":
+        refusal = _template_refusal(request.model, report)
+        if refusal is None:
+            return Check.unchecked(
+                CHAT_TEMPLATE_CHECK,
+                f"the script reading {request.model}'s chat template reported {found!r}, which "
+                "this litetune does not know how to state",
+                observed=observed,
+            ), None
+        return Check.failed(
+            CHAT_TEMPLATE_CHECK, f"{refusal}. {_template_advice()}", observed=observed
+        ), None
+
+    written = partial.read_bytes()
+    if not written.startswith(block) or (
+        hashlib.sha256(written[len(block) :]).hexdigest() != report.get("sha256")
+    ):
+        return Check.unchecked(
+            CHAT_TEMPLATE_CHECK,
+            f"{partial} does not hold the text-parts block followed by the template whose "
+            f"sha256 the script reported ({report.get('sha256')}); nothing was exported with it",
+            observed=observed,
+        ), None
+
+    renders = report.get("renders")
+    faults = [
+        r["error"]
+        for r in (renders.values() if isinstance(renders, dict) else ())
+        if isinstance(r, dict) and r.get("environment")
+    ]
+    if faults:
+        return Check.unchecked(
+            CHAT_TEMPLATE_CHECK,
+            f"{request.model}: the probe could not render in the {request.env.name} environment "
+            f"({faults[0]}). That is the environment's, not a fact about the template",
+            observed=observed,
+        ), None
+    try:
+        refusal, alone_same = _probe_refusal(request.model, renders)
+    except ValueError as exc:
+        return Check.unchecked(CHAT_TEMPLATE_CHECK, str(exc), observed=observed), None
+    observed["renders_parts_without_the_block"] = alone_same
+    if refusal is not None:
+        return Check.failed(
+            CHAT_TEMPLATE_CHECK, f"{refusal}. {_template_advice()}", observed=observed
+        ), None
+
+    composed_sha256 = hashlib.sha256(written).hexdigest()
+    final = request.composed_template_path(composed_sha256)
+    os.replace(partial, final)
+    composed = ComposedTemplate(
+        path=final,
+        text=written.decode("utf-8"),
+        template_sha256=str(report.get("sha256")),
+        composed_sha256=composed_sha256,
+    )
+    observed |= {"composed": str(final), "composed_sha256": composed_sha256}
+    return Check.passed(
+        CHAT_TEMPLATE_CHECK,
+        f"{final}: litetune's text-parts block, then {request.model}'s own chat template "
+        f"(from its {report.get('source')}, sha256 {composed.template_sha256[:12]}, "
+        f"{report.get('characters')} characters) as transformers {report.get('transformers')} "
+        f"reads it in the {request.env.name} environment. Rendered by transformers' Jinja2, one "
+        "user message given as parts behind the block prints as the template prints it given as "
+        "a string; verify's rendering check is what checks the runtime. Every recipe exports "
+        f"with {models.TEMPLATE_FLAG}={final}, and each bundle's template is read back",
+        observed=observed,
+    ), composed
+
+
 # Runs inside envs.EXPORT, where `litert_lm_builder` and `tomllib` live. The
 # bundle format is the builder's to define, so every fact about it -- how a
 # section is laid out, which keys the rebuild regenerates, what a declaration
@@ -710,14 +1332,25 @@ def repair_vocab_file(model_dir: Path) -> tuple[bool, str | None]:
 _REPACK_SCRIPT = r'''
 """Set one metadata key on a bundle's prefill/decode section; verify by round-trip.
 
-Reads JSON {artifact, work, key, value} from argv[1]. Writes JSON to argv[2]:
-  {"declared": <str|null>, "written": <bool>, "reason": <str|null>}
+Reads JSON {artifact, work, key, value, template_out} from argv[1]. Writes JSON
+to argv[2]:
+  {"declared": <str|null>, "written": <bool>, "reason": <str|null>,
+   "broken": <str|null>}
 `declared` is the value the section carries after this script (or before it,
-if it was left alone); `written` says whether the file was replaced.
+if it was left alone); `written` says whether the file was replaced. `broken`
+says why the bundle itself is unsound, found before anything was unpacked.
+
+With `template_out` set, the bundle's LlmMetadata `jinja_prompt_template` is
+written there as JSON as soon as the first unpack has it --
+  {"sections": <int>, "present": <bool>, "template": <str|null>}
+-- and a rebuild that would change it is refused, so it describes the file
+that is left at `artifact` whatever happens after.
 """
 import copy
+import io
 import json
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -727,6 +1360,8 @@ except ModuleNotFoundError:  # Python < 3.11: the builder itself depends on toml
     import tomli as tomllib
 
 from litert_lm_builder import litertlm_builder as lb
+from litert_lm_builder import litertlm_core
+from litert_lm_builder import litertlm_peek
 
 VOLATILE = {"uuid", "creation_timestamp"}
 
@@ -824,10 +1459,68 @@ def write_toml(doc, path):
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
-def report(declared=None, written=False, reason=None):
+def chat_template_in(directory, doc):
+    """The LlmMetadata section's `jinja_prompt_template`, as `unpack` wrote it:
+    text, through the builder's own proto (`litertlm_peek` `_dump_llm_metadata_proto`)."""
+    from google.protobuf import text_format
+    from litert_lm_builder.runtime.proto import llm_metadata_pb2
+
+    sections = [s for s in doc.get("section", []) if s.get("section_type") == "LlmMetadata"]
+    if len(sections) != 1:
+        return {"sections": len(sections), "present": False, "template": None}
+    text = (Path(directory) / os.path.basename(sections[0]["data_path"])).read_text(
+        encoding="utf-8"
+    )
+    meta = text_format.Parse(text, llm_metadata_pb2.LlmMetadata())
+    present = meta.HasField("jinja_prompt_template")
+    return {
+        "sections": 1,
+        "present": present,
+        "template": meta.jinja_prompt_template if present else None,
+    }
+
+
+def report(declared=None, written=False, reason=None, broken=None):
     """This script's whole result. The exit status says only whether the script
     itself ran; every outcome the parent tells apart is in here."""
-    return {"declared": declared, "written": written, "reason": reason}
+    return {"declared": declared, "written": written, "reason": reason, "broken": broken}
+
+
+def past_the_end(path):
+    """Why the bundle is not whole, or None.
+
+    `unpack` reads each section with one `read` of its length, which returns
+    short at the end of a file and raises nothing (`litertlm_peek.py`), so a cut
+    bundle would unpack, repack into a well-formed shorter one, and read back
+    whole. So the header is checked first, with the builder's own reader and
+    its own layout (`litertlm_core.py`): a file too short to name where its
+    header ends, a header that ends past the file, one the reader refuses (a
+    wrong magic number, a cut header), and then each section's end."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as handle:
+        handle.seek(litertlm_core.HEADER_END_LOCATION_BYTE_OFFSET)
+        raw = handle.read(8)
+    if len(raw) < 8:
+        return f"the {size:,}-byte file is cut short inside its header"
+    header_end = struct.unpack("<Q", raw)[0]
+    if header_end > size:
+        return f"its header ends at byte {header_end:,}, past the end of the {size:,}-byte file"
+    try:
+        header = litertlm_peek.read_litertlm_header(path, io.StringIO())
+    except OSError:
+        raise
+    except Exception as exc:  # the builder's own reader refuses it
+        return f"its header cannot be read ({type(exc).__name__}: {exc})"
+    sections = header.SectionMetadata()
+    count = sections.ObjectsLength() if sections else 0
+    for index in range(count):
+        end = sections.Objects(index).EndOffset()
+        if end > size:
+            return (
+                f"section {index} of {count} ends at byte {end:,}, past the end of the "
+                f"{size:,}-byte file"
+            )
+    return None
 
 
 def main(spec):
@@ -835,9 +1528,17 @@ def main(spec):
     key, value = spec["key"], spec["value"]
     entry = {"key": key, "value_type": "String", "value": value}
 
+    cut = past_the_end(artifact)
+    if cut is not None:
+        return report(reason=cut, broken=cut)
+
     before_dir = work / "before"
     lb.unpack(artifact, str(before_dir))
     before = load(before_dir / "model.toml")
+    template_out = spec.get("template_out")
+    if template_out:
+        template = chat_template_in(before_dir, before)
+        Path(template_out).write_text(json.dumps(template), encoding="utf-8")
     targets = prefill_sections(before)
     if len(targets) != 1:
         return report(
@@ -871,6 +1572,8 @@ def main(spec):
     read_back = declared_in(prefill_sections(after)[0], key)
     if read_back != value:
         return report(reason=f"the rebuild wrote {key} = {read_back!r}; {value!r} was asked")
+    if template_out and chat_template_in(after_dir, after) != template:
+        return report(reason="the rebuild changed the bundle's chat template")
     os.replace(rebuilt, artifact)
     return report(declared=read_back, written=True)
 
@@ -908,6 +1611,55 @@ def set_gpu_activation(
     The exporter offers no flag for this value, and the one flag it does offer
     (`--experimental_use_mixed_precision`) changes the graph as well.
     """
+    repack = repack_bundle(artifact, env, timeout=timeout)
+    return repack.declared, repack.note
+
+
+@dataclass(frozen=True)
+class BundleTemplate:
+    """A bundle's LlmMetadata `jinja_prompt_template`, as the builder's `unpack` reads it.
+
+    `text` is None when the bundle carries none, and `sections` is how many
+    LlmMetadata sections it has; `empty` when the file has no bytes at all.
+    `unread` is set when no reading was made, which says nothing about the bundle.
+    """
+
+    text: str | None = None
+    sections: int = 1
+    unread: str | None = None
+    empty: bool = False
+
+
+@dataclass(frozen=True)
+class Repack:
+    """What `repack_bundle` did: the GPU key, and what it found on the way."""
+
+    declared: str | None
+    note: str | None
+    # The bundle's chat template, when it was asked for.
+    template: BundleTemplate | None = None
+    # Why the bundle is unsound, found before anything was unpacked: it is not
+    # handed on, whatever its family.
+    broken: str | None = None
+
+
+def repack_bundle(
+    artifact: Path,
+    env: envs.StageEnv,
+    *,
+    timeout: int = REPACK_TIMEOUT_S,
+    read_template: bool = False,
+) -> Repack:
+    """`set_gpu_activation`, and with `read_template` the bundle's chat template too.
+
+    One unpack serves both. `_REPACK_SCRIPT` writes the template out as soon as
+    its first unpack has it, before anything that can fail after, and refuses a
+    rebuild that would change it -- so the reading describes the file left at
+    `artifact` whether or not the key was written, and survives a repack that
+    failed. `template` is None when it was not asked for. A bundle whose
+    header places a section past the end of the file is `broken`, and is
+    neither unpacked nor read.
+    """
     # Absolute before anything is derived from it. Below Python 3.12
     # `tempfile.mkdtemp(dir=...)` returns a relative path for a relative `dir`,
     # the script then wrote relative `data_path`s, and the builder resolved each
@@ -918,61 +1670,40 @@ def set_gpu_activation(
     if artifact.stat().st_size == 0:
         # Nothing to repack, and the sweep's size comparison downstream is
         # what reports a zero-byte export; this must not turn it into 8 bytes.
-        return None, "the artifact is empty; nothing to repack"
+        empty = BundleTemplate(sections=0, empty=True) if read_template else None
+        return Repack(None, "the artifact is empty; nothing to repack", empty)
     work: Path | None = None
+    template_out: Path | None = None
     try:
-        # A fresh private directory, never a deterministic name: a stale or
-        # planted `.foo-repack` symlink would otherwise have its *target*
-        # emptied by cleanup, and two runs on one output dir would delete each
-        # other's unpack mid-flight. Same filesystem as the artifact so the
-        # script's final `os.replace` is one rename.
-        work = Path(tempfile.mkdtemp(prefix=f".{artifact.stem}-repack-", dir=artifact.parent))
-        script = work / "repack.py"
-        script.write_text(_REPACK_SCRIPT, encoding="utf-8")
-        spec = work / "spec.json"
-        result = work / "result.json"
-        spec.write_text(
-            json.dumps(
-                {
-                    "artifact": str(artifact),
-                    "work": str(work),
-                    "key": GPU_ACTIVATION_KEY,
-                    "value": GPU_ACTIVATION,
-                }
-            ),
-            encoding="utf-8",
-        )
-        proc = env.run(["python", str(script), str(spec), str(result)], timeout=timeout)
-        if proc.returncode != 0 or not result.is_file():
-            # The script does not catch its own errors, so a builder failure
-            # arrives as a traceback. The last line is the reason; the rest
-            # goes to the log where a frame is worth having.
-            stderr = proc.stderr or ""
-            last = next((ln for ln in reversed(stderr.splitlines()) if ln.strip()), "no stderr")
-            logger.warning("GPU activation repack of %s failed:\n%s", artifact, _tail(stderr, 2000))
-            return (
+        try:
+            # A fresh private directory, never a deterministic name: a stale or
+            # planted `.foo-repack` symlink would otherwise have its *target*
+            # emptied by cleanup, and two runs on one output dir would delete
+            # each other's unpack mid-flight. Same filesystem as the artifact so
+            # the script's final `os.replace` is one rename.
+            work = Path(tempfile.mkdtemp(prefix=f".{artifact.stem}-repack-", dir=artifact.parent))
+            template_out = work / "template.json" if read_template else None
+            declared, note, broken = _run_repack(artifact, env, work, timeout, template_out)
+        except subprocess.TimeoutExpired:
+            declared, note, broken = (
                 None,
-                f"the repack script exited {proc.returncode}: {last}; the original was kept",
+                f"the repack did not finish within {timeout}s; the original was kept",
+                None,
             )
-        report = json.loads(result.read_text(encoding="utf-8"))
-        declared = report.get("declared")
-        reason = report.get("reason")
-        if declared is None:
-            return None, f"{reason}; the original was kept"
-        if report.get("written") and reason is not None:
-            # The script's contract: a replaced file has no reason to give.
-            return None, f"the repack reported both a rebuild and a reason ({reason}); refused"
-        return str(declared), reason
-    except subprocess.TimeoutExpired:
-        return None, f"the repack did not finish within {timeout}s; the original was kept"
-    except Exception as exc:  # noqa: BLE001 - a broken repack must not unmake a good export
-        # Whatever went wrong here, the toolchain's artifact is intact and is a
-        # working CPU bundle. Escaping would let `guard` record the whole
-        # recipe as "could not check", which is a smaller truth than the one
-        # available: exported, without the GPU key, and here is why. The frame is kept in
-        # the log; the note is what the user reads.
-        logger.exception("GPU activation repack of %s failed", artifact)
-        return None, f"{type(exc).__name__}: {exc}; the original was kept"
+        except Exception as exc:  # noqa: BLE001 - a broken repack must not unmake a good export
+            # Whatever went wrong here, the toolchain's artifact is intact and is a
+            # working CPU bundle. Escaping would let `guard` record the whole
+            # recipe as "could not check", which is a smaller truth than the one
+            # available: exported, without the GPU key, and here is why. The frame is kept in
+            # the log; the note is what the user reads.
+            logger.exception("GPU activation repack of %s failed", artifact)
+            declared, note, broken = (
+                None,
+                f"{type(exc).__name__}: {exc}; the original was kept",
+                None,
+            )
+        template = _bundle_template(template_out, note) if read_template else None
+        return Repack(declared, note, template, broken)
     finally:
         if work is not None:
             # A scratch dir the size of two bundles; a leak has to be said,
@@ -987,10 +1718,168 @@ def set_gpu_activation(
                 )
 
 
-def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
-    """Run one export. A non-zero exit is recorded, not raised."""
+def _run_repack(
+    artifact: Path, env: envs.StageEnv, work: Path, timeout: int, template_out: Path | None
+) -> tuple[str | None, str | None, str | None]:
+    """Run `_REPACK_SCRIPT` on `artifact` in `work`. Returns (declared, note, broken)."""
+    script = work / "repack.py"
+    script.write_text(_REPACK_SCRIPT, encoding="utf-8")
+    spec = work / "spec.json"
+    result = work / "result.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "artifact": str(artifact),
+                "work": str(work),
+                "key": GPU_ACTIVATION_KEY,
+                "value": GPU_ACTIVATION,
+                "template_out": str(template_out) if template_out is not None else None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    proc = env.run(["python", str(script), str(spec), str(result)], timeout=timeout)
+    if proc.returncode != 0 or not result.is_file():
+        # The script does not catch its own errors, so a builder failure
+        # arrives as a traceback. The last line is the reason; the rest
+        # goes to the log where a frame is worth having.
+        stderr = proc.stderr or ""
+        last = next((ln for ln in reversed(stderr.splitlines()) if ln.strip()), "no stderr")
+        logger.warning("GPU activation repack of %s failed:\n%s", artifact, _tail(stderr, 2000))
+        note = f"the repack script exited {proc.returncode}: {last}; the original was kept"
+        return None, note, None
+    report = json.loads(result.read_text(encoding="utf-8"))
+    declared = report.get("declared")
+    reason = report.get("reason")
+    broken = str(report["broken"]) if report.get("broken") else None
+    if declared is None:
+        return None, f"{reason}; the original was kept", broken
+    if report.get("written") and reason is not None:
+        # The script's contract: a replaced file has no reason to give.
+        return None, f"the repack reported both a rebuild and a reason ({reason}); refused", broken
+    return str(declared), reason, broken
+
+
+def _bundle_template(path: Path | None, note: str | None) -> BundleTemplate:
+    """What `_REPACK_SCRIPT` wrote to `template_out`, or why there is nothing."""
+    if path is None or not path.is_file():
+        return BundleTemplate(unread=f"the repack script took no reading: {note or 'no reason'}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return BundleTemplate(unread=f"the repack script's reading could not be read: {exc}")
+    sections = data.get("sections") if isinstance(data, dict) else None
+    text = data.get("template") if isinstance(data, dict) else None
+    if not isinstance(sections, int) or not (text is None or isinstance(text, str)):
+        return BundleTemplate(unread=f"the repack script's reading is not one this reads: {data!r}")
+    return BundleTemplate(text=text if data.get("present") else None, sections=sections)
+
+
+def _template_carried(
+    name: str, artifact: Path, composed: ComposedTemplate, carried: BundleTemplate | None
+) -> Check | None:
+    """Refuse a bundle whose template is not exactly the composed file's text.
+
+    None when it is. Handing the exporter the file does not settle what the
+    bundle carries: it reads the file in text mode (`litert_lm_builder.py:430`),
+    `--experimental_transpile_chat_template_for_minijinja` rewrites the template
+    (`:316-317`), and a metadata override takes the place of the metadata it
+    builds (`:438-456`). Nothing before this reads what it embedded.
+    """
+    observed: dict[str, Any] = {
+        "artifact": str(artifact),
+        "composed": str(composed.path),
+        "composed_sha256": composed.composed_sha256,
+    }
+    if carried is None or carried.unread is not None:
+        why = carried.unread if carried is not None else "it was not read"
+        return Check.unchecked(
+            name,
+            f"{artifact.name}: the chat template it carries could not be read back ({why}), so "
+            f"nothing shows it is {composed.path.name}",
+            observed=observed,
+        )
+    if carried.empty:
+        return Check.failed(
+            name,
+            f"{artifact.name} is empty (0 bytes), so it carries no template; it was handed "
+            f"{composed.path.name}",
+            observed=observed | {"artifact_bytes": 0},
+        )
+    if carried.sections != 1:
+        return Check.failed(
+            name,
+            f"{artifact.name} has {carried.sections} LlmMetadata sections where one was expected, "
+            f"so it does not carry {composed.path.name} as its template",
+            observed=observed | {"llm_metadata_sections": carried.sections},
+        )
+    if carried.text is None:
+        return Check.failed(
+            name,
+            f"{artifact.name} carries no jinja_prompt_template, where it was handed "
+            f"{composed.path.name} (sha256 {composed.composed_sha256[:12]})",
+            observed=observed | {"bundle_template_sha256": None},
+        )
+    carried_sha256 = hashlib.sha256(carried.text.encode("utf-8")).hexdigest()
+    if carried.text != composed.text:
+        return Check.failed(
+            name,
+            f"{artifact.name} carries a jinja_prompt_template with sha256 {carried_sha256[:12]}, "
+            f"not {composed.path.name}'s {composed.composed_sha256[:12]} that it was handed",
+            observed=observed | {"bundle_template_sha256": carried_sha256},
+        )
+    return None
+
+
+REFUSED_SUFFIX = ".refused"
+
+
+def _set_aside(check: Check, artifact: Path) -> Check:
+    """`check`, with its bundle renamed out of the place a usable one goes.
+
+    A refused bundle left at `<recipe>/model.litertlm` is picked up by anything
+    that globs for bundles, or by a person who sees the file and not the exit
+    code. Renamed, not deleted: it is what diagnoses the refusal.
+    """
+    aside = artifact.with_name(artifact.name + REFUSED_SUFFIX)
+    try:
+        os.replace(artifact, aside)
+    except OSError as exc:
+        logger.exception("could not move the refused bundle %s aside", artifact)
+        said = (
+            f"; it could not be moved aside ({type(exc).__name__}: {exc}) and is still at "
+            f"{artifact}"
+        )
+        moved = None
+    else:
+        said = f"; the bundle was moved to {aside}"
+        moved = str(aside)
+    observed = dict(check.observed or {}) | {"refused_bundle": moved}
+    return Check(check.name, check.outcome, check.detail + said, observed)
+
+
+def export_recipe(
+    request: ExportRequest, recipe: str, composed: ComposedTemplate | None = None
+) -> RecipeExport:
+    """Run one export. A non-zero exit is recorded, not raised.
+
+    `composed` is what `compose_chat_template` wrote, for a plan that asks for
+    one. Such a plan given none is recorded as not attempted, since there is no
+    command line to give the exporter; given one, the bundle's own template is
+    read back and must be its text.
+    """
     name = check_name(recipe)
-    argv = tuple(request.argv(recipe))
+    if request.composes_chat_template and composed is None:
+        return RecipeExport(
+            recipe=recipe,
+            check=Check.unchecked(
+                name,
+                "the plan asks for the checkpoint's own chat template behind litetune's "
+                f"text-parts block, and none was composed; nothing was exported for {recipe}",
+                observed={"recipe": recipe},
+            ),
+        )
+    argv = tuple(request.argv(recipe, composed.path if composed is not None else None))
     try:
         definition = definition_of(recipe)
     except RecipeDefinitionError as exc:
@@ -1126,11 +2015,31 @@ def export_recipe(request: ExportRequest, recipe: str) -> RecipeExport:
     # that is recorded. A repack that cannot be made is a limitation on a
     # passed check, not a failed one -- the CPU artifact is intact.
     remaining = max(1, int(request.timeout_s - seconds))
-    gpu_activation, gpu_note = set_gpu_activation(
-        artifact, request.env, timeout=min(REPACK_TIMEOUT_S, remaining)
+    repack = repack_bundle(
+        artifact,
+        request.env,
+        timeout=min(REPACK_TIMEOUT_S, remaining),
+        read_template=composed is not None,
     )
+    gpu_activation, gpu_note = repack.declared, repack.note
     if gpu_activation is None:
         logger.warning("recipe %s: GPU activation not set: %s", recipe, gpu_note)
+    refused = None
+    if repack.broken is not None:
+        # The same verdict as an export that exited zero having written no
+        # bundle: the exporter's output is not a usable one.
+        refused = Check.failed(
+            name,
+            f"litert-torch exited zero but {artifact.name} is not whole: {repack.broken}",
+            observed=observed | {"artifact": str(artifact)},
+        )
+    elif composed is not None:
+        refused = _template_carried(name, artifact, composed, repack.template)
+    if refused is not None:
+        # Not handed on as an artifact, and not left where one would be.
+        return RecipeExport(**base, check=_set_aside(refused, artifact))
+    if composed is not None:
+        observed["chat_template_sha256"] = composed.composed_sha256
     artifact_bytes = artifact.stat().st_size
     companions = tuple(p.name for p in produced if p != artifact)
     shipped_bytes = sum(p.stat().st_size for p in produced)
@@ -1299,6 +2208,9 @@ class ExportResult:
     # somebody with more information recommends. Surfaced, never substituted --
     # the recipe that was asked for is the recipe that was exported.
     recommendations: list[str] = field(default_factory=list)
+    # The file every recipe's exporter was handed in place of
+    # `models.COMPOSED_TEMPLATE`, when the plan asked for one and it was made.
+    chat_template: ComposedTemplate | None = None
 
     @property
     def outcome(self) -> Outcome:
@@ -1325,7 +2237,7 @@ class ExportResult:
         return {
             "schema": EXPORT_SCHEMA,
             "verified": False,
-            "unverified_reason": NOT_VERIFIED,
+            "unverified_reason": NOT_VERIFIED if self.artifacts else NO_ARTIFACT,
             "outcome": self.outcome.value,
             "request": self.request.as_dict(),
             "toolchain": self.toolchain.as_dict(),
@@ -1335,6 +2247,7 @@ class ExportResult:
             "checks": self.checks.as_dict(),
             "limitations": list(self.limitations),
             "recommendations": list(self.recommendations),
+            "chat_template": self.chat_template.as_dict() if self.chat_template else None,
             "model_rules": self.request.plan.as_dict(),
         }
 
@@ -1352,8 +2265,6 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
         checks=CheckSet(name=f"export:{request.model}"),
         toolchain=Toolchain.unknown("not read yet", request.env.requirements),
     )
-    result.limitations.append(NOT_VERIFIED)
-
     # Two answers to "what is this", and no way to choose. Refused before any
     # work: exporting under either one produces a bundle whose family flags may
     # be wrong, and the check would say `passed` about it.
@@ -1527,13 +2438,50 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
             events.stage_finished(result.outcome.value, attempted=0)
             return result
 
+    # -- the chat template the bundle carries -------------------------------
+    # Only when the plan asks for it: a caller's own override satisfies the
+    # rule (`RequiredFlag.satisfied_by`) and is passed through as given.
+    composed: ComposedTemplate | None = None
+    if request.composes_chat_template:
+        with guard(CHAT_TEMPLATE_CHECK) as sink:
+            check, composed = compose_chat_template(request)
+            sink.append(check)
+        if composed is None and sink[0].outcome is Outcome.PASSED:
+            # A pass with nothing to hand the exporter is not a pass: no recipe
+            # can run on it, and a stage with none run must not read as one.
+            sink[0] = Check.unchecked(
+                CHAT_TEMPLATE_CHECK,
+                f"the composition passed and named no file ({sink[0].detail}); nothing was "
+                "exported",
+            )
+        composition = result.checks.add(sink[0])
+        events.check(composition)
+        # One condition for both: the sweep runs on a passed check that came
+        # with a file, which is also what every exporter argv needs.
+        if composed is None or composition.outcome is not Outcome.PASSED:
+            # Never an export with the marker, which the exporter would look up
+            # as a repository, nor one without the block, which is the bundle
+            # the rule exists to prevent. Not a verdict about any recipe, so
+            # none is recorded as failed.
+            result.not_attempted = tuple(request.recipes)
+            result.comparison = Uncompared(f"no recipe was exported: {composition.detail}")
+            result.limitations.append(
+                f"none of {list(request.recipes)} was attempted: {composition.detail}"
+            )
+            events.stage_finished(result.outcome.value, attempted=0)
+            return result
+        result.chat_template = composed
+
     # -- the sweep ---------------------------------------------------------
     for recipe in request.recipes:
         events.note(f"exporting {recipe} on cpu", recipe=recipe, model=request.model)
         with guard(check_name(recipe)) as sink:
-            export = export_recipe(request, recipe)
+            export = export_recipe(request, recipe, composed)
         if sink:
-            export = RecipeExport(recipe=recipe, argv=tuple(request.argv(recipe)), check=sink[0])
+            path = composed.path if composed is not None else None
+            export = RecipeExport(
+                recipe=recipe, argv=tuple(request.argv(recipe, path)), check=sink[0]
+            )
         result.exports.append(export)
         result.checks.add(export.check)
         events.check(export.check)
@@ -1591,6 +2539,10 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
             "passes fp32 itself and can still measure them on a GPU"
         )
 
+    if result.artifacts:
+        # Said only where there is an artifact for it to be about: a run that
+        # refused before exporting, or exported nothing usable, has none.
+        result.limitations.insert(0, NOT_VERIFIED)
     events.stage_finished(
         result.outcome.value,
         exported=len(result.succeeded),

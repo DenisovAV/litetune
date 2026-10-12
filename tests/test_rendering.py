@@ -139,6 +139,8 @@ def test_a_rendering_that_lost_the_prompt_names_the_018_cause():
     assert "does not contain the prompt's text" in detail
     assert "One known cause: from LiteRT-LM 0.18.0" in detail
     assert "converting it again" in detail
+    # Not only 0.3.0's: 0.4.0 gave no block to a name its rules did not claim.
+    assert "or litetune 0.4.0 under a name 0.4.0 did not claim" in detail
 
 
 def test_a_rendering_the_runtime_could_not_make_is_not_a_short_one():

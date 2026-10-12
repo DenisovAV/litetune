@@ -70,9 +70,14 @@ dev = [
     # The repack script runs inside the export env, which has tomli via
     # litert-lm-builder; the tests run that script with the host interpreter.
     "tomli==2.4.1; python_version < '3.11'",
-    # The tests render the packaged templates with the MiniJinja LiteRT-LM
-    # renders them with: v0.18.0 builds 2.14.0 (`Cargo.toml`, `=2.14.0`).
+    # The tests render the text-parts block, and checkpoint templates behind it,
+    # with the MiniJinja LiteRT-LM renders them with: v0.18.0 builds 2.14.0
+    # (`Cargo.toml`, `=2.14.0`).
     "minijinja==2.14.0",
+    # And with the Jinja2 transformers renders them with, for `convert`'s probe:
+    # the version a provisioned export environment holds (`jinja2-3.1.6.dist-info`
+    # there; `envs.EXPORT` does not pin it).
+    "jinja2==3.1.6",
 ]
 
 [project.scripts]

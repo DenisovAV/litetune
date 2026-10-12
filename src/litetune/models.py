@@ -9,10 +9,9 @@ Three kinds of knowledge live here:
 
 **Export flags a family requires.** Gemma 4 will not export without
 `--externalize_embedder`, and will export *wrongly* -- silently -- without
-`--jinja_chat_template_override`. litetune adds them and says so;
-`--litert_lm_model_type_override=gemma4` is refused rather than dropped,
-because a flag that quietly does the opposite of its name is worse than an
-error.
+`--jinja_chat_template_override`. litetune adds them and says so; a
+`--litert_lm_model_type_override` is refused rather than dropped, because a flag
+that quietly does the opposite of its name is worse than an error.
 
 **The minimum `transformers` a family needs.** A version too old does not
 produce a subtly worse model, it raises `AttributeError: 'list' object has no
@@ -37,6 +36,7 @@ family, different answer. It is decided by `tune`, carried by
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -74,6 +74,147 @@ class FlagRefused(ValueError):
 # Flags
 # ---------------------------------------------------------------------------
 
+TEMPLATE_FLAG = "--jinja_chat_template_override"
+METADATA_OVERRIDE_FLAG = "--litert_lm_llm_metadata_override"
+
+
+def flag_key(name: str) -> str:
+    """The keyword a flag name sets on the exporter's command line.
+
+    `litert-torch export_hf` hands its arguments to Fire (`litert_torch/cli.py`),
+    which strips every leading hyphen and then reads `-` in the name as `_`
+    (`fire/core.py:868` and `:875`, fire 0.7.1).
+    """
+    return name.split("=", 1)[0].lstrip("-").replace("-", "_")
+
+
+@dataclass(frozen=True)
+class ExporterFlag:
+    """One keyword the exporter's command line sets, as Fire reads it."""
+
+    name: str  # Fire's keyword: leading hyphens stripped, `-` read as `_`
+    value: object  # what Fire hands the exporter for it
+    token: str  # the argument that sets it, handed to the exporter unchanged
+
+    @property
+    def shown(self) -> str:
+        """The flag as it takes effect: its keyword and the value the exporter gets."""
+        value = self.value if isinstance(self.value, str) else repr(self.value)
+        return f"--{self.name}={value}"
+
+
+# The keywords litetune passes itself, from `convert`'s own options. Fire keeps
+# the last of a repeated keyword (`fire/core.py:925`), so a caller's token for
+# one would replace litetune's in the exporter's argv while the report named
+# litetune's.
+OWNED_FLAGS = {"model": "--model", "output_dir": "--output-dir", "quantization_recipe": "--recipe"}
+
+# litert-torch's `export` (`export_hf/export.py:79-142`, litert-torch-nightly
+# 0.10.0.dev20260926) takes `**kwargs`, so Fire accepts every keyword
+# (`fire/core.py:881-884`). A valueless `--no<name>` then sets <name> to False
+# unless `no<name>` is itself a parameter (`:902-912`); none of `export`'s
+# parameters begins with "no".
+_EXPORT_PARAMETERS_NAMED_NO: frozenset[str] = frozenset()
+
+
+def _is_fire_flag(token: str) -> bool:
+    """Fire's `_IsFlag` (`fire/core.py:936-956`): two hyphens, or one and a letter."""
+    return token.startswith("--") or re.match(r"-[a-zA-Z]", token) is not None
+
+
+def parse_exporter_flags(model: str, tokens: Sequence[str]) -> dict[str, ExporterFlag]:
+    """The keywords `tokens` set on the exporter, by Fire's rules; raises `FlagRefused`.
+
+    Each token is read as Fire's `_ParseKeywordArgs` reads it (`fire/core.py:
+    816-934`): `--name=text` sets `name` to `exporter_value(text)`; a valueless
+    `--name` sets it to True, or `--no<name>` sets `<name>` to False. The last
+    token for a keyword is the one in effect, and the only one kept: the table
+    is what litetune reasons about and, one token per keyword, what the
+    exporter is given, so the two cannot disagree. Refused, each with what to
+    pass instead, are the tokens Fire would read some other way -- a positional
+    argument, a bare `--` and everything after it, a value in the next
+    argument -- and the keywords litetune sets itself.
+    """
+    table: dict[str, ExporterFlag] = {}
+    for index, token in enumerate(tokens):
+        if token == "--":
+            raise FlagRefused(_DOUBLE_DASH.format(model=model))
+        if not _is_fire_flag(token):
+            raise FlagRefused(_POSITIONAL.format(model=model, token=token))
+        stripped = token.lstrip("-")
+        if "=" in token:
+            key, text = stripped.split("=", 1)
+            key = key.replace("-", "_")
+            value: object = exporter_value(text)
+        else:
+            key = stripped.replace("-", "_")
+            following = tokens[index + 1] if index + 1 < len(tokens) else None
+            if following is not None and not _is_fire_flag(following):
+                raise FlagRefused(_split_value(model, token, f"--{key}"))
+            if key not in _EXPORT_PARAMETERS_NAMED_NO and key.startswith("no"):
+                key, value = key[2:], False
+            else:
+                value = True
+        if not key:
+            raise FlagRefused(f"{model}: litetune refuses {token!r}: it names no keyword")
+        if key in OWNED_FLAGS:
+            raise FlagRefused(
+                f"{model}: litetune refuses {token!r}: litetune passes --{key} to the exporter "
+                f"itself, from convert's {OWNED_FLAGS[key]}, and Fire would let this one replace "
+                f"it (`fire/core.py:925`). Use {OWNED_FLAGS[key]}"
+            )
+        table.pop(key, None)
+        table[key] = ExporterFlag(key, value, token)
+    return table
+
+
+_DOUBLE_DASH = (
+    "{model}: litetune refuses '--': Fire hands every argument after a bare '--' to its own "
+    "options and drops what they do not name (`fire/parser.py:39-56`, `fire/core.py:121-124`), "
+    "so litetune's own flags after it would never reach the exporter"
+)
+
+_POSITIONAL = (
+    "{model}: litetune refuses {token!r}: Fire reads an argument that begins with neither two "
+    "hyphens nor a hyphen and a letter as a positional one (`fire/core.py:936-956`), and the "
+    "exporter would take it for its first parameter not yet given. Pass an exporter flag as "
+    "--flag=--name=value"
+)
+
+
+def exporter_value(text: str) -> object:
+    """The value Fire hands the exporter for `--name=<text>`.
+
+    Fire's `DefaultParseValue` (`fire/parser.py:59-76`): `_LiteralEval`
+    (`:79-116`) reads the text as a Python literal after turning every bare
+    name but `True`, `False` and `None` into a string (`_Replacement`,
+    `:119-132`), refuses a binary operation, and on a syntax or value error the
+    text stays the string it was. So `None` is None, `0` is 0, `''` and `""` are
+    empty, `"gemma4"` is `gemma4`, and a path is itself. Written out here rather
+    than imported: litetune does not depend on Fire.
+    """
+    try:
+        root = ast.parse(text, mode="eval")
+        if isinstance(root.body, ast.BinOp):
+            raise ValueError(text)
+        for node in ast.walk(root):
+            for field, child in ast.iter_fields(node):
+                if isinstance(child, list):
+                    for index, item in enumerate(child):
+                        if isinstance(item, ast.Name):
+                            child[index] = _bare_word(item)
+                elif isinstance(child, ast.Name):
+                    setattr(node, field, _bare_word(child))
+        return ast.literal_eval(root)
+    except (SyntaxError, ValueError):
+        return text
+
+
+def _bare_word(node: ast.Name) -> ast.expr:
+    if node.id in ("True", "False", "None"):
+        return node
+    return ast.Constant(node.id)
+
 
 @dataclass(frozen=True)
 class RequiredFlag:
@@ -97,18 +238,22 @@ class RequiredFlag:
             return None
         return self.name if self.value is None else f"{self.name}={self.value}"
 
-    def satisfied_by(self, flags: Sequence[str]) -> str | None:
-        """The caller's own form of this flag, if they passed one.
+    @property
+    def takes_value(self) -> bool:
+        """Whether the flag means anything without a value after `=`."""
+        return self.value is not None or bool(self.value_unknown)
 
-        Matched on the flag *name*, so a caller who supplied their own value has
-        satisfied the requirement with it. Their value wins: litetune knows this
-        flag is needed, and does not know better than the caller which template
-        their checkpoint was trained against.
+    def satisfied_by(self, table: dict[str, ExporterFlag]) -> ExporterFlag | None:
+        """The caller's own setting of this flag, if they passed one.
+
+        Looked up by keyword in `parse_exporter_flags`' table, so a caller who
+        supplied their own value, in any spelling Fire reads as this keyword,
+        has satisfied the requirement with the value the exporter will get.
+        Their value wins: litetune knows this flag is needed, and does not know
+        better than the caller which template their checkpoint was trained
+        against.
         """
-        for flag in flags:
-            if flag == self.name or flag.startswith(f"{self.name}="):
-                return flag
-        return None
+        return table.get(flag_key(self.name))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -127,10 +272,12 @@ class ForbiddenFlag:
     value: str | None
     reason: str
 
-    def matches(self, flag: str) -> bool:
-        if self.value is None:
-            return flag == self.name or flag.startswith(f"{self.name}=")
-        return flag == f"{self.name}={self.value}"
+    def matches(self, flag: ExporterFlag) -> bool:
+        """Whether `flag` sets this one, to this value or, with none named, to any
+        the exporter acts on (a falsy override is none to it)."""
+        if flag.name != flag_key(self.name):
+            return False
+        return bool(flag.value) if self.value is None else flag.value == self.value
 
     @property
     def rendered(self) -> str:
@@ -199,14 +346,27 @@ class ModelRules:
     # claimed by the wrong family and exported with the wrong flags, green.
     config_only: bool = False
 
+    # Whether a repack -- already-quantized or non-PyTorch weights -- is turned
+    # away rather than claimed. The evidence differs by where the checkpoint
+    # is: a directory's own `config.json` says whether its weights are
+    # quantized, so the names in its hint (the path, the sidecar's base, the
+    # config's `_name_or_path`, which may name the repack a full-precision merge
+    # came from) are not consulted for it; a Hub id has only its name, which is
+    # read for one of `_REPACK_MARKERS` after the match.
+    repack_guard: bool = False
+
     def matches(self, text: str) -> bool:
         return any(re.search(pattern, text) for pattern in self.patterns)
 
     def matches_hint(self, hint: ModelHint) -> bool:
-        if not self.config_only:
+        if self.config_only:
+            # The path is precisely the evidence this rule declares worthless.
+            return any(self.matches(_normalise(value)) for value in hint.from_config)
+        if not self.repack_guard:
             return self.matches(hint.text)
-        # The path is precisely the evidence this rule declares worthless.
-        return any(self.matches(_normalise(value)) for value in hint.from_config)
+        if hint.local:
+            return not hint.quantized and self.matches(hint.text)
+        return any(re.search(pattern + _NOT_A_REPACK, hint.text) for pattern in self.patterns)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -259,15 +419,22 @@ _TEMPLATE_VARIANT_UNKNOWN = (
     "the override names a per-variant repository (E2B and E4B have different ones) and this model "
     "id does not say which variant it is, so litetune will not guess: the wrong chat template is "
     "the exact failure this flag exists to prevent, and it fails silently. Name the variant in the "
-    "model id, or pass --jinja_chat_template_override=<repo> yourself"
+    "model id, or pass --flag=--jinja_chat_template_override=<repo> to convert yourself"
 )
 
-# Measured: the flag leaves `generic_model` set *and* skips the Gemma 4 metadata
-# builder, so it produces a generic-model artifact with no Gemma 4 metadata.
+# Measured when litetune 0.1.0a1 pinned an earlier litert-torch nightly: the
+# value `gemma4` left `generic_model` set *and* skipped the Gemma 4 metadata
+# builder. In litert-torch-nightly 0.10.0.dev20260926, pinned now, `gemma4` does
+# select the gemma4 type (`litert_lm_builder.py:368-371`), but the
+# model-specific metadata builder -- Gemma 4's, for a Gemma 4 config
+# (`model_ext/metadata_builder.py:32-35`) -- runs only when there is no override
+# at all (`litert_lm_builder.py:379-387`). So every value the exporter acts on is
+# refused, not only `gemma4`.
 _TYPE_OVERRIDE_REASON = (
-    "--litert_lm_model_type_override=gemma4 does the opposite of what its name suggests: it leaves "
-    "generic_model set *and* skips the Gemma 4 metadata builder, so the artifact is written as a "
-    "generic model with none of the metadata the flag appears to request. litetune refuses it "
+    "--litert_lm_model_type_override does the opposite of what it suggests on Gemma 4: whatever "
+    "its value, the exporter then skips the Gemma 4 metadata builder, which it runs only when "
+    "there is no override, so the artifact has none of the Gemma 4 metadata. With gemma4 it was "
+    "measured, on an earlier exporter, to leave generic_model set as well. litetune refuses it "
     "rather than dropping it silently, because a dropped flag reads as an applied one"
 )
 
@@ -371,12 +538,10 @@ _GEMMA4_NOT_GOOGLES_ARTIFACT = (
 def _gemma4(family: str, patterns: tuple[str, ...], override_repo: str | None) -> ModelRules:
     """One Gemma 4 variant. The variants differ only in the template repository."""
     template = (
-        RequiredFlag(
-            name="--jinja_chat_template_override", value=override_repo, reason=_TEMPLATE_REASON
-        )
+        RequiredFlag(name=TEMPLATE_FLAG, value=override_repo, reason=_TEMPLATE_REASON)
         if override_repo is not None
         else RequiredFlag(
-            name="--jinja_chat_template_override",
+            name=TEMPLATE_FLAG,
             reason=_TEMPLATE_REASON,
             value_unknown=_TEMPLATE_VARIANT_UNKNOWN,
         )
@@ -391,7 +556,7 @@ def _gemma4(family: str, patterns: tuple[str, ...], override_repo: str | None) -
         forbidden_flags=(
             ForbiddenFlag(
                 name="--litert_lm_model_type_override",
-                value="gemma4",
+                value=None,
                 reason=_TYPE_OVERRIDE_REASON,
             ),
         ),
@@ -461,6 +626,20 @@ def packaged_template(name: str) -> str:
     return str(files("litetune") / "templates" / name)
 
 
+TEXT_PARTS_BLOCK = "text_parts.jinja"
+"""The packaged block a Qwen rule puts in front of the checkpoint's own template."""
+
+COMPOSED_TEMPLATE = "<the checkpoint's own chat template behind litetune's text-parts block>"
+"""The `--jinja_chat_template_override` value that means "compose it at export".
+
+Not a path and not a repository: the template it stands for is the converted
+checkpoint's own, which only the export environment can read, so
+`export.run_export` writes it there -- `TEXT_PARTS_BLOCK`, then the checkpoint's
+template -- and hands the exporter that file in place of this value. A plan that
+carries it and cannot be composed exports nothing.
+"""
+
+
 # Sourced from the runtime and measured on it. From LiteRT-LM v0.18.0
 # `ModelDataProcessor::MessageToTemplateInput` (`model_data_processor.h`) hands
 # the template every message's content as a list of parts, through
@@ -468,20 +647,40 @@ def packaged_template(name: str) -> str:
 # processor's own override, which handed a single text part over as the string
 # in v0.17.1 (`qwen3_data_processor.cc`), is gone. Both Qwen checkpoints'
 # templates read `content` as a string.
-def _text_parts_reason(checkpoint: str, revision: str, others: str) -> str:
-    """Why a Qwen rule packs its own template, naming the one it packs."""
-    return (
-        "LiteRT-LM from 0.18.0 hands a bundle's template each message's content as a list of "
-        "parts, and this checkpoint's own template reads it as a string. Measured 2026-10-08 on "
-        "litert-lm 0.18.0: a Qwen3 0.6B bundle carrying its checkpoint's template rendered "
-        "'<|im_start|>user\\n<|im_end|>' -- the user's text gone, no error -- where 0.17.1 "
-        "rendered it; with Qwen2.5's template every send failed, because it adds the list to a "
-        "string, which the runtime's MiniJinja refuses. The packaged template is the chat "
-        f"template of {checkpoint} at revision {revision[:7]}, unchanged, behind a block that "
-        f"turns a list of text parts back into the string. {others} gets this one all the "
-        "same; verify's rendering check compares the single turn it renders, not multi-turn, "
-        "reasoning or tool handling"
-    )
+#
+# "As the exporter reads it": given no override and its default
+# `use_jinja_template`, litert-torch's exporter embeds the `chat_template` of
+# `transformers.AutoTokenizer.from_pretrained` on the model it converts
+# (`export_lib.py`, `litert_lm_builder.py` `package_model`).
+# `export.compose_chat_template` loads the tokenizer the same way, in the same
+# environment, and falls back to `chat_template.json` as `export_lib.py:390-402`
+# does. Where the two part: a tokenizer carrying several named templates, of
+# which litetune takes "default" where the exporter would unpack the dict into
+# three prompt parts (`litert_lm_builder.py:320`), raising unless it holds
+# exactly three; and
+# what it refuses -- no template after that fallback, one that is only
+# whitespace, one with a carriage return (the exporter reads the override file
+# in text mode, `litert_lm_builder.py:430`, so it could not arrive unchanged),
+# and one the block is not for.
+_TEXT_PARTS_REASON = (
+    "LiteRT-LM from 0.18.0 hands a bundle's template each message's content as a list of "
+    "parts, and the chat templates of Qwen3 0.6B and Qwen2.5 0.5B Instruct read it as a "
+    "string. Measured 2026-10-08 on litert-lm 0.18.0: a Qwen3 0.6B bundle carrying its "
+    "checkpoint's template rendered '<|im_start|>user\\n<|im_end|>' -- the user's text gone, "
+    "no error -- where 0.17.1 rendered it; with Qwen2.5's template every send failed, because "
+    "it adds the list to a string, which the runtime's MiniJinja refuses. At export litetune "
+    "reads the checkpoint's own chat template as the exporter reads it, through transformers' "
+    "AutoTokenizer on the model being converted, and hands the exporter that template, "
+    "unchanged, behind a block that turns a list of text parts back into the string, then "
+    "reads each bundle's template back -- so a checkpoint this rule claims keeps its own "
+    "template, or no bundle is handed over: one that does not carry it fails its recipe, and "
+    "litetune tries to rename it with a '.refused' suffix, naming the path it ends up at. It "
+    "refuses a template the block is not for: one that, "
+    "rendered by transformers' Jinja2 rather than the runtime, does not print a one-message "
+    "conversation given as parts behind the block as it prints the same message as a string. "
+    "verify's rendering check is what checks the runtime, and it compares the single turn it "
+    "renders, not multi-turn, reasoning or tool handling"
+)
 
 
 _FUNCTION_TEMPLATE_REASON = (
@@ -553,6 +752,14 @@ _MODEL_TYPE_REASON = (
 )
 
 
+# Formats a Hub repack names after the model it repacks, as a whole token of
+# the normalised name: FP8, MLX, GGUF, ONNX, AWQ, GPTQ, bitsandbytes (`bnb`)
+# and an n-bit build (`4bit`). `_NOT_A_REPACK` refuses a match that continues,
+# past any number of other tokens, into one of them.
+_REPACK_MARKERS = r"(?:fp8|mlx|gguf|onnx|awq|gptq|bnb|\d+bit)"
+_NOT_A_REPACK = rf"(?!(?:-[a-z0-9]+)*?-{_REPACK_MARKERS}(?:-|$))"
+
+
 RULES: tuple[ModelRules, ...] = (
     _gemma4(
         "gemma-4-e2b",
@@ -579,7 +786,7 @@ RULES: tuple[ModelRules, ...] = (
                 reason=_MODEL_TYPE_REASON,
             ),
             RequiredFlag(
-                name="--jinja_chat_template_override",
+                name=TEMPLATE_FLAG,
                 value=functiongemma_template(),
                 reason=_FUNCTION_TEMPLATE_REASON,
             ),
@@ -638,7 +845,7 @@ RULES: tuple[ModelRules, ...] = (
         # is typed correctly with none. Measured 2026-09-14 on Qwen/Qwen3-0.6B:
         # both int8 recipes exported with no flag from litetune, and the
         # conversion cost is in MEASUREMENTS.md. The template override below is
-        # LiteRT-LM 0.18.0's, not the exporter's: see `_text_parts_reason`. What
+        # LiteRT-LM 0.18.0's, not the exporter's: see `_TEXT_PARTS_REASON`. What
         # the artifact's own `llm_model_type` reads is not recorded here: that
         # observation appears in no manifest or log of any run, and was struck
         # from the documents for the same reason.
@@ -648,35 +855,47 @@ RULES: tuple[ModelRules, ...] = (
         # project has run. No `min_transformers` either -- none was measured.
         # Sizes are added here as they are.
         #
-        # Which checkpoints, exactly: the rule packs Qwen/Qwen3-0.6B's own
-        # template, so it claims only checkpoints that template was checked
-        # against. Qwen/Qwen3-0.6B itself; Qwen3-0.6B-Base, whose own template
-        # raises on the parts 0.18.0 hands it while the packaged one renders a
-        # single turn as Base's renders the string (MiniJinja 2.14.0, review of
-        # 2026-10-10); either as a Hub id, as a local snapshot of the Hub
-        # repository (`.../models--Qwen--Qwen3-0.6B/snapshots/<sha>`, which
-        # `tune` records verbatim when it trained from one), and with the
-        # `model_type` and architecture `hint_for` appends for a checkpoint
-        # `tune` wrote. A derivative, a repack or a mirror under another
-        # organisation is not claimed: its template is its own, and on 0.18.0
-        # the unknown-family note and verify's rendering check are what speak
-        # for it. Like every rule here this matches the hint's text, not
-        # structured provenance: a local path that spells the repository name is
-        # claimed, and no revision is compared -- another revision of the
-        # repository gets c1899de's template, which the reason says.
-        patterns=(
-            r"(?:^|-)qwen-qwen3-0-6b(?:-base)?(?:-snapshots-[0-9a-f]{40})?"
-            r"(?:$|-qwen3-qwen3forcausallm$)",
-        ),
+        # Not by organisation, variant or revision, but by name, as every rule
+        # here matches: a Hub id is matched on its spelling alone, and
+        # `hint_for` reads `config.json` and `tune`'s sidecar only for a local
+        # directory. So a name that still contains Qwen3-0.6B is claimed --
+        # Qwen3-0.6B-Base, a copy or a fine-tune under another organisation
+        # that kept the name, a local snapshot -- and a fine-tune renamed past
+        # it is not. Base, which no run here measured, has been claimed since
+        # this pattern was first written by size alone. Claiming a checkpoint
+        # no longer hands it another's template, as litetune 0.4.0 did when it
+        # packed Qwen/Qwen3-0.6B's at c1899de for every checkpoint it claimed,
+        # and so narrowed this pattern to the checkpoints that one template had
+        # been checked against: `COMPOSED_TEMPLATE` is composed from the
+        # converted checkpoint's own template, and `export.compose_chat_template`
+        # refuses one the block is not for.
+        #
+        # Not a repack the exporter cannot load (`repack_guard`). For a Hub id
+        # that is read from the name: one that continues past the size into one
+        # of `_REPACK_MARKERS` names already-quantized or non-PyTorch weights
+        # (`Qwen/Qwen3-0.6B-FP8`, `Qwen/Qwen3-0.6B-MLX-4bit`,
+        # `unsloth/Qwen3-0.6B-unsloth-bnb-4bit`, `Qwen/Qwen3-0.6B-GGUF`,
+        # `onnx-community/Qwen3-0.6B-ONNX`). The export environment's
+        # transformers 5.16.1 loads neither FP8 nor bitsandbytes weights without
+        # accelerate, which that environment does not install
+        # (`quantizer_finegrained_fp8.py:31-32`, `quantizer_bnb_4bit.py:57-64`),
+        # and refuses a quantization config with no `quant_method`, as MLX
+        # writes it (`quantizers/auto.py:158-166`). Claiming those would trade
+        # the unknown-family note for an exporter error. A name cannot show a
+        # format it does not spell after the size: an MLX or ONNX build
+        # published under the bare model name is still claimed, whatever its
+        # repository holds, and if that is not weights transformers loads the
+        # exporter fails at its model load. For a local directory it is read
+        # from the checkpoint: a `quantization_config` in its `config.json`. A
+        # full-precision merge whose config's `_name_or_path` names the bnb
+        # repack it was tuned from is claimed, which a name read would refuse.
+        patterns=(r"qwen-?3-0-6b",),
+        repack_guard=True,
         required_flags=(
             RequiredFlag(
-                name="--jinja_chat_template_override",
-                value=packaged_template("qwen3-0.6b.jinja"),
-                reason=_text_parts_reason(
-                    "Qwen/Qwen3-0.6B",
-                    "c1899de289a04d12100db370d81485cdf75e47ca",
-                    "Qwen3-0.6B-Base, whose own template is a different one, or another revision",
-                ),
+                name=TEMPLATE_FLAG,
+                value=COMPOSED_TEMPLATE,
+                reason=_TEXT_PARTS_REASON,
             ),
         ),
     ),
@@ -699,44 +918,53 @@ RULES: tuple[ModelRules, ...] = (
         # printed its unknown-family note on every convert, which was the
         # honest state and is what this rule replaces.
         #
-        # By size *and* variant, for the reason the qwen-3 rule above gives:
-        # `Qwen2.5-0.5B-Instruct` was run and `Qwen2.5-0.5B` was not. They are
-        # two checkpoints, and this file's own history is that a rule written
-        # on the strength of a neighbouring one goes unexercised for weeks --
-        # the gemma-3-text rule claimed the 1B for three weeks before anything
-        # exported it.
+        # By size *and* variant: `Qwen2.5-0.5B-Instruct` was run and
+        # `Qwen2.5-0.5B` was not. They are two checkpoints, and this file's own
+        # history is that a rule written on the strength of a neighbouring one
+        # goes unexercised for weeks -- the gemma-3-text rule claimed the 1B for
+        # three weeks before anything exported it. (The qwen-3 rule claims its
+        # base model, which it has done since its pattern was first written by
+        # size alone; this rule has never claimed this one's.)
         #
         # The tail is what makes that true. `identify` searches rather than
         # matches, so a bare `qwen-?2-5-0-5b-instruct` also claims
         # any id that continues past it -- an `-AWQ`, a `-GPTQ-Int4`, a
         # bnb-4bit repack -- which name already-quantized checkpoints nobody
-        # here exported, and for which "no flags needed" is least likely to
-        # hold. The tests pin the regex against those spellings; whether each
+        # here exported, and for which what this rule records is least likely
+        # to hold. The tests pin the regex against those spellings; whether each
         # repository exists is not something this checks. So the
         # pattern ends either at the end of the hint text or at the
         # `model_type` `hint_for` appends for a local checkpoint: this run's
         # merged model read `qwen-qwen2-5-0-5b-instruct-qwen2-qwen2forcausallm`
-        # and must keep matching, a repack must not.
+        # and must keep matching, a repack must not. A Hub id is also held to
+        # the qwen-3 rule's `repack_guard` after the tail, because `-qwen2` can
+        # begin a repack's own suffix (`someorg/Qwen2.5-0.5B-Instruct-qwen2-GGUF`);
+        # a local directory to its own `config.json`, as there. A name cannot show a
+        # format it does not spell after the model name: an ONNX export
+        # published under the bare name, `onnx-community/Qwen2.5-0.5B-Instruct`,
+        # is claimed whatever its repository holds, and if that is not weights
+        # transformers loads the exporter fails at its model load.
         #
         # No `min_transformers` -- the pinned 5.16.1 loaded it, and nothing
         # here establishes a floor, which is not the same as there being none.
         #
-        # Since the rule packs this checkpoint's template (LiteRT-LM 0.18.0),
-        # it claims the Hub id, a local snapshot of it and what `tune` wrote
-        # from either -- not an id under another organisation.
-        patterns=(
-            r"(?:^|-)qwen-qwen2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{40})?"
-            r"(?:$|-qwen2-qwen2forcausallm$)",
-        ),
+        # Under any organisation, as before litetune 0.4.0: the template is
+        # composed at export from the checkpoint's own (`COMPOSED_TEMPLATE`), so
+        # the same name under another organisation -- a mirror, or a fine-tune
+        # that kept it -- keeps its own template, and 0.4.0's reason for
+        # claiming only Qwen's repository -- it packed that repository's
+        # template at 7ae5576 -- is gone. The optional snapshot
+        # segment 0.4.0 added stays: a local snapshot of the Hub repository
+        # (`.../models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/<sha>`, which
+        # `tune` records verbatim when it trained from one) normalises to the
+        # name followed by `-snapshots-<sha>`, which the tail alone refuses.
+        patterns=(r"qwen-?2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{40})?(?:$|-qwen2\b)",),
+        repack_guard=True,
         required_flags=(
             RequiredFlag(
-                name="--jinja_chat_template_override",
-                value=packaged_template("qwen2.5-0.5b-instruct.jinja"),
-                reason=_text_parts_reason(
-                    "Qwen/Qwen2.5-0.5B-Instruct",
-                    "7ae557604adf67be50417f59c2c2f167def9a775",
-                    "Another revision, whose template may differ,",
-                ),
+                name=TEMPLATE_FLAG,
+                value=COMPOSED_TEMPLATE,
+                reason=_TEXT_PARTS_REASON,
             ),
         ),
     ),
@@ -808,6 +1036,12 @@ class ModelHint:
     # `recorded=False` with no error: one is a fault to fix, the other is just a
     # checkpoint from before this existed.
     provenance_error: str | None = None
+    # A directory on this machine, whose own files say what it holds; a Hub id
+    # has only its name. `quantized` is what the directory's `config.json` says:
+    # a `quantization_config`, which is what makes transformers load the weights
+    # as pre-quantized (`quantizers/auto.py:334-338`, transformers 5.16.1).
+    local: bool = False
+    quantized: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -817,6 +1051,8 @@ class ModelHint:
             "config_error": self.config_error,
             "identity_recorded": self.recorded,
             "provenance_error": self.provenance_error,
+            "local": self.local,
+            "quantized": self.quantized,
         }
 
 
@@ -896,13 +1132,72 @@ def same_family(a: str | None, b: str | None) -> bool:
     return left is not None and right is not None and left.family == right.family
 
 
+# transformers 5.16.1's `AUTO_QUANTIZATION_CONFIG_MAPPING` (`quantizers/auto.py:
+# 107-134`): the methods it loads as pre-quantized.
+_PRE_QUANTIZED_METHODS = frozenset(
+    {
+        "awq",
+        "bitsandbytes_4bit",
+        "bitsandbytes_8bit",
+        "eetq",
+        "gptq",
+        "aqlm",
+        "quanto",
+        "quark",
+        "fouroversix",
+        "fp_quant",
+        "hqq",
+        "compressed-tensors",
+        "fbgemm_fp8",
+        "higgs",
+        "torchao",
+        "bitnet",
+        "vptq",
+        "spqr",
+        "fp8",
+        "nvfp4",
+        "mxfp8",
+        "auto-round",
+        "mxfp4",
+        "metal",
+        "sinq",
+        "gemma",
+    }
+)
+
+
+def _pre_quantized(config: dict[str, Any]) -> bool:
+    """Whether transformers 5.16.1 loads this `config.json`'s weights as pre-quantized.
+
+    `get_hf_quantizer` (`quantizers/auto.py:334-340`) takes the config's
+    `quantization_config`, or else its text config's -- the config itself when
+    it has no sub-config -- and counts it only when `supports_quant_method`
+    (`:282-299`) knows its method: `load_in_4bit`/`load_in_8bit` name
+    bitsandbytes, an unknown method is skipped with a warning and the weights
+    load as they are. A config with no method -- `{}` among them, since an empty
+    one falls through to the text config, which for a plain config is itself,
+    and is then not None -- makes transformers raise, which is the exporter's
+    failure to report, not a repack to turn away.
+    """
+    text_config = config.get("text_config")
+    params = config.get("quantization_config") or (
+        text_config.get("quantization_config") if isinstance(text_config, dict) else None
+    )
+    if not isinstance(params, dict) or not params:
+        return False
+    method: object = params.get("quant_method")
+    if params.get("load_in_8bit", False) or params.get("load_in_4bit", False):
+        method = "bitsandbytes_4bit" if params.get("load_in_4bit", False) else "bitsandbytes_8bit"
+    return isinstance(method, str) and method in _PRE_QUANTIZED_METHODS
+
+
 def hint_for(model: str) -> ModelHint:
     """The text `identify` matches against: the model id, plus a local checkpoint."""
     path = Path(model)
     normalised = _normalise(model)
     config = path / CONFIG_NAME
     if not (path.is_dir() and config.is_file()):
-        return ModelHint(model=model, text=normalised)
+        return ModelHint(model=model, text=normalised, local=path.is_dir())
 
     # Before config.json: what produced the checkpoint knows what it was, and
     # config.json only knows what architecture it is -- which is not enough,
@@ -924,6 +1219,7 @@ def hint_for(model: str) -> ModelHint:
             config_error=f"{type(exc).__name__}: {exc}",
             recorded=bool(recorded_base),
             provenance_error=provenance_error,
+            local=True,
         )
     if not isinstance(data, dict):
         return ModelHint(
@@ -932,6 +1228,7 @@ def hint_for(model: str) -> ModelHint:
             config_error=f"{config} does not contain a JSON object",
             recorded=bool(recorded_base),
             provenance_error=provenance_error,
+            local=True,
         )
 
     values: list[str] = []
@@ -943,12 +1240,15 @@ def hint_for(model: str) -> ModelHint:
             values.extend(str(item) for item in value)
     extra = tuple(values)
     text = "-".join([normalised, *(_normalise(v) for v in extra)])
+    quantized = _pre_quantized(data)
     return ModelHint(
         model=model,
         text=text,
         from_config=extra,
         recorded=bool(recorded_base),
         provenance_error=provenance_error,
+        local=True,
+        quantized=quantized,
     )
 
 
@@ -1124,6 +1424,12 @@ class ExportPlan:
     notes: tuple[str, ...] = ()
     recommendations: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
+    # What `flags` set, keyword by keyword, as `parse_exporter_flags` reads them.
+    table: tuple[ExporterFlag, ...] = ()
+
+    def setting(self, name: str) -> ExporterFlag | None:
+        """What the exporter will get for this flag, if the plan sets it."""
+        return next((f for f in self.table if f.name == flag_key(name)), None)
 
     @property
     def outcome(self) -> Outcome:
@@ -1159,50 +1465,71 @@ def plan_export(
 ) -> ExportPlan:
     """Work out the flags this model's export must carry.
 
-    Raises `FlagRefused` for a flag that must never be passed. Everything else
-    is reported: a flag litetune added is named with its reason, and a required
-    flag whose value it cannot determine makes the plan unusable rather than
-    guessed at.
+    Raises `FlagRefused` for a flag that must never be passed, or that the
+    exporter would read otherwise than litetune can say (`parse_exporter_flags`).
+    Everything else is reported: a flag litetune added is named with its reason,
+    and a required flag whose value it cannot determine makes the plan unusable
+    rather than guessed at. Every decision reads the parsed table, and `flags`
+    is that table, one token per keyword: what the exporter is given.
     """
     hint = hint_for(model)
     rules = rules_for_hint(hint)
-    flags = list(dict.fromkeys(requested_flags))
+    table = parse_exporter_flags(model, requested_flags)
 
     if rules is None:
         return ExportPlan(
             model=model,
             hint=hint,
             rules=None,
-            flags=tuple(flags),
+            flags=tuple(f.token for f in table.values()),
             notes=(UNKNOWN_FAMILY,),
+            table=tuple(table.values()),
         )
 
     for forbidden in rules.forbidden_flags:
-        for flag in flags:
-            if forbidden.matches(flag):
-                raise FlagRefused(f"{model}: litetune refuses {flag!r}. {forbidden.reason}")
+        setting = table.get(flag_key(forbidden.name))
+        if setting is not None and forbidden.matches(setting):
+            raise FlagRefused(f"{model}: litetune refuses {setting.token!r}. {forbidden.reason}")
 
     added: list[str] = []
     notes: list[str] = []
     checks: list[Check] = []
+    limitations = list(rules.limitations)
+    composes = False
     for required in rules.required_flags:
-        supplied = required.satisfied_by(flags)
+        supplied = required.satisfied_by(table)
+        if supplied is not None and required.takes_value:
+            _refuse_unusable_value(model, supplied, required.name)
+        if supplied is not None and not required.takes_value and not supplied.value:
+            # A switch the family cannot export without, turned off by the
+            # caller: their value would win below, and the export would fail or
+            # be wrong for the reason the rule gives.
+            raise FlagRefused(
+                f"{model}: litetune refuses {supplied.token!r}: this family needs "
+                f"{required.name}. {required.reason}"
+            )
+        if supplied is not None and required.value == COMPOSED_TEMPLATE:
+            limitations.append(_CALLER_TEMPLATE.format(flag=supplied.shown))
         if supplied is not None:
             wanted = required.rendered
-            detail = f"{supplied} was supplied by the caller"
-            if wanted is not None and supplied != wanted:
+            detail = f"{supplied.shown} was supplied by the caller"
+            if wanted is not None and supplied.shown != wanted:
                 # Their value, not litetune's: the caller may have trained
                 # against a template litetune has never seen. Recorded, because
                 # a difference here is invisible in the artifact.
                 detail = (
-                    f"{supplied} was supplied by the caller; litetune would have used {wanted}. "
-                    "The caller's value was kept"
+                    f"{supplied.shown} was supplied by the caller; litetune would have used "
+                    f"{wanted}. The caller's value was kept"
                 )
             checks.append(
                 Check.passed(
                     EXPORT_FLAGS_CHECK,
                     f"{rules.family}: {detail}",
-                    observed={"flag": supplied, "family": rules.family},
+                    observed={
+                        "flag": supplied.shown,
+                        "token": supplied.token,
+                        "family": rules.family,
+                    },
                 )
             )
             continue
@@ -1219,7 +1546,8 @@ def plan_export(
             )
             continue
 
-        flags.append(rendered)
+        composes = composes or required.value == COMPOSED_TEMPLATE
+        table.update(parse_exporter_flags(model, [rendered]))
         added.append(rendered)
         notes.append(f"added {rendered}: {required.reason}")
         checks.append(
@@ -1229,6 +1557,15 @@ def plan_export(
                 observed={"flag": rendered, "family": rules.family, "added": True},
             )
         )
+
+    # On a rule that composes, whether it did or the caller brought a template:
+    # either way the template reaches the bundle only through the metadata the
+    # exporter builds, and an override of its own takes that metadata's place.
+    if any(required.value == COMPOSED_TEMPLATE for required in rules.required_flags):
+        override = table.get(flag_key(METADATA_OVERRIDE_FLAG))
+        if override is not None and override.value:
+            reason = _METADATA_OVERRIDE_REASON if composes else _METADATA_OVERRIDE_OWN_REASON
+            raise FlagRefused(f"{model}: litetune refuses {override.token!r}. {reason}")
 
     recommendations: list[str] = []
     if rules.recommended_recipes and recipes:
@@ -1243,24 +1580,82 @@ def plan_export(
         model=model,
         hint=hint,
         rules=rules,
-        flags=tuple(flags),
+        flags=tuple(f.token for f in table.values()),
         added=tuple(added),
         checks=tuple(checks),
         notes=tuple(notes),
         recommendations=tuple(recommendations),
-        limitations=tuple(rules.limitations),
+        limitations=tuple(limitations),
+        table=tuple(table.values()),
     )
+
+
+def _refuse_unusable_value(model: str, flag: ExporterFlag, name: str) -> None:
+    """Raise `FlagRefused` for a value-bearing flag the exporter would get no value from."""
+    if not (isinstance(flag.value, str) and flag.value):
+        raise FlagRefused(
+            f"{model}: litetune refuses {flag.token!r}. The exporter reads its value as "
+            f"{flag.value!r}, {_UNUSABLE_VALUE.format(name=name)}"
+        )
+
+
+def _split_value(model: str, flag: str, name: str) -> str:
+    return (
+        f"{model}: litetune refuses {flag!r} without a value in the same argument. Fire, which "
+        "reads the exporter's command line, takes the next argument as its value when that "
+        "argument is not a flag (`fire/core.py:876-921`), and litetune passes each flag on as "
+        f"one argument: pass --flag={name}=<value>"
+    )
+
+
+# The exporter tests both value-bearing overrides litetune requires for truth
+# and proceeds as if they were absent when falsy: the template at
+# `litert_lm_builder.py:414`, the model type at `:380`. A value that is not a
+# string is no path, repository or model type either.
+_UNUSABLE_VALUE = (
+    "which is not a value {name} can take: the exporter would read a falsy one as no override "
+    "at all, so the rule would be satisfied in name only. Give it a value, or leave it out for "
+    "litetune to add"
+)
+
+_CALLER_TEMPLATE = (
+    "{flag} was passed by the caller and used as given: litetune put no text-parts block in front "
+    "of it. From LiteRT-LM 0.18.0 the runtime hands the template each message's content as a list "
+    "of parts, and a template that reads it as a string loses the prompt or fails every send; "
+    "verify's rendering check is what shows it"
+)
+
+# `package_model` takes a metadata override in place of the LlmMetadata it
+# would build (`litert_lm_builder.py:438-456`, then `add_llm_metadata` at
+# `:487`), and `build_llm_metadata` is the only place a chat template is
+# written into it (`:314-318`).
+_METADATA_OVERRIDE_REASON = (
+    "The exporter puts a metadata override in the bundle in place of the LlmMetadata it builds, "
+    "and the chat template litetune composes reaches the bundle only through the metadata it "
+    "builds: the bundle would carry the override's template, or none, without the text-parts "
+    "block. Leave the override out; a template of your own goes in "
+    f"--flag={TEMPLATE_FLAG}=<file>, and on LiteRT-LM 0.18.0 it has to read a list of parts itself"
+)
+
+_METADATA_OVERRIDE_OWN_REASON = (
+    "The exporter puts a metadata override in the bundle in place of the LlmMetadata it builds, "
+    f"and the template given with {TEMPLATE_FLAG} reaches the bundle only through the metadata it "
+    "builds: the bundle would carry the override's template, or none, and not the one passed. "
+    "Pass one or the other; a template written into the override has to read LiteRT-LM 0.18.0's "
+    "list of parts itself"
+)
 
 
 def refuse_forbidden_flags(model: str, flags: Sequence[str]) -> None:
     """Raise `FlagRefused` if any flag must never be passed for this model."""
+    table = parse_exporter_flags(model, flags)
     rules = identify(model)
     if rules is None:
         return
     for forbidden in rules.forbidden_flags:
-        for flag in flags:
-            if forbidden.matches(flag):
-                raise FlagRefused(f"{model}: litetune refuses {flag!r}. {forbidden.reason}")
+        setting = table.get(flag_key(forbidden.name))
+        if setting is not None and forbidden.matches(setting):
+            raise FlagRefused(f"{model}: litetune refuses {setting.token!r}. {forbidden.reason}")
 
 
 # ---------------------------------------------------------------------------

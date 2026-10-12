@@ -3,13 +3,18 @@
 No network, no accelerator, no model load, no subprocess. `FakeBackend`
 satisfies `evaluate.GenerationBackend` structurally -- it inherits nothing,
 which is the reason that interface is a Protocol: a mock would accept a typo in
-a method name and this will not.
+a method name and this will not. The one subprocess is `run_compose_script`,
+which the convert tests' toolchain fakes share: it runs litetune's own script in
+the host interpreter, against a fake `transformers`.
 """
 
 from __future__ import annotations
 
 import builtins
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -368,3 +373,161 @@ def mark_provisioned(env) -> Path:
     env.python.touch()
     (env.path / ".litetune-ready").write_text(env.identity, encoding="utf-8")
     return env.path
+
+
+# What `export._COMPOSE_SCRIPT` imports in place of the export environment's
+# transformers: an `AutoTokenizer` whose tokenizer carries `_TEMPLATE` as its
+# `chat_template`, writes each path it is asked to load to `_LOADS`, and renders
+# with `apply_chat_template` the way transformers 5.16.1 does for a string
+# template and `tokenize=False`: Jinja2's `ImmutableSandboxedEnvironment` with
+# `trim_blocks`, `lstrip_blocks` and the loop-controls extension, its own
+# `tojson`, `raise_exception` and `strftime_now`, and the messages handed to
+# `render` as given (`utils/chat_template_utils.py:478-495` and `:581-587`;
+# `tokenization_utils_base.py:3085-3117`). The `{% generation %}` tracker it
+# also registers is left out: no template rendered here uses it. The template
+# also sees the tokenizer's special tokens (`:3107`), Qwen's here: `eos_token`
+# and `pad_token` as both checkpoints' `tokenizer_config.json` set them, BOS and
+# UNK unset. `_RAISE` makes `apply_chat_template` raise as transformers does
+# without a usable jinja2 (`chat_template_utils.py:426-428`).
+_FAKE_TRANSFORMERS = """
+import json
+from datetime import datetime
+
+import jinja2
+import jinja2.ext
+from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+
+def _raise_exception(message):
+    raise jinja2.exceptions.TemplateError(message)
+
+
+def _tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+    return json.dumps(
+        x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys
+    )
+
+
+class _Tokenizer:
+    special_tokens_map = {"eos_token": "<|im_end|>", "pad_token": "<|endoftext|>"}
+
+    def apply_chat_template(
+        self, conversation, chat_template=None, tokenize=True, add_generation_prompt=False
+    ):
+        assert tokenize is False, "only the text path is faked"
+        if _RAISE:
+            raise ImportError(_RAISE)
+        env = ImmutableSandboxedEnvironment(
+            trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols]
+        )
+        env.filters["tojson"] = _tojson
+        env.globals["raise_exception"] = _raise_exception
+        env.globals["strftime_now"] = lambda fmt: datetime.now().strftime(fmt)
+        template = chat_template if chat_template is not None else self.chat_template
+        return env.from_string(template).render(
+            messages=conversation,
+            tools=None,
+            documents=None,
+            add_generation_prompt=add_generation_prompt,
+            **self.special_tokens_map,
+        )
+
+
+class AutoTokenizer:
+    @staticmethod
+    def from_pretrained(path):
+        with open(_LOADS, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(path) + "\\n")
+        tokenizer = _Tokenizer()
+        tokenizer.chat_template = _TEMPLATE
+        return tokenizer
+"""
+
+# And `huggingface_hub` 1.33.0, for the `chat_template.json` a Hub id falls
+# back to: `_HUB` maps a file name to its text, and any other is missing, which
+# `hf_hub_download` raises as `RemoteEntryNotFoundError`; `_HUB_FAULT` names the
+# error it raises instead when the Hub cannot be reached, as it raises
+# `LocalEntryNotFoundError` (`file_download.py:1961`), or any other.
+_FAKE_HUB = """
+import os
+
+from huggingface_hub.errors import LocalEntryNotFoundError, RemoteEntryNotFoundError
+
+
+def hf_hub_download(repo_id, filename):
+    if _HUB_FAULT == "LocalEntryNotFoundError":
+        raise LocalEntryNotFoundError("cannot reach the Hub and the file is not cached")
+    if _HUB_FAULT:
+        raise ConnectionResetError(_HUB_FAULT)
+    if filename not in _HUB:
+        raise RemoteEntryNotFoundError(f"404: {filename} is not in {repo_id}")
+    path = os.path.join(_DIR, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(_HUB[filename])
+    return path
+"""
+
+_FAKE_HUB_ERRORS = """
+class EntryNotFoundError(Exception):
+    pass
+
+
+class RemoteEntryNotFoundError(OSError, EntryNotFoundError):
+    pass
+
+
+class LocalEntryNotFoundError(FileNotFoundError, EntryNotFoundError):
+    pass
+"""
+
+
+def run_compose_script(
+    args: Sequence[str],
+    timeout: int,
+    chat_template: object,
+    version: str = "5.16.1",
+    hub_files: dict[str, str] | None = None,
+    hub_fault: str = "",
+    render_raises: str = "",
+) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """`export._COMPOSE_SCRIPT`, run for real with the host interpreter.
+
+    The script's own reading of the template -- a dict, an empty one, the
+    `chat_template.json` fallback, the bytes it writes, the probe it renders --
+    is exercised; only `transformers` and `huggingface_hub` are fakes, through
+    packages of those names first on `PYTHONPATH`. Rendering is real Jinja2,
+    which the dev extras pin at the export environment's version. Returns the
+    completed process and the paths `AutoTokenizer.from_pretrained` was given,
+    in order. The toolchain fakes in the test files each call this for the one
+    command it answers.
+    """
+    script, spec, result = str(args[1]), str(args[2]), str(args[3])
+    shim = Path(spec).parent / "shim"
+    package = shim / "transformers"
+    package.mkdir(parents=True, exist_ok=True)
+    loads = shim / "loads.jsonl"
+    (package / "__init__.py").write_text(
+        f"__version__ = {version!r}\n_TEMPLATE = {chat_template!r}\n_LOADS = {str(loads)!r}\n"
+        f"_RAISE = {render_raises!r}\n" + _FAKE_TRANSFORMERS,
+        encoding="utf-8",
+    )
+    hub = shim / "huggingface_hub"
+    hub.mkdir(exist_ok=True)
+    (hub / "errors.py").write_text(_FAKE_HUB_ERRORS, encoding="utf-8")
+    (hub / "__init__.py").write_text(
+        f"_HUB = {dict(hub_files or {})!r}\n_DIR = {str(shim)!r}\n_HUB_FAULT = {hub_fault!r}\n"
+        + _FAKE_HUB,
+        encoding="utf-8",
+    )
+    # The caller's path after the shim's, so a Jinja2 that is not installed in
+    # this interpreter can be supplied on PYTHONPATH as well.
+    path = os.pathsep.join(filter(None, [str(shim), os.environ.get("PYTHONPATH", "")]))
+    proc = subprocess.run(
+        [sys.executable, script, spec, result],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env={**os.environ, "PYTHONPATH": path},
+    )
+    seen = loads.read_text(encoding="utf-8").splitlines() if loads.is_file() else []
+    return proc, [json.loads(line) for line in seen]

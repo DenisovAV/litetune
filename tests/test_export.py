@@ -15,24 +15,33 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import mark_provisioned
+from conftest import mark_provisioned, run_compose_script
 
-from litetune import envs
-from litetune.checks import Outcome
+from litetune import envs, models
+from litetune.checks import Check, Outcome
 from litetune.events import Event, EventStream
 from litetune.export import (
+    _COMPOSE_SCRIPT,
+    CHAT_TEMPLATE_CHECK,
+    COMPOSED_TEMPLATE_FLAG,
+    COMPOSED_TEMPLATE_PREFIX,
     KNOWN_RECIPES,
     MEASURED_RECIPES,
+    NO_ARTIFACT,
+    NOT_VERIFIED,
+    PROBE_TEXT,
     TOOLCHAIN_DEFAULT_RECIPE,
     ExportRequest,
     NoRecipesRequested,
     SizeComparison,
     Uncompared,
     compare_sizes,
+    export_recipe,
     parse_pip_freeze,
     requirement_names,
     run_export,
@@ -53,6 +62,12 @@ litert-torch-nightly==0.10.0.dev20260926
 numpy==2.0.2
 transformers==5.16.1
 """
+
+
+# The chat template of Qwen/Qwen3-0.6B at c1899de, as its tokenizer carries it.
+QWEN3_TEMPLATE = (
+    Path(__file__).parent / "fixtures" / "qwen3-0.6b-c1899de.chat_template.jinja"
+).read_text(encoding="utf-8")
 
 
 @dataclass
@@ -86,6 +101,13 @@ class FakeToolchain:
     bug in the script would show here -- while the bundle format is a fake.
     `repack_toml` sets what a pristine artifact unpacks to; the `repack_*`
     knobs make each builder step fail.
+
+    The exporter fake embeds a chat template the way `package_model` does with
+    an override: the file read in text mode (`litert_lm_builder.py:430`).
+    `embedded` records it by artifact, and the fake builder's `unpack` writes it
+    into the LlmMetadata section's text, where the repack script reads it back.
+    `template_embedded` changes what is embedded, for an exporter that put
+    something else in the bundle.
     """
 
     runs: dict[str, RecipeRun] = field(default_factory=dict)
@@ -100,6 +122,32 @@ class FakeToolchain:
     repack_pack_drifts: bool = False  # pack adds an unrequested key
     repack_pack_misplaces: bool = False  # pack puts the key on the embedder
     repack_script_returncode: int = 0  # a crashed interpreter
+    # The chat template script's knobs: what the checkpoint's tokenizer carries,
+    # and each way the script can fail to say.
+    chat_template: object = QWEN3_TEMPLATE
+    template_returncode: int | None = None  # the child's code, in place of running it
+    template_stderr: str = ""
+    template_no_result: bool = False  # exits 0 having written no result
+    template_raises: BaseException | None = None
+    template_overwrite: bytes | None = None  # written over its file once it has run
+    template_result: str | None = None  # written as its result, in place of running it
+    template_exit_after: int | None = None  # the code it ends with, after it has run
+    template_report_edit: Callable[[dict], object] | None = None  # rewrites its report
+    template_loads: list[str] = field(default_factory=list)
+    transformers_version: str = "5.16.1"
+    hub_files: dict[str, str] = field(default_factory=dict)  # what a Hub id's repo holds
+    hub_fault: str = ""  # how the Hub download fails instead, when it does
+    render_raises: str = ""  # an ImportError the fake renderer raises, as transformers can
+    # The end offsets the fake bundle's header gives its sections; by default
+    # one section ending at the end of the file. `repack_header_raises` makes
+    # the header reader raise that message, as the real one does on a wrong magic.
+    repack_section_ends: list[int] | None = None
+    repack_header_raises: str = ""
+    bundle_header_end: int | None = None  # what the exporter fake writes at byte 24
+    # What the exporter embeds as the bundle's template, and how a test changes it.
+    embedded: dict[str, str | None] = field(default_factory=dict)
+    template_embedded: Callable[[str | None], str | None] | None = None
+    repack_pack_rewrites_template: bool = False
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(Call(argv=list(args), timeout=timeout, kwargs=dict(kwargs)))
@@ -107,6 +155,8 @@ class FakeToolchain:
             return subprocess.CompletedProcess(args, self.pip_returncode, self.pip_stdout, "")
         if args[0] == "python" and str(args[1]).endswith("repack.py"):
             return self._repack(args, timeout)
+        if args[0] == "python" and str(args[1]).endswith("compose_template.py"):
+            return self._compose(args, timeout)
         assert args[:2] == ["litert-torch", "export_hf"], args
         flags = dict(a.removeprefix("--").split("=", 1) for a in args[2:] if "=" in a)
         run = self.runs.get(flags["quantization_recipe"], self.default)
@@ -114,8 +164,20 @@ class FakeToolchain:
             raise run.raises
         out_dir = Path(flags["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
+        template = None
+        override = flags.get("jinja_chat_template_override")
+        if override and os.path.exists(override):
+            with open(override, encoding="utf-8") as handle:  # text mode, as package_model
+                template = handle.read()
+        if self.template_embedded is not None:
+            template = self.template_embedded(template)
         for name, size in run.writes:
-            (out_dir / name).write_bytes(b"\0" * size)
+            body = bytearray(size)
+            if self.bundle_header_end is not None and size >= 32:
+                # Where a bundle names its header's end (`litertlm_core.py`: byte 24).
+                body[24:32] = self.bundle_header_end.to_bytes(8, "little")
+            (out_dir / name).write_bytes(bytes(body))
+            self.embedded[str((out_dir / name).absolute())] = template
         return subprocess.CompletedProcess(args, run.returncode, run.stdout, run.stderr)
 
     @property
@@ -124,7 +186,47 @@ class FakeToolchain:
 
     @property
     def repacks(self) -> list[Call]:
-        return [c for c in self.calls if c.argv[0] == "python"]
+        return [c for c in self.calls if c.argv[0] == "python" and c.argv[1].endswith("repack.py")]
+
+    @property
+    def compositions(self) -> list[Call]:
+        return [
+            c
+            for c in self.calls
+            if c.argv[0] == "python" and c.argv[1].endswith("compose_template.py")
+        ]
+
+    def _compose(self, args, timeout: int) -> subprocess.CompletedProcess:
+        if self.template_raises is not None:
+            raise self.template_raises
+        if self.template_returncode is not None:
+            return subprocess.CompletedProcess(
+                args, self.template_returncode, "", self.template_stderr
+            )
+        if self.template_no_result:
+            return subprocess.CompletedProcess(args, 0, "", self.template_stderr)
+        if self.template_result is not None:
+            Path(args[3]).write_text(self.template_result, encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        proc, loads = run_compose_script(
+            args,
+            timeout,
+            self.chat_template,
+            version=self.transformers_version,
+            hub_files=self.hub_files,
+            hub_fault=self.hub_fault,
+            render_raises=self.render_raises,
+        )
+        self.template_loads.extend(loads)
+        if self.template_overwrite is not None:
+            out = Path(json.loads(Path(args[2]).read_text(encoding="utf-8"))["out"])
+            out.write_bytes(self.template_overwrite)
+        if self.template_exit_after is not None:
+            return subprocess.CompletedProcess(args, self.template_exit_after, "", "")
+        if self.template_report_edit is not None:
+            report = json.loads(Path(args[3]).read_text(encoding="utf-8"))
+            Path(args[3]).write_text(json.dumps(self.template_report_edit(report)))
+        return proc
 
     def _repack(self, args, timeout: int) -> subprocess.CompletedProcess:
         if self.repack_script_returncode:
@@ -135,6 +237,8 @@ class FakeToolchain:
         shim = Path(spec).parent / "shim" / "litert_lm_builder"
         shim.mkdir(parents=True, exist_ok=True)
         (shim / "__init__.py").write_text("")
+        embedded = shim.parent / "embedded.json"
+        embedded.write_text(json.dumps(self.embedded), encoding="utf-8")
         (shim / "litertlm_builder.py").write_text(
             FAKE_BUILDER_MODULE.format(
                 default_toml=self.repack_toml if self.repack_toml is not None else FAKE_TOML,
@@ -142,9 +246,28 @@ class FakeToolchain:
                 pack_fails=self.repack_pack_fails,
                 pack_drifts=self.repack_pack_drifts,
                 pack_misplaces=self.repack_pack_misplaces,
+                pack_rewrites_template=self.repack_pack_rewrites_template,
+                embedded_path=str(embedded),
             ),
             encoding="utf-8",
         )
+        (shim / "litertlm_peek.py").write_text(
+            f"SECTION_ENDS = {self.repack_section_ends!r}\n"
+            f"HEADER_RAISES = {self.repack_header_raises!r}\n" + FAKE_PEEK_HEADER,
+            encoding="utf-8",
+        )
+        # The real layout constant (`litertlm_core.py`): where a bundle names its header's end.
+        (shim / "litertlm_core.py").write_text("HEADER_END_LOCATION_BYTE_OFFSET = 24\n")
+        # The builder's own proto and protobuf's text format, which the script
+        # imports to read the LlmMetadata text `unpack` wrote.
+        for package, module, source in (
+            (shim / "runtime" / "proto", "llm_metadata_pb2.py", FAKE_LLM_METADATA_PB2),
+            (shim.parent / "google" / "protobuf", "text_format.py", FAKE_TEXT_FORMAT),
+        ):
+            package.mkdir(parents=True, exist_ok=True)
+            for level in (package, package.parent):
+                (level / "__init__.py").write_text("")
+            (package / module).write_text(source, encoding="utf-8")
         return subprocess.run(
             [sys.executable, script, spec, result],
             capture_output=True,
@@ -168,6 +291,7 @@ class FakeToolchain:
 # Knobs are formatted in as Python literals; braces that belong to the module
 # are doubled for `str.format`.
 FAKE_BUILDER_MODULE = """
+import json
 import os
 import re
 import uuid as _uuid
@@ -179,14 +303,37 @@ UNPACK_FAILS = {unpack_fails}
 PACK_FAILS = {pack_fails}
 PACK_DRIFTS = {pack_drifts}
 PACK_MISPLACES = {pack_misplaces}
+PACK_REWRITES_TEMPLATE = {pack_rewrites_template}
+EMBEDDED = json.loads(Path({embedded_path!r}).read_text(encoding="utf-8"))
+# The LlmMetadata text of each bundle `pack` wrote, by path: kept beside the
+# fake rather than inside the bundle, so that a bundle's size stays the
+# exporter fake's.
+PACKED = os.path.join(os.path.dirname({embedded_path!r}), "packed.json")
 MAGIC = b"LITERTLM"
+METADATA = "LlmMetadataProto.pbtext"
 
 
-def _toml_of(bundle_path):
+def _packed():
+    if not os.path.exists(PACKED):
+        return {{}}
+    return json.loads(Path(PACKED).read_text(encoding="utf-8"))
+
+
+def _metadata_text(template):
+    if template is None:
+        return ""
+    return "jinja_prompt_template: " + json.dumps(template) + "\\n"
+
+
+def _contents_of(bundle_path):
+    # (TOML, LlmMetadata text) of a bundle.
     raw = Path(bundle_path).read_bytes()
     if not raw.startswith(MAGIC):
-        return DEFAULT_TOML  # a pristine artifact from the export fake
-    return raw[len(MAGIC):].rstrip(b"\\0").decode("utf-8")
+        # A pristine artifact from the export fake: its template is the one the
+        # exporter fake embedded.
+        return DEFAULT_TOML, _metadata_text(EMBEDDED.get(os.path.abspath(bundle_path)))
+    toml = raw[len(MAGIC):].rstrip(b"\\0").decode("utf-8")
+    return toml, _packed().get(os.path.abspath(bundle_path), "")
 
 
 def unpack(litertlm_path, output_dir, jinja_prompt_template_path=None):
@@ -194,10 +341,14 @@ def unpack(litertlm_path, output_dir, jinja_prompt_template_path=None):
         raise RuntimeError("unpack: boom")
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    toml = _toml_of(litertlm_path)
+    toml, metadata = _contents_of(litertlm_path)
     (out / "model.toml").write_text(toml, encoding="utf-8")
     for m in re.finditer(r'data_path\\s*=\\s*"([^"]+)"', toml):
-        (out / os.path.basename(m.group(1))).write_bytes(b"x")
+        name = os.path.basename(m.group(1))
+        if name == METADATA:
+            (out / name).write_text(metadata, encoding="utf-8")
+        else:
+            (out / name).write_bytes(b"x")
     return str(out / "model.toml")
 
 
@@ -216,13 +367,15 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
         raise RuntimeError("pack: boom")
     toml_path = Path(toml_path)
     toml = toml_path.read_text(encoding="utf-8")
+    metadata = []
     # Resolve and open every data_path as the real builder does; a relative
     # path the caller forgot to absolutize fails here, not silently.
     def resolve(m):
         raw = m.group(2)
         path = Path(raw) if os.path.isabs(raw) else toml_path.parent / raw
-        with open(path, "rb"):
-            pass
+        with open(path, "rb") as handle:
+            if os.path.basename(raw) == METADATA:
+                metadata.append(handle.read())
         return m.group(1) + os.path.basename(raw) + m.group(3)
     toml = re.sub(r'(data_path\\s*=\\s*")([^"]+)(")', resolve, toml)
     toml = _regenerate_system(toml)
@@ -237,6 +390,13 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
             lines[idx:idx + 1] = [lines[idx], "additional_metadata = [", act[0], "]"]
             toml = "\\n".join(lines)
     body = MAGIC + toml.encode("utf-8")
+    if metadata:
+        packed = _packed()
+        text = metadata[0].decode("utf-8")
+        packed[os.path.abspath(output_path)] = (
+            _metadata_text("rewritten") if PACK_REWRITES_TEMPLATE else text
+        )
+        Path(PACKED).write_text(json.dumps(packed), encoding="utf-8")
     target = Path(output_path)
     original = target.parent.parent / target.name
     size = original.stat().st_size if original.exists() else len(body)
@@ -247,6 +407,10 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
 
 FAKE_TOML = """[system_metadata]
 entries = []
+
+[[section]]
+section_type = "LlmMetadata"
+data_path = "LlmMetadataProto.pbtext"
 
 [[section]]
 section_type = "SP_Tokenizer"
@@ -261,6 +425,75 @@ data_path = "prefill_decode.tflite"
 model_type = "embedder"
 section_type = "TFLiteModel"
 data_path = "embedder.tflite"
+"""
+
+
+# `litertlm_peek.read_litertlm_header`, as far as the repack script reads it:
+# each section's end offset, from `SECTION_ENDS` or else the file's size.
+FAKE_PEEK_HEADER = """
+import os
+
+
+class _Section:
+    def __init__(self, end):
+        self.end = end
+
+    def EndOffset(self):
+        return self.end
+
+
+class _Sections:
+    def __init__(self, ends):
+        self.ends = ends
+
+    def ObjectsLength(self):
+        return len(self.ends)
+
+    def Objects(self, index):
+        return _Section(self.ends[index])
+
+
+class _Header:
+    def __init__(self, ends):
+        self.ends = ends
+
+    def SectionMetadata(self):
+        return _Sections(self.ends)
+
+
+def read_litertlm_header(path, output_stream):
+    if HEADER_RAISES:
+        raise ValueError(HEADER_RAISES)
+    return _Header(SECTION_ENDS if SECTION_ENDS is not None else [os.path.getsize(path)])
+"""
+
+
+# The builder's `LlmMetadata` and protobuf's `text_format.Parse`, as far as the
+# repack script uses them, reading the one-field-per-line text the fake
+# builder's `unpack` writes.
+FAKE_LLM_METADATA_PB2 = """
+class LlmMetadata:
+    def __init__(self):
+        self.fields = {}
+
+    def HasField(self, name):
+        return name in self.fields
+
+    @property
+    def jinja_prompt_template(self):
+        return self.fields.get("jinja_prompt_template", "")
+"""
+
+FAKE_TEXT_FORMAT = """
+import json
+
+
+def Parse(text, message):
+    for line in text.splitlines():
+        if line.strip():
+            name, _, value = line.partition(": ")
+            message.fields[name] = json.loads(value)
+    return message
 """
 
 
@@ -1664,3 +1897,1064 @@ def test_an_owned_recipe_that_cannot_be_read_is_not_exported_in_anothers_place(
     assert not any(f"--quantization_recipe={target}" in argv for argv in exported)
     assert any("--quantization_recipe=dynamic_wi8_afp32" in argv for argv in exported)
     assert next(e for e in result.exports if e.recipe == "dynamic_wi8_afp32").ok
+
+
+# ---------------------------------------------------------------------------
+# The checkpoint's own chat template, behind the text-parts block
+# ---------------------------------------------------------------------------
+
+QWEN3 = "Qwen/Qwen3-0.6B"
+QWEN25_TEMPLATE = (
+    Path(__file__).parent / "fixtures" / "qwen2.5-0.5b-instruct-7ae5576.chat_template.jinja"
+).read_text(encoding="utf-8")
+_BLOCK = Path(models.packaged_template(models.TEXT_PARTS_BLOCK)).read_bytes()
+# A template written for parts: it reads the first part's text and nothing else.
+PARTS_NATIVE = "{%- for m in messages %}{{ m.content[0].text }}{% endfor %}"
+# One that reads both.
+TOLERANT = (
+    "{%- for m in messages %}{% if m.content is string %}{{ m.content }}"
+    "{% else %}{{ m.content[0].text }}{% endif %}{% endfor %}"
+)
+
+
+@pytest.fixture
+def qwen_request(tmp_path):
+    def _build(model=QWEN3, recipes=MEASURED_RECIPES, **kwargs) -> ExportRequest:
+        return ExportRequest(model=model, output_dir=tmp_path / "out", recipes=recipes, **kwargs)
+
+    return _build
+
+
+def _template_flags(argv: Sequence[str]) -> list[str]:
+    return [a for a in argv if a.startswith(f"{models.TEMPLATE_FLAG}=")]
+
+
+def _chat_template_check(result):
+    (check,) = [c for c in result.checks.checks if c.name == CHAT_TEMPLATE_CHECK]
+    return check
+
+
+def _composed_files(directory: Path) -> list[str]:
+    """Every file a composition left in the output directory, by name."""
+    return sorted(p.name for p in directory.glob(f"{COMPOSED_TEMPLATE_PREFIX}*"))
+
+
+@pytest.mark.parametrize(
+    ("model", "carried"),
+    [
+        (QWEN3, QWEN3_TEMPLATE),
+        ("Qwen/Qwen2.5-0.5B-Instruct", QWEN25_TEMPLATE),
+        # A fine-tune whose name still contains the size: claimed by the qwen-3
+        # rule, and its own template is the one composed.
+        ("someorg/Qwen3-0.6B-sql-assistant", "{%- for m in messages %}{{ m.content }}{% endfor %}"),
+    ],
+    ids=["qwen3", "qwen2.5", "fine-tune"],
+)
+def test_a_qwen_export_carries_its_checkpoints_template_behind_the_block(
+    toolchain, qwen_request, tmp_path, model, carried
+):
+    """What every recipe's exporter is handed in place of the marker: one file,
+    written once for the sweep and named for its content, holding the block and
+    then the template the checkpoint's own tokenizer carries -- and what each
+    bundle is read back to carry."""
+    toolchain.chat_template = carried
+    request = qwen_request(model)
+    result = run_export(request)
+
+    assert result.outcome is Outcome.PASSED
+    composed_bytes = _BLOCK + carried.encode("utf-8")
+    digest = hashlib.sha256(composed_bytes).hexdigest()
+    composed = tmp_path / "out" / f"{COMPOSED_TEMPLATE_PREFIX}{digest[:12]}.jinja"
+    assert composed.read_bytes() == composed_bytes
+    assert _composed_files(tmp_path / "out") == [composed.name], "no partial file is left"
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.PASSED
+    sha256 = hashlib.sha256(carried.encode("utf-8")).hexdigest()
+    assert check.observed["template_sha256"] == sha256
+    assert check.observed["template_source"] == "tokenizer"
+    assert check.observed["composed"] == str(composed)
+    assert str(composed) in check.detail and sha256[:12] in check.detail
+    # The record names the file and both digests.
+    assert result.chat_template is not None
+    assert result.as_dict()["chat_template"] == {
+        "path": str(composed),
+        "template_sha256": sha256,
+        "composed_sha256": digest,
+    }
+    # Read once, from what the exporter is given as --model, in the stage's time.
+    (composition,) = toolchain.compositions
+    assert composition.timeout == request.timeout_s
+    assert toolchain.template_loads == [model]
+    assert len(toolchain.exports) == 2
+    for call in toolchain.exports:
+        assert _template_flags(call.argv) == [f"{models.TEMPLATE_FLAG}={composed}"]
+    for export in result.exports:
+        assert f"{models.TEMPLATE_FLAG}={composed}" in export.argv
+        assert export.check.observed["chat_template_sha256"] == digest
+    assert not any(models.COMPOSED_TEMPLATE in a for c in toolchain.calls for a in c.argv)
+
+
+def test_the_composed_file_is_the_block_and_the_template_byte_for_byte(
+    toolchain, qwen_request, tmp_path
+):
+    """Nothing between the two and nothing translated: a non-ASCII character
+    and the missing final newline reach the file, and the bundle, as they were."""
+    toolchain.chat_template = "{#- é -#}\n{%- for m in messages %}{{ m.content }}\n{% endfor %}"
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    assert result.outcome is Outcome.PASSED
+    assert result.chat_template is not None
+    written = result.chat_template.path.read_bytes()
+    assert written == _BLOCK + toolchain.chat_template.encode("utf-8")
+    observed = _chat_template_check(result).observed
+    assert observed["template_characters"] == len(toolchain.chat_template)
+    assert observed["composed_sha256"] == hashlib.sha256(written).hexdigest()
+    (artifact,) = toolchain.embedded
+    assert toolchain.embedded[artifact] == written.decode("utf-8")
+
+
+def test_named_templates_compose_the_one_named_default(toolchain, qwen_request, tmp_path):
+    """transformers keeps several named templates as a dict and, given no
+    tools, applies "default" (`get_chat_template`)."""
+    toolchain.chat_template = {
+        "tool_use": "{{ 'tools' }}",
+        "default": "{{ messages[0].content }}",
+    }
+    result = run_export(qwen_request())
+
+    assert result.outcome is Outcome.PASSED
+    assert result.chat_template is not None
+    assert result.chat_template.path.read_bytes() == _BLOCK + b"{{ messages[0].content }}"
+    assert _chat_template_check(result).observed["template_names"] == ["default", "tool_use"]
+
+
+@pytest.mark.parametrize(
+    ("carried", "says"),
+    [
+        (None, "the tokenizer carries no chat template"),
+        ("", "the tokenizer's chat template is empty (a str)"),
+        # What transformers makes of `"chat_template": []` (`__init__`, :1079-1082).
+        ({}, "the tokenizer's chat template is empty (a dict)"),
+        (
+            {"tool_use": "{{ 'a' }}", "rag": "{{ 'b' }}"},
+            "holds 2 named templates (rag, tool_use) and none named 'default'",
+        ),
+        ({"default": "", "tool_use": "{{ 'a' }}"}, "chat template named 'default' is empty"),
+        (" \n\t", "is 3 characters of whitespace"),
+        ("{{ messages[0].content }}\r\n", "contains a carriage return"),
+        # The block is not for a template that reads parts itself.
+        (PARTS_NATIVE, "given one user message as a string, does not print its text"),
+        (
+            "{{ raise_exception('no') }}",
+            "raises on one user message given as a string (TemplateError: no) -- an error of "
+            "the template's own",
+        ),
+        # One that reads a name the block defines prints differently behind it.
+        (
+            "{{ messages[0].content }}{% if litetune is defined %}!{% endif %}",
+            "this template does not render that way",
+        ),
+    ],
+    ids=[
+        "none",
+        "empty",
+        "empty-dict",
+        "unnamed",
+        "empty-default",
+        "blank",
+        "carriage-return",
+        "parts-native",
+        "raises",
+        "renders-differently",
+    ],
+)
+def test_a_checkpoint_with_no_template_to_compose_refuses_and_exports_nothing(
+    toolchain, qwen_request, tmp_path, carried, says
+):
+    """A fact about the checkpoint, so `failed`; never an export without the
+    block, and never one with the marker in it."""
+    toolchain.chat_template = carried
+    result = run_export(qwen_request())
+
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.FAILED
+    assert says in check.detail
+    # The advice is a command line `convert` accepts as typed, and it names the
+    # block a caller's own template would need in front.
+    assert f"pass --flag={models.TEMPLATE_FLAG}=<file>" in check.detail
+    assert models.packaged_template(models.TEXT_PARTS_BLOCK) in check.detail
+    assert result.outcome is Outcome.FAILED
+    assert toolchain.exports == []
+    assert result.exports == [] and result.failed == []
+    assert result.not_attempted == tuple(MEASURED_RECIPES)
+    assert result.chat_template is None
+    assert any(text.startswith("none of") and says in text for text in result.limitations)
+    assert _composed_files(tmp_path / "out") == []
+
+
+def test_the_probe_quotes_what_the_template_rendered(toolchain, qwen_request):
+    toolchain.chat_template = "{{ messages[0].content }}{% if litetune is defined %}!{% endif %}"
+    detail = _chat_template_check(run_export(qwen_request())).detail
+    assert f"printed '{PROBE_TEXT}'" in detail
+    assert f"printed '{PROBE_TEXT}!'" in detail
+    assert "transformers' Jinja2 (not LiteRT-LM's MiniJinja)" in detail
+
+
+@pytest.mark.parametrize(
+    ("carried", "alone"), [(QWEN3_TEMPLATE, False), (TOLERANT, True)], ids=["qwen3", "tolerant"]
+)
+def test_a_template_that_reads_both_passes_and_says_the_block_was_not_needed(
+    toolchain, qwen_request, carried, alone
+):
+    """The block is harmless in front of a template that already reads a list
+    of parts; the record says whether it needed it."""
+    toolchain.chat_template = carried
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    assert result.outcome is Outcome.PASSED
+    assert _chat_template_check(result).observed["renders_parts_without_the_block"] is alone
+
+
+def test_with_no_template_the_refusal_says_what_the_exporter_would_embed(toolchain, qwen_request):
+    """`export_lib.py` tries `chat_template.json`; with none, the exporter embeds
+    no template and LiteRT-LM 0.18.0 makes its own default."""
+    toolchain.chat_template = None
+    detail = _chat_template_check(run_export(qwen_request())).detail
+    assert "carries no chat template, and its repository has no chat_template.json" in detail
+    assert "the exporter would embed no template" in detail
+    assert "LiteRT-LM 0.18.0 would put its own default for the model type" in detail
+    assert "empty template" not in detail
+
+
+def test_a_hub_id_with_no_template_falls_back_to_its_chat_template_json(toolchain, qwen_request):
+    """As `export_lib.py:390-402` does for a repo id: `hf_hub_download` of
+    chat_template.json, and its "chat_template"."""
+    toolchain.chat_template = None
+    toolchain.hub_files = {"chat_template.json": json.dumps({"chat_template": TOLERANT})}
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    assert result.outcome is Outcome.PASSED
+    assert result.chat_template is not None
+    assert result.chat_template.path.read_bytes() == _BLOCK + TOLERANT.encode("utf-8")
+    observed = _chat_template_check(result).observed
+    assert observed["template_source"] == "chat_template.json"
+    assert observed["chat_template_json"]["outcome"] == "found"
+
+
+def test_a_local_checkpoint_with_no_template_falls_back_to_its_own_chat_template_json(
+    toolchain, tmp_path
+):
+    """For a path the exporter reads `<path>/chat_template.json` and never the
+    Hub, which a local checkpoint's fake hub would have answered otherwise."""
+    checkpoint = tmp_path / "Qwen3-0.6B"
+    checkpoint.mkdir()
+    (checkpoint / "chat_template.json").write_text(
+        json.dumps({"chat_template": TOLERANT}), encoding="utf-8"
+    )
+    toolchain.chat_template = None
+    toolchain.hub_files = {"chat_template.json": json.dumps({"chat_template": "{{ 'hub' }}"})}
+    result = run_export(
+        ExportRequest(
+            model=str(checkpoint), output_dir=tmp_path / "out", recipes=("dynamic_wi8_afp32",)
+        )
+    )
+
+    assert result.outcome is Outcome.PASSED
+    assert result.chat_template is not None
+    assert result.chat_template.path.read_bytes() == _BLOCK + TOLERANT.encode("utf-8")
+    observed = _chat_template_check(result).observed
+    assert observed["chat_template_json"]["path"] == str(checkpoint / "chat_template.json")
+
+
+def test_a_local_checkpoint_without_one_says_which_file_it_looked_for(toolchain, tmp_path):
+    checkpoint = tmp_path / "Qwen3-0.6B"
+    checkpoint.mkdir()
+    toolchain.chat_template = None
+    result = run_export(
+        ExportRequest(
+            model=str(checkpoint), output_dir=tmp_path / "out", recipes=("dynamic_wi8_afp32",)
+        )
+    )
+    detail = _chat_template_check(result).detail
+    assert (
+        f"carries no chat template, and there is no {checkpoint / 'chat_template.json'}" in detail
+    )
+    assert "repository" not in detail
+
+
+@pytest.mark.parametrize(
+    ("hub_json", "says"),
+    [
+        ('{"chat_template": null}', "and the chat_template in"),
+        ('{"other": "x"}', "has no chat_template key"),
+        ("{not json", "could not be used (JSONDecodeError"),
+    ],
+    ids=["null", "no-key", "not-json"],
+)
+def test_what_the_chat_template_json_holds_is_said_as_it_is(
+    toolchain, qwen_request, hub_json, says
+):
+    """A present null is not an absent key, and a file the exporter could not
+    use is a fact about the checkpoint, as a missing one is."""
+    toolchain.chat_template = None
+    toolchain.hub_files = {"chat_template.json": hub_json}
+    check = _chat_template_check(run_export(qwen_request()))
+    assert check.outcome is Outcome.FAILED
+    assert says in check.detail
+    if hub_json.startswith('{"chat_template": null'):
+        assert "is null" in check.detail and "no chat_template key" not in check.detail
+
+
+def test_a_template_that_is_not_text_is_refused(toolchain, qwen_request):
+    """Reachable through chat_template.json, whose value the exporter assigns as
+    it finds it (`export_lib.py:401-402`); transformers turns a tokenizer's own
+    list into named templates when it loads it (`tokenization_utils_base.py:1079-1082`)."""
+    toolchain.chat_template = None
+    toolchain.hub_files = {"chat_template.json": json.dumps({"chat_template": ["a", "b"]})}
+    check = _chat_template_check(run_export(qwen_request()))
+    assert check.outcome is Outcome.FAILED
+    assert "the chat_template in" in check.detail and "is a list, not text" in check.detail
+
+
+def test_an_empty_template_from_chat_template_json_is_named_as_from_there(toolchain, qwen_request):
+    toolchain.chat_template = None
+    toolchain.hub_files = {"chat_template.json": json.dumps({"chat_template": ""})}
+    check = _chat_template_check(run_export(qwen_request()))
+    assert check.outcome is Outcome.FAILED
+    assert check.observed["template_source"] == "chat_template.json"
+    assert "the chat_template in" in check.detail and "is empty (a str)" in check.detail
+    assert "the tokenizer's chat template" not in check.detail
+
+
+def test_an_empty_string_template_falls_back_as_the_exporter_does(toolchain, qwen_request):
+    """`export_lib.py:390` tests `not tokenizer.chat_template`: "" falls back too."""
+    toolchain.chat_template = ""
+    toolchain.hub_files = {"chat_template.json": json.dumps({"chat_template": TOLERANT})}
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+    assert result.outcome is Outcome.PASSED
+    assert _chat_template_check(result).observed["template_source"] == "chat_template.json"
+
+
+@pytest.mark.parametrize(
+    ("make", "says"),
+    [
+        (lambda path: path.mkdir(), "could not be used (IsADirectoryError"),
+        (
+            lambda path: path.write_bytes(b'{"chat_template": "\xe9"}'),
+            "could not be used (UnicodeDecodeError",
+        ),
+    ],
+    ids=["a-directory", "not-utf-8"],
+)
+def test_what_a_local_checkpoint_holds_at_chat_template_json_is_its_own(
+    toolchain, tmp_path, make, says
+):
+    """The exporter reads the path and goes on with no template whatever it finds
+    there (`export_lib.py:396-404`): a fact about the checkpoint, not the machine."""
+    checkpoint = tmp_path / "Qwen3-0.6B"
+    checkpoint.mkdir()
+    make(checkpoint / "chat_template.json")
+    toolchain.chat_template = None
+    result = run_export(
+        ExportRequest(
+            model=str(checkpoint), output_dir=tmp_path / "out", recipes=("dynamic_wi8_afp32",)
+        )
+    )
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.FAILED
+    assert says in check.detail
+
+
+def test_a_local_chat_template_json_the_machine_will_not_open_is_could_not_check(
+    toolchain, tmp_path
+):
+    """Not a missing file and not the checkpoint's: the file system would not let it be read."""
+    checkpoint = tmp_path / "Qwen3-0.6B"
+    checkpoint.mkdir()
+    locked = checkpoint / "chat_template.json"
+    locked.write_text("{}", encoding="utf-8")
+    locked.chmod(0)
+    toolchain.chat_template = None
+    try:
+        result = run_export(
+            ExportRequest(
+                model=str(checkpoint), output_dir=tmp_path / "out", recipes=("dynamic_wi8_afp32",)
+            )
+        )
+    finally:
+        locked.chmod(0o644)
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.UNCHECKED
+    assert "could not be looked up (PermissionError" in check.detail
+
+
+# -- the probe: each condition on its own ------------------------------------
+
+
+def test_a_block_that_does_not_read_parts_is_caught_by_the_probe(
+    monkeypatch, toolchain, qwen_request, tmp_path
+):
+    """The composed rendering is given parts: with a block that does nothing,
+    Qwen3's template behind it does not render them as it renders the string."""
+    noop = tmp_path / "noop.jinja"
+    noop.write_text("{#- a block that does nothing -#}", encoding="utf-8")
+    real = models.packaged_template
+    monkeypatch.setattr(
+        models,
+        "packaged_template",
+        lambda name: str(noop) if name == models.TEXT_PARTS_BLOCK else real(name),
+    )
+    check = _chat_template_check(run_export(qwen_request()))
+    assert check.outcome is Outcome.FAILED
+    assert "this template does not render that way" in check.detail
+
+
+@pytest.mark.parametrize(
+    ("carried", "says"),
+    [
+        # Output, but not the user's text: a template reading another field.
+        ("{%- for m in messages %}<|user|>{{ m.text }}{% endfor %}", "does not print its text"),
+        # A difference of whitespace only is a difference.
+        (
+            "{{ messages[0].content }}{% if litetune is defined %} {% endif %}",
+            "this template does not render that way",
+        ),
+        # Rendered with the generation prompt, as the runtime renders it.
+        (
+            "{{ messages[0].content }}"
+            "{% if add_generation_prompt and litetune is defined %}!{% endif %}",
+            "this template does not render that way",
+        ),
+        # With the tokenizer's special tokens, as transformers passes them.
+        (
+            "{% if eos_token is defined %}{{ litetune is defined }}{% endif %}"
+            "{{ messages[0].content }}",
+            "this template does not render that way",
+        ),
+    ],
+    ids=["other-text", "whitespace", "generation-prompt", "special-tokens"],
+)
+def test_the_probe_holds_each_condition(toolchain, qwen_request, carried, says):
+    toolchain.chat_template = carried
+    check = _chat_template_check(run_export(qwen_request()))
+    assert check.outcome is Outcome.FAILED
+    assert says in check.detail
+
+
+@pytest.mark.parametrize("base_model", [None, QWEN3])
+def test_the_template_is_read_from_the_checkpoint_converted_not_its_base(
+    toolchain, tmp_path, base_model
+):
+    """The checkpoint's own: a tuned model's tokenizer is the one the exporter
+    loads, whatever `--base-model` or its sidecar names."""
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+        encoding="utf-8",
+    )
+    (checkpoint / "litetune.json").write_text(json.dumps({"base_model": QWEN3}), encoding="utf-8")
+    result = run_export(
+        ExportRequest(
+            model=str(checkpoint),
+            base_model=base_model,
+            output_dir=tmp_path / "out",
+            recipes=("dynamic_wi8_afp32",),
+        )
+    )
+
+    assert result.outcome is Outcome.PASSED
+    assert toolchain.template_loads == [str(checkpoint)]
+
+
+def test_the_transformers_version_is_the_one_the_script_saw(toolchain, qwen_request):
+    toolchain.transformers_version = "9.9.9"
+    check = _chat_template_check(run_export(qwen_request(recipes=("dynamic_wi8_afp32",))))
+    assert check.observed["transformers"] == "9.9.9"
+    assert "transformers 9.9.9 reads it" in check.detail
+
+
+@pytest.mark.parametrize(
+    ("knobs", "says"),
+    [
+        (
+            {
+                "template_returncode": 1,
+                "template_stderr": "Traceback (most recent call last):\n"
+                "OSError: Qwen/Qwen3-0.6B does not appear to have a file named tokenizer.json\n",
+            },
+            "exited 1: OSError: Qwen/Qwen3-0.6B does not appear to have a file named",
+        ),
+        ({"template_returncode": -9}, "chat template was killed by SIGKILL"),
+        # Killed after its result and file were written: still no answer.
+        ({"template_exit_after": -9}, "chat template was killed by SIGKILL"),
+        ({"template_no_result": True}, "exited 0 and wrote no result"),
+        ({"template_raises": subprocess.TimeoutExpired("python", 5)}, "gave no result after"),
+        ({"template_result": "{not json"}, "wrote a result that is not JSON"),
+        ({"template_result": "[]"}, "wrote list, not a report"),
+        ({"template_result": '{"found": "maybe"}'}, "reported 'maybe', which is not one of"),
+        ({"template_overwrite": b"{{ messages }}"}, "does not hold the text-parts block"),
+        # Each half of the read-back on its own: the block, then another template ...
+        (
+            {"template_overwrite": _BLOCK + b"{{ 'not the template it reported' }}"},
+            "does not hold the text-parts block",
+        ),
+        # ... and the template, behind a block with one byte changed: the first,
+        (
+            {"template_overwrite": b"X" + _BLOCK[1:] + QWEN3_TEMPLATE.encode("utf-8")},
+            "does not hold the text-parts block",
+        ),
+        # ... and a later one.
+        (
+            {
+                "template_overwrite": _BLOCK[:1]
+                + b"X" * (len(_BLOCK) - 1)
+                + QWEN3_TEMPLATE.encode("utf-8")
+            },
+            "does not hold the text-parts block",
+        ),
+        # The environment's faults, not facts about the checkpoint: a jinja2
+        # transformers cannot render with ...
+        (
+            {"render_raises": "apply_chat_template requires jinja2>=3.1.0 to be installed"},
+            "the probe could not render in the export environment (ImportError",
+        ),
+        # ... a Hub that cannot be reached for the chat_template.json fallback ...
+        (
+            {"chat_template": None, "hub_fault": "LocalEntryNotFoundError"},
+            "could not be looked up (LocalEntryNotFoundError",
+        ),
+        # ... or that drops the connection.
+        (
+            {"chat_template": None, "hub_fault": "Connection reset by peer"},
+            "could not be looked up (ConnectionResetError: Connection reset by peer)",
+        ),
+        (
+            {"template_report_edit": lambda report: report | {"renders": "no"}},
+            "renders this litetune cannot read",
+        ),
+    ],
+)
+def test_a_script_that_cannot_say_refuses_with_the_reason(
+    toolchain, qwen_request, tmp_path, knobs, says
+):
+    """Nothing here is a fact about the checkpoint, so `could not check`; and no
+    recipe ran, so none is recorded as failed."""
+    for name, value in knobs.items():
+        setattr(toolchain, name, value)
+    result = run_export(qwen_request())
+
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.UNCHECKED
+    assert says in check.detail
+    assert result.outcome is Outcome.UNCHECKED
+    assert toolchain.exports == []
+    assert result.failed == []
+    assert result.not_attempted == tuple(MEASURED_RECIPES)
+    assert any(text.startswith("none of") and says in text for text in result.limitations)
+    assert _composed_files(tmp_path / "out") == []
+
+
+def test_a_file_another_run_left_is_never_read_or_removed(toolchain, qwen_request, tmp_path):
+    """This run writes a name of its own: a file under the content-addressed
+    name, or any other, is neither read back as this run's nor removed when
+    this run is refused."""
+    out = tmp_path / "out"
+    out.mkdir()
+    others = [
+        out / f"{COMPOSED_TEMPLATE_PREFIX}000000000000.jinja",
+        out / f"{COMPOSED_TEMPLATE_PREFIX}abcdef.partial",
+    ]
+    for other in others:
+        other.write_bytes(_BLOCK + QWEN3_TEMPLATE.encode("utf-8"))
+    toolchain.template_result = json.dumps(
+        {
+            "transformers": "5.16.1",
+            "found": "text",
+            "sha256": hashlib.sha256(QWEN3_TEMPLATE.encode("utf-8")).hexdigest(),
+            "characters": len(QWEN3_TEMPLATE),
+        }
+    )
+    result = run_export(qwen_request())
+
+    assert _chat_template_check(result).outcome is Outcome.UNCHECKED
+    assert toolchain.exports == []
+    assert _composed_files(out) == sorted(p.name for p in others)
+
+
+def test_an_error_after_the_script_wrote_leaves_no_file(
+    monkeypatch, toolchain, qwen_request, tmp_path
+):
+    """The `finally` is what removes this run's file when something it does not
+    catch escapes; `guard` records the check as unchecked."""
+
+    def raises(model, renders):
+        raise RuntimeError("probe reader broke")
+
+    monkeypatch.setattr("litetune.export._probe_refusal", raises)
+    result = run_export(qwen_request())
+
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.UNCHECKED
+    assert "probe reader broke" in check.detail
+    assert toolchain.exports == []
+    assert _composed_files(tmp_path / "out") == []
+
+
+def test_a_composition_that_passes_with_no_file_exports_nothing(
+    monkeypatch, toolchain, qwen_request
+):
+    """The sweep runs on one condition: a passed check *and* a file. Either
+    alone is could-not-check, never a passed stage with nothing exported."""
+    monkeypatch.setattr(
+        "litetune.export.compose_chat_template",
+        lambda request: (Check.passed(CHAT_TEMPLATE_CHECK, "said it passed"), None),
+    )
+    result = run_export(qwen_request())
+
+    assert _chat_template_check(result).outcome is Outcome.UNCHECKED
+    assert result.outcome is Outcome.UNCHECKED
+    assert toolchain.exports == []
+    assert result.not_attempted == tuple(MEASURED_RECIPES)
+
+
+def test_a_refusal_is_reported_as_events(toolchain, qwen_request):
+    toolchain.chat_template = None
+    seen: list[Event] = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+
+    run_export(qwen_request(), events=events)
+
+    checks = [e for e in seen if e.kind == "check" and e.data["name"] == CHAT_TEMPLATE_CHECK]
+    assert [e.data["outcome"] for e in checks] == ["failed"]
+    assert seen[-1].kind == "stage_finished"
+    assert seen[-1].data["attempted"] == 0
+
+
+@pytest.mark.parametrize(
+    ("embedded", "says", "outcome"),
+    [
+        (lambda text: text[:-1], "carries a jinja_prompt_template with sha256", Outcome.FAILED),
+        (lambda text: None, "carries no jinja_prompt_template", Outcome.FAILED),
+        # The exporter reads the override in text mode: a CR it folded is a
+        # template other than the one composed.
+        (lambda text: text.replace("\n", "\r\n", 1), "with sha256", Outcome.FAILED),
+        # Equality, not length and not equality modulo trailing whitespace.
+        (
+            lambda text: text[:-1] + ("X" if text[-1] != "X" else "Y"),
+            "with sha256",
+            Outcome.FAILED,
+        ),
+        (lambda text: text + "\n", "with sha256", Outcome.FAILED),
+    ],
+    ids=["truncated", "none", "translated", "same-length", "trailing-newline"],
+)
+def test_a_bundle_that_does_not_carry_the_composed_template_fails_that_recipe(
+    toolchain, qwen_request, tmp_path, embedded, says, outcome
+):
+    """The invariant: no recipe passes unless its bundle carries exactly the
+    composed text, whatever the exporter was handed. The refused bundle is moved
+    out of the place a usable one goes, and the detail says where."""
+    toolchain.template_embedded = embedded
+    result = run_export(qwen_request())
+
+    assert result.outcome is outcome
+    assert len(result.exports) == 2
+    for export in result.exports:
+        assert export.check.outcome is outcome
+        assert says in export.check.detail
+        assert export.artifact is None, "not handed on as an artifact"
+        recipe_dir = tmp_path / "out" / export.recipe
+        assert not (recipe_dir / "model.litertlm").exists()
+        aside = recipe_dir / "model.litertlm.refused"
+        assert aside.is_file()
+        assert f"moved to {aside}" in export.check.detail
+        assert export.check.observed["refused_bundle"] == str(aside)
+    assert result.artifacts == []
+
+
+def test_a_bundle_that_cannot_be_moved_aside_says_where_it_is(
+    monkeypatch, toolchain, qwen_request, tmp_path
+):
+    import litetune.export as export_module
+
+    real = export_module.os.replace
+
+    def refuse(src, dst):
+        if str(dst).endswith(".refused"):
+            raise PermissionError("read-only")
+        return real(src, dst)
+
+    monkeypatch.setattr(export_module.os, "replace", refuse)
+    toolchain.template_embedded = lambda text: None
+    (export,) = run_export(qwen_request(recipes=("dynamic_wi8_afp32",))).exports
+
+    assert export.check.outcome is Outcome.FAILED
+    bundle = tmp_path / "out" / "dynamic_wi8_afp32" / "model.litertlm"
+    assert f"could not be moved aside (PermissionError: read-only) and is still at {bundle}" in (
+        export.check.detail
+    )
+    assert export.check.observed["refused_bundle"] is None
+
+
+@pytest.mark.parametrize("model", [QWEN3, "google/functiongemma-270m-it"])
+def test_a_bundle_cut_short_fails_whatever_the_family(toolchain, tmp_path, model):
+    """`unpack` reads a short section without raising, so a cut bundle would
+    read back whole and repack into a shorter, well-formed one: the header's
+    section ends are compared with the file's size first."""
+    toolchain.repack_section_ends = [1024, 8192]
+    result = run_export(
+        ExportRequest(model=model, output_dir=tmp_path / "out", recipes=("dynamic_wi8_afp32",))
+    )
+
+    (export,) = result.exports
+    assert export.check.outcome is Outcome.FAILED
+    assert "is not whole: section 1 of 2 ends at byte 8,192, past the end" in export.check.detail
+    assert export.artifact is None
+    assert (tmp_path / "out" / "dynamic_wi8_afp32" / "model.litertlm.refused").is_file()
+    assert result.outcome is Outcome.FAILED
+
+
+@pytest.mark.parametrize("model", [QWEN3, "google/functiongemma-270m-it"])
+@pytest.mark.parametrize(
+    ("knobs", "size", "says"),
+    [
+        (
+            {"repack_header_raises": "Invalid magic number: b'xxxxxxxx'"},
+            4096,
+            "its header cannot be read (ValueError: Invalid magic number",
+        ),
+        (
+            {"bundle_header_end": 1 << 20},
+            4096,
+            "its header ends at byte 1,048,576, past the end of the 4,096-byte file",
+        ),
+        ({}, 20, "the 20-byte file is cut short inside its header"),
+    ],
+    ids=["bad-magic", "header-past-the-end", "cut-inside-the-header"],
+)
+def test_a_bundle_whose_header_is_unsound_fails_whatever_the_family(
+    toolchain, tmp_path, model, knobs, size, says
+):
+    """The builder writes the header last (`litertlm_builder.py` `_build_sections`),
+    so a bundle cut short or never finished may have none to read."""
+    for name, value in knobs.items():
+        setattr(toolchain, name, value)
+    toolchain.default = RecipeRun(writes=(("model.litertlm", size),))
+    result = run_export(
+        ExportRequest(model=model, output_dir=tmp_path / "out", recipes=("dynamic_wi8_afp32",))
+    )
+    (export,) = result.exports
+    assert export.check.outcome is Outcome.FAILED
+    assert says in export.check.detail
+    assert (tmp_path / "out" / "dynamic_wi8_afp32" / "model.litertlm.refused").is_file()
+    assert NOT_VERIFIED not in result.limitations, "no artifact for it to be about"
+
+
+def test_a_bundle_whose_sections_end_at_its_size_is_whole(toolchain, qwen_request):
+    toolchain.repack_section_ends = [1024, 4096]
+    (export,) = run_export(qwen_request(recipes=("dynamic_wi8_afp32",))).exports
+    assert export.check.outcome is Outcome.PASSED
+
+
+def test_a_bundle_whose_template_cannot_be_read_back_is_could_not_check(toolchain, qwen_request):
+    """The builder's `unpack` failed before it read anything: no reading, which
+    says nothing about the bundle."""
+    toolchain.repack_unpack_fails = True
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    (export,) = result.exports
+    assert export.check.outcome is Outcome.UNCHECKED
+    assert "could not be read back" in export.check.detail
+    assert "unpack: boom" in export.check.detail
+
+
+def test_a_bundle_with_no_llm_metadata_section_fails(toolchain, qwen_request):
+    toolchain.repack_toml = FAKE_TOML.replace(
+        '[[section]]\nsection_type = "LlmMetadata"\ndata_path = "LlmMetadataProto.pbtext"\n\n',
+        "",
+    )
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    (export,) = result.exports
+    assert export.check.outcome is Outcome.FAILED
+    assert "0 LlmMetadata sections" in export.check.detail
+
+
+def test_two_llm_metadata_sections_fail(toolchain, qwen_request):
+    """The script and the parent each insist on exactly one."""
+    section = '[[section]]\nsection_type = "LlmMetadata"\ndata_path = "LlmMetadataProto.pbtext"\n\n'
+    toolchain.repack_toml = FAKE_TOML.replace(section, section + section)
+    (export,) = run_export(qwen_request(recipes=("dynamic_wi8_afp32",))).exports
+    assert export.check.outcome is Outcome.FAILED
+    assert "2 LlmMetadata sections" in export.check.detail
+
+
+def test_an_empty_bundle_carries_no_template_section(toolchain, qwen_request):
+    toolchain.default = RecipeRun(writes=(("model.litertlm", 0),))
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    (export,) = result.exports
+    assert export.check.outcome is Outcome.FAILED
+    assert "is empty (0 bytes), so it carries no template" in export.check.detail
+
+
+def test_a_repack_that_fails_after_reading_keeps_the_reading(toolchain, qwen_request):
+    """The template is written out before `pack` runs, so a pack that fails
+    leaves the original -- whose template was read -- and a passed recipe
+    with the GPU key's note."""
+    toolchain.repack_pack_fails = True
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    (export,) = result.exports
+    assert export.check.outcome is Outcome.PASSED
+    assert export.gpu_activation is None
+    assert "pack: boom" in (export.gpu_activation_note or "")
+
+
+def test_a_rebuild_that_would_change_the_template_is_refused(toolchain, qwen_request):
+    """The repack keeps the original rather than ship a template other than
+    the one it read, so the reading still describes the bundle."""
+    toolchain.repack_pack_rewrites_template = True
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    (export,) = result.exports
+    assert export.check.outcome is Outcome.PASSED
+    assert export.gpu_activation is None
+    assert "the rebuild changed the bundle's chat template" in (export.gpu_activation_note or "")
+
+
+def test_a_callers_own_template_is_passed_through_and_nothing_is_composed(
+    toolchain, qwen_request, tmp_path
+):
+    """`RequiredFlag.satisfied_by`: the caller's value wins, and then there is
+    nothing to compose or read back -- the plan says so in a note."""
+    own = tmp_path / "mine.jinja"
+    own.write_text("{{ messages }}", encoding="utf-8")
+    result = run_export(qwen_request(extra_flags=(f"{models.TEMPLATE_FLAG}={own}",)))
+
+    assert result.outcome is Outcome.PASSED
+    assert toolchain.compositions == []
+    assert not any(c.name == CHAT_TEMPLATE_CHECK for c in result.checks.checks)
+    for call in toolchain.exports:
+        assert _template_flags(call.argv) == [f"{models.TEMPLATE_FLAG}={own}"]
+    assert _composed_files(tmp_path / "out") == []
+    assert any("litetune put no text-parts block" in text for text in result.limitations)
+
+
+def test_a_recipe_that_raises_records_the_argv_it_was_given(monkeypatch, toolchain, qwen_request):
+    """The sweep's backstop rebuilds the argv for its record, and that one too
+    carries the composed file rather than raising on the marker."""
+    monkeypatch.setattr(
+        "litetune.export._sha256",
+        lambda path: (_ for _ in ()).throw(OSError("input/output error")),
+    )
+    result = run_export(qwen_request(recipes=("dynamic_wi8_afp32",)))
+
+    (export,) = result.exports
+    assert export.check.outcome is Outcome.UNCHECKED
+    assert result.chat_template is not None
+    path = result.chat_template.path
+    assert _template_flags(export.argv) == [f"{models.TEMPLATE_FLAG}={path}"]
+
+
+@pytest.mark.parametrize(
+    ("flag", "source", "carried"),
+    [
+        ("--noexternalize_embedder", "caller opted out", False),
+        ("--externalize-embedder=False", "caller opted out", False),
+        ("--externalize_embedder", "caller", True),
+    ],
+)
+def test_externalize_embedder_is_read_off_the_parsed_flags(request_for, flag, source, carried):
+    """A caller's own setting, in any spelling Fire reads, is theirs: the default
+    is added only where nothing set it."""
+    request = request_for(MEASURED_RECIPES, extra_flags=(flag,))
+    argv = request.argv("dynamic_wi8_afp32")
+    assert request.externalize_source == source
+    assert request.as_dict()["externalize_embedder"] is carried
+    assert flag in argv
+    assert ("--externalize_embedder" in argv) is (flag == "--externalize_embedder")
+
+
+def test_the_cli_opt_out_is_the_callers_setting(request_for):
+    """`convert --no-externalize-embedder` enters the plan's table as the caller's
+    own setting, so the exporter gets the opt-out and nothing litetune adds."""
+    request = request_for(MEASURED_RECIPES, externalize_embedder=False)
+    argv = request.argv("dynamic_wi8_afp32")
+    assert request.externalize_source == "caller opted out"
+    assert request.as_dict()["externalize_embedder"] is False
+    assert "--noexternalize_embedder" in argv
+    assert "--externalize_embedder" not in argv
+
+
+GEMMA4 = "google/gemma-4-E2B-it"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "flags"),
+    [
+        ({"externalize_embedder": False}, ()),
+        ({}, ("--noexternalize_embedder",)),
+        ({}, ("--externalize-embedder=False",)),
+        ({}, ("--externalize_embedder", "--externalize_embedder=0")),
+    ],
+)
+def test_gemma4_refuses_an_embedder_opt_out(tmp_path, kwargs, flags):
+    """Gemma 4 does not export without `--externalize_embedder`: a caller's
+    opt-out, from `convert`'s own option or a `--flag=` Fire reads as False, is
+    refused with that reason instead of being overridden by the rule."""
+    with pytest.raises(models.FlagRefused, match="this family needs --externalize_embedder") as exc:
+        ExportRequest(
+            model=GEMMA4,
+            output_dir=tmp_path / "out",
+            recipes=MEASURED_RECIPES,
+            extra_flags=flags,
+            **kwargs,
+        )
+    assert "External embedder is required for Gemma4" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "flags", "source"),
+    [
+        ({}, (), "family rule"),
+        ({"externalize_embedder": True}, (), "caller"),
+        ({}, ("--externalize-embedder",), "caller"),
+    ],
+)
+def test_gemma4_names_who_set_the_embedder_flag(tmp_path, kwargs, flags, source):
+    """The flag Gemma 4's rule adds is reported as the rule's, not the caller's,
+    and the exporter gets it exactly once."""
+    request = ExportRequest(
+        model=GEMMA4,
+        output_dir=tmp_path / "out",
+        recipes=MEASURED_RECIPES,
+        extra_flags=flags,
+        **kwargs,
+    )
+    argv = request.argv("dynamic_wi8_afp32")
+    assert request.externalize_source == source
+    assert request.as_dict()["externalize_embedder"] is True
+    assert sum(models.flag_key(a) == "externalize_embedder" for a in argv) == 1
+    assert ("--externalize_embedder" in request.plan.added) is (source == "family rule")
+
+
+def test_the_argv_sets_each_keyword_once_and_none_of_litetunes_three(request_for):
+    """`ExportRequest.argv` checks what the plan promises."""
+    request = request_for(MEASURED_RECIPES)
+    duplicated = (*request.extra_flags, "--externalize-embedder")
+    object.__setattr__(request, "extra_flags", duplicated)
+    with pytest.raises(ValueError, match="more than once"):
+        request.argv("dynamic_wi8_afp32")
+    object.__setattr__(request, "extra_flags", (*duplicated[:-1], "--model=other"))
+    with pytest.raises(ValueError, match="Use --model"):
+        request.argv("dynamic_wi8_afp32")
+
+
+def test_a_refusal_before_export_claims_no_artifact(toolchain, qwen_request):
+    toolchain.chat_template = None
+    result = run_export(qwen_request())
+    assert result.artifacts == []
+    assert NOT_VERIFIED not in result.limitations
+    assert result.as_dict()["unverified_reason"] == NO_ARTIFACT
+
+
+def test_an_export_with_an_artifact_says_it_is_not_verified(toolchain, request_for):
+    result = run_export(request_for(("dynamic_wi8_afp32",)))
+    assert result.artifacts
+    assert result.limitations[0] == NOT_VERIFIED
+    assert result.as_dict()["unverified_reason"] == NOT_VERIFIED
+
+
+def test_a_composing_plan_given_no_template_is_recorded_not_raised(qwen_request):
+    """`export_recipe` called directly, as `test_exits` does: there is no
+    command line to give the exporter, and that is a record, not an error."""
+    export = export_recipe(qwen_request(), "dynamic_wi8_afp32")
+    assert export.check.outcome is Outcome.UNCHECKED
+    assert "none was composed" in export.check.detail
+    assert not export.attempted
+
+
+def test_a_family_with_a_packaged_template_composes_nothing(toolchain, request_for):
+    result = run_export(request_for(("dynamic_wi8_afp32",)))
+
+    assert result.outcome is Outcome.PASSED
+    assert toolchain.compositions == []
+    assert not any(c.name == CHAT_TEMPLATE_CHECK for c in result.checks.checks)
+    assert result.chat_template is None
+
+
+def test_the_marker_never_reaches_an_exporter_argv(qwen_request):
+    """It describes a file, and the exporter would look it up as a repository."""
+    request = qwen_request()
+    assert request.composes_chat_template
+    assert COMPOSED_TEMPLATE_FLAG in request.extra_flags
+    with pytest.raises(ValueError, match="no composed template was given"):
+        request.argv("dynamic_wi8_afp32")
+    argv = request.argv("dynamic_wi8_afp32", Path("/composed/t.jinja"))
+    assert _template_flags(argv) == [f"{models.TEMPLATE_FLAG}=/composed/t.jinja"]
+    assert not any(models.COMPOSED_TEMPLATE in a for a in argv)
+
+
+def test_a_marker_in_any_other_shape_is_refused_too(qwen_request):
+    request = qwen_request()
+    flags = (*request.extra_flags, f"--other={models.COMPOSED_TEMPLATE}")
+    object.__setattr__(request, "extra_flags", flags)
+    with pytest.raises(ValueError, match="would hand the exporter the marker"):
+        request.argv("dynamic_wi8_afp32", Path("/composed/t.jinja"))
+
+
+def test_the_composed_path_is_absolute_for_a_relative_output_dir(tmp_path, monkeypatch):
+    """So that the argv and the report name the file however they are read."""
+    monkeypatch.chdir(tmp_path)
+    request = ExportRequest(model=QWEN3, output_dir=Path("rel"), recipes=("dynamic_wi8_afp32",))
+    path = request.composed_template_path("ab" * 32)
+    assert path.is_absolute()
+    assert path == Path.cwd() / "rel" / f"{COMPOSED_TEMPLATE_PREFIX}{'ab' * 6}.jinja"
+
+
+def test_no_recipe_name_can_be_the_composed_file(tmp_path):
+    """A recipe names a directory beside the composed file; the prefix is one
+    the recipe-name rule refuses."""
+    name = f"{COMPOSED_TEMPLATE_PREFIX}{'ab' * 6}.jinja"
+    with pytest.raises(ValueError, match="not a usable recipe name"):
+        ExportRequest(model=QWEN3, output_dir=tmp_path, recipes=(name,))
+
+
+def test_the_chat_template_script_is_python_that_imports_nothing_from_litetune():
+    """It runs in the export environment, which does not install litetune."""
+    import re
+
+    compile(_COMPOSE_SCRIPT, "compose_template.py", "exec")
+    assert not re.search(r"^\s*(?:import|from)\s+litetune\b", _COMPOSE_SCRIPT, re.MULTILINE)
+
+
+def test_the_script_decides_local_or_hub_as_the_exporter_does(tmp_path):
+    """`get_model_path_type`, export_hf/core/utils.py:110-139."""
+    model_path_type = _exec_script(_COMPOSE_SCRIPT)["model_path_type"]
+    assert model_path_type(str(tmp_path)) == "local"
+    assert model_path_type("./nowhere") == "local_not_found"
+    assert model_path_type("Qwen/Qwen3-0.6B") == "repo_id"
+    assert model_path_type("gpt2") == "repo_id"
+    assert model_path_type("a/b/c") == "unknown"
+
+
+def _exec_script(source: str) -> dict:
+    """The script's functions, without running its `__main__` (or importing
+    transformers, which a stub stands in for)."""
+    import types
+
+    stub = types.ModuleType("transformers")
+    namespace: dict = {"__name__": "compose_script_under_test"}
+    saved = sys.modules.get("transformers")
+    sys.modules["transformers"] = stub
+    try:
+        exec(compile(source, "compose_template.py", "exec"), namespace)  # noqa: S102
+    finally:
+        if saved is None:
+            del sys.modules["transformers"]
+        else:
+            sys.modules["transformers"] = saved
+    return namespace
