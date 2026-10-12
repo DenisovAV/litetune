@@ -96,7 +96,7 @@ four-bit recipes on the same four checkpoints, in *Four bits on litert-lm
 0.17.1*; the tuned Gemma 4 E2B's two eight-bit bundles, in *Gemma 4 E2B on
 litert-lm 0.17.1*; and FunctionGemma's tool path, in *The same checkpoint on
 litert-lm 0.17.1*. Each of those was taken again on litert-lm 0.18.0, the runtime
-0.4.0 and 0.4.1 pin, in *The 0.17.1 re-measurements again on litert-lm 0.18.0*, after the
+0.4.0 – 0.4.2 pin, in *The 0.17.1 re-measurements again on litert-lm 0.18.0*, after the
 banking77 sections. The rest has not been; among it the headline FunctionGemma
 runs, the conversions of Gemma 4's base weights and the runs on untuned bases
 are `verify` numbers taken on 0.16.1, and the phone runs ran on the device.
@@ -1225,10 +1225,10 @@ backend in the same container, 12 vCPU. litetune 0.1.8; training environment
 The float reference in every Qwen2.5 run here, this section's and the
 re-measurements on 0.17.1 and 0.18.0, decoded with `repetition_penalty` 1.1:
 litetune up to 0.4.1 left the checkpoint's `generation_config` in force, and
-transformers merges it into a greedy `generate` call. litetune after 0.4.1
+transformers merges it into a greedy `generate` call. litetune 0.4.2
 decodes the reference greedily without it. On 2026-10-12, on litert-lm 0.18.0,
 the `dynamic_wi8_afp32` bundle verified against the same tuned checkpoint with
-the reference of 0.4.1 and with the one after it gave the same figures both
+the reference of 0.4.1 and with that of 0.4.2 gave the same figures both
 times: candidate 0.7700, reference 0.7700, cost 0.0000 on 8 discordant rows,
 which are the 0.18.0 figures published above. The candidate never decoded with a
 penalty: LiteRT-LM applies none unless asked, and litetune does not ask.
