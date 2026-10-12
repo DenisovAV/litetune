@@ -354,3 +354,14 @@ def test_the_spec_hash_covers_everything_including_the_uri():
     # The whole-spec hash identifies the job for the manifest; unlike a cache
     # key it records where the data came from too.
     assert make_spec().hash != make_spec(dataset={"uri": "s3://elsewhere.jsonl"}).hash
+
+
+def test_a_duplicate_authenticated_requirement_is_not_shown_raw():
+    """The duplicate-entry refusal shows requirements as every report does."""
+    secret = "https://user:s3cret@packages.invalid/pkg-1.whl?sig=T0KEN#sha256=ab"
+    from litetune import spec
+
+    with pytest.raises(spec.SpecError) as raised:
+        spec._as_str_list([secret, secret], "toolchain.requirements")
+    assert "s3cret" not in str(raised.value) and "T0KEN" not in str(raised.value)
+    assert "***@packages.invalid" in str(raised.value)

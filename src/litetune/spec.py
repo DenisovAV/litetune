@@ -254,12 +254,15 @@ def _as_str_list(value: Any, field_name: str, pattern: re.Pattern[str] | None = 
         raise SpecError(f"{field_name}: expected at least one entry")
     duplicates = sorted({item for item in items if items.count(item) > 1})
     if duplicates:
-        raise SpecError(f"{field_name}: duplicate entries {duplicates}")
+        # Shown as every report shows a requirement: an entry may be a direct
+        # URL that carries a credential.
+        raise SpecError(f"{field_name}: duplicate entries {envs.shown_requirements(duplicates)}")
     if pattern is not None:
         bad = [item for item in items if not pattern.fullmatch(item)]
         if bad:
             raise SpecError(
-                f"{field_name}: {bad} are not usable names; entries reach the filesystem and the "
+                f"{field_name}: {envs.shown_requirements(bad)} are not usable names; entries reach "
+                "the filesystem and the "
                 f"command line, so they must match {pattern.pattern}"
             )
     return tuple(items)

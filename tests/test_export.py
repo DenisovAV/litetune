@@ -3210,3 +3210,14 @@ def _exec_script(source: str) -> dict:
         else:
             sys.modules["transformers"] = saved
     return namespace
+
+
+def test_requirement_names_skip_a_pin_whose_marker_is_false_here():
+    """`resolve_toolchain` reads what is installed; a pin for another Python is
+    not installed here and is not reported missing."""
+    other = "3.99" if sys.version_info[:2] != (3, 99) else "3.98"
+    names = requirement_names(
+        [f'onlythere==1.0; python_version == "{other}"', "here==2.0", "pkg @ https://h/p.whl"]
+    )
+    # A named direct URL keeps its name, which `pip show` answers to.
+    assert names == ("here", "pkg")

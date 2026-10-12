@@ -37,7 +37,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from litetune import envs, models
+from litetune import envs, models, wheels
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.events import EventStream
 from litetune.exits import read_returncode
@@ -296,15 +296,23 @@ def _canonical(name: str) -> str:
 
 
 def requirement_names(requirements: Sequence[str]) -> tuple[str, ...]:
-    """Distribution names from pinned requirement strings."""
+    """Distribution names from pinned requirement strings, those that apply here.
+
+    Read as pip reads them (`wheels.applies`): a requirement whose marker is
+    false for this interpreter is not installed, so naming it would report a
+    phantom "missing" entry.
+    """
     names: list[str] = []
+    environment = wheels.marker_environment()
     for requirement in requirements:
         if requirement.startswith(("http://", "https://", "file://")):
             # A direct URL carries no reliable distribution name; `pip show`
             # would report nothing for it, so it is left out rather than
             # producing a phantom "missing" entry.
             continue
-        name = re.split(r"[=<>!~\[;]", requirement, maxsplit=1)[0].strip()
+        if not wheels.applies(requirement, environment):
+            continue
+        name = re.split(r"[=<>!~\[;@ ]", requirement, maxsplit=1)[0].strip()
         if name:
             names.append(name)
     return tuple(names)

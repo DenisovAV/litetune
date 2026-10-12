@@ -5004,3 +5004,20 @@ def test_the_export_environment_pins_what_litert_torch_leaves_open():
     assert pins["litert-lm"] == pins["litert-lm-builder"]
     runtime = dict(r.split("==", 1) for r in envs.RUNTIME.requirements if "==" in r)
     assert pins["litert-lm"] == runtime["litert-lm"]
+
+
+@pytest.mark.parametrize(
+    ("url", "shown"),
+    [
+        ("https://h/p.whl#sha256=0123abcd", "https://h/p.whl#sha256=0123abcd"),
+        ("https://h/p.tar.gz#egg=p&subdirectory=sub", "https://h/p.tar.gz#egg=p&subdirectory=sub"),
+        ("https://h/p.whl#token=FRAGMENT_SECRET", "https://h/p.whl#***"),
+        ("https://h/p.whl#sha256=0123abcd&token=X", "https://h/p.whl#sha256=0123abcd&***"),
+        ("https://h/p.whl#sha256=not-hex-SECRET", "https://h/p.whl#***"),
+        ("https://u:s3cret@h/p.whl?sig=T0K#sha256=ab", "https://***@h/p.whl?***#sha256=ab"),
+    ],
+)
+def test_a_shown_requirement_keeps_only_the_fragments_pip_reads(url, shown):
+    """A fragment is free text: only the keys pip reads from a link, with values
+    that cannot be a credential, survive (pip/_internal/models/link.py)."""
+    assert envs.shown_requirements([url]) == [shown]

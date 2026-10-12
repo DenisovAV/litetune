@@ -1704,8 +1704,27 @@ def redact_url(url: str, *, keep_fragment: bool = False) -> str:
     if "@" in netloc:
         netloc = "***@" + netloc.rpartition("@")[2]
     query = "***" if parts.query else ""
-    fragment = parts.fragment if keep_fragment else ("***" if parts.fragment else "")
+    if not parts.fragment:
+        fragment = ""
+    elif keep_fragment:
+        fragment = "&".join(
+            item if _PROVENANCE_FRAGMENT.fullmatch(item) else "***"
+            for item in parts.fragment.split("&")
+        )
+    else:
+        fragment = "***"
     return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+
+
+# The fragment keys pip reads from a link, kept because they are provenance:
+# a hash (`Link.hashes`, `_HASHES_RE` in pip/_internal/models/link.py, pip
+# 26.2.1), `subdirectory` and `egg` (`Link.subdirectory_fragment`,
+# `Link._egg_fragment`). A hash value is hex and a name or a path is not a
+# credential; any other key, or a hash key with a value that is not hex, is
+# shown as `***`, because a fragment is free text and can carry a token.
+_PROVENANCE_FRAGMENT = re.compile(
+    r"(?:(?:sha1|sha224|sha256|sha384|sha512|md5)=[0-9a-fA-F]+|subdirectory=[^&]*|egg=[^&]*)"
+)
 
 
 def redact_text(text: str, *, keep_fragment: bool = False) -> str:
