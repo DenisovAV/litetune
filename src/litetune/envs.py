@@ -33,6 +33,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import venv
@@ -1377,6 +1378,7 @@ def _run_guarded(
     argv: Sequence[str],
     timeout: float,
     env: Mapping[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a subprocess so that whatever ends litetune ends it too.
 
@@ -1441,6 +1443,7 @@ def _run_guarded(
         # one from being waited on at all.
         stdin=subprocess.DEVNULL,
         env=_child_env(env),
+        cwd=cwd,
         # POSIX only; accepted and ignored on Windows, where `_kill_tree`
         # falls back to killing the child alone. Not overridable: a caller
         # reaching past it with `process_group=` would put the child in *our*
@@ -1689,6 +1692,40 @@ _INSTALL_SECTIONS = frozenset({"global", "install", ":env:"})
 _PIP_CONFIG_TIMEOUT_S = 60
 
 
+# A URL inside free text: a pip message, an error naming a setting.
+_URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
+
+
+def _redacted(url: str) -> str:
+    """`url` as it may be shown: its user information, query and fragment replaced.
+
+    An index URL can carry its credentials as user information --
+    `https://user:token@host/simple`, or a token alone in the user's place --
+    and some carry a token in the query. Everything litetune says about where
+    pip looks goes through this; what it decides is decided on the value as
+    given, never on this. A path, which has no network location, is shown as
+    it is.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        # Not even splittable: show nothing past the scheme.
+        return f"{url.partition(':')[0]}://***"
+    if not parts.netloc:
+        return url
+    netloc = parts.netloc
+    if "@" in netloc:
+        netloc = "***@" + netloc.rpartition("@")[2]
+    query = "***" if parts.query else ""
+    fragment = "***" if parts.fragment else ""
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+
+
+def _redact_text(text: str) -> str:
+    """`text` with every URL in it `_redacted`."""
+    return _URL_IN_TEXT.sub(lambda m: _redacted(m.group(0)), text)
+
+
 def _is_pypi(url: str) -> bool:
     """Whether an index URL is pip's default, PyPI's simple API."""
     # `urlsplit` lowercases the scheme itself; the host it leaves as given.
@@ -1720,7 +1757,10 @@ def _parse_pip_config(text: str) -> list[tuple[str, str, str]]:
             raise ValueError(f"unrecognised `pip config list` line: {line!r}")
         if section not in _INSTALL_SECTIONS or option not in _SOURCE_OPTIONS:
             continue
-        value = ast.literal_eval(shown)
+        try:
+            value = ast.literal_eval(shown)
+        except (ValueError, SyntaxError) as exc:
+            raise ValueError(f"unrecognised `pip config list` value: {line!r}") from exc
         if not isinstance(value, str):
             raise ValueError(f"unrecognised `pip config list` value: {line!r}")
         found.append((f"pip config {key}", option, value))
@@ -1742,16 +1782,24 @@ def _pip_configuration() -> tuple[list[tuple[str, str, str]], str | None]:
     """
     argv = [sys.executable, "-m", "pip", "config", "list"]
     try:
-        proc = _run_guarded(argv, _PIP_CONFIG_TIMEOUT_S)
+        # From an empty directory made for it. `python -m` puts the working
+        # directory first on `sys.path` ("python -m module command line:
+        # prepend the current working directory", `sys.path`, Python's
+        # documentation), so a `pip.py` or `pip/` wherever litetune was started
+        # would run in pip's place. `-P` would stop that too, but only from
+        # 3.11; this package supports 3.10.
+        with tempfile.TemporaryDirectory(prefix="litetune-pip-config-") as empty:
+            proc = _run_guarded(argv, _PIP_CONFIG_TIMEOUT_S, cwd=empty)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return [], f"{type(exc).__name__}: {exc}"
+        return [], _redact_text(f"{type(exc).__name__}: {exc}")
     if proc.returncode != 0:
         said = (proc.stderr or proc.stdout or "").strip().splitlines()
-        return [], f"`pip config list` exited {proc.returncode}: {said[-1] if said else 'nothing'}"
+        last = said[-1] if said else "nothing"
+        return [], _redact_text(f"`pip config list` exited {proc.returncode}: {last}")
     try:
         return _parse_pip_config(proc.stdout), None
-    except (ValueError, SyntaxError) as exc:
-        return [], str(exc)
+    except ValueError as exc:
+        return [], _redact_text(str(exc))
 
 
 def _other_sources() -> tuple[list[str], str | None]:
@@ -1768,9 +1816,11 @@ def _other_sources() -> tuple[list[str], str | None]:
         # List-valued options are split on whitespace, as pip splits them
         # (`_update_defaults`, pip/_internal/cli/parser.py).
         for item in value.split():
+            # Decided on the value as given; said redacted, since it is said
+            # in notes, refusals and the manifests that carry them.
             if option == "find-links" or not _is_pypi(item):
-                others.setdefault(item, f"{where}={item}")
-    return list(others.values()), unread
+                others.setdefault(item, f"{where}={_redacted(item)}")
+    return list(dict.fromkeys(others.values())), unread
 
 
 @dataclass(frozen=True)
@@ -2278,7 +2328,11 @@ class StageEnv:
         pip and has to find that line themselves.
         """
         platform = platform or sys.platform
-        missing = _NO_DISTRIBUTION.search(stderr or "")
+        # pip names the index it consulted, and a credential in that URL would
+        # otherwise reach the report verbatim. Redacted whole, then cut: a cut
+        # first could leave half a URL the pattern no longer recognises.
+        stderr = _redact_text(stderr or "")
+        missing = _NO_DISTRIBUTION.search(stderr)
         package = missing.group(1) if missing else None
         detail = (
             f"could not provision environment {self.name!r} on "

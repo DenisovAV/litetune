@@ -1165,6 +1165,21 @@ def test_convert_refused_on_this_machine_writes_nothing_into_the_checkpoint(monk
     ), "where convert can run, the same checkpoint is repaired"
 
 
+def test_a_report_carries_no_index_credential(toolchain, request_for, monkeypatch):
+    """The manifest is what a user pastes into an issue; an index URL in it is
+    shown without its user information or query."""
+    monkeypatch.setenv("PIP_INDEX_URL", "https://user:s3cret@mirror.invalid/simple")
+    monkeypatch.setenv("PIP_EXTRA_INDEX_URL", "https://cdn.invalid/simple?token=T0KEN")
+    monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
+
+    result = run_export(request_for(("weight_only_wi8_afp32",), auto_provision=False))
+    report = json.dumps(result.as_dict(), default=str)
+
+    assert result.outcome is Outcome.UNCHECKED
+    assert "s3cret" not in report and "T0KEN" not in report
+    assert "https://***@mirror.invalid/simple" in report
+
+
 def test_a_ready_export_environment_is_used_on_any_machine(toolchain, request_for, monkeypatch):
     """The refusal is for an environment that would have to be built here.
 

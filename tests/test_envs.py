@@ -546,16 +546,21 @@ def test_pip_config_list_is_read_as_pip_prints_it():
 
 @pytest.mark.parametrize("line", ["no equals sign", "global.index-url=not a repr"])
 def test_a_pip_config_line_this_cannot_read_is_said_rather_than_skipped(line):
-    with pytest.raises((ValueError, SyntaxError)):
+    with pytest.raises(ValueError, match="unrecognised `pip config list`"):
         envs._parse_pip_config(line)
 
 
-def test_pip_config_list_is_asked_of_the_interpreter_running_litetune(monkeypatch):
-    """The one a stage environment is built from, through the stages' own guard."""
+def test_pip_config_list_is_asked_of_the_interpreter_running_litetune(monkeypatch, tmp_path):
+    """The one a stage environment is built from, through the stages' own guard,
+    from a directory made empty for it -- not wherever litetune was started."""
     asked: list[list[str]] = []
+    where: list[tuple[str, list[str]]] = []
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pip.py").write_text("raise SystemExit('planted')\n")
 
-    def answer(argv, timeout, env=None):
+    def answer(argv, timeout, env=None, cwd=None):
         asked.append(list(argv))
+        where.append((str(cwd), sorted(os.listdir(cwd))))
         return subprocess.CompletedProcess(argv, 0, "global.find-links='/w'\n", "")
 
     monkeypatch.setattr(envs, "_run_guarded", answer)
@@ -565,6 +570,34 @@ def test_pip_config_list_is_asked_of_the_interpreter_running_litetune(monkeypatc
         None,
     )
     assert asked == [[sys.executable, "-m", "pip", "config", "list"]]
+    ((directory, contents),) = where
+    assert contents == [], "nothing there for `python -m` to find first"
+    assert pathlib.Path(directory).resolve() != tmp_path.resolve()
+    assert not pathlib.Path(directory).exists(), "and it is removed afterwards"
+
+
+def test_a_pip_planted_where_litetune_was_started_does_not_run(monkeypatch, tmp_path):
+    """`python -m pip` puts the working directory first on `sys.path`.
+
+    Run from where litetune was started, a `pip.py` there ran in pip's place
+    (`sys.path`, Python's documentation: "python -m module command line:
+    prepend the current working directory"). This plants one and runs the
+    real `pip config list`.
+    """
+    pytest.importorskip("pip")
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    ran = tmp_path / "planted-pip-ran"
+    (caller / "pip.py").write_text(
+        f"open({str(ran)!r}, 'w').write('1')\nprint(\"global.index-url='https://planted'\")\n"
+    )
+    monkeypatch.chdir(caller)
+
+    settings, unread = _REAL_PIP_CONFIGURATION()
+
+    assert not ran.exists(), "the planted pip.py ran"
+    assert unread is None
+    assert all("planted" not in value for _, _, value in settings)
 
 
 @pytest.mark.parametrize(
@@ -577,7 +610,7 @@ def test_pip_config_list_is_asked_of_the_interpreter_running_litetune(monkeypatc
     ids=["exit", "oserror", "unreadable"],
 )
 def test_a_pip_that_cannot_answer_says_why(monkeypatch, outcome, said):
-    def answer(argv, timeout, env=None):
+    def answer(argv, timeout, env=None, cwd=None):
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -608,6 +641,126 @@ def test_the_real_pip_reports_a_configured_index(monkeypatch, tmp_path):
     assert ("extra-index-url", "https://example.invalid/simple") in [
         (option, value) for _, option, value in settings
     ]
+
+
+@pytest.mark.parametrize(
+    ("given", "shown"),
+    [
+        ("https://user:s3cret@mirror.invalid/simple", "https://***@mirror.invalid/simple"),
+        (
+            "https://pypi-T0KEN@mirror.invalid:8443/simple/",
+            "https://***@mirror.invalid:8443/simple/",
+        ),
+        ("https://mirror.invalid/simple?token=T0KEN", "https://mirror.invalid/simple?***"),
+        ("https://mirror.invalid/simple#T0KEN", "https://mirror.invalid/simple#***"),
+        ("https://download.pytorch.org/whl/cu124", "https://download.pytorch.org/whl/cu124"),
+        ("/srv/wheels", "/srv/wheels"),
+        ("C:\\wheels", "C:\\wheels"),
+        ("https://[::1/simple", "https://***"),
+    ],
+)
+def test_an_index_url_is_shown_without_its_credentials(given, shown):
+    assert envs._redacted(given) == shown
+
+
+def test_a_url_inside_a_message_is_redacted_where_it_stands():
+    said = "Looking in indexes: https://pypi.org/simple, https://u:p4ss@corp.invalid/simple?k=v"
+
+    assert envs._redact_text(said) == (
+        "Looking in indexes: https://pypi.org/simple, https://***@corp.invalid/simple?***"
+    )
+
+
+_SECRETS = ("s3cret", "T0KEN", "pypi-AgEN", "p4ss")
+
+
+def test_no_index_credential_reaches_anything_litetune_says(monkeypatch, tmp_path, caplog):
+    """Notes, warnings, refusals, `unready_detail` and pip's own words alike.
+
+    The URLs are compared as given -- each still counts as another source --
+    and only their user information and query are kept out of what is said.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv("PIP_INDEX_URL", "https://user:s3cret@mirror.invalid/simple")
+    monkeypatch.setenv("PIP_EXTRA_INDEX_URL", "https://cdn.invalid/simple?token=T0KEN")
+    monkeypatch.setattr(
+        envs,
+        "_pip_configuration",
+        lambda: (
+            [
+                (
+                    "pip config global.find-links",
+                    "find-links",
+                    "https://__token__:pypi-AgEN@w.invalid/",
+                )
+            ],
+            None,
+        ),
+    )
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
+    monkeypatch.setattr(
+        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
+    )
+    _host(monkeypatch, "win_amd64", (3, 12))
+    notes: list[str] = []
+
+    detail = EXPORT.unready_detail
+    with caplog.at_level("WARNING"):
+        EXPORT.provision(events=types.SimpleNamespace(note=lambda text, **_: notes.append(text)))
+        TRAIN.provision()
+    failed = RUNTIME._provisioning_failed(
+        "Looking in indexes: https://u:p4ss@corp.invalid/simple\n"
+        "ERROR: No matching distribution found for nosuchpkg"
+    )
+
+    said = "\n".join([detail, *notes, caplog.text, failed])
+    for secret in _SECRETS:
+        assert secret not in said, secret
+    assert "https://***@mirror.invalid/simple" in detail
+    assert "https://cdn.invalid/simple?***" in detail
+    assert "https://***@w.invalid/" in detail
+    assert "https://***@corp.invalid/simple" in failed
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        subprocess.CompletedProcess([], 1, "", "bad index https://u:p4ss@corp.invalid/simple\n"),
+        subprocess.CompletedProcess([], 0, "global.index-url=https://u:p4ss@corp.invalid\n", ""),
+        OSError("cannot reach https://u:p4ss@corp.invalid/simple"),
+    ],
+    ids=["exit", "unreadable", "oserror"],
+)
+def test_a_reason_pip_could_not_answer_carries_no_credential(monkeypatch, outcome):
+    """What `_pip_configuration` reports when pip fails is quoted text from pip
+    or from its own output, which can hold the very URL being protected."""
+
+    def answer(argv, timeout, env=None, cwd=None):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(envs, "_run_guarded", answer)
+
+    _, reason = _REAL_PIP_CONFIGURATION()
+
+    assert reason is not None
+    assert "p4ss" not in reason
+    assert "corp.invalid" in reason
+
+
+def test_pips_words_are_redacted_before_they_are_cut():
+    """`_provisioning_failed` keeps the last 2000 characters of what pip said.
+
+    Cut first, a URL straddling the cut loses its scheme, the pattern no longer
+    sees a URL, and the credential after it survives.
+    """
+    url = "https://u:p4ss@corp.invalid/simple"
+    said = "x" * 3000 + " " + url + " " + "y" * (2000 - len(url) + 5)
+
+    message = RUNTIME._provisioning_failed(said)
+
+    assert "p4ss" not in message
 
 
 def test_convert_is_refused_on_windows_before_anything_is_installed(monkeypatch, tmp_path):
