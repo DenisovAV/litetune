@@ -1985,6 +1985,10 @@ _SETTINGS_THAT_CHANGE_THE_CALL: dict[str, Any] = {
     "token_healing": True,
     "renormalize_logits": True,
     "return_dict_in_generate": True,
+    # The scores `_sample` collects go to stopping (generation/utils.py:2836,
+    # :2900-2902, :2936), and a criterion `is_assistant` adds reads them
+    # (:1385-1392; stopping_criteria.py:611).
+    "output_scores": True,
     # Not shown by the source to be without effect, so reported too: these two
     # reach the model's forward (generation/utils.py:1831-1834), and more than
     # one sequence stops a greedy call (configuration_utils.py:788-795).
@@ -2027,7 +2031,6 @@ _SETTINGS_WITHOUT_EFFECT: dict[str, Any] = {
     "early_stopping": True,
     "num_beam_groups": 2,
     "diversity_penalty": 0.5,
-    "output_scores": True,
     "output_logits": True,
 }
 
@@ -2039,6 +2042,21 @@ def test_a_setting_without_effect_is_left_out_unreported(tmp_path, monkeypatch, 
     )
     assert captured["generation"].get(field) != value
     assert captured["run_report"]["generation_settings_not_applied"] == {}
+
+
+def test_an_assistant_config_is_reported_whole(tmp_path, monkeypatch):
+    """Together these stop a 5.16.1 call on a token below the assistant's
+    confidence threshold: `is_assistant` adds `ConfidenceCriteria`
+    (generation/utils.py:1385-1392), which reads the scores `_sample` collects
+    only when both output flags are on (:2836, :2900-2902, :2936). None of the
+    three may reach the call, and the record names all three."""
+    assistant = {"is_assistant": True, "return_dict_in_generate": True, "output_scores": True}
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config={"eos_token_id": 1, **assistant}
+    )
+    for field in assistant:
+        assert captured["generation"].get(field) == _TRANSFORMERS_DEFAULTS.get(field)
+    assert captured["run_report"]["generation_settings_not_applied"] == assistant
 
 
 def test_every_setting_the_script_calls_without_effect_is_pinned():

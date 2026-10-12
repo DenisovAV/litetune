@@ -1818,10 +1818,14 @@ NO_EFFECT_ON_THE_CALL = (
     "early_stopping",
     "num_beam_groups",
     "diversity_penalty",
-    # Read by `_sample` (generation/utils.py:2829-2830) only to fill the dict
-    # output `return_dict_in_generate` asks for (:2836-2837, :2900-2904). That
-    # one is reported: it turns the returned tensor into that dict (:2946-2973).
-    "output_scores",
+    # Read by `_sample` (generation/utils.py:2830) and `_assisted_decoding`
+    # (:3650) only to fill the `logits` of the dict output
+    # `return_dict_in_generate` asks for (:2837, :2903-2904, :3655, :3824-3825).
+    # Stopping is handed the scores, not these (:2936, :3859). Beam search, the
+    # third reader (:3258), needs `num_beams` > 1, which the call never passes.
+    # `output_scores` is reported: its scores reach stopping, where
+    # `is_assistant` adds a criterion that reads them (:1385-1392;
+    # stopping_criteria.py:611).
     "output_logits",
 )
 
