@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import mark_provisioned, run_compose_script
+from conftest import buildable_here, mark_provisioned, run_compose_script
 
 from litetune import envs, models
 from litetune.checks import Check, Outcome
@@ -68,6 +68,9 @@ transformers==5.16.1
 QWEN3_TEMPLATE = (
     Path(__file__).parent / "fixtures" / "qwen3-0.6b-c1899de.chat_template.jinja"
 ).read_text(encoding="utf-8")
+
+# Kept at import, before any fixture replaces it, for the test that needs it back.
+_REAL_REFUSAL = envs.StageEnv.refusal
 
 
 @dataclass
@@ -508,6 +511,7 @@ def toolchain(monkeypatch, tmp_path) -> FakeToolchain:
 
     fake = FakeToolchain()
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
+    buildable_here(monkeypatch)
     monkeypatch.setattr(envs.StageEnv, "run", fake)
     return fake
 
@@ -1104,6 +1108,81 @@ def test_a_bpe_checkpoint_needs_no_repair_and_is_not_an_error(tmp_path):
     assert repair_vocab_file(model) == (True, None)
 
 
+def test_convert_refused_on_this_machine_writes_nothing_into_the_checkpoint(monkeypatch, tmp_path):
+    """Windows has no `litert-converter` wheel, and `export` says so before anything else.
+
+    The `vocab_file` repair rewrites `tokenizer_config.json` in the checkpoint
+    it was handed, and it used to run -- with the plan drawn first -- before
+    provisioning refused, so a run that could never convert here still edited
+    the caller's input. The same checkpoint on a machine that can convert is
+    repaired, which is what makes "nothing was written" mean something.
+    """
+    from litetune.export import ExportRequest, run_export
+
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    provisioned: list[str] = []
+    monkeypatch.setattr(
+        envs.StageEnv, "provision", lambda self, events=None, force=False: provisioned.append(1)
+    )
+    model = _checkpoint(tmp_path)
+    (model / "tokenizer.model").write_bytes(b"sp")
+    config = model / "tokenizer_config.json"
+    config.write_text(
+        json.dumps({"vocab_file": "/tmp/elsewhere/tokenizer.model"}), encoding="utf-8"
+    )
+
+    def snapshot() -> dict[str, tuple[bytes, int]]:
+        return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in sorted(model.iterdir())}
+
+    def convert():
+        return run_export(
+            ExportRequest(
+                model=str(model),
+                base_model="google/gemma-3-270m-it",
+                output_dir=tmp_path / "out",
+                recipes=("dynamic_wi8_afp32",),
+            )
+        )
+
+    before = snapshot()
+    monkeypatch.setattr(envs.wheels, "host_platform", lambda: "win_amd64")
+    monkeypatch.setattr(envs.sys, "version_info", (3, 12, 0, "final", 0))
+    result = convert()
+
+    assert snapshot() == before, "the checkpoint is left as it was handed in"
+    assert provisioned == [], "and nothing was asked to provision"
+    assert result.outcome is Outcome.UNCHECKED
+    assert result.not_attempted == ("dynamic_wi8_afp32",)
+    detail = result.checks.first_unchecked.detail
+    assert detail.startswith("environment 'export' cannot be provisioned on win_amd64")
+    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in detail
+
+    monkeypatch.setattr(envs.wheels, "host_platform", lambda: "linux_x86_64")
+    convert()
+    assert json.loads(config.read_text(encoding="utf-8"))["vocab_file"] == str(
+        (model / "tokenizer.model").resolve()
+    ), "where convert can run, the same checkpoint is repaired"
+
+
+def test_a_ready_export_environment_is_used_on_any_machine(toolchain, request_for, monkeypatch):
+    """The refusal is for an environment that would have to be built here.
+
+    One already standing -- built from another index, or by hand -- is used,
+    as `provision` uses it; refusing it on PyPI's account would refuse a
+    machine that has what it needs.
+    """
+    from litetune.envs import StageEnv
+
+    monkeypatch.setattr(StageEnv, "refusal", _REAL_REFUSAL)
+    monkeypatch.setattr(envs.wheels, "host_platform", lambda: "win_amd64")
+    mark_provisioned(envs.EXPORT)
+
+    result = run_export(request_for(("weight_only_wi8_afp32",)))
+
+    assert result.not_attempted == ()
+    assert toolchain.exports, "the recipe ran"
+
+
 def test_run_export_repairs_the_path_and_says_so(toolchain, request_for, tmp_path, monkeypatch):
     """The call site, not just the function.
 
@@ -1204,10 +1283,13 @@ def test_the_plan_is_keyed_on_the_identity_while_argv_still_names_the_path(tmp_p
     assert f"--model={checkpoint}" in request.argv("dynamic_wi8_afp32")
 
 
-def test_an_unreadable_sidecar_reaches_the_report(tmp_path):
+def test_an_unreadable_sidecar_reaches_the_report(tmp_path, monkeypatch):
     """Recorded in the hint is not enough: nobody reads a hint."""
     from litetune.export import ExportRequest, run_export
 
+    # About the sidecar, not this machine: on Windows or 3.13 `export` would be
+    # refused before the sidecar is read.
+    buildable_here(monkeypatch)
     checkpoint = _checkpoint(tmp_path)
     (checkpoint / "litetune.json").write_text('{"base_model": "goo', encoding="utf-8")
 

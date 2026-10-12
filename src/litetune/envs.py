@@ -1604,10 +1604,10 @@ def _child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
 # One shared ceiling was tried and was wrong: it refused `train` on 3.13 for a
 # `numpy==2.0.2` limit that `train` does not have, in a project whose README
 # said `tune` works there. A ceiling per environment was the next step, and
-# `train`'s 3.13 was not a fact even on Linux: `torch==2.5.1` has a cp313 wheel
-# for manylinux x86_64 alone, and `sentencepiece==0.2.0` has none anywhere. So
-# the limits are not recorded here at all. They are read off what each pinned
-# release publishes, for this platform, in `wheels`.
+# `train`'s 3.13 was a Linux fact: `torch==2.5.1` has a cp313 wheel for
+# manylinux x86_64 alone (and `sentencepiece==0.2.0`, pinned then, had none
+# anywhere). So the limits are not recorded here at all. They are read off what
+# each pinned release publishes, for this platform, in `wheels`.
 STAGE_PYTHON_MIN = (3, 10)
 
 
@@ -1668,25 +1668,47 @@ def _msvcrt_attempt(handle, locking: Callable[[int, int, int], None], mode: int)
     return True
 
 
-def _refuse_unsupported_host(env: StageEnv) -> None:
+# The variables that point pip at files PyPI's lists do not cover: another
+# index in place of PyPI, one beside it, or a directory or page of archives.
+# PyTorch's own index, which the README names for a CUDA `tune` on Windows, is
+# the case in point. Set from a pip configuration file instead, they are not
+# seen here, and the table refuses as it would for PyPI.
+_INDEX_VARIABLES = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS")
+
+
+def _custom_indexes() -> list[str]:
+    """The `_INDEX_VARIABLES` set to something in this environment."""
+    return [name for name in _INDEX_VARIABLES if os.environ.get(name)]
+
+
+def _refuse_unsupported_host(env: StageEnv, events=None) -> None:
     """Say which pin cannot be installed here, before pip spends minutes not saying it.
 
     Named per environment and per pin, because what stops one differs: on
     Windows `export` stops at `litert-converter`, which `runtime` does not pin;
-    on Python 3.13 `train` stops at `sentencepiece==0.2.0` everywhere and at
-    `torch==2.5.1` everywhere but Linux on x86-64. A message naming the wrong
-    pin sends the reader to fix the wrong thing.
+    on Python 3.13 `train` stops at `torch==2.5.1` everywhere but Linux on
+    x86-64, and `export` at `numpy==2.0.2` everywhere. A message naming the
+    wrong pin sends the reader to fix the wrong thing.
+
+    Where pip is pointed past PyPI the gap is said and not enforced: the table
+    is PyPI's, and the other index may carry the wheel. pip is then asked, and
+    `_provisioning_failed` reads its answer if it has none either.
     """
-    current = sys.version_info[:2]
-    if current < STAGE_PYTHON_MIN:
-        raise RuntimeError(
-            f"environment {env.name!r} needs at least python"
-            f"{STAGE_PYTHON_MIN[0]}.{STAGE_PYTHON_MIN[1]}; this is python"
-            f"{current[0]}.{current[1]}"
-        )
-    refusal = env.unprovisionable(python=current)
+    refusal = env.refusal()
     if refusal:
-        raise RuntimeError(f"environment {env.name!r} {refusal}")
+        raise RuntimeError(refusal)
+    indexes = _custom_indexes()
+    reason = env.unprovisionable() if indexes else None
+    if reason:
+        note = (
+            f"by PyPI's file lists, environment {env.name!r} {reason}. Provisioning anyway: "
+            f"{', '.join(indexes)} points pip at an index those lists do not cover, which may "
+            "carry what PyPI does not, and pip says so if it does not"
+        )
+        if events:
+            events.note(note)
+        else:
+            logger.warning("%s", note)
 
 
 def _host_refusal(
@@ -1913,10 +1935,36 @@ class StageEnv:
             )
         # With `--no-provision`, "not provisioned" alone sends the reader to drop
         # the flag, and the run after that refuses for this reason instead.
-        refusal = self.unprovisionable()
-        if refusal:
-            return f"is not provisioned at {self.path}, and {refusal}"
+        reason = self.unprovisionable()
+        if reason and _custom_indexes():
+            return (
+                f"is not provisioned at {self.path}; by PyPI's file lists it {reason}, though "
+                f"{', '.join(_custom_indexes())} points pip at an index those lists do not cover"
+            )
+        if reason:
+            return f"is not provisioned at {self.path}, and {reason}"
         return f"is not provisioned at {self.path}"
+
+    def refusal(self) -> str | None:
+        """What `provision` refuses to build this environment here with, or None.
+
+        A whole sentence about the environment: the Python floor first, then
+        PyPI's file lists -- which a custom index (`_INDEX_VARIABLES`) turns
+        into a warning `provision` gives instead. Public so a stage can ask
+        before it does anything else: `export` asks before it writes into the
+        checkpoint it was handed.
+        """
+        current = (sys.version_info[0], sys.version_info[1])
+        if current < STAGE_PYTHON_MIN:
+            return (
+                f"environment {self.name!r} needs at least python"
+                f"{STAGE_PYTHON_MIN[0]}.{STAGE_PYTHON_MIN[1]}; this is python"
+                f"{current[0]}.{current[1]}"
+            )
+        if _custom_indexes():
+            return None
+        reason = self.unprovisionable(python=current)
+        return f"environment {self.name!r} {reason}" if reason else None
 
     def unprovisionable(
         self, platform: str | None = None, python: tuple[int, int] | None = None
@@ -1962,7 +2010,7 @@ class StageEnv:
         """
         if self.ready and not force:
             return self.path
-        _refuse_unsupported_host(self)
+        _refuse_unsupported_host(self, events)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # One budget, not two. Passing `timeout` to both the wait and the
         # install let a caller who waited the full 1800s then get another
@@ -2577,6 +2625,18 @@ TRAIN = StageEnv(
         "torch==2.5.1",
         "transformers==5.16.1",
         "peft==0.20.0",
-        "sentencepiece==0.2.0",
+        # 0.2.1, not 0.2.0: it publishes cp313 wheels for Linux x86_64 and
+        # aarch64, macOS arm64 and x86_64, and Windows x64, ARM64 and 32-bit
+        # (https://pypi.org/pypi/sentencepiece/0.2.1/json), where 0.2.0
+        # published no cp313 wheel at all. Measured 2026-10-12 on Linux x86_64
+        # under Python 3.13.16: with 0.2.0 the install stopped at "Failed
+        # building wheel for sentencepiece" (no cmake or pkg-config there), and
+        # 0.2.1 installed as a wheel. Its version does not reach the training
+        # data -- measured the same day, for all five measured families
+        # (gemma-3-270m, gemma-3-1b, qwen3-0.6b, qwen2.5-0.5b, functiongemma),
+        # the tuned checkpoints' tokenizers load the same class and give
+        # identical token ids on every data row (3000 to 6434 rows each) with
+        # sentencepiece blocked.
+        "sentencepiece==0.2.1",
     ),
 )

@@ -10,10 +10,11 @@ readme = "README.md"
 # No upper bound, deliberately, and this was tried the other way first.
 #
 # The stage environments are built from the interpreter that runs litetune, and
-# their pinned `numpy==2.0.2` and `sentencepiece==0.2.0` publish no wheel above
-# cp312 -- so `convert`, `verify` and `tune` cannot provision on 3.13+. But
-# `prepare` and `bundle` work there, and the whole test suite passes on 3.14.
-# Declaring `<3.13` made pip refuse to install a package that still runs.
+# their pinned `numpy==2.0.2` publishes no wheel above cp312 -- so `convert` and
+# `verify` cannot provision on 3.13+ -- while `torch==2.5.1` has a cp313 wheel
+# for Linux x86_64 alone, so `tune` provisions on 3.13 there and nowhere else.
+# But `prepare` and `bundle` work there, and the whole test suite passes on
+# 3.14. Declaring `<3.13` made pip refuse to install a package that still runs.
 #
 # So the ceiling is enforced where it actually bites: `StageEnv.provision`
 # refuses with a message naming the interpreter, the platform and the pin,

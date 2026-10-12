@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import mark_provisioned
+from conftest import buildable_here, mark_provisioned
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -116,6 +116,7 @@ def killing_toolchain(monkeypatch, tmp_path, request):
         return subprocess.CompletedProcess(args, kill_code, "", "")
 
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
+    buildable_here(monkeypatch)
     monkeypatch.setattr(envs.StageEnv, "run", fake_run)
 
 

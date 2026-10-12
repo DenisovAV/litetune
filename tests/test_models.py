@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from conftest import (
     FakeBackend,
+    buildable_here,
     correct_texts,
     labelled_rows,
     mark_provisioned,
@@ -1056,6 +1057,7 @@ def toolchain(monkeypatch, tmp_path) -> FakeToolchain:
 
     fake = FakeToolchain()
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
+    buildable_here(monkeypatch)
     monkeypatch.setattr(envs.StageEnv, "run", fake)
     return fake
 

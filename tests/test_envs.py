@@ -313,28 +313,109 @@ def test_a_ceiling_is_a_fact_about_one_platform(monkeypatch, tmp_path):
         torch_only.provision(force=True)
 
 
-def test_train_names_every_pin_that_stops_it(monkeypatch, tmp_path):
-    """`sentencepiece==0.2.0` has no cp313 wheel on any platform.
+def test_train_reaches_3_13_where_torch_does_and_nowhere_else(monkeypatch, tmp_path):
+    """`sentencepiece==0.2.1` has cp313 wheels everywhere; `torch==2.5.1` on Linux x86-64 alone.
 
-    So `train`'s 3.13 was never a fact: on Linux pip would have built
-    sentencepiece from source. On Windows two pins stop it, and naming one
-    sends the reader to move a pin and meet the other.
+    With `sentencepiece==0.2.0`, which had none anywhere, 3.13 on Linux meant
+    a source build that stopped at "Failed building wheel for sentencepiece".
+    Now `tune` provisions there, and elsewhere the refusal names torch -- only
+    torch, since naming a pin that is fine sends the reader to move it.
     """
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    reached = _tripwires(monkeypatch)
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
+    monkeypatch.setattr(
+        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
+    )
 
     _host(monkeypatch, "linux_x86_64", (3, 13))
-    with pytest.raises(RuntimeError) as linux:
-        TRAIN.provision()
-    assert "sentencepiece==0.2.0" in str(linux.value)
-    assert "torch==2.5.1" not in str(linux.value), "torch has its wheel there"
+    TRAIN.provision()
+    assert TRAIN.ready, "every pin in train has a cp313 wheel for Linux x86-64"
 
+    for platform, python in (("win_amd64", (3, 13)), ("linux_x86_64", (3, 14))):
+        _host(monkeypatch, platform, python)
+        with pytest.raises(RuntimeError) as caught:
+            TRAIN.provision(force=True)
+        assert "torch==2.5.1" in str(caught.value)
+        assert "sentencepiece" not in str(caught.value), "0.2.1 has its wheel there"
+
+
+@pytest.mark.parametrize("variable", ["PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS"])
+def test_a_custom_index_turns_the_refusal_into_a_note(monkeypatch, tmp_path, variable):
+    """The table is PyPI's; another index may carry the wheel PyPI lacks.
+
+    PyTorch's own index is the README's way to a CUDA `tune` on Windows. So
+    with pip pointed past PyPI the gap is said -- the missing wheel and that it
+    was PyPI that lacked it -- and pip is asked, rather than a working index
+    being refused on PyPI's account.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv(variable, "https://download.pytorch.org/whl/cu124")
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
+    monkeypatch.setattr(
+        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
+    )
     _host(monkeypatch, "win_amd64", (3, 13))
-    with pytest.raises(RuntimeError) as windows:
+    notes: list[str] = []
+
+    TRAIN.provision(events=types.SimpleNamespace(note=lambda text, **_: notes.append(text)))
+
+    assert TRAIN.ready
+    said = [n for n in notes if "torch==2.5.1" in n]
+    assert said, notes
+    assert "by PyPI's file lists" in said[0]
+    assert variable in said[0]
+    assert TRAIN.refusal() is None
+
+
+def test_without_an_event_stream_the_note_is_a_warning(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv("PIP_EXTRA_INDEX_URL", "https://download.pytorch.org/whl/cu124")
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
+    monkeypatch.setattr(
+        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
+    )
+    _host(monkeypatch, "win_amd64", (3, 13))
+
+    with caplog.at_level("WARNING"):
         TRAIN.provision()
-    assert "torch==2.5.1" in str(windows.value)
-    assert "sentencepiece==0.2.0" in str(windows.value)
+
+    assert "torch==2.5.1" in caplog.text and "PIP_EXTRA_INDEX_URL" in caplog.text
+
+
+def test_an_empty_index_variable_points_pip_nowhere_else(monkeypatch, tmp_path):
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv("PIP_INDEX_URL", "")
+    reached = _tripwires(monkeypatch)
+    _host(monkeypatch, "win_amd64", (3, 13))
+
+    with pytest.raises(RuntimeError, match="torch==2.5.1"):
+        TRAIN.provision()
     assert reached == []
+
+
+def test_a_custom_index_does_not_lift_the_python_floor(monkeypatch, tmp_path):
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv("PIP_INDEX_URL", "https://example.invalid/simple")
+    reached = _tripwires(monkeypatch)
+    _host(monkeypatch, "linux_x86_64", (3, 9))
+
+    with pytest.raises(RuntimeError, match=r"needs at least python3\.10"):
+        TRAIN.provision()
+    assert reached == []
+
+
+def test_an_unready_environment_says_what_pypi_lacks_and_where_pip_was_pointed(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv("PIP_FIND_LINKS", "/wheels")
+    _host(monkeypatch, "win_amd64", (3, 12))
+
+    detail = EXPORT.unready_detail
+
+    assert detail.startswith(f"is not provisioned at {EXPORT.path}; by PyPI's file lists it ")
+    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in detail
+    assert "PIP_FIND_LINKS" in detail
 
 
 def test_convert_is_refused_on_windows_before_anything_is_installed(monkeypatch, tmp_path):
@@ -413,12 +494,12 @@ def test_a_machine_nobody_has_can_be_asked_about(monkeypatch):
     """
     monkeypatch.setattr(envs.sys, "version_info", (3, 12, 0, "final", 0))
 
-    message = TRAIN.unprovisionable(platform="linux_x86_64", python=(3, 13))
+    message = TRAIN.unprovisionable(platform="win_amd64", python=(3, 13))
 
     assert message is not None
-    assert message.startswith("cannot be provisioned on python3.13 on linux_x86_64: ")
-    assert "sentencepiece==0.2.0" in message
-    assert TRAIN.unprovisionable(platform="linux_x86_64", python=(3, 12)) is None
+    assert message.startswith("cannot be provisioned on python3.13 on win_amd64: ")
+    assert "torch==2.5.1" in message
+    assert TRAIN.unprovisionable(platform="win_amd64", python=(3, 12)) is None
 
 
 def test_a_wheel_missing_for_the_platform_outranks_one_missing_for_the_python(monkeypatch):

@@ -375,6 +375,20 @@ def mark_provisioned(env) -> Path:
     return env.path
 
 
+def buildable_here(monkeypatch) -> None:
+    """Let a faked `provision` stand for the whole of provisioning.
+
+    `export` asks `StageEnv.refusal` before anything else, and that reads this
+    machine's platform and Python against PyPI's file lists: on Windows
+    `litert-converter` stops it, on 3.13 `numpy==2.0.2` does. A test that fakes
+    the install is about what follows one, so a fake environment is one this
+    machine can build, wherever the suite runs.
+    """
+    from litetune.envs import StageEnv
+
+    monkeypatch.setattr(StageEnv, "refusal", lambda self: None)
+
+
 # What `export._COMPOSE_SCRIPT` imports in place of the export environment's
 # transformers: an `AutoTokenizer` whose tokenizer carries `_TEMPLATE` as its
 # `chat_template`, writes each path it is asked to load to `_LOADS`, and renders

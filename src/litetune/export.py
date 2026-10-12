@@ -2253,6 +2253,26 @@ class ExportResult:
         }
 
 
+def _nothing_attempted(
+    result: ExportResult, request: ExportRequest, detail: str, events: EventStream
+) -> ExportResult:
+    """End a run whose export environment was not usable.
+
+    Nothing was attempted, so nothing failed. Recording these recipes as
+    failures would be a verdict about the toolchain drawn from a fact about
+    this machine.
+    """
+    result.not_attempted = tuple(request.recipes)
+    result.toolchain = Toolchain.unknown(
+        f"the export environment was not usable, so its versions were never read: {detail}",
+        request.env.requirements,
+    )
+    result.comparison = Uncompared(f"no recipe was exported: {detail}")
+    result.limitations.append(f"none of {list(request.recipes)} was attempted: {detail}")
+    events.stage_finished(result.outcome.value, attempted=0)
+    return result
+
+
 def run_export(request: ExportRequest, events: EventStream | None = None) -> ExportResult:
     """Sweep the requested recipes. Returns a result; failures are recorded, not raised."""
     # This run's own record of which host variables it dropped, so a second
@@ -2266,6 +2286,25 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
         checks=CheckSet(name=f"export:{request.model}"),
         toolchain=Toolchain.unknown("not read yet", request.env.requirements),
     )
+    # -- can this machine build the toolchain at all? -----------------------
+    # First, before this run writes into the checkpoint it was handed: the
+    # `vocab_file` repair below edits the input directory, and a run that cannot
+    # convert here -- Windows, where `litert-converter` publishes no wheel --
+    # must leave what it was handed as it found it. `provision` asks the same
+    # question again for a caller that reaches it another way.
+    if not request.env.ready:
+        refusal = request.env.refusal()
+        if refusal:
+            environment = result.checks.add(
+                Check.unchecked(
+                    "export environment",
+                    refusal,
+                    observed={"name": request.env.name, "identity": request.env.identity},
+                )
+            )
+            events.check(environment)
+            return _nothing_attempted(result, request, environment.detail, events)
+
     # Two answers to "what is this", and no way to choose. Refused before any
     # work: exporting under either one produces a bundle whose family flags may
     # be wrong, and the check would say `passed` about it.
@@ -2379,21 +2418,7 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
     environment = result.checks.add(sink[0])
     events.check(environment)
     if not environment.conclusive:
-        # Nothing was attempted, so nothing failed. Recording these recipes as
-        # failures would be a verdict about the toolchain drawn from a fact
-        # about this machine.
-        result.not_attempted = tuple(request.recipes)
-        result.toolchain = Toolchain.unknown(
-            f"the export environment was not usable, so its versions were never read: "
-            f"{environment.detail}",
-            request.env.requirements,
-        )
-        result.comparison = Uncompared(f"no recipe was exported: {environment.detail}")
-        result.limitations.append(
-            f"none of {list(request.recipes)} was attempted: {environment.detail}"
-        )
-        events.stage_finished(result.outcome.value, attempted=0)
-        return result
+        return _nothing_attempted(result, request, environment.detail, events)
 
     # -- provenance --------------------------------------------------------
     with guard("toolchain versions") as sink:

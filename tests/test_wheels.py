@@ -74,25 +74,28 @@ def test_every_release_on_record_is_the_one_it_names(release: Release):
 @pytest.mark.parametrize(
     ("env", "platform", "minor", "blocking"),
     [
-        # Linux x86-64: everything to 3.12; numpy stops runtime and export at
-        # 3.13, sentencepiece stops train there -- torch alone would not.
+        # Linux x86-64: everything to 3.12, and numpy stops runtime and export at
+        # 3.13. Train reaches 3.13 here and nowhere else -- torch 2.5.1's one
+        # cp313 wheel is manylinux x86_64 -- and stops at 3.14, at torch.
         (envs.RUNTIME, "linux_x86_64", 12, []),
         (envs.EXPORT, "linux_x86_64", 12, []),
         (envs.TRAIN, "linux_x86_64", 12, []),
         (envs.RUNTIME, "linux_x86_64", 13, ["numpy==2.0.2"]),
         (envs.EXPORT, "linux_x86_64", 13, ["numpy==2.0.2"]),
-        (envs.TRAIN, "linux_x86_64", 13, ["sentencepiece==0.2.0"]),
+        (envs.TRAIN, "linux_x86_64", 13, []),
+        (envs.TRAIN, "linux_x86_64", 14, ["torch==2.5.1"]),
+        (envs.TRAIN, "linux_aarch64", 13, ["torch==2.5.1"]),
         # Apple Silicon: the same, except torch has no cp313 wheel there.
         (envs.EXPORT, "macosx_arm64", 12, []),
-        (envs.TRAIN, "macosx_arm64", 13, ["sentencepiece==0.2.0", "torch==2.5.1"]),
+        (envs.TRAIN, "macosx_arm64", 13, ["torch==2.5.1"]),
         # Windows x64: verify and tune install; convert does not, for one pin.
         (envs.RUNTIME, "win_amd64", 12, []),
         (envs.TRAIN, "win_amd64", 12, []),
         (envs.EXPORT, "win_amd64", 12, ["litert-converter==0.4.0"]),
-        (envs.TRAIN, "win_amd64", 13, ["sentencepiece==0.2.0", "torch==2.5.1"]),
+        (envs.TRAIN, "win_amd64", 13, ["torch==2.5.1"]),
         # Windows on ARM64 and 32-bit Windows: no stage at all.
         (envs.RUNTIME, "win_arm64", 12, ["litert-lm-api==0.18.0", "numpy==2.0.2"]),
-        (envs.TRAIN, "win_arm64", 12, ["sentencepiece==0.2.0", "torch==2.5.1"]),
+        (envs.TRAIN, "win_arm64", 12, ["torch==2.5.1"]),
         (envs.RUNTIME, "win32", 12, ["litert-lm-api==0.18.0"]),
         (envs.TRAIN, "win32", 12, ["torch==2.5.1"]),
         (
@@ -197,6 +200,19 @@ def test_python_tags_are_read_as_cpython(filename, minors, every):
     assert wheel.every_python is every
 
 
+def test_a_free_threaded_wheel_installs_on_no_regular_build():
+    """`sentencepiece==0.2.1` ships `cp313t` beside `cp313`; only one is ours.
+
+    Counted as a regular wheel, a release with nothing but free-threaded builds
+    for a platform would read as installable there.
+    """
+    assert wheels._wheel("sentencepiece-0.2.1-cp313-cp313t-win_arm64.whl") is None
+    only_free_threaded = Release(
+        "x==1", "https://pypi.org/pypi/x/1/json", files=("x-1-cp313-cp313t-win_arm64.whl",)
+    )
+    assert gaps(["x==1"], "win_arm64", 13, {"x==1": only_free_threaded})[0].platform_missing
+
+
 def test_a_pypy_wheel_installs_on_no_cpython():
     assert wheels._wheel("numpy-2.0.2-pp39-pypy39_pp73-win_amd64.whl") is None
 
@@ -205,7 +221,6 @@ def test_a_pypy_wheel_installs_on_no_cpython():
     "filename",
     [
         "x-1-cp312-abi3-win_amd64.whl",
-        "x-1-cp313-cp313t-win_amd64.whl",
         "x-1-cp312-cp312-linux_x86_64.whl",
         "x-1-cp312-cp312-macosx_10_9_intel.whl",
         "x-1-jy27-none-any.whl",

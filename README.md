@@ -186,11 +186,12 @@ the pins, which an index does not change, so a cached CPU environment would be
 reused in silence. Either way the run records what it got: `device` and
 `cuda_build` are in the training metrics.
 
-Python 3.13 runs `bundle`, and `prepare` without `--tokenizer`, but no stage
-that builds an environment: each builds from the interpreter you launched, and
-`numpy==2.0.2`, pinned for `convert` and `verify`, and `sentencepiece==0.2.0`,
-pinned for `tune`, publish no wheel past 3.12. Past a ceiling the command
-refuses and names the pin that set it.
+Python 3.13 runs `bundle`, and `prepare` without `--tokenizer`, everywhere;
+`tune`, and `prepare --tokenizer`, on Linux x86_64 only; and `convert` and
+`verify` nowhere. Each stage builds its environment from the interpreter you
+launched: `torch==2.5.1` publishes its one cp313 wheel for manylinux x86_64,
+and `numpy==2.0.2`, pinned for `convert` and `verify`, publishes none past
+3.12. Past a ceiling the command refuses and names the pin that set it.
 
 Each of `tune`, `convert` and `verify` builds its environment on first use and
 caches it. Measured on macOS:

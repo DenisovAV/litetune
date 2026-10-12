@@ -107,13 +107,17 @@ class _Wheel:
 
 _CPYTHON = re.compile(r"cp3(\d+)")
 # The ABIs a regular CPython build installs: none, its own, and its own with the
-# `m` suffix older releases carried. `abi3` and the free-threaded `t` builds are
-# refused below until a pin needs them and somebody reads what they mean.
+# `m` suffix older releases carried. `abi3` is refused below until a pin needs it
+# and somebody reads what it means.
 _ABI = re.compile(r"none|cp3\d+m?")
+# A free-threaded build's ABI, `cp313t`: a wheel for it installs on that build
+# and not on the regular one beside it (`sentencepiece==0.2.1` ships both). A
+# free-threaded host is not modelled, so these wheels count for nothing.
+_FREE_THREADED = re.compile(r"cp3\d+t")
 
 
 def _wheel(filename: str) -> _Wheel | None:
-    """Read a wheel file name's tags. None for a wheel no CPython installs."""
+    """Read a wheel file name's tags. None for a wheel no regular CPython build installs."""
     if not filename.endswith(".whl"):
         raise ValueError(f"{filename} is not a wheel")
     python, abi, tag = filename[: -len(".whl")].split("-")[-3:]
@@ -131,7 +135,7 @@ def _wheel(filename: str) -> _Wheel | None:
             continue
         else:
             raise ValueError(f"unrecognised python tag {part!r} in {filename}")
-    if not cpython:
+    if not cpython or _FREE_THREADED.fullmatch(abi):
         return None
     if not _ABI.fullmatch(abi):
         raise ValueError(f"unrecognised ABI tag {abi!r} in {filename}")
@@ -483,62 +487,74 @@ _RELEASES = (
         ),
     ),
     Release(
-        "sentencepiece==0.2.0",
-        "https://pypi.org/pypi/sentencepiece/0.2.0/json",
+        "sentencepiece==0.2.1",
+        "https://pypi.org/pypi/sentencepiece/0.2.1/json",
         files=(
-            "sentencepiece-0.2.0-cp310-cp310-macosx_10_9_universal2.whl",
-            "sentencepiece-0.2.0-cp310-cp310-macosx_10_9_x86_64.whl",
-            "sentencepiece-0.2.0-cp310-cp310-macosx_11_0_arm64.whl",
-            "sentencepiece-0.2.0-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
-            "sentencepiece-0.2.0-cp310-cp310-manylinux_2_17_i686.manylinux2014_i686.whl",
-            "sentencepiece-0.2.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-            "sentencepiece-0.2.0-cp310-cp310-win32.whl",
-            "sentencepiece-0.2.0-cp310-cp310-win_amd64.whl",
-            "sentencepiece-0.2.0-cp311-cp311-macosx_10_9_universal2.whl",
-            "sentencepiece-0.2.0-cp311-cp311-macosx_10_9_x86_64.whl",
-            "sentencepiece-0.2.0-cp311-cp311-macosx_11_0_arm64.whl",
-            "sentencepiece-0.2.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
-            "sentencepiece-0.2.0-cp311-cp311-manylinux_2_17_i686.manylinux2014_i686.whl",
-            "sentencepiece-0.2.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-            "sentencepiece-0.2.0-cp311-cp311-win32.whl",
-            "sentencepiece-0.2.0-cp311-cp311-win_amd64.whl",
-            "sentencepiece-0.2.0-cp312-cp312-macosx_10_9_universal2.whl",
-            "sentencepiece-0.2.0-cp312-cp312-macosx_10_9_x86_64.whl",
-            "sentencepiece-0.2.0-cp312-cp312-macosx_11_0_arm64.whl",
-            "sentencepiece-0.2.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
-            "sentencepiece-0.2.0-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl",
-            "sentencepiece-0.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-            "sentencepiece-0.2.0-cp312-cp312-win32.whl",
-            "sentencepiece-0.2.0-cp312-cp312-win_amd64.whl",
-            "sentencepiece-0.2.0-cp36-cp36m-macosx_10_9_x86_64.whl",
-            "sentencepiece-0.2.0-cp36-cp36m-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
-            "sentencepiece-0.2.0-cp36-cp36m-manylinux_2_17_i686.manylinux2014_i686.whl",
-            "sentencepiece-0.2.0-cp36-cp36m-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-            "sentencepiece-0.2.0-cp36-cp36m-win32.whl",
-            "sentencepiece-0.2.0-cp36-cp36m-win_amd64.whl",
-            "sentencepiece-0.2.0-cp37-cp37m-macosx_10_9_x86_64.whl",
-            "sentencepiece-0.2.0-cp37-cp37m-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
-            "sentencepiece-0.2.0-cp37-cp37m-manylinux_2_17_i686.manylinux2014_i686.whl",
-            "sentencepiece-0.2.0-cp37-cp37m-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-            "sentencepiece-0.2.0-cp37-cp37m-win32.whl",
-            "sentencepiece-0.2.0-cp37-cp37m-win_amd64.whl",
-            "sentencepiece-0.2.0-cp38-cp38-macosx_10_9_universal2.whl",
-            "sentencepiece-0.2.0-cp38-cp38-macosx_10_9_x86_64.whl",
-            "sentencepiece-0.2.0-cp38-cp38-macosx_11_0_arm64.whl",
-            "sentencepiece-0.2.0-cp38-cp38-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
-            "sentencepiece-0.2.0-cp38-cp38-manylinux_2_17_i686.manylinux2014_i686.whl",
-            "sentencepiece-0.2.0-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-            "sentencepiece-0.2.0-cp38-cp38-win32.whl",
-            "sentencepiece-0.2.0-cp38-cp38-win_amd64.whl",
-            "sentencepiece-0.2.0-cp39-cp39-macosx_10_9_universal2.whl",
-            "sentencepiece-0.2.0-cp39-cp39-macosx_10_9_x86_64.whl",
-            "sentencepiece-0.2.0-cp39-cp39-macosx_11_0_arm64.whl",
-            "sentencepiece-0.2.0-cp39-cp39-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
-            "sentencepiece-0.2.0-cp39-cp39-manylinux_2_17_i686.manylinux2014_i686.whl",
-            "sentencepiece-0.2.0-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-            "sentencepiece-0.2.0-cp39-cp39-win32.whl",
-            "sentencepiece-0.2.0-cp39-cp39-win_amd64.whl",
-            "sentencepiece-0.2.0.tar.gz",
+            "sentencepiece-0.2.1-cp310-cp310-macosx_10_9_universal2.whl",
+            "sentencepiece-0.2.1-cp310-cp310-macosx_10_9_x86_64.whl",
+            "sentencepiece-0.2.1-cp310-cp310-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.1-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+            "sentencepiece-0.2.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "sentencepiece-0.2.1-cp310-cp310-win32.whl",
+            "sentencepiece-0.2.1-cp310-cp310-win_amd64.whl",
+            "sentencepiece-0.2.1-cp310-cp310-win_arm64.whl",
+            "sentencepiece-0.2.1-cp311-cp311-macosx_10_9_universal2.whl",
+            "sentencepiece-0.2.1-cp311-cp311-macosx_10_9_x86_64.whl",
+            "sentencepiece-0.2.1-cp311-cp311-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+            "sentencepiece-0.2.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "sentencepiece-0.2.1-cp311-cp311-win32.whl",
+            "sentencepiece-0.2.1-cp311-cp311-win_amd64.whl",
+            "sentencepiece-0.2.1-cp311-cp311-win_arm64.whl",
+            "sentencepiece-0.2.1-cp312-cp312-macosx_10_13_universal2.whl",
+            "sentencepiece-0.2.1-cp312-cp312-macosx_10_13_x86_64.whl",
+            "sentencepiece-0.2.1-cp312-cp312-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+            "sentencepiece-0.2.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "sentencepiece-0.2.1-cp312-cp312-win32.whl",
+            "sentencepiece-0.2.1-cp312-cp312-win_amd64.whl",
+            "sentencepiece-0.2.1-cp312-cp312-win_arm64.whl",
+            "sentencepiece-0.2.1-cp313-cp313-macosx_10_13_universal2.whl",
+            "sentencepiece-0.2.1-cp313-cp313-macosx_10_13_x86_64.whl",
+            "sentencepiece-0.2.1-cp313-cp313-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.1-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+            "sentencepiece-0.2.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "sentencepiece-0.2.1-cp313-cp313-win32.whl",
+            "sentencepiece-0.2.1-cp313-cp313-win_amd64.whl",
+            "sentencepiece-0.2.1-cp313-cp313-win_arm64.whl",
+            "sentencepiece-0.2.1-cp313-cp313t-macosx_10_13_universal2.whl",
+            "sentencepiece-0.2.1-cp313-cp313t-macosx_10_13_x86_64.whl",
+            "sentencepiece-0.2.1-cp313-cp313t-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.1-cp313-cp313t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+            "sentencepiece-0.2.1-cp313-cp313t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "sentencepiece-0.2.1-cp313-cp313t-win32.whl",
+            "sentencepiece-0.2.1-cp313-cp313t-win_amd64.whl",
+            "sentencepiece-0.2.1-cp313-cp313t-win_arm64.whl",
+            "sentencepiece-0.2.1-cp314-cp314-macosx_10_13_universal2.whl",
+            "sentencepiece-0.2.1-cp314-cp314-macosx_10_13_x86_64.whl",
+            "sentencepiece-0.2.1-cp314-cp314-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.1-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+            "sentencepiece-0.2.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "sentencepiece-0.2.1-cp314-cp314-win32.whl",
+            "sentencepiece-0.2.1-cp314-cp314-win_amd64.whl",
+            "sentencepiece-0.2.1-cp314-cp314-win_arm64.whl",
+            "sentencepiece-0.2.1-cp314-cp314t-macosx_10_13_universal2.whl",
+            "sentencepiece-0.2.1-cp314-cp314t-macosx_10_13_x86_64.whl",
+            "sentencepiece-0.2.1-cp314-cp314t-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.1-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+            "sentencepiece-0.2.1-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "sentencepiece-0.2.1-cp314-cp314t-win32.whl",
+            "sentencepiece-0.2.1-cp314-cp314t-win_amd64.whl",
+            "sentencepiece-0.2.1-cp314-cp314t-win_arm64.whl",
+            "sentencepiece-0.2.1-cp39-cp39-macosx_10_9_universal2.whl",
+            "sentencepiece-0.2.1-cp39-cp39-macosx_10_9_x86_64.whl",
+            "sentencepiece-0.2.1-cp39-cp39-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.1-cp39-cp39-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+            "sentencepiece-0.2.1-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "sentencepiece-0.2.1-cp39-cp39-win32.whl",
+            "sentencepiece-0.2.1-cp39-cp39-win_amd64.whl",
+            "sentencepiece-0.2.1-cp39-cp39-win_arm64.whl",
+            "sentencepiece-0.2.1.tar.gz",
         ),
     ),
 )
