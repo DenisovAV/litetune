@@ -3,6 +3,12 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.5.0 — 2026-10-12
+- A stage whose pinned packages publish no wheel for this platform and Python is refused before pip, naming the package: `convert` on Windows, a 32-bit or ARM64 Python on Windows, Intel macOS, macOS before 12 and older glibc; `LITETUNE_ALLOW_MISSING_WHEELS=1` lets pip try anyway, and litetune now depends on `packaging` (#74).
+- `tune` runs on Python 3.13 on Linux x86_64, with `sentencepiece` 0.2.1 there and 0.2.0 on 3.10 – 3.12 as before (#74).
+- On Windows, JSON written by PowerShell is read, console output and help no longer raise on characters the code page lacks, `convert` touches no checkpoint before its environment stands, and the test suite runs in CI (#74).
+- `verify`'s float reference decodes greedily without the checkpoint's own `generation_config` penalties, and names any it left out; the Qwen2.5 references measured here applied `repetition_penalty` 1.1, and re-measured without it their figures are unchanged (#73).
+
 ## 0.4.1 — 2026-10-12
 - **A Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle litetune 0.4.0 converted from a checkpoint it did not recognise -- another organisation's copy, or a fine-tune under its own name -- has no block that reads LiteRT-LM 0.18.0's parts: convert it again; one converted from Qwen's own repositories at their current revisions, or what `tune` made from them, is unaffected (#71).**
 - `convert` puts the text-parts block in front of the checkpoint's own chat template instead of a packaged copy, and reads the template back from every bundle it writes (#71).
