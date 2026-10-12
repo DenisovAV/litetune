@@ -221,7 +221,7 @@ tool path only and the CPU nowhere.
 |---|---|---|---|
 | 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
 | 0.2.0 – 0.3.0 | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
-| 0.4.0 | `litert-lm==0.18.0` | `litert-lm==0.18.0` and `litert-lm-builder==0.18.0`; `litert-torch-nightly` and the LiteRT, quantizer and converter pins unchanged | unchanged |
+| 0.4.0 – 0.4.1 | `litert-lm==0.18.0` | `litert-lm==0.18.0` and `litert-lm-builder==0.18.0`; `litert-torch-nightly` and the LiteRT, quantizer and converter pins unchanged | unchanged |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
@@ -718,18 +718,22 @@ was converted with a template of your own, when:
   `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-0.6B-Base` and `Qwen/Qwen2.5-0.5B-Instruct` -- as
   Hub ids, local snapshots, paths ending in one of those names and what `tune` made
   from them -- so another organisation's copy, or a fine-tune under its own name,
-  carries its template alone too;
-- litetune 0.4.0 converted it for a checkpoint whose own template is not the one
-  0.4.0 packed. 0.4.0 gave every checkpoint it claimed the template of
-  `Qwen/Qwen3-0.6B` at `c1899de` or `Qwen/Qwen2.5-0.5B-Instruct` at `7ae5576` behind
-  the block, whatever its own was: Qwen3-0.6B-Base and its fine-tunes got
-  Qwen3-0.6B's, and another revision of either repository got the packed one
-  whether or not its own differs.
+  carries its template alone too.
 
-`verify` refuses a bundle of the first two kinds at its rendering check and names
-this as a possible cause. It need not refuse the third: it compares single turns,
-and 0.4.0's README recorded that Qwen3-0.6B's template renders a single turn as
-Qwen3-0.6B-Base's does, their multi-turn handling being what differs.
+`verify` refuses a bundle of either kind at its rendering check and names this as a
+possible cause.
+
+A bundle litetune 0.4.0 converted from a checkpoint it claimed carries the template
+of `Qwen/Qwen3-0.6B` at `c1899de` or `Qwen/Qwen2.5-0.5B-Instruct` at `7ae5576` behind
+the block, whatever the checkpoint's own was. For those two checkpoints and what
+`tune` made from them that is their own template, and converting again gives the
+same bundle but for Jinja comments (MEASUREMENTS.md, the 0.18.0 section).
+Qwen3-0.6B-Base and its fine-tunes got Qwen3-0.6B's: rendered by transformers'
+Jinja2 on 2026-10-12, Qwen3-0.6B-Base's template at `da87bfb` and Qwen3-0.6B's at
+`c1899de` print the same prompt for one user turn and for a two-turn text
+conversation, and differ only where a message carries a tool response, reasoning
+content or content that is not a string. Other revisions of either repository were
+not compared.
 
 Any other family's template is not rewritten: `convert` says so in its note on a
 checkpoint it has no rules for, and `verify`'s rendering check is what shows whether
@@ -787,7 +791,7 @@ incompatible dependencies and cannot share an interpreter.
 ## Results
 
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
-runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and 0.4.0 pins 0.18.0.
+runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and 0.4.0 – 0.4.1 pin 0.18.0.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
 0.17.1 re-measurements beside the originals where there are any, and the same
 again on 0.18.0.
