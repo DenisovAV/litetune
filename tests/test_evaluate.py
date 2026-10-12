@@ -30,6 +30,7 @@ from conftest import (
 from litetune import envs, toolpath
 from litetune.evaluate import (
     BACKEND_OBSERVED,
+    GENERATION_SETTINGS_NOT_APPLIED,
     UNKNOWN_BACKEND,
     DataError,
     DecodeConfig,
@@ -1352,6 +1353,166 @@ class _GenerationStopped(RuntimeError):
     """
 
 
+# What transformers 5.16.1 falls back to for a generation field nobody set
+# (`GenerationConfig._get_default_generation_params`,
+# generation/configuration_utils.py:609-645), verbatim.
+_TRANSFORMERS_DEFAULTS: dict[str, Any] = {
+    "max_length": 20,
+    "min_length": 0,
+    "do_sample": False,
+    "use_cache": True,
+    "early_stopping": False,
+    "num_beams": 1,
+    "temperature": 1.0,
+    "top_k": 50,
+    "top_p": 1.0,
+    "typical_p": 1.0,
+    "repetition_penalty": 1.0,
+    "length_penalty": 1.0,
+    "no_repeat_ngram_size": 0,
+    "encoder_no_repeat_ngram_size": 0,
+    "bad_words_ids": None,
+    "num_return_sequences": 1,
+    "output_scores": False,
+    "return_dict_in_generate": False,
+    "forced_bos_token_id": None,
+    "forced_eos_token_id": None,
+    "remove_invalid_values": False,
+    "exponential_decay_length_penalty": None,
+    "suppress_tokens": None,
+    "begin_suppress_tokens": None,
+    "epsilon_cutoff": 0.0,
+    "eta_cutoff": 0.0,
+    "encoder_repetition_penalty": 1.0,
+    "num_assistant_tokens": 20,
+    "num_assistant_tokens_schedule": "constant",
+    "assistant_confidence_threshold": 0.4,
+    "assistant_lookbehind": 10,
+    "target_lookbehind": 10,
+    "num_beam_groups": 1,
+    "diversity_penalty": 0.0,
+}
+
+# Every field a fresh 5.16.1 `GenerationConfig` serializes, all of them `None`
+# but the version: what `__init__` sets (generation/configuration_utils.py:
+# 392-497) as `to_dict` writes it out (:1172-1191).
+_GENERATION_CONFIG_FIELDS = tuple(
+    """
+    max_length max_new_tokens min_length min_new_tokens early_stopping max_time
+    stop_strings do_sample num_beams use_mtp use_cache cache_implementation
+    cache_config max_cache_len temperature top_k top_p min_p top_h typical_p
+    epsilon_cutoff eta_cutoff repetition_penalty encoder_repetition_penalty
+    length_penalty no_repeat_ngram_size bad_words_ids renormalize_logits
+    forced_bos_token_id forced_eos_token_id remove_invalid_values
+    exponential_decay_length_penalty suppress_tokens begin_suppress_tokens
+    sequence_bias token_healing guidance_scale watermarking_config
+    num_return_sequences output_attentions output_hidden_states output_scores
+    output_logits return_dict_in_generate pad_token_id bos_token_id eos_token_id
+    encoder_no_repeat_ngram_size decoder_start_token_id is_assistant
+    num_assistant_tokens num_assistant_tokens_schedule
+    assistant_confidence_threshold prompt_lookup_num_tokens
+    max_matching_ngram_size assistant_early_exit assistant_lookbehind
+    target_lookbehind assistant_ensemble_weight speculation_type compile_config
+    disable_compile continuous_batching_config low_memory penalty_alpha
+    dola_layers diversity_penalty num_beam_groups constraints force_words_ids
+    prefill_chunk_size _from_model_config transformers_version
+    """.split()
+)
+
+# 5.16.1's `METADATA_FIELDS` (generation/configuration_utils.py:46).
+_METADATA_FIELDS = (
+    "_from_model_config",
+    "_commit_hash",
+    "_original_object_hash",
+    "transformers_version",
+)
+
+
+class FakeGenerationConfig:
+    """`transformers.GenerationConfig`, as far as the generation script and
+    `generate`'s merge use it.
+
+    A field nobody set is `None`, as every field of a fresh one is in 5.16.1
+    (`__init__`, generation/configuration_utils.py:385-518), and a field it
+    does not know is kept, as `__init__` keeps one read from a
+    `generation_config.json` (:499-505).
+    """
+
+    def __init__(self, **settings: Any) -> None:
+        for key in _GENERATION_CONFIG_FIELDS:
+            setattr(self, key, None)
+        for key, value in settings.items():
+            setattr(self, key, value)
+
+    def to_json_string(self, use_diff: bool = True, ignore_metadata: bool = False) -> str:
+        # `to_dict` writes every field, and the running version over the one
+        # read from the file (configuration_utils.py:1172-1191). `use_diff`
+        # keeps what a fresh config does not have: a field set to anything but
+        # `None`, a field a fresh one lacks, and the version (`to_diff_dict`,
+        # :1149-1170).
+        settings = {**vars(self), "transformers_version": "5.16.1"}
+        if use_diff:
+            settings = {
+                key: value
+                for key, value in settings.items()
+                if value is not None
+                or key not in _GENERATION_CONFIG_FIELDS
+                or key == "transformers_version"
+            }
+        if ignore_metadata:
+            settings = {k: v for k, v in settings.items() if k not in _METADATA_FIELDS}
+        return json.dumps(settings, sort_keys=True)
+
+    @staticmethod
+    def _get_default_generation_params() -> dict[str, Any]:
+        return dict(_TRANSFORMERS_DEFAULTS)
+
+
+def merged_generation(
+    passed: FakeGenerationConfig | None, model_config: FakeGenerationConfig, kwargs: dict
+) -> dict[str, Any]:
+    """The settings a 5.16.1 `generate` call runs under, by its own merge.
+
+    `_prepare_generation_config` (generation/utils.py:1784-1818): the config
+    passed to the call, or a fresh one; every field still unset filled from
+    `model.generation_config`, then from the global defaults; then the call's
+    keyword arguments over all of it; then a "hybrid" cache cleared.
+    """
+    merged = {k: v for k, v in vars(passed).items() if v is not None} if passed else {}
+    for source in (vars(model_config), _TRANSFORMERS_DEFAULTS):
+        for key, value in source.items():
+            if merged.get(key) is None:
+                merged[key] = value
+    merged.update({k: v for k, v in kwargs.items() if k != "input_ids"})
+    if merged.get("cache_implementation") == "hybrid":
+        merged["cache_implementation"] = None
+    return merged
+
+
+# Qwen/Qwen2.5-0.5B-Instruct's `generation_config.json` at 7ae55760, verbatim.
+_QWEN25_GENERATION_CONFIG: dict[str, Any] = {
+    "bos_token_id": 151643,
+    "pad_token_id": 151643,
+    "do_sample": True,
+    "eos_token_id": [151645, 151643],
+    "repetition_penalty": 1.1,
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "transformers_version": "4.37.0",
+}
+
+# google/functiongemma-270m-it's `generation_config.json` at 39eccb09, verbatim.
+_FUNCTIONGEMMA_GENERATION_CONFIG: dict[str, Any] = {
+    "cache_implementation": "hybrid",
+    "do_sample": True,
+    "eos_token_id": [1, 50, 106],
+    "top_k": 64,
+    "top_p": 0.95,
+    "transformers_version": "4.57.3",
+}
+
+
 def _run_hf_generate_script(
     tmp_path: Path,
     monkeypatch,
@@ -1362,6 +1523,7 @@ def _run_hf_generate_script(
     stop_generation: bool = False,
     runtime_rendered: bool = False,
     prompts: tuple[str, ...] = ("hi",),
+    generation_config: dict[str, Any] | None = None,
 ) -> dict:
     """Runs `_HF_GENERATE_SCRIPT`'s real `main()` against faked `torch` and
     `transformers`, and returns what the fakes captured.
@@ -1375,6 +1537,11 @@ def _run_hf_generate_script(
     their own device and hand back a new object when `.to()` actually moves
     them, the way a real tensor does -- a double that returns `self`
     unconditionally cannot tell a dropped `.to()` call from one that ran.
+
+    `generation_config` is the checkpoint's `generation_config.json`, which
+    the fake model loads as its own `generation_config`. Its `generate`
+    merges that into the call the way transformers does, and records the
+    result as `captured["generation"]`.
     """
     import sys
     import types
@@ -1384,6 +1551,9 @@ def _run_hf_generate_script(
     captured: dict = {}
 
     class FakeModel:
+        def __init__(self) -> None:
+            self.generation_config = FakeGenerationConfig(**(generation_config or {}))
+
         def eval(self) -> "FakeModel":
             return self
 
@@ -1394,8 +1564,13 @@ def _run_hf_generate_script(
             captured["model_device"] = device
             return self
 
-        def generate(self, **kwargs: object) -> list[list[int]]:
+        def generate(
+            self, generation_config: "FakeGenerationConfig | None" = None, **kwargs: object
+        ) -> list[list[int]]:
             captured["generate_input_ids_device"] = getattr(kwargs["input_ids"], "device", None)
+            captured["generation"] = merged_generation(
+                generation_config, self.generation_config, kwargs
+            )
             if stop_generation:
                 raise _GenerationStopped("the run stopped after the model was placed")
             return [[0, 1, 2, 3]]
@@ -1661,6 +1836,289 @@ def test_the_reference_script_prefers_what_the_parent_already_resolved(tmp_path,
     assert captured["model_device"] == "cuda"
 
 
+# -- the checkpoint's generation config --------------------------------------
+
+
+def test_the_checkpoints_repetition_penalty_does_not_reach_generate(tmp_path, monkeypatch):
+    """transformers fills every field a `generate` call leaves unset from the
+    model's own generation config (generation/utils.py:1807 at 5.16.1), and
+    builds the repetition-penalty processor whether or not it samples (:1174,
+    ahead of the sampling-only block at :1296). Asking for greedy decoding and
+    nothing more left Qwen2.5-0.5B-Instruct's `repetition_penalty: 1.1` on
+    the float reference.
+    """
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config=_QWEN25_GENERATION_CONFIG
+    )
+    generation = captured["generation"]
+    assert generation["repetition_penalty"] == 1.0
+    assert generation["do_sample"] is False
+    assert generation["num_beams"] == 1
+
+
+def test_the_checkpoints_stop_ids_still_reach_generate(tmp_path, monkeypatch):
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config=_QWEN25_GENERATION_CONFIG
+    )
+    generation = captured["generation"]
+    assert generation["eos_token_id"] == [151645, 151643]
+    assert generation["bos_token_id"] == 151643
+    # The tokenizer's, as before: the call passes it, and a call's own
+    # argument wins over the checkpoint's.
+    assert generation["pad_token_id"] == 0
+
+
+def test_the_reference_reports_the_settings_it_left_out(tmp_path, monkeypatch):
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config=_QWEN25_GENERATION_CONFIG
+    )
+    assert captured["run_report"]["generation_settings_not_applied"] == {"repetition_penalty": 1.1}
+    # Read back under the key `describe()` publishes, from the report the
+    # script really wrote: the two sides spell the key separately.
+    backend = HuggingFaceBackend(model="org/m", auto_provision=False)
+    backend._take_run_report(captured["run_report"])
+    assert backend.describe()[GENERATION_SETTINGS_NOT_APPLIED] == {"repetition_penalty": 1.1}
+
+
+@pytest.mark.parametrize(
+    "report",
+    [{"device": "cpu"}, {"device": "cpu", GENERATION_SETTINGS_NOT_APPLIED: ["top_k"]}],
+    ids=["no record", "not a mapping"],
+)
+def test_a_report_without_a_record_is_not_published_as_one(report):
+    """`None`, not `{}`: a report that says nothing must not read as one
+    saying nothing was left out."""
+    backend = HuggingFaceBackend(model="org/m", auto_provision=False)
+    backend._take_run_report(report)
+    assert backend.describe()[GENERATION_SETTINGS_NOT_APPLIED] is None
+
+
+def test_the_settings_left_out_are_reported_before_generation(tmp_path, monkeypatch):
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config=_QWEN25_GENERATION_CONFIG, stop_generation=True
+    )
+    assert captured["run_report"]["generation_settings_not_applied"] == {"repetition_penalty": 1.1}
+
+
+def test_sampling_settings_and_the_cache_are_not_reported_as_left_out(tmp_path, monkeypatch):
+    """FunctionGemma's config asks for sampling, which greedy decoding does
+    not use -- those processors are built only under `do_sample`
+    (generation/utils.py:1296-1343) -- and for a "hybrid" cache, which the
+    reference keeps and 5.16.1 clears after the merge (:1817-1818), as it did
+    before."""
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config=_FUNCTIONGEMMA_GENERATION_CONFIG
+    )
+    assert captured["run_report"]["generation_settings_not_applied"] == {}
+    assert captured["generation"]["cache_implementation"] is None
+    assert captured["generation"]["eos_token_id"] == [1, 50, 106]
+
+
+def test_every_cache_setting_is_kept(tmp_path, monkeypatch):
+    """The four settings 5.16.1 groups as "Parameters that control the cache"
+    (generation/configuration_utils.py:405-409) reach the call as before."""
+    cache = {
+        "use_cache": False,
+        "cache_implementation": "static",
+        "cache_config": {"device": "cpu"},
+        "max_cache_len": 512,
+    }
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config={"eos_token_id": 1, **cache}
+    )
+    assert {key: captured["generation"][key] for key in cache} == cache
+    assert captured["run_report"]["generation_settings_not_applied"] == {}
+
+
+def test_a_setting_at_a_value_that_does_nothing_is_not_reported(tmp_path, monkeypatch):
+    """At transformers' own default, at a guidance scale of 1, which builds no
+    processor (generation/utils.py:1144), or with `renormalize_logits` off,
+    which appends none (:1354)."""
+    captured = _run_hf_generate_script(
+        tmp_path,
+        monkeypatch,
+        generation_config={
+            "eos_token_id": 1,
+            "repetition_penalty": 1.0,
+            "no_repeat_ngram_size": 0,
+            "guidance_scale": 1.0,
+            "renormalize_logits": False,
+        },
+    )
+    assert captured["run_report"]["generation_settings_not_applied"] == {}
+
+
+# Settings a 5.16.1 generation config can carry that change what a greedy call
+# generates or returns, each at a value that does: a logits processor built
+# whatever `do_sample` says (generation/utils.py:1144-1290, watermarking at
+# :1346, the log-softmax at :1354-1355, which can move the pick on a logit that
+# is not finite), a stopping criterion (:1373-1391), a rewritten prompt (:2595),
+# a dict returned instead of a tensor (:2946-2973), or a decoding mode other than
+# greedy (`get_generation_mode`, configuration_utils.py:548-598). `constraints`,
+# which holds objects, takes `force_words_ids`' branch (:548).
+_SETTINGS_THAT_CHANGE_THE_CALL: dict[str, Any] = {
+    "guidance_scale": 1.5,
+    "sequence_bias": [[[7], -1.0]],
+    "encoder_repetition_penalty": 1.2,
+    "repetition_penalty": 1.1,
+    "no_repeat_ngram_size": 3,
+    "encoder_no_repeat_ngram_size": 3,
+    "bad_words_ids": [[7]],
+    "min_length": 4,
+    "min_new_tokens": 4,
+    "forced_bos_token_id": 2,
+    "forced_eos_token_id": 1,
+    "remove_invalid_values": True,
+    "exponential_decay_length_penalty": [4, 1.5],
+    "suppress_tokens": [5],
+    "begin_suppress_tokens": [6],
+    "watermarking_config": {"bias": 2.0},
+    "force_words_ids": [[7]],
+    "penalty_alpha": 0.6,
+    "use_mtp": True,
+    "prompt_lookup_num_tokens": 3,
+    "assistant_early_exit": 2,
+    "dola_layers": "low",
+    "max_time": 1.0,
+    "stop_strings": ["stop"],
+    "is_assistant": True,
+    "token_healing": True,
+    "renormalize_logits": True,
+    "return_dict_in_generate": True,
+    # The scores `_sample` collects go to stopping (generation/utils.py:2836,
+    # :2900-2902, :2936), and a criterion `is_assistant` adds reads them
+    # (:1385-1392; stopping_criteria.py:611).
+    "output_scores": True,
+    # Not shown by the source to be without effect, so reported too: these two
+    # reach the model's forward (generation/utils.py:1831-1834), and more than
+    # one sequence stops a greedy call (configuration_utils.py:788-795).
+    "output_attentions": True,
+    "output_hidden_states": True,
+    "num_return_sequences": 2,
+}
+
+# Set beside a case so that 5.16.1 accepts its config at all: it refuses more
+# than one returned sequence without sampling (configuration_utils.py:788-795).
+_COMPANIONS: dict[str, dict[str, Any]] = {"num_return_sequences": {"do_sample": True}}
+
+
+@pytest.mark.parametrize(("field", "value"), sorted(_SETTINGS_THAT_CHANGE_THE_CALL.items()))
+def test_no_setting_that_changes_the_call_reaches_it_unreported(
+    tmp_path, monkeypatch, field, value
+):
+    checkpoint = {"eos_token_id": 1, **_COMPANIONS.get(field, {}), field: value}
+    captured = _run_hf_generate_script(tmp_path, monkeypatch, generation_config=checkpoint)
+    assert captured["generation"].get(field) == _TRANSFORMERS_DEFAULTS.get(field)
+    assert captured["run_report"]["generation_settings_not_applied"] == {field: value}
+
+
+# A value off transformers' default for every entry of the script's
+# `NO_EFFECT_ON_THE_CALL`.
+_SETTINGS_WITHOUT_EFFECT: dict[str, Any] = {
+    "do_sample": True,
+    "num_beams": 4,
+    "max_new_tokens": 99,
+    "max_length": 99,
+    "temperature": 0.7,
+    "top_k": 20,
+    "top_p": 0.8,
+    "min_p": 0.1,
+    "typical_p": 0.9,
+    "top_h": 0.5,
+    "epsilon_cutoff": 0.001,
+    "eta_cutoff": 0.001,
+    "length_penalty": 1.2,
+    "early_stopping": True,
+    "num_beam_groups": 2,
+    "diversity_penalty": 0.5,
+    "output_logits": True,
+}
+
+
+@pytest.mark.parametrize(("field", "value"), sorted(_SETTINGS_WITHOUT_EFFECT.items()))
+def test_a_setting_without_effect_is_left_out_unreported(tmp_path, monkeypatch, field, value):
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config={"eos_token_id": 1, field: value}
+    )
+    assert captured["generation"].get(field) != value
+    assert captured["run_report"]["generation_settings_not_applied"] == {}
+
+
+def test_an_assistant_config_is_reported_whole(tmp_path, monkeypatch):
+    """Together these stop a 5.16.1 call on a token below the assistant's
+    confidence threshold: `is_assistant` adds `ConfidenceCriteria`
+    (generation/utils.py:1385-1392), which reads the scores `_sample` collects
+    only when both output flags are on (:2836, :2900-2902, :2936). None of the
+    three may reach the call, and the record names all three."""
+    assistant = {"is_assistant": True, "return_dict_in_generate": True, "output_scores": True}
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config={"eos_token_id": 1, **assistant}
+    )
+    for field in assistant:
+        assert captured["generation"].get(field) == _TRANSFORMERS_DEFAULTS.get(field)
+    assert captured["run_report"]["generation_settings_not_applied"] == assistant
+
+
+def test_every_setting_the_script_calls_without_effect_is_pinned():
+    """A field added to the script's list without a case above is a claim
+    about transformers nothing here checks."""
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+
+    namespace: dict = {"__name__": "litetune_hf_script_under_test"}
+    exec(compile(_HF_GENERATE_SCRIPT, "hf_generate.py", "exec"), namespace)  # noqa: S102
+
+    assert set(namespace["NO_EFFECT_ON_THE_CALL"]) == set(_SETTINGS_WITHOUT_EFFECT)
+
+
+def test_a_setting_litetune_has_no_name_for_is_left_out_and_reported(tmp_path, monkeypatch):
+    """A field a later transformers adds, or one a checkpoint invents, does
+    not reach the call by default: the reference keeps a named few and leaves
+    out the rest. It is reported rather than refused, because leaving it out
+    is the greedy decode whatever the field does."""
+    captured = _run_hf_generate_script(
+        tmp_path,
+        monkeypatch,
+        generation_config={"eos_token_id": 1, "no_repeat_ngram_size": 3, "logit_floor": -5.0},
+    )
+    assert captured["generation"].get("logit_floor") is None
+    assert captured["generation"]["no_repeat_ngram_size"] == 0
+    assert captured["generation"]["eos_token_id"] == 1
+    assert captured["run_report"]["generation_settings_not_applied"] == {
+        "logit_floor": -5.0,
+        "no_repeat_ngram_size": 3,
+    }
+
+
+def test_a_run_with_no_report_does_not_keep_the_last_runs_settings(monkeypatch):
+    """One run reports what it left out; the next writes no report at all.
+    The first run's record must not be published as the second's."""
+    _ready_env()
+    reports: list[dict | None] = [
+        {"device": "cpu", "generation_settings_not_applied": {"repetition_penalty": 1.1}},
+        None,
+    ]
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        if args[1] == "-c":
+            return subprocess.CompletedProcess(args, 0, probe_answer("cpu"), "")
+        spec = json.loads(Path(args[2]).read_text())
+        Path(spec["out"]).write_text(
+            json.dumps({"index": 0, "text": call_text("a")}) + "\n", encoding="utf-8"
+        )
+        report = reports.pop(0)
+        if report is not None:
+            Path(spec["run_report"]).write_text(json.dumps(report), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    backend = HuggingFaceBackend(model="org/model", auto_provision=False)
+
+    backend.generate(["a"])
+    assert backend.describe()[GENERATION_SETTINGS_NOT_APPLIED] == {"repetition_penalty": 1.1}
+    backend.generate(["b"])
+    assert backend.describe()[GENERATION_SETTINGS_NOT_APPLIED] is None
+
+
 def test_an_unprovisioned_environment_is_a_third_state(monkeypatch, tmp_path):
     """ "Nobody asked", "it was asked and could not say", and "there was nothing
     to ask" are three different facts, and the third used to be filed as the
@@ -1794,6 +2252,11 @@ def test_the_reference_script_renders_the_prompt_with_the_declarations(tmp_path,
             return self
 
     class Model:
+        def __init__(self):
+            # Every model transformers can generate with carries one
+            # (modeling_utils.py:1356-1361 at 5.16.1).
+            self.generation_config = FakeGenerationConfig()
+
         def eval(self):
             return self
 

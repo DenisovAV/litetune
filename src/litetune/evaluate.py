@@ -98,6 +98,13 @@ CPU_BACKEND = "cpu"
 # cannot observe says so, and says it here rather than by convention.
 BACKEND_OBSERVED = "backend_observed"
 
+# The settings in the reference checkpoint's generation config that the float
+# reference left out of its `generate` call, with their values, under this key
+# in `HuggingFaceBackend.describe()` -- see `greedy_generation_config` in
+# `_HF_GENERATE_SCRIPT`. `{}` when it left none out; `None` when no run report
+# said. `verify` names any it finds in a limitation.
+GENERATION_SETTINGS_NOT_APPLIED = "generation_settings_not_applied"
+
 
 @dataclass(frozen=True)
 class DecodeConfig:
@@ -1755,6 +1762,110 @@ def generation_device(torch, given=None):
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# What the reference takes from the checkpoint's generation config: the token ids
+# that start, end and pad a generation, and what transformers 5.16.1 groups as
+# "Parameters that control the cache" (generation/configuration_utils.py:405-409).
+# Nothing else in that config reaches `generate`. transformers fills every field a
+# call leaves unset from `model.generation_config` (`_prepare_generation_config`,
+# generation/utils.py:1806-1808), and builds the repetition-penalty processor,
+# among others, whether or not it samples (`_get_logits_processor`, :1144-1290,
+# ahead of the sampling-only block at :1296) -- so a reference that asked for
+# greedy decoding and nothing more still decoded with the `repetition_penalty:
+# 1.1` in Qwen2.5-0.5B-Instruct's generation_config.json at 7ae55760.
+#
+# The cache settings apply as they did before: `_prepare_cache_for_generation`
+# builds the cache they name (generation/utils.py:1929-2028), "quantized"
+# quantizes its keys and values (:2001-2011), a static one lets the forward be
+# compiled on CUDA (:2119-2138, :2861-2865), and "hybrid" is cleared after the
+# merge (:1817-1818).
+KEPT_GENERATION_SETTINGS = (
+    "bos_token_id",
+    "eos_token_id",
+    "pad_token_id",
+    "use_cache",
+    "cache_implementation",
+    "cache_config",
+    "max_cache_len",
+)
+
+# Left out of the call like the rest, and not reported, because none of them can
+# change what this call generates, when it stops, or what it returns.
+NO_EFFECT_ON_THE_CALL = (
+    # The call passes `do_sample`, `num_beams` and `max_new_tokens`, and
+    # `max_new_tokens` replaces `max_length` (generation/utils.py:1726-1734); the
+    # checkpoint's `max_length` is otherwise read only for warnings (:2462-2466,
+    # :1669-1713).
+    "do_sample",
+    "num_beams",
+    "max_new_tokens",
+    "max_length",
+    # Read only under `do_sample` (:1296-1343). `top_k` also selects contrastive
+    # search, but only beside `penalty_alpha` (configuration_utils.py:553-556),
+    # which is reported.
+    "temperature",
+    "top_k",
+    "top_p",
+    "min_p",
+    "typical_p",
+    "top_h",
+    "epsilon_cutoff",
+    "eta_cutoff",
+    # Read only by beam search: `_beam_search` (:3208) reads the first two
+    # (:3261-3262), `get_generation_mode` reads `num_beam_groups` only when
+    # `num_beams` > 1 (configuration_utils.py:564), and nothing in
+    # generation/utils.py reads `diversity_penalty`.
+    "length_penalty",
+    "early_stopping",
+    "num_beam_groups",
+    "diversity_penalty",
+    # Read by `_sample` (generation/utils.py:2830) and `_assisted_decoding`
+    # (:3650) only to fill the `logits` of the dict output
+    # `return_dict_in_generate` asks for (:2837, :2903-2904, :3655, :3824-3825).
+    # Stopping is handed the scores, not these (:2936, :3859). Beam search, the
+    # third reader (:3258), needs `num_beams` > 1, which the call never passes.
+    # `output_scores` is reported: its scores reach stopping, where
+    # `is_assistant` adds a criterion that reads them (:1385-1392;
+    # stopping_criteria.py:611).
+    "output_logits",
+)
+
+# Values that build nothing, beside transformers' own defaults: a guidance scale
+# of 1 adds no processor (generation/utils.py:1144), and only `True` appends the
+# log-softmax `renormalize_logits` names (:1354-1355), which can move the pick
+# when a logit is not finite.
+NO_OP_VALUES = {"guidance_scale": 1, "renormalize_logits": False}
+
+
+def greedy_generation_config(checkpoint):
+    """The config the reference generates under, and the settings it left out.
+
+    `checkpoint` is the model's own `generation_config`. The first value is a
+    new config of the same class carrying only `KEPT_GENERATION_SETTINGS` from
+    it, to stand in for it on the model: a config passed to `generate` instead
+    would have its unset fields filled from the checkpoint's all the same. The
+    second maps each other setting the checkpoint makes to its value, leaving
+    out `NO_EFFECT_ON_THE_CALL`, `NO_OP_VALUES`, and any setting equal to what
+    transformers uses for a field nobody set (`_get_default_generation_params`,
+    which `_prepare_generation_config` applies at generation/utils.py:1808).
+
+    The kept settings are named and everything else is left out, rather than
+    the other way round, so a field this list has never heard of -- one a
+    later transformers adds -- cannot reach the call. It is reported instead,
+    as is any setting the source does not show to be without effect here.
+    """
+    settings = json.loads(checkpoint.to_json_string(use_diff=True, ignore_metadata=True))
+    neutral = {**type(checkpoint)._get_default_generation_params(), **NO_OP_VALUES}
+    kept = {key: value for key, value in settings.items() if key in KEPT_GENERATION_SETTINGS}
+    left_out = {
+        key: value
+        for key, value in settings.items()
+        if key not in KEPT_GENERATION_SETTINGS
+        and key not in NO_EFFECT_ON_THE_CALL
+        and value != neutral.get(key)
+    }
+    return type(checkpoint)(**kept), left_out
+
+
 def main() -> int:
     spec = json.loads(Path(sys.argv[1]).read_text())
 
@@ -1774,6 +1885,7 @@ def main() -> int:
         attn_implementation=spec["attn_implementation"],
     )
     model.eval()
+    model.generation_config, not_applied = greedy_generation_config(model.generation_config)
     device = generation_device(torch, spec.get("device"))
     model.to(device)
     # Structured, not only printed. The stderr line below is for a human
@@ -1781,8 +1893,13 @@ def main() -> int:
     # path that matters it reaches nobody. This file is what the parent reads
     # back, and it is written before generation starts so that a run killed
     # part-way still says where it was running -- and which MPS variables it
-    # read, for the parent to compare with what it sent.
-    report = {"device": device, "mps_environment": environment_seen()}
+    # read, for the parent to compare with what it sent, and which of the
+    # checkpoint's generation settings it left out.
+    report = {
+        "device": device,
+        "mps_environment": environment_seen(),
+        "generation_settings_not_applied": not_applied,
+    }
     Path(spec["run_report"]).write_text(json.dumps(report), encoding="utf-8")
     print(f"reference generation on {device}", file=sys.stderr, flush=True)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
@@ -1903,6 +2020,9 @@ class HuggingFaceBackend:
     # Set when what the script read differs from what the memory policy
     # records reaching it (`devices.environment_mismatch`); `verify` records it.
     mps_environment_mismatch: str | None = None
+    # From this call's run report: the checkpoint's generation settings the
+    # script left out of `generate` (`GENERATION_SETTINGS_NOT_APPLIED`).
+    generation_settings_not_applied: dict[str, Any] | None = None
 
     name = "transformers"
     # `generate()` receives max_new_tokens and the stop condition, so here the
@@ -1982,6 +2102,7 @@ class HuggingFaceBackend:
             "requirements": list(self.env.requirements),
             "decode_declared": self.decode.as_dict(),
             "decode_passed_to_runtime": self.decode_enforced,
+            GENERATION_SETTINGS_NOT_APPLIED: self.generation_settings_not_applied,
             "prompt_mode": self.prompt_mode.value,
             "prompt_mode_declared": self.declared_prompt_mode is not None,
             "applies_chat_template": self.uses_template,
@@ -2106,6 +2227,8 @@ class HuggingFaceBackend:
         self.mps_memory_sampled_max = sampled if isinstance(sampled, dict) else None
         seen = run_report.get("mps_environment")
         self.mps_environment_seen = seen if isinstance(seen, dict) else None
+        left_out = run_report.get(GENERATION_SETTINGS_NOT_APPLIED)
+        self.generation_settings_not_applied = left_out if isinstance(left_out, dict) else None
         if self.mps_memory is not None:
             self.mps_environment_mismatch = devices.environment_mismatch(
                 self.mps_memory, seen, "reference generation script"
@@ -2152,6 +2275,7 @@ class HuggingFaceBackend:
         self.mps_memory_sampled_max = None
         self.mps_environment_seen = None
         self.mps_environment_mismatch = None
+        self.generation_settings_not_applied = None
         # Before provisioning, which costs minutes: a LITETUNE_DEVICE litetune
         # does not accept stops this reference from running at all, rather
         # than being read as "auto" and placing it on the accelerator it was

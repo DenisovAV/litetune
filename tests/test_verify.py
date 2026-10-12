@@ -1160,6 +1160,65 @@ def test_a_reference_cuda_build_with_no_device_reaches_the_manifest(
     )
 
 
+def _verify_with_reference_report(write_split, monkeypatch, tmp_path, run_report):
+    """`verify` with a real `HuggingFaceBackend` whose script wrote `run_report`."""
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    answer = probe_answer("cpu")
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=answer, run_report=run_report)
+    )
+    return verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+
+def test_settings_the_reference_left_out_are_named_in_the_manifest(
+    write_split, monkeypatch, tmp_path
+):
+    """Qwen2.5-0.5B-Instruct's `generation_config.json` asks for
+    `repetition_penalty: 1.1`, and the reference decodes greedily without it.
+    A reader comparing this reference with another harness's run of the same
+    checkpoint has to be told. Each value is written as JSON, so a string
+    reads as one."""
+    left_out = {"repetition_penalty": 1.1, "dola_layers": "low"}
+    result = _verify_with_reference_report(
+        write_split,
+        monkeypatch,
+        tmp_path,
+        {"device": "cpu", "generation_settings_not_applied": left_out},
+    )
+
+    engine = result.manifest["measurements"]["reference"]["engine"]
+    assert engine["generation_settings_not_applied"] == left_out
+    named = [
+        t
+        for t in result.manifest["limitations"]
+        if 'dola_layers="low", repetition_penalty=1.1' in t
+    ]
+    assert len(named) == 1
+
+
+def test_nothing_is_said_when_the_reference_left_no_setting_out(write_split, monkeypatch, tmp_path):
+    # A report with no record at all names nothing either: there is nothing to name.
+    unrecorded = _verify_with_reference_report(
+        write_split, monkeypatch, tmp_path, {"device": "cpu"}
+    )
+    none_left_out = _verify_with_reference_report(
+        write_split,
+        monkeypatch,
+        tmp_path,
+        {"device": "cpu", "generation_settings_not_applied": {}},
+    )
+
+    assert none_left_out.manifest["limitations"] == unrecorded.manifest["limitations"]
+    assert not any("generation config" in t for t in unrecorded.manifest["limitations"])
+
+
 def test_a_reference_whose_terminator_is_unknown_is_not_a_conversion_cost(write_split):
     """The gate this check exists to close.
 

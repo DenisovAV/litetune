@@ -43,6 +43,7 @@ from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
 from litetune.devices import DEVICE_VARIABLE, DeviceSettingError, device_setting
 from litetune.evaluate import (
+    GENERATION_SETTINGS_NOT_APPLIED,
     GREEDY,
     UNKNOWN_BACKEND,
     DataError,
@@ -718,6 +719,23 @@ INFERRED_PROMPT_MODE = (
     "training decided. Pass the mode explicitly, or point --contract at the bundle this model "
     "shipped with"
 )
+
+REFERENCE_SETTINGS_LEFT_OUT = (
+    "the float reference decoded greedily without these settings from its checkpoint's "
+    "generation config, which transformers would otherwise have merged into its generate "
+    "call: {settings}. Of that config it keeps only the bos, eos and pad token ids and the "
+    "cache settings"
+)
+
+
+def _reference_settings_left_out(engine: dict[str, Any]) -> str | None:
+    """The limitation naming what the reference left out of its checkpoint's
+    generation config, or `None` when the engine record names nothing."""
+    left_out = engine.get(GENERATION_SETTINGS_NOT_APPLIED)
+    if not isinstance(left_out, dict) or not left_out:
+        return None
+    settings = ", ".join(f"{key}={json.dumps(value)}" for key, value in sorted(left_out.items()))
+    return REFERENCE_SETTINGS_LEFT_OUT.format(settings=settings)
 
 
 def contract_prompt_mode(path: Path) -> PromptMode:
@@ -1407,6 +1425,11 @@ def run_verify(
                 run.limitation(text)
         if pair.reference.mps_environment_mismatch is not None:
             run.limitation(pair.reference.mps_environment_mismatch)
+    # Read off the measurement rather than the backend, like the device: what
+    # the manifest records is what the limitation names.
+    left_out = _reference_settings_left_out(reference.engine)
+    if left_out is not None:
+        run.limitation(left_out)
     # Same vocabulary, opposite baseline: `generate` on the transformers side
     # halts at the first eos, so a generation that stopped on its own carries
     # at least one terminator -- but not every generation is guaranteed to
