@@ -135,11 +135,13 @@ brew install DenisovAV/tap/litetune
 
 **Linux, macOS on Apple Silicon or Windows on x64**, Python 3.10–3.12 — with
 `convert` needing Linux x86_64 or an Apple Silicon Mac, for the reason below.
-The pinned wheels set the minimums: glibc 2.27 on Linux for every stage that
-builds an environment (`litert-lm-api`, `litert-converter` and
-`sentencepiece==0.2.1` are `manylinux_2_27`), macOS 12 for `convert`, `verify`
-and `towers` (`litert-lm-api` is `macosx_12_0_arm64`) and macOS 11 for `tune`;
-musl Linux, Alpine's, has none of them. Each stage checks, before pip runs, that
+The pinned wheels set the minimums. On Linux: glibc 2.27 for `convert`,
+`verify` and `towers` (`litert-lm-api` and `litert-converter` are
+`manylinux_2_27`); for `tune`, glibc 2.17 on Python 3.10–3.12, where it pins
+`sentencepiece==0.2.0` (`manylinux2014`), and 2.27 on 3.13, where it pins
+`sentencepiece==0.2.1`, the first with cp313 wheels and `manylinux_2_27`. On
+macOS: 12 for `convert`, `verify` and `towers` (`litert-lm-api` is
+`macosx_12_0_arm64`) and 11 for `tune`. musl Linux, Alpine's, has none of them. Each stage checks, before pip runs, that
 every pin it installs publishes a wheel this interpreter accepts — the whole
 tag, matched as pip matches it — and refuses by naming the one that does not:
 the runtime's native library `litert-lm-api` and `torch==2.5.1` publish none for

@@ -332,7 +332,9 @@ def parse_pip_freeze(text: str) -> dict[str, str]:
     """
     versions: dict[str, str] = {}
     for raw in text.splitlines():
-        line = raw.strip()
+        # A direct URL is kept verbatim, and one can carry the credentials of
+        # the index it was fetched from; the record is a manifest.
+        line = envs.redact_text(raw.strip())
         if not line or line.startswith("#"):
             continue
         if "==" in line:
@@ -373,7 +375,7 @@ def resolve_toolchain(env: envs.StageEnv, timeout_s: int = TOOLCHAIN_TIMEOUT_S) 
     if not resolved:
         return Toolchain.unknown(
             f"pip freeze exited {proc.returncode} and reported no packages: "
-            f"{_tail(proc.stderr) or 'no stderr'}",
+            f"{_tail(envs.redact_text(proc.stderr or '')) or 'no stderr'}",
             declared,
         )
     seen = {_canonical(n) for n in resolved}

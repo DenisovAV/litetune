@@ -997,6 +997,24 @@ def test_the_declared_pin_is_read_from_a_requirement_list():
     assert models.declared_version(("torch==2.5.1",)) is None
 
 
+def test_a_declared_version_is_read_without_its_marker_and_only_where_it_applies(monkeypatch):
+    """`sentencepiece==0.2.0; python_version < "3.13"` is the version 0.2.0 on
+    3.12 and no answer on 3.13; split on `==`, the marker became the version."""
+    from conftest import machine
+
+    from litetune import wheels
+
+    pins = (
+        'sentencepiece==0.2.0; python_version < "3.13"',
+        'sentencepiece==0.2.1; python_version >= "3.13"',
+    )
+    real = wheels.marker_environment
+    for minor, expected in ((12, "0.2.0"), (13, "0.2.1")):
+        asked = real(machine("linux_x86_64", (3, minor)))
+        monkeypatch.setattr(wheels, "marker_environment", lambda host=None, a=asked: a)
+        assert models.declared_version(pins, "sentencepiece") == expected
+
+
 # ---------------------------------------------------------------------------
 # The rules where the stages consult them
 # ---------------------------------------------------------------------------

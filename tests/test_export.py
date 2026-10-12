@@ -1180,6 +1180,23 @@ def test_a_report_carries_no_index_credential(toolchain, request_for, monkeypatc
     assert "https://***@mirror.invalid/simple" in report
 
 
+def test_a_pip_freeze_that_failed_is_quoted_without_credentials(monkeypatch, tmp_path):
+    """What `pip freeze` printed when it reported nothing reaches the manifest."""
+    from litetune.export import resolve_toolchain
+
+    def run(self, args, timeout=3600, **kwargs):
+        said = "Looking in indexes: https://u:p4ssw0rd@corp.invalid/simple?token=T0KEN"
+        return subprocess.CompletedProcess(args, 1, "", said)
+
+    monkeypatch.setattr(envs.StageEnv, "run", run)
+
+    toolchain = resolve_toolchain(envs.StageEnv(name="x", requirements=("a==1",)))
+
+    reason = toolchain.unresolved_reason or ""
+    assert "corp.invalid" in reason
+    assert "p4ssw0rd" not in reason and "T0KEN" not in reason
+
+
 def test_a_ready_export_environment_is_used_on_any_machine(toolchain, request_for, monkeypatch):
     """The refusal is for an environment that would have to be built here.
 

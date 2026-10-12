@@ -44,7 +44,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from litetune import envs
+from litetune import envs, wheels
 from litetune.checks import Check, CheckSet, Outcome
 from litetune.declarations import (
     DeclarationsError,
@@ -125,12 +125,15 @@ def versions_from(*stage_envs: envs.StageEnv) -> dict[str, str]:
     `export.resolve_toolchain` reads the resolved closure from a live
     environment and is strictly better; pass that when a run produced one.
     """
+    # The pins that apply to this interpreter, read as pip reads them: a marker
+    # is neither part of a version nor a second answer for the same name.
+    environment = wheels.marker_environment()
     versions: dict[str, str] = {}
     for env in stage_envs:
         for requirement in env.requirements:
-            name, sep, version = requirement.partition("==")
-            if sep:
-                versions[name.strip()] = version.strip()
+            pinned = wheels.pin(requirement)
+            if pinned and wheels.applies(requirement, environment):
+                versions[pinned[0]] = pinned[1]
     return versions
 
 

@@ -1489,3 +1489,23 @@ def test_the_shipped_declarations_hash_to_the_contract_on_a_platform_that_rewrit
     # and a reader who hashes the file compares against that.
     for name in (CONTRACT_NAME, "manifest.json", "report.json"):
         assert b"\r\n" not in (tmp_path / "bundle" / name).read_bytes(), name
+
+
+def test_versions_are_read_without_markers_and_only_where_they_apply(monkeypatch):
+    """`established_against` names the version a pin installs here, not its marker."""
+    from conftest import machine
+
+    from litetune import wheels
+
+    env = envs.StageEnv(
+        name="x",
+        requirements=(
+            "a==1",
+            'b==2.0; python_version < "3.13"',
+            'b==2.1; python_version >= "3.13"',
+        ),
+    )
+    asked = wheels.marker_environment(machine("linux_x86_64", (3, 12)))
+    monkeypatch.setattr(wheels, "marker_environment", lambda host=None: asked)
+
+    assert versions_from(env) == {"a": "1", "b": "2.0"}

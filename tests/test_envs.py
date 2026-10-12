@@ -52,6 +52,60 @@ def test_lower_bound_is_not_a_pin():
         StageEnv(name="bad", requirements=("torch>=2.0",))
 
 
+def test_an_equals_sign_inside_a_marker_is_not_a_pin():
+    """`"==" in requirement` passed this, which floats on every Python."""
+    with pytest.raises(UnpinnedRequirement):
+        StageEnv(name="bad", requirements=('torch>=2.0; python_version == "3.12"',))
+    with pytest.raises(UnpinnedRequirement):
+        StageEnv(name="bad", requirements=("torch==2.*",))
+
+
+def test_a_pin_behind_a_marker_is_still_a_pin():
+    StageEnv(name="ok", requirements=('sentencepiece==0.2.0; python_version < "3.13"',))
+
+
+# `train`'s definition on main before sentencepiece was pinned per Python.
+_TRAIN_ON_MAIN = ("torch==2.5.1", "transformers==5.16.1", "peft==0.20.0", "sentencepiece==0.2.0")
+
+
+def _identity_of(requirements: tuple[str, ...]) -> str:
+    """The identity formula as main computes it: interpreter version and sorted pins."""
+    import hashlib
+
+    payload = "\n".join((sys.version.split()[0], *sorted(requirements)))
+    return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+@pytest.mark.parametrize("minor", [10, 11, 12])
+def test_train_keeps_its_identity_where_its_pins_did_not_change(monkeypatch, minor):
+    """3.10 to 3.12 install exactly what main installs, so the cache they built is theirs.
+
+    A changed identity would rebuild every user's training environment for a
+    definition that installs the same files.
+    """
+    asked = wheels.marker_environment(machine("linux_x86_64", (3, minor)))
+    monkeypatch.setattr(envs.wheels, "marker_environment", lambda host=None: asked)
+
+    assert TRAIN.identity == _identity_of(_TRAIN_ON_MAIN)
+
+
+def test_train_on_3_13_is_another_environment(monkeypatch):
+    asked = wheels.marker_environment(machine("linux_x86_64", (3, 13)))
+    monkeypatch.setattr(envs.wheels, "marker_environment", lambda host=None: asked)
+
+    assert TRAIN.identity == _identity_of(_TRAIN_ON_MAIN[:3] + ("sentencepiece==0.2.1",))
+    assert TRAIN.identity != _identity_of(_TRAIN_ON_MAIN)
+
+
+def test_a_pin_that_does_not_apply_changes_no_identity(monkeypatch):
+    asked = wheels.marker_environment(machine("linux_x86_64", (3, 12)))
+    monkeypatch.setattr(envs.wheels, "marker_environment", lambda host=None: asked)
+    plain = StageEnv(name="x", requirements=("a==1",))
+    marked = StageEnv(name="x", requirements=("a==1", 'b==2; python_version >= "3.13"'))
+
+    assert plain.identity == marked.identity
+
+
 def test_shipped_environments_are_pinned():
     for env in (RUNTIME, EXPORT, TRAIN):
         assert env.identity, env.name
@@ -576,6 +630,31 @@ def test_pip_config_list_is_asked_of_the_interpreter_running_litetune(monkeypatc
     assert not pathlib.Path(directory).exists(), "and it is removed afterwards"
 
 
+def test_the_install_does_not_run_a_pip_planted_where_litetune_was_started(monkeypatch, tmp_path):
+    """`provision` runs `python -m pip install`, with the same hazard.
+
+    The environment's interpreter is stood in for by this one, and nothing is
+    given to install: pip refuses at once, with no index asked, and what is
+    under test is only which pip answered.
+    """
+    pytest.importorskip("pip")
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    ran = tmp_path / "planted-pip-ran"
+    (caller / "pip.py").write_text(f"open({str(ran)!r}, 'w').write('1')\n")
+    monkeypatch.chdir(caller)
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    monkeypatch.setenv("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", lambda self, path: None)
+    monkeypatch.setattr(StageEnv, "python", property(lambda self: pathlib.Path(sys.executable)))
+
+    with pytest.raises(RuntimeError, match="could not provision"):
+        StageEnv(name="planted", requirements=()).provision()
+
+    assert not ran.exists(), "the planted pip.py ran in the environment's own pip's place"
+
+
 def test_a_pip_planted_where_litetune_was_started_does_not_run(monkeypatch, tmp_path):
     """`python -m pip` puts the working directory first on `sys.path`.
 
@@ -660,18 +739,142 @@ def test_the_real_pip_reports_a_configured_index(monkeypatch, tmp_path):
     ],
 )
 def test_an_index_url_is_shown_without_its_credentials(given, shown):
-    assert envs._redacted(given) == shown
+    assert envs.redact_url(given) == shown
 
 
 def test_a_url_inside_a_message_is_redacted_where_it_stands():
     said = "Looking in indexes: https://pypi.org/simple, https://u:p4ss@corp.invalid/simple?k=v"
 
-    assert envs._redact_text(said) == (
+    assert envs.redact_text(said) == (
         "Looking in indexes: https://pypi.org/simple, https://***@corp.invalid/simple?***"
     )
 
 
 _SECRETS = ("s3cret", "T0KEN", "pypi-AgEN", "p4ss")
+
+
+def _no_secret_in(*said: str) -> None:
+    text = "\n".join(said)
+    for secret in _SECRETS:
+        assert secret not in text, secret
+
+
+def test_a_credential_in_the_environment_reaches_no_output(monkeypatch, tmp_path, caplog):
+    """`PIP_INDEX_URL` with a password: every log record at DEBUG, the note,
+    `unready_detail` and the refusal question all leave it out."""
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv("PIP_INDEX_URL", "https://user:s3cret@mirror.invalid/simple")
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
+    monkeypatch.setattr(
+        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
+    )
+    _host(monkeypatch, "win_amd64", (3, 12))
+    notes: list[str] = []
+
+    with caplog.at_level("DEBUG"):
+        assert EXPORT.refusal() is None, "another index: a note, not a refusal"
+        detail = EXPORT.unready_detail
+        EXPORT.provision(events=types.SimpleNamespace(note=lambda text, **_: notes.append(text)))
+        TRAIN.provision()
+
+    _no_secret_in(caplog.text, detail, *notes)
+    assert "https://***@mirror.invalid/simple" in detail
+
+
+def test_a_credential_in_pips_configuration_file_reaches_no_output(monkeypatch, tmp_path, caplog):
+    """The real `pip config list`, reading a `PIP_CONFIG_FILE` with a token in it."""
+    pytest.importorskip("pip")
+    config = tmp_path / "pip.ini"
+    config.write_text(
+        "[global]\nextra-index-url = https://__token__:pypi-AgEN@cfg.invalid/simple\n"
+    )
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    monkeypatch.setattr(envs, "_pip_configuration", _REAL_PIP_CONFIGURATION)
+    _host(monkeypatch, "win_amd64", (3, 12))
+
+    with caplog.at_level("DEBUG"):
+        others, unread = envs._other_sources()
+        detail = EXPORT.unready_detail
+
+    assert unread is None
+    assert any("https://***@cfg.invalid/simple" in o for o in others), others
+    _no_secret_in(caplog.text, detail, *others)
+
+
+_STRADDLING = "https://u:p4ssw0rd@corp.invalid/simple"
+
+
+def _tail_cuts_into_the_url(keep: int) -> str:
+    """Text whose last `keep` characters begin just past the URL's `https:`.
+
+    A sink that keeps a tail and redacts afterwards sees `//u:p4ssw0rd@...`,
+    which is no longer a URL to the pattern, and leaks the password.
+    """
+    pad = keep - (len(_STRADDLING) - len("https:")) - 1
+    return "x" * 300 + " " + _STRADDLING + " " + "y" * pad
+
+
+def _head_cuts_into_the_password(keep: int) -> str:
+    """Text whose first `keep` characters end inside the URL's password."""
+    return "x" * (keep - len("https://u:p4ssw")) + _STRADDLING
+
+
+def test_a_credential_in_what_pip_says_reaches_no_output(monkeypatch, tmp_path, caplog, probe_env):
+    """pip names the index it consulted, and every place its words or a stage's
+    are quoted -- a failed install, a failed virtualenv build, a `pip config
+    list` that failed, the device probe, `pip freeze` -- leaves the credential
+    out, including where the quote is cut."""
+    from litetune.export import parse_pip_freeze
+
+    messages: list[str] = []
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+
+    with caplog.at_level("DEBUG"):
+        # A failed install: the last 2000 characters of what pip said.
+        messages.append(RUNTIME._provisioning_failed(_tail_cuts_into_the_url(2000)))
+
+        # A failed virtualenv build: the last 2000 characters of ensurepip's output.
+        def failing_create(self, path):
+            output = _tail_cuts_into_the_url(2000).encode()
+            raise subprocess.CalledProcessError(1, ["python", "-m", "ensurepip"], output=output)
+
+        monkeypatch.setattr(envs.venv.EnvBuilder, "create", failing_create)
+        with pytest.raises(RuntimeError) as built:
+            StageEnv(name="venv", requirements=()).provision()
+        messages.append(str(built.value))
+        # A `pip config list` that failed, quoting its last line.
+        monkeypatch.setattr(
+            envs,
+            "_run_guarded",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", f"bad {_STRADDLING}"),
+        )
+        messages.append(str(_REAL_PIP_CONFIGURATION()[1]))
+        # The device probe: the last 200 characters of stderr, the first 200 of stdout.
+        _answers(monkeypatch, returncode=1, stderr=_tail_cuts_into_the_url(200))
+        messages.append(envs.resolve_device(probe_env).detail)
+        _answers(monkeypatch, stdout=_head_cuts_into_the_password(200))
+        messages.append(envs.resolve_device(probe_env).detail)
+        # A probe that could not start, its exception quoted.
+        _answers(monkeypatch, raises=OSError(f"cannot reach {_STRADDLING}"))
+        messages.append(envs.resolve_device(probe_env).detail)
+        # `pip freeze` keeps a direct URL verbatim.
+        frozen = parse_pip_freeze("pkg @ https://u:p4ssw0rd@corp.invalid/pkg-1-py3-none-any.whl\n")
+        messages.extend(frozen.values())
+
+    _no_secret_in(caplog.text, *messages)
+    assert "https://***@corp.invalid/simple" in messages[0]
+    assert "pkg @ https://***@corp.invalid/pkg-1-py3-none-any.whl" in messages
+
+
+def test_a_command_line_described_in_a_log_carries_no_credential():
+    """`_describe` returns a command line given as one string whole."""
+    proc = types.SimpleNamespace(
+        args="pip install --index-url https://u:p4ss@corp.invalid/simple x"
+    )
+
+    assert "p4ss" not in envs._describe(proc)
+    assert "corp.invalid" in envs._describe(proc)
 
 
 def test_no_index_credential_reaches_anything_litetune_says(monkeypatch, tmp_path, caplog):

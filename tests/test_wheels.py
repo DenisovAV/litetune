@@ -45,7 +45,9 @@ def test_every_pin_has_its_wheels_on_record():
     seen: set[str] = set()
     while pending:
         requirement = pending.pop()
-        name, _, version = requirement.partition("==")
+        pinned = wheels.pin(requirement)
+        assert pinned is not None, requirement
+        name, version = pinned
         key = f"{canonical(name)}=={version}"
         assert key in PUBLISHED, f"{requirement}: read https://pypi.org/pypi/{name}/{version}/json"
         if key not in seen:
@@ -91,8 +93,10 @@ def test_every_release_on_record_is_the_one_it_names(release: Release):
         (envs.TRAIN, "linux_x86_64", 13, []),
         (envs.TRAIN, "linux_x86_64", 14, ["torch==2.5.1"]),
         (envs.TRAIN, "linux_aarch64", 13, ["torch==2.5.1"]),
-        # glibc: litert-lm-api, the converter, ai-edge-litert and sentencepiece
-        # 0.2.1 are all manylinux_2_27, so 2.27 is every stage's floor.
+        # glibc: litert-lm-api, the converter and ai-edge-litert are
+        # manylinux_2_27, so 2.27 is runtime's and export's floor. Train's is
+        # 2.17 to 3.12 -- sentencepiece 0.2.0 is manylinux2014 -- and 2.27 on
+        # 3.13, where 0.2.1, manylinux_2_27, is the one with a cp313 wheel.
         (
             envs.EXPORT,
             "linux_x86_64_glibc_2_26",
@@ -103,13 +107,17 @@ def test_every_release_on_record_is_the_one_it_names(release: Release):
                 "litert-lm-api==0.18.0",
             ],
         ),
-        (envs.TRAIN, "linux_x86_64_glibc_2_26", 12, ["sentencepiece==0.2.1"]),
+        (envs.TRAIN, "linux_x86_64_glibc_2_26", 12, []),
+        (envs.TRAIN, "linux_x86_64_glibc_2_17", 12, []),
+        (envs.TRAIN, "linux_x86_64_glibc_2_16", 12, ["sentencepiece==0.2.0"]),
+        (envs.TRAIN, "linux_x86_64_glibc_2_26", 13, ["sentencepiece==0.2.1"]),
+        (envs.TRAIN, "linux_x86_64_glibc_2_27", 13, []),
         (envs.RUNTIME, "linux_x86_64_glibc_2_27", 12, []),
         (envs.EXPORT, "linux_x86_64_glibc_2_27", 12, []),
         (envs.TRAIN, "linux_x86_64_glibc_2_27", 12, []),
         # musl: nothing, not even the runtime's own library.
         (envs.RUNTIME, "musl_x86_64", 12, ["litert-lm-api==0.18.0"]),
-        (envs.TRAIN, "musl_x86_64", 12, ["sentencepiece==0.2.1", "torch==2.5.1"]),
+        (envs.TRAIN, "musl_x86_64", 12, ["sentencepiece==0.2.0", "torch==2.5.1"]),
         # Apple Silicon: macOS 12 for what carries litert-lm-api, 11 for train.
         (envs.EXPORT, "macosx_arm64", 12, []),
         (envs.TRAIN, "macosx_arm64", 13, ["torch==2.5.1"]),
@@ -124,7 +132,8 @@ def test_every_release_on_record_is_the_one_it_names(release: Release):
         (envs.TRAIN, "win_amd64", 13, ["torch==2.5.1"]),
         # Windows on ARM64 and 32-bit Windows: no stage at all.
         (envs.RUNTIME, "win_arm64", 12, ["litert-lm-api==0.18.0", "numpy==2.0.2"]),
-        (envs.TRAIN, "win_arm64", 12, ["torch==2.5.1"]),
+        (envs.TRAIN, "win_arm64", 12, ["sentencepiece==0.2.0", "torch==2.5.1"]),
+        (envs.TRAIN, "win_arm64", 13, ["torch==2.5.1"]),
         (envs.RUNTIME, "win32", 12, ["litert-lm-api==0.18.0"]),
         (envs.TRAIN, "win32", 12, ["torch==2.5.1"]),
         (
@@ -291,3 +300,49 @@ def test_this_interpreter_is_seen_as_pip_sees_it():
 
     assert _accepted(host.tags) == _accepted(compatibility.get_supported())
     assert host.tags == frozenset(sys_tags())
+
+
+# ---------------------------------------------------------------------------
+# Requirements as pip reads them
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("requirement", "pinned"),
+    [
+        ("torch==2.5.1", ("torch", "2.5.1")),
+        ('sentencepiece==0.2.0; python_version < "3.13"', ("sentencepiece", "0.2.0")),
+        ('torch>=2.0; python_version == "3.12"', None),
+        ("torch==2.*", None),
+        ("torch==2.5.1,<3", None),
+        ("litert-lm", None),
+        ("pkg @ https://example.invalid/pkg-1-py3-none-any.whl", None),
+        ("not a requirement ==", None),
+    ],
+)
+def test_a_pin_is_one_exact_version_and_a_marker_is_not_part_of_it(requirement, pinned):
+    assert wheels.pin(requirement) == pinned
+
+
+def test_a_pin_for_another_python_is_not_this_hosts_business():
+    """On 3.12 `sentencepiece==0.2.1; python_version >= "3.13"` is not asked for,
+    so its wheels -- `manylinux_2_27` -- do not refuse a glibc 2.26 machine."""
+    pins = [
+        'sentencepiece==0.2.0; python_version < "3.13"',
+        'sentencepiece==0.2.1; python_version >= "3.13"',
+    ]
+    host = machine("linux_x86_64_glibc_2_26", (3, 12))
+
+    assert gaps(pins, host) == []
+    (gap,) = gaps(pins, machine("linux_x86_64_glibc_2_26", (3, 13)))
+    assert gap.release.requirement == "sentencepiece==0.2.1"
+
+
+def test_a_marker_is_read_for_the_python_asked_about():
+    """Not the interpreter running the check: a POSIX 3.12 runner asking about 3.13."""
+    asked = wheels.marker_environment(machine("win_amd64", (3, 13)))
+
+    assert asked["python_version"] == "3.13"
+    assert wheels.applies('x==1; python_version >= "3.13"', asked)
+    assert not wheels.applies('x==1; python_version < "3.13"', asked)
+    assert wheels.applies("x==1", asked), "no marker applies everywhere"

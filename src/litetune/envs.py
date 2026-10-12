@@ -86,9 +86,14 @@ def _cache_root() -> Path:
 
 
 # A requirement is pinned if it fixes an exact version. `>=` is not a pin: it
-# admits tomorrow's release, which is precisely the failure mode above.
+# admits tomorrow's release, which is precisely the failure mode above. Read as
+# pip reads it (`wheels.pin`), so a marker is neither part of the version nor a
+# pin of its own: `torch>=2.0; python_version == "3.12"` holds an `==` and
+# floats, where `sentencepiece==0.2.0; python_version < "3.13"` is a pin.
 def _is_pinned(requirement: str) -> bool:
-    return "==" in requirement or requirement.startswith(("http://", "https://", "file://"))
+    if requirement.startswith(("http://", "https://", "file://")):
+        return True
+    return wheels.pin(requirement) is not None
 
 
 # A pip install of torch is minutes, not seconds; a stalled one is forever.
@@ -1520,11 +1525,15 @@ def _as_text(chunk: str | bytes | None, encoding: str = "utf-8") -> str:
 
 
 def _describe(proc: subprocess.Popen) -> str:
-    """The first word of a subprocess's command line, for a log message."""
+    """The first word of a subprocess's command line, for a log message.
+
+    Redacted: a command line given as one string is returned whole, and one
+    could name an index with its credentials in it.
+    """
     args = proc.args
     if isinstance(args, str | bytes | os.PathLike):
-        return os.fsdecode(args)
-    return os.fsdecode(next(iter(args), "the stage subprocess"))
+        return redact_text(os.fsdecode(args))
+    return redact_text(os.fsdecode(next(iter(args), "the stage subprocess")))
 
 
 def _child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -1610,9 +1619,10 @@ def _child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
 # `numpy==2.0.2` limit that `train` does not have, in a project whose README
 # said `tune` works there. A ceiling per environment was the next step, and
 # `train`'s 3.13 was a Linux fact: `torch==2.5.1` has a cp313 wheel for
-# manylinux x86_64 alone (and `sentencepiece==0.2.0`, pinned then, had none
-# anywhere). So the limits are not recorded here at all. They are read off what
-# each pinned release publishes, for this platform, in `wheels`.
+# manylinux x86_64 alone (and `sentencepiece==0.2.0` has none anywhere, which is
+# why `train` pins 0.2.1 on 3.13). So the limits are not recorded here at all.
+# They are read off what each pin that applies publishes, for this platform, in
+# `wheels`.
 STAGE_PYTHON_MIN = (3, 10)
 
 
@@ -1696,7 +1706,7 @@ _PIP_CONFIG_TIMEOUT_S = 60
 _URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
 
 
-def _redacted(url: str) -> str:
+def redact_url(url: str) -> str:
     """`url` as it may be shown: its user information, query and fragment replaced.
 
     An index URL can carry its credentials as user information --
@@ -1721,9 +1731,9 @@ def _redacted(url: str) -> str:
     return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
 
 
-def _redact_text(text: str) -> str:
-    """`text` with every URL in it `_redacted`."""
-    return _URL_IN_TEXT.sub(lambda m: _redacted(m.group(0)), text)
+def redact_text(text: str) -> str:
+    """`text` with every URL in it `redact_url`-ed."""
+    return _URL_IN_TEXT.sub(lambda m: redact_url(m.group(0)), text)
 
 
 def _is_pypi(url: str) -> bool:
@@ -1791,15 +1801,15 @@ def _pip_configuration() -> tuple[list[tuple[str, str, str]], str | None]:
         with tempfile.TemporaryDirectory(prefix="litetune-pip-config-") as empty:
             proc = _run_guarded(argv, _PIP_CONFIG_TIMEOUT_S, cwd=empty)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return [], _redact_text(f"{type(exc).__name__}: {exc}")
+        return [], redact_text(f"{type(exc).__name__}: {exc}")
     if proc.returncode != 0:
         said = (proc.stderr or proc.stdout or "").strip().splitlines()
         last = said[-1] if said else "nothing"
-        return [], _redact_text(f"`pip config list` exited {proc.returncode}: {last}")
+        return [], redact_text(f"`pip config list` exited {proc.returncode}: {last}")
     try:
         return _parse_pip_config(proc.stdout), None
     except ValueError as exc:
-        return [], _redact_text(str(exc))
+        return [], redact_text(str(exc))
 
 
 def _other_sources() -> tuple[list[str], str | None]:
@@ -1819,7 +1829,7 @@ def _other_sources() -> tuple[list[str], str | None]:
             # Decided on the value as given; said redacted, since it is said
             # in notes, refusals and the manifests that carry them.
             if option == "find-links" or not _is_pypi(item):
-                others.setdefault(item, f"{where}={_redacted(item)}")
+                others.setdefault(item, f"{where}={redact_url(item)}")
     return list(dict.fromkeys(others.values())), unread
 
 
@@ -2062,8 +2072,19 @@ class StageEnv:
 
     @property
     def identity(self) -> str:
-        """Content hash of the definition. Participates in stage cache keys."""
-        payload = "\n".join((sys.version.split()[0], *sorted(self.requirements)))
+        """Content hash of the definition, as it applies here. Participates in stage cache keys.
+
+        The requirements pip installs on this interpreter, each without its
+        marker: a pin whose marker is false here installs nothing and changes
+        nothing, so it changes no identity. An environment whose pins carry no
+        markers hashes exactly as it did before markers were read at all --
+        which is what keeps `train` on 3.10 to 3.12 the environment it was.
+        """
+        environment = wheels.marker_environment()
+        applied = [
+            wheels.without_marker(r) for r in self.requirements if wheels.applies(r, environment)
+        ]
+        payload = "\n".join((sys.version.split()[0], *sorted(applied)))
         return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
     @property
@@ -2252,6 +2273,9 @@ class StageEnv:
                     said = exc.output or b""
                     if isinstance(said, bytes):
                         said = said.decode("utf-8", "replace")
+                    # Redacted whole, then cut: ensurepip runs pip, and a cut
+                    # first can leave half a URL the pattern no longer finds.
+                    said = redact_text(said)
                     raise RuntimeError(
                         f"could not build the virtualenv for environment {self.name!r} from "
                         f"{getattr(sys, '_base_executable', sys.executable)}: {exc}. It said:\n"
@@ -2281,7 +2305,15 @@ class StageEnv:
                     # out of reach, which would otherwise install somewhere
                     # other than this venv while `.litetune-ready` was written
                     # over it regardless.
-                    proc = _run_guarded(cmd, remaining)
+                    #
+                    # From an empty directory made for it, for the reason
+                    # `_pip_configuration` gives: `python -m` puts the working
+                    # directory first on `sys.path`, so a `pip.py` where
+                    # litetune was started would run in the environment's own
+                    # pip's place. The command names pinned distributions,
+                    # never paths, so nothing in it depends on where it runs.
+                    with tempfile.TemporaryDirectory(prefix="litetune-pip-install-") as empty:
+                        proc = _run_guarded(cmd, remaining, cwd=empty)
                 except subprocess.TimeoutExpired:
                     raise RuntimeError(
                         f"provisioning environment {self.name!r} exceeded its {timeout}s budget "
@@ -2331,7 +2363,7 @@ class StageEnv:
         # pip names the index it consulted, and a credential in that URL would
         # otherwise reach the report verbatim. Redacted whole, then cut: a cut
         # first could leave half a URL the pattern no longer recognises.
-        stderr = _redact_text(stderr or "")
+        stderr = redact_text(stderr or "")
         missing = _NO_DISTRIBUTION.search(stderr)
         package = missing.group(1) if missing else None
         detail = (
@@ -2562,7 +2594,9 @@ NOT_PROBED = DeviceProbe(device=None, detail="no device probe was run")
 
 
 def _unanswered(env: StageEnv, reason: str, events=None) -> DeviceProbe:
-    detail = f"the device probe on environment {env.name!r} could not answer: {reason}"
+    # Every reason is redacted here as well, where it is logged, noted and
+    # recorded: some quote what the probe or its exception said.
+    detail = redact_text(f"the device probe on environment {env.name!r} could not answer: {reason}")
     logger.warning("%s", detail)
     if events is not None:
         events.note(detail, environment=env.name)
@@ -2616,7 +2650,9 @@ def resolve_device(
     if proc.returncode != 0:
         return _unanswered(
             env,
-            f"it exited {proc.returncode} ({(proc.stderr or '').strip()[-200:] or 'no stderr'})",
+            # Redacted whole, then cut, as `_provisioning_failed` does.
+            f"it exited {proc.returncode} "
+            f"({redact_text(proc.stderr or '').strip()[-200:] or 'no stderr'})",
             events,
         )
 
@@ -2635,7 +2671,9 @@ def resolve_device(
         device_count = answer["device_count"]
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         return _unanswered(
-            env, f"its last stdout line is not an answer ({exc}): {lines[-1][:200]!r}", events
+            env,
+            f"its last stdout line is not an answer ({exc}): {redact_text(lines[-1])[:200]!r}",
+            events,
         )
     if device not in DEVICES:
         return _unanswered(
@@ -2792,18 +2830,24 @@ TRAIN = StageEnv(
         "torch==2.5.1",
         "transformers==5.16.1",
         "peft==0.20.0",
-        # 0.2.1, not 0.2.0: it publishes cp313 wheels for Linux x86_64 and
-        # aarch64, macOS arm64 and x86_64, and Windows x64, ARM64 and 32-bit
-        # (https://pypi.org/pypi/sentencepiece/0.2.1/json), where 0.2.0
-        # published no cp313 wheel at all. Measured 2026-10-12 on Linux x86_64
-        # under Python 3.13.16: with 0.2.0 the install stopped at "Failed
-        # building wheel for sentencepiece" (no cmake or pkg-config there), and
-        # 0.2.1 installed as a wheel. Its version does not reach the training
-        # data -- measured the same day, for all five measured families
-        # (gemma-3-270m, gemma-3-1b, qwen3-0.6b, qwen2.5-0.5b, functiongemma),
-        # the tuned checkpoints' tokenizers load the same class and give
-        # identical token ids on every data row (3000 to 6434 rows each) with
-        # sentencepiece blocked.
-        "sentencepiece==0.2.1",
+        # One sentencepiece per Python. 0.2.0 publishes no cp313 wheel at all
+        # (https://pypi.org/pypi/sentencepiece/0.2.0/json); 0.2.1 does, for Linux
+        # x86_64 and aarch64, macOS and Windows
+        # (https://pypi.org/pypi/sentencepiece/0.2.1/json) -- but its Linux
+        # wheels are `manylinux_2_27`, where 0.2.0's are `manylinux2014`, so
+        # 0.2.1 everywhere would raise `tune`'s glibc floor from 2.17 to 2.27 on
+        # the Pythons that already worked. 3.10 to 3.12 install what they always
+        # did, and keep their identity; 3.13 gets the release it has wheels for.
+        # Measured 2026-10-12: on Linux x86_64 under Python 3.13.16, 0.2.0
+        # stopped at "Failed building wheel for sentencepiece" (no cmake or
+        # pkg-config there) and 0.2.1 installed as a wheel; for all five
+        # measured families (gemma-3-270m, gemma-3-1b, qwen3-0.6b, qwen2.5-0.5b,
+        # functiongemma) the tuned checkpoints' tokenizers load the same class
+        # and give identical token ids on every data row (3000 to 6434 rows
+        # each) with sentencepiece blocked; and the same 8-step LoRA run gave
+        # identical loss and adapter sha256 on main under 3.12 and on this
+        # definition under 3.12 and 3.13.
+        'sentencepiece==0.2.0; python_version < "3.13"',
+        'sentencepiece==0.2.1; python_version >= "3.13"',
     ),
 )

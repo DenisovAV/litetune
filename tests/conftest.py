@@ -400,6 +400,8 @@ def _manylinux(arch: str, glibc_minor: int) -> list[str]:
 MACHINES: dict[str, list[str]] = {
     "linux_x86_64": _manylinux("x86_64", 35),
     "linux_aarch64": _manylinux("aarch64", 35),
+    "linux_x86_64_glibc_2_16": _manylinux("x86_64", 16),
+    "linux_x86_64_glibc_2_17": _manylinux("x86_64", 17),
     "linux_x86_64_glibc_2_26": _manylinux("x86_64", 26),
     "linux_x86_64_glibc_2_27": _manylinux("x86_64", 27),
     "musl_x86_64": [f"musllinux_1_{m}_x86_64" for m in (2, 1, 0)] + ["linux_x86_64"],

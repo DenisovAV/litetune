@@ -46,6 +46,8 @@ import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
+from packaging.markers import default_environment
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.tags import Tag, compatible_tags, cpython_tags, platform_tags, sys_tags
 from packaging.utils import parse_wheel_filename
 
@@ -190,12 +192,62 @@ def _span(minors: frozenset[int]) -> str:
     return ", ".join(f"python3.{m}" for m in ordered)
 
 
+def marker_environment(host: Host | None = None) -> dict[str, str]:
+    """What a requirement's marker is evaluated against, for `host` or this interpreter.
+
+    `packaging.markers.default_environment()`, the values pip evaluates a
+    marker with, with the Python version replaced by `host`'s when it asks
+    about another one. Only the version follows a machine nobody has here: the
+    pins' markers name nothing else.
+    """
+    environment = {key: str(value) for key, value in default_environment().items()}
+    if host is not None and environment["python_version"] != f"{host.python[0]}.{host.python[1]}":
+        environment["python_version"] = f"{host.python[0]}.{host.python[1]}"
+        environment["python_full_version"] = f"{host.python[0]}.{host.python[1]}.0"
+    return environment
+
+
+def pin(requirement: str) -> tuple[str, str] | None:
+    """`(name, version)` for a requirement that fixes one exact version, else None.
+
+    Read as pip reads it (`packaging.requirements.Requirement`), so a marker is
+    not part of the version and an `==` inside a marker is not a pin:
+    `torch>=2.0; python_version == "3.12"` floats. A URL is not a version and
+    answers None here; whether it counts as pinned is the caller's rule.
+    """
+    try:
+        parsed = Requirement(requirement)
+    except InvalidRequirement:
+        return None
+    specifiers = list(parsed.specifier)
+    if parsed.url or len(specifiers) != 1:
+        return None
+    (only,) = specifiers
+    if only.operator not in ("==", "===") or only.version.endswith(".*"):
+        return None
+    return parsed.name, only.version
+
+
+def applies(requirement: str, environment: Mapping[str, str]) -> bool:
+    """Whether pip would install `requirement` under `environment`: no marker, or a true one."""
+    try:
+        marker = Requirement(requirement).marker
+    except InvalidRequirement:
+        return True
+    return marker is None or marker.evaluate(environment)
+
+
+def without_marker(requirement: str) -> str:
+    """The requirement as written, before its `;` marker, if it has one."""
+    return requirement.partition(";")[0].strip()
+
+
 def _key(requirement: str) -> str | None:
     """`name==version` in canonical spelling, or None for a requirement that is not one."""
-    name, sep, version = requirement.partition("==")
-    if not sep:
+    pinned = pin(requirement)
+    if pinned is None:
         return None
-    return f"{canonical(name.strip())}=={version.strip()}"
+    return f"{canonical(pinned[0])}=={pinned[1]}"
 
 
 def gaps(
@@ -203,7 +255,7 @@ def gaps(
     host: Host,
     published: Mapping[str, Release] | None = None,
 ) -> list[Gap]:
-    """Every pin with no wheel `host` installs.
+    """Every pin that applies to `host` with no wheel `host` installs.
 
     Follows each release's own exact requirements, so a pin whose wheel exists
     but whose `==` dependency's does not is caught and named as that
@@ -213,7 +265,13 @@ def gaps(
     table = PUBLISHED if published is None else published
     found: list[Gap] = []
     seen: set[str] = set()
-    pending: list[tuple[str, str | None]] = [(r, None) for r in requirements]
+    # Only what pip would install there: a pin whose marker is false for
+    # `host`'s Python is not asked for, so its wheels are not this host's
+    # business -- `sentencepiece==0.2.1; python_version >= "3.13"` on 3.12.
+    environment = marker_environment(host)
+    pending: list[tuple[str, str | None]] = [
+        (r, None) for r in requirements if applies(r, environment)
+    ]
     while pending:
         requirement, parent = pending.pop(0)
         key = _key(requirement)
@@ -420,6 +478,65 @@ _RELEASES = (
         files=(
             "peft-0.20.0-py3-none-any.whl",
             "peft-0.20.0.tar.gz",
+        ),
+    ),
+    Release(
+        "sentencepiece==0.2.0",
+        "https://pypi.org/pypi/sentencepiece/0.2.0/json",
+        files=(
+            "sentencepiece-0.2.0-cp310-cp310-macosx_10_9_universal2.whl",
+            "sentencepiece-0.2.0-cp310-cp310-macosx_10_9_x86_64.whl",
+            "sentencepiece-0.2.0-cp310-cp310-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.0-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            "sentencepiece-0.2.0-cp310-cp310-manylinux_2_17_i686.manylinux2014_i686.whl",
+            "sentencepiece-0.2.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "sentencepiece-0.2.0-cp310-cp310-win32.whl",
+            "sentencepiece-0.2.0-cp310-cp310-win_amd64.whl",
+            "sentencepiece-0.2.0-cp311-cp311-macosx_10_9_universal2.whl",
+            "sentencepiece-0.2.0-cp311-cp311-macosx_10_9_x86_64.whl",
+            "sentencepiece-0.2.0-cp311-cp311-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            "sentencepiece-0.2.0-cp311-cp311-manylinux_2_17_i686.manylinux2014_i686.whl",
+            "sentencepiece-0.2.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "sentencepiece-0.2.0-cp311-cp311-win32.whl",
+            "sentencepiece-0.2.0-cp311-cp311-win_amd64.whl",
+            "sentencepiece-0.2.0-cp312-cp312-macosx_10_9_universal2.whl",
+            "sentencepiece-0.2.0-cp312-cp312-macosx_10_9_x86_64.whl",
+            "sentencepiece-0.2.0-cp312-cp312-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            "sentencepiece-0.2.0-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl",
+            "sentencepiece-0.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "sentencepiece-0.2.0-cp312-cp312-win32.whl",
+            "sentencepiece-0.2.0-cp312-cp312-win_amd64.whl",
+            "sentencepiece-0.2.0-cp36-cp36m-macosx_10_9_x86_64.whl",
+            "sentencepiece-0.2.0-cp36-cp36m-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            "sentencepiece-0.2.0-cp36-cp36m-manylinux_2_17_i686.manylinux2014_i686.whl",
+            "sentencepiece-0.2.0-cp36-cp36m-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "sentencepiece-0.2.0-cp36-cp36m-win32.whl",
+            "sentencepiece-0.2.0-cp36-cp36m-win_amd64.whl",
+            "sentencepiece-0.2.0-cp37-cp37m-macosx_10_9_x86_64.whl",
+            "sentencepiece-0.2.0-cp37-cp37m-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            "sentencepiece-0.2.0-cp37-cp37m-manylinux_2_17_i686.manylinux2014_i686.whl",
+            "sentencepiece-0.2.0-cp37-cp37m-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "sentencepiece-0.2.0-cp37-cp37m-win32.whl",
+            "sentencepiece-0.2.0-cp37-cp37m-win_amd64.whl",
+            "sentencepiece-0.2.0-cp38-cp38-macosx_10_9_universal2.whl",
+            "sentencepiece-0.2.0-cp38-cp38-macosx_10_9_x86_64.whl",
+            "sentencepiece-0.2.0-cp38-cp38-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.0-cp38-cp38-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            "sentencepiece-0.2.0-cp38-cp38-manylinux_2_17_i686.manylinux2014_i686.whl",
+            "sentencepiece-0.2.0-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "sentencepiece-0.2.0-cp38-cp38-win32.whl",
+            "sentencepiece-0.2.0-cp38-cp38-win_amd64.whl",
+            "sentencepiece-0.2.0-cp39-cp39-macosx_10_9_universal2.whl",
+            "sentencepiece-0.2.0-cp39-cp39-macosx_10_9_x86_64.whl",
+            "sentencepiece-0.2.0-cp39-cp39-macosx_11_0_arm64.whl",
+            "sentencepiece-0.2.0-cp39-cp39-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            "sentencepiece-0.2.0-cp39-cp39-manylinux_2_17_i686.manylinux2014_i686.whl",
+            "sentencepiece-0.2.0-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "sentencepiece-0.2.0-cp39-cp39-win32.whl",
+            "sentencepiece-0.2.0-cp39-cp39-win_amd64.whl",
+            "sentencepiece-0.2.0.tar.gz",
         ),
     ),
     Release(
