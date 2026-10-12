@@ -22,6 +22,7 @@ from conftest import (
     buildable_here,
     correct_texts,
     labelled_rows,
+    machine,
     mark_provisioned,
     probe_answer,
     run_compose_script,
@@ -773,6 +774,40 @@ def test_convert_json_writes_the_report_to_stdout(toolchain, tmp_path, capsys):
     assert report["model_rules"]["family"] == "functiongemma"
 
 
+def test_convert_on_windows_is_refused_by_the_converter_and_says_so(tmp_path, capsys, monkeypatch):
+    """What the `windows-latest` job runs against the installed wheel, on any machine here.
+
+    A directory with nothing but a `config.json`: the refusal comes before the
+    checkpoint is read for anything else, and before any environment is built.
+    """
+    monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
+    model = tmp_path / "tiny"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type": "gemma3_text"}', encoding="utf-8")
+
+    code = main(
+        [
+            "convert",
+            "--model",
+            str(model),
+            "--base-model",
+            "google/gemma-3-270m-it",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--recipe",
+            "dynamic_wi8_afp32",
+            "--json",
+        ]
+    )
+
+    report = capsys.readouterr().out
+    assert code == 4
+    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in report
+    assert json.loads(report)["outcome"] == "could_not_check"
+    assert sorted(p.name for p in model.iterdir()) == ["config.json"]
+    assert not (tmp_path / "out").exists()
+
+
 # -- tune -------------------------------------------------------------------
 
 
@@ -1003,6 +1038,49 @@ def test_prepare_summary_survives_a_stdout_that_cannot_hold_its_arrow(
     assert "token lengths: not measured — " in written, "what cp1252 holds is kept as it is"
     assert code == 4, "the outcome is the stage's: no tokenizer, so nothing was measured"
     assert "could not complete the run" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["verify", "convert"])
+def test_help_survives_a_stdout_that_cannot_hold_its_dash(monkeypatch, capsys, command):
+    """`litetune verify --help > help.txt` under cp932, Japanese Windows' code page.
+
+    argparse writes the help text itself, and it has `—` in it, which cp932
+    cannot encode: the run ended in `UnicodeEncodeError`. Written through the
+    escape the summaries use, the dash arrives as `\\u2014` and the rest as is.
+    """
+    read = _redirected_stdout(monkeypatch, "cp932")
+
+    code = main([command, "--help"])
+
+    written = read()
+    assert code == 0
+    assert f"usage: litetune {command}" in written
+    assert "\\u2014" in written
+    assert "\u2014" not in written
+    assert capsys.readouterr().err == ""
+
+
+def test_prepare_names_the_encoding_of_a_utf16_dataset(tmp_path, capsys):
+    """`prepare --data raw.jsonl` where PowerShell 5.1 wrote the file: a refusal, by name."""
+    data = _dataset(tmp_path)
+    data.write_bytes(data.read_text(encoding="utf-8").encode("utf-16"))
+
+    code = main(
+        [
+            "prepare",
+            "--data",
+            str(data),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--context-length",
+            "1024",
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert code == 4
+    assert f"{data} is UTF-16; save it as UTF-8 without a byte-order mark" in err
+    assert "could not complete the run" not in err
 
 
 def test_env_listing_survives_a_stdout_that_cannot_hold_what_it_names(tmp_path, monkeypatch):

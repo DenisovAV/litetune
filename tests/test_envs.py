@@ -394,248 +394,185 @@ def test_train_reaches_3_13_where_torch_does_and_nowhere_else(monkeypatch, tmp_p
         assert "sentencepiece" not in str(caught.value), "0.2.1 has its wheel there"
 
 
-@pytest.mark.parametrize("variable", ["PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS"])
-def test_a_custom_index_turns_the_refusal_into_a_note(monkeypatch, tmp_path, variable):
-    """The table is PyPI's; another index may carry the wheel PyPI lacks.
+def test_a_missing_wheel_is_refused_and_the_refusal_names_the_opt_out(monkeypatch, tmp_path):
+    """The table is PyPI's, and the refusal says so and says how to go past it.
 
-    PyTorch's own index is the README's way to a CUDA `tune` on Windows. So
-    with pip pointed past PyPI the gap is said -- the missing wheel and that it
-    was PyPI that lacked it -- and pip is asked, rather than a working index
-    being refused on PyPI's account.
+    Nothing infers another index from pip's settings any more: someone
+    installing from an index or a wheelhouse that has the wheel says so.
     """
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    monkeypatch.setenv(variable, "https://download.pytorch.org/whl/cu124")
-    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
-    monkeypatch.setattr(
-        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
+    reached = _tripwires(monkeypatch)
+    _host(monkeypatch, "win_amd64", (3, 13))
+
+    with pytest.raises(RuntimeError) as caught:
+        TRAIN.provision()
+    message = str(caught.value)
+
+    assert reached == [], "refused before the venv and before pip"
+    assert "torch==2.5.1" in message
+    assert message.endswith(
+        "That is by PyPI's file lists. Installing from another index or a wheelhouse that has "
+        f"the wheel, set {envs.ALLOW_MISSING_WHEELS}=1: this becomes a note, and pip is asked"
     )
+    assert TRAIN.refusal() == message, "the question a stage asks first gets the same answer"
+
+
+def _pip_answers_yes(monkeypatch) -> list[list[str]]:
+    asked: list[list[str]] = []
+
+    def answer(cmd, *args, **kwargs):
+        asked.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
+    monkeypatch.setattr(envs, "_run_guarded", answer)
+    return asked
+
+
+def test_the_opt_out_turns_the_refusal_into_a_note_and_asks_pip(monkeypatch, tmp_path):
+    """PyTorch's own index is the README's way to a CUDA `tune` on Windows."""
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
+    monkeypatch.setenv(envs.ALLOW_MISSING_WHEELS, "1")
+    asked = _pip_answers_yes(monkeypatch)
     _host(monkeypatch, "win_amd64", (3, 13))
     notes: list[str] = []
 
+    assert TRAIN.refusal() is None
     TRAIN.provision(events=types.SimpleNamespace(note=lambda text, **_: notes.append(text)))
 
     assert TRAIN.ready
-    said = [n for n in notes if "torch==2.5.1" in n]
-    assert said, notes
-    assert "by PyPI's file lists" in said[0]
-    assert variable in said[0]
-    assert TRAIN.refusal() is None
+    assert [c[c.index("install") + 2 :] for c in asked] == [list(TRAIN.requirements)]
+    (said,) = [n for n in notes if "torch==2.5.1" in n]
+    assert said.startswith("by PyPI's file lists, environment 'train' cannot be provisioned")
+    assert f"as {envs.ALLOW_MISSING_WHEELS}=1 asks" in said
 
 
 def test_without_an_event_stream_the_note_is_a_warning(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    monkeypatch.setenv("PIP_EXTRA_INDEX_URL", "https://download.pytorch.org/whl/cu124")
-    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
-    monkeypatch.setattr(
-        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
-    )
+    monkeypatch.setenv(envs.ALLOW_MISSING_WHEELS, "1")
+    _pip_answers_yes(monkeypatch)
     _host(monkeypatch, "win_amd64", (3, 13))
 
     with caplog.at_level("WARNING"):
         TRAIN.provision()
 
-    assert "torch==2.5.1" in caplog.text and "PIP_EXTRA_INDEX_URL" in caplog.text
+    assert "torch==2.5.1" in caplog.text and f"{envs.ALLOW_MISSING_WHEELS}=1" in caplog.text
 
 
-def test_an_empty_index_variable_points_pip_nowhere_else(monkeypatch, tmp_path):
+@pytest.mark.parametrize("value", ["", "0", "true", "yes", " 1"])
+def test_only_1_is_the_opt_out(monkeypatch, tmp_path, value):
+    """A value the refusal did not ask for is not read as one it did."""
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    monkeypatch.setenv("PIP_INDEX_URL", "")
+    monkeypatch.setenv(envs.ALLOW_MISSING_WHEELS, value)
     reached = _tripwires(monkeypatch)
     _host(monkeypatch, "win_amd64", (3, 13))
 
-    with pytest.raises(RuntimeError, match="torch==2.5.1"):
+    with pytest.raises(RuntimeError, match=r"torch==2\.5\.1"):
         TRAIN.provision()
     assert reached == []
 
 
-def test_a_custom_index_does_not_lift_the_python_floor(monkeypatch, tmp_path):
+def test_the_opt_out_does_not_lift_the_python_floor(monkeypatch, tmp_path):
+    """The floor is litetune's own, not a fact about PyPI, and no index changes it."""
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    monkeypatch.setenv("PIP_INDEX_URL", "https://example.invalid/simple")
+    monkeypatch.setenv(envs.ALLOW_MISSING_WHEELS, "1")
     reached = _tripwires(monkeypatch)
     _host(monkeypatch, "linux_x86_64", (3, 9))
 
-    with pytest.raises(RuntimeError, match=r"needs at least python3\.10"):
+    with pytest.raises(RuntimeError, match=r"needs at least python3\.10") as caught:
         TRAIN.provision()
     assert reached == []
+    assert envs.ALLOW_MISSING_WHEELS not in str(caught.value)
 
 
-def test_an_unready_environment_says_what_pypi_lacks_and_where_pip_was_pointed(
-    monkeypatch, tmp_path
-):
+@pytest.mark.parametrize("allowed", [False, True], ids=["refused", "opted-out"])
+def test_an_unready_environment_says_what_pypi_lacks(monkeypatch, tmp_path, allowed):
+    """`--no-provision` reads this; it says the gap under either setting."""
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    monkeypatch.setenv("PIP_FIND_LINKS", "/wheels")
+    if allowed:
+        monkeypatch.setenv(envs.ALLOW_MISSING_WHEELS, "1")
     _host(monkeypatch, "win_amd64", (3, 12))
 
     detail = EXPORT.unready_detail
 
-    assert detail.startswith(f"is not provisioned at {EXPORT.path}; by PyPI's file lists it ")
     assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in detail
-    assert "PIP_FIND_LINKS" in detail
+    if allowed:
+        assert detail.startswith(f"is not provisioned at {EXPORT.path}; by PyPI's file lists it ")
+        assert detail.endswith(f"though {envs.ALLOW_MISSING_WHEELS}=1 lets pip try")
+    else:
+        assert detail.startswith(f"is not provisioned at {EXPORT.path}, and cannot be ")
+        assert f"set {envs.ALLOW_MISSING_WHEELS}=1" in detail
 
 
-# Kept at import, before the autouse fixture in conftest replaces it.
-_REAL_PIP_CONFIGURATION = envs._pip_configuration
+def test_a_pin_missing_for_one_python_names_the_pythons_that_work_here(monkeypatch):
+    """glibc 2.26 on 3.13: `sentencepiece==0.2.1` has no wheel below glibc 2.27.
 
-
-@pytest.mark.parametrize(
-    ("variable", "value"),
-    [
-        ("PIP_INDEX_URL", "https://pypi.org/simple"),
-        ("PIP_INDEX_URL", "https://pypi.org/simple/"),
-        ("PIP_INDEX_URL", "HTTPS://PyPI.org/simple"),
-        ("PIP_EXTRA_INDEX_URL", "https://pypi.org/simple"),
-    ],
-)
-def test_pypi_named_as_the_index_is_still_pypi(monkeypatch, tmp_path, variable, value):
-    """pip's default index is `https://pypi.org/simple` (`PyPI.simple_url`).
-
-    Any non-empty variable used to lift the refusal, so naming PyPI itself --
-    which changes nothing about where pip looks -- let pip download and fail.
+    3.10 to 3.12 get `sentencepiece==0.2.0`, whose wheels are manylinux2014,
+    so on the same machine they work. A refusal worded as if the platform could
+    never install `train` sent the reader away from a Python that would.
     """
-    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    monkeypatch.setenv(variable, value)
-    reached = _tripwires(monkeypatch)
-    _host(monkeypatch, "win_amd64", (3, 12))
+    _host(monkeypatch, "linux_x86_64_glibc_2_26", (3, 13))
 
-    with pytest.raises(RuntimeError, match="litert-converter==0.4.0 publishes no wheel"):
-        EXPORT.provision()
-    assert reached == []
+    refusal = TRAIN.refusal()
+
+    assert refusal is not None and "sentencepiece==0.2.1" in refusal
+    assert (
+        ". On this platform every pin has its wheel for python3.10, python3.11, python3.12 "
+        "-- run litetune under one of those"
+    ) in refusal
 
 
-def test_a_list_of_extra_indexes_is_read_item_by_item(monkeypatch, tmp_path):
-    """pip splits a list-valued option on whitespace; PyPI among them is no other source."""
-    monkeypatch.setenv(
-        "PIP_EXTRA_INDEX_URL", "https://pypi.org/simple https://download.pytorch.org/whl/cu124"
-    )
+def test_a_pin_missing_for_this_python_names_the_others(monkeypatch):
     _host(monkeypatch, "win_amd64", (3, 13))
 
-    others, unread = envs._other_sources()
+    refusal = TRAIN.refusal()
 
-    assert others == ["PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124"]
-    assert unread is None
+    assert refusal is not None
+    assert "every pin has its wheel for python3.10, python3.11, python3.12" in refusal
 
 
-@pytest.mark.parametrize(
-    ("setting", "refused"),
-    [
-        (
-            ("pip config global.extra-index-url", "extra-index-url", "https://example.invalid/s"),
-            False,
-        ),
-        (("pip config install.index-url", "index-url", "https://mirror.invalid/simple"), False),
-        (("pip config global.find-links", "find-links", "/wheels"), False),
-        # A page of links is not an index, whatever it names.
-        (("pip config global.find-links", "find-links", "https://pypi.org/simple"), False),
-        (("pip config global.index-url", "index-url", "https://pypi.org/simple"), True),
-    ],
-)
-def test_pips_own_configuration_counts_like_its_environment(
-    monkeypatch, tmp_path, setting, refused
-):
-    """An index set in `pip.conf`, `pip.ini` or `PIP_CONFIG_FILE` is one pip uses.
-
-    Reading only the three variables refused a Windows user whose configured
-    index carries the converter; reading pip's configuration and finding PyPI
-    there changes nothing.
-    """
-    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    monkeypatch.setattr(envs, "_pip_configuration", lambda: ([setting], None))
+def test_no_python_is_named_where_none_works(monkeypatch):
     _host(monkeypatch, "win_amd64", (3, 12))
 
     refusal = EXPORT.refusal()
 
-    assert (refusal is not None) is refused
-    if not refused:
-        assert setting[2] in EXPORT.unready_detail
+    assert refusal is not None and "every pin has its wheel" not in refusal
 
 
-def test_a_configuration_pip_could_not_report_is_not_taken_for_pypi(monkeypatch, tmp_path):
-    """No `pip` to ask, or one that fails: whether it points past PyPI is unknown.
+def test_a_32_bit_python_is_named_as_one(monkeypatch):
+    """`win32` reads as "Windows"; it is the tag of a 32-bit Python."""
+    _host(monkeypatch, "win32", (3, 12))
 
-    So the gap is said and pip is asked, rather than refusing on a guess.
-    """
-    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    monkeypatch.setattr(
-        envs, "_pip_configuration", lambda: ([], "`pip config list` exited 1: No module named pip")
-    )
-    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
-    monkeypatch.setattr(
-        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
-    )
-    _host(monkeypatch, "win_amd64", (3, 13))
-    notes: list[str] = []
+    refusal = RUNTIME.refusal()
 
-    assert TRAIN.refusal() is None
-    TRAIN.provision(events=types.SimpleNamespace(note=lambda text, **_: notes.append(text)))
-
-    (said,) = [n for n in notes if "torch==2.5.1" in n]
-    assert "pip's own configuration could not be read" in said
-    assert "No module named pip" in said
+    assert refusal is not None
+    assert "cannot be provisioned on win32 (a 32-bit Python; install the 64-bit one)" in refusal
 
 
-def test_pip_config_list_is_read_as_pip_prints_it():
-    """`section.option=repr(value)`, the environment's under `:env:`.
+def test_an_arm64_python_is_told_what_an_x64_one_would_do(monkeypatch):
+    """The tag is the interpreter's build: an x64 Python on an ARM64 machine is `win_amd64`."""
+    _host(monkeypatch, "win_arm64", (3, 12))
 
-    Only the sections `pip install` reads -- `global`, `install`, `:env:` --
-    and only the three source options; a value on several lines is one string.
-    """
-    printed = (
-        "download.index-url='https://ignored.invalid/simple'\n"
-        "global.extra-index-url='\\nhttps://a.invalid/simple\\nhttps://b.invalid/simple'\n"
-        "global.timeout='60'\n"
-        "install.find-links='/wheels'\n"
-        ":env:.index-url='https://pypi.org/simple'\n"
-    )
+    refusal = RUNTIME.refusal()
 
-    assert envs._parse_pip_config(printed) == [
-        (
-            "pip config global.extra-index-url",
-            "extra-index-url",
-            "\nhttps://a.invalid/simple\nhttps://b.invalid/simple",
-        ),
-        ("pip config install.find-links", "find-links", "/wheels"),
-        ("pip config :env:.index-url", "index-url", "https://pypi.org/simple"),
-    ]
-
-
-@pytest.mark.parametrize("line", ["no equals sign", "global.index-url=not a repr"])
-def test_a_pip_config_line_this_cannot_read_is_said_rather_than_skipped(line):
-    with pytest.raises(ValueError, match="unrecognised `pip config list`"):
-        envs._parse_pip_config(line)
-
-
-def test_pip_config_list_is_asked_of_the_interpreter_running_litetune(monkeypatch, tmp_path):
-    """The one a stage environment is built from, through the stages' own guard,
-    from a directory made empty for it -- not wherever litetune was started."""
-    asked: list[list[str]] = []
-    where: list[tuple[str, list[str]]] = []
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "pip.py").write_text("raise SystemExit('planted')\n")
-
-    def answer(argv, timeout, env=None, cwd=None):
-        asked.append(list(argv))
-        where.append((str(cwd), sorted(os.listdir(cwd))))
-        return subprocess.CompletedProcess(argv, 0, "global.find-links='/w'\n", "")
-
-    monkeypatch.setattr(envs, "_run_guarded", answer)
-
-    assert _REAL_PIP_CONFIGURATION() == (
-        [("pip config global.find-links", "find-links", "/w")],
-        None,
-    )
-    assert asked == [[sys.executable, "-m", "pip", "config", "list"]]
-    ((directory, contents),) = where
-    assert contents == [], "nothing there for `python -m` to find first"
-    assert pathlib.Path(directory).resolve() != tmp_path.resolve()
-    assert not pathlib.Path(directory).exists(), "and it is removed afterwards"
+    assert refusal is not None
+    assert (
+        "win_arm64 (an ARM64 Python; an x64 Python, which Windows 11 on Arm runs under "
+        "emulation, installs win_amd64 wheels)"
+    ) in refusal
+    _host(monkeypatch, "win_amd64", (3, 12))
+    assert RUNTIME.refusal() is None, "and that one is not refused"
 
 
 def test_the_install_does_not_run_a_pip_planted_where_litetune_was_started(monkeypatch, tmp_path):
-    """`provision` runs `python -m pip install`, with the same hazard.
+    """`provision` runs `python -m pip install` where litetune was started.
 
-    The environment's interpreter is stood in for by this one, and nothing is
-    given to install: pip refuses at once, with no index asked, and what is
-    under test is only which pip answered.
+    `python -m` puts the working directory first on `sys.path` ("python -m
+    module command line: prepend the current working directory", `sys.path`,
+    Python's documentation), so a `pip.py` there ran in the environment's own
+    pip's place. The environment's interpreter is stood in for by this one,
+    and nothing is given to install: the real pip refuses at once, with no
+    index asked, and what is under test is only which pip answered.
     """
     pytest.importorskip("pip")
     caller = tmp_path / "caller"
@@ -646,80 +583,82 @@ def test_the_install_does_not_run_a_pip_planted_where_litetune_was_started(monke
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
     monkeypatch.setenv("PIP_DISABLE_PIP_VERSION_CHECK", "1")
     monkeypatch.setenv("PIP_NO_INDEX", "1")
-    monkeypatch.setattr(envs.venv.EnvBuilder, "create", lambda self, path: None)
+    monkeypatch.setattr(
+        envs.venv.EnvBuilder, "create", lambda self, path: pathlib.Path(path).mkdir(parents=True)
+    )
     monkeypatch.setattr(StageEnv, "python", property(lambda self: pathlib.Path(sys.executable)))
 
-    with pytest.raises(RuntimeError, match="could not provision"):
+    # The real pip refuses an empty install; the planted one exits 0.
+    with contextlib.suppress(RuntimeError):
         StageEnv(name="planted", requirements=()).provision()
 
     assert not ran.exists(), "the planted pip.py ran in the environment's own pip's place"
 
 
-def test_a_pip_planted_where_litetune_was_started_does_not_run(monkeypatch, tmp_path):
-    """`python -m pip` puts the working directory first on `sys.path`.
+def _wheel(directory: pathlib.Path, name: str, version: str) -> pathlib.Path:
+    """A pure-Python wheel with nothing in it but its metadata (PEP 427's layout)."""
+    import zipfile
 
-    Run from where litetune was started, a `pip.py` there ran in pip's place
-    (`sys.path`, Python's documentation: "python -m module command line:
-    prepend the current working directory"). This plants one and runs the
-    real `pip config list`.
+    info = f"{name}-{version}.dist-info"
+    members = {
+        f"{name}/__init__.py": "",
+        f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+        f"{info}/WHEEL": (
+            "Wheel-Version: 1.0\nGenerator: litetune-tests\nRoot-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+        ),
+    }
+    records = [f"{path},," for path in members] + [f"{info}/RECORD,,"]
+    members[f"{info}/RECORD"] = "\n".join(records) + "\n"
+    path = directory / f"{name}-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        for member, text in members.items():
+            archive.writestr(member, text)
+    return path
+
+
+def test_a_relative_wheelhouse_means_the_one_where_litetune_was_started(monkeypatch, tmp_path):
+    """`PIP_FIND_LINKS=wheelhouse` names the caller's `wheelhouse`, as it does to pip itself.
+
+    The install ran from an empty directory for a while, and there a relative
+    wheelhouse, constraint file or certificate named nothing. It runs where
+    litetune was started again, with `-I` keeping that directory off
+    `sys.path`. A dry run from the wheelhouse alone, with this interpreter
+    standing in for the environment's: nothing is installed anywhere, and what
+    is under test is that pip found the wheel.
     """
     pytest.importorskip("pip")
     caller = tmp_path / "caller"
-    caller.mkdir()
-    ran = tmp_path / "planted-pip-ran"
-    (caller / "pip.py").write_text(
-        f"open({str(ran)!r}, 'w').write('1')\nprint(\"global.index-url='https://planted'\")\n"
-    )
+    (caller / "wheelhouse").mkdir(parents=True)
+    _wheel(caller / "wheelhouse", "litetunetestpkg", "1.0")
     monkeypatch.chdir(caller)
+    for name, value in {
+        "LITETUNE_ENV_DIR": str(tmp_path / "envs"),
+        "PIP_FIND_LINKS": "wheelhouse",
+        "PIP_NO_INDEX": "1",
+        "PIP_DRY_RUN": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        envs.venv.EnvBuilder, "create", lambda self, path: pathlib.Path(path).mkdir(parents=True)
+    )
+    monkeypatch.setattr(StageEnv, "python", property(lambda self: pathlib.Path(sys.executable)))
+    ran: list[list[str]] = []
+    real = envs._run_guarded
 
-    settings, unread = _REAL_PIP_CONFIGURATION()
+    def watched(cmd, *args, **kwargs):
+        ran.append(list(cmd))
+        return real(cmd, *args, **kwargs)
 
-    assert not ran.exists(), "the planted pip.py ran"
-    assert unread is None
-    assert all("planted" not in value for _, _, value in settings)
+    monkeypatch.setattr(envs, "_run_guarded", watched)
 
+    # Run from anywhere else, pip finds no `wheelhouse` and says "No matching
+    # distribution found", which `provision` raises.
+    StageEnv(name="wheelhouse", requirements=("litetunetestpkg==1.0",)).provision()
 
-@pytest.mark.parametrize(
-    ("outcome", "said"),
-    [
-        (subprocess.CompletedProcess([], 1, "", "No module named pip\n"), "exited 1: No module"),
-        (OSError("no such interpreter"), "OSError: no such interpreter"),
-        (subprocess.CompletedProcess([], 0, "garbled", ""), "unrecognised"),
-    ],
-    ids=["exit", "oserror", "unreadable"],
-)
-def test_a_pip_that_cannot_answer_says_why(monkeypatch, outcome, said):
-    def answer(argv, timeout, env=None, cwd=None):
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-    monkeypatch.setattr(envs, "_run_guarded", answer)
-
-    settings, unread = _REAL_PIP_CONFIGURATION()
-
-    assert settings == []
-    assert unread is not None and said in unread
-
-
-def test_the_real_pip_reports_a_configured_index(monkeypatch, tmp_path):
-    """The format above, checked against the pip this suite runs with.
-
-    `PIP_CONFIG_FILE` names a file pip loads after the global and user ones
-    (pip's configuration documentation); whatever else this machine has
-    configured, this index must come back.
-    """
-    pytest.importorskip("pip")
-    config = tmp_path / "pip.ini"
-    config.write_text("[global]\nextra-index-url = https://example.invalid/simple\n")
-    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
-
-    settings, unread = _REAL_PIP_CONFIGURATION()
-
-    assert unread is None
-    assert ("extra-index-url", "https://example.invalid/simple") in [
-        (option, value) for _, option, value in settings
-    ]
+    (cmd,) = ran
+    assert cmd[1:6] == ["-I", "-X", "utf8", "-m", "pip"]
 
 
 @pytest.mark.parametrize(
@@ -742,6 +681,18 @@ def test_an_index_url_is_shown_without_its_credentials(given, shown):
     assert envs.redact_url(given) == shown
 
 
+def test_a_fragment_is_kept_where_it_is_provenance():
+    """In a requirement or a `pip freeze` line the fragment is the archive's hash."""
+    url = "https://u:p4ss@h.invalid/pkg.whl?k=v#sha256=ab12"
+
+    assert (
+        envs.redact_url(url, keep_fragment=True) == "https://***@h.invalid/pkg.whl?***#sha256=ab12"
+    )
+    assert envs.redact_text(f"pkg @ {url}", keep_fragment=True) == (
+        "pkg @ https://***@h.invalid/pkg.whl?***#sha256=ab12"
+    )
+
+
 def test_a_url_inside_a_message_is_redacted_where_it_stands():
     said = "Looking in indexes: https://pypi.org/simple, https://u:p4ss@corp.invalid/simple?k=v"
 
@@ -757,49 +708,6 @@ def _no_secret_in(*said: str) -> None:
     text = "\n".join(said)
     for secret in _SECRETS:
         assert secret not in text, secret
-
-
-def test_a_credential_in_the_environment_reaches_no_output(monkeypatch, tmp_path, caplog):
-    """`PIP_INDEX_URL` with a password: every log record at DEBUG, the note,
-    `unready_detail` and the refusal question all leave it out."""
-    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    monkeypatch.setenv("PIP_INDEX_URL", "https://user:s3cret@mirror.invalid/simple")
-    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
-    monkeypatch.setattr(
-        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
-    )
-    _host(monkeypatch, "win_amd64", (3, 12))
-    notes: list[str] = []
-
-    with caplog.at_level("DEBUG"):
-        assert EXPORT.refusal() is None, "another index: a note, not a refusal"
-        detail = EXPORT.unready_detail
-        EXPORT.provision(events=types.SimpleNamespace(note=lambda text, **_: notes.append(text)))
-        TRAIN.provision()
-
-    _no_secret_in(caplog.text, detail, *notes)
-    assert "https://***@mirror.invalid/simple" in detail
-
-
-def test_a_credential_in_pips_configuration_file_reaches_no_output(monkeypatch, tmp_path, caplog):
-    """The real `pip config list`, reading a `PIP_CONFIG_FILE` with a token in it."""
-    pytest.importorskip("pip")
-    config = tmp_path / "pip.ini"
-    config.write_text(
-        "[global]\nextra-index-url = https://__token__:pypi-AgEN@cfg.invalid/simple\n"
-    )
-    monkeypatch.setenv("PIP_CONFIG_FILE", str(config))
-    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
-    monkeypatch.setattr(envs, "_pip_configuration", _REAL_PIP_CONFIGURATION)
-    _host(monkeypatch, "win_amd64", (3, 12))
-
-    with caplog.at_level("DEBUG"):
-        others, unread = envs._other_sources()
-        detail = EXPORT.unready_detail
-
-    assert unread is None
-    assert any("https://***@cfg.invalid/simple" in o for o in others), others
-    _no_secret_in(caplog.text, detail, *others)
 
 
 _STRADDLING = "https://u:p4ssw0rd@corp.invalid/simple"
@@ -822,9 +730,9 @@ def _head_cuts_into_the_password(keep: int) -> str:
 
 def test_a_credential_in_what_pip_says_reaches_no_output(monkeypatch, tmp_path, caplog, probe_env):
     """pip names the index it consulted, and every place its words or a stage's
-    are quoted -- a failed install, a failed virtualenv build, a `pip config
-    list` that failed, the device probe, `pip freeze` -- leaves the credential
-    out, including where the quote is cut."""
+    are quoted -- a failed install, a failed virtualenv build, the device
+    probe, `pip freeze` -- leaves the credential out, including where the quote
+    is cut."""
     from litetune.export import parse_pip_freeze
 
     messages: list[str] = []
@@ -843,13 +751,6 @@ def test_a_credential_in_what_pip_says_reaches_no_output(monkeypatch, tmp_path, 
         with pytest.raises(RuntimeError) as built:
             StageEnv(name="venv", requirements=()).provision()
         messages.append(str(built.value))
-        # A `pip config list` that failed, quoting its last line.
-        monkeypatch.setattr(
-            envs,
-            "_run_guarded",
-            lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", f"bad {_STRADDLING}"),
-        )
-        messages.append(str(_REAL_PIP_CONFIGURATION()[1]))
         # The device probe: the last 200 characters of stderr, the first 200 of stdout.
         _answers(monkeypatch, returncode=1, stderr=_tail_cuts_into_the_url(200))
         messages.append(envs.resolve_device(probe_env).detail)
@@ -877,79 +778,105 @@ def test_a_command_line_described_in_a_log_carries_no_credential():
     assert "corp.invalid" in envs._describe(proc)
 
 
-def test_no_index_credential_reaches_anything_litetune_says(monkeypatch, tmp_path, caplog):
-    """Notes, warnings, refusals, `unready_detail` and pip's own words alike.
+_PRIVATE_WHEEL = "https://user:s3cret@packages.invalid/pkg-1-py3-none-any.whl?sig=T0KEN#sha256=ab12"
+_PRIVATE_SHOWN = "https://***@packages.invalid/pkg-1-py3-none-any.whl?***#sha256=ab12"
 
-    The URLs are compared as given -- each still counts as another source --
-    and only their user information and query are kept out of what is said.
+
+def test_a_requirement_is_shown_without_its_credential_and_with_its_hash():
+    """A direct URL is an accepted pin, and it can carry a token.
+
+    Shown, it loses its user information and query and keeps its fragment --
+    the archive's hash is provenance. Installed and hashed, it is as given.
     """
-    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
-    monkeypatch.setenv("PIP_INDEX_URL", "https://user:s3cret@mirror.invalid/simple")
-    monkeypatch.setenv("PIP_EXTRA_INDEX_URL", "https://cdn.invalid/simple?token=T0KEN")
-    monkeypatch.setattr(
-        envs,
-        "_pip_configuration",
-        lambda: (
-            [
-                (
-                    "pip config global.find-links",
-                    "find-links",
-                    "https://__token__:pypi-AgEN@w.invalid/",
-                )
-            ],
-            None,
-        ),
-    )
-    monkeypatch.setattr(envs.venv.EnvBuilder, "create", _fake_venv)
-    monkeypatch.setattr(
-        envs, "_run_guarded", lambda *a, **k: types.SimpleNamespace(returncode=0, stderr="")
-    )
-    _host(monkeypatch, "win_amd64", (3, 12))
-    notes: list[str] = []
+    private = StageEnv(name="private", requirements=(_PRIVATE_WHEEL, "numpy==2.0.2"))
 
-    detail = EXPORT.unready_detail
-    with caplog.at_level("WARNING"):
-        EXPORT.provision(events=types.SimpleNamespace(note=lambda text, **_: notes.append(text)))
-        TRAIN.provision()
-    failed = RUNTIME._provisioning_failed(
-        "Looking in indexes: https://u:p4ss@corp.invalid/simple\n"
-        "ERROR: No matching distribution found for nosuchpkg"
-    )
+    assert envs.shown_requirements(private.requirements) == [_PRIVATE_SHOWN, "numpy==2.0.2"]
+    assert private.identity != StageEnv(name="private", requirements=(_PRIVATE_SHOWN,)).identity
 
-    said = "\n".join([detail, *notes, caplog.text, failed])
-    for secret in _SECRETS:
-        assert secret not in said, secret
-    assert "https://***@mirror.invalid/simple" in detail
-    assert "https://cdn.invalid/simple?***" in detail
-    assert "https://***@w.invalid/" in detail
-    assert "https://***@corp.invalid/simple" in failed
+
+def test_a_failed_install_names_its_pins_without_their_credentials():
+    private = StageEnv(name="private", requirements=(_PRIVATE_WHEEL,))
+
+    failed = private._provisioning_failed("ERROR: something else went wrong")
+
+    _no_secret_in(failed)
+    assert f"It pins {_PRIVATE_SHOWN}" in failed
+
+
+def test_an_unpinned_requirement_is_refused_without_its_credential():
+    with pytest.raises(envs.UnpinnedRequirement) as caught:
+        StageEnv(name="private", requirements=("pkg @ https://u:p4ss@packages.invalid/pkg.whl",))
+
+    _no_secret_in(str(caught.value))
+    assert "pkg @ https://***@packages.invalid/pkg.whl" in str(caught.value)
+
+
+def _litert(env):
+    from litetune.evaluate import LiteRtLmBackend
+
+    return LiteRtLmBackend(model="m.litertlm", env=env).describe()
+
+
+def _hugging_face(env):
+    from litetune.evaluate import HuggingFaceBackend
+
+    return HuggingFaceBackend(model="m", env=env).describe()
+
+
+def _token_counter(env):
+    from litetune.prepare import HuggingFaceTokenCounter
+
+    return HuggingFaceTokenCounter(model="m", env=env).describe()
+
+
+def _tool_path(env):
+    from litetune.toolpath import ToolPathBackend
+
+    return ToolPathBackend(model=pathlib.Path("m.litertlm"), declarations=[], env=env).describe()
+
+
+def _tune_request(env):
+    from litetune.tune import TuneRequest
+
+    return TuneRequest(
+        model="m", data=pathlib.Path("d.jsonl"), output_dir=pathlib.Path("o"), env=env
+    ).as_dict()
+
+
+def _spec(env):
+    from litetune.spec import ToolchainSpec
+
+    return ToolchainSpec(environments=(env,)).as_dict()
 
 
 @pytest.mark.parametrize(
-    "outcome",
-    [
-        subprocess.CompletedProcess([], 1, "", "bad index https://u:p4ss@corp.invalid/simple\n"),
-        subprocess.CompletedProcess([], 0, "global.index-url=https://u:p4ss@corp.invalid\n", ""),
-        OSError("cannot reach https://u:p4ss@corp.invalid/simple"),
-    ],
-    ids=["exit", "unreadable", "oserror"],
+    "described", [_litert, _hugging_face, _token_counter, _tool_path, _tune_request, _spec]
 )
-def test_a_reason_pip_could_not_answer_carries_no_credential(monkeypatch, outcome):
-    """What `_pip_configuration` reports when pip fails is quoted text from pip
-    or from its own output, which can hold the very URL being protected."""
+def test_every_record_of_what_an_environment_pins_is_shown_redacted(described):
+    """Each place a manifest lists an environment's pins goes through one serializer."""
+    said = json.dumps(described(StageEnv(name="private", requirements=(_PRIVATE_WHEEL,))))
 
-    def answer(argv, timeout, env=None, cwd=None):
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
+    _no_secret_in(said)
+    assert _PRIVATE_SHOWN in said
 
-    monkeypatch.setattr(envs, "_run_guarded", answer)
 
-    _, reason = _REAL_PIP_CONFIGURATION()
+def test_a_semicolon_inside_a_url_is_part_of_the_url():
+    """Two direct URLs that differ after a `;` are two environments.
 
-    assert reason is not None
-    assert "p4ss" not in reason
-    assert "corp.invalid" in reason
+    The marker used to be cut at the first `;`, so both hashed as the URL's
+    first half and one could reuse the other's cached packages.
+    """
+    first = StageEnv(name="u", requirements=("https://h.invalid/pkg.whl?sig=one;part",))
+    second = StageEnv(name="u", requirements=("https://h.invalid/pkg.whl?sig=one;other",))
+
+    assert first.identity != second.identity
+    assert wheels.without_marker("https://h.invalid/pkg.whl?sig=one;part") == (
+        "https://h.invalid/pkg.whl?sig=one;part"
+    )
+    # A named direct URL with a marker: the marker is not stripped either, so
+    # the URL is never re-spelled.
+    named = 'pkg @ https://h.invalid/pkg.whl?sig=one;part ; python_version >= "3"'
+    assert wheels.without_marker(named) == named
 
 
 def test_pips_words_are_redacted_before_they_are_cut():
@@ -1028,7 +955,8 @@ def test_an_architecture_with_no_wheel_is_refused_by_the_package(
         RUNTIME.provision()
 
     message = str(caught.value)
-    assert message.startswith(f"environment 'runtime' cannot be provisioned on {host.platform}: ")
+    shown = envs._platform_named(host.platform)
+    assert message.startswith(f"environment 'runtime' cannot be provisioned on {shown}: ")
     for clause in named:
         assert f"{clause} publishes no wheel for {host.platform}" in message, message
     assert reached == []
@@ -1085,7 +1013,7 @@ def test_a_wheel_missing_for_the_platform_outranks_one_missing_for_the_python(mo
     message = TRAIN.unprovisionable(machine("win_arm64", (3, 13)))
 
     assert message is not None
-    assert message.startswith("cannot be provisioned on win_arm64:")
+    assert message.startswith("cannot be provisioned on win_arm64 (an ARM64 Python; ")
     assert "python3.13" not in message
 
 

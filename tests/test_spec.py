@@ -185,6 +185,24 @@ def test_an_unpinned_toolchain_requirement_is_refused_by_field():
     assert "toolchain.export" in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        ["pkg @ https://u:s3cret@packages.invalid/pkg.whl?sig=T0KEN"],
+        "https://u:s3cret@packages.invalid/pkg.whl?sig=T0KEN",
+    ],
+    ids=["unpinned", "not-a-list"],
+)
+def test_a_refused_toolchain_requirement_is_quoted_without_its_credential(value):
+    """A spec is a file people share, and its refusal is what they paste back."""
+    with pytest.raises(SpecError) as exc:
+        make_spec(toolchain={"export": value})
+
+    said = str(exc.value)
+    assert "s3cret" not in said and "T0KEN" not in said
+    assert "https://***@packages.invalid/pkg.whl?***" in said
+
+
 def test_a_missing_toolchain_environment_is_named():
     with pytest.raises(SpecError) as exc:
         make_spec(toolchain={"train": "default", "export": "default", "runtime": None})

@@ -19,7 +19,6 @@ is useless if its *definition* resolves differently on different days, so
 
 from __future__ import annotations
 
-import ast
 import codecs
 import contextlib
 import errno
@@ -33,11 +32,10 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.parse
 import venv
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -1383,7 +1381,6 @@ def _run_guarded(
     argv: Sequence[str],
     timeout: float,
     env: Mapping[str, str] | None = None,
-    cwd: str | os.PathLike[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a subprocess so that whatever ends litetune ends it too.
 
@@ -1448,7 +1445,6 @@ def _run_guarded(
         # one from being waited on at all.
         stdin=subprocess.DEVNULL,
         env=_child_env(env),
-        cwd=cwd,
         # POSIX only; accepted and ignored on Windows, where `_kill_tree`
         # falls back to killing the child alone. Not overridable: a caller
         # reaching past it with `process_group=` would put the child in *our*
@@ -1683,38 +1679,19 @@ def _msvcrt_attempt(handle, locking: Callable[[int, int, int], None], mode: int)
     return True
 
 
-# Where `pip install` looks for distributions besides PyPI: the options, and
-# the environment variables pip reads them from (`PIP_` and the option's name).
-# A value that is PyPI itself is not another source: pip's default index is
-# `https://pypi.org/simple` (`PyPI.simple_url`, pip/_internal/models/index.py,
-# pip 26.2.1), so an index set to that, however it is spelled, still means the
-# files these lists describe.
-_SOURCE_VARIABLES = (
-    ("PIP_INDEX_URL", "index-url"),
-    ("PIP_EXTRA_INDEX_URL", "extra-index-url"),
-    ("PIP_FIND_LINKS", "find-links"),
-)
-_SOURCE_OPTIONS = frozenset(option for _, option in _SOURCE_VARIABLES)
-# The sections `pip install` reads options from, in its order: `global`, the
-# command's own, then the environment (`_get_ordered_configuration_items`,
-# pip/_internal/cli/parser.py, pip 26.2.1).
-_INSTALL_SECTIONS = frozenset({"global", "install", ":env:"})
-_PIP_CONFIG_TIMEOUT_S = 60
-
-
 # A URL inside free text: a pip message, an error naming a setting.
 _URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
 
 
-def redact_url(url: str) -> str:
-    """`url` as it may be shown: its user information, query and fragment replaced.
+def redact_url(url: str, *, keep_fragment: bool = False) -> str:
+    """`url` as it may be shown: its user information and query replaced.
 
-    An index URL can carry its credentials as user information --
-    `https://user:token@host/simple`, or a token alone in the user's place --
-    and some carry a token in the query. Everything litetune says about where
-    pip looks goes through this; what it decides is decided on the value as
-    given, never on this. A path, which has no network location, is shown as
-    it is.
+    A URL pip prints, or one in a requirement, can carry credentials as user
+    information -- `https://user:token@host/simple`, or a token alone in the
+    user's place -- and some carry a token in the query. The fragment goes too
+    unless `keep_fragment`: in a requirement or a `pip freeze` line it is the
+    archive's `#sha256=` or `#subdirectory=`, which is provenance, not a
+    credential. A path, with no network location, is shown as it is.
     """
     try:
         parts = urllib.parse.urlsplit(url)
@@ -1727,110 +1704,44 @@ def redact_url(url: str) -> str:
     if "@" in netloc:
         netloc = "***@" + netloc.rpartition("@")[2]
     query = "***" if parts.query else ""
-    fragment = "***" if parts.fragment else ""
+    fragment = parts.fragment if keep_fragment else ("***" if parts.fragment else "")
     return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
 
 
-def redact_text(text: str) -> str:
+def redact_text(text: str, *, keep_fragment: bool = False) -> str:
     """`text` with every URL in it `redact_url`-ed."""
-    return _URL_IN_TEXT.sub(lambda m: redact_url(m.group(0)), text)
+    return _URL_IN_TEXT.sub(lambda m: redact_url(m.group(0), keep_fragment=keep_fragment), text)
 
 
-def _is_pypi(url: str) -> bool:
-    """Whether an index URL is pip's default, PyPI's simple API."""
-    # `urlsplit` lowercases the scheme itself; the host it leaves as given.
-    parts = urllib.parse.urlsplit(url.strip())
-    return (
-        parts.scheme == "https"
-        and parts.netloc.lower() == "pypi.org"
-        and parts.path.rstrip("/") == "/simple"
-        and not parts.query
-        and not parts.fragment
-    )
+def shown_requirements(requirements: Iterable[str]) -> list[str]:
+    """Requirements as a report or a message shows them.
 
-
-def _parse_pip_config(text: str) -> list[tuple[str, str, str]]:
-    """`(where, option, value)` for each source option in `pip config list`'s output.
-
-    pip prints every loaded setting as `section.option=repr(value)`
-    (`list_values`, pip/_internal/commands/configuration.py, pip 26.2.1), the
-    environment's under the section `:env:`. Raises `ValueError` on a line it
-    cannot read: a format this does not know is not evidence of PyPI alone.
+    The one serializer for every place a requirement is read rather than used:
+    a direct URL loses its user information and query and keeps its fragment.
+    What is installed, and what an identity hashes, is the string as given.
     """
-    found: list[tuple[str, str, str]] = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        key, sep, shown = line.partition("=")
-        section, dot, option = key.rpartition(".")
-        if not sep or not dot:
-            raise ValueError(f"unrecognised `pip config list` line: {line!r}")
-        if section not in _INSTALL_SECTIONS or option not in _SOURCE_OPTIONS:
-            continue
-        try:
-            value = ast.literal_eval(shown)
-        except (ValueError, SyntaxError) as exc:
-            raise ValueError(f"unrecognised `pip config list` value: {line!r}") from exc
-        if not isinstance(value, str):
-            raise ValueError(f"unrecognised `pip config list` value: {line!r}")
-        found.append((f"pip config {key}", option, value))
-    return found
+    return [redact_text(r, keep_fragment=True) for r in requirements]
 
 
-def _pip_configuration() -> tuple[list[tuple[str, str, str]], str | None]:
-    """The source options pip's own configuration sets, and why it could not be read, if not.
-
-    `python -m pip config list`, pip's own command for its configuration,
-    which prints every setting pip loaded: its global, user and site files,
-    `PIP_CONFIG_FILE`'s, and the environment's under `:env:`
-    (`Configuration.load`, pip/_internal/configuration.py, pip 26.2.1). Run
-    with the interpreter running litetune, which a stage environment is built
-    from, in the environment a stage's pip gets: the global and user files are
-    the same ones, and the site file is this interpreter's own rather than the
-    new environment's, which has none -- a difference that can only add a
-    source, and so only turn a refusal into a note.
-    """
-    argv = [sys.executable, "-m", "pip", "config", "list"]
-    try:
-        # From an empty directory made for it. `python -m` puts the working
-        # directory first on `sys.path` ("python -m module command line:
-        # prepend the current working directory", `sys.path`, Python's
-        # documentation), so a `pip.py` or `pip/` wherever litetune was started
-        # would run in pip's place. `-P` would stop that too, but only from
-        # 3.11; this package supports 3.10.
-        with tempfile.TemporaryDirectory(prefix="litetune-pip-config-") as empty:
-            proc = _run_guarded(argv, _PIP_CONFIG_TIMEOUT_S, cwd=empty)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return [], redact_text(f"{type(exc).__name__}: {exc}")
-    if proc.returncode != 0:
-        said = (proc.stderr or proc.stdout or "").strip().splitlines()
-        last = said[-1] if said else "nothing"
-        return [], redact_text(f"`pip config list` exited {proc.returncode}: {last}")
-    try:
-        return _parse_pip_config(proc.stdout), None
-    except ValueError as exc:
-        return [], redact_text(str(exc))
+# The one way to provision past PyPI's file lists: someone installing from
+# another index or a wheelhouse that carries a wheel PyPI does not says so.
+# Nothing here infers it from pip's settings any more: that inference read
+# `PIP_INDEX_URL` and `pip config list`, and every way it could be wrong --
+# no pip in litetune's own interpreter, which a uv install has; `PIP_VERBOSE`
+# or `PIP_QUIET` changing what `pip config list` prints; a relative path; PyPI
+# spelled `pypi.org:443` -- either switched the check off in silence or
+# refused a working index.
+ALLOW_MISSING_WHEELS = "LITETUNE_ALLOW_MISSING_WHEELS"
 
 
-def _other_sources() -> tuple[list[str], str | None]:
-    """Where pip would look besides PyPI, and why pip's configuration was unreadable, if it was.
+def _missing_wheels_allowed() -> bool:
+    return os.environ.get(ALLOW_MISSING_WHEELS) == "1"
 
-    Every setting is taken as given, wherever it is set: which of several
-    files or sections pip would let win is not modelled, and a source counted
-    that pip would not use can only turn a refusal into a note.
-    """
-    settings = [(name, option, os.environ.get(name, "")) for name, option in _SOURCE_VARIABLES]
-    configured, unread = _pip_configuration()
-    others: dict[str, str] = {}
-    for where, option, value in settings + configured:
-        # List-valued options are split on whitespace, as pip splits them
-        # (`_update_defaults`, pip/_internal/cli/parser.py).
-        for item in value.split():
-            # Decided on the value as given; said redacted, since it is said
-            # in notes, refusals and the manifests that carry them.
-            if option == "find-links" or not _is_pypi(item):
-                others.setdefault(item, f"{where}={redact_url(item)}")
-    return list(dict.fromkeys(others.values())), unread
+
+_OPT_OUT = (
+    "That is by PyPI's file lists. Installing from another index or a wheelhouse that has the "
+    f"wheel, set {ALLOW_MISSING_WHEELS}=1: this becomes a note, and pip is asked"
+)
 
 
 @dataclass(frozen=True)
@@ -1839,12 +1750,17 @@ class _HostVerdict:
 
     # The rest of a sentence about the environment, or None when nothing stops it.
     reason: str | None = None
-    # Why a reason found in PyPI's lists is said and not enforced, or "".
-    caveat: str = ""
+    # Whether `reason` comes from PyPI's file lists, which the opt-out turns into
+    # a note, rather than from the Python floor, which it does not.
+    from_wheels: bool = False
+
+    @property
+    def refused(self) -> bool:
+        return self.reason is not None and not (self.from_wheels and _missing_wheels_allowed())
 
 
 def _host_verdict(env: StageEnv) -> _HostVerdict:
-    """The Python floor, then PyPI's lists unless pip is pointed past PyPI."""
+    """The Python floor, then PyPI's file lists."""
     host = wheels.current_host()
     if host.python < STAGE_PYTHON_MIN:
         return _HostVerdict(
@@ -1852,22 +1768,12 @@ def _host_verdict(env: StageEnv) -> _HostVerdict:
             f"python{host.python[0]}.{host.python[1]}"
         )
     reason = env.unprovisionable(host)
-    if reason is None:
-        return _HostVerdict()
-    others, unread = _other_sources()
-    if others:
-        caveat = (
-            f"pip is also pointed at {', '.join(others)}, which those lists do not cover and "
-            "which may carry what PyPI does not -- pip says so if it does not"
-        )
-    elif unread:
-        caveat = (
-            f"pip's own configuration could not be read ({unread}), so whether it points past "
-            "PyPI is not known -- pip says so if it finds nothing"
-        )
-    else:
-        caveat = ""
-    return _HostVerdict(reason, caveat)
+    return _HostVerdict(reason, from_wheels=True) if reason else _HostVerdict()
+
+
+def _refusal_text(env: StageEnv, verdict: _HostVerdict) -> str:
+    text = f"environment {env.name!r} {verdict.reason}"
+    return f"{text}. {_OPT_OUT}" if verdict.from_wheels else text
 
 
 def _refuse_unsupported_host(env: StageEnv, events=None) -> None:
@@ -1879,17 +1785,18 @@ def _refuse_unsupported_host(env: StageEnv, events=None) -> None:
     x86-64, and `export` at `numpy==2.0.2` everywhere. A message naming the
     wrong pin sends the reader to fix the wrong thing.
 
-    Where pip is pointed past PyPI, or its configuration cannot be read, the
-    gap is said and not enforced: the table is PyPI's. pip is then asked, and
-    `_provisioning_failed` reads its answer if it has nothing either.
+    With `LITETUNE_ALLOW_MISSING_WHEELS=1` a gap in PyPI's lists is said and
+    not enforced, and pip is asked; `_provisioning_failed` reads its answer if
+    it has nothing either.
     """
     verdict = _host_verdict(env)
-    if verdict.reason and not verdict.caveat:
-        raise RuntimeError(f"environment {env.name!r} {verdict.reason}")
+    if verdict.refused:
+        raise RuntimeError(_refusal_text(env, verdict))
     if verdict.reason:
         note = (
             f"by PyPI's file lists, environment {env.name!r} {verdict.reason}. Provisioning "
-            f"anyway: {verdict.caveat}"
+            f"anyway, as {ALLOW_MISSING_WHEELS}=1 asks -- pip says so if what it is pointed at "
+            "has nothing either"
         )
         if events:
             events.note(note)
@@ -1897,20 +1804,65 @@ def _refuse_unsupported_host(env: StageEnv, events=None) -> None:
             logger.warning("%s", note)
 
 
+def _platform_named(platform: str) -> str:
+    """A platform tag, with what it means said where the tag alone misleads.
+
+    `win32` reads as "Windows" and is a 32-bit Python; `win_arm64` is the
+    interpreter's build, not the machine's: `sysconfig.get_platform()` answers
+    from the build (`Lib/sysconfig.py`), so an x64 Python on an ARM64 machine is
+    `win_amd64`, and Windows 11 on Arm runs x64 apps under emulation
+    (learn.microsoft.com/en-us/windows/arm/apps-on-arm-x86-emulation).
+    """
+    if platform == "win32" or platform.endswith("_i686"):
+        return f"{platform} (a 32-bit Python; install the 64-bit one)"
+    if platform == "win_arm64":
+        return (
+            f"{platform} (an ARM64 Python; an x64 Python, which Windows 11 on Arm runs under "
+            "emulation, installs win_amd64 wheels)"
+        )
+    return platform
+
+
+def _pythons_that_work(requirements: Sequence[str], host: wheels.Host) -> list[int]:
+    """The Python 3 minors, from the floor up, for which every applying pin has a wheel here.
+
+    Asked of each minor a pinned wheel names, on `host`'s own platforms: a pin
+    chosen by a marker can be missing for one Python and present for another,
+    so "no wheel for this platform" is not always "no Python works here".
+    Called only for a host with a gap, so its own minor never comes back.
+    """
+    return [
+        minor
+        for minor in wheels.named_minors()
+        if minor >= STAGE_PYTHON_MIN[1]
+        and not wheels.gaps(requirements, wheels.Host.of(host.platforms, (3, minor)))
+    ]
+
+
 def _host_refusal(requirements: Sequence[str], host: wheels.Host) -> str | None:
     """Why `requirements` cannot be installed on `host`; None if nothing says so.
 
-    A pin with no wheel for the platform at all is said first and alone: no
-    interpreter on this machine would install it, so naming a Python version
-    would send the reader to change the wrong thing.
+    A pin with no wheel for the platform is said first: no version of it this
+    environment asks for would install there. Either way the Pythons that would
+    work on this platform are named, where there are any.
     """
     found = wheels.gaps(requirements, host)
     if not found:
         return None
+    working = _pythons_that_work(requirements, host)
+    elsewhere = (
+        ". On this platform every pin has its wheel for "
+        + ", ".join(f"python3.{m}" for m in working)
+        + " -- run litetune under one of those"
+        if working
+        else ""
+    )
     missing = [gap for gap in found if gap.platform_missing]
     if missing:
-        text = f"cannot be provisioned on {host.platform}: " + "; ".join(
-            g.describe() for g in missing
+        text = (
+            f"cannot be provisioned on {_platform_named(host.platform)}: "
+            + "; ".join(g.describe() for g in missing)
+            + elsewhere
         )
         converter = next(
             (
@@ -1925,10 +1877,10 @@ def _host_refusal(requirements: Sequence[str], host: wheels.Host) -> str | None:
         return text
     return (
         f"cannot be provisioned on python{host.python[0]}.{host.python[1]} on "
-        f"{host.platform}: it pins "
+        f"{_platform_named(host.platform)}: it pins "
         + "; and ".join(g.describe() for g in found)
-        + ". Stage environments are built from the interpreter running litetune; run litetune "
-        "under one of those (Colab's default works), or install it into a virtualenv on one"
+        + ". Stage environments are built from the interpreter running litetune"
+        + elsewhere
     )
 
 
@@ -2065,7 +2017,8 @@ class StageEnv:
         unpinned = [r for r in self.requirements if not _is_pinned(r)]
         if unpinned:
             raise UnpinnedRequirement(
-                f"environment {self.name!r} has unpinned requirements: {unpinned}. "
+                f"environment {self.name!r} has unpinned requirements: "
+                f"{shown_requirements(unpinned)}. "
                 "Pin them with '==': an unchanged definition that resolves "
                 "differently over time silently changes pipeline behaviour."
             )
@@ -2134,28 +2087,26 @@ class StageEnv:
         # With `--no-provision`, "not provisioned" alone sends the reader to drop
         # the flag, and the run after that refuses for this reason instead.
         verdict = _host_verdict(self)
-        if verdict.reason and verdict.caveat:
+        if verdict.refused:
+            opt_out = f". {_OPT_OUT}" if verdict.from_wheels else ""
+            return f"is not provisioned at {self.path}, and {verdict.reason}{opt_out}"
+        if verdict.reason:
             return (
                 f"is not provisioned at {self.path}; by PyPI's file lists it {verdict.reason}, "
-                f"though {verdict.caveat}"
+                f"though {ALLOW_MISSING_WHEELS}=1 lets pip try"
             )
-        if verdict.reason:
-            return f"is not provisioned at {self.path}, and {verdict.reason}"
         return f"is not provisioned at {self.path}"
 
     def refusal(self) -> str | None:
         """What `provision` refuses to build this environment here with, or None.
 
         A whole sentence about the environment: the Python floor first, then
-        PyPI's file lists -- which pip pointed past PyPI, or a pip whose
-        configuration cannot be read, turns into a note `provision` gives
-        instead. Public so a stage can ask before it does anything else:
-        `export` asks before it writes into the checkpoint it was handed.
+        PyPI's file lists -- which `LITETUNE_ALLOW_MISSING_WHEELS=1` turns into
+        a note `provision` gives instead. Public so a stage can ask before it
+        does anything else.
         """
         verdict = _host_verdict(self)
-        if verdict.reason and not verdict.caveat:
-            return f"environment {self.name!r} {verdict.reason}"
-        return None
+        return _refusal_text(self, verdict) if verdict.refused else None
 
     def unprovisionable(self, host: wheels.Host | None = None) -> str | None:
         """Why pip cannot build this environment on `host`, by PyPI's file lists, or None.
@@ -2291,7 +2242,30 @@ class StageEnv:
                 # The same spelling `ready` and `run` use, from one function:
                 # two of them disagreeing on Windows is what made this worth
                 # naming at all.
-                cmd = [str(self.python), "-m", "pip", "install", "--quiet", *self.requirements]
+                # `-I`: isolated mode keeps the working directory off
+                # `sys.path` -- "-I option can be used to run the script in
+                # isolated mode where sys.path contains neither the current
+                # directory nor the user's site-packages directory" (`-m`,
+                # docs.python.org/3.10/using/cmdline.html). Run as plain `-m`
+                # from where litetune was started, a `pip.py` there ran in the
+                # environment's own pip's place: measured on uv's CPython
+                # 3.10.19, `-m pip` ran a planted one and `-I -m pip` the
+                # venv's. pip still runs in the caller's directory, so relative
+                # `PIP_FIND_LINKS`, `PIP_CONSTRAINT`, `PIP_CERT` and
+                # `PIP_CONFIG_FILE` keep their meaning. `-I` also ignores every
+                # `PYTHON*` variable, `_child_env`'s UTF-8 mode among them, so
+                # `-X utf8` says it on the command line instead.
+                cmd = [
+                    str(self.python),
+                    "-I",
+                    "-X",
+                    "utf8",
+                    "-m",
+                    "pip",
+                    "install",
+                    "--quiet",
+                    *self.requirements,
+                ]
                 try:
                     # Through the same guard the stages use, and for the same
                     # reason. `subprocess.run` kills its direct child, and
@@ -2305,15 +2279,7 @@ class StageEnv:
                     # out of reach, which would otherwise install somewhere
                     # other than this venv while `.litetune-ready` was written
                     # over it regardless.
-                    #
-                    # From an empty directory made for it, for the reason
-                    # `_pip_configuration` gives: `python -m` puts the working
-                    # directory first on `sys.path`, so a `pip.py` where
-                    # litetune was started would run in the environment's own
-                    # pip's place. The command names pinned distributions,
-                    # never paths, so nothing in it depends on where it runs.
-                    with tempfile.TemporaryDirectory(prefix="litetune-pip-install-") as empty:
-                        proc = _run_guarded(cmd, remaining, cwd=empty)
+                    proc = _run_guarded(cmd, remaining)
                 except subprocess.TimeoutExpired:
                     raise RuntimeError(
                         f"provisioning environment {self.name!r} exceeded its {timeout}s budget "
@@ -2369,7 +2335,7 @@ class StageEnv:
         detail = (
             f"could not provision environment {self.name!r} on "
             f"{platform}/python{sys.version_info.major}.{sys.version_info.minor}. "
-            f"It pins {', '.join(self.requirements)}"
+            f"It pins {', '.join(shown_requirements(self.requirements))}"
         )
         debian = self.system_requirements_on(platform)
         if debian:

@@ -29,7 +29,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import IO, Any, NoReturn
 
 from litetune import envs, jsonfile, models
 from litetune._version import __version__
@@ -174,6 +174,16 @@ class _Parser(argparse.ArgumentParser):
     ran. A usage error is a request litetune will not run, which is what 4
     means everywhere else in this vocabulary.
     """
+
+    def _print_message(self, message: str, file: IO[str] | None = None) -> None:
+        # Every argparse write -- `--help`, `--version`, usage -- goes through
+        # here, and writes `message` as is: `litetune verify --help > help.txt`
+        # under the cp932 code page raised `UnicodeEncodeError` on a `—`. The
+        # same escape `_say_out` gives a summary; `file` is what argparse
+        # writes to, stderr where it names none.
+        if message:
+            message = _encodable(message, file if file is not None else sys.stderr)
+        super()._print_message(message, file)
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)

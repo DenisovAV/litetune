@@ -34,9 +34,10 @@ read here, and for that #45's reading of pip's output still stands behind it.
 
 **What is not read, so that nothing is refused on a guess.** Requirements the
 pins leave open or put behind a marker, which pip resolves itself and whose
-failures reach the reader through pip's own output; and any index but PyPI --
-this is PyPI's file list, and `envs` says so rather than refusing where pip is
-pointed elsewhere.
+failures reach the reader through pip's own output; and any index but PyPI.
+This is PyPI's file list: `envs` refuses by it and says so, and
+`LITETUNE_ALLOW_MISSING_WHEELS=1` is how someone installing from an index or a
+wheelhouse that has the wheel turns the refusal into a note.
 """
 
 from __future__ import annotations
@@ -238,8 +239,21 @@ def applies(requirement: str, environment: Mapping[str, str]) -> bool:
 
 
 def without_marker(requirement: str) -> str:
-    """The requirement as written, before its `;` marker, if it has one."""
-    return requirement.partition(";")[0].strip()
+    """The requirement without its marker, read as pip reads it.
+
+    Unchanged when it has no marker -- so an identity over unmarked pins hashes
+    the very strings it always did -- and when it is a direct URL, or not a
+    requirement packaging can read: a `;` inside a URL's query is part of the
+    URL, and splitting there made two different URLs one identity.
+    """
+    try:
+        parsed = Requirement(requirement)
+    except InvalidRequirement:
+        return requirement
+    if parsed.marker is None or parsed.url:
+        return requirement
+    parsed.marker = None
+    return str(parsed)
 
 
 def _key(requirement: str) -> str | None:
@@ -248,6 +262,20 @@ def _key(requirement: str) -> str | None:
     if pinned is None:
         return None
     return f"{canonical(pinned[0])}=={pinned[1]}"
+
+
+def named_minors(published: Mapping[str, Release] | None = None) -> list[int]:
+    """Every CPython 3 minor some wheel on record is built for, in order."""
+    table = PUBLISHED if published is None else published
+    return sorted(
+        {
+            int(m.group(1))
+            for release in table.values()
+            for tags in release.wheels()
+            for tag in tags
+            if (m := re.fullmatch(r"cp3(\d+)", tag.interpreter))
+        }
+    )
 
 
 def gaps(

@@ -50,7 +50,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
-from litetune import envs
+from litetune import envs, jsonfile
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.declarations import (
     argument_problem,
@@ -486,10 +486,21 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
     them would refuse splits that work.
     """
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except OSError:
         logger.exception("could not read dataset %s", path)
         raise
+    # Named rather than let through: a `UnicodeDecodeError` escaped every
+    # `except` here and ended the run without naming the file or the encoding,
+    # and Windows PowerShell 5.1's `>` writes UTF-16 with a byte-order mark
+    # (`jsonfile`).
+    marked = jsonfile.marked_encoding(raw)
+    if marked is not None:
+        raise PrepareError(f"{path} is {marked}; save it as UTF-8 without a byte-order mark")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PrepareError(f"{path} is not UTF-8 ({exc}); save it as UTF-8") from exc
 
     rows: list[Row] = []
     for lineno, line in enumerate(text.splitlines(), start=1):
@@ -669,7 +680,7 @@ class HuggingFaceTokenCounter:
             "tokenizer": self.model,
             "revision": self.revision,
             "environment": self.env.name,
-            "requirements": list(self.env.requirements),
+            "requirements": envs.shown_requirements(self.env.requirements),
         }
 
     def count(self, texts: Sequence[str]) -> list[int]:

@@ -142,13 +142,16 @@ The pinned wheels set the minimums. On Linux: glibc 2.27 for `convert`,
 `sentencepiece==0.2.1`, the first with cp313 wheels and `manylinux_2_27`. On
 macOS: 12 for `convert`, `verify` and `towers` (`litert-lm-api` is
 `macosx_12_0_arm64`) and 11 for `tune`. musl Linux, Alpine's, has none of them. Each stage checks, before pip runs, that
-every pin it installs publishes a wheel this interpreter accepts — the whole
-tag, matched as pip matches it — and refuses by naming the one that does not:
-the runtime's native library `litert-lm-api` and `torch==2.5.1` publish none for
-Intel Macs, 32-bit Python or Windows on ARM64, so no stage that builds an
-environment runs there. Where pip is pointed at another index or archive —
-`PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL` or `PIP_FIND_LINKS`, or the same settings
-in a pip configuration file — the check says what PyPI lacks and lets pip look.
+every pin it installs publishes a wheel on PyPI that this interpreter accepts —
+the whole tag, matched as pip matches it — and refuses by naming the one that
+does not: the runtime's native library `litert-lm-api` and `torch==2.5.1`
+publish none for Intel Macs, 32-bit Python or an ARM64 Python on Windows, so no
+stage that builds an environment runs there. The tag is the interpreter's, not
+the machine's: an x64 Python on Windows 11 on Arm, which runs x64 programs under
+emulation, is checked as x64 and pip installs `win_amd64` wheels into it, as for
+any x64 install; litetune has not been run there. Installing from another index
+or a wheelhouse that has a wheel PyPI lacks, set
+`LITETUNE_ALLOW_MISSING_WHEELS=1`: the refusal becomes a note, and pip is asked.
 On Linux you also need
 `libvulkan1` —
 `litert-lm` `dlopen()`s a Vulkan-linked library even for the CPU backend, and

@@ -30,7 +30,21 @@ _MARKS = (
     (codecs.BOM_UTF16_BE, "utf-16"),
 )
 
+# What each codec above is called where a refusal names it.
+_NAMED = {"utf-32": "UTF-32", "utf-8-sig": "UTF-8 with a byte-order mark", "utf-16": "UTF-16"}
+
 UNREADABLE = "is not text in UTF-8, or in UTF-16 or UTF-32 with a byte-order mark"
+
+
+def marked_encoding(raw: bytes) -> str | None:
+    """The encoding a byte-order mark at the start of `raw` names, or `None` where there is none.
+
+    For the readers that take UTF-8 alone and refuse anything else by name.
+    """
+    for mark, codec in _MARKS:
+        if raw.startswith(mark):
+            return _NAMED[codec]
+    return None
 
 
 def decode(raw: bytes) -> str:

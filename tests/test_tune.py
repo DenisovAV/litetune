@@ -968,6 +968,24 @@ def test_an_unprovisioned_environment_is_could_not_check(monkeypatch, request_fo
     assert any("not attempted" in text for text in result.limitations)
 
 
+def test_the_environment_check_records_its_pins_without_a_credential(trainer, request_for):
+    """A direct URL is an accepted pin; the check's record shows it as every report does."""
+    private = envs.StageEnv(
+        name="train",
+        requirements=(
+            "https://u:s3cret@packages.invalid/pkg-1-py3-none-any.whl?sig=T0KEN#sha256=ab",
+        ),
+    )
+
+    result = run_tune(request_for(env=private))
+
+    check = check_named(result, ENV_CHECK)
+    assert check.outcome is Outcome.PASSED
+    assert check.observed["requirements"] == [
+        "https://***@packages.invalid/pkg-1-py3-none-any.whl?***#sha256=ab"
+    ]
+
+
 def test_a_missing_training_split_is_a_failure_not_a_crash(trainer, request_for, tmp_path):
     result = run_tune(request_for(data=tmp_path / "absent.jsonl"))
 

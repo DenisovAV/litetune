@@ -37,6 +37,7 @@ from litetune.export import (
     PROBE_TEXT,
     TOOLCHAIN_DEFAULT_RECIPE,
     ExportRequest,
+    ExportResult,
     NoRecipesRequested,
     SizeComparison,
     Uncompared,
@@ -982,6 +983,15 @@ def test_parse_pip_freeze_keeps_unpinnable_entries_verbatim():
     assert frozen["foo"].startswith("foo @ https://")
 
 
+def test_a_frozen_direct_url_keeps_its_hash_and_loses_its_credential():
+    """pip writes the archive's hash in the fragment; it is provenance, not a secret."""
+    frozen = parse_pip_freeze(
+        "pkg @ https://u:p4ss@h.invalid/pkg-1-py3-none-any.whl?sig=T0KEN#sha256=ab12\n"
+    )
+
+    assert frozen["pkg"] == "pkg @ https://***@h.invalid/pkg-1-py3-none-any.whl?***#sha256=ab12"
+
+
 def test_requirement_names_drop_the_pins():
     assert requirement_names(("litert-lm==0.16.1", "numpy==2.0.2")) == ("litert-lm", "numpy")
     assert requirement_names(("https://example.invalid/wheel.whl",)) == ()
@@ -1110,47 +1120,56 @@ def test_a_bpe_checkpoint_needs_no_repair_and_is_not_an_error(tmp_path):
     assert repair_vocab_file(model) == (True, None)
 
 
-def test_convert_refused_on_this_machine_writes_nothing_into_the_checkpoint(monkeypatch, tmp_path):
+def _stale_vocab_checkpoint(tmp_path) -> Path:
+    """A checkpoint whose `tokenizer_config.json` names a `vocab_file` elsewhere."""
+    model = _checkpoint(tmp_path)
+    (model / "tokenizer.model").write_bytes(b"sp")
+    (model / "tokenizer_config.json").write_text(
+        json.dumps({"vocab_file": "/tmp/elsewhere/tokenizer.model"}), encoding="utf-8"
+    )
+    return model
+
+
+def _files_of(model: Path) -> dict[str, tuple[bytes, int]]:
+    return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in sorted(model.iterdir())}
+
+
+def _convert_checkpoint(model: Path, tmp_path) -> ExportResult:
+    return run_export(
+        ExportRequest(
+            model=str(model),
+            base_model="google/gemma-3-270m-it",
+            output_dir=tmp_path / "out",
+            recipes=("dynamic_wi8_afp32",),
+        )
+    )
+
+
+def test_convert_refused_on_this_machine_writes_nothing_into_the_checkpoint(
+    toolchain, monkeypatch, tmp_path
+):
     """Windows has no `litert-converter` wheel, and `export` says so before anything else.
 
     The `vocab_file` repair rewrites `tokenizer_config.json` in the checkpoint
     it was handed, and it used to run -- with the plan drawn first -- before
     provisioning refused, so a run that could never convert here still edited
-    the caller's input. The same checkpoint on a machine that can convert is
+    the caller's input. The same checkpoint where the environment stands is
     repaired, which is what makes "nothing was written" mean something.
     """
-    from litetune.export import ExportRequest, run_export
-
-    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    monkeypatch.setattr(envs.StageEnv, "refusal", _REAL_REFUSAL)
     provisioned: list[str] = []
     monkeypatch.setattr(
-        envs.StageEnv, "provision", lambda self, events=None, force=False: provisioned.append(1)
+        envs.StageEnv,
+        "provision",
+        lambda self, events=None, force=False: provisioned.append(1) or mark_provisioned(self),
     )
-    model = _checkpoint(tmp_path)
-    (model / "tokenizer.model").write_bytes(b"sp")
-    config = model / "tokenizer_config.json"
-    config.write_text(
-        json.dumps({"vocab_file": "/tmp/elsewhere/tokenizer.model"}), encoding="utf-8"
-    )
+    model = _stale_vocab_checkpoint(tmp_path)
+    before = _files_of(model)
 
-    def snapshot() -> dict[str, tuple[bytes, int]]:
-        return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in sorted(model.iterdir())}
-
-    def convert():
-        return run_export(
-            ExportRequest(
-                model=str(model),
-                base_model="google/gemma-3-270m-it",
-                output_dir=tmp_path / "out",
-                recipes=("dynamic_wi8_afp32",),
-            )
-        )
-
-    before = snapshot()
     monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
-    result = convert()
+    result = _convert_checkpoint(model, tmp_path)
 
-    assert snapshot() == before, "the checkpoint is left as it was handed in"
+    assert _files_of(model) == before, "the checkpoint is left as it was handed in"
     assert provisioned == [], "and nothing was asked to provision"
     assert result.outcome is Outcome.UNCHECKED
     assert result.not_attempted == ("dynamic_wi8_afp32",)
@@ -1159,25 +1178,84 @@ def test_convert_refused_on_this_machine_writes_nothing_into_the_checkpoint(monk
     assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in detail
 
     monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("linux_x86_64", (3, 12)))
-    convert()
-    assert json.loads(config.read_text(encoding="utf-8"))["vocab_file"] == str(
+    _convert_checkpoint(model, tmp_path)
+    config = json.loads((model / "tokenizer_config.json").read_text(encoding="utf-8"))
+    assert provisioned == [1]
+    assert config["vocab_file"] == str(
         (model / "tokenizer.model").resolve()
-    ), "where convert can run, the same checkpoint is repaired"
+    ), "where the environment stands, the same checkpoint is repaired"
 
 
-def test_a_report_carries_no_index_credential(toolchain, request_for, monkeypatch):
-    """The manifest is what a user pastes into an issue; an index URL in it is
-    shown without its user information or query."""
-    monkeypatch.setenv("PIP_INDEX_URL", "https://user:s3cret@mirror.invalid/simple")
-    monkeypatch.setenv("PIP_EXTRA_INDEX_URL", "https://cdn.invalid/simple?token=T0KEN")
-    monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
+def _pip_fails(monkeypatch) -> None:
+    """The real `provision`, with a virtualenv that builds and a pip that finds nothing."""
+    monkeypatch.setattr(
+        envs.venv.EnvBuilder, "create", lambda self, path: Path(path).mkdir(parents=True)
+    )
+    monkeypatch.setattr(
+        envs,
+        "_run_guarded",
+        lambda *a, **k: subprocess.CompletedProcess(
+            a[0], 1, "", "ERROR: No matching distribution found for litert-converter==0.4.0\n"
+        ),
+    )
 
-    result = run_export(request_for(("weight_only_wi8_afp32",), auto_provision=False))
+
+@pytest.mark.parametrize("how", ["provision-raises", "opted-out-and-pip-fails"])
+def test_a_convert_that_could_not_provision_writes_nothing_into_the_checkpoint(
+    monkeypatch, tmp_path, how
+):
+    """The repair waits for a usable environment, on every platform.
+
+    With `LITETUNE_ALLOW_MISSING_WHEELS=1` on Windows the refusal is a note and
+    pip is asked; when pip has nothing either, the checkpoint must be as it was.
+    """
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    if how == "provision-raises":
+        monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("linux_x86_64", (3, 12)))
+
+        def provision(self, events=None, force=False):
+            raise RuntimeError("could not provision environment 'export'")
+
+        monkeypatch.setattr(envs.StageEnv, "provision", provision)
+    else:
+        monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("win_amd64", (3, 12)))
+        monkeypatch.setenv(envs.ALLOW_MISSING_WHEELS, "1")
+        _pip_fails(monkeypatch)
+    model = _stale_vocab_checkpoint(tmp_path)
+    before = _files_of(model)
+
+    result = _convert_checkpoint(model, tmp_path)
+
+    assert _files_of(model) == before
+    assert result.outcome is Outcome.UNCHECKED
+    assert result.not_attempted == ("dynamic_wi8_afp32",)
+    assert "could not provision" in result.checks.first_unchecked.detail
+
+
+_PRIVATE_WHEEL = "https://user:s3cret@packages.invalid/pkg-1-py3-none-any.whl?sig=T0KEN#sha256=ab12"
+_PRIVATE_SHOWN = "https://***@packages.invalid/pkg-1-py3-none-any.whl?***#sha256=ab12"
+
+
+@pytest.mark.parametrize("ready", [False, True], ids=["unready", "ready"])
+def test_a_report_carries_no_credential_from_a_requirement(
+    toolchain, request_for, monkeypatch, ready
+):
+    """The manifest is what a user pastes into an issue.
+
+    A direct URL is an accepted pin, and every place the report lists what an
+    environment pins -- the request, the toolchain's declaration, the
+    environment check -- shows it without its user information or query, and
+    with its hash.
+    """
+    private = envs.StageEnv(name="export", requirements=(_PRIVATE_WHEEL,))
+    if ready:
+        mark_provisioned(private)
+
+    result = run_export(request_for(("weight_only_wi8_afp32",), env=private, auto_provision=False))
     report = json.dumps(result.as_dict(), default=str)
 
-    assert result.outcome is Outcome.UNCHECKED
     assert "s3cret" not in report and "T0KEN" not in report
-    assert "https://***@mirror.invalid/simple" in report
+    assert report.count(_PRIVATE_SHOWN) >= (3 if ready else 2), report
 
 
 def test_a_pip_freeze_that_failed_is_quoted_without_credentials(monkeypatch, tmp_path):

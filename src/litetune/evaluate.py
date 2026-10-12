@@ -800,7 +800,7 @@ class LiteRtLmBackend:
             # The arithmetic depends on the CPU model as much as on the runtime,
             # so the CPU travels with the number. `None` when no report was read.
             "cpu": cpu_of(self.device_report),
-            "requirements": list(self.env.requirements),
+            "requirements": envs.shown_requirements(self.env.requirements),
             # What this platform needs: Debian names are recorded on Linux only.
             "system_requirements": list(self.env.system_requirements_on()),
             # What the script calls, in place of the command line this
@@ -2100,7 +2100,7 @@ class HuggingFaceBackend:
             "mps_refusal": self.mps_refusal,
             "mps_memory_sampled_max": self.mps_memory_sampled_max,
             "mps_environment_seen": self.mps_environment_seen,
-            "requirements": list(self.env.requirements),
+            "requirements": envs.shown_requirements(self.env.requirements),
             "decode_declared": self.decode.as_dict(),
             "decode_passed_to_runtime": self.decode_enforced,
             GENERATION_SETTINGS_NOT_APPLIED: self.generation_settings_not_applied,

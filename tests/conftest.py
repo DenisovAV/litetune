@@ -421,20 +421,16 @@ def machine(name: str, python: tuple[int, int]) -> Host:
 
 
 @pytest.fixture(autouse=True)
-def _pip_points_at_pypi_alone(monkeypatch):
-    """The machine running the suite does not choose the index a test sees.
+def _missing_wheels_refused(monkeypatch):
+    """The shell running the suite does not decide which tests refuse.
 
-    A refusal is enforced only where pip is pointed at PyPI alone, and that is
-    read from `PIP_INDEX_URL` and its two siblings and from pip's own
-    configuration. A developer's `pip.conf`, or a CI image's, would otherwise
-    decide which tests refuse; and asking the real pip is a subprocess. Tests
-    about either set them themselves.
+    `LITETUNE_ALLOW_MISSING_WHEELS=1` turns the wheel table's refusal into a
+    note, so a developer who set it for their own installs would otherwise see
+    every refusal test fail. Tests about the opt-out set it themselves.
     """
     from litetune import envs
 
-    for name, _ in envs._SOURCE_VARIABLES:
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(envs, "_pip_configuration", lambda: ([], None))
+    monkeypatch.delenv(envs.ALLOW_MISSING_WHEELS, raising=False)
 
 
 def buildable_here(monkeypatch) -> None:

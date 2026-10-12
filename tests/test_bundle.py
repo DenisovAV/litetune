@@ -271,6 +271,50 @@ def test_declarations_that_do_not_parse_are_shipped_and_rejected(tmp_path, reque
     assert (result.request.output_dir / DECLARATIONS_NAME).is_file()
 
 
+@pytest.mark.parametrize(
+    ("encoding", "named"),
+    [
+        ("utf-16", "UTF-16"),
+        ("utf-8-sig", "UTF-8 with a byte-order mark"),
+        ("utf-32", "UTF-32"),
+        ("cp1252", "not UTF-8 ("),
+    ],
+)
+def test_prerendered_declarations_not_in_utf8_are_refused_by_encoding(
+    tmp_path, request_for, encoding, named
+):
+    """What Windows PowerShell 5.1's `>` writes is UTF-16 with a byte-order mark.
+
+    `prepare` reads that file, and in prerendered mode `bundle` refused it as
+    "not valid JSON", naming neither the encoding nor what to do. The file
+    ships byte for byte there, so it is refused, up front and by encoding,
+    and nothing is copied.
+    """
+    # Valid JSON in its own encoding, and not ASCII, so every encoding differs from UTF-8.
+    text = json.dumps([{"type": "function", "function": {"name": "caf\u00e9"}}], ensure_ascii=False)
+    given = tmp_path / "given.json"
+    given.write_bytes(text.encode(encoding))
+
+    result = build_bundle(request_for(declarations=given))
+
+    check = check_named(result, "declarations included")
+    assert check.outcome is Outcome.FAILED
+    assert check.detail.startswith(f"the declarations at {given} are {named}")
+    assert check.detail.endswith("save it as UTF-8 without a byte-order mark")
+    assert "valid JSON" not in check.detail
+    assert not (result.request.output_dir / DECLARATIONS_NAME).exists()
+
+
+def test_prerendered_declarations_in_utf8_are_shipped_as_given(tmp_path, request_for):
+    given = tmp_path / "given.json"
+    given.write_bytes('[{"type": "function", "function": {"name": "caf\u00e9"}}]'.encode())
+
+    result = build_bundle(request_for(declarations=given))
+
+    assert check_named(result, "declarations included").outcome is Outcome.PASSED
+    assert (result.request.output_dir / DECLARATIONS_NAME).read_bytes() == given.read_bytes()
+
+
 def test_declarations_that_are_not_the_ones_the_contract_names_fail(request_for, declarations):
     contract = a_contract(declarations_sha256="f" * 64)
 

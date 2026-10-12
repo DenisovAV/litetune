@@ -99,6 +99,26 @@ jobs:
           python -m venv ../fresh
           ../fresh/Scripts/python.exe -m pip install dist/*.whl
           ../fresh/Scripts/litetune.exe --help
+      # The refusal end to end, from the installed wheel and its venv
+      # redirector rather than the toolcache interpreter the tests run under:
+      # `litert-converter` publishes no Windows wheel, so `convert` says so by
+      # name and exits 4 ("could not check") before it builds anything or
+      # writes anywhere.
+      - name: convert is refused by name from the installed wheel
+        run: |
+          mkdir ../tiny
+          printf '{"model_type": "gemma3_text"}' > ../tiny/config.json
+          set +e
+          ../fresh/Scripts/litetune.exe convert --model ../tiny \
+            --base-model google/gemma-3-270m-it --output-dir ../tiny-out \
+            --recipe dynamic_wi8_afp32 --json > ../convert.json
+          code=$?
+          set -e
+          cat ../convert.json
+          test "$code" -eq 4
+          grep -q "litert-converter==0.4.0 publishes no wheel for win_amd64" ../convert.json
+          test "$(ls ../tiny)" = "config.json"
+          test ! -e ../tiny-out
 
   # An editable install is not the artifact anyone receives. `src/` layout plus
   # a dynamic hatch version plus `license-files` is exactly the surface where

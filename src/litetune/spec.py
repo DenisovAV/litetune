@@ -48,7 +48,7 @@ from typing import Any
 import yaml
 
 from litetune import envs
-from litetune.envs import StageEnv, UnpinnedRequirement
+from litetune.envs import StageEnv, UnpinnedRequirement, shown_requirements
 
 logger = logging.getLogger(__name__)
 
@@ -649,7 +649,7 @@ class ToolchainSpec:
         )
 
     def as_dict(self) -> dict[str, Any]:
-        return {env.name: list(env.requirements) for env in self.environments}
+        return {env.name: shown_requirements(env.requirements) for env in self.environments}
 
     def identities(self) -> dict[str, str]:
         return {env.name: env.identity for env in self.environments}
@@ -679,7 +679,7 @@ class ToolchainSpec:
                 if value != "default":
                     raise SpecError(
                         f"toolchain.{name}: expected a list of pinned requirements or the word "
-                        f"'default', got {value!r}"
+                        f"'default', got {shown_requirements([value])[0]!r}"
                     )
                 # Explicit in the spec, resolved from litetune's own pins, and
                 # recorded in the manifest by identity. Not a silent default:
