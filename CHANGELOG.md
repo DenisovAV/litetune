@@ -3,6 +3,12 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.4.1 — 2026-10-12
+- **A Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle litetune 0.4.0 converted from a checkpoint it did not recognise -- another organisation's copy, or a fine-tune under its own name -- has no block that reads LiteRT-LM 0.18.0's parts: convert it again; one converted from Qwen's own repositories at their current revisions, or what `tune` made from them, is unaffected (#71).**
+- `convert` puts the text-parts block in front of the checkpoint's own chat template instead of a packaged copy, and reads the template back from every bundle it writes (#71).
+- Exporter flags passed with `--flag=` are read as the exporter reads them and forms it would read differently are refused; Gemma 4 refuses any model-type override and an embedder opt-out (#71).
+- Stage environments link the interpreter instead of copying it, so a Python that loads libpython relative to itself, such as uv 0.10.6's CPython on macOS, can provision them (#70).
+
 ## 0.4.0 — 2026-10-11
 - **Convert a Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle again for an app on LiteRT-LM 0.18.0, as flutter_edge_ai_litertlm 1.10.0 ships: 0.18.0 hands the template a list of parts, which their checkpoint templates do not read, and the user's text is lost or every send fails (#67).**
 - **Convert again any bundle `convert` wrote to a relative `--output-dir` on Python 3.10 or 3.11: it has no GPU activation key, which its report named, and on a GPU backend it answers wrong (#67).**
