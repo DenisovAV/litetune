@@ -1183,17 +1183,23 @@ def test_settings_the_reference_left_out_are_named_in_the_manifest(
     """Qwen2.5-0.5B-Instruct's `generation_config.json` asks for
     `repetition_penalty: 1.1`, and the reference decodes greedily without it.
     A reader comparing this reference with another harness's run of the same
-    checkpoint has to be told."""
+    checkpoint has to be told. Each value is written as JSON, so a string
+    reads as one."""
+    left_out = {"repetition_penalty": 1.1, "dola_layers": "low"}
     result = _verify_with_reference_report(
         write_split,
         monkeypatch,
         tmp_path,
-        {"device": "cpu", "generation_settings_not_applied": {"repetition_penalty": 1.1}},
+        {"device": "cpu", "generation_settings_not_applied": left_out},
     )
 
     engine = result.manifest["measurements"]["reference"]["engine"]
-    assert engine["generation_settings_not_applied"] == {"repetition_penalty": 1.1}
-    named = [t for t in result.manifest["limitations"] if "repetition_penalty=1.1" in t]
+    assert engine["generation_settings_not_applied"] == left_out
+    named = [
+        t
+        for t in result.manifest["limitations"]
+        if 'dola_layers="low", repetition_penalty=1.1' in t
+    ]
     assert len(named) == 1
 
 

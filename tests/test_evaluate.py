@@ -1355,21 +1355,42 @@ class _GenerationStopped(RuntimeError):
 
 # What transformers 5.16.1 falls back to for a generation field nobody set
 # (`GenerationConfig._get_default_generation_params`,
-# generation/configuration_utils.py:601-645), for the fields the tests below set.
+# generation/configuration_utils.py:609-645), verbatim.
 _TRANSFORMERS_DEFAULTS: dict[str, Any] = {
     "max_length": 20,
     "min_length": 0,
     "do_sample": False,
     "use_cache": True,
+    "early_stopping": False,
     "num_beams": 1,
     "temperature": 1.0,
     "top_k": 50,
     "top_p": 1.0,
     "typical_p": 1.0,
     "repetition_penalty": 1.0,
+    "length_penalty": 1.0,
     "no_repeat_ngram_size": 0,
+    "encoder_no_repeat_ngram_size": 0,
     "bad_words_ids": None,
+    "num_return_sequences": 1,
+    "output_scores": False,
+    "return_dict_in_generate": False,
+    "forced_bos_token_id": None,
+    "forced_eos_token_id": None,
+    "remove_invalid_values": False,
+    "exponential_decay_length_penalty": None,
     "suppress_tokens": None,
+    "begin_suppress_tokens": None,
+    "epsilon_cutoff": 0.0,
+    "eta_cutoff": 0.0,
+    "encoder_repetition_penalty": 1.0,
+    "num_assistant_tokens": 20,
+    "num_assistant_tokens_schedule": "constant",
+    "assistant_confidence_threshold": 0.4,
+    "assistant_lookbehind": 10,
+    "target_lookbehind": 10,
+    "num_beam_groups": 1,
+    "diversity_penalty": 0.0,
 }
 
 # 5.16.1's `METADATA_FIELDS` (generation/configuration_utils.py:46).
@@ -1396,8 +1417,13 @@ class FakeGenerationConfig:
             setattr(self, key, value)
 
     def to_json_string(self, use_diff: bool = True, ignore_metadata: bool = False) -> str:
-        # `use_diff` drops what equals a fresh config, which is every `None`.
-        settings = {key: value for key, value in vars(self).items() if value is not None}
+        # Without `use_diff` every field a fresh config has is there, `None` or
+        # not (`to_dict`, configuration_utils.py:1172-1191) -- here the fields
+        # in `_TRANSFORMERS_DEFAULTS`. With it, what equals a fresh config goes,
+        # which is every `None` (`to_diff_dict`, :1149-1170).
+        settings = {**dict.fromkeys(_TRANSFORMERS_DEFAULTS), **vars(self)}
+        if use_diff:
+            settings = {key: value for key, value in settings.items() if value is not None}
         if ignore_metadata:
             settings = {k: v for k, v in settings.items() if k not in _METADATA_FIELDS}
         return json.dumps(settings, sort_keys=True)
@@ -1412,10 +1438,10 @@ def merged_generation(
 ) -> dict[str, Any]:
     """The settings a 5.16.1 `generate` call runs under, by its own merge.
 
-    `_prepare_generation_config` (generation/utils.py:1784-1811): the config
+    `_prepare_generation_config` (generation/utils.py:1784-1818): the config
     passed to the call, or a fresh one; every field still unset filled from
     `model.generation_config`, then from the global defaults; then the call's
-    keyword arguments over all of it.
+    keyword arguments over all of it; then a "hybrid" cache cleared.
     """
     merged = {k: v for k, v in vars(passed).items() if v is not None} if passed else {}
     for source in (vars(model_config), _TRANSFORMERS_DEFAULTS):
@@ -1423,6 +1449,8 @@ def merged_generation(
             if merged.get(key) is None:
                 merged[key] = value
     merged.update({k: v for k, v in kwargs.items() if k != "input_ids"})
+    if merged.get("cache_implementation") == "hybrid":
+        merged["cache_implementation"] = None
     return merged
 
 
@@ -1817,9 +1845,16 @@ def test_the_reference_reports_the_settings_it_left_out(tmp_path, monkeypatch):
     assert backend.describe()[GENERATION_SETTINGS_NOT_APPLIED] == {"repetition_penalty": 1.1}
 
 
-def test_a_record_that_is_not_a_mapping_is_not_published():
+@pytest.mark.parametrize(
+    "report",
+    [{"device": "cpu"}, {"device": "cpu", GENERATION_SETTINGS_NOT_APPLIED: ["top_k"]}],
+    ids=["no record", "not a mapping"],
+)
+def test_a_report_without_a_record_is_not_published_as_one(report):
+    """`None`, not `{}`: a report that says nothing must not read as one
+    saying nothing was left out."""
     backend = HuggingFaceBackend(model="org/m", auto_provision=False)
-    backend._take_run_report({"device": "cpu", GENERATION_SETTINGS_NOT_APPLIED: ["top_k"]})
+    backend._take_run_report(report)
     assert backend.describe()[GENERATION_SETTINGS_NOT_APPLIED] is None
 
 
@@ -1833,13 +1868,14 @@ def test_the_settings_left_out_are_reported_before_generation(tmp_path, monkeypa
 def test_sampling_settings_and_the_cache_are_not_reported_as_left_out(tmp_path, monkeypatch):
     """FunctionGemma's config asks for sampling, which greedy decoding does
     not use -- those processors are built only under `do_sample`
-    (generation/utils.py:1296-1343) -- and for a cache, which the reference
-    keeps."""
+    (generation/utils.py:1296-1343) -- and for a "hybrid" cache, which the
+    reference keeps and 5.16.1 clears after the merge (:1817-1818), as it did
+    before."""
     captured = _run_hf_generate_script(
         tmp_path, monkeypatch, generation_config=_FUNCTIONGEMMA_GENERATION_CONFIG
     )
     assert captured["run_report"]["generation_settings_not_applied"] == {}
-    assert captured["generation"]["cache_implementation"] == "hybrid"
+    assert captured["generation"]["cache_implementation"] is None
     assert captured["generation"]["eos_token_id"] == [1, 50, 106]
 
 
@@ -1859,13 +1895,119 @@ def test_every_cache_setting_is_kept(tmp_path, monkeypatch):
     assert captured["run_report"]["generation_settings_not_applied"] == {}
 
 
-def test_a_setting_at_transformers_default_is_not_reported(tmp_path, monkeypatch):
+def test_a_setting_at_a_value_that_does_nothing_is_not_reported(tmp_path, monkeypatch):
+    """At transformers' own default, or at a guidance scale of 1, which builds
+    no processor (generation/utils.py:1144)."""
     captured = _run_hf_generate_script(
         tmp_path,
         monkeypatch,
-        generation_config={"eos_token_id": 1, "repetition_penalty": 1.0, "no_repeat_ngram_size": 0},
+        generation_config={
+            "eos_token_id": 1,
+            "repetition_penalty": 1.0,
+            "no_repeat_ngram_size": 0,
+            "guidance_scale": 1.0,
+        },
     )
     assert captured["run_report"]["generation_settings_not_applied"] == {}
+
+
+# Settings a 5.16.1 generation config can carry that change what a greedy call
+# generates, each at a value that does: a logits processor built whatever
+# `do_sample` says (generation/utils.py:1144-1290, watermarking at :1346), a
+# stopping criterion (:1373-1391), a rewritten prompt (:2595), or a decoding
+# mode other than greedy (`get_generation_mode`, configuration_utils.py:548-598).
+# `constraints`, which holds objects, takes `force_words_ids`' branch (:548).
+_SETTINGS_THAT_CHANGE_THE_CALL: dict[str, Any] = {
+    "guidance_scale": 1.5,
+    "sequence_bias": [[[7], -1.0]],
+    "encoder_repetition_penalty": 1.2,
+    "repetition_penalty": 1.1,
+    "no_repeat_ngram_size": 3,
+    "encoder_no_repeat_ngram_size": 3,
+    "bad_words_ids": [[7]],
+    "min_length": 4,
+    "min_new_tokens": 4,
+    "forced_bos_token_id": 2,
+    "forced_eos_token_id": 1,
+    "remove_invalid_values": True,
+    "exponential_decay_length_penalty": [4, 1.5],
+    "suppress_tokens": [5],
+    "begin_suppress_tokens": [6],
+    "watermarking_config": {"bias": 2.0},
+    "force_words_ids": [[7]],
+    "penalty_alpha": 0.6,
+    "use_mtp": True,
+    "prompt_lookup_num_tokens": 3,
+    "assistant_early_exit": 2,
+    "dola_layers": "low",
+    "max_time": 1.0,
+    "stop_strings": ["stop"],
+    "is_assistant": True,
+    "token_healing": True,
+    # Not shown by the source to be without effect, so reported too: these two
+    # reach the model's forward (generation/utils.py:1831-1834), and more than
+    # one sequence stops a greedy call (configuration_utils.py:789-795).
+    "output_attentions": True,
+    "output_hidden_states": True,
+    "num_return_sequences": 2,
+}
+
+
+@pytest.mark.parametrize(("field", "value"), sorted(_SETTINGS_THAT_CHANGE_THE_CALL.items()))
+def test_no_setting_that_changes_the_call_reaches_it_unreported(
+    tmp_path, monkeypatch, field, value
+):
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config={"eos_token_id": 1, field: value}
+    )
+    assert captured["generation"].get(field) == _TRANSFORMERS_DEFAULTS.get(field)
+    assert captured["run_report"]["generation_settings_not_applied"] == {field: value}
+
+
+# A value off transformers' default for every entry of the script's
+# `NO_EFFECT_ON_THE_CALL`.
+_SETTINGS_WITHOUT_EFFECT: dict[str, Any] = {
+    "do_sample": True,
+    "num_beams": 4,
+    "max_new_tokens": 99,
+    "max_length": 99,
+    "temperature": 0.7,
+    "top_k": 20,
+    "top_p": 0.8,
+    "min_p": 0.1,
+    "typical_p": 0.9,
+    "top_h": 0.5,
+    "epsilon_cutoff": 0.001,
+    "eta_cutoff": 0.001,
+    "length_penalty": 1.2,
+    "early_stopping": True,
+    "num_beam_groups": 2,
+    "diversity_penalty": 0.5,
+    "output_scores": True,
+    "output_logits": True,
+    "return_dict_in_generate": True,
+    "renormalize_logits": True,
+}
+
+
+@pytest.mark.parametrize(("field", "value"), sorted(_SETTINGS_WITHOUT_EFFECT.items()))
+def test_a_setting_without_effect_is_left_out_unreported(tmp_path, monkeypatch, field, value):
+    captured = _run_hf_generate_script(
+        tmp_path, monkeypatch, generation_config={"eos_token_id": 1, field: value}
+    )
+    assert captured["generation"].get(field) != value
+    assert captured["run_report"]["generation_settings_not_applied"] == {}
+
+
+def test_every_setting_the_script_calls_without_effect_is_pinned():
+    """A field added to the script's list without a case above is a claim
+    about transformers nothing here checks."""
+    from litetune.evaluate import _HF_GENERATE_SCRIPT
+
+    namespace: dict = {"__name__": "litetune_hf_script_under_test"}
+    exec(compile(_HF_GENERATE_SCRIPT, "hf_generate.py", "exec"), namespace)  # noqa: S102
+
+    assert set(namespace["NO_EFFECT_ON_THE_CALL"]) == set(_SETTINGS_WITHOUT_EFFECT)
 
 
 def test_a_setting_litetune_has_no_name_for_is_left_out_and_reported(tmp_path, monkeypatch):

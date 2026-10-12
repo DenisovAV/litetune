@@ -1764,15 +1764,20 @@ def generation_device(torch, given=None):
 
 # What the reference takes from the checkpoint's generation config: the token ids
 # that start, end and pad a generation, and what transformers 5.16.1 groups as
-# "Parameters that control the cache" (generation/configuration_utils.py:405-409),
-# kept as before. Nothing else in that config reaches `generate`. transformers
-# fills every field a call leaves unset from `model.generation_config`
-# (`_prepare_generation_config`, generation/utils.py:1806-1808), and builds the
-# repetition-penalty processor, among others, whether or not it samples
-# (`_get_logits_processor`, :1144-1290, ahead of the sampling-only block at
-# :1296) -- so a reference that asked for greedy decoding and nothing more still
-# decoded with the `repetition_penalty: 1.1` in Qwen2.5-0.5B-Instruct's
-# generation_config.json at 7ae55760.
+# "Parameters that control the cache" (generation/configuration_utils.py:405-409).
+# Nothing else in that config reaches `generate`. transformers fills every field a
+# call leaves unset from `model.generation_config` (`_prepare_generation_config`,
+# generation/utils.py:1806-1808), and builds the repetition-penalty processor,
+# among others, whether or not it samples (`_get_logits_processor`, :1144-1290,
+# ahead of the sampling-only block at :1296) -- so a reference that asked for
+# greedy decoding and nothing more still decoded with the `repetition_penalty:
+# 1.1` in Qwen2.5-0.5B-Instruct's generation_config.json at 7ae55760.
+#
+# The cache settings apply as they did before: `_prepare_cache_for_generation`
+# builds the cache they name (generation/utils.py:1929-2028), "quantized"
+# quantizes its keys and values (:2001-2011), a static one lets the forward be
+# compiled on CUDA (:2119-2138, :2861-2865), and "hybrid" is cleared after the
+# merge (:1817-1818).
 KEPT_GENERATION_SETTINGS = (
     "bos_token_id",
     "eos_token_id",
@@ -1783,18 +1788,18 @@ KEPT_GENERATION_SETTINGS = (
     "max_cache_len",
 )
 
-# Left out of the call like the rest, and not reported, because the call decides
-# them itself or greedy decoding never reads them: `do_sample` and `num_beams`
-# are passed, `max_new_tokens` is passed and replaces `max_length`
-# (generation/utils.py:1726-1734), and the others build warpers only under
-# `do_sample` (:1296-1343). `top_k` also selects contrastive search, but only
-# beside `penalty_alpha` (generation/configuration_utils.py:553-556), which is
-# reported.
-GREEDY_DECIDES = (
+# Left out of the call like the rest, and not reported, because none of them can
+# change what this call generates.
+NO_EFFECT_ON_THE_CALL = (
+    # The call passes `do_sample`, `num_beams` and `max_new_tokens`, and
+    # `max_new_tokens` replaces `max_length` (generation/utils.py:1726-1734).
     "do_sample",
     "num_beams",
     "max_new_tokens",
     "max_length",
+    # Read only under `do_sample` (:1296-1343). `top_k` also selects contrastive
+    # search, but only beside `penalty_alpha` (configuration_utils.py:553-556),
+    # which is reported.
     "temperature",
     "top_k",
     "top_p",
@@ -1803,7 +1808,27 @@ GREEDY_DECIDES = (
     "top_h",
     "epsilon_cutoff",
     "eta_cutoff",
+    # Read only by beam search: `_beam_search` (:3208) reads the first two
+    # (:3261-3262), `get_generation_mode` reads `num_beam_groups` only when
+    # `num_beams` > 1 (configuration_utils.py:564), and nothing in
+    # generation/utils.py reads `diversity_penalty`.
+    "length_penalty",
+    "early_stopping",
+    "num_beam_groups",
+    "diversity_penalty",
+    # Read by `_sample` (generation/utils.py:2829-2831) to collect scores and
+    # shape what `generate` returns, never to pick a token.
+    "output_scores",
+    "output_logits",
+    "return_dict_in_generate",
+    # A log-softmax appended after every other processor (:1353-1355;
+    # logits_process.py:1811-1813), which keeps the largest logit the largest.
+    "renormalize_logits",
 )
+
+# A value that builds nothing, beside transformers' own defaults: a guidance
+# scale of 1 adds no processor (generation/utils.py:1144).
+NO_OP_VALUES = {"guidance_scale": 1}
 
 
 def greedy_generation_config(checkpoint):
@@ -1814,23 +1839,24 @@ def greedy_generation_config(checkpoint):
     it, to stand in for it on the model: a config passed to `generate` instead
     would have its unset fields filled from the checkpoint's all the same. The
     second maps each other setting the checkpoint makes to its value, leaving
-    out `GREEDY_DECIDES` and any setting equal to what transformers uses for a
-    field nobody set (`_get_default_generation_params`, which
-    `_prepare_generation_config` applies at generation/utils.py:1808).
+    out `NO_EFFECT_ON_THE_CALL`, `NO_OP_VALUES`, and any setting equal to what
+    transformers uses for a field nobody set (`_get_default_generation_params`,
+    which `_prepare_generation_config` applies at generation/utils.py:1808).
 
     The kept settings are named and everything else is left out, rather than
     the other way round, so a field this list has never heard of -- one a
-    later transformers adds -- cannot reach the call. It is reported instead.
+    later transformers adds -- cannot reach the call. It is reported instead,
+    as is any setting the source does not show to be without effect here.
     """
     settings = json.loads(checkpoint.to_json_string(use_diff=True, ignore_metadata=True))
-    defaults = type(checkpoint)._get_default_generation_params()
+    neutral = {**type(checkpoint)._get_default_generation_params(), **NO_OP_VALUES}
     kept = {key: value for key, value in settings.items() if key in KEPT_GENERATION_SETTINGS}
     left_out = {
         key: value
         for key, value in settings.items()
         if key not in KEPT_GENERATION_SETTINGS
-        and key not in GREEDY_DECIDES
-        and value != defaults.get(key)
+        and key not in NO_EFFECT_ON_THE_CALL
+        and value != neutral.get(key)
     }
     return type(checkpoint)(**kept), left_out
 
