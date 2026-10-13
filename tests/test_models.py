@@ -617,7 +617,11 @@ def test_the_reason_says_the_checkpoints_own_template_is_kept(model, family):
     else:
         assert "LiteRT-LM v0.18.0 publishes its own Qwen 3 template" in flag.reason
         assert "trained runtime_rendered without tool declarations" in flag.reason
-        assert "no record, a prerendered run, a run with declarations" in flag.reason
+        assert "no litetune.json and the checkpoint's template is Qwen/Qwen3-0.6B's own" in (
+            flag.reason
+        )
+        assert "a prerendered run, a run with declarations" in flag.reason
+        assert "no record and any other template" in flag.reason
         assert models.QWEN3_CANONICAL_TEMPLATE in flag.reason
         assert "google-ai-edge/LiteRT-LM#3443" in flag.reason
 

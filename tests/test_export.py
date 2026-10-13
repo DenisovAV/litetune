@@ -2825,6 +2825,9 @@ LITERT_QWEN3 = models.canonical_template_text(models.QWEN3_CANONICAL_TEMPLATE)
 # LiteRT-LM's template does not render, and whose replies still go through
 # Qwen3's think block.
 QWEN3_WITH_A_PREAMBLE = "{{- 'Be brief.\\n' }}" + QWEN3_TEMPLATE
+# Qwen3's template with one byte more, which renders every case as it does:
+# what tells it from Qwen's own is its bytes alone.
+QWEN3_ONE_BYTE_ON = QWEN3_TEMPLATE + "\n"
 _NOT_RECORDED = object()
 
 
@@ -2887,6 +2890,10 @@ def test_a_qwen3_checkpoint_gets_litert_lms_template_and_holds_a_conversation(
     assert check.outcome is Outcome.PASSED
     assert check.observed["chosen"] == "canonical"
     assert check.observed["canonical_withheld"] is None
+    assert (
+        "records that it was trained runtime_rendered without declarations"
+        in (check.observed["canonical_offered"])
+    )
     assert check.observed["canonical_differences"] == []
     assert f"LiteRT-LM's canonical template {models.QWEN3_CANONICAL_TEMPLATE}" in check.detail
     assert "each of 96 single-turn renderings" in check.detail
@@ -2912,35 +2919,43 @@ def test_a_qwen3_checkpoint_gets_litert_lms_template_and_holds_a_conversation(
 
 
 @pytest.mark.parametrize(
-    ("record", "says"),
+    ("record", "carried", "says"),
     [
-        (_NOT_RECORDED, f"carries no {models.PROVENANCE_NAME}, so nothing records that it was"),
-        ({"prompt_mode": "prerendered"}, "records that it was trained prerendered"),
+        (
+            _NOT_RECORDED,
+            QWEN3_ONE_BYTE_ON,
+            f"carries no {models.PROVENANCE_NAME}, so nothing records that it was",
+        ),
+        ({"prompt_mode": "prerendered"}, QWEN3_TEMPLATE, "records that it was trained prerendered"),
         (
             {"declarations_sha256": "ab" * 32},
+            QWEN3_TEMPLATE,
             "records that it was trained with tool declarations (sha256 abababababab)",
         ),
-        ({"prompt_mode": None}, "records no prompt_mode"),
-        ({"prompt_mode": "rendered-somehow"}, "could not be read (ValueError"),
-        ("{not json", "could not be read (JSONDecodeError"),
+        ({"prompt_mode": None}, QWEN3_TEMPLATE, "records no prompt_mode"),
+        ({"prompt_mode": "rendered-somehow"}, QWEN3_TEMPLATE, "could not be read (ValueError"),
+        ("{not json", QWEN3_TEMPLATE, "could not be read (JSONDecodeError"),
     ],
     ids=["no-record", "prerendered", "declarations", "no-mode", "unknown-mode", "unreadable"],
 )
 def test_a_qwen3_checkpoint_whose_training_the_cases_do_not_cover_keeps_its_own(
-    toolchain, qwen_request, trained, record, says
+    toolchain, qwen_request, trained, record, carried, says
 ):
     """The single-turn cases stand for what training rendered only where the
-    record shows training rendered one user message through the template. The
-    same template, trained any other way or with no record, keeps the
-    checkpoint's own -- which answers one message, and the report says so."""
-    toolchain.chat_template = QWEN3_TEMPLATE
+    record shows training rendered one user message through the template, or
+    where there is no record and the template is Qwen's own. Anything else --
+    Qwen's own template, trained another way; or no record and a template a
+    byte away from Qwen's -- keeps the checkpoint's own, which answers one
+    message, and the report says so."""
+    toolchain.chat_template = carried
     result = run_export(qwen_request(trained(record)))
 
     assert result.outcome is Outcome.PASSED
     template = result.chat_template
     assert template is not None and template.source == "composed"
-    assert template.path.read_bytes() == _BLOCK + QWEN3_TEMPLATE.encode("utf-8")
+    assert template.path.read_bytes() == _BLOCK + carried.encode("utf-8")
     check = _chat_template_check(result)
+    assert check.observed["canonical_offered"] is None
     assert says in check.observed["canonical_withheld"]
     assert f"LiteRT-LM's canonical template {models.QWEN3_CANONICAL_TEMPLATE} was not offered" in (
         check.detail
@@ -2951,15 +2966,46 @@ def test_a_qwen3_checkpoint_whose_training_the_cases_do_not_cover_keeps_its_own(
     assert "google-ai-edge/LiteRT-LM#3443" in limitation
 
 
-def test_a_hub_id_has_no_record_and_keeps_its_own(toolchain, qwen_request):
+@pytest.mark.parametrize("checkpoint", ["hub", "local"])
+def test_the_base_model_as_published_gets_litert_lms_template(
+    toolchain, qwen_request, trained, checkpoint
+):
+    """flutter_gemma #659 converted `Qwen/Qwen3-0.6B` itself: no litetune.json,
+    and the template Qwen ships, byte for byte -- Qwen 3's own chat format, which
+    LiteRT-LM publishes its template for. That bundle holds a conversation."""
     toolchain.chat_template = QWEN3_TEMPLATE
+    model = QWEN3 if checkpoint == "hub" else trained(_NOT_RECORDED)
+    result = run_export(qwen_request(model))
+
+    assert result.outcome is Outcome.PASSED
+    template = result.chat_template
+    assert template is not None and template.source == "canonical"
+    assert template.path.read_bytes() == LITERT_QWEN3.encode("utf-8")
+    check = _chat_template_check(result)
+    assert check.observed["canonical_withheld"] is None
+    offered = check.observed["canonical_offered"]
+    assert f"{model} carries no {models.PROVENANCE_NAME}" in offered
+    assert "Qwen/Qwen3-0.6B's own at c1899de289a04d12100db370d81485cdf75e47ca" in offered
+    assert "byte for byte (sha256 a55ee1b16601)" in offered
+    assert check.observed["canonical_differences"] == []
+    assert f"offered because {offered}" in check.detail
+    assert all(e.conversation and e.conversation.holds is True for e in result.exports)
+    assert _one_message(result) == []
+
+
+def test_a_base_model_whose_single_turns_differ_is_not_given_litert_lms_template(
+    toolchain, qwen_request, monkeypatch
+):
+    """Qwen's own bytes offer the template; the renderings still decide."""
+    pinned = {hashlib.sha256(QWEN3_WITH_A_PREAMBLE.encode("utf-8")).hexdigest(): "a test's"}
+    monkeypatch.setitem(models.CANONICAL_UPSTREAM, models.QWEN3_CANONICAL_TEMPLATE, pinned)
+    toolchain.chat_template = QWEN3_WITH_A_PREAMBLE
     result = run_export(qwen_request(QWEN3))
 
     assert result.chat_template is not None and result.chat_template.source == "composed"
-    assert (
-        f"{QWEN3} carries no {models.PROVENANCE_NAME}"
-        in (_chat_template_check(result).observed["canonical_withheld"])
-    )
+    check = _chat_template_check(result)
+    assert check.observed["canonical_offered"] is not None
+    assert len(check.observed["canonical_differences"]) == 96
     assert _one_message(result)
 
 
@@ -3004,9 +3050,18 @@ def test_a_qwen3_fine_tune_whose_single_turns_differ_keeps_its_own_and_answers_o
         (None, QWEN3_TEMPLATE, True),
         (None, QWEN3_WITH_A_PREAMBLE, False),
         ({"prompt_mode": "prerendered"}, QWEN3_TEMPLATE, False),
+        (_NOT_RECORDED, QWEN3_TEMPLATE, True),
+        (_NOT_RECORDED, QWEN3_ONE_BYTE_ON, False),
         (_NOT_RECORDED, "{%- for m in messages %}{{ m.content }}{% endfor %}", True),
     ],
-    ids=["qwen3", "qwen3-preamble", "qwen3-prerendered", "fine-tune"],
+    ids=[
+        "qwen3",
+        "qwen3-preamble",
+        "qwen3-prerendered",
+        "base",
+        "base-one-byte-on",
+        "fine-tune",
+    ],
 )
 def test_the_report_says_a_bundle_answers_one_message_exactly_when_it_does(
     toolchain, qwen_request, trained, record, carried, holds

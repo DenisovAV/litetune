@@ -464,6 +464,18 @@ def test_a_packaged_canonical_template_that_is_not_the_pinned_one_is_refused(
         models.canonical_template_text(models.QWEN3_CANONICAL_TEMPLATE)
 
 
+def test_qwens_own_template_is_pinned_as_the_fixture_holds_it():
+    """The digest a checkpoint with no record is offered LiteRT-LM's template on is
+    Qwen/Qwen3-0.6B's own at c1899de, the fixture byte for byte -- whose
+    single turns LiteRT-LM's renders as it does (the test above)."""
+    upstream = models.CANONICAL_UPSTREAM[models.QWEN3_CANONICAL_TEMPLATE]
+    digest = hashlib.sha256(QWEN3.encode("utf-8")).hexdigest()
+    assert digest == "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+    assert list(upstream) == [digest]
+    assert "c1899de289a04d12100db370d81485cdf75e47ca" in upstream[digest]
+    assert set(models.CANONICAL_UPSTREAM) <= set(models.CANONICAL_TEMPLATES)
+
+
 def test_every_rule_offering_a_canonical_template_names_a_pinned_one():
     for rules in models.RULES:
         markers = {r.value for r in rules.required_flags if r.name == models.TEMPLATE_FLAG}

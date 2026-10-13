@@ -677,6 +677,34 @@ CANONICAL_TEMPLATES = {
 # text follows it.
 CANONICAL_HEADER_END = "-#}\n"
 
+# The chat templates each packaged canonical template is LiteRT-LM's version
+# of, by the sha256 of the template's text as a checkpoint ships it -- the
+# `chat_template` of its tokenizer_config.json, which is what transformers'
+# AutoTokenizer reads and `export._COMPOSE_SCRIPT` hashes -- and where those
+# bytes were read. A checkpoint that ships one of these unchanged is in that
+# model family's own chat format, and LiteRT-LM v0.18.0 publishes
+# `models/qwen3/chat_template.jinja` as its template for Qwen 3's format
+# (`models/qwen3/README.md`: "Canonical LiteRT-LM prompt templates and
+# metadata configuration for the Qwen 3 model family"; the conversion it
+# describes passes the metadata carrying it). `export._canonical_basis` offers
+# the canonical template on that ground to a checkpoint with no training
+# record, and it is chosen only if the single-turn renderings match.
+#
+# Read from the Hub on 2026-10-14: Qwen/Qwen3-1.7B (70d244c), -4B (1cfa9a7),
+# -8B (b968826), -14B (40c0698), -32B (9216db5) and -30B-A3B (ad44e77) ship
+# these same bytes, so the one digest is theirs too -- though the qwen-3 rule
+# claims only names containing Qwen3-0.6B, so none of them reaches this.
+# Qwen/Qwen3-0.6B-Base at da87bfb ships other bytes (sha256 87a2728c...), and
+# is left out: nothing here establishes which format a base model is in.
+CANONICAL_UPSTREAM: dict[str, dict[str, str]] = {
+    QWEN3_CANONICAL_TEMPLATE: {
+        "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8": (
+            "Qwen/Qwen3-0.6B's own at c1899de289a04d12100db370d81485cdf75e47ca "
+            "(tokenizer_config.json; tests/fixtures/qwen3-0.6b-c1899de.chat_template.jinja)"
+        ),
+    },
+}
+
 
 def canonical_template_text(name: str) -> str:
     """The packaged canonical template `name`, provenance comment included.
@@ -777,14 +805,16 @@ _QWEN3_TEMPLATE_REASON = (
     f"which litetune packages as {QWEN3_CANONICAL_TEMPLATE} with its sha256 pinned. At export "
     "litetune reads the checkpoint's own chat template as the exporter reads it, through "
     "transformers' AutoTokenizer on the model being converted, and hands the exporter "
-    "LiteRT-LM's template only when the litetune.json `tune` wrote beside the checkpoint records "
-    "that it was "
-    "trained runtime_rendered without tool declarations -- one user message rendered through "
-    "that template -- and LiteRT-LM's renders single-turn prompts (with and without a system "
-    "message, the text in one part and in two, enable_thinking undefined, true and false, with "
-    "no tools and with one) exactly as the checkpoint's own renders them. Otherwise -- no "
-    "record, a prerendered run, a run with declarations, which the record keeps only as a "
-    "digest, or a template that renders otherwise -- it hands the exporter the checkpoint's "
+    "LiteRT-LM's template only when LiteRT-LM's renders single-turn prompts (with and without "
+    "a system message, the text in one part and in two, enable_thinking undefined, true and "
+    "false, with no tools and with one) exactly as the checkpoint's own renders them, and either "
+    "the litetune.json `tune` wrote beside the checkpoint records that it was trained "
+    "runtime_rendered without tool declarations -- one user message rendered through that "
+    "template -- or there is no litetune.json and the checkpoint's template is Qwen/Qwen3-0.6B's "
+    "own, byte for byte: Qwen 3's own chat format, which LiteRT-LM publishes that template for. "
+    "Otherwise -- a prerendered run, a run with declarations, which the record keeps only as a "
+    "digest, a record it cannot read, no record and any other template, or a template that "
+    "renders otherwise -- it hands the exporter the checkpoint's "
     "template behind a block that turns a list of text parts back into the string, and refuses "
     "a template the block is not for: "
     f"{_SINGLE_TURN_SAID}. It reads each bundle's template back, and one that does not carry "

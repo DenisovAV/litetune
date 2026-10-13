@@ -8,9 +8,10 @@ transformers. The first case, no system message and no context, is what
 training rendered for a `runtime_rendered` run without declarations and what
 the float reference renders (`prompt_mode.RENDERING_SOURCE`: one user message,
 its content a string, through the tokenizer's `apply_chat_template`); the
-others are what the runtime may hand the same template. Which training the
-cases stand for is `export._canonical_withheld`'s to decide, from the record
-`tune` leaves beside the checkpoint.
+others are what the runtime may hand the same template. Whether the cases
+stand for what a checkpoint was trained on is `export._canonical_basis`'s to
+decide, from the record `tune` leaves beside it or, without one, from whether
+its template is the one its family ships.
 
 **The conversation prefix invariant.** Rendering a history that ends in an
 assistant reply, with no generation prompt, is a byte prefix of rendering that

@@ -1275,49 +1275,68 @@ def _choose_template(
     )
 
 
-def _canonical_withheld(request: ExportRequest) -> str | None:
-    """Why the rule's canonical template is not offered for this checkpoint; None when it is.
+def _canonical_basis(
+    request: ExportRequest, canonical: str, template_sha256: object
+) -> tuple[str | None, str | None]:
+    """Why the rule's canonical template is offered for this checkpoint, or why it is
+    withheld: (offered, withheld), exactly one of them a reason.
 
-    Single-turn identity stands for what training rendered only where training
-    rendered through the checkpoint's template the inputs the cases cover.
-    `tune` records how it trained beside the checkpoint (`litetune.json`:
-    `prompt_mode`, and `declarations_sha256` for a run with tool
-    declarations), and `verify` reads the same record. A `runtime_rendered`
-    run without declarations rendered one user message, its content a string,
-    with no tools and no `enable_thinking` (`prompt_mode.RENDERING_SOURCE`):
-    the first single-turn case, and the others go further. Anything else --
-    no record, a `prerendered` run, declarations, which the record keeps only
-    as a digest -- is not shown to be covered, and keeps the checkpoint's own
-    template.
+    Offered on one of two grounds, and then chosen only if every single-turn
+    case renders as the checkpoint's own template renders it.
+
+    The training record. `tune` records how it trained beside the checkpoint
+    (`litetune.json`: `prompt_mode`, and `declarations_sha256` for a run with
+    tool declarations), and `verify` reads the same record. A
+    `runtime_rendered` run without declarations rendered one user message, its
+    content a string, with no tools and no `enable_thinking`
+    (`prompt_mode.RENDERING_SOURCE`): the first single-turn case, which the
+    others go beyond. A `prerendered` run, one with declarations, which the
+    record keeps only as a digest, or a record that cannot be read or names no
+    mode, is not shown to be covered, and keeps the checkpoint's own template.
+
+    The family's own template, for a checkpoint with no record at all -- one
+    litetune did not train, such as the base model converted as published: a
+    checkpoint whose chat template is, byte for byte, one the family ships
+    (`models.CANONICAL_UPSTREAM`) is in the family's own chat format, which is
+    the format LiteRT-LM's canonical template is published for. Any other
+    template without a record is withheld.
     """
     # Here, not at the top: `verify` imports this module.
     from litetune.verify import recorded_declarations_sha256, recorded_prompt_mode
 
     sidecar = Path(request.model) / models.PROVENANCE_NAME
     if not sidecar.is_file():
-        return (
+        upstream = models.CANONICAL_UPSTREAM.get(canonical, {})
+        if isinstance(template_sha256, str) and template_sha256 in upstream:
+            return (
+                f"{request.model} carries no {models.PROVENANCE_NAME}, and its chat template is "
+                f"{upstream[template_sha256]}, byte for byte (sha256 {template_sha256[:12]}): "
+                "the family's own chat format, which LiteRT-LM publishes this template for"
+            ), None
+        return None, (
             f"{request.model} carries no {models.PROVENANCE_NAME}, so nothing records that it was "
-            "trained on prompts rendered through its chat template"
+            "trained on prompts rendered through its chat template, and its chat template "
+            f"(sha256 {str(template_sha256)[:12]}) is not one the family ships unchanged"
         )
     try:
         mode = recorded_prompt_mode(request.model)
         declarations = recorded_declarations_sha256(request.model)
     except (OSError, ValueError) as exc:
-        return f"{sidecar} could not be read ({type(exc).__name__}: {exc})"
+        return None, f"{sidecar} could not be read ({type(exc).__name__}: {exc})"
     if mode is None:
-        return f"{sidecar} records no prompt_mode"
+        return None, f"{sidecar} records no prompt_mode"
     if mode is PromptMode.PRERENDERED:
-        return (
+        return None, (
             f"{sidecar} records that it was trained prerendered: its training prompts never went "
             "through the chat template"
         )
     if declarations is not None:
-        return (
+        return None, (
             f"{sidecar} records that it was trained with tool declarations (sha256 "
             f"{declarations[:12]}), which litetune keeps as a digest alone, so the single-turn "
             "cases cannot render the prompts it was trained on"
         )
-    return None
+    return f"{sidecar} records that it was trained runtime_rendered without declarations", None
 
 
 @dataclass(frozen=True)
@@ -1390,12 +1409,9 @@ def _compose_chat_template(
         "block": str(block_path),
         "block_sha256": hashlib.sha256(block).hexdigest(),
     }
+    # Read and rendered whenever the rule names one; whether it is offered is
+    # decided once the checkpoint's own template is known.
     canonical = request.canonical_template
-    withheld = _canonical_withheld(request) if canonical is not None else None
-    if canonical is not None:
-        observed |= {"canonical": canonical, "canonical_withheld": withheld}
-    if withheld is not None:
-        canonical = None
     canonical_text: str | None = None
     if canonical is not None:
         try:
@@ -1407,7 +1423,10 @@ def _compose_chat_template(
                 f"{request.model}: the packaged canonical template could not be used ({exc})",
                 observed=observed | {"canonical": canonical},
             ), None
-        observed["canonical_sha256"] = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
+        observed |= {
+            "canonical": canonical,
+            "canonical_sha256": hashlib.sha256(canonical_text.encode("utf-8")).hexdigest(),
+        }
     with tempfile.TemporaryDirectory(prefix="litetune-template-") as tmp:
         work = Path(tmp)
         script = work / "compose_template.py"
@@ -1531,12 +1550,19 @@ def _compose_chat_template(
             f"({faults[0]}). That is the environment's, not a fact about the template",
             observed=observed,
         ), None
+    offered: str | None = None
+    withheld: str | None = None
+    if canonical is not None:
+        offered, withheld = _canonical_basis(request, canonical, report.get("sha256"))
+        observed |= {"canonical_offered": offered, "canonical_withheld": withheld}
     try:
-        choice = _choose_template(request.model, renders, canonical, request.env.name)
+        choice = _choose_template(
+            request.model, renders, canonical if offered else None, request.env.name
+        )
     except ValueError as exc:
         return Check.unchecked(CHAT_TEMPLATE_CHECK, str(exc), observed=observed), None
     observed["renders_parts_without_the_block"] = choice.parts_alone_same
-    if canonical is not None:
+    if offered:
         observed["canonical_differences"] = list(choice.canonical_differences)
     if choice.unchecked is not None:
         return Check.unchecked(
@@ -1589,8 +1615,8 @@ def _compose_chat_template(
     )
     if choice.source == "canonical":
         detail = (
-            f"{final}: LiteRT-LM's canonical template {canonical}, checked against {checkpoints}: "
-            f"{rendered}. {exported}"
+            f"{final}: LiteRT-LM's canonical template {canonical}, offered because {offered}, "
+            f"and checked against {checkpoints}: {rendered}. {exported}"
         )
     else:
         detail = (
@@ -1598,10 +1624,7 @@ def _compose_chat_template(
             f"{rendered}. {exported}"
         )
         if withheld is not None:
-            detail += (
-                f". LiteRT-LM's canonical template {request.canonical_template} was not offered: "
-                f"{withheld}"
-            )
+            detail += f". LiteRT-LM's canonical template {canonical} was not offered: {withheld}"
         elif choice.canonical_differences:
             detail += (
                 f". LiteRT-LM's canonical template {canonical} was not chosen: "

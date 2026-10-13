@@ -715,10 +715,12 @@ block with the export environment's Jinja2 configured as LiteRT-LM's MiniJinja, 
 pair must print the same; a template using what that renderer does not vouch for is not
 checked, and nothing is exported. Neither renderer is LiteRT-LM; `verify`'s rendering
 check is what checks the runtime. For Qwen3 0.6B the bundle carries LiteRT-LM v0.18.0's
-own Qwen 3 template instead when the `litetune.json` beside the checkpoint records that
-`tune` trained it `runtime_rendered` without declarations and that template prints those
-prompts as the checkpoint's own does, because Qwen3's template breaks a LiteRT-LM
-conversation at its second message. Every bundle's template, of any family, is checked
+own Qwen 3 template instead, because Qwen3's template breaks a LiteRT-LM conversation at
+its second message -- when that template prints those prompts as the checkpoint's own does,
+and either the `litetune.json` beside the checkpoint records that `tune` trained it
+`runtime_rendered` without declarations, or there is no `litetune.json` and the
+checkpoint's template is `Qwen/Qwen3-0.6B`'s own, byte for byte, as when the base model
+is converted as published. Every bundle's template, of any family, is checked
 after export to hold a LiteRT-LM conversation past its first message in those contexts,
 and a bundle that does not, or could not be checked, says so in `convert`'s report. A template you pass yourself with
 `--flag=--jinja_chat_template_override=<file>` is used as given, with no block, so
