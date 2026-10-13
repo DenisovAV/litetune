@@ -180,8 +180,8 @@ class WhyItExists extends StatelessComponent {
           '0.6B parameters, text only. A reasonable first try when the '
           'task is labels, and the first family measured here that '
           'litetune had no per-model rule for — it exported with no flag '
-          'from litetune; from LiteRT-LM 0.18.0 its rule puts a block in '
-          "front of the checkpoint's own template.",
+          'from litetune; from LiteRT-LM 0.18.0 its rule hands over '
+          "LiteRT-LM's own Qwen 3 template.",
       hubId: 'Qwen/Qwen3-0.6B',
       revision: 'c1899de2',
       anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',

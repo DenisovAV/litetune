@@ -627,7 +627,7 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 | `gemma-3-text` | `--litert_lm_model_type_override=gemma3` |
 | `gemma-4-e2b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm` |
 | `gemma-4-e4b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E4B-it-litert-lm` |
-| `qwen-3` (Qwen3 0.6B) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
+| `qwen-3` (Qwen3 0.6B) | `--jinja_chat_template_override=<LiteRT-LM's canonical chat template if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
 | `qwen-2.5` (Qwen2.5 0.5B Instruct) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
 
 **A LoRA scope keyed on model identity.** On a multimodal checkpoint the
@@ -707,10 +707,16 @@ templates gets its `default` composed; the exporter left alone never selects
 and otherwise takes their names for prompt parts. `convert` refuses, and exports
 nothing, for a checkpoint with no template, one that is only whitespace, one with a
 carriage return (the exporter reads the file in text mode, which would turn it into
-a newline), and one the block is not for: before any export it renders one user message through transformers' Jinja2, as a string
-through the template alone and as parts through the block, and the two must print
-the same. That is transformers' renderer, not LiteRT-LM's MiniJinja; `verify`'s
-rendering check is what checks the runtime. A template you pass yourself with
+a newline), and one the block is not for: before any export it renders single-turn
+prompts, with and without a system message and in one part and two, as strings through
+the template alone with transformers, as training did, and as parts through the block
+with the export environment's Jinja2 configured as LiteRT-LM's MiniJinja, and each pair
+must print the same. Neither renderer is LiteRT-LM; `verify`'s rendering check is what
+checks the runtime. For Qwen3 0.6B the bundle carries LiteRT-LM v0.18.0's own Qwen 3
+template instead when it prints those prompts as the checkpoint's own does, because
+Qwen3's template breaks a LiteRT-LM conversation at its second message. Every bundle's
+template, of any family, is checked after export to hold a LiteRT-LM conversation past
+its first message, and a bundle that cannot says so in `convert`'s report. A template you pass yourself with
 `--flag=--jinja_chat_template_override=<file>` is used as given, with no block, so
 on LiteRT-LM 0.18.0 it has to read a list of parts itself, and `convert` says so in
 a note. A metadata override (`--litert_lm_llm_metadata_override`) is refused for
