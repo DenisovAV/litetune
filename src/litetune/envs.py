@@ -1037,15 +1037,20 @@ def _end_unowned(proc: subprocess.Popen, tree: _StageJob | _BreakOnly | None) ->
 
     Reached only when control left `_windows_stage` between the resume and the
     guard -- an exception that was not a held signal. Nothing else will stop
-    this one: the caller's own kill is inside the guard. Its job or its group
-    where it has one, as `_kill_tree` would with no grace; `Popen.kill` where
-    it has neither, as Windows did before jobs.
+    this one: the caller's own kill is inside the guard.
+
+    Through handles only, and no Ctrl-Break. `TerminateJobObject` on the job
+    where there is one, `Popen.kill` -- `TerminateProcess` on the handle
+    `Popen` keeps -- where there is not. A Ctrl-Break is addressed by pid,
+    and `_ctrl_break_reaches_our_child` says what that cannot rule out: the
+    child exiting between the check and the send, and its number naming
+    another group by then. With no grace to give, that risk buys nothing.
     """
     try:
-        if tree is None:
-            _signal_tree(proc, None, None)
+        if isinstance(tree, _StageJob):
+            _terminate_job(proc, tree)
         else:
-            _kill_tree(proc, grace=0, pgid=tree)
+            _signal_tree(proc, None, None)
     finally:
         _reap(proc)
         _let_go_of_pipes(proc)
@@ -1209,11 +1214,15 @@ def _kill_job(
 
     A job already closed is ALREADY_GONE: its handle value may belong to
     something else by now. No Ctrl-Break, and so no grace, where
-    `_send_ctrl_break` declines.
+    `_send_ctrl_break` declines -- and none at all with a grace of 0, the
+    guard's escalation, where the job's own handle ends everything anyway.
     """
     if job.closed or _job_holds_nothing(job, proc):
         return Reach.ALREADY_GONE
-    reached = _send_ctrl_break(proc, job.api)
+    # No Ctrl-Break where there is no grace to give it: it is addressed by
+    # pid (`_ctrl_break_reaches_our_child`), and the hard kill that follows
+    # goes through the job's handle anyway.
+    reached = _send_ctrl_break(proc, job.api) if grace > 0 else Reach.NOTHING
     if reached is Reach.GROUP and grace > 0:
         try:
             if _wait_until(lambda: _job_holds_nothing(job, proc), grace, stop, pump):
@@ -1266,7 +1275,7 @@ def _kill_break_only(
     Ctrl-Break to the group, a grace that ends when the child exits -- the only
     process there is a handle to -- then `Popen.kill` on the child alone.
     """
-    reached = _send_ctrl_break(proc, tree.api)
+    reached = _send_ctrl_break(proc, tree.api) if grace > 0 else Reach.NOTHING
     if reached is Reach.GROUP and grace > 0:
         try:
             if _wait_until(lambda: proc.poll() is not None, grace, stop, pump):
@@ -1506,33 +1515,42 @@ def _kill_child_if_we_are_told_to_exit(
         # and to CPython's exit status, and nobody typed Ctrl-C.
         raise StageInterrupted(signum)
 
-    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
-        sig = getattr(signal, name, None)
-        if sig is None:
-            continue
-        try:
-            if inherited is not None and sig in inherited:
-                current, taken_over = inherited[sig], True
-            else:
-                current, taken_over = signal.getsignal(sig), False
-            if current == signal.SIG_IGN:
-                continue
-            replaced = signal.signal(sig, take_the_child_with_us)
-            installed[sig] = current if taken_over else replaced
-        except (ValueError, OSError) as exc:
-            # Off the main thread, or a platform without this signal -- the
-            # message must not pick one. `warning`, not `debug`: the
-            # consequence is a six-hour torch run outliving the SIGTERM that
-            # was meant to end it, and `cli` leaves the level at WARNING unless
-            # asked for more.
-            logger.warning(
-                "no %s guard for %s (%s): a termination signal will not reach it",
-                name,
-                _describe(proc),
-                exc,
-            )
-
+    # Installation is inside the `try` whose `finally` restores, not before
+    # it. A signal can arrive the moment a handler is in place -- before
+    # `signal.signal` has even returned -- and on Windows the handler raises;
+    # with the loop outside, that exception skipped the restore and left this
+    # handler bound for good, closed over a stage that had ended. For the
+    # same reason the disposition being replaced is recorded *before* the
+    # call, and taken back out if the call fails.
     try:
+        for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                if inherited is not None and sig in inherited:
+                    current, taken_over = inherited[sig], True
+                else:
+                    current, taken_over = signal.getsignal(sig), False
+                if current == signal.SIG_IGN:
+                    continue
+                installed[sig] = current
+                replaced = signal.signal(sig, take_the_child_with_us)
+                if not taken_over:
+                    installed[sig] = replaced
+            except (ValueError, OSError) as exc:
+                installed.pop(sig, None)
+                # Off the main thread, or a platform without this signal -- the
+                # message must not pick one. `warning`, not `debug`: the
+                # consequence is a six-hour torch run outliving the SIGTERM that
+                # was meant to end it, and `cli` leaves the level at WARNING
+                # unless asked for more.
+                logger.warning(
+                    "no %s guard for %s (%s): a termination signal will not reach it",
+                    name,
+                    _describe(proc),
+                    exc,
+                )
         yield
     finally:
         for sig, previous in installed.items():

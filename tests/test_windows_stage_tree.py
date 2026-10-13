@@ -385,8 +385,11 @@ _TREES = {
 def test_an_exception_before_the_guard_stops_the_running_stage(windows, monkeypatch, tree):
     """Between the start handing the child over and the guard owning it, an
     exception that is not a held signal: the start's `finally` owns the
-    running child, and stops it without a grace through whatever tree it
-    has -- nothing else would, the caller's own kill being inside the guard."""
+    running child, and stops it without a grace -- nothing else would, the
+    caller's own kill being inside the guard. Through handles only: the job's,
+    or `Popen`'s. A Ctrl-Break is addressed by pid, and with no grace to give
+    there is nothing to set against the chance that the pid names another
+    group by the time it is sent."""
     log: list[tuple[Any, ...]] = []
     windows(FakeStage(log, answers=("wait",)), FakeJobApi(log, counts=(1, 0), fail=_TREES[tree]))
 
@@ -400,14 +403,13 @@ def test_an_exception_before_the_guard_stops_the_running_stage(windows, monkeypa
 
     steps = _steps(log)
     assert "communicate" not in steps
+    assert "send_ctrl_break" not in steps, "no Ctrl-Break without a grace"
     stopped = steps[steps.index("popen") + 1 :]
     if tree == "job":
         assert ("terminate", JOB, envs._JOB_KILL_EXIT_CODE) in log
         assert log[-1] == ("close", JOB)
-    elif tree == "group only":
-        assert ("send_ctrl_break", PID) in log and "kill" in stopped
     else:
-        assert "kill" in stopped and "send_ctrl_break" not in steps
+        assert "kill" in stopped
     assert "wait" in stopped, "and reaped"
 
 
@@ -449,6 +451,77 @@ def test_a_signal_before_the_guard_is_held_until_the_guard_owns_the_stage(
         assert "send_signal" in after, "the stop `Popen` had before jobs"
     assert "finished with" not in caplog.text, "an interrupted stage did not finish"
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler, "handed back"
+
+
+def _is_the_guard(handler: Any) -> bool:
+    return getattr(handler, "__name__", "") == "take_the_child_with_us"
+
+
+@pytest.mark.parametrize("path", ["posix", "win32"])
+def test_a_signal_during_the_guards_installation_leaves_nothing_behind(monkeypatch, path):
+    """The guard's handler can run the moment it is in place -- before
+    `signal.signal` has returned. Here it does, on the last signal installed,
+    and raises out of the guard before its body is entered: every signal the
+    guard had taken, that one included, must be back where it was. On the
+    win32 path SIGBREAK was held when the guard came, and its original is the
+    one put back, not the recorder."""
+    sig = _a_sigbreak(monkeypatch)
+    guarded = [
+        s for s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None), sig) if s
+    ]
+    before = {s: signal.getsignal(s) for s in guarded}
+    monkeypatch.setattr(envs.sys, "platform", path if path == "win32" else "linux")
+    monkeypatch.setattr(envs.os, "kill", lambda pid, s: None)
+    monkeypatch.setattr(envs, "_kill_tree", lambda proc, **kwargs: envs.Reach.GROUP)
+    real_signal = signal.signal
+
+    def arrives_at_once(signum: int, handler: Any) -> Any:
+        replaced = real_signal(signum, handler)
+        if signum == sig and _is_the_guard(handler):
+            handler(signum, None)
+        return replaced
+
+    held = envs._DeferredSignals() if path == "win32" else None
+    try:
+        monkeypatch.setattr(envs.signal, "signal", arrives_at_once)
+        try:
+            with pytest.raises(envs.StageInterrupted):
+                with envs._kill_child_if_we_are_told_to_exit(
+                    FakeStage(), inherited=held.originals if held is not None else None
+                ):
+                    pytest.fail("the guard's body ran after a signal ended its installation")
+        finally:
+            monkeypatch.setattr(envs.signal, "signal", real_signal)
+        if held is not None:
+            held.restore()
+        after = {s: signal.getsignal(s) for s in guarded}
+        assert not any(_is_the_guard(h) for h in after.values()), "a guard handler was left bound"
+        assert after == before
+    finally:
+        if held is not None:
+            held.restore()
+
+
+def test_a_signal_the_guard_could_not_take_is_not_put_back(monkeypatch, caplog):
+    """Its disposition was recorded before the call, so that a handler running
+    early could be undone; a call that failed took nothing, and restoring
+    "what it replaced" would set a disposition this guard never changed."""
+    real_signal = signal.signal
+    restored: list[int] = []
+
+    def refuses_the_guard(signum: int, handler: Any) -> Any:
+        if _is_the_guard(handler):
+            raise ValueError("signal only works in main thread of the main interpreter")
+        restored.append(signum)
+        return real_signal(signum, handler)
+
+    monkeypatch.setattr(envs.signal, "signal", refuses_the_guard)
+    with caplog.at_level(logging.WARNING, logger="litetune.envs"):
+        with envs._kill_child_if_we_are_told_to_exit(FakeStage()):
+            pass
+
+    assert restored == []
+    assert "a termination signal will not reach it" in caplog.text
 
 
 def test_the_guard_takes_a_held_signal_over_and_puts_the_original_back(monkeypatch):
@@ -780,11 +853,30 @@ def test_a_refused_job_termination_falls_back_to_the_child(caplog):
     api = FakeJobApi(log, counts=(2,), fail={"terminate": OSError("access denied")})
 
     with caplog.at_level(logging.WARNING, logger="litetune.envs"):
-        reached = envs._kill_tree(FakeStage(log), grace=0, pgid=_job(api))
+        reached = envs._kill_tree(FakeStage(log), grace=0.1, pgid=_job(api), pump=time.sleep)
 
     assert reached is envs.Reach.GROUP, "the best reach achieved: the break reached the group"
     assert ("kill",) in log, "`Popen.kill` is what is left"
     assert "could not terminate the job" in caplog.text
+
+
+@pytest.mark.parametrize("tree", ["job", "group only"])
+def test_without_a_grace_there_is_no_ctrl_break(tree):
+    """A grace of 0 -- the guard's escalation -- goes straight to the hard
+    kill through a handle, with no Ctrl-Break addressed by pid first."""
+    log: list[tuple[Any, ...]] = []
+    api = FakeJobApi(log, counts=(2, 0))
+    pgid = _job(api) if tree == "job" else envs._BreakOnly(api)
+
+    reached = envs._kill_tree(FakeStage(log), grace=0, pgid=pgid, pump=time.sleep)
+
+    assert "send_ctrl_break" not in api.steps()
+    if tree == "job":
+        assert ("terminate", JOB, envs._JOB_KILL_EXIT_CODE) in log
+        assert reached is envs.Reach.GROUP
+    else:
+        assert ("kill",) in log
+        assert reached is envs.Reach.CHILD_ONLY
 
 
 def test_when_neither_the_break_nor_the_job_works_only_the_child_was_reached():
