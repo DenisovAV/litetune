@@ -608,12 +608,16 @@ def test_the_reason_says_the_checkpoints_own_template_is_kept(model, family):
     assert "with and without a system message, the text in one part and in two" in flag.reason
     assert "configured as LiteRT-LM's MiniJinja, which is not the runtime" in flag.reason
     assert "verify's rendering check is what checks the runtime, on single turns" in flag.reason
-    assert "holds a conversation past its first message is checked after export" in flag.reason
+    assert "past its first message, in the contexts checked, is checked after export" in flag.reason
+    assert "enable_thinking undefined, true and false, with no tools and with one" in flag.reason
+    assert "a template using what that renderer does not vouch for is not checked" in flag.reason
     assert "revision" not in flag.reason
     if family == "qwen-2.5":
         assert "keeps its own template, or no bundle is handed over" in flag.reason
     else:
         assert "LiteRT-LM v0.18.0 publishes its own Qwen 3 template" in flag.reason
+        assert "trained runtime_rendered without tool declarations" in flag.reason
+        assert "no record, a prerendered run, a run with declarations" in flag.reason
         assert models.QWEN3_CANONICAL_TEMPLATE in flag.reason
         assert "google-ai-edge/LiteRT-LM#3443" in flag.reason
 

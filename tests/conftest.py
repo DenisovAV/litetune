@@ -453,15 +453,17 @@ def buildable_here(monkeypatch) -> None:
 # with `apply_chat_template` the way transformers 5.16.1 does for a string
 # template and `tokenize=False`: Jinja2's `ImmutableSandboxedEnvironment` with
 # `trim_blocks`, `lstrip_blocks` and the loop-controls extension, its own
-# `tojson`, `raise_exception` and `strftime_now`, and the messages handed to
-# `render` as given (`utils/chat_template_utils.py:478-495` and `:581-587`;
-# `tokenization_utils_base.py:3085-3117`). The `{% generation %}` tracker it
+# `tojson`, `raise_exception` and `strftime_now`, and the messages, the tools
+# and every other keyword handed to `render` as given, the keywords over the
+# special tokens (`utils/chat_template_utils.py:478-495`, `:516-530` and
+# `:581-587`; `tokenization_utils_base.py:3085-3117`). The `{% generation %}` tracker it
 # also registers is left out: no template rendered here uses it. The template
 # also sees the tokenizer's special tokens (`:3107`), Qwen's here: `eos_token`
 # and `pad_token` as both checkpoints' `tokenizer_config.json` set them, BOS and
 # UNK unset. `_RAISE` makes `apply_chat_template` raise as transformers does
 # without a usable jinja2 (`chat_template_utils.py:426-428`).
 _FAKE_TRANSFORMERS = """
+import functools
 import json
 from datetime import datetime
 
@@ -484,25 +486,37 @@ class _Tokenizer:
     special_tokens_map = {"eos_token": "<|im_end|>", "pad_token": "<|endoftext|>"}
 
     def apply_chat_template(
-        self, conversation, chat_template=None, tokenize=True, add_generation_prompt=False
+        self,
+        conversation,
+        tools=None,
+        documents=None,
+        chat_template=None,
+        add_generation_prompt=False,
+        tokenize=True,
+        **kwargs,
     ):
         assert tokenize is False, "only the text path is faked"
         if _RAISE:
             raise ImportError(_RAISE)
-        env = ImmutableSandboxedEnvironment(
-            trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols]
-        )
-        env.filters["tojson"] = _tojson
-        env.globals["raise_exception"] = _raise_exception
-        env.globals["strftime_now"] = lambda fmt: datetime.now().strftime(fmt)
         template = chat_template if chat_template is not None else self.chat_template
-        return env.from_string(template).render(
+        return _compiled(template).render(
             messages=conversation,
-            tools=None,
-            documents=None,
+            tools=None if tools is None else list(tools),
+            documents=documents,
             add_generation_prompt=add_generation_prompt,
-            **self.special_tokens_map,
+            **{**self.special_tokens_map, **kwargs},
         )
+
+
+@functools.lru_cache(maxsize=16)
+def _compiled(template):
+    env = ImmutableSandboxedEnvironment(
+        trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols]
+    )
+    env.filters["tojson"] = _tojson
+    env.globals["raise_exception"] = _raise_exception
+    env.globals["strftime_now"] = lambda fmt: datetime.now().strftime(fmt)
+    return env.from_string(template)
 
 
 class AutoTokenizer:

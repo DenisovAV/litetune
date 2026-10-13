@@ -723,14 +723,17 @@ def canonical_template_text(name: str) -> str:
 # configured as LiteRT-LM v0.18.0 configures MiniJinja.
 _SINGLE_TURN_SAID = (
     "one that, given single-turn prompts -- with and without a system message, the text in one "
-    "part and in two -- as parts behind the block, does not print what the checkpoint's "
-    "template prints given them as strings through transformers, as training rendered them"
+    "part and in two, enable_thinking undefined, true and false, with no tools and with one -- "
+    "as parts behind the block, does not print what the checkpoint's template prints given them "
+    "as strings through transformers, the way training rendered them"
 )
 _RENDERERS_SAID = (
     "The bundle's side is rendered by the export environment's Jinja2 configured as LiteRT-LM's "
-    "MiniJinja, which is not the runtime: verify's rendering check is what checks the runtime, "
-    "on single turns. Whether a bundle holds a conversation past its first message is checked "
-    "after export, for every family, and a bundle that does not says so in the report"
+    "MiniJinja, which is not the runtime: a template using what that renderer does not vouch "
+    "for is not checked, and verify's rendering check is what checks the runtime, on single "
+    "turns. Whether a bundle holds a conversation past its first message, in the contexts "
+    "checked, is checked after export for every family, and a bundle that does not says so in "
+    "the report"
 )
 
 _TEXT_PARTS_REASON = (
@@ -774,11 +777,16 @@ _QWEN3_TEMPLATE_REASON = (
     f"which litetune packages as {QWEN3_CANONICAL_TEMPLATE} with its sha256 pinned. At export "
     "litetune reads the checkpoint's own chat template as the exporter reads it, through "
     "transformers' AutoTokenizer on the model being converted, and hands the exporter "
-    "LiteRT-LM's template when that renders single-turn prompts -- with and without a system "
-    "message, the text in one part and in two -- exactly as the checkpoint's own renders them "
-    "as strings, which is what training rendered. Otherwise, for a checkpoint whose template "
-    "differs, it hands the exporter the checkpoint's template behind a block that turns a list "
-    "of text parts back into the string, and refuses a template the block is not for: "
+    "LiteRT-LM's template only when the litetune.json `tune` wrote beside the checkpoint records "
+    "that it was "
+    "trained runtime_rendered without tool declarations -- one user message rendered through "
+    "that template -- and LiteRT-LM's renders single-turn prompts (with and without a system "
+    "message, the text in one part and in two, enable_thinking undefined, true and false, with "
+    "no tools and with one) exactly as the checkpoint's own renders them. Otherwise -- no "
+    "record, a prerendered run, a run with declarations, which the record keeps only as a "
+    "digest, or a template that renders otherwise -- it hands the exporter the checkpoint's "
+    "template behind a block that turns a list of text parts back into the string, and refuses "
+    "a template the block is not for: "
     f"{_SINGLE_TURN_SAID}. It reads each bundle's template back, and one that does not carry "
     "the file handed over fails its recipe. " + _RENDERERS_SAID
 )
@@ -1066,12 +1074,14 @@ RULES: tuple[ModelRules, ...] = (
         # No `canonical_template`, unlike Qwen 3, for two reasons rendered in
         # tests/test_template_checks.py on Qwen2.5-0.5B-Instruct's template at
         # 7ae5576. Composed behind the block it already holds a conversation:
-        # every case in `template_checks.CONVERSATIONS` renders as a prefix of
-        # the next. And LiteRT-LM v0.18.0's `models/qwen2_5/chat_template.jinja`
-        # does not render single turns as it does: with no system message the
+        # every case in `template_checks.CONVERSATIONS`, in every context in
+        # `template_checks.CONTEXTS`, renders as a prefix of the next. And
+        # LiteRT-LM v0.18.0's `models/qwen2_5/chat_template.jinja` does not
+        # render single turns as it does: with no system message the
         # checkpoint's template prints its default one ("You are Qwen, created
         # by Alibaba Cloud. You are a helpful assistant.") and LiteRT-LM's
-        # prints none, so 8 of the 16 single-turn renderings differ.
+        # prints none, so 48 of the 96 single-turn renderings differ: exactly
+        # those without a system message, in every context.
         patterns=(r"qwen-?2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{40})?(?:$|-qwen2\b)",),
         repack_guard=True,
         required_flags=(

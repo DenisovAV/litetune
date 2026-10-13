@@ -19,19 +19,25 @@ from typing import Any
 
 import pytest
 from conftest import run_compose_script
-from minijinja_runtime import MINIJINJA_EDITS, minijinja_render
+from minijinja_runtime import MINIJINJA_EDITS, minijinja_render_native
 
 from litetune import export, models, template_checks
 from litetune.template_checks import (
+    CONTEXTS,
     CONVERSATIONS,
     FORMS,
     LIMITATION_PREFIX,
     PROBE_TEXT,
     SINGLE_TURNS,
+    TOOLS,
+    Break,
+    Context,
     ConversationCheck,
+    Refused,
     Rendering,
     conversation_breaks,
     conversation_limitation,
+    conversation_spec,
     single_turn_differences,
     unchecked_limitation,
 )
@@ -83,16 +89,24 @@ def _render(template: str, messages: list, gen: bool = True, **context: Any) -> 
     return _script("renderer")["runtime_render"](template, messages, gen, **context)
 
 
-def _breaks(template: str) -> list[template_checks.Break]:
+def _unvouched(template: str) -> list[str]:
+    return _script("renderer")["unvouched"](template)
+
+
+def _conversation(template: str) -> dict[str, Any]:
+    """What the conversation script reports for `template`."""
+    return _script("conversation")["main"]({"template": template, **conversation_spec()})
+
+
+def _breaks(template: str) -> tuple[list[Break], list[Refused]]:
     """What the conversation script renders for `template`, read as `convert` reads it."""
-    spec = {"template": template, "conversations": template_checks.conversation_spec()}
-    report = _script("conversation")["main"](spec)
-    return conversation_breaks(report["renders"])
+    return conversation_breaks(_conversation(template)["renders"])
 
 
 def _minijinja(template: str, messages: list, gen: bool, **context: Any) -> dict:
+    """MiniJinja 2.14.0's rendering, the values handed over as its own, as the runtime's are."""
     try:
-        return {"text": minijinja_render(template, messages, gen, **context)}
+        return {"text": minijinja_render_native(template, messages, gen, **context)}
     except Exception as error:  # noqa: BLE001 -- MiniJinja's own error type
         return {"error": str(error)}
 
@@ -102,23 +116,36 @@ def _minijinja(template: str, messages: list, gen: bool, **context: Any) -> dict
 # ---------------------------------------------------------------------------
 
 
-def _every_rendering() -> list[tuple[list, bool]]:
-    """Each message list and generation-prompt flag the checks render a bundle with."""
-    renderings = [(case.as_parts(form), True) for case in SINGLE_TURNS for form in FORMS]
+def _every_rendering() -> list[tuple[list, bool, dict]]:
+    """Each message list, generation-prompt flag and context the checks render a bundle with."""
+    renderings = [
+        (case.as_parts(form), True, case.context.values())
+        for case in SINGLE_TURNS
+        for form in FORMS
+    ]
     for case in CONVERSATIONS:
-        renderings += [(case.history(), False), ([*case.history(), case.following()], True)]
+        for context in CONTEXTS:
+            values = context.values()
+            renderings += [
+                (case.first(), True, values),
+                (case.history(), False, values),
+                ([*case.history(), case.following()], True, values),
+            ]
     return renderings
 
 
 @pytest.mark.parametrize("name", sorted(BUNDLED))
 def test_the_renderer_renders_every_case_as_minijinja_does(name):
     """`convert` renders with Jinja2 configured as LiteRT-LM configures MiniJinja;
-    on every template and case it checks, the two agree byte for byte, or both raise."""
+    on every template and case it checks, in every context, the two agree byte
+    for byte, or both raise."""
     template = BUNDLED[name]
-    for messages, gen in _every_rendering():
-        ours, theirs = _render(template, messages, gen), _minijinja(template, messages, gen)
-        assert ("text" in ours) == ("text" in theirs), (messages, ours, theirs)
-        assert ours.get("text") == theirs.get("text"), messages
+    assert _unvouched(template) == []
+    for messages, gen, context in _every_rendering():
+        ours = _render(template, messages, gen, **context)
+        theirs = _minijinja(template, messages, gen, **context)
+        assert ("text" in ours) == ("text" in theirs), (messages, context, ours, theirs)
+        assert ours.get("text") == theirs.get("text"), (messages, context)
 
 
 def test_the_renderer_rewrites_as_the_runtime_does():
@@ -126,26 +153,165 @@ def test_the_renderer_rewrites_as_the_runtime_does():
     assert _script("renderer")["MINIJINJA_EDITS"] == MINIJINJA_EDITS
 
 
+# Each name the renderer vouches for, with what it does to values that are not
+# strings -- booleans, none, numbers, lists, maps, undefined -- where Jinja2,
+# left to itself, coerces as Python prints and MiniJinja as Rust does. Every
+# snippet must render the same as MiniJinja 2.14.0 does, or raise in both.
+_ADVERSARIAL_FILTERS = {
+    "default": ["[{{ none | default('d') }}|{{ nope | default('d') }}|{{ false | default('d') }}]"],
+    "d": ["[{{ nope | d('x') }}|{{ '' | d('x', true) }}]"],
+    "dictsort": [
+        "{% for k, v in {'b': 1, 'A': 2, 'a': 3} | dictsort %}{{ k }}={{ v }};{% endfor %}",
+        "{% for k, v in {'b': 1, 'a': 2} | dictsort(by='value') %}{{ k }};{% endfor %}",
+    ],
+    "first": ["{{ 'abc' | first }}|{{ [true, 1] | first }}|{{ [] | first }}"],
+    "items": [
+        "{% for k, v in {'a': true, 'b': none} | items %}{{ k }}={{ v }};{% endfor %}",
+        "{% for k, v in [1, 2] | items %}x{% endfor %}",
+        "{% for k, v in nope | items %}x{% endfor %}y",
+    ],
+    "join": [
+        "{{ [true, none, 1, 'x', 2.0, [1, 'y'], {'k': false}] | join(',') }}",
+        "{{ 'abc' | join('-') }}|{{ {'a': 1, 'b': 2} | join }}|[{{ none | join }}]",
+        "[{{ nope | join(',') }}]",
+        "{{ 3 | join(',') }}",
+        "{{ [1, 2] | join(true) }}",
+    ],
+    "last": ["{{ 'abc' | last }}|{{ [1, false] | last }}"],
+    "length": ["{{ {'a': 1} | length }}|{{ 'abc' | length }}|{{ [none] | length }}"],
+    "list": ["{{ 'ab' | list }}|{{ {'x': 1} | list }}|{{ [true] | list }}"],
+    "lower": ["{{ 'aB' | lower }}|{{ true | lower }}|{{ none | lower }}"],
+    "lstrip": ["[{{ '  a ' | lstrip }}]|{{ 'xxa' | lstrip('x') }}"],
+    "map": [
+        "{{ [{'n': 'a'}, {'n': true}] | map(attribute='n') | join(',') }}",
+        "{{ ['a', true] | map('upper') | join(',') }}",
+        "{{ [1, none] | map('string') | join(',') }}",
+    ],
+    "replace": ["{{ 'aXb' | replace('X', true) }}|{{ true | replace('t', 'T') }}"],
+    "rstrip": ["[{{ ' a  ' | rstrip }}]|{{ 'axx' | rstrip('x') }}"],
+    "split": [
+        "{{ 'a,b,,c' | split(',') | join('|') }}|{{ ' a  b ' | split | join('|') }}",
+        "{{ 'a,b,c' | split(',', 1) | last }}|{{ true | split('u') | first }}",
+    ],
+    "string": ["{{ [1, 'a', true, none] | string }}|{{ {'a': none} | string }}|{{ 1.5 | string }}"],
+    "tojson": ["{{ {'a': none, 'b': true, 'c': 1.5, 'd': ['é', 2]} | tojson }}"],
+    "trim": ["[{{ '  a ' | trim }}]|{{ 'xxaxx' | trim('x') }}|{{ true | trim }}|{{ none | trim }}"],
+    "upper": ["{{ 'aB' | upper }}|{{ true | upper }}|{{ [1] | upper }}"],
+}
+_ADVERSARIAL_TESTS = {
+    "boolean": ["{{ true is boolean }}|{{ 1 is boolean }}|{{ none is boolean }}"],
+    "defined": ["{{ nope is defined }}|{{ none is defined }}|{{ messages is defined }}"],
+    "undefined": ["{{ nope is undefined }}|{{ none is undefined }}"],
+    "endingwith": ["{{ 'abc' is endingwith 'c' }}|{{ true is endingwith 'e' }}"],
+    "startingwith": ["{{ 'abc' is startingwith 'a' }}|{{ 12 is startingwith '1' }}"],
+    "eq": ["{{ 1 is eq 1 }}|{{ true is eq 1 }}|{{ 'a' is eq 'a' }}"],
+    "ne": ["{{ 1 is ne 2 }}|{{ none is ne false }}"],
+    "false": ["{{ false is false }}|{{ 0 is false }}|{{ none is false }}"],
+    "true": ["{{ true is true }}|{{ 1 is true }}"],
+    "in": ["{{ 'a' is in 'abc' }}|{{ 1 is in [1] }}|{{ 'k' is in {'k': 1} }}"],
+    "iterable": ["{{ 'a' is iterable }}|{{ 1 is iterable }}|{{ {} is iterable }}"],
+    "mapping": ["{{ {} is mapping }}|{{ [] is mapping }}|{{ 'a' is mapping }}"],
+    "number": ["{{ 1 is number }}|{{ 1.5 is number }}|{{ true is number }}"],
+    "sequence": ["{{ 'a' is sequence }}|{{ [1] is sequence }}|{{ {} is sequence }}"],
+    "string": ["{{ 'a' is string }}|{{ 1 is string }}|{{ none is string }}"],
+}
+_ADVERSARIAL_FUNCTIONS = {
+    "dict": ["{{ dict(a=1, b=true) | tojson }}"],
+    "namespace": ["{% set ns = namespace(a=1) %}{% set ns.a = ns.a + 1 %}{{ ns.a }}"],
+    "range": ["{{ range(3) | join(',') }}|{{ range(1, 6, 2) | list }}"],
+    "raise_exception": ["{{ raise_exception('no') }}"],
+}
+# `~`, printing, and the coercions every template meets, beside any name.
+_ADVERSARIAL_SYNTAX = [
+    "{{ 'a' ~ true ~ none ~ [1, 'x'] ~ {'k': false} ~ 1.0 ~ 2 ~ nope }}",
+    "{% set marker = true ~ '' %}{{ marker }}|{{ marker == 'True' }}",
+    "{{ (false ~ '') | upper }}",
+    # Constant, so Jinja2's optimizer would fold the comparison as Python joins.
+    "{{ (true ~ '') == 'true' }}|{{ (none ~ 'x') == 'nonex' }}",
+    "{{ true }}|{{ none }}|{{ [1, 'a', none] }}|{{ {'a': true} }}|{{ 1e20 }}|{{ 1e-7 }}|{{ 0.5 }}",
+    "{{ 'a' + 'b' }}|{{ 1 + 2 }}|{{ [1] + [2] }}|{{ 7 // 2 }}|{{ 7 / 2 }}|{{ 7 % 3 }}",
+    "{{ 'a' + 1 }}",
+    "{{ 'ab' * 2 }}|{{ -1 }}|{{ not none }}|{{ not nope }}",
+    "{{ 'y' if 0 else 'n' }}|{{ 'y' if [] else 'n' }}|{{ 'y' if 'x' else 'n' }}",
+    "{{ [1, 2, 3][1:] }}|{{ 'abc'[::-1] }}|{{ [1, 2][-1] }}",
+    "{% for x in [1, 2, 3] %}{{ loop.index }}{{ loop.revindex }}{{ loop.first }}{% endfor %}",
+    "{% macro f(x) %}<{{ x }}>{% endmacro %}{{ f(true) ~ 'z' }}",
+    "{{ 'abc'.foo }}|{{ {'a': 1}.a }}|{{ {'a': 1}['b'] }}",
+    "{{ nope.x }}",
+    "{{ 'a'.upper() }}",
+]
+
+
+def test_every_name_the_renderer_vouches_for_is_held_to_minijinja():
+    renderer = _script("renderer")
+    # `none` alone: the Python binding cannot show the runtime's; its own test is below.
+    assert set(_ADVERSARIAL_FILTERS) == renderer["VOUCHED_FILTERS"]
+    assert set(_ADVERSARIAL_TESTS) == renderer["VOUCHED_TESTS"] - {"none"}
+    assert set(_ADVERSARIAL_FUNCTIONS) == renderer["VOUCHED_FUNCTIONS"]
+
+
+_EVERY_ADVERSARIAL = [
+    snippet
+    for table in (_ADVERSARIAL_FILTERS, _ADVERSARIAL_TESTS, _ADVERSARIAL_FUNCTIONS)
+    for snippets in table.values()
+    for snippet in snippets
+] + _ADVERSARIAL_SYNTAX
+
+
+@pytest.mark.parametrize("source", _EVERY_ADVERSARIAL)
+def test_the_renderer_renders_what_jinja2_coerces_otherwise_as_minijinja_does(source):
+    ours, theirs = _render(source, [], True), _minijinja(source, [], True)
+    assert ("text" in ours) == ("text" in theirs), (ours, theirs)
+    assert ours.get("text") == theirs.get("text")
+
+
 @pytest.mark.parametrize(
     ("source", "printed"),
     [
-        # A Python method MiniJinja has none of, unless the runtime rewrote it.
-        ("{{ 'a'.upper() }}", None),
-        ("{{ 'abc'.startswith('a') }}", "true"),
-        ("[{{ 'abc'.foo }}]", "[]"),
-        ("{{ 'a' is sequence }}|{{ [1] is sequence }}", "false|true"),
-        ("{{ true }}|{{ none }}|{{ [1, 'a'] }}|{{ {'a': 1} }}", 'true|none|[1, "a"]|{"a": 1}'),
-        ("{{ 1 is startingwith '1' }}", "true"),
-        ("{{ {'a': [1, 'é']} | tojson }}", '{"a": [1, "é"]}'),
-        ("{{ 'xxaxx' | trim('x') }}|{{ 'a,b' | split(',') | last }}", "a|b"),
-        ("{{ true is number }}", "false"),
+        # What `create_env`'s own `lstrip` and `rstrip` take: `Cow<str>`, which
+        # takes any value as it prints (`minijinja_template.rs`; `ArgType for
+        # Cow<str>`, MiniJinja 2.14.0 `src/value/argtypes.rs`). The Python
+        # binding's harness cannot show it: its filters are Python's.
+        ("{{ true | lstrip('t') }}|{{ none | rstrip('e') }}", "rue|non"),
+        ("{{ 'a' ~ true }}", "atrue"),
+        ("{{ [true, none] | join(',') }}", "true,none"),
+        ("{{ 1e20 }}|{{ 1e-7 }}", "100000000000000000000.0|0.0000001"),
         ("{{ 'kept' }}\n", "kept\n"),
     ],
 )
-def test_the_renderer_reads_what_jinja2_reads_otherwise_as_minijinja_does(source, printed):
-    ours, theirs = _render(source, [], True), _minijinja(source, [], True)
-    assert ours.get("text") == printed
-    assert theirs.get("text") == printed
+def test_the_renderer_prints_as_minijinja_does(source, printed):
+    assert _render(source, [], True) == {"text": printed}
+
+
+# What Codex found: a template whose verdict a Python `True` reverses. With
+# `~` joined as Python prints, `marker` is "True" and every message is rendered
+# -- a prefix-safe template; as MiniJinja prints, it is "true" and only the last
+# message is, which rewrites the history on every message.
+_REVERSED_BY_COERCION = (
+    "{%- set marker = true ~ '' -%}"
+    "{%- if marker == 'True' -%}{%- for m in messages %}{{ m.role }};{% endfor -%}"
+    "{%- else -%}{{ messages[-1].role }};{%- endif -%}"
+    "{%- if add_generation_prompt %}assistant:{% endif %}"
+)
+
+
+def test_a_verdict_jinja2_would_reverse_is_the_runtimes():
+    # Jinja2 as transformers configures it, from the renderer's own import.
+    stock = _script("renderer")["ImmutableSandboxedEnvironment"](
+        trim_blocks=True, lstrip_blocks=True
+    )
+    history = CONVERSATIONS[0].history()
+    stock_old = stock.from_string(_REVERSED_BY_COERCION).render(
+        messages=history, add_generation_prompt=False
+    )
+    stock_new = stock.from_string(_REVERSED_BY_COERCION).render(
+        messages=[*history, CONVERSATIONS[0].following()], add_generation_prompt=True
+    )
+    assert stock_new.startswith(stock_old), "stock Jinja2 calls it prefix-safe"
+    assert _minijinja(_REVERSED_BY_COERCION, history, False) == {"text": "assistant;"}
+    breaks, refused = _breaks(_REVERSED_BY_COERCION)
+    assert refused == []
+    assert len(breaks) == len(CONVERSATIONS) * len(CONTEXTS)
 
 
 def test_the_renderers_none_is_the_runtimes_is_undefined():
@@ -165,6 +331,41 @@ def test_the_renderer_refuses_a_break_as_the_runtime_build_does():
     source = "{% for x in [1, 2] %}{{ x }}{% break %}{% endfor %}"
     assert "error" in _render(source, [], True)
     assert _minijinja(source, [], True) == {"text": "1"}
+    assert any("cannot parse" in gap for gap in _unvouched(source))
+
+
+@pytest.mark.parametrize(
+    ("source", "named"),
+    [
+        ("{{ messages[0].content | title }}", "the filter `title`"),
+        ("{{ messages | selectattr('role') | list }}", "the filter `selectattr`"),
+        ("{{ 1 is divisibleby 1 }}", "the test `divisibleby`"),
+        ("{{ strftime_now('%Y') }}", "the function `strftime_now`"),
+        ("{{ cycler(1, 2).next() }}", "the function `cycler`"),
+        ("{% include 'x' %}", "a `Include` tag"),
+        ("{% import 'x' as y %}", "a `Import` tag"),
+        ("{% block b %}{% endblock %}", "a `Block` tag"),
+        ("{% autoescape true %}{% endautoescape %}", "a `ScopedEvalContextModifier` tag"),
+        ("{{ 'x' if is_appending_to_prefill }}", "`is_appending_to_prefill`"),
+        ("{% if %}", "Jinja2 cannot parse it"),
+    ],
+)
+def test_what_the_renderer_does_not_vouch_for_is_named(source, named):
+    assert any(named in gap for gap in _unvouched(source)), _unvouched(source)
+
+
+def test_a_macro_of_the_templates_own_is_vouched_for():
+    assert _unvouched("{% macro f() %}x{% endmacro %}{{ f() }}{{ namespace(a=1).a }}") == []
+
+
+def test_a_template_the_renderer_does_not_vouch_for_is_not_checked():
+    """Rendered, it would pass: every case grows by appending. Not vouched for, it
+    is not checked -- never passed."""
+    template = "{%- for m in messages %}{{ m.content[0].text | title }};{% endfor %}"
+    report = _conversation(template)
+    breaks, _ = conversation_breaks(report["renders"])
+    assert breaks == []
+    assert report["unvouched"] == ["the filter `title`"]
 
 
 GOLDENS = FIXTURES / "litert-lm-v0.18.0-qwen3-testdata"
@@ -305,23 +506,42 @@ def _compose(tmp_path: Path, checkpoint: str, canonical: str | None) -> dict:
     return report["renders"]
 
 
+TOTAL = len(SINGLE_TURNS) * len(FORMS)
+
+
 def test_litert_lms_qwen3_template_renders_single_turns_as_qwen3s_own(tmp_path):
-    """The condition the qwen-3 rule packs it on, on the checkpoint it was run on."""
+    """The condition the qwen-3 rule packs it on, on the checkpoint it was run
+    on: every case, with enable_thinking undefined, true and false, with no
+    tools and with one."""
     renders = _compose(tmp_path, QWEN3, LITERT_QWEN3)
     assert single_turn_differences(renders["reference"], renders["candidates"]["canonical"]) == []
     assert single_turn_differences(renders["reference"], renders["candidates"]["composed"]) == []
+    assert renders["unvouched"] == {"composed": [], "canonical": []}
     choice = export._choose_template("m", renders, models.QWEN3_CANONICAL_TEMPLATE)
     assert choice.source == "canonical"
-    assert choice.refusal is None
+    assert choice.refusal is None and choice.unchecked is None
+
+
+def test_the_contexts_reach_both_sides(tmp_path):
+    """enable_thinking false adds Qwen3's empty think block to the generation
+    prompt, and a tool adds a system turn of declarations, on both sides."""
+    renders = _compose(tmp_path, QWEN3, LITERT_QWEN3)
+    for case, reference, canonical in zip(
+        SINGLE_TURNS, renders["reference"], renders["candidates"]["canonical"], strict=True
+    ):
+        text = reference["text"]
+        assert canonical["one_part"]["text"] == text
+        assert text.endswith("<think>\n\n</think>\n\n") is (case.context.thinking is False)
+        assert ("<tools>" in text) is case.context.tools
 
 
 def test_litert_lms_qwen25_template_does_not_render_qwen25s_default_system_prompt(tmp_path):
     """Why the qwen-2.5 rule offers no canonical template (the comment beside it):
     with no system message the checkpoint's template prints its default one and
-    LiteRT-LM's prints none -- 8 of the 16 renderings, exactly those."""
+    LiteRT-LM's prints none -- half the renderings, exactly those."""
     renders = _compose(tmp_path, QWEN25, LITERT_QWEN25)
     differences = single_turn_differences(renders["reference"], renders["candidates"]["canonical"])
-    assert len(differences) == 8
+    assert len(differences) == TOTAL // 2 == 48
     assert {d.case.system for d in differences} == {None}
     default = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
     assert all(default in (d.reference.text or "") for d in differences)
@@ -329,17 +549,57 @@ def test_litert_lms_qwen25_template_does_not_render_qwen25s_default_system_promp
     assert single_turn_differences(renders["reference"], renders["candidates"]["composed"]) == []
     choice = export._choose_template("m", renders, "litert-qwen2.5")
     assert choice.source == "composed"
-    assert len(choice.canonical_differences) == 8
+    assert len(choice.canonical_differences) == 48
 
 
-def test_the_cases_cover_a_system_message_and_two_parts():
-    assert len(SINGLE_TURNS) == 8
+def _renders(**unvouched: list[str]) -> dict:
+    """Renderings in which both candidates render as the checkpoint's template does."""
+    reference, candidate = _same(text=PROBE_TEXT)
+    return {
+        "reference": reference,
+        "candidates": {"canonical": candidate, "composed": candidate},
+        "unvouched": {"canonical": [], "composed": [], **unvouched},
+        "parts_alone": {"text": f"{PROBE_TEXT}0"},
+    }
+
+
+def test_a_canonical_template_the_renderer_does_not_vouch_for_is_not_chosen():
+    choice = export._choose_template("m", _renders(canonical=["the filter `title`"]), "c")
+    assert choice.source == "composed"
+    assert choice.canonical_differences == (
+        "it uses the filter `title`, which the renderer does not vouch for",
+    )
+
+
+def test_a_composed_template_the_renderer_does_not_vouch_for_is_not_checked():
+    choice = export._choose_template("m", _renders(composed=["the filter `title`"]), None)
+    assert choice.source is None and choice.refusal is None
+    assert choice.unchecked is not None
+    assert "uses the filter `title`" in choice.unchecked and "was not checked" in choice.unchecked
+
+
+@pytest.mark.parametrize("unvouched", [None, "x", [1], {"composed": []}])
+def test_unvouched_constructs_this_cannot_read_are_refused(unvouched):
+    renders = _renders()
+    renders["unvouched"] = unvouched
+    with pytest.raises(ValueError):
+        export._choose_template("m", renders, "c")
+
+
+def test_the_cases_cover_a_system_message_two_parts_thinking_and_tools():
+    assert len(SINGLE_TURNS) == 48
     assert {case.system is None for case in SINGLE_TURNS} == {True, False}
+    assert {case.context for case in SINGLE_TURNS} == set(CONTEXTS)
+    assert {context.thinking for context in CONTEXTS} == {None, True, False}
+    assert {context.tools for context in CONTEXTS} == {True, False}
+    # The probe is what a run without declarations trained on: no context at all.
     assert SINGLE_TURNS[0] == template_checks.SingleTurn(PROBE_TEXT)
+    assert SINGLE_TURNS[0].context.values() == {}
     two = SINGLE_TURNS[1].as_parts("two_parts")
     assert [len(m["content"]) for m in two] == [2, 2]
     assert "".join(p["text"] for p in two[1]["content"]) == PROBE_TEXT
     assert SINGLE_TURNS[1].as_strings()[0] == {"role": "system", "content": SINGLE_TURNS[1].system}
+    assert Context(False, True).values() == {"enable_thinking": False, "tools": list(TOOLS)}
 
 
 def _same(count: int = len(SINGLE_TURNS), text: str = "x") -> tuple[list, list]:
@@ -394,20 +654,25 @@ def test_renderings_this_cannot_read_are_refused(spoil):
 # The conversation prefix invariant
 # ---------------------------------------------------------------------------
 
+ALL_CASES = [(case, context) for case in CONVERSATIONS for context in CONTEXTS]
+
 
 def test_qwen3s_own_template_breaks_every_conversation():
     """The defect: behind the block, which it needs on 0.18.0, Qwen3's template
     renders the latest reply with a think block and an earlier one without --
     for a plain reply, one carrying a think block and one a thought channel
-    took, over two turns and three, with a system message or none."""
-    breaks = _breaks(BLOCK + QWEN3)
-    assert [b.case for b in breaks] == list(CONVERSATIONS)
+    took, over two turns and three, with a system message or none, in every
+    context."""
+    breaks, refused = _breaks(BLOCK + QWEN3)
+    assert refused == []
+    assert [(b.case, b.context) for b in breaks] == ALL_CASES
     plain = breaks[0]
     assert plain.case.reply.name == "a plain reply" and plain.case.turns == 2
     assert plain.previous.text is not None and plain.following.text is not None
     assert "<|im_start|>assistant\n<think>\n\n</think>\n\ncard_lost" in plain.previous.text
     assert "<|im_start|>assistant\ncard_lost<|im_end|>" in plain.following.text
     assert "from character" in plain.describe()
+    assert "enable_thinking undefined, no tools" in plain.describe()
 
 
 @pytest.mark.parametrize(
@@ -415,11 +680,11 @@ def test_qwen3s_own_template_breaks_every_conversation():
     ["qwen3 litert-lm", "qwen2.5 composed", "qwen2.5 litert-lm", "functiongemma packaged"],
 )
 def test_these_templates_hold_every_conversation(name):
-    assert _breaks(BUNDLED[name]) == []
+    assert _breaks(BUNDLED[name]) == ([], [])
 
 
 # Templates that break only where one kind of case reaches them: what each case
-# is there to catch.
+# and each context is there to catch.
 _LAST_REPLY_MARKED_FROM_TURN_THREE = (
     "{%- for m in messages %}{{ m.role }}:{{ m.content[0].text }}"
     "{% if m.role == 'assistant' and loop.index0 >= 3 and loop.last %}*{% endif %};"
@@ -434,45 +699,108 @@ _LAST_REASONING_SHOWN = (
     "{% if m.reasoning_content and loop.last %}<{{ m.reasoning_content }}>{% endif %};"
     "{% endfor %}"
 )
+_LAST_REPLY_MARKED_WITHOUT_THINKING = (
+    "{%- for m in messages %}{{ m.content[0].text }}"
+    "{% if enable_thinking is false and m.role == 'assistant' and loop.last %}!{% endif %};"
+    "{% endfor %}"
+)
+_LAST_REPLY_MARKED_WITH_THINKING = (
+    "{%- for m in messages %}{{ m.content[0].text }}"
+    "{% if enable_thinking is true and m.role == 'assistant' and loop.last %}!{% endif %};"
+    "{% endfor %}"
+)
+_LAST_REPLY_MARKED_WITH_TOOLS = (
+    "{%- for m in messages %}{{ m.content[0].text }}"
+    "{% if tools and m.role == 'assistant' and loop.last %}!{% endif %};"
+    "{% endfor %}"
+)
 
 
 @pytest.mark.parametrize(
     ("template", "reached"),
     [
-        (_LAST_REPLY_MARKED_FROM_TURN_THREE, lambda case: case.turns == 3),
-        (_LAST_THINK_BLOCK_BRACKETED, lambda case: case.reply.name.endswith("a think block")),
-        (_LAST_REASONING_SHOWN, lambda case: "thought channel" in case.reply.name),
+        (_LAST_REPLY_MARKED_FROM_TURN_THREE, lambda case, context: case.turns == 3),
+        (
+            _LAST_THINK_BLOCK_BRACKETED,
+            lambda case, context: case.reply.name.endswith("a think block"),
+        ),
+        (
+            _LAST_REASONING_SHOWN,
+            lambda case, context: "thought channel" in case.reply.name,
+        ),
+        (_LAST_REPLY_MARKED_WITHOUT_THINKING, lambda case, context: context.thinking is False),
+        (_LAST_REPLY_MARKED_WITH_THINKING, lambda case, context: context.thinking is True),
+        (_LAST_REPLY_MARKED_WITH_TOOLS, lambda case, context: context.tools),
     ],
-    ids=["three-turns", "think-block", "thought-channel"],
+    ids=[
+        "three-turns",
+        "think-block",
+        "thought-channel",
+        "thinking-false",
+        "thinking-true",
+        "tools",
+    ],
 )
 def test_each_kind_of_case_catches_what_only_it_reaches(template, reached):
-    breaks = _breaks(template)
+    breaks, refused = _breaks(template)
+    assert refused == []
     assert breaks, "a case is missing"
-    assert [b.case for b in breaks] == [case for case in CONVERSATIONS if reached(case)]
+    assert [(b.case, b.context) for b in breaks] == [
+        (case, context) for case, context in ALL_CASES if reached(case, context)
+    ]
 
 
 def test_a_template_that_raises_on_a_reply_breaks_with_the_error():
-    breaks = _breaks(
+    breaks, refused = _breaks(
         "{%- for m in messages %}{% if m.role == 'assistant' %}"
         "{{ raise_exception('no replies') }}{% endif %}{% endfor %}"
     )
-    assert len(breaks) == len(CONVERSATIONS)
+    assert refused == []
+    assert len(breaks) == len(ALL_CASES)
     said = breaks[0].describe()
     assert "the template raises on the history ending in the reply" in said
     assert "no replies" in said
 
 
+def test_a_first_message_the_template_refuses_is_not_a_break():
+    """A template that refuses a system message refuses it in the first message
+    too: that says nothing about the second, and is not counted either way."""
+    template = (
+        "{%- for m in messages %}{% if m.role == 'system' %}{{ raise_exception('no system') }}"
+        "{% endif %}{{ m.content[0].text }};{% endfor %}"
+    )
+    breaks, refused = _breaks(template)
+    assert breaks == []
+    assert [(r.case, r.context) for r in refused] == [
+        (case, context) for case, context in ALL_CASES if case.system
+    ]
+    assert "the first message raised" in refused[0].describe()
+    check = ConversationCheck.of(template, breaks, refused, "the renderer")
+    assert check.holds is True
+    assert "36 of them the template refuses the conversation's first message" in check.detail
+
+
+def test_a_template_that_refuses_every_first_message_is_not_checked():
+    template = "{{ raise_exception('never') }}"
+    breaks, refused = _breaks(template)
+    check = ConversationCheck.of(template, breaks, refused, "the renderer")
+    assert check.holds is None
+    assert len(check.refused) == len(ALL_CASES)
+
+
 def test_a_template_that_grows_by_appending_holds():
-    assert _breaks("{%- for m in messages %}{{ m.content[0].text }};{% endfor %}") == []
+    assert _breaks("{%- for m in messages %}{{ m.content[0].text }};{% endfor %}") == ([], [])
 
 
 def test_the_conversations_cover_both_reply_shapes_and_three_turns():
     assert len(CONVERSATIONS) == 12
+    assert len(CONTEXTS) == 6
     assert {case.turns for case in CONVERSATIONS} == {2, 3}
     assert {case.system is None for case in CONVERSATIONS} == {True, False}
     three = next(c for c in CONVERSATIONS if c.turns == 3 and c.system)
     roles = [m["role"] for m in three.history()]
     assert roles == ["system", "user", "assistant", "user", "assistant"]
+    assert [m["role"] for m in three.first()] == ["system", "user"]
     assert three.following()["role"] == "user"
     think, channel = (r.message for r in template_checks.REPLIES[1:])
     assert "<think>" in think["content"][0]["text"]
@@ -480,8 +808,9 @@ def test_the_conversations_cover_both_reply_shapes_and_three_turns():
     assert channel["reasoning_content"] == channel["channels"]["thought"]
 
 
-def _rendered(previous: dict, following: dict) -> list[dict]:
-    return [{"previous": previous, "next": following} for _ in CONVERSATIONS]
+def _rendered(first: dict, previous: dict, following: dict) -> list:
+    entry = {"first": first, "previous": previous, "next": following}
+    return [[dict(entry) for _ in CONTEXTS] for _ in CONVERSATIONS]
 
 
 @pytest.mark.parametrize(
@@ -496,21 +825,36 @@ def _rendered(previous: dict, following: dict) -> list[dict]:
     ],
 )
 def test_the_invariant_is_a_byte_prefix(previous, following, breaks):
-    assert bool(conversation_breaks(_rendered(previous, following))) is breaks
+    found, refused = conversation_breaks(_rendered({"text": "a"}, previous, following))
+    assert bool(found) is breaks
+    assert refused == []
+
+
+def test_a_refused_first_message_is_never_a_break():
+    found, refused = conversation_breaks(_rendered({"error": "E"}, {"text": "ab"}, {"text": "xab"}))
+    assert found == [] and len(refused) == len(ALL_CASES)
 
 
 @pytest.mark.parametrize(
     "entries",
-    ["renders", [], _rendered({"text": "a"}, {"text": "a"})[:-1], [{"previous": {"text": "a"}}]],
+    [
+        "renders",
+        [],
+        _rendered({"text": "a"}, {"text": "a"}, {"text": "a"})[:-1],
+        [[{"previous": {"text": "a"}}] * len(CONTEXTS)] * len(CONVERSATIONS),
+        [[{"first": {"text": "a"}, "previous": {"text": "a"}, "next": {"text": "a"}}]]
+        * len(CONVERSATIONS),
+    ],
 )
 def test_conversation_renderings_this_cannot_read_are_refused(entries):
     with pytest.raises(ValueError):
         conversation_breaks(entries)
 
 
-def test_the_limitation_names_the_recipes_the_runtime_and_the_first_break():
-    check = ConversationCheck.of(BLOCK + QWEN3, _breaks(BLOCK + QWEN3), "the renderer")
-    assert check.holds is False
+def test_the_limitation_names_the_recipes_the_runtime_the_contexts_and_the_first_break():
+    breaks, refused = _breaks(BLOCK + QWEN3)
+    check = ConversationCheck.of(BLOCK + QWEN3, breaks, refused, "the renderer")
+    assert check.holds is False and check.applicable
     assert check.template_sha256 == hashlib.sha256((BLOCK + QWEN3).encode()).hexdigest()
     text = conversation_limitation(["dynamic_wi8_afp32", "weight_only_wi8_afp32"], check)
     assert text.startswith(f"dynamic_wi8_afp32, weight_only_wi8_afp32: {LIMITATION_PREFIX}")
@@ -518,20 +862,40 @@ def test_the_limitation_names_the_recipes_the_runtime_and_the_first_break():
         "The new rendered template string does not start with the previous rendered template",
         "Conversation::GetSingleTurnTextFromFullHistory",
         "google-ai-edge/LiteRT-LM#3443",
-        "12 of the 12 conversations break it",
+        "72 of the 72 cases break it",
+        "enable_thinking undefined, true and false, each with no tools and with one tool",
         check.breaks[0],
     ):
         assert fact in text
-    held = ConversationCheck.of(LITERT_QWEN3, [], "the renderer")
+    held = ConversationCheck.of(LITERT_QWEN3, [], [], "the renderer")
     assert held.holds is True and held.breaks == ()
+    assert "Other contexts were not checked" in held.detail
     assert held.as_dict() == {
         "holds": True,
+        "applicable": True,
         "detail": held.detail,
         "template_sha256": hashlib.sha256(LITERT_QWEN3.encode()).hexdigest(),
+        "contexts": [context.name for context in CONTEXTS],
         "breaks": [],
+        "refused": [],
     }
     assert "was not checked: why" in unchecked_limitation(["r"], "why")
     assert LIMITATION_PREFIX not in unchecked_limitation(["r"], "why")
+
+
+def test_a_template_on_the_single_turn_protocol_is_not_applicable():
+    """LiteRT-LM finds `is_appending_to_prefill` by reading the source and then
+    never compares full-history renderings for that template; the check says
+    the invariant does not apply, and never that the bundle answers one message."""
+    template = "{%- if is_appending_to_prefill %}{% endif %}{{ messages[-1].content[0].text }}"
+    assert template_checks.single_turn_protocol(template)
+    assert not template_checks.single_turn_protocol(LITERT_QWEN3)
+    check = ConversationCheck.not_applicable(template)
+    assert check.holds is None and not check.applicable
+    text = template_checks.not_applicable_limitation(["r"], check.detail)
+    assert "does not apply" in text and LIMITATION_PREFIX not in text
+    # Rendered as a full history it would look broken: that is what the check avoids.
+    assert _breaks(template)[0]
 
 
 @pytest.mark.parametrize(

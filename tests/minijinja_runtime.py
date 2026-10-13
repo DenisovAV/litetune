@@ -11,6 +11,7 @@ Jinja2 `convert` renders with, to it.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import time
@@ -47,8 +48,22 @@ def minijinja_render(
 
     Not its `none` test, which the runtime makes true only for an undefined
     value: the Python binding hands a test `None` for both undefined and null,
-    so the difference cannot be reproduced here. The templates rendered with
-    this use neither `none` nor `strftime_now`, which `test_models.py` holds."""
+    so the difference cannot be reproduced here. Nor its build: the binding is
+    compiled with `loop_controls`, which LiteRT-LM's is not. The templates
+    rendered with this use neither, which `test_models.py` holds for the ones
+    it renders."""
+    return _environment(source).render_template(
+        "template",
+        messages=messages,
+        add_generation_prompt=add_generation_prompt,
+        bos_token="",
+        eos_token="",
+        **context,
+    )
+
+
+@functools.lru_cache(maxsize=32)
+def _environment(source: str) -> Any:
     import minijinja
 
     for pattern, replacement in MINIJINJA_EDITS:
@@ -71,11 +86,46 @@ def minijinja_render(
     )
     env.add_filter("lstrip", lambda s, chars=None: s.lstrip(chars))
     env.add_filter("rstrip", lambda s, chars=None: s.rstrip(chars))
-    return env.render_str(
-        source,
-        messages=messages,
-        add_generation_prompt=add_generation_prompt,
-        bos_token="",
-        eos_token="",
+    env.add_template("template", source)
+    return env
+
+
+def minijinja_render_native(
+    source: str, messages: list[dict], add_generation_prompt: bool = True, **context: Any
+) -> str:
+    """`minijinja_render`, with every value handed over as MiniJinja's own.
+
+    The runtime's values are MiniJinja maps and lists made from JSON
+    (`MinijinjaTemplate::apply_impl`), and MiniJinja prints a map as Rust's
+    debug form (`impl Display for Value`). The Python binding wraps a Python
+    dict instead and prints it as Python does, so a template that prints a
+    message or a tool is rendered otherwise here than on the device. Written as
+    literals in front of the template, the values are MiniJinja's own.
+    """
+    values = {
+        "messages": messages,
+        "add_generation_prompt": add_generation_prompt,
+        "bos_token": "",
+        "eos_token": "",
         **context,
-    )
+    }
+    preamble = "".join(f"{{% set {name} = {_literal(value)} %}}" for name, value in values.items())
+    return minijinja_render(preamble + source, [], add_generation_prompt)
+
+
+def _literal(value: Any) -> str:
+    """`value` as a MiniJinja expression that evaluates to it."""
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list | tuple):
+        return "[" + ", ".join(_literal(item) for item in value) + "]"
+    if isinstance(value, dict):
+        pairs = (f"{_literal(key)}: {_literal(item)}" for key, item in value.items())
+        return "{" + ", ".join(pairs) + "}"
+    raise TypeError(f"no MiniJinja literal for {type(value).__name__}")
