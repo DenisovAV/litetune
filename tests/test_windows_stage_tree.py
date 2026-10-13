@@ -371,33 +371,148 @@ def test_a_signal_while_the_stage_starts_is_held_until_it_can_be_acted_on(window
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler, "handed back"
 
 
-@pytest.mark.parametrize("how", ["raised", "signalled"])
-def test_an_interrupt_before_the_guard_is_installed_still_ends_the_job(
-    windows, monkeypatch, caplog, how
-):
-    """Between the start handing the child over and the guard owning it: the
-    start's `finally` still owns the job, and terminates and closes it."""
+# The three trees a Windows stage can have, by what the job API refuses: a
+# job; a process group and no job, when the job will not take the child; and
+# neither, when no job can be made.
+_TREES = {
+    "job": {},
+    "group only": {"assign": OSError("access denied")},
+    "plain": {"create_job": OSError("access denied")},
+}
+
+
+@pytest.mark.parametrize("tree", list(_TREES))
+def test_an_exception_before_the_guard_stops_the_running_stage(windows, monkeypatch, tree):
+    """Between the start handing the child over and the guard owning it, an
+    exception that is not a held signal: the start's `finally` owns the
+    running child, and stops it without a grace through whatever tree it
+    has -- nothing else would, the caller's own kill being inside the guard."""
     log: list[tuple[Any, ...]] = []
-    windows(FakeStage(log, answers=("wait",)), FakeJobApi(log, counts=(1, 0)))
+    windows(FakeStage(log, answers=("wait",)), FakeJobApi(log, counts=(1, 0), fail=_TREES[tree]))
+
+    def raises_first(proc, pgid=None, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(envs, "_kill_child_if_we_are_told_to_exit", raises_first)
+
+    with pytest.raises(KeyboardInterrupt):
+        envs._run_guarded(["python", "-c", "pass"], timeout=5)
+
+    steps = _steps(log)
+    assert "communicate" not in steps
+    stopped = steps[steps.index("popen") + 1 :]
+    if tree == "job":
+        assert ("terminate", JOB, envs._JOB_KILL_EXIT_CODE) in log
+        assert log[-1] == ("close", JOB)
+    elif tree == "group only":
+        assert ("send_ctrl_break", PID) in log and "kill" in stopped
+    else:
+        assert "kill" in stopped and "send_ctrl_break" not in steps
+    assert "wait" in stopped, "and reaped"
+
+
+@pytest.mark.parametrize("tree", list(_TREES))
+def test_a_signal_before_the_guard_is_held_until_the_guard_owns_the_stage(
+    windows, monkeypatch, caplog, tree
+):
+    """A real SIGINT between the start and the guard is still held -- the
+    recorders stay installed until the guard is in place -- and is then
+    delivered inside the guard, which stops the stage through its tree."""
+    monkeypatch.setattr(envs.sys, "platform", "win32")
+    log: list[tuple[Any, ...]] = []
+    stage = FakeStage(log, answers=("wait",))
+
+    def exits() -> None:
+        stage.returncode = 0xC000013A
+
+    windows(stage, FakeJobApi(log, counts=(1, 0), fail=_TREES[tree], on_break=exits))
     real_guard = envs._kill_child_if_we_are_told_to_exit
 
-    def interrupted_first(proc, pgid=None):
-        if how == "raised":
-            raise KeyboardInterrupt
+    def signalled_first(proc, pgid=None, **kwargs):
         _raise_sigint()
-        return real_guard(proc, pgid)
+        return real_guard(proc, pgid, **kwargs)
 
-    monkeypatch.setattr(envs, "_kill_child_if_we_are_told_to_exit", interrupted_first)
+    monkeypatch.setattr(envs, "_kill_child_if_we_are_told_to_exit", signalled_first)
 
     with caplog.at_level(logging.WARNING, logger="litetune.envs"):
         with pytest.raises(KeyboardInterrupt):
             envs._run_guarded(["python", "-c", "pass"], timeout=5)
 
     steps = _steps(log)
-    assert "communicate" not in steps
-    assert ("terminate", JOB, envs._JOB_KILL_EXIT_CODE) in log
-    assert log[-1] == ("close", JOB)
+    assert steps.count("communicate") == 1, "delivered after the first wait, inside the guard"
+    after = steps[steps.index("communicate") :]
+    if tree == "job":
+        assert "send_ctrl_break" in after and log[-1] == ("close", JOB)
+    elif tree == "group only":
+        assert "send_ctrl_break" in after
+    else:
+        assert "send_signal" in after, "the stop `Popen` had before jobs"
     assert "finished with" not in caplog.text, "an interrupted stage did not finish"
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler, "handed back"
+
+
+def test_the_guard_takes_a_held_signal_over_and_puts_the_original_back(monkeypatch):
+    """`inherited` is what a held signal was bound to before: the guard decides
+    on it and restores it, and never puts the recorder back."""
+    sig = _a_sigbreak(monkeypatch)
+    original = signal.getsignal(sig)
+    held = envs._DeferredSignals()
+    try:
+        assert signal.getsignal(sig) is held._recorder, "held while the stage starts"
+        with envs._kill_child_if_we_are_told_to_exit(FakeStage(), inherited=held.originals):
+            assert signal.getsignal(sig) is not held._recorder, "the guard replaced the recorder"
+            held.hand_to_guard()
+            assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        assert signal.getsignal(sig) == original
+        assert held.originals == {}
+    finally:
+        held.restore()
+
+
+def test_a_held_signal_that_was_ignored_stays_ignored_under_the_guard(monkeypatch):
+    sig = _a_sigbreak(monkeypatch)
+    previous = signal.signal(sig, signal.SIG_IGN)
+    held = envs._DeferredSignals()
+    try:
+        with envs._kill_child_if_we_are_told_to_exit(FakeStage(), inherited=held.originals):
+            held.hand_to_guard()
+            assert signal.getsignal(sig) == signal.SIG_IGN, "not installed over an ignore"
+        assert signal.getsignal(sig) == signal.SIG_IGN
+    finally:
+        held.restore()
+        signal.signal(sig, previous)
+
+
+def test_an_interrupted_restore_is_finished_by_the_next_one(monkeypatch):
+    """A Ctrl-C between putting SIGBREAK back and putting SIGINT back must not
+    leave either bound to a recorder nobody reads: each is forgotten only once
+    it is back, and the `finally` that calls `restore` again finishes it."""
+    sig = _a_sigbreak(monkeypatch)
+    original_break = signal.getsignal(sig)
+    held = envs._DeferredSignals()
+    real_signal = signal.signal
+    calls: list[int] = []
+
+    def interrupted_the_first_time(signum: int, handler: Any) -> Any:
+        calls.append(signum)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        return real_signal(signum, handler)
+
+    monkeypatch.setattr(envs.signal, "signal", interrupted_the_first_time)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            held.restore()
+    finally:
+        monkeypatch.setattr(envs.signal, "signal", real_signal)
+    assert calls == [sig], "SIGINT is put back last"
+    assert signal.getsignal(sig) is held._recorder, "the interruption came before it was put back"
+
+    held.restore()
+
+    assert signal.getsignal(sig) == original_break
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    assert held.originals == {}
 
 
 def test_an_ignored_sigint_is_not_held_or_delivered(windows, monkeypatch):
@@ -492,6 +607,28 @@ def test_a_pid_list_with_anything_else_in_it_is_not_empty():
     assert envs._job_holds_nothing(_job(FakeJobApi(counts=(1,), ids=(PID,))), stage)
     running = FakeStage(log)
     assert not envs._job_holds_nothing(_job(FakeJobApi(counts=(1,), ids=(PID,))), running)
+
+
+def test_the_child_is_known_dead_before_the_pid_list_is_trusted():
+    """Read the list first and the child could start a grandchild and exit
+    between the two looks: a list taken while it was alone would then vouch
+    for a job that is not empty. Here the child does exactly that the moment
+    the list has been read."""
+    log: list[tuple[Any, ...]] = []
+    stage = FakeStage(log)
+    api = FakeJobApi(log, counts=(2,), ids=(PID,))
+    listed = api.process_ids
+
+    def then_it_spawns_and_exits(job: int) -> list[int]:
+        answer = listed(job)
+        stage.returncode = 0
+        return answer
+
+    api.process_ids = then_it_spawns_and_exits
+
+    assert not envs._job_holds_nothing(_job(api), stage)
+    stage.returncode = None
+    assert envs._still_in_job(_job(api), stage) == 1, "our child, alive when it was counted"
 
 
 def test_without_a_console_there_is_no_grace(caplog, monkeypatch):
@@ -748,6 +885,26 @@ def test_a_stage_that_finishes_with_processes_left_is_told_they_are_ended(window
     assert "finished with 2 processes it started still running" in caplog.text
     steps = _steps(log)
     assert steps.index("terminate") < steps.index("close") == len(steps) - 1
+
+
+def test_a_stage_that_did_not_finish_is_not_said_to_have_finished(windows, caplog, monkeypatch):
+    """A job left holding processes after an interrupted stage is ended all
+    the same, but the warning about a *finished* stage leaving processes
+    behind would be false there."""
+    monkeypatch.setattr(envs, "_REAP_AFTER_KILL_S", 0.1)
+    log: list[tuple[Any, ...]] = []
+    stuck = FakeJobApi(
+        log, counts=(2,), ids=(PID, 7), fail={"send_ctrl_break": OSError("no console")}
+    )
+    windows(FakeStage(log, answers=(KeyboardInterrupt(),)), stuck)
+
+    with caplog.at_level(logging.WARNING, logger="litetune.envs"):
+        with pytest.raises(KeyboardInterrupt):
+            envs._run_guarded(["python", "-c", "pass"], timeout=5)
+
+    assert "still holds processes" in caplog.text
+    assert "finished with" not in caplog.text
+    assert log[-1] == ("close", JOB)
 
 
 def test_a_timed_out_stage_is_killed_through_its_job_and_reports_its_own_timeout(

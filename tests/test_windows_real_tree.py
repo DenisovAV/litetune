@@ -20,8 +20,9 @@ which runs the base interpreter as a child of its own, in a job of its own
 from 3.13, per `PCbuild/venvlauncher.vcxproj`).
 
 The first versions of tests 1 to 6 passed on windows-latest, CPython 3.12, the
-toolcache interpreter (PR #77, on 23bfc53). What else is asserted here about
-Windows is what these tests exist to measure.
+toolcache interpreter (PR #77, on 23bfc53), and every test here on 3.10, 3.12
+and 3.13 on 3400921. What else is asserted here about Windows is what these
+tests exist to measure.
 """
 
 from __future__ import annotations
@@ -781,14 +782,17 @@ def test_a_stage_ended_by_our_ctrl_break_exits_status_control_c_exit(
 
 @on_windows
 def test_a_grace_ends_when_the_tree_has_exited(
-    tmp_path, monkeypatch, capsys, spy_on_job_termination
+    tmp_path, monkeypatch, capsys, spy_on_job_termination, jobs_left_open
 ):
     """`ActiveProcesses` is decremented, says Microsoft, "when the terminated
     process exits and all references to the process are released" -- and
     `Popen` holds a reference to the child. A tree that exits on Ctrl-Break at
-    once must end the grace at once whichever way that goes; how many
-    processes the count shows for an exited child whose handle is still open
-    is printed, as the measurement it is."""
+    once must end the grace at once whichever way that goes. The job is kept
+    open until both processes are seen to have exited, so a check that said
+    "empty" too soon cannot pass on the kill-on-close that closing it would
+    add. How many processes the count shows for an exited child whose handle
+    is still open is printed: 0, on windows-latest, CPython 3.10.11, on the
+    first run of this test."""
     from litetune import winjob
 
     tree = _Tree(tmp_path, "tree")
@@ -808,6 +812,13 @@ def test_a_grace_ends_when_the_tree_has_exited(
             _popen_once_the_tree_is_up(patched, tree)
             with pytest.raises(subprocess.TimeoutExpired):
                 envs._run_guarded(tree.stage(sys.executable, "default", 60), timeout=1)
+        assert jobs_left_open, "the stage's job was not let go of"
+        assert tree.child is not None and tree.child.gone_within(
+            0
+        ), "the grace ended while the child was still running"
+        assert tree.grandchild is not None and tree.grandchild.gone_within(
+            0
+        ), "the grace ended while the grandchild was still running"
         assert spy_on_job_termination == [], "the grace ran out on a tree that had left"
         assert lasted and lasted[0] < envs._TERM_GRACE_S / 2, f"the stop took {lasted[0]:.2f} s"
 

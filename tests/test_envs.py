@@ -1838,6 +1838,18 @@ def test_the_host_cannot_reach_past_the_pins(name, monkeypatch):
     assert name not in envs._child_env()
 
 
+def test_a_stage_keeps_what_its_interpreter_needs_from_the_host(monkeypatch):
+    """`SystemRoot` reaches every stage, because the base is the host's own
+    environment and only the reach is taken out of it. CPython 3.10 on Windows
+    does not start without it -- the training-script tests, which build an
+    environment from nothing, measured that (`_INTERPRETER_NEEDS` in
+    `test_tune.py`) -- and no production path builds one from nothing."""
+    monkeypatch.setenv("SYSTEMROOT", "C:\\Windows")
+
+    assert envs._child_env()["SYSTEMROOT"] == "C:\\Windows"
+    assert envs._child_env({"CUDA_VISIBLE_DEVICES": ""})["SYSTEMROOT"] == "C:\\Windows"
+
+
 def _symlinked_env(tmp_path, monkeypatch, name: str) -> StageEnv:
     """A stage environment whose interpreter is the one running the tests.
 
@@ -2784,9 +2796,9 @@ def test_the_install_is_killed_with_litetune(tmp_path, monkeypatch, start):
     real_guard = envs._kill_child_if_we_are_told_to_exit
 
     @contextlib.contextmanager
-    def note_the_guard(proc, pgid=None):
+    def note_the_guard(proc, pgid=None, **kwargs):
         guarded.append((proc, pgid))
-        with real_guard(proc, pgid):
+        with real_guard(proc, pgid, **kwargs):
             yield
 
     def capture(argv, **kwargs):

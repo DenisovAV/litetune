@@ -832,7 +832,7 @@ def _windows_job_api() -> _JobApi | None:
 class _DeferredSignals:
     """SIGINT and SIGBREAK held back while a Windows stage has no owner yet.
 
-    From just before `Popen` until the child is resumed in its job there are
+    From just before `Popen` until the guard owns the running child there are
     states no `finally` can clean up: a Ctrl-C inside `Popen.__init__` after
     `CreateProcess` returned loses the only handle to a suspended child, and a
     Ctrl-Break with no Python handler ends litetune while the child is
@@ -842,19 +842,25 @@ class _DeferredSignals:
     back). An ignored signal is recorded like any other and then dropped at
     delivery, because its handler is `SIG_IGN` again by then.
 
-    `restore` puts the handlers back once `_windows_stage` owns the child,
-    before the guard is installed, so the guard records the real dispositions
-    as the ones to restore. `deliver` then hands what was recorded to whatever
-    handler is in place by then -- the guard's for SIGBREAK, `KeyboardInterrupt`
-    for SIGINT -- which is the path the signal would have taken had it arrived
-    a moment later. A handler that is `SIG_DFL` gets `signal.raise_signal`.
+    The hand-over is what keeps that true up to the guard. The recorders stay
+    installed until the guard is in place; the guard is given `originals` and
+    replaces the recorder with its own handler, keeping the original as the
+    one to put back (`_kill_child_if_we_are_told_to_exit`'s `inherited`).
+    `hand_to_guard` then puts back what the guard did not take -- SIGINT,
+    always -- and `deliver` hands what was recorded to whatever handles it by
+    then: the guard's handler for SIGBREAK, `KeyboardInterrupt` for SIGINT,
+    the path the signal would have taken had it arrived a moment later. A
+    handler that is `SIG_DFL` gets `signal.raise_signal`.
     """
 
     def __init__(self) -> None:
-        self._previous: dict[int, Any] = {}
+        self.originals: dict[int, Any] = {}
+        self.handed = False
         self._arrived: list[int] = []
-        self._restored = False
         self._delivered = False
+        # One bound method, kept: `restore` recognises its own recorder by
+        # identity, and every attribute access would make a new one.
+        self._recorder = self._record
         for name in ("SIGINT", "SIGBREAK"):
             sig = getattr(signal, name, None)
             if sig is None:
@@ -862,7 +868,7 @@ class _DeferredSignals:
             try:
                 if signal.getsignal(sig) is None:
                     continue
-                self._previous[sig] = signal.signal(sig, self._record)
+                self.originals[sig] = signal.signal(sig, self._recorder)
             except (ValueError, OSError) as exc:
                 # Off the main thread. The guard says so when it cannot install
                 # either, and that is the warning that matters.
@@ -872,11 +878,25 @@ class _DeferredSignals:
         self._arrived.append(signum)
 
     def restore(self) -> None:
-        if self._restored:
-            return
-        self._restored = True
-        for sig, previous in self._previous.items():
-            signal.signal(sig, previous)
+        """Put back each disposition still bound to the recorder; SIGINT last.
+
+        One signal at a time, and each forgotten only once it is back, so an
+        interruption part-way leaves the rest for the next call -- the
+        `finally` in `_windows_stage` makes one -- rather than a recorder
+        nobody reads bound for the life of the process. SIGINT last, because
+        until it is back a Ctrl-C is recorded rather than raised in here. A
+        signal the guard took over is no longer bound to the recorder, and is
+        only forgotten: the guard puts the original back itself.
+        """
+        for sig in sorted(self.originals, key=lambda s: s == signal.SIGINT):
+            if signal.getsignal(sig) is self._recorder:
+                signal.signal(sig, self.originals[sig])
+            del self.originals[sig]
+
+    def hand_to_guard(self) -> None:
+        """The guard owns the child now: give back what it did not take."""
+        self.handed = True
+        self.restore()
 
     def deliver(self) -> None:
         self.restore()
@@ -901,7 +921,7 @@ def _spawn_suspended(
 @contextlib.contextmanager
 def _windows_stage(
     argv: Sequence[str], env: Mapping[str, str] | None, api: _JobApi
-) -> Iterator[tuple[subprocess.Popen, _StageJob | _BreakOnly | None, Callable[[], None]]]:
+) -> Iterator[tuple[subprocess.Popen, _StageJob | _BreakOnly | None, _DeferredSignals]]:
     """Start a Windows stage in a job of its own, and own both until the block ends.
 
     The order is the reason for all of it. The job is created first, so a
@@ -922,16 +942,21 @@ def _windows_stage(
     hosts is named once per process.
 
     Everything this starts is let go of in the one `finally` below, on every
-    route: a suspended child terminated, the job emptied and closed. Closing
-    the job is what ends whatever the stage left running, so it happens only
-    when the block is done with the stage. SIGINT and SIGBREAK are held back
-    until the child runs in its job (`_DeferredSignals`); the caller delivers
-    them -- the third value yielded -- once the guard is installed and the
-    first wait has started the pipe readers.
+    route: a suspended child terminated; a running one the guard never took
+    over stopped without a grace (`_end_unowned`); the job emptied and closed.
+    Closing the job is what ends whatever the stage left running, so it
+    happens only when the block is done with the stage.
+
+    SIGINT and SIGBREAK are held from before `Popen` until the guard owns the
+    child (`_DeferredSignals`, the third value yielded): the caller passes its
+    `originals` to the guard, calls `hand_to_guard` as the first thing the
+    guard covers, and `deliver` once the first wait has started the pipe
+    readers.
     """
-    deferred = _DeferredSignals()
+    held = _DeferredSignals()
     job: _StageJob | None = None
     proc: subprocess.Popen | None = None
+    tree: _StageJob | _BreakOnly | None = None
     suspended = False
     completed = False
     try:
@@ -941,7 +966,7 @@ def _windows_stage(
             _warn_no_job("could not create a job object for a stage", exc, _WITHOUT_A_JOB)
         proc = _spawn_suspended(argv, env, job is not None)
         suspended = job is not None
-        tree: _StageJob | _BreakOnly | None = job
+        tree = job
         if job is not None:
             try:
                 api.assign(job.handle, proc)
@@ -960,19 +985,28 @@ def _windows_stage(
                     f"could be put in a job first: {exc}"
                 ) from exc
             suspended = False
-        deferred.restore()
-        yield proc, tree, deferred.deliver
+        yield proc, tree, held
         completed = True
     finally:
         try:
             if proc is not None and suspended:
                 _abandon_suspended(proc, in_a_job=job is not None)
+            elif proc is not None and not held.handed:
+                _end_unowned(proc, tree)
         finally:
             try:
                 if job is not None:
                     _let_go_of_job(job, proc, completed)
             finally:
-                deferred.deliver()
+                held.deliver()
+
+
+def _let_go_of_pipes(proc: subprocess.Popen) -> None:
+    """Close the two pipe ends `Popen` opened on our side of a stage nobody reads."""
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError):
+                stream.close()
 
 
 def _abandon_suspended(proc: subprocess.Popen, in_a_job: bool) -> None:
@@ -995,37 +1029,64 @@ def _abandon_suspended(proc: subprocess.Popen, in_a_job: bool) -> None:
         )
     finally:
         _reap(proc)
-        for stream in (proc.stdout, proc.stderr):
-            if stream is not None:
-                with contextlib.suppress(OSError):
-                    stream.close()
+        _let_go_of_pipes(proc)
+
+
+def _end_unowned(proc: subprocess.Popen, tree: _StageJob | _BreakOnly | None) -> None:
+    """Stop a running stage the guard never took over: no grace, then the reap.
+
+    Reached only when control left `_windows_stage` between the resume and the
+    guard -- an exception that was not a held signal. Nothing else will stop
+    this one: the caller's own kill is inside the guard. Its job or its group
+    where it has one, as `_kill_tree` would with no grace; `Popen.kill` where
+    it has neither, as Windows did before jobs.
+    """
+    try:
+        if tree is None:
+            _signal_tree(proc, None, None)
+        else:
+            _kill_tree(proc, grace=0, pgid=tree)
+    finally:
+        _reap(proc)
+        _let_go_of_pipes(proc)
 
 
 def _job_holds_nothing(job: _StageJob, proc: subprocess.Popen) -> bool:
     """Whether every process in the stage's job has exited.
 
-    `ActiveProcesses` at 0 says so. It may also stay at 1 for a child that has
-    exited: the accounting page says a count is decremented "when the
-    terminated process exits and all references to the process are released",
-    of a process whose association failed a limit, and `Popen` keeps its
-    handle -- a reference -- for as long as it lives. Whether a normal exit is
-    counted the same way is not stated, so it is not relied on either way: a
-    job whose only pid is our child's, with `poll()` saying the child exited,
-    holds nothing either. `test_a_grace_ends_when_the_tree_has_exited` measures
-    which case Windows takes.
+    `ActiveProcesses` at 0 says so. The accounting page says a count is
+    decremented "when the terminated process exits and all references to the
+    process are released" -- of a process whose association failed a limit --
+    and `Popen` keeps its child's handle, a reference, for as long as it lives.
+    Measured, the count does reach 0 for an exited child whose handle is still
+    open: `test_a_grace_ends_when_the_tree_has_exited`, on windows-latest,
+    CPython 3.10.11. That is one host, so the pid list stands behind it: a job
+    whose only pid is our child's, once the child has exited, holds nothing
+    either.
+
+    The child's exit is established before the list is read, and not after. A
+    live child can start a grandchild and exit between the two; read the other
+    way round, a list taken while the child was alone would vouch for a job
+    that is not empty. Read this way round, the child was already dead when
+    the list was taken, and a dead child starts nothing.
     """
     if job.active_processes() == 0:
         return True
+    if proc.poll() is None:
+        return False
     ids = job.process_ids()
-    return ids is not None and set(ids) <= {proc.pid} and proc.poll() is not None
+    return ids is not None and set(ids) <= {proc.pid}
 
 
 def _still_in_job(job: _StageJob, proc: subprocess.Popen) -> int | None:
-    """How many processes besides our exited child the job holds; None if unknown."""
+    """How many processes besides our exited child the job holds; None if unknown.
+
+    The child's exit is read first, for the reason `_job_holds_nothing` gives.
+    """
+    exited = proc.poll() is not None
     ids = job.process_ids()
     if ids is None:
         return None
-    exited = proc.poll() is not None
     return sum(1 for pid in ids if not (exited and pid == proc.pid))
 
 
@@ -1278,10 +1339,13 @@ def _run_guarded_in_a_job(
     in slices. Kept beside it rather than folded into it so the POSIX path
     reads as it always has.
     """
-    with _windows_stage(argv, env, jobs) as (proc, tree, deliver):
-        with _kill_child_if_we_are_told_to_exit(proc, tree):
+    with _windows_stage(argv, env, jobs) as (proc, tree, held):
+        # The guard replaces the held SIGBREAK directly, keeping the original as
+        # the one to put back; `hand_to_guard` is the first thing it covers.
+        with _kill_child_if_we_are_told_to_exit(proc, tree, inherited=held.originals):
             try:
-                out, err = _communicate_in_slices(proc, timeout, after_first_wait=deliver)
+                held.hand_to_guard()
+                out, err = _communicate_in_slices(proc, timeout, after_first_wait=held.deliver)
             except subprocess.TimeoutExpired as expired:
                 out, err = _kill_and_drain(proc, tree, (expired.output, expired.stderr))
                 raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from None
@@ -1294,7 +1358,10 @@ def _run_guarded_in_a_job(
 
 @contextlib.contextmanager
 def _kill_child_if_we_are_told_to_exit(
-    proc: subprocess.Popen, pgid: int | _StageJob | _BreakOnly | None = None
+    proc: subprocess.Popen,
+    pgid: int | _StageJob | _BreakOnly | None = None,
+    *,
+    inherited: Mapping[int, Any] | None = None,
 ):
     """Take the child down with us on SIGTERM or SIGHUP -- or SIGBREAK on Windows.
 
@@ -1335,6 +1402,12 @@ def _kill_child_if_we_are_told_to_exit(
     the process", within a 5000 ms time-out (`HandlerRoutine`). What covers
     it is the job: the process ending closes litetune's handle, and the job
     was created with kill-on-close.
+
+    `inherited` maps a signal to the disposition it had before something else
+    took it over for a moment -- `_DeferredSignals`, holding SIGINT and
+    SIGBREAK while a Windows stage starts. That is the disposition this guard
+    stands in for: it decides whether the signal was ignored, and it is the
+    one put back on the way out, rather than the recorder in its place.
     """
     installed: dict[int, Any] = {}
     handling = False
@@ -1438,9 +1511,14 @@ def _kill_child_if_we_are_told_to_exit(
         if sig is None:
             continue
         try:
-            if signal.getsignal(sig) == signal.SIG_IGN:
+            if inherited is not None and sig in inherited:
+                current, taken_over = inherited[sig], True
+            else:
+                current, taken_over = signal.getsignal(sig), False
+            if current == signal.SIG_IGN:
                 continue
-            installed[sig] = signal.signal(sig, take_the_child_with_us)
+            replaced = signal.signal(sig, take_the_child_with_us)
+            installed[sig] = current if taken_over else replaced
         except (ValueError, OSError) as exc:
             # Off the main thread, or a platform without this signal -- the
             # message must not pick one. `warning`, not `debug`: the
