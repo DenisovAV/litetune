@@ -142,17 +142,30 @@ WINDOWS_MEMORY_HINT = (
 )
 
 # MS-ERREF 2.3.1 names 0xC000013A "{Application Exit by CTRL+C} The application
-# terminated as a result of a CTRL+C". Which code a console process's default
-# handler exits with on a Ctrl-Break is not in Microsoft's console
-# documentation -- it "calls the ExitProcess function" (`GenerateConsoleCtrlEvent`)
-# -- and is not measured here, so the hint below does not say this is that code.
+# terminated as a result of a CTRL+C". Microsoft's console documentation says
+# only that the default handler "calls the ExitProcess function"
+# (`GenerateConsoleCtrlEvent`); that a Python stage with no Ctrl-Break handler,
+# sent the Ctrl-Break litetune stops it with, exits with this code is measured:
+# `test_a_stage_ended_by_our_ctrl_break_exits_status_control_c_exit`, on
+# windows-latest, CPython 3.12, the toolcache interpreter.
 STATUS_CONTROL_C_EXIT = 0xC000013A
 
+# The same argument `OOM_HINT` makes about -9: every Ctrl-Break litetune sends
+# a stage ends in a raised exception in `envs`, so a stage whose code reaches
+# this module was not stopped by litetune. A Ctrl-C typed at the console does
+# not reach a stage started in a process group of its own, which every stage
+# in a job is: "If this flag is specified, CTRL+C signals will be disabled for
+# all processes within the new process group" (CREATE_NEW_PROCESS_GROUP,
+# "Process Creation Flags"). A Ctrl-Break typed there reaches every process
+# attached to the console ("CTRL+C and CTRL+BREAK Signals").
 WINDOWS_CTRL_EXIT_HINT = (
-    "STATUS_CONTROL_C_EXIT is Windows' status for an application that ended as a result of a "
-    "Ctrl-C. litetune sends Ctrl-Break to a stage it is stopping, on a timeout or an interrupt, "
-    "and a Ctrl-C or Ctrl-Break typed at the console reaches, by default, every process attached "
-    "to it: this reads as a stop, not as a crash, and nothing about memory follows from it."
+    "STATUS_CONTROL_C_EXIT is how a console process ends on a Ctrl-C or Ctrl-Break it does not "
+    "handle. Every Ctrl-Break litetune sends a stage ends in a raised exception rather than a "
+    "return code, so this did not come from litetune stopping it. What can deliver one: a "
+    "Ctrl-Break typed at the console, which reaches every process attached to it; a Ctrl-C typed "
+    "there, which reaches a stage only where it runs without a process group of its own; or a "
+    "program that sent the stage either event. The process was stopped, not crashed, and nothing "
+    "about memory follows from it."
 )
 
 WINDOWS_KILL_HINT = (

@@ -59,10 +59,16 @@ jobs:
           otool -L "$base" | tee /dev/stderr | grep -q '@rpath/libpython3.11.dylib'
       - run: .venv/bin/pytest -q tests/test_envs.py
 
-  # Windows x64, on Python 3.12, the newest the stage environments install on
-  # there (`litetune/wheels.py`). `convert` cannot run there -- `litert-converter`
-  # publishes no Windows wheel, and `provision` refuses before pip -- but the
-  # rest is meant to, and nothing above imports litetune on Windows at all.
+  # Windows x64, on the check job's Pythons: the floor, 3.12 -- the newest the
+  # stage environments install on there (`litetune/wheels.py`) -- and 3.13.
+  # What a stage's process tree rests on differs by version underneath:
+  # `os.kill` handles a failed Ctrl-Break differently on 3.10 and 3.11
+  # (`winjob.send_ctrl_break` says how), and a virtualenv's `python.exe` is
+  # built from `PC/launcher.c` up to 3.12 and from `PC/venvlauncher.c` from
+  # 3.13 (`PCbuild/venvlauncher.vcxproj`). `convert` cannot run there --
+  # `litert-converter` publishes no Windows wheel, and `provision` refuses
+  # before pip -- but the rest is meant to, and nothing above imports litetune
+  # on Windows at all.
   # Tests that assert a POSIX mechanism (process groups and sessions, signal
   # names and dispositions, select() over pipes, fcntl, a shebang, permission
   # bits) carry the `posix` marker and are deselected; nothing else is
@@ -74,6 +80,10 @@ jobs:
   # GitHub's workflow syntax reference.
   windows:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
     defaults:
       run:
         shell: bash
@@ -86,12 +96,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: ruff check src tests
       - run: ruff format --check src tests
       - run: mypy
-      - run: pytest -q -m "not posix"
+      # `-rs` names every skip in the log, so a real-tree test that did not run
+      # cannot pass for one that did.
+      - run: pytest -q -rs -m "not posix"
       - name: the wheel installs and runs from a clean environment
         run: |
           pip install build

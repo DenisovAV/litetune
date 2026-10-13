@@ -19,8 +19,6 @@ search for them.
 from __future__ import annotations
 
 import ctypes
-import os
-import signal
 import subprocess
 import sys
 from ctypes import wintypes
@@ -32,8 +30,12 @@ if sys.platform != "win32":
 # `CreateToolhelp32Snapshot`: "Includes all threads in the system in the
 # snapshot."
 TH32CS_SNAPTHREAD = 0x00000004
-# Thread Security and Access Rights: "Required to suspend or resume a thread".
+# Thread Security and Access Rights: "Required to suspend or resume a thread",
+# and the right `GetProcessIdOfThread` asks for.
 THREAD_SUSPEND_RESUME = 0x0002
+THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+# `GenerateConsoleCtrlEvent`: "CTRL_BREAK_EVENT 1 Generates a CTRL+BREAK signal."
+CTRL_BREAK_EVENT = 1
 # `JOBOBJECT_BASIC_LIMIT_INFORMATION.LimitFlags`: "Causes all processes
 # associated with the job to terminate when the last handle to the job is
 # closed." That page also says the flag "requires use of a
@@ -42,11 +44,21 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 # `JOBOBJECTINFOCLASS` values, from `QueryInformationJobObject` and
 # `SetInformationJobObject`.
 JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
+JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+# How many process ids one `JobObjectBasicProcessIdList` query asks room for
+# at first; `_process_ids` doubles it while the list does not fit.
+_FIRST_ID_ROOM = 16
+# And the most it asks room for before giving up, so the doubling has an end:
+# 65,536 ids is a 512 KiB buffer.
+_MOST_ID_ROOM = 1 << 16
 # `Thread32First` / `Thread32Next`: "The ERROR_NO_MORE_FILES error value is
 # returned by the GetLastError function if no threads exist or the snapshot
 # does not contain thread information."
 ERROR_NO_MORE_FILES = 18
+# What a query answers when its buffer is too small for what it returns
+# (System Error Codes).
+ERROR_MORE_DATA = 234
 # `ResumeThread`: "If the function fails, the return value is (DWORD) -1."
 _RESUME_FAILED = 0xFFFFFFFF
 # `CreateToolhelp32Snapshot` fails with `INVALID_HANDLE_VALUE`, `(HANDLE)-1`.
@@ -100,6 +112,23 @@ class _BasicAccounting(ctypes.Structure):
         ("ActiveProcesses", wintypes.DWORD),
         ("TotalTerminatedProcesses", wintypes.DWORD),
     ]
+
+
+def _process_id_list(room: int) -> Any:
+    """`JOBOBJECT_BASIC_PROCESS_ID_LIST` with room for `room` ids.
+
+    Its `ProcessIdList` is "a variable-length array", declared with one
+    element in C, so the structure is built at the size the query needs.
+    """
+
+    class _ProcessIdList(ctypes.Structure):
+        _fields_ = [
+            ("NumberOfAssignedProcesses", wintypes.DWORD),
+            ("NumberOfProcessIdsInList", wintypes.DWORD),
+            ("ProcessIdList", ctypes.c_size_t * room),
+        ]
+
+    return _ProcessIdList()
 
 
 class _ThreadEntry32(ctypes.Structure):
@@ -170,14 +199,20 @@ _OpenThread = _prototype(
     "OpenThread", wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
 )
 _ResumeThread = _prototype("ResumeThread", wintypes.DWORD, wintypes.HANDLE)
+_GetProcessIdOfThread = _prototype("GetProcessIdOfThread", wintypes.DWORD, wintypes.HANDLE)
+_GenerateConsoleCtrlEvent = _prototype(
+    "GenerateConsoleCtrlEvent", wintypes.BOOL, wintypes.DWORD, wintypes.DWORD
+)
 
 
 def _failed(call: str, code: int | None = None) -> OSError:
     """The `OSError` for a failed kernel32 call, naming the call.
 
     `use_last_error=True` above is what makes `get_last_error` the error of
-    *this* call: ctypes saves `GetLastError` right after each foreign call,
-    before anything in Python can overwrite it.
+    *this* call: ctypes keeps a private copy of the Windows error code that is
+    exchanged with the real one before and after each foreign call (the
+    `use_errno` and `use_last_error` parameters, the ctypes documentation), so
+    nothing Python does in between can overwrite it.
     """
     code = ctypes.get_last_error() if code is None else code
     return ctypes.WinError(code, f"{call} failed: {ctypes.FormatError(code)}")
@@ -269,6 +304,14 @@ class Win32JobApi:
         so the snapshot is read for the process `Popen` started and not for
         whatever else holds the number.
 
+        A thread id from the snapshot is checked again once it is open: "The
+        identifier is valid until the thread terminates" (Microsoft, "Thread
+        Handles and Identifiers"), and a child terminated by something else
+        after the snapshot would free its thread's id for another thread. Once
+        a handle is open the thread it names cannot change, so
+        `GetProcessIdOfThread` on that handle has to answer our child's pid
+        before anything is resumed.
+
         Exactly one thread is required, and a previous suspend count of
         exactly 1. Neither is a documented property of a new suspended process
         -- `CREATE_SUSPENDED` says only that "the primary thread of the new
@@ -276,7 +319,9 @@ class Win32JobApi:
         and anything else is refused: a second thread could be running already,
         and a count above 1 leaves the thread suspended ("If the return value
         is greater than 1, the specified thread is still suspended",
-        `ResumeThread`).
+        `ResumeThread`). Both held for every stage the real-tree tests started
+        on windows-latest, CPython 3.12, the toolcache interpreter
+        (`tests/test_windows_real_tree.py`).
         """
         handle = _process_handle(proc)
         owner = _GetProcessId(handle)
@@ -287,10 +332,17 @@ class Win32JobApi:
             raise OSError(
                 f"pid {proc.pid} was created suspended and has {len(threads)} threads, not one"
             )
-        thread = _OpenThread(THREAD_SUSPEND_RESUME, False, threads[0])
+        thread = _OpenThread(
+            THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME, False, threads[0]
+        )
         if not thread:
             raise _failed("OpenThread")
         try:
+            belongs_to = _GetProcessIdOfThread(thread)
+            if belongs_to != proc.pid:
+                raise OSError(
+                    f"thread {threads[0]} of pid {proc.pid} now belongs to pid {belongs_to}"
+                )
             previous = _ResumeThread(thread)
             if previous == _RESUME_FAILED:
                 raise _failed("ResumeThread")
@@ -317,6 +369,33 @@ class Win32JobApi:
             raise _failed("QueryInformationJobObject")
         return int(info.ActiveProcesses)
 
+    def process_ids(self, job: int) -> list[int]:
+        """`JOBOBJECT_BASIC_PROCESS_ID_LIST`: the pids the job holds now.
+
+        "If this number is less than NumberOfAssignedProcesses, increase the
+        size of the buffer to accommodate the complete list" -- so the query
+        is repeated with twice the room until the whole list fits. Whether a
+        short buffer makes the call fail with ERROR_MORE_DATA or succeed with
+        part of the list is not stated there; either is taken as "more room".
+        """
+        room = _FIRST_ID_ROOM
+        while room <= _MOST_ID_ROOM:
+            listed = _process_id_list(room)
+            if not _QueryInformationJobObject(
+                job,
+                JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+                ctypes.byref(listed),
+                ctypes.sizeof(listed),
+                None,
+            ):
+                code = ctypes.get_last_error()
+                if code != ERROR_MORE_DATA:
+                    raise _failed("QueryInformationJobObject", code)
+            elif listed.NumberOfProcessIdsInList >= listed.NumberOfAssignedProcesses:
+                return [int(pid) for pid in listed.ProcessIdList[: listed.NumberOfProcessIdsInList]]
+            room *= 2
+        raise OSError(f"the job holds more than {_MOST_ID_ROOM} processes")
+
     def terminate(self, job: int, exit_code: int) -> None:
         """`TerminateJobObject`: "as if TerminateProcess were called for each
         process associated with the job", with `exit_code` for each."""
@@ -330,15 +409,23 @@ class Win32JobApi:
     def send_ctrl_break(self, pid: int) -> None:
         """`CTRL_BREAK_EVENT` to the console process group `pid` leads.
 
-        `os.kill` with `CTRL_BREAK_EVENT` is `GenerateConsoleCtrlEvent(sig,
-        pid)` and raises `OSError` when that fails (`os_kill_impl`,
-        `Modules/posixmodule.c`). A group id of 0 is refused before it is
-        sent: `GenerateConsoleCtrlEvent` documents 0 as "all processes that
-        share the console of the calling process", litetune among them.
+        `GenerateConsoleCtrlEvent` itself, rather than `os.kill`: on CPython
+        3.10 and 3.11 `os.kill` sets the error from a failed
+        `GenerateConsoleCtrlEvent` and then falls through to `OpenProcess` and
+        `TerminateProcess(handle, 1)` on the same pid, returning with the error
+        still set -- a `SystemError` after the process was killed outright
+        (`os_kill_impl`, `Modules/posixmodule.c`, 3.10 and 3.11; 3.12 returns
+        at the failure). This raises `OSError` on every version and touches
+        nothing else.
+
+        A group id of 0 is refused before it is sent: `GenerateConsoleCtrlEvent`
+        documents 0 as "all processes that share the console of the calling
+        process", litetune among them.
         """
         if pid <= 0:
             raise ValueError(f"refusing to send CTRL_BREAK_EVENT to process group {pid}")
-        os.kill(pid, signal.CTRL_BREAK_EVENT)
+        if not _GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid):
+            raise _failed("GenerateConsoleCtrlEvent")
 
 
 API = Win32JobApi()

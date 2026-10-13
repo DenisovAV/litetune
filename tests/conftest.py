@@ -610,3 +610,80 @@ def run_compose_script(
     )
     seen = loads.read_text(encoding="utf-8").splitlines() if loads.is_file() else []
     return proc, [json.loads(line) for line in seen]
+
+
+# The job a `FakeJobApi` hands out, and the pid of the stages the Windows tests
+# start.
+FAKE_JOB = 100
+
+
+class FakeJobApi:
+    """`envs._JobApi`'s Win32 calls, recorded in one log with whatever else a test records.
+
+    For the Windows process model run on any host: `envs` decides the order of
+    those calls and what each failure means, so a recording stand-in is enough
+    to reach every branch. A step named in `fail` raises what it maps to.
+    `counts` is what `active_processes` answers, one entry per call, the last
+    one repeated; `ids` is what `process_ids` answers. `on_break` runs when a
+    Ctrl-Break is sent -- a stage that exits on one.
+    """
+
+    def __init__(
+        self,
+        log: list[tuple[Any, ...]] | None = None,
+        *,
+        fail: dict[str, BaseException] | None = None,
+        counts: tuple[int, ...] = (1,),
+        ids: tuple[int, ...] = (),
+        on_break: Any = None,
+    ) -> None:
+        self.log = log if log is not None else []
+        self.fail = fail or {}
+        self.counts = list(counts)
+        self.ids = list(ids)
+        self.on_break = on_break
+
+    def _step(self, *call: Any) -> None:
+        self.log.append(call)
+        if call[0] in self.fail:
+            raise self.fail[call[0]]
+
+    def create_job(self) -> int:
+        self._step("create_job")
+        return FAKE_JOB
+
+    def assign(self, job: int, proc: subprocess.Popen) -> None:
+        self._step("assign", job, proc.pid)
+
+    def resume(self, proc: subprocess.Popen) -> None:
+        self._step("resume", proc.pid)
+
+    def active_processes(self, job: int) -> int:
+        self._step("active_processes", job)
+        return self.counts.pop(0) if len(self.counts) > 1 else self.counts[0]
+
+    def process_ids(self, job: int) -> list[int]:
+        self._step("process_ids", job)
+        return list(self.ids)
+
+    def terminate(self, job: int, exit_code: int) -> None:
+        self._step("terminate", job, exit_code)
+
+    def close(self, job: int) -> None:
+        self._step("close", job)
+
+    def send_ctrl_break(self, pid: int) -> None:
+        self._step("send_ctrl_break", pid)
+        if self.on_break is not None:
+            self.on_break()
+
+    def steps(self) -> list[Any]:
+        return [call[0] for call in self.log]
+
+
+def _job_api_conforms() -> None:
+    """Checked by mypy: a renamed or re-typed `_JobApi` method fails here, not in CI."""
+    from litetune import envs
+
+    conforms: envs._JobApi = FakeJobApi()
+    del conforms
