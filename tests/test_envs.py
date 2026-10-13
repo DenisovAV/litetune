@@ -18,7 +18,7 @@ import time
 import types
 
 import pytest
-from conftest import PROBE_FIELDS, machine, mark_provisioned, probe_answer
+from conftest import PROBE_FIELDS, FakeJobApi, machine, mark_provisioned, probe_answer
 
 from litetune import envs, wheels
 from litetune.envs import EXPORT, RUNTIME, TRAIN, StageEnv, UnpinnedRequirement
@@ -1838,6 +1838,18 @@ def test_the_host_cannot_reach_past_the_pins(name, monkeypatch):
     assert name not in envs._child_env()
 
 
+def test_a_stage_keeps_what_its_interpreter_needs_from_the_host(monkeypatch):
+    """`SystemRoot` reaches every stage, because the base is the host's own
+    environment and only the reach is taken out of it. CPython 3.10 on Windows
+    does not start without it -- the training-script tests, which build an
+    environment from nothing, measured that (`_INTERPRETER_NEEDS` in
+    `test_tune.py`) -- and no production path builds one from nothing."""
+    monkeypatch.setenv("SYSTEMROOT", "C:\\Windows")
+
+    assert envs._child_env()["SYSTEMROOT"] == "C:\\Windows"
+    assert envs._child_env({"CUDA_VISIBLE_DEVICES": ""})["SYSTEMROOT"] == "C:\\Windows"
+
+
 def _symlinked_env(tmp_path, monkeypatch, name: str) -> StageEnv:
     """A stage environment whose interpreter is the one running the tests.
 
@@ -2008,6 +2020,21 @@ class _FakePopen:
         return self.returncode
 
 
+# Both ways a stage starts, for the tests that hand `_run_guarded` a fake
+# `Popen`: "plain" is how every platform started one before job objects, and
+# what POSIX still does; "job" is the Windows start, against a recording job
+# API -- a fake `Popen` can be put in a fake job, never in a real one. Each
+# runs on every platform, so neither is reachable only on one of them.
+_STARTS = pytest.mark.parametrize("start", ["plain", "job"])
+_WINDOWS_FLAGS = 0x00000004 | 0x00000200  # CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP
+
+
+def _start_as(monkeypatch, start: str) -> FakeJobApi | None:
+    api = None if start == "plain" else FakeJobApi(counts=(1, 0))
+    monkeypatch.setattr(envs, "_windows_job_api", lambda: api)
+    return api
+
+
 class _FakeProc:
     """A `Popen` stand-in that records what was signalled, and never dies.
 
@@ -2166,7 +2193,8 @@ def test_the_cpu_only_override_is_overrides_and_not_an_environment(monkeypatch):
     assert "PYTHONPATH" not in _cpu_only_environ()
 
 
-def test_the_install_does_not_inherit_a_redirected_pip(tmp_path, monkeypatch):
+@_STARTS
+def test_the_install_does_not_inherit_a_redirected_pip(tmp_path, monkeypatch, start):
     """`PIP_TARGET` installs elsewhere while `.litetune-ready` is written here.
 
     The result is an environment that reports ready and holds nothing, which is
@@ -2180,14 +2208,19 @@ def test_the_install_does_not_inherit_a_redirected_pip(tmp_path, monkeypatch):
 
     # At `Popen`, which is where the environment is actually handed over.
     # Capturing at a wrapper only proves the wrapper was called.
+    flags = []
+
     def capture(argv, **kwargs):
         seen.update(kwargs.get("env") or {})
+        flags.append(kwargs.get("creationflags"))
         return _FakePopen()
 
+    _start_as(monkeypatch, start)
     monkeypatch.setattr(envs.subprocess, "Popen", capture)
     StageEnv(name="pipenv", requirements=("pyyaml==6.0.2",)).provision()
     assert seen, "the install must have started a process"
     assert "PIP_TARGET" not in seen
+    assert flags == [0 if start == "plain" else _WINDOWS_FLAGS]
 
 
 # ---------------------------------------------------------------------------
@@ -2744,7 +2777,8 @@ def test_a_drain_that_reached_the_end_does_not_sit_out_its_budget(monkeypatch):
     assert time.monotonic() - started >= 0.25, "pump must spend its budget, EOF or not"
 
 
-def test_the_install_is_killed_with_litetune(tmp_path, monkeypatch):
+@_STARTS
+def test_the_install_is_killed_with_litetune(tmp_path, monkeypatch, start):
     """`provision` was the last unguarded subprocess in the package.
 
     `subprocess.run` kills its direct child, and only on a path that raises. A
@@ -2762,15 +2796,16 @@ def test_the_install_is_killed_with_litetune(tmp_path, monkeypatch):
     real_guard = envs._kill_child_if_we_are_told_to_exit
 
     @contextlib.contextmanager
-    def note_the_guard(proc, pgid=None):
-        guarded.append(proc)
-        with real_guard(proc, pgid):
+    def note_the_guard(proc, pgid=None, **kwargs):
+        guarded.append((proc, pgid))
+        with real_guard(proc, pgid, **kwargs):
             yield
 
     def capture(argv, **kwargs):
         started.update(kwargs)
         return _FakePopen()
 
+    _start_as(monkeypatch, start)
     monkeypatch.setattr(envs.subprocess, "Popen", capture)
     monkeypatch.setattr(envs, "_kill_child_if_we_are_told_to_exit", note_the_guard)
     StageEnv(name="guarded", requirements=("pyyaml==6.0.2",)).provision()
@@ -2780,6 +2815,11 @@ def test_the_install_is_killed_with_litetune(tmp_path, monkeypatch):
         "group, and there is no group left to kill that is only pip's"
     )
     assert guarded, "the install must run inside the termination guard"
+    if start == "job":
+        assert started.get("creationflags") == _WINDOWS_FLAGS
+        assert isinstance(
+            guarded[0][1], envs._StageJob
+        ), "the guard must be handed the install's job, or a Ctrl-Break reaches pip alone"
 
 
 def test_a_selector_that_accepts_and_then_refuses_does_not_escape(monkeypatch):
@@ -3778,7 +3818,8 @@ def test_the_rescue_kill_does_not_signal_a_group_that_is_no_longer_ours(monkeypa
     )
 
 
-def test_the_discarded_drain_is_not_seeded_either(monkeypatch):
+@_STARTS
+def test_the_discarded_drain_is_not_seeded_either(monkeypatch, start):
     """`run`'s own cleanup discards its drain, exactly as the handler does.
 
     Seeding it means a `b"".join` over everything the stage has said, on the
@@ -3791,6 +3832,7 @@ def test_the_discarded_drain_is_not_seeded_either(monkeypatch):
 
     def note(proc, pgid=None, already=(None, None), *, seed=True):
         seen["seed"] = seed
+        seen["tree"] = pgid
         return real(proc, pgid, already, seed=seed)
 
     monkeypatch.setattr(envs, "_kill_and_drain", note)
@@ -3799,10 +3841,13 @@ def test_the_discarded_drain_is_not_seeded_either(monkeypatch):
         def communicate(self, timeout=None):
             raise KeyboardInterrupt
 
+    _start_as(monkeypatch, start)
     monkeypatch.setattr(envs.subprocess, "Popen", lambda *a, **k: Interrupted())
     with pytest.raises(KeyboardInterrupt):
         envs._run_guarded(["python", "-c", "pass"], timeout=5)
     assert seen.get("seed") is False, "the discarded drain must not pay for a seed"
+    if start == "job":
+        assert isinstance(seen["tree"], envs._StageJob), "the kill goes through the job"
 
 
 @pytest.mark.posix
@@ -4724,7 +4769,8 @@ def test_a_grandchild_is_collected_after_its_parent_has_exited(tmp_path, monkeyp
         os.killpg(pgid, 0)
 
 
-def test_a_stage_pipe_is_decoded_as_utf8_whatever_the_host_calls_its_encoding(monkeypatch):
+@_STARTS
+def test_a_stage_pipe_is_decoded_as_utf8_whatever_the_host_calls_its_encoding(monkeypatch, start):
     """The generation comes back through this pipe, so the locale must not shape it.
 
     `text=True` alone decodes with the locale's encoding -- the ANSI code page
@@ -4740,9 +4786,11 @@ def test_a_stage_pipe_is_decoded_as_utf8_whatever_the_host_calls_its_encoding(mo
         started.update(kwargs)
         return _FakePopen()
 
+    _start_as(monkeypatch, start)
     monkeypatch.setattr(envs.subprocess, "Popen", capture)
     envs._run_guarded(["python", "-c", "pass"], timeout=5)
 
+    assert started.get("creationflags") == (0 if start == "plain" else _WINDOWS_FLAGS)
     assert started.get("encoding") == "utf-8"
     assert started.get("errors") == "surrogateescape", (
         "a byte that is not UTF-8 must neither raise out of the decode nor be erased: "

@@ -22,6 +22,7 @@ share an exit code with one.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import os
@@ -1783,9 +1784,11 @@ def main(argv: list[str] | None = None) -> int:
         # `_Parser` exists to stop this command emitting it for a request
         # it would not run.
         return exc.code if isinstance(exc.code, int) else EXIT_CODES[Status.ERROR]
-    except BrokenPipeError:
+    except OSError as exc:
         # The parser could not report. A usage error is still a usage error, and
         # returning 0 here reported a malformed command line as success.
+        if not _a_closed_pipe(exc):
+            raise
         _silence_streams()
         return EXIT_CODES[Status.ERROR]
 
@@ -1800,6 +1803,28 @@ def main(argv: list[str] | None = None) -> int:
         # function has already decided the answer.
         _silence_streams()
     return code
+
+
+def _a_closed_pipe(exc: OSError) -> bool:
+    """Whether a failed write means the reader of the pipe had gone.
+
+    `BrokenPipeError` says so on POSIX. Windows says it with `EINVAL`: a write
+    to a pipe whose reader has gone fails that way there -- CPython's own
+    `Popen._stdin_write` ignores it for exactly that reason ("bpo-19612,
+    bpo-30418: On Windows, stdin.write() fails with EINVAL if the child
+    process exited or if the child process is still running but closed the
+    pipe", `Lib/subprocess.py`). It reaches `main` on CPython 3.10 only:
+    argparse's `_print_message` writes without a guard there and swallows
+    `OSError` from 3.11 (`Lib/argparse.py`). Measured on windows-latest,
+    CPython 3.10.11: a usage error with stderr closed exited 120, the code
+    `Py_FinalizeEx` leaves, instead of 4.
+
+    `EINVAL` counts only on Windows, so nothing changes on POSIX: an `EINVAL`
+    there is some other fault, and is raised as before.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return sys.platform == "win32" and exc.errno == errno.EINVAL
 
 
 def _flush_streams() -> bool:

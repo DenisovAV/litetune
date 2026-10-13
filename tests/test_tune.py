@@ -1616,6 +1616,22 @@ def stub_env(tmp_path):
     return stubs, log
 
 
+# What the interpreter itself needs from the environment the tests build for
+# the training script, which is otherwise only the stubs and their switches.
+# On Windows that is `SystemRoot`: "On Windows, in order to run a side-by-side
+# assembly the specified env **must** include a valid SystemRoot" (the
+# `subprocess` documentation, `Popen`'s `env`). Without it CPython 3.10 dies
+# before running a line -- "Fatal Python error: _Py_HashRandomization_Init:
+# failed to get random numbers to initialize Python", measured on
+# windows-latest. The random numbers come from CryptoAPI there
+# (`win32_urandom_init` calls `CryptAcquireContextW`, `Python/bootstrap_hash.c`
+# in 3.10); 3.11 replaced that with `BCryptGenRandom` (bpo-44611), and 3.12 and
+# 3.13 started without `SystemRoot` in the same run. `os.environ` upper-cases
+# its keys on Windows (`encodekey`, `Lib/os.py`), so `SystemRoot` is found as
+# `SYSTEMROOT`.
+_INTERPRETER_NEEDS = ("SYSTEMROOT",) if sys.platform == "win32" else ()
+
+
 def run_real_script(
     request: TuneRequest,
     stub_env,
@@ -1661,6 +1677,7 @@ def run_real_script(
         capture_output=True,
         text=True,
         env={
+            **{name: os.environ[name] for name in _INTERPRETER_NEEDS if name in os.environ},
             "PATH": "",
             "PYTHONPATH": str(stubs),
             "LITETUNE_STUB_LOG": str(log),

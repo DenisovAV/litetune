@@ -1894,6 +1894,50 @@ def test_a_usage_error_to_a_closed_stderr_keeps_its_code():
     assert returncode == 4, f"exited {returncode}"
 
 
+@pytest.mark.parametrize(
+    ("platform", "fault", "code"),
+    [
+        ("win32", OSError(22, "Invalid argument"), 4),
+        ("linux", BrokenPipeError(32, "Broken pipe"), 4),
+        ("win32", BrokenPipeError(32, "Broken pipe"), 4),
+        ("linux", OSError(22, "Invalid argument"), None),
+        ("win32", OSError(5, "Access is denied"), None),
+    ],
+    ids=[
+        "windows' closed pipe",
+        "a posix closed pipe",
+        "a broken pipe on windows",
+        "einval on posix is another fault",
+        "another windows fault",
+    ],
+)
+def test_a_parser_that_cannot_write_its_usage_still_exits_4(monkeypatch, platform, fault, code):
+    """The usage error above, in-process and on any host: Windows reports a
+    write to a pipe whose reader has gone as `EINVAL`, not `BrokenPipeError`
+    (`Popen._stdin_write`, `Lib/subprocess.py`), and argparse lets it out of
+    `parse_args` on 3.10. Read as the closed pipe it is there and nowhere
+    else, so POSIX keeps raising what it always raised."""
+    from litetune import cli
+
+    class Unwritable:
+        def parse_args(self, argv):
+            raise fault
+
+    silenced: list[str] = []
+    monkeypatch.setattr(cli.sys, "platform", platform)
+    monkeypatch.setattr(cli, "build_parser", lambda: Unwritable())
+    monkeypatch.setattr(cli, "_silence_streams", lambda: silenced.append("both"))
+
+    if code is None:
+        with pytest.raises(OSError) as caught:
+            cli.main(["not-a-command"])
+        assert caught.value is fault
+        assert silenced == []
+    else:
+        assert cli.main(["not-a-command"]) == code
+        assert silenced == ["both"], "nothing may be left buffered for a dead pipe"
+
+
 def test_a_refusal_to_a_closed_stderr_keeps_its_code():
     """`litetune convert --model m --output-dir o 2>&1 | head`.
 

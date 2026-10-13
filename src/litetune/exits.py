@@ -50,6 +50,13 @@ logger = logging.getLogger(__name__)
 # this function -- every one ends in a raise -- so a -9 read here still came
 # from outside. That is a whole-program invariant with nothing enforcing it,
 # which is worth knowing if `StageEnv.run` is ever restructured again.
+#
+# The Windows kills are in the same position: `CTRL_BREAK_EVENT` to a stage's
+# process group, `TerminateJobObject` on its job and `Popen.kill` on the child
+# all happen on the way to a raise in `envs._run_guarded`. The last two leave
+# exit code 1, the code CPython's `Popen.terminate` passes to `TerminateProcess`
+# (`Lib/subprocess.py`), which nothing here can tell from a program that
+# exited 1; it is the raise, not the code, that keeps it from being read.
 SIGKILL = 9
 
 OOM_HINT = (
@@ -134,6 +141,33 @@ WINDOWS_MEMORY_HINT = (
     "with more memory, or a smaller model, before concluding anything about the model."
 )
 
+# MS-ERREF 2.3.1 names 0xC000013A "{Application Exit by CTRL+C} The application
+# terminated as a result of a CTRL+C". Microsoft's console documentation says
+# only that the default handler "calls the ExitProcess function"
+# (`GenerateConsoleCtrlEvent`); that a Python stage with no Ctrl-Break handler,
+# sent the Ctrl-Break litetune stops it with, exits with this code is measured:
+# `test_a_stage_ended_by_our_ctrl_break_exits_status_control_c_exit`, on
+# windows-latest, CPython 3.12, the toolcache interpreter.
+STATUS_CONTROL_C_EXIT = 0xC000013A
+
+# The same argument `OOM_HINT` makes about -9: every Ctrl-Break litetune sends
+# a stage ends in a raised exception in `envs`, so a stage whose code reaches
+# this module was not stopped by litetune. A Ctrl-C typed at the console does
+# not reach a stage started in a process group of its own, which every stage
+# in a job is: "If this flag is specified, CTRL+C signals will be disabled for
+# all processes within the new process group" (CREATE_NEW_PROCESS_GROUP,
+# "Process Creation Flags"). A Ctrl-Break typed there reaches every process
+# attached to the console ("CTRL+C and CTRL+BREAK Signals").
+WINDOWS_CTRL_EXIT_HINT = (
+    "STATUS_CONTROL_C_EXIT is how a console process ends on a Ctrl-C or Ctrl-Break it does not "
+    "handle. Every Ctrl-Break litetune sends a stage ends in a raised exception rather than a "
+    "return code, so this did not come from litetune stopping it. What can deliver one: a "
+    "Ctrl-Break typed at the console, which reaches every process attached to it; a Ctrl-C typed "
+    "there, which reaches a stage only where it runs without a process group of its own; or a "
+    "program that sent the stage either event. The process was stopped, not crashed, and nothing "
+    "about memory follows from it."
+)
+
 WINDOWS_KILL_HINT = (
     "Windows reports no signal for a process that was terminated: an unhandled exception surfaces "
     "as its NTSTATUS, and `ExitProcess` and `TerminateProcess` take any code their caller passes, "
@@ -180,9 +214,16 @@ class ExitReading:
         if not self.killed:
             return f"exited {self.returncode}"
         if self.status is not None:
+            # A stop is not an exception, so it does not get the hint that
+            # reads the code as one.
+            hint = (
+                WINDOWS_CTRL_EXIT_HINT
+                if self.returncode == STATUS_CONTROL_C_EXIT
+                else WINDOWS_KILL_HINT
+            )
             text = (
                 f"terminated by {self.status} (return code {self.returncode}): read as "
-                f"unperformed rather than as a verdict about {subject}. {WINDOWS_KILL_HINT}"
+                f"unperformed rather than as a verdict about {subject}. {hint}"
             )
             # The same event as a -9, spelled the way Windows spells it. Without
             # this the memory hint would reach a Linux reader and not a Windows
