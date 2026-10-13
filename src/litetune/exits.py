@@ -50,6 +50,13 @@ logger = logging.getLogger(__name__)
 # this function -- every one ends in a raise -- so a -9 read here still came
 # from outside. That is a whole-program invariant with nothing enforcing it,
 # which is worth knowing if `StageEnv.run` is ever restructured again.
+#
+# The Windows kills are in the same position: `CTRL_BREAK_EVENT` to a stage's
+# process group, `TerminateJobObject` on its job and `Popen.kill` on the child
+# all happen on the way to a raise in `envs._run_guarded`. The last two leave
+# exit code 1, the code CPython's `Popen.terminate` passes to `TerminateProcess`
+# (`Lib/subprocess.py`), which nothing here can tell from a program that
+# exited 1; it is the raise, not the code, that keeps it from being read.
 SIGKILL = 9
 
 OOM_HINT = (
@@ -134,6 +141,20 @@ WINDOWS_MEMORY_HINT = (
     "with more memory, or a smaller model, before concluding anything about the model."
 )
 
+# MS-ERREF 2.3.1 names 0xC000013A "{Application Exit by CTRL+C} The application
+# terminated as a result of a CTRL+C". Which code a console process's default
+# handler exits with on a Ctrl-Break is not in Microsoft's console
+# documentation -- it "calls the ExitProcess function" (`GenerateConsoleCtrlEvent`)
+# -- and is not measured here, so the hint below does not say this is that code.
+STATUS_CONTROL_C_EXIT = 0xC000013A
+
+WINDOWS_CTRL_EXIT_HINT = (
+    "STATUS_CONTROL_C_EXIT is Windows' status for an application that ended as a result of a "
+    "Ctrl-C. litetune sends Ctrl-Break to a stage it is stopping, on a timeout or an interrupt, "
+    "and a Ctrl-C or Ctrl-Break typed at the console reaches, by default, every process attached "
+    "to it: this reads as a stop, not as a crash, and nothing about memory follows from it."
+)
+
 WINDOWS_KILL_HINT = (
     "Windows reports no signal for a process that was terminated: an unhandled exception surfaces "
     "as its NTSTATUS, and `ExitProcess` and `TerminateProcess` take any code their caller passes, "
@@ -180,9 +201,16 @@ class ExitReading:
         if not self.killed:
             return f"exited {self.returncode}"
         if self.status is not None:
+            # A stop is not an exception, so it does not get the hint that
+            # reads the code as one.
+            hint = (
+                WINDOWS_CTRL_EXIT_HINT
+                if self.returncode == STATUS_CONTROL_C_EXIT
+                else WINDOWS_KILL_HINT
+            )
             text = (
                 f"terminated by {self.status} (return code {self.returncode}): read as "
-                f"unperformed rather than as a verdict about {subject}. {WINDOWS_KILL_HINT}"
+                f"unperformed rather than as a verdict about {subject}. {hint}"
             )
             # The same event as a -9, spelled the way Windows spells it. Without
             # this the memory hint would reach a Linux reader and not a Windows

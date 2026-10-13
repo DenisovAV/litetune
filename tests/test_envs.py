@@ -2184,6 +2184,9 @@ def test_the_install_does_not_inherit_a_redirected_pip(tmp_path, monkeypatch):
         seen.update(kwargs.get("env") or {})
         return _FakePopen()
 
+    # A fake `Popen` cannot be put in a Windows job or resumed, so this runs
+    # the start every platform had before jobs: what it pins is the arguments.
+    monkeypatch.setattr(envs, "_windows_job_api", lambda: None)
     monkeypatch.setattr(envs.subprocess, "Popen", capture)
     StageEnv(name="pipenv", requirements=("pyyaml==6.0.2",)).provision()
     assert seen, "the install must have started a process"
@@ -2771,6 +2774,9 @@ def test_the_install_is_killed_with_litetune(tmp_path, monkeypatch):
         started.update(kwargs)
         return _FakePopen()
 
+    # A fake `Popen` cannot be put in a Windows job or resumed, so this runs
+    # the start every platform had before jobs: what it pins is the arguments.
+    monkeypatch.setattr(envs, "_windows_job_api", lambda: None)
     monkeypatch.setattr(envs.subprocess, "Popen", capture)
     monkeypatch.setattr(envs, "_kill_child_if_we_are_told_to_exit", note_the_guard)
     StageEnv(name="guarded", requirements=("pyyaml==6.0.2",)).provision()
@@ -3799,6 +3805,9 @@ def test_the_discarded_drain_is_not_seeded_either(monkeypatch):
         def communicate(self, timeout=None):
             raise KeyboardInterrupt
 
+    # A fake `Popen` cannot be put in a Windows job or resumed, so this runs
+    # the start every platform had before jobs: what it pins is the arguments.
+    monkeypatch.setattr(envs, "_windows_job_api", lambda: None)
     monkeypatch.setattr(envs.subprocess, "Popen", lambda *a, **k: Interrupted())
     with pytest.raises(KeyboardInterrupt):
         envs._run_guarded(["python", "-c", "pass"], timeout=5)
@@ -4740,6 +4749,9 @@ def test_a_stage_pipe_is_decoded_as_utf8_whatever_the_host_calls_its_encoding(mo
         started.update(kwargs)
         return _FakePopen()
 
+    # A fake `Popen` cannot be put in a Windows job or resumed, so this runs
+    # the start every platform had before jobs: what it pins is the arguments.
+    monkeypatch.setattr(envs, "_windows_job_api", lambda: None)
     monkeypatch.setattr(envs.subprocess, "Popen", capture)
     envs._run_guarded(["python", "-c", "pass"], timeout=5)
 

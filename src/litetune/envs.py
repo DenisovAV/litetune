@@ -39,7 +39,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import IO, Any, cast
+from typing import IO, Any, Protocol, cast
 
 from litetune import wheels
 from litetune.exits import read_returncode
@@ -253,6 +253,34 @@ _MAX_INTERRUPTED_READS = 8
 # cannot meaningfully extend the timeout it already blew through.
 _TERM_GRACE_S = 5
 
+# The two `CreateProcess` flags a stage starts with on Windows, with the values
+# and meanings in Microsoft's "Process Creation Flags". `CREATE_SUSPENDED`: "The
+# primary thread of the new process is created in a suspended state, and does
+# not run until the ResumeThread function is called" -- so the child is in its
+# job before it can start anything. `CREATE_NEW_PROCESS_GROUP`: "The new process
+# is the root process of a new process group ... The process identifier of the
+# new process group is the same as the process identifier", which is the group
+# `GenerateConsoleCtrlEvent` addresses. `subprocess` exports the second, on
+# Windows only, and never the first; both are spelled out here, which also lets
+# the Windows sequence be tested on any host.
+_CREATE_SUSPENDED = 0x00000004
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+# The exit code `TerminateJobObject` gives every process it ends: the one
+# CPython's `Popen.terminate` passes to `TerminateProcess` on Windows, which
+# `Popen.kill` is an alias of (`_winapi.TerminateProcess(self._handle, 1)`,
+# `Lib/subprocess.py`). A stage litetune kills therefore ends with the same code
+# whether the job or `Popen` did it. No such code reaches `exits` from a kill:
+# every path that kills a stage ends in a raised exception.
+_JOB_KILL_EXIT_CODE = 1
+
+# The longest one wait on a Windows stage blocks before control comes back to
+# the interpreter, which is where Python runs a pending signal handler. See
+# `_communicate_in_slices`. Copied rather than chosen: it is the 0.25 s `Popen`
+# itself gives a child after a KeyboardInterrupt (`_sigint_wait_secs`,
+# `Lib/subprocess.py`), and nothing here measured a better one.
+_INTERRUPT_POLL_S = 0.25
+
 # Windows has no `SIGKILL`, and reading the attribute unconditionally is enough
 # to raise there -- inside the very handler that was reporting a timeout, so
 # the timeout would never be reported at all. `None` means "kill through
@@ -443,7 +471,7 @@ def _kill_tree(
     proc: subprocess.Popen,
     grace: float = _TERM_GRACE_S,
     stop: Callable[[], bool] | None = None,
-    pgid: int | None = None,
+    pgid: int | _StageJob | None = None,
     pump: Callable[[float], None] | None = None,
 ) -> Reach:
     """End the child and everything it spawned: SIGTERM, then SIGKILL.
@@ -459,7 +487,14 @@ def _kill_tree(
     Going straight to SIGKILL would have been a quiet downgrade of that, so the
     grace is the part that keeps the replacement honest; SIGKILL still follows,
     because a wedged process must not be able to outlast its own timeout.
+
+    On Windows `pgid` carries the stage's job instead (`_StageJob`), and
+    `_kill_job` does the same thing in that platform's terms.
     """
+    if isinstance(pgid, _StageJob):
+        # Before the `returncode` check below, because a job is still worth
+        # ending after the child has exited: what it started is in there too.
+        return _kill_job(proc, pgid, grace, stop, pump)
     if proc.returncode is not None:
         return Reach.ALREADY_GONE
     # Read before anything can poll, and `poll()` is deliberately not called
@@ -630,9 +665,368 @@ def _wait_without_reaping(
             time.sleep(interval)
 
 
+# ---------------------------------------------------------------------------
+# Windows: a job object per stage
+# ---------------------------------------------------------------------------
+#
+# What the session and the process group are on POSIX, a job is on Windows:
+# `start_new_session` is ignored there (`_execute_child` takes it as
+# `unused_start_new_session`, `Lib/subprocess.py`), and `Popen.kill` is
+# `TerminateProcess` on the direct child alone. The kernel32 calls are in
+# `litetune.winjob`; the order they are made in, and what each failure means,
+# is decided here, behind `_JobApi`, so it runs on any host with a fake in the
+# API's place.
+
+
+class _JobApi(Protocol):
+    """The Win32 job calls a stage needs, one per step. Each raises `OSError`."""
+
+    def create_job(self) -> int:
+        """A job that ends every process in it when its last handle closes."""
+        ...
+
+    def assign(self, job: int, proc: subprocess.Popen) -> None: ...
+
+    def resume(self, proc: subprocess.Popen) -> None:
+        """Let a child created with `CREATE_SUSPENDED` run."""
+        ...
+
+    def active_processes(self, job: int) -> int: ...
+
+    def terminate(self, job: int, exit_code: int) -> None: ...
+
+    def close(self, job: int) -> None: ...
+
+    def send_ctrl_break(self, pid: int) -> None:
+        """`CTRL_BREAK_EVENT` to the console process group `pid` leads."""
+        ...
+
+
+@dataclass(eq=False)
+class _StageJob:
+    """One stage's job object: what `pgid` is on POSIX.
+
+    Carried in the same parameter, under the same name, by every function that
+    takes a process group -- the guard, `_kill_and_drain`, `_kill_tree` -- so
+    none of their call sites changed shape, and neither did the test doubles
+    that stand in for them. `_kill_tree` tells the two apart by type.
+    """
+
+    api: _JobApi
+    handle: int
+    closed: bool = False
+    _uncounted: bool = False
+
+    def active_processes(self) -> int | None:
+        """How many processes the job holds now, or None if it will not say.
+
+        `None` is not "empty": a caller that cannot count waits out its grace
+        rather than reading silence as an exit.
+        """
+        try:
+            return self.api.active_processes(self.handle)
+        except OSError as exc:
+            if not self._uncounted:
+                self._uncounted = True
+                logger.debug("cannot count the processes in a stage's job: %s", exc)
+            return None
+
+    def close(self) -> None:
+        """Let go of the job, once -- which ends whatever it still holds.
+
+        Closing is the kill: the job was created with kill-on-close, and "if
+        the job has the JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE flag specified,
+        closing the last job object handle terminates all associated processes
+        and then destroys the job object itself" (Microsoft, "Job Objects").
+        So it happens only once litetune is done with the stage.
+        """
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.api.close(self.handle)
+        except OSError as exc:
+            # A warning and not a raise: this runs in a `finally`, and raising
+            # would replace whatever the stage itself ended with.
+            logger.warning(
+                "could not close the job object of a stage (%s): anything still in it runs "
+                "until litetune exits, which closes the handle",
+                exc,
+            )
+
+
+# Whether the "no job" warning has been given. Per process, not per run: the
+# host cannot do it, and that does not change between runs.
+_NO_JOB_WARNED = False
+
+
+def _windows_job_api() -> _JobApi | None:
+    """The job API where a stage runs in a Windows job; None everywhere else.
+
+    The one place the start of a stage reads the platform. Everything after it
+    takes the API it is handed, which is what lets the Windows sequence run on
+    a POSIX host with a fake in its place.
+    """
+    if sys.platform != "win32":
+        return None
+    from litetune import winjob
+
+    return winjob.API
+
+
+def _warn_no_job(proc: subprocess.Popen, exc: OSError) -> None:
+    global _NO_JOB_WARNED
+    if _NO_JOB_WARNED:
+        logger.debug("no job object for %s either: %s", _describe(proc), exc)
+        return
+    _NO_JOB_WARNED = True
+    logger.warning(
+        "could not put %s in a job object (%s). On this host a stage's descendants cannot be "
+        "collected: a timeout, Ctrl-C or Ctrl-Break stops the stage's own process and not what "
+        "it started. Said once per process.",
+        _describe(proc),
+        exc,
+    )
+
+
+def _into_job(proc: subprocess.Popen, api: _JobApi) -> _StageJob | None:
+    """Put a child created suspended into a job of its own, then let it run.
+
+    The order is the reason for all of it. A child assigned after it started
+    has a window in which a grandchild is created outside the job, and nothing
+    would ever collect that one; created suspended, it cannot run a single
+    instruction until it is resumed, so the assignment comes first. A
+    grandchild then joins by default: "After a process is associated with a
+    job, by default any child processes it creates using CreateProcess are
+    also associated with the job" (Microsoft, "Job Objects").
+
+    A job that cannot be created or assigned -- a host without job support, a
+    parent job that refuses -- leaves the child to run without one: it is
+    resumed anyway, the host is named once per process, and stopping it falls
+    back to `Popen.kill`, which is all Windows had before this. Returns None
+    then.
+
+    A child that cannot be resumed is never handed back or waited on, since
+    it would wait for ever: it is terminated, the job closed, and an `OSError`
+    naming the step is raised. Anything else that interrupts this -- a Ctrl-C
+    between the spawn and the resume -- terminates it the same way.
+    """
+    job: _StageJob | None = None
+    try:
+        try:
+            job = _StageJob(api, api.create_job())
+            api.assign(job.handle, proc)
+        except OSError as exc:
+            if job is not None:
+                job.close()
+                job = None
+            _warn_no_job(proc, exc)
+        api.resume(proc)
+    except BaseException as exc:
+        _abandon_suspended(proc, job)
+        if isinstance(exc, OSError):
+            raise OSError(
+                f"could not resume {_describe(proc)}, which was created suspended so that it "
+                f"could be put in a job first: {exc}. It was terminated rather than left "
+                "suspended."
+            ) from exc
+        raise
+    return job
+
+
+def _abandon_suspended(proc: subprocess.Popen, job: _StageJob | None) -> None:
+    """End a child that may never have run, and let go of what it holds.
+
+    `Popen.kill` is `TerminateProcess` on Windows (`Lib/subprocess.py`), which
+    asks nothing of the process, suspended or not; closing the job ends it as
+    well where it had been assigned. Then the bounded reap, and the two pipe
+    ends `Popen` opened on our side, which nothing else is going to close.
+    """
+    try:
+        proc.kill()
+    except OSError as exc:
+        logger.warning(
+            "could not terminate %s, which was started suspended: %s", _describe(proc), exc
+        )
+    finally:
+        try:
+            if job is not None:
+                job.close()
+        finally:
+            _reap(proc)
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    with contextlib.suppress(OSError):
+                        stream.close()
+
+
+def _ctrl_break_reaches_our_child(proc: subprocess.Popen) -> bool:
+    """Whether `proc.pid` may be handed to `GenerateConsoleCtrlEvent` now.
+
+    Never 0: `GenerateConsoleCtrlEvent` sends a group id of 0 to "all processes
+    that share the console of the calling process", litetune among them.
+
+    And only while the child is alive. "The identifier is valid from the time
+    the process is created until the process has been terminated" (Microsoft,
+    "Process Handles and Identifiers"), and a child created with
+    `CREATE_NEW_PROCESS_GROUP` leads the group with its own pid -- so a live
+    child is a group id that is ours. `poll()` is how that is asked, and on
+    Windows it is safe in a way it is not on POSIX: it is `WaitForSingleObject`
+    on the handle `Popen` keeps, and the handle stays open
+    (`Popen._internal_poll`, `Lib/subprocess.py`).
+
+    What that sentence does not cover is the interval between this check and
+    the send: Microsoft's reference does not say whether a pid can be reused
+    while a handle to its terminated process is still open, and this does not
+    assume it.
+    """
+    return proc.pid > 0 and proc.poll() is None
+
+
+def _kill_job(
+    proc: subprocess.Popen,
+    job: _StageJob,
+    grace: float = _TERM_GRACE_S,
+    stop: Callable[[], bool] | None = None,
+    pump: Callable[[float], None] | None = None,
+) -> Reach:
+    """`_kill_tree` for a stage in a job: Ctrl-Break, a grace, then the job.
+
+    `CTRL_BREAK_EVENT` to the child's process group is the nearest thing to
+    SIGTERM: it reaches every process in the group that shares litetune's
+    console, and "all console processes have a default handler function that
+    calls the ExitProcess function" while a process that installs its own gets
+    to run it (`GenerateConsoleCtrlEvent`). The grace ends as soon as the job
+    holds nothing, and the pipes are pumped meanwhile as on POSIX. Then
+    `TerminateJobObject`, which "it is not possible for any of the processes
+    associated with the job to postpone or handle".
+
+    No Ctrl-Break at all for a child that has exited -- its group id is no
+    longer known to be ours -- or where `GenerateConsoleCtrlEvent` refuses,
+    which it does when litetune has no console. The job is terminated at once
+    then: a grace with no signal to use it is only a delay.
+
+    `stop` is the guard's escalation, as on POSIX: a second signal has already
+    terminated the job, and this one terminates it again rather than waiting.
+    """
+    if job.active_processes() == 0:
+        return Reach.ALREADY_GONE
+    reached = Reach.NOTHING
+    if _ctrl_break_reaches_our_child(proc):
+        try:
+            job.api.send_ctrl_break(proc.pid)
+            reached = Reach.GROUP
+        except OSError as exc:
+            logger.debug(
+                "no Ctrl-Break for %s (%s), so no grace: its job is terminated now",
+                _describe(proc),
+                exc,
+            )
+    if reached is Reach.GROUP and grace > 0:
+        try:
+            if _wait_for_an_empty_job(job, grace, stop, pump):
+                return Reach.GROUP
+        except BaseException:
+            # The same rescue as POSIX's: a Ctrl-C during the grace must not
+            # take the hard kill with it.
+            _terminate_job(proc, job)
+            raise
+    return max(reached, _terminate_job(proc, job))
+
+
+def _wait_for_an_empty_job(
+    job: _StageJob,
+    grace: float,
+    stop: Callable[[], bool] | None = None,
+    pump: Callable[[float], None] | None = None,
+) -> bool:
+    """Wait up to `grace` for the job to hold no process. True if it emptied.
+
+    `ActiveProcesses` is "the total number of processes currently associated
+    with the job" (`JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`). A job that will
+    not be counted is waited on for the whole grace, as `_wait_without_reaping`
+    sleeps out a grace it cannot observe.
+    """
+    deadline = time.monotonic() + grace
+    while True:
+        if stop is not None and stop():
+            return False
+        if job.active_processes() == 0:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        interval = min(0.05, remaining)
+        if pump is not None:
+            pump(interval)
+        else:
+            time.sleep(interval)
+
+
+def _terminate_job(proc: subprocess.Popen, job: _StageJob) -> Reach:
+    """`TerminateJobObject`, or `Popen.kill` where that is refused."""
+    try:
+        job.api.terminate(job.handle, _JOB_KILL_EXIT_CODE)
+    except OSError as exc:
+        logger.warning(
+            "could not terminate the job of %s (%s): killing its own process instead, and what "
+            "it started is left to the job being closed at the end of the stage",
+            _describe(proc),
+            exc,
+        )
+        return _signal_tree(proc, None, None)
+    return Reach.GROUP
+
+
 @contextlib.contextmanager
-def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen, pgid: int | None = None):
-    """Take the child down with us on SIGTERM or SIGHUP.
+def _closed_last(tree: int | _StageJob | None):
+    """Close a stage's job when the block ends, however it ends. A process
+    group needs nothing of the kind, so for one this does nothing."""
+    try:
+        yield
+    finally:
+        if isinstance(tree, _StageJob):
+            tree.close()
+
+
+def _communicate_in_slices(proc: subprocess.Popen, timeout: float) -> tuple[Any, Any]:
+    """`proc.communicate(timeout=timeout)`, in waits short enough for a signal to land.
+
+    On Windows `communicate` waits in `Thread.join` on its two reader threads
+    (`Popen._communicate`, `Lib/subprocess.py`), and before 3.14 that join
+    cannot be interrupted there: "Pressing Ctrl-C while blocked in
+    threading.Lock.acquire, threading.RLock.acquire, and threading.Thread.join
+    now interrupts the function call and raises a KeyboardInterrupt exception
+    on Windows" is gh-125541, new in 3.14.0a2. And on every version a Python
+    handler for any other signal runs only once the main thread is back in the
+    interpreter: CPython's C-level handler wakes a blocked wait for SIGINT
+    alone (`signal_handler` in `Modules/signalmodule.c` sets `sigint_event`
+    `if (sig_num == SIGINT)`), so SIGBREAK's handler waits for the join to
+    return. Each slice returns within `_INTERRUPT_POLL_S`.
+
+    Nothing is lost between slices: "Catching this exception and retrying
+    communication will not lose any output" (`Popen.communicate`, the
+    `subprocess` documentation). On Windows the reader threads the first call
+    started go on reading into the same buffers. Once the stage's own deadline
+    has passed the last slice's `TimeoutExpired` is re-raised, and
+    `_run_guarded` builds the one its callers have always had from it.
+
+    POSIX keeps the single call: its `communicate` waits in `select`, which a
+    signal interrupts, running the handler then (PEP 475).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        wait = min(_INTERRUPT_POLL_S, max(0.0, deadline - time.monotonic()))
+        try:
+            return proc.communicate(timeout=wait)
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                raise
+
+
+@contextlib.contextmanager
+def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen, pgid: int | _StageJob | None = None):
+    """Take the child down with us on SIGTERM or SIGHUP -- or SIGBREAK on Windows.
 
     `start_new_session=True` is what lets a timeout kill everything the stage
     spawned, but it also took the child out of the terminal's process group --
@@ -654,6 +1048,15 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen, pgid: int | None 
     the main thread; elsewhere this is a no-op rather than an error, because a
     library that refused to run off the main thread would be worse than one
     that cleans up in fewer cases.
+
+    Windows has no SIGHUP, and `os.kill` with any number but the two CTRL_*
+    events is `TerminateProcess` there (`os_kill_impl`,
+    `Modules/posixmodule.c`), which runs no handler at all. What reaches a
+    console process as a signal is Ctrl-C or Ctrl-Break, typed at the console
+    or sent with `GenerateConsoleCtrlEvent` -- "treated as a signal (SIGINT or
+    SIGBREAK)" (Microsoft, "CTRL+C and CTRL+BREAK Signals"). So SIGBREAK is
+    guarded where it exists, under the same rules. On Windows the handler does
+    not re-deliver: see the end of it.
     """
     installed: dict[int, Any] = {}
     handling = False
@@ -723,8 +1126,18 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen, pgid: int | None 
             # `_TERM_GRACE_S` plus `_DRAIN_AFTER_KILL_S` plus
             # `_REAP_AFTER_KILL_S`, up to 5 + 10 + 5 = 20 seconds on either
             # route. (SIGKILL always got through, and SIGINT was never this
-            # guard's to swallow -- it installs only TERM and HUP.)
+            # guard's to swallow -- it installs only TERM, HUP and BREAK.)
             handling = False
+        if sys.platform == "win32":
+            # Not a re-delivery there. `os.kill(os.getpid(), signum)` is
+            # `GenerateConsoleCtrlEvent` for CTRL_C_EVENT and CTRL_BREAK_EVENT
+            # and `TerminateProcess(handle, signum)` for any other number
+            # (`os_kill_impl`, `Modules/posixmodule.c`): SIGBREAK is 21, so
+            # litetune would end with exit code 21, past `cli`'s "interrupted"
+            # report and its exit 4. The tree is already down, so this raises
+            # what the embedded case below raises, and the guard's own
+            # `finally` restores the dispositions on the way out.
+            raise StageInterrupted(signum)
         # `None` means the handler in place was installed from C and cannot be
         # restored from Python -- `signal.signal(sig, None)` is a `TypeError`.
         # Falling back to the default is what "die the way we would have" means
@@ -742,7 +1155,7 @@ def _kill_child_if_we_are_told_to_exit(proc: subprocess.Popen, pgid: int | None 
         # and to CPython's exit status, and nobody typed Ctrl-C.
         raise StageInterrupted(signum)
 
-    for name in ("SIGTERM", "SIGHUP"):
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
         sig = getattr(signal, name, None)
         if sig is None:
             continue
@@ -1160,7 +1573,7 @@ def _reap(proc: subprocess.Popen) -> None:
 
 def _kill_and_drain(
     proc: subprocess.Popen,
-    pgid: int | None = None,
+    pgid: int | _StageJob | None = None,
     already: tuple[str | bytes | None, str | bytes | None] = (None, None),
     *,
     seed: bool = True,
@@ -1433,7 +1846,16 @@ def _run_guarded(
     minus `_HOST_OVERRIDES`, so a caller cannot accidentally hand the pins
     back through `PYTHONPATH`, and `PIP_TARGET` cannot redirect an install out
     of the venv it is supposed to fill.
+
+    On Windows the session's part is played by a job object: the child is
+    created suspended and in a process group of its own, put in a job, and
+    only then let run (`_into_job`); the job is closed once the child is reaped
+    and its pipes drained, and closing it ends anything the stage left behind.
+    The wait is taken in slices there (`_communicate_in_slices`), so a Ctrl-C
+    or a Ctrl-Break is not held up behind it.
     """
+    # Where this is not None the stage runs in a Windows job: see `_into_job`.
+    jobs = _windows_job_api()
     proc = subprocess.Popen(
         list(argv),
         stdout=subprocess.PIPE,
@@ -1445,13 +1867,17 @@ def _run_guarded(
         # one from being waited on at all.
         stdin=subprocess.DEVNULL,
         env=_child_env(env),
-        # POSIX only; accepted and ignored on Windows, where `_kill_tree`
-        # falls back to killing the child alone. Not overridable: a caller
+        # POSIX only; accepted and ignored on Windows, where the job and the
+        # process group below stand in for it. Not overridable: a caller
         # reaching past it with `process_group=` would put the child in *our*
         # group, and `_kill_tree` would then aim SIGKILL at the session that
         # is running litetune. There was a `**kwargs` passthrough here with no
         # user in the package; it is gone.
         start_new_session=True,
+        # Windows only, and refused elsewhere: `Popen.__init__` raises
+        # `ValueError` for any non-zero value on POSIX (`Lib/subprocess.py`),
+        # so this is 0 there.
+        creationflags=0 if jobs is None else _CREATE_SUSPENDED | _CREATE_NEW_PROCESS_GROUP,
     )
     # The guard wraps the cleanup as well as the wait, and that is the whole
     # point of where it sits. With the `try` outside it, the context manager
@@ -1469,10 +1895,19 @@ def _run_guarded(
     # way, and it is unsafe: a host using `SA_NOCLDWAIT` has the kernel reap
     # without `Popen` or `getsignal` ever knowing, and the number is then free
     # for somebody else.
-    pgid = _group_of(proc)
-    with _kill_child_if_we_are_told_to_exit(proc, pgid):
+    #
+    # On Windows the same slot carries the job, which `_kill_tree` knows by its
+    # type; `_into_job` has resumed the child by the time it returns.
+    pgid: int | _StageJob | None = _group_of(proc) if jobs is None else _into_job(proc, jobs)
+    # `_closed_last` is outermost, so the job is closed after everything else
+    # here has finished with the stage -- reaped, drained or given up on -- on
+    # every route out. Closing it is what ends anything the stage left running.
+    with _closed_last(pgid), _kill_child_if_we_are_told_to_exit(proc, pgid):
         try:
-            out, err = proc.communicate(timeout=timeout)
+            if jobs is None:
+                out, err = proc.communicate(timeout=timeout)
+            else:
+                out, err = _communicate_in_slices(proc, timeout)
         except subprocess.TimeoutExpired as expired:
             # Kill first, then drain: reading first would wait on a pipe the
             # group is still holding open. What `communicate` already read is
