@@ -32,17 +32,18 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from packaging.requirements import InvalidRequirement, Requirement
 
-from litetune import envs, models, wheels
+from litetune import envs, models, template_checks, wheels
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.events import EventStream
 from litetune.exits import read_returncode
+from litetune.prompt_mode import PromptMode
 from litetune.recipes import (
     DEFINED_RECIPES,
     RecipeDefinitionError,
@@ -50,6 +51,7 @@ from litetune.recipes import (
     source_of,
     toolchain_argument,
 )
+from litetune.template_checks import PROBE_TEXT, ConversationCheck
 
 logger = logging.getLogger(__name__)
 
@@ -68,17 +70,18 @@ the same 270M model is 286 MB without and 457 MB with.
 
 TOOLCHAIN_DEFAULT_RECIPE = "dynamic_wi8_afp32"
 
-# The flag as a plan carries it when the template is to be composed at export.
+# The flag as a plan carries it when the template is to be composed at export,
+# and when it is to be chosen there between the rule's canonical template and
+# the composed one.
 COMPOSED_TEMPLATE_FLAG = f"{models.TEMPLATE_FLAG}={models.COMPOSED_TEMPLATE}"
+CANONICAL_OR_COMPOSED_FLAG = f"{models.TEMPLATE_FLAG}={models.CANONICAL_OR_COMPOSED_TEMPLATE}"
+WRITTEN_TEMPLATE_FLAGS = (COMPOSED_TEMPLATE_FLAG, CANONICAL_OR_COMPOSED_FLAG)
 # Beside the recipes' directories, named for its content: two converts into one
 # directory each get their own file, and one composed the same way is the same
 # file. The leading underscore is one `_RECIPE_NAME_RE` cannot produce, so no
 # recipe's directory can take the name.
 COMPOSED_TEMPLATE_PREFIX = "_litetune-chat-template-"
 CHAT_TEMPLATE_CHECK = "chat template"
-# The user's text in the probe `_COMPOSE_SCRIPT` renders: one token, so that a
-# template that trims or splits text has nothing to change in it.
-PROBE_TEXT = "litetune-probe-7d1c"
 
 KNOWN_RECIPES = (
     "dynamic_wi8_afp32",
@@ -175,6 +178,11 @@ DEFAULT_TIMEOUT_S = 1800
 # `pip show` is metadata collection, not model work; if it has not answered in
 # a minute the environment is broken in a way the export itself will surface.
 TOOLCHAIN_TIMEOUT_S = 60
+
+# Rendering one template over `template_checks.CONVERSATIONS` is Jinja2 alone,
+# no model; the bound is for a stalled interpreter, not for the work.
+CONVERSATION_TIMEOUT_S = 120
+CONVERSATION_SCRIPT_NAME = "conversation_template.py"
 
 # Export must not require an accelerator: it is a pure format conversion, so
 # it has to run on a runner that has no GPU. Unlike training and the float
@@ -551,8 +559,20 @@ class ExportRequest:
 
     @property
     def composes_chat_template(self) -> bool:
-        """Whether the plan asks for `models.COMPOSED_TEMPLATE`, which `run_export` writes."""
-        return COMPOSED_TEMPLATE_FLAG in self.extra_flags
+        """Whether the plan asks for a template `run_export` writes (`models.WRITTEN_AT_EXPORT`)."""
+        return any(flag in self.extra_flags for flag in WRITTEN_TEMPLATE_FLAGS)
+
+    @property
+    def canonical_template(self) -> str | None:
+        """The packaged canonical template the plan lets `compose_chat_template` choose."""
+        if CANONICAL_OR_COMPOSED_FLAG not in self.extra_flags:
+            return None
+        rules = self.plan.rules
+        if rules is None or rules.canonical_template is None:
+            raise ValueError(
+                f"{self.model}: the plan asks for a canonical template and its rule names none"
+            )
+        return rules.canonical_template
 
     def composed_template_path(self, composed_sha256: str) -> Path:
         """Where a composed template with this digest is kept.
@@ -567,26 +587,26 @@ class ExportRequest:
         return (self.output_dir / name).absolute()
 
     def argv(self, recipe: str, chat_template: Path | None = None) -> list[str]:
-        """The exporter's command line, with the composed template in place of the marker.
+        """The exporter's command line, with the written template in place of the marker.
 
-        A plan carrying `models.COMPOSED_TEMPLATE` needs `chat_template`, the
-        file `compose_chat_template` wrote, and without it this raises: the
+        A plan carrying one of `models.WRITTEN_AT_EXPORT` needs `chat_template`,
+        the file `compose_chat_template` wrote, and without it this raises: the
         marker is a description, and handed to the exporter it would be looked
         up as a repository. So does a marker in any other shape than the one
         the plan writes, which this would otherwise pass through.
         """
         flags = list(self.extra_flags)
-        if COMPOSED_TEMPLATE_FLAG in flags:
+        if self.composes_chat_template:
             if chat_template is None:
                 raise ValueError(
-                    f"{self.model}: the plan asks for the checkpoint's own chat template behind "
-                    "litetune's text-parts block, and no composed template was given"
+                    f"{self.model}: the plan asks for a chat template litetune writes at export, "
+                    "and none was given"
                 )
             flags = [
-                f"{models.TEMPLATE_FLAG}={chat_template}" if f == COMPOSED_TEMPLATE_FLAG else f
+                f"{models.TEMPLATE_FLAG}={chat_template}" if f in WRITTEN_TEMPLATE_FLAGS else f
                 for f in flags
             ]
-        leftover = [f for f in flags if models.COMPOSED_TEMPLATE in f]
+        leftover = [f for f in flags if any(m in f for m in models.WRITTEN_AT_EXPORT)]
         if leftover:
             raise ValueError(f"{self.model}: {leftover} would hand the exporter the marker")
         # One argument per keyword, none of them litetune's own three: the plan
@@ -672,6 +692,11 @@ class RecipeExport:
     # first traceback frame as the last.
     stderr: str = ""
     stdout_tail: str = ""
+    # The chat template the bundle carries, read back after the export, and
+    # whether it holds a LiteRT-LM conversation past the first message
+    # (`template_checks`), which `run_export` fills in once per template.
+    bundle_template: BundleTemplate | None = field(default=None, repr=False)
+    conversation: ConversationCheck | None = None
 
     @property
     def ok(self) -> bool:
@@ -722,6 +747,7 @@ class RecipeExport:
             "returncode": self.returncode,
             "stderr": self.stderr,
             "stdout_tail": self.stdout_tail,
+            "conversation": self.conversation.as_dict() if self.conversation else None,
         }
 
 
@@ -793,15 +819,18 @@ def repair_vocab_file(model_dir: Path) -> tuple[bool, str | None]:
 # back to a `chat_template.json` when that tokenizer has no template, and with
 # its default `use_jinja_template`, `litert_lm_builder.py:432-433` embeds the
 # tokenizer's `chat_template` (litert-torch-nightly 0.10.0.dev20260926). It
-# renders the probe through the tokenizer's own `apply_chat_template`, which
-# hands the template the messages as given (transformers 5.16.1,
-# `chat_template_utils.py` `render_jinja_template`). It imports nothing from
-# litetune, which the export environment does not install; the block arrives in
-# the spec.
-_COMPOSE_SCRIPT = r'''
+# renders the checkpoint's template through the tokenizer's own
+# `apply_chat_template`, which hands the template the messages as given
+# (transformers 5.16.1, `chat_template_utils.py` `render_jinja_template`), and
+# each candidate for the bundle through `template_checks.RENDERER_SOURCE`, which
+# follows it in the script. It imports nothing from litetune, which the export
+# environment does not install; the block, the canonical template and the cases
+# arrive in the spec.
+_COMPOSE_BODY = r'''
 """Write litetune's text-parts block in front of a checkpoint's own chat template.
 
-Reads JSON {model, block, out, probe} from argv[1]. Writes JSON to argv[2]:
+Reads JSON {model, block, out, canonical, single_turns} from argv[1]. Writes
+JSON to argv[2]:
   {"transformers": <str>, "found": <str>, "source": <str>, "fallback": <dict|null>,
    "names": <list|null>, "type": <str|null>, "sha256": <str|null>,
    "characters": <int|null>, "renders": <dict|null>}
@@ -813,11 +842,16 @@ otherwise says why it does not: "empty", "blank" (only whitespace),
 `fallback` says what the chat_template.json lookup found, when the tokenizer had
 no template. `type` is the template's Python type for
 "empty" and "not_text". `sha256` and `characters` describe the template alone,
-as UTF-8. For "text", `renders` holds one user message whose text is `probe`,
-rendered three ways -- "string": the template, the content a string;
-"composed": block and template, the content a list of one text part;
-"parts_alone": the template, the content that list -- each {"text": ...} or
-{"error": ...}, with "environment": true for an error of the environment's.
+as UTF-8. For "text", `renders` holds, for each single-turn case:
+"reference": the template, through the tokenizer, the content strings;
+"candidates": {"composed": block and template, and "canonical" when the spec
+gives one: each through the runtime's renderer, {form: rendering} with the
+content in each of the case's forms}; and "parts_alone": the template through
+the tokenizer, the first case in one part; and "unvouched": for each candidate,
+what in it `runtime_render` does not render as LiteRT-LM does. Each case's
+"context" -- `enable_thinking`, `tools` -- reaches both sides. A rendering is
+{"text": ...} or {"error": ...}, with "environment": true for an error of the
+environment's.
 """
 import errno
 import hashlib
@@ -895,13 +929,17 @@ def chat_template_json(model):
     return template, lookup("found" if found else "no_key", where)
 
 
-def render(tokenizer, template, content):
+def render(tokenizer, template, messages, context=None):
+    # `context` is what LiteRT-LM would add: `tools`, which transformers takes
+    # as a keyword of its own, and `enable_thinking`, which it hands the
+    # template with every other keyword (`render_jinja_template`).
     try:
         text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": content}],
+            messages,
             chat_template=template,
             tokenize=False,
             add_generation_prompt=True,
+            **(context or {}),
         )
     except ImportError as exc:
         # transformers raises this for a jinja2 that is missing or older than
@@ -960,24 +998,44 @@ def main(spec):
     composed = spec["block"] + template
     # Bytes, not text: a text-mode write turns each newline into the platform's.
     Path(spec["out"]).write_bytes(composed.encode("utf-8"))
-    parts = [{"type": "text", "text": spec["probe"]}]
+    cases = spec["single_turns"]
+    candidates = {"composed": composed}
+    if spec.get("canonical") is not None:
+        candidates["canonical"] = spec["canonical"]
+    forms = [form for form in cases[0] if form not in ("strings", "context")]
     return report(
         "text",
         sha256=hashlib.sha256(template.encode("utf-8")).hexdigest(),
         characters=len(template),
         renders={
-            "string": render(tokenizer, template, spec["probe"]),
-            "composed": render(tokenizer, composed, parts),
-            "parts_alone": render(tokenizer, template, parts),
+            "reference": [
+                render(tokenizer, template, case["strings"], case["context"]) for case in cases
+            ],
+            "candidates": {
+                name: [
+                    {
+                        form: runtime_render(text, case[form], True, **case["context"])
+                        for form in forms
+                    }
+                    for case in cases
+                ]
+                for name, text in candidates.items()
+            },
+            "unvouched": {name: unvouched(text) for name, text in candidates.items()},
+            "parts_alone": render(tokenizer, template, cases[0]["one_part"]),
         },
         **found,
     )
+'''
 
+_SCRIPT_ENTRY = r"""
 
 if __name__ == "__main__":
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     Path(sys.argv[2]).write_text(json.dumps(main(spec)), encoding="utf-8")
-'''
+"""
+
+_COMPOSE_SCRIPT = _COMPOSE_BODY + template_checks.RENDERER_SOURCE + _SCRIPT_ENTRY
 
 # What `_COMPOSE_SCRIPT` may report as `found`; anything else is a script this
 # litetune does not know how to read.
@@ -1086,50 +1144,214 @@ def _template_advice() -> str:
 
 
 def _quoted(text: str, limit: int = 160) -> str:
-    return repr(text if len(text) <= limit else text[:limit] + "...")
+    return template_checks.quoted(text, limit)
 
 
-def _probe_refusal(model: str, renders: Any) -> tuple[str | None, bool | None]:
-    """Why the block is not for this template, if it is not; and whether the
-    template alone already renders the parts as the string (None: unknown).
+# How the two sides of single-turn identity are rendered, said wherever it is.
+_RENDERED_HOW = (
+    "the checkpoint's side through transformers' apply_chat_template, as training rendered it, "
+    "and the bundle's through the {env} environment's Jinja2 configured as LiteRT-LM's MiniJinja "
+    "(`template_checks`), not through LiteRT-LM itself"
+)
 
-    The rendering is transformers' Jinja2, not the runtime's MiniJinja: this
-    shows what the template means, and verify's rendering check is what shows
-    what LiteRT-LM makes of it.
+
+@dataclass(frozen=True)
+class TemplateChoice:
+    """Which template the renderings say to hand the exporter, or why none.
+
+    `source` is "canonical" or "composed", None with a `refusal`.
+    `canonical_differences` says why a canonical template that was offered was
+    not chosen. `parts_alone_same` is whether the checkpoint's template alone
+    renders the probe given as parts as it renders it given as a string (None:
+    unknown).
     """
-    if not isinstance(renders, dict) or not all(
-        isinstance(renders.get(k), dict) for k in ("string", "composed", "parts_alone")
-    ):
+
+    source: str | None
+    refusal: str | None = None
+    canonical_differences: tuple[str, ...] = ()
+    parts_alone_same: bool | None = None
+    # Why the composed template's single turns were not checked: it uses what
+    # the renderer does not vouch for. `could not check`, never a pass.
+    unchecked: str | None = None
+
+
+def _environment_faults(renders: Any) -> list[str]:
+    """The errors a rendering reported as the environment's, not the template's."""
+    if not isinstance(renders, dict):
+        return []
+    reference = renders.get("reference")
+    entries = [*(reference if isinstance(reference, list) else []), renders.get("parts_alone")]
+    return [
+        str(entry.get("error"))
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("environment") is True
+    ]
+
+
+def _choose_template(
+    model: str, renders: Any, canonical: str | None, env_name: str = "export"
+) -> TemplateChoice:
+    """What `_COMPOSE_SCRIPT`'s renderings say to hand the exporter.
+
+    The checkpoint's own template must render the probe, the first single-turn
+    case, and print its text; otherwise nothing can be checked against it and
+    the composition is refused. Then `canonical`, the rule's canonical template
+    when the plan offers one, is chosen if it renders every single-turn case as
+    the checkpoint's template does; then the composed template, under the same
+    condition, or a refusal. Raises ValueError for renderings this litetune
+    cannot read.
+    """
+    if not isinstance(renders, dict) or not isinstance(renders.get("candidates"), dict):
         raise ValueError(f"the script reported renders this litetune cannot read: {renders!r}")
-    string, composed, alone = renders["string"], renders["composed"], renders["parts_alone"]
-    alone_same = alone.get("text") == string.get("text") if "text" in alone else False
-    if "text" not in string:
-        return (
-            f"{model}: the template raises on one user message given as a string "
-            f"({string.get('error')}) -- an error of the template's own, not of the environment",
+    probe = template_checks.references(renders.get("reference"))[0]
+    alone = template_checks.Rendering.read(renders.get("parts_alone"))
+    if probe.text is None:
+        return TemplateChoice(
             None,
+            refusal=(
+                f"{model}: the template raises on one user message given as a string "
+                f"({probe.error}) -- an error of the template's own, not of the environment"
+            ),
         )
-    if PROBE_TEXT not in string["text"]:
-        return (
-            f"{model}: the template, given one user message as a string, does not print its "
-            f"text: it rendered {_quoted(string['text'])}",
-            alone_same,
+    alone_same = alone.text == probe.text
+    if PROBE_TEXT not in probe.text:
+        return TemplateChoice(
+            None,
+            refusal=(
+                f"{model}: the template, given one user message as a string, does not print its "
+                f"text: it rendered {_quoted(probe.text)}"
+            ),
+            parts_alone_same=alone_same,
         )
-    if composed.get("text") != string["text"]:
-        shown = (
-            _quoted(composed["text"])
-            if "text" in composed
-            else f"an error ({composed.get('error')})"
+    candidates = renders["candidates"]
+    vouching = renders.get("unvouched")
+    if not isinstance(vouching, dict):
+        raise ValueError(f"the script reported no unvouched constructs: {vouching!r}")
+    total = len(template_checks.SINGLE_TURNS) * len(template_checks.FORMS)
+    passed_over: tuple[str, ...] = ()
+    if canonical is not None:
+        gaps = template_checks.unvouched(vouching.get("canonical"))
+        if gaps:
+            passed_over = (f"it uses {', '.join(gaps)}, which the renderer does not vouch for",)
+        else:
+            differences = template_checks.single_turn_differences(
+                renders["reference"], candidates.get("canonical")
+            )
+            if not differences:
+                return TemplateChoice("canonical", parts_alone_same=alone_same)
+            passed_over = tuple(d.describe() for d in differences)
+    gaps = template_checks.unvouched(vouching.get("composed"))
+    if gaps:
+        return TemplateChoice(
+            None,
+            unchecked=(
+                f"{model}: its chat template uses {', '.join(gaps)}, which litetune's renderer "
+                "does not render as LiteRT-LM's MiniJinja does, so whether the bundle would "
+                "render single turns as the checkpoint's own template does was not checked"
+            ),
+            canonical_differences=passed_over,
+            parts_alone_same=alone_same,
         )
-        return (
+    differences = template_checks.single_turn_differences(
+        renders["reference"], candidates.get("composed")
+    )
+    if differences:
+        refusal = (
             f"{model}: the text-parts block turns a list of text parts into the string a template "
-            "written for a string expects, and this template does not render that way. Rendered by "
-            "transformers' Jinja2 (not LiteRT-LM's MiniJinja), one user message given as a string "
-            f"printed {_quoted(string['text'])}, and the same message given as parts, behind the "
-            f"block, printed {shown}",
-            alone_same,
+            f"written for a string expects, and this template does not render that way: "
+            f"{len(differences)} of {total} single-turn renderings differ, the first "
+            f"{differences[0].describe()}. Rendered {_RENDERED_HOW.format(env=env_name)}"
         )
-    return None, alone_same
+        if passed_over:
+            refusal += (
+                f". LiteRT-LM's {canonical} does not render them as the checkpoint's does either: "
+                f"{len(passed_over)} of {total} differ, the first {passed_over[0]}"
+            )
+        return TemplateChoice(
+            None, refusal=refusal, canonical_differences=passed_over, parts_alone_same=alone_same
+        )
+    return TemplateChoice(
+        "composed", canonical_differences=passed_over, parts_alone_same=alone_same
+    )
+
+
+def _canonical_basis(
+    request: ExportRequest, canonical: str, template_sha256: object
+) -> tuple[str | None, str | None]:
+    """Why the rule's canonical template is offered for this checkpoint, or why it is
+    withheld: (offered, withheld), exactly one of them a reason.
+
+    Offered on one of two grounds, and then chosen only if every single-turn
+    case renders as the checkpoint's own template renders it.
+
+    The training record. `tune` records how it trained beside the checkpoint
+    (`litetune.json`: `prompt_mode`, and `declarations_sha256` for a run with
+    tool declarations), and `verify` reads the same record. A
+    `runtime_rendered` run without declarations rendered one user message, its
+    content a string, with no tools and no `enable_thinking`
+    (`prompt_mode.RENDERING_SOURCE`): the first single-turn case, which the
+    others go beyond. A `prerendered` run, one with declarations, which the
+    record keeps only as a digest, or a record that cannot be read or names no
+    mode, is not shown to be covered, and keeps the checkpoint's own template.
+
+    The family's own template, for a checkpoint with no record at all -- one
+    litetune did not train, such as the base model converted as published: a
+    checkpoint whose chat template is, byte for byte, one the family ships
+    (`models.CANONICAL_UPSTREAM`) is in the family's own chat format, which is
+    the format LiteRT-LM's canonical template is published for. Any other
+    template without a record is withheld. This ground is a compatibility
+    heuristic, not training provenance: the bytes say which chat format the
+    checkpoint's tokenizer is configured for, and nothing about the prompts its
+    weights were trained on. A checkpoint trained elsewhere on another format
+    that kept the family's template unchanged is offered the canonical template
+    all the same.
+
+    No record means none at all: `verify.read_training_record` returns `None`.
+    A `litetune.json` that is there and cannot be read -- a directory, a FIFO
+    or a device, a link going nowhere, a permission failure, text that is not a
+    JSON object -- is a record this cannot read, and withholds, whatever the
+    template.
+    """
+    # Here, not at the top: `verify` imports this module.
+    from litetune.verify import declarations_sha256_in, prompt_mode_in, read_training_record
+
+    sidecar = Path(request.model) / models.PROVENANCE_NAME
+    try:
+        record = read_training_record(request.model)
+    except (OSError, ValueError) as exc:
+        return None, f"{sidecar} could not be read ({type(exc).__name__}: {exc})"
+    if record is None:
+        upstream = models.CANONICAL_UPSTREAM.get(canonical, {})
+        if isinstance(template_sha256, str) and template_sha256 in upstream:
+            return (
+                f"{request.model} carries no {models.PROVENANCE_NAME}, and its chat template is "
+                f"{upstream[template_sha256]}, byte for byte (sha256 {template_sha256[:12]}): "
+                "the family's own chat format, which LiteRT-LM publishes this template for"
+            ), None
+        return None, (
+            f"{request.model} carries no {models.PROVENANCE_NAME}, so nothing records that it was "
+            "trained on prompts rendered through its chat template, and its chat template "
+            f"(sha256 {str(template_sha256)[:12]}) is not one the family ships unchanged"
+        )
+    try:
+        mode = prompt_mode_in(record)
+        declarations = declarations_sha256_in(record)
+    except ValueError as exc:
+        return None, f"{sidecar} could not be read ({type(exc).__name__}: {exc})"
+    if mode is None:
+        return None, f"{sidecar} records no prompt_mode"
+    if mode is PromptMode.PRERENDERED:
+        return None, (
+            f"{sidecar} records that it was trained prerendered: its training prompts never went "
+            "through the chat template"
+        )
+    if declarations is not None:
+        return None, (
+            f"{sidecar} records that it was trained with tool declarations (sha256 "
+            f"{declarations[:12]}), which litetune keeps as a digest alone, so the single-turn "
+            "cases cannot render the prompts it was trained on"
+        )
+    return f"{sidecar} records that it was trained runtime_rendered without declarations", None
 
 
 @dataclass(frozen=True)
@@ -1137,30 +1359,42 @@ class ComposedTemplate:
     """The file every recipe's exporter is handed, and what it holds."""
 
     path: Path
-    # The block and the checkpoint's template, as written; what each bundle's
-    # `jinja_prompt_template` is read back against.
+    # What was written, the block and the checkpoint's template or the
+    # canonical template; what each bundle's `jinja_prompt_template` is read
+    # back against.
     text: str
+    # The checkpoint's own template, which the file was checked against.
     template_sha256: str
     composed_sha256: str
+    # "composed", or "canonical" for the rule's `canonical_template`; and the
+    # rule's canonical template, whether it was offered, chosen or neither.
+    source: str = "composed"
+    canonical: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "path": str(self.path),
             "template_sha256": self.template_sha256,
             "composed_sha256": self.composed_sha256,
+            "source": self.source,
+            "canonical": self.canonical,
         }
 
 
 def compose_chat_template(request: ExportRequest) -> tuple[Check, ComposedTemplate | None]:
-    """Write `models.TEXT_PARTS_BLOCK` in front of the checkpoint's own chat template.
+    """Write the chat template the plan's marker stands for, checked against the checkpoint's own.
 
     Returns the check and, when it passed, the file every recipe's exporter is
-    handed in place of `models.COMPOSED_TEMPLATE`. The template is read in the
-    export environment by `_COMPOSE_SCRIPT`, as the exporter would read it, and
-    written after the block unchanged to a name of this run's own; that file is
-    read back here and must be exactly the block followed by the template the
-    script reported, and the script's probe must show the block is for this
-    template. Only then is it renamed to its content-addressed name. A
+    handed in place of one of `models.WRITTEN_AT_EXPORT`. The template is read
+    in the export environment by `_COMPOSE_SCRIPT`, as the exporter would read
+    it, and written after `models.TEXT_PARTS_BLOCK` unchanged to a name of this
+    run's own; that file is read back here and must be exactly the block
+    followed by the template the script reported. The script renders the
+    single-turn cases in `template_checks` through the checkpoint's template and
+    through each candidate, and `_choose_template` reads them: the rule's
+    canonical template when the plan offers one and it renders every case as
+    the checkpoint's does, written over that file; otherwise the composed one,
+    which must. Only then is it renamed to its content-addressed name. A
     checkpoint whose template cannot be composed is `failed`, a script that
     could not say is `could not check`, and either way nothing is returned and
     this run's file is gone. A file another run left, under any name, is never
@@ -1190,6 +1424,24 @@ def _compose_chat_template(
         "block": str(block_path),
         "block_sha256": hashlib.sha256(block).hexdigest(),
     }
+    # Read and rendered whenever the rule names one; whether it is offered is
+    # decided once the checkpoint's own template is known.
+    canonical = request.canonical_template
+    canonical_text: str | None = None
+    if canonical is not None:
+        try:
+            canonical_text = models.canonical_template_text(canonical)
+        except (OSError, ValueError) as exc:
+            logger.exception("could not read the packaged canonical template %s", canonical)
+            return Check.unchecked(
+                CHAT_TEMPLATE_CHECK,
+                f"{request.model}: the packaged canonical template could not be used ({exc})",
+                observed=observed | {"canonical": canonical},
+            ), None
+        observed |= {
+            "canonical": canonical,
+            "canonical_sha256": hashlib.sha256(canonical_text.encode("utf-8")).hexdigest(),
+        }
     with tempfile.TemporaryDirectory(prefix="litetune-template-") as tmp:
         work = Path(tmp)
         script = work / "compose_template.py"
@@ -1202,7 +1454,8 @@ def _compose_chat_template(
                     "model": request.model,
                     "block": block.decode("utf-8"),
                     "out": str(partial),
-                    "probe": PROBE_TEXT,
+                    "canonical": canonical_text,
+                    "single_turns": template_checks.single_turn_spec(),
                 }
             ),
             encoding="utf-8",
@@ -1304,11 +1557,7 @@ def _compose_chat_template(
         ), None
 
     renders = report.get("renders")
-    faults = [
-        r["error"]
-        for r in (renders.values() if isinstance(renders, dict) else ())
-        if isinstance(r, dict) and r.get("environment")
-    ]
+    faults = _environment_faults(renders)
     if faults:
         return Check.unchecked(
             CHAT_TEMPLATE_CHECK,
@@ -1316,16 +1565,36 @@ def _compose_chat_template(
             f"({faults[0]}). That is the environment's, not a fact about the template",
             observed=observed,
         ), None
+    offered: str | None = None
+    withheld: str | None = None
+    if canonical is not None:
+        offered, withheld = _canonical_basis(request, canonical, report.get("sha256"))
+        observed |= {"canonical_offered": offered, "canonical_withheld": withheld}
     try:
-        refusal, alone_same = _probe_refusal(request.model, renders)
+        choice = _choose_template(
+            request.model, renders, canonical if offered else None, request.env.name
+        )
     except ValueError as exc:
         return Check.unchecked(CHAT_TEMPLATE_CHECK, str(exc), observed=observed), None
-    observed["renders_parts_without_the_block"] = alone_same
-    if refusal is not None:
+    observed["renders_parts_without_the_block"] = choice.parts_alone_same
+    if offered:
+        observed["canonical_differences"] = list(choice.canonical_differences)
+    if choice.unchecked is not None:
+        return Check.unchecked(
+            CHAT_TEMPLATE_CHECK, f"{choice.unchecked}. {_template_advice()}", observed=observed
+        ), None
+    if choice.refusal is not None or choice.source is None:
         return Check.failed(
-            CHAT_TEMPLATE_CHECK, f"{refusal}. {_template_advice()}", observed=observed
+            CHAT_TEMPLATE_CHECK, f"{choice.refusal}. {_template_advice()}", observed=observed
         ), None
 
+    if choice.source == "canonical":
+        if canonical_text is None:
+            raise RuntimeError(f"{request.model}: the canonical template was chosen unread")
+        # Over this run's own file, which is renamed below as the composed one
+        # would have been.
+        written = canonical_text.encode("utf-8")
+        partial.write_bytes(written)
     composed_sha256 = hashlib.sha256(written).hexdigest()
     final = request.composed_template_path(composed_sha256)
     os.replace(partial, final)
@@ -1334,19 +1603,50 @@ def _compose_chat_template(
         text=written.decode("utf-8"),
         template_sha256=str(report.get("sha256")),
         composed_sha256=composed_sha256,
+        source=choice.source,
+        canonical=request.canonical_template,
     )
-    observed |= {"composed": str(final), "composed_sha256": composed_sha256}
-    return Check.passed(
-        CHAT_TEMPLATE_CHECK,
-        f"{final}: litetune's text-parts block, then {request.model}'s own chat template "
-        f"(from its {report.get('source')}, sha256 {composed.template_sha256[:12]}, "
-        f"{report.get('characters')} characters) as transformers {report.get('transformers')} "
-        f"reads it in the {request.env.name} environment. Rendered by transformers' Jinja2, one "
-        "user message given as parts behind the block prints as the template prints it given as "
-        "a string; verify's rendering check is what checks the runtime. Every recipe exports "
-        f"with {models.TEMPLATE_FLAG}={final}, and each bundle's template is read back",
-        observed=observed,
-    ), composed
+    observed |= {
+        "composed": str(final),
+        "composed_sha256": composed_sha256,
+        "chosen": choice.source,
+    }
+    checkpoints = (
+        f"{request.model}'s own chat template (from its {report.get('source')}, sha256 "
+        f"{composed.template_sha256[:12]}, {report.get('characters')} characters) as transformers "
+        f"{report.get('transformers')} reads it in the {request.env.name} environment"
+    )
+    cases = len(template_checks.SINGLE_TURNS) * len(template_checks.FORMS)
+    rendered = (
+        f"each of {cases} single-turn renderings -- with and without a system message, the text "
+        "in one part and in two, enable_thinking undefined, true and false, with no tools and "
+        "with one -- is the same on both sides, "
+        + _RENDERED_HOW.format(env=request.env.name)
+        + "; verify's rendering check is what checks the runtime"
+    )
+    exported = (
+        f"Every recipe exports with {models.TEMPLATE_FLAG}={final}, and each bundle's template "
+        "is read back"
+    )
+    if choice.source == "canonical":
+        detail = (
+            f"{final}: LiteRT-LM's canonical template {canonical}, offered because {offered}, "
+            f"and checked against {checkpoints}: {rendered}. {exported}"
+        )
+    else:
+        detail = (
+            f"{final}: litetune's text-parts block, then {checkpoints}. Through the block, "
+            f"{rendered}. {exported}"
+        )
+        if withheld is not None:
+            detail += f". LiteRT-LM's canonical template {canonical} was not offered: {withheld}"
+        elif choice.canonical_differences:
+            detail += (
+                f". LiteRT-LM's canonical template {canonical} was not chosen: "
+                f"{len(choice.canonical_differences)} of {cases} single-turn renderings differ "
+                f"from the checkpoint's, the first {choice.canonical_differences[0]}"
+            )
+    return Check.passed(CHAT_TEMPLATE_CHECK, detail, observed=observed), composed
 
 
 # Runs inside envs.EXPORT, where `litert_lm_builder` and `tomllib` live. The
@@ -1857,6 +2157,174 @@ def _template_carried(
     return None
 
 
+_CONVERSATION_BODY = r'''
+"""Render a chat template over the conversations litetune checks, as LiteRT-LM renders.
+
+Reads JSON {template, conversations, contexts} from argv[1]. Writes JSON to
+argv[2]:
+  {"jinja2": <str>, "unvouched": [<str>, ...],
+   "renders": [[{"first", "previous", "next"}, ...one per context], ...one per conversation]}
+"first" is the conversation's first message with the generation prompt;
+"previous" its history, which ends in an assistant reply, with none; "next" the
+history and the user message that follows it, with one. Each context's keys
+reach every rendering. A rendering is {"text": ...} or {"error": ...}.
+"unvouched" is what in the template `runtime_render`, which follows, does not
+render as LiteRT-LM does.
+"""
+import json
+import sys
+from pathlib import Path
+
+
+def main(spec):
+    template = spec["template"]
+    renders = []
+    for case in spec["conversations"]:
+        history = case["history"]
+        renders.append(
+            [
+                {
+                    "first": runtime_render(template, case["first"], True, **context),
+                    "previous": runtime_render(template, history, False, **context),
+                    "next": runtime_render(
+                        template, history + [case["following"]], True, **context
+                    ),
+                }
+                for context in spec["contexts"]
+            ]
+        )
+    return {"jinja2": jinja2.__version__, "unvouched": unvouched(template), "renders": renders}
+'''
+
+_CONVERSATION_SCRIPT = _CONVERSATION_BODY + template_checks.RENDERER_SOURCE + _SCRIPT_ENTRY
+
+
+def check_conversation(
+    template: str, env: envs.StageEnv, timeout: int = CONVERSATION_TIMEOUT_S
+) -> ConversationCheck:
+    """Whether `template` holds a LiteRT-LM conversation, rendered in `env`.
+
+    `_CONVERSATION_SCRIPT` renders it over `template_checks.CONVERSATIONS` and
+    `template_checks.conversation_breaks` reads the result. A script that gives
+    no reading is `holds=None`, with the reason, never a verdict either way.
+    """
+    if template_checks.single_turn_protocol(template):
+        return ConversationCheck.not_applicable(template)
+    with tempfile.TemporaryDirectory(prefix="litetune-conversation-") as tmp:
+        work = Path(tmp)
+        script = work / CONVERSATION_SCRIPT_NAME
+        script.write_text(_CONVERSATION_SCRIPT, encoding="utf-8")
+        spec, result = work / "spec.json", work / "result.json"
+        spec.write_text(
+            json.dumps({"template": template, **template_checks.conversation_spec()}),
+            encoding="utf-8",
+        )
+        try:
+            proc = env.run(["python", str(script), str(spec), str(result)], timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return ConversationCheck.not_checked(
+                f"the script rendering it gave no result after {timeout}s (timeout)", template
+            )
+        if proc.returncode != 0 or not result.is_file():
+            stderr = proc.stderr or ""
+            last = next((ln for ln in reversed(stderr.splitlines()) if ln.strip()), "no stderr")
+            logger.warning("conversation script failed:\n%s", _tail(stderr, 2000))
+            reading = read_returncode(proc.returncode)
+            if proc.returncode == 0:
+                what = "exited 0 and wrote no result"
+            elif reading.conclusive:
+                what = reading.describe()
+            else:
+                what = f"was {reading.describe('the template')}"
+            return ConversationCheck.not_checked(
+                f"the script rendering it {what}: {last}", template
+            )
+        try:
+            report = json.loads(result.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            return ConversationCheck.not_checked(
+                f"the script rendering it wrote a result that is not JSON: {exc}", template
+            )
+    if not isinstance(report, dict):
+        return ConversationCheck.not_checked(f"the script rendering it wrote {report!r}", template)
+    try:
+        gaps = template_checks.unvouched(report.get("unvouched"))
+        breaks, refused = template_checks.conversation_breaks(report.get("renders"))
+    except ValueError as exc:
+        return ConversationCheck.not_checked(str(exc), template)
+    if gaps:
+        return ConversationCheck.not_checked(
+            f"its chat template uses {', '.join(gaps)}, which litetune's renderer does not render "
+            "as LiteRT-LM's MiniJinja does",
+            template,
+        )
+    renderer = (
+        f"Jinja2 {report.get('jinja2')} in the {env.name} environment configured as LiteRT-LM's "
+        "MiniJinja (`template_checks`), not LiteRT-LM itself"
+    )
+    return ConversationCheck.of(template, breaks, refused, renderer)
+
+
+def _no_template_to_render(reading: BundleTemplate | None) -> str | None:
+    """Why a bundle's read-back gives no template to render, or None when it gives one."""
+    if reading is None:
+        return "its chat template was not read back"
+    if reading.unread is not None:
+        return f"its chat template could not be read back ({reading.unread})"
+    if reading.empty:
+        return "the bundle is empty"
+    if reading.sections != 1:
+        return f"it has {reading.sections} LlmMetadata sections where one was expected"
+    if reading.text is None:
+        return "it carries no jinja_prompt_template, so there is no template of its own to render"
+    return None
+
+
+def _check_conversations(result: ExportResult, request: ExportRequest, events: EventStream) -> None:
+    """Fill in each produced bundle's `conversation`, and say which ones answer one message.
+
+    Once per distinct template: the recipes of one sweep normally carry the
+    same one. Never a failed or unchecked check -- a bundle that answers one
+    message is a working bundle, and `convert` exports it -- but a limitation
+    in the report, which `convert` prints, naming the recipes.
+    """
+    groups: dict[tuple[str, str], list[int]] = {}
+    for index, export in enumerate(result.exports):
+        if not export.ok or export.artifact is None:
+            continue
+        reading = export.bundle_template
+        why = _no_template_to_render(reading)
+        if why is None and reading is not None and reading.text is not None:
+            key = ("text", reading.text)
+        else:
+            key = ("unread", why or "its chat template was not read back")
+        groups.setdefault(key, []).append(index)
+    for (kind, value), indices in groups.items():
+        recipes = [result.exports[i].recipe for i in indices]
+        if kind == "unread":
+            check = ConversationCheck.not_checked(value)
+        else:
+            with guard("conversation") as sink:
+                check = check_conversation(
+                    value, request.env, timeout=min(CONVERSATION_TIMEOUT_S, request.timeout_s)
+                )
+            if sink:
+                logger.error("the conversation check raised: %s", sink[0].detail)
+                check = ConversationCheck.not_checked(sink[0].detail, value)
+        for index in indices:
+            result.exports[index] = replace(result.exports[index], conversation=check)
+        if check.holds is False:
+            text = template_checks.conversation_limitation(recipes, check)
+        elif not check.applicable:
+            text = template_checks.not_applicable_limitation(recipes, check.detail)
+        elif check.holds is None:
+            text = template_checks.unchecked_limitation(recipes, check.detail)
+        else:
+            continue
+        result.limitations.append(text)
+        events.note(text, model=request.model, recipes=recipes)
+
+
 REFUSED_SUFFIX = ".refused"
 
 
@@ -2041,11 +2509,13 @@ def export_recipe(
     # that is recorded. A repack that cannot be made is a limitation on a
     # passed check, not a failed one -- the CPU artifact is intact.
     remaining = max(1, int(request.timeout_s - seconds))
+    # The template is read back for every family: whether a bundle holds a
+    # conversation is a question about the template it carries, whoever chose it.
     repack = repack_bundle(
         artifact,
         request.env,
         timeout=min(REPACK_TIMEOUT_S, remaining),
-        read_template=composed is not None,
+        read_template=True,
     )
     gpu_activation, gpu_note = repack.declared, repack.note
     if gpu_activation is None:
@@ -2082,6 +2552,7 @@ def export_recipe(
         sha256=digest,
         gpu_activation=gpu_activation,
         gpu_activation_note=gpu_note,
+        bundle_template=repack.template,
         check=Check.passed(
             name,
             f"{artifact.name}: {artifact_bytes:,} bytes in {seconds:.1f}s exported on cpu; "
@@ -2551,6 +3022,8 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
                 verified=False,
             )
             events.metric(f"{recipe} bytes", export.artifact_bytes, recipe=recipe)
+
+    _check_conversations(result, request, events)
 
     # A recipe whose definition could not be read never ran, and `not_attempted`
     # is where a reader looks for that. Without this it held only the recipes an

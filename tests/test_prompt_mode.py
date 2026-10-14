@@ -12,11 +12,18 @@ litetune did not produce.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import FakeBackend, correct_texts, labelled_rows
+from conftest import (
+    FakeBackend,
+    correct_texts,
+    fifo_released_after,
+    labelled_rows,
+    record_opens,
+)
 
 from litetune import envs
 from litetune.bundle import Contract
@@ -639,6 +646,66 @@ def test_a_reference_directory_that_is_a_broken_link_raises(tmp_path):
 
     with pytest.raises(OSError):
         recorded_prompt_mode(str(reference))
+
+
+_RECORD = json.dumps({"prompt_mode": "prerendered"}).encode()
+
+
+@pytest.mark.posix
+def test_a_sidecar_that_is_a_fifo_is_refused_unopened(tmp_path, monkeypatch):
+    """Looked at, not opened: opening a FIFO waits for a writer, and opening a
+    device can act on it."""
+    from litetune import verify
+
+    reference = tmp_path / "tuned-model"
+    reference.mkdir()
+    sidecar = reference / "litetune.json"
+    os.mkfifo(sidecar)
+    opened = record_opens(monkeypatch)
+    with fifo_released_after(sidecar, 5, _RECORD) as released:
+        with pytest.raises(OSError, match="is not a regular file: it is a FIFO"):
+            verify.read_training_record(str(reference))
+    assert released == []
+    assert sidecar not in opened
+
+
+@pytest.mark.posix
+def test_a_sidecar_replaced_by_a_fifo_after_it_was_looked_at_is_refused(tmp_path, monkeypatch):
+    """The entry can change between the look and the open: what is opened is
+    looked at again, and it is opened without waiting for a writer."""
+    from litetune import verify
+
+    reference = tmp_path / "tuned-model"
+    reference.mkdir()
+    sidecar = reference / "litetune.json"
+    os.mkfifo(sidecar)
+    regular = tmp_path / "regular.json"
+    regular.write_bytes(_RECORD)
+    look = os.stat
+
+    def looked_at_before_the_swap(path, *args, **kwargs):
+        return look(regular if Path(path) == sidecar else path, *args, **kwargs)
+
+    monkeypatch.setattr(verify.os, "stat", looked_at_before_the_swap)
+    with fifo_released_after(sidecar, 5, _RECORD) as released:
+        with pytest.raises(OSError, match="is not a regular file: it is a FIFO"):
+            verify.read_training_record(str(reference))
+    assert released == []
+
+
+@pytest.mark.posix
+def test_a_sidecar_linked_to_a_device_is_refused_unopened(tmp_path, monkeypatch):
+    from litetune.verify import read_training_record
+
+    reference = tmp_path / "tuned-model"
+    reference.mkdir()
+    sidecar = reference / "litetune.json"
+    sidecar.symlink_to("/dev/null")
+    opened = record_opens(monkeypatch)
+
+    with pytest.raises(OSError, match="is not a regular file: it is a character device"):
+        read_training_record(str(reference))
+    assert not {sidecar, Path("/dev/null")} & set(opened)
 
 
 def test_a_healthy_symlinked_reference_with_no_sidecar_is_no_record(tmp_path):

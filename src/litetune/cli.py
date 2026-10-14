@@ -1361,11 +1361,17 @@ def summarise_convert(result: ExportResult) -> list[str]:
         lines.append(
             f"  added {flag} (required by {plan.rules.family if plan.rules else 'litetune'})"
         )
-    if result.chat_template is not None:
+    template = result.chat_template
+    if template is not None and template.source == "canonical":
         # The file the marker above stood for, which no flag in the plan names.
         lines.append(
-            f"  chat template: {result.chat_template.path}, the checkpoint's own (sha256 "
-            f"{result.chat_template.template_sha256[:12]}) behind litetune's text-parts block"
+            f"  chat template: {template.path}, LiteRT-LM's {template.canonical}, which renders "
+            f"single turns as the checkpoint's own (sha256 {template.template_sha256[:12]}) does"
+        )
+    elif template is not None:
+        lines.append(
+            f"  chat template: {template.path}, the checkpoint's own (sha256 "
+            f"{template.template_sha256[:12]}) behind litetune's text-parts block"
         )
     for export in result.exports:
         if export.ok and export.artifact is not None:

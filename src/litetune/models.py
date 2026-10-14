@@ -37,6 +37,7 @@ family, different answer. It is decided by `tune`, carried by
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import re
@@ -356,6 +357,12 @@ class ModelRules:
     # read for one of `_REPACK_MARKERS` after the match.
     repack_guard: bool = False
 
+    # A chat template LiteRT-LM publishes for this family, packaged under
+    # `templates/` and pinned in `CANONICAL_TEMPLATES`, which a rule whose
+    # template override is `CANONICAL_OR_COMPOSED_TEMPLATE` packs in place of
+    # the composed one when it renders single turns as the checkpoint's own.
+    canonical_template: str | None = None
+
     def matches(self, text: str) -> bool:
         return any(re.search(pattern, text) for pattern in self.patterns)
 
@@ -386,6 +393,7 @@ class ModelRules:
             "renders_declarations": self.renders_declarations,
             "wire_format": self.wire_format,
             "tool_path_reason": self.tool_path_reason,
+            "canonical_template": self.canonical_template,
         }
 
 
@@ -640,6 +648,83 @@ template -- and hands the exporter that file in place of this value. A plan that
 carries it and cannot be composed exports nothing.
 """
 
+CANONICAL_OR_COMPOSED_TEMPLATE = (
+    "<LiteRT-LM's canonical chat template if it renders single turns as the checkpoint's own "
+    "does, else the checkpoint's own behind litetune's text-parts block>"
+)
+"""Like `COMPOSED_TEMPLATE`, for a rule that names a `canonical_template`.
+
+`export.compose_chat_template` reads the checkpoint's template as it does for
+`COMPOSED_TEMPLATE` and writes the rule's canonical template in place of this
+value when that renders every single-turn case in `template_checks` as the
+checkpoint's own does; otherwise the composed one, under the same refusals.
+"""
+
+WRITTEN_AT_EXPORT = (COMPOSED_TEMPLATE, CANONICAL_OR_COMPOSED_TEMPLATE)
+"""The template override values `export.run_export` replaces with a file it writes."""
+
+QWEN3_CANONICAL_TEMPLATE = "litert-lm-v0.18.0-qwen3.jinja"
+"""LiteRT-LM v0.18.0's `models/qwen3/chat_template.jinja`, as packaged here."""
+
+# sha256 of each packaged canonical template's text after its provenance
+# comment: the upstream file byte for byte, which the comment names by path and
+# git blob. `canonical_template_text` refuses a packaged file that is not.
+CANONICAL_TEMPLATES = {
+    QWEN3_CANONICAL_TEMPLATE: "4315c96833e8b2a21b878d70e8d2f6415416d5e23ed8ee0ae0a111a540d844f7",
+}
+
+# Where a packaged canonical template's provenance comment ends; the upstream
+# text follows it.
+CANONICAL_HEADER_END = "-#}\n"
+
+# The chat templates each packaged canonical template is LiteRT-LM's version
+# of, by the sha256 of the template's text as a checkpoint ships it -- the
+# `chat_template` of its tokenizer_config.json, which is what transformers'
+# AutoTokenizer reads and `export._COMPOSE_SCRIPT` hashes -- and where those
+# bytes were read. A checkpoint that ships one of these unchanged is in that
+# model family's own chat format, and LiteRT-LM v0.18.0 publishes
+# `models/qwen3/chat_template.jinja` as its template for Qwen 3's format
+# (`models/qwen3/README.md`: "Canonical LiteRT-LM prompt templates and
+# metadata configuration for the Qwen 3 model family"; the conversion it
+# describes passes the metadata carrying it). `export._canonical_basis` offers
+# the canonical template on that ground to a checkpoint with no training
+# record, and it is chosen only if the single-turn renderings match. That is a
+# compatibility heuristic, not training provenance: these bytes say which chat
+# format a checkpoint's tokenizer is configured for, not what its weights were
+# trained on.
+#
+# Read from the Hub on 2026-10-14: Qwen/Qwen3-1.7B (70d244c), -4B (1cfa9a7),
+# -8B (b968826), -14B (40c0698), -32B (9216db5) and -30B-A3B (ad44e77) ship
+# these same bytes, so the one digest is theirs too -- though the qwen-3 rule
+# claims only names containing Qwen3-0.6B, so none of them reaches this.
+# Qwen/Qwen3-0.6B-Base at da87bfb ships other bytes (sha256 87a2728c...), and
+# is left out: nothing here establishes which format a base model is in.
+CANONICAL_UPSTREAM: dict[str, dict[str, str]] = {
+    QWEN3_CANONICAL_TEMPLATE: {
+        "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8": (
+            "Qwen/Qwen3-0.6B's own at c1899de289a04d12100db370d81485cdf75e47ca "
+            "(tokenizer_config.json; tests/fixtures/qwen3-0.6b-c1899de.chat_template.jinja)"
+        ),
+    },
+}
+
+
+def canonical_template_text(name: str) -> str:
+    """The packaged canonical template `name`, provenance comment included.
+
+    Raises ValueError when the text after the comment is not the upstream file
+    its sha256 is pinned to: a bundle must carry what the comment says it does.
+    """
+    text = Path(packaged_template(name)).read_bytes().decode("utf-8")
+    header, found, body = text.partition(CANONICAL_HEADER_END)
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if not found or not header.startswith("{#-") or digest != CANONICAL_TEMPLATES.get(name):
+        raise ValueError(
+            f"the packaged {name} is not the upstream template its sha256 is pinned to "
+            f"({CANONICAL_TEMPLATES.get(name)}); after its comment it hashes to {digest}"
+        )
+    return text
+
 
 # Sourced from the runtime and measured on it. From LiteRT-LM v0.18.0
 # `ModelDataProcessor::MessageToTemplateInput` (`model_data_processor.h`) hands
@@ -663,6 +748,25 @@ carries it and cannot be composed exports nothing.
 # whitespace, one with a carriage return (the exporter reads the override file
 # in text mode, `litert_lm_builder.py:430`, so it could not arrive unchanged),
 # and one the block is not for.
+#
+# The cases and the renderer are `template_checks`': the checkpoint's side as
+# training rendered it, the bundle's as the export environment's Jinja2
+# configured as LiteRT-LM v0.18.0 configures MiniJinja.
+_SINGLE_TURN_SAID = (
+    "one that, given single-turn prompts -- with and without a system message, the text in one "
+    "part and in two, enable_thinking undefined, true and false, with no tools and with one -- "
+    "as parts behind the block, does not print what the checkpoint's template prints given them "
+    "as strings through transformers, the way training rendered them"
+)
+_RENDERERS_SAID = (
+    "The bundle's side is rendered by the export environment's Jinja2 configured as LiteRT-LM's "
+    "MiniJinja, which is not the runtime: a template using what that renderer does not vouch "
+    "for is not checked, and verify's rendering check is what checks the runtime, on single "
+    "turns. Whether a bundle holds a conversation past its first message, in the contexts "
+    "checked, is checked after export for every family, and a bundle that does not says so in "
+    "the report"
+)
+
 _TEXT_PARTS_REASON = (
     "LiteRT-LM from 0.18.0 hands a bundle's template each message's content as a list of "
     "parts, and the chat templates of Qwen3 0.6B and Qwen2.5 0.5B Instruct read it as a "
@@ -676,11 +780,48 @@ _TEXT_PARTS_REASON = (
     "reads each bundle's template back -- so a checkpoint this rule claims keeps its own "
     "template, or no bundle is handed over: one that does not carry it fails its recipe, and "
     "litetune tries to rename it with a '.refused' suffix, naming the path it ends up at. It "
-    "refuses a template the block is not for: one that, "
-    "rendered by transformers' Jinja2 rather than the runtime, does not print a one-message "
-    "conversation given as parts behind the block as it prints the same message as a string. "
-    "verify's rendering check is what checks the runtime, and it compares the single turn it "
-    "renders, not multi-turn, reasoning or tool handling"
+    f"refuses a template the block is not for: {_SINGLE_TURN_SAID}. {_RENDERERS_SAID}"
+)
+
+# Sourced. Qwen3 0.6B's template (`Qwen/Qwen3-0.6B` at c1899de, the fixture
+# `tests/fixtures/qwen3-0.6b-c1899de.chat_template.jinja`) renders an assistant
+# turn after `ns.last_query_index` -- the last user message -- with
+# `<think>\n`, its reasoning and `\n</think>\n\n`, and an earlier one without:
+# the reply a conversation has just received is rendered one way while it is
+# last and the other once the next user message arrives, and
+# `Conversation::GetSingleTurnTextFromFullHistory` (`conversation.cc`, LiteRT-LM
+# v0.18.0) refuses the second rendering because it does not begin with the
+# first (google-ai-edge/LiteRT-LM#3443). LiteRT-LM v0.18.0's own Qwen 3
+# template (`models/qwen3/chat_template.jinja`) prints a reply's text as it is
+# wherever the reply falls, and reads the list of parts itself. Which of the
+# two a checkpoint renders, and how each renders single turns, is
+# `template_checks`' to show, and tests/test_template_checks.py renders both.
+_QWEN3_TEMPLATE_REASON = (
+    "LiteRT-LM from 0.18.0 hands a bundle's template each message's content as a list of "
+    "parts, which Qwen3 0.6B's chat template reads as a string (measured 2026-10-08 on "
+    "litert-lm 0.18.0: a bundle carrying it rendered '<|im_start|>user\\n<|im_end|>'), and "
+    "LiteRT-LM renders a conversation's whole history again on every message and refuses one "
+    "that does not begin with the previous rendering, which that template's think block breaks: "
+    "it renders the latest reply with `<think>...</think>` and an earlier one without, so the "
+    "second message of every conversation fails with INTERNAL (google-ai-edge/LiteRT-LM#3443). "
+    "LiteRT-LM v0.18.0 publishes its own Qwen 3 template (models/qwen3/chat_template.jinja), "
+    f"which litetune packages as {QWEN3_CANONICAL_TEMPLATE} with its sha256 pinned. At export "
+    "litetune reads the checkpoint's own chat template as the exporter reads it, through "
+    "transformers' AutoTokenizer on the model being converted, and hands the exporter "
+    "LiteRT-LM's template only when LiteRT-LM's renders single-turn prompts (with and without "
+    "a system message, the text in one part and in two, enable_thinking undefined, true and "
+    "false, with no tools and with one) exactly as the checkpoint's own renders them, and either "
+    "the litetune.json `tune` wrote beside the checkpoint records that it was trained "
+    "runtime_rendered without tool declarations -- one user message rendered through that "
+    "template -- or there is no litetune.json and the checkpoint's template is Qwen/Qwen3-0.6B's "
+    "own, byte for byte: Qwen 3's own chat format, which LiteRT-LM publishes that template for. "
+    "Otherwise -- a prerendered run, a run with declarations, which the record keeps only as a "
+    "digest, a record it cannot read, no record and any other template, or a template that "
+    "renders otherwise -- it hands the exporter the checkpoint's "
+    "template behind a block that turns a list of text parts back into the string, and refuses "
+    "a template the block is not for: "
+    f"{_SINGLE_TURN_SAID}. It reads each bundle's template back, and one that does not carry "
+    "the file handed over fails its recipe. " + _RENDERERS_SAID
 )
 
 
@@ -846,7 +987,8 @@ RULES: tuple[ModelRules, ...] = (
         # is typed correctly with none. Measured 2026-09-14 on Qwen/Qwen3-0.6B:
         # both int8 recipes exported with no flag from litetune, and the
         # conversion cost is in MEASUREMENTS.md. The template override below is
-        # LiteRT-LM 0.18.0's, not the exporter's: see `_TEXT_PARTS_REASON`. What
+        # LiteRT-LM 0.18.0's, not the exporter's: see `_QWEN3_TEMPLATE_REASON`,
+        # and `_TEXT_PARTS_REASON` for the composed fallback. What
         # the artifact's own `llm_model_type` reads is not recorded here: that
         # observation appears in no manifest or log of any run, and was struck
         # from the documents for the same reason.
@@ -867,9 +1009,10 @@ RULES: tuple[ModelRules, ...] = (
         # no longer hands it another's template, as litetune 0.4.0 did when it
         # packed Qwen/Qwen3-0.6B's at c1899de for every checkpoint it claimed,
         # and so narrowed this pattern to the checkpoints that one template had
-        # been checked against: `COMPOSED_TEMPLATE` is composed from the
-        # converted checkpoint's own template, and `export.compose_chat_template`
-        # refuses one the block is not for.
+        # been checked against: `CANONICAL_OR_COMPOSED_TEMPLATE` is chosen
+        # against the converted checkpoint's own template, LiteRT-LM's only when
+        # it renders single turns as that one does, and
+        # `export.compose_chat_template` refuses one the block is not for.
         #
         # Not a repack the exporter cannot load (`repack_guard`). For a Hub id
         # that is read from the name: one that continues past the size into one
@@ -895,10 +1038,11 @@ RULES: tuple[ModelRules, ...] = (
         required_flags=(
             RequiredFlag(
                 name=TEMPLATE_FLAG,
-                value=COMPOSED_TEMPLATE,
-                reason=_TEXT_PARTS_REASON,
+                value=CANONICAL_OR_COMPOSED_TEMPLATE,
+                reason=_QWEN3_TEMPLATE_REASON,
             ),
         ),
+        canonical_template=QWEN3_CANONICAL_TEMPLATE,
     ),
     ModelRules(
         family="qwen-2.5",
@@ -959,6 +1103,18 @@ RULES: tuple[ModelRules, ...] = (
         # (`.../models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/<sha>`, which
         # `tune` records verbatim when it trained from one) normalises to the
         # name followed by `-snapshots-<sha>`, which the tail alone refuses.
+        #
+        # No `canonical_template`, unlike Qwen 3, for two reasons rendered in
+        # tests/test_template_checks.py on Qwen2.5-0.5B-Instruct's template at
+        # 7ae5576. Composed behind the block it already holds a conversation:
+        # every case in `template_checks.CONVERSATIONS`, in every context in
+        # `template_checks.CONTEXTS`, renders as a prefix of the next. And
+        # LiteRT-LM v0.18.0's `models/qwen2_5/chat_template.jinja` does not
+        # render single turns as it does: with no system message the
+        # checkpoint's template prints its default one ("You are Qwen, created
+        # by Alibaba Cloud. You are a helpful assistant.") and LiteRT-LM's
+        # prints none, so 48 of the 96 single-turn renderings differ: exactly
+        # those without a system message, in every context.
         patterns=(r"qwen-?2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{40})?(?:$|-qwen2\b)",),
         repack_guard=True,
         required_flags=(
@@ -1509,7 +1665,7 @@ def plan_export(
                 f"{model}: litetune refuses {supplied.token!r}: this family needs "
                 f"{required.name}. {required.reason}"
             )
-        if supplied is not None and required.value == COMPOSED_TEMPLATE:
+        if supplied is not None and required.value in WRITTEN_AT_EXPORT:
             limitations.append(_CALLER_TEMPLATE.format(flag=supplied.shown))
         if supplied is not None:
             wanted = required.rendered
@@ -1547,7 +1703,7 @@ def plan_export(
             )
             continue
 
-        composes = composes or required.value == COMPOSED_TEMPLATE
+        composes = composes or required.value in WRITTEN_AT_EXPORT
         table.update(parse_exporter_flags(model, [rendered]))
         added.append(rendered)
         notes.append(f"added {rendered}: {required.reason}")
@@ -1562,7 +1718,7 @@ def plan_export(
     # On a rule that composes, whether it did or the caller brought a template:
     # either way the template reaches the bundle only through the metadata the
     # exporter builds, and an override of its own takes that metadata's place.
-    if any(required.value == COMPOSED_TEMPLATE for required in rules.required_flags):
+    if any(required.value in WRITTEN_AT_EXPORT for required in rules.required_flags):
         override = table.get(flag_key(METADATA_OVERRIDE_FLAG))
         if override is not None and override.value:
             reason = _METADATA_OVERRIDE_REASON if composes else _METADATA_OVERRIDE_OWN_REASON
@@ -1632,9 +1788,9 @@ _CALLER_TEMPLATE = (
 # written into it (`:314-318`).
 _METADATA_OVERRIDE_REASON = (
     "The exporter puts a metadata override in the bundle in place of the LlmMetadata it builds, "
-    "and the chat template litetune composes reaches the bundle only through the metadata it "
-    "builds: the bundle would carry the override's template, or none, without the text-parts "
-    "block. Leave the override out; a template of your own goes in "
+    "and the chat template litetune writes at export reaches the bundle only through the "
+    "metadata it builds: the bundle would carry the override's template, or none, and not the "
+    "one litetune checked. Leave the override out; a template of your own goes in "
     f"--flag={TEMPLATE_FLAG}=<file>, and on LiteRT-LM 0.18.0 it has to read a list of parts itself"
 )
 

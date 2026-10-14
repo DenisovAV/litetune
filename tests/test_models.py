@@ -23,6 +23,7 @@ from conftest import (
     mark_provisioned,
     run_compose_script,
 )
+from minijinja_runtime import minijinja_render
 
 from litetune import envs, models
 from litetune.checks import Outcome
@@ -353,6 +354,11 @@ def test_a_family_with_no_rules_has_its_flags_left_alone(tmp_path):
 
 
 QWEN_RULES = [("Qwen/Qwen3-0.6B", "qwen-3"), ("Qwen/Qwen2.5-0.5B-Instruct", "qwen-2.5")]
+# The template override each Qwen rule adds: Qwen 3 may get LiteRT-LM's own.
+QWEN_MARKERS = {
+    "qwen-3": models.CANONICAL_OR_COMPOSED_TEMPLATE,
+    "qwen-2.5": models.COMPOSED_TEMPLATE,
+}
 
 
 @pytest.mark.parametrize(("model", "family"), QWEN_RULES)
@@ -369,7 +375,7 @@ def test_a_qwen_export_asks_for_its_own_template_composed_and_no_type_override(m
     assert plan.rules.family == family
     assert plan.flags[0] == "--some_flag=1"
     assert len(plan.flags) == 2
-    assert plan.flags[1] == f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}"
+    assert plan.flags[1] == f"--jinja_chat_template_override={QWEN_MARKERS[family]}"
     assert plan.added == (plan.flags[1],)
     assert not any("--litert_lm_model_type_override" in f for f in plan.flags)
     assert plan.usable
@@ -378,11 +384,14 @@ def test_a_qwen_export_asks_for_its_own_template_composed_and_no_type_override(m
 
 
 def test_no_checkpoints_template_ships_in_the_package():
-    """The template is the converted checkpoint's own, read at export; the
-    package carries only litetune's block and FunctionGemma's template."""
+    """A checkpoint's template is read at export, never packaged: the package
+    carries litetune's block, FunctionGemma's template and LiteRT-LM's Qwen 3
+    template, which the qwen-3 rule hands over only when it renders single
+    turns as the checkpoint's own does."""
     templates = Path(models.packaged_template(models.TEXT_PARTS_BLOCK)).parent
     assert sorted(p.name for p in templates.iterdir()) == [
         "functiongemma.jinja",
+        models.QWEN3_CANONICAL_TEMPLATE,
         models.TEXT_PARTS_BLOCK,
     ]
 
@@ -406,72 +415,8 @@ def test_the_text_parts_block_can_print_nothing():
     assert "{{" not in block
 
 
-# What LiteRT-LM v0.18.0 does to a template before rendering it, in order:
-# `EditTemplateForMinijinja` (`runtime/components/prompt_template.cc`) rewrites
-# Python method calls MiniJinja lacks into filters and tests, with RE2's
-# non-greedy `.*?`, which Python's `re` reads the same way.
-_MINIJINJA_EDITS = (
-    (r"\.startswith\((.*?)\)", r" is startingwith \1"),
-    (r"\.endswith\((.*?)\)", r" is endingwith \1"),
-    (r"\.replace\((.*?),(.*?)\)", r" | replace(\1,\2)"),
-    (r"\.split\((.*?)\)\[0\]", r" | split(\1) | first"),
-    (r"\.split\((.*?)\)\[-1\]", r" | split(\1) | last"),
-    (r"\.split\((.*?)\)", r" | split(\1)"),
-    (r"\.join\((.*?)\)", r" | join(\1)"),
-    (r"\.lstrip\(\)", " | lstrip"),
-    (r"\.lstrip\((.*?)\)", r" | lstrip(\1)"),
-    (r"\.rstrip\(\)", " | rstrip"),
-    (r"\.rstrip\((.*?)\)", r" | rstrip(\1)"),
-    (r"\.strip\(\)", " | trim"),
-    (r"\.strip\((.*?)\)", r" | trim(\1)"),
-    (r"\.items\(\)", " | items"),
-    (r"{% generation %}", ""),
-    (r"{% endgeneration %}", ""),
-)
-
-
-def _runtime_render(source: str, messages: list[dict], **context: object) -> str:
-    """Render as LiteRT-LM v0.18.0 does: MiniJinja 2.14.0 (`Cargo.toml`, the
-    version pinned in this project's dev extras), with the settings, functions
-    and filters `create_env` gives it in `runtime/components/rust/minijinja_template.rs`.
-
-    Not its `none` test, which the runtime makes true only for an undefined
-    value: the Python binding hands a test `None` for both undefined and null,
-    so the difference cannot be reproduced here. The block and the checkpoint
-    templates rendered below use neither `none` nor `strftime_now`, which a test
-    below holds."""
-    import re
-    import time
-
-    import minijinja
-
-    for pattern, replacement in _MINIJINJA_EDITS:
-        source = re.sub(pattern, replacement, source)
-
-    def raise_exception(message: str) -> str:
-        raise RuntimeError(message)
-
-    # `pycompat=False`: the Python binding answers `.startswith()` and friends
-    # by default, the runtime's `Environment::new()` does not -- which is why
-    # it rewrites them first, and why the rewrite above is under test here.
-    env = minijinja.Environment(
-        keep_trailing_newline=True, trim_blocks=True, lstrip_blocks=True, pycompat=False
-    )
-    env.add_function("raise_exception", raise_exception)
-    env.add_function("strftime_now", lambda fmt: time.strftime(fmt))
-    # serde_json with a formatter that spaces after `,` and `:`, writing UTF-8.
-    env.add_filter(
-        "tojson", lambda value: json.dumps(value, separators=(", ", ": "), ensure_ascii=False)
-    )
-    env.add_filter("lstrip", lambda s, chars=None: s.lstrip(chars))
-    env.add_filter("rstrip", lambda s, chars=None: s.rstrip(chars))
-    return env.render_str(
-        source,
-        messages=messages,
-        add_generation_prompt=context.get("add_generation_prompt", True),
-        bos_token="",
-        eos_token="",
-    )
+# MiniJinja as LiteRT-LM v0.18.0 renders with it (`minijinja_runtime.py`).
+_runtime_render = minijinja_render
 
 
 def _as_parts(messages: list[dict]) -> list[dict]:
@@ -659,11 +604,26 @@ def test_the_reason_says_the_checkpoints_own_template_is_kept(model, family):
     assert plan.rules is not None
     (flag,) = plan.rules.required_flags
     assert "reads the checkpoint's own chat template as the exporter reads it" in flag.reason
-    assert "keeps its own template, or no bundle is handed over" in flag.reason
     assert "reads each bundle's template back" in flag.reason
-    assert "transformers' Jinja2 rather than the runtime" in flag.reason
-    assert "not multi-turn, reasoning or tool handling" in flag.reason
+    assert "with and without a system message, the text in one part and in two" in flag.reason
+    assert "configured as LiteRT-LM's MiniJinja, which is not the runtime" in flag.reason
+    assert "verify's rendering check is what checks the runtime, on single turns" in flag.reason
+    assert "past its first message, in the contexts checked, is checked after export" in flag.reason
+    assert "enable_thinking undefined, true and false, with no tools and with one" in flag.reason
+    assert "a template using what that renderer does not vouch for is not checked" in flag.reason
     assert "revision" not in flag.reason
+    if family == "qwen-2.5":
+        assert "keeps its own template, or no bundle is handed over" in flag.reason
+    else:
+        assert "LiteRT-LM v0.18.0 publishes its own Qwen 3 template" in flag.reason
+        assert "trained runtime_rendered without tool declarations" in flag.reason
+        assert "no litetune.json and the checkpoint's template is Qwen/Qwen3-0.6B's own" in (
+            flag.reason
+        )
+        assert "a prerendered run, a run with declarations" in flag.reason
+        assert "no record and any other template" in flag.reason
+        assert models.QWEN3_CANONICAL_TEMPLATE in flag.reason
+        assert "google-ai-edge/LiteRT-LM#3443" in flag.reason
 
 
 def test_an_unknown_family_is_told_about_the_list_of_parts():
@@ -712,7 +672,8 @@ def test_the_qwen3_rule_claims_a_name_that_still_contains_its_size():
     ):
         assert identify(claimed).family == "qwen-3", claimed
         plan = plan_export(claimed, (), ("dynamic_wi8_afp32",))
-        assert f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}" in plan.flags
+        marker = models.CANONICAL_OR_COMPOSED_TEMPLATE
+        assert f"--jinja_chat_template_override={marker}" in plan.flags
     for unclaimed in (*_QWEN3_REPACKS, "acme/banking77-assistant", "Qwen/Qwen3-1.7B"):
         assert identify(unclaimed) is None, unclaimed
 
@@ -1047,7 +1008,9 @@ class FakeToolchain:
             return subprocess.CompletedProcess(
                 args, 1, "", "ModuleNotFoundError: No module named 'litert_lm_builder'"
             )
-        if args[0] == "python" and str(args[1]).endswith("compose_template.py"):
+        if args[0] == "python" and str(args[1]).endswith(
+            ("compose_template.py", "conversation_template.py")
+        ):
             return run_compose_script(args, timeout, self.chat_template)[0]
         flags = dict(a.removeprefix("--").split("=", 1) for a in args[2:] if "=" in a)
         out_dir = Path(flags["output_dir"])
@@ -1116,7 +1079,7 @@ def test_convert_composes_the_template_a_qwen_rule_asks_for(toolchain, tmp_path)
     assert composed.read_bytes() == block + str(toolchain.chat_template).encode("utf-8")
     (argv,) = toolchain.exports
     assert f"--jinja_chat_template_override={composed}" in argv
-    assert not any(models.COMPOSED_TEMPLATE in a for a in argv)
+    assert not any(m in a for m in models.WRITTEN_AT_EXPORT for a in argv)
 
 
 # -- how the exporter reads a flag's name, and what a value-bearing flag needs --
@@ -1230,7 +1193,7 @@ def test_a_repeated_flag_is_read_as_its_last_occurrence(flags, composes):
 def test_a_longer_flag_name_does_not_satisfy_the_rule():
     """`--jinja_chat_template_override_x` is another keyword to Fire."""
     plan = plan_export("Qwen/Qwen3-0.6B", ("--jinja_chat_template_override_x=1",), ())
-    assert f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}" in plan.added
+    assert f"--jinja_chat_template_override={models.CANONICAL_OR_COMPOSED_TEMPLATE}" in plan.added
 
 
 @pytest.mark.parametrize(
@@ -1354,14 +1317,14 @@ def test_a_no_prefix_with_a_value_is_a_keyword_of_its_own():
     """Only a valueless `--no<name>` is read as a negation (`fire/core.py:902-912`)."""
     plan = plan_export(QWEN3, ("--nojinja_chat_template_override=/x.jinja",), ())
     assert plan.setting("--nojinja_chat_template_override").value == "/x.jinja"
-    assert f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}" in plan.added
+    assert f"--jinja_chat_template_override={models.CANONICAL_OR_COMPOSED_TEMPLATE}" in plan.added
 
 
 def test_a_hyphenated_no_prefix_negates_the_keyword_fire_makes_of_it():
     """Fire reads `-` as `_` before it looks for `no`, so `--no-x` sets `_x`."""
     plan = plan_export(QWEN3, ("--no-jinja-chat-template-override",), ())
     assert plan.setting("_jinja_chat_template_override").value is False
-    assert f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}" in plan.added
+    assert f"--jinja_chat_template_override={models.CANONICAL_OR_COMPOSED_TEMPLATE}" in plan.added
 
 
 def test_a_value_is_reported_as_the_exporter_will_get_it():
@@ -1424,7 +1387,7 @@ def test_a_metadata_override_the_exporter_reads_as_none_is_not_one():
     """The last occurrence is empty, which the exporter reads as no override."""
     flags = ("--litert_lm_llm_metadata_override=meta.pbtext", "--litert_lm_llm_metadata_override=")
     plan = plan_export("Qwen/Qwen3-0.6B", flags, ())
-    assert f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}" in plan.added
+    assert f"--jinja_chat_template_override={models.CANONICAL_OR_COMPOSED_TEMPLATE}" in plan.added
 
 
 def test_a_metadata_override_on_a_rule_that_does_not_compose_is_left_alone():

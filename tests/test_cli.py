@@ -538,7 +538,9 @@ class FakeToolchain:
         self.calls.append(list(args))
         if args[0] == "pip":
             return subprocess.CompletedProcess(args, 0, self.pip_stdout, "")
-        if args[0] == "python" and str(args[1]).endswith("compose_template.py"):
+        if args[0] == "python" and str(args[1]).endswith(
+            ("compose_template.py", "conversation_template.py")
+        ):
             return run_compose_script(args, timeout, self.chat_template)[0]
         if args[:2] == ["python", "-c"]:
             # The device probe, answered the way every other probe fake in the

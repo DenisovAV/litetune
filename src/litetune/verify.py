@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -754,17 +755,20 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
     """The mode `tune` recorded beside a local reference checkpoint, if it recorded one.
 
     `None` when the checkpoint records no mode, and under every condition
-    `_recorded` returns `None` for. Those conditions are written down there
-    rather than here, because they are the same for every question asked of the
-    sidecar and two copies of them would drift. Falling back to the contract or
-    to the prompts when a record exists would silently replace a mode the
-    checkpoint wrote down, which is why an unreadable record raises instead of
-    reading as absent.
+    `read_training_record` returns `None` for. Those conditions are written
+    down there rather than here, because they are the same for every question
+    asked of the sidecar and two copies of them would drift. Falling back to
+    the contract or to the prompts when a record exists would silently replace
+    a mode the checkpoint wrote down, which is why an unreadable record raises
+    instead of reading as absent.
     """
-    read = _recorded(reference)
-    if read is None:
-        return None
-    data, sidecar = read
+    read = read_training_record(reference)
+    return None if read is None else prompt_mode_in(read)
+
+
+def prompt_mode_in(record: tuple[dict, Path]) -> PromptMode | None:
+    """The mode in a record `read_training_record` returned, `None` if it names none."""
+    data, sidecar = record
     raw = data.get("prompt_mode")
     return None if raw is None else parse_prompt_mode(raw, str(sidecar))
 
@@ -777,29 +781,38 @@ def recorded_declarations_sha256(reference: str) -> str | None:
     that trained plain text. Comparing against `None` is not a disagreement:
     it is the absence of anything to disagree with.
     """
-    read = _recorded(reference)
-    if read is None:
-        return None
-    raw = read[0].get("declarations_sha256")
+    read = read_training_record(reference)
+    return None if read is None else declarations_sha256_in(read)
+
+
+def declarations_sha256_in(record: tuple[dict, Path]) -> str | None:
+    """The declarations digest in a record `read_training_record` returned, if any."""
+    data, sidecar = record
+    raw = data.get("declarations_sha256")
     if raw is None:
         return None
     if not isinstance(raw, str):
-        raise ValueError(f"{read[1]} records declarations_sha256 {raw!r}, which is not a string")
+        raise ValueError(f"{sidecar} records declarations_sha256 {raw!r}, which is not a string")
     return raw
 
 
-def _recorded(reference: str) -> tuple[dict, Path] | None:
+def read_training_record(reference: str) -> tuple[dict, Path] | None:
     """The checkpoint's own record and where it was read from, or `None` for no record.
 
-    One reader for every question asked of `litetune.json`. The distinction
-    below is subtle enough that a second copy would drift from it, and the two
-    copies would then disagree about whether a checkpoint said anything.
+    One reader for every question `verify` and `export` ask of
+    `litetune.json` -- `export` offers a canonical chat template on a record's
+    absence, so it must not mistake an unreadable record for none. The
+    distinction below is subtle enough that a second copy would drift from it,
+    and the two copies would then disagree about whether a checkpoint said
+    anything.
 
     `None` for a Hugging Face id, for a directory with no `litetune.json`, and
     for a reference that is not a directory at all -- including a directory
     reached through a symlink that resolves and simply has no sidecar. A
-    sidecar that exists and cannot be read raises, and so does a reference that
-    is a link going nowhere.
+    sidecar that exists and cannot be read raises -- one that is not a regular
+    file, a FIFO or a device, without being opened, as far as
+    `_read_regular_file` says it can -- and so does a reference that is a link
+    going nowhere.
 
     A link going nowhere further up the path is not detected. Reading through
     it raises the same `FileNotFoundError` as an absent directory, and the
@@ -808,7 +821,7 @@ def _recorded(reference: str) -> tuple[dict, Path] | None:
     """
     sidecar = Path(reference) / models.PROVENANCE_NAME
     try:
-        text = sidecar.read_text(encoding="utf-8")
+        text = _read_regular_file(sidecar).decode("utf-8")
     except FileNotFoundError:
         # A link going nowhere raises this too, and it is not the same
         # statement: the link is an entry, so something recorded a checkpoint's
@@ -835,6 +848,41 @@ def _recorded(reference: str) -> tuple[dict, Path] | None:
     if not isinstance(data, dict):
         raise ValueError(f"{sidecar} does not contain a JSON object")
     return data, sidecar
+
+
+_NOT_REGULAR = (
+    (stat.S_ISDIR, "a directory"),
+    (stat.S_ISFIFO, "a FIFO"),
+    (stat.S_ISCHR, "a character device"),
+    (stat.S_ISBLK, "a block device"),
+    (stat.S_ISSOCK, "a socket"),
+)
+
+
+def _refuse_unless_regular(path: Path, mode: int) -> None:
+    if stat.S_ISREG(mode):
+        return
+    kind = next((name for test, name in _NOT_REGULAR if test(mode)), "not a file")
+    raise OSError(f"{path} is not a regular file: it is {kind}")
+
+
+def _read_regular_file(path: Path) -> bytes:
+    """The bytes of `path`, a regular file once its links are followed, or `OSError`.
+
+    Looked at before it is opened, because opening a FIFO waits for a writer
+    and reading a device need not end; and looked at again through the
+    descriptor once open. On POSIX the open does not wait (`O_NONBLOCK`), so the
+    second look closes the gap in which the entry could be replaced after the
+    first. Windows has neither `O_NONBLOCK` nor `os.mkfifo` (both Unix-only in
+    Python's `os` documentation), so there the guard is the first look alone:
+    an entry replaced between the look and the open is not caught before the
+    open.
+    """
+    _refuse_unless_regular(path, os.stat(path).st_mode)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags), "rb") as handle:
+        _refuse_unless_regular(path, os.fstat(handle.fileno()).st_mode)
+        return handle.read()
 
 
 def _resolve_mode(request: VerifyRequest, split: Split) -> PromptModeDecision:

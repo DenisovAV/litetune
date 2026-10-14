@@ -20,13 +20,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import buildable_here, machine, mark_provisioned, run_compose_script
+from conftest import (
+    buildable_here,
+    fifo_released_after,
+    machine,
+    mark_provisioned,
+    record_opens,
+    run_compose_script,
+)
 
-from litetune import envs, models
+from litetune import envs, models, template_checks
 from litetune.checks import Check, Outcome
+from litetune.cli import summarise_convert
 from litetune.events import Event, EventStream
 from litetune.export import (
     _COMPOSE_SCRIPT,
+    CANONICAL_OR_COMPOSED_FLAG,
     CHAT_TEMPLATE_CHECK,
     COMPOSED_TEMPLATE_FLAG,
     COMPOSED_TEMPLATE_PREFIX,
@@ -152,6 +161,10 @@ class FakeToolchain:
     embedded: dict[str, str | None] = field(default_factory=dict)
     template_embedded: Callable[[str | None], str | None] | None = None
     repack_pack_rewrites_template: bool = False
+    # The conversation script's knobs: its exit code, or its result, in place
+    # of running it.
+    conversation_returncode: int | None = None
+    conversation_result: str | None = None
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(Call(argv=list(args), timeout=timeout, kwargs=dict(kwargs)))
@@ -161,6 +174,8 @@ class FakeToolchain:
             return self._repack(args, timeout)
         if args[0] == "python" and str(args[1]).endswith("compose_template.py"):
             return self._compose(args, timeout)
+        if args[0] == "python" and str(args[1]).endswith("conversation_template.py"):
+            return self._conversation(args, timeout)
         assert args[:2] == ["litert-torch", "export_hf"], args
         flags = dict(a.removeprefix("--").split("=", 1) for a in args[2:] if "=" in a)
         run = self.runs.get(flags["quantization_recipe"], self.default)
@@ -199,6 +214,23 @@ class FakeToolchain:
             for c in self.calls
             if c.argv[0] == "python" and c.argv[1].endswith("compose_template.py")
         ]
+
+    @property
+    def conversations(self) -> list[Call]:
+        return [
+            c
+            for c in self.calls
+            if c.argv[0] == "python" and c.argv[1].endswith("conversation_template.py")
+        ]
+
+    def _conversation(self, args, timeout: int) -> subprocess.CompletedProcess:
+        """`export._CONVERSATION_SCRIPT`, run for real, or a canned answer."""
+        if self.conversation_returncode is not None:
+            return subprocess.CompletedProcess(args, self.conversation_returncode, "", "boom")
+        if self.conversation_result is not None:
+            Path(args[3]).write_text(self.conversation_result, encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return run_compose_script(args, timeout, self.chat_template)[0]
 
     def _compose(self, args, timeout: int) -> subprocess.CompletedProcess:
         if self.template_raises is not None:
@@ -2148,18 +2180,22 @@ def _composed_files(directory: Path) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("model", "carried"),
+    ("model", "carried", "canonical"),
     [
-        (QWEN3, QWEN3_TEMPLATE),
-        ("Qwen/Qwen2.5-0.5B-Instruct", QWEN25_TEMPLATE),
+        ("Qwen/Qwen2.5-0.5B-Instruct", QWEN25_TEMPLATE, None),
         # A fine-tune whose name still contains the size: claimed by the qwen-3
-        # rule, and its own template is the one composed.
-        ("someorg/Qwen3-0.6B-sql-assistant", "{%- for m in messages %}{{ m.content }}{% endfor %}"),
+        # rule, and its own template, which LiteRT-LM's does not render like,
+        # is the one composed.
+        (
+            "someorg/Qwen3-0.6B-sql-assistant",
+            "{%- for m in messages %}{{ m.content }}{% endfor %}",
+            models.QWEN3_CANONICAL_TEMPLATE,
+        ),
     ],
-    ids=["qwen3", "qwen2.5", "fine-tune"],
+    ids=["qwen2.5", "fine-tune"],
 )
 def test_a_qwen_export_carries_its_checkpoints_template_behind_the_block(
-    toolchain, qwen_request, tmp_path, model, carried
+    toolchain, qwen_request, tmp_path, model, carried, canonical
 ):
     """What every recipe's exporter is handed in place of the marker: one file,
     written once for the sweep and named for its content, holding the block and
@@ -2188,6 +2224,8 @@ def test_a_qwen_export_carries_its_checkpoints_template_behind_the_block(
         "path": str(composed),
         "template_sha256": sha256,
         "composed_sha256": digest,
+        "source": "composed",
+        "canonical": canonical,
     }
     # Read once, from what the exporter is given as --model, in the stage's time.
     (composition,) = toolchain.compositions
@@ -2305,7 +2343,9 @@ def test_the_probe_quotes_what_the_template_rendered(toolchain, qwen_request):
     detail = _chat_template_check(run_export(qwen_request())).detail
     assert f"printed '{PROBE_TEXT}'" in detail
     assert f"printed '{PROBE_TEXT}!'" in detail
-    assert "transformers' Jinja2 (not LiteRT-LM's MiniJinja)" in detail
+    assert "the checkpoint's side through transformers' apply_chat_template" in detail
+    assert "Jinja2 configured as LiteRT-LM's MiniJinja" in detail
+    assert "not through LiteRT-LM itself" in detail
 
 
 @pytest.mark.parametrize(
@@ -2545,7 +2585,8 @@ def test_a_block_that_does_not_read_parts_is_caught_by_the_probe(
         "packaged_template",
         lambda name: str(noop) if name == models.TEXT_PARTS_BLOCK else real(name),
     )
-    check = _chat_template_check(run_export(qwen_request()))
+    toolchain.chat_template = QWEN25_TEMPLATE
+    check = _chat_template_check(run_export(qwen_request("Qwen/Qwen2.5-0.5B-Instruct")))
     assert check.outcome is Outcome.FAILED
     assert "this template does not render that way" in check.detail
 
@@ -2738,10 +2779,10 @@ def test_an_error_after_the_script_wrote_leaves_no_file(
     """The `finally` is what removes this run's file when something it does not
     catch escapes; `guard` records the check as unchecked."""
 
-    def raises(model, renders):
+    def raises(*args):
         raise RuntimeError("probe reader broke")
 
-    monkeypatch.setattr("litetune.export._probe_refusal", raises)
+    monkeypatch.setattr("litetune.export._choose_template", raises)
     result = run_export(qwen_request())
 
     check = _chat_template_check(result)
@@ -2780,6 +2821,573 @@ def test_a_refusal_is_reported_as_events(toolchain, qwen_request):
     assert [e.data["outcome"] for e in checks] == ["failed"]
     assert seen[-1].kind == "stage_finished"
     assert seen[-1].data["attempted"] == 0
+
+
+# ---------------------------------------------------------------------------
+# LiteRT-LM's Qwen 3 template, and whether each bundle holds a conversation
+# ---------------------------------------------------------------------------
+
+LITERT_QWEN3 = models.canonical_template_text(models.QWEN3_CANONICAL_TEMPLATE)
+# Qwen3's template behind a line of its own: a fine-tune whose single turns
+# LiteRT-LM's template does not render, and whose replies still go through
+# Qwen3's think block.
+QWEN3_WITH_A_PREAMBLE = "{{- 'Be brief.\\n' }}" + QWEN3_TEMPLATE
+# Qwen3's template with one byte more, which renders every case as it does:
+# what tells it from Qwen's own is its bytes alone.
+QWEN3_ONE_BYTE_ON = QWEN3_TEMPLATE + "\n"
+_NOT_RECORDED = object()
+
+
+def _one_message(result: ExportResult) -> list[str]:
+    """The report's limitations that say a bundle answers one message."""
+    return [t for t in result.limitations if template_checks.LIMITATION_PREFIX in t]
+
+
+@pytest.fixture
+def trained(tmp_path):
+    """A Qwen3 0.6B checkpoint `tune` wrote, recording how it trained.
+
+    `record` is what its `litetune.json` holds besides the base model -- by
+    default what a `runtime_rendered` run without declarations records -- or
+    `_NOT_RECORDED` for a directory with no `litetune.json` at all, or raw text.
+    """
+
+    # Named for the model, so that a checkpoint without a record is still
+    # claimed by the qwen-3 rule, by its path.
+    def _build(record: object = None, name: str = "Qwen3-0.6B-tuned") -> str:
+        checkpoint = tmp_path / name
+        checkpoint.mkdir()
+        (checkpoint / "config.json").write_text(
+            json.dumps({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}),
+            encoding="utf-8",
+        )
+        if record is _NOT_RECORDED:
+            return str(checkpoint)
+        sidecar = checkpoint / models.PROVENANCE_NAME
+        if isinstance(record, str):
+            sidecar.write_text(record, encoding="utf-8")
+            return str(checkpoint)
+        fields = {"prompt_mode": "runtime_rendered", "declarations_sha256": None}
+        fields.update(record if isinstance(record, dict) else {})
+        sidecar.write_text(json.dumps({"base_model": QWEN3, **fields}), encoding="utf-8")
+        return str(checkpoint)
+
+    return _build
+
+
+def test_a_qwen3_checkpoint_gets_litert_lms_template_and_holds_a_conversation(
+    toolchain, qwen_request, trained, tmp_path
+):
+    """Trained runtime_rendered without declarations, from a template that renders
+    single turns as LiteRT-LM's does, in every context: the bundle carries
+    LiteRT-LM's, which holds a conversation, and the report says nothing about
+    one message."""
+    toolchain.chat_template = QWEN3_TEMPLATE
+    result = run_export(qwen_request(trained()))
+
+    assert result.outcome is Outcome.PASSED
+    template = result.chat_template
+    assert template is not None
+    assert (template.source, template.canonical) == ("canonical", models.QWEN3_CANONICAL_TEMPLATE)
+    assert template.path.read_bytes() == LITERT_QWEN3.encode("utf-8")
+    digest = hashlib.sha256(LITERT_QWEN3.encode("utf-8")).hexdigest()
+    assert template.path.name == f"{COMPOSED_TEMPLATE_PREFIX}{digest[:12]}.jinja"
+    assert _composed_files(tmp_path / "out") == [template.path.name], "no partial file is left"
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.PASSED
+    assert check.observed["chosen"] == "canonical"
+    assert check.observed["canonical_withheld"] is None
+    assert (
+        "records that it was trained runtime_rendered without declarations"
+        in (check.observed["canonical_offered"])
+    )
+    assert check.observed["canonical_differences"] == []
+    assert f"LiteRT-LM's canonical template {models.QWEN3_CANONICAL_TEMPLATE}" in check.detail
+    assert "each of 96 single-turn renderings" in check.detail
+    assert len(toolchain.exports) == 2
+    for call in toolchain.exports:
+        assert _template_flags(call.argv) == [f"{models.TEMPLATE_FLAG}={template.path}"]
+    assert set(toolchain.embedded.values()) == {LITERT_QWEN3}
+    for export in result.exports:
+        assert export.conversation is not None
+        assert export.conversation.holds is True
+        dumped = export.as_dict()["conversation"]
+        assert dumped["holds"] is True
+        assert dumped["contexts"] == [context.name for context in template_checks.CONTEXTS]
+    # Once for the sweep: both bundles carry the one template.
+    assert len(toolchain.conversations) == 1
+    assert _one_message(result) == []
+    assert result.as_dict()["chat_template"]["source"] == "canonical"
+    summary = summarise_convert(result)
+    assert any(
+        f"LiteRT-LM's {models.QWEN3_CANONICAL_TEMPLATE}, which renders single turns" in line
+        for line in summary
+    )
+
+
+@pytest.mark.parametrize(
+    ("record", "carried", "says"),
+    [
+        (
+            _NOT_RECORDED,
+            QWEN3_ONE_BYTE_ON,
+            f"carries no {models.PROVENANCE_NAME}, so nothing records that it was",
+        ),
+        ({"prompt_mode": "prerendered"}, QWEN3_TEMPLATE, "records that it was trained prerendered"),
+        (
+            {"declarations_sha256": "ab" * 32},
+            QWEN3_TEMPLATE,
+            "records that it was trained with tool declarations (sha256 abababababab)",
+        ),
+        ({"prompt_mode": None}, QWEN3_TEMPLATE, "records no prompt_mode"),
+        ({"prompt_mode": "rendered-somehow"}, QWEN3_TEMPLATE, "could not be read (ValueError"),
+        ("{not json", QWEN3_TEMPLATE, "could not be read (JSONDecodeError"),
+    ],
+    ids=["no-record", "prerendered", "declarations", "no-mode", "unknown-mode", "unreadable"],
+)
+def test_a_qwen3_checkpoint_whose_training_the_cases_do_not_cover_keeps_its_own(
+    toolchain, qwen_request, trained, record, carried, says
+):
+    """The single-turn cases stand for what training rendered only where the
+    record shows training rendered one user message through the template, or
+    where there is no record and the template is Qwen's own. Anything else --
+    Qwen's own template, trained another way; or no record and a template a
+    byte away from Qwen's -- keeps the checkpoint's own, which answers one
+    message, and the report says so."""
+    toolchain.chat_template = carried
+    result = run_export(qwen_request(trained(record)))
+
+    assert result.outcome is Outcome.PASSED
+    template = result.chat_template
+    assert template is not None and template.source == "composed"
+    assert template.path.read_bytes() == _BLOCK + carried.encode("utf-8")
+    check = _chat_template_check(result)
+    assert check.observed["canonical_offered"] is None
+    assert says in check.observed["canonical_withheld"]
+    assert f"LiteRT-LM's canonical template {models.QWEN3_CANONICAL_TEMPLATE} was not offered" in (
+        check.detail
+    )
+    assert says in check.detail
+    assert "canonical_differences" not in check.observed
+    (limitation,) = _one_message(result)
+    assert "google-ai-edge/LiteRT-LM#3443" in limitation
+
+
+@pytest.mark.parametrize("checkpoint", ["hub", "local"])
+def test_the_base_model_as_published_gets_litert_lms_template(
+    toolchain, qwen_request, trained, checkpoint
+):
+    """flutter_gemma #659 converted `Qwen/Qwen3-0.6B` itself: no litetune.json,
+    and the template Qwen ships, byte for byte -- Qwen 3's own chat format, which
+    LiteRT-LM publishes its template for. That bundle holds a conversation."""
+    toolchain.chat_template = QWEN3_TEMPLATE
+    model = QWEN3 if checkpoint == "hub" else trained(_NOT_RECORDED)
+    result = run_export(qwen_request(model))
+
+    assert result.outcome is Outcome.PASSED
+    template = result.chat_template
+    assert template is not None and template.source == "canonical"
+    assert template.path.read_bytes() == LITERT_QWEN3.encode("utf-8")
+    check = _chat_template_check(result)
+    assert check.observed["canonical_withheld"] is None
+    offered = check.observed["canonical_offered"]
+    assert f"{model} carries no {models.PROVENANCE_NAME}" in offered
+    assert "Qwen/Qwen3-0.6B's own at c1899de289a04d12100db370d81485cdf75e47ca" in offered
+    assert "byte for byte (sha256 a55ee1b16601)" in offered
+    assert check.observed["canonical_differences"] == []
+    assert f"offered because {offered}" in check.detail
+    assert all(e.conversation and e.conversation.holds is True for e in result.exports)
+    assert _one_message(result) == []
+
+
+def _a_directory(sidecar: Path) -> None:
+    sidecar.mkdir()
+
+
+def _a_link_going_nowhere(sidecar: Path) -> None:
+    sidecar.symlink_to(sidecar.parent / "never-written.json")
+
+
+def _not_json(sidecar: Path) -> None:
+    sidecar.write_text("{not json", encoding="utf-8")
+
+
+def _not_an_object(sidecar: Path) -> None:
+    sidecar.write_text("[]", encoding="utf-8")
+
+
+def _withheld_for_an_unreadable_record(result: ExportResult) -> str:
+    """Why LiteRT-LM's template was withheld, asserting that the bundle kept the
+    checkpoint's own and says it answers one message."""
+    assert result.outcome is Outcome.PASSED
+    template = result.chat_template
+    assert template is not None and template.source == "composed"
+    assert template.path.read_bytes() == _BLOCK + QWEN3_TEMPLATE.encode("utf-8")
+    check = _chat_template_check(result)
+    assert check.observed["canonical_offered"] is None
+    withheld = check.observed["canonical_withheld"]
+    assert "could not be read (" in withheld
+    assert f"carries no {models.PROVENANCE_NAME}" not in withheld
+    (limitation,) = _one_message(result)
+    assert "google-ai-edge/LiteRT-LM#3443" in limitation
+    return withheld
+
+
+@pytest.mark.parametrize(
+    ("spoil", "raised"),
+    [
+        # Refused before it is opened, on every platform.
+        (_a_directory, ("OSError: ", "is not a regular file: it is a directory")),
+        (_a_link_going_nowhere, ("FileNotFoundError: ",)),
+        (_not_json, ("JSONDecodeError: ",)),
+        (_not_an_object, ("ValueError: ",)),
+    ],
+    ids=["directory", "dangling-symlink", "malformed-json", "not-an-object"],
+)
+def test_a_record_that_is_there_and_cannot_be_read_is_not_an_absent_one(
+    toolchain, qwen_request, trained, spoil, raised
+):
+    """Only a checkpoint with no litetune.json at all is offered LiteRT-LM's
+    template on its template's bytes. A litetune.json that is there and cannot
+    be read keeps the checkpoint's own -- here Qwen's template, byte for byte,
+    which the base model with no record is offered LiteRT-LM's on."""
+    toolchain.chat_template = QWEN3_TEMPLATE
+    model = trained(_NOT_RECORDED)
+    spoil(Path(model) / models.PROVENANCE_NAME)
+    withheld = _withheld_for_an_unreadable_record(run_export(qwen_request(model)))
+    assert all(said in withheld for said in raised), withheld
+
+
+# What a reader that opened it would read: a record that offers LiteRT-LM's
+# template, so that reading it fails the test as surely as waiting would.
+_OFFERING_RECORD = json.dumps({"base_model": QWEN3, "prompt_mode": "runtime_rendered"}).encode()
+
+
+# Untyped, so that `mypy --platform win32` does not look for `os.mkfifo`.
+def _a_fifo(sidecar):
+    os.mkfifo(sidecar)
+
+
+def _a_link_to_dev_null(sidecar):
+    sidecar.symlink_to("/dev/null")
+
+
+@pytest.mark.posix
+@pytest.mark.parametrize(
+    ("make", "kind"),
+    [
+        (_a_fifo, "a FIFO"),
+        (_a_link_to_dev_null, "a character device"),
+    ],
+    ids=["fifo", "link-to-dev-null"],
+)
+def test_a_record_that_is_not_a_regular_file_is_refused_unopened(
+    toolchain, qwen_request, trained, monkeypatch, make, kind
+):
+    """A FIFO named litetune.json would hold the open until something wrote to
+    it, and a device need not end. Neither is opened: refused for what it is."""
+    toolchain.chat_template = QWEN3_TEMPLATE
+    model = trained(_NOT_RECORDED)
+    sidecar = Path(model) / models.PROVENANCE_NAME
+    make(sidecar)
+    opened = record_opens(monkeypatch)
+    if make is _a_fifo:
+        with fifo_released_after(sidecar, 5, _OFFERING_RECORD) as released:
+            result = run_export(qwen_request(model))
+        assert released == [], "convert waited on the FIFO"
+    else:
+        # No watchdog: opening the device for writing would not tell a reader.
+        result = run_export(qwen_request(model))
+    assert not {sidecar, sidecar.resolve()} & set(opened)
+    withheld = _withheld_for_an_unreadable_record(result)
+    assert f"(OSError: {sidecar} is not a regular file: it is {kind})" in withheld
+
+
+@pytest.mark.posix
+def test_a_record_that_cannot_be_opened_is_not_an_absent_one(toolchain, qwen_request, trained):
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root opens a file whatever its permission bits")
+    toolchain.chat_template = QWEN3_TEMPLATE
+    model = trained()
+    sidecar = Path(model) / models.PROVENANCE_NAME
+    sidecar.chmod(0)
+    try:
+        result = run_export(qwen_request(model))
+    finally:
+        sidecar.chmod(0o600)
+    assert "(PermissionError: " in _withheld_for_an_unreadable_record(result)
+
+
+def test_a_base_model_whose_single_turns_differ_is_not_given_litert_lms_template(
+    toolchain, qwen_request, monkeypatch
+):
+    """Qwen's own bytes offer the template; the renderings still decide."""
+    pinned = {hashlib.sha256(QWEN3_WITH_A_PREAMBLE.encode("utf-8")).hexdigest(): "a test's"}
+    monkeypatch.setitem(models.CANONICAL_UPSTREAM, models.QWEN3_CANONICAL_TEMPLATE, pinned)
+    toolchain.chat_template = QWEN3_WITH_A_PREAMBLE
+    result = run_export(qwen_request(QWEN3))
+
+    assert result.chat_template is not None and result.chat_template.source == "composed"
+    check = _chat_template_check(result)
+    assert check.observed["canonical_offered"] is not None
+    assert len(check.observed["canonical_differences"]) == 96
+    assert _one_message(result)
+
+
+def test_a_qwen3_fine_tune_whose_single_turns_differ_keeps_its_own_and_answers_one_message(
+    toolchain, qwen_request, trained
+):
+    """LiteRT-LM's template does not render this checkpoint's single turns, so the
+    bundle keeps the checkpoint's own behind the block -- whose think block breaks
+    a conversation, which the report says, naming both recipes."""
+    toolchain.chat_template = QWEN3_WITH_A_PREAMBLE
+    result = run_export(qwen_request(trained()))
+
+    assert result.outcome is Outcome.PASSED
+    template = result.chat_template
+    assert template is not None and template.source == "composed"
+    assert template.path.read_bytes() == _BLOCK + QWEN3_WITH_A_PREAMBLE.encode("utf-8")
+    check = _chat_template_check(result)
+    assert check.observed["chosen"] == "composed"
+    assert check.observed["canonical_withheld"] is None
+    assert len(check.observed["canonical_differences"]) == 96
+    assert (
+        f"LiteRT-LM's canonical template {models.QWEN3_CANONICAL_TEMPLATE} was not chosen: "
+        "96 of 96 single-turn renderings differ"
+    ) in check.detail
+    for export in result.exports:
+        assert export.conversation is not None and export.conversation.holds is False
+        assert export.conversation.breaks
+        assert export.as_dict()["conversation"]["holds"] is False
+    (limitation,) = _one_message(result)
+    assert limitation.startswith(
+        f"{', '.join(MEASURED_RECIPES)}: {template_checks.LIMITATION_PREFIX}"
+    )
+    assert "google-ai-edge/LiteRT-LM#3443" in limitation
+    assert "72 of the 72 cases break it" in limitation
+    assert f"  note: {limitation}" in summarise_convert(result)
+    assert limitation in result.as_dict()["limitations"]
+
+
+@pytest.mark.parametrize(
+    ("record", "carried", "holds"),
+    [
+        (None, QWEN3_TEMPLATE, True),
+        (None, QWEN3_WITH_A_PREAMBLE, False),
+        ({"prompt_mode": "prerendered"}, QWEN3_TEMPLATE, False),
+        (_NOT_RECORDED, QWEN3_TEMPLATE, True),
+        (_NOT_RECORDED, QWEN3_ONE_BYTE_ON, False),
+        (_NOT_RECORDED, "{%- for m in messages %}{{ m.content }}{% endfor %}", True),
+    ],
+    ids=[
+        "qwen3",
+        "qwen3-preamble",
+        "qwen3-prerendered",
+        "base",
+        "base-one-byte-on",
+        "fine-tune",
+    ],
+)
+def test_the_report_says_a_bundle_answers_one_message_exactly_when_it_does(
+    toolchain, qwen_request, trained, record, carried, holds
+):
+    toolchain.chat_template = carried
+    result = run_export(qwen_request(trained(record)))
+
+    assert result.outcome is Outcome.PASSED
+    assert [e.conversation.holds if e.conversation else None for e in result.exports] == [
+        holds,
+        holds,
+    ]
+    assert bool(_one_message(result)) is not holds
+
+
+def test_qwen25_keeps_its_own_template_which_holds_a_conversation(toolchain, qwen_request):
+    toolchain.chat_template = QWEN25_TEMPLATE
+    result = run_export(qwen_request("Qwen/Qwen2.5-0.5B-Instruct"))
+
+    assert result.outcome is Outcome.PASSED
+    assert result.chat_template is not None and result.chat_template.source == "composed"
+    assert "canonical_withheld" not in _chat_template_check(result).observed
+    assert all(e.conversation and e.conversation.holds is True for e in result.exports)
+    assert _one_message(result) == []
+
+
+# A filter the renderer does not render as MiniJinja does, and a chained
+# comparison, which MiniJinja 2.14 reads as nested ones: `1 == 2 == false` is
+# false in Jinja2 and true on the device.
+_UNVOUCHED_CONSTRUCTS = [
+    ("{{ 'x' | title }}", "uses the filter `title`"),
+    (
+        "{% if 1 == 2 == false %}!{% endif %}",
+        "uses a chained comparison, which MiniJinja 2.14 reads as nested ones",
+    ),
+]
+
+
+@pytest.mark.parametrize(("construct", "named"), _UNVOUCHED_CONSTRUCTS)
+def test_a_composed_template_the_renderer_does_not_vouch_for_exports_nothing(
+    toolchain, qwen_request, construct, named
+):
+    """`could not check`, never a pass: a checkpoint template using a construct
+    the renderer does not render as MiniJinja does."""
+    toolchain.chat_template = "{{ messages[0].content }}" + construct
+    result = run_export(qwen_request("Qwen/Qwen2.5-0.5B-Instruct"))
+
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.UNCHECKED
+    assert named in check.detail and "was not checked" in check.detail
+    assert toolchain.exports == []
+
+
+def test_every_family_is_checked_and_functiongemmas_template_holds(toolchain, request_for):
+    """No template is written at export for FunctionGemma; the one its bundles
+    carry, the packaged one, is read back and checked all the same."""
+    result = run_export(request_for())
+
+    assert result.outcome is Outcome.PASSED
+    assert toolchain.compositions == []
+    assert len(toolchain.conversations) == 1
+    packaged = Path(models.functiongemma_template()).read_bytes()
+    for export in result.exports:
+        assert export.conversation is not None and export.conversation.holds is True
+        assert export.conversation.template_sha256 == hashlib.sha256(packaged).hexdigest()
+    assert _one_message(result) == []
+
+
+def _own_template(tmp_path: Path, text: str) -> str:
+    path = tmp_path / "own.jinja"
+    path.write_text(text, encoding="utf-8")
+    return f"--jinja_chat_template_override={path}"
+
+
+def test_a_template_on_the_single_turn_protocol_is_not_applicable(toolchain, tmp_path):
+    """A template of the caller's own, which LiteRT-LM renders through its
+    single-turn protocol: the full-history invariant does not apply, and the
+    report says that -- not that the bundle answers one message."""
+    template = "{%- if is_appending_to_prefill %}{% endif %}{{ messages[-1].content[0].text }}"
+    result = run_export(
+        ExportRequest(
+            model="acme/some-model",
+            output_dir=tmp_path / "out",
+            recipes=("dynamic_wi8_afp32",),
+            extra_flags=(_own_template(tmp_path, template),),
+        )
+    )
+
+    assert result.outcome is Outcome.PASSED
+    assert toolchain.conversations == []
+    (export,) = result.exports
+    assert export.conversation is not None
+    assert export.conversation.holds is None and not export.conversation.applicable
+    assert _one_message(result) == []
+    assert any(
+        "the conversation check does not apply to this bundle" in text
+        and "is_appending_to_prefill" in text
+        for text in result.limitations
+    )
+
+
+@pytest.mark.parametrize(("construct", "named"), _UNVOUCHED_CONSTRUCTS)
+def test_a_bundled_template_the_renderer_does_not_vouch_for_is_not_checked(
+    toolchain, tmp_path, construct, named
+):
+    template = "{%- for m in messages %}{{ m.content[0].text }};" + construct + "{% endfor %}"
+    result = run_export(
+        ExportRequest(
+            model="acme/some-model",
+            output_dir=tmp_path / "out",
+            recipes=("dynamic_wi8_afp32",),
+            extra_flags=(_own_template(tmp_path, template),),
+        )
+    )
+
+    assert result.outcome is Outcome.PASSED
+    (export,) = result.exports
+    assert export.conversation is not None and export.conversation.holds is None
+    assert _one_message(result) == []
+    assert any(
+        "was not checked" in t and named.removeprefix("uses ") in t for t in result.limitations
+    )
+
+
+def test_a_bundle_carrying_no_template_is_said_not_to_be_checked(toolchain, tmp_path):
+    """Gemma 3 gets no override, and this fake exporter embeds nothing without one."""
+    result = run_export(
+        ExportRequest(
+            model="google/gemma-3-270m-it",
+            output_dir=tmp_path / "out",
+            recipes=("dynamic_wi8_afp32",),
+        )
+    )
+
+    assert result.outcome is Outcome.PASSED
+    assert toolchain.conversations == []
+    (export,) = result.exports
+    assert export.conversation is not None and export.conversation.holds is None
+    assert _one_message(result) == []
+    assert any(
+        "dynamic_wi8_afp32: whether this bundle holds a LiteRT-LM conversation past its first "
+        "message was not checked: it carries no jinja_prompt_template" in text
+        for text in result.limitations
+    )
+
+
+@pytest.mark.parametrize(
+    ("knobs", "says"),
+    [
+        ({"conversation_returncode": 1}, "the script rendering it exited 1: boom"),
+        ({"conversation_result": "{not json"}, "wrote a result that is not JSON"),
+        ({"conversation_result": "[]"}, "the script rendering it wrote []"),
+        ({"conversation_result": '{"renders": []}'}, "unvouched constructs this litetune cannot"),
+        (
+            {"conversation_result": '{"unvouched": [], "renders": []}'},
+            "the conversations is not 12 renderings",
+        ),
+        ({"repack_script_returncode": 1}, "its chat template could not be read back"),
+    ],
+)
+def test_a_conversation_that_could_not_be_checked_is_said_so_and_exported(
+    toolchain, request_for, knobs, says
+):
+    """Never a verdict either way, and never a reason to refuse the bundle."""
+    for name, value in knobs.items():
+        setattr(toolchain, name, value)
+    result = run_export(request_for())
+
+    assert result.outcome is Outcome.PASSED
+    assert all(e.conversation and e.conversation.holds is None for e in result.exports)
+    assert _one_message(result) == []
+    (text,) = [t for t in result.limitations if "was not checked" in t]
+    assert says in text
+    assert text.startswith(", ".join(MEASURED_RECIPES))
+
+
+def test_a_conversation_check_that_raises_is_said_not_to_be_checked(
+    toolchain, request_for, monkeypatch
+):
+    def raises(*args, **kwargs):
+        raise RuntimeError("renderer broke")
+
+    monkeypatch.setattr("litetune.export.check_conversation", raises)
+    result = run_export(request_for())
+
+    assert result.outcome is Outcome.PASSED
+    assert all(e.conversation and e.conversation.holds is None for e in result.exports)
+    assert any("was not checked" in t and "renderer broke" in t for t in result.limitations)
+
+
+def test_a_packaged_canonical_template_that_is_not_the_pinned_one_exports_nothing(
+    toolchain, qwen_request, trained, monkeypatch
+):
+    monkeypatch.setitem(models.CANONICAL_TEMPLATES, models.QWEN3_CANONICAL_TEMPLATE, "0" * 64)
+    result = run_export(qwen_request(trained()))
+
+    check = _chat_template_check(result)
+    assert check.outcome is Outcome.UNCHECKED
+    assert "the packaged canonical template could not be used" in check.detail
+    assert toolchain.compositions == [] and toolchain.exports == []
+    assert result.not_attempted == tuple(MEASURED_RECIPES)
 
 
 @pytest.mark.parametrize(
@@ -3136,18 +3744,26 @@ def test_a_family_with_a_packaged_template_composes_nothing(toolchain, request_f
     assert result.chat_template is None
 
 
-def test_the_marker_never_reaches_an_exporter_argv(qwen_request):
+@pytest.mark.parametrize(
+    ("model", "marker", "canonical"),
+    [
+        (QWEN3, CANONICAL_OR_COMPOSED_FLAG, models.QWEN3_CANONICAL_TEMPLATE),
+        ("Qwen/Qwen2.5-0.5B-Instruct", COMPOSED_TEMPLATE_FLAG, None),
+    ],
+)
+def test_the_marker_never_reaches_an_exporter_argv(qwen_request, model, marker, canonical):
     """It describes a file, and the exporter would look it up as a repository."""
-    request = qwen_request()
+    request = qwen_request(model)
     assert request.composes_chat_template
-    assert COMPOSED_TEMPLATE_FLAG in request.extra_flags
-    with pytest.raises(ValueError, match="no composed template was given"):
+    assert marker in request.extra_flags
+    assert request.canonical_template == canonical
+    with pytest.raises(ValueError, match="and none was given"):
         request.argv("dynamic_wi8_afp32")
     composed = Path("/composed/t.jinja")
     argv = request.argv("dynamic_wi8_afp32", composed)
     # The path as this platform spells it: `\composed\t.jinja` on Windows.
     assert _template_flags(argv) == [f"{models.TEMPLATE_FLAG}={composed}"]
-    assert not any(models.COMPOSED_TEMPLATE in a for a in argv)
+    assert not any(m in a for m in models.WRITTEN_AT_EXPORT for a in argv)
 
 
 def test_a_marker_in_any_other_shape_is_refused_too(qwen_request):
