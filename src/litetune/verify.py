@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -808,8 +809,9 @@ def read_training_record(reference: str) -> tuple[dict, Path] | None:
     `None` for a Hugging Face id, for a directory with no `litetune.json`, and
     for a reference that is not a directory at all -- including a directory
     reached through a symlink that resolves and simply has no sidecar. A
-    sidecar that exists and cannot be read raises, and so does a reference that
-    is a link going nowhere.
+    sidecar that exists and cannot be read raises -- one that is not a regular
+    file, a FIFO or a device, without being opened (`_read_regular_file`) --
+    and so does a reference that is a link going nowhere.
 
     A link going nowhere further up the path is not detected. Reading through
     it raises the same `FileNotFoundError` as an absent directory, and the
@@ -818,7 +820,7 @@ def read_training_record(reference: str) -> tuple[dict, Path] | None:
     """
     sidecar = Path(reference) / models.PROVENANCE_NAME
     try:
-        text = sidecar.read_text(encoding="utf-8")
+        text = _read_regular_file(sidecar).decode("utf-8")
     except FileNotFoundError:
         # A link going nowhere raises this too, and it is not the same
         # statement: the link is an entry, so something recorded a checkpoint's
@@ -845,6 +847,37 @@ def read_training_record(reference: str) -> tuple[dict, Path] | None:
     if not isinstance(data, dict):
         raise ValueError(f"{sidecar} does not contain a JSON object")
     return data, sidecar
+
+
+_NOT_REGULAR = (
+    (stat.S_ISDIR, "a directory"),
+    (stat.S_ISFIFO, "a FIFO"),
+    (stat.S_ISCHR, "a character device"),
+    (stat.S_ISBLK, "a block device"),
+    (stat.S_ISSOCK, "a socket"),
+)
+
+
+def _refuse_unless_regular(path: Path, mode: int) -> None:
+    if stat.S_ISREG(mode):
+        return
+    kind = next((name for test, name in _NOT_REGULAR if test(mode)), "not a file")
+    raise OSError(f"{path} is not a regular file: it is {kind}")
+
+
+def _read_regular_file(path: Path) -> bytes:
+    """The bytes of `path`, a regular file once its links are followed, or `OSError`.
+
+    Looked at before it is opened, because opening a FIFO waits for a writer
+    and reading a device need not end; and looked at again through the
+    descriptor, opened without waiting, because the entry can be replaced
+    between the two.
+    """
+    _refuse_unless_regular(path, os.stat(path).st_mode)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags), "rb") as handle:
+        _refuse_unless_regular(path, os.fstat(handle.fileno()).st_mode)
+        return handle.read()
 
 
 def _resolve_mode(request: VerifyRequest, split: Split) -> PromptModeDecision:

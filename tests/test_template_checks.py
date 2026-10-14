@@ -350,9 +350,12 @@ _EVERY_ADVERSARIAL = [
 
 @pytest.mark.parametrize("source", _EVERY_ADVERSARIAL)
 def test_the_renderer_renders_what_jinja2_coerces_otherwise_as_minijinja_does(source):
+    """Each case renders as MiniJinja renders it, and is vouched for: a case the
+    renderer reproduced but refused would document nothing `convert` checks."""
     ours, theirs = _render(source, [], True), _minijinja(source, [], True)
     assert ("text" in ours) == ("text" in theirs), (ours, theirs)
     assert ours.get("text") == theirs.get("text")
+    assert _unvouched(source) == []
 
 
 @pytest.mark.parametrize(
@@ -371,6 +374,7 @@ def test_the_renderer_renders_what_jinja2_coerces_otherwise_as_minijinja_does(so
 )
 def test_the_renderer_prints_as_minijinja_does(source, printed):
     assert _render(source, [], True) == {"text": printed}
+    assert _unvouched(source) == []
 
 
 # What Codex found: a template whose verdict a Python `True` reverses. With
@@ -438,6 +442,17 @@ def test_the_renderer_refuses_a_break_as_the_runtime_build_does():
         ("{% autoescape true %}{% endautoescape %}", "a `ScopedEvalContextModifier` tag"),
         ("{{ 'x' if is_appending_to_prefill }}", "`is_appending_to_prefill`"),
         ("{% if %}", "Jinja2 cannot parse it"),
+        # `loop(...)` re-enters only the `recursive` loop whose body it is in.
+        ("{% for x in [1] %}{{ loop([2]) }}{% endfor %}", "the function `loop`"),
+        (
+            "{% for x in [1] recursive %}{% for y in [2] %}{{ loop([y]) }}{% endfor %}{% endfor %}",
+            "the function `loop`",
+        ),
+        (
+            "{% for x in [1] recursive %}{% if x %}{% for y in [2] %}{{ loop([y]) }}{% endfor %}"
+            "{% endif %}{% endfor %}",
+            "the function `loop`",
+        ),
     ],
 )
 def test_what_the_renderer_does_not_vouch_for_is_named(source, named):
@@ -468,7 +483,40 @@ _RENDERED_OTHERWISE = [
     ),
     ("{% macro f(a, b=a) %}[{{ b }}]{% endmacro %}{{ f(1) }}", "a macro default that names"),
     ("{% macro f(a=b, b=1) %}[{{ a }}]{% endmacro %}{{ f() }}", "a macro default that names"),
+    # A function printed: Python's repr here, a Rust type name there.
+    ("[{{ range }}]", "the function `range` as a value"),
+    ("[{{ debug }}]", "the function `debug` as a value"),
+    ("[{{ __mj_iter__ }}]", "the name `__mj_iter__`, which this renderer reserves"),
 ]
+
+
+# Jinja2's globals MiniJinja 2.14.0 does not have, used other than in a call:
+# printed, aliased, aliased under a macro's name, assigned over. The renderer
+# has none of them, so each renders as on the device; each is still not
+# vouched for.
+_JINJA2_ONLY_GLOBAL_USES = [
+    "[{{ cycler }}]",
+    "{% set c = cycler %}[{{ c }}]",
+    "{% macro m() %}{% endmacro %}{% set m = joiner %}{{ m(',') }}",
+    "{% set cycler = 1 %}{{ cycler }}",
+    "[{{ lipsum }}]",
+]
+
+
+@pytest.mark.parametrize("source", _JINJA2_ONLY_GLOBAL_USES)
+def test_a_jinja2_global_minijinja_lacks_is_undefined_and_not_vouched_for(source):
+    ours, theirs = _render(source, [], True), _minijinja(source, [], True)
+    assert ("text" in ours) == ("text" in theirs), (ours, theirs)
+    assert ours.get("text") == theirs.get("text")
+    assert any("a Jinja2 global MiniJinja 2.14 does not have" in gap for gap in _unvouched(source))
+
+
+def test_jinja2_as_transformers_configures_it_prints_a_global_minijinja_lacks():
+    stock = _script("renderer")["ImmutableSandboxedEnvironment"](
+        trim_blocks=True, lstrip_blocks=True
+    )
+    assert stock.from_string("[{{ cycler }}]").render() == "[<class 'jinja2.utils.Cycler'>]"
+    assert _render("[{{ cycler }}]", [], True) == {"text": "[]"}
 
 
 @pytest.mark.parametrize(("source", "named"), _RENDERED_OTHERWISE)

@@ -1307,9 +1307,10 @@ def _canonical_basis(
     all the same.
 
     No record means none at all: `verify.read_training_record` returns `None`.
-    A `litetune.json` that is there and cannot be read -- a directory, a link
-    going nowhere, a permission failure, text that is not a JSON object -- is a
-    record this cannot read, and withholds, whatever the template.
+    A `litetune.json` that is there and cannot be read -- a directory, a FIFO
+    or a device, a link going nowhere, a permission failure, text that is not a
+    JSON object -- is a record this cannot read, and withholds, whatever the
+    template.
     """
     # Here, not at the top: `verify` imports this module.
     from litetune.verify import declarations_sha256_in, prompt_mode_in, read_training_record

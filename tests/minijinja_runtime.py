@@ -78,6 +78,12 @@ def _environment(source: str) -> Any:
     env = minijinja.Environment(
         keep_trailing_newline=True, trim_blocks=True, lstrip_blocks=True, pycompat=False
     )
+    # The binding adds `minijinja-contrib`'s `cycler` and `joiner`; LiteRT-LM
+    # depends on `minijinja` alone (`Cargo.toml`) and builds its environment
+    # with `Environment::new()`, whose globals are `range`, `dict`, `debug` and
+    # `namespace` (`get_globals`, `src/defaults.rs`).
+    for name in ("cycler", "joiner"):
+        env.remove_global(name)
     env.add_function("raise_exception", raise_exception)
     env.add_function("strftime_now", lambda fmt: time.strftime(fmt))
     # serde_json with a formatter that spaces after `,` and `:`, writing UTF-8.

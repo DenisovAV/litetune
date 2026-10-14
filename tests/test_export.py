@@ -20,7 +20,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from conftest import buildable_here, machine, mark_provisioned, run_compose_script
+from conftest import (
+    buildable_here,
+    fifo_released_after,
+    machine,
+    mark_provisioned,
+    run_compose_script,
+)
 
 from litetune import envs, models, template_checks
 from litetune.checks import Check, Outcome
@@ -3029,11 +3035,11 @@ def _withheld_for_an_unreadable_record(result: ExportResult) -> str:
 @pytest.mark.parametrize(
     ("spoil", "raised"),
     [
-        # Windows reads a directory as a permission failure.
-        (_a_directory, ("IsADirectoryError", "PermissionError")),
-        (_a_link_going_nowhere, ("FileNotFoundError",)),
-        (_not_json, ("JSONDecodeError",)),
-        (_not_an_object, ("ValueError",)),
+        # Refused before it is opened, on every platform.
+        (_a_directory, ("OSError: ", "is not a regular file: it is a directory")),
+        (_a_link_going_nowhere, ("FileNotFoundError: ",)),
+        (_not_json, ("JSONDecodeError: ",)),
+        (_not_an_object, ("ValueError: ",)),
     ],
     ids=["directory", "dangling-symlink", "malformed-json", "not-an-object"],
 )
@@ -3048,7 +3054,46 @@ def test_a_record_that_is_there_and_cannot_be_read_is_not_an_absent_one(
     model = trained(_NOT_RECORDED)
     spoil(Path(model) / models.PROVENANCE_NAME)
     withheld = _withheld_for_an_unreadable_record(run_export(qwen_request(model)))
-    assert any(f"({name}: " in withheld for name in raised), withheld
+    assert all(said in withheld for said in raised), withheld
+
+
+# What a reader that opened it would read: a record that offers LiteRT-LM's
+# template, so that reading it fails the test as surely as waiting would.
+_OFFERING_RECORD = json.dumps({"base_model": QWEN3, "prompt_mode": "runtime_rendered"}).encode()
+
+
+# Untyped, so that `mypy --platform win32` does not look for `os.mkfifo`.
+def _a_fifo(sidecar):
+    os.mkfifo(sidecar)
+
+
+def _a_link_to_dev_null(sidecar):
+    sidecar.symlink_to("/dev/null")
+
+
+@pytest.mark.posix
+@pytest.mark.parametrize(
+    ("make", "kind"),
+    [
+        (_a_fifo, "a FIFO"),
+        (_a_link_to_dev_null, "a character device"),
+    ],
+    ids=["fifo", "link-to-dev-null"],
+)
+def test_a_record_that_is_not_a_regular_file_is_refused_unopened(
+    toolchain, qwen_request, trained, make, kind
+):
+    """A FIFO named litetune.json would hold the open until something wrote to
+    it, and a device need not end. Neither is opened: refused for what it is."""
+    toolchain.chat_template = QWEN3_TEMPLATE
+    model = trained(_NOT_RECORDED)
+    sidecar = Path(model) / models.PROVENANCE_NAME
+    make(sidecar)
+    with fifo_released_after(sidecar, 5, _OFFERING_RECORD) as released:
+        result = run_export(qwen_request(model))
+    assert released == [], "convert waited on the FIFO"
+    withheld = _withheld_for_an_unreadable_record(result)
+    assert f"(OSError: {sidecar} is not a regular file: it is {kind})" in withheld
 
 
 @pytest.mark.posix

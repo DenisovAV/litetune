@@ -785,6 +785,11 @@ def runtime_environment():
         optimized=False,
     )
     env.code_generator_class = _MiniJinjaCodeGenerator
+    # Only the globals MiniJinja 2.14.0 has as LiteRT-LM builds it, so that a
+    # template naming another one -- Jinja2's `cycler`, `joiner`, `lipsum` --
+    # finds it undefined, as on the device.
+    for name in set(env.globals) - MINIJINJA_GLOBALS:
+        del env.globals[name]
     env.minijinja_str = minijinja_str
     env.globals["raise_exception"] = _raise_exception
     env.globals["strftime_now"] = lambda fmt: _time.strftime(fmt, _time.gmtime())
@@ -855,6 +860,20 @@ _UNVOUCHED_NODES = (
 # and `kwargs` (MiniJinja refuses an extra argument, "too many arguments"), and
 # `self`.
 _UNVOUCHED_NAMES = frozenset({"varargs", "kwargs", "self"})
+# The globals MiniJinja 2.14.0 has as LiteRT-LM builds it: the crate's own
+# (`get_globals`, `src/defaults.rs`; LiteRT-LM uses no `minijinja-contrib`,
+# `Cargo.toml`) and the two `create_env` adds (`minijinja_template.rs`).
+# Every one of them is a function, which MiniJinja prints by its Rust type
+# name (`minijinja::functions::builtins::range`, in the 2.14.0 binding) and
+# this renderer as a Python object, so each is vouched for only as the name of
+# a call.
+MINIJINJA_GLOBALS = frozenset({"range", "dict", "debug", "namespace"})
+_GLOBAL_FUNCTIONS = MINIJINJA_GLOBALS | {"raise_exception", "strftime_now"}
+# Jinja2's globals MiniJinja does not have, whatever a template does with
+# them: called, printed, aliased or assigned.
+_JINJA2_ONLY_GLOBALS = frozenset(ImmutableSandboxedEnvironment().globals) - MINIJINJA_GLOBALS
+# The name `__mj_iter__` is this renderer's own (`RuntimeEnvironment._parse`).
+_RESERVED = "__mj_iter__"
 # The escapes MiniJinja 2.14.0 reads in a string literal as Python does
 # (`Unescaper::unescape`, `src/utils.rs`): it refuses `\s`, `\a` and other
 # escapes Python keeps or reads, reads `\/` as `/`, and joins a surrogate pair.
@@ -881,6 +900,31 @@ def _constant(node):
     if isinstance(node, _nodes.Concat):
         return all(_constant(item) for item in node.nodes)
     return False
+
+
+def _recursive_loop_calls(tree):
+    # The `loop(...)` calls that re-enter the loop they are in: in the body of
+    # a `recursive` loop, outside any loop, macro or call block within it.
+    found = set()
+
+    def walk(node):
+        for child in node.iter_child_nodes():
+            if isinstance(child, (_nodes.For, _nodes.Macro, _nodes.CallBlock)):
+                continue
+            if (
+                isinstance(child, _nodes.Call)
+                and isinstance(child.node, _nodes.Name)
+                and child.node.name == "loop"
+            ):
+                found.add(id(child))
+            walk(child)
+
+    for loop in tree.find_all(_nodes.For):
+        if loop.recursive:
+            for statement in loop.body:
+                if not isinstance(statement, (_nodes.For, _nodes.Macro, _nodes.CallBlock)):
+                    walk(statement)
+    return found
 
 
 def _lexical_gaps(source):
@@ -919,11 +963,27 @@ def unvouched(template):
     for node in tree.find_all(_nodes.Test):
         if node.name not in VOUCHED_TESTS:
             found.add(f"the test `{node.name}`")
+    recursive_calls = _recursive_loop_calls(tree)
+    callees = set()
     for node in tree.find_all(_nodes.Call):
-        if isinstance(node.node, _nodes.Name) and node.node.name not in (
-            VOUCHED_FUNCTIONS | macros | {"caller", "__mj_iter__"}
+        if not isinstance(node.node, _nodes.Name):
+            continue
+        callees.add(id(node.node))
+        if id(node) not in recursive_calls and node.node.name not in (
+            VOUCHED_FUNCTIONS | macros | {"caller", _RESERVED}
         ):
             found.add(f"the function `{node.node.name}`")
+    for node in tree.find_all(_nodes.Name):
+        if node.name in _JINJA2_ONLY_GLOBALS:
+            found.add(f"the name `{node.name}`, a Jinja2 global MiniJinja 2.14 does not have")
+        elif (
+            node.name in _GLOBAL_FUNCTIONS
+            and node.ctx == "load"
+            and id(node) not in callees
+        ):
+            found.add(f"the function `{node.name}` as a value, which the two print otherwise")
+    if _RESERVED in template:
+        found.add(f"the name `{_RESERVED}`, which this renderer reserves")
     for node in tree.find_all(_UNVOUCHED_NODES):
         found.add(f"a `{type(node).__name__}` tag")
     for node in tree.find_all(_nodes.Compare):

@@ -11,11 +11,14 @@ the host interpreter, against a fake `transformers`.
 from __future__ import annotations
 
 import builtins
+import contextlib
+import errno
 import json
 import os
 import subprocess
 import sys
-from collections.abc import Sequence
+import threading
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -565,6 +568,41 @@ class RemoteEntryNotFoundError(OSError, EntryNotFoundError):
 class LocalEntryNotFoundError(FileNotFoundError, EntryNotFoundError):
     pass
 """
+
+
+@contextlib.contextmanager
+def fifo_released_after(fifo: Path, seconds: float, payload: bytes) -> Iterator[list[bool]]:
+    """Guard code that must not open `fifo` and wait for a writer.
+
+    If a reader is still waiting on `fifo` after `seconds`, it is given
+    `payload` and end of file -- so a regression fails its test instead of
+    hanging the suite -- and the list yielded holds `True`. Nothing reading is
+    the case asserted: the list stays empty.
+    """
+    stop = threading.Event()
+    released: list[bool] = []
+
+    def release() -> None:
+        if stop.wait(seconds):
+            return
+        try:
+            # POSIX alone: the tests using this are.
+            descriptor = os.open(fifo, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0))
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:  # no reader: nothing to release
+                return
+            raise
+        released.append(True)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+
+    thread = threading.Thread(target=release, daemon=True)
+    thread.start()
+    try:
+        yield released
+    finally:
+        stop.set()
+        thread.join(timeout=seconds + 5)
 
 
 def run_compose_script(
