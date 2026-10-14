@@ -545,9 +545,9 @@ def _git_blob(data: bytes) -> str:
 
 
 def test_each_litert_lm_fixture_is_the_file_at_v0_18_0():
-    assert sorted(str(p.relative_to(GOLDENS)) for p in GOLDENS.rglob("*") if p.is_file()) == sorted(
-        GOLDEN_BLOBS
-    )
+    assert sorted(
+        p.relative_to(GOLDENS).as_posix() for p in GOLDENS.rglob("*") if p.is_file()
+    ) == sorted(GOLDEN_BLOBS)
     for name, blob in GOLDEN_BLOBS.items():
         assert _git_blob((GOLDENS / name).read_bytes()) == blob, name
     qwen25 = (FIXTURES / "litert-lm-v0.18.0-qwen2_5.chat_template.jinja").read_bytes()
