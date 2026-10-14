@@ -1,0 +1,306 @@
+{
+ "runs": [
+  {
+   "name": "rosenbrock-2",
+   "objective": "rosenbrock",
+   "start": [
+    -1.2,
+    1.0
+   ],
+   "settings": {},
+   "x": [
+    0.9999814210791365,
+    0.9999619651810987
+   ],
+   "loss": 4.2214575113045607e-10,
+   "iterations": 35,
+   "evaluations": 43
+  },
+  {
+   "name": "rosenbrock-10",
+   "objective": "rosenbrock",
+   "start": [
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0
+   ],
+   "settings": {},
+   "x": [
+    1.0000000456124698,
+    1.000000005363262,
+    0.9999999973551602,
+    0.9999999216892267,
+    0.9999999238562892,
+    0.9999998553880314,
+    0.9999997712885903,
+    0.9999995198848809,
+    0.9999993522178382,
+    0.9999989572029406
+   ],
+   "loss": 1.9248414038655262e-11,
+   "iterations": 65,
+   "evaluations": 77
+  },
+  {
+   "name": "max-iter-5",
+   "objective": "rosenbrock",
+   "start": [
+    -1.2,
+    1.0
+   ],
+   "settings": {
+    "maxIter": 5
+   },
+   "x": [
+    -1.0276177663827242,
+    1.0584120782656612
+   ],
+   "loss": 4.111816451757751,
+   "iterations": 4,
+   "evaluations": 6
+  },
+  {
+   "name": "max-eval-12",
+   "objective": "rosenbrock",
+   "start": [
+    -1.2,
+    1.0
+   ],
+   "settings": {
+    "maxEval": 12
+   },
+   "x": [
+    -0.6657084570888967,
+    0.41398308319536203
+   ],
+   "loss": 2.8597591407314664,
+   "iterations": 10,
+   "evaluations": 12
+  },
+  {
+   "name": "history-3",
+   "objective": "rosenbrock",
+   "start": [
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0
+   ],
+   "settings": {
+    "historySize": 3
+   },
+   "x": [
+    0.9999991524224388,
+    0.9999997841906751,
+    0.9999980031982415,
+    0.9999993724210817,
+    0.9999979083588431,
+    0.9999980136168022,
+    0.9999959454382822,
+    0.9999905741633811,
+    0.9999806106170092,
+    0.9999596243324652
+   ],
+   "loss": 3.1022404750439766e-9,
+   "iterations": 96,
+   "evaluations": 109
+  },
+  {
+   "name": "tolerance-change-1e-3",
+   "objective": "rosenbrock",
+   "start": [
+    -1.2,
+    1.0
+   ],
+   "settings": {
+    "toleranceChange": 0.001
+   },
+   "x": [
+    0.9768773674816708,
+    0.9525832436370911
+   ],
+   "loss": 0.0008257500503867106,
+   "iterations": 30,
+   "evaluations": 38
+  },
+  {
+   "name": "tolerance-grad-1e-2",
+   "objective": "rosenbrock",
+   "start": [
+    -1.2,
+    1.0
+   ],
+   "settings": {
+    "toleranceGrad": 0.01
+   },
+   "x": [
+    0.9998139520065205,
+    0.9996256094716779
+   ],
+   "loss": 3.515635228114477e-8,
+   "iterations": 33,
+   "evaluations": 42
+  },
+  {
+   "name": "lr-0.5",
+   "objective": "rosenbrock",
+   "start": [
+    -1.2,
+    1.0
+   ],
+   "settings": {
+    "lr": 0.5
+   },
+   "x": [
+    0.9999851753808625,
+    0.9999696906475958
+   ],
+   "loss": 2.6337341833046603e-10,
+   "iterations": 60,
+   "evaluations": 63
+  },
+  {
+   "name": "far-start",
+   "objective": "rosenbrock",
+   "start": [
+    3.0,
+    -4.0,
+    2.5
+   ],
+   "settings": {},
+   "x": [
+    1.0000001437488435,
+    1.0000006404634696,
+    1.0000011405097284
+   ],
+   "loss": 1.4861050921813897e-11,
+   "iterations": 47,
+   "evaluations": 56
+  },
+  {
+   "name": "at-the-minimum",
+   "objective": "rosenbrock",
+   "start": [
+    1.0,
+    1.0
+   ],
+   "settings": {},
+   "x": [
+    1.0,
+    1.0
+   ],
+   "loss": 0.0,
+   "iterations": 0,
+   "evaluations": 1
+  },
+  {
+   "name": "quartic-tiny-curvature",
+   "objective": "quartic",
+   "start": [
+    -1.25,
+    -1.75
+   ],
+   "settings": {
+    "toleranceGrad": 1e-30,
+    "toleranceChange": 1e-30
+   },
+   "x": [
+    0.9227293128793193,
+    1.9016665099833094
+   ],
+   "loss": 0.004596913615908751,
+   "iterations": 21,
+   "evaluations": 22
+  },
+  {
+   "name": "rosenbrock-max-eval-20",
+   "objective": "rosenbrock",
+   "start": [
+    1.75,
+    -2.0,
+    4.0
+   ],
+   "settings": {
+    "maxEval": 20
+   },
+   "x": [
+    0.03524241265080992,
+    0.024969985268604007,
+    0.00518495308457251
+   ],
+   "loss": 1.9398230145269464,
+   "iterations": 17,
+   "evaluations": 21
+  },
+  {
+   "name": "quartic-history-2",
+   "objective": "quartic",
+   "start": [
+    2.25,
+    -1.5
+   ],
+   "settings": {
+    "historySize": 2
+   },
+   "x": [
+    0.9227465976603015,
+    1.901689594387979
+   ],
+   "loss": 0.004596913658354134,
+   "iterations": 20,
+   "evaluations": 22
+  },
+  {
+   "name": "mix-step-size",
+   "objective": "mix",
+   "start": [
+    -9.0,
+    -4.0
+   ],
+   "settings": {},
+   "x": [
+    1.0,
+    -3.9999999991359996
+   ],
+   "loss": 1295.9999992535036,
+   "iterations": 2,
+   "evaluations": 4
+  },
+  {
+   "name": "well-zoom",
+   "objective": "well",
+   "start": [
+    -2.5,
+    -2.0,
+    2.75,
+    -1.0
+   ],
+   "settings": {
+    "toleranceGrad": 1e-30,
+    "toleranceChange": 1e-30
+   },
+   "x": [
+    -1.3008395619135176,
+    -1.3008395631123524,
+    1.1309011243171814,
+    -1.3008395696669415
+   ],
+   "loss": -11.611945298580522,
+   "iterations": 13,
+   "evaluations": 52
+  }
+ ]
+}

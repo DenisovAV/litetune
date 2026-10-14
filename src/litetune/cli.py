@@ -44,6 +44,19 @@ from litetune.bundle import (
     versions_from,
 )
 from litetune.checks import Outcome
+from litetune.decide import (
+    CALIBRATIONS as DECIDE_CALIBRATIONS,
+)
+from litetune.decide import (
+    DEFAULT_EXAMPLES_IN_ARTIFACT,
+    DEFAULT_KEEP,
+    DEFAULT_MAX_ERROR,
+    DecideError,
+    DecideRequest,
+    run_decide,
+)
+from litetune.decide import METHODS as DECIDE_METHODS
+from litetune.decide import summarise as summarise_decide
 from litetune.declarations import DeclarationsError
 from litetune.envs import cached_environments, env_cache_root, remove_cached
 from litetune.evaluate import CANDIDATE_BACKENDS, GREEDY, DataError
@@ -111,6 +124,7 @@ REFUSALS = (
     TuneError,
     PrepareError,
     TowersError,
+    DecideError,
     # A declarations file the runtime or the reference template would render
     # differently is refused with the property named; printed as a traceback,
     # the sentence that says what to change was buried under it.
@@ -226,6 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_convert(sub)
     _add_bundle(sub)
     _add_towers(sub)
+    _add_decide(sub)
 
     env = sub.add_parser(
         "env",
@@ -765,6 +780,124 @@ def _add_towers(sub) -> None:
         help="fail instead of provisioning the runtime environment the builder runs in",
     )
     towers.add_argument("--json", action="store_true", help="write the report to stdout")
+
+
+def _add_decide(sub) -> None:
+    decide = sub.add_parser(
+        "decide",
+        help="fit an embedding decider offline, for flutter_edge_ai's loadDecider",
+        description=(
+            "Embed labelled requests with an embedding .litertlm on the CPU, fit the decider "
+            "flutter_edge_ai's EmbeddingModel.createDecider fits -- centroids, an optional "
+            "linear layer, an abstain threshold -- and write the artifact its loadDecider "
+            "reads, with decide.json beside it: what was fitted, and on --test rows what the "
+            "artifact as written answers. Exit codes: 0 written, 4 refused or not written, or "
+            "written but its --json report could not be delivered."
+        ),
+    )
+    decide.add_argument(
+        "--train",
+        required=True,
+        type=Path,
+        help=(
+            'JSONL rows {"text": ..., "label": "<option id>"}: every row is an input of its '
+            "option"
+        ),
+    )
+    decide.add_argument(
+        "--embedder",
+        required=True,
+        type=Path,
+        help="the embedding .litertlm file the app installs",
+    )
+    decide.add_argument(
+        "--output-dir",
+        required=True,
+        type=Path,
+        help="where decider.json and decide.json are written; neither may exist yet",
+    )
+    decide.add_argument(
+        "--options",
+        type=Path,
+        help=(
+            'a JSON array of {"id", "description"?, "metadata"?}. Without it the options are '
+            "the --train labels in first-seen order, with no description. A description is "
+            "embedded as one more input of its option, as createDecider embeds it"
+        ),
+    )
+    decide.add_argument(
+        "--calib",
+        type=Path,
+        help=(
+            "held-out labelled JSONL rows for --calibration labelled; none may repeat a --train "
+            "text or a description"
+        ),
+    )
+    decide.add_argument(
+        "--test",
+        type=Path,
+        help=(
+            'JSONL rows to measure the written artifact on; "label": null marks a row that '
+            "should be refused"
+        ),
+    )
+    who = decide.add_mutually_exclusive_group()
+    who.add_argument(
+        "--embedder-name",
+        help=(
+            "the name the app installs the file under, when it is not this file's own name. "
+            "The space id carries the name and the size; an app that installs another name "
+            "is refused by loadDecider"
+        ),
+    )
+    who.add_argument(
+        "--embedder-id",
+        help=(
+            "the embedderId the app passes to createDecider and loadDecider, which replaces "
+            "the installed file's name and size in the space id"
+        ),
+    )
+    decide.add_argument("--method", choices=list(DECIDE_METHODS), default="centroid")
+    decide.add_argument(
+        "--calibration",
+        choices=list(DECIDE_CALIBRATIONS),
+        default="crossFit",
+        help=(
+            "crossFit (default): a 5-fold cross-fit of the options' own inputs; labelled: the "
+            "--calib rows, which also fit a temperature for probabilities; minSimilarity: the "
+            "fixed cosine --min-similarity; none: never abstain"
+        ),
+    )
+    decide.add_argument(
+        "--keep",
+        type=float,
+        help=f"crossFit: the share of held-out inputs the threshold keeps (default {DEFAULT_KEEP})",
+    )
+    decide.add_argument(
+        "--max-error",
+        type=float,
+        help=(
+            "labelled: the error allowed on the --calib rows answered at the threshold "
+            f"(default {DEFAULT_MAX_ERROR})"
+        ),
+    )
+    decide.add_argument("--min-similarity", type=float, help="minSimilarity: the cosine threshold")
+    decide.add_argument(
+        "--examples-in-artifact",
+        type=int,
+        default=DEFAULT_EXAMPLES_IN_ARTIFACT,
+        help=(
+            "how many train texts of each option the artifact stores, the first in data order "
+            f"(default {DEFAULT_EXAMPLES_IN_ARTIFACT}); the fit uses every row"
+        ),
+    )
+    decide.add_argument("--timeout-s", type=int, default=DecideRequest.timeout_s)
+    decide.add_argument(
+        "--no-provision",
+        action="store_true",
+        help="fail instead of provisioning the runtime environment the embedding runs in",
+    )
+    decide.add_argument("--json", action="store_true", help="write the report to stdout")
 
 
 # ---------------------------------------------------------------------------
@@ -1328,6 +1461,35 @@ def _towers(args: argparse.Namespace) -> int:
     return EXIT_CODES[Status.PASSED] if delivered else EXIT_CODES[Status.ERROR]
 
 
+def _decide(args: argparse.Namespace) -> int:
+    events = _stream()
+    request = DecideRequest(
+        train=args.train,
+        embedder=args.embedder,
+        output_dir=args.output_dir,
+        options=args.options,
+        calib=args.calib,
+        test=args.test,
+        embedder_name=args.embedder_name,
+        embedder_id=args.embedder_id,
+        method=args.method,
+        calibration=args.calibration,
+        keep=args.keep,
+        max_error=args.max_error,
+        min_similarity=args.min_similarity,
+        examples_in_artifact=args.examples_in_artifact,
+        timeout_s=args.timeout_s,
+        auto_provision=not args.no_provision,
+    )
+    result = run_decide(request, events=events)
+    delivered = _report(result.as_dict(), lambda: summarise_decide(result), args.json)
+    if not delivered:
+        logger.error(
+            "%s was written, but its --json report could not be delivered", result.artifact
+        )
+    return EXIT_CODES[Status.PASSED] if delivered else EXIT_CODES[Status.ERROR]
+
+
 def _artifact_line(export: RecipeExport) -> str:
     """One produced artifact. Companion files are named, not folded into one number.
 
@@ -1756,6 +1918,7 @@ HANDLERS = {
     "convert": _convert,
     "bundle": _bundle,
     "towers": _towers,
+    "decide": _decide,
     "env": _env,
 }
 
