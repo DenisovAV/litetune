@@ -32,7 +32,6 @@ import hashlib
 import json
 import logging
 import os
-import stat
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -90,7 +89,7 @@ from litetune.metrics import (
     strip_reasoning,
     terminators_trimmed,
 )
-from litetune.models import identify, renders_declarations_for
+from litetune.models import identify, read_training_record, renders_declarations_for
 from litetune.prompt_mode import (
     PromptMode,
     PromptModeConflict,
@@ -794,95 +793,6 @@ def declarations_sha256_in(record: tuple[dict, Path]) -> str | None:
     if not isinstance(raw, str):
         raise ValueError(f"{sidecar} records declarations_sha256 {raw!r}, which is not a string")
     return raw
-
-
-def read_training_record(reference: str) -> tuple[dict, Path] | None:
-    """The checkpoint's own record and where it was read from, or `None` for no record.
-
-    One reader for every question `verify` and `export` ask of
-    `litetune.json` -- `export` offers a canonical chat template on a record's
-    absence, so it must not mistake an unreadable record for none. The
-    distinction below is subtle enough that a second copy would drift from it,
-    and the two copies would then disagree about whether a checkpoint said
-    anything.
-
-    `None` for a Hugging Face id, for a directory with no `litetune.json`, and
-    for a reference that is not a directory at all -- including a directory
-    reached through a symlink that resolves and simply has no sidecar. A
-    sidecar that exists and cannot be read raises -- one that is not a regular
-    file, a FIFO or a device, without being opened, as far as
-    `_read_regular_file` says it can -- and so does a reference that is a link
-    going nowhere.
-
-    A link going nowhere further up the path is not detected. Reading through
-    it raises the same `FileNotFoundError` as an absent directory, and the
-    reference is then not itself a link, so nothing here tells the two apart;
-    it reads as no record.
-    """
-    sidecar = Path(reference) / models.PROVENANCE_NAME
-    try:
-        text = _read_regular_file(sidecar).decode("utf-8")
-    except FileNotFoundError:
-        # A link going nowhere raises this too, and it is not the same
-        # statement: the link is an entry, so something recorded a checkpoint's
-        # own account here and the link no longer reaches it.
-        #
-        # The two calls are not the same test. For the sidecar, `is_symlink`
-        # settles it: a link that resolved would have been read, so a link that
-        # is still an entry after `FileNotFoundError` is dangling. For the
-        # reference directory, the same exception is raised by the ordinary
-        # case of a checkpoint that simply has no sidecar, and the directory
-        # link being intact says nothing -- so that one has to be asked whether
-        # it resolves. `exists` follows the link; `is_symlink` does not.
-        reference_path = Path(reference)
-        if sidecar.is_symlink() or (reference_path.is_symlink() and not reference_path.exists()):
-            raise
-        return None
-    except NotADirectoryError:
-        # The reference is not a directory at all: a Hugging Face id, or a file.
-        return None
-    # Every other OSError propagates -- a permission, a stale mount -- because
-    # falling through to the contract, to inference, or to "no declarations
-    # recorded" would silently replace what the checkpoint wrote down.
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError(f"{sidecar} does not contain a JSON object")
-    return data, sidecar
-
-
-_NOT_REGULAR = (
-    (stat.S_ISDIR, "a directory"),
-    (stat.S_ISFIFO, "a FIFO"),
-    (stat.S_ISCHR, "a character device"),
-    (stat.S_ISBLK, "a block device"),
-    (stat.S_ISSOCK, "a socket"),
-)
-
-
-def _refuse_unless_regular(path: Path, mode: int) -> None:
-    if stat.S_ISREG(mode):
-        return
-    kind = next((name for test, name in _NOT_REGULAR if test(mode)), "not a file")
-    raise OSError(f"{path} is not a regular file: it is {kind}")
-
-
-def _read_regular_file(path: Path) -> bytes:
-    """The bytes of `path`, a regular file once its links are followed, or `OSError`.
-
-    Looked at before it is opened, because opening a FIFO waits for a writer
-    and reading a device need not end; and looked at again through the
-    descriptor once open. On POSIX the open does not wait (`O_NONBLOCK`), so the
-    second look closes the gap in which the entry could be replaced after the
-    first. Windows has neither `O_NONBLOCK` nor `os.mkfifo` (both Unix-only in
-    Python's `os` documentation), so there the guard is the first look alone:
-    an entry replaced between the look and the open is not caught before the
-    open.
-    """
-    _refuse_unless_regular(path, os.stat(path).st_mode)
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
-    with os.fdopen(os.open(path, flags), "rb") as handle:
-        _refuse_unless_regular(path, os.fstat(handle.fileno()).st_mode)
-        return handle.read()
 
 
 def _resolve_mode(request: VerifyRequest, split: Split) -> PromptModeDecision:

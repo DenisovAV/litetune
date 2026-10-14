@@ -1426,7 +1426,23 @@ def test_the_plan_is_keyed_on_the_identity_while_argv_still_names_the_path(tmp_p
     assert f"--model={checkpoint}" in request.argv("dynamic_wi8_afp32")
 
 
-def test_an_unreadable_sidecar_reaches_the_report(tmp_path, monkeypatch):
+def _cut_short(sidecar):
+    sidecar.write_text('{"base_model": "goo', encoding="utf-8")
+
+
+def _a_directory_sidecar(sidecar):
+    sidecar.mkdir()
+
+
+@pytest.mark.parametrize(
+    ("spoil", "said"),
+    [
+        (_cut_short, "could not be read: JSONDecodeError: "),
+        (_a_directory_sidecar, "could not be read: OSError: "),
+    ],
+    ids=["cut-short", "directory"],
+)
+def test_an_unreadable_sidecar_reaches_the_report(tmp_path, monkeypatch, spoil, said):
     """Recorded in the hint is not enough: nobody reads a hint."""
     from litetune.export import ExportRequest, run_export
 
@@ -1434,7 +1450,7 @@ def test_an_unreadable_sidecar_reaches_the_report(tmp_path, monkeypatch):
     # refused before the sidecar is read.
     buildable_here(monkeypatch)
     checkpoint = _checkpoint(tmp_path)
-    (checkpoint / "litetune.json").write_text('{"base_model": "goo', encoding="utf-8")
+    spoil(checkpoint / "litetune.json")
 
     result = run_export(
         ExportRequest(
@@ -1450,7 +1466,7 @@ def test_an_unreadable_sidecar_reaches_the_report(tmp_path, monkeypatch):
             auto_provision=False,
         )
     )
-    assert any("could not be read" in line for line in result.limitations)
+    assert any(said in line for line in result.limitations), result.limitations
 
 
 # ---------------------------------------------------------------------------

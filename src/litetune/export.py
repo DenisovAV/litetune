@@ -1306,18 +1306,18 @@ def _canonical_basis(
     that kept the family's template unchanged is offered the canonical template
     all the same.
 
-    No record means none at all: `verify.read_training_record` returns `None`.
+    No record means none at all: `models.read_training_record` returns `None`.
     A `litetune.json` that is there and cannot be read -- a directory, a FIFO
     or a device, a link going nowhere, a permission failure, text that is not a
     JSON object -- is a record this cannot read, and withholds, whatever the
     template.
     """
     # Here, not at the top: `verify` imports this module.
-    from litetune.verify import declarations_sha256_in, prompt_mode_in, read_training_record
+    from litetune.verify import declarations_sha256_in, prompt_mode_in
 
     sidecar = Path(request.model) / models.PROVENANCE_NAME
     try:
-        record = read_training_record(request.model)
+        record = models.read_training_record(request.model)
     except (OSError, ValueError) as exc:
         return None, f"{sidecar} could not be read ({type(exc).__name__}: {exc})"
     if record is None:
