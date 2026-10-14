@@ -329,6 +329,20 @@ _ADVERSARIAL_SYNTAX = [
     "{% endwith %}[{{ a }}]",
     "{% for x in [[1, [2]], 3] recursive %}{% if x is sequence %}{{ loop(x) }}{% else %}{{ x }}"
     "{{ loop.depth }}{% endif %}{% endfor %}",
+    # A loop's iterable is evaluated in the scope around it: here, the
+    # recursive loop's.
+    "{% for x in [[[]]] recursive %}{% for y in loop(x) %}{{ y }}{% endfor %}{% endfor %}",
+    "{% for x in [['ab']] recursive %}{% if x is string %}{{ x }}{% else %}"
+    "{% for y in loop(x) %}{{ y }};{% endfor %}{% endif %}{% endfor %}",
+    # `dict`: a map or none, and keyword arguments (`functions::dict`).
+    "{{ dict(a=1) | tojson }}|{{ dict({'b': 2}, a=1) | tojson }}|{{ dict({'b': 2}, b=1) | tojson }}"
+    "|{{ dict(nope, a=1) | tojson }}|{{ dict(namespace(b=1, a=2)) | tojson }}",
+    "{% set x = none %}{{ dict(x) | tojson }}",
+    "{% set x = [['a', 1]] %}{{ dict(x) | tojson }}",
+    "{{ ['a'] | map('replace', 'a', 'b') | list }}",
+    # `range` takes a float that is an integer.
+    "{{ range(2.0) | list }}|{{ range(true) | list }}|{{ range(5, 1, -2) | list }}",
+    "{{ range(2.5) | list }}",
 ]
 
 
@@ -487,6 +501,13 @@ _RENDERED_OTHERWISE = [
     ("[{{ range }}]", "the function `range` as a value"),
     ("[{{ debug }}]", "the function `debug` as a value"),
     ("[{{ __mj_iter__ }}]", "the name `__mj_iter__`, which this renderer reserves"),
+    # `map` by name finds Jinja2's filters here; MiniJinja has no `wordcount`.
+    ("{{ ['a b'] | map('wordcount') | list }}", "`map` of the filter `wordcount`"),
+    # MiniJinja's `map` drops a keyword argument the named filter is given.
+    (
+        "{{ ['a'] | map('replace', 'a', 'b', count=1) | list }}",
+        "`map` with keyword arguments other than one plain `attribute`",
+    ),
 ]
 
 
@@ -494,29 +515,49 @@ _RENDERED_OTHERWISE = [
 # printed, aliased, aliased under a macro's name, assigned over. The renderer
 # has none of them, so each renders as on the device; each is still not
 # vouched for.
-_JINJA2_ONLY_GLOBAL_USES = [
-    "[{{ cycler }}]",
-    "{% set c = cycler %}[{{ c }}]",
-    "{% macro m() %}{% endmacro %}{% set m = joiner %}{{ m(',') }}",
-    "{% set cycler = 1 %}{{ cycler }}",
-    "[{{ lipsum }}]",
+_JINJA2_ONLY_GLOBAL = "a Jinja2 global MiniJinja 2.14 does not have"
+_RENDERED_ALIKE_NOT_VOUCHED_FOR = [
+    ("[{{ cycler }}]", _JINJA2_ONLY_GLOBAL),
+    ("{% set c = cycler %}[{{ c }}]", _JINJA2_ONLY_GLOBAL),
+    ("{% macro m() %}{% endmacro %}{% set m = joiner %}{{ m(',') }}", _JINJA2_ONLY_GLOBAL),
+    ("{% set cycler = 1 %}{{ cycler }}", _JINJA2_ONLY_GLOBAL),
+    ("[{{ lipsum }}]", _JINJA2_ONLY_GLOBAL),
+    # Pairs: Jinja2's `dict` is Python's and takes them; MiniJinja's refuses
+    # them, and so does the renderer's.
+    ("{{ dict([['a', 1]]) | tojson }}", "`dict` of a value that is not a map"),
+    ("{{ dict({'a': 1}, {'b': 2}) }}", "`dict` of more than one value"),
+    ("{% set kw = {'a': 1} %}{{ dict(**kw) }}", "`dict` with `*` or `**` arguments"),
+    # `map` shapes not vouched for, whatever they render.
+    ("{% set f = 'upper' %}{{ ['a'] | map(f) | list }}", "`map` of a filter named at run time"),
+    (
+        "{{ [{'a': {'b': 1}}] | map(attribute='a.b') | list }}",
+        "`map` with keyword arguments other than one plain `attribute`",
+    ),
+    (
+        "{{ [{'a': 1}] | map(attribute='b', default=2) | list }}",
+        "`map` with keyword arguments other than one plain `attribute`",
+    ),
 ]
 
 
-@pytest.mark.parametrize("source", _JINJA2_ONLY_GLOBAL_USES)
-def test_a_jinja2_global_minijinja_lacks_is_undefined_and_not_vouched_for(source):
+@pytest.mark.parametrize(("source", "named"), _RENDERED_ALIKE_NOT_VOUCHED_FOR)
+def test_what_the_renderer_renders_alike_but_does_not_vouch_for_is_named(source, named):
+    """Rendered as MiniJinja renders it, and still not vouched for: a shape this
+    renderer's tests do not hold to MiniJinja in general."""
     ours, theirs = _render(source, [], True), _minijinja(source, [], True)
     assert ("text" in ours) == ("text" in theirs), (ours, theirs)
     assert ours.get("text") == theirs.get("text")
-    assert any("a Jinja2 global MiniJinja 2.14 does not have" in gap for gap in _unvouched(source))
+    assert any(named in gap for gap in _unvouched(source)), _unvouched(source)
 
 
-def test_jinja2_as_transformers_configures_it_prints_a_global_minijinja_lacks():
+def test_jinja2_as_transformers_configures_it_renders_these_otherwise():
     stock = _script("renderer")["ImmutableSandboxedEnvironment"](
         trim_blocks=True, lstrip_blocks=True
     )
     assert stock.from_string("[{{ cycler }}]").render() == "[<class 'jinja2.utils.Cycler'>]"
     assert _render("[{{ cycler }}]", [], True) == {"text": "[]"}
+    assert stock.from_string("{{ dict([['a', 1]]) | tojson }}").render() == '{"a": 1}'
+    assert "error" in _render("{{ dict([['a', 1]]) | tojson }}", [], True)
 
 
 @pytest.mark.parametrize(("source", "named"), _RENDERED_OTHERWISE)

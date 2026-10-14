@@ -25,6 +25,7 @@ from conftest import (
     fifo_released_after,
     machine,
     mark_provisioned,
+    record_opens,
     run_compose_script,
 )
 
@@ -3081,7 +3082,7 @@ def _a_link_to_dev_null(sidecar):
     ids=["fifo", "link-to-dev-null"],
 )
 def test_a_record_that_is_not_a_regular_file_is_refused_unopened(
-    toolchain, qwen_request, trained, make, kind
+    toolchain, qwen_request, trained, monkeypatch, make, kind
 ):
     """A FIFO named litetune.json would hold the open until something wrote to
     it, and a device need not end. Neither is opened: refused for what it is."""
@@ -3089,9 +3090,15 @@ def test_a_record_that_is_not_a_regular_file_is_refused_unopened(
     model = trained(_NOT_RECORDED)
     sidecar = Path(model) / models.PROVENANCE_NAME
     make(sidecar)
-    with fifo_released_after(sidecar, 5, _OFFERING_RECORD) as released:
+    opened = record_opens(monkeypatch)
+    if make is _a_fifo:
+        with fifo_released_after(sidecar, 5, _OFFERING_RECORD) as released:
+            result = run_export(qwen_request(model))
+        assert released == [], "convert waited on the FIFO"
+    else:
+        # No watchdog: opening the device for writing would not tell a reader.
         result = run_export(qwen_request(model))
-    assert released == [], "convert waited on the FIFO"
+    assert not {sidecar, sidecar.resolve()} & set(opened)
     withheld = _withheld_for_an_unreadable_record(result)
     assert f"(OSError: {sidecar} is not a regular file: it is {kind})" in withheld
 

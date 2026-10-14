@@ -810,8 +810,9 @@ def read_training_record(reference: str) -> tuple[dict, Path] | None:
     for a reference that is not a directory at all -- including a directory
     reached through a symlink that resolves and simply has no sidecar. A
     sidecar that exists and cannot be read raises -- one that is not a regular
-    file, a FIFO or a device, without being opened (`_read_regular_file`) --
-    and so does a reference that is a link going nowhere.
+    file, a FIFO or a device, without being opened, as far as
+    `_read_regular_file` says it can -- and so does a reference that is a link
+    going nowhere.
 
     A link going nowhere further up the path is not detected. Reading through
     it raises the same `FileNotFoundError` as an absent directory, and the
@@ -870,8 +871,12 @@ def _read_regular_file(path: Path) -> bytes:
 
     Looked at before it is opened, because opening a FIFO waits for a writer
     and reading a device need not end; and looked at again through the
-    descriptor, opened without waiting, because the entry can be replaced
-    between the two.
+    descriptor once open. On POSIX the open does not wait (`O_NONBLOCK`), so the
+    second look closes the gap in which the entry could be replaced after the
+    first. Windows has neither `O_NONBLOCK` nor `os.mkfifo` (both Unix-only in
+    Python's `os` documentation), so there the guard is the first look alone:
+    an entry replaced between the look and the open is not caught before the
+    open.
     """
     _refuse_unless_regular(path, os.stat(path).st_mode)
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)

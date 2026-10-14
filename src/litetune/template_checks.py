@@ -276,6 +276,24 @@ class _Namespace(dict, jinja2.utils.Namespace):
         dict.update(self, ordered)
 
 
+_NO_VALUE = object()
+
+
+def _dict(value=_NO_VALUE, **kwargs):
+    # MiniJinja's `dict(value, **kwargs)` (`src/functions.rs`): a map, or
+    # nothing, none or undefined for an empty one (an `Option` argument), updated
+    # with the keyword arguments; any other value is an error. Jinja2's is
+    # Python's `dict`, which also takes pairs.
+    if value is _NO_VALUE or value is None or isinstance(value, jinja2.Undefined):
+        result = {}
+    elif isinstance(value, dict):
+        result = dict(value)
+    else:
+        raise TypeError("invalid operation")
+    result.update(kwargs)
+    return result
+
+
 def _namespace(*args, **kwargs):
     # MiniJinja's `namespace(defaults)`: one map or keyword arguments, not both,
     # and only its string keys.
@@ -337,12 +355,13 @@ def _times(sequence, count, left, right):
 
 
 def _bound(value):
-    # A slice bound is `i64::try_from`: a bool, an integer, or a float that is one.
+    # A slice bound, or a bound of `range`, is `i64::try_from`: a bool, an
+    # integer, or a float that is one.
     if isinstance(value, float) and value.is_integer() and abs(value) < 2.0**63:
         return int(value)
     if isinstance(value, int):
         return int(value)
-    raise TypeError(f"cannot convert {minijinja_str(value)} to a slice index")
+    raise TypeError(f"cannot convert {minijinja_str(value)} to an integer")
 
 
 def _backwards(start, stop, step, end):
@@ -738,8 +757,9 @@ def _length(value):
 
 
 def _range(*args):
-    # MiniJinja's `range`: an iterable of no more than 100000 items.
-    values = range(*args)
+    # MiniJinja's `range`: an iterable of no more than 100000 items, whose
+    # bounds are integers as a slice's are (`_bound`), a float that is one too.
+    values = range(*(_bound(arg) for arg in args))
     if len(values) > 100000:
         raise OverflowError("range has too many elements")
     return _Iterable(values)
@@ -808,6 +828,7 @@ def runtime_environment():
     env.filters["length"] = _length
     env.filters["map"] = _map
     env.globals["range"] = _range
+    env.globals["dict"] = _dict
     env.globals["namespace"] = _namespace
     env.globals["__mj_iter__"] = _loop_iterable
     env.minijinja_compare = minijinja_compare
@@ -903,28 +924,74 @@ def _constant(node):
 
 
 def _recursive_loop_calls(tree):
-    # The `loop(...)` calls that re-enter the loop they are in: in the body of
-    # a `recursive` loop, outside any loop, macro or call block within it.
+    # The `loop(...)` calls that re-enter the loop they are in: those in the
+    # body of a `recursive` loop. A loop within that body opens a scope of its
+    # own for its body, its `else` and its condition, but its iterable is
+    # evaluated before, in the recursive loop's; a macro or a call block
+    # within it is not looked into.
     found = set()
 
-    def walk(node):
-        for child in node.iter_child_nodes():
-            if isinstance(child, (_nodes.For, _nodes.Macro, _nodes.CallBlock)):
-                continue
-            if (
-                isinstance(child, _nodes.Call)
-                and isinstance(child.node, _nodes.Name)
-                and child.node.name == "loop"
-            ):
-                found.add(id(child))
-            walk(child)
+    def visit(node):
+        if (
+            isinstance(node, _nodes.Call)
+            and isinstance(node.node, _nodes.Name)
+            and node.node.name == "loop"
+        ):
+            found.add(id(node))
+        if isinstance(node, _nodes.For):
+            visit(node.iter)
+        elif not isinstance(node, (_nodes.Macro, _nodes.CallBlock)):
+            for child in node.iter_child_nodes():
+                visit(child)
 
     for loop in tree.find_all(_nodes.For):
         if loop.recursive:
             for statement in loop.body:
-                if not isinstance(statement, (_nodes.For, _nodes.Macro, _nodes.CallBlock)):
-                    walk(statement)
+                visit(statement)
     return found
+
+
+def _map_gaps(node):
+    # `map` as MiniJinja 2.14.0 has it (`filters::map`, `src/filters.rs`): by
+    # `attribute`, or by a filter it looks up by name and hands the rest of
+    # the positional arguments, dropping any keyword argument. Vouched for only
+    # by one attribute name with no dot, or by the constant name of a filter
+    # this renderer vouches for and positional arguments.
+    if node.dyn_args is not None or node.dyn_kwargs is not None:
+        return {"`map` with `*` or `**` arguments"}
+    keywords = {keyword.key: keyword.value for keyword in node.kwargs}
+    if keywords:
+        attribute = keywords.get("attribute")
+        if (
+            set(keywords) == {"attribute"}
+            and not node.args
+            and isinstance(attribute, _nodes.Const)
+            and isinstance(attribute.value, str)
+            and "." not in attribute.value
+        ):
+            return set()
+        return {"`map` with keyword arguments other than one plain `attribute`"}
+    if not node.args:
+        return {"`map` with no filter"}
+    name = node.args[0]
+    if not (isinstance(name, _nodes.Const) and isinstance(name.value, str)):
+        return {"`map` of a filter named at run time"}
+    if name.value not in VOUCHED_FILTERS:
+        return {f"`map` of the filter `{name.value}`"}
+    return set()
+
+
+def _dict_gaps(node):
+    # MiniJinja's `dict` takes one map, or none, and keyword arguments
+    # (`functions::dict`, `src/functions.rs`); a literal that is not a map is
+    # refused there, and here before it is rendered.
+    if node.dyn_args is not None or node.dyn_kwargs is not None:
+        return {"`dict` with `*` or `**` arguments"}
+    if len(node.args) > 1:
+        return {"`dict` of more than one value"}
+    if node.args and isinstance(node.args[0], (_nodes.List, _nodes.Tuple, _nodes.Const)):
+        return {"`dict` of a value that is not a map"}
+    return set()
 
 
 def _lexical_gaps(source):
@@ -960,6 +1027,11 @@ def unvouched(template):
     for node in tree.find_all(_nodes.Filter):
         if node.name not in VOUCHED_FILTERS:
             found.add(f"the filter `{node.name}`")
+        elif node.name == "map":
+            found |= _map_gaps(node)
+    for node in tree.find_all(_nodes.Call):
+        if isinstance(node.node, _nodes.Name) and node.node.name == "dict":
+            found |= _dict_gaps(node)
     for node in tree.find_all(_nodes.Test):
         if node.name not in VOUCHED_TESTS:
             found.add(f"the test `{node.name}`")

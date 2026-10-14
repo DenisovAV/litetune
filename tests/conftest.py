@@ -570,31 +570,56 @@ class LocalEntryNotFoundError(FileNotFoundError, EntryNotFoundError):
 """
 
 
+def record_opens(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """The paths `os.open` is given for the rest of the test, in order.
+
+    `os` is one module, so this sees `litetune.verify`'s calls as well.
+    """
+    opened: list[Path] = []
+    open_ = os.open
+
+    def recorded(path: Any, *args: Any, **kwargs: Any) -> int:
+        opened.append(Path(os.fsdecode(path)))
+        return open_(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recorded)
+    return opened
+
+
 @contextlib.contextmanager
 def fifo_released_after(fifo: Path, seconds: float, payload: bytes) -> Iterator[list[bool]]:
     """Guard code that must not open `fifo` and wait for a writer.
 
-    If a reader is still waiting on `fifo` after `seconds`, it is given
-    `payload` and end of file -- so a regression fails its test instead of
-    hanging the suite -- and the list yielded holds `True`. Nothing reading is
-    the case asserted: the list stays empty.
+    From `seconds` on, until the block ends, any reader waiting on `fifo` --
+    one already there, or one that arrives later -- is given `payload` and end
+    of file, so a regression fails its test instead of hanging the suite, and
+    the list yielded holds `True`. Nothing reading is the case asserted: the
+    list stays empty. What fails in the watchdog is raised when the block ends,
+    and so is a watchdog that did not end.
     """
     stop = threading.Event()
     released: list[bool] = []
+    failures: list[BaseException] = []
 
     def release() -> None:
-        if stop.wait(seconds):
-            return
         try:
-            # POSIX alone: the tests using this are.
-            descriptor = os.open(fifo, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0))
-        except OSError as exc:
-            if exc.errno == errno.ENXIO:  # no reader: nothing to release
+            if stop.wait(seconds):
                 return
-            raise
-        released.append(True)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
+            while not stop.is_set():
+                try:
+                    # POSIX alone: the tests using this are.
+                    descriptor = os.open(fifo, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0))
+                except OSError as exc:
+                    if exc.errno != errno.ENXIO:  # ENXIO: no reader yet
+                        raise
+                    stop.wait(0.05)
+                    continue
+                released.append(True)
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(payload)
+                return
+        except BaseException as exc:  # noqa: BLE001 -- the thread's top: re-raised below
+            failures.append(exc)
 
     thread = threading.Thread(target=release, daemon=True)
     thread.start()
@@ -602,7 +627,10 @@ def fifo_released_after(fifo: Path, seconds: float, payload: bytes) -> Iterator[
         yield released
     finally:
         stop.set()
-        thread.join(timeout=seconds + 5)
+        thread.join(timeout=10)
+    assert not thread.is_alive(), f"the watchdog on {fifo} did not end"
+    if failures:
+        raise failures[0]
 
 
 def run_compose_script(
