@@ -244,7 +244,7 @@ tool path only and the CPU nowhere.
 | 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
 | 0.2.0 – 0.3.0 | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
 | 0.4.0 – 0.4.1 | `litert-lm==0.18.0` | `litert-lm==0.18.0` and `litert-lm-builder==0.18.0`; `litert-torch-nightly` and the LiteRT, quantizer and converter pins unchanged | unchanged |
-| 0.4.2 | `litert-lm==0.18.0` | unchanged | unchanged on Python 3.10 – 3.12; `sentencepiece==0.2.1` in place of 0.2.0 on Python 3.13 |
+| 0.4.2 – 0.4.3 | `litert-lm==0.18.0` | unchanged | unchanged on Python 3.10 – 3.12; `sentencepiece==0.2.1` in place of 0.2.0 on Python 3.13 |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
@@ -827,7 +827,7 @@ incompatible dependencies and cannot share an interpreter.
 ## Results
 
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
-runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and 0.4.0 – 0.4.2 pin 0.18.0.
+runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and 0.4.0 – 0.4.3 pin 0.18.0.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
 0.17.1 re-measurements beside the originals where there are any, and the same
 again on 0.18.0.

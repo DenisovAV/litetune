@@ -96,7 +96,7 @@ four-bit recipes on the same four checkpoints, in *Four bits on litert-lm
 0.17.1*; the tuned Gemma 4 E2B's two eight-bit bundles, in *Gemma 4 E2B on
 litert-lm 0.17.1*; and FunctionGemma's tool path, in *The same checkpoint on
 litert-lm 0.17.1*. Each of those was taken again on litert-lm 0.18.0, the runtime
-0.4.0 – 0.4.2 pin, in *The 0.17.1 re-measurements again on litert-lm 0.18.0*, after the
+0.4.0 – 0.4.3 pin, in *The 0.17.1 re-measurements again on litert-lm 0.18.0*, after the
 banking77 sections. The rest has not been; among it the headline FunctionGemma
 runs, the conversions of Gemma 4's base weights and the runs on untuned bases
 are `verify` numbers taken on 0.16.1, and the phone runs ran on the device.
@@ -239,7 +239,26 @@ and 0.7717, −0.0017 (3), Qwen3 0.6983, 0.0000 (10) and 0.6933, +0.0050 (5), fo
 each of the branch's five commits.
 Which checkpoints get the block is the qwen-3 and qwen-2.5 patterns' to say
 (`models.py`); one they do not claim gets none, and whether its template reads a list
-is what verify's rendering check shows.
+is what verify's rendering check shows. From 0.4.3 the qwen-3 pattern hands a checkpoint
+LiteRT-LM's own Qwen 3 template instead, where it is offered (below).
+
+**Every Qwen3 bundle up to 0.4.2 answers one message of a LiteRT-LM conversation.** LiteRT-LM
+renders the whole history on every message and requires the new rendering to start with the
+previous one (`Conversation::GetSingleTurnTextFromFullHistory`; LiteRT-LM #3443). Qwen3's own
+template renders the last assistant turn with an empty `<think>` pair and drops the pair once
+the next user message arrives, so the second message fails with `INTERNAL: The new rendered
+template string does not start with the previous rendered template string`. Up to 0.3.0 a Qwen3
+bundle carries that template alone (`models.py` at v0.3.0), and from 0.4.0 behind the block.
+Measured on 2026-10-13 on Linux x86_64 on litert-lm 0.18.0's CPU backend, `dynamic_wi8_afp32`:
+the tuned Qwen3 checkpoint converted by litetune 0.4.2 answered the first message and failed the
+second, in both conversations tried; `Qwen/Qwen3-0.6B` as published, converted by the main branch
+after #77, did the same with a reply cut at 64 tokens and with one of 512. Converted by #78's code,
+both carry LiteRT-LM v0.18.0's `models/qwen3/chat_template.jinja` and answered every message sent
+(three in one conversation; "Paris", then "Berlin" for the base model at 512 tokens, its reasoning
+in the `thought` channel). The tuned bundle verified at 0.6983 for candidate and reference, cost
+0.0000 (10), as before, with the reference's token ids for all 600 prompts. The Qwen2.5 and
+Gemma 3 bundles of the same run held a three-message conversation. litetune 0.4.3 checks each
+bundle's template for this after export and says in the report when one answers one message.
 
 FunctionGemma's tool path, both grammar modes, 640 rows: the bundle converted on
 2026-09-19 and the same checkpoint converted again at c7ee2da -- litert-lm-builder

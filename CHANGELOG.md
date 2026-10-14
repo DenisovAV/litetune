@@ -3,6 +3,12 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.4.3 — 2026-10-14
+- **Convert a Qwen3 bundle again if an application holds a conversation with it: every Qwen3 bundle earlier litetune converted without a template of the caller's carries Qwen's own chat template, which LiteRT-LM's conversation cannot render past the first message, so the second message fails (#78).**
+- `convert` checks that each bundle's chat template renders single turns as the checkpoint was trained and holds a LiteRT-LM conversation, says in its report when one does not, and gives Qwen3 LiteRT-LM's own Qwen 3 template (#78).
+- On Windows each stage runs in a job object: a timeout, Ctrl-C, Ctrl-Break or a forced kill of litetune stops everything the stage started, and Ctrl-Break exits 4 (#77).
+- On Windows a stage that closes its pipes and then hangs keeps its output, and on Python 3.10 a usage error with stderr closed exits 4 rather than 120 (#77).
+
 ## 0.4.2 — 2026-10-12
 - A stage whose pinned packages publish no wheel for this platform and Python is refused before pip, naming the package: `convert` on Windows, a 32-bit or ARM64 Python on Windows, Intel macOS, macOS before 12 and older glibc; `LITETUNE_ALLOW_MISSING_WHEELS=1` lets pip try anyway, and litetune now depends on `packaging` (#74).
 - `tune` runs on Python 3.13 on Linux x86_64, with `sentencepiece` 0.2.1 there and 0.2.0 on 3.10 – 3.12 as before (#74).
