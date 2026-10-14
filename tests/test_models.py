@@ -9,8 +9,11 @@ the code under test is built to keep.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,8 +22,10 @@ from conftest import (
     FakeBackend,
     buildable_here,
     correct_texts,
+    fifo_released_after,
     labelled_rows,
     mark_provisioned,
+    record_opens,
     run_compose_script,
 )
 from minijinja_runtime import minijinja_render
@@ -1806,3 +1811,213 @@ def test_an_unreadable_sidecar_is_a_fault_not_an_absence(tmp_path):
     plain.mkdir(parents=True)
     (plain / "config.json").write_text(json.dumps({"model_type": "llama"}), encoding="utf-8")
     assert hint_for(str(plain)).provenance_error is None
+
+
+def _identity_checkpoint(tmp_path: Path) -> Path:
+    """A Gemma 3 checkpoint by its path and its config.json; each test sets its sidecar."""
+    checkpoint = tmp_path / "gemma-3-270m-it"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "gemma3_text"}), encoding="utf-8"
+    )
+    return checkpoint
+
+
+def _sidecar_a_directory(sidecar):
+    sidecar.mkdir()
+
+
+def _sidecar_a_link_going_nowhere(sidecar):
+    sidecar.symlink_to(sidecar.parent / "never-written.json")
+
+
+def _sidecar_nested_too_deeply(sidecar):
+    # Past the interpreter's recursion limit: `json.loads` raises RecursionError.
+    sidecar.write_text('{"a":' * 100_000 + "1" + "}" * 100_000, encoding="utf-8")
+
+
+def _assert_a_provenance_error(checkpoint: Path, said: str) -> None:
+    """The record is an error, said by every reader of it, and identity is not taken from it."""
+    from litetune.models import hint_for, provenance_error, recorded_identity
+
+    sidecar = checkpoint / "litetune.json"
+    hint = hint_for(str(checkpoint))
+    assert hint.provenance_error is not None
+    assert hint.provenance_error.startswith(f"{sidecar} could not be read: "), hint
+    assert said in hint.provenance_error, hint.provenance_error
+    assert hint.recorded is False
+    assert provenance_error(str(checkpoint)) == hint.provenance_error
+    assert recorded_identity(str(checkpoint)) is None
+
+
+@pytest.mark.parametrize(
+    ("spoil", "said"),
+    [
+        (_sidecar_a_directory, "OSError: {sidecar} is not a regular file: it is a directory"),
+        (_sidecar_a_link_going_nowhere, "FileNotFoundError: "),
+        (_sidecar_nested_too_deeply, "ValueError: {sidecar} is nested too deeply to read"),
+    ],
+    ids=["directory", "dangling-symlink", "nested-too-deeply"],
+)
+def test_a_sidecar_that_is_there_and_cannot_be_read_is_not_an_absent_one(tmp_path, spoil, said):
+    """`is_file()` called a directory or a link going nowhere absent, and the
+    family was then guessed from the path with nothing in the report to say
+    the checkpoint's own record had been passed over."""
+    checkpoint = _identity_checkpoint(tmp_path)
+    sidecar = checkpoint / "litetune.json"
+    spoil(sidecar)
+    _assert_a_provenance_error(checkpoint, said.format(sidecar=sidecar))
+
+
+@pytest.mark.posix
+def test_a_sidecar_that_is_a_fifo_is_a_provenance_error_unopened(tmp_path, monkeypatch):
+    checkpoint = _identity_checkpoint(tmp_path)
+    sidecar = checkpoint / "litetune.json"
+    os.mkfifo(sidecar)
+    opened = record_opens(monkeypatch)
+    record = json.dumps({"base_model": "Qwen/Qwen3-0.6B"}).encode()
+    with fifo_released_after(sidecar, 5, record) as released:
+        _assert_a_provenance_error(checkpoint, f"{sidecar} is not a regular file: it is a FIFO")
+    assert released == []
+    assert sidecar not in opened
+
+
+@pytest.mark.posix
+def test_a_sidecar_linked_to_a_device_is_a_provenance_error_unopened(tmp_path, monkeypatch):
+    checkpoint = _identity_checkpoint(tmp_path)
+    sidecar = checkpoint / "litetune.json"
+    sidecar.symlink_to("/dev/null")
+    opened = record_opens(monkeypatch)
+    _assert_a_provenance_error(
+        checkpoint, f"{sidecar} is not a regular file: it is a character device"
+    )
+    assert not {sidecar, Path("/dev/null")} & set(opened)
+
+
+@pytest.mark.posix
+def test_a_sidecar_that_cannot_be_opened_is_a_provenance_error(tmp_path):
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root opens a file whatever its permission bits")
+    checkpoint = _identity_checkpoint(tmp_path)
+    sidecar = checkpoint / "litetune.json"
+    sidecar.write_text(json.dumps({"base_model": "Qwen/Qwen3-0.6B"}), encoding="utf-8")
+    sidecar.chmod(0)
+    try:
+        _assert_a_provenance_error(checkpoint, "PermissionError: ")
+    finally:
+        sidecar.chmod(0o600)
+
+
+def test_only_an_absent_sidecar_is_no_record(tmp_path, monkeypatch):
+    """What did not change: no sidecar, a healthy link to a checkpoint without
+    one, a checkpoint not there under a healthy link, a file, a path under a
+    file and a Hugging Face id are no record, and no error."""
+    from litetune.models import hint_for, provenance_error, read_training_record, recorded_identity
+
+    monkeypatch.chdir(tmp_path)  # so that the Hub id names nothing on disk
+    plain = _identity_checkpoint(tmp_path)
+    link = tmp_path / "current"
+    link.symlink_to(plain)
+    a_file = tmp_path / "weights.bin"
+    a_file.write_bytes(b"")
+    references = (
+        str(plain),
+        str(link),
+        str(link / "run-42"),
+        str(a_file),
+        str(a_file / "child"),
+        "google/gemma-3-270m-it",
+    )
+    for reference in references:
+        assert read_training_record(reference) is None, reference
+        hint = hint_for(reference)
+        assert (hint.provenance_error, hint.recorded) == (None, False), reference
+        assert provenance_error(reference) is None, reference
+        assert recorded_identity(reference) is None, reference
+
+
+def _a_link_into_a_file(sidecar):
+    # The entry is there; following it fails with ENOTDIR, not ENOENT.
+    (sidecar.parent / "weights.bin").write_bytes(b"")
+    sidecar.symlink_to(sidecar.parent / "weights.bin" / "litetune.json")
+
+
+@pytest.mark.parametrize(
+    ("config", "spoil", "said"),
+    [
+        # No config.json: hint_for used to return before reading the record.
+        (None, _sidecar_a_directory, ("is not a regular file: it is a directory",)),
+        ("a directory", _sidecar_a_directory, ("is not a regular file: it is a directory",)),
+        # ENOTDIR on POSIX; Windows may say the path is not found instead.
+        ("a file", _a_link_into_a_file, ("NotADirectoryError: ", "FileNotFoundError: ")),
+    ],
+    ids=["no-config", "config-a-directory", "sidecar-linked-into-a-file"],
+)
+def test_an_unreadable_record_is_said_whatever_else_the_checkpoint_holds(
+    tmp_path, config, spoil, said
+):
+    from litetune.models import hint_for, provenance_error, read_training_record
+
+    checkpoint = tmp_path / "gemma-3-270m-it"
+    checkpoint.mkdir()
+    if config == "a directory":
+        (checkpoint / "config.json").mkdir()
+    elif config == "a file":
+        (checkpoint / "config.json").write_text(
+            json.dumps({"model_type": "gemma3_text"}), encoding="utf-8"
+        )
+    sidecar = checkpoint / "litetune.json"
+    spoil(sidecar)
+    with pytest.raises(OSError):
+        read_training_record(str(checkpoint))
+    hint = hint_for(str(checkpoint))
+    assert hint.provenance_error is not None, hint
+    assert hint.provenance_error.startswith(f"{sidecar} could not be read: ")
+    assert any(part in hint.provenance_error for part in said), hint.provenance_error
+    assert provenance_error(str(checkpoint)) == hint.provenance_error
+
+
+@pytest.mark.parametrize("depth", ["the-reference", "an-ancestor"])
+def test_a_broken_link_on_the_way_to_the_checkpoint_is_not_an_absent_record(tmp_path, depth):
+    """`models/current -> missing`: the reference, or a directory above it, once
+    led to a checkpoint and no longer does. `is_dir()` is false for both, and
+    reading through either raises what an absent directory raises."""
+    from litetune.models import hint_for, provenance_error, read_training_record
+
+    current = tmp_path / "models" / "current"
+    current.parent.mkdir()
+    current.symlink_to(tmp_path / "models" / "missing")
+    reference = current if depth == "the-reference" else current / "run-42"
+    with pytest.raises(FileNotFoundError, match=re.escape(f"{current}, a link on the way to")):
+        read_training_record(str(reference))
+    error = provenance_error(str(reference))
+    assert error is not None and error.startswith(
+        f"{reference / 'litetune.json'} could not be read"
+    )
+    assert hint_for(str(reference)).provenance_error == error
+
+
+def test_a_directory_junction_is_taken_for_a_link():
+    """What `os.lstat` reports for a Windows junction: not `S_ISLNK`, its reparse
+    tag. Shown with the fields alone, which any system can hold."""
+    from types import SimpleNamespace
+
+    from litetune.models import _MOUNT_POINT_TAG, _is_link
+
+    junction = SimpleNamespace(st_mode=stat.S_IFDIR, st_reparse_tag=_MOUNT_POINT_TAG)
+    directory = SimpleNamespace(st_mode=stat.S_IFDIR, st_reparse_tag=0)
+    symlink = SimpleNamespace(st_mode=stat.S_IFLNK)
+    assert _is_link(junction) and _is_link(symlink) and not _is_link(directory)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a directory junction is Windows'")
+def test_a_broken_junction_on_the_way_to_the_checkpoint_is_not_an_absent_record(tmp_path):
+    from litetune.models import read_training_record
+
+    target = tmp_path / "run-42"
+    target.mkdir()
+    junction = tmp_path / "current"
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(target)], check=True)
+    target.rmdir()
+    with pytest.raises(FileNotFoundError, match="a link on the way to"):
+        read_training_record(str(junction))

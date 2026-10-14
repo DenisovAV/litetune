@@ -40,7 +40,9 @@ import ast
 import hashlib
 import json
 import logging
+import os
 import re
+import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib.resources import files
@@ -1230,6 +1232,134 @@ load path on the next load anyway.
 """
 
 
+def read_training_record(reference: str) -> tuple[dict, Path] | None:
+    """The checkpoint's own record and where it was read from, or `None` for no record.
+
+    One reader for every question asked of `litetune.json`: the base model
+    here (`_provenance`), the mode and declarations in `verify`, and in
+    `export` whether a canonical chat template is offered on a record's
+    absence. None of them may mistake an unreadable record for none, and the
+    distinction below is subtle enough that a second copy would drift from it,
+    and the two copies would then disagree about whether a checkpoint said
+    anything. Here rather than in `verify`, which imports this module.
+
+    `None` -- no record -- in two cases only: the reference is not a
+    directory, links followed (a Hugging Face id, a file, a path that is not
+    there); or it is one, and holds no `litetune.json` entry. Everything else
+    raises: a link on the way to the reference that no longer resolves
+    (`_refuse_a_broken_link_in`), and a `litetune.json` entry that cannot be
+    read -- a link going nowhere, or through a file, one that is not a regular
+    file, a FIFO or a device, without being opened, as far as
+    `_read_regular_file` says it can, one that cannot be opened, or text that
+    is not a JSON object.
+    """
+    reference_path = Path(reference)
+    sidecar = reference_path / PROVENANCE_NAME
+    if not _is_a_directory(reference_path):
+        return None
+    try:
+        os.lstat(sidecar)
+    except FileNotFoundError:
+        return None
+    # The entry is there, so every failure from here on propagates -- a
+    # permission, a stale mount, a link that no longer reaches a file --
+    # because falling through to the contract, to inference, to "no
+    # declarations recorded" or to a family guessed from the path would
+    # silently replace what the checkpoint wrote down.
+    text = _read_regular_file(sidecar).decode("utf-8")
+    try:
+        data = json.loads(text)
+    except RecursionError as exc:
+        # Nested past the interpreter's recursion limit: as unreadable as text
+        # that is not JSON, and said the same way, so that every reader's
+        # `ValueError` covers it.
+        raise ValueError(f"{sidecar} is nested too deeply to read") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{sidecar} does not contain a JSON object")
+    return data, sidecar
+
+
+def _is_a_directory(path: Path) -> bool:
+    """Whether `path`, links followed, is a directory; an error for a broken link on the way."""
+    try:
+        return stat.S_ISDIR(os.stat(path).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        _refuse_a_broken_link_in(path)
+        return False
+
+
+# Python defines `stat.IO_REPARSE_TAG_MOUNT_POINT` on Windows alone; the value
+# is Windows' own for a directory junction (winnt.h), and nothing else reports
+# an `st_reparse_tag`, so on another system nothing matches it.
+_MOUNT_POINT_TAG = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+
+
+def _is_link(entry: os.stat_result) -> bool:
+    # A symbolic link, or on Windows a directory junction, which `os.lstat`
+    # opens itself rather than its target (Python 3.8 and later) and reports by
+    # its reparse tag: `os.path.isjunction` is 3.12 and later, and litetune
+    # runs on 3.10.
+    return stat.S_ISLNK(entry.st_mode) or getattr(entry, "st_reparse_tag", 0) == _MOUNT_POINT_TAG
+
+
+def _refuse_a_broken_link_in(path: Path) -> None:
+    """Raise if a link on the way to `path` -- `path` itself included -- no longer resolves.
+
+    Called once `path` is known not to be there. Each of its prefixes is looked
+    at in turn, without following it: the first that is not there, or that
+    lies under a file, ends the path, which is then simply absent. A prefix
+    that is a link (`_is_link`) and does not resolve is something that once
+    led to a checkpoint and no longer does: an error, not an absence.
+    """
+    for prefix in (*reversed(path.parents), path):
+        try:
+            entry = os.lstat(prefix)
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        if _is_link(entry):
+            try:
+                os.stat(prefix)
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                raise FileNotFoundError(
+                    f"{prefix}, a link on the way to {path}, no longer resolves"
+                ) from exc
+
+
+_NOT_REGULAR = (
+    (stat.S_ISDIR, "a directory"),
+    (stat.S_ISFIFO, "a FIFO"),
+    (stat.S_ISCHR, "a character device"),
+    (stat.S_ISBLK, "a block device"),
+    (stat.S_ISSOCK, "a socket"),
+)
+
+
+def _refuse_unless_regular(path: Path, mode: int) -> None:
+    if stat.S_ISREG(mode):
+        return
+    kind = next((name for test, name in _NOT_REGULAR if test(mode)), "not a file")
+    raise OSError(f"{path} is not a regular file: it is {kind}")
+
+
+def _read_regular_file(path: Path) -> bytes:
+    """The bytes of `path`, a regular file once its links are followed, or `OSError`.
+
+    Looked at before it is opened, because opening a FIFO waits for a writer
+    and reading a device need not end; and looked at again through the
+    descriptor once open. On POSIX the open does not wait (`O_NONBLOCK`), so the
+    second look closes the gap in which the entry could be replaced after the
+    first. Windows has neither `O_NONBLOCK` nor `os.mkfifo` (both Unix-only in
+    Python's `os` documentation), so there the guard is the first look alone:
+    an entry replaced between the look and the open is not caught before the
+    open.
+    """
+    _refuse_unless_regular(path, os.stat(path).st_mode)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags), "rb") as handle:
+        _refuse_unless_regular(path, os.fstat(handle.fileno()).st_mode)
+        return handle.read()
+
+
 def _provenance(path: Path) -> tuple[str | None, str | None]:
     """The base model `tune` recorded beside this checkpoint. Returns (id, error).
 
@@ -1238,16 +1368,20 @@ def _provenance(path: Path) -> tuple[str | None, str | None]:
     truncated by a full disk or half-copied by an interrupted `rsync` would then
     look like a checkpoint that never recorded anything -- and be guessed at from
     the path, which is the fault this sidecar exists to remove.
+
+    Absent is what `read_training_record` says is absent, and nothing else: a
+    `litetune.json` that is there and is a directory, a link going nowhere, a
+    FIFO or a device, or that cannot be opened or parsed, or holds no JSON
+    object, is an error here, as it is to `verify` and `export`.
     """
     sidecar = path / PROVENANCE_NAME
-    if not sidecar.is_file():
-        return None, None
     try:
-        data = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
+        read = read_training_record(str(path))
+    except (OSError, ValueError) as exc:
         return None, f"{sidecar} could not be read: {type(exc).__name__}: {exc}"
-    if not isinstance(data, dict):
-        return None, f"{sidecar} does not contain a JSON object"
+    if read is None:
+        return None, None
+    data = read[0]
     base = data.get("base_model")
     if base is None:
         return None, f"{sidecar} records no 'base_model'"
@@ -1259,9 +1393,12 @@ def _provenance(path: Path) -> tuple[str | None, str | None]:
 
 
 def recorded_identity(model: str) -> str | None:
-    """What the checkpoint at `model` says it came from, if it says anything."""
-    path = Path(model)
-    return _provenance(path)[0] if path.is_dir() else None
+    """What the checkpoint at `model` says it came from, if it says anything.
+
+    Asked of every reference: `read_training_record` tells a Hugging Face id
+    and anything else that is not a directory from a checkpoint.
+    """
+    return _provenance(Path(model))[0]
 
 
 def provenance_error(model: str) -> str | None:
@@ -1271,8 +1408,7 @@ def provenance_error(model: str) -> str | None:
     an id, the plan is built from that string and never opens the directory --
     which is exactly when a broken record most needs saying out loud.
     """
-    path = Path(model)
-    return _provenance(path)[1] if path.is_dir() else None
+    return _provenance(Path(model))[1]
 
 
 def same_family(a: str | None, b: str | None) -> bool:
@@ -1353,14 +1489,18 @@ def hint_for(model: str) -> ModelHint:
     path = Path(model)
     normalised = _normalise(model)
     config = path / CONFIG_NAME
+    # Read first, whatever the checkpoint holds: a record that cannot be read
+    # is said even where there is no config.json to identify by.
+    recorded_base, provenance_error = _provenance(path)
     if not (path.is_dir() and config.is_file()):
-        return ModelHint(model=model, text=normalised, local=path.is_dir())
+        return ModelHint(
+            model=model, text=normalised, local=path.is_dir(), provenance_error=provenance_error
+        )
 
     # Before config.json: what produced the checkpoint knows what it was, and
     # config.json only knows what architecture it is -- which is not enough,
     # since FunctionGemma and Gemma 3 declare the same `model_type` and need
     # different overrides.
-    recorded_base, provenance_error = _provenance(path)
     if recorded_base:
         normalised = _normalise(recorded_base)
 
