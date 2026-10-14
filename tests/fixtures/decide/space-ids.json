@@ -1,0 +1,32 @@
+{
+ "cases": [
+  {
+   "installedFiles": [
+    {
+     "name": "embeddinggemma-2-text-270m.litertlm",
+     "bytes": 164626432
+    }
+   ],
+   "dimension": 768,
+   "backend": "cpu",
+   "spaceId": "model=embeddinggemma-2-text-270m.litertlm@164626432;dim=768;backend=cpu;prefix=task: classification | query: "
+  },
+  {
+   "installedFiles": [
+    {
+     "name": "a;b+c@d%e\u0001\u001f é 😀 {x}.litertlm",
+     "bytes": 12345
+    }
+   ],
+   "dimension": 768,
+   "backend": "cpu",
+   "spaceId": "model=a%3Bb%2Bc%40d%25e%01%1F é 😀 {x}.litertlm@12345;dim=768;backend=cpu;prefix=task: classification | query: "
+  },
+  {
+   "embedderId": "eg2@v1;cpu+int4%\n\t 50% ü",
+   "dimension": 768,
+   "backend": "cpu",
+   "spaceId": "model=eg2%40v1%3Bcpu%2Bint4%25%0A%09 50%25 ü;dim=768;backend=cpu;prefix=task: classification | query: "
+  }
+ ]
+}

@@ -87,6 +87,13 @@ dev = [
     # the version a provisioned export environment holds (`jinja2-3.1.6.dist-info`
     # there; `envs.EXPORT` does not pin it).
     "jinja2==3.1.6",
+    # `decide` fits its decider in `envs.RUNTIME`, which pins numpy 2.0.2, and the tests
+    # run that script's fit in this interpreter against goldens flutter_edge_ai's own Dart
+    # code wrote (`tests/fixtures/decide/`). 2.0.2 publishes no wheel above cp312
+    # (https://pypi.org/pypi/numpy/2.0.2/json); 2.3.5's start at cp311 and include cp313
+    # (https://pypi.org/pypi/numpy/2.3.5/json).
+    "numpy==2.0.2; python_version < '3.13'",
+    "numpy==2.3.5; python_version >= '3.13'",
 ]
 
 [project.scripts]

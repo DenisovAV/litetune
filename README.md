@@ -612,6 +612,79 @@ audio turn and its text answers did not change; a turn carrying both was
 answered for the image alone, as Google's own bundles answer it through the same
 runtime ([MEASUREMENTS.md](MEASUREMENTS.md#towers-grafted-into-an-sm8850-npu-bundle)).
 
+### A decider for flutter_edge_ai, fitted offline
+
+flutter_edge_ai's `EmbeddingModel.createDecider` picks one of an app's options — an
+intent, a route, a tool — for a request, or answers "none of these", from an embedding
+model: each option is the centroid of its embedded inputs, optionally with a softmax
+regression over them, and a threshold on the highest centroid cosine decides when to
+abstain. On the phone it embeds every example and fits. `decide` does that fit on a
+workstation, with as many examples per option as you have, and writes the artifact the
+app loads with `embedder.loadDecider(artifact)` without embedding anything:
+
+```bash
+litetune decide --train train.jsonl --options options.json \
+                --embedder embeddinggemma-2-text-270m.litertlm \
+                --method linear --calibration labelled --calib calib.jsonl \
+                --test test.jsonl --output-dir decider/
+```
+
+**This is for flutter_edge_ai core 2.4.0, which is not released at the time of writing.**
+The decider API is on the `feat/decision-engine` branch of
+[DenisovAV/flutter_gemma](https://github.com/DenisovAV/flutter_gemma) and marked
+`@experimental`; until 2.4.0 is on pub.dev no released app can load what this writes. The
+format is theirs (`flutter_edge_ai.decider`, version 1, read at commit `77f0484e`), and
+litetune writes that and nothing else.
+
+The inputs:
+
+| Flag | |
+|---|---|
+| `--train` | JSONL rows `{"text": ..., "label": "<option id>"}`; every row is an input of its option |
+| `--options` | optional JSON array of `{"id", "description"?, "metadata"?}`; without it the options are the labels in first-seen order. A description is embedded as one more input of its option, first, as `createDecider` embeds it |
+| `--embedder` | the embedding `.litertlm` the app installs |
+| `--method` | `centroid` (default) or `linear`: softmax regression, weight decay 1e-5 |
+| `--calibration` | `crossFit` (default, `--keep 0.95`): each option's inputs held out in five folds; `labelled` (`--max-error 0.05`): the `--calib` rows, which also fit a temperature for probabilities; `minSimilarity` (`--min-similarity`): a fixed cosine; `none` |
+| `--calib` | held-out labelled rows for `labelled`; none may repeat a `--train` text or a description |
+| `--test` | rows to measure on; `"label": null` marks one that should be refused |
+| `--examples-in-artifact` | how many train texts per option the artifact stores (30); the fit uses every row |
+
+Every text is embedded the way flutter_edge_ai_litertlm embeds it: LiteRT-LM 0.18.0's
+`EmbeddingEngine` on the CPU, normalised, with special tokens, after the prefix
+`task: classification | query: `, one request at a time. An input longer than the engine's
+limit — the smaller of 1024 tokens and the bundle's largest text signature, as the app sets
+it — is refused (`InputOverflowStrategy.ERROR`), not truncated. What `createDecider` refuses is refused here by name, before
+anything is embedded: a label that names no option, an option with nothing to embed, a
+cross-fit with fewer than two inputs for an option, a held-out row that repeats a training
+one; and so is what its fit refuses after — held-out rows no threshold keeps within
+`--max-error`, or whose best temperature is an end of its grid.
+
+**The fit is flutter_edge_ai's.** It is a port of `decider_fit.dart` and
+`softmax_regression.dart`, and the tests hold it to goldens that Dart code wrote on fixed
+vectors ([tests/fixtures/decide](tests/fixtures/decide/README.md)): centroids, cross-fit
+signals and thresholds equal to the bit, the temperature equal as a float32, and every field
+of the artifact equal but the linear layer's. That layer's two matrix products are numpy's,
+summed in another order than Dart's, so its weights are held to the tolerance
+flutter_edge_ai's own fit fingerprints allow between two platforms, 1e-9 relative, and its
+stored float32 values to within one step of Dart's; in the goldens they came out equal.
+
+**The embedding space is pinned by name and size.** The artifact's `spaceId` is
+`model=<install name>@<bytes>;dim=<d>;backend=cpu;prefix=task: classification | query: `,
+as `deciderSpaceId` builds it. The app must install the embedder under that name — the
+file's own, or `--embedder-name` — or pass the `embedderId` given here as `--embedder-id`;
+otherwise `loadDecider` refuses it with `DeciderSpaceMismatchException`. Only the CPU is
+supported: an NPU bundle's vectors are another space. The artifact is checked against a port
+of `loadDecider`'s own checks before it is written.
+
+`decide.json` beside `decider.json` names the embedder (path, name, size, sha256), the
+litert-lm version and CPU it ran on, the space id, the rows per split and option, the method
+and the fitted threshold and temperature; with `--test`, the argmax accuracy on in-scope
+rows, the share of them answered at the threshold and the error among those, and the share
+of out-of-scope rows refused, each with its 95 % interval — computed from `decider.json` as
+written, its float32 centroids and weights read back, as the app would score them.
+
+No figures for `decide` are published yet: [MEASUREMENTS.md](MEASUREMENTS.md) has none.
+
 ---
 
 ## What it knows that a shell script does not
@@ -1153,6 +1226,9 @@ re-measures nothing.
 `towers` measures nothing either: it exits 0 when it wrote the new bundle and 4
 when it refused or could not, or when it wrote the bundle but could not deliver
 the `--json` report.
+
+`decide` the same: 0 when it wrote the decider, 4 when it refused or could not, or when it
+wrote it but could not deliver the `--json` report.
 
 Wiring `|| exit 1` on anything non-zero throws all of this away.
 
