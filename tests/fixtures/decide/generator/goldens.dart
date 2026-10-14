@@ -533,6 +533,78 @@ Future<void> main(List<String> args) async {
     );
   }
 
+  // Overlap: three options of 7, 6 and 8 inputs -- not multiples of five, so
+  // an option's folds are not its rows' positions mod 5 -- with a few training
+  // examples drawn near another option, whose best centroid is then that
+  // option's fold-centroid; and labelled rows between two options, where the
+  // linear layer and the centroids disagree.
+  {
+    final rng = Rng(seed + 4);
+    final base = bases(rng, 3, d16);
+    final table = <String, List<double>>{};
+    final options = <DeciderOption>[];
+    final sizes = [7, 5, 8];
+    // Example k of option o drawn near another option.
+    const strays = {(0, 2): 1, (0, 5): 2, (2, 3): 0, (1, 4): 0};
+    for (var o = 0; o < 3; o++) {
+      final description = o == 1 ? 'overlap $o: what it means' : null;
+      if (description != null) table[description] = around(base[o], 0.6, rng);
+      final examples = <EmbeddingInput>[];
+      for (var k = 0; k < sizes[o]; k++) {
+        final text = 'overlap $o example $k';
+        table[text] = around(base[strays[(o, k)] ?? o], 0.9, rng);
+        examples.add(EmbeddingInput.text(text));
+      }
+      options.add(
+        DeciderOption('v$o', description: description, examples: examples),
+      );
+    }
+    final labelled = <({String text, String optionId})>[];
+    for (var k = 0; k < 36; k++) {
+      final text = 'overlap held $k';
+      final a = k % 3, b = (k + 1) % 3;
+      final mix = k < 24 ? 0.0 : 0.4;
+      table[text] = around(
+        [for (var j = 0; j < d16; j++) (1 - mix) * base[a][j] + mix * base[b][j]],
+        1.0,
+        rng,
+      );
+      labelled.add((text: text, optionId: 'v$a'));
+    }
+    for (final (method, tag) in [
+      (DeciderMethod.centroid, 'centroid'),
+      (DeciderMethod.linear, 'linear'),
+    ]) {
+      cases.add(
+        Case(
+          name: 'overlap-$tag-crossfit',
+          group: 'overlap',
+          dimension: d16,
+          options: options,
+          table: table,
+          method: method,
+          calibration: const DeciderCalibration.crossFit(),
+          calibrationJson: {'kind': 'crossFit', 'keep': 0.95},
+        ),
+      );
+      cases.add(
+        Case(
+          name: 'overlap-$tag-labelled',
+          group: 'overlap',
+          dimension: d16,
+          options: options,
+          table: table,
+          method: method,
+          calibration: DeciderCalibration.fromLabelled([
+            for (final r in labelled) (input: EmbeddingInput.text(r.text), optionId: r.optionId),
+          ], maxError: 0.3),
+          calibrationJson: {'kind': 'labelled', 'maxError': 0.3},
+          labelled: labelled,
+        ),
+      );
+    }
+  }
+
   // Refusals the fit makes (the argument checks before it are litetune's own).
   {
     // Every labelled row right with room to spare: the temperature's floor.
@@ -663,6 +735,7 @@ Future<void> main(List<String> args) async {
   }
 
   await fingerprints(outDir);
+  await lbfgs(outDir);
 
   final ids = {
     'installed': deciderSpaceId(
@@ -818,5 +891,123 @@ Future<void> fingerprints(Directory outDir) async {
   }
   File('${outDir.path}/fingerprints.json').writeAsStringSync(
     jsonEncode({'fits': rows}),
+  );
+}
+
+// -- minimizeLbfgs on its own --------------------------------------------------
+
+/// The chained Rosenbrock function and its gradient, written so that every
+/// operation is one a Python float does in the same order.
+double rosenbrock(Float64List x, Float64List g) {
+  g.fillRange(0, g.length, 0);
+  var f = 0.0;
+  for (var i = 0; i < x.length - 1; i++) {
+    final a = x[i + 1] - x[i] * x[i];
+    final b = 1 - x[i];
+    f = f + (100 * a * a + b * b);
+    g[i] = g[i] + (-400 * a * x[i] - 2 * b);
+    g[i + 1] = g[i + 1] + 200 * a;
+  }
+  return f;
+}
+
+/// `(x_i - (i + 1))^4 + 0.001 x_i^2`, summed: flat near its minimum.
+double quartic(Float64List x, Float64List g) {
+  var v = 0.0;
+  for (var i = 0; i < x.length; i++) {
+    final xi = x[i];
+    final c = xi - (i + 1);
+    v = v + (c * c * c * c + 0.001 * xi * xi);
+    g[i] = 4 * c * c * c + 0.002 * xi;
+  }
+  return v;
+}
+
+/// `x_i^4 - 3 x_i^2 + x_i`, summed: two wells in every coordinate.
+double well(Float64List x, Float64List g) {
+  var v = 0.0;
+  for (var i = 0; i < x.length; i++) {
+    final xi = x[i];
+    v = v + (xi * xi * xi * xi - 3 * xi * xi + xi);
+    g[i] = 4 * xi * xi * xi - 6 * xi + 1;
+  }
+  return v;
+}
+
+/// `1e12 (x_0 - 1)^2 + sum_{i>0} (x_i - 2)^4`: one coordinate far stiffer.
+double mix(Float64List x, Float64List g) {
+  var v = 0.0;
+  for (var i = 0; i < x.length; i++) {
+    final xi = x[i];
+    if (i == 0) {
+      final c = xi - 1;
+      v = v + 1e12 * c * c;
+      g[i] = 2e12 * c;
+    } else {
+      final c = xi - 2;
+      v = v + c * c * c * c;
+      g[i] = 4 * c * c * c;
+    }
+  }
+  return v;
+}
+
+const objectives = <String, double Function(Float64List, Float64List)>{
+  'rosenbrock': rosenbrock,
+  'quartic': quartic,
+  'well': well,
+  'mix': mix,
+};
+
+Future<void> lbfgs(Directory outDir) async {
+  final runs = <Map<String, Object?>>[];
+  for (final (name, objective, start, settings) in [
+    ('rosenbrock-2', 'rosenbrock', [-1.2, 1.0], <String, num>{}),
+    ('rosenbrock-10', 'rosenbrock', List<double>.filled(10, -1.0), <String, num>{}),
+    ('max-iter-5', 'rosenbrock', [-1.2, 1.0], <String, num>{'maxIter': 5}),
+    ('max-eval-12', 'rosenbrock', [-1.2, 1.0], <String, num>{'maxEval': 12}),
+    ('history-3', 'rosenbrock', List<double>.filled(10, -1.0), <String, num>{'historySize': 3}),
+    ('tolerance-change-1e-3', 'rosenbrock', [-1.2, 1.0], <String, num>{'toleranceChange': 1e-3}),
+    ('tolerance-grad-1e-2', 'rosenbrock', [-1.2, 1.0], <String, num>{'toleranceGrad': 1e-2}),
+    ('lr-0.5', 'rosenbrock', [-1.2, 1.0], <String, num>{'lr': 0.5}),
+    ('far-start', 'rosenbrock', [3.0, -4.0, 2.5], <String, num>{}),
+    ('at-the-minimum', 'rosenbrock', [1.0, 1.0], <String, num>{}),
+    // Found to reach a branch the runs above do not (litetune's port, each
+    // branch changed in turn): a curvature pair below 1e-10, a line search
+    // capped by the evaluations left, the sufficient-decrease constant, the
+    // step-size stop, the zoom's insufficient-progress rule.
+    ('quartic-tiny-curvature', 'quartic', [-1.25, -1.75], <String, num>{'toleranceGrad': 1e-30, 'toleranceChange': 1e-30}),
+    ('rosenbrock-max-eval-20', 'rosenbrock', [1.75, -2.0, 4.0], <String, num>{'maxEval': 20}),
+    ('quartic-history-2', 'quartic', [2.25, -1.5], <String, num>{'historySize': 2}),
+    ('mix-step-size', 'mix', [-9.0, -4.0], <String, num>{}),
+    ('well-zoom', 'well', [-2.5, -2.0, 2.75, -1.0], <String, num>{'toleranceGrad': 1e-30, 'toleranceChange': 1e-30}),
+  ]) {
+    final x = Float64List.fromList(start);
+    final f = objectives[objective]!;
+    final result = await minimizeLbfgs(
+      (at, g) async => f(at, g),
+      x,
+      lr: (settings['lr'] ?? 1).toDouble(),
+      maxIter: (settings['maxIter'] ?? 500).toInt(),
+      maxEval: settings['maxEval']?.toInt(),
+      toleranceGrad: (settings['toleranceGrad'] ?? 1e-7).toDouble(),
+      toleranceChange: (settings['toleranceChange'] ?? 1e-9).toDouble(),
+      historySize: (settings['historySize'] ?? 20).toInt(),
+    );
+    runs.add({
+      'name': name,
+      'objective': objective,
+      'start': start,
+      'settings': settings,
+      'x': x.toList(),
+      'loss': result.loss,
+      'iterations': result.iterations,
+      'evaluations': result.evaluations,
+    });
+    stdout.writeln('lbfgs $name: loss ${result.loss} iterations '
+        '${result.iterations} evaluations ${result.evaluations}');
+  }
+  File('${outDir.path}/lbfgs.json').writeAsStringSync(
+    const JsonEncoder.withIndent(' ').convert({'runs': runs}),
   );
 }

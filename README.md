@@ -663,10 +663,11 @@ one; and so is what its fit refuses after — held-out rows no threshold keeps w
 `softmax_regression.dart`, and the tests hold it to goldens that Dart code wrote on fixed
 vectors ([tests/fixtures/decide](tests/fixtures/decide/README.md)): centroids, cross-fit
 signals and thresholds equal to the bit, the temperature equal as a float32, and every field
-of the artifact equal but the linear layer's. That layer's two matrix products are numpy's,
-summed in another order than Dart's, so its weights are held to the tolerance
-flutter_edge_ai's own fit fingerprints allow between two platforms, 1e-9 relative, and its
-stored float32 values to within one step of Dart's; in the goldens they came out equal.
+of the artifact equal but the linear layer's. Its optimiser, run alone on polynomial
+objectives, takes Dart's path to the bit. The layer's two matrix products are numpy's, summed
+in another order than Dart's, so its weights are held to the tolerance flutter_edge_ai's own
+fit fingerprints allow between two platforms, 1e-9 relative, and its stored float32 values
+to within one step of Dart's; in the goldens they came out equal.
 
 **The embedding space is pinned by name and size.** The artifact's `spaceId` is
 `model=<install name>@<bytes>;dim=<d>;backend=cpu;prefix=task: classification | query: `,

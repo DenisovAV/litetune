@@ -74,8 +74,10 @@ with its error type and message instead.
 | `small-*.json` | 4 options, 16 dimensions, two with a description (7 inputs, two uneven folds), two without (6), metadata on one; both methods; crossFit 0.95 and 0.8, labelled (20 rows, 4 labelled as the next option), minSimilarity 0.25, none; 12 probes |
 | `keep09-ten-inputs.json` | keep 0.9 over ten held-out inputs, where `(1 - 0.9) * 10` is 0.9999999999999998 |
 | `ties-*.json` | two labelled rows sharing one vector, one right and one wrong, at the lowest signal: maxError 0.05 excludes the group whole, 0.25 admits it; two identical examples in one option |
+| `overlap-*.json` | 3 options of 7, 6 and 8 inputs with four training examples drawn near another option, so some held-out inputs' best centroid is another option's fold-centroid; 36 labelled rows, 12 of them between two options, some of which `linear` and the centroids answer differently; both methods, crossFit and labelled (maxError 0.3); 82 L-BFGS iterations |
 | `refused-*.json` | the temperature at either end of its grid, no threshold within maxError 0, two inputs that cancel out |
 | `fingerprints.json` | `test/decision/fit_fingerprint.dart`'s model-free fixture (10, 50, 150 options x 10 rows, 768 dimensions, crossFit 0.95, both methods): the fingerprints, equal to that file's `vmFingerprint*` constants, and for 10 options the full centroids, weights, bias and cross-fit signal |
+| `lbfgs.json` | `minimizeLbfgs` itself on four polynomial objectives the generator defines (`rosenbrock`, `quartic`, `well`, `mix`): Rosenbrock from its defaults and with `maxIter` 5, `maxEval` 12 and 20, `historySize` 3, `toleranceChange` 1e-3, `toleranceGrad` 1e-2, `lr` 0.5, a far start and a start at the minimum; and five runs that reach what those do not -- a curvature pair below 1e-10, a line search capped by the evaluations left, the sufficient-decrease constant, the step-size stop, the zoom's insufficient-progress rule (found by changing each in litetune's port). The final point, loss, iterations and evaluations |
 | `space-ids.json` | `deciderSpaceId` for the installed file, for a name with every escaped character, and for an `embedderId` |
 
 `generator/load_litetune.dart`, run from the same package, loads an artifact litetune wrote
@@ -91,6 +93,11 @@ choice, cosine and score, to the bit.
 ```
 4697e86334a21528bb9659a137521e201efaf729d7afff933c62ae79680fc21f  fingerprints.json
 effc650de9575b55741b41bca92aaeae74608a23fcaaa183b8cbcb0bb7d2967e  keep09-ten-inputs.json
+24a8ab2e78d96fe0398cac40695cae8f6356cccc51d6c490630d43cbcbde9d83  lbfgs.json
+47e3241312a958e4090d8c214eb9c9c2457a6d586d5ee00e9310110c76b77f65  overlap-centroid-crossfit.json
+bd7f63e2b90be43a75d40bae17274c1c6ca393e5059d0250688a224ef5389602  overlap-centroid-labelled.json
+09728f556f8006e15b3c3519a8c12f3f5bf60ec8d346742bab0c77537f36549e  overlap-linear-crossfit.json
+e12eb6d78c888aa0ffd8e7bfef8936edbb653df6ecb706bd2ca3389b2a5937a2  overlap-linear-labelled.json
 6ff41599d91675c87ada3510838f6f1d835db290eae9cd33d071a517dd385072  refused-cancelling-inputs.json
 90c220a392504c1555d957f7b21ef81a27d8095e89d2425281b4e4be75b94bf3  refused-no-threshold.json
 d20e24ded16917eab75ab399581543ac17c949b41e02ed41c86ceeebd982617b  refused-temperature-ceiling.json
@@ -109,10 +116,11 @@ fc24cad00de06bd088e14ee9c37156bbd66f7459537cea32146da286d0f459fc  small-linear-n
 504c08fad45ebe6a87c9450f237fa1854ec7f07a7288ff264ea1132224fb0a38  ties-linear-maxerror0.05.json
 cb857648dca1720c832bc202cc20e36485559805dbe52fa43ecc7415b584bd75  ties-linear-maxerror0.25.json
 3ac3b259c20d0bc453de11e577d458c8498aea84bdcbbb43c47e71cb48f311dc  vectors-keep09.json
+3121cc36d84adce612052929371d8f1d5f121a8c060919d8e62e542766b63ac9  vectors-overlap.json
 083db64c818a9a54f9a42210941a98a62004c1ac01cff7bc9dbcb5b52b566131  vectors-refusals.json
 b49592654909dc7fc67f86832643a83bd38516b6137e465a9f34508c0b698545  vectors-small.json
 751aa127a7e325467efc65b01c2d801f8c137a7e67d517e0ceaf489f2f5a37e4  vectors-ties.json
-40c16dc65162c52f90684bda5f7064e677366799a91fea326342bb427b26151d  generator/goldens.dart
+c8ce5042b7da0ce5ff9f1a4674210750f423064a04c812529532a5cbbcd2b4e0  generator/goldens.dart
 530bdc66775dadeb5b6c9628bf3c5814608af3d908b4abbad69337029652b271  generator/load_litetune.dart
 6fe215142ab13ebec3d2ad7ae2174539963e18acdc9f1b53f9df7fef81294bb2  generator/pubspec.yaml
 c1ebd9b3f2a795be3494b1cb2ffa7b9d46e87e4bfcfb59613a04b29921e0f0d4  generator/shim_flutter/pubspec.yaml

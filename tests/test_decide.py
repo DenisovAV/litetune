@@ -57,7 +57,7 @@ def golden(name: str) -> dict[str, Any]:
 CASES = sorted(
     p.stem
     for p in FIXTURES.glob("*.json")
-    if not p.stem.startswith(("vectors-", "fingerprints", "space-ids"))
+    if not p.stem.startswith(("vectors-", "fingerprints", "space-ids", "lbfgs"))
 )
 FITTED = [name for name in CASES if not name.startswith("refused-")]
 REFUSED = [name for name in CASES if name.startswith("refused-")]
@@ -134,6 +134,8 @@ def same_artifact(ours: Any, dart: Any, where: str = "artifact") -> None:
     elif where.endswith(".weights"):
         assert within_one_float32_step(float32s(ours), float32s(dart)), where
     elif where.endswith(".bias"):
+        # Stored as the float32 value it is, as `bias![o]` reads a Float32List.
+        assert float(np.float32(ours)) == ours, where
         assert within_one_float32_step(ours, dart), where
     elif where.endswith(".temperature"):
         assert np.float32(ours) == np.float32(dart), where
@@ -228,6 +230,18 @@ REFUSED_SAYING = {
 }
 
 
+def test_a_similarity_at_the_threshold_is_answered():
+    """`similarity < limit` abstains (embedding_decider.dart L779): equal is answered."""
+    case = golden("small-centroid-crossfit")
+    artifact = copy.deepcopy(case["artifact"])
+    rows = unit_rows(case, [p["text"] for p in case["probes"]])
+    _, similarity, _, _ = script()["decisions"](rows, artifact)
+    artifact["calibration"]["threshold"] = float(similarity[0])
+    assert not script()["decisions"](rows, artifact)[2][0]
+    artifact["calibration"]["threshold"] = float(np.nextafter(similarity[0], 2.0))
+    assert script()["decisions"](rows, artifact)[2][0]
+
+
 @pytest.mark.parametrize("name", REFUSED)
 def test_what_the_dart_fit_refuses_is_refused(name):
     case = golden(name)
@@ -309,6 +323,80 @@ def test_flutter_edge_ais_own_fit_fingerprints(row):
             assert within_one_float32_step(fitted["bias"], row["biasValues"])
 
 
+def rosenbrock(x: Any, g: Any) -> float:
+    """The generator's objectives (fixtures/decide/generator/goldens.dart), operation for
+    operation, so the optimiser sees the numbers Dart's did."""
+    g[:] = 0.0
+    f = 0.0
+    for i in range(len(x) - 1):
+        xi, xn = float(x[i]), float(x[i + 1])
+        a = xn - xi * xi
+        b = 1 - xi
+        f = f + (100 * a * a + b * b)
+        g[i] = float(g[i]) + (-400 * a * xi - 2 * b)
+        g[i + 1] = float(g[i + 1]) + 200 * a
+    return f
+
+
+def quartic(x: Any, g: Any) -> float:
+    f = 0.0
+    for i in range(len(x)):
+        xi = float(x[i])
+        c = xi - (i + 1)
+        f = f + (c * c * c * c + 0.001 * xi * xi)
+        g[i] = 4 * c * c * c + 0.002 * xi
+    return f
+
+
+def well(x: Any, g: Any) -> float:
+    f = 0.0
+    for i in range(len(x)):
+        xi = float(x[i])
+        f = f + (xi * xi * xi * xi - 3 * xi * xi + xi)
+        g[i] = 4 * xi * xi * xi - 6 * xi + 1
+    return f
+
+
+def mix(x: Any, g: Any) -> float:
+    f = 0.0
+    for i in range(len(x)):
+        xi = float(x[i])
+        if i == 0:
+            c = xi - 1
+            f = f + 1e12 * c * c
+            g[i] = 2e12 * c
+        else:
+            c = xi - 2
+            f = f + c * c * c * c
+            g[i] = 4 * c * c * c
+    return f
+
+
+OBJECTIVES = {"rosenbrock": rosenbrock, "quartic": quartic, "well": well, "mix": mix}
+LBFGS_RUNS = json.loads((FIXTURES / "lbfgs.json").read_text(encoding="utf-8"))["runs"]
+LBFGS_SETTINGS = {
+    "lr": "lr",
+    "maxIter": "max_iter",
+    "maxEval": "max_eval",
+    "toleranceGrad": "tolerance_grad",
+    "toleranceChange": "tolerance_change",
+    "historySize": "history_size",
+}
+
+
+@pytest.mark.parametrize("run", LBFGS_RUNS, ids=[r["name"] for r in LBFGS_RUNS])
+def test_the_optimiser_is_minimizeLbfgs_to_the_bit(run):
+    """Every branch of the line search and every stop, on a function whose arithmetic is
+    the same in both languages: the same point, loss, iterations and evaluations."""
+    x = np.array(run["start"], dtype=np.float64)
+    settings = {LBFGS_SETTINGS[k]: v for k, v in run["settings"].items()}
+    objective = OBJECTIVES[run["objective"]]
+    loss, iterations, evaluations = script()["minimize_lbfgs"](objective, x, **settings)
+    assert (iterations, evaluations) == (run["iterations"], run["evaluations"])
+    assert loss == run["loss"]
+    assert np.array_equal(x, np.array(run["x"]))
+
+
 # -- the pieces the goldens do not reach -----------------------------------------------
 
 
@@ -345,6 +433,12 @@ def test_a_sum_is_taken_in_order_from_positive_zero():
     assert seq_sum(terms) != math.fsum(terms)
     assert math.copysign(1.0, seq_sum([-0.0, -0.0])) == 1.0
     assert seq_sum([]) == 0.0
+    # Rows too: past eight terms numpy's own sum pairs them, and 1 + 1e-16 is 1 eleven
+    # times over in order, where pairs of 1e-16 add up first.
+    small = [1.0] + [1e-16] * 11
+    rows = script()["seq_row_sums"](np.array([small, [-0.0] * 12]))
+    assert rows[0] == 1.0 and np.array([small]).sum(axis=1)[0] > 1.0
+    assert math.copysign(1.0, rows[1]) == 1.0
 
 
 def test_an_embedded_row_is_refused_as_dart_refuses_it():
@@ -380,40 +474,63 @@ def test_a_non_finite_score_never_reaches_the_temperature():
         script()["fit_temperature"](np.array([[0.1, math.nan]]), [0])
 
 
+def test_a_nan_gradient_never_reads_as_converged():
+    """`_maxAbs` (softmax_regression.dart L626-L637) is NaN when any entry is."""
+    assert math.isnan(script()["max_abs"](np.array([1.0, math.nan, 2.0])))
+    assert script()["max_abs"](np.array([-3.0, 2.0])) == 3.0
+
+
 def test_dart_min_keeps_nan():
     dart_min = script()["dart_min"]
     assert math.isnan(dart_min(1.0, math.nan)) and math.isnan(dart_min(math.nan, 1.0))
     assert dart_min(1.0, 0.5) == 0.5 and dart_min(0.5, 1.0) == 0.5
 
 
-def test_measure_counts_from_the_artifact():
-    case = golden("small-linear-labelled")
-    probes = case["probes"]
+def probe_labels(case: dict[str, Any]) -> list[str | None]:
+    """The --test label of each probe: its own option, but the second probe of each option
+    labelled as the next one -- rows the decider answers wrong -- and null for the four
+    drawn away from every option (generator `smallSet`)."""
     ids = [o["id"] for o in case["options"]]
-    # The first eight probes are near an option (generator `smallSet`); the rest are not.
-    labels: list[int | None] = [
-        ids.index(p["text"].split()[1]) if not p["text"].startswith("probe elsewhere") else None
-        for p in probes
-    ]
-    counts = script()["measure"](
-        unit_rows(case, [p["text"] for p in probes]), labels, case["artifact"]
-    )
-    inside = [p for p, label in zip(probes, labels, strict=True) if label is not None]
-    outside = [p for p, label in zip(probes, labels, strict=True) if label is None]
-    answered = [p for p in inside if p["choice"] is not None]
-    assert counts == {
+    labels: list[str | None] = []
+    for probe in case["probes"]:
+        _, option, k = probe["text"].split()
+        if option == "elsewhere":
+            labels.append(None)
+        elif k == "1":
+            labels.append(ids[(ids.index(option) + 1) % len(ids)])
+        else:
+            labels.append(option)
+    return labels
+
+
+def expected_counts(case: dict[str, Any]) -> dict[str, int]:
+    """What the Dart decider's own answers to the probes count to, under `probe_labels`."""
+    pairs = list(zip(case["probes"], probe_labels(case), strict=True))
+    inside = [(p, label) for p, label in pairs if label is not None]
+    answered = [(p, label) for p, label in inside if p["choice"] is not None]
+    return {
         "in_scope": len(inside),
-        "argmax_right": sum(
-            1
-            for p, label in zip(probes, labels, strict=True)
-            if label is not None and p["ranked"][0]["id"] == ids[label]
-        ),
+        "argmax_right": sum(1 for p, label in inside if p["ranked"][0]["id"] == label),
         "answered": len(answered),
-        "answered_wrong": sum(1 for p in answered if p["choice"] != p["text"].split()[1]),
-        "out_of_scope": len(outside),
-        "rejected": sum(1 for p in outside if p["choice"] is None),
+        "answered_wrong": sum(1 for p, label in answered if p["choice"] != label),
+        "out_of_scope": len(pairs) - len(inside),
+        "rejected": sum(1 for p, label in pairs if label is None and p["choice"] is None),
     }
-    assert 0 < counts["answered"] < counts["in_scope"] or counts["rejected"] > 0
+
+
+# Probes some of which, in scope, are refused, and some answered wrong.
+MEASURED_CASE = "small-linear-crossfit-keep08"
+
+
+def test_measure_counts_from_the_artifact():
+    case = golden(MEASURED_CASE)
+    ids = [o["id"] for o in case["options"]]
+    labels = [None if label is None else ids.index(label) for label in probe_labels(case)]
+    counts = script()["measure"](
+        unit_rows(case, [p["text"] for p in case["probes"]]), labels, case["artifact"]
+    )
+    assert counts == expected_counts(case)
+    assert 0 < counts["answered"] < counts["in_scope"] and counts["answered_wrong"] > 0
 
 
 # -- the embedding-space id ------------------------------------------------------------
@@ -533,6 +650,20 @@ def test_the_loader_port_refuses_what_loadDecider_refuses(mutate, message):
     with pytest.raises(ArtifactError) as raised:
         check_artifact(artifact, expected_space_id=sid, dimension=dimension)
     assert message in str(raised.value)
+
+
+def test_a_stored_centroid_may_be_off_unit_length_by_rounding_alone():
+    """Within 1e-3 of 1 is float32 rounding; further is another vector (L1073-L1080)."""
+    artifact, sid, dimension = valid()
+    near = np.zeros(16, dtype="<f4")
+    for norm, refused in ((1.0009, False), (0.9991, False), (1.0011, True), (0.9989, True)):
+        near[0] = norm
+        artifact["options"][1]["centroid"] = base64.b64encode(near.tobytes()).decode()
+        if refused:
+            with pytest.raises(ArtifactError, match="not unit length"):
+                check_artifact(artifact, expected_space_id=sid, dimension=dimension)
+        else:
+            check_artifact(artifact, expected_space_id=sid, dimension=dimension)
 
 
 def test_the_loader_port_reads_what_loadDecider_reads():
@@ -949,11 +1080,8 @@ def stage_inputs(tmp_path: Path, case: dict[str, Any]) -> dict[str, Any]:
         jsonl(
             tmp_path / "test.jsonl",
             [
-                {
-                    "text": p["text"],
-                    "label": None if "elsewhere" in p["text"] else p["text"].split()[1],
-                }
-                for p in case["probes"]
+                {"text": p["text"], "label": label}
+                for p, label in zip(case["probes"], probe_labels(case), strict=True)
             ],
         )
         kwargs["test"] = tmp_path / "test.jsonl"
@@ -996,36 +1124,36 @@ def test_the_stage_writes_the_darts_artifact(toolchain, tmp_path, name):
 
 
 def test_the_report_is_measured_from_the_artifact_as_the_app_answers(toolchain, tmp_path):
-    case = golden("small-linear-labelled")
+    case = golden(MEASURED_CASE)
     toolchain.table = case["table"]
     report = run_decide(request(tmp_path, **stage_inputs(tmp_path, case))).report
 
-    probes = case["probes"]
-    inside = [p for p in probes if "elsewhere" not in p["text"]]
-    outside = [p for p in probes if "elsewhere" in p["text"]]
-    answered = [p for p in inside if p["choice"] is not None]
+    counts = expected_counts(case)
     measured = report["measurements"]
-    assert measured["rows"] == {"in_scope": len(inside), "out_of_scope": len(outside)}
-    right = sum(1 for p in inside if p["ranked"][0]["id"] == p["text"].split()[1])
-    assert (measured["argmax_accuracy"]["value"], measured["argmax_accuracy"]["n"]) == (
-        round(right / len(inside), 6),
-        len(inside),
-    )
-    assert measured["coverage"]["n"] == len(inside)
-    assert measured["coverage"]["value"] == round(len(answered) / len(inside), 6)
-    wrong = sum(1 for p in answered if p["choice"] != p["text"].split()[1])
-    assert measured["error_on_answered"]["value"] == round(wrong / len(answered), 6)
-    rejected = sum(1 for p in outside if p["choice"] is None)
-    assert measured["out_of_scope_rejected"]["value"] == round(rejected / len(outside), 6)
+    assert measured["rows"] == {
+        "in_scope": counts["in_scope"],
+        "out_of_scope": counts["out_of_scope"],
+    }
+    for key, successes, n in (
+        ("argmax_accuracy", "argmax_right", "in_scope"),
+        ("coverage", "answered", "in_scope"),
+        ("error_on_answered", "answered_wrong", "answered"),
+        ("out_of_scope_rejected", "rejected", "out_of_scope"),
+    ):
+        value = measured[key]
+        assert (value["value"], value["n"]) == (
+            round(counts[successes] / counts[n], 6),
+            counts[n],
+        ), key
     assert report["calibration"] == {
-        "kind": "labelled",
-        "max_error": 0.05,
+        "kind": "crossFit",
+        "keep": 0.8,
         "threshold": case["fit"]["threshold"],
-        "temperature": pytest.approx(case["fit"]["temperature"], rel=1e-7),
+        "temperature": None,
     }
     assert report["linear"]["iterations"] == case["internals"]["linear"]["iterations"]
     assert report["inputs"]["train"]["per_option"] == {o["id"]: 6 for o in case["options"]}
-    assert report["inputs"]["test"]["out_of_scope"] == len(outside)
+    assert report["inputs"]["test"]["out_of_scope"] == counts["out_of_scope"]
     assert report["runtime"]["litert_lm"] == "0.18.0"
     assert report["embedder"]["dimension"] == 16 and report["embedder"]["max_input_length"] == 1024
     assert (
@@ -1033,6 +1161,21 @@ def test_the_report_is_measured_from_the_artifact_as_the_app_answers(toolchain, 
         in report["install_rule"]
     )
     assert report["artifact"]["sha256"].startswith("sha256:")
+
+
+def test_without_answered_or_out_of_scope_rows_those_figures_are_unavailable(toolchain, tmp_path):
+    case = golden("small-centroid-minsimilarity")
+    toolchain.table = case["table"]
+    kwargs = stage_inputs(tmp_path, case)
+    jsonl(tmp_path / "test.jsonl", [{"text": "probe alpha 0", "label": "alpha"}])
+    kwargs["min_similarity"] = 1.0
+    measured = run_decide(request(tmp_path, **kwargs)).report["measurements"]
+    assert measured["coverage"]["value"] == 0.0
+    assert measured["error_on_answered"] == {
+        "available": False,
+        "reason": "no in-scope row was answered at the threshold",
+    }
+    assert measured["out_of_scope_rejected"]["available"] is False
 
 
 def test_an_embedder_id_replaces_the_installed_name(toolchain, tmp_path):
