@@ -1299,13 +1299,27 @@ def _canonical_basis(
     checkpoint whose chat template is, byte for byte, one the family ships
     (`models.CANONICAL_UPSTREAM`) is in the family's own chat format, which is
     the format LiteRT-LM's canonical template is published for. Any other
-    template without a record is withheld.
+    template without a record is withheld. This ground is a compatibility
+    heuristic, not training provenance: the bytes say which chat format the
+    checkpoint's tokenizer is configured for, and nothing about the prompts its
+    weights were trained on. A checkpoint trained elsewhere on another format
+    that kept the family's template unchanged is offered the canonical template
+    all the same.
+
+    No record means none at all: `verify.read_training_record` returns `None`.
+    A `litetune.json` that is there and cannot be read -- a directory, a link
+    going nowhere, a permission failure, text that is not a JSON object -- is a
+    record this cannot read, and withholds, whatever the template.
     """
     # Here, not at the top: `verify` imports this module.
-    from litetune.verify import recorded_declarations_sha256, recorded_prompt_mode
+    from litetune.verify import declarations_sha256_in, prompt_mode_in, read_training_record
 
     sidecar = Path(request.model) / models.PROVENANCE_NAME
-    if not sidecar.is_file():
+    try:
+        record = read_training_record(request.model)
+    except (OSError, ValueError) as exc:
+        return None, f"{sidecar} could not be read ({type(exc).__name__}: {exc})"
+    if record is None:
         upstream = models.CANONICAL_UPSTREAM.get(canonical, {})
         if isinstance(template_sha256, str) and template_sha256 in upstream:
             return (
@@ -1319,9 +1333,9 @@ def _canonical_basis(
             f"(sha256 {str(template_sha256)[:12]}) is not one the family ships unchanged"
         )
     try:
-        mode = recorded_prompt_mode(request.model)
-        declarations = recorded_declarations_sha256(request.model)
-    except (OSError, ValueError) as exc:
+        mode = prompt_mode_in(record)
+        declarations = declarations_sha256_in(record)
+    except ValueError as exc:
         return None, f"{sidecar} could not be read ({type(exc).__name__}: {exc})"
     if mode is None:
         return None, f"{sidecar} records no prompt_mode"

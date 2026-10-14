@@ -718,9 +718,10 @@ check is what checks the runtime. For Qwen3 0.6B the bundle carries LiteRT-LM v0
 own Qwen 3 template instead, because Qwen3's template breaks a LiteRT-LM conversation at
 its second message -- when that template prints those prompts as the checkpoint's own does,
 and either the `litetune.json` beside the checkpoint records that `tune` trained it
-`runtime_rendered` without declarations, or there is no `litetune.json` and the
+`runtime_rendered` without declarations, or there is no `litetune.json` at all and the
 checkpoint's template is `Qwen/Qwen3-0.6B`'s own, byte for byte, as when the base model
-is converted as published. Every bundle's template, of any family, is checked
+is converted as published (a `litetune.json` that is there and cannot be read keeps the
+checkpoint's own template). Every bundle's template, of any family, is checked
 after export to hold a LiteRT-LM conversation past its first message in those contexts,
 and a bundle that does not, or could not be checked, says so in `convert`'s report. A template you pass yourself with
 `--flag=--jinja_chat_template_override=<file>` is used as given, with no block, so

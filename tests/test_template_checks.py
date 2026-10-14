@@ -239,6 +239,96 @@ _ADVERSARIAL_SYNTAX = [
     "{{ 'abc'.foo }}|{{ {'a': 1}.a }}|{{ {'a': 1}['b'] }}",
     "{{ nope.x }}",
     "{{ 'a'.upper() }}",
+    # MiniJinja's arithmetic (`src/value/ops.rs`): Euclidean `//` and integer
+    # `%`, `/` in f64, integers checked in i128, a negative integer exponent
+    # refused, a repetition by a non-negative count, `-` for numbers alone.
+    "{{ -7 // 2 }}|{{ 7 // -2 }}|{{ 7.5 // 2 }}|{{ -7.5 // 2 }}|{{ 7.5 // -2 }}|{{ -7 // 2.0 }}",
+    "{{ -7 % 3 }}|{{ 7 % -3 }}|{{ 7.5 % 2 }}|{{ -7.5 % 2 }}|{{ 7.5 % -2 }}|{{ 1.0 % 0 }}",
+    "{{ 1 / 0 }}|{{ -1 / 0 }}|{{ 0 / 0 }}|{{ 1.0 // 0 }}|{{ 10 / 4 }}|{{ 6 / 3 }}",
+    "{{ 1 // 0 }}",
+    "{{ 1 % 0 }}",
+    "{{ 2 ** 3 }}|{{ 2 ** 0.5 }}|{{ 2.0 ** -1 }}|{{ 0 ** 0 }}|{{ -2 ** 2 }}|{{ 2 ** 3 ** 2 }}",
+    "{{ 0.0 ** -1 }}|{{ (-8) ** (1 / 3) }}|{{ 1e308 * 10 }}|{{ true + true }}|{{ true * 3 }}",
+    "{{ 2 ** -1 }}",
+    "{{ 2 ** 127 }}",
+    "{{ 1 ** 4294967296 }}",
+    "{{ 2 ** 126 * 2 }}",
+    "{{ 2 ** 64 }}|{{ 9223372036854775807 + 1 }}|{{ (-2) ** 127 }}|{{ -(-9223372036854775808) }}",
+    "{{ 2 * 'ab' }}|{{ 'ab' * 2.0 }}|{{ 'ab' * true }}|{{ [1] * 2 }}|{{ 2 * [1] }}|{{ [1] * 0 }}",
+    "{{ 'ab' * -1 }}",
+    "{{ [1] * -1 }}",
+    "{{ 'ab' * 2.5 }}",
+    "{{ 'a' - 1 }}",
+    "{{ none + 1 }}",
+    "{{ {'a': 1} + {'b': 2} }}",
+    "{{ - 1 + 2 }}|{{ -(1 + 2) }}|{{ -0.0 }}",
+    "{{ -true }}",
+    "{{ -'a' }}",
+    "{{ -none }}",
+    # Equality (`impl PartialEq for Value`): item by item, a tuple a list.
+    "{{ (1, 2) == [1, 2] }}|{{ [(1, 2)] == [[1, 2]] }}|{{ 1 == 1.0 }}|{{ true == 1 }}",
+    "{{ 'a' == 1 }}|{{ nope == none }}|{{ nope == nope }}|{{ none != nope }}",
+    "{{ ({'b': 1, 'a': 2} | dictsort)[0] == ['a', 2] }}|{{ (1,) is eq [1] }}|{{ 1 is ne 'a' }}",
+    # Ordering across kinds (`impl Ord for Value`).
+    "{{ 1 < 'a' }}|{{ none < 1 }}|{{ [1] < 'a' }}|{{ true < 2 }}|{{ 'a' < none }}",
+    "{{ nope < 1 }}|{{ [1] < [1, 0] }}|{{ {'a': 1} < {'b': 1} }}|{{ [1, 'a'] < [1, 2] }}",
+    # Containment (`ops::contains`, and the `in` test).
+    "{{ 1 in 'a1' }}|{{ 'a' in nope }}|{{ [1, 2] in [(1, 2)] }}|{{ [1] in {'a': 1} }}",
+    "{{ 1 is in 1 }}|{{ 'a' is in none }}|{{ 1 is in [1.0] }}",
+    "{{ 'a' in none }}",
+    "{{ 1 in 1 }}",
+    # Loops (`Value::try_iter`, `vm/loop_object.rs`).
+    "{% for x in none %}x{% else %}e{% endfor %}|{% for x in nope %}x{% else %}e{% endfor %}",
+    "{% for x in 1 %}x{% endfor %}",
+    "{% for x in 'ab' %}{{ loop.length }}|{{ loop.revindex }}|{{ loop.last }};{% endfor %}",
+    "{% for x in 'a,b' | split(',') %}{{ loop.length }}|{{ loop.last }};{% endfor %}",
+    "{% for x in [1, 2, 3] %}{{ loop.changed(x % 2) }}{{ loop.cycle('a', 'b') }}"
+    "[{{ loop.previtem }}|{{ loop.nextitem }}]{% endfor %}",
+    "{% for x in [1] %}{{ loop }}|{{ loop.depth }}|[{{ loop.foo }}]{% endfor %}",
+    # What MiniJinja holds as an iterable, of a known length or of none.
+    "{{ 'a,b' | split(',') }}|{{ ('a,b' | split(','))[0] }}"
+    "|{{ 'a,b' | split(',') | list | length }}",
+    "{{ 'a,b' | split(',') | length }}",
+    "{{ nope | length }}",
+    "{% set v = [1, 2, 3][1:] %}{{ v is sequence }}|{{ v | length }}|{{ v < [9] }}|{{ v }}",
+    "{{ ([1] + [2]) is sequence }}|{{ ({'a': 1} | items) is sequence }}|{{ range(2) is sequence }}",
+    "{{ ([1] * 2) is sequence }}|{{ ([1, 2] | map('string')) is sequence }}|{{ range(3) }}",
+    "{% set p = 'a,b,c' | split(',') %}{{ p[1:] }}|{{ p[:2] }}|{{ p[::-1] }}|{{ p[-1] }}"
+    "|{{ p + [1] }}",
+    "{% set p = 'a,b' | split(',') %}{{ p * 2 }}",
+    "{{ range(100001) | length }}",
+    # Slices (`ops::slice`).
+    "{{ [1, 2, 3][0:0:-1] }}|{{ [1, 2, 3][:0:-1] }}|{{ 'abc'[:0:-1] }}|{{ [1, 2, 3][-10:-20:-1] }}",
+    "{{ 'abcdef'[4:1:-2] }}|{{ none[1:] }}|{{ nope[1:] }}|{{ [1, 2, 3][1.0:] }}"
+    "|{{ [1, 2, 3][1.0] }}",
+    "{{ [1, 2, 3][::0] }}",
+    "{{ {'a': 1}[1:] }}",
+    "{{ [1, 2, 3][1.5:] }}",
+    "{% for m in [1, 2, 3][1:] %}{{ loop.index }}{{ loop.last }}{{ loop.length }};{% endfor %}",
+    # A namespace is a map with its keys in order (`value/namespace_object.rs`).
+    "{{ namespace(b=[1], a='x') }}|{{ 'y' if namespace() else 'n' }}|{{ namespace(a=1) | tojson }}",
+    "{% for k in namespace(b=1, a=2) %}{{ k }}{% endfor %}|{{ 'a' in namespace(a=1) }}"
+    "|{{ namespace(a=1) == {'a': 1} }}|{{ namespace(a=1) is mapping }}",
+    "{% set ns = namespace(b=0) %}{% set ns.a, ns.b = 1, 2 %}{{ ns }}",
+    "{% set ns = namespace(x=[]) %}{% for i in [3, 1] %}{% set ns.x = ns.x + [i] %}{% endfor %}"
+    "{{ ns.x }}|{{ ns.x is sequence }}|{{ ns.x[-1] }}",
+    "{{ namespace({'a': 1}, b=2) }}",
+    "{{ namespace(1) }}",
+    # A macro (`vm/macro_object.rs`, `compile_macro_expression`).
+    "{% macro f(a=1) %}[{{ a }}]{% endmacro %}{{ f }}|{{ f(nope) }}|{{ f(a=nope) }}|{{ f.name }}"
+    "|{{ f.arguments }}|[{{ f.catch_kwargs }}]",
+    "{% macro f() %}{{ caller(nope) }}{% endmacro %}{% call(x=2) f() %}[{{ x }}]{% endcall %}",
+    "{% macro f() %}{{ caller(1, 2) }}{% endmacro %}{% call(a, b) f() %}{{ a + b }}{% endcall %}",
+    "{% macro f(x) %}{{ x }}{% endmacro %}{{ f(1, x=2) }}",
+    # Syntax the two read alike.
+    "{{ 1_000 }}|{{ 0x10 }}|{{ 0o10 }}|{{ 0b11 }}|{{ 1e3 }}|{{ 'a' 'b' }}|{{ [1, 2,] }}"
+    "|{{ (1, 2,) }}",
+    "{% filter upper %}ab{% endfilter %}|{% set x | upper %}cd{% endset %}{{ x }}"
+    "|{{ not 1 in [1] }}",
+    "{% set x = 1 %}{% for i in [1] %}{% set x = 2 %}{% endfor %}{{ x }}|{% with a = 1 %}{{ a }}"
+    "{% endwith %}[{{ a }}]",
+    "{% for x in [[1, [2]], 3] recursive %}{% if x is sequence %}{{ loop(x) }}{% else %}{{ x }}"
+    "{{ loop.depth }}{% endif %}{% endfor %}",
 ]
 
 
@@ -352,6 +442,73 @@ def test_the_renderer_refuses_a_break_as_the_runtime_build_does():
 )
 def test_what_the_renderer_does_not_vouch_for_is_named(source, named):
     assert any(named in gap for gap in _unvouched(source)), _unvouched(source)
+
+
+# What the renderer renders otherwise than MiniJinja 2.14.0, and so does not
+# vouch for: each one differs, and each one is named.
+_RENDERED_OTHERWISE = [
+    # Python's chaining, which MiniJinja has only from 2.20.0; 2.14 reads
+    # `(1 == 2) == false`.
+    ("{{ 1 == 2 == false }}", "a chained comparison, which MiniJinja 2.14 reads as nested ones"),
+    ("{{ 1 < 3 < 2 }}", "a chained comparison"),
+    ("{{ +3 }}", "a unary `+`, which MiniJinja 2.14 cannot parse"),
+    ("{{ 0 and 1 }}", "an `and` of constants"),
+    ("{{ 'a\\/b' }}", "whose escapes MiniJinja 2.14 reads otherwise"),
+    ("{{ 'a\\sb' }}", "whose escapes MiniJinja 2.14 reads otherwise"),
+    ("{{ 'a\\ab' }}", "whose escapes MiniJinja 2.14 reads otherwise"),
+    ("{{ '\\ud83d\\ude80' }}", "whose escapes MiniJinja 2.14 reads otherwise"),
+    ("{{ [1, 2].0 }}", "a dotted integer lookup"),
+    ("{% set x = [{'a': 1}] %}{{ x.0.a }}", "a dotted integer lookup"),
+    ("{% macro f(a) %}{{ a }}{{ varargs }}{% endmacro %}{{ f(1, 2) }}", "the name `varargs`"),
+    ("{% macro f(a) %}{{ kwargs }}{% endmacro %}{{ f(1, k=3) }}", "the name `kwargs`"),
+    ("{{ self }}", "the name `self`"),
+    (
+        "{{ -170141183460469231731687303715884105728 }}",
+        "the integer literal 170141183460469231731687303715884105728",
+    ),
+    ("{% macro f(a, b=a) %}[{{ b }}]{% endmacro %}{{ f(1) }}", "a macro default that names"),
+    ("{% macro f(a=b, b=1) %}[{{ a }}]{% endmacro %}{{ f() }}", "a macro default that names"),
+]
+
+
+@pytest.mark.parametrize(("source", "named"), _RENDERED_OTHERWISE)
+def test_what_the_renderer_renders_otherwise_than_minijinja_is_named(source, named):
+    ours, theirs = _render(source, [], True), _minijinja(source, [], True)
+    same = ("text" in ours) == ("text" in theirs) and ours.get("text") == theirs.get("text")
+    assert not same, (ours, theirs)
+    assert any(named in gap for gap in _unvouched(source)), _unvouched(source)
+
+
+def test_a_composed_template_with_a_chained_comparison_is_not_checked(tmp_path):
+    """Every single-turn case renders as the checkpoint's template renders it --
+    the renderer chains as Jinja2 does -- so only the construct keeps it from
+    passing: MiniJinja 2.14 would render the comparison true, and print `!`."""
+    template = (
+        "{%- for m in messages %}{{ m.role }}:{{ m.content }};"
+        "{% if 1 == 2 == false %}!{% endif %}{% endfor %}"
+    )
+    renders = _compose(tmp_path, template, None)
+    assert single_turn_differences(renders["reference"], renders["candidates"]["composed"]) == []
+    assert renders["unvouched"]["composed"] == [
+        "a chained comparison, which MiniJinja 2.14 reads as nested ones"
+    ]
+    choice = export._choose_template("m", renders, None)
+    assert choice.source is None and choice.refusal is None
+    assert choice.unchecked is not None
+    assert "a chained comparison" in choice.unchecked and "was not checked" in choice.unchecked
+
+
+def test_a_conversation_with_a_chained_comparison_is_not_checked():
+    """Rendered, it would pass: every case grows by appending."""
+    template = (
+        "{%- for m in messages %}{{ m.role }};{% if 1 == 2 == false %}!{% endif %}{% endfor %}"
+    )
+    report = _conversation(template)
+    breaks, _ = conversation_breaks(report["renders"])
+    assert breaks == []
+    assert report["unvouched"] == [
+        "a chained comparison, which MiniJinja 2.14 reads as nested ones"
+    ]
 
 
 def test_a_macro_of_the_templates_own_is_vouched_for():

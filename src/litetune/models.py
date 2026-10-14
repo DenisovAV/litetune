@@ -688,7 +688,10 @@ CANONICAL_HEADER_END = "-#}\n"
 # metadata configuration for the Qwen 3 model family"; the conversion it
 # describes passes the metadata carrying it). `export._canonical_basis` offers
 # the canonical template on that ground to a checkpoint with no training
-# record, and it is chosen only if the single-turn renderings match.
+# record, and it is chosen only if the single-turn renderings match. That is a
+# compatibility heuristic, not training provenance: these bytes say which chat
+# format a checkpoint's tokenizer is configured for, not what its weights were
+# trained on.
 #
 # Read from the Hub on 2026-10-14: Qwen/Qwen3-1.7B (70d244c), -4B (1cfa9a7),
 # -8B (b968826), -14B (40c0698), -32B (9216db5) and -30B-A3B (ad44e77) ship

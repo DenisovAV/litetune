@@ -754,17 +754,20 @@ def recorded_prompt_mode(reference: str) -> PromptMode | None:
     """The mode `tune` recorded beside a local reference checkpoint, if it recorded one.
 
     `None` when the checkpoint records no mode, and under every condition
-    `_recorded` returns `None` for. Those conditions are written down there
-    rather than here, because they are the same for every question asked of the
-    sidecar and two copies of them would drift. Falling back to the contract or
-    to the prompts when a record exists would silently replace a mode the
-    checkpoint wrote down, which is why an unreadable record raises instead of
-    reading as absent.
+    `read_training_record` returns `None` for. Those conditions are written
+    down there rather than here, because they are the same for every question
+    asked of the sidecar and two copies of them would drift. Falling back to
+    the contract or to the prompts when a record exists would silently replace
+    a mode the checkpoint wrote down, which is why an unreadable record raises
+    instead of reading as absent.
     """
-    read = _recorded(reference)
-    if read is None:
-        return None
-    data, sidecar = read
+    read = read_training_record(reference)
+    return None if read is None else prompt_mode_in(read)
+
+
+def prompt_mode_in(record: tuple[dict, Path]) -> PromptMode | None:
+    """The mode in a record `read_training_record` returned, `None` if it names none."""
+    data, sidecar = record
     raw = data.get("prompt_mode")
     return None if raw is None else parse_prompt_mode(raw, str(sidecar))
 
@@ -777,23 +780,30 @@ def recorded_declarations_sha256(reference: str) -> str | None:
     that trained plain text. Comparing against `None` is not a disagreement:
     it is the absence of anything to disagree with.
     """
-    read = _recorded(reference)
-    if read is None:
-        return None
-    raw = read[0].get("declarations_sha256")
+    read = read_training_record(reference)
+    return None if read is None else declarations_sha256_in(read)
+
+
+def declarations_sha256_in(record: tuple[dict, Path]) -> str | None:
+    """The declarations digest in a record `read_training_record` returned, if any."""
+    data, sidecar = record
+    raw = data.get("declarations_sha256")
     if raw is None:
         return None
     if not isinstance(raw, str):
-        raise ValueError(f"{read[1]} records declarations_sha256 {raw!r}, which is not a string")
+        raise ValueError(f"{sidecar} records declarations_sha256 {raw!r}, which is not a string")
     return raw
 
 
-def _recorded(reference: str) -> tuple[dict, Path] | None:
+def read_training_record(reference: str) -> tuple[dict, Path] | None:
     """The checkpoint's own record and where it was read from, or `None` for no record.
 
-    One reader for every question asked of `litetune.json`. The distinction
-    below is subtle enough that a second copy would drift from it, and the two
-    copies would then disagree about whether a checkpoint said anything.
+    One reader for every question `verify` and `export` ask of
+    `litetune.json` -- `export` offers a canonical chat template on a record's
+    absence, so it must not mistake an unreadable record for none. The
+    distinction below is subtle enough that a second copy would drift from it,
+    and the two copies would then disagree about whether a checkpoint said
+    anything.
 
     `None` for a Hugging Face id, for a directory with no `litetune.json`, and
     for a reference that is not a directory at all -- including a directory

@@ -2993,6 +2993,79 @@ def test_the_base_model_as_published_gets_litert_lms_template(
     assert _one_message(result) == []
 
 
+def _a_directory(sidecar: Path) -> None:
+    sidecar.mkdir()
+
+
+def _a_link_going_nowhere(sidecar: Path) -> None:
+    sidecar.symlink_to(sidecar.parent / "never-written.json")
+
+
+def _not_json(sidecar: Path) -> None:
+    sidecar.write_text("{not json", encoding="utf-8")
+
+
+def _not_an_object(sidecar: Path) -> None:
+    sidecar.write_text("[]", encoding="utf-8")
+
+
+def _withheld_for_an_unreadable_record(result: ExportResult) -> str:
+    """Why LiteRT-LM's template was withheld, asserting that the bundle kept the
+    checkpoint's own and says it answers one message."""
+    assert result.outcome is Outcome.PASSED
+    template = result.chat_template
+    assert template is not None and template.source == "composed"
+    assert template.path.read_bytes() == _BLOCK + QWEN3_TEMPLATE.encode("utf-8")
+    check = _chat_template_check(result)
+    assert check.observed["canonical_offered"] is None
+    withheld = check.observed["canonical_withheld"]
+    assert "could not be read (" in withheld
+    assert f"carries no {models.PROVENANCE_NAME}" not in withheld
+    (limitation,) = _one_message(result)
+    assert "google-ai-edge/LiteRT-LM#3443" in limitation
+    return withheld
+
+
+@pytest.mark.parametrize(
+    ("spoil", "raised"),
+    [
+        # Windows reads a directory as a permission failure.
+        (_a_directory, ("IsADirectoryError", "PermissionError")),
+        (_a_link_going_nowhere, ("FileNotFoundError",)),
+        (_not_json, ("JSONDecodeError",)),
+        (_not_an_object, ("ValueError",)),
+    ],
+    ids=["directory", "dangling-symlink", "malformed-json", "not-an-object"],
+)
+def test_a_record_that_is_there_and_cannot_be_read_is_not_an_absent_one(
+    toolchain, qwen_request, trained, spoil, raised
+):
+    """Only a checkpoint with no litetune.json at all is offered LiteRT-LM's
+    template on its template's bytes. A litetune.json that is there and cannot
+    be read keeps the checkpoint's own -- here Qwen's template, byte for byte,
+    which the base model with no record is offered LiteRT-LM's on."""
+    toolchain.chat_template = QWEN3_TEMPLATE
+    model = trained(_NOT_RECORDED)
+    spoil(Path(model) / models.PROVENANCE_NAME)
+    withheld = _withheld_for_an_unreadable_record(run_export(qwen_request(model)))
+    assert any(f"({name}: " in withheld for name in raised), withheld
+
+
+@pytest.mark.posix
+def test_a_record_that_cannot_be_opened_is_not_an_absent_one(toolchain, qwen_request, trained):
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root opens a file whatever its permission bits")
+    toolchain.chat_template = QWEN3_TEMPLATE
+    model = trained()
+    sidecar = Path(model) / models.PROVENANCE_NAME
+    sidecar.chmod(0)
+    try:
+        result = run_export(qwen_request(model))
+    finally:
+        sidecar.chmod(0o600)
+    assert "(PermissionError: " in _withheld_for_an_unreadable_record(result)
+
+
 def test_a_base_model_whose_single_turns_differ_is_not_given_litert_lms_template(
     toolchain, qwen_request, monkeypatch
 ):
@@ -3088,17 +3161,30 @@ def test_qwen25_keeps_its_own_template_which_holds_a_conversation(toolchain, qwe
     assert _one_message(result) == []
 
 
+# A filter the renderer does not render as MiniJinja does, and a chained
+# comparison, which MiniJinja 2.14 reads as nested ones: `1 == 2 == false` is
+# false in Jinja2 and true on the device.
+_UNVOUCHED_CONSTRUCTS = [
+    ("{{ 'x' | title }}", "uses the filter `title`"),
+    (
+        "{% if 1 == 2 == false %}!{% endif %}",
+        "uses a chained comparison, which MiniJinja 2.14 reads as nested ones",
+    ),
+]
+
+
+@pytest.mark.parametrize(("construct", "named"), _UNVOUCHED_CONSTRUCTS)
 def test_a_composed_template_the_renderer_does_not_vouch_for_exports_nothing(
-    toolchain, qwen_request
+    toolchain, qwen_request, construct, named
 ):
-    """`could not check`, never a pass: a checkpoint template using a filter the
-    renderer does not render as MiniJinja does."""
-    toolchain.chat_template = "{{ messages[0].content }}{{ 'x' | title }}"
+    """`could not check`, never a pass: a checkpoint template using a construct
+    the renderer does not render as MiniJinja does."""
+    toolchain.chat_template = "{{ messages[0].content }}" + construct
     result = run_export(qwen_request("Qwen/Qwen2.5-0.5B-Instruct"))
 
     check = _chat_template_check(result)
     assert check.outcome is Outcome.UNCHECKED
-    assert "uses the filter `title`" in check.detail and "was not checked" in check.detail
+    assert named in check.detail and "was not checked" in check.detail
     assert toolchain.exports == []
 
 
@@ -3150,8 +3236,11 @@ def test_a_template_on_the_single_turn_protocol_is_not_applicable(toolchain, tmp
     )
 
 
-def test_a_bundled_template_the_renderer_does_not_vouch_for_is_not_checked(toolchain, tmp_path):
-    template = "{%- for m in messages %}{{ m.content[0].text | title }};{% endfor %}"
+@pytest.mark.parametrize(("construct", "named"), _UNVOUCHED_CONSTRUCTS)
+def test_a_bundled_template_the_renderer_does_not_vouch_for_is_not_checked(
+    toolchain, tmp_path, construct, named
+):
+    template = "{%- for m in messages %}{{ m.content[0].text }};" + construct + "{% endfor %}"
     result = run_export(
         ExportRequest(
             model="acme/some-model",
@@ -3165,7 +3254,9 @@ def test_a_bundled_template_the_renderer_does_not_vouch_for_is_not_checked(toolc
     (export,) = result.exports
     assert export.conversation is not None and export.conversation.holds is None
     assert _one_message(result) == []
-    assert any("was not checked" in t and "the filter `title`" in t for t in result.limitations)
+    assert any(
+        "was not checked" in t and named.removeprefix("uses ") in t for t in result.limitations
+    )
 
 
 def test_a_bundle_carrying_no_template_is_said_not_to_be_checked(toolchain, tmp_path):

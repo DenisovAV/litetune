@@ -62,11 +62,16 @@ newlines kept, blocks trimmed, its `tojson`, `lstrip`, `rstrip`,
 `raise_exception` and `none`, the same rewrite first, the MiniJinja tests and
 filters the rewrite produces, no Python methods on a string, list or mapping,
 no `{% break %}`, values printed, joined with `~` and coerced by filters as
-MiniJinja does. It is an emulation, so it vouches only for what is held to
-MiniJinja 2.14.0 in the tests -- the filters, tests and functions it names, on
-non-string values as well as strings -- and to LiteRT-LM's own goldens for its
-Qwen 3 template; a template that uses anything else is not checked, never
-passed (`unvouched`). The reference side of single-turn identity is what
+MiniJinja does, and its operators, comparisons, slices, loops, namespaces and
+macro arguments MiniJinja's (`src/value/ops.rs`, `src/value/mod.rs`,
+`src/vm/loop_object.rs`, `src/compiler/codegen.rs` of that crate). It is an
+emulation, so it vouches only for what is held to MiniJinja 2.14.0 in the
+tests -- the filters, tests and functions it names, on non-string values as
+well as strings, and the syntax those tests render -- and to LiteRT-LM's own
+goldens for its Qwen 3 template; a template that uses anything else, or syntax
+the two read differently (a chained comparison, which MiniJinja reads as
+nested ones until 2.20.0, among them), is not checked, never passed
+(`unvouched`). The reference side of single-turn identity is what
 training rendered, transformers' `apply_chat_template`, run in the export
 environment by `export._COMPOSE_SCRIPT`.
 """
@@ -111,9 +116,12 @@ import functools as _functools
 import json as _json
 import math as _math
 import re as _re
+import struct as _struct
 import time as _time
 
 import jinja2
+import jinja2.runtime
+import jinja2.utils
 from jinja2 import nodes as _nodes
 from jinja2.compiler import CodeGenerator as _CodeGenerator
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -154,28 +162,464 @@ _PLAIN = (str, list, tuple, dict, int, float, bool, type(None))
 
 
 class RuntimeEnvironment(ImmutableSandboxedEnvironment):
+    # MiniJinja's arithmetic (`src/value/ops.rs`): integers checked in i128,
+    # `//` and integer `%` Euclidean, `/` in f64 (so `1 / 0` is `inf`), a
+    # negative integer exponent an error, a string or list repeated only a
+    # non-negative number of times, and `-` only for numbers. Jinja2 hands
+    # each of these operators to `call_binop`/`call_unop` when it is listed.
+    intercepted_binops = frozenset({"+", "-", "*", "/", "//", "%", "**"})
+    intercepted_unops = frozenset({"-"})
+
     def getattr(self, obj, attribute):
         if isinstance(obj, dict):
             return obj[attribute] if attribute in obj else self.undefined(obj=obj, name=attribute)
         if isinstance(obj, _PLAIN):
             return self.undefined(obj=obj, name=attribute)
+        if isinstance(obj, jinja2.runtime.LoopContext) and isinstance(
+            getattr(obj, "_iterable", None), _Unsized
+        ):
+            # MiniJinja knows no length for a string or an iterator it loops
+            # over (`vm/loop_object.rs`): no `length` or `revindex`, and
+            # `last` is false.
+            if attribute in ("length", "revindex", "revindex0"):
+                return self.undefined(obj=obj, name=attribute)
+            if attribute == "last":
+                return False
+        if isinstance(obj, jinja2.runtime.Macro):
+            # `name`, `arguments` and `caller`, and nothing else
+            # (`vm/macro_object.rs`).
+            if attribute == "arguments":
+                return list(obj.arguments)
+            if attribute in ("name", "caller"):
+                return getattr(obj, attribute)
+            return self.undefined(obj=obj, name=attribute)
         return super().getattr(obj, attribute)
 
     def getitem(self, obj, argument):
+        if isinstance(argument, slice):
+            return _slice(obj, argument)
         if isinstance(obj, dict):
             return obj[argument] if argument in obj else self.undefined(obj=obj, name=argument)
+        # An index is `Value::as_i64` (`get_item_opt`, `src/value/mod.rs`): a
+        # float that is an integer is one. An iterator of no known length has
+        # no item counted from its end.
+        if isinstance(argument, float) and argument.is_integer() and abs(argument) < 2.0**63:
+            argument = int(argument)
+        if isinstance(obj, _Unsized) and isinstance(argument, int) and argument < 0:
+            return self.undefined(obj=obj, name=argument)
         if isinstance(obj, _PLAIN) and not isinstance(argument, (int, slice)):
             return self.undefined(obj=obj, name=argument)
         return super().getitem(obj, argument)
 
+    def call(__self, __context, __obj, *args, **kwargs):  # noqa: N805 -- Jinja2's own signature
+        # A macro takes a parameter's default for an argument passed undefined,
+        # not only for one not passed (`IsUndefined` in
+        # `compile_macro_expression`, `src/compiler/codegen.rs`).
+        if isinstance(__obj, jinja2.runtime.Macro):
+            missing = jinja2.utils.missing
+            args = tuple(missing if isinstance(a, jinja2.Undefined) else a for a in args)
+            kwargs = {
+                k: missing if isinstance(v, jinja2.Undefined) else v for k, v in kwargs.items()
+            }
+        return super().call(__context, __obj, *args, **kwargs)
+
+    def call_binop(self, context, operator, left, right):
+        return _binop(operator, left, right)
+
+    def call_unop(self, context, operator, arg):
+        if isinstance(arg, bool) or not isinstance(arg, (int, float)):
+            raise TypeError("invalid operation")
+        return -arg if isinstance(arg, float) else _checked(-arg, "-", 0, arg)
+
+    def _parse(self, source, name, filename):
+        # Every loop's iterable through `__mj_iter__`: MiniJinja loops over
+        # none or undefined as over nothing, and over a string without a length.
+        tree = super()._parse(source, name, filename)
+        for node in tree.find_all(_nodes.For):
+            call = _nodes.Call(_nodes.Name("__mj_iter__", "load"), [node.iter], [], None, None)
+            node.iter = call.set_lineno(node.lineno).set_environment(self)
+        return tree
+
+
+class _Iterable(list):
+    # What MiniJinja holds as an iterable rather than a sequence
+    # (`ObjectRepr::Iterable`): a slice, a sum or a repetition of sequences
+    # (`ops::slice`, `ops::add`, `ops::mul`), and what `items` and `range`
+    # return. Iterated, indexed and printed as a list; not a `sequence`, and
+    # ordered after every map.
+    pass
+
+
+class _Unsized(_Iterable):
+    # An iterable of no known length: `split`'s result, a string a loop goes
+    # over, and what is sliced or summed from them. Printed `<iterator>`, true
+    # even when empty, and `length` refuses it.
+    def __bool__(self):
+        return True
+
+
+class _Namespace(dict, jinja2.utils.Namespace):
+    # MiniJinja's namespace is a map with its keys in order (a `BTreeMap`,
+    # `src/value/namespace_object.rs`): looked up, iterated, printed, compared
+    # and false when empty as one. A `Namespace` still, for Jinja2's check on
+    # `{% set ns.a = ... %}`, which assigns through `__setitem__`.
+    __getattribute__ = object.__getattribute__
+    __repr__ = dict.__repr__
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(sorted(dict(*args, **kwargs).items()))
+
+    def __setitem__(self, key, value):
+        dict.__setitem__(self, key, value)
+        ordered = sorted(self.items())
+        self.clear()
+        dict.update(self, ordered)
+
+
+def _namespace(*args, **kwargs):
+    # MiniJinja's `namespace(defaults)`: one map or keyword arguments, not both,
+    # and only its string keys.
+    if len(args) + bool(kwargs) > 1:
+        raise TypeError("too many arguments")
+    defaults = args[0] if args else kwargs
+    if not isinstance(defaults, dict):
+        raise TypeError("expected object or keyword arguments")
+    return _Namespace({key: value for key, value in defaults.items() if isinstance(key, str)})
+
+
+_I128 = (-(2**127), 2**127 - 1)
+
+
+def _checked(value, operator, left, right):
+    if _I128[0] <= value <= _I128[1]:
+        return value
+    raise OverflowError(
+        f"unable to calculate {minijinja_str(left)} {operator} {minijinja_str(right)}"
+    )
+
+
+def _is_int(value):
+    return isinstance(value, int)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float))
+
+
+def _fdiv(a, b):
+    # f64 division as Rust does it: by zero, an infinity or NaN.
+    if b == 0:
+        if a == 0 or _math.isnan(a):
+            return _math.nan
+        return _math.copysign(_math.inf, a) * _math.copysign(1.0, b)
+    return a / b
+
+
+def _fmod(a, b):
+    # Rust's f64 `%`, C's fmod: NaN for a zero divisor or an infinite dividend.
+    if b == 0 or _math.isinf(a) or _math.isnan(a) or _math.isnan(b):
+        return _math.nan
+    return _math.fmod(a, b)
+
+
+def _times(sequence, count, left, right):
+    # `Value::as_usize`: a bool, a non-negative integer, or a float that is
+    # one; and a sequence repeated is an iterable, of a length it must know.
+    if isinstance(count, float) and count.is_integer() and abs(count) < 2.0**63:
+        count = int(count)
+    if not (isinstance(count, int) and count >= 0):
+        raise TypeError(f"cannot repeat by {minijinja_str(count)}")
+    if isinstance(sequence, str):
+        return sequence * count
+    if isinstance(sequence, _Unsized):
+        raise TypeError("cannot repeat unsized iterables")
+    return _Iterable(list(sequence) * count)
+
+
+def _bound(value):
+    # A slice bound is `i64::try_from`: a bool, an integer, or a float that is one.
+    if isinstance(value, float) and value.is_integer() and abs(value) < 2.0**63:
+        return int(value)
+    if isinstance(value, int):
+        return int(value)
+    raise TypeError(f"cannot convert {minijinja_str(value)} to a slice index")
+
+
+def _backwards(start, stop, step, end):
+    # `range_step_backwards`: Python's negative step, but for a stop of 0,
+    # which reads as no stop, and for an empty value, whose one index panics.
+    if start is None or start >= end:
+        first = max(end - 1, 0)
+    else:
+        first = start if start >= 0 else max(end + start, 0)
+    last = 0 if stop is None else (max(end + stop, 0) if stop < 0 else stop)
+    if last > first:
+        return []
+    length = (first + step) // step if last == 0 else (first - last + step - 1) // step
+    indices = list(range(first, last - 1, -step))[:length]
+    if any(index >= end for index in indices):
+        raise IndexError("index out of bounds")
+    return indices
+
+
+def _slice(value, bounds):
+    # `ops::slice` (`src/value/ops.rs`): none and undefined slice to an empty
+    # sequence; a sequence slices to an iterable, which with a positive step
+    # counts a missing or negative bound from a length an unsized one does
+    # not have, 0.
+    start, stop, step = (
+        None if bound is None else _bound(bound)
+        for bound in (bounds.start, bounds.stop, bounds.step)
+    )
+    step = 1 if step is None else step
+    if step == 0:
+        raise ValueError("cannot slice by step size of 0")
+    if value is None or isinstance(value, jinja2.Undefined):
+        return []
+    if not isinstance(value, (str, list, tuple)):
+        raise TypeError(f"value of type {type(value).__name__} cannot be sliced")
+    if step > 0:
+        end = 0 if isinstance(value, _Unsized) else len(value)
+        first = 0 if start is None else start
+        if first < 0 or stop is None or stop < 0:
+            last = end if stop is None else (max(end + stop, 0) if stop < 0 else stop)
+            first = max(end + first, 0) if first < 0 else first
+        else:
+            last = stop
+        items = value[first : max(first, last)][::step]
+    else:
+        items = [value[index] for index in _backwards(start, stop, -step, len(value))]
+    if isinstance(value, str):
+        return "".join(items)
+    # An unsized slice knows its length only when it takes nothing: `take(0)`.
+    unsized = isinstance(value, _Unsized) and step > 0 and max(first, last) > first
+    return (_Unsized if unsized else _Iterable)(items)
+
+
+def _binop(operator, left, right):
+    ints = _is_int(left) and _is_int(right)
+    numbers = _is_number(left) and _is_number(right)
+    if operator == "+":
+        if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+            unsized = isinstance(left, _Unsized) or isinstance(right, _Unsized)
+            return (_Unsized if unsized else _Iterable)(list(left) + list(right))
+        if isinstance(left, str) and isinstance(right, str):
+            return left + right
+        if ints:
+            return _checked(left + right, "+", left, right)
+        if numbers:
+            return float(left) + float(right)
+    elif operator == "-":
+        if ints:
+            return _checked(left - right, "-", left, right)
+        if numbers:
+            return float(left) - float(right)
+    elif operator == "*":
+        if isinstance(left, str):
+            return _times(left, right, left, right)
+        if isinstance(right, str):
+            return _times(right, left, left, right)
+        if isinstance(left, (list, tuple)):
+            return _times(left, right, left, right)
+        if isinstance(right, (list, tuple)):
+            return _times(right, left, left, right)
+        if ints:
+            return _checked(left * right, "*", left, right)
+        if numbers:
+            return float(left) * float(right)
+    elif operator == "/":
+        if numbers:
+            return _fdiv(float(left), float(right))
+    elif operator == "//":
+        if ints:
+            if right == 0:
+                raise ZeroDivisionError(f"unable to calculate {left} // {right}")
+            quotient = left // right
+            if right < 0 and left % right != 0:
+                quotient += 1
+            return _checked(quotient, "//", left, right)
+        if numbers:
+            a, b = float(left), float(right)
+            quotient = _fdiv(a, b)
+            if _math.isfinite(quotient):
+                quotient = float(_math.trunc(quotient))
+            if _fmod(a, b) < 0:
+                quotient = quotient - 1.0 if b > 0 else quotient + 1.0
+            return quotient
+    elif operator == "%":
+        if ints:
+            if right == 0:
+                raise ZeroDivisionError(f"unable to calculate {left} % {right}")
+            return left % abs(right)
+        if numbers:
+            return _fmod(float(left), float(right))
+    elif operator == "**":
+        if ints:
+            if right < 0 or right > 2**32 - 1 or (abs(left) > 1 and right > 128):
+                raise OverflowError(f"unable to calculate {left} ** {right}")
+            return _checked(left**right, "**", left, right)
+        if numbers:
+            a, b = float(left), float(right)
+            try:
+                return _math.pow(a, b)
+            except OverflowError:
+                odd = b.is_integer() and int(b) % 2 == 1
+                return _math.copysign(_math.inf, a) if odd else _math.inf
+            except ValueError:
+                if a == 0 and b < 0:
+                    odd = b.is_integer() and int(b) % 2 == 1
+                    return _math.copysign(_math.inf, a) if odd else _math.inf
+                return _math.nan
+    raise TypeError(
+        f"tried to use {operator} operator on unsupported types {type(left).__name__} and "
+        f"{type(right).__name__}"
+    )
+
+
+# The order MiniJinja sorts values of different kinds in (`ValueKind`, and
+# `impl Ord for Value`, `src/value/mod.rs`): undefined, none, bool, number,
+# string, bytes, sequence, map, iterable, plain object.
+def _kind(value):
+    if isinstance(value, jinja2.Undefined):
+        return 0
+    if value is None:
+        return 1
+    if isinstance(value, bool):
+        return 2
+    if isinstance(value, (int, float)):
+        return 3
+    if isinstance(value, str):
+        return 4
+    if isinstance(value, _Iterable):
+        return 8
+    if isinstance(value, (list, tuple)):
+        return 6
+    if isinstance(value, dict):
+        return 7
+    return 9
+
+
+def _total_order(value):
+    # `f64_total_cmp`: the order Rust's `f64::total_cmp` gives, -0.0 before 0.0.
+    bits = _struct.unpack("<q", _struct.pack("<d", value))[0]
+    return bits ^ (((bits >> 63) & 0xFFFFFFFFFFFFFFFF) >> 1)
+
+
+def _order(left, right):
+    a, b = _kind(left), _kind(right)
+    if a != b:
+        return (a > b) - (a < b)
+    if a <= 1:
+        return 0
+    if a in (2, 3):
+        if isinstance(left, float) or isinstance(right, float):
+            x, y = _total_order(float(left)), _total_order(float(right))
+        else:
+            x, y = left, right
+        return (x > y) - (x < y)
+    if a == 4:
+        return (left > right) - (left < right)
+    if a in (6, 8):
+        for x, y in zip(left, right):
+            found = _order(x, y)
+            if found:
+                return found
+        return (len(left) > len(right)) - (len(left) < len(right))
+    if a == 7:
+        return _order(
+            [[k, v] for k, v in left.items()], [[k, v] for k, v in right.items()]
+        )
+    raise TypeError("cannot order these values")
+
+
+def _as_f64(value):
+    # `ops::as_f64` without loss: a float, a bool, an integer a float holds.
+    if isinstance(value, float):
+        return value
+    if isinstance(value, int):
+        return float(value) if int(float(value)) == value else None
+    return None
+
+
+def _equal(left, right):
+    # `impl PartialEq for Value` (`src/value/mod.rs`): none and undefined each
+    # equal only themselves, a string only a string, numbers and bools by value
+    # (through `ops::coerce`), sequences of every kind item by item -- a tuple
+    # is a list there -- maps key by key, and other objects as they print.
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, jinja2.Undefined) or isinstance(right, jinja2.Undefined):
+        return isinstance(left, jinja2.Undefined) and isinstance(right, jinja2.Undefined)
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if _is_number(left) and _is_number(right):
+        if isinstance(left, float) or isinstance(right, float):
+            a, b = _as_f64(left), _as_f64(right)
+            return a is not None and b is not None and a == b
+        return int(left) == int(right)
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(map(_equal, left, right))
+    if isinstance(left, dict) and isinstance(right, dict):
+        return len(left) == len(right) and all(
+            key in right and _equal(right[key], item) for key, item in left.items()
+        )
+    if isinstance(left, _PLAIN) or isinstance(right, _PLAIN):
+        return False
+    return left is right or minijinja_str(left) == minijinja_str(right)
+
+
+def _contains(container, value):
+    # `ops::contains`: false in undefined, a substring in a string -- of the
+    # value as it prints, when it is not a string -- a key of a map, an item of
+    # a sequence by `_equal`, nothing in a plain object, an error in anything
+    # else.
+    if isinstance(container, jinja2.Undefined):
+        return False
+    if isinstance(container, str):
+        return (value if isinstance(value, str) else minijinja_str(value)) in container
+    if isinstance(container, _Namespace):
+        return isinstance(value, str) and value in container
+    if isinstance(container, dict):
+        try:
+            return value in container
+        except TypeError:
+            return False
+    if isinstance(container, (list, tuple)):
+        return any(_equal(item, value) for item in container)
+    if isinstance(container, (int, float)) or container is None:
+        raise TypeError("cannot perform a containment check on this value")
+    return False
+
+
+def _is_in(value, container):
+    # MiniJinja's `in` test: the operator's answer, and false where it errs.
+    try:
+        return _contains(container, value)
+    except TypeError:
+        return False
+
+
+def minijinja_compare(operator, left, right):
+    if operator == "in":
+        return _contains(right, left)
+    if operator == "notin":
+        return not _contains(right, left)
+    if operator == "eq":
+        return _equal(left, right)
+    if operator == "ne":
+        return not _equal(left, right)
+    found = _order(left, right)
+    return {"lt": found < 0, "lteq": found <= 0, "gt": found > 0, "gteq": found >= 0}[operator]
+
 
 class _MiniJinjaCodeGenerator(_CodeGenerator):
-    # `~` joins its operands as MiniJinja prints them; Jinja2's `str_join`
-    # would write `True` where MiniJinja writes `true`. An output holding a `~`
-    # is never folded at compile time, where `Concat.as_const` would join them
-    # as Python prints them.
+    # Nothing but a constant is folded at compile time: Jinja2 folds with
+    # Python's operators, and every operator here is MiniJinja's. `~` joins
+    # its operands as MiniJinja prints them -- Jinja2's `str_join` would write
+    # `True` where MiniJinja writes `true` -- and a comparison of one operator
+    # is MiniJinja's (`_equal`, `_order`, `_contains`), and so is a slice.
     def _output_child_to_const(self, node, frame, finalize):
-        if isinstance(node, _nodes.Concat) or node.find(_nodes.Concat) is not None:
+        if not isinstance(node, (_nodes.Const, _nodes.TemplateData)):
             raise _nodes.Impossible()
         return super()._output_child_to_const(node, frame, finalize)
 
@@ -186,6 +630,32 @@ class _MiniJinjaCodeGenerator(_CodeGenerator):
             self.visit(arg, frame)
             self.write("), ")
         self.write("))")
+
+    def visit_Getitem(self, node, frame):
+        # Jinja2 writes a slice as Python's, around `getitem`; here it goes
+        # through `getitem` too, which slices as MiniJinja does (`_slice`).
+        if not isinstance(node.arg, _nodes.Slice):
+            return super().visit_Getitem(node, frame)
+        self.write("environment.getitem(")
+        self.visit(node.node, frame)
+        self.write(", slice(")
+        for bound in (node.arg.start, node.arg.stop, node.arg.step):
+            if bound is None:
+                self.write("None")
+            else:
+                self.visit(bound, frame)
+            self.write(", ")
+        self.write("))")
+
+    def visit_Compare(self, node, frame):
+        operator = node.ops[0].op if len(node.ops) == 1 else None
+        if operator not in ("eq", "ne", "lt", "lteq", "gt", "gteq", "in", "notin"):
+            return super().visit_Compare(node, frame)
+        self.write(f"environment.minijinja_compare({operator!r}, ")
+        self.visit(node.expr, frame)
+        self.write(", ")
+        self.visit(node.ops[0].expr, frame)
+        self.write(")")
 
 
 def _raise_exception(message):
@@ -201,6 +671,13 @@ def minijinja_str(value):
         return ""
     if value is None:
         return "none"
+    if isinstance(value, _Unsized):
+        return "<iterator>"
+    if isinstance(value, jinja2.runtime.Macro):
+        return f"<macro {value.name}>"
+    if isinstance(value, jinja2.runtime.LoopContext):
+        length = "?" if isinstance(value._iterable, _Unsized) else value.length
+        return f"<loop {value.index0}/{length}>"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, float):
@@ -245,17 +722,54 @@ def _join(value, joiner=None):
 
 
 def _split(value, sep=None, maxsplits=None):
-    # MiniJinja's `split`, whose value is an `Arc<str>`: a string and nothing else.
+    # MiniJinja's `split`, whose value is an `Arc<str>`: a string and nothing
+    # else; it returns an iterator of no known length.
     if not isinstance(value, str):
         raise TypeError("value is not a string")
-    return value.split(sep) if maxsplits is None else value.split(sep, maxsplits)
+    return _Unsized(value.split(sep) if maxsplits is None else value.split(sep, maxsplits))
+
+
+def _length(value):
+    # MiniJinja's `length`, which refuses undefined and an iterator of no
+    # known length, where Jinja2 gives 0 and counts.
+    if isinstance(value, (jinja2.Undefined, _Unsized)) or value is None:
+        raise TypeError("cannot calculate length of value")
+    return len(value)
+
+
+def _range(*args):
+    # MiniJinja's `range`: an iterable of no more than 100000 items.
+    values = range(*args)
+    if len(values) > 100000:
+        raise OverflowError("range has too many elements")
+    return _Iterable(values)
+
+
+def _loop_iterable(value):
+    # What a MiniJinja loop iterates (`Value::try_iter`): nothing for none or
+    # undefined, a string's characters with no known length, a map's keys,
+    # and an error for a number.
+    if value is None or isinstance(value, jinja2.Undefined):
+        return []
+    if isinstance(value, str):
+        return _Unsized(value)
+    if isinstance(value, (int, float)):
+        raise TypeError(f"{type(value).__name__} is not iterable")
+    return value
+
+
+@jinja2.pass_context
+def _map(context, value, *args, **kwargs):
+    # MiniJinja's `map` returns a sequence; Jinja2's a generator.
+    return list(jinja2.filters.do_map(context, value, *args, **kwargs))
 
 
 def _items(value):
-    # MiniJinja's `items`, which takes a map and nothing else.
+    # MiniJinja's `items`, which takes a map and nothing else, and returns an
+    # iterable.
     if not isinstance(value, dict):
         raise TypeError("cannot convert value into pairs")
-    return [[key, item] for key, item in value.items()]
+    return _Iterable([key, item] for key, item in value.items())
 
 
 def runtime_environment():
@@ -286,14 +800,25 @@ def runtime_environment():
     env.filters["trim"] = lambda s, chars=None: minijinja_str(s).strip(chars)
     env.filters["join"] = _join
     env.filters["items"] = _items
+    env.filters["length"] = _length
+    env.filters["map"] = _map
+    env.globals["range"] = _range
+    env.globals["namespace"] = _namespace
+    env.globals["__mj_iter__"] = _loop_iterable
+    env.minijinja_compare = minijinja_compare
     env.filters["upper"] = lambda s: minijinja_str(s).upper()
     env.filters["lower"] = lambda s: minijinja_str(s).lower()
     env.filters["replace"] = lambda s, old, new: minijinja_str(s).replace(
         minijinja_str(old), minijinja_str(new)
     )
+    env.tests["eq"] = _equal
+    env.tests["ne"] = lambda value, other: not _equal(value, other)
+    env.tests["in"] = _is_in
     env.tests["startingwith"] = _strings("startswith")
     env.tests["endingwith"] = _strings("endswith")
-    env.tests["sequence"] = lambda value: isinstance(value, (list, tuple))
+    env.tests["sequence"] = lambda value: (
+        isinstance(value, (list, tuple)) and not isinstance(value, _Iterable)
+    )
     env.tests["number"] = lambda value: (
         isinstance(value, (int, float)) and not isinstance(value, bool)
     )
@@ -326,6 +851,57 @@ _UNVOUCHED_NODES = (
     _nodes.Extends, _nodes.Include, _nodes.Import, _nodes.FromImport, _nodes.Block,
     _nodes.EvalContextModifier,
 )
+# Names Jinja2 gives a meaning MiniJinja 2.14.0 does not: a macro's `varargs`
+# and `kwargs` (MiniJinja refuses an extra argument, "too many arguments"), and
+# `self`.
+_UNVOUCHED_NAMES = frozenset({"varargs", "kwargs", "self"})
+# The escapes MiniJinja 2.14.0 reads in a string literal as Python does
+# (`Unescaper::unescape`, `src/utils.rs`): it refuses `\s`, `\a` and other
+# escapes Python keeps or reads, reads `\/` as `/`, and joins a surrogate pair.
+_SAME_ESCAPES = _re.compile(
+    r"\\(?:[nrtbf'\"\\]|x[0-9A-Fa-f]{2}|u(?![dD][89a-fA-F])[0-9A-Fa-f]{4})"
+)
+
+
+def _constant(node):
+    # Whether MiniJinja folds `node` at compile time (`Expr::as_const`,
+    # `src/compiler/ast.rs`).
+    if isinstance(node, _nodes.Const):
+        return True
+    if isinstance(node, (_nodes.List, _nodes.Tuple)):
+        return all(_constant(item) for item in node.items)
+    if isinstance(node, _nodes.Dict):
+        return all(_constant(pair.key) and _constant(pair.value) for pair in node.items)
+    if isinstance(node, (_nodes.Neg, _nodes.Not)):
+        return _constant(node.node)
+    if isinstance(node, _nodes.BinExpr):
+        return _constant(node.left) and _constant(node.right)
+    if isinstance(node, _nodes.Compare):
+        return _constant(node.expr) and all(_constant(op.expr) for op in node.ops)
+    if isinstance(node, _nodes.Concat):
+        return all(_constant(item) for item in node.nodes)
+    return False
+
+
+def _lexical_gaps(source):
+    # What MiniJinja 2.14.0 reads otherwise than Jinja2 before any parsing: a
+    # dotted integer lookup (`x.0`, added in MiniJinja 2.18), and a string
+    # literal with an escape the two read differently.
+    found = set()
+    previous = None
+    for _, token, value in runtime_environment().lexer.tokeniter(source, None):
+        if token == "whitespace":
+            continue
+        if previous == "." and token in ("integer", "float"):
+            found.add("a dotted integer lookup (`x.0`), which MiniJinja 2.14 does not read")
+        if token == "string":
+            body = value[1:-1]
+            if _SAME_ESCAPES.sub("", body).count("\\"):
+                found.add(
+                    f"the string literal {value}, whose escapes MiniJinja 2.14 reads otherwise"
+                )
+        previous = value if token == "operator" else token
+    return found
 
 
 def unvouched(template):
@@ -345,11 +921,53 @@ def unvouched(template):
             found.add(f"the test `{node.name}`")
     for node in tree.find_all(_nodes.Call):
         if isinstance(node.node, _nodes.Name) and node.node.name not in (
-            VOUCHED_FUNCTIONS | macros | {"caller"}
+            VOUCHED_FUNCTIONS | macros | {"caller", "__mj_iter__"}
         ):
             found.add(f"the function `{node.node.name}`")
     for node in tree.find_all(_UNVOUCHED_NODES):
         found.add(f"a `{type(node).__name__}` tag")
+    for node in tree.find_all(_nodes.Compare):
+        # MiniJinja 2.14 reads `a < b < c` as `(a < b) < c`: `parse_compare`
+        # (`src/compiler/parser.rs`) nests each comparison in the next. Python's
+        # chaining arrived in 2.20.0 ("Added support for chained comparisons",
+        # MiniJinja's CHANGELOG.md).
+        if len(node.ops) > 1:
+            found.add("a chained comparison, which MiniJinja 2.14 reads as nested ones")
+    for node in tree.find_all((_nodes.Macro, _nodes.CallBlock)):
+        # MiniJinja assigns parameters last to first, each default evaluated
+        # as its parameter is (`compile_macro_expression`): a default sees the
+        # parameters after it, where Jinja2's sees those before.
+        parameters = {arg.name for arg in node.args}
+        if any(
+            name.name in parameters
+            for default in node.defaults
+            for name in [default, *default.find_all(_nodes.Name)]
+            if isinstance(name, _nodes.Name)
+        ):
+            found.add(
+                "a macro default that names a parameter, which MiniJinja 2.14 binds otherwise"
+            )
+    for node in tree.find_all(_nodes.Pos):
+        found.add("a unary `+`, which MiniJinja 2.14 cannot parse")
+    for node in tree.find_all(_nodes.Name):
+        if node.name in _UNVOUCHED_NAMES:
+            found.add(f"the name `{node.name}`, which MiniJinja 2.14 does not read as Jinja2")
+    for node in tree.find_all(_nodes.And):
+        # Folded at compile time to `false` when either side is falsy, where at
+        # run time, and in Jinja2, `and` gives the falsy operand itself.
+        if _constant(node):
+            found.add(
+                "an `and` of constants, which MiniJinja 2.14 folds to false when either is falsy"
+            )
+    for node in tree.find_all(_nodes.Const):
+        # A literal that does not fit 64 bits is a `u128` there
+        # (`Token::Int128`, `src/compiler/lexer.rs`), which `ops::neg` and
+        # `ops::coerce` read otherwise, and one past 128 bits does not parse.
+        if type(node.value) is int and node.value >= 2**64:
+            found.add(
+                f"the integer literal {node.value}, which MiniJinja 2.14 holds as a 128-bit one"
+            )
+    found |= _lexical_gaps(edit_for_minijinja(template))
     # `detect_capabilities` (`minijinja_template.rs`): such a template is
     # rendered through the single-turn protocol, with variables of its own.
     if "is_appending_to_prefill" in template:

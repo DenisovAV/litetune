@@ -109,7 +109,11 @@ def minijinja_render_native(
         "eos_token": "",
         **context,
     }
-    preamble = "".join(f"{{% set {name} = {_literal(value)} %}}" for name, value in values.items())
+    # One statement a line: `trim_blocks` takes each newline, and the template
+    # then begins a line, as it does on the device, for `lstrip_blocks`.
+    preamble = "".join(
+        f"{{% set {name} = {_literal(value)} %}}\n" for name, value in values.items()
+    )
     return minijinja_render(preamble + source, [], add_generation_prompt)
 
 
