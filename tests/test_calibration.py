@@ -177,13 +177,13 @@ def test_rows_that_rank_their_targets_first_with_room_to_spare_are_refused():
     # Every target leads by at least 4 nats: the NLL falls all the way to the
     # bottom of the grid, where every answer reads as certain.
     rows = [[4.0 + i, 0.0, 0.0] for i in range(30)]
-    with pytest.raises(C.CalibrationError, match="bottom of the grid"):
+    with pytest.raises(C.CalibrationError, match="temperatures is its bottom"):
         C.fit_temperature(rows, [0] * 30)
 
 
 def test_scores_that_say_nothing_about_the_targets_are_refused():
     rows = [[float(i % 3), 0.0, 0.0] for i in range(30)]
-    with pytest.raises(C.CalibrationError, match="top of the grid"):
+    with pytest.raises(C.CalibrationError, match="temperatures is its top"):
         C.fit_temperature(rows, [1 if i % 3 else 2 for i in range(30)])
 
 

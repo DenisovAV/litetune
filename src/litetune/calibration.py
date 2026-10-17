@@ -121,17 +121,18 @@ def fit_temperature(rows: Sequence[Sequence[float]], targets: Sequence[int]) -> 
         )
     if best == 0:
         raise CalibrationError(
-            f"the best temperature is the bottom of the grid, {T_LOW}: the NLL of the "
-            f"{len(rows)} in-scope calibration rows is lowest there, so the fit has no minimum "
-            "inside the grid to report, and a probability at that edge is not a calibrated one. "
-            "Rows whose target loses, or wins narrowly, are what hold the temperature up; more "
-            "calibration rows usually have them"
+            f"the best of the grid's {T_POINTS} temperatures is its bottom, {T_LOW}: the NLL of "
+            f"the {len(rows)} in-scope calibration rows is lowest at the edge, where the best "
+            "temperature may lie at or below it, so the fit is refused rather than reported "
+            "there. Rows whose target loses, or wins narrowly, are what hold the temperature up; "
+            "more calibration rows usually have them"
         )
     if best == T_POINTS - 1:
         raise CalibrationError(
-            f"the best temperature is the top of the grid, {T_HIGH:g}: the scores carry almost "
-            f"nothing about the targets of the {len(rows)} in-scope calibration rows, so the fit "
-            "would make every option about equally likely"
+            f"the best of the grid's {T_POINTS} temperatures is its top, {T_HIGH:g}: the NLL of "
+            f"the {len(rows)} in-scope calibration rows is lowest at the edge, where options whose "
+            "scores differ by a few nats are about equally likely, so the fit is refused rather "
+            "than reported there"
         )
     lo, hi = grid[max(0, best - 1)], grid[min(len(grid) - 1, best + 1)]
     for _ in range(T_REFINEMENTS):
