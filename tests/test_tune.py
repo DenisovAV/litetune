@@ -5147,3 +5147,20 @@ def test_the_real_script_records_the_option_decision_beside_the_checkpoint(
     metrics = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
     assert sidecar["decision"] == asked.as_dict()
     assert sidecar["decision_sha256"] == asked.digest() == metrics["decision_sha256"]
+
+
+def test_a_decision_split_declared_prerendered_is_refused(tmp_path, request_for, trainer):
+    data, decision = _decision_split(tmp_path)
+
+    result = run_tune(
+        request_for(
+            model=GEMMA_270M,
+            data=data,
+            decision=decision,
+            prompt_mode=PromptMode.PRERENDERED,
+            force_prompt_mode=True,
+        )
+    )
+
+    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
+    assert any("trained runtime_rendered" in c.detail for c in failed)

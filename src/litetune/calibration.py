@@ -118,8 +118,8 @@ def fit_temperature(rows: Sequence[Sequence[float]], targets: Sequence[int]) -> 
 def max_answered(n: int, reject_target: float = REJECT_TARGET) -> int:
     """How many of `n` out-of-scope rows may answer: `n - ceil(reject_target * n)`, exactly.
 
-    In floating point `100 * (1 - 0.9)` floors to 9; the rule's budget for 100
-    rows at 0.9 is 10.
+    In floating point `100 * (1 - 0.9)` floors to 9, where the rule's budget for
+    100 rows at 0.9 is 10; and `0.55 * 100` ceils to 56, not 55.
     """
     return n - math.ceil(Fraction(repr(reject_target)) * n)
 

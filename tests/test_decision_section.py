@@ -514,3 +514,49 @@ def test_the_cli_still_requires_declarations_for_any_other_model(toy, tmp_path, 
 
     assert code == 4
     assert "--declarations is required" in capsys.readouterr().err
+
+
+class ResultEnv:
+    """A stage environment whose section script 'succeeds' with a result of the test's choosing."""
+
+    name = "export"
+
+    def __init__(self, result: dict):
+        self.result = result
+
+    def provision(self, events=None, force: bool = False):
+        return None
+
+    def run(self, argv, timeout=None, env=None):
+        Path(argv[3]).write_text(json.dumps(self.result), encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def test_a_section_whose_digest_is_not_the_payloads_is_not_taken_as_written(tmp_path):
+    env = ResultEnv({"written": True, "reason": None, "payload_sha256": "0" * 64})
+
+    written = write_section(tmp_path / "m.litertlm", PAYLOAD, env=env)
+
+    assert not written.written
+    assert "not the payload written" in str(written.reason)
+
+
+TOY_CORRUPTING = TOY_BUILDER.replace(
+    "        payloads.append(p.read_bytes())",
+    "        data = p.read_bytes()\n"
+    "        if s['section_type'] == 'GenericBinaryData':\n"
+    "            data = data[:-1] + b'!'\n"
+    "        payloads.append(data)",
+)
+
+
+def test_a_payload_the_builder_changed_is_refused_by_the_read_back(toy):
+    shim, bundle = toy
+    (shim / "litert_lm_builder" / "litertlm_builder.py").write_text(TOY_CORRUPTING)
+    original = bundle.read_bytes()
+
+    written = write_section(bundle, PAYLOAD, env=ShimEnv(shim))
+
+    assert not written.written
+    assert f"named {SECTION_NAME} read back" in str(written.reason)
+    assert bundle.read_bytes() == original

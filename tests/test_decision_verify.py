@@ -758,3 +758,56 @@ def test_a_checkpoint_with_no_decision_and_no_calibration_is_verified_as_before(
 
     assert _decision_record(str(checkpoint)) is None
     assert _decision_record("google/gemma-3-270m-it") is None
+
+
+# ---------------------------------------------------------------------------
+# Pieces
+# ---------------------------------------------------------------------------
+
+
+def test_an_option_is_scored_on_its_unique_prefix_only():
+    from litetune.decision_verify import summed
+
+    assert summed([[-1.0, -2.0, -3.0], [-4.0, -5.0]], [1, 2]) == [-1.0, -9.0]
+
+
+def test_accuracy_is_over_in_scope_rows_and_out_of_scope_rows_are_counted_apart():
+    from litetune.decision_verify import answers, outcome_metrics
+
+    fit = calibration.Fit(1.0, calibration.C2, 0.0, 3, 1, 0.0, 0.0)
+    # Three in-scope rows answered right; one out-of-scope row answered as "joy".
+    scores = [[5.0, 0.0, 0.0], [0.0, 5.0, 0.0], [5.0, 0.0, 0.0], [5.0, 0.0, 0.0]]
+    metrics = outcome_metrics(answers(scores, 1.0), [0, 1, 0, 2], fit, 2, "choice")
+
+    assert metrics["accuracy"] == 1.0
+    assert metrics["in_scope_rows"] == 3
+    assert metrics["out_of_scope_rows"] == 1
+    assert metrics["out_of_scope_rejected"] == 0.0
+
+
+def test_a_heldout_row_whose_target_is_not_an_option_is_refused(split, tmp_path):
+    s = split()
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text(
+        json.dumps({"prompt": s["decision"].render("text 1 about joy"), "target": "love"}) + "\n",
+        encoding="utf-8",
+    )
+
+    status, fields = run(job_for(s, tmp_path, heldout=bad), s["record"])
+
+    assert status == "failed_harness"
+    assert "the target 'love' is not one of" in check(fields, ROWS_CHECK)["detail"]
+
+
+def test_the_reference_scores_of_heldout_rows_are_the_ones_measured(split, tmp_path):
+    """The reference scores calibration rows first, held-out rows after them."""
+    s = split()
+    job = job_for(s, tmp_path)
+
+    _, fields = run(job, s["record"])
+
+    held = [json.loads(line) for line in s["heldout"].read_text().splitlines()]
+    in_scope = [r for r in held if r["target"] != "none_of_these"]
+    assert fields["measurements"]["reference"]["rows"] == len(held)
+    assert fields["measurements"]["reference"]["in_scope_rows"] == len(in_scope)
+    assert fields["measurements"]["reference"]["accuracy"] == 1.0

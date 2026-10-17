@@ -181,3 +181,16 @@ def test_each_bound_is_where_the_tail_reaches_alpha(k, n):
 
 def test_fifty_nine_clean_rows_are_the_fewest_that_show_a_five_percent_error():
     assert C.upper_bound(0, 59) <= 0.05 < C.upper_bound(0, 58)
+
+
+def test_the_budget_is_exact_where_floating_point_is_not():
+    """0.55 * 100 is 55.00000000000001 in floating point, whose ceiling is 56."""
+    assert C.max_answered(100, 0.55) == 45
+
+
+def test_the_refinement_finds_the_minimum_between_grid_points():
+    rows, targets = _rows_at(1.7, 500, seed=3)
+    t = C.fit_temperature(rows, targets)
+    dense = [t * math.exp(i / 2000 - 0.05) for i in range(201)]
+    best = min(C.mean_nll(rows, targets, x) for x in dense)
+    assert C.mean_nll(rows, targets, t) <= best + 1e-9
