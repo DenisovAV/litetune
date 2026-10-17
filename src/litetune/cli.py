@@ -1410,6 +1410,12 @@ def summarise_convert(result: ExportResult) -> list[str]:
         lines.append(
             f"  added {flag} (required by {plan.rules.family if plan.rules else 'litetune'})"
         )
+    decision = result.request.decision_record()
+    if decision is not None:
+        lines.append(
+            f"  decision checkpoint: {decision['prefill_lengths']} "
+            f"({decision['prefill_lengths_source']})"
+        )
     template = result.chat_template
     if template is not None and template.source == "canonical":
         # The file the marker above stood for, which no flag in the plan names.
