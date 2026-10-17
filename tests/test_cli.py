@@ -310,6 +310,36 @@ def test_tune_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     assert seen["request"].declarations == decls
 
 
+def test_tune_carries_the_decision_to_the_request(monkeypatch, tmp_path):
+    from litetune import cli
+    from litetune.checks import CheckSet
+    from litetune.tune import TuneResult
+
+    decision = tmp_path / "decision.json"
+    seen = {}
+
+    def fake_run_tune(request, events=None):
+        seen["request"] = request
+        return TuneResult(request=request, checks=CheckSet(name="train"))
+
+    monkeypatch.setattr(cli, "run_tune", fake_run_tune)
+    main(
+        [
+            "tune",
+            "--model",
+            "m",
+            "--data",
+            str(tmp_path / "d.jsonl"),
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--decision",
+            str(decision),
+        ]
+    )
+
+    assert seen["request"].decision == decision
+
+
 @pytest.mark.parametrize(("flags", "expected"), [([], None), (["--dtype", "bfloat16"], "bfloat16")])
 def test_tune_tells_a_declared_dtype_from_the_default(monkeypatch, tmp_path, flags, expected):
     """No `--dtype` is "not declared", which `tune` resolves per device --

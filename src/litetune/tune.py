@@ -48,6 +48,7 @@ from typing import Any
 
 from litetune import devices, envs, models
 from litetune.checks import Check, CheckSet, Outcome, guard
+from litetune.decisions import Decision, DecisionError, read_questions
 from litetune.declarations import (
     DeclarationsError,
     entry_count,
@@ -65,6 +66,8 @@ from litetune.models import (
 )
 from litetune.prepare import (
     CONTROL_TEXT,
+    DECISION_FAMILY,
+    DECISION_MEASURED_MODEL,
     PrepareError,
     Row,
     control_text_held,
@@ -83,11 +86,74 @@ TUNE_SCHEMA = "litetune.tune/1"
 # too: a refusal is read by whoever typed the command.
 PROMPT_MODE_CHECK = "prompt mode"
 DECLARATIONS_CHECK = "tool declarations"
+DECISION_CHECK = "decision"
 CALLS_CHECK = "calls are written as the runtime reads them"
 COMPLETIONS_CHECK = "every row carries its completion"
 
 # A name no declaration could plausibly use, rendered only to ask the template how a call ends.
 CALL_PROBE_NAME = "litetune_probe"
+
+
+def _check_decision(
+    request: TuneRequest, path: Path, mode: PromptMode, rows: Sequence[Row]
+) -> Check:
+    """Whether every row is the decision rendered around a state, answered with one of its ids.
+
+    `prepare` renders decision rows this way; a split edited by hand, or one
+    rendered with another `decision.json`, reaches this stage without that, and
+    would train the model on a prompt the application never sends while the
+    record said otherwise.
+    """
+    where = {"decision": str(path)}
+    try:
+        asked, _ = read_questions(path)
+    except DecisionError as exc:
+        return Check.failed(DECISION_CHECK, str(exc), observed=where)
+    if request.declarations is not None:
+        return Check.failed(
+            DECISION_CHECK,
+            "--decision and --declarations: a decision model answers with the id of an option, "
+            "never with a tool call",
+            observed=where,
+        )
+    if mode is not PromptMode.RUNTIME_RENDERED:
+        return Check.failed(
+            DECISION_CHECK,
+            f"a decision model is trained runtime_rendered, as the application asks it through "
+            f"the runtime's chat template; these prompts are {mode.value}",
+            observed=where,
+        )
+    rules = identify(request.model)
+    if rules is None or rules.family != DECISION_FAMILY:
+        return Check.failed(
+            DECISION_CHECK,
+            f"{request.model} is not a Gemma 3 text model. Decisions by option scoring have been "
+            f"trained and measured on {DECISION_MEASURED_MODEL} only",
+            observed=where,
+        )
+    suffix = asked.render("")
+    for row in rows:
+        if not row.prompt.endswith(suffix) or len(row.prompt) == len(suffix):
+            return Check.failed(
+                DECISION_CHECK,
+                f"{request.data}:{row.lineno}: the prompt is not a state rendered with "
+                f"{path.name}: it does not end with that decision's question and "
+                "options. Render the rows with `prepare --questions` and train on its split",
+                observed=where,
+            )
+        if row.completion not in asked.ids:
+            return Check.failed(
+                DECISION_CHECK,
+                f"{request.data}:{row.lineno}: the completion {row.completion!r} is not one of "
+                f"the decision's options",
+                observed=where,
+            )
+    return Check.passed(
+        DECISION_CHECK,
+        f"every row asks {asked.type} question {asked.question!r} over {len(asked.ids)} options, "
+        f"{asked.digest()[:23]}",
+        observed=where | {"sha256": asked.digest()},
+    )
 
 
 def _refuse_calls_without_declarations(
@@ -1141,6 +1207,11 @@ def main() -> int:
                 "declarations_sha256": spec.get("declarations_sha256"),
                 "turn_terminator": terminator,
                 "sentencepiece": sentencepiece,
+                # The decision this checkpoint answers, whole: `convert`,
+                # `verify` and `bundle` read it from here rather than being
+                # handed a file that could be another one.
+                "decision": spec.get("decision"),
+                "decision_sha256": spec.get("decision_sha256"),
             },
             indent=2,
         ),
@@ -1208,6 +1279,8 @@ def main() -> int:
                 "prompt_mode_decision": spec.get("prompt_mode_decision"),
                 # Which tool declarations these calls were trained against.
                 "declarations_sha256": spec.get("declarations_sha256"),
+                # Which decision these rows were rendered with.
+                "decision_sha256": spec.get("decision_sha256"),
                 "n_examples": len(examples),
                 "supervised_tokens": supervised,
                 "total_tokens": total,
@@ -1415,6 +1488,10 @@ class TuneRequest:
     # Their digest is recorded beside the checkpoint, where `verify` reads it
     # back rather than being told it. Absent, no declaration turn is rendered.
     declarations: Path | None = field(default=None, kw_only=True)
+    # The decision the rows were rendered with: `prepare`'s `decision.json`.
+    # Every row is checked against it, and it is recorded beside the checkpoint
+    # whole, for `convert`, `verify` and `bundle` to read back.
+    decision: Path | None = field(default=None, kw_only=True)
     timeout_s: int = DEFAULT_TIMEOUT_S
     env: envs.StageEnv = envs.TRAIN
     auto_provision: bool = True
@@ -1479,6 +1556,7 @@ class TuneRequest:
         decision: PromptModeDecision | None = None,
         declarations_sha256: str | None = None,
         declarations: list | None = None,
+        trained_decision: Decision | None = None,
         lora_container: str | None = None,
         device_probe: Mapping[str, Any] | None = None,
         host: Mapping[str, Any] | None = None,
@@ -1548,6 +1626,10 @@ class TuneRequest:
             # under the other name and a reader must not have to work out
             # which of two `declarations` a report means.
             "tools": declarations,
+            # The decision whole, and its digest, for the script to write
+            # beside the checkpoint. The script cannot import litetune.
+            "decision": trained_decision.as_dict() if trained_decision is not None else None,
+            "decision_sha256": trained_decision.digest() if trained_decision is not None else None,
             # The call `prepare` renders for a probe, so the script can ask the
             # chat template what ends a call turn and check that the template
             # writes a call the way `render_call` does. The script cannot import
@@ -1598,6 +1680,9 @@ class TuneRequest:
         # write `None` into `request` on every report, beside the real digest at
         # the top level -- two fields in one record disagreeing about one fact.
         record.pop("declarations_sha256")
+        # The decision is the file's content, and the result's to report.
+        record.pop("decision")
+        record.pop("decision_sha256")
         # And the probe, which the run decides from the split as well as the
         # family: recomputed here from the family alone, it disagreed with the
         # one the script was given (`train_config.json`).
@@ -1616,6 +1701,7 @@ class TuneRequest:
         record.pop("host")
         record.pop("mps_memory")
         record["declarations"] = str(self.declarations) if self.declarations else None
+        record["decision"] = str(self.decision) if self.decision else None
         record["force_prompt_mode"] = self.force_prompt_mode
         record["learning_rate_source"] = (
             f"default for method {self.method!r}" if self.rate_is_default else "declared"
@@ -1863,6 +1949,9 @@ class TuneResult:
     # environment was touched. `None` when none were supplied, which is every
     # run that trains plain text.
     declarations_sha256: str | None = None
+    # The decision this run's rows were rendered with, read and checked before
+    # the environment was touched. `None` for every run that is not a decision.
+    trained_decision: Decision | None = None
     # The container this run's LoRA was restricted to, as the family's rules
     # gave it. `None` on a full fine-tune, on a text-only family, and on a
     # checkpoint litetune has no rules for -- which are three different things,
@@ -1934,6 +2023,12 @@ class TuneResult:
             # Top-level for the same reason as the mode: a bundle's contract is
             # built from this, and a reader must not have to go looking for it.
             "declarations_sha256": self.declarations_sha256,
+            "decision": (
+                self.trained_decision.as_dict() if self.trained_decision is not None else None
+            ),
+            "decision_sha256": (
+                self.trained_decision.digest() if self.trained_decision is not None else None
+            ),
             # Top-level because `request` cannot hold it: the caller does not
             # choose it, the family's rules do. See the pop in
             # `TuneRequest.as_dict`.
@@ -2145,6 +2240,16 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     )
     result.checks.add(decided)
     events.check(decided)
+
+    # A decision split is checked first: its refusals name the decision, where
+    # the generic ones below would name a tool channel it never had.
+    if request.decision is not None:
+        checked = _check_decision(request, request.decision, decision.mode, rows)
+        if checked.outcome is not Outcome.PASSED:
+            return _refused(result, events, checked)
+        result.trained_decision = read_questions(request.decision)[0]
+        result.checks.add(checked)
+        events.check(checked)
 
     # Before the environment, like the mode above: each of these is a fact about
     # the request, and finding it out after provisioning costs minutes and a
@@ -2447,6 +2552,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
                 decision=result.prompt_mode_decision,
                 declarations_sha256=result.declarations_sha256,
                 declarations=declarations,
+                trained_decision=result.trained_decision,
                 lora_container=lora_container,
                 device_probe=probe.as_dict(),
                 host=result.host,

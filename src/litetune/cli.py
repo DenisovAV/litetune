@@ -494,6 +494,15 @@ def _add_tune(sub) -> None:
         ),
     )
     tune.add_argument(
+        "--decision",
+        type=Path,
+        help=(
+            "the decision.json prepare wrote beside a decision split. Every row is checked to be "
+            "that decision rendered around a state, and the decision is recorded beside the "
+            "checkpoint, where convert, verify and bundle read it"
+        ),
+    )
+    tune.add_argument(
         "--learning-rate",
         type=float,
         help="default is per method: 1e-5 for full, 2e-4 for lora",
@@ -1166,6 +1175,7 @@ def _tune(args: argparse.Namespace) -> int:
         prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
         force_prompt_mode=args.force_prompt_mode,
         declarations=args.declarations,
+        decision=args.decision,
         timeout_s=args.timeout_s,
         auto_provision=not args.no_provision,
     )
