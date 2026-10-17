@@ -34,8 +34,12 @@ TOY_BUILDER = r"""
 import json
 import os
 import struct
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11: the real builder depends on tomli too
+    import tomli as tomllib
 
 MAGIC = b"LITERTLM"
 
