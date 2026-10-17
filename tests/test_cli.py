@@ -1173,6 +1173,16 @@ def test_prepare_carries_the_questions_to_the_request(monkeypatch, tmp_path):
     assert request.questions == questions
 
 
+def test_prepare_carries_the_calibration_split_to_the_request(monkeypatch):
+    request = _captured_request(
+        monkeypatch,
+        "prepare",
+        [*_PREPARE_ARGV, "--calibration-fraction", "0.2", "--calibration-size", "30"],
+    )
+
+    assert (request.calibration_fraction, request.calibration_size) == (0.2, 30)
+
+
 def _decision_dataset(tmp_path: Path) -> tuple[Path, Path]:
     data = tmp_path / "decisions.jsonl"
     data.write_text(
@@ -1216,6 +1226,7 @@ def test_prepare_renders_decision_rows_and_says_what_it_asked(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 4  # no tokenizer, so the length check could not run
     assert "decision: choice, 3 options: Which emotion does the text express?" in out
+    assert "calibration.jsonl (2 for calibration)" in out
     assert str(tmp_path / "out" / "decision.json") in out
     assert (tmp_path / "out" / "decision.json").is_file()
 

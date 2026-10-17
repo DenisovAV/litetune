@@ -105,6 +105,12 @@ MIN_HELDOUT_EXAMPLES = DEFAULT_MIN_HELDOUT_EXAMPLES
 
 DEFAULT_HELDOUT_FRACTION = 0.2
 
+# A decision split also sets rows aside to fit the temperature and the abstain
+# threshold on, so that neither is fitted on the rows it is then measured on.
+# One in ten, as the option-scoring measurement of 2026-10-15 had: 2,000 of
+# 20,000 emotion rows, 1,004 of 10,039 ABCD rows.
+DEFAULT_CALIBRATION_FRACTION = 0.1
+
 # An argument whose values are this close to all-distinct carries no repeated
 # label for a model to learn. Anchored on the two measured datasets: 92/95 =
 # 0.968 (unscoreable) and 2270/2276 = 0.997 (fine, because extractive).
@@ -730,6 +736,7 @@ class DecisionProfile:
     questions_sha256: str | None
     rows: dict[str, int]
     train: dict[str, int] | None = None
+    calibration: dict[str, int] | None = None
     heldout: dict[str, int] | None = None
     # `decision.json`, once a split has been written beside it.
     path: Path | None = None
@@ -752,6 +759,9 @@ class DecisionProfile:
                 option: {
                     "all": n,
                     "train": self.train[option] if self.train is not None else None,
+                    "calibration": (
+                        self.calibration[option] if self.calibration is not None else None
+                    ),
                     "heldout": self.heldout[option] if self.heldout is not None else None,
                 }
                 for option, n in self.rows.items()
@@ -816,6 +826,32 @@ def split_rows(
     return (
         [row for i, row in enumerate(rows) if i not in held],
         [row for i, row in enumerate(rows) if i in held],
+    )
+
+
+def calibration_size_for(
+    n: int, heldout: int, fraction: float, requested: int | None = None
+) -> int:
+    """How many rows a decision split sets aside for calibration. At least one, never all."""
+    size = requested if requested is not None else round(n * fraction)
+    return max(1, min(int(size), n - heldout - 1)) if n - heldout >= 2 else 0
+
+
+def split_calibration(
+    rows: Sequence[Row], content_sha256: str, seed: int, heldout: int, calibration: int
+) -> tuple[list[Row], list[Row]]:
+    """The training rows `split_rows` leaves, divided into training and calibration.
+
+    The calibration rows are the next `calibration` places of the same
+    permutation, so the held-out set is the one `split_rows` gives for the same
+    content, seed and size.
+    """
+    order = _permutation(len(rows), split_seed(content_sha256, seed))
+    held = {order[i] for i in range(heldout)}
+    aside = {order[i] for i in range(heldout, heldout + calibration)}
+    return (
+        [row for i, row in enumerate(rows) if i not in held and i not in aside],
+        [row for i, row in enumerate(rows) if i in aside],
     )
 
 
@@ -1282,6 +1318,10 @@ class PrepareRequest:
     # their order (`decisions.read_questions`). Rows with labels and no answers
     # are decisions without it too, asked a generic question.
     questions: Path | None = None
+    # Decision splits only: the calibration rows `verify` fits on. `None`
+    # takes `DEFAULT_CALIBRATION_FRACTION`.
+    calibration_fraction: float | None = None
+    calibration_size: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", Path(self.data))
@@ -1294,6 +1334,13 @@ class PrepareRequest:
             )
         if self.heldout_size is not None and self.heldout_size < 1:
             raise ValueError(f"heldout_size must be at least 1, got {self.heldout_size}")
+        if self.calibration_fraction is not None and not 0.0 < self.calibration_fraction < 1.0:
+            raise ValueError(
+                "calibration_fraction must be between 0 and 1 exclusive, got "
+                f"{self.calibration_fraction}"
+            )
+        if self.calibration_size is not None and self.calibration_size < 1:
+            raise ValueError(f"calibration_size must be at least 1, got {self.calibration_size}")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1309,6 +1356,8 @@ class PrepareRequest:
             "base_model": self.base_model,
             "declarations": str(self.declarations) if self.declarations is not None else None,
             "questions": str(self.questions) if self.questions is not None else None,
+            "calibration_fraction": self.calibration_fraction,
+            "calibration_size": self.calibration_size,
         }
 
 
@@ -1340,6 +1389,8 @@ class PrepareResult:
     n_rows: int
     train: SplitFile | None = None
     heldout: SplitFile | None = None
+    # Decision splits only: the rows `verify` fits the calibration on.
+    calibration: SplitFile | None = None
     lengths: LengthStats | Unavailable = field(
         default_factory=lambda: Unavailable("token lengths were not measured")
     )
@@ -1415,6 +1466,7 @@ class PrepareResult:
             },
             "train": self.train.as_dict() if self.train else None,
             "heldout": self.heldout.as_dict() if self.heldout else None,
+            "calibration": self.calibration.as_dict() if self.calibration else None,
             "lengths": self.lengths.as_dict(),
             "arguments": [a.as_dict() for a in self.arguments],
             "unscoreable_arguments": [f"{a.tool}.{a.argument}" for a in self.unscoreable],
@@ -1446,7 +1498,11 @@ def _write_split(path: Path, rows: Sequence[Row]) -> SplitFile:
 
 def _options_check(profile: DecisionProfile) -> Check:
     """Whether every option the decision lists has a row in the training split."""
-    observed = {"train": profile.train, "heldout": profile.heldout}
+    observed = {
+        "train": profile.train,
+        "calibration": profile.calibration,
+        "heldout": profile.heldout,
+    }
     untrained = profile.untrained
     if untrained:
         more = f" and {len(untrained) - 12} more" if len(untrained) > 12 else ""
@@ -1575,6 +1631,11 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             rows=_count_by_option(asked, rows),
         )
     else:
+        if request.calibration_fraction is not None or request.calibration_size is not None:
+            raise PrepareError(
+                "a calibration split is set aside for decision rows only, and these rows are not "
+                "decisions: they give completions or targets, and no --questions was given"
+            )
         rows = _rows_from(request.data, objects, wire)
     # Before anything is profiled or split: a row calling a tool the prompt will
     # never offer is a row that cannot be trained, and saying so after a split
@@ -1720,12 +1781,38 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             "not at the size that was asked for"
         )
     halves = split_rows(rows, content_sha256, request.seed, heldout_n) if heldout_n >= 1 else None
+    calibration_rows: list[Row] = []
     options_check = None
     if decision is not None and halves is not None:
-        decision.train = _count_by_option(decision.decision, halves[0])
+        calibration_n = calibration_size_for(
+            len(rows),
+            heldout_n,
+            request.calibration_fraction or DEFAULT_CALIBRATION_FRACTION,
+            request.calibration_size,
+        )
+        if request.calibration_size is not None and calibration_n != request.calibration_size:
+            result.limitation(
+                f"a calibration split of {request.calibration_size} was requested but only "
+                f"{len(rows) - heldout_n} rows are left after the held-out split, so "
+                f"{calibration_n} were set aside"
+            )
+        train_part, calibration_rows = split_calibration(
+            rows, content_sha256, request.seed, heldout_n, calibration_n
+        )
+        halves = (train_part, halves[1])
+        decision.train = _count_by_option(decision.decision, train_part)
+        decision.calibration = _count_by_option(decision.decision, calibration_rows)
         decision.heldout = _count_by_option(decision.decision, halves[1])
         options_check = result.checks.add(_options_check(decision))
         events.check(options_check)
+        none_option = decision.decision.none_option
+        if none_option is not None and decision.calibration[none_option] == 0:
+            result.limitation(
+                f"no calibration row is labelled {none_option!r}, so `verify` cannot set the "
+                "threshold by out-of-scope rejection and falls back to the error budget, which "
+                "does not reject out-of-scope inputs reliably. Add out-of-scope rows, or a larger "
+                "calibration split"
+            )
     if halves is None:
         split_check = Check.failed(
             SPLIT_CHECK,
@@ -1769,16 +1856,26 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         train_rows, heldout_rows = halves
         result.train = _write_split(request.output_dir / "train.jsonl", train_rows)
         result.heldout = _write_split(request.output_dir / "heldout.jsonl", heldout_rows)
-        for split in (result.train, result.heldout):
+        if decision is not None:
+            result.calibration = _write_split(
+                request.output_dir / "calibration.jsonl", calibration_rows
+            )
+        for split in (result.train, result.calibration, result.heldout):
+            if split is None:
+                continue
             events.artifact(
                 str(split.path), name=split.name, n=split.n, content_hash=split.content_sha256
             )
+        aside = (
+            f", {result.calibration.n} for calibration" if result.calibration is not None else ""
+        )
         split_check = Check.passed(
             SPLIT_CHECK,
-            f"{result.train.n} training and {result.heldout.n} held-out examples, split by "
-            f"content {_bare_digest(content_sha256)[:16]} and seed {request.seed}",
+            f"{result.train.n} training{aside} and {result.heldout.n} held-out examples, split "
+            f"by content {_bare_digest(content_sha256)[:16]} and seed {request.seed}",
             observed={
                 "train": result.train.as_dict(),
+                "calibration": result.calibration.as_dict() if result.calibration else None,
                 "heldout": result.heldout.as_dict(),
                 "split_seed": split_seed(content_sha256, request.seed),
             },

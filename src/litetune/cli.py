@@ -384,6 +384,17 @@ def _add_prepare(sub) -> None:
     prep.add_argument("--heldout-fraction", type=float, default=0.2)
     prep.add_argument("--heldout-size", type=int, help="exact number of held-out rows")
     prep.add_argument(
+        "--calibration-fraction",
+        type=float,
+        help=(
+            "decision rows only: the share of rows set aside to fit the temperature and the "
+            "abstain threshold on (default 0.1)"
+        ),
+    )
+    prep.add_argument(
+        "--calibration-size", type=int, help="decision rows only: exact number of calibration rows"
+    )
+    prep.add_argument(
         "--min-heldout-examples",
         type=int,
         default=PrepareRequest.min_heldout_examples,
@@ -1075,6 +1086,8 @@ def _prepare(args: argparse.Namespace) -> int:
         declarations=args.declarations,
         base_model=args.base_model,
         questions=args.questions,
+        calibration_fraction=args.calibration_fraction,
+        calibration_size=args.calibration_size,
     )
     result = prepare(request, events=events)
     delivered = _report(result.as_dict(), lambda: summarise_prepare(result), args.json)
@@ -1093,6 +1106,8 @@ def summarise_prepare(result: PrepareResult) -> list[str]:
             f"(content {result.content_sha256.split(':')[-1][:16]}, seed {result.request.seed})"
         )
         lines.append(f"  {result.train.path}")
+        if result.calibration is not None:
+            lines.append(f"  {result.calibration.path} ({result.calibration.n} for calibration)")
         lines.append(f"  {result.heldout.path}")
     else:
         lines.append(f"  {result.n_rows} rows read; no split was written")

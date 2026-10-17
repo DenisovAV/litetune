@@ -1395,6 +1395,10 @@ def split_records(split) -> list[dict]:
     return [json.loads(line) for line in split.path.read_text(encoding="utf-8").splitlines()]
 
 
+def all_records(result) -> list[dict]:
+    return [r for s in (result.train, result.calibration, result.heldout) for r in split_records(s)]
+
+
 def test_decision_rows_are_rendered_into_the_contract_with_the_id_as_completion(
     write_jsonl, request_for, questions
 ):
@@ -1403,7 +1407,7 @@ def test_decision_rows_are_rendered_into_the_contract_with_the_id_as_completion(
     )
 
     assert result.train is not None and result.heldout is not None
-    records = split_records(result.train) + split_records(result.heldout)
+    records = all_records(result)
     assert len(records) == 12
     for record in records:
         state, _, rest = record["prompt"].partition("\n\n")
@@ -1434,7 +1438,9 @@ def test_the_decision_is_written_beside_the_split_and_reads_back(
     assert report["questions_sha256"] == hash_file(result.request.questions)
     counts = report["rows_per_option"]
     assert list(counts) == list(EMOTIONS)
-    assert all(c["all"] == 4 and c["train"] + c["heldout"] == 4 for c in counts.values())
+    assert all(
+        c["all"] == 4 and c["train"] + c["calibration"] + c["heldout"] == 4 for c in counts.values()
+    )
     assert report["untrained_options"] == []
 
 
@@ -1509,7 +1515,7 @@ def test_a_null_label_trains_the_none_option(write_jsonl, request_for, questions
 
     result = prepare(request_for(write_jsonl(data), questions=path))
 
-    records = split_records(result.train) + split_records(result.heldout)
+    records = all_records(result)
     outside = [r for r in records if r["prompt"].startswith("weather")]
     assert len(outside) == 4
     assert all(r["completion"] == "none_of_these" for r in outside)
@@ -1664,3 +1670,90 @@ def test_the_length_check_counts_the_rendered_prompt(write_jsonl, request_for, q
     assert len(counted) == 24
     assert all(text.endswith("Answer with the id of one option.") for text in counted[:12])
     assert counted[12:] == [r["label"] for r in decision_rows()]
+
+
+def test_a_decision_split_sets_a_tenth_aside_for_calibration(write_jsonl, request_for, questions):
+    data = write_jsonl(decision_rows(n_per_option=20))
+
+    result = prepare(request_for(data, questions=questions()))
+
+    assert result.calibration is not None
+    assert result.calibration.path.name == "calibration.jsonl"
+    assert (result.train.n, result.calibration.n, result.heldout.n) == (42, 6, 12)
+    lines = [r["source_line"] for r in all_records(result)]
+    assert sorted(lines) == list(range(1, 61)), "every row lands in exactly one split"
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["calibration"]["n"] == 6
+    assert sum(c["calibration"] for c in report["decision"]["rows_per_option"].values()) == 6
+
+
+def test_setting_calibration_aside_leaves_the_heldout_rows_where_they_were(
+    write_jsonl, request_for, questions
+):
+    data = write_jsonl(decision_rows(n_per_option=20))
+    rows_ = [Row(i, "p", "c", "c") for i in range(1, 61)]
+    _, heldout = split_rows(rows_, hash_file(data), 0, 12)
+
+    result = prepare(request_for(data, questions=questions()))
+
+    assert {r["source_line"] for r in split_records(result.heldout)} == {r.lineno for r in heldout}
+
+
+def test_a_calibration_size_is_honoured_or_the_shortfall_said(write_jsonl, request_for, questions):
+    data = write_jsonl(decision_rows(n_per_option=20))
+
+    exact = prepare(request_for(data, questions=questions(), calibration_size=9))
+    assert exact.calibration.n == 9
+    assert not any("calibration split of" in text for text in exact.limitations)
+
+    # One training row is left, and two options lose theirs, so no split is
+    # written; the shortfall is still said.
+    short = prepare(request_for(data, questions=questions(), calibration_size=100))
+    assert sum(short.decision.calibration.values()) == 47
+    assert sum(short.decision.train.values()) == 1
+    assert any("calibration split of 100 was requested" in text for text in short.limitations)
+
+
+def test_a_calibration_fraction_is_a_share_of_every_row(write_jsonl, request_for, questions):
+    data = write_jsonl(decision_rows(n_per_option=20))
+
+    result = prepare(request_for(data, questions=questions(), calibration_fraction=0.25))
+
+    assert result.calibration.n == 15
+
+
+@pytest.mark.parametrize("flag", [{"calibration_size": 3}, {"calibration_fraction": 0.1}])
+def test_calibration_is_for_decision_rows_only(write_jsonl, request_for, flag):
+    with pytest.raises(PrepareError, match="decision rows only"):
+        prepare(request_for(write_jsonl(rows(10)), **flag))
+
+
+def test_an_ordinary_split_writes_no_calibration_file(write_jsonl, request_for):
+    result = prepare(request_for(write_jsonl(rows(10))))
+
+    assert result.calibration is None
+    assert not (result.request.output_dir / "calibration.jsonl").exists()
+
+
+def test_a_none_option_with_no_calibration_row_says_the_threshold_falls_back(
+    write_jsonl, request_for, questions
+):
+    path = questions(
+        {"question": "Which?", "options": [{"id": e} for e in EMOTIONS], "none_option": "other"}
+    )
+    data = decision_rows(n_per_option=20) + [{"prompt": "weather", "label": None}]
+    data_path = write_jsonl(data)
+    from litetune.prepare import split_calibration
+
+    as_rows = [Row(i, d["prompt"], "c", "c") for i, d in enumerate(data, 1)]
+    # A seed that leaves the one out-of-scope row in training.
+    seed = next(
+        s
+        for s in range(200)
+        if 61 in {r.lineno for r in split_calibration(as_rows, hash_file(data_path), s, 12, 6)[0]}
+    )
+
+    result = prepare(request_for(data_path, questions=path, heldout_size=12, seed=seed))
+
+    assert result.decision.calibration["other"] == 0
+    assert any("falls back to the error budget" in text for text in result.limitations)
