@@ -1921,7 +1921,7 @@ def summarise_bundle(result: BundleResult) -> list[str]:
     if contract.decision is not None:
         lines.append(
             f"  decision section {contract.decision.get('section')}: sha256 "
-            f"{str(contract.decision.get('payload_sha256', '')).split(':')[-1][:16]}"
+            f"{str(contract.decision.get('section_sha256', '')).split(':')[-1][:16]}"
         )
         lines.append("  use it with:")
         call = str(contract.decision.get("create_decider", ""))

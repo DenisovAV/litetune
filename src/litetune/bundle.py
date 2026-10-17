@@ -872,10 +872,21 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
             )
         if copied is not None and copied.is_file():
             # The file may have changed after it was recorded -- on success, and
-            # on a failure after the script replaced it -- so the member names
-            # the bytes that are on disk now.
+            # on a failure after the script replaced it -- so the member, and the
+            # check that counted it, name the bytes that are on disk now.
             result.members = [
                 _member(copied.name, copied) if m.path == copied else m for m in result.members
+            ]
+            shipped_bytes = copied.stat().st_size
+            result.checks.checks = [
+                Check.passed(
+                    c.name,
+                    f"1 file(s), {shipped_bytes:,} bytes at {copied}, with the decision section",
+                    observed={"files": 1, "bytes": shipped_bytes},
+                )
+                if c.name == "model included" and c.outcome is Outcome.PASSED
+                else c
+                for c in result.checks.checks
             ]
         result.checks.add(section_check)
         events.check(section_check)
@@ -1036,7 +1047,9 @@ def _write_decision_section(
     contract = {
         "section": SECTION_NAME,
         "payload": payload,
-        "payload_sha256": hash_bytes(data),
+        # Of the section's bytes in the file, in the order verify wrote the keys;
+        # `payload` above is the same object, written sorted with the contract.
+        "section_sha256": hash_bytes(data),
         "create_decider": dart_call(payload),
     }
     report = written.report
