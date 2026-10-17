@@ -75,6 +75,9 @@ class FakeScoringEnv:
     report_extra: dict[str, Any] = field(default_factory=dict)
     skip_rows: set[int] = field(default_factory=set)
     token_of: Callable[[str], list[int]] = tokens
+    # Options whose unique prefix "does not round-trip": scored in full, as the
+    # runtime script does.
+    full_for: set[str] = field(default_factory=set)
     specs: list[dict[str, Any]] = field(default_factory=list)
     provisioned: int = 0
 
@@ -92,6 +95,10 @@ class FakeScoringEnv:
         report: dict[str, Any] = {"cont_ids": cont}
         if engine:
             full = spec["targets"] == "full"
+            lengths = [
+                len(c) if full or o in self.full_for else k
+                for o, c, k in zip(spec["options"], cont, ks, strict=True)
+            ]
             report.update(
                 {
                     "runtime": {"litert-lm": "0.18.0"},
@@ -100,8 +107,8 @@ class FakeScoringEnv:
                     "mode": "once" if spec["mode"] == "auto" else spec["mode"],
                     "selfcheck": {"verdict": "dropped", "comparisons": 18, "max_abs_diff": 0.0},
                     "k": ks,
-                    "scored_lengths": [len(c) for c in cont] if full else ks,
-                    "mismatches": [],
+                    "scored_lengths": lengths,
+                    "mismatches": [{"option": o} for o in spec["options"] if o in self.full_for],
                 }
             )
         else:
@@ -115,8 +122,8 @@ class FakeScoringEnv:
                     self.scores(row["index"], row["prompt"], o, c)
                     for o, c in zip(spec["options"], cont, strict=True)
                 ]
-                if engine and not full:
-                    per = [p[:k] for p, k in zip(per, ks, strict=True)]
+                if engine:
+                    per = [p[:n] for p, n in zip(per, lengths, strict=True)]
                 rec = {"index": row["index"], "token_scores": per}
                 rec["ms" if engine else "seconds"] = 10.0
                 out.write(json.dumps(rec) + "\n")
@@ -162,7 +169,13 @@ def split(tmp_path):
             "base_model": "google/gemma-3-270m-it",
             "decision": decision.as_dict(),
             "decision_sha256": decision.digest(),
-            "turn_terminator": TERM,
+            # As `tune` records it: E5's gemma-3-270m-it run wrote exactly this.
+            "turn_terminator": {
+                "ids": [106, 107],
+                "source": "chat_template",
+                "text": "<end_of_turn>\n",
+                "call": None,
+            },
         }
         return {
             "decision": decision,
@@ -756,8 +769,8 @@ def test_a_checkpoint_with_no_decision_and_no_calibration_is_verified_as_before(
         json.dumps({"base_model": "google/gemma-3-270m-it", "decision": None}), encoding="utf-8"
     )
 
-    assert _decision_record(str(checkpoint)) is None
-    assert _decision_record("google/gemma-3-270m-it") is None
+    assert _decision_record(str(checkpoint)) == (None, None)
+    assert _decision_record("google/gemma-3-270m-it") == (None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -811,3 +824,180 @@ def test_the_reference_scores_of_heldout_rows_are_the_ones_measured(split, tmp_p
     assert fields["measurements"]["reference"]["rows"] == len(held)
     assert fields["measurements"]["reference"]["in_scope_rows"] == len(in_scope)
     assert fields["measurements"]["reference"]["accuracy"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# What the review found
+# ---------------------------------------------------------------------------
+
+
+def test_the_scorers_get_the_first_token_of_the_recorded_end_of_turn(split, tmp_path):
+    s = split()
+    job = job_for(s, tmp_path)
+
+    status, _ = run(job, s["record"])
+
+    assert status == "passed"
+    assert job.train_env.specs[0]["terminator"] == "<end_of_turn>"
+    assert job.runtime_env.specs[0]["terminator"] == "<end_of_turn>"
+
+
+def test_a_checkpoint_whose_turn_ends_otherwise_is_refused(split, tmp_path):
+    s = split()
+    record = dict(s["record"], turn_terminator={"text": "<|im_end|>\n", "ids": [1]})
+
+    status, fields = run(job_for(s, tmp_path), record)
+
+    assert status == "failed_harness"
+    failed = [c for c in fields["checks"]["checks"] if c["outcome"] == "failed"]
+    assert len(failed) == 1 and "'<|im_end|>\\n'" in failed[0]["detail"]
+
+
+def test_options_scored_in_full_on_the_runtime_are_scored_in_full_on_both_sides(split, tmp_path):
+    s = split()
+
+    def tail_heavy(index, prompt, option, ids):
+        base = default_scores(index, prompt, option, ids)
+        # The tail decides: summed over the unique prefix only, "anger" would win.
+        if option == "anger":
+            return [0.5, *([-30.0] * (len(ids) - 1))]
+        return base
+
+    eng = FakeScoringEnv("runtime", scores=tail_heavy, full_for={"anger"})
+    job = job_for(
+        s, tmp_path, train_env=FakeScoringEnv("train", scores=tail_heavy), runtime_env=eng
+    )
+
+    status, fields = run(job, s["record"])
+
+    lengths = fields["decision"]["scored_lengths"]
+    anger = s["decision"].ids.index("anger")
+    assert lengths[anger] == len(tokens("anger"))
+    assert fields["quality"]["argmax_agreement"] == 1.0
+    assert "scored in full on both sides" in check(fields, TARGETS_CHECK)["detail"]
+    assert status == "passed"
+
+
+def test_a_runtime_that_abstains_where_the_reference_answers_is_refused(split, tmp_path):
+    s = split(with_none=False)
+
+    def unsure(index, prompt, option, ids):
+        base = default_scores(index, prompt, option, ids)
+        return [base[0] * 0.05, *base[1:]]
+
+    eng = FakeScoringEnv("runtime", scores=unsure)
+
+    status, fields = run(job_for(s, tmp_path, runtime_env=eng), s["record"])
+
+    assert fields["quality"]["argmax_agreement"] == 1.0
+    assert fields["quality"]["answer_agreement"] < 0.95
+    assert status == "failed_gate"
+    assert check(fields, AGREEMENT_CHECK)["outcome"] == "failed"
+
+
+def test_calibrating_on_the_heldout_rows_is_refused(split, tmp_path):
+    s = split()
+
+    status, fields = run(job_for(s, tmp_path, calibration=s["heldout"]), s["record"])
+
+    assert status == "failed_harness"
+    assert "the same rows" in check(fields, CALIBRATION_CHECK)["detail"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [({"reference_role": "untuned_base"}, "--reference-role"), ({"limit": 10}, "--limit")],
+)
+def test_what_the_decision_path_does_not_do_is_refused_not_ignored(
+    split, tmp_path, kwargs, message
+):
+    s = split()
+
+    status, fields = run(job_for(s, tmp_path, **kwargs), s["record"])
+
+    assert status == "failed_harness"
+    assert message in check(fields, ROWS_CHECK)["detail"]
+
+
+def test_an_unreadable_record_is_named_as_unreadable(split, tmp_path):
+    s = split()
+
+    status, fields = run(job_for(s, tmp_path, record_error="ValueError: not JSON"), None)
+
+    assert status == "failed_harness"
+    assert "could not be read (ValueError: not JSON)" in check(fields, ROWS_CHECK)["detail"]
+
+
+def test_a_reference_score_that_is_not_finite_is_refused(split, tmp_path):
+    s = split()
+
+    def nan_once(index, prompt, option, ids):
+        base = default_scores(index, prompt, option, ids)
+        # Every "joy" row: some are surely among the rows the reference scores.
+        return [float("nan"), *base[1:]] if label_of(prompt) == "joy" else base
+
+    job = job_for(s, tmp_path, train_env=FakeScoringEnv("train", scores=nan_once))
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "not finite" in check(fields, REFERENCE_CHECK)["detail"]
+
+
+def test_a_script_that_writes_no_report_is_a_harness_failure(split, tmp_path):
+    s = split()
+
+    class Silent(FakeScoringEnv):
+        def run(self, argv, timeout=None, env=None):
+            proc = super().run(argv, timeout, env)
+            Path(json.loads(Path(argv[2]).read_text())["report"]).unlink()
+            return proc
+
+    status, fields = run(job_for(s, tmp_path, train_env=Silent("train")), s["record"])
+
+    assert status == "failed_harness"
+    assert "wrote no report" in check(fields, REFERENCE_CHECK)["detail"]
+
+
+def test_a_well_trained_none_option_ships_a_threshold_json_can_hold(split, tmp_path):
+    """Every out-of-scope calibration row already picks the none option: the rule's -inf."""
+    from litetune.decision_section import payload_bytes
+
+    s = split()
+
+    status, fields = run(job_for(s, tmp_path), s["record"])
+
+    payload = fields["decision"]["section"]["payload"]
+    assert payload["abstain_below"] == 0.0
+    assert json.loads(payload_bytes(payload).decode("utf-8"), parse_constant=None) == payload
+    assert status == "passed"
+
+
+def test_no_runtime_rows_is_refused_rather_than_divided_by(split, tmp_path):
+    s = split()
+
+    status, fields = run(job_for(s, tmp_path, engine_rows=0), s["record"])
+
+    assert status == "failed_harness"
+    assert "engine_rows is 0" in check(fields, RUNTIME_CHECK)["detail"]
+
+
+def test_plain_on_the_measured_runtime_without_a_twin_is_not_called_correct(split, tmp_path):
+    s = split()
+    eng = FakeScoringEnv("runtime", report_extra={"mode": "plain"})
+
+    status, fields = run(job_for(s, tmp_path, runtime_env=eng), s["record"])
+
+    assert status == "inconclusive"
+    assert "the measured method is 'once'" in check(fields, TWIN_CHECK)["detail"]
+
+
+def test_the_reference_checks_its_longest_row_against_the_uncached_scores(split, tmp_path):
+    s = split()
+    job = job_for(s, tmp_path)
+
+    run(job, s["record"])
+
+    spec = job.train_env.specs[0]
+    longest = max(spec["rows"], key=lambda r: len(r["prompt"]))
+    assert spec["check_indices"] == [longest["index"]]

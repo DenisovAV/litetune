@@ -560,3 +560,50 @@ def test_a_payload_the_builder_changed_is_refused_by_the_read_back(toy):
     assert not written.written
     assert f"named {SECTION_NAME} read back" in str(written.reason)
     assert bundle.read_bytes() == original
+
+
+def test_a_payload_that_is_not_finite_is_refused_rather_than_written_as_infinity():
+    with pytest.raises(ValueError):
+        payload_bytes({"abstain_below": float("-inf")})
+
+
+def test_a_decision_bundle_of_another_file_than_the_verified_one_is_refused(toy, tmp_path):
+    from litetune.bundle import BundleRequest, build_bundle
+
+    shim, model = toy
+
+    result = build_bundle(
+        BundleRequest(
+            output_dir=tmp_path / "bundle",
+            model=model,
+            declarations=None,
+            contract=a_contract(),
+            decision=PAYLOAD,
+            section_env=ShimEnv(shim),
+            verified_sha256="sha256:" + "0" * 64,
+        )
+    )
+
+    section = next(c for c in result.checks.checks if c.name == "decision section")
+    assert section.outcome.value == "failed"
+    assert "is not the file verify measured" in section.detail
+    report = json.loads((tmp_path / "bundle" / "report.json").read_text())
+    assert report["use"] is None, "no call is printed for a file without the section"
+
+
+def test_the_section_is_built_beside_the_artifact_not_in_the_system_temp(toy):
+    """The script ends with an os.replace onto the artifact, which crosses no filesystem."""
+    shim, bundle = toy
+    seen = {}
+
+    class Recording(ShimEnv):
+        def run(self, argv, timeout=None, env=None):
+            seen["work"] = Path(json.loads(Path(argv[2]).read_text())["work"])
+            return super().run(argv, timeout, env)
+
+    written = write_section(bundle, PAYLOAD, env=Recording(shim))
+
+    assert written.written, written.reason
+    assert seen["work"].parent == bundle.parent.absolute()
+    assert seen["work"].name.startswith(".model-section-")
+    assert not seen["work"].exists(), "the work directory is removed afterwards"

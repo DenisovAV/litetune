@@ -222,8 +222,10 @@ def run_script(
         if report.exists():
             try:
                 run.report = json.loads(report.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                run.report = {}
+            except json.JSONDecodeError as exc:
+                run.failure = run.failure or f"the script's report could not be read: {exc}"
+        elif proc is not None and run.failure is None:
+            run.failure = "the script wrote no report"
         if proc is not None and proc.returncode != 0 and run.failure is None:
             said = run.report.get("error") or (proc.stderr or "").strip()[-2000:]
             run.failure = f"the script exited {proc.returncode}: {said}"
@@ -251,6 +253,14 @@ def unique_lengths(cont_ids: Sequence[Sequence[int]]) -> list[int]:
 def summed(token_scores: Sequence[Sequence[float]], lengths: Sequence[int]) -> list[float]:
     """Each option's score: its first `lengths[j]` token log-probabilities, summed."""
     return [math.fsum(t[:k]) for t, k in zip(token_scores, lengths, strict=True)]
+
+
+def _not_finite(scores: dict[int, list[list[float]]]) -> int | None:
+    """The first row holding a token score that is not a finite number, if any."""
+    for index, per in sorted(scores.items()):
+        if not all(isinstance(x, int | float) and math.isfinite(x) for t in per for x in t):
+            return index
+    return None
 
 
 def _kl(p: Sequence[float], q: Sequence[float]) -> float:
@@ -362,6 +372,12 @@ class DecisionVerify:
     engine_rows: int = DEFAULT_ENGINE_ROWS
     threads: int = DEFAULT_THREADS
     backend: str = "cpu"
+    # What `verify` was asked that the decision path does not do: refused rather
+    # than ignored, so a manifest never records a role or a limit nobody applied.
+    reference_role: str = "float_twin"
+    limit: int | None = None
+    # Why the reference's litetune.json could not be read, when it could not.
+    record_error: str | None = None
     train_env: envs.StageEnv = envs.TRAIN
     runtime_env: envs.StageEnv = envs.RUNTIME
     auto_provision: bool = True
@@ -408,11 +424,36 @@ def verify_decision(
         return finish("failed_harness")
 
     # -- what the checkpoint answers -------------------------------------------
-    if record is None or not isinstance(record.get("decision"), dict):
+    if job.record_error is not None:
+        return refuse(
+            ROWS_CHECK,
+            f"the reference's litetune.json could not be read ({job.record_error}), so whether it "
+            "is a decision checkpoint, and which decision it answers, is unknown",
+        )
+    if record is None or record.get("decision") is None:
         return refuse(
             ROWS_CHECK,
             "--calibration or --float-twin was given, but the reference records no decision. A "
             "decision checkpoint is one `tune --decision` trained; its litetune.json holds it",
+        )
+    if not isinstance(record.get("decision"), dict):
+        return refuse(
+            ROWS_CHECK,
+            "the reference's litetune.json has a 'decision' that is not an object: "
+            f"{json.dumps(record.get('decision'))[:200]}",
+        )
+    if job.reference_role != "float_twin":
+        return refuse(
+            ROWS_CHECK,
+            f"--reference-role {job.reference_role}: a decision checkpoint is measured against "
+            "itself in float32, the role float_twin; an untuned base answers a question it was "
+            "never trained on",
+        )
+    if job.limit is not None:
+        return refuse(
+            ROWS_CHECK,
+            "--limit does not apply to a decision checkpoint: the reference scores every held-out "
+            "row, and --engine-rows sets how many the runtime scores",
         )
     try:
         decision = decision_from(record["decision"], "the reference's litetune.json")
@@ -444,6 +485,19 @@ def verify_decision(
         calib = read_decision_rows(job.calibration, decision)
     except DecisionRowsError as exc:
         return refuse(ROWS_CHECK, str(exc))
+    if hash_file(job.heldout) == hash_file(job.calibration):
+        return refuse(
+            CALIBRATION_CHECK,
+            f"--calibration and --data are the same rows ({job.calibration}); a threshold fitted "
+            "on the rows it is then measured on shows nothing about new ones",
+        )
+    shared = len(set(calib.prompts) & set(heldout.prompts))
+    if shared:
+        state.limitations.append(
+            f"{shared} prompt(s) appear in both the calibration and the held-out rows; a "
+            "dataset's own duplicates do this, and a split made by `prepare` from one file keeps "
+            "every row on one side"
+        )
     state.add(
         Check.passed(
             ROWS_CHECK,
@@ -454,10 +508,41 @@ def verify_decision(
     )
     fields["data"] = {"heldout": heldout.as_dict(), "calibration": calib.as_dict()}
     none_index = decision.ids.index(decision.none_option) if decision.none_option else None
-    terminator = record.get("turn_terminator") or DEFAULT_TERMINATOR
+    # The scorers' terminator is the first token of the end of turn, as
+    # measured: `<end_of_turn>` for Gemma 3. `tune` records the whole end of
+    # turn as text and ids (`<end_of_turn>\n` for gemma-3-270m-it), so it is
+    # checked against that record, never handed over as it is.
+    recorded_turn = record.get("turn_terminator")
+    turn_text = (
+        recorded_turn.get("text")
+        if isinstance(recorded_turn, dict)
+        else recorded_turn
+        if isinstance(recorded_turn, str)
+        else None
+    )
+    if turn_text is None:
+        state.limitations.append(
+            "the checkpoint records no end of turn, so the scorers take Gemma 3's "
+            f"{DEFAULT_TERMINATOR!r}, the family `tune --decision` accepts"
+        )
+    elif not turn_text.startswith(DEFAULT_TERMINATOR):
+        return refuse(
+            ROWS_CHECK,
+            f"the checkpoint's turn ends with {turn_text!r}; option scoring is measured with "
+            f"{DEFAULT_TERMINATOR!r} as the token after the id, the end of a Gemma 3 turn",
+        )
+    terminator = DEFAULT_TERMINATOR
+
+    if job.engine_rows < 1:
+        return refuse(
+            RUNTIME_CHECK, f"engine_rows is {job.engine_rows}; the runtime has to score a row"
+        )
 
     # -- the reference -----------------------------------------------------------
     prompts = [*calib.prompts, *heldout.prompts]
+    # Besides its first rows, the longest: a cache gone wrong past Gemma 3's
+    # sliding window would not show on short ones.
+    longest = max(range(len(prompts)), key=lambda i: len(prompts[i]))
     events.note(f"reference: scoring {len(decision.ids)} options on {len(prompts)} rows")
     ref = run_script(
         job.train_env,
@@ -467,6 +552,7 @@ def verify_decision(
             "rows": [{"index": i, "prompt": p} for i, p in enumerate(prompts)],
             "options": list(decision.ids),
             "terminator": terminator,
+            "check_indices": [longest],
         },
         timeout=STARTUP_TIMEOUT_S + REFERENCE_ROW_TIMEOUT_S * len(prompts),
         auto_provision=job.auto_provision,
@@ -479,6 +565,9 @@ def verify_decision(
             REFERENCE_CHECK,
             ref.failure or f"{len(missing)} of {len(prompts)} rows have no reference scores",
         )
+    unusable = _not_finite(ref.scores)
+    if unusable is not None:
+        return refuse(REFERENCE_CHECK, f"row {unusable} has a reference score that is not finite")
     cont_ids = ref.report.get("cont_ids")
     try:
         ks = unique_lengths(cont_ids or [])
@@ -494,51 +583,12 @@ def verify_decision(
         ),
         events,
     )
-    ref_scores = [summed(ref.scores[i], ks) for i in range(len(prompts))]
-    calib_scores, held_scores = ref_scores[: len(calib.prompts)], ref_scores[len(calib.prompts) :]
-
-    # -- the calibration --------------------------------------------------------
-    try:
-        fit = calibration.fit(decision.type, calib_scores, calib.targets, none_index)
-    except calibration.CalibrationError as exc:
-        return refuse(CALIBRATION_CHECK, str(exc))
-    state.add(
-        Check.passed(
-            CALIBRATION_CHECK,
-            f"temperature {fit.temperature:.4f}"
-            + (
-                f", abstain below {fit.abstain_below:.4f} ({fit.rule})"
-                if fit.rule is not None and fit.abstain_below is not None
-                else ""
-            ),
-            observed=fit.as_dict(),
-        ),
-        events,
-    )
-    if fit.rule == calibration.C1:
-        state.limitations.append(calibration.C1_NOTE)
-    payload = section_payload(decision, fit)
-    fields["decision"].update(
-        {
-            "fit": fit.as_dict(),
-            "k": ks,
-            "option_tokens": cont_ids,
-            "section": {
-                "name": SECTION_NAME,
-                "payload": payload,
-                "bytes": len(section_bytes(payload)),
-            },
-        }
-    )
-    ref_answers = answers(held_scores, fit.temperature)
-    ref_metrics = outcome_metrics(ref_answers, heldout.targets, fit, none_index, decision.type)
-    fields["measurements"] = {"reference": ref_metrics}
-
-    # -- does the rule hold on held-out rows? (Choice) ----------------------------
-    if decision.type == "choice" and fit.rule is not None:
-        state.add(_rule_check(fit, ref_metrics), events)
 
     # -- the runtime ---------------------------------------------------------------
+    # Before the calibration: the runtime decides how many tokens each option is
+    # scored on. A unique prefix that does not tokenise back to its own ids is
+    # scored in full there, and then on both sides, so that the calibration, the
+    # comparison and the section all describe the scores an application gets.
     n_engine = min(job.engine_rows, len(heldout.prompts))
     engine_prompts = list(heldout.prompts[:n_engine])
     events.note(f"runtime: scoring {len(decision.ids)} options on {n_engine} held-out rows")
@@ -578,17 +628,29 @@ def verify_decision(
             "would score different targets",
             observed={"reference_k": ks, "runtime_k": eng.report.get("k")},
         )
+    lengths = eng.report.get("scored_lengths")
+    if (
+        not isinstance(lengths, list)
+        or len(lengths) != len(ks)
+        or any(not k <= n <= len(c) for k, n, c in zip(ks, lengths, cont_ids or [], strict=False))
+    ):
+        return refuse(TARGETS_CHECK, f"the runtime reported unusable scored lengths: {lengths}")
     mismatched = eng.report.get("mismatches") or []
     state.add(
         Check.passed(
             TARGETS_CHECK,
-            f"both sides tokenise all {len(ks)} options alike; {sum(ks)} scored tokens per "
-            f"decision" + (f", {len(mismatched)} scored in full" if mismatched else ""),
+            f"both sides tokenise all {len(ks)} options alike and score {sum(lengths)} tokens per "
+            "decision"
+            + (
+                f"; {len(mismatched)} option(s) whose unique prefix does not tokenise back to its "
+                "own ids are scored in full on both sides"
+                if mismatched
+                else ""
+            ),
+            observed={"k": ks, "scored_lengths": lengths, "mismatches": mismatched},
         ),
         events,
     )
-    eng_lengths = eng.report.get("scored_lengths") or ks
-    eng_scores = [summed(eng.scores[i], eng_lengths) for i in range(n_engine)]
     state.add(
         Check.passed(
             RUNTIME_CHECK,
@@ -598,12 +660,63 @@ def verify_decision(
         ),
         events,
     )
+    eng_scores = [summed(eng.scores[i], lengths) for i in range(n_engine)]
+    ref_scores = [summed(ref.scores[i], lengths) for i in range(len(prompts))]
+    calib_scores, held_scores = ref_scores[: len(calib.prompts)], ref_scores[len(calib.prompts) :]
+
+    # -- the calibration --------------------------------------------------------
+    try:
+        fit = calibration.fit(decision.type, calib_scores, calib.targets, none_index)
+    except calibration.CalibrationError as exc:
+        return refuse(CALIBRATION_CHECK, str(exc))
+    state.add(
+        Check.passed(
+            CALIBRATION_CHECK,
+            f"temperature {fit.temperature:.4f}"
+            + (
+                f", abstain below {fit.abstain_below:.4f} ({fit.rule})"
+                if fit.rule is not None and fit.abstain_below is not None
+                else ""
+            ),
+            observed=fit.as_dict(),
+        ),
+        events,
+    )
+    if fit.rule == calibration.C1:
+        state.limitations.append(calibration.C1_NOTE)
+    payload = section_payload(decision, fit)
+    fields["decision"].update(
+        {
+            "fit": fit.as_dict(),
+            "k": ks,
+            "scored_lengths": lengths,
+            "option_tokens": cont_ids,
+            "section": {
+                "name": SECTION_NAME,
+                "payload": payload,
+                "bytes": len(section_bytes(payload)),
+            },
+        }
+    )
+    ref_answers = answers(held_scores, fit.temperature)
+    ref_metrics = outcome_metrics(ref_answers, heldout.targets, fit, none_index, decision.type)
+    fields["measurements"] = {"reference": ref_metrics}
+
+    # -- does the rule hold on held-out rows? (Choice) ----------------------------
+    if decision.type == "choice" and fit.rule is not None:
+        state.add(_rule_check(fit, ref_metrics), events)
 
     # -- runtime against reference, on the same rows -------------------------------
     sub_ref = answers(held_scores[:n_engine], fit.temperature)
     sub_eng = answers(eng_scores, fit.temperature)
     targets = heldout.targets[:n_engine]
     agree = sum(a == b for a, b in zip(sub_ref.choice, sub_eng.choice, strict=True)) / n_engine
+    # What the application returns: the option, or an abstention. A runtime
+    # that keeps the reference's top option but crosses the threshold the other
+    # way gives another answer, which the top option alone does not show.
+    given_ref = [_given(sub_ref, i, fit, none_index) for i in range(n_engine)]
+    given_eng = [_given(sub_eng, i, fit, none_index) for i in range(n_engine)]
+    answer_agree = sum(a == b for a, b in zip(given_ref, given_eng, strict=True)) / n_engine
     kl = [_kl(p, q) for p, q in zip(sub_ref.probabilities, sub_eng.probabilities, strict=True)]
     in_scope = [i for i, t in enumerate(targets) if t != none_index]
     ms = [eng.ms[i] for i in range(n_engine)]
@@ -626,6 +739,7 @@ def verify_decision(
         "available": True,
         "rows": n_engine,
         "argmax_agreement": agree,
+        "answer_agreement": answer_agree,
         "mean_kl": math.fsum(kl) / len(kl),
         "max_kl": max(kl),
         "accuracy_difference": (
@@ -641,19 +755,21 @@ def verify_decision(
         "ms_per_decision_median": statistics.median(ms),
         "ms_per_decision_max": max(ms),
         "options": len(decision.ids),
-        "scored_tokens_per_decision": sum(eng_lengths),
+        "scored_tokens_per_decision": sum(lengths),
         "mode": mode,
         "threads": job.threads,
         "cpu": eng.report.get("cpu"),
         "runtime": eng.report.get("runtime"),
         "rows": n_engine,
     }
+    worst = min(agree, answer_agree)
     state.add(
-        (Check.passed if agree >= AGREEMENT_FLOOR else Check.failed)(
+        (Check.passed if worst >= AGREEMENT_FLOOR else Check.failed)(
             AGREEMENT_CHECK,
-            f"the runtime's answer is the reference's on {agree:.4f} of {n_engine} rows "
-            f"(refused below {AGREEMENT_FLOOR}); mean KL {fields['quality']['mean_kl']:.2e}",
-            observed={"agreement": agree, "rows": n_engine},
+            f"the runtime's top option is the reference's on {agree:.4f} and its answer, "
+            f"abstentions included, on {answer_agree:.4f} of {n_engine} rows (refused below "
+            f"{AGREEMENT_FLOOR}); mean KL {fields['quality']['mean_kl']:.2e}",
+            observed={"argmax": agree, "answer": answer_agree, "rows": n_engine},
         ),
         events,
     )
@@ -667,8 +783,18 @@ def verify_decision(
     # -- the float twin -----------------------------------------------------------------
     runtime_version = (eng.report.get("runtime") or {}).get("litert-lm")
     if job.float_twin is None:
-        if runtime_version == MEASURED_RUNTIME:
+        if runtime_version == MEASURED_RUNTIME and mode == "once":
             state.limitations.append(NO_TWIN.format(runtime=MEASURED_RUNTIME))
+        elif runtime_version == MEASURED_RUNTIME:
+            state.add(
+                Check.unchecked(
+                    TWIN_CHECK,
+                    f"the self-check picked mode {mode!r} on litert-lm {MEASURED_RUNTIME}, where "
+                    "the measured method is 'once', and no --float-twin was given to show which "
+                    "is right on this build",
+                ),
+                events,
+            )
         else:
             state.add(
                 Check.unchecked(
@@ -695,6 +821,14 @@ def verify_decision(
     return finish("passed")
 
 
+def _given(side: Answers, i: int, fit: calibration.Fit, none_index: int | None) -> int | None:
+    """The answer row `i` gets: its top option, or `None` where it abstains."""
+    if fit.rule is None:
+        return side.choice[i]
+    forced = side.choice[i] == none_index
+    return side.choice[i] if calibration.answers(side.top[i], forced, fit.abstain_below) else None
+
+
 def _rule_check(fit: calibration.Fit, held: dict[str, Any]) -> Check:
     """Whether the held-out rows clearly contradict the rule the threshold was fitted by."""
     if fit.rule == calibration.C2 and held.get("out_of_scope_rows"):
@@ -712,9 +846,16 @@ def _rule_check(fit: calibration.Fit, held: dict[str, Any]) -> Check:
             f"lower bound {bound:.4f} against the {calibration.ERROR_BUDGET} budget"
         )
         ok = bound <= calibration.ERROR_BUDGET
+    elif fit.rule == calibration.C1:
+        return Check.unchecked(
+            RULE_CHECK,
+            "the model abstained on every held-out row at the fitted threshold, so the error on "
+            "answered rows cannot be measured",
+            observed=held,
+        )
     else:
         return Check.unchecked(
-            RULE_CHECK, "the held-out rows have none of the rows the rule is about"
+            RULE_CHECK, "the held-out rows have no out-of-scope row to measure rejection on"
         )
     return (Check.passed if ok else Check.failed)(RULE_CHECK, detail, observed=held)
 
@@ -748,7 +889,14 @@ def _twin_check(
         events=events,
     )
     if twin.failure or len(twin.scores) < n:
-        return Check.failed(TWIN_CHECK, twin.failure or "the float twin left rows unscored")
+        said = twin.failure or (
+            "the float twin left rows unscored"
+            + (f": {next(iter(twin.errors.values()))}" if twin.errors else "")
+        )
+        return Check.failed(TWIN_CHECK, said)
+    unusable = _not_finite(twin.scores)
+    if unusable is not None:
+        return Check.failed(TWIN_CHECK, f"row {unusable} has a twin score that is not finite")
     worst = 0.0
     for i in range(n):
         for a, b in zip(twin.scores[i], ref.scores[calib_n + i], strict=True):

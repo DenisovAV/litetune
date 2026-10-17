@@ -187,7 +187,7 @@ def main():
                         break
             per = score_cached(prompt_ids, state["variant"])
             rec = {"index": row["index"], "prompt_len": len(prompt_ids), "token_scores": per}
-            if n_done < int(spec.get("check_rows", 3)):
+            if row["index"] in set(spec.get("check_indices", [])) or n_done < 3:
                 d = worst(score_full(prompt_ids), per)
                 rec["check_max_abs_token"] = d
                 if d > tol:
@@ -310,6 +310,11 @@ def main():
         with session(engine) as s:
             s.run_prefill([rendered])
             c_call(s, "litert_lm_session_save_checkpoint", b"p")
+            # Once per decision, after the checkpoint. Rewinding resets only the
+            # step, and the cell this prefill wrote stays: measured 2026-10-16,
+            # this sequence gave every option the scores of a re-prefill before
+            # each one, bit for bit over 108,300 tokens, and within 8.2e-4 nats
+            # of PyTorch on a float32 bundle.
             if mode == "once":
                 s.run_prefill([last])
             for text in texts:
@@ -340,7 +345,11 @@ def main():
                 z = engine.detokenize([cont_ids[j][0]])
                 if list(engine.tokenize(z)) == [cont_ids[j][0]]:
                     zs.append(z)
-            pairs = [FIXED] + [render(engine, r["prompt"])[0] for r in spec["rows"][:2]]
+            # The fixed pair only, as flutter_edge_ai runs it: measured 2026-10-16,
+            # its gap was 0.0 on 0.18.0 and at least 0.135 with the fix, where a
+            # task's own prompts gave a gap as small as 2.1e-5 with a near-certain
+            # target. The two must never pick different modes.
+            pairs = [FIXED]
             diffs, checked = [], []
             for a in pairs:
                 if not a.endswith(MODEL_TURN):

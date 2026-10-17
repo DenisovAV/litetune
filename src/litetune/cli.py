@@ -1862,6 +1862,9 @@ def _bundle(args: argparse.Namespace) -> int:
         adapter=args.adapter,
         declarations=args.declarations,
         decision=decision,
+        verified_sha256=(
+            _mapping(manifest.get("model")).get("sha256") if decision is not None else None
+        ),
         contract=contract,
         status=status,
         measurements=measurements_from_verify(manifest),

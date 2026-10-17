@@ -341,6 +341,9 @@ class BundleRequest:
     decision: Mapping[str, Any] | None = None
     section_env: envs.StageEnv = envs.EXPORT
     auto_provision: bool = True
+    # The sha256 of the `.litertlm` `verify` measured, from its manifest. The
+    # section goes into that file or into none.
+    verified_sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "output_dir", Path(self.output_dir))
@@ -460,9 +463,11 @@ class BundleResult:
             "attribution": dict(self.request.attribution),
             "checks": self.checks.as_dict(),
             "limitations": list(self.limitations),
+            # Only once the section is in the file: a model without it is an
+            # ordinary chat model, whose createDecider throws.
             "use": (
-                {"dart": dart_call(dict(self.request.decision))}
-                if self.request.decision is not None
+                {"dart": self.request.contract.decision["create_decider"]}
+                if self.request.contract.decision is not None
                 else None
             ),
         }
@@ -854,14 +859,21 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     # flutter_edge_ai's `createDecider` reads them.
     if request.decision is not None:
         section_check = _write_decision_section(request, copied, events)
-        if section_check.outcome is Outcome.PASSED and section_check.observed and copied:
+        if section_check.outcome is Outcome.PASSED and section_check.observed:
             request = replace(
                 request,
                 contract=replace(request.contract, decision=section_check.observed["contract"]),
             )
             result.request = request
-            # The file changed after it was recorded: the member has to name the
-            # bytes that ship, or the manifest describes a file nobody has.
+            result.limitation(
+                "the shipped .litertlm is the file verify measured with one section added, "
+                f"{SECTION_NAME}, which the LLM runtime does not map; its scores were not measured "
+                "again on the shipped bytes"
+            )
+        if copied is not None and copied.is_file():
+            # The file may have changed after it was recorded -- on success, and
+            # on a failure after the script replaced it -- so the member names
+            # the bytes that are on disk now.
             result.members = [
                 _member(copied.name, copied) if m.path == copied else m for m in result.members
             ]
@@ -1001,6 +1013,15 @@ def _write_decision_section(
             f"{copied.name} is not a .litertlm; the decision section is part of the bundle "
             "file flutter_edge_ai loads, so a decision model is bundled as its converted file",
         )
+    if request.verified_sha256 is not None:
+        on_disk = hash_file(copied).split(":", 1)[-1]
+        if on_disk != request.verified_sha256.split(":", 1)[-1]:
+            return Check.failed(
+                name,
+                f"{request.model} is not the file verify measured (sha256 {on_disk[:16]} against "
+                f"{request.verified_sha256.split(':', 1)[-1][:16]}); its decision and calibration "
+                "belong to that file",
+            )
     payload = dict(request.decision or {})
     written = write_section(
         copied,

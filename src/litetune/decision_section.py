@@ -160,8 +160,14 @@ class SectionWrite:
 
 
 def payload_bytes(payload: dict[str, Any]) -> bytes:
-    """The section's bytes: compact UTF-8 JSON, keys in the order `verify` wrote them."""
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    """The section's bytes: compact UTF-8 JSON, keys in the order `verify` wrote them.
+
+    Strict JSON: a value that is not finite raises rather than being written as
+    `NaN` or `Infinity`, which Python accepts and a JSON decoder does not.
+    """
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode(
+        "utf-8"
+    )
 
 
 def write_section(
@@ -184,7 +190,13 @@ def write_section(
                 False, f"the {env.name} environment could not be provisioned: {exc}", {}
             )
     data = payload_bytes(payload)
-    with tempfile.TemporaryDirectory(prefix="litetune-section-") as tmp:
+    # Beside the artifact, never in the system temp: the script's last step is
+    # an `os.replace` onto the artifact, which fails across filesystems (a tmpfs
+    # /tmp), and the unpacks are a model's size each. As `export`'s repack.
+    artifact = Path(artifact).absolute()
+    with tempfile.TemporaryDirectory(
+        prefix=f".{artifact.stem}-section-", dir=artifact.parent
+    ) as tmp:
         work = Path(tmp)
         (work / "repack.py").write_text(_REPACK_SCRIPT, encoding="utf-8")
         script = work / "section.py"

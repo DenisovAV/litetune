@@ -942,24 +942,27 @@ class _Run:
         return VerifyResult(status=status, manifest=self.manifest)
 
 
-def _decision_record(reference: str) -> dict[str, Any] | None:
-    """The reference's training record when it records a decision; `None` otherwise.
+def _decision_record(reference: str) -> tuple[dict[str, Any] | None, str | None]:
+    """The reference's training record when it records a decision, and why it could not be read.
 
-    An unreadable record is `None` here: the generative path reads it again and
-    says what is wrong with it.
+    `(None, None)` for a reference that records no decision. An unreadable
+    record is `(None, reason)`: the generative path reads it again and says what
+    is wrong with it, and the decision path, entered for `--calibration`, says
+    the same rather than that no decision was recorded.
     """
     try:
         read = read_training_record(reference)
-    except (OSError, ValueError):
-        return None
+    except (OSError, ValueError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
     if read is None or "decision" not in read[0] or read[0]["decision"] is None:
-        return None
-    return read[0]
+        return None, None
+    return read[0], None
 
 
 def _verify_decision(
     request: VerifyRequest,
     record: dict[str, Any] | None,
+    unreadable: str | None,
     run: _Run,
     events: EventStream,
 ) -> VerifyResult:
@@ -974,6 +977,9 @@ def _verify_decision(
         engine_rows=request.engine_rows,
         threads=request.threads,
         backend=request.backend,
+        reference_role=request.reference_role.value,
+        limit=request.limit,
+        record_error=unreadable,
     )
     status, fields = verify_decision(job, record, events)
     manifest = run.manifest
@@ -1009,9 +1015,9 @@ def run_verify(
     # -- a decision checkpoint is measured by option scoring --------------------
     # Before anything generative: such a model never generates in use, and the
     # checks below are about generations.
-    decision_record = _decision_record(request.reference)
+    decision_record, unreadable = _decision_record(request.reference)
     if decision_record is not None or request.calibration is not None or request.float_twin:
-        return _verify_decision(request, decision_record, run, events)
+        return _verify_decision(request, decision_record, unreadable, run, events)
 
     # -- did the operator ask for a device litetune knows? ---------------------
     # First, because it costs nothing and everything after it costs minutes: a

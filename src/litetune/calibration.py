@@ -132,13 +132,16 @@ def threshold_reject_target(
     `top` and `forced` are per out-of-scope calibration row: its top
     probability, and whether its top option is the `none_option`, which
     abstains whatever the threshold. When no observed value is high enough, the
-    next float above the highest, so that none answers; when the rows that could
-    answer are already few enough, `-inf`.
+    next float above the highest, so that none answers. When the rows that
+    could answer are already few enough, 0.0: every top probability is at or
+    above it, so every row may answer -- the measured rule's `-inf`, written as
+    a number JSON has. The section is read by a JSON decoder, and `-Infinity`
+    is not JSON.
     """
     allowed = max_answered(len(top), reject_target)
     free = sorted(p for p, f in zip(top, forced, strict=True) if not f)
     if len(free) <= allowed:
-        return -math.inf
+        return 0.0
     for i, value in enumerate(free):
         if i > 0 and value == free[i - 1]:
             continue
@@ -155,18 +158,22 @@ def threshold_error_budget(
 ) -> float | None:
     """The lowest top probability at which the answered in-scope rows err at most `target_error`.
 
-    A stable sort by descending top probability, a running error count over the
-    rows that can answer, and the value of the last prefix within the budget.
-    `None` when no prefix is.
+    Rows by descending top probability, a running error count over the rows that
+    can answer, and the value of the last prefix within the budget. `None` when
+    no prefix is. Rows with the same top probability are taken together, since
+    a threshold at that value answers all of them: counted one at a time, two
+    rows at 0.9, one right and one wrong, gave 0.9 under a 5 % budget and then
+    answered both. A saturated softmax puts many rows at exactly 1.0.
     """
     rows = [(p, ok) for p, ok, f in zip(top, correct, forced, strict=True) if not f]
-    order = sorted(range(len(rows)), key=lambda i: -rows[i][0])
+    rows.sort(key=lambda r: -r[0])
     errors = 0
     found: float | None = None
-    for size, i in enumerate(order, 1):
-        errors += not rows[i][1]
-        if errors / size <= target_error:
-            found = rows[i][0]
+    for size, (value, ok) in enumerate(rows, 1):
+        errors += not ok
+        last_of_its_value = size == len(rows) or rows[size][0] != value
+        if last_of_its_value and errors / size <= target_error:
+            found = value
     return found
 
 

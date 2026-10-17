@@ -75,7 +75,8 @@ def test_rows_sent_to_the_none_option_count_as_rejected():
 
 def test_when_few_enough_could_answer_every_one_may():
     forced = [True] * 95 + [False] * 5
-    assert C.threshold_reject_target([0.5] * 100, forced) == -math.inf
+    # 0.0, not -inf: every probability is at or above it, and it is JSON.
+    assert C.threshold_reject_target([0.5] * 100, forced) == 0.0
 
 
 def test_ties_at_the_top_push_the_threshold_past_them():
@@ -194,3 +195,17 @@ def test_the_refinement_finds_the_minimum_between_grid_points():
     dense = [t * math.exp(i / 2000 - 0.05) for i in range(201)]
     best = min(C.mean_nll(rows, targets, x) for x in dense)
     assert C.mean_nll(rows, targets, t) <= best + 1e-9
+
+
+def test_rows_tied_at_a_value_are_answered_together_in_the_error_budget():
+    """A threshold at 0.9 answers both rows at 0.9, one of them wrong: 50 % error."""
+    top = [0.95, 0.9, 0.9, 0.5]
+    correct = [True, True, False, True]
+    assert C.threshold_error_budget(top, correct, [False] * 4, 0.05) == 0.95
+
+
+def test_a_saturated_softmax_does_not_hide_an_error_at_one():
+    top = [1.0] * 30 + [0.99]
+    correct = [True] * 29 + [False] + [True]
+    threshold = C.threshold_error_budget(top, correct, [False] * 31, 0.01)
+    assert threshold is None
