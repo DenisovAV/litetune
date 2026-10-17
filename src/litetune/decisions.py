@@ -75,7 +75,10 @@ GENERIC_QUESTION = "Which option applies?"
 # would close the user turn early in one renderer and not in the other.
 CONTROL_TEXT = tuple(dict.fromkeys((*TURN_MARKERS, "<end_of_turn>", "<bos>", "<eos>", "<pad>")))
 
-_KEYS = frozenset({"contract_version", "type", "question", "options", "none_option"})
+# The keys a decision has: in `--questions`, in `decision.json`, in the checkpoint's
+# record, and first in the bundle's section, which adds how the options were scored.
+CONTRACT_KEYS = frozenset({"contract_version", "type", "question", "options", "none_option"})
+_KEYS = CONTRACT_KEYS
 
 
 class DecisionError(ValueError):

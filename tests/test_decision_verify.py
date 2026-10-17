@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from litetune import calibration
+from litetune.decision_section import payload_bytes
 from litetune.decision_verify import (
     AGREEMENT_CHECK,
     CALIBRATION_CHECK,
@@ -31,7 +32,6 @@ from litetune.decision_verify import (
     TARGETS_CHECK,
     TWIN_CHECK,
     DecisionVerify,
-    section_bytes,
     unique_lengths,
     verify_decision,
 )
@@ -231,10 +231,14 @@ def test_a_decision_that_scores_alike_on_both_sides_passes(split, tmp_path):
         "options": [{"id": o} for o in OPTIONS],
         "none_option": "none_of_these",
         "scoring": "unique_prefix",
+        "terminator": TERM,
+        "scored_lengths": fields["decision"]["scored_lengths"],
         "temperature": fit["temperature"],
+        "abstain_rule": calibration.C2,
         "abstain_below": fit["abstain_below"],
     }
-    assert fields["decision"]["section"]["bytes"] == len(section_bytes(payload))
+    assert payload["scored_lengths"] == unique_lengths([tokens(o) for o in s["decision"].ids])
+    assert fields["decision"]["section"]["bytes"] == len(payload_bytes(payload))
     assert fields["quality"]["argmax_agreement"] == 1.0
     assert fields["measurements"]["reference"]["accuracy"] == 1.0
     assert fields["cost"]["mode"] == "once"

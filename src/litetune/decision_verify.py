@@ -44,7 +44,7 @@ from litetune import calibration, envs
 from litetune.checks import Check, CheckSet, Outcome
 from litetune.decision_scripts import ENGINE_SCRIPT, REFERENCE_SCRIPT
 from litetune.decision_section import SECTION_NAME, payload_bytes
-from litetune.decisions import CONTRACT_VERSION, Decision, DecisionError, decision_from
+from litetune.decisions import CONTRACT_KEYS, Decision, DecisionError, decision_from
 from litetune.events import EventStream
 from litetune.metrics import paired_difference
 from litetune.storage import hash_file
@@ -336,23 +336,38 @@ def outcome_metrics(
     return out
 
 
-def section_payload(decision: Decision, fit: calibration.Fit) -> dict[str, Any]:
-    """What the bundle carries in its `litetune.decision` section, and flutter_edge_ai reads."""
+def section_payload(
+    decision: Decision,
+    fit: calibration.Fit,
+    scored_lengths: Sequence[int],
+    terminator: str,
+) -> dict[str, Any]:
+    """What the bundle carries in its `litetune.decision` section, for flutter_edge_ai to read.
+
+    The decision as `tune` recorded it, then how its options were scored: each
+    listed option's id followed by `terminator`, on its first `scored_lengths[i]`
+    tokens (the shortest unique prefix, or the whole target where that prefix
+    does not tokenise back to itself), the `none_option` last. The temperature
+    and the threshold were fitted on exactly those scores, so a reader that
+    tokenises the options differently is scoring something else.
+    """
     return {
-        "contract_version": CONTRACT_VERSION,
-        "type": decision.type,
-        "question": decision.question,
-        "options": [option.as_dict() for option in decision.options],
-        "none_option": decision.none_option,
+        **decision.as_dict(),
         "scoring": SCORING,
+        "terminator": terminator,
+        "scored_lengths": list(scored_lengths),
         "temperature": fit.temperature,
+        "abstain_rule": fit.rule,
         "abstain_below": fit.abstain_below,
     }
 
 
-def section_bytes(payload: dict[str, Any]) -> bytes:
-    """The section's bytes, as `bundle` writes them."""
-    return payload_bytes(payload)
+def decision_of_section(payload: dict[str, Any]) -> Decision:
+    """The decision a section payload carries. Raises `DecisionError` naming what is wrong."""
+    return decision_from(
+        {key: value for key, value in payload.items() if key in CONTRACT_KEYS},
+        "the decision section",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +699,7 @@ def verify_decision(
     )
     if fit.rule == calibration.C1:
         state.limitations.append(calibration.C1_NOTE)
-    payload = section_payload(decision, fit)
+    payload = section_payload(decision, fit, lengths, terminator)
     fields["decision"].update(
         {
             "fit": fit.as_dict(),
@@ -694,7 +709,7 @@ def verify_decision(
             "section": {
                 "name": SECTION_NAME,
                 "payload": payload,
-                "bytes": len(section_bytes(payload)),
+                "bytes": len(payload_bytes(payload)),
             },
         }
     )
