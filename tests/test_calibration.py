@@ -131,7 +131,7 @@ def test_noul_and_score_get_a_temperature_and_no_threshold(kind):
 
 def test_the_temperature_is_fitted_on_in_scope_rows_alone():
     rows, targets = _rows_at(1.0, 200)
-    noise = [[50.0, 0.0, 0.0, 0.0, 0.0, 0.0]] * 50
+    noise = [[3.0, 0.0, 0.0, 0.0, 0.0, 0.0]] * 50
     with_noise = C.fit("choice", rows + noise, targets + [5] * 50, none_index=5)
     alone = C.fit(
         "choice",
@@ -158,8 +158,47 @@ def test_calibration_with_no_in_scope_row_is_refused():
 
 
 def test_an_error_budget_nothing_meets_is_refused():
+    # The most confident of ten rows is wrong, so every prefix errs on at least
+    # a tenth; the other nine pull the temperature inside the grid.
+    rows = [[8.0, 0.0]] + [[m, 0.0] for m in (1.0, 1.5, 2.0, 2.5, 3.0, 0.5, 1.2, 2.2, 0.8)]
     with pytest.raises(C.CalibrationError, match="even the most confident row is wrong"):
-        C.fit("choice", [[5.0, 0.0], [5.0, 0.0]], [1, 1], none_index=None)
+        C.fit("choice", rows, [1] + [0] * 9, none_index=None)
+
+
+def test_an_error_budget_with_every_row_on_the_none_option_says_so():
+    # In scope, every row's target a close second to the none_option (index 1),
+    # and a far third that keeps the temperature inside the grid.
+    rows = [[2.0, 2.5, -10.0], [1.0, 1.4, -8.0], [3.0, 3.3, -9.0], [0.5, 1.0, -7.0]]
+    with pytest.raises(C.CalibrationError, match="none_option as its top option"):
+        C.fit("choice", rows, [0, 0, 0, 0], none_index=1)
+
+
+def test_rows_that_rank_their_targets_first_with_room_to_spare_are_refused():
+    # Every target leads by at least 4 nats: the NLL falls all the way to the
+    # bottom of the grid, where every answer reads as certain.
+    rows = [[4.0 + i, 0.0, 0.0] for i in range(30)]
+    with pytest.raises(C.CalibrationError, match="bottom of the grid"):
+        C.fit_temperature(rows, [0] * 30)
+
+
+def test_scores_that_say_nothing_about_the_targets_are_refused():
+    rows = [[float(i % 3), 0.0, 0.0] for i in range(30)]
+    with pytest.raises(C.CalibrationError, match="top of the grid"):
+        C.fit_temperature(rows, [1 if i % 3 else 2 for i in range(30)])
+
+
+def test_rows_that_score_every_option_alike_are_refused():
+    with pytest.raises(C.CalibrationError, match="same at every temperature"):
+        C.fit_temperature([[1.0, 1.0, 1.0]] * 5, [0, 1, 2, 0, 1])
+
+
+def test_out_of_scope_rows_answered_with_certainty_are_refused_not_given_a_threshold_above_one():
+    # Three in-scope rows fit an inside temperature; of five out-of-scope rows
+    # none may answer, and one is read as option 0 with a 60-nat lead.
+    rows = [[2.0, 0.0, 0.0], [0.0, 1.5, 0.0], [1.0, 0.0, 0.3], [0.2, 1.0, 0.0]]
+    outside = [[60.0, 0.0, 0.0], [0.0, 0.0, 2.0], [0.0, 0.0, 3.0], [0.0, 0.0, 1.0], [0.0, 0.0, 2.5]]
+    with pytest.raises(C.CalibrationError, match="above 1.0, which abstains on every input"):
+        C.fit("choice", rows + outside, [0, 1, 0, 0] + [2] * 5, none_index=2)
 
 
 @pytest.mark.parametrize("n", [1, 10, 59, 300])

@@ -168,9 +168,12 @@ DECLARATIONS_NOT_COUNTED = (
 OPTIONS_CHECK = "every option has a training row"
 
 # The one family whose decisions have been trained and scored by option
-# scoring: google/gemma-3-270m-it, on 2026-10-15, on four tasks.
+# scoring: google/gemma-3-270m-it, on 2026-10-15, as four models on three tasks (6 to 151 options).
 DECISION_FAMILY = "gemma-3-text"
 DECISION_MEASURED_MODEL = "google/gemma-3-270m-it"
+
+# Out-of-scope calibration rows below which the threshold rule answers none of them.
+THIN_CALIBRATION_OOS = 10
 
 DECISION_MODEL_UNNAMED = (
     "no --base-model was named, so the model this split trains was not checked. Decisions by "
@@ -195,6 +198,12 @@ DECISION_MODEL_UNMEASURED = (
     f"{DECISION_MEASURED_MODEL} was trained and measured. Its accuracy and cost here are not "
     "measured"
 )
+
+
+def is_measured_decision_model(model: str) -> bool:
+    """Whether `model` names the one model decisions were trained and measured on."""
+    return re.search(r"gemma-?3-270m", hint_for(model).text, re.IGNORECASE) is not None
+
 
 NO_SCOREABILITY_FOR_DECISIONS = (
     "decision rows are measured by scoring each option's log-probability, not by exact match on "
@@ -1665,7 +1674,7 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     if decision is not None:
         if request.base_model is None:
             result.limitation(DECISION_MODEL_UNNAMED)
-        elif not re.search(r"gemma-?3-270m", hint_for(request.base_model).text, re.IGNORECASE):
+        elif not is_measured_decision_model(request.base_model):
             result.limitation(DECISION_MODEL_UNMEASURED.format(model=request.base_model))
         if request.questions is None:
             result.limitation(DECISION_INFERRED.format(question=decision.decision.question))
@@ -1806,6 +1815,15 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         options_check = result.checks.add(_options_check(decision))
         events.check(options_check)
         none_option = decision.decision.none_option
+        if none_option is not None and (
+            0 < (oos_rows := decision.calibration[none_option]) < THIN_CALIBRATION_OOS
+        ):
+            result.limitation(
+                f"the calibration rows hold {oos_rows} out-of-scope row(s); with fewer than "
+                f"{THIN_CALIBRATION_OOS}, the threshold rule lets none of them be answered, so a "
+                "single confidently misread row sets the threshold. Give the calibration split "
+                f"at least {THIN_CALIBRATION_OOS}"
+            )
         if none_option is not None and decision.calibration[none_option] == 0:
             result.limitation(
                 f"no calibration row is labelled {none_option!r}, so `verify` cannot set the "

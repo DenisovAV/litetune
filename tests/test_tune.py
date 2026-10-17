@@ -5164,3 +5164,87 @@ def test_a_decision_split_declared_prerendered_is_refused(tmp_path, request_for,
 
     failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
     assert any("trained runtime_rendered" in c.detail for c in failed)
+
+
+def test_a_decision_for_a_model_with_no_known_rules_is_refused(tmp_path, request_for, trainer):
+    data, decision = _decision_split(tmp_path)
+
+    result = run_tune(
+        request_for(
+            model="meta-llama/Llama-3.2-1B",
+            data=data,
+            decision=decision,
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+        )
+    )
+
+    assert result.outcome is Outcome.FAILED
+    assert any("not a Gemma 3 text model" in c.detail for c in result.checks.checks)
+
+
+def test_a_row_that_is_only_the_suffix_has_no_state_and_is_refused(tmp_path, request_for, trainer):
+    def no_state(rows):
+        prompt = rows[2]["prompt"]
+        rows[2].update(prompt=prompt[prompt.index("\n\nQuestion:") :])
+
+    data, decision = _decision_split(tmp_path, no_state)
+    assert json.loads(data.read_text().splitlines()[2])["prompt"].startswith("\n\nQuestion:")
+
+    result = run_tune(
+        request_for(
+            model=GEMMA_270M, data=data, decision=decision, prompt_mode=PromptMode.RUNTIME_RENDERED
+        )
+    )
+
+    assert result.outcome is Outcome.FAILED
+    assert any("decisions.jsonl:3: the prompt is not" in c.detail for c in result.checks.checks)
+
+
+def test_another_gemma_3_model_trains_a_decision_with_the_unmeasured_limitation(
+    tmp_path, request_for, trainer
+):
+    data, decision = _decision_split(tmp_path)
+
+    other = run_tune(
+        request_for(
+            model="google/gemma-3-1b-it",
+            data=data,
+            decision=decision,
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+        )
+    )
+    measured = run_tune(
+        request_for(
+            model=GEMMA_270M, data=data, decision=decision, prompt_mode=PromptMode.RUNTIME_RENDERED
+        )
+    )
+
+    assert not any(c.outcome is Outcome.FAILED for c in other.checks.checks)
+    assert any(
+        "google/gemma-3-1b-it is a Gemma 3 text model" in text and "not measured" in text
+        for text in other.limitations
+    )
+    assert not any("Gemma 3 text model, the family" in text for text in measured.limitations)
+
+
+def test_tune_reads_decision_json_once(tmp_path, request_for, trainer, monkeypatch):
+    import litetune.tune as tune_module
+
+    data, decision = _decision_split(tmp_path)
+    reads = []
+    real = tune_module.read_questions
+
+    def counting(path):
+        reads.append(path)
+        return real(path)
+
+    monkeypatch.setattr(tune_module, "read_questions", counting)
+
+    result = run_tune(
+        request_for(
+            model=GEMMA_270M, data=data, decision=decision, prompt_mode=PromptMode.RUNTIME_RENDERED
+        )
+    )
+
+    assert result.trained_decision is not None
+    assert reads == [decision]

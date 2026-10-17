@@ -25,6 +25,7 @@ from litetune.decision_section import payload_bytes
 from litetune.decision_verify import (
     AGREEMENT_CHECK,
     CALIBRATION_CHECK,
+    PROMPT_CHECK,
     REFERENCE_CHECK,
     ROWS_CHECK,
     RULE_CHECK,
@@ -32,6 +33,8 @@ from litetune.decision_verify import (
     TARGETS_CHECK,
     TWIN_CHECK,
     DecisionVerify,
+    run_script,
+    summed,
     unique_lengths,
     verify_decision,
 )
@@ -58,11 +61,40 @@ def default_scores(index: int, prompt: str, option: str, ids: list[int]) -> list
 
     A function of the prompt, never of `index`: the two scripts number the same
     row differently, as the real ones do, and a real model sees only the prompt.
+    Every tenth in-scope row is a near miss: the first option scores just above
+    the right one. Rows that are all right with room to spare fit a temperature
+    at the bottom of the grid, which calibration refuses, as it would a real
+    model's.
     """
-    right = label_of(prompt) or "none_of_these"
+    label = label_of(prompt)
+    right = label or "none_of_these"
     number = int(re.search(r"\d+", prompt).group())  # type: ignore[union-attr]
     first = 0.0 if option == right else -2.0 - (number % 5) - 0.1 * len(option)
+    if label is not None and number % 10 == 9 and option != right:
+        first = 0.3 if option == OPTIONS[0] and right != OPTIONS[0] else first
+        if right == OPTIONS[0] and option == OPTIONS[1]:
+            first = 0.3
     return [first] + [-0.01] * (len(ids) - 1)
+
+
+BOS = 2
+
+
+def prompt_ids(prompt: str) -> list[int]:
+    """A stand-in for the runtime's tokenisation of a rendered prompt, without the BOS."""
+    return [ord(c) % 1000 + 3 for c in prompt]
+
+
+def near_miss(prompt: str) -> bool:
+    """Whether `default_scores` answers this row wrong: every tenth in-scope row."""
+    number = int(re.search(r"\d+", prompt).group())  # type: ignore[union-attr]
+    return label_of(prompt) is not None and number % 10 == 9
+
+
+def expected_accuracy(rows: list[dict[str, Any]]) -> float:
+    """`default_scores`'s accuracy on in-scope rows: right except on its near misses."""
+    in_scope = [r for r in rows if r["target"] != "none_of_these"]
+    return sum(not near_miss(r["prompt"]) for r in in_scope) / len(in_scope)
 
 
 @dataclass
@@ -78,6 +110,9 @@ class FakeScoringEnv:
     # Options whose unique prefix "does not round-trip": scored in full, as the
     # runtime script does.
     full_for: set[str] = field(default_factory=set)
+    # How the runtime tokenises a row's prompt. The reference returns the BOS
+    # and then `prompt_ids`, as a chat template that writes the BOS does.
+    prompt_ids_of: Callable[[str], list[int]] = prompt_ids
     specs: list[dict[str, Any]] = field(default_factory=list)
     provisioned: int = 0
 
@@ -112,7 +147,7 @@ class FakeScoringEnv:
                 }
             )
         else:
-            report.update({"device": "cpu", "cache_variant": "position_ids"})
+            report.update({"device": "cpu", "bos_id": BOS, "cache_variant": "position_ids"})
         report.update(self.report_extra)
         with open(spec["out"], "w", encoding="utf-8") as out:
             for row in spec["rows"]:
@@ -126,6 +161,10 @@ class FakeScoringEnv:
                     per = [p[:n] for p, n in zip(per, lengths, strict=True)]
                 rec = {"index": row["index"], "token_scores": per}
                 rec["ms" if engine else "seconds"] = 10.0
+                if engine:
+                    rec["prompt_ids"] = self.prompt_ids_of(row["prompt"])
+                elif row["index"] in spec.get("ids_for", []):
+                    rec["prompt_ids"] = [BOS, *prompt_ids(row["prompt"])]
                 out.write(json.dumps(rec) + "\n")
         Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
         return subprocess.CompletedProcess(argv, self.returncode, "", "fake stderr")
@@ -240,7 +279,8 @@ def test_a_decision_that_scores_alike_on_both_sides_passes(split, tmp_path):
     assert payload["scored_lengths"] == unique_lengths([tokens(o) for o in s["decision"].ids])
     assert fields["decision"]["section"]["bytes"] == len(payload_bytes(payload))
     assert fields["quality"]["argmax_agreement"] == 1.0
-    assert fields["measurements"]["reference"]["accuracy"] == 1.0
+    held = [json.loads(line) for line in s["heldout"].read_text().splitlines()]
+    assert fields["measurements"]["reference"]["accuracy"] == expected_accuracy(held)
     assert fields["cost"]["mode"] == "once"
     assert fields["cost"]["scored_tokens_per_decision"] == sum(
         unique_lengths([tokens(o) for o in s["decision"].ids])
@@ -267,7 +307,11 @@ def test_the_reference_scores_every_calibration_and_heldout_row_and_the_runtime_
     assert len(eng_spec["rows"]) == 5
     assert eng_spec["mode"] == "auto" and eng_spec["targets"] == "unique"
     held = [json.loads(line)["prompt"] for line in s["heldout"].read_text().splitlines()]
-    assert [r["prompt"] for r in eng_spec["rows"]] == held[:5]
+    # Spread through the file, not its first rows: a split keeps the source's
+    # order, and a source grouped by label would give them to one option.
+    picked = [(i * held_n) // 5 for i in range(5)]
+    assert [r["prompt"] for r in eng_spec["rows"]] == [held[i] for i in picked]
+    assert ref_spec["ids_for"] == [calib_n + i for i in picked]
 
 
 def test_a_runtime_that_answers_differently_is_refused(split, tmp_path):
@@ -491,10 +535,13 @@ FAKE_LITERT_LM = r'''
 """A pure-Python stand-in for litert_lm 0.18.0's session API, enough for ENGINE_SCRIPT.
 
 Tokens are special markers, words, or single characters. Scoring is a fixed
-function of the context the session reads. With FAKE_DROPS=1 the session reads
-a prompt prefilled once without its second-to-last token, as LiteRT-LM 0.18.0
-does (#3561), and prefilling its last token again restores it; without it the
-session reads what was prefilled, as an engine with the fix does.
+function of the whole context the session reads. With FAKE_DROPS=1 the session
+reads a prompt prefilled once without its second-to-last token, as LiteRT-LM
+0.18.0 does (#3561), and prefilling its last token again restores it; without
+it the session reads what was prefilled, as an engine with the fix does; with
+FAKE_DROPS=alternate it drops on every other pair of scorings, an engine nobody
+has measured. Scoring an option advances the session past it until a rewind,
+and a rewind needs a saved checkpoint, so the order of the calls matters.
 """
 import os
 import re
@@ -502,6 +549,7 @@ import zlib
 
 _SPECIAL = r"<start_of_turn>|<end_of_turn>|<bos>"
 _WORDS = {}
+_SCORINGS = 0
 
 
 def _ids(text):
@@ -515,7 +563,7 @@ def _ids(text):
 
 
 def true_score(context, token):
-    return -((hash(tuple(context[-3:])) + 31 * token) % 997) / 100.0
+    return -((hash(tuple(context)) + 31 * token) % 997) / 100.0
 
 
 class LogSeverity:
@@ -542,9 +590,23 @@ class _CFunc:
         return 0
 
 
+class _Save:
+    def __call__(self, ptr, name):
+        ptr.saved = True
+        return 0
+
+
+class _Rewind:
+    def __call__(self, ptr, name):
+        if not ptr.saved:
+            return -1
+        ptr.pending = []
+        return 0
+
+
 class _Lib:
-    litert_lm_session_save_checkpoint = _CFunc()
-    litert_lm_session_rewind_to_checkpoint = _CFunc()
+    litert_lm_session_save_checkpoint = _Save()
+    litert_lm_session_rewind_to_checkpoint = _Rewind()
     litert_lm_get_last_error_message = _CFunc()
 
 
@@ -558,7 +620,9 @@ class _Session:
         self.tokens = []
         self.prefills = 0
         self._lib = _Lib()
-        self._ptr = 1
+        self._ptr = self
+        self.pending = []
+        self.saved = False
 
     def __enter__(self):
         return self
@@ -572,8 +636,14 @@ class _Session:
         self.prefills += 1
 
     def _context(self):
+        global _SCORINGS
+        _SCORINGS += 1
         t = self.tokens
-        if os.environ.get("FAKE_DROPS") != "1":
+        drops = os.environ.get("FAKE_DROPS")
+        if drops == "alternate":
+            if ((_SCORINGS - 1) // 2) % 2:
+                return t
+        elif drops != "1":
             return t
         if self.prefills == 1 and len(t) >= 2:
             return t[:-2] + t[-1:]
@@ -582,7 +652,8 @@ class _Session:
         return t
 
     def run_text_scoring(self, texts, store_token_lengths=False):
-        ctx, target = list(self._context()), _ids(texts[0])
+        ctx, target = list(self._context()) + self.pending, _ids(texts[0])
+        self.pending = self.pending + target
         return _Result([true_score(ctx + target[:i], target[i]) for i in range(len(target))])
 
 
@@ -621,7 +692,9 @@ class Engine:
 '''
 
 
-def _run_engine_script(tmp_path, drops: bool, prompts, options, mode="auto"):
+def _run_engine_script(
+    tmp_path, drops: bool | str, prompts, options, mode="auto", fake_source=FAKE_LITERT_LM
+):
     import os
     import sys
 
@@ -629,7 +702,7 @@ def _run_engine_script(tmp_path, drops: bool, prompts, options, mode="auto"):
 
     fake = tmp_path / "fake"
     fake.mkdir(exist_ok=True)
-    (fake / "litert_lm.py").write_text(FAKE_LITERT_LM, encoding="utf-8")
+    (fake / "litert_lm.py").write_text(fake_source, encoding="utf-8")
     script = tmp_path / "engine.py"
     script.write_text(ENGINE_SCRIPT, encoding="utf-8")
     spec = tmp_path / "spec.json"
@@ -650,7 +723,8 @@ def _run_engine_script(tmp_path, drops: bool, prompts, options, mode="auto"):
         ),
         encoding="utf-8",
     )
-    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_DROPS="1" if drops else "0")
+    drops_value = drops if isinstance(drops, str) else "1" if drops else "0"
+    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_DROPS=drops_value)
     proc = subprocess.run(
         [sys.executable, str(script), str(spec)], env=env, capture_output=True, text=True
     )
@@ -827,7 +901,7 @@ def test_the_reference_scores_of_heldout_rows_are_the_ones_measured(split, tmp_p
     in_scope = [r for r in held if r["target"] != "none_of_these"]
     assert fields["measurements"]["reference"]["rows"] == len(held)
     assert fields["measurements"]["reference"]["in_scope_rows"] == len(in_scope)
-    assert fields["measurements"]["reference"]["accuracy"] == 1.0
+    assert fields["measurements"]["reference"]["accuracy"] == expected_accuracy(held)
 
 
 # ---------------------------------------------------------------------------
@@ -862,9 +936,11 @@ def test_options_scored_in_full_on_the_runtime_are_scored_in_full_on_both_sides(
 
     def tail_heavy(index, prompt, option, ids):
         base = default_scores(index, prompt, option, ids)
-        # The tail decides: summed over the unique prefix only, "anger" would win.
+        # The tail decides: summed over the unique prefix only, "anger" would win
+        # every row; summed in full, only its own.
         if option == "anger":
-            return [0.5, *([-30.0] * (len(ids) - 1))]
+            tail = 0.0 if label_of(prompt) == "anger" else -30.0
+            return [0.5, *([tail] * (len(ids) - 1))]
         return base
 
     eng = FakeScoringEnv("runtime", scores=tail_heavy, full_for={"anger"})
@@ -874,6 +950,7 @@ def test_options_scored_in_full_on_the_runtime_are_scored_in_full_on_both_sides(
 
     status, fields = run(job, s["record"])
 
+    assert "scored_lengths" in fields["decision"], fields["checks"]
     lengths = fields["decision"]["scored_lengths"]
     anger = s["decision"].ids.index("anger")
     assert lengths[anger] == len(tokens("anger"))
@@ -1005,3 +1082,404 @@ def test_the_reference_checks_its_longest_row_against_the_uncached_scores(split,
     spec = job.train_env.specs[0]
     longest = max(spec["rows"], key=lambda r: len(r["prompt"]))
     assert spec["check_indices"] == [longest["index"]]
+
+
+# ---------------------------------------------------------------------------
+# What the review of 2026-10-17 found
+# ---------------------------------------------------------------------------
+
+
+def failed(fields: dict[str, Any], name: str) -> dict[str, Any]:
+    """The failed check of that name: a refusal can follow a passed one of the same name."""
+    return next(
+        c for c in fields["checks"]["checks"] if c["name"] == name and c["outcome"] == "failed"
+    )
+
+
+def test_summed_refuses_an_option_with_fewer_token_scores_than_its_length():
+    with pytest.raises(ValueError, match="option 0 has 1 token score"):
+        summed([[-1.0], [-2.0, -3.0]], [2, 2])
+
+
+def test_a_reference_that_scored_fewer_tokens_than_the_runtime_is_refused(split, tmp_path):
+    s = split()
+
+    def short_anger(index, prompt, option, ids):
+        base = default_scores(index, prompt, option, ids)
+        return base[:1] if option == "anger" else base
+
+    job = job_for(
+        s,
+        tmp_path,
+        train_env=FakeScoringEnv("train", scores=short_anger),
+        runtime_env=FakeScoringEnv("runtime", full_for={"anger"}),
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "too few tokens" in failed(fields, REFERENCE_CHECK)["detail"]
+
+
+@dataclass
+class ExitingEnv:
+    """A stage environment whose script writes nothing: it exits, times out, or never starts."""
+
+    returncode: int = 1
+    stderr: str = ""
+    raises: BaseException | None = None
+    name: str = "runtime"
+
+    def provision(self, events=None, force: bool = False) -> None:
+        return None
+
+    def run(self, argv, timeout=None, env=None) -> subprocess.CompletedProcess:
+        if self.raises is not None:
+            raise self.raises
+        return subprocess.CompletedProcess(argv, self.returncode, "", self.stderr)
+
+
+def test_a_script_that_dies_before_its_report_says_why():
+    said = "Traceback (most recent call last):\nRuntimeError: Failed to create LiteRT-LM engine"
+    got = run_script(ExitingEnv(stderr=said), "pass", {}, timeout=5, auto_provision=False)
+
+    assert got.failure is not None and got.failure.startswith("the script exited 1:")
+    assert "Failed to create LiteRT-LM engine" in got.failure
+
+
+def test_a_script_that_exits_cleanly_without_a_report_says_so_with_its_stderr():
+    env = ExitingEnv(returncode=0, stderr="a warning on the way out")
+    got = run_script(env, "pass", {}, timeout=5, auto_provision=False)
+
+    assert got.failure == "the script wrote no report: a warning on the way out"
+
+
+def test_a_timeout_keeps_the_end_of_the_scripts_stderr():
+    expired = subprocess.TimeoutExpired(
+        ["python"], 5, stderr=b"RuntimeError: litert_lm_session_rewind_to_checkpoint returned 3"
+    )
+    got = run_script(ExitingEnv(raises=expired), "pass", {}, timeout=5, auto_provision=False)
+
+    assert got.failure is not None and got.failure.startswith("no result after 5 s (timeout): ")
+    assert "rewind_to_checkpoint returned 3" in got.failure
+
+
+def test_a_script_that_cannot_start_is_a_failure_not_an_exception():
+    missing = FileNotFoundError(2, "No such file or directory", "python")
+    got = run_script(ExitingEnv(raises=missing), "pass", {}, timeout=5, auto_provision=False)
+
+    assert got.failure is not None
+    assert got.failure.startswith("the script could not be started: FileNotFoundError")
+
+
+@pytest.mark.parametrize("which", ["model", "float_twin"])
+def test_a_missing_model_or_twin_is_refused_before_the_reference_runs(split, tmp_path, which):
+    s = split()
+    job = job_for(s, tmp_path, **{which: tmp_path / "nowhere.litertlm"})
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "is not a file" in failed(fields, RUNTIME_CHECK)["detail"]
+    assert job.train_env.specs == [], "the reference never ran"
+
+
+def test_both_sides_scoring_the_same_prompts_is_a_passed_check(split, tmp_path):
+    s = split()
+
+    status, fields = run(job_for(s, tmp_path), s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert check(fields, PROMPT_CHECK)["outcome"] == "passed"
+
+
+@pytest.mark.parametrize(
+    "tokenised",
+    [
+        lambda p: [BOS, *prompt_ids(p)],
+        lambda p: [],
+        lambda p: prompt_ids(p + " "),
+    ],
+    ids=["a second BOS", "an empty render", "another text"],
+)
+def test_a_runtime_that_scores_another_prompt_is_refused(split, tmp_path, tokenised):
+    s = split()
+    eng = FakeScoringEnv("runtime", prompt_ids_of=tokenised)
+
+    status, fields = run(job_for(s, tmp_path, runtime_env=eng), s["record"])
+
+    assert status == "failed_harness"
+    assert "is not the reference's" in failed(fields, PROMPT_CHECK)["detail"]
+
+
+def test_the_runtime_script_refuses_a_prompt_rendered_as_empty_text(tmp_path):
+    empty = FAKE_LITERT_LM.replace(
+        'return "<start_of_turn>user\\n" + prompt + "<end_of_turn>\\n<start_of_turn>model\\n"',
+        'return ""',
+    )
+    assert empty != FAKE_LITERT_LM
+
+    proc, rows, _ = _run_engine_script(
+        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_source=empty
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert [r.get("error") for r in rows] == ["the runtime rendered the prompt as empty text"]
+
+
+def test_the_runtime_script_returns_each_rows_prompt_ids(tmp_path):
+    import importlib.util
+
+    proc, rows, _ = _run_engine_script(tmp_path, True, ["text 1 about joy"], OPTIONS)
+
+    spec = importlib.util.spec_from_file_location("fake_ids", tmp_path / "fake" / "litert_lm.py")
+    fake = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fake)
+    rendered = "<start_of_turn>user\ntext 1 about joy<end_of_turn>\n<start_of_turn>model\n"
+    assert proc.returncode == 0, proc.stderr
+    assert rows[0]["prompt_ids"] == fake._ids(rendered)
+
+
+def test_a_threshold_that_answers_no_in_scope_row_fails_the_rule(split, tmp_path):
+    s = split()
+
+    def confident_outside(index, prompt, option, ids):
+        base = default_scores(index, prompt, option, ids)
+        if label_of(prompt) is None:
+            # Out of scope, read as "joy" by more than any in-scope row leads.
+            return [0.0 if option == "joy" else -9.0] + base[1:]
+        return base
+
+    job = job_for(
+        s,
+        tmp_path,
+        train_env=FakeScoringEnv("train", scores=confident_outside),
+        runtime_env=FakeScoringEnv("runtime", scores=confident_outside),
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert fields["decision"]["fit"]["abstain_below"] <= 1.0
+    assert fields["measurements"]["reference"]["answered"] == 0
+    assert "would answer nothing" in failed(fields, RULE_CHECK)["detail"]
+    assert status == "failed_gate"
+
+
+def test_fewer_than_ten_out_of_scope_calibration_rows_are_said_to_set_the_threshold(
+    split, tmp_path
+):
+    s = split(oos=12)
+
+    status, fields = run(job_for(s, tmp_path), s["record"])
+
+    out_of_scope = fields["decision"]["fit"]["out_of_scope_rows"]
+    assert 0 < out_of_scope < 10
+    assert any("most confidently misread one" in text for text in fields["limitations"])
+
+
+def test_enough_out_of_scope_calibration_rows_are_not_called_thin(split, tmp_path):
+    s = split(oos=80)
+
+    _, fields = run(job_for(s, tmp_path), s["record"])
+
+    assert fields["decision"]["fit"]["out_of_scope_rows"] >= 10
+    assert not any("most confidently misread one" in text for text in fields["limitations"])
+
+
+def test_a_recorded_decision_without_its_digest_is_refused(split, tmp_path):
+    s = split()
+    record = {k: v for k, v in s["record"].items() if k != "decision_sha256"}
+
+    status, fields = run(job_for(s, tmp_path), record)
+
+    assert status == "failed_harness"
+    assert "a record without its digest" in failed(fields, ROWS_CHECK)["detail"]
+
+
+def test_the_reference_runs_where_litetune_device_says(split, tmp_path):
+    s = split()
+    job = job_for(s, tmp_path, device="cpu")
+
+    run(job, s["record"])
+
+    assert job.train_env.specs[0]["device"] == "cpu"
+
+
+def test_a_heldout_error_clearly_over_the_budget_fails_the_rule(split, tmp_path):
+    s = split(with_none=False)
+    held = {json.loads(line)["prompt"] for line in s["heldout"].read_text().splitlines()}
+
+    def wrong_on_heldout(index, prompt, option, ids):
+        if prompt in held:
+            right = label_of(prompt)
+            wrong = "anger" if right == "joy" else "joy"
+            return [0.0 if option == wrong else -9.0] + [-0.01] * (len(ids) - 1)
+        return default_scores(index, prompt, option, ids)
+
+    job = job_for(
+        s,
+        tmp_path,
+        train_env=FakeScoringEnv("train", scores=wrong_on_heldout),
+        runtime_env=FakeScoringEnv("runtime", scores=wrong_on_heldout),
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert fields["decision"]["fit"]["rule"] == calibration.C1
+    assert failed(fields, RULE_CHECK)["outcome"] == "failed"
+    assert status == "failed_gate"
+
+
+def test_a_failed_gate_outranks_an_unchecked_twin(split, tmp_path):
+    s = split()
+
+    def swapped(index, prompt, option, ids):
+        right = label_of(prompt) or "none_of_these"
+        wrong = "anger" if right == "joy" else "joy"
+        return [0.0 if option == wrong else -5.0] + [-0.01] * (len(ids) - 1)
+
+    eng = FakeScoringEnv(
+        "runtime", scores=swapped, report_extra={"runtime": {"litert-lm": "0.19.0"}}
+    )
+
+    status, fields = run(job_for(s, tmp_path, runtime_env=eng), s["record"])
+
+    assert check(fields, AGREEMENT_CHECK)["outcome"] == "failed"
+    assert check(fields, TWIN_CHECK)["outcome"] == "could_not_check"
+    assert status == "failed_gate"
+
+
+def test_scored_lengths_shorter_than_the_unique_prefix_are_refused(split, tmp_path):
+    s = split()
+    eng = FakeScoringEnv("runtime", report_extra={"scored_lengths": [0, 0, 0, 0]})
+
+    status, fields = run(job_for(s, tmp_path, runtime_env=eng), s["record"])
+
+    assert status == "failed_harness"
+    assert "unusable scored lengths" in failed(fields, TARGETS_CHECK)["detail"]
+
+
+def test_a_self_check_that_sees_both_behaviours_refuses(tmp_path):
+    proc, rows, report = _run_engine_script(
+        tmp_path, "alternate", ["text 1 about joy"], ("joy", "anger")
+    )
+
+    assert proc.returncode == 3, (proc.stdout, proc.stderr, report)
+    assert report["selfcheck"]["verdict"] == "mixed"
+    assert rows == []
+
+
+# -- through run_verify ---------------------------------------------------------------
+
+
+def _checkpoint(tmp_path, record) -> Path:
+    cp = tmp_path / "checkpoint"
+    cp.mkdir(exist_ok=True)
+    (cp / "litetune.json").write_text(json.dumps(record), encoding="utf-8")
+    return cp
+
+
+@pytest.mark.parametrize("flag", ["calibration", "float_twin"])
+def test_decision_flags_for_a_checkpoint_without_a_decision_are_refused(split, tmp_path, flag):
+    from litetune.verify import VerifyRequest, run_verify
+
+    s = split()
+    cp = _checkpoint(tmp_path, {"base_model": "google/gemma-3-270m-it"})
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"bundle")
+    value = s["calibration"] if flag == "calibration" else tmp_path / "twin.litertlm"
+
+    result = run_verify(
+        VerifyRequest(model=model, reference=str(cp), data=s["heldout"], **{flag: value})
+    )
+
+    assert result.manifest["scorer"]["name"] == "option-scoring"
+    assert result.status.value == "failed_harness"
+    details = [c["detail"] for c in result.manifest["checks"]["checks"]]
+    assert any("records no decision" in d for d in details)
+
+
+def test_run_verify_hands_every_decision_field_to_the_decision_path(tmp_path, monkeypatch):
+    import litetune.decision_verify as dv
+    from litetune.verify import ReferenceRole, VerifyRequest, run_verify
+
+    seen = {}
+
+    def capture(job, record, events):
+        seen["job"] = job
+        return "failed_harness", {"scorer": {"name": "option-scoring"}, "limitations": []}
+
+    monkeypatch.setattr(dv, "verify_decision", capture)
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    cp = _checkpoint(tmp_path, {"decision": {"question": "Q?", "options": [{"id": "a"}]}})
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"bundle")
+
+    run_verify(
+        VerifyRequest(
+            model=model,
+            reference=str(cp),
+            data=tmp_path / "heldout.jsonl",
+            calibration=tmp_path / "calibration.jsonl",
+            float_twin=tmp_path / "twin.litertlm",
+            engine_rows=7,
+            threads=8,
+            backend="gpu",
+            reference_role=ReferenceRole("untuned_base"),
+            limit=10,
+        )
+    )
+
+    job = seen["job"]
+    assert job.float_twin == tmp_path / "twin.litertlm"
+    assert (job.engine_rows, job.threads, job.backend) == (7, 8, "gpu")
+    assert (job.reference_role, job.limit) == ("untuned_base", 10)
+    assert (job.device, job.device_error, job.not_applicable) == ("cpu", None, ())
+
+
+def test_verify_flags_a_decision_does_not_use_are_refused_by_name(split, tmp_path):
+    from litetune.verify import VerifyRequest, run_verify
+
+    s = split()
+    cp = _checkpoint(tmp_path, s["record"])
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"bundle")
+
+    result = run_verify(
+        VerifyRequest(
+            model=model,
+            reference=str(cp),
+            data=s["heldout"],
+            calibration=s["calibration"],
+            scorer="exact-text",
+            max_conversion_cost=0.0,
+        )
+    )
+
+    assert result.status.value == "failed_harness"
+    detail = next(
+        c["detail"] for c in result.manifest["checks"]["checks"] if c["outcome"] == "failed"
+    )
+    assert "--scorer, --max-conversion-cost do(es) not apply" in detail
+
+
+def test_a_litetune_device_litetune_does_not_accept_stops_a_decision_run(
+    split, tmp_path, monkeypatch
+):
+    from litetune.verify import VerifyRequest, run_verify
+
+    s = split()
+    cp = _checkpoint(tmp_path, s["record"])
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"bundle")
+    monkeypatch.setenv("LITETUNE_DEVICE", "gpu")
+
+    result = run_verify(
+        VerifyRequest(
+            model=model, reference=str(cp), data=s["heldout"], calibration=s["calibration"]
+        )
+    )
+
+    assert result.status.value == "failed_harness"
+    details = [c["detail"] for c in result.manifest["checks"]["checks"]]
+    assert any("verification was not attempted" in d and "LITETUNE_DEVICE" in d for d in details)

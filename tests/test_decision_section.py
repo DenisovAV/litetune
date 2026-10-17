@@ -29,6 +29,8 @@ from litetune.decision_section import (
     payload_bytes,
     write_section,
 )
+from litetune.decision_verify import SCORER, decision_of_section
+from litetune.events import EventStream
 
 TOY_BUILDER = r"""
 import json
@@ -225,6 +227,10 @@ class ShimEnv:
         )
 
 
+def sha_of(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def sections_of(bundle: Path) -> list[dict]:
     raw = bundle.read_bytes()
     end = struct.unpack("<Q", raw[24:32])[0]
@@ -363,6 +369,7 @@ def test_a_decision_bundle_carries_the_section_in_its_copy_and_says_how_to_call_
             contract=a_contract(),
             decision=PAYLOAD,
             section_env=ShimEnv(shim),
+            verified_sha256=sha_of(model),
         )
     )
 
@@ -426,16 +433,24 @@ def test_a_bundle_carries_declarations_or_a_decision(tmp_path, declarations, dec
         )
 
 
-def _decision_manifest(tmp_path, model_sha256: str | None = None) -> Path:
+def _decision_manifest(
+    tmp_path, model_sha256: str | None = None, *, status="passed", decision_sha256="payload's"
+) -> Path:
+    """A decision manifest as verify writes it; `decision_sha256=None` leaves the digest out."""
+    if decision_sha256 == "payload's":
+        decision_sha256 = decision_of_section(PAYLOAD).digest()
     path = tmp_path / "manifest.json"
     path.write_text(
         json.dumps(
             {
                 "schema": "litetune.verify/1",
-                "status": "passed",
+                "status": status,
                 "model": {"sha256": model_sha256} if model_sha256 else {},
-                "scorer": {"name": "option-scoring"},
-                "decision": {"section": {"name": SECTION_NAME, "payload": PAYLOAD}},
+                "scorer": {"name": SCORER},
+                "decision": {
+                    "section": {"name": SECTION_NAME, "payload": PAYLOAD},
+                    **({"decision_sha256": decision_sha256} if decision_sha256 else {}),
+                },
                 "measurements": {
                     "candidate": {
                         "accuracy": 0.9,
@@ -596,6 +611,9 @@ def test_a_decision_bundle_of_another_file_than_the_verified_one_is_refused(toy,
     assert "is not the file verify measured" in section.detail
     report = json.loads((tmp_path / "bundle" / "report.json").read_text())
     assert report["use"] is None, "no call is printed for a file without the section"
+    included = next(c for c in result.checks.checks if c.name == "model included")
+    assert "with the decision section" not in included.detail
+    assert included.observed["bytes"] == model.stat().st_size
 
 
 def test_the_section_is_built_beside_the_artifact_not_in_the_system_temp(toy):
@@ -635,3 +653,493 @@ def test_the_cli_refuses_to_put_a_decision_into_a_file_verify_did_not_measure(
     assert code == 4, out
     assert "is not the file verify measured" in out
     assert "use it with:" not in out
+
+
+# ---------------------------------------------------------------------------
+# What the bundle reports about the file it ships
+# ---------------------------------------------------------------------------
+
+
+class RecordingEvents(EventStream):
+    """An event stream that keeps the checks it was handed, for comparing with the report."""
+
+    def __init__(self) -> None:
+        super().__init__(echo_json=False)
+        self.checks: list = []
+
+    def check(self, check) -> None:
+        self.checks.append(check)
+        super().check(check)
+
+
+def _bundled(tmp_path, shim, model, events=None, **overrides):
+    from litetune.bundle import BundleRequest, build_bundle
+
+    fields = {
+        "output_dir": tmp_path / "bundle",
+        "model": model,
+        "declarations": None,
+        "contract": a_contract(),
+        "decision": PAYLOAD,
+        "section_env": ShimEnv(shim),
+        "verified_sha256": sha_of(model),
+    }
+    return build_bundle(BundleRequest(**{**fields, **overrides}), events=events)
+
+
+def _check(result, name):
+    return next(c for c in result.checks.checks if c.name == name)
+
+
+def _has_section(bundle: Path) -> bool:
+    return any(s["type"] == "GenericBinaryData" for s in sections_of(bundle))
+
+
+def test_the_model_check_counts_the_bytes_after_the_section_in_events_and_report(toy, tmp_path):
+    shim, model = toy
+    events = RecordingEvents()
+
+    result = _bundled(tmp_path, shim, model, events=events)
+
+    shipped = tmp_path / "bundle" / model.name
+    size = shipped.stat().st_size
+    assert size != model.stat().st_size, "the section added bytes"
+    included = _check(result, "model included")
+    assert included.observed["bytes"] == size
+    assert included.detail.endswith(", with the decision section")
+    streamed = next(c for c in events.checks if c.name == "model included")
+    assert streamed.observed["bytes"] == size
+    report = json.loads((tmp_path / "bundle" / "report.json").read_text())
+    reported = next(c for c in report["checks"]["checks"] if c["name"] == "model included")
+    assert reported["observed"]["bytes"] == size
+    member = next(m for m in report["members"] if m["name"] == model.name)
+    assert member["bytes"] == size
+    assert member["content_sha256"] == sha_of(shipped)
+
+
+def test_the_bundle_says_the_shipped_file_was_not_scored_again(toy, tmp_path):
+    shim, model = toy
+
+    result = _bundled(tmp_path, shim, model)
+
+    assert any(
+        text.startswith("the shipped .litertlm is the file verify measured with one section added")
+        and "which the LLM runtime does not map" in text
+        and "not measured again on the shipped bytes" in text
+        for text in result.limitations
+    )
+
+
+def test_a_section_that_was_not_written_is_not_claimed_by_the_model_check(toy, tmp_path):
+    shim, model = toy
+    events = RecordingEvents()
+
+    result = _bundled(tmp_path, shim, model, events=events, verified_sha256="sha256:" + "0" * 64)
+
+    assert _check(result, "decision section").outcome.value == "failed"
+    included = _check(result, "model included")
+    assert "with the decision section" not in included.detail
+    streamed = next(c for c in events.checks if c.name == "model included")
+    assert "with the decision section" not in streamed.detail
+    assert not any("not measured again" in text for text in result.limitations)
+    assert not _has_section(tmp_path / "bundle" / model.name)
+
+
+def test_a_manifest_that_records_no_digest_for_its_file_gives_no_section(toy, tmp_path):
+    shim, model = toy
+
+    result = _bundled(tmp_path, shim, model, verified_sha256=None)
+
+    section = _check(result, "decision section")
+    assert section.outcome.value == "failed"
+    assert "records no sha256 for the file it measured" in section.detail
+    assert "belong to that file" in section.detail
+    assert not _has_section(tmp_path / "bundle" / model.name)
+    assert result.status.value == "failed_harness"
+
+
+@pytest.mark.parametrize("status", ["failed_gate", "failed_harness"])
+def test_a_decision_whose_verify_failed_is_not_given_its_section(toy, tmp_path, status):
+    from litetune.manifest import RunStatus
+
+    shim, model = toy
+
+    result = _bundled(tmp_path, shim, model, status=RunStatus(status))
+
+    section = _check(result, "decision section")
+    assert section.outcome.value == "failed"
+    assert f"verify's status is {status}" in section.detail
+    assert "createDecider would refuse the file" in section.detail
+    assert not _has_section(tmp_path / "bundle" / model.name)
+    report = json.loads((tmp_path / "bundle" / "report.json").read_text())
+    assert report["use"] is None
+    assert "with the decision section" not in _check(result, "model included").detail
+
+
+def test_an_inconclusive_verify_still_gets_its_section(toy, tmp_path):
+    from litetune.manifest import RunStatus
+
+    shim, model = toy
+
+    result = _bundled(tmp_path, shim, model, status=RunStatus.INCONCLUSIVE)
+
+    assert _check(result, "decision section").outcome.value == "passed"
+    assert _has_section(tmp_path / "bundle" / model.name)
+
+
+def test_a_decision_bundle_does_not_miss_the_untuned_base_it_never_measures(toy, tmp_path):
+    shim, model = toy
+    point = {"accuracy": 0.9}
+
+    result = _bundled(
+        tmp_path, shim, model, measurements={"tuned_float": point, "tuned_converted": point}
+    )
+
+    assert result.missing_measurements == []
+    assert not any("base_float" in text for text in result.limitations)
+    assert result.coverage is not None and result.coverage.outcome.value == "passed"
+
+
+def test_a_decision_bundle_still_says_when_a_point_it_does_measure_is_missing(toy, tmp_path):
+    shim, model = toy
+
+    result = _bundled(tmp_path, shim, model, measurements={"tuned_converted": {"accuracy": 0.9}})
+
+    assert result.missing_measurements == ["tuned_float"]
+    assert any("'tuned_float'" in text for text in result.limitations)
+
+
+def test_an_empty_decision_payload_is_refused_at_the_request(tmp_path):
+    from litetune.bundle import BundleError, BundleRequest
+
+    with pytest.raises(BundleError, match="decision section is empty"):
+        BundleRequest(
+            output_dir=tmp_path / "bundle",
+            model=tmp_path / "m.litertlm",
+            declarations=None,
+            contract=a_contract(),
+            decision={},
+        )
+
+
+def test_a_contract_that_already_holds_a_decision_is_refused(toy, tmp_path):
+    from dataclasses import replace
+
+    from litetune.bundle import BundleError
+
+    shim, model = toy
+    contract = replace(a_contract(), decision={"section": SECTION_NAME})
+
+    with pytest.raises(BundleError, match="contract already holds a decision section"):
+        _bundled(tmp_path, shim, model, contract=contract)
+    assert not (tmp_path / "bundle").exists(), "refused before anything was written"
+
+
+# ---------------------------------------------------------------------------
+# The CLI's cross-checks of the decision it was handed
+# ---------------------------------------------------------------------------
+
+
+def _patch_section_env(monkeypatch, shim):
+    from litetune import envs
+
+    runner = ShimEnv(shim)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", lambda self, argv, timeout=None, env=None: runner.run(argv, timeout)
+    )
+    monkeypatch.setattr(envs.StageEnv, "provision", lambda self, events=None, force=False: None)
+
+
+def test_the_cli_gives_a_manifest_with_no_model_digest_no_section(
+    toy, tmp_path, monkeypatch, capsys
+):
+    from litetune.cli import main
+
+    shim, model = toy
+    _patch_section_env(monkeypatch, shim)
+
+    code = main(_bundle_argv(tmp_path, model, _decision_manifest(tmp_path)))
+
+    out = capsys.readouterr().out
+    assert code == 4, out
+    assert "records no sha256 for the file it measured" in out
+    assert "use it with:" not in out
+    assert not _has_section(tmp_path / "bundle" / model.name)
+
+
+def test_the_cli_gives_a_failed_verify_no_section_and_prints_no_call(
+    toy, tmp_path, monkeypatch, capsys
+):
+    from litetune.cli import main
+
+    shim, model = toy
+    _patch_section_env(monkeypatch, shim)
+    manifest = _decision_manifest(tmp_path, sha_of(model), status="failed_gate")
+
+    code = main(_bundle_argv(tmp_path, model, manifest))
+
+    out = capsys.readouterr().out
+    assert code != 0, out
+    assert "verify's status is failed_gate" in out
+    assert "use it with:" not in out
+    assert not _has_section(tmp_path / "bundle" / model.name)
+
+
+def test_the_cli_refuses_a_decision_for_a_model_that_was_not_trained_runtime_rendered(
+    toy, tmp_path, capsys
+):
+    from litetune.cli import main
+
+    _, model = toy
+    manifest = _decision_manifest(tmp_path, sha_of(model))
+
+    code = main(_bundle_argv(tmp_path, model, manifest, "--prompt-mode", "prerendered"))
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert "prompt mode is prerendered" in err
+    assert "tune trains a decision only in runtime_rendered" in err
+    assert not (tmp_path / "bundle").exists()
+
+
+def test_the_cli_refuses_a_section_whose_decision_is_not_the_one_the_manifest_names(
+    toy, tmp_path, capsys
+):
+    from litetune.cli import main
+
+    _, model = toy
+    other = "sha256:" + "1" * 64
+    manifest = _decision_manifest(tmp_path, sha_of(model), decision_sha256=other)
+
+    code = main(_bundle_argv(tmp_path, model, manifest))
+
+    assert code == 4
+    err = capsys.readouterr().err
+    digest = decision_of_section(PAYLOAD).digest()
+    assert digest in err and other in err and "the verify manifest" in err
+    assert not (tmp_path / "bundle").exists()
+
+
+def test_the_cli_refuses_a_section_whose_decision_is_not_the_one_the_run_trained(
+    toy, tmp_path, capsys
+):
+    from litetune.cli import main
+
+    _, model = toy
+    digest = decision_of_section(PAYLOAD).digest()
+    manifest = _decision_manifest(tmp_path, sha_of(model), decision_sha256=digest)
+    other = "sha256:" + "2" * 64
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text(
+        json.dumps({"prompt_mode": "runtime_rendered", "decision_sha256": other}),
+        encoding="utf-8",
+    )
+
+    code = main(_bundle_argv(tmp_path, model, manifest, "--train-metrics", str(metrics)))
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert digest in err and other in err and str(metrics) in err
+
+
+def test_the_cli_refuses_a_decision_manifest_that_records_no_digest(toy, tmp_path, capsys):
+    from litetune.cli import main
+
+    _, model = toy
+    manifest = _decision_manifest(tmp_path, sha_of(model), decision_sha256=None)
+
+    code = main(_bundle_argv(tmp_path, model, manifest))
+
+    assert code == 4
+    assert "the verify manifest records no decision digest" in capsys.readouterr().err
+    assert not (tmp_path / "bundle").exists()
+
+
+def test_the_cli_refuses_metrics_from_a_run_that_trained_no_decision(toy, tmp_path, capsys):
+    from litetune.cli import main
+
+    _, model = toy
+    manifest = _decision_manifest(tmp_path, sha_of(model))
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text(
+        json.dumps({"prompt_mode": "runtime_rendered", "decision_sha256": None}),
+        encoding="utf-8",
+    )
+
+    code = main(_bundle_argv(tmp_path, model, manifest, "--train-metrics", str(metrics)))
+
+    assert code == 4
+    assert f"{metrics} records no decision digest" in capsys.readouterr().err
+
+
+def test_the_cli_bundles_a_decision_whose_digests_all_agree(toy, tmp_path, monkeypatch, capsys):
+    from litetune.cli import main
+
+    shim, model = toy
+    _patch_section_env(monkeypatch, shim)
+    digest = decision_of_section(PAYLOAD).digest()
+    manifest = _decision_manifest(tmp_path, sha_of(model), decision_sha256=digest)
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text(
+        json.dumps({"prompt_mode": "runtime_rendered", "decision_sha256": digest}),
+        encoding="utf-8",
+    )
+
+    code = main(_bundle_argv(tmp_path, model, manifest, "--train-metrics", str(metrics)))
+
+    assert code == 0, capsys.readouterr().out
+    assert _has_section(tmp_path / "bundle" / model.name)
+
+
+def test_a_decision_manifest_with_no_section_is_refused_with_a_sentence(toy, tmp_path, capsys):
+    from litetune.cli import main
+
+    _, model = toy
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": "litetune.verify/1",
+                "status": "failed_harness",
+                "model": {},
+                "scorer": {"name": SCORER},
+                "decision": {"decision": {"question": "Q?"}},
+                "limitations": [],
+            }
+        )
+    )
+
+    code = main(_bundle_argv(tmp_path, model, manifest))
+
+    assert code == 4
+    assert "carries no decision section" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# The section script
+# ---------------------------------------------------------------------------
+
+_ITEMS = '[{"key": e["key"], "value": e["value"]} for e in s.get("additional_metadata", [])]'
+TOY_LOSSY = TOY_BUILDER.replace(
+    f"        items = {_ITEMS}",
+    f'        items = [] if s["section_type"] == "TFLiteModel" else {_ITEMS}',
+)
+
+
+def test_a_rebuild_that_loses_a_sections_metadata_is_refused_by_the_round_trip(toy):
+    assert TOY_LOSSY != TOY_BUILDER
+    shim, bundle = toy
+    (shim / "litert_lm_builder" / "litertlm_builder.py").write_text(TOY_LOSSY)
+    original = bundle.read_bytes()
+
+    written = write_section(bundle, PAYLOAD, env=ShimEnv(shim))
+
+    assert not written.written
+    assert "unpacks to something else" in str(written.reason)
+    assert bundle.read_bytes() == original
+
+
+@pytest.mark.parametrize("size", [16, 30])
+def test_a_file_cut_inside_its_header_gets_the_cut_file_sentence_not_a_struct_error(toy, size):
+    shim, bundle = toy
+    bundle.write_bytes(bundle.read_bytes()[:size])
+
+    written = write_section(bundle, PAYLOAD, env=ShimEnv(shim))
+
+    assert not written.written
+    assert "cut short inside its header" in str(written.reason)
+    assert "struct" not in str(written.reason)
+
+
+def test_the_script_reads_the_header_end_where_the_builders_constant_says(toy):
+    shim, bundle = toy
+    real = struct.unpack("<Q", bundle.read_bytes()[24:32])[0]
+    # The toy's bytes 16..24 are zero, so a script that reads where the builder
+    # says reads a header end of 0; one that reads a literal 24 reads `real`.
+    (shim / "litert_lm_builder" / "litertlm_core.py").write_text(
+        "HEADER_END_LOCATION_BYTE_OFFSET = 16\n"
+    )
+
+    written = write_section(bundle, PAYLOAD, env=ShimEnv(shim))
+
+    assert written.report["header_end_before"] == 0 != real
+
+
+class RaisingEnv:
+    name = "export"
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def provision(self, events=None, force: bool = False):
+        return None
+
+    def run(self, argv, timeout=None, env=None):
+        raise self.error
+
+
+def test_a_timeout_keeps_the_end_of_the_childs_stderr(tmp_path):
+    stderr = "x" * 5000 + "\nthe last thing it said"
+    env = RaisingEnv(subprocess.TimeoutExpired(["python"], 7, stderr=stderr))
+
+    written = write_section(tmp_path / "m.litertlm", PAYLOAD, env=env, timeout=7)
+
+    assert not written.written
+    assert "no result after 7 s (timeout)" in str(written.reason)
+    assert "the last thing it said" in str(written.reason)
+    assert len(str(written.reason)) < 2300, "the tail is bounded"
+
+
+def test_a_timeout_with_stderr_as_bytes_keeps_it_too(tmp_path):
+    env = RaisingEnv(subprocess.TimeoutExpired(["python"], 7, stderr=b"unpacking\n"))
+
+    written = write_section(tmp_path / "m.litertlm", PAYLOAD, env=env)
+
+    assert "unpacking" in str(written.reason)
+
+
+def test_a_missing_interpreter_is_a_failed_write_not_an_exception(tmp_path):
+    env = RaisingEnv(FileNotFoundError(2, "No such file or directory", "python"))
+
+    written = write_section(tmp_path / "m.litertlm", PAYLOAD, env=env)
+
+    assert not written.written
+    assert "could not be started" in str(written.reason)
+    assert "FileNotFoundError" in str(written.reason)
+
+
+# ---------------------------------------------------------------------------
+# The Dart call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "literal"),
+    [
+        ("café", "'caf\\u{E9}'"),
+        ("a b", "'a\\u{2028}b'"),
+        ("a\nb", "'a\\u{A}b'"),
+        ("\U0001f600", "'\\u{1F600}'"),
+        ("it's $5 \\", "'it\\'s \\$5 \\\\'"),
+    ],
+)
+def test_a_character_that_is_not_printable_ascii_is_written_as_a_dart_code_point(text, literal):
+    assert dart_string(text) == literal
+
+
+def test_the_printed_call_survives_splitlines_whatever_the_ids_hold():
+    payload = {
+        "options": [
+            {"id": "café", "description": "a b"},
+            {"id": "x y\u0085z"},
+        ]
+    }
+
+    call = dart_call(payload)
+
+    assert call.isascii()
+    assert call.splitlines() == [
+        "final decider = await model.createDecider(",
+        "  options: [DeciderOption('caf\\u{E9}'), DeciderOption('x\\u{2028}y\\u{85}z')],",
+        ");",
+    ]

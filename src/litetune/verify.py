@@ -40,6 +40,7 @@ from typing import Any
 
 from litetune import envs, metrics, models
 from litetune.checks import Check, CheckSet, Outcome, guard
+from litetune.decision_verify import DEFAULT_ENGINE_ROWS, DEFAULT_THREADS
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
 from litetune.devices import DEVICE_VARIABLE, DeviceSettingError, device_setting
 from litetune.evaluate import (
@@ -235,8 +236,8 @@ class VerifyRequest:
     # the runtime scores; and the runtime's CPU threads.
     calibration: Path | None = None
     float_twin: Path | None = None
-    engine_rows: int = 200
-    threads: int = 4
+    engine_rows: int = DEFAULT_ENGINE_ROWS
+    threads: int = DEFAULT_THREADS
 
 
 @dataclass(frozen=True)
@@ -968,6 +969,26 @@ def _verify_decision(
 ) -> VerifyResult:
     from litetune.decision_verify import DecisionVerify, verify_decision
 
+    # What a generative run reads and this one does not: refused by name rather
+    # than dropped, so that no manifest records a gate or a mode nobody applied.
+    not_applicable = tuple(
+        flag
+        for flag, given in (
+            ("--scorer", request.scorer != VerifyRequest.scorer),
+            ("--max-conversion-cost", request.max_conversion_cost is not None),
+            ("--prompt-mode", request.prompt_mode is not None),
+            ("--contract", request.contract is not None),
+            ("--declarations", request.declarations is not None),
+            ("--max-tokens", request.decode != GREEDY),
+            ("the liveness thresholds", request.thresholds != DEFAULT_THRESHOLDS),
+        )
+        if given
+    )
+    device, device_error = "auto", None
+    try:
+        device = device_setting(os.environ)
+    except DeviceSettingError as exc:
+        device_error = str(exc)
     job = DecisionVerify(
         model=request.model,
         reference=request.reference,
@@ -979,6 +1000,9 @@ def _verify_decision(
         backend=request.backend,
         reference_role=request.reference_role.value,
         limit=request.limit,
+        not_applicable=not_applicable,
+        device=device,
+        device_error=device_error,
         record_error=unreadable,
     )
     status, fields = verify_decision(job, record, events)

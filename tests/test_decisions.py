@@ -25,10 +25,11 @@ from litetune.storage import hash_file
 
 FIXTURE = Path(__file__).parent / "fixtures" / "decision-contract-v1.json"
 
-# The fixture is the contract flutter_edge_ai's renderer tests against. A change
-# to it is a change to what both sides render, so it is made on purpose: update
+# The fixture is the contract litetune's renderer tests against, and the one
+# flutter_edge_ai's proposed renderer is to test against. A change to it is a
+# change to what both sides render, so it is made on purpose: update
 # this digest in the same commit, and the contract version with it.
-FIXTURE_SHA256 = "sha256:fc518061b589038e5b0fce7d222f4bb1d8e1fb6b5dbdc20286b55cc328a82e1f"
+FIXTURE_SHA256 = "sha256:bcac6b4fd2f3131b9bb713d9aa5d9270a4dc7707b411985861fa1c7ce552a051"
 
 CASES = json.loads(FIXTURE.read_text(encoding="utf-8"))["cases"]
 
@@ -43,6 +44,11 @@ def test_each_golden_prompt_is_rendered_byte_for_byte(case):
     decision = decision_from(case["questions"], case["name"])
     assert decision.render(case["state"]) == case["prompt"]
     assert decision.answer_for(case["label"], case["name"]) == case["completion"]
+
+
+@pytest.mark.parametrize("case", CASES, ids=[c["name"] for c in CASES])
+def test_each_case_spells_out_the_decision_a_reader_of_the_section_gets(case):
+    assert case["decision"] == decision_from(case["questions"], case["name"]).as_dict()
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c["name"] for c in CASES])
@@ -189,6 +195,42 @@ def test_only_a_choice_question_has_a_none_option(kind):
 def test_a_decision_that_cannot_be_rendered_is_refused_naming_the_field(obj, message):
     with pytest.raises(DecisionError, match=message):
         decision_from(obj, "questions.json")
+
+
+@pytest.mark.parametrize("version", [True, 1.0])
+def test_the_contract_version_must_be_the_int_one(version):
+    with pytest.raises(DecisionError, match="contract_version"):
+        decision_from(
+            {"contract_version": version, "question": "Q?", "options": [{"id": "a"}, {"id": "b"}]},
+            "q",
+        )
+
+
+@pytest.mark.parametrize(
+    "char", ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+)
+def test_a_character_that_splitlines_splits_on_is_a_line_break(char):
+    with pytest.raises(DecisionError, match="more than one line"):
+        decision_from({"question": "Q?", "options": [{"id": f"a{char}b"}, {"id": "b"}]}, "q")
+
+
+def test_a_lone_surrogate_is_refused_naming_it():
+    with pytest.raises(DecisionError, match="lone surrogate U\\+D800"):
+        decision_from({"question": "Q?", "options": [{"id": "a\ud800"}, {"id": "b"}]}, "q")
+
+
+def test_a_control_character_is_refused_naming_it_but_a_tab_is_text():
+    with pytest.raises(DecisionError, match="control character U\\+0007"):
+        decision_from({"question": "Q?", "options": [{"id": "a\x07"}, {"id": "b"}]}, "q")
+    decision = decision_from({"question": "Q?", "options": [{"id": "a\tb"}, {"id": "b"}]}, "q")
+    assert decision.ids == ("a\tb", "b")
+
+
+def test_an_option_id_with_a_colon_and_space_is_refused():
+    with pytest.raises(DecisionError, match="would read the same as an option"):
+        decision_from({"question": "Q?", "options": [{"id": "a: b"}, {"id": "b"}]}, "q")
+    # A colon without the space cannot be mistaken for the separator.
+    assert decision_from({"question": "Q?", "options": [{"id": "a:b"}, {"id": "b"}]}, "q")
 
 
 def test_the_inferred_decision_is_the_sorted_labels_under_the_generic_question():

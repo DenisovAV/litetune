@@ -1,25 +1,28 @@
 """`verify` for a decision checkpoint: option scores on both sides, calibration, the shipped file.
 
-A decision model never generates in use. flutter_edge_ai's `createDecider`
-scores every option's log-probability through the runtime and answers with the
-best one, so that is what this measures, as `decision_scripts.py` describes:
+A decision model never generates in use. flutter_edge_ai's proposed
+`createDecider` (the 2026-10-16 design) is to score every option's
+log-probability through the runtime and answer with the best one, so that is
+what this measures, as `decision_scripts.py` describes:
 - **the reference**, the tuned checkpoint in PyTorch float32, scores every
   option on every calibration and held-out row;
 - **the calibration** (`calibration.py`) is fitted on the reference's
   calibration scores: a temperature, and for Choice the abstain threshold;
-- **the runtime** scores the shipped `.litertlm` on the first `engine_rows`
-  held-out rows, in the mode its self-check picks, and is compared with the
-  reference on the same rows at the same calibration.
+- **the runtime** scores the shipped `.litertlm` on `engine_rows` held-out
+  rows spread through the split, in the mode its self-check picks, and is
+  compared with the reference on the same rows, prompt ids first, at the same
+  calibration.
 
 Scoring the runtime on every row costs too much: at 151 options a decision took
 7.2 s on four threads of a server CPU (measured 2026-10-16), so 3,000 rows
 would take six hours.
 
-**Refused:** a runtime whose answers agree with the reference's on fewer than
-95 % of the rows, a gross-failure check; a float twin whose per-token scores
-differ from the reference's by more than 1e-3 nats; and a Choice question that
-clearly misses its own rule on the held-out rows, by a one-sided 95 %
-Clopper-Pearson bound.
+**Refused:** a runtime that scored another prompt than the reference; a
+runtime whose answers agree with the reference's on fewer than 95 % of the
+rows, a gross-failure check; a float twin whose per-token scores differ from
+the reference's by more than 1e-3 nats; and a Choice question that answers no
+in-scope held-out row, or clearly misses its own rule on them, by a one-sided
+95 % Clopper-Pearson bound.
 
 **The section.** The calibration and the decision travel inside the bundle as
 the `litetune.decision` section; this stage writes its payload into the
@@ -54,8 +57,8 @@ logger = logging.getLogger(__name__)
 SCORER = "option-scoring"
 SCORER_MEANS = (
     "the option whose shortest unique prefix has the highest summed log-probability, as "
-    "flutter_edge_ai's createDecider scores it; a Choice answer abstains below the fitted "
-    "threshold or on the none_option"
+    "flutter_edge_ai's proposed createDecider would score it; a Choice answer abstains below "
+    "the fitted threshold or on the none_option"
 )
 SCORING = "unique_prefix"
 
@@ -83,6 +86,10 @@ TARGETS_CHECK = "both sides score the same targets"
 AGREEMENT_CHECK = "runtime answers agree with the reference"
 TWIN_CHECK = "float twin matches the reference"
 RULE_CHECK = "the abstain rule holds on held-out rows"
+PROMPT_CHECK = "both sides score the same prompts"
+# Below this many out-of-scope calibration rows, the rejection rule lets none of
+# them answer (`calibration.max_answered`), so one row sets the threshold.
+THIN_OUT_OF_SCOPE = 10
 
 NO_TWIN = (
     "no --float-twin was given, so the runtime's per-token scores were not compared with the "
@@ -171,8 +178,17 @@ class ScoreRun:
     errors: dict[int, str] = field(default_factory=dict)
     # Milliseconds per row, as the script measured it.
     ms: dict[int, float] = field(default_factory=dict)
+    # The prompt's token ids, for the rows the script was asked to give them for.
+    prompt_ids: dict[int, list[int]] = field(default_factory=dict)
     report: dict[str, Any] = field(default_factory=dict)
     failure: str | None = None
+
+
+def _tail(text: str | bytes | None, limit: int = 2000) -> str:
+    """The end of a child's stderr, as text: where a Python traceback says what went wrong."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    return (text or "").strip()[-limit:]
 
 
 def run_script(
@@ -204,8 +220,11 @@ def run_script(
         proc = None
         try:
             proc = env.run(["python", str(script), str(spec_path)], timeout=timeout)
-        except subprocess.TimeoutExpired:
-            run.failure = f"no result after {timeout} s (timeout)"
+        except subprocess.TimeoutExpired as expired:
+            said = _tail(expired.stderr)
+            run.failure = f"no result after {timeout} s (timeout)" + (f": {said}" if said else "")
+        except OSError as exc:
+            run.failure = f"the script could not be started: {type(exc).__name__}: {exc}"
         if out.exists():
             for line in out.read_text(encoding="utf-8").splitlines():
                 try:
@@ -216,19 +235,23 @@ def run_script(
                     run.errors[rec["index"]] = str(rec["error"])
                 elif "token_scores" in rec:
                     run.scores[rec["index"]] = rec["token_scores"]
-                    run.ms[rec["index"]] = (
-                        float(rec["ms"]) if "ms" in rec else float(rec.get("seconds", 0.0)) * 1000
-                    )
+                    if "ms" in rec:
+                        run.ms[rec["index"]] = float(rec["ms"])
+                if "prompt_ids" in rec:
+                    run.prompt_ids[rec["index"]] = rec["prompt_ids"]
         if report.exists():
             try:
                 run.report = json.loads(report.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
                 run.failure = run.failure or f"the script's report could not be read: {exc}"
-        elif proc is not None and run.failure is None:
-            run.failure = "the script wrote no report"
+        # A non-zero exit first: a script that died before its report says why
+        # on stderr, and "wrote no report" alone would throw that away.
         if proc is not None and proc.returncode != 0 and run.failure is None:
-            said = run.report.get("error") or (proc.stderr or "").strip()[-2000:]
+            said = run.report.get("error") or _tail(proc.stderr)
             run.failure = f"the script exited {proc.returncode}: {said}"
+        elif proc is not None and not report.exists() and run.failure is None:
+            said = _tail(proc.stderr)
+            run.failure = "the script wrote no report" + (f": {said}" if said else "")
     return run
 
 
@@ -251,8 +274,25 @@ def unique_lengths(cont_ids: Sequence[Sequence[int]]) -> list[int]:
 
 
 def summed(token_scores: Sequence[Sequence[float]], lengths: Sequence[int]) -> list[float]:
-    """Each option's score: its first `lengths[j]` token log-probabilities, summed."""
+    """Each option's score: its first `lengths[j]` token log-probabilities, summed.
+
+    Raises `ValueError` when an option has fewer token scores than its length:
+    a shorter sum is a score for another target.
+    """
+    for j, (t, k) in enumerate(zip(token_scores, lengths, strict=True)):
+        if len(t) < k:
+            raise ValueError(f"option {j} has {len(t)} token score(s), and {k} are scored")
     return [math.fsum(t[:k]) for t, k in zip(token_scores, lengths, strict=True)]
+
+
+def spread(total: int, count: int) -> list[int]:
+    """`count` row indices out of `total`, evenly through them, in order.
+
+    `prepare` keeps the source file's order within a split, and a file grouped
+    by label would give its first rows to one or two options.
+    """
+    count = min(count, total)
+    return [(i * total) // count for i in range(count)]
 
 
 def _not_finite(scores: dict[int, list[list[float]]]) -> int | None:
@@ -391,6 +431,13 @@ class DecisionVerify:
     # than ignored, so a manifest never records a role or a limit nobody applied.
     reference_role: str = "float_twin"
     limit: int | None = None
+    # The other verify flags given that do not apply here, by their CLI names.
+    not_applicable: tuple[str, ...] = ()
+    # Where the reference runs: the operator's LITETUNE_DEVICE ("auto" or
+    # "cpu"); "auto" is CUDA when the training environment's torch reaches one.
+    device: str = "auto"
+    # A LITETUNE_DEVICE litetune does not accept, as `devices.device_setting` said.
+    device_error: str | None = None
     # Why the reference's litetune.json could not be read, when it could not.
     record_error: str | None = None
     train_env: envs.StageEnv = envs.TRAIN
@@ -470,15 +517,25 @@ def verify_decision(
             "--limit does not apply to a decision checkpoint: the reference scores every held-out "
             "row, and --engine-rows sets how many the runtime scores",
         )
+    if job.device_error is not None:
+        return refuse(REFERENCE_CHECK, f"verification was not attempted: {job.device_error}")
+    if job.not_applicable:
+        return refuse(
+            ROWS_CHECK,
+            f"{', '.join(job.not_applicable)} do(es) not apply to a decision checkpoint, which is "
+            "measured by option scoring in the prompt mode tune trained it in, against its own "
+            "reference, and gated on their agreement; refused rather than ignored",
+        )
     try:
         decision = decision_from(record["decision"], "the reference's litetune.json")
     except DecisionError as exc:
         return refuse(ROWS_CHECK, str(exc))
-    if record.get("decision_sha256") not in (None, decision.digest()):
+    if record.get("decision_sha256") != decision.digest():
         return refuse(
             ROWS_CHECK,
             "the reference's litetune.json records a decision whose digest is not its own: "
-            f"{record.get('decision_sha256')} against {decision.digest()}",
+            f"{record.get('decision_sha256')} against {decision.digest()}. `tune --decision` "
+            "records both; a record without its digest was not written by it",
         )
     fields["decision"] = {"decision": decision.as_dict(), "decision_sha256": decision.digest()}
     if decision.type != "choice":
@@ -495,6 +552,13 @@ def verify_decision(
             "a decision checkpoint needs its calibration rows: pass --calibration with the "
             "calibration.jsonl `prepare` wrote beside the held-out split",
         )
+    # Before the reference, which scores every row first and takes minutes.
+    for flag, path in (("--model", job.model), ("--float-twin", job.float_twin)):
+        if path is not None and not Path(path).is_file():
+            return refuse(
+                RUNTIME_CHECK,
+                f"{flag} {path} is not a file; the runtime scores a converted .litertlm",
+            )
     try:
         heldout = read_decision_rows(job.heldout, decision)
         calib = read_decision_rows(job.calibration, decision)
@@ -553,6 +617,11 @@ def verify_decision(
             RUNTIME_CHECK, f"engine_rows is {job.engine_rows}; the runtime has to score a row"
         )
 
+    # The held-out rows the runtime scores, chosen now so that the reference
+    # also returns their prompt's token ids.
+    engine_rows = spread(len(heldout.prompts), job.engine_rows)
+    calib_n = len(calib.prompts)
+
     # -- the reference -----------------------------------------------------------
     prompts = [*calib.prompts, *heldout.prompts]
     # Besides its first rows, the longest: a cache gone wrong past Gemma 3's
@@ -568,6 +637,8 @@ def verify_decision(
             "options": list(decision.ids),
             "terminator": terminator,
             "check_indices": [longest],
+            "ids_for": [calib_n + i for i in engine_rows],
+            "device": job.device,
         },
         timeout=STARTUP_TIMEOUT_S + REFERENCE_ROW_TIMEOUT_S * len(prompts),
         auto_provision=job.auto_provision,
@@ -604,8 +675,8 @@ def verify_decision(
     # scored on. A unique prefix that does not tokenise back to its own ids is
     # scored in full there, and then on both sides, so that the calibration, the
     # comparison and the section all describe the scores an application gets.
-    n_engine = min(job.engine_rows, len(heldout.prompts))
-    engine_prompts = list(heldout.prompts[:n_engine])
+    n_engine = len(engine_rows)
+    engine_prompts = [heldout.prompts[i] for i in engine_rows]
     events.note(f"runtime: scoring {len(decision.ids)} options on {n_engine} held-out rows")
     eng = run_script(
         job.runtime_env,
@@ -651,6 +722,7 @@ def verify_decision(
     ):
         return refuse(TARGETS_CHECK, f"the runtime reported unusable scored lengths: {lengths}")
     mismatched = eng.report.get("mismatches") or []
+    fields["decision"].update({"k": ks, "scored_lengths": lengths, "option_tokens": cont_ids})
     state.add(
         Check.passed(
             TARGETS_CHECK,
@@ -675,9 +747,44 @@ def verify_decision(
         ),
         events,
     )
-    eng_scores = [summed(eng.scores[i], lengths) for i in range(n_engine)]
-    ref_scores = [summed(ref.scores[i], lengths) for i in range(len(prompts))]
-    calib_scores, held_scores = ref_scores[: len(calib.prompts)], ref_scores[len(calib.prompts) :]
+    # The same prompt on both sides: the reference's ids, which its chat
+    # template starts with the BOS, against the runtime's after the BOS its
+    # session adds. An empty render, a second BOS or another tokenisation of
+    # the text would otherwise show only as disagreement, if at all.
+    bos = ref.report.get("bos_id")
+    differing = [
+        j
+        for j, i in enumerate(engine_rows)
+        if bos is None
+        or eng.prompt_ids.get(j) is None
+        or ref.prompt_ids.get(calib_n + i) != [bos, *eng.prompt_ids[j]]
+    ]
+    if differing:
+        j = differing[0]
+        want, got = ref.prompt_ids.get(calib_n + engine_rows[j]), eng.prompt_ids.get(j)
+        return refuse(
+            PROMPT_CHECK,
+            f"on {len(differing)} of {n_engine} rows the runtime's prompt is not the "
+            f"reference's. First, held-out row {engine_rows[j]}: the reference's "
+            f"{_ids_text(want)}, the runtime's BOS {bos} and then {_ids_text(got)}",
+        )
+    state.add(
+        Check.passed(
+            PROMPT_CHECK,
+            f"on all {n_engine} rows the runtime's prompt ids, after the BOS its session adds, "
+            "are the reference's",
+        ),
+        events,
+    )
+    try:
+        ref_scores = [summed(ref.scores[i], lengths) for i in range(len(prompts))]
+    except ValueError as exc:
+        return refuse(REFERENCE_CHECK, f"the reference scored too few tokens: {exc}")
+    try:
+        eng_scores = [summed(eng.scores[i], lengths) for i in range(n_engine)]
+    except ValueError as exc:
+        return refuse(RUNTIME_CHECK, f"the runtime scored too few tokens: {exc}")
+    calib_scores, held_scores = ref_scores[:calib_n], ref_scores[calib_n:]
 
     # -- the calibration --------------------------------------------------------
     try:
@@ -699,13 +806,16 @@ def verify_decision(
     )
     if fit.rule == calibration.C1:
         state.limitations.append(calibration.C1_NOTE)
+    if fit.rule == calibration.C2 and fit.out_of_scope_rows < THIN_OUT_OF_SCOPE:
+        state.limitations.append(
+            f"the calibration rows hold {fit.out_of_scope_rows} out-of-scope row(s); with fewer "
+            f"than {THIN_OUT_OF_SCOPE}, the rejection rule lets none of them be answered, so the "
+            "most confidently misread one sets the threshold"
+        )
     payload = section_payload(decision, fit, lengths, terminator)
     fields["decision"].update(
         {
             "fit": fit.as_dict(),
-            "k": ks,
-            "scored_lengths": lengths,
-            "option_tokens": cont_ids,
             "section": {
                 "name": SECTION_NAME,
                 "payload": payload,
@@ -722,9 +832,9 @@ def verify_decision(
         state.add(_rule_check(fit, ref_metrics), events)
 
     # -- runtime against reference, on the same rows -------------------------------
-    sub_ref = answers(held_scores[:n_engine], fit.temperature)
+    sub_ref = answers([held_scores[i] for i in engine_rows], fit.temperature)
     sub_eng = answers(eng_scores, fit.temperature)
-    targets = heldout.targets[:n_engine]
+    targets = tuple(heldout.targets[i] for i in engine_rows)
     agree = sum(a == b for a, b in zip(sub_ref.choice, sub_eng.choice, strict=True)) / n_engine
     # What the application returns: the option, or an abstention. A runtime
     # that keeps the reference's top option but crosses the threshold the other
@@ -767,6 +877,10 @@ def verify_decision(
         ),
     }
     fields["cost"] = {
+        "measures": (
+            "per decision: the session's prefill, the re-prefill of mode 'once', and every "
+            "option's scoring; not rendering or tokenising the prompt"
+        ),
         "ms_per_decision_median": statistics.median(ms),
         "ms_per_decision_max": max(ms),
         "options": len(decision.ids),
@@ -790,8 +904,9 @@ def verify_decision(
     )
     if n_engine < len(heldout.prompts):
         state.limitations.append(
-            f"the runtime scored the first {n_engine} of {len(heldout.prompts)} held-out rows; "
-            "the reference scored them all. Runtime accuracy and agreement are on those rows"
+            f"the runtime scored {n_engine} of the {len(heldout.prompts)} held-out rows, spread "
+            "evenly through the file; the reference scored them all. Runtime accuracy and "
+            "agreement are on those rows"
         )
     state.limitations.append(TEMPERATURE_CARRIED)
 
@@ -822,7 +937,9 @@ def verify_decision(
             )
     else:
         state.add(
-            _twin_check(job, decision, terminator, heldout, ref, mode, events),
+            _twin_check(
+                job, decision, terminator, heldout, engine_rows, calib_n, ref, mode, events
+            ),
             events,
             harness=True,
         )
@@ -836,6 +953,12 @@ def verify_decision(
     return finish("passed")
 
 
+def _ids_text(ids: list[int] | None) -> str:
+    if ids is None:
+        return "no ids"
+    return f"{len(ids)} ids, {ids[:6]}{' ...' if len(ids) > 6 else ''}"
+
+
 def _given(side: Answers, i: int, fit: calibration.Fit, none_index: int | None) -> int | None:
     """The answer row `i` gets: its top option, or `None` where it abstains."""
     if fit.rule is None:
@@ -845,7 +968,22 @@ def _given(side: Answers, i: int, fit: calibration.Fit, none_index: int | None) 
 
 
 def _rule_check(fit: calibration.Fit, held: dict[str, Any]) -> Check:
-    """Whether the held-out rows clearly contradict the rule the threshold was fitted by."""
+    """Whether the held-out rows clearly contradict the rule the threshold was fitted by.
+
+    Under either rule, a threshold that answers no in-scope held-out row fails:
+    the rejection rule alone is met by a decider that abstains on everything.
+    """
+    if not held.get("in_scope_rows"):
+        return Check.unchecked(
+            RULE_CHECK, "the held-out rows have no in-scope row to measure answers on"
+        )
+    if not held.get("answered"):
+        return Check.failed(
+            RULE_CHECK,
+            f"the model abstained on every one of the {held['in_scope_rows']} in-scope held-out "
+            "rows at the fitted threshold: as calibrated, it would answer nothing",
+            observed=held,
+        )
     if fit.rule == calibration.C2 and held.get("out_of_scope_rows"):
         bound = held["out_of_scope_rejected_upper_bound_95"]
         detail = (
@@ -854,20 +992,13 @@ def _rule_check(fit: calibration.Fit, held: dict[str, Any]) -> Check:
             f"{calibration.REJECT_TARGET} target"
         )
         ok = bound >= calibration.REJECT_TARGET
-    elif fit.rule == calibration.C1 and held.get("answered"):
+    elif fit.rule == calibration.C1:
         bound = held["error_lower_bound_95"]
         detail = (
             f"{held['error_on_answered']:.4f} error on {held['answered']} answered rows; the 95 % "
             f"lower bound {bound:.4f} against the {calibration.ERROR_BUDGET} budget"
         )
         ok = bound <= calibration.ERROR_BUDGET
-    elif fit.rule == calibration.C1:
-        return Check.unchecked(
-            RULE_CHECK,
-            "the model abstained on every held-out row at the fitted threshold, so the error on "
-            "answered rows cannot be measured",
-            observed=held,
-        )
     else:
         return Check.unchecked(
             RULE_CHECK, "the held-out rows have no out-of-scope row to measure rejection on"
@@ -880,19 +1011,21 @@ def _twin_check(
     decision: Decision,
     terminator: str,
     heldout: DecisionRows,
+    engine_rows: Sequence[int],
+    calib_n: int,
     ref: ScoreRun,
     mode: str | None,
     events: EventStream,
 ) -> Check:
-    """The float twin's per-token scores against the reference's, on a few held-out rows."""
-    n = min(PROBE_ROWS, len(heldout.prompts))
-    calib_n = len(ref.scores) - len(heldout.prompts)
+    """The float twin's per-token scores against the reference's, on a few of the runtime's rows."""
+    rows = list(engine_rows[:PROBE_ROWS])
+    n = len(rows)
     twin = run_script(
         job.runtime_env,
         ENGINE_SCRIPT,
         {
             "model": str(job.float_twin),
-            "rows": [{"index": i, "prompt": heldout.prompts[i]} for i in range(n)],
+            "rows": [{"index": j, "prompt": heldout.prompts[i]} for j, i in enumerate(rows)],
             "options": list(decision.ids),
             "terminator": terminator,
             "threads": job.threads,
@@ -913,8 +1046,8 @@ def _twin_check(
     if unusable is not None:
         return Check.failed(TWIN_CHECK, f"row {unusable} has a twin score that is not finite")
     worst = 0.0
-    for i in range(n):
-        for a, b in zip(twin.scores[i], ref.scores[calib_n + i], strict=True):
+    for j, i in enumerate(rows):
+        for a, b in zip(twin.scores[j], ref.scores[calib_n + i], strict=True):
             if len(a) != len(b):
                 return Check.failed(TWIN_CHECK, "the float twin scored targets of another length")
             worst = max(worst, max(abs(x - y) for x, y in zip(a, b, strict=True)))

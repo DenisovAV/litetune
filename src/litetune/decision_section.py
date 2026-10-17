@@ -1,15 +1,16 @@
 """The decision a model answers, carried inside its `.litertlm` as one section.
 
-flutter_edge_ai's `createDecider` needs the question, the trained options, the
-temperature, the abstain threshold and the scoring form, and nothing may ship
-beside the model. They travel in a `GenericBinaryData` section whose `name`
-item is `litetune.decision` and whose payload is the UTF-8 JSON `verify` wrote
-(`decision_verify.section_payload`).
+In the 2026-10-16 design, flutter_edge_ai's `createDecider` is to read the
+question, the trained options, the temperature, the abstain threshold and the
+scoring form from the model file, and nothing may ship beside the model. They travel
+in a `GenericBinaryData` section whose `name` item is `litetune.decision` and whose
+payload is the UTF-8 JSON `verify` wrote (`decision_verify.section_payload`).
 
 **A section, not header `system_metadata`.** LiteRT-LM reads at most 16 KiB of
 header (`kLitertLmHeaderMaxSize`, `runtime/util/litert_lm_loader.h:44` at
-v0.18.0) and litert-lm-builder does not check it; 151 options with 60-byte
-descriptions would not fit. The LLM runtime never maps a `GenericBinaryData`
+v0.18.0) and litert-lm-builder does not check it; 151 options with
+descriptions longer than 63 bytes each would not fit (computed 2026-10-16; no such
+bundle was built). The LLM runtime never maps a `GenericBinaryData`
 section (`litert_lm_loader.cc:189-201,369-404`). Measured 2026-10-16 on a
 CLINC151 bundle: a 3,480-byte payload moved the header end from 760 to 864
 bytes and grew the file by 12,024 bytes; the payload read back byte for byte,
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 SECTION_NAME = "litetune.decision"
 HEADER_MAX = 16 * 1024
 SECTION_TIMEOUT_S = 1800
+STDERR_TAIL_CHARS = 2000
 
 SECTION_SCRIPT = r'''
 """Add or replace the litetune.decision section. Spec: argv[1]; result JSON: argv[2]."""
@@ -70,7 +72,7 @@ def named(section, name):
 
 def header_end(path):
     with open(path, "rb") as fh:
-        fh.seek(24)
+        fh.seek(R.litertlm_core.HEADER_END_LOCATION_BYTE_OFFSET)
         return struct.unpack("<Q", fh.read(8))[0]
 
 
@@ -92,10 +94,10 @@ def section_bytes(path, name):
 def main(spec):
     artifact, work, name = spec["artifact"], Path(spec["work"]), spec["name"]
     payload = Path(spec["payload"]).read_bytes()
-    end_before = header_end(artifact)
     cut = R.past_the_end(artifact)
     if cut is not None:
         return {"written": False, "reason": cut}
+    end_before = header_end(artifact)
     before_dir = work / "before"
     lb.unpack(artifact, str(before_dir))
     before = R.load(before_dir / "model.toml")
@@ -218,8 +220,24 @@ def write_section(
         )
         try:
             proc = env.run(["python", str(script), str(spec), str(result)], timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return SectionWrite(False, f"no result after {timeout} s (timeout)", {})
+        except subprocess.TimeoutExpired as expired:
+            # The child's last words, as evaluate.py keeps them on a timeout: a
+            # budget alone says nothing about where the script was.
+            killed = expired.stderr or ""
+            if isinstance(killed, bytes):
+                killed = killed.decode("utf-8", "surrogateescape")
+            tail = killed[-STDERR_TAIL_CHARS:].strip()
+            return SectionWrite(
+                False,
+                f"no result after {timeout} s (timeout)"
+                + (f"; its stderr ended: {tail}" if tail else ""),
+                {},
+            )
+        except OSError as exc:
+            logger.exception("could not start the section script in environment %r", env.name)
+            return SectionWrite(
+                False, f"the section script could not be started: {type(exc).__name__}: {exc}", {}
+            )
         if proc.returncode != 0 or not result.is_file():
             last = next(
                 (ln for ln in reversed((proc.stderr or "").splitlines()) if ln.strip()),
@@ -235,16 +253,21 @@ def write_section(
 
 
 def dart_string(text: str) -> str:
-    """A single-quoted Dart string literal: `$` would interpolate, `\\` and `'` would end it."""
+    """A single-quoted Dart string literal: `$` would interpolate, `\\` and `'` would end it.
+
+    Every character that is not printable ASCII is written as Dart's `\\u{XXXX}`, so the
+    printed call is ASCII and keeps the lines `dart_call` gives it: a line separator in
+    an id (U+2028, U+0085) would otherwise split it under `str.splitlines()`.
+    """
     escaped = text.replace("\\", "\\\\").replace("'", "\\'").replace("$", "\\$")
-    return f"'{escaped}'"
+    return "'" + "".join(c if " " <= c <= "~" else f"\\u{{{ord(c):X}}}" for c in escaped) + "'"
 
 
 def dart_call(payload: dict[str, Any]) -> str:
     """The call an app makes: the trained options, in their trained order.
 
     The `none_option` is not among them: it is the section's, as the question is,
-    and flutter_edge_ai lists it last itself.
+    and the 2026-10-16 design has flutter_edge_ai list it last itself.
     """
     options = ", ".join(f"DeciderOption({dart_string(o['id'])})" for o in payload["options"])
     return "final decider = await model.createDecider(\n" f"  options: [{options}],\n" ");"

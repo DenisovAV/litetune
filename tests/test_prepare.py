@@ -1757,3 +1757,62 @@ def test_a_none_option_with_no_calibration_row_says_the_threshold_falls_back(
 
     assert result.decision.calibration["other"] == 0
     assert any("falls back to the error budget" in text for text in result.limitations)
+
+
+def _none_option_questions(questions):
+    return questions(
+        {"question": "Which?", "options": [{"id": e} for e in EMOTIONS], "none_option": "other"}
+    )
+
+
+def test_a_none_option_with_calibration_rows_does_not_say_the_threshold_falls_back(
+    write_jsonl, request_for, questions
+):
+    data = decision_rows(n_per_option=20) + [
+        {"prompt": f"weather {i}", "label": None} for i in range(40)
+    ]
+
+    result = prepare(request_for(write_jsonl(data), questions=_none_option_questions(questions)))
+
+    assert result.decision.calibration["other"] > 0
+    assert not any("falls back to the error budget" in t for t in result.limitations)
+
+
+def test_a_thin_out_of_scope_calibration_says_a_single_misread_row_sets_the_threshold(
+    write_jsonl, request_for, questions
+):
+    data = decision_rows(n_per_option=20) + [
+        {"prompt": f"weather {i}", "label": None} for i in range(40)
+    ]
+
+    thin = prepare(
+        request_for(
+            write_jsonl(data), questions=_none_option_questions(questions), calibration_size=10
+        )
+    )
+
+    held = thin.decision.calibration["other"]
+    assert 1 <= held < 10
+    assert any(
+        f"the calibration rows hold {held} out-of-scope row(s); with fewer than 10" in text
+        and "Give the calibration split at least 10" in text
+        for text in thin.limitations
+    )
+
+    enough = prepare(
+        request_for(
+            write_jsonl(data), questions=_none_option_questions(questions), calibration_size=60
+        )
+    )
+    assert enough.decision.calibration["other"] >= 10
+    assert not any("single confidently misread row" in text for text in enough.limitations)
+
+
+def test_a_decision_without_a_none_option_has_no_thin_calibration_limitation(
+    write_jsonl, request_for, questions
+):
+    result = prepare(
+        request_for(write_jsonl(decision_rows(n_per_option=20)), questions=questions())
+    )
+
+    assert not any("out-of-scope row(s)" in text for text in result.limitations)

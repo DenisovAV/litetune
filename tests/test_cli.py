@@ -1577,6 +1577,52 @@ def test_a_reference_that_was_never_run_is_not_recorded_as_a_measurement():
     assert sorted(points) == ["tuned_converted"]
 
 
+def _decision_verify_manifest(**measurements) -> dict:
+    return {
+        "scorer": {"name": "option-scoring"},
+        "reference": {"role": "float_twin"},
+        "measurements": measurements,
+    }
+
+
+def test_a_decisions_float_point_is_the_reference_on_the_runtimes_own_rows():
+    points = measurements_from_verify(
+        _decision_verify_manifest(
+            candidate={"rows": 200},
+            reference={"rows": 1000},
+            reference_on_runtime_rows={"rows": 200},
+        )
+    )
+
+    assert points == {"tuned_converted": {"rows": 200}, "tuned_float": {"rows": 200}}
+
+
+def test_a_decision_without_the_reference_on_the_runtimes_rows_records_no_float_point():
+    points = measurements_from_verify(
+        _decision_verify_manifest(candidate={"rows": 200}, reference={"rows": 1000})
+    )
+
+    assert sorted(points) == ["tuned_converted"]
+
+
+def test_the_decision_summary_prints_both_agreements_beside_the_kl():
+    manifest = {
+        "scorer": {"name": "option-scoring"},
+        "quality": {
+            "available": True,
+            "rows": 200,
+            "argmax_agreement": 0.995,
+            "answer_agreement": 0.97,
+            "mean_kl": 0.0012,
+        },
+    }
+
+    assert (
+        "  runtime against reference on 200 rows: same top option 0.9950, same answer "
+        "(abstentions included) 0.9700, mean KL 0.0012"
+    ) in summarise(manifest)
+
+
 def test_bundle_of_a_gemma4_model_carries_the_recorded_ceiling(tmp_path, deliverable, capsys):
     model, declarations = deliverable
     main(

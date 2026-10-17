@@ -26,9 +26,12 @@ false, `<name>-thinking.txt` with it true. The template itself is packaged, as
 `src/litetune/templates/litert-lm-v0.18.0-qwen3.jinja`.
 
 `decision-contract-v1.json` holds the golden strings of the decision prompt
-contract (`src/litetune/decisions.py`), which flutter_edge_ai's renderer tests
-against too. Three cases are rows the option-scoring measurement of 2026-10-15
-trained or scored, rendered here from the dataset's own text and checked equal
+contract (`src/litetune/decisions.py`), which litetune's renderer tests against
+and flutter_edge_ai's proposed renderer is to test against too. Each case also
+carries `decision`, the section-shaped decision its `questions` read as, with
+every option spelled out; the test checks it against `decision_from`. Three
+cases are rows the option-scoring measurement of 2026-10-15 trained or scored,
+rendered here from the dataset's own text and checked equal
 to the rows it rendered; the emotion, Noul and Score cases are constructed, and
 were never trained.
 

@@ -552,11 +552,12 @@ format, and the report says that it assumed it.
 
 A decision model answers a question about a text with one of a fixed list of
 options: which emotion, which support issue, yes or no. It is an ordinary
-`.litertlm`, used through flutter_edge_ai's `InferenceModel.createDecider`,
-which scores every option's log-probability through the runtime instead of
-letting the model generate. litetune trains it, measures it the way
-`createDecider` uses it, and writes the question, the options and the
-calibration into the `.litertlm` itself. Nothing ships beside it.
+`.litertlm`, made for flutter_edge_ai's `InferenceModel.createDecider`, which
+is to score every option's log-probability through the runtime instead of
+letting the model generate (a proposal; see below). litetune trains it,
+measures it the way `createDecider` is to use it, and writes the question, the
+options and the calibration into the `.litertlm` itself. Nothing ships beside
+it.
 
 Rows carry the text and the option it should get; `questions.json` names the
 question and the options, in the order the prompt lists them:
@@ -604,20 +605,23 @@ What each stage does differently for a decision:
   — with the option id as the completion. It sets a tenth of the rows aside as
   `calibration.jsonl` and writes `decision.json`. It refuses a label outside the
   options and refuses to write a split in which some option has no training row.
-  The prompt is pinned by golden strings that flutter_edge_ai's renderer tests
-  against too (`tests/fixtures/decision-contract-v1.json`).
+  The prompt is pinned by golden strings that litetune's renderer tests against
+  and that flutter_edge_ai's proposed renderer is to test against too
+  (`tests/fixtures/decision-contract-v1.json`).
 - **tune** checks every row against `decision.json` and records the decision
   beside the checkpoint, where the later stages read it.
 - **convert** adds `--prefill_lengths=8,128`: scoring re-prefills one token per
   decision, which ran padded to 128 tokens without it.
 - **verify** scores every option on every calibration and held-out row with the
   float checkpoint, fits a temperature and, for `choice`, the threshold below
-  which an answer abstains, then scores the first 200 held-out rows through the
-  runtime and compares. It refuses a runtime whose answers agree with the
-  reference's on fewer than 95 % of rows, and a float twin whose per-token
-  scores differ by more than 1e-3 nats. LiteRT-LM 0.18.0 scores a prompt
-  without its second-to-last token right after a prefill; a self-check finds
-  out whether the runtime does, and scores accordingly.
+  which an answer abstains, then scores 200 held-out rows, spread through the
+  split, through the runtime and compares. It refuses a runtime that scored
+  another prompt than the reference, a runtime whose answers agree with the
+  reference's on fewer than 95 % of rows, a float twin whose per-token scores
+  differ by more than 1e-3 nats, and a threshold that answers no in-scope row.
+  LiteRT-LM 0.18.0 scores a prompt without its second-to-last token right after
+  a prefill; a self-check finds out whether the runtime does, and scores
+  accordingly.
 - **bundle** writes the decision and its calibration into the `.litertlm` as a
   `litetune.decision` section, and prints the call:
 
@@ -636,17 +640,19 @@ of writing; until it ships, that call throws `DeciderUnsupportedException`.
 What has and has not been measured:
 
 - Decisions are trained and measured on `google/gemma-3-270m-it` only;
-  another family is refused. Only `choice` questions have been measured;
-  `noul` and `score` follow the same contract and are not.
+  another family is refused, and another Gemma 3 text model is accepted with a
+  limitation saying it was not measured. Only `choice` questions have been
+  measured; `noul` and `score` follow the same contract and are not.
 - It needs training on the task: the untuned model, and a model trained on
   other tasks, chose far worse.
 - Scoring is measured on the CPU backend, and against the float reference on
-  LiteRT-LM 0.18.0 only. On another runtime, `verify` needs `--float-twin` to
-  say more than "could not check".
+  LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561 fix only. On
+  another runtime, `verify` needs `--float-twin` to say more than "could not
+  check".
 - A decision costs one scoring pass per option, so the cost grows with the
-  option count, and no phone has run it yet. For many topic-like options, an
-  embedding model through `EmbeddingModel.createDecider` was more accurate and
-  costs one embedding.
+  option count, and no phone has run it yet. On CLINC150 (150 intents), a
+  frozen embedding model with a linear head was more accurate (0.954 against
+  0.903); with 55 options the difference was not resolved.
 - Without out-of-scope rows (`label: null`) in the calibration split, the
   threshold caps the error on answered rows and does not reject out-of-scope
   inputs reliably.

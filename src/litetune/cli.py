@@ -44,6 +44,13 @@ from litetune.bundle import (
     versions_from,
 )
 from litetune.checks import Outcome
+from litetune.decision_verify import (
+    DEFAULT_ENGINE_ROWS,
+    DEFAULT_THREADS,
+    SCORER,
+    decision_of_section,
+)
+from litetune.decisions import DecisionError
 from litetune.declarations import DeclarationsError
 from litetune.envs import cached_environments, env_cache_root, remove_cached
 from litetune.evaluate import CANDIDATE_BACKENDS, GREEDY, DataError
@@ -377,18 +384,18 @@ def _add_verify(sub) -> None:
     verify.add_argument(
         "--engine-rows",
         type=_positive,
-        default=200,
+        default=DEFAULT_ENGINE_ROWS,
         help=(
-            "decision checkpoints: how many held-out rows the runtime scores (default 200). The "
-            "reference scores all of them; at 151 options a runtime decision took 7.2 s on four "
-            "server CPU threads"
+            "decision checkpoints: how many held-out rows the runtime scores (default "
+            f"{DEFAULT_ENGINE_ROWS}). The reference scores all of them; at 151 options a runtime "
+            "decision took 7.2 s on four server CPU threads"
         ),
     )
     verify.add_argument(
         "--threads",
         type=_positive,
-        default=4,
-        help="decision checkpoints: the runtime's CPU threads (default 4)",
+        default=DEFAULT_THREADS,
+        help=f"decision checkpoints: the runtime's CPU threads (default {DEFAULT_THREADS})",
     )
     verify.add_argument("--json", action="store_true", help="write the manifest to stdout")
 
@@ -458,9 +465,9 @@ def _add_prepare(sub) -> None:
             "the decision the rows are trained for: one question, its type (choice, noul or "
             "score), its options in order with optional descriptions, and an optional "
             'none_option for rows labelled null. Each row is {"prompt": <the state>, '
-            '"label": <option id>}, rendered into the prompt flutter_edge_ai\'s createDecider '
-            "scores. Rows with labels and no completions are decisions without it too, asked a "
-            "generic question about their sorted labels"
+            '"label": <option id>}, rendered into the prompt createDecider is to '
+            "score (the 2026-10-16 design). Rows with labels and no completions are decisions "
+            "without it too, asked a generic question about their sorted labels"
         ),
     )
     prep.add_argument(
@@ -1046,8 +1053,9 @@ def summarise_decision(manifest: dict) -> list[str]:
     quality = _mapping(manifest.get("quality"))
     if quality.get("available"):
         lines.append(
-            f"  runtime against reference on {quality.get('rows', '?')} rows: same answer "
-            f"{_num(quality.get('argmax_agreement'))}, mean KL {_num(quality.get('mean_kl'))}"
+            f"  runtime against reference on {quality.get('rows', '?')} rows: same top option "
+            f"{_num(quality.get('argmax_agreement'))}, same answer (abstentions included) "
+            f"{_num(quality.get('answer_agreement'))}, mean KL {_num(quality.get('mean_kl'))}"
         )
     cost = _mapping(manifest.get("cost"))
     if cost:
@@ -1067,7 +1075,7 @@ def summarise_decision(manifest: dict) -> list[str]:
 
 def summarise(manifest: dict) -> list[str]:
     """The human-readable result. Every number printed carries n and its interval."""
-    if _mapping(manifest.get("scorer")).get("name") == "option-scoring":
+    if _mapping(manifest.get("scorer")).get("name") == SCORER:
         return summarise_decision(manifest)
     status = manifest.get("status")
     lines = [f"status: {status}"]
@@ -1579,9 +1587,18 @@ def measurements_from_verify(manifest: dict[str, Any]) -> dict[str, Any]:
     candidate = measured.get("candidate")
     if isinstance(candidate, dict) and candidate.get("available") is not False:
         points["tuned_converted"] = candidate
-    reference = measured.get("reference")
+    # A decision's reference scores every held-out row and its runtime
+    # `engine_rows` of them; the float point that sits beside the converted one is
+    # the reference on the runtime's own rows, or the two would differ in what
+    # they were asked as well as in what they ran on.
+    decision = _mapping(manifest.get("scorer")).get("name") == SCORER
+    reference = measured.get("reference_on_runtime_rows" if decision else "reference")
     if isinstance(reference, dict) and reference.get("available") is not False:
-        name = _REFERENCE_POINT.get(role)
+        name = (
+            _REFERENCE_POINT[ReferenceRole.FLOAT_TWIN.value]
+            if decision
+            else _REFERENCE_POINT.get(role)
+        )
         if name is not None:
             points[name] = reference
     return points
@@ -1827,6 +1844,8 @@ def _bundle(args: argparse.Namespace) -> int:
         terminator_notes = tuple(n for n in (terminator_note,) if n)
 
     decision = _decision_payload(manifest)
+    if decision is not None:
+        _check_decision(decision, manifest, recorded, prompt_mode, args.train_metrics)
     if decision is None and args.declarations is None:
         raise BundleInputError(
             "--declarations is required: the bundle records the tools its model is called with. "
@@ -1899,7 +1918,7 @@ def _bundle(args: argparse.Namespace) -> int:
 
 def _decision_payload(manifest: dict[str, Any]) -> dict[str, Any] | None:
     """The decision section a decision manifest carries, or `None` for any other manifest."""
-    if _mapping(manifest.get("scorer")).get("name") != "option-scoring":
+    if _mapping(manifest.get("scorer")).get("name") != SCORER:
         return None
     payload = _mapping(_mapping(_mapping(manifest.get("decision")).get("section")).get("payload"))
     if not payload:
@@ -1908,6 +1927,55 @@ def _decision_payload(manifest: dict[str, Any]) -> dict[str, Any] | None:
             "verify did not reach the calibration, so there is nothing to bundle"
         )
     return payload
+
+
+def _check_decision(
+    payload: dict[str, Any],
+    manifest: dict[str, Any],
+    recorded: Mapping[str, Any],
+    prompt_mode: PromptMode,
+    train_metrics: Path | None,
+) -> None:
+    """Refuse a decision that is not the one the model was trained on.
+
+    The section is written into the file as verify's manifest carries it, and the
+    only tie between that payload and the training run was the manifest's own
+    word, so each digest recorded for the decision is held against the payload's.
+    """
+    if prompt_mode is not PromptMode.RUNTIME_RENDERED:
+        raise BundleInputError(
+            f"the bundle's prompt mode is {prompt_mode.value}, and tune trains a decision only "
+            f"in {PromptMode.RUNTIME_RENDERED.value}; a decision section on a model trained "
+            "otherwise would be asked in a form it never learned. Pass the metrics of the tune "
+            "run that produced this model"
+        )
+    try:
+        digest = decision_of_section(payload).digest()
+    except DecisionError as exc:
+        raise BundleInputError(
+            f"the decision section in the verify manifest is not a decision: {exc}"
+        ) from None
+    # Both are written whenever there is a decision: verify records the digest
+    # beside the payload, and a `tune --decision` run in its metrics. A missing
+    # one is a manifest or metrics from another run, not a pass.
+    recorded_digests = [
+        ("the verify manifest", _mapping(manifest.get("decision")).get("decision_sha256"))
+    ]
+    if train_metrics is not None:
+        recorded_digests.append((str(train_metrics), recorded.get("decision_sha256")))
+    for where, expected in recorded_digests:
+        if expected is None:
+            raise BundleInputError(
+                f"{where} records no decision digest, and every run that measured or trained "
+                "this decision records one: it comes from another run, so the section is not "
+                "written into the file"
+            )
+        if expected != digest:
+            raise BundleInputError(
+                f"the decision section hashes to {digest}, and {where} records {expected} for the "
+                "decision; the section is not the decision this model was measured and trained "
+                "on, so it is not written into the file"
+            )
 
 
 def summarise_bundle(result: BundleResult) -> list[str]:

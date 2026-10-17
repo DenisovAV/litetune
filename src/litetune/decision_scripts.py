@@ -7,15 +7,19 @@ row, flushed as it is scored, and a report.
 
 **The reference** (`REFERENCE_SCRIPT`, `envs.TRAIN`) is the scorer the
 option-scoring measurements of 2026-10-15 and 2026-10-16 ran: float32, eager
-attention, TF32 off, on the GPU when there is one. Each row's prompt is
-rendered as `tune` trains it, and every option is scored as its id followed by
-the turn terminator, teacher-forced, every token's log-probability kept. One
-forward over the prompt keeps its cache, and the options go in batches over
-copies of it; on the first rows each option is also scored with no cache, and
-the run stops if any token differs by more than `check_tol`.
+attention, TF32 off, on the GPU when there is one and `LITETUNE_DEVICE` allows
+it. Each row's prompt is rendered as `tune` trains it, and every option is
+scored as its id followed by the turn terminator, teacher-forced, every token's
+log-probability kept. One forward over the prompt keeps its cache, and the
+options go in batches over copies of it. On the first row each way of passing
+the cache is checked against scoring with no cache, and the first within
+`check_tol` is used; when none is, every row is scored with no cache. On the
+first three rows and the longest the check is repeated, and a difference above
+`check_tol` stops the run.
 
 **The runtime** (`ENGINE_SCRIPT`, `envs.RUNTIME`) scores through LiteRT-LM's
-session API on the CPU, the way flutter_edge_ai's decider does. It renders with
+session API on the CPU, as the flutter_edge_ai design of 2026-10-16 has its
+decider do. It renders with
 `Conversation.render_message_to_string`, prefills the prompt, saves a
 checkpoint, and per option scores and rewinds. LiteRT-LM 0.18.0 scores right
 after a prefill without the prompt's second-to-last token (#3561): mode `once`
@@ -31,6 +35,9 @@ Targets are each option's shortest unique prefix: the first k ids of
 `id + terminator`, k the smallest no other option shares. A truncated target
 goes to the runtime as text and must tokenise back to the same ids; one that
 does not is scored in full and listed.
+
+Both scripts return the prompt's token ids for the rows the runtime scores, so
+that `verify` can check the two sides scored the same prompt.
 """
 
 from __future__ import annotations
@@ -53,7 +60,8 @@ def main():
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    wanted = spec.get("device", "auto")
+    device = "cuda" if wanted == "auto" and torch.cuda.is_available() else "cpu"
     kwargs = {"revision": spec["revision"]} if spec.get("revision") else {}
     tok = AutoTokenizer.from_pretrained(spec["model"], **kwargs)
     try:
@@ -170,6 +178,7 @@ def main():
 
     started = time.time()
     trials = {}
+    ids_for = set(spec.get("ids_for", []))
     with open(spec["out"], "w", encoding="utf-8") as out:
         for n_done, row in enumerate(spec["rows"]):
             t0 = time.perf_counter()
@@ -187,6 +196,8 @@ def main():
                         break
             per = score_cached(prompt_ids, state["variant"])
             rec = {"index": row["index"], "prompt_len": len(prompt_ids), "token_scores": per}
+            if row["index"] in ids_for:
+                rec["prompt_ids"] = prompt_ids
             if row["index"] in set(spec.get("check_indices", [])) or n_done < 3:
                 d = worst(score_full(prompt_ids), per)
                 rec["check_max_abs_token"] = d
@@ -201,6 +212,7 @@ def main():
         json.dumps(
             {
                 "device": device,
+                "bos_id": tok.bos_token_id,
                 "torch": torch.__version__,
                 "transformers": __import__("transformers").__version__,
                 "cont_ids": conts,
@@ -238,7 +250,6 @@ from pathlib import Path
 import litert_lm as L
 
 FIXED = "<start_of_turn>user\nAnswer with one word.<end_of_turn>\n<start_of_turn>model\n"
-MODEL_TURN = "<start_of_turn>model\n"
 
 
 def last_error(lib):
@@ -299,6 +310,10 @@ def main():
         with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
             rendered = conv.render_message_to_string(prompt)
         ids = list(engine.tokenize(rendered))
+        # 0.18.0 returns "" when the render fails in C, and "" tokenises to no
+        # ids, which every check below would pass.
+        if not ids:
+            raise RuntimeError("the runtime rendered the prompt as empty text")
         last = engine.detokenize(ids[-1:])
         if not rendered.endswith(last) or list(engine.tokenize(last)) != ids[-1:]:
             raise RuntimeError(f"the last prompt token {ids[-1]} does not round-trip as {last!r}")
@@ -311,10 +326,11 @@ def main():
             s.run_prefill([rendered])
             c_call(s, "litert_lm_session_save_checkpoint", b"p")
             # Once per decision, after the checkpoint. Rewinding resets only the
-            # step, and the cell this prefill wrote stays: measured 2026-10-16,
+            # step, and the cell this prefill wrote stays. Measured 2026-10-16:
             # this sequence gave every option the scores of a re-prefill before
-            # each one, bit for bit over 108,300 tokens, and within 8.2e-4 nats
-            # of PyTorch on a float32 bundle.
+            # each one, bit for bit on 3,584 tokens of a float32 bundle and to
+            # the six decimals stored on 108,300 int8 tokens, and within 8.2e-4
+            # nats of PyTorch on that float32 bundle.
             if mode == "once":
                 s.run_prefill([last])
             for text in texts:
@@ -345,15 +361,13 @@ def main():
                 z = engine.detokenize([cont_ids[j][0]])
                 if list(engine.tokenize(z)) == [cont_ids[j][0]]:
                     zs.append(z)
-            # The fixed pair only, as flutter_edge_ai runs it: measured 2026-10-16,
-            # its gap was 0.0 on 0.18.0 and at least 0.135 with the fix, where a
-            # task's own prompts gave a gap as small as 2.1e-5 with a near-certain
-            # target. The two must never pick different modes.
-            pairs = [FIXED]
+            # The fixed pair only, as the flutter_edge_ai design has it run:
+            # measured 2026-10-16, its gap was 0.0 on 0.18.0 and at least 0.135
+            # with the fix, where a task's own prompts gave a gap as small as
+            # 2.1e-5 with a near-certain target. The two must never pick
+            # different modes.
             diffs, checked = [], []
-            for a in pairs:
-                if not a.endswith(MODEL_TURN):
-                    continue
+            for a in [FIXED]:
                 b = a[: -len("model\n")] + "user\n"
                 ia, ib = list(engine.tokenize(a)), list(engine.tokenize(b))
                 differing = [i for i in range(min(len(ia), len(ib))) if ia[i] != ib[i]]
@@ -415,8 +429,8 @@ def main():
         # -- the rows -------------------------------------------------------------
         with open(spec["out"], "w", encoding="utf-8") as out:
             for row in spec["rows"]:
-                rendered, ids, last = render(engine, row["prompt"])
                 try:
+                    rendered, ids, last = render(engine, row["prompt"])
                     per, ms = decide(engine, mode, rendered, last, texts)
                 except RuntimeError as exc:
                     out.write(json.dumps({"index": row["index"], "error": str(exc)}) + "\n")
@@ -426,7 +440,7 @@ def main():
                     options[k] for k, x in enumerate(per)
                     if x is None or len(x) != len(want[k]) or not all(math.isfinite(v) for v in x)
                 ]
-                rec = {"index": row["index"], "prompt_len": len(ids), "ms": round(ms, 1)}
+                rec = {"index": row["index"], "prompt_ids": ids, "ms": round(ms, 1)}
                 if bad:
                     rec["error"] = f"no usable scores for {bad[:5]}"
                 else:

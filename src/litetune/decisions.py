@@ -2,14 +2,14 @@
 
 A decision model is an ordinary chat model, trained to answer a question about a
 state with the id of one of the listed options. The application never lets it
-generate: flutter_edge_ai's `InferenceModel.createDecider` renders the same
-prompt and scores each option's log-probability through the engine. So the
-prompt is a contract between two renderers, this one and flutter_edge_ai's, and
-the golden strings in `tests/fixtures/decision-contract-v1.json` pin it for
-both.
+generate: flutter_edge_ai's `InferenceModel.createDecider` (a proposal, not
+shipped) is to render the same prompt and score each option's log-probability
+through the engine. So the prompt is a contract between two renderers, this one
+and flutter_edge_ai's proposed one, and the golden strings in
+`tests/fixtures/decision-contract-v1.json` pin it for both.
 
 **Contract version 1** is the text the option-scoring measurement of
-2026-10-15 trained and scored, on four tasks with 6 to 151 options. It is the
+2026-10-15 trained and scored, on four models on three tasks (6 to 151 options). It is the
 content of one user message, which the model's own chat template renders:
 
     <state>
@@ -58,8 +58,8 @@ CONTRACT_VERSION = 1
 
 QUESTION_TYPES = ("choice", "noul", "score")
 
-# Slot order is the answer: Jev's Noul answer is P(yes), and a swapped order
-# would return 1 - P(yes) without an error.
+# The prompt lists `no` then `yes`, as trained; another order is not measured.
+# The answer is P(yes), read by id.
 NOUL_IDS = ("no", "yes")
 
 ANSWER_LINE = "Answer with the id of one option."
@@ -85,6 +85,11 @@ class DecisionError(ValueError):
     """A decision or a row that cannot be rendered. Names the file or row and the field."""
 
 
+# The characters, besides \\n and \\r, on which `str.splitlines()` splits; a reader
+# of the prompt that splits lines this way would see another option.
+_LINE_BREAKS = frozenset("\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
+
+
 def control_text_in(text: str) -> str | None:
     """The first control-token string `text` contains, or `None`."""
     return next((marker for marker in CONTROL_TEXT if marker in text), None)
@@ -96,11 +101,22 @@ def _line_text(value: object, what: str, where: str) -> str:
         raise DecisionError(f"{where}: {what} must be a string, got {json.dumps(value)}")
     if not value.strip():
         raise DecisionError(f"{where}: {what} is empty")
-    if "\n" in value or "\r" in value:
+    if "\n" in value or "\r" in value or _LINE_BREAKS.intersection(value):
         raise DecisionError(
             f"{where}: {what} {value!r} spans more than one line. The prompt lists one option "
             "per line, so a line break inside one is read as another option"
         )
+    for char in value:
+        if "\ud800" <= char <= "\udfff":
+            raise DecisionError(
+                f"{where}: {what} {value!r} contains the lone surrogate U+{ord(char):04X}, "
+                "which is not text and cannot be encoded"
+            )
+        if ord(char) < 0x20 and char != "\t":
+            raise DecisionError(
+                f"{where}: {what} {value!r} contains the control character U+{ord(char):04X}. "
+                "Only a tab is allowed besides printable text"
+            )
     if value != value.strip():
         raise DecisionError(
             f"{where}: {what} {value!r} starts or ends with whitespace. It is written into the "
@@ -135,9 +151,10 @@ class Option:
 class Decision:
     """One question with its options, as a model is trained and asked it.
 
-    `options` are the ones given, in order; `listed` adds the `none_option`
-    last, which is the order the prompt shows and the order the application
-    must pass them in.
+    `options` are the ones given, in order. `listed` adds the `none_option`
+    last: the order the prompt shows. The application passes `options` only, in
+    any order; the renderer lists them in this order and adds the `none_option`
+    itself.
     """
 
     type: str
@@ -223,6 +240,12 @@ def _options(raw: object, kind: str, where: str) -> tuple[Option, ...]:
         if "id" not in entry:
             raise DecisionError(f"{at} has no 'id'")
         option_id = _line_text(entry["id"], "the id", at)
+        if ": " in option_id:
+            raise DecisionError(
+                f"{at}: the id {option_id!r} contains ': '. The line '- {option_id}' would read "
+                "the same as an option with the text before it as its id and the rest as its "
+                "description"
+            )
         description = entry.get("description")
         if description is not None:
             description = _line_text(description, "the description", at)
@@ -241,7 +264,8 @@ def decision_from(obj: object, where: str) -> Decision:
             f"{sorted(_KEYS)}; one question per model"
         )
     version = obj.get("contract_version", CONTRACT_VERSION)
-    if version != CONTRACT_VERSION:
+    # `type is int` refuses true, which equals 1, and 1.0.
+    if type(version) is not int or version != CONTRACT_VERSION:
         raise DecisionError(
             f"{where}: contract_version {json.dumps(version)} is not one this litetune renders; "
             f"it renders version {CONTRACT_VERSION}"
@@ -271,7 +295,8 @@ def decision_from(obj: object, where: str) -> Decision:
         if tuple(o.id for o in options) != NOUL_IDS:
             raise DecisionError(
                 f"{where}: a noul question's options are {list(NOUL_IDS)}, in that order; got "
-                f"{[o.id for o in options]}. The answer is P(yes), read from the second"
+                f"{[o.id for o in options]}. The prompt lists them in this order, as trained "
+                "(another order is not measured), and the answer is P(yes), read by id"
             )
     else:
         if "options" not in obj:

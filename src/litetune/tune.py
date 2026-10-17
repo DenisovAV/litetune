@@ -68,9 +68,11 @@ from litetune.prepare import (
     CONTROL_TEXT,
     DECISION_FAMILY,
     DECISION_MEASURED_MODEL,
+    DECISION_MODEL_UNMEASURED,
     PrepareError,
     Row,
     control_text_held,
+    is_measured_decision_model,
     read_rows,
     refuse_undeclared_tools,
     render_call,
@@ -96,8 +98,11 @@ CALL_PROBE_NAME = "litetune_probe"
 
 def _check_decision(
     request: TuneRequest, path: Path, mode: PromptMode, rows: Sequence[Row]
-) -> Check:
+) -> tuple[Check, Decision | None]:
     """Whether every row is the decision rendered around a state, answered with one of its ids.
+
+    Returns the check and, when it passed, the one decision it read, which is
+    the one the run records: `decision.json` is read once.
 
     `prepare` renders decision rows this way; a split edited by hand, or one
     rendered with another `decision.json`, reaches this stage without that, and
@@ -108,51 +113,69 @@ def _check_decision(
     try:
         asked, _ = read_questions(path)
     except DecisionError as exc:
-        return Check.failed(DECISION_CHECK, str(exc), observed=where)
+        return Check.failed(DECISION_CHECK, str(exc), observed=where), None
     if request.declarations is not None:
-        return Check.failed(
-            DECISION_CHECK,
-            "--decision and --declarations: a decision model answers with the id of an option, "
-            "never with a tool call",
-            observed=where,
+        return (
+            Check.failed(
+                DECISION_CHECK,
+                "--decision and --declarations: a decision model answers with the id of an option, "
+                "never with a tool call",
+                observed=where,
+            ),
+            None,
         )
     if mode is not PromptMode.RUNTIME_RENDERED:
-        return Check.failed(
-            DECISION_CHECK,
-            f"a decision model is trained runtime_rendered, as the application asks it through "
-            f"the runtime's chat template; these prompts are {mode.value}",
-            observed=where,
+        return (
+            Check.failed(
+                DECISION_CHECK,
+                f"a decision model is trained runtime_rendered, as the application asks it through "
+                f"the runtime's chat template; these prompts are {mode.value}",
+                observed=where,
+            ),
+            None,
         )
     rules = identify(request.model)
     if rules is None or rules.family != DECISION_FAMILY:
-        return Check.failed(
-            DECISION_CHECK,
-            f"{request.model} is not a Gemma 3 text model. Decisions by option scoring have been "
-            f"trained and measured on {DECISION_MEASURED_MODEL} only",
-            observed=where,
+        return (
+            Check.failed(
+                DECISION_CHECK,
+                f"{request.model} is not a Gemma 3 text model. Decisions by option scoring have "
+                f"been trained and measured on {DECISION_MEASURED_MODEL} only",
+                observed=where,
+            ),
+            None,
         )
     suffix = asked.render("")
     for row in rows:
         if not row.prompt.endswith(suffix) or len(row.prompt) == len(suffix):
-            return Check.failed(
-                DECISION_CHECK,
-                f"{request.data}:{row.lineno}: the prompt is not a state rendered with "
-                f"{path.name}: it does not end with that decision's question and "
-                "options. Render the rows with `prepare --questions` and train on its split",
-                observed=where,
+            return (
+                Check.failed(
+                    DECISION_CHECK,
+                    f"{request.data}:{row.lineno}: the prompt is not a state rendered with "
+                    f"{path.name}: it does not end with that decision's question and "
+                    "options. Render the rows with `prepare --questions` and train on its split",
+                    observed=where,
+                ),
+                None,
             )
         if row.completion not in asked.ids:
-            return Check.failed(
-                DECISION_CHECK,
-                f"{request.data}:{row.lineno}: the completion {row.completion!r} is not one of "
-                f"the decision's options",
-                observed=where,
+            return (
+                Check.failed(
+                    DECISION_CHECK,
+                    f"{request.data}:{row.lineno}: the completion {row.completion!r} is not one of "
+                    f"the decision's options",
+                    observed=where,
+                ),
+                None,
             )
-    return Check.passed(
-        DECISION_CHECK,
-        f"every row asks {asked.type} question {asked.question!r} over {len(asked.ids)} options, "
-        f"{asked.digest()[:23]}",
-        observed=where | {"sha256": asked.digest()},
+    return (
+        Check.passed(
+            DECISION_CHECK,
+            f"every row asks {asked.type} question {asked.question!r} over {len(asked.ids)} "
+            f"options, {asked.digest()[:23]}",
+            observed=where | {"sha256": asked.digest()},
+        ),
+        asked,
     )
 
 
@@ -2244,10 +2267,14 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     # A decision split is checked first: its refusals name the decision, where
     # the generic ones below would name a tool channel it never had.
     if request.decision is not None:
-        checked = _check_decision(request, request.decision, decision.mode, rows)
-        if checked.outcome is not Outcome.PASSED:
+        checked, asked = _check_decision(request, request.decision, decision.mode, rows)
+        if checked.outcome is not Outcome.PASSED or asked is None:
             return _refused(result, events, checked)
-        result.trained_decision = read_questions(request.decision)[0]
+        result.trained_decision = asked
+        # The same limitation `prepare` records for a split made for another model; a
+        # Gemma 3 text model that is not the measured one passes the family check.
+        if not is_measured_decision_model(request.model):
+            result.limitation(DECISION_MODEL_UNMEASURED.format(model=request.model))
         result.checks.add(checked)
         events.check(checked)
 

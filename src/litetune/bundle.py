@@ -78,6 +78,10 @@ MEASUREMENT_POINTS: dict[str, str] = {
     "tuned_converted": ("the converted artifact itself, which is what actually runs on the device"),
 }
 
+# The run statuses whose decision is given its section: a failed gate or a failed
+# harness means the decision was not shown to decide like its reference.
+SECTION_STATUSES = frozenset({RunStatus.PASSED, RunStatus.INCONCLUSIVE})
+
 CONTRACT_NAME = "contract.json"
 REPORT_NAME = "report.json"
 MANIFEST_NAME = "manifest.json"
@@ -353,6 +357,11 @@ class BundleRequest:
                 "a bundle needs the tool declarations its model is called with, or, for a "
                 "decision model, the decision section verify measured"
             )
+        if self.decision is not None and not self.decision:
+            raise BundleError(
+                "the decision section is empty; a decision model's bundle carries the payload "
+                "verify wrote into its manifest, or nothing"
+            )
         if self.declarations is not None and self.decision is not None:
             raise BundleError(
                 "a decision model answers with the id of an option and calls no tools, so a "
@@ -464,7 +473,8 @@ class BundleResult:
             "checks": self.checks.as_dict(),
             "limitations": list(self.limitations),
             # Only once the section is in the file: a model without it is an
-            # ordinary chat model, whose createDecider throws.
+            # ordinary chat model, which the 2026-10-16 design has createDecider
+            # refuse.
             "use": (
                 {"dart": self.request.contract.decision["create_decider"]}
                 if self.request.contract.decision is not None
@@ -785,6 +795,13 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     bundle to describe, and in the second case the message names where the
     checkpoint survived.
     """
+    if request.contract.decision is not None:
+        # The bundle writes this field itself, from the section it wrote; one
+        # supplied on input would be shipped as if it had been.
+        raise BundleError(
+            "the contract already holds a decision section; the bundle records the section it "
+            "writes, so pass the decision payload in the request and leave contract.decision unset"
+        )
     events = events or EventStream(echo_json=False)
     events.stage_started(
         "bundle",
@@ -802,6 +819,7 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
 
     # -- the model ---------------------------------------------------------
     copied: Path | None = None
+    model_check: Check
     if not request.model.exists():
         model_check = Check.failed(
             "model included",
@@ -812,7 +830,6 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
         try:
             copied = _copy_model(request.model, request.output_dir)
         except (OSError, shutil.Error) as exc:
-            copied = None
             logger.exception("could not copy the model into %s", request.output_dir)
             model_check = Check.failed(
                 "model included",
@@ -820,19 +837,35 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
                 f"{type(exc).__name__}: {exc}",
                 observed={"model": str(request.model)},
             )
-        else:
-            members = (
-                _directory_members(MODEL_DIR_NAME, copied)
-                if copied.is_dir()
-                else [_member(copied.name, copied)]
-            )
-            result.members.extend(members)
-            total = sum(m.bytes for m in members)
-            model_check = Check.passed(
-                "model included",
-                f"{len(members)} file(s), {total:,} bytes at {copied}",
-                observed={"files": len(members), "bytes": total},
-            )
+    # A decision model's section goes into the bundled copy before the copy is
+    # recorded, so the member and the check below name the bytes that ship, in
+    # the event stream and in `report.json` alike. Into the copy, never the
+    # caller's file: the question, the trained options and the calibration travel
+    # inside the `.litertlm`, where the 2026-10-16 design has flutter_edge_ai's
+    # `createDecider` read them.
+    section_check = (
+        _write_decision_section(request, copied, events) if request.decision is not None else None
+    )
+    if copied is not None:
+        members = (
+            _directory_members(MODEL_DIR_NAME, copied)
+            if copied.is_dir()
+            else [_member(copied.name, copied)]
+        )
+        result.members.extend(members)
+        total = sum(m.bytes for m in members)
+        # Only a section that was written is in the file; the words are about
+        # the bytes counted here.
+        with_section = (
+            ", with the decision section"
+            if section_check is not None and section_check.outcome is Outcome.PASSED
+            else ""
+        )
+        model_check = Check.passed(
+            "model included",
+            f"{len(members)} file(s), {total:,} bytes at {copied}{with_section}",
+            observed={"files": len(members), "bytes": total},
+        )
     result.checks.add(model_check)
     events.check(model_check)
 
@@ -854,11 +887,8 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
         events.check(adapter_check)
 
     # -- a decision model's section ---------------------------------------
-    # Into the bundled copy, never the caller's file: the question, the trained
-    # options and the calibration travel inside the `.litertlm`, where
-    # flutter_edge_ai's `createDecider` reads them.
-    if request.decision is not None:
-        section_check = _write_decision_section(request, copied, events)
+    # Written above, before the model was recorded; its check is reported here.
+    if section_check is not None:
         if section_check.outcome is Outcome.PASSED and section_check.observed:
             request = replace(
                 request,
@@ -870,24 +900,6 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
                 f"{SECTION_NAME}, which the LLM runtime does not map; its scores were not measured "
                 "again on the shipped bytes"
             )
-        if copied is not None and copied.is_file():
-            # The file may have changed after it was recorded -- on success, and
-            # on a failure after the script replaced it -- so the member, and the
-            # check that counted it, name the bytes that are on disk now.
-            result.members = [
-                _member(copied.name, copied) if m.path == copied else m for m in result.members
-            ]
-            shipped_bytes = copied.stat().st_size
-            result.checks.checks = [
-                Check.passed(
-                    c.name,
-                    f"1 file(s), {shipped_bytes:,} bytes at {copied}, with the decision section",
-                    observed={"files": 1, "bytes": shipped_bytes},
-                )
-                if c.name == "model included" and c.outcome is Outcome.PASSED
-                else c
-                for c in result.checks.checks
-            ]
         result.checks.add(section_check)
         events.check(section_check)
 
@@ -955,9 +967,16 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     events.check(contract_check)
 
     # -- which measurements were not made ----------------------------------
-    result.missing_measurements = [
-        name for name in MEASUREMENT_POINTS if name not in request.measurements
+    # The untuned base in float is what a training gain is measured against. A
+    # decision's verify refuses `--reference-role untuned_base` (decision_verify.py,
+    # "a decision checkpoint is measured against itself in float32"), so for a
+    # decision bundle that point is not one that was missed.
+    points = [
+        name
+        for name in MEASUREMENT_POINTS
+        if not (request.decision is not None and name == "base_float")
     ]
+    result.missing_measurements = [name for name in points if name not in request.measurements]
     if result.missing_measurements:
         for name in result.missing_measurements:
             result.limitation(
@@ -967,7 +986,7 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
             )
         measured = Check.unchecked(
             "measurements present",
-            f"{len(request.measurements)} of {len(MEASUREMENT_POINTS)} measurement points are in "
+            f"{len(request.measurements)} of {len(points)} measurement points are in "
             f"this bundle; missing: {', '.join(result.missing_measurements)}",
             observed={
                 "present": sorted(request.measurements),
@@ -978,7 +997,10 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
         measured = Check.passed(
             "measurements present",
             "all three measurement points are recorded, so the training gain and the conversion "
-            "cost are separable",
+            "cost are separable"
+            if len(points) == len(MEASUREMENT_POINTS)
+            else f"the {len(points)} measurement points a decision model has are recorded: "
+            f"{', '.join(points)}",
             observed={"present": sorted(request.measurements)},
         )
     # Recorded and emitted, but kept out of `result.checks`: see `BundleResult`.
@@ -1022,17 +1044,30 @@ def _write_decision_section(
         return Check.failed(
             name,
             f"{copied.name} is not a .litertlm; the decision section is part of the bundle "
-            "file flutter_edge_ai loads, so a decision model is bundled as its converted file",
+            "file the 2026-10-16 design has createDecider load, so a decision model is bundled "
+            "as its converted file",
         )
-    if request.verified_sha256 is not None:
-        on_disk = hash_file(copied).split(":", 1)[-1]
-        if on_disk != request.verified_sha256.split(":", 1)[-1]:
-            return Check.failed(
-                name,
-                f"{request.model} is not the file verify measured (sha256 {on_disk[:16]} against "
-                f"{request.verified_sha256.split(':', 1)[-1][:16]}); its decision and calibration "
-                "belong to that file",
-            )
+    if request.status not in SECTION_STATUSES:
+        return Check.failed(
+            name,
+            f"verify's status is {request.status.value}; a decision whose verify failed is not "
+            "given its section, so createDecider would refuse the file rather than decide like a "
+            "verified one",
+        )
+    if request.verified_sha256 is None:
+        return Check.failed(
+            name,
+            "the verify manifest records no sha256 for the file it measured, so this file cannot "
+            "be matched to it; the decision and its calibration belong to that file",
+        )
+    on_disk = hash_file(copied).split(":", 1)[-1]
+    if on_disk != request.verified_sha256.split(":", 1)[-1]:
+        return Check.failed(
+            name,
+            f"{request.model} is not the file verify measured (sha256 {on_disk[:16]} against "
+            f"{request.verified_sha256.split(':', 1)[-1][:16]}); its decision and calibration "
+            "belong to that file",
+        )
     payload = dict(request.decision or {})
     written = write_section(
         copied,

@@ -5,14 +5,19 @@ the reference's scores and then measures the engine's at the same values, so
 this is the one implementation of both.
 
 **Scores** are one per option, each the sum of the log-probabilities of the
-option's shortest unique prefix (`decisions.py`, contract version 1). The
+option's shortest unique prefix, or of its whole `<id><end_of_turn>` where that
+prefix does not tokenise back to itself (`decision_scripts.py`). The
 probabilities are `softmax(scores / T)`.
 
-**The temperature** is fitted by NLL on the in-scope calibration rows: a grid
-of 241 points over log T in [0.01, 1000], then 60 ternary steps between the
+**The temperature** is fitted by NLL on the in-scope calibration rows: 241
+log-spaced points over T in [0.01, 1000], then 60 ternary steps between the
 grid point's neighbours. That is the fit the option-scoring measurements of
-2026-10-15 and 2026-10-16 used, and `tests/test_calibration.py` holds it to
-their recorded temperatures.
+2026-10-15 and 2026-10-16 used: on the 2026-10-16 run's CLINC151 reference
+scores it gave that run's temperature, 1.278985, and threshold, 0.783395
+(checked once on 2026-10-16; those scores are not in this repository). A best
+temperature at either end of the grid is refused: there the scores either
+leave every row certain or carry nothing about the targets, and a probability
+from either is not a calibrated one.
 
 **Abstention, Choice only.** A row abstains when its top option is the
 `none_option`, or when its top probability is below the threshold. The
@@ -50,8 +55,9 @@ C1 = "error_budget"
 
 C1_NOTE = (
     "the calibration rows have no out-of-scope rows, so the threshold caps the error on answered "
-    "in-scope rows instead (the error budget). It does not reject out-of-scope inputs reliably: "
-    "measured on 2026-10-15, its held-out error exceeded the budget it kept on calibration rows"
+    "in-scope rows instead (the error budget). It is not a rejection rule: measured on 2026-10-15 "
+    "on CLINC150, it rejected 0.686 of the out-of-scope test rows, and its test error, 0.0595, "
+    "exceeded the 0.0499 it kept on the calibration rows"
 )
 
 
@@ -98,13 +104,35 @@ def mean_nll(rows: Sequence[Sequence[float]], targets: Sequence[int], temperatur
 
 
 def fit_temperature(rows: Sequence[Sequence[float]], targets: Sequence[int]) -> float:
-    """The temperature with the lowest mean NLL: a log grid, then a ternary refinement."""
+    """The temperature with the lowest mean NLL: a log grid, then a ternary refinement.
+
+    Raises `CalibrationError` when the best grid point is an end of the grid.
+    """
     _check(rows, "temperature")
     low, high = math.log(T_LOW), math.log(T_HIGH)
     step = (high - low) / (T_POINTS - 1)
     grid = [math.exp(low + i * step) for i in range(T_POINTS)]
     values = [mean_nll(rows, targets, t) for t in grid]
     best = min(range(len(grid)), key=lambda i: (values[i], i))
+    if max(values) == min(values):
+        raise CalibrationError(
+            f"the NLL of the {len(rows)} in-scope calibration rows is the same at every "
+            "temperature: each row scores its options alike, so no temperature can be fitted"
+        )
+    if best == 0:
+        raise CalibrationError(
+            f"the best temperature is the bottom of the grid, {T_LOW}: every one of the "
+            f"{len(rows)} in-scope calibration rows already ranks its target first with room to "
+            "spare, so the fit would report every answer as certain, a near-tie included. The "
+            "calibration rows need some the model gets wrong or nearly wrong; more rows usually "
+            "have them"
+        )
+    if best == T_POINTS - 1:
+        raise CalibrationError(
+            f"the best temperature is the top of the grid, {T_HIGH:g}: the scores carry almost "
+            f"nothing about the targets of the {len(rows)} in-scope calibration rows, so the fit "
+            "would make every option about equally likely"
+        )
     lo, hi = grid[max(0, best - 1)], grid[min(len(grid) - 1, best + 1)]
     for _ in range(T_REFINEMENTS):
         m1, m2 = lo + (hi - lo) / 3, hi - (hi - lo) / 3
@@ -242,11 +270,24 @@ def fit(
             rule = C2
             top, forced = signals(outside)
             threshold = threshold_reject_target(top, forced)
+            if threshold > 1.0:
+                saturated = sum(p >= 1.0 and not f for p, f in zip(top, forced, strict=True))
+                raise CalibrationError(
+                    f"no threshold rejects enough out-of-scope calibration rows: {saturated} of "
+                    f"the {len(outside)} have top probability 1.0 on an in-scope option, and at "
+                    f"most {max_answered(len(outside))} may answer. The only threshold left is "
+                    "above 1.0, which abstains on every input"
+                )
         else:
             rule = C1
             top, forced = signals(in_scope)
             correct = [argmax(scores[i]) == targets[i] for i in in_scope]
             threshold = threshold_error_budget(top, correct, forced)
+            if threshold is None and all(forced):
+                raise CalibrationError(
+                    f"every one of the {len(in_scope)} in-scope calibration rows has the "
+                    "none_option as its top option, so no row answers at any threshold"
+                )
             if threshold is None:
                 raise CalibrationError(
                     f"no threshold keeps the error on answered calibration rows within "
