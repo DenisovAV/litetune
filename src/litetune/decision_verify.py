@@ -289,10 +289,12 @@ def spread(total: int, count: int) -> list[int]:
     """`count` row indices out of `total`, evenly through them, in order.
 
     `prepare` keeps the source file's order within a split, and a file grouped
-    by label would give its first rows to one or two options.
+    by label would give its first rows to one or two options. Each index is the
+    middle of its stretch of `total / count` rows, so the last stretch is
+    sampled as the first is: 2 of 3 rows are 0 and 2, not 0 and 1.
     """
     count = min(count, total)
-    return [(i * total) // count for i in range(count)]
+    return [((2 * i + 1) * total) // (2 * count) for i in range(count)]
 
 
 def _not_finite(scores: dict[int, list[list[float]]]) -> int | None:

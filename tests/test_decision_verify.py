@@ -309,7 +309,7 @@ def test_the_reference_scores_every_calibration_and_heldout_row_and_the_runtime_
     held = [json.loads(line)["prompt"] for line in s["heldout"].read_text().splitlines()]
     # Spread through the file, not its first rows: a split keeps the source's
     # order, and a source grouped by label would give them to one option.
-    picked = [(i * held_n) // 5 for i in range(5)]
+    picked = [((2 * i + 1) * held_n) // 10 for i in range(5)]
     assert [r["prompt"] for r in eng_spec["rows"]] == [held[i] for i in picked]
     assert ref_spec["ids_for"] == [calib_n + i for i in picked]
 
@@ -1094,6 +1094,16 @@ def failed(fields: dict[str, Any], name: str) -> dict[str, Any]:
     return next(
         c for c in fields["checks"]["checks"] if c["name"] == name and c["outcome"] == "failed"
     )
+
+
+@pytest.mark.parametrize(
+    ("total", "count", "picked"),
+    [(3, 2, [0, 2]), (10, 5, [1, 3, 5, 7, 9]), (4, 4, [0, 1, 2, 3]), (2, 5, [0, 1]), (7, 1, [3])],
+)
+def test_the_runtime_rows_are_spread_to_the_end_of_the_split(total, count, picked):
+    from litetune.decision_verify import spread
+
+    assert spread(total, count) == picked
 
 
 def test_summed_refuses_an_option_with_fewer_token_scores_than_its_length():

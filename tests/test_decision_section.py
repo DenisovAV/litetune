@@ -885,6 +885,19 @@ def test_the_cli_gives_a_failed_verify_no_section_and_prints_no_call(
     assert not _has_section(tmp_path / "bundle" / model.name)
 
 
+def test_the_cli_refuses_a_status_that_overrides_a_failed_decision_verify(toy, tmp_path, capsys):
+    from litetune.cli import main
+
+    _, model = toy
+    manifest = _decision_manifest(tmp_path, sha_of(model), status="failed_gate")
+
+    code = main(_bundle_argv(tmp_path, model, manifest, "--status", "passed"))
+
+    assert code == 4
+    assert "--status does not replace it" in capsys.readouterr().err
+    assert not (tmp_path / "bundle").exists()
+
+
 def test_the_cli_refuses_a_decision_for_a_model_that_was_not_trained_runtime_rendered(
     toy, tmp_path, capsys
 ):

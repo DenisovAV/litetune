@@ -1845,6 +1845,13 @@ def _bundle(args: argparse.Namespace) -> int:
 
     decision = _decision_payload(manifest)
     if decision is not None:
+        # The section is written only for the status verify recorded, so an
+        # override here would put a failed verify's calibration into the file.
+        if args.status and args.status != manifest.get("status"):
+            raise BundleInputError(
+                f"--status {args.status}: a decision model is given its section for the status "
+                f"verify recorded, {manifest.get('status')}, and --status does not replace it"
+            )
         _check_decision(decision, manifest, recorded, prompt_mode, args.train_metrics)
     if decision is None and args.declarations is None:
         raise BundleInputError(

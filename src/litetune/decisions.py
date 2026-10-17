@@ -90,6 +90,23 @@ class DecisionError(ValueError):
 _LINE_BREAKS = frozenset("\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
 
 
+def _id_text(value: object, what: str, where: str) -> str:
+    """An option id: one line of text, and no ': ' in it.
+
+    The prompt lists an option as `- <id>: <description>`, so `- a: b` reads the
+    same as option `a` described as `b`. Every id the prompt lists is one: the
+    options, the `none_option`, and labels a split's question is inferred from.
+    """
+    option_id = _line_text(value, what, where)
+    if ": " in option_id:
+        raise DecisionError(
+            f"{where}: {what} {option_id!r} contains ': '. The line '- {option_id}' would read "
+            "the same as an option with the text before it as its id and the rest as its "
+            "description"
+        )
+    return option_id
+
+
 def control_text_in(text: str) -> str | None:
     """The first control-token string `text` contains, or `None`."""
     return next((marker for marker in CONTROL_TEXT if marker in text), None)
@@ -239,13 +256,7 @@ def _options(raw: object, kind: str, where: str) -> tuple[Option, ...]:
             raise DecisionError(f"{at} has keys this contract does not read: {unknown}")
         if "id" not in entry:
             raise DecisionError(f"{at} has no 'id'")
-        option_id = _line_text(entry["id"], "the id", at)
-        if ": " in option_id:
-            raise DecisionError(
-                f"{at}: the id {option_id!r} contains ': '. The line '- {option_id}' would read "
-                "the same as an option with the text before it as its id and the rest as its "
-                "description"
-            )
+        option_id = _id_text(entry["id"], "the id", at)
         description = entry.get("description")
         if description is not None:
             description = _line_text(description, "the description", at)
@@ -284,7 +295,7 @@ def decision_from(obj: object, where: str) -> Decision:
             raise DecisionError(
                 f"{where}: a {kind} question has no none_option. Only a Choice answer abstains"
             )
-        none_option = _line_text(none_option, "the none_option", where)
+        none_option = _id_text(none_option, "the none_option", where)
 
     if kind == "noul":
         options = (
@@ -353,7 +364,7 @@ def inferred_decision(labels: Iterable[str]) -> Decision:
     would be, since it is written into the prompt the same way.
     """
     ids = sorted(set(labels))
-    options = tuple(Option(_line_text(i, "the label", "the labels")) for i in ids)
+    options = tuple(Option(_id_text(i, "the label", "the labels")) for i in ids)
     if len(options) < 2:
         raise DecisionError(
             f"the labels name {len(options)} distinct option(s) ({_listing(ids)}); a decision "

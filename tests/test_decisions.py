@@ -233,6 +233,19 @@ def test_an_option_id_with_a_colon_and_space_is_refused():
     assert decision_from({"question": "Q?", "options": [{"id": "a:b"}, {"id": "b"}]}, "q")
 
 
+def test_a_none_option_with_a_colon_and_space_is_refused():
+    with pytest.raises(DecisionError, match="none_option 'out: other' contains ': '"):
+        decision_from(
+            {"question": "Q?", "options": [{"id": "a"}, {"id": "b"}], "none_option": "out: other"},
+            "q",
+        )
+
+
+def test_an_inferred_label_with_a_colon_and_space_is_refused():
+    with pytest.raises(DecisionError, match="label 'a: b' contains ': '"):
+        inferred_decision(["a: b", "c"])
+
+
 def test_the_inferred_decision_is_the_sorted_labels_under_the_generic_question():
     decision = inferred_decision(["joy", "anger", "joy", "fear"])
     assert decision == Decision(
