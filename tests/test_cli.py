@@ -253,6 +253,35 @@ def test_verify_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     assert request.declarations == decls
 
 
+def test_verify_carries_the_decision_flags_to_the_request(monkeypatch, tmp_path):
+    request = _captured_request(
+        monkeypatch,
+        "run_verify",
+        [
+            *_VERIFY_ARGV,
+            "--calibration",
+            str(tmp_path / "calibration.jsonl"),
+            "--float-twin",
+            str(tmp_path / "twin.litertlm"),
+            "--engine-rows",
+            "50",
+            "--threads",
+            "8",
+        ],
+    )
+
+    assert request.calibration == tmp_path / "calibration.jsonl"
+    assert request.float_twin == tmp_path / "twin.litertlm"
+    assert (request.engine_rows, request.threads) == (50, 8)
+
+
+def test_the_decision_flags_default_to_two_hundred_rows_on_four_threads(monkeypatch):
+    request = _captured_request(monkeypatch, "run_verify", list(_VERIFY_ARGV))
+
+    assert (request.calibration, request.float_twin) == (None, None)
+    assert (request.engine_rows, request.threads) == (200, 4)
+
+
 def test_verify_carries_the_backend_to_the_request(monkeypatch):
     request = _captured_request(monkeypatch, "run_verify", [*_VERIFY_ARGV, "--backend", "gpu"])
     assert request.backend == "gpu"

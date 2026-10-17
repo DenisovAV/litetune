@@ -357,6 +357,39 @@ def _add_verify(sub) -> None:
             "float reference resolves its own"
         ),
     )
+    verify.add_argument(
+        "--calibration",
+        type=Path,
+        help=(
+            "decision checkpoints: the calibration.jsonl prepare wrote. The temperature and the "
+            "abstain threshold are fitted on it, never on --data"
+        ),
+    )
+    verify.add_argument(
+        "--float-twin",
+        type=Path,
+        help=(
+            "decision checkpoints: a --recipe none export of the same checkpoint. Its per-token "
+            "option scores are compared with the reference's, and more than 1e-3 nats apart is "
+            "refused: the check that the runtime's scoring method is right on this runtime"
+        ),
+    )
+    verify.add_argument(
+        "--engine-rows",
+        type=_positive,
+        default=200,
+        help=(
+            "decision checkpoints: how many held-out rows the runtime scores (default 200). The "
+            "reference scores all of them; at 151 options a runtime decision took 7.2 s on four "
+            "server CPU threads"
+        ),
+    )
+    verify.add_argument(
+        "--threads",
+        type=_positive,
+        default=4,
+        help="decision checkpoints: the runtime's CPU threads (default 4)",
+    )
     verify.add_argument("--json", action="store_true", help="write the manifest to stdout")
 
 
@@ -925,6 +958,10 @@ def _verify(args: argparse.Namespace) -> int:
         contract=args.contract,
         declarations=args.declarations,
         backend=args.backend,
+        calibration=args.calibration,
+        float_twin=args.float_twin,
+        engine_rows=args.engine_rows,
+        threads=args.threads,
         # `is not None`, not truthiness: `--max-tokens 0` is a request this
         # cannot honour, and silently substituting the default would report a
         # limit the run did not use.
@@ -966,8 +1003,65 @@ def _num(value: object, *, signed: bool = False) -> str:
     return f"{value:+.4f}" if signed else f"{value:.4f}"
 
 
+def summarise_decision(manifest: dict) -> list[str]:
+    """A decision checkpoint's result: what it answers, how well on each side, at what cost."""
+    lines = [f"status: {manifest.get('status')}"]
+    decision = _mapping(manifest.get("decision"))
+    asked = _mapping(decision.get("decision"))
+    fit = _mapping(decision.get("fit"))
+    options = asked.get("options")
+    count = (len(options) if isinstance(options, list) else 0) + (
+        1 if asked.get("none_option") else 0
+    )
+    line = f"  decision: {asked.get('type', '?')}, {count} options"
+    if fit:
+        line += f", temperature {_num(fit.get('temperature'))}"
+        if fit.get("abstain_below") is not None:
+            line += f", abstain below {_num(fit.get('abstain_below'))} ({fit.get('rule')})"
+    lines.append(line)
+    measurements = _mapping(manifest.get("measurements"))
+    for side, label in (("reference", "reference"), ("candidate", "runtime")):
+        block = _mapping(measurements.get(side))
+        if not block:
+            continue
+        text = (
+            f"  {label:<9}  accuracy {_num(block.get('accuracy'))} "
+            f"(n={block.get('in_scope_rows', '?')} in scope)"
+        )
+        if block.get("coverage") is not None:
+            text += (
+                f", answers {_num(block.get('coverage'))}, error on answered "
+                f"{_num(block.get('error_on_answered'))}"
+            )
+        if block.get("out_of_scope_rejected") is not None:
+            text += f", out-of-scope rejected {_num(block.get('out_of_scope_rejected'))}"
+        lines.append(text)
+    quality = _mapping(manifest.get("quality"))
+    if quality.get("available"):
+        lines.append(
+            f"  runtime against reference on {quality.get('rows', '?')} rows: same answer "
+            f"{_num(quality.get('argmax_agreement'))}, mean KL {_num(quality.get('mean_kl'))}"
+        )
+    cost = _mapping(manifest.get("cost"))
+    if cost:
+        lines.append(
+            f"  cost: {_num(cost.get('ms_per_decision_median'))} ms per decision (median), "
+            f"{cost.get('options', '?')} options, mode {cost.get('mode')}, "
+            f"{cost.get('threads', '?')} threads, {cost.get('cpu') or 'CPU not reported'}"
+        )
+    for check in _mapping(manifest.get("checks")).get("checks") or []:
+        check = _mapping(check)
+        if check.get("outcome") != "passed":
+            lines.append(f"  {check.get('outcome')}: {check.get('name')} — {check.get('detail')}")
+    for text in manifest.get("limitations") or []:
+        lines.append(f"  note: {text}")
+    return lines
+
+
 def summarise(manifest: dict) -> list[str]:
     """The human-readable result. Every number printed carries n and its interval."""
+    if _mapping(manifest.get("scorer")).get("name") == "option-scoring":
+        return summarise_decision(manifest)
     status = manifest.get("status")
     lines = [f"status: {status}"]
 

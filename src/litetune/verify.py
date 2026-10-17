@@ -229,6 +229,14 @@ class VerifyRequest:
     # asked of the kernel by the driver script, not read off this field; see
     # `device_report` in `evaluate.RUNTIME_ENGINE_SOURCE`.
     backend: str = "cpu"
+    # A decision checkpoint (`tune --decision`) only. The calibration rows
+    # `prepare` wrote; a `--recipe none` export of the same checkpoint, whose
+    # per-token scores are compared with the reference's; how many held-out rows
+    # the runtime scores; and the runtime's CPU threads.
+    calibration: Path | None = None
+    float_twin: Path | None = None
+    engine_rows: int = 200
+    threads: int = 4
 
 
 @dataclass(frozen=True)
@@ -934,6 +942,49 @@ class _Run:
         return VerifyResult(status=status, manifest=self.manifest)
 
 
+def _decision_record(reference: str) -> dict[str, Any] | None:
+    """The reference's training record when it records a decision; `None` otherwise.
+
+    An unreadable record is `None` here: the generative path reads it again and
+    says what is wrong with it.
+    """
+    try:
+        read = read_training_record(reference)
+    except (OSError, ValueError):
+        return None
+    if read is None or "decision" not in read[0] or read[0]["decision"] is None:
+        return None
+    return read[0]
+
+
+def _verify_decision(
+    request: VerifyRequest,
+    record: dict[str, Any] | None,
+    run: _Run,
+    events: EventStream,
+) -> VerifyResult:
+    from litetune.decision_verify import DecisionVerify, verify_decision
+
+    job = DecisionVerify(
+        model=request.model,
+        reference=request.reference,
+        heldout=request.data,
+        calibration=request.calibration,
+        float_twin=request.float_twin,
+        engine_rows=request.engine_rows,
+        threads=request.threads,
+        backend=request.backend,
+    )
+    status, fields = verify_decision(job, record, events)
+    manifest = run.manifest
+    for key in ("harness", "measurements", "quality"):
+        manifest.pop(key, None)
+    manifest.update(fields)
+    manifest["status"] = status
+    events.stage_finished(status)
+    return VerifyResult(status=Status(status), manifest=manifest)
+
+
 def run_verify(
     request: VerifyRequest,
     events: EventStream | None = None,
@@ -954,6 +1005,13 @@ def run_verify(
     envs.forget_reported_drops()
     events.stage_started("verify", model=str(request.model), reference=request.reference)
     run = _Run(request=request, events=events)
+
+    # -- a decision checkpoint is measured by option scoring --------------------
+    # Before anything generative: such a model never generates in use, and the
+    # checks below are about generations.
+    decision_record = _decision_record(request.reference)
+    if decision_record is not None or request.calibration is not None or request.float_twin:
+        return _verify_decision(request, decision_record, run, events)
 
     # -- did the operator ask for a device litetune knows? ---------------------
     # First, because it costs nothing and everything after it costs minutes: a
