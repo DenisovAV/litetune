@@ -11,6 +11,7 @@ fake.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import struct
@@ -421,13 +422,14 @@ def test_a_bundle_carries_declarations_or_a_decision(tmp_path, declarations, dec
         )
 
 
-def _decision_manifest(tmp_path) -> Path:
+def _decision_manifest(tmp_path, model_sha256: str | None = None) -> Path:
     path = tmp_path / "manifest.json"
     path.write_text(
         json.dumps(
             {
                 "schema": "litetune.verify/1",
                 "status": "passed",
+                "model": {"sha256": model_sha256} if model_sha256 else {},
                 "scorer": {"name": "option-scoring"},
                 "decision": {"section": {"name": SECTION_NAME, "payload": PAYLOAD}},
                 "measurements": {
@@ -479,7 +481,8 @@ def test_the_cli_bundles_a_decision_model_without_declarations(toy, tmp_path, mo
     )
     monkeypatch.setattr(envs.StageEnv, "provision", lambda self, events=None, force=False: None)
 
-    code = main(_bundle_argv(tmp_path, model, _decision_manifest(tmp_path)))
+    measured = hashlib.sha256(model.read_bytes()).hexdigest()
+    code = main(_bundle_argv(tmp_path, model, _decision_manifest(tmp_path, measured)))
 
     out = capsys.readouterr().out
     assert code == 0, out
@@ -607,3 +610,24 @@ def test_the_section_is_built_beside_the_artifact_not_in_the_system_temp(toy):
     assert seen["work"].parent == bundle.parent.absolute()
     assert seen["work"].name.startswith(".model-section-")
     assert not seen["work"].exists(), "the work directory is removed afterwards"
+
+
+def test_the_cli_refuses_to_put_a_decision_into_a_file_verify_did_not_measure(
+    toy, tmp_path, monkeypatch, capsys
+):
+    from litetune import envs
+    from litetune.cli import main
+
+    shim, model = toy
+    runner = ShimEnv(shim)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", lambda self, argv, timeout=None, env=None: runner.run(argv, timeout)
+    )
+    monkeypatch.setattr(envs.StageEnv, "provision", lambda self, events=None, force=False: None)
+
+    code = main(_bundle_argv(tmp_path, model, _decision_manifest(tmp_path, "ab" * 32)))
+
+    out = capsys.readouterr().out
+    assert code == 4, out
+    assert "is not the file verify measured" in out
+    assert "use it with:" not in out
