@@ -698,7 +698,14 @@ def _add_bundle(sub) -> None:
     bundle.add_argument(
         "--model", required=True, type=Path, help=".litertlm file or checkpoint dir"
     )
-    bundle.add_argument("--declarations", required=True, type=Path, help="tool declarations JSON")
+    bundle.add_argument(
+        "--declarations",
+        type=Path,
+        help=(
+            "tool declarations JSON. Required, except for a decision model: when "
+            "--verify-manifest measured one, the bundle carries its decision section instead"
+        ),
+    )
     bundle.add_argument(
         "--prompt-mode",
         choices=[mode.value for mode in PromptMode],
@@ -1819,6 +1826,17 @@ def _bundle(args: argparse.Namespace) -> int:
     else:
         terminator_notes = tuple(n for n in (terminator_note,) if n)
 
+    decision = _decision_payload(manifest)
+    if decision is None and args.declarations is None:
+        raise BundleInputError(
+            "--declarations is required: the bundle records the tools its model is called with. "
+            "Only a decision model, whose --verify-manifest carries a decision section, has none"
+        )
+    if decision is not None and args.declarations is not None:
+        raise BundleInputError(
+            "--verify-manifest measured a decision model, which answers with an option id and "
+            "calls no tools; drop --declarations"
+        )
     established_against, runtime_notes = _runtime_established(manifest, versions_from(envs.RUNTIME))
     contract = Contract(
         prompt_mode=prompt_mode,
@@ -1843,6 +1861,7 @@ def _bundle(args: argparse.Namespace) -> int:
         model=args.model,
         adapter=args.adapter,
         declarations=args.declarations,
+        decision=decision,
         contract=contract,
         status=status,
         measurements=measurements_from_verify(manifest),
@@ -1861,7 +1880,7 @@ def _bundle(args: argparse.Namespace) -> int:
                 "checkpoint the wrong one costs a resolved 0.019-0.036 exact match -- as a wrong "
                 "argument value, not a reordered one. A consumer has to guess.",
             )
-            if args.wire_convention is None
+            if args.wire_convention is None and args.declarations is not None
             else ()
         )
         # A tag can be moved. Recorded rather than refused: it still pins
@@ -1875,6 +1894,19 @@ def _bundle(args: argparse.Namespace) -> int:
     return EXIT_CODES[Status(result.status.value)]
 
 
+def _decision_payload(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """The decision section a decision manifest carries, or `None` for any other manifest."""
+    if _mapping(manifest.get("scorer")).get("name") != "option-scoring":
+        return None
+    payload = _mapping(_mapping(_mapping(manifest.get("decision")).get("section")).get("payload"))
+    if not payload:
+        raise BundleInputError(
+            "the verify manifest measured a decision model but carries no decision section: "
+            "verify did not reach the calibration, so there is nothing to bundle"
+        )
+    return payload
+
+
 def summarise_bundle(result: BundleResult) -> list[str]:
     contract = result.request.contract
     lines = [
@@ -1883,6 +1915,14 @@ def summarise_bundle(result: BundleResult) -> list[str]:
         f"  contract: prompt mode {contract.prompt_mode.value}, base {contract.base_model}"
         f"@{contract.base_model_revision}",
     ]
+    if contract.decision is not None:
+        lines.append(
+            f"  decision section {contract.decision.get('section')}: sha256 "
+            f"{str(contract.decision.get('payload_sha256', '')).split(':')[-1][:16]}"
+        )
+        lines.append("  use it with:")
+        call = str(contract.decision.get("create_decider", ""))
+        lines.extend(f"    {line}" for line in call.splitlines())
     for check in result.checks.checks:
         if check.outcome is not Outcome.PASSED:
             lines.append(f"  {check.outcome.value}: {check.name} — {check.detail}")

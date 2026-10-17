@@ -46,6 +46,7 @@ from typing import Any
 
 from litetune import envs, jsonfile, wheels
 from litetune.checks import Check, CheckSet, Outcome
+from litetune.decision_section import SECTION_NAME, dart_call, payload_bytes, write_section
 from litetune.declarations import (
     DeclarationsError,
     canonical_text,
@@ -56,7 +57,7 @@ from litetune.events import EventStream
 from litetune.manifest import RunManifest, RunStatus
 from litetune.metrics import Unavailable
 from litetune.prompt_mode import PromptMode, parse_prompt_mode
-from litetune.storage import hash_file
+from litetune.storage import hash_bytes, hash_file
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +186,10 @@ class Contract:
     # guess costing a measured, resolved 0.019-0.036 exact match when wrong.
     wire_convention: WireConvention | None = None
     notes: Sequence[str] = ()
+    # A decision model's section: its name, its payload as written into the
+    # `.litertlm`, the payload's digest, and the call an app makes. `None` for
+    # every other model.
+    decision: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.prompt_mode is None:
@@ -257,6 +262,7 @@ class Contract:
                 "one property"
             ),
             "notes": list(self.notes),
+            "decision": dict(self.decision) if self.decision is not None else None,
         }
 
     @classmethod
@@ -290,6 +296,7 @@ class Contract:
                 WireConvention(data["wire_convention"]) if data.get("wire_convention") else None
             ),
             notes=data.get("notes") or (),
+            decision=data.get("decision"),
         )
 
 
@@ -309,7 +316,8 @@ class BundleRequest:
 
     output_dir: Path
     model: Path
-    declarations: Path
+    # `None` only for a decision model, which calls no tools.
+    declarations: Path | None
     contract: Contract
     # The LoRA weights, when the run produced them. Optional because a full
     # fine-tune has none -- not because they are optional to keep.
@@ -327,11 +335,28 @@ class BundleRequest:
     attribution: Mapping[str, Any] = field(default_factory=dict)
     manifest: RunManifest | None = None
     limitations: Sequence[str] = ()
+    # A decision model's `litetune.decision` section payload, as `verify` wrote
+    # it into its manifest. It is written into the bundled `.litertlm`, in the
+    # environment that holds litert-lm-builder.
+    decision: Mapping[str, Any] | None = None
+    section_env: envs.StageEnv = envs.EXPORT
+    auto_provision: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "output_dir", Path(self.output_dir))
         object.__setattr__(self, "model", Path(self.model))
-        object.__setattr__(self, "declarations", Path(self.declarations))
+        if self.declarations is None and self.decision is None:
+            raise BundleError(
+                "a bundle needs the tool declarations its model is called with, or, for a "
+                "decision model, the decision section verify measured"
+            )
+        if self.declarations is not None and self.decision is not None:
+            raise BundleError(
+                "a decision model answers with the id of an option and calls no tools, so a "
+                "bundle carries a decision section or declarations, not both"
+            )
+        if self.declarations is not None:
+            object.__setattr__(self, "declarations", Path(self.declarations))
         if self.adapter is not None:
             # The one path field that was left out, four lines from its siblings.
             # A `str` reached `build_bundle` and raised `AttributeError` from
@@ -435,6 +460,11 @@ class BundleResult:
             "attribution": dict(self.request.attribution),
             "checks": self.checks.as_dict(),
             "limitations": list(self.limitations),
+            "use": (
+                {"dart": dart_call(dict(self.request.decision))}
+                if self.request.decision is not None
+                else None
+            ),
         }
 
 
@@ -766,6 +796,7 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     request.output_dir.mkdir(parents=True, exist_ok=True)
 
     # -- the model ---------------------------------------------------------
+    copied: Path | None = None
     if not request.model.exists():
         model_check = Check.failed(
             "model included",
@@ -776,6 +807,7 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
         try:
             copied = _copy_model(request.model, request.output_dir)
         except (OSError, shutil.Error) as exc:
+            copied = None
             logger.exception("could not copy the model into %s", request.output_dir)
             model_check = Check.failed(
                 "model included",
@@ -816,14 +848,40 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
         result.checks.add(adapter_check)
         events.check(adapter_check)
 
+    # -- a decision model's section ---------------------------------------
+    # Into the bundled copy, never the caller's file: the question, the trained
+    # options and the calibration travel inside the `.litertlm`, where
+    # flutter_edge_ai's `createDecider` reads them.
+    if request.decision is not None:
+        section_check = _write_decision_section(request, copied, events)
+        if section_check.outcome is Outcome.PASSED and section_check.observed and copied:
+            request = replace(
+                request,
+                contract=replace(request.contract, decision=section_check.observed["contract"]),
+            )
+            result.request = request
+            # The file changed after it was recorded: the member has to name the
+            # bytes that ship, or the manifest describes a file nobody has.
+            result.members = [
+                _member(copied.name, copied) if m.path == copied else m for m in result.members
+            ]
+        result.checks.add(section_check)
+        events.check(section_check)
+
     # -- the declarations --------------------------------------------------
     # Shipped with the model because they are half of the calling convention:
     # the same weights against a different tool list are a different model from
     # the caller's point of view, and the contract's prompt mode is only
-    # meaningful with respect to a specific set of declarations.
-    declarations_check = _copy_declarations(request, result)
-    result.checks.add(declarations_check)
-    events.check(declarations_check)
+    # meaningful with respect to a specific set of declarations. A decision
+    # model has none: it answers with an option id.
+    declarations_check = (
+        _copy_declarations(request, result, request.declarations)
+        if request.declarations is not None
+        else None
+    )
+    if declarations_check is not None:
+        result.checks.add(declarations_check)
+        events.check(declarations_check)
 
     # -- the contract ------------------------------------------------------
     # Which declarations this contract was written against, always. A contract
@@ -834,7 +892,11 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     # Not when the declarations were refused, because then no list was shipped.
     contract = request.contract
     recorded = contract.declarations_sha256
-    if declarations_check.outcome is Outcome.PASSED:
+    if (
+        declarations_check is not None
+        and declarations_check.outcome is Outcome.PASSED
+        and request.declarations is not None
+    ):
         shipped = _shipped_digest(request.declarations, not contract.runtime_renders_declarations)
         if recorded is None:
             contract = replace(contract, declarations_sha256=shipped)
@@ -924,6 +986,48 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
         verified=False,
     )
     return result
+
+
+def _write_decision_section(
+    request: BundleRequest, copied: Path | None, events: EventStream
+) -> Check:
+    """Write the decision section into the bundled `.litertlm`, and read it back."""
+    name = "decision section"
+    if copied is None:
+        return Check.failed(name, "the model is not in the bundle, so no section was written")
+    if copied.is_dir() or copied.suffix != ".litertlm":
+        return Check.failed(
+            name,
+            f"{copied.name} is not a .litertlm; the decision section is part of the bundle "
+            "file flutter_edge_ai loads, so a decision model is bundled as its converted file",
+        )
+    payload = dict(request.decision or {})
+    written = write_section(
+        copied,
+        payload,
+        env=request.section_env,
+        auto_provision=request.auto_provision,
+        events=events,
+    )
+    if not written.written:
+        return Check.failed(name, f"the section was not written: {written.reason}")
+    data = payload_bytes(payload)
+    contract = {
+        "section": SECTION_NAME,
+        "payload": payload,
+        "payload_sha256": hash_bytes(data),
+        "create_decider": dart_call(payload),
+    }
+    report = written.report
+    return Check.passed(
+        name,
+        f"{SECTION_NAME}: {len(data):,} bytes, read back byte for byte; the header ends at byte "
+        f"{report.get('header_end')} (it ended at {report.get('header_end_before')})"
+        + (
+            f", replacing {report['replaced']} earlier section(s)" if report.get("replaced") else ""
+        ),
+        observed={"contract": contract, "write": report},
+    )
 
 
 def _copy_adapter(request: BundleRequest, result: BundleResult) -> Check | None:
@@ -1111,7 +1215,7 @@ def _encoding_refusal(source: Path) -> str | None:
     )
 
 
-def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
+def _copy_declarations(request: BundleRequest, result: BundleResult, source: Path) -> Check:
     """Put the tool declarations in, and check they are readable as declarations.
 
     **Two modes, and the order in the file means something different in each.**
@@ -1128,7 +1232,6 @@ def _copy_declarations(request: BundleRequest, result: BundleResult) -> Check:
     bundle then sends.
     """
     name = "declarations included"
-    source = request.declarations
     if not source.is_file():
         return Check.failed(
             name,

@@ -43,6 +43,7 @@ from typing import Any
 from litetune import calibration, envs
 from litetune.checks import Check, CheckSet, Outcome
 from litetune.decision_scripts import ENGINE_SCRIPT, REFERENCE_SCRIPT
+from litetune.decision_section import SECTION_NAME, payload_bytes
 from litetune.decisions import CONTRACT_VERSION, Decision, DecisionError, decision_from
 from litetune.events import EventStream
 from litetune.metrics import paired_difference
@@ -57,7 +58,6 @@ SCORER_MEANS = (
     "threshold or on the none_option"
 )
 SCORING = "unique_prefix"
-SECTION_NAME = "litetune.decision"
 
 DEFAULT_ENGINE_ROWS = 200
 DEFAULT_THREADS = 4
@@ -341,8 +341,8 @@ def section_payload(decision: Decision, fit: calibration.Fit) -> dict[str, Any]:
 
 
 def section_bytes(payload: dict[str, Any]) -> bytes:
-    """The section's bytes: compact UTF-8 JSON, keys in the order written."""
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    """The section's bytes, as `bundle` writes them."""
+    return payload_bytes(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +610,15 @@ def verify_decision(
     fields["measurements"]["candidate"] = outcome_metrics(
         sub_eng, targets, fit, none_index, decision.type
     )
+    # In the shape the generative path records, so `bundle` reads the runtime
+    # and the CPU these numbers were taken on the same way.
+    fields["measurements"]["candidate"]["engine"] = {
+        "engine": "litert-lm",
+        "backend": "cpu",
+        "runtime_version": (eng.report.get("runtime") or {}).get("litert-lm"),
+        "cpu": {"model": eng.report.get("cpu")},
+        "threads": job.threads,
+    }
     fields["measurements"]["reference_on_runtime_rows"] = outcome_metrics(
         sub_ref, targets, fit, none_index, decision.type
     )
