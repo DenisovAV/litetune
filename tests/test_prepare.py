@@ -19,6 +19,7 @@ import pytest
 from stage_fakes import spec_mapping
 
 from litetune.checks import Outcome
+from litetune.decisions import NOUL_IDS
 from litetune.declarations import read_declarations
 from litetune.events import EventStream
 from litetune.metrics import Proportion, ToolCall, Unavailable, parse_call, runtime_calls
@@ -1347,3 +1348,471 @@ def test_a_split_has_the_same_digest_on_a_platform_that_rewrites_newlines(
         rows_as_written = split.path.read_text(encoding="utf-8").splitlines()
         payload = "".join(line + "\n" for line in rows_as_written).encode("utf-8")
         assert split.content_sha256 == f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+# ---------------------------------------------------------------------------
+# Decision rows
+# ---------------------------------------------------------------------------
+
+GEMMA_270M = "google/gemma-3-270m-it"
+
+EMOTIONS = ("sadness", "joy", "anger")
+
+
+def decision_rows(n_per_option: int = 4, options: Sequence[str] = EMOTIONS) -> list[dict]:
+    return [
+        {"prompt": f"text {i} about {option}", "label": option}
+        for option in options
+        for i in range(n_per_option)
+    ]
+
+
+@pytest.fixture
+def questions(tmp_path):
+    def _write(obj: dict[str, Any] | None = None) -> Path:
+        path = tmp_path / "questions.json"
+        path.write_text(
+            json.dumps(
+                obj
+                or {
+                    "type": "choice",
+                    "question": "Which emotion does the text express?",
+                    "options": [
+                        {"id": "sadness"},
+                        {"id": "joy", "description": "happy"},
+                        {"id": "anger"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    return _write
+
+
+def split_records(split) -> list[dict]:
+    return [json.loads(line) for line in split.path.read_text(encoding="utf-8").splitlines()]
+
+
+def all_records(result) -> list[dict]:
+    return [r for s in (result.train, result.calibration, result.heldout) for r in split_records(s)]
+
+
+def test_decision_rows_are_rendered_into_the_contract_with_the_id_as_completion(
+    write_jsonl, request_for, questions
+):
+    result = prepare(
+        request_for(write_jsonl(decision_rows()), questions=questions(), base_model=GEMMA_270M)
+    )
+
+    assert result.train is not None and result.heldout is not None
+    records = all_records(result)
+    assert len(records) == 12
+    for record in records:
+        state, _, rest = record["prompt"].partition("\n\n")
+        i, option = (record["source_line"] - 1) % 4, EMOTIONS[(record["source_line"] - 1) // 4]
+        assert state == f"text {i} about {option}"
+        assert rest == (
+            "Question: Which emotion does the text express?\nOptions:\n- sadness\n"
+            "- joy: happy\n- anger\nAnswer with the id of one option."
+        )
+        assert record["completion"] == record["target"] == option
+
+
+def test_the_decision_is_written_beside_the_split_and_reads_back(
+    write_jsonl, request_for, questions
+):
+    from litetune.decisions import read_questions
+
+    result = prepare(request_for(write_jsonl(decision_rows()), questions=questions()))
+
+    assert result.decision is not None and result.decision.path is not None
+    assert result.decision.path == result.train.path.parent / "decision.json"
+    decision, _ = read_questions(result.decision.path)
+    assert decision == result.decision.decision
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))["decision"]
+    assert report["source"] == "questions"
+    assert report["decision"]["options"][1] == {"id": "joy", "description": "happy"}
+    assert report["decision_sha256"] == decision.digest() == hash_file(result.decision.path)
+    assert report["questions_sha256"] == hash_file(result.request.questions)
+    counts = report["rows_per_option"]
+    assert list(counts) == list(EMOTIONS)
+    assert all(
+        c["all"] == 4 and c["train"] + c["calibration"] + c["heldout"] == 4 for c in counts.values()
+    )
+    assert report["untrained_options"] == []
+
+
+def test_the_decision_record_is_written_with_unix_newlines(
+    write_jsonl, request_for, questions, windows_text_writes
+):
+    result = prepare(request_for(write_jsonl(decision_rows()), questions=questions()))
+
+    assert result.decision is not None and result.decision.path is not None
+    assert b"\r\n" not in result.decision.path.read_bytes()
+    assert hash_file(result.decision.path) == result.decision.decision.digest()
+
+
+def test_labels_without_answers_are_decisions_under_the_generic_question(write_jsonl, request_for):
+    from litetune.decisions import GENERIC_QUESTION
+    from litetune.prepare import DECISION_INFERRED
+
+    result = prepare(request_for(write_jsonl(decision_rows())))
+
+    assert result.decision is not None
+    assert result.decision.decision.question == GENERIC_QUESTION
+    assert result.decision.decision.ids == ("anger", "joy", "sadness")
+    assert DECISION_INFERRED.format(question=GENERIC_QUESTION) in result.limitations
+    assert json.loads(result.report_path.read_text())["decision"]["source"] == "labels"
+
+
+def test_a_label_beside_a_completion_is_read_as_it_always_was(write_jsonl, request_for):
+    data = [{"prompt": f"p{i}", "completion": "c", "label": "x"} for i in range(6)]
+
+    result = prepare(request_for(write_jsonl(data)))
+
+    assert result.decision is None
+    assert {r["prompt"] for r in split_records(result.train)} <= {f"p{i}" for i in range(6)}
+
+
+def test_a_labelled_row_in_an_ordinary_split_is_named_as_a_decision_row(write_jsonl, request_for):
+    data = [{"prompt": "p", "completion": "c"}, {"prompt": "q", "label": "x"}]
+
+    with pytest.raises(PrepareError, match=r"data.jsonl:2: a row with a 'label' and no completion"):
+        prepare(request_for(write_jsonl(data)))
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ({"prompt": "no label"}, r":13: no 'label'"),
+        ({"prompt": "both", "label": "joy", "completion": "joy"}, r":13: .*\['completion'\]"),
+        ({"prompt": "both", "label": "joy", "target": "joy"}, r":13: .*\['target'\]"),
+        ({"prompt": "x", "label": 2}, r":13: the label must be an option id"),
+        ({"prompt": "x", "label": "love"}, r":13: the label 'love' is not one of the options"),
+        ({"prompt": "x", "label": None}, r":13: the label is null"),
+        ({"prompt": "", "label": "joy"}, r":13: the prompt is empty"),
+        ({"prompt": "x<end_of_turn>", "label": "joy"}, r":13: the prompt contains"),
+    ],
+)
+def test_a_decision_row_that_cannot_be_trained_is_refused_by_line(
+    write_jsonl, request_for, questions, extra, message
+):
+    with pytest.raises(PrepareError, match=message):
+        prepare(request_for(write_jsonl([*decision_rows(), extra]), questions=questions()))
+
+
+def test_a_null_label_trains_the_none_option(write_jsonl, request_for, questions):
+    path = questions(
+        {
+            "question": "Which emotion?",
+            "options": [{"id": e} for e in EMOTIONS],
+            "none_option": "none_of_these",
+        }
+    )
+    data = decision_rows() + [{"prompt": f"weather {i}", "label": None} for i in range(4)]
+
+    result = prepare(request_for(write_jsonl(data), questions=path))
+
+    records = all_records(result)
+    outside = [r for r in records if r["prompt"].startswith("weather")]
+    assert len(outside) == 4
+    assert all(r["completion"] == "none_of_these" for r in outside)
+    assert all(
+        r["prompt"].endswith("- anger\n- none_of_these\nAnswer with the id of one option.")
+        for r in records
+    )
+    assert result.decision.rows["none_of_these"] == 4
+
+
+def test_an_option_with_no_training_row_stops_the_split(write_jsonl, request_for, questions):
+    from litetune.prepare import OPTIONS_CHECK
+
+    path = questions({"question": "Which?", "options": [{"id": e} for e in (*EMOTIONS, "love")]})
+
+    result = prepare(request_for(write_jsonl(decision_rows()), questions=path))
+
+    check = next(c for c in result.checks.checks if c.name == OPTIONS_CHECK)
+    assert check.outcome is Outcome.FAILED
+    assert "1 of 4 options have no training row: 'love'" in check.detail
+    assert result.outcome is Outcome.FAILED
+    assert result.train is None and result.heldout is None
+    assert result.decision.path is None
+    assert not (result.request.output_dir / "decision.json").exists()
+    assert not (result.request.output_dir / "train.jsonl").exists()
+    assert any(s.name == SPLIT_CHECK and OPTIONS_CHECK in s.reason for s in result.skipped)
+    assert result.decision.untrained == ("love",)
+
+
+def test_an_option_whose_rows_were_all_held_out_is_untrained(write_jsonl, request_for):
+    from litetune.prepare import OPTIONS_CHECK
+
+    data = decision_rows(n_per_option=6) + [{"prompt": "rare", "label": "zzz"}]
+    data_path = write_jsonl(data)
+    seed = next(
+        s
+        for s in range(200)
+        if any(
+            r.completion == "zzz"
+            for r in split_rows(
+                [Row(i, d["prompt"], d["label"], d["label"]) for i, d in enumerate(data, 1)],
+                hash_file(data_path),
+                s,
+                4,
+            )[1]
+        )
+    )
+
+    result = prepare(request_for(data_path, seed=seed, heldout_size=4))
+
+    check = next(c for c in result.checks.checks if c.name == OPTIONS_CHECK)
+    assert check.outcome is Outcome.FAILED
+    assert result.decision.untrained == ("zzz",)
+    assert result.decision.heldout["zzz"] == 1
+
+
+def test_every_option_trained_passes_and_names_the_fewest(write_jsonl, request_for, questions):
+    from litetune.prepare import OPTIONS_CHECK
+
+    result = prepare(
+        request_for(write_jsonl(decision_rows(n_per_option=10)), questions=questions())
+    )
+
+    check = next(c for c in result.checks.checks if c.name == OPTIONS_CHECK)
+    assert check.outcome is Outcome.PASSED
+    assert check.detail.startswith("all 3 options have training rows; the fewest is ")
+
+
+def test_decision_rows_are_not_profiled_for_exact_match(write_jsonl, request_for, questions):
+    from litetune.prepare import NO_SCOREABILITY_FOR_DECISIONS
+
+    result = prepare(
+        request_for(write_jsonl(decision_rows(n_per_option=10)), questions=questions())
+    )
+
+    assert result.arguments == ()
+    assert not any(c.name == SCOREABILITY_CHECK for c in result.checks.checks)
+    assert any(
+        s.name == SCOREABILITY_CHECK and s.reason == NO_SCOREABILITY_FOR_DECISIONS
+        for s in result.skipped
+    )
+    # With every check that ran passing, so does the stage.
+    assert result.outcome is Outcome.PASSED
+
+
+def test_decision_rows_with_declarations_are_refused(tmp_path, write_jsonl, request_for, questions):
+    with pytest.raises(PrepareError, match="never with a tool call"):
+        prepare(
+            request_for(
+                write_jsonl(decision_rows()),
+                questions=questions(),
+                declarations=_declarations(tmp_path, "open_app"),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "model", ["Qwen/Qwen2.5-0.5B-Instruct", FUNCTIONGEMMA, "meta-llama/Llama-3.2-1B"]
+)
+def test_a_decision_split_for_an_unmeasured_family_is_refused(
+    write_jsonl, request_for, questions, model
+):
+    with pytest.raises(PrepareError, match="measured on google/gemma-3-270m-it only"):
+        prepare(request_for(write_jsonl(decision_rows()), questions=questions(), base_model=model))
+
+
+def test_what_was_and_was_not_measured_is_said_per_model(write_jsonl, request_for, questions):
+    from litetune.prepare import DECISION_MODEL_UNMEASURED, DECISION_MODEL_UNNAMED
+
+    def limitations(**kwargs) -> list[str]:
+        data = write_jsonl(decision_rows(n_per_option=10))
+        return prepare(request_for(data, questions=questions(), **kwargs)).limitations
+
+    assert DECISION_MODEL_UNNAMED in limitations()
+    measured = limitations(base_model=GEMMA_270M)
+    assert DECISION_MODEL_UNNAMED not in measured
+    assert not any("is a Gemma 3 text model" in text for text in measured)
+    one_b = "google/gemma-3-1b-it"
+    assert DECISION_MODEL_UNMEASURED.format(model=one_b) in limitations(base_model=one_b)
+
+
+@pytest.mark.parametrize("kind", ["noul", "score"])
+def test_a_question_type_never_measured_says_so(write_jsonl, request_for, questions, kind):
+    from litetune.prepare import DECISION_TYPE_UNMEASURED
+
+    obj: dict[str, Any] = {"type": kind, "question": "Q?"}
+    ids = list(NOUL_IDS) if kind == "noul" else ["0", "1"]
+    if kind == "score":
+        obj["options"] = ["low", "high"]
+    data = [{"prompt": f"s{i}", "label": ids[i % 2]} for i in range(20)]
+
+    result = prepare(request_for(write_jsonl(data), questions=questions(obj)))
+
+    assert DECISION_TYPE_UNMEASURED.format(kind=kind) in result.limitations
+    assert result.decision.decision.ids == tuple(ids)
+
+
+def test_a_choice_question_carries_no_type_limitation(write_jsonl, request_for, questions):
+    result = prepare(
+        request_for(write_jsonl(decision_rows(n_per_option=10)), questions=questions())
+    )
+
+    assert not any("Only Choice questions" in text for text in result.limitations)
+
+
+def test_the_length_check_counts_the_rendered_prompt(write_jsonl, request_for, questions):
+    """The options are part of every prompt, so they are what fills the window."""
+    counter = FakeTokenCounter()
+    prepare(request_for(write_jsonl(decision_rows()), questions=questions(), tokens=counter))
+
+    counted = counter.calls[0]
+    assert len(counted) == 24
+    assert all(text.endswith("Answer with the id of one option.") for text in counted[:12])
+    assert counted[12:] == [r["label"] for r in decision_rows()]
+
+
+def test_a_decision_split_sets_a_tenth_aside_for_calibration(write_jsonl, request_for, questions):
+    data = write_jsonl(decision_rows(n_per_option=20))
+
+    result = prepare(request_for(data, questions=questions()))
+
+    assert result.calibration is not None
+    assert result.calibration.path.name == "calibration.jsonl"
+    assert (result.train.n, result.calibration.n, result.heldout.n) == (42, 6, 12)
+    lines = [r["source_line"] for r in all_records(result)]
+    assert sorted(lines) == list(range(1, 61)), "every row lands in exactly one split"
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["calibration"]["n"] == 6
+    assert sum(c["calibration"] for c in report["decision"]["rows_per_option"].values()) == 6
+
+
+def test_setting_calibration_aside_leaves_the_heldout_rows_where_they_were(
+    write_jsonl, request_for, questions
+):
+    data = write_jsonl(decision_rows(n_per_option=20))
+    rows_ = [Row(i, "p", "c", "c") for i in range(1, 61)]
+    _, heldout = split_rows(rows_, hash_file(data), 0, 12)
+
+    result = prepare(request_for(data, questions=questions()))
+
+    assert {r["source_line"] for r in split_records(result.heldout)} == {r.lineno for r in heldout}
+
+
+def test_a_calibration_size_is_honoured_or_the_shortfall_said(write_jsonl, request_for, questions):
+    data = write_jsonl(decision_rows(n_per_option=20))
+
+    exact = prepare(request_for(data, questions=questions(), calibration_size=9))
+    assert exact.calibration.n == 9
+    assert not any("calibration split of" in text for text in exact.limitations)
+
+    # One training row is left, and two options lose theirs, so no split is
+    # written; the shortfall is still said.
+    short = prepare(request_for(data, questions=questions(), calibration_size=100))
+    assert sum(short.decision.calibration.values()) == 47
+    assert sum(short.decision.train.values()) == 1
+    assert any("calibration split of 100 was requested" in text for text in short.limitations)
+
+
+def test_a_calibration_fraction_is_a_share_of_every_row(write_jsonl, request_for, questions):
+    data = write_jsonl(decision_rows(n_per_option=20))
+
+    result = prepare(request_for(data, questions=questions(), calibration_fraction=0.25))
+
+    assert result.calibration.n == 15
+
+
+@pytest.mark.parametrize("flag", [{"calibration_size": 3}, {"calibration_fraction": 0.1}])
+def test_calibration_is_for_decision_rows_only(write_jsonl, request_for, flag):
+    with pytest.raises(PrepareError, match="decision rows only"):
+        prepare(request_for(write_jsonl(rows(10)), **flag))
+
+
+def test_an_ordinary_split_writes_no_calibration_file(write_jsonl, request_for):
+    result = prepare(request_for(write_jsonl(rows(10))))
+
+    assert result.calibration is None
+    assert not (result.request.output_dir / "calibration.jsonl").exists()
+
+
+def test_a_none_option_with_no_calibration_row_says_the_threshold_falls_back(
+    write_jsonl, request_for, questions
+):
+    path = questions(
+        {"question": "Which?", "options": [{"id": e} for e in EMOTIONS], "none_option": "other"}
+    )
+    data = decision_rows(n_per_option=20) + [{"prompt": "weather", "label": None}]
+    data_path = write_jsonl(data)
+    from litetune.prepare import split_calibration
+
+    as_rows = [Row(i, d["prompt"], "c", "c") for i, d in enumerate(data, 1)]
+    # A seed that leaves the one out-of-scope row in training.
+    seed = next(
+        s
+        for s in range(200)
+        if 61 in {r.lineno for r in split_calibration(as_rows, hash_file(data_path), s, 12, 6)[0]}
+    )
+
+    result = prepare(request_for(data_path, questions=path, heldout_size=12, seed=seed))
+
+    assert result.decision.calibration["other"] == 0
+    assert any("falls back to the error budget" in text for text in result.limitations)
+
+
+def _none_option_questions(questions):
+    return questions(
+        {"question": "Which?", "options": [{"id": e} for e in EMOTIONS], "none_option": "other"}
+    )
+
+
+def test_a_none_option_with_calibration_rows_does_not_say_the_threshold_falls_back(
+    write_jsonl, request_for, questions
+):
+    data = decision_rows(n_per_option=20) + [
+        {"prompt": f"weather {i}", "label": None} for i in range(40)
+    ]
+
+    result = prepare(request_for(write_jsonl(data), questions=_none_option_questions(questions)))
+
+    assert result.decision.calibration["other"] > 0
+    assert not any("falls back to the error budget" in t for t in result.limitations)
+
+
+def test_a_thin_out_of_scope_calibration_says_a_single_misread_row_sets_the_threshold(
+    write_jsonl, request_for, questions
+):
+    data = decision_rows(n_per_option=20) + [
+        {"prompt": f"weather {i}", "label": None} for i in range(40)
+    ]
+
+    thin = prepare(
+        request_for(
+            write_jsonl(data), questions=_none_option_questions(questions), calibration_size=10
+        )
+    )
+
+    held = thin.decision.calibration["other"]
+    assert 1 <= held < 10
+    assert any(
+        f"the calibration rows hold {held} out-of-scope row(s); with fewer than 10" in text
+        and "Give the calibration split at least 10" in text
+        for text in thin.limitations
+    )
+
+    enough = prepare(
+        request_for(
+            write_jsonl(data), questions=_none_option_questions(questions), calibration_size=60
+        )
+    )
+    assert enough.decision.calibration["other"] >= 10
+    assert not any("single confidently misread row" in text for text in enough.limitations)
+
+
+def test_a_decision_without_a_none_option_has_no_thin_calibration_limitation(
+    write_jsonl, request_for, questions
+):
+    result = prepare(
+        request_for(write_jsonl(decision_rows(n_per_option=20)), questions=questions())
+    )
+
+    assert not any("out-of-scope row(s)" in text for text in result.limitations)

@@ -253,6 +253,35 @@ def test_verify_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     assert request.declarations == decls
 
 
+def test_verify_carries_the_decision_flags_to_the_request(monkeypatch, tmp_path):
+    request = _captured_request(
+        monkeypatch,
+        "run_verify",
+        [
+            *_VERIFY_ARGV,
+            "--calibration",
+            str(tmp_path / "calibration.jsonl"),
+            "--float-twin",
+            str(tmp_path / "twin.litertlm"),
+            "--engine-rows",
+            "50",
+            "--threads",
+            "8",
+        ],
+    )
+
+    assert request.calibration == tmp_path / "calibration.jsonl"
+    assert request.float_twin == tmp_path / "twin.litertlm"
+    assert (request.engine_rows, request.threads) == (50, 8)
+
+
+def test_the_decision_flags_default_to_two_hundred_rows_on_four_threads(monkeypatch):
+    request = _captured_request(monkeypatch, "run_verify", list(_VERIFY_ARGV))
+
+    assert (request.calibration, request.float_twin) == (None, None)
+    assert (request.engine_rows, request.threads) == (200, 4)
+
+
 def test_verify_carries_the_backend_to_the_request(monkeypatch):
     request = _captured_request(monkeypatch, "run_verify", [*_VERIFY_ARGV, "--backend", "gpu"])
     assert request.backend == "gpu"
@@ -308,6 +337,36 @@ def test_tune_carries_the_declarations_to_the_request(monkeypatch, tmp_path):
     )
 
     assert seen["request"].declarations == decls
+
+
+def test_tune_carries_the_decision_to_the_request(monkeypatch, tmp_path):
+    from litetune import cli
+    from litetune.checks import CheckSet
+    from litetune.tune import TuneResult
+
+    decision = tmp_path / "decision.json"
+    seen = {}
+
+    def fake_run_tune(request, events=None):
+        seen["request"] = request
+        return TuneResult(request=request, checks=CheckSet(name="train"))
+
+    monkeypatch.setattr(cli, "run_tune", fake_run_tune)
+    main(
+        [
+            "tune",
+            "--model",
+            "m",
+            "--data",
+            str(tmp_path / "d.jsonl"),
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--decision",
+            str(decision),
+        ]
+    )
+
+    assert seen["request"].decision == decision
 
 
 @pytest.mark.parametrize(("flags", "expected"), [([], None), (["--dtype", "bfloat16"], "bfloat16")])
@@ -1163,6 +1222,99 @@ def test_prepare_refuses_a_declarations_file_rather_than_crashing(tmp_path, caps
     assert "could not complete the run" not in err
 
 
+def test_prepare_carries_the_questions_to_the_request(monkeypatch, tmp_path):
+    questions = tmp_path / "questions.json"
+
+    request = _captured_request(
+        monkeypatch, "prepare", [*_PREPARE_ARGV, "--questions", str(questions)]
+    )
+
+    assert request.questions == questions
+
+
+def test_prepare_carries_the_calibration_split_to_the_request(monkeypatch):
+    request = _captured_request(
+        monkeypatch,
+        "prepare",
+        [*_PREPARE_ARGV, "--calibration-fraction", "0.2", "--calibration-size", "30"],
+    )
+
+    assert (request.calibration_fraction, request.calibration_size) == (0.2, 30)
+
+
+def _decision_dataset(tmp_path: Path) -> tuple[Path, Path]:
+    data = tmp_path / "decisions.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps({"prompt": f"text {i} about {label}", "label": label}) + "\n"
+            for label in ("sadness", "joy", "anger")
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+    questions = tmp_path / "questions.json"
+    questions.write_text(
+        json.dumps(
+            {
+                "question": "Which emotion does the text express?",
+                "options": [{"id": "sadness"}, {"id": "joy"}, {"id": "anger"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return data, questions
+
+
+def test_prepare_renders_decision_rows_and_says_what_it_asked(tmp_path, capsys):
+    data, questions = _decision_dataset(tmp_path)
+
+    code = main(
+        [
+            "prepare",
+            "--data",
+            str(data),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--context-length",
+            "1024",
+            "--questions",
+            str(questions),
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert code == 4  # no tokenizer, so the length check could not run
+    assert "decision: choice, 3 options: Which emotion does the text express?" in out
+    assert "calibration.jsonl (2 for calibration)" in out
+    assert str(tmp_path / "out" / "decision.json") in out
+    assert (tmp_path / "out" / "decision.json").is_file()
+
+
+def test_prepare_refuses_a_questions_file_rather_than_crashing(tmp_path, capsys):
+    data, questions = _decision_dataset(tmp_path)
+    questions.write_text(json.dumps({"question": "Which?", "options": ["sadness", "joy"]}))
+
+    code = main(
+        [
+            "prepare",
+            "--data",
+            str(data),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--context-length",
+            "1024",
+            "--questions",
+            str(questions),
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert code == 4
+    assert "options[0] must be an object" in err
+    assert "Traceback" not in err
+    assert "could not complete the run" not in err
+
+
 # -- bundle -----------------------------------------------------------------
 
 
@@ -1423,6 +1575,52 @@ def test_a_reference_that_was_never_run_is_not_recorded_as_a_measurement():
         }
     )
     assert sorted(points) == ["tuned_converted"]
+
+
+def _decision_verify_manifest(**measurements) -> dict:
+    return {
+        "scorer": {"name": "option-scoring"},
+        "reference": {"role": "float_twin"},
+        "measurements": measurements,
+    }
+
+
+def test_a_decisions_float_point_is_the_reference_on_the_runtimes_own_rows():
+    points = measurements_from_verify(
+        _decision_verify_manifest(
+            candidate={"rows": 200},
+            reference={"rows": 1000},
+            reference_on_runtime_rows={"rows": 200},
+        )
+    )
+
+    assert points == {"tuned_converted": {"rows": 200}, "tuned_float": {"rows": 200}}
+
+
+def test_a_decision_without_the_reference_on_the_runtimes_rows_records_no_float_point():
+    points = measurements_from_verify(
+        _decision_verify_manifest(candidate={"rows": 200}, reference={"rows": 1000})
+    )
+
+    assert sorted(points) == ["tuned_converted"]
+
+
+def test_the_decision_summary_prints_both_agreements_beside_the_kl():
+    manifest = {
+        "scorer": {"name": "option-scoring"},
+        "quality": {
+            "available": True,
+            "rows": 200,
+            "argmax_agreement": 0.995,
+            "answer_agreement": 0.97,
+            "mean_kl": 0.0012,
+        },
+    }
+
+    assert (
+        "  runtime against reference on 200 rows: same top option 0.9950, same answer "
+        "(abstentions included) 0.9700, mean KL 0.0012"
+    ) in summarise(manifest)
 
 
 def test_bundle_of_a_gemma4_model_carries_the_recorded_ceiling(tmp_path, deliverable, capsys):

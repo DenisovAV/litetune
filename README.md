@@ -548,6 +548,118 @@ the record, so the file `tune` read has to reach `verify` and `bundle`
 unchanged. `prepare` without `--base-model` still renders FunctionGemma's
 format, and the report says that it assumed it.
 
+### Decisions: a model that chooses among options
+
+A decision model answers a question about a text with one of a fixed list of
+options: which emotion, which support issue, yes or no. It is an ordinary
+`.litertlm`, made for flutter_edge_ai's `InferenceModel.createDecider`, which
+is to score every option's log-probability through the runtime instead of
+letting the model generate (a proposal; see below). litetune trains it,
+measures it the way `createDecider` is to use it, and writes the question, the
+options and the calibration into the `.litertlm` itself. Nothing ships beside
+it.
+
+Rows carry the text and the option it should get; `questions.json` names the
+question and the options, in the order the prompt lists them:
+
+```json
+{"prompt": "i finally got the job and cannot stop smiling", "label": "joy"}
+```
+
+```json
+{"type": "choice", "question": "Which emotion does the text express?",
+ "options": [{"id": "sadness"}, {"id": "joy"}, {"id": "anger", "description": "cross or annoyed"}],
+ "none_option": "none_of_these"}
+```
+
+A row whose `label` is `null` is outside every option and is trained as the
+`none_option`. `type` is `choice`, `noul` (options `no`, `yes`) or `score`
+(levels lowest first, given as their text). Then:
+
+```bash
+litetune prepare --data rows.jsonl --questions questions.json --output-dir data \
+                 --context-length 2048 --base-model google/gemma-3-270m-it \
+                 --tokenizer google/gemma-3-270m-it
+
+litetune tune --model google/gemma-3-270m-it --data data/train.jsonl \
+              --decision data/decision.json --output-dir tuned --method lora \
+              --epochs 2 --prompt-mode runtime_rendered --max-seq-length 2048
+
+litetune convert --model tuned/model --train-metrics tuned/metrics.json \
+                 --output-dir artifacts --recipe dynamic_wi8_afp32 --recipe none
+
+litetune verify --model artifacts/dynamic_wi8_afp32/<name>.litertlm \
+                --reference tuned/model --data data/heldout.jsonl \
+                --calibration data/calibration.jsonl \
+                --float-twin artifacts/none/<name>.litertlm --json > manifest.json
+
+litetune bundle --output-dir bundle --model artifacts/dynamic_wi8_afp32/<name>.litertlm \
+                --verify-manifest manifest.json --train-metrics tuned/metrics.json \
+                --base-model google/gemma-3-270m-it --base-model-revision <sha>
+```
+
+What each stage does differently for a decision:
+
+- **prepare** renders every row into the prompt `createDecider` sends — the
+  text, the question, one option per line, "Answer with the id of one option."
+  — with the option id as the completion. It sets a tenth of the rows aside as
+  `calibration.jsonl` and writes `decision.json`. It refuses a label outside the
+  options and refuses to write a split in which some option has no training row.
+  The prompt is pinned by golden strings that litetune's renderer tests against
+  and that flutter_edge_ai's proposed renderer is to test against too
+  (`tests/fixtures/decision-contract-v1.json`).
+- **tune** checks every row against `decision.json` and records the decision
+  beside the checkpoint, where the later stages read it.
+- **convert** adds `--prefill_lengths=8,128`: scoring re-prefills one token per
+  decision, which ran padded to 128 tokens without it.
+- **verify** scores every option on every calibration and held-out row with the
+  float checkpoint, fits a temperature and, for `choice`, the threshold below
+  which an answer abstains, then scores 200 held-out rows, spread through the
+  split, through the runtime and compares. It refuses a runtime that scored
+  another prompt than the reference, a runtime whose answers agree with the
+  reference's on fewer than 95 % of rows, a float twin whose per-token scores
+  differ by more than 1e-3 nats, and a threshold that answers no in-scope row.
+  LiteRT-LM 0.18.0 scores a prompt without its second-to-last token right after
+  a prefill; a self-check finds out whether the runtime does, and scores
+  accordingly.
+- **bundle** writes the decision and its calibration into the `.litertlm` as a
+  `litetune.decision` section, and prints the call:
+
+  ```dart
+  final decider = await model.createDecider(
+    options: [DeciderOption('sadness'), DeciderOption('joy'), DeciderOption('anger')],
+  );
+  ```
+
+The app passes every trained option, in any order, and never the
+`none_option`: the prompt lists them in the trained order, and the question,
+the `none_option` and the calibration come from the section.
+flutter_edge_ai's `createDecider` for a `.litertlm` is a proposal at the time
+of writing; until it ships, that call throws `DeciderUnsupportedException`.
+
+What has and has not been measured:
+
+- Decisions are trained and measured on `google/gemma-3-270m-it` only;
+  another family is refused, and another Gemma 3 text model is accepted with a
+  limitation saying it was not measured. Only `choice` questions have been
+  measured; `noul` and `score` follow the same contract and are not.
+- It needs training on the task: the untuned model, and a model trained on
+  other tasks, chose far worse.
+- Scoring is measured on the CPU backend, and against the float reference on
+  LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561 fix only. On
+  another runtime, `verify` needs `--float-twin` to say more than "could not
+  check".
+- A decision costs one scoring pass per option, so the cost grows with the
+  option count, and no phone has run it yet. On CLINC150 (150 intents), a
+  frozen embedding model with a linear head was more accurate (0.954 against
+  0.903); with 55 options the difference was not resolved.
+- Without out-of-scope rows (`label: null`) in the calibration split, the
+  threshold caps the error on answered rows and does not reject out-of-scope
+  inputs reliably.
+- One question per model. The order the app lists the options in is not
+  used, and another order than the trained one is not measured. Without
+  `--questions` the prompt asks a generic question, which is not measured.
+
 ### Gemma 4 towers: drop them, or take them from another bundle
 
 Google's Gemma 4 E2B CPU/GPU bundle carries its vision and audio towers as six
