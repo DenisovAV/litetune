@@ -41,6 +41,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import statistics
 import subprocess
 import tempfile
@@ -52,6 +53,13 @@ from typing import Any, Protocol
 
 from litetune import envs, jsonfile
 from litetune.checks import Check, CheckSet, Outcome, guard
+from litetune.decisions import (
+    Decision,
+    DecisionError,
+    inferred_decision,
+    read_questions,
+    state_problem,
+)
 from litetune.declarations import (
     argument_problem,
     declared_order,
@@ -76,6 +84,7 @@ from litetune.metrics import (
 from litetune.models import (
     WireFormat,
     hint_for,
+    identify,
     renders_declarations_for,
     wire_format_for,
 )
@@ -147,6 +156,43 @@ DECLARATIONS_NOT_COUNTED = (
     "in front of it, which this stage cannot render the way the runtime does. `tune` measures "
     "the rendered sequence and refuses a row over max_seq_length, so nothing is truncated; the "
     "check here is the earlier, cheaper one, and it undercounts"
+)
+
+
+OPTIONS_CHECK = "every option has a training row"
+
+# The one family whose decisions have been trained and scored by option
+# scoring: google/gemma-3-270m-it, on 2026-10-15, on four tasks.
+DECISION_FAMILY = "gemma-3-text"
+DECISION_MEASURED_MODEL = "google/gemma-3-270m-it"
+
+DECISION_MODEL_UNNAMED = (
+    "no --base-model was named, so the model this split trains was not checked. Decisions by "
+    f"option scoring have been trained and measured on {DECISION_MEASURED_MODEL} only, and "
+    "this stage refuses a named model of another family"
+)
+
+DECISION_INFERRED = (
+    "no --questions was given, so the options are the labels' distinct ids, sorted, with no "
+    "descriptions, and every prompt asks the generic question {question!r}. A task-specific "
+    "question is the measured form; a generic one is not measured. Pass --questions to name "
+    "the question, the options' order and their descriptions"
+)
+
+DECISION_TYPE_UNMEASURED = (
+    "this is a {kind} question. Only Choice questions have been trained and measured by option "
+    "scoring; {kind} follows the same contract and is not measured"
+)
+
+DECISION_MODEL_UNMEASURED = (
+    "{model} is a Gemma 3 text model, the family decisions were measured on, but only "
+    f"{DECISION_MEASURED_MODEL} was trained and measured. Its accuracy and cost here are not "
+    "measured"
+)
+
+NO_SCOREABILITY_FOR_DECISIONS = (
+    "decision rows are measured by scoring each option's log-probability, not by exact match on "
+    "an argument, so there are no arguments to profile"
 )
 
 
@@ -485,6 +531,11 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
     measured, and `prepare` records a limitation saying so, because refusing
     them would refuse splits that work.
     """
+    return _rows_from(path, read_objects(path), wire_format)
+
+
+def read_objects(path: Path) -> list[tuple[int, dict[str, Any]]]:
+    """Each row of a JSONL dataset as an object with a `prompt`, with its line number."""
     try:
         raw = path.read_bytes()
     except OSError:
@@ -502,7 +553,7 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
     except UnicodeDecodeError as exc:
         raise PrepareError(f"{path} is not UTF-8 ({exc}); save it as UTF-8") from exc
 
-    rows: list[Row] = []
+    objects: list[tuple[int, dict[str, Any]]] = []
     for lineno, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
             continue
@@ -512,6 +563,17 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
             raise PrepareError(f"{path}:{lineno}: not valid JSON: {exc}") from exc
         if not isinstance(obj, dict) or "prompt" not in obj:
             raise PrepareError(f"{path}:{lineno}: expected an object with a 'prompt' field")
+        objects.append((lineno, obj))
+    if not objects:
+        raise PrepareError(f"{path}: no examples")
+    return objects
+
+
+def _rows_from(
+    path: Path, objects: Sequence[tuple[int, dict[str, Any]]], wire_format: WireFormat | None
+) -> list[Row]:
+    rows: list[Row] = []
+    for lineno, obj in objects:
         try:
             target = read_target(obj.get("target"))
         except ValueError as exc:
@@ -527,6 +589,14 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
             except ValueError as exc:
                 raise PrepareError(f"{path}:{lineno}: {exc}") from exc
         if not isinstance(completion, str) or not completion.strip():
+            if "label" in obj:
+                raise PrepareError(
+                    f"{path}:{lineno}: a row with a 'label' and no completion is a decision row, "
+                    "and this file is read as ordinary rows. `prepare` renders decision rows "
+                    "into the prompt the model is asked in when --questions is given, or when "
+                    "rows have labels and none gives a completion or a target; train on the "
+                    "split it writes"
+                )
             raise PrepareError(
                 f"{path}:{lineno}: no supervised span. A row needs a 'completion' string or a "
                 "'target' to render one from; training on a row with no answer contributes "
@@ -544,6 +614,150 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
     if not rows:
         raise PrepareError(f"{path}: no examples")
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Decision rows
+# ---------------------------------------------------------------------------
+
+
+def is_decision_split(
+    objects: Sequence[tuple[int, dict[str, Any]]], questions: Path | None
+) -> bool:
+    """Whether these rows are decisions: `--questions` was given, or labels without answers.
+
+    A row that gives a completion or a target alongside a label is read as it
+    always was, the label unread, so a dataset that merely carries a `label`
+    column trains what it trained before.
+    """
+    if questions is not None:
+        return True
+    return any("label" in obj for _, obj in objects) and not any(
+        "completion" in obj or "target" in obj for _, obj in objects
+    )
+
+
+def read_decision_rows(
+    path: Path, objects: Sequence[tuple[int, dict[str, Any]]], questions: Path | None
+) -> tuple[Decision, str | None, list[Row]]:
+    """Decision rows rendered into the prompt the model is asked in.
+
+    A row is `{"prompt": <the state>, "label": <option id>}`; a `null` label is
+    a row outside every option, trained as the decision's `none_option`. The
+    decision is `--questions`, or the Choice question the labels imply.
+    Returns it, the digest of the `--questions` file (`None` when inferred),
+    and the rows, each with the rendered prompt and the id as its completion.
+
+    Every refusal names the row, on the ground `read_rows` refuses a row with no
+    answer: a label outside the options, or a state the template would read as
+    structure, cannot be trained honestly.
+    """
+    for lineno, obj in objects:
+        where = f"{path}:{lineno}"
+        if "label" not in obj:
+            raise PrepareError(
+                f"{where}: no 'label'. Every row of a decision split names its option, or null "
+                "for a row outside every option"
+            )
+        given = [key for key in ("completion", "target") if key in obj]
+        if given:
+            raise PrepareError(
+                f"{where}: a decision row's answer is its 'label', and this one also gives "
+                f"{given}, which could disagree with it"
+            )
+        problem = state_problem(obj["prompt"])
+        if problem is not None:
+            raise PrepareError(f"{where}: {problem}")
+        label = obj["label"]
+        if label is not None and not isinstance(label, str):
+            raise PrepareError(
+                f"{where}: the label must be an option id, as a string, or null for a row outside "
+                f"every option; got {json.dumps(label)}"
+            )
+    try:
+        if questions is not None:
+            decision, digest = read_questions(questions)
+        else:
+            decision = inferred_decision(
+                obj["label"] for _, obj in objects if obj["label"] is not None
+            )
+            digest = None
+        rows = []
+        for lineno, obj in objects:
+            answer = decision.answer_for(obj["label"], f"{path}:{lineno}")
+            rows.append(
+                Row(
+                    lineno=lineno,
+                    prompt=decision.render(obj["prompt"]),
+                    completion=answer,
+                    target=answer,
+                    rendered=True,
+                )
+            )
+    except DecisionError as exc:
+        raise PrepareError(str(exc)) from exc
+    return decision, digest, rows
+
+
+def refuse_unmeasured_decision_model(base_model: str) -> None:
+    """Refuse a model outside the one family decisions have been measured on."""
+    rules = identify(base_model)
+    if rules is None or rules.family != DECISION_FAMILY:
+        family = rules.family if rules is not None else "a family litetune has no entry for"
+        raise PrepareError(
+            f"{base_model} is {family}. Decisions by option scoring have been trained and "
+            f"measured on {DECISION_MEASURED_MODEL} only, and another family is refused until it "
+            "has been measured: its template, its end of turn and its accuracy on the task are "
+            "all unknown"
+        )
+
+
+def _count_by_option(decision: Decision, rows: Sequence[Row]) -> dict[str, int]:
+    counts = dict.fromkeys(decision.ids, 0)
+    for row in rows:
+        counts[row.completion] += 1
+    return counts
+
+
+@dataclass
+class DecisionProfile:
+    """What a decision split asks, and how its rows fall across the options."""
+
+    decision: Decision
+    # The `--questions` file and the digest of its bytes; both `None` when the
+    # decision was inferred from the labels.
+    questions: Path | None
+    questions_sha256: str | None
+    rows: dict[str, int]
+    train: dict[str, int] | None = None
+    heldout: dict[str, int] | None = None
+    # `decision.json`, once a split has been written beside it.
+    path: Path | None = None
+
+    @property
+    def untrained(self) -> tuple[str, ...]:
+        if self.train is None:
+            return ()
+        return tuple(option for option, n in self.train.items() if n == 0)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source": "questions" if self.questions is not None else "labels",
+            "questions": str(self.questions) if self.questions is not None else None,
+            "questions_sha256": self.questions_sha256,
+            "decision": self.decision.as_dict(),
+            "decision_sha256": self.decision.digest(),
+            "decision_path": str(self.path) if self.path is not None else None,
+            "rows_per_option": {
+                option: {
+                    "all": n,
+                    "train": self.train[option] if self.train is not None else None,
+                    "heldout": self.heldout[option] if self.heldout is not None else None,
+                }
+                for option, n in self.rows.items()
+            },
+            "untrained_options": list(self.untrained),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1064,6 +1278,10 @@ class PrepareRequest:
     # tokenizer, and making the wire format depend on it would tie the trained
     # format to whether the caller asked for length measurement.
     base_model: str | None = None
+    # The decision the rows are rendered into: one question, its options and
+    # their order (`decisions.read_questions`). Rows with labels and no answers
+    # are decisions without it too, asked a generic question.
+    questions: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", Path(self.data))
@@ -1090,6 +1308,7 @@ class PrepareRequest:
             "headroom_probe": type(self.headroom).__name__ if self.headroom else None,
             "base_model": self.base_model,
             "declarations": str(self.declarations) if self.declarations is not None else None,
+            "questions": str(self.questions) if self.questions is not None else None,
         }
 
 
@@ -1137,6 +1356,7 @@ class PrepareResult:
     # The digest of the declarations the targets were checked against, the
     # same one `tune` records, so the split can be traced to its tool list.
     declarations_sha256: str | None = None
+    decision: DecisionProfile | None = None
     skipped: list[SkippedCheck] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
     report_path: Path | None = None
@@ -1201,6 +1421,7 @@ class PrepareResult:
             "slices": [s.as_dict() for s in self.slices],
             "model": self.identity,
             "declarations_sha256": self.declarations_sha256,
+            "decision": self.decision.as_dict() if self.decision is not None else None,
             "checks": self.checks.as_dict() | {"skipped": [s.as_dict() for s in self.skipped]},
             "limitations": list(self.limitations),
             "spec_fragment": self.spec_fragment(),
@@ -1223,6 +1444,100 @@ def _write_split(path: Path, rows: Sequence[Row]) -> SplitFile:
     return SplitFile(name=path.stem, path=path, n=len(rows), content_sha256=hash_file(path))
 
 
+def _options_check(profile: DecisionProfile) -> Check:
+    """Whether every option the decision lists has a row in the training split."""
+    observed = {"train": profile.train, "heldout": profile.heldout}
+    untrained = profile.untrained
+    if untrained:
+        more = f" and {len(untrained) - 12} more" if len(untrained) > 12 else ""
+        return Check.failed(
+            OPTIONS_CHECK,
+            f"{len(untrained)} of {len(profile.rows)} options have no training row: "
+            f"{', '.join(repr(o) for o in untrained[:12])}{more}. The model is never taught to "
+            "answer them, and the application lists and scores them all the same",
+            observed=observed,
+        )
+    fewest = min(profile.train.values()) if profile.train else 0
+    return Check.passed(
+        OPTIONS_CHECK,
+        f"all {len(profile.rows)} options have training rows; the fewest is {fewest}",
+        observed=observed,
+    )
+
+
+def _check_scoreability(result: PrepareResult, rows: Sequence[Row], events: EventStream) -> None:
+    """Profile every argument, and record whether exact match can measure them."""
+    result.arguments = profile_arguments(rows)
+    unscoreable = result.unscoreable
+    if not result.arguments:
+        # Two reasons produce no argument profile, and they are not the same
+        # news. String targets are a task with no arguments -- there is nothing
+        # to warn about. Absent targets are a split nobody can score at all.
+        labelled = sum(1 for row in rows if row.target is not None)
+        if labelled:
+            detail = (
+                "every target is a string, so there are no arguments to profile. With "
+                "`--scorer exact-text` the whole answer is the unit and per-argument "
+                "cardinality does not apply; this check has nothing to say about such a "
+                "split, which is not the same as saying the split is fine"
+            )
+        else:
+            detail = (
+                "no row carries a 'target', so there are no arguments to profile and "
+                "nothing here can say whether exact match would measure anything"
+            )
+        scoreability = Check.unchecked(
+            SCOREABILITY_CHECK,
+            detail,
+            observed={"rows": len(rows), "labelled": labelled},
+        )
+    elif len(unscoreable) == len(result.arguments):
+        # Every argument invented rather than quoted: exact match has nothing
+        # left to measure on this dataset, and it will read 0.00 for the tuned
+        # model, the base model and every quantization recipe alike. That is not
+        # a gradient of quality with a caveat on it, it is no instrument at all,
+        # and it is the state the measured 92-distinct-values-in-95-examples
+        # dataset was in. Reported before a GPU is booked, which is the whole
+        # point of this stage running first.
+        scoreability = Check.failed(
+            SCOREABILITY_CHECK,
+            f"all {len(result.arguments)} profiled argument(s) are high-cardinality and "
+            f"non-extractive ({', '.join(f'{a.tool}.{a.argument}' for a in unscoreable)}): exact "
+            "match cannot measure anything on this dataset and will read 0.00 for every model",
+            observed={"arguments": [a.as_dict() for a in unscoreable]},
+        )
+        for profile in unscoreable:
+            result.limitation(profile.limitation())
+    elif unscoreable:
+        # Some, not all. The dataset may be exactly what the product needs and
+        # the remaining arguments still carry signal, so this is a limitation on
+        # what the numbers mean rather than a refusal to produce them --
+        # `metrics.py` already reports operation name and argument accuracy
+        # separately for the same reason.
+        scoreability = Check.passed(
+            SCOREABILITY_CHECK,
+            f"{len(result.arguments) - len(unscoreable)} of {len(result.arguments)} arguments are "
+            f"scoreable; {', '.join(f'{a.tool}.{a.argument}' for a in unscoreable)} "
+            "cannot be scored by exact match and will drag every model's argument accuracy down "
+            "by the same amount",
+            observed={
+                "scoreable": [f"{a.tool}.{a.argument}" for a in result.arguments if a.scoreable],
+                "unscoreable": [a.as_dict() for a in unscoreable],
+            },
+        )
+        for profile in unscoreable:
+            result.limitation(profile.limitation())
+    else:
+        scoreability = Check.passed(
+            SCOREABILITY_CHECK,
+            f"{len(result.arguments)} argument(s) profiled; none is both high-cardinality and "
+            "non-extractive",
+            observed={"arguments": [a.as_dict() for a in result.arguments]},
+        )
+    result.checks.add(scoreability)
+    events.check(scoreability)
+
+
 def prepare(request: PrepareRequest, events: EventStream | None = None) -> PrepareResult:
     """Read, measure and split a dataset. Raises only if the file is not a dataset.
 
@@ -1241,7 +1556,26 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     # from the model rather than asked of the caller. A run that named no
     # model gets `None`: FunctionGemma's format, and a limitation saying so.
     wire = wire_format_for(request.base_model) if request.base_model else None
-    rows = read_rows(request.data, wire)
+    objects = read_objects(request.data)
+    decision: DecisionProfile | None = None
+    if is_decision_split(objects, request.questions):
+        if request.declarations is not None:
+            raise PrepareError(
+                "these are decision rows, and --declarations was given. A decision model "
+                "answers with the id of an option, never with a tool call, so there is nothing "
+                "for a tool list to check"
+            )
+        if request.base_model is not None:
+            refuse_unmeasured_decision_model(request.base_model)
+        asked, questions_sha256, rows = read_decision_rows(request.data, objects, request.questions)
+        decision = DecisionProfile(
+            decision=asked,
+            questions=request.questions,
+            questions_sha256=questions_sha256,
+            rows=_count_by_option(asked, rows),
+        )
+    else:
+        rows = _rows_from(request.data, objects, wire)
     # Before anything is profiled or split: a row calling a tool the prompt will
     # never offer is a row that cannot be trained, and saying so after a split
     # has been written means the caller re-runs the stage to learn it.
@@ -1263,9 +1597,19 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         n_rows=len(rows),
         identity=_identity(request.base_model, wire),
         declarations_sha256=declarations_sha256,
+        decision=decision,
     )
     if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
         result.limitation(ASSUMED_WIRE_FORMAT)
+    if decision is not None:
+        if request.base_model is None:
+            result.limitation(DECISION_MODEL_UNNAMED)
+        elif not re.search(r"gemma-?3-270m", hint_for(request.base_model).text, re.IGNORECASE):
+            result.limitation(DECISION_MODEL_UNMEASURED.format(model=request.base_model))
+        if request.questions is None:
+            result.limitation(DECISION_INFERRED.format(question=decision.decision.question))
+        if decision.decision.type != "choice":
+            result.limitation(DECISION_TYPE_UNMEASURED.format(kind=decision.decision.type))
     events.metric("rows", len(rows), source=str(request.data))
 
     # -- lengths -----------------------------------------------------------
@@ -1338,75 +1682,10 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         )
 
     # -- scoreability, before anyone pays for a GPU -------------------------
-    result.arguments = profile_arguments(rows)
-    unscoreable = result.unscoreable
-    if not result.arguments:
-        # Two reasons produce no argument profile, and they are not the same
-        # news. String targets are a task with no arguments -- there is nothing
-        # to warn about. Absent targets are a split nobody can score at all.
-        labelled = sum(1 for row in rows if row.target is not None)
-        if labelled:
-            detail = (
-                "every target is a string, so there are no arguments to profile. With "
-                "`--scorer exact-text` the whole answer is the unit and per-argument "
-                "cardinality does not apply; this check has nothing to say about such a "
-                "split, which is not the same as saying the split is fine"
-            )
-        else:
-            detail = (
-                "no row carries a 'target', so there are no arguments to profile and "
-                "nothing here can say whether exact match would measure anything"
-            )
-        scoreability = Check.unchecked(
-            SCOREABILITY_CHECK,
-            detail,
-            observed={"rows": len(rows), "labelled": labelled},
-        )
-    elif len(unscoreable) == len(result.arguments):
-        # Every argument invented rather than quoted: exact match has nothing
-        # left to measure on this dataset, and it will read 0.00 for the tuned
-        # model, the base model and every quantization recipe alike. That is not
-        # a gradient of quality with a caveat on it, it is no instrument at all,
-        # and it is the state the measured 92-distinct-values-in-95-examples
-        # dataset was in. Reported before a GPU is booked, which is the whole
-        # point of this stage running first.
-        scoreability = Check.failed(
-            SCOREABILITY_CHECK,
-            f"all {len(result.arguments)} profiled argument(s) are high-cardinality and "
-            f"non-extractive ({', '.join(f'{a.tool}.{a.argument}' for a in unscoreable)}): exact "
-            "match cannot measure anything on this dataset and will read 0.00 for every model",
-            observed={"arguments": [a.as_dict() for a in unscoreable]},
-        )
-        for profile in unscoreable:
-            result.limitation(profile.limitation())
-    elif unscoreable:
-        # Some, not all. The dataset may be exactly what the product needs and
-        # the remaining arguments still carry signal, so this is a limitation on
-        # what the numbers mean rather than a refusal to produce them --
-        # `metrics.py` already reports operation name and argument accuracy
-        # separately for the same reason.
-        scoreability = Check.passed(
-            SCOREABILITY_CHECK,
-            f"{len(result.arguments) - len(unscoreable)} of {len(result.arguments)} arguments are "
-            f"scoreable; {', '.join(f'{a.tool}.{a.argument}' for a in unscoreable)} "
-            "cannot be scored by exact match and will drag every model's argument accuracy down "
-            "by the same amount",
-            observed={
-                "scoreable": [f"{a.tool}.{a.argument}" for a in result.arguments if a.scoreable],
-                "unscoreable": [a.as_dict() for a in unscoreable],
-            },
-        )
-        for profile in unscoreable:
-            result.limitation(profile.limitation())
+    if decision is not None:
+        result.skipped.append(SkippedCheck(SCOREABILITY_CHECK, NO_SCOREABILITY_FOR_DECISIONS))
     else:
-        scoreability = Check.passed(
-            SCOREABILITY_CHECK,
-            f"{len(result.arguments)} argument(s) profiled; none is both high-cardinality and "
-            "non-extractive",
-            observed={"arguments": [a.as_dict() for a in result.arguments]},
-        )
-    result.checks.add(scoreability)
-    events.check(scoreability)
+        _check_scoreability(result, rows, events)
 
     # -- headroom: the hook, reported as unmeasured until a probe exists ----
     result.slices = profile_slices(rows, request.headroom)
@@ -1440,7 +1719,14 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             f"{len(rows) - heldout_n}. Every interval on this split is computed at n={heldout_n}, "
             "not at the size that was asked for"
         )
-    if heldout_n < 1:
+    halves = split_rows(rows, content_sha256, request.seed, heldout_n) if heldout_n >= 1 else None
+    options_check = None
+    if decision is not None and halves is not None:
+        decision.train = _count_by_option(decision.decision, halves[0])
+        decision.heldout = _count_by_option(decision.decision, halves[1])
+        options_check = result.checks.add(_options_check(decision))
+        events.check(options_check)
+    if halves is None:
         split_check = Check.failed(
             SPLIT_CHECK,
             f"{len(rows)} row(s) cannot be split into a training set and a held-out set; with no "
@@ -1467,8 +1753,20 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 "remove the rows it named and run prepare again",
             )
         )
+    elif options_check is not None and options_check.outcome is Outcome.FAILED:
+        # As for rows that do not fit: a split is the next stage's input, and
+        # one that trains a model never taught some of its options would reach
+        # `tune` without this check.
+        result.skipped.append(
+            SkippedCheck(
+                SPLIT_CHECK,
+                f"not reached: {OPTIONS_CHECK} did not pass, so no split was written. Add "
+                "training rows for the options it named, or leave them out of the decision, and "
+                "run prepare again",
+            )
+        )
     else:
-        train_rows, heldout_rows = split_rows(rows, content_sha256, request.seed, heldout_n)
+        train_rows, heldout_rows = halves
         result.train = _write_split(request.output_dir / "train.jsonl", train_rows)
         result.heldout = _write_split(request.output_dir / "heldout.jsonl", heldout_rows)
         for split in (result.train, result.heldout):
@@ -1488,6 +1786,16 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         result.checks.add(split_check)
         events.check(split_check)
         events.metric("heldout_examples", result.heldout.n)
+        if decision is not None:
+            # Beside the split it was rendered with, so `verify` and `bundle`
+            # work from the decision the model learned, inferred ones included.
+            decision.path = request.output_dir / "decision.json"
+            decision.path.write_text(
+                decision.decision.canonical_text(), encoding="utf-8", newline=""
+            )
+            events.artifact(
+                str(decision.path), name="decision.json", content_hash=decision.decision.digest()
+            )
 
         if result.heldout.n < request.min_heldout_examples:
             # A warning that travels with every number measured on this split,

@@ -24,3 +24,15 @@ The goldens are what LiteRT-LM's own `chat_template_test_runner.cc` compares
 for `models/qwen3/chat_template.jinja`: `<name>.txt` with `enable_thinking`
 false, `<name>-thinking.txt` with it true. The template itself is packaged, as
 `src/litetune/templates/litert-lm-v0.18.0-qwen3.jinja`.
+
+`decision-contract-v1.json` holds the golden strings of the decision prompt
+contract (`src/litetune/decisions.py`), which flutter_edge_ai's renderer tests
+against too. Three cases are rows the option-scoring measurement of 2026-10-15
+trained or scored, rendered here from the dataset's own text and checked equal
+to the rows it rendered; the emotion, Noul and Score cases are constructed, and
+were never trained.
+
+| case | dataset | revision | licence |
+|---|---|---|---|
+| `abcd` (state, option ids and descriptions) | `asappresearch/abcd` (GitHub), `data/abcd_v1.1.json.gz` | `6b8700ce67c6b37b062dd7a60abc76d7ef832a97` | MIT |
+| `clinc151 in scope`, `clinc151 out of scope` (states and intent ids) | `clinc/clinc_oos` (Hugging Face), config `plus` | `155b9c710419136e17307b80d0a13e68cd46b4ec` | CC BY 3.0 (Larson et al., 2019) |

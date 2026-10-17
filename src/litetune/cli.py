@@ -408,6 +408,18 @@ def _add_prepare(sub) -> None:
         ),
     )
     prep.add_argument(
+        "--questions",
+        type=Path,
+        help=(
+            "the decision the rows are trained for: one question, its type (choice, noul or "
+            "score), its options in order with optional descriptions, and an optional "
+            'none_option for rows labelled null. Each row is {"prompt": <the state>, '
+            '"label": <option id>}, rendered into the prompt flutter_edge_ai\'s createDecider '
+            "scores. Rows with labels and no completions are decisions without it too, asked a "
+            "generic question about their sorted labels"
+        ),
+    )
+    prep.add_argument(
         "--base-model",
         help=(
             "the model this split is for, resolved the way convert and bundle resolve it. It "
@@ -1062,6 +1074,7 @@ def _prepare(args: argparse.Namespace) -> int:
         tokens=counter,
         declarations=args.declarations,
         base_model=args.base_model,
+        questions=args.questions,
     )
     result = prepare(request, events=events)
     delivered = _report(result.as_dict(), lambda: summarise_prepare(result), args.json)
@@ -1083,6 +1096,17 @@ def summarise_prepare(result: PrepareResult) -> list[str]:
         lines.append(f"  {result.heldout.path}")
     else:
         lines.append(f"  {result.n_rows} rows read; no split was written")
+    if result.decision is not None:
+        asked = result.decision.decision
+        lines.append(
+            f"  decision: {asked.type}, {len(asked.ids)} options"
+            + (f" (none option {asked.none_option!r})" if asked.none_option else "")
+            + f": {asked.question}"
+        )
+        if result.decision.path is not None:
+            lines.append(f"  {result.decision.path}")
+        if result.decision.untrained:
+            lines.append(f"  options with no training row: {', '.join(result.decision.untrained)}")
     if isinstance(result.lengths, LengthStats):
         lines.append(
             f"  longest example {result.lengths.total['max']} tokens against a "

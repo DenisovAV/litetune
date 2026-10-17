@@ -1163,6 +1163,88 @@ def test_prepare_refuses_a_declarations_file_rather_than_crashing(tmp_path, caps
     assert "could not complete the run" not in err
 
 
+def test_prepare_carries_the_questions_to_the_request(monkeypatch, tmp_path):
+    questions = tmp_path / "questions.json"
+
+    request = _captured_request(
+        monkeypatch, "prepare", [*_PREPARE_ARGV, "--questions", str(questions)]
+    )
+
+    assert request.questions == questions
+
+
+def _decision_dataset(tmp_path: Path) -> tuple[Path, Path]:
+    data = tmp_path / "decisions.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps({"prompt": f"text {i} about {label}", "label": label}) + "\n"
+            for label in ("sadness", "joy", "anger")
+            for i in range(8)
+        ),
+        encoding="utf-8",
+    )
+    questions = tmp_path / "questions.json"
+    questions.write_text(
+        json.dumps(
+            {
+                "question": "Which emotion does the text express?",
+                "options": [{"id": "sadness"}, {"id": "joy"}, {"id": "anger"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return data, questions
+
+
+def test_prepare_renders_decision_rows_and_says_what_it_asked(tmp_path, capsys):
+    data, questions = _decision_dataset(tmp_path)
+
+    code = main(
+        [
+            "prepare",
+            "--data",
+            str(data),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--context-length",
+            "1024",
+            "--questions",
+            str(questions),
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert code == 4  # no tokenizer, so the length check could not run
+    assert "decision: choice, 3 options: Which emotion does the text express?" in out
+    assert str(tmp_path / "out" / "decision.json") in out
+    assert (tmp_path / "out" / "decision.json").is_file()
+
+
+def test_prepare_refuses_a_questions_file_rather_than_crashing(tmp_path, capsys):
+    data, questions = _decision_dataset(tmp_path)
+    questions.write_text(json.dumps({"question": "Which?", "options": ["sadness", "joy"]}))
+
+    code = main(
+        [
+            "prepare",
+            "--data",
+            str(data),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--context-length",
+            "1024",
+            "--questions",
+            str(questions),
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert code == 4
+    assert "options[0] must be an object" in err
+    assert "Traceback" not in err
+    assert "could not complete the run" not in err
+
+
 # -- bundle -----------------------------------------------------------------
 
 
