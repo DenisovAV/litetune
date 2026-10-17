@@ -168,6 +168,23 @@ def kvp_to_dict(item):
 """
 
 
+@pytest.fixture(autouse=True)
+def no_real_environment(monkeypatch):
+    """A test that reaches a real stage environment fails at once, rather than provisioning one.
+
+    A refusal that regresses would otherwise carry a CLI test on to the export
+    environment, and on to installing it. Tests that need an environment patch
+    in the toy builder (`_patch_section_env`) or pass their own.
+    """
+    from litetune import envs
+
+    def refuse(self, *args, **kwargs):
+        raise AssertionError(f"the test reached the real {self.name} environment")
+
+    monkeypatch.setattr(envs.StageEnv, "provision", refuse)
+    monkeypatch.setattr(envs.StageEnv, "run", refuse)
+
+
 @pytest.fixture
 def toy(tmp_path):
     """The toy builder on a path, and a bundle it packed with two ordinary sections."""
@@ -895,6 +912,34 @@ def test_the_cli_refuses_a_status_that_overrides_a_failed_decision_verify(toy, t
 
     assert code == 4
     assert "--status does not replace it" in capsys.readouterr().err
+    assert not (tmp_path / "bundle").exists()
+
+
+def test_the_cli_refuses_any_status_given_beside_a_decision_manifest(toy, tmp_path, capsys):
+    from litetune.cli import main
+
+    _, model = toy
+    manifest = _decision_manifest(tmp_path, sha_of(model), status="passed")
+
+    code = main(_bundle_argv(tmp_path, model, manifest, "--status", "passed"))
+
+    assert code == 4
+    assert "--status does not replace it" in capsys.readouterr().err
+
+
+def test_the_cli_refuses_a_decision_manifest_that_records_no_status(toy, tmp_path, capsys):
+    from litetune.cli import main
+
+    _, model = toy
+    manifest = _decision_manifest(tmp_path, sha_of(model))
+    doc = json.loads(manifest.read_text())
+    del doc["status"]
+    manifest.write_text(json.dumps(doc), encoding="utf-8")
+
+    code = main(_bundle_argv(tmp_path, model, manifest))
+
+    assert code == 4
+    assert "the verify manifest records no status" in capsys.readouterr().err
     assert not (tmp_path / "bundle").exists()
 
 

@@ -122,11 +122,10 @@ def fit_temperature(rows: Sequence[Sequence[float]], targets: Sequence[int]) -> 
     if best == 0:
         raise CalibrationError(
             f"the best temperature is the bottom of the grid, {T_LOW}: the NLL of the "
-            f"{len(rows)} in-scope calibration rows still falls as the temperature does, where "
-            "each row's top option gets a probability near 1 and only exact ties are split, so "
-            "the fit would report every answer as certain. It happens when the rows the model "
-            "gets wrong or nearly wrong are too few to hold it up; more calibration rows usually "
-            "have them"
+            f"{len(rows)} in-scope calibration rows is lowest there, so the fit has no minimum "
+            "inside the grid to report, and a probability at that edge is not a calibrated one. "
+            "Rows whose target loses, or wins narrowly, are what hold the temperature up; more "
+            "calibration rows usually have them"
         )
     if best == T_POINTS - 1:
         raise CalibrationError(
