@@ -81,6 +81,16 @@ WRITTEN_TEMPLATE_FLAGS = (COMPOSED_TEMPLATE_FLAG, CANONICAL_OR_COMPOSED_FLAG)
 # file. The leading underscore is one `_RECIPE_NAME_RE` cannot produce, so no
 # recipe's directory can take the name.
 COMPOSED_TEMPLATE_PREFIX = "_litetune-chat-template-"
+
+# A decision checkpoint is exported with a second prefill signature of 8 tokens
+# beside the default 128. Option scoring re-prefills one token per decision,
+# and without a signature that small it ran padded to 128: 142 ms against 23
+# ms per re-prefill, measured 2026-10-16 on LiteRT-LM 0.18.0, with scores
+# bit-identical to the bundle without it on 540 rows and a file 1.3 % larger.
+# `1,128` re-prefilled faster still but prefilled a 64-token prompt in 869 ms
+# against 204 ms.
+PREFILL_FLAG = "--prefill_lengths"
+DECISION_PREFILL_LENGTHS = "8,128"
 CHAT_TEMPLATE_CHECK = "chat template"
 
 KNOWN_RECIPES = (
@@ -488,6 +498,20 @@ class ExportRequest:
         object.__setattr__(self, "output_dir", Path(self.output_dir))
 
         requested = list(self.extra_flags)
+        # A checkpoint that records a decision is scored option by option, and
+        # gets the small prefill signature that scoring needs unless the caller
+        # set the flag. An unreadable record is not read as "no decision": the
+        # plan reports it through the base-model identity, as for any record.
+        decision = _recorded_decision(self.model)
+        prefill_source: str | None = None
+        if decision is not None:
+            if any(models.flag_key(t) == models.flag_key(PREFILL_FLAG) for t in requested):
+                prefill_source = "caller"
+            else:
+                requested.append(f"{PREFILL_FLAG}={DECISION_PREFILL_LENGTHS}")
+                prefill_source = "decision checkpoint"
+        object.__setattr__(self, "_decision", decision)
+        object.__setattr__(self, "_prefill_source", prefill_source)
         # `convert`'s own option is the caller's setting, so it enters the table
         # the plan reads like any `--flag=`: an opt-out a family cannot export
         # without is then refused by the plan, not overridden by its rule.
@@ -537,6 +561,18 @@ class ExportRequest:
         object.__setattr__(self, "_externalize_source", source)
         object.__setattr__(self, "_externalized", externalized)
         object.__setattr__(self, "_plan", plan)
+
+    def decision_record(self) -> dict[str, Any] | None:
+        """The decision the checkpoint records, and the prefill lengths it was exported with."""
+        decision = self._decision  # type: ignore[attr-defined]
+        if decision is None:
+            return None
+        setting = self.plan.setting(PREFILL_FLAG)
+        return {
+            "decision_sha256": decision.get("decision_sha256"),
+            "prefill_lengths": setting.token if setting is not None else None,
+            "prefill_lengths_source": self._prefill_source,  # type: ignore[attr-defined]
+        }
 
     @property
     def identity_conflict(self) -> str | None:
@@ -637,6 +673,7 @@ class ExportRequest:
             "externalize_embedder_source": self.externalize_source,
             "flags": list(self.extra_flags),
             "model_rules": self.plan.as_dict(),
+            "decision": self.decision_record(),
             "timeout_s": self.timeout_s,
             "environment": {
                 "name": self.env.name,
@@ -652,6 +689,17 @@ class ExportRequest:
 # ---------------------------------------------------------------------------
 # One recipe
 # ---------------------------------------------------------------------------
+
+
+def _recorded_decision(model: str) -> dict[str, Any] | None:
+    """The checkpoint's training record, when it records a decision; `None` otherwise."""
+    try:
+        read = models.read_training_record(model)
+    except (OSError, ValueError):
+        return None
+    if read is None or not isinstance(read[0].get("decision"), dict):
+        return None
+    return read[0]
 
 
 @dataclass(frozen=True)

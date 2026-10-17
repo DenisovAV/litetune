@@ -3858,3 +3858,74 @@ def test_requirement_names_skip_a_pin_whose_marker_is_false_here():
 def test_requirement_names_read_a_pin_as_pip_does():
     """Leading whitespace is no part of a name to pip (`packaging.Requirement`)."""
     assert requirement_names([" pkg==1.0", "other[extra]==2.0"]) == ("pkg", "other")
+
+
+# ---------------------------------------------------------------------------
+# Decision checkpoints
+# ---------------------------------------------------------------------------
+
+
+def _decision_checkpoint(tmp_path) -> Path:
+    from litetune.decisions import decision_from
+
+    asked = decision_from({"question": "Which?", "options": [{"id": "a"}, {"id": "b"}]}, "q")
+    d = tmp_path / "model"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text(json.dumps({"model_type": "gemma3_text"}), encoding="utf-8")
+    (d / "litetune.json").write_text(
+        json.dumps(
+            {
+                "base_model": "google/gemma-3-270m-it",
+                "decision": asked.as_dict(),
+                "decision_sha256": asked.digest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return d
+
+
+def test_a_decision_checkpoint_is_exported_with_the_small_prefill_signature(tmp_path):
+    from litetune.export import ExportRequest
+
+    checkpoint = _decision_checkpoint(tmp_path)
+
+    request = ExportRequest(
+        model=str(checkpoint), output_dir=tmp_path / "out", recipes=["dynamic_wi8_afp32"]
+    )
+
+    assert "--prefill_lengths=8,128" in request.extra_flags
+    assert "--prefill_lengths=8,128" in request.argv("dynamic_wi8_afp32")
+    record = request.as_dict()["decision"]
+    assert record["prefill_lengths"] == "--prefill_lengths=8,128"
+    assert record["prefill_lengths_source"] == "decision checkpoint"
+    assert record["decision_sha256"].startswith("sha256:")
+
+
+def test_the_callers_prefill_lengths_are_kept_and_said_to_be_theirs(tmp_path):
+    from litetune.export import ExportRequest
+
+    checkpoint = _decision_checkpoint(tmp_path)
+
+    request = ExportRequest(
+        model=str(checkpoint),
+        output_dir=tmp_path / "out",
+        recipes=["dynamic_wi8_afp32"],
+        extra_flags=["--prefill-lengths=16,128"],
+    )
+
+    assert not any(f.startswith("--prefill_lengths=8,128") for f in request.extra_flags)
+    assert request.as_dict()["decision"]["prefill_lengths_source"] == "caller"
+
+
+def test_a_checkpoint_without_a_decision_gets_no_prefill_flag(tmp_path):
+    from litetune.export import ExportRequest
+
+    checkpoint = _checkpoint(tmp_path, recorded="google/gemma-3-270m-it")
+
+    request = ExportRequest(
+        model=str(checkpoint), output_dir=tmp_path / "out", recipes=["dynamic_wi8_afp32"]
+    )
+
+    assert not any("prefill" in f for f in request.extra_flags)
+    assert request.as_dict()["decision"] is None

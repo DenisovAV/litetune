@@ -44,6 +44,13 @@ from litetune.bundle import (
     versions_from,
 )
 from litetune.checks import Outcome
+from litetune.decision_verify import (
+    DEFAULT_ENGINE_ROWS,
+    DEFAULT_THREADS,
+    SCORER,
+    decision_of_section,
+)
+from litetune.decisions import DecisionError
 from litetune.declarations import DeclarationsError
 from litetune.envs import cached_environments, env_cache_root, remove_cached
 from litetune.evaluate import CANDIDATE_BACKENDS, GREEDY, DataError
@@ -357,6 +364,39 @@ def _add_verify(sub) -> None:
             "float reference resolves its own"
         ),
     )
+    verify.add_argument(
+        "--calibration",
+        type=Path,
+        help=(
+            "decision checkpoints: the calibration.jsonl prepare wrote. The temperature and the "
+            "abstain threshold are fitted on it, never on --data"
+        ),
+    )
+    verify.add_argument(
+        "--float-twin",
+        type=Path,
+        help=(
+            "decision checkpoints: a --recipe none export of the same checkpoint. Its per-token "
+            "option scores are compared with the reference's, and more than 1e-3 nats apart is "
+            "refused: the check that the runtime's scoring method is right on this runtime"
+        ),
+    )
+    verify.add_argument(
+        "--engine-rows",
+        type=_positive,
+        default=DEFAULT_ENGINE_ROWS,
+        help=(
+            "decision checkpoints: how many held-out rows the runtime scores (default "
+            f"{DEFAULT_ENGINE_ROWS}). The reference scores all of them; at 151 options a runtime "
+            "decision took 7.2 s on four server CPU threads"
+        ),
+    )
+    verify.add_argument(
+        "--threads",
+        type=_positive,
+        default=DEFAULT_THREADS,
+        help=f"decision checkpoints: the runtime's CPU threads (default {DEFAULT_THREADS})",
+    )
     verify.add_argument("--json", action="store_true", help="write the manifest to stdout")
 
 
@@ -384,6 +424,17 @@ def _add_prepare(sub) -> None:
     prep.add_argument("--heldout-fraction", type=float, default=0.2)
     prep.add_argument("--heldout-size", type=int, help="exact number of held-out rows")
     prep.add_argument(
+        "--calibration-fraction",
+        type=float,
+        help=(
+            "decision rows only: the share of rows set aside to fit the temperature and the "
+            "abstain threshold on (default 0.1)"
+        ),
+    )
+    prep.add_argument(
+        "--calibration-size", type=int, help="decision rows only: exact number of calibration rows"
+    )
+    prep.add_argument(
         "--min-heldout-examples",
         type=int,
         default=PrepareRequest.min_heldout_examples,
@@ -405,6 +456,18 @@ def _add_prepare(sub) -> None:
             "tool the declarations do not offer is rejected, rather than teaching a call the "
             "prompt never offers, and so is one whose arguments contradict its declaration. "
             "Without it no row is checked against a tool list"
+        ),
+    )
+    prep.add_argument(
+        "--questions",
+        type=Path,
+        help=(
+            "the decision the rows are trained for: one question, its type (choice, noul or "
+            "score), its options in order with optional descriptions, and an optional "
+            'none_option for rows labelled null. Each row is {"prompt": <the state>, '
+            '"label": <option id>}, rendered into the prompt createDecider is to '
+            "score (the 2026-10-16 design). Rows with labels and no completions are decisions "
+            "without it too, asked a generic question about their sorted labels"
         ),
     )
     prep.add_argument(
@@ -468,6 +531,15 @@ def _add_tune(sub) -> None:
             "being told it. Without it no declaration turn is rendered into the training "
             "prompt, which a family whose runtime renders declarations refuses for a "
             "runtime_rendered split that trains calls"
+        ),
+    )
+    tune.add_argument(
+        "--decision",
+        type=Path,
+        help=(
+            "the decision.json prepare wrote beside a decision split. Every row is checked to be "
+            "that decision rendered around a state, and the decision is recorded beside the "
+            "checkpoint, where convert, verify and bundle read it"
         ),
     )
     tune.add_argument(
@@ -633,7 +705,14 @@ def _add_bundle(sub) -> None:
     bundle.add_argument(
         "--model", required=True, type=Path, help=".litertlm file or checkpoint dir"
     )
-    bundle.add_argument("--declarations", required=True, type=Path, help="tool declarations JSON")
+    bundle.add_argument(
+        "--declarations",
+        type=Path,
+        help=(
+            "tool declarations JSON. Required, except for a decision model: when "
+            "--verify-manifest measured one, the bundle carries its decision section instead"
+        ),
+    )
     bundle.add_argument(
         "--prompt-mode",
         choices=[mode.value for mode in PromptMode],
@@ -893,6 +972,10 @@ def _verify(args: argparse.Namespace) -> int:
         contract=args.contract,
         declarations=args.declarations,
         backend=args.backend,
+        calibration=args.calibration,
+        float_twin=args.float_twin,
+        engine_rows=args.engine_rows,
+        threads=args.threads,
         # `is not None`, not truthiness: `--max-tokens 0` is a request this
         # cannot honour, and silently substituting the default would report a
         # limit the run did not use.
@@ -934,8 +1017,66 @@ def _num(value: object, *, signed: bool = False) -> str:
     return f"{value:+.4f}" if signed else f"{value:.4f}"
 
 
+def summarise_decision(manifest: dict) -> list[str]:
+    """A decision checkpoint's result: what it answers, how well on each side, at what cost."""
+    lines = [f"status: {manifest.get('status')}"]
+    decision = _mapping(manifest.get("decision"))
+    asked = _mapping(decision.get("decision"))
+    fit = _mapping(decision.get("fit"))
+    options = asked.get("options")
+    count = (len(options) if isinstance(options, list) else 0) + (
+        1 if asked.get("none_option") else 0
+    )
+    line = f"  decision: {asked.get('type', '?')}, {count} options"
+    if fit:
+        line += f", temperature {_num(fit.get('temperature'))}"
+        if fit.get("abstain_below") is not None:
+            line += f", abstain below {_num(fit.get('abstain_below'))} ({fit.get('rule')})"
+    lines.append(line)
+    measurements = _mapping(manifest.get("measurements"))
+    for side, label in (("reference", "reference"), ("candidate", "runtime")):
+        block = _mapping(measurements.get(side))
+        if not block:
+            continue
+        text = (
+            f"  {label:<9}  accuracy {_num(block.get('accuracy'))} "
+            f"(n={block.get('in_scope_rows', '?')} in scope)"
+        )
+        if block.get("coverage") is not None:
+            text += (
+                f", answers {_num(block.get('coverage'))}, error on answered "
+                f"{_num(block.get('error_on_answered'))}"
+            )
+        if block.get("out_of_scope_rejected") is not None:
+            text += f", out-of-scope rejected {_num(block.get('out_of_scope_rejected'))}"
+        lines.append(text)
+    quality = _mapping(manifest.get("quality"))
+    if quality.get("available"):
+        lines.append(
+            f"  runtime against reference on {quality.get('rows', '?')} rows: same top option "
+            f"{_num(quality.get('argmax_agreement'))}, same answer (abstentions included) "
+            f"{_num(quality.get('answer_agreement'))}, mean KL {_num(quality.get('mean_kl'))}"
+        )
+    cost = _mapping(manifest.get("cost"))
+    if cost:
+        lines.append(
+            f"  cost: {_num(cost.get('ms_per_decision_median'))} ms per decision (median), "
+            f"{cost.get('options', '?')} options, mode {cost.get('mode')}, "
+            f"{cost.get('threads', '?')} threads, {cost.get('cpu') or 'CPU not reported'}"
+        )
+    for check in _mapping(manifest.get("checks")).get("checks") or []:
+        check = _mapping(check)
+        if check.get("outcome") != "passed":
+            lines.append(f"  {check.get('outcome')}: {check.get('name')} — {check.get('detail')}")
+    for text in manifest.get("limitations") or []:
+        lines.append(f"  note: {text}")
+    return lines
+
+
 def summarise(manifest: dict) -> list[str]:
     """The human-readable result. Every number printed carries n and its interval."""
+    if _mapping(manifest.get("scorer")).get("name") == SCORER:
+        return summarise_decision(manifest)
     status = manifest.get("status")
     lines = [f"status: {status}"]
 
@@ -1062,6 +1203,9 @@ def _prepare(args: argparse.Namespace) -> int:
         tokens=counter,
         declarations=args.declarations,
         base_model=args.base_model,
+        questions=args.questions,
+        calibration_fraction=args.calibration_fraction,
+        calibration_size=args.calibration_size,
     )
     result = prepare(request, events=events)
     delivered = _report(result.as_dict(), lambda: summarise_prepare(result), args.json)
@@ -1080,9 +1224,22 @@ def summarise_prepare(result: PrepareResult) -> list[str]:
             f"(content {result.content_sha256.split(':')[-1][:16]}, seed {result.request.seed})"
         )
         lines.append(f"  {result.train.path}")
+        if result.calibration is not None:
+            lines.append(f"  {result.calibration.path} ({result.calibration.n} for calibration)")
         lines.append(f"  {result.heldout.path}")
     else:
         lines.append(f"  {result.n_rows} rows read; no split was written")
+    if result.decision is not None:
+        asked = result.decision.decision
+        lines.append(
+            f"  decision: {asked.type}, {len(asked.ids)} options"
+            + (f" (none option {asked.none_option!r})" if asked.none_option else "")
+            + f": {asked.question}"
+        )
+        if result.decision.path is not None:
+            lines.append(f"  {result.decision.path}")
+        if result.decision.untrained:
+            lines.append(f"  options with no training row: {', '.join(result.decision.untrained)}")
     if isinstance(result.lengths, LengthStats):
         lines.append(
             f"  longest example {result.lengths.total['max']} tokens against a "
@@ -1127,6 +1284,7 @@ def _tune(args: argparse.Namespace) -> int:
         prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
         force_prompt_mode=args.force_prompt_mode,
         declarations=args.declarations,
+        decision=args.decision,
         timeout_s=args.timeout_s,
         auto_provision=not args.no_provision,
     )
@@ -1361,6 +1519,12 @@ def summarise_convert(result: ExportResult) -> list[str]:
         lines.append(
             f"  added {flag} (required by {plan.rules.family if plan.rules else 'litetune'})"
         )
+    decision = result.request.decision_record()
+    if decision is not None:
+        lines.append(
+            f"  decision checkpoint: {decision['prefill_lengths']} "
+            f"({decision['prefill_lengths_source']})"
+        )
     template = result.chat_template
     if template is not None and template.source == "canonical":
         # The file the marker above stood for, which no flag in the plan names.
@@ -1423,9 +1587,18 @@ def measurements_from_verify(manifest: dict[str, Any]) -> dict[str, Any]:
     candidate = measured.get("candidate")
     if isinstance(candidate, dict) and candidate.get("available") is not False:
         points["tuned_converted"] = candidate
-    reference = measured.get("reference")
+    # A decision's reference scores every held-out row and its runtime
+    # `engine_rows` of them; the float point that sits beside the converted one is
+    # the reference on the runtime's own rows, or the two would differ in what
+    # they were asked as well as in what they ran on.
+    decision = _mapping(manifest.get("scorer")).get("name") == SCORER
+    reference = measured.get("reference_on_runtime_rows" if decision else "reference")
     if isinstance(reference, dict) and reference.get("available") is not False:
-        name = _REFERENCE_POINT.get(role)
+        name = (
+            _REFERENCE_POINT[ReferenceRole.FLOAT_TWIN.value]
+            if decision
+            else _REFERENCE_POINT.get(role)
+        )
         if name is not None:
             points[name] = reference
     return points
@@ -1670,6 +1843,32 @@ def _bundle(args: argparse.Namespace) -> int:
     else:
         terminator_notes = tuple(n for n in (terminator_note,) if n)
 
+    decision = _decision_payload(manifest)
+    if decision is not None:
+        # The section is written only for the status verify recorded: an
+        # override, or a default standing in for a missing one, would put a
+        # failed verify's calibration into the file.
+        if args.status:
+            raise BundleInputError(
+                f"--status {args.status}: a decision model is given its section for the status "
+                f"verify recorded, {manifest.get('status')}, and --status does not replace it"
+            )
+        if not manifest.get("status"):
+            raise BundleInputError(
+                "the verify manifest records no status, and a decision model is given its "
+                "section only for a verify that passed or could not tell"
+            )
+        _check_decision(decision, manifest, recorded, prompt_mode, args.train_metrics)
+    if decision is None and args.declarations is None:
+        raise BundleInputError(
+            "--declarations is required: the bundle records the tools its model is called with. "
+            "Only a decision model, whose --verify-manifest carries a decision section, has none"
+        )
+    if decision is not None and args.declarations is not None:
+        raise BundleInputError(
+            "--verify-manifest measured a decision model, which answers with an option id and "
+            "calls no tools; drop --declarations"
+        )
     established_against, runtime_notes = _runtime_established(manifest, versions_from(envs.RUNTIME))
     contract = Contract(
         prompt_mode=prompt_mode,
@@ -1694,6 +1893,10 @@ def _bundle(args: argparse.Namespace) -> int:
         model=args.model,
         adapter=args.adapter,
         declarations=args.declarations,
+        decision=decision,
+        verified_sha256=(
+            _mapping(manifest.get("model")).get("sha256") if decision is not None else None
+        ),
         contract=contract,
         status=status,
         measurements=measurements_from_verify(manifest),
@@ -1712,7 +1915,7 @@ def _bundle(args: argparse.Namespace) -> int:
                 "checkpoint the wrong one costs a resolved 0.019-0.036 exact match -- as a wrong "
                 "argument value, not a reordered one. A consumer has to guess.",
             )
-            if args.wire_convention is None
+            if args.wire_convention is None and args.declarations is not None
             else ()
         )
         # A tag can be moved. Recorded rather than refused: it still pins
@@ -1726,6 +1929,68 @@ def _bundle(args: argparse.Namespace) -> int:
     return EXIT_CODES[Status(result.status.value)]
 
 
+def _decision_payload(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """The decision section a decision manifest carries, or `None` for any other manifest."""
+    if _mapping(manifest.get("scorer")).get("name") != SCORER:
+        return None
+    payload = _mapping(_mapping(_mapping(manifest.get("decision")).get("section")).get("payload"))
+    if not payload:
+        raise BundleInputError(
+            "the verify manifest measured a decision model but carries no decision section: "
+            "verify did not reach the calibration, so there is nothing to bundle"
+        )
+    return payload
+
+
+def _check_decision(
+    payload: dict[str, Any],
+    manifest: dict[str, Any],
+    recorded: Mapping[str, Any],
+    prompt_mode: PromptMode,
+    train_metrics: Path | None,
+) -> None:
+    """Refuse a decision that is not the one the model was trained on.
+
+    The section is written into the file as verify's manifest carries it, and the
+    only tie between that payload and the training run was the manifest's own
+    word, so each digest recorded for the decision is held against the payload's.
+    """
+    if prompt_mode is not PromptMode.RUNTIME_RENDERED:
+        raise BundleInputError(
+            f"the bundle's prompt mode is {prompt_mode.value}, and tune trains a decision only "
+            f"in {PromptMode.RUNTIME_RENDERED.value}; a decision section on a model trained "
+            "otherwise would be asked in a form it never learned. Pass the metrics of the tune "
+            "run that produced this model"
+        )
+    try:
+        digest = decision_of_section(payload).digest()
+    except DecisionError as exc:
+        raise BundleInputError(
+            f"the decision section in the verify manifest is not a decision: {exc}"
+        ) from None
+    # Both are written whenever there is a decision: verify records the digest
+    # beside the payload, and a `tune --decision` run in its metrics. A missing
+    # one is a manifest or metrics from another run, not a pass.
+    recorded_digests = [
+        ("the verify manifest", _mapping(manifest.get("decision")).get("decision_sha256"))
+    ]
+    if train_metrics is not None:
+        recorded_digests.append((str(train_metrics), recorded.get("decision_sha256")))
+    for where, expected in recorded_digests:
+        if expected is None:
+            raise BundleInputError(
+                f"{where} records no decision digest, and every run that measured or trained "
+                "this decision records one: it comes from another run, so the section is not "
+                "written into the file"
+            )
+        if expected != digest:
+            raise BundleInputError(
+                f"the decision section hashes to {digest}, and {where} records {expected} for the "
+                "decision; the section is not the decision this model was measured and trained "
+                "on, so it is not written into the file"
+            )
+
+
 def summarise_bundle(result: BundleResult) -> list[str]:
     contract = result.request.contract
     lines = [
@@ -1734,6 +1999,14 @@ def summarise_bundle(result: BundleResult) -> list[str]:
         f"  contract: prompt mode {contract.prompt_mode.value}, base {contract.base_model}"
         f"@{contract.base_model_revision}",
     ]
+    if contract.decision is not None:
+        lines.append(
+            f"  decision section {contract.decision.get('section')}: sha256 "
+            f"{str(contract.decision.get('section_sha256', '')).split(':')[-1][:16]}"
+        )
+        lines.append("  use it with:")
+        call = str(contract.decision.get("create_decider", ""))
+        lines.extend(f"    {line}" for line in call.splitlines())
     for check in result.checks.checks:
         if check.outcome is not Outcome.PASSED:
             lines.append(f"  {check.outcome.value}: {check.name} — {check.detail}")
