@@ -669,6 +669,20 @@ def test_a_removal_the_header_reader_does_not_confirm_leaves_the_file(toy):
     assert bundle.read_bytes() == sectioned
 
 
+def test_a_file_unpack_finds_clean_is_not_taken_as_clean_when_its_header_names_one(toy):
+    shim, bundle = toy
+    original = bundle.read_bytes()
+    (shim / "litert_lm_builder" / "litertlm_peek.py").write_text(TOY_PEEK_PHANTOM)
+
+    removed = remove_section(bundle, env=ShimEnv(shim))
+
+    assert removed.removed == 0
+    assert f"the header names 1 section(s) {SECTION_NAME} that unpack did not list" in str(
+        removed.reason
+    )
+    assert bundle.read_bytes() == original
+
+
 @pytest.mark.parametrize("count", [None, True, "1"])
 def test_a_removal_without_a_count_is_not_taken_as_done(tmp_path, count):
     result = {"written": True, "reason": None}

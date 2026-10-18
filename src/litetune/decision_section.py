@@ -105,7 +105,12 @@ def main(spec):
     kept = [s for s in before.get("section", []) if not named(s, name)]
     replaced = len(before.get("section", [])) - len(kept)
     if payload is None and not replaced:
-        # Nothing to take out, so the file is left as it is.
+        # Nothing to take out, so the file is left as it is -- once its header,
+        # read by its own offsets as the read-back below reads it, agrees.
+        seen = section_bytes(artifact, name)
+        if seen:
+            return {"written": False, "reason": f"the header names {len(seen)} section(s) "
+                    f"{name} that unpack did not list"}
         return {"written": False, "reason": None, "replaced": 0, "header_end_before": end_before}
     for s in kept:
         s["data_path"] = str(before_dir / os.path.basename(s["data_path"]))
