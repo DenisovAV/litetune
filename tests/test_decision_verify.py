@@ -32,13 +32,14 @@ from litetune.decision_verify import (
     RUNTIME_CHECK,
     TARGETS_CHECK,
     TWIN_CHECK,
+    TYPE_LESS_MEASURED,
     DecisionVerify,
     run_script,
     summed,
     unique_lengths,
     verify_decision,
 )
-from litetune.decisions import decision_from
+from litetune.decisions import NOUL_IDS, TYPE_MEASURED, decision_from
 from litetune.events import EventStream
 from litetune.prepare import PrepareRequest, prepare
 
@@ -174,18 +175,27 @@ class FakeScoringEnv:
 def split(tmp_path):
     """`prepare`'s decision split: three emotions and an out-of-scope option."""
 
-    def _make(with_none: bool = True, per_option: int = 30, oos: int = 40) -> dict[str, Any]:
+    def _make(
+        with_none: bool = True, per_option: int = 30, oos: int = 40, kind: str = "choice"
+    ) -> dict[str, Any]:
         obj: dict[str, Any] = {
             "question": "Which emotion?",
             "options": [{"id": o} for o in OPTIONS],
         }
+        options: tuple[str, ...] = OPTIONS
+        if kind == "noul":
+            obj = {"type": "noul", "question": "Is it joyful?"}
+            options = NOUL_IDS
+        elif kind == "score":
+            obj = {"type": "score", "question": "How joyful?", "options": ["low", "high"]}
+            options = ("0", "1")
         if with_none:
             obj["none_option"] = "none_of_these"
         questions = tmp_path / "questions.json"
         questions.write_text(json.dumps(obj), encoding="utf-8")
         rows: list[dict[str, Any]] = [
             {"prompt": f"text {i} about {o}", "label": o}
-            for o in OPTIONS
+            for o in options
             for i in range(per_option)
         ]
         if with_none:
@@ -495,6 +505,27 @@ def test_out_of_scope_rows_the_threshold_lets_through_on_heldout_fail_the_rule(s
 
     assert status == "failed_gate"
     assert check(fields, RULE_CHECK)["outcome"] == "failed"
+
+
+@pytest.mark.parametrize("kind", ["noul", "score"])
+def test_a_question_type_measured_on_fewer_tasks_says_how_many(split, tmp_path, kind):
+    s = split(with_none=False, kind=kind)
+    assert s["decision"].type == kind
+
+    _, fields = run(job_for(s, tmp_path), s["record"])
+
+    text = TYPE_LESS_MEASURED.format(kind=kind, measured=TYPE_MEASURED[kind])
+    assert text in fields["limitations"]
+
+
+def test_a_choice_question_carries_no_type_limitation(split, tmp_path):
+    s = split()
+
+    _, fields = run(job_for(s, tmp_path), s["record"])
+
+    phrase = TYPE_LESS_MEASURED.split("{kind}")[1]
+    assert phrase.strip()
+    assert not any(phrase in text for text in fields["limitations"])
 
 
 def test_without_out_of_scope_rows_the_error_budget_is_used_and_said(split, tmp_path):

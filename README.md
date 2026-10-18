@@ -645,10 +645,10 @@ What has and has not been measured:
 - Decisions are trained and measured on `google/gemma-3-270m-it` only;
   another family is refused, and another Gemma 3 text model is accepted with a
   limitation saying it was not measured. `choice` questions have been
-  measured on several tasks, `noul` and `score` on one each: irony as `noul`,
-  whose eight-bit bundle answered as the reference did on 0.9367 of 300 rows
-  and was refused by verify's 0.95 gate, and SST-5's five levels as `score`,
-  which passed at 0.9567
+  measured on several tasks, `noul` on two and `score` on one. As `noul`,
+  irony's eight-bit bundle answered as the reference did on 0.9367 of 300 rows
+  and was refused by verify's 0.95 gate, and SST-2's passed at 0.9767; as
+  `score`, SST-5's five levels passed at 0.9567
   ([MEASUREMENTS.md](MEASUREMENTS.md#decisions-a-model-that-chooses-among-options)).
 - It needs training on the task: the untuned model, and a model trained on
   other tasks, chose far worse.

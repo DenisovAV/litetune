@@ -1673,7 +1673,7 @@ measurement could see, because the text scorer finds `call:` anywhere:
 `google/gemma-3-270m-it` at `ac82b4e8`, trained to answer a question about a
 text with one of a fixed list of options and scored the way flutter_edge_ai's
 proposed `createDecider` is to use it: every option's log-probability through
-the runtime, with no generation (the README's *Decisions* section). Three
+the runtime, with no generation (the README's *Decisions* section). Four
 tasks, each one question over its own options. Every row of each dataset was
 used, split by `prepare` (seed 0) into the sizes of the dataset's own splits:
 
@@ -1681,7 +1681,12 @@ used, split by `prepare` (seed 0) into the sizes of the dataset's own splits:
 |---|---|---|---|
 | emotion | `choice`, six options | `dair-ai/emotion`, config `split`, at `cab853a1` | 16,000 / 2,000 / 2,000 |
 | irony | `noul` | `cardiffnlp/tweet_eval`, config `irony`, at `b3a375ba` | 2,862 / 955 / 784 |
+| SST-2 | `noul` | `SetFit/sst5` at `e51bdcd8`, without its neutral rows | 6,920 / 872 / 1,821 |
 | SST-5 | `score`, five levels | `SetFit/sst5` at `e51bdcd8` | 8,544 / 1,101 / 2,210 |
+
+SST-2 is SST-5 without its 2,242 neutral rows: `very negative` and `negative`
+answer `no`, `positive` and `very positive` answer `yes`, and the question is
+"Is the text positive?".
 
 Each ran `tune --method lora --epochs 2 --prompt-mode runtime_rendered
 --max-seq-length 2048 --micro-batch-size 4` (LoRA rank 16 on the seven
@@ -1690,7 +1695,10 @@ which added `--prefill_lengths=8,128`, `verify --engine-rows 300 --threads 4`
 with the `none` file as `--float-twin`, and `bundle`. Emotion was prepared,
 tuned and its eight-bit file converted on #82's branch at `d0833f1`; its float
 twin was converted, and it was verified and bundled, at `b49aaab`, the commit
-that merged #82. Irony and SST-5 ran every stage at `b49aaab`.
+that merged #82. Irony and SST-5 ran every stage at `b49aaab`. SST-2 ran every
+stage at `46199f4`, litetune 0.5.0, which also converted, verified and bundled
+SST-5's checkpoint again: every score `verify` took, on all three sides,
+equalled `b49aaab`'s bit for bit.
 
 The candidate is the eight-bit file on litert-lm 0.18.0's CPU backend, on four
 threads of an Intel Xeon @ 2.20GHz, scoring 300 held-out rows spread through
@@ -1698,15 +1706,15 @@ the split. The reference is the float checkpoint in PyTorch on an NVIDIA A100,
 scoring every held-out row. Agreement below is therefore between a runtime on a
 CPU and a reference on a GPU.
 
-| | emotion | irony | SST-5 |
-|---|---|---|---|
-| verify | passed | **failed_gate** | passed |
-| reference accuracy, every held-out row | 0.9335 | 0.6901 | 0.5330 |
-| runtime's top option is the reference's, of 300 rows | **1.0000** | **0.9367** | **0.9567** |
-| runtime's answer is the reference's, abstentions included | 0.9933 | 0.9367 | 0.9567 |
-| runtime accuracy on its 300 rows (reference on the same rows) | 0.9533 (0.9533) | 0.6767 (0.7000) | 0.5267 (0.5167) |
-| ms per decision, median | 370.1 | 234.8 | 394.9 |
-| float twin against the reference, largest per-token difference on 4 rows | 2.96e-05 nats | 3.30e-04 nats | 2.97e-05 nats |
+| | emotion | irony | SST-2 | SST-5 |
+|---|---|---|---|---|
+| verify | passed | **failed_gate** | passed | passed |
+| reference accuracy, every held-out row | 0.9335 | 0.6901 | 0.9055 | 0.5330 |
+| runtime's top option is the reference's, of 300 rows | **1.0000** | **0.9367** | **0.9767** | **0.9567** |
+| runtime's answer is the reference's, abstentions included | 0.9933 | 0.9367 | 0.9767 | 0.9567 |
+| runtime accuracy on its 300 rows (reference on the same rows) | 0.9533 (0.9533) | 0.6767 (0.7000) | 0.8867 (0.8700) | 0.5267 (0.5167) |
+| ms per decision, median | 370.1 | 234.8 | 235.4 | 394.9 |
+| float twin against the reference, largest per-token difference on 4 rows | 2.96e-05 nats | 3.30e-04 nats | 6.25e-05 nats | 2.97e-05 nats |
 
 - `verify` refused irony's eight-bit bundle: 0.9367 is under its 0.95 floor.
   The 19 rows where the runtime chose otherwise were near-ties for the
@@ -1714,6 +1722,14 @@ CPU and a reference on a GPU.
   (median 0.162), against a median of 1.426 on the 281 rows where the two
   agreed. On those 300 rows the runtime's accuracy differed from the
   reference's by −0.0233 ± 0.0285, which does not resolve a difference.
+- SST-2, the other `noul` task, passed, and its reference was further from ties:
+  its best option led its second by less than 0.5 nats on 7 of the 300 rows,
+  where irony's did on 60, and by a median of 4.911 nats on the 293 rows where
+  the two agreed. Six of the 7 rows where the runtime chose otherwise had
+  margins of 0.011 to 0.866 nats. The seventh did not: the reference led by
+  2.248 nats, and the runtime moved one option's score by 1.674. On the 300 rows
+  the runtime's accuracy differed from the reference's by +0.0167 ± 0.0173,
+  which does not resolve a difference either.
 - Emotion's threshold abstains: the reference answered 0.9805 of the held-out
   rows, and was wrong on 0.0571 of those it answered. A `noul` or `score`
   question never abstains.
@@ -1723,9 +1739,9 @@ CPU and a reference on a GPU.
 
 ### Limitations carried by the decision numbers
 
-- One run per task, on one model, one recipe and the CPU backend of one CPU
-  model. No phone has run a decision.
+- One training run per task, on one model, one recipe and the CPU backend of
+  one CPU model. No phone has run a decision.
 - The temperature, and for emotion the threshold, were fitted on the
   reference's calibration scores and are applied to the runtime's.
-- The runtime scored 300 of the held-out rows: all 2,000, 784 and 2,210 went
-  through the reference only.
+- The runtime scored 300 of the held-out rows: all 2,000, 784, 1,821 and
+  2,210 went through the reference only.
