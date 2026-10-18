@@ -646,8 +646,10 @@ What has and has not been measured:
   another family is refused, and another Gemma 3 text model is accepted with a
   limitation saying it was not measured. `choice` questions have been
   measured on several tasks, `noul` on two and `score` on one. As `noul`,
-  irony's eight-bit bundle answered as the reference did on 0.9367 of 300 rows
-  and was refused by verify's 0.95 gate, and SST-2's passed at 0.9767; as
+  SST-2's eight-bit bundle answered as the reference did on 0.9767 of 300 rows
+  and passed verify's 0.95 gate. Irony's, trained for two epochs, did so on
+  0.9367 and was refused; trained for four or six, it passed at 0.9667 and
+  0.9500, and its reference's accuracy did not change by a resolved amount. As
   `score`, SST-5's five levels passed at 0.9567
   ([MEASUREMENTS.md](MEASUREMENTS.md#decisions-a-model-that-chooses-among-options)).
 - It needs training on the task: the untuned model, and a model trained on

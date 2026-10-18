@@ -1722,6 +1722,7 @@ CPU and a reference on a GPU.
   (median 0.162), against a median of 1.426 on the 281 rows where the two
   agreed. On those 300 rows the runtime's accuracy differed from the
   reference's by −0.0233 ± 0.0285, which does not resolve a difference.
+  Trained for longer, irony passed (below).
 - SST-2, the other `noul` task, passed, and its reference was further from ties:
   its best option led its second by less than 0.5 nats on 7 of the 300 rows,
   where irony's did on 60, and by a median of 4.911 nats on the 293 rows where
@@ -1737,10 +1738,36 @@ CPU and a reference on a GPU.
   bundled the file without one, as it should, but reported `failed_harness`
   rather than verify's `failed_gate`; #83 carries verify's status.
 
+### Irony trained for longer
+
+Irony was trained again for four and for six epochs, from the same split and
+with every other flag as above, and each checkpoint was converted, verified
+and bundled at `46199f4`. `tune.py` and `decision_scripts.py` are the same at
+`b49aaab` and `46199f4`, and both runs' first two epochs had the two-epoch
+run's mean training losses, bit for bit. Both bundles passed, on the same 300
+rows:
+
+| irony as `noul` | 2 epochs | 4 epochs | 6 epochs |
+|---|---|---|---|
+| verify | **failed_gate** | passed | passed |
+| runtime's top option is the reference's, of 300 rows | 0.9367 | 0.9667 | 0.9500 |
+| reference's best option led its second by under 0.5 nats, of the 300 rows | 60 | 17 | 19 |
+| reference accuracy, 784 held-out rows | 0.6901 | 0.6671 | 0.7117 |
+| reference answered `yes`, of the 784 rows (the labels: 0.4949) | 0.2334 | 0.7666 | 0.4592 |
+
+- The six-epoch bundle passed on the floor: the runtime agreed with the
+  reference on 285 of the 300 rows, and one row fewer would have failed the
+  gate.
+- Neither longer run's reference accuracy differed from the two-epoch
+  reference's by a resolved amount: −0.0230 ± 0.0511 at four epochs and
+  +0.0217 ± 0.0365 at six, paired on the same 784 rows. The answers moved more
+  than the accuracy did: the four-epoch reference answered otherwise than the
+  two-epoch one on 418 of the rows, and was right on 200 of them.
+
 ### Limitations carried by the decision numbers
 
-- One training run per task, on one model, one recipe and the CPU backend of
-  one CPU model. No phone has run a decision.
+- One training run per task and epoch count, on one model, one recipe and the
+  CPU backend of one CPU model. No phone has run a decision.
 - The temperature, and for emotion the threshold, were fitted on the
   reference's calibration scores and are applied to the runtime's.
 - The runtime scored 300 of each task's held-out rows. The reference scored

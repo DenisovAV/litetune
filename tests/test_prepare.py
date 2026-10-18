@@ -1643,7 +1643,7 @@ def test_what_was_and_was_not_measured_is_said_per_model(write_jsonl, request_fo
         (
             "noul",
             "this is a noul question. Option scoring has trained and measured Choice on several "
-            "tasks, and noul on two, one of which verify's gate refused at eight bits",
+            "tasks, and noul on two",
         ),
         (
             "score",

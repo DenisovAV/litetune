@@ -513,7 +513,7 @@ def test_out_of_scope_rows_the_threshold_lets_through_on_heldout_fail_the_rule(s
         (
             "noul",
             "this is a noul question; option scoring has trained and measured Choice on several "
-            "tasks, and noul on two, one of which verify's gate refused at eight bits",
+            "tasks, and noul on two",
         ),
         (
             "score",
