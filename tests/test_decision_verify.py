@@ -39,7 +39,7 @@ from litetune.decision_verify import (
     unique_lengths,
     verify_decision,
 )
-from litetune.decisions import NOUL_IDS, TYPE_MEASURED, decision_from
+from litetune.decisions import NOUL_IDS, decision_from
 from litetune.events import EventStream
 from litetune.prepare import PrepareRequest, prepare
 
@@ -507,14 +507,28 @@ def test_out_of_scope_rows_the_threshold_lets_through_on_heldout_fail_the_rule(s
     assert check(fields, RULE_CHECK)["outcome"] == "failed"
 
 
-@pytest.mark.parametrize("kind", ["noul", "score"])
-def test_a_question_type_measured_on_fewer_tasks_says_how_many(split, tmp_path, kind):
+@pytest.mark.parametrize(
+    ("kind", "text"),
+    [
+        (
+            "noul",
+            "this is a noul question; option scoring has trained and measured Choice on several "
+            "tasks, and noul on two, one of which verify's gate refused at eight bits",
+        ),
+        (
+            "score",
+            "this is a score question; option scoring has trained and measured Choice on several "
+            "tasks, and score on one only",
+        ),
+    ],
+)
+def test_a_question_type_measured_on_fewer_tasks_says_how_many(split, tmp_path, kind, text):
+    """Spelled out: MEASUREMENTS.md's decisions section is what this sentence claims."""
     s = split(with_none=False, kind=kind)
     assert s["decision"].type == kind
 
     _, fields = run(job_for(s, tmp_path), s["record"])
 
-    text = TYPE_LESS_MEASURED.format(kind=kind, measured=TYPE_MEASURED[kind])
     assert text in fields["limitations"]
 
 
@@ -523,9 +537,12 @@ def test_a_choice_question_carries_no_type_limitation(split, tmp_path):
 
     _, fields = run(job_for(s, tmp_path), s["record"])
 
+    # Every wording so far: "Only Choice questions ...", "this is a choice question ...".
     phrase = TYPE_LESS_MEASURED.split("{kind}")[1]
     assert phrase.strip()
-    assert not any(phrase in text for text in fields["limitations"])
+    assert not any(
+        phrase in text or "choice question" in text.lower() for text in fields["limitations"]
+    )
 
 
 def test_without_out_of_scope_rows_the_error_budget_is_used_and_said(split, tmp_path):

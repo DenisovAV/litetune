@@ -1743,5 +1743,5 @@ CPU and a reference on a GPU.
   one CPU model. No phone has run a decision.
 - The temperature, and for emotion the threshold, were fitted on the
   reference's calibration scores and are applied to the runtime's.
-- The runtime scored 300 of the held-out rows: all 2,000, 784, 1,821 and
-  2,210 went through the reference only.
+- The runtime scored 300 of each task's held-out rows. The reference scored
+  every one of them: 2,000, 784, 1,821 and 2,210.

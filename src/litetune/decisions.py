@@ -67,7 +67,7 @@ NOUL_IDS = ("no", "yes")
 # (MEASUREMENTS.md, "Decisions"). `prepare` and `verify` carry it as a
 # limitation.
 TYPE_MEASURED = {
-    "noul": "on two, and verify's gate refused one of them at eight bits",
+    "noul": "on two, one of which verify's gate refused at eight bits",
     "score": "on one only",
 }
 
