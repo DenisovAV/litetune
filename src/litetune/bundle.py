@@ -46,7 +46,13 @@ from typing import Any
 
 from litetune import envs, jsonfile, wheels
 from litetune.checks import Check, CheckSet, Outcome
-from litetune.decision_section import SECTION_NAME, dart_call, payload_bytes, write_section
+from litetune.decision_section import (
+    SECTION_NAME,
+    dart_call,
+    payload_bytes,
+    remove_section,
+    write_section,
+)
 from litetune.declarations import (
     DeclarationsError,
     canonical_text,
@@ -850,13 +856,17 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     # the event stream and in `report.json` alike. Into the copy, never the
     # caller's file: the question, the trained options and the calibration travel
     # inside the `.litertlm`, where the 2026-10-16 design has flutter_edge_ai's
-    # `createDecider` read them.
-    withheld = _withheld_section(request)
-    section_check = (
-        _write_decision_section(request, copied, events)
-        if request.decision is not None and withheld is None
-        else None
-    )
+    # `createDecider` read them. When verify's status withholds the section, any
+    # section the file already carries is taken out instead.
+    section_check: Check | None = None
+    withheld: Check | None = None
+    if request.decision is not None:
+        section_check = _section_target(request, copied)
+        if section_check is None and copied is not None:
+            if request.status in SECTION_STATUSES:
+                section_check = _write_decision_section(request, copied, events)
+            else:
+                section_check, withheld = _withhold_decision_section(request, copied, events)
     if copied is not None:
         members = (
             _directory_members(MODEL_DIR_NAME, copied)
@@ -898,13 +908,13 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
         events.check(adapter_check)
 
     # -- a decision model's section ---------------------------------------
-    # Written above, before the model was recorded; its check is reported here.
+    # Written or withheld above, before the model was recorded; reported here.
     if withheld is not None:
         # Recorded and emitted, but kept out of `result.checks`: see `BundleResult`.
         result.withheld_section = withheld
         result.limitation(
-            f"the shipped .litertlm has no {SECTION_NAME} section, because verify's status is "
-            f"{request.status.value}: it is bundled as an ordinary chat model"
+            f"the shipped .litertlm carries no {SECTION_NAME} section, because verify's status "
+            f"is {request.status.value}: an app sees an ordinary chat model"
         )
         events.check(withheld)
     if section_check is not None:
@@ -1052,23 +1062,14 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     return result
 
 
-def _withheld_section(request: BundleRequest) -> Check | None:
-    """The decision section's check when verify's status withholds it, else `None`."""
-    if request.decision is None or request.status in SECTION_STATUSES:
-        return None
-    return Check.failed(
-        "decision section",
-        f"verify's status is {request.status.value}; a decision whose verify failed is not "
-        "given its section, so createDecider would refuse the file rather than decide like a "
-        "verified one",
-        observed={"verify_status": request.status.value},
-    )
+def _section_target(request: BundleRequest, copied: Path | None) -> Check | None:
+    """A failed check when the bundled model is missing, not a `.litertlm`, or not the file
+    verify measured; else `None`.
 
-
-def _write_decision_section(
-    request: BundleRequest, copied: Path | None, events: EventStream
-) -> Check:
-    """Write the decision section into the bundled `.litertlm`, and read it back."""
+    Run before verify's status is looked at: a decision's verdict, whichever it
+    is, belongs to that file, and a bundle of another file is one litetune could
+    not assemble.
+    """
     name = "decision section"
     if copied is None:
         return Check.failed(name, "the model is not in the bundle, so no section was written")
@@ -1093,6 +1094,51 @@ def _write_decision_section(
             f"{request.verified_sha256.split(':', 1)[-1][:16]}); its decision and calibration "
             "belong to that file",
         )
+    return None
+
+
+def _withhold_decision_section(
+    request: BundleRequest, copied: Path, events: EventStream
+) -> tuple[Check | None, Check | None]:
+    """Take any decision section out of the bundled `.litertlm`, for a status that withholds it.
+
+    Returns `(failed packaging check, None)` when the file could not be shown to
+    carry none, else `(None, withheld check)`. A file verify measured may already
+    carry an earlier bundle's section, which createDecider would decide with.
+    """
+    name = "decision section"
+    status = request.status.value
+    removal = remove_section(
+        copied, env=request.section_env, auto_provision=request.auto_provision, events=events
+    )
+    if removal.reason is not None:
+        return (
+            Check.failed(
+                name,
+                f"verify's status is {status}, so the bundled file must carry no decision "
+                f"section, and it could not be checked for an earlier one: {removal.reason}",
+                observed={"verify_status": status, "removal": removal.report},
+            ),
+            None,
+        )
+    taken = (
+        f"; the {removal.removed} {SECTION_NAME} section(s) the file already carried were "
+        "taken out"
+        if removal.removed
+        else ""
+    )
+    return None, Check.failed(
+        name,
+        f"verify's status is {status}; a decision is given its section only when verify passed "
+        "or was inconclusive, so createDecider would refuse the file rather than decide like a "
+        f"verified one{taken}",
+        observed={"verify_status": status, "removed": removal.removed},
+    )
+
+
+def _write_decision_section(request: BundleRequest, copied: Path, events: EventStream) -> Check:
+    """Write the decision section into the bundled `.litertlm`, and read it back."""
+    name = "decision section"
     payload = dict(request.decision or {})
     written = write_section(
         copied,

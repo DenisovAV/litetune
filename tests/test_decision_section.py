@@ -27,6 +27,7 @@ from litetune.decision_section import (
     dart_call,
     dart_string,
     payload_bytes,
+    remove_section,
     write_section,
 )
 from litetune.decision_verify import SCORER, decision_of_section
@@ -332,6 +333,49 @@ def test_a_failing_script_is_reported_with_its_last_line(toy, tmp_path):
     assert "litert_lm_builder" in str(written.reason)
 
 
+def test_removing_takes_every_decision_section_out_and_keeps_the_rest(toy):
+    shim, bundle = toy
+    before = [(s["type"], s["payload"]) for s in sections_of(bundle)]
+    write_section(bundle, PAYLOAD, env=ShimEnv(shim))
+    assert [s["type"] for s in sections_of(bundle)].count("GenericBinaryData") == 1
+
+    removed = remove_section(bundle, env=ShimEnv(shim))
+
+    assert removed.reason is None
+    assert removed.removed == 1
+    assert [(s["type"], s["payload"]) for s in sections_of(bundle)] == before
+
+
+def test_removing_from_a_file_without_a_section_leaves_its_bytes(toy):
+    shim, bundle = toy
+    original = bundle.read_bytes()
+
+    removed = remove_section(bundle, env=ShimEnv(shim))
+
+    assert removed.reason is None
+    assert removed.removed == 0
+    assert bundle.read_bytes() == original
+
+
+def test_removing_from_a_cut_bundle_says_why(toy):
+    shim, bundle = toy
+    bundle.write_bytes(bundle.read_bytes()[:-100])
+
+    removed = remove_section(bundle, env=ShimEnv(shim))
+
+    assert removed.removed == 0
+    assert "past the end" in str(removed.reason)
+
+
+def test_a_failing_removal_is_reported_with_its_last_line(toy, tmp_path):
+    _, bundle = toy
+
+    removed = remove_section(bundle, env=ShimEnv(tmp_path / "nowhere"))
+
+    assert "exited 1" in str(removed.reason)
+    assert "litert_lm_builder" in str(removed.reason)
+
+
 def test_the_payload_is_compact_utf8_json_in_the_order_written():
     payload = {"b": "é", "a": 1}
     assert payload_bytes(payload) == '{"b":"é","a":1}'.encode()
@@ -601,6 +645,42 @@ def test_a_payload_the_builder_changed_is_refused_by_the_read_back(toy):
     assert bundle.read_bytes() == original
 
 
+TOY_PEEK_PHANTOM = TOY_PEEK.replace(
+    '    return _Header(json.loads(raw[32:end].decode("utf-8")))',
+    '    header = json.loads(raw[32:end].decode("utf-8"))\n'
+    '    header["sections"].append(\n'
+    '        {"begin": 0, "end": 0, "items": [{"key": "name", "value": "litetune.decision"}]}\n'
+    "    )\n"
+    "    return _Header(header)",
+)
+
+
+def test_a_removal_the_header_reader_does_not_confirm_leaves_the_file(toy):
+    shim, bundle = toy
+    write_section(bundle, PAYLOAD, env=ShimEnv(shim))
+    sectioned = bundle.read_bytes()
+    # A reader that still finds a section named litetune.decision after the rebuild.
+    (shim / "litert_lm_builder" / "litertlm_peek.py").write_text(TOY_PEEK_PHANTOM)
+
+    removed = remove_section(bundle, env=ShimEnv(shim))
+
+    assert removed.removed == 0
+    assert f"named {SECTION_NAME} read back, after taking them out" in str(removed.reason)
+    assert bundle.read_bytes() == sectioned
+
+
+@pytest.mark.parametrize("count", [None, True, "1"])
+def test_a_removal_without_a_count_is_not_taken_as_done(tmp_path, count):
+    result = {"written": True, "reason": None}
+    if count is not None:
+        result["replaced"] = count
+
+    removed = remove_section(tmp_path / "m.litertlm", env=ResultEnv(result))
+
+    assert removed.removed == 0
+    assert "reported no count" in str(removed.reason)
+
+
 def test_a_payload_that_is_not_finite_is_refused_rather_than_written_as_infinity():
     with pytest.raises(ValueError):
         payload_bytes({"abstain_below": float("-inf")})
@@ -699,8 +779,10 @@ def _bundled(tmp_path, shim, model, events=None, **overrides):
         "contract": a_contract(),
         "decision": PAYLOAD,
         "section_env": ShimEnv(shim),
-        "verified_sha256": sha_of(model),
     }
+    # Hashed only when not given: a directory or a missing file has no sha256.
+    if "verified_sha256" not in overrides:
+        fields["verified_sha256"] = sha_of(model)
     return build_bundle(BundleRequest(**{**fields, **overrides}), events=events)
 
 
@@ -775,7 +857,9 @@ def test_a_manifest_that_records_no_digest_for_its_file_gives_no_section(toy, tm
     assert result.status.value == "failed_harness"
 
 
-@pytest.mark.parametrize("status", ["failed_gate", "failed_harness"])
+@pytest.mark.parametrize(
+    "status", ["failed_smoke", "failed_gate", "unmeasured", "failed_harness", "error"]
+)
 def test_a_decision_whose_verify_failed_is_not_given_its_section(toy, tmp_path, status):
     from litetune.manifest import RunStatus
 
@@ -788,19 +872,121 @@ def test_a_decision_whose_verify_failed_is_not_given_its_section(toy, tmp_path, 
     assert section.outcome.value == "failed"
     assert f"verify's status is {status}" in section.detail
     assert "createDecider would refuse the file" in section.detail
-    assert section.observed == {"verify_status": status}
+    assert section.observed == {"verify_status": status, "removed": 0}
     assert not _has_section(tmp_path / "bundle" / model.name)
     report = json.loads((tmp_path / "bundle" / "report.json").read_text())
     assert report["use"] is None
-    assert report["withheld_section"]["outcome"] == "failed"
+    assert report["withheld_section"] == json.loads(json.dumps(section.as_dict(), default=str))
     assert "with the decision section" not in _check(result, "model included").detail
-    assert any("has no litetune.decision section" in t for t in report["limitations"])
+    assert any(
+        "carries no litetune.decision section" in t and f"because verify's status is {status}" in t
+        for t in report["limitations"]
+    )
     # Verify's verdict, carried: withholding the section is not a bundle that
     # could not be assembled, so it is kept out of the packaging checks.
     assert "decision section" not in [c.name for c in result.checks.checks]
     assert result.complete
     assert result.status.value == status
     assert report["status"] == status
+
+
+def test_a_failed_verify_takes_out_the_section_an_earlier_bundle_left(toy, tmp_path):
+    from litetune.manifest import RunStatus
+
+    shim, model = toy
+    # A file verify measured after an earlier bundle had already given it a section.
+    write_section(model, {**PAYLOAD, "temperature": 9.0}, env=ShimEnv(shim))
+
+    result = _bundled(tmp_path, shim, model, status=RunStatus.FAILED_GATE)
+
+    assert not _has_section(tmp_path / "bundle" / model.name)
+    section = result.withheld_section
+    assert section is not None
+    assert section.observed == {"verify_status": "failed_gate", "removed": 1}
+    assert "the 1 litetune.decision section(s) the file already carried were taken out" in (
+        section.detail
+    )
+    assert result.status.value == "failed_gate"
+    shipped = tmp_path / "bundle" / model.name
+    included = _check(result, "model included")
+    assert included.observed["bytes"] == shipped.stat().st_size, "counted after the removal"
+
+
+@pytest.mark.parametrize("status", ["failed_gate", "failed_harness"])
+def test_a_failed_verify_of_a_checkpoint_directory_is_still_refused(toy, tmp_path, status):
+    from litetune.manifest import RunStatus
+
+    shim, model = toy
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}")
+
+    result = _bundled(
+        tmp_path, shim, checkpoint, verified_sha256=sha_of(model), status=RunStatus(status)
+    )
+
+    section = _check(result, "decision section")
+    assert section.outcome.value == "failed"
+    assert "is not a .litertlm" in section.detail
+    assert result.withheld_section is None
+    assert result.status.value == "failed_harness"
+    report = json.loads((tmp_path / "bundle" / "report.json").read_text())
+    assert not any("carries no litetune.decision section" in t for t in report["limitations"])
+
+
+def test_a_failed_verify_of_another_file_is_refused_as_another_file(toy, tmp_path):
+    from litetune.manifest import RunStatus
+
+    shim, model = toy
+
+    result = _bundled(
+        tmp_path,
+        shim,
+        model,
+        status=RunStatus.FAILED_GATE,
+        verified_sha256="sha256:" + "0" * 64,
+    )
+
+    section = _check(result, "decision section")
+    assert "is not the file verify measured" in section.detail
+    assert result.withheld_section is None
+    assert result.status.value == "failed_harness"
+
+
+def test_a_failed_verify_of_a_missing_model_claims_no_shipped_file(toy, tmp_path):
+    from litetune.manifest import RunStatus
+
+    shim, model = toy
+    gone = tmp_path / "gone.litertlm"
+
+    result = _bundled(
+        tmp_path, shim, gone, verified_sha256=sha_of(model), status=RunStatus.FAILED_GATE
+    )
+
+    assert "the model is not in the bundle" in _check(result, "decision section").detail
+    assert result.withheld_section is None
+    assert result.status.value == "failed_harness"
+    assert not any("carries no litetune.decision section" in t for t in result.limitations)
+
+
+def test_a_failed_verify_whose_file_cannot_be_checked_for_a_section_is_refused(toy, tmp_path):
+    from litetune.manifest import RunStatus
+
+    _, model = toy
+
+    result = _bundled(
+        tmp_path,
+        tmp_path / "nowhere",
+        model,
+        status=RunStatus.FAILED_GATE,
+    )
+
+    section = _check(result, "decision section")
+    assert "could not be checked for an earlier one" in section.detail
+    assert "exited 1" in section.detail
+    assert section.observed["verify_status"] == "failed_gate"
+    assert result.withheld_section is None
+    assert result.status.value == "failed_harness"
 
 
 def test_an_inconclusive_verify_still_gets_its_section(toy, tmp_path):
@@ -906,11 +1092,38 @@ def test_the_cli_gives_a_failed_verify_no_section_and_prints_no_call(
     code = main(_bundle_argv(tmp_path, model, manifest))
 
     captured = capsys.readouterr()
-    out = captured.out + captured.err
-    assert code == 1, out
-    # The check's own line, not the limitation that repeats its reason.
-    assert "decision section — verify's status is failed_gate" in out
-    assert "bundle: failed_gate" in out
+    assert code == 1, captured
+    # The summary's own line on stdout, not the limitation that repeats its reason,
+    # and the check on stderr, from the event stream.
+    assert "decision section withheld — verify's status is failed_gate" in captured.out
+    assert "✗ decision section — verify's status is failed_gate" in captured.err
+    assert "bundle: failed_gate" in captured.err
+    assert "use it with:" not in captured.out + captured.err
+    assert not _has_section(tmp_path / "bundle" / model.name)
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        ("failed_smoke", 1),
+        ("failed_gate", 1),
+        ("unmeasured", 3),
+        ("failed_harness", 4),
+        ("error", 4),
+    ],
+)
+def test_the_cli_exits_with_the_status_verify_recorded_when_it_withholds_the_section(
+    toy, tmp_path, monkeypatch, capsys, status, code
+):
+    from litetune.cli import main
+
+    shim, model = toy
+    _patch_section_env(monkeypatch, shim)
+    manifest = _decision_manifest(tmp_path, sha_of(model), status=status)
+
+    assert main(_bundle_argv(tmp_path, model, manifest)) == code
+    out = capsys.readouterr().out
+    assert f"status: {status}" in out
     assert "use it with:" not in out
     assert not _has_section(tmp_path / "bundle" / model.name)
 

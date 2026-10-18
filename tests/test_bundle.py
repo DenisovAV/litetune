@@ -368,6 +368,10 @@ def test_a_failed_run_still_produces_a_manifest_and_a_report(tmp_path, request_f
     report = json.loads((root / REPORT_NAME).read_text(encoding="utf-8"))
     assert report["status"] == "failed_gate"
     assert report["verified"] is False
+    # Not a decision model, so no decision section was withheld from it.
+    assert result.withheld_section is None
+    assert report["withheld_section"] is None
+    assert not any("litetune.decision" in t for t in result.limitations)
 
 
 def test_the_report_names_the_measurements_that_were_not_made(request_for):

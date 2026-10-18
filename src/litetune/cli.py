@@ -710,7 +710,8 @@ def _add_bundle(sub) -> None:
         type=Path,
         help=(
             "tool declarations JSON. Required, except for a decision model: when "
-            "--verify-manifest measured one, the bundle carries its decision section instead"
+            "--verify-manifest measured one, the bundle carries its decision section instead, "
+            "if verify passed or was inconclusive"
         ),
     )
     bundle.add_argument(
@@ -1856,7 +1857,7 @@ def _bundle(args: argparse.Namespace) -> int:
         if not manifest.get("status"):
             raise BundleInputError(
                 "the verify manifest records no status, and a decision model is given its "
-                "section only for a verify that passed or could not tell"
+                "section only for a verify that passed or was inconclusive"
             )
         _check_decision(decision, manifest, recorded, prompt_mode, args.train_metrics)
     if decision is None and args.declarations is None:
@@ -2010,6 +2011,8 @@ def summarise_bundle(result: BundleResult) -> list[str]:
     for check in result.checks.checks:
         if check.outcome is not Outcome.PASSED:
             lines.append(f"  {check.outcome.value}: {check.name} — {check.detail}")
+    if result.withheld_section is not None:
+        lines.append(f"  decision section withheld — {result.withheld_section.detail}")
     if result.missing_measurements:
         lines.append(f"  measurements not made: {', '.join(result.missing_measurements)}")
     for text in result.limitations:
