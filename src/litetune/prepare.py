@@ -188,9 +188,9 @@ DECISION_INFERRED = (
     "the question, the options' order and their descriptions"
 )
 
-DECISION_TYPE_UNMEASURED = (
-    "this is a {kind} question. Only Choice questions have been trained and measured by option "
-    "scoring; {kind} follows the same contract and is not measured"
+DECISION_TYPE_ONE_TASK = (
+    "this is a {kind} question. Option scoring has trained and measured {kind} on one task only, "
+    "and Choice on several"
 )
 
 DECISION_MODEL_UNMEASURED = (
@@ -1679,7 +1679,7 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         if request.questions is None:
             result.limitation(DECISION_INFERRED.format(question=decision.decision.question))
         if decision.decision.type != "choice":
-            result.limitation(DECISION_TYPE_UNMEASURED.format(kind=decision.decision.type))
+            result.limitation(DECISION_TYPE_ONE_TASK.format(kind=decision.decision.type))
     events.metric("rows", len(rows), source=str(request.data))
 
     # -- lengths -----------------------------------------------------------

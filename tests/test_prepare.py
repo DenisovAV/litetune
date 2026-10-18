@@ -1638,8 +1638,8 @@ def test_what_was_and_was_not_measured_is_said_per_model(write_jsonl, request_fo
 
 
 @pytest.mark.parametrize("kind", ["noul", "score"])
-def test_a_question_type_never_measured_says_so(write_jsonl, request_for, questions, kind):
-    from litetune.prepare import DECISION_TYPE_UNMEASURED
+def test_a_question_type_measured_on_one_task_says_so(write_jsonl, request_for, questions, kind):
+    from litetune.prepare import DECISION_TYPE_ONE_TASK
 
     obj: dict[str, Any] = {"type": kind, "question": "Q?"}
     ids = list(NOUL_IDS) if kind == "noul" else ["0", "1"]
@@ -1649,7 +1649,7 @@ def test_a_question_type_never_measured_says_so(write_jsonl, request_for, questi
 
     result = prepare(request_for(write_jsonl(data), questions=questions(obj)))
 
-    assert DECISION_TYPE_UNMEASURED.format(kind=kind) in result.limitations
+    assert DECISION_TYPE_ONE_TASK.format(kind=kind) in result.limitations
     assert result.decision.decision.ids == tuple(ids)
 
 
