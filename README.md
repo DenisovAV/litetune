@@ -623,7 +623,10 @@ What each stage does differently for a decision:
   a prefill; a self-check finds out whether the runtime does, and scores
   accordingly.
 - **bundle** writes the decision and its calibration into the `.litertlm` as a
-  `litetune.decision` section, and prints the call:
+  `litetune.decision` section when verify passed or was inconclusive. With any
+  other status it bundles the file without the section, taking out one an
+  earlier bundle left, and carries that status: a failed gate exits 1, a verify
+  that could not check exits 4. With the section, it prints the call:
 
   ```dart
   final decider = await model.createDecider(
@@ -1259,8 +1262,8 @@ argparse's usual 2: here 2 means *inconclusive*, which is a claim about a
 measurement, and a typo should not produce one.
 
 `bundle` carries a verdict rather than producing one, so it returns whatever
-`--status` or `--verify-manifest` gave it. With neither it returns 2: bundling
-re-measures nothing.
+`--status` or `--verify-manifest` gave it, or 4 when it could not assemble the
+bundle. With neither it returns 2: bundling re-measures nothing.
 
 `towers` measures nothing either: it exits 0 when it wrote the new bundle and 4
 when it refused or could not, or when it wrote the bundle but could not deliver

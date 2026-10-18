@@ -46,7 +46,7 @@ SECTION_TIMEOUT_S = 1800
 STDERR_TAIL_CHARS = 2000
 
 SECTION_SCRIPT = r'''
-"""Add or replace the litetune.decision section. Spec: argv[1]; result JSON: argv[2]."""
+"""Add, replace or remove the litetune.decision section. Spec: argv[1]; result JSON: argv[2]."""
 import copy
 import hashlib
 import io
@@ -93,7 +93,8 @@ def section_bytes(path, name):
 
 def main(spec):
     artifact, work, name = spec["artifact"], Path(spec["work"]), spec["name"]
-    payload = Path(spec["payload"]).read_bytes()
+    # No payload: take every section named `name` out and add none.
+    payload = None if spec["payload"] is None else Path(spec["payload"]).read_bytes()
     cut = R.past_the_end(artifact)
     if cut is not None:
         return {"written": False, "reason": cut}
@@ -103,19 +104,30 @@ def main(spec):
     before = R.load(before_dir / "model.toml")
     kept = [s for s in before.get("section", []) if not named(s, name)]
     replaced = len(before.get("section", [])) - len(kept)
+    if payload is None and not replaced:
+        # Nothing to take out, so the file is left as it is -- once its header,
+        # read by its own offsets as the read-back below reads it, agrees.
+        seen = section_bytes(artifact, name)
+        if seen:
+            return {"written": False, "reason": f"the header names {len(seen)} section(s) "
+                    f"{name} that unpack did not list"}
+        return {"written": False, "reason": None, "replaced": 0, "header_end_before": end_before}
     for s in kept:
         s["data_path"] = str(before_dir / os.path.basename(s["data_path"]))
-    # Named as `unpack` names it, so the round trip compares like with like.
-    data = work / f"Section{len(kept)}_GenericBinaryData.bin"
-    data.write_bytes(payload)
+    added = []
+    if payload is not None:
+        # Named as `unpack` names it, so the round trip compares like with like.
+        data = work / f"Section{len(kept)}_GenericBinaryData.bin"
+        data.write_bytes(payload)
+        added = [
+            {
+                "section_type": "GenericBinaryData",
+                "data_path": str(data),
+                "additional_metadata": [{"key": "name", "value_type": "String", "value": name}],
+            }
+        ]
     built = copy.deepcopy(before)
-    built["section"] = kept + [
-        {
-            "section_type": "GenericBinaryData",
-            "data_path": str(data),
-            "additional_metadata": [{"key": "name", "value_type": "String", "value": name}],
-        }
-    ]
+    built["section"] = kept + added
     toml = work / "decision.toml"
     R.write_toml(built, toml)
     rebuilt = work / Path(artifact).name
@@ -130,9 +142,9 @@ def main(spec):
     if R.comparable(after) != R.comparable(built):
         return {"written": False, "reason": "the rebuilt bundle unpacks to something else"}
     read = section_bytes(rebuilt, name)
-    if read != [payload]:
+    if read != ([] if payload is None else [payload]):
         return {"written": False, "reason": f"{len(read)} section(s) named {name} read back, "
-                "not the one payload written"}
+                + ("after taking them out" if payload is None else "not the one payload written")}
     os.replace(rebuilt, artifact)
     return {
         "written": True,
@@ -140,8 +152,8 @@ def main(spec):
         "header_end": end,
         "header_end_before": end_before,
         "replaced": replaced,
-        "payload_bytes": len(payload),
-        "payload_sha256": hashlib.sha256(read[0]).hexdigest(),
+        "payload_bytes": None if payload is None else len(payload),
+        "payload_sha256": None if payload is None else hashlib.sha256(read[0]).hexdigest(),
         "sections": len(built["section"]),
     }
 
@@ -157,6 +169,19 @@ class SectionWrite:
     """What writing the section did. `reason` is set exactly when nothing was written."""
 
     written: bool
+    reason: str | None
+    report: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SectionRemoval:
+    """What taking the section out did.
+
+    `reason` is set exactly when the file is not known to be without one; `removed`
+    counts the sections taken out, 0 for a file that had none and was left as it is.
+    """
+
+    removed: int
     reason: str | None
     report: dict[str, Any]
 
@@ -181,6 +206,48 @@ def write_section(
     timeout: int = SECTION_TIMEOUT_S,
 ) -> SectionWrite:
     """Write the decision section into `artifact` in place, and read it back."""
+    data = payload_bytes(payload)
+    report, failure = _run_section_script(artifact, data, env, auto_provision, events, timeout)
+    if failure is not None:
+        return SectionWrite(False, failure, report)
+    if not report.get("written"):
+        return SectionWrite(False, str(report.get("reason") or "no reason given"), report)
+    if report.get("payload_sha256") != hashlib.sha256(data).hexdigest():
+        return SectionWrite(False, "the section read back is not the payload written", report)
+    return SectionWrite(True, None, report)
+
+
+def remove_section(
+    artifact: Path,
+    env: envs.StageEnv = envs.EXPORT,
+    auto_provision: bool = True,
+    events: EventStream | None = None,
+    timeout: int = SECTION_TIMEOUT_S,
+) -> SectionRemoval:
+    """Take every decision section out of `artifact` in place, and check that none is left."""
+    report, failure = _run_section_script(artifact, None, env, auto_provision, events, timeout)
+    if failure is not None:
+        return SectionRemoval(0, failure, report)
+    if report.get("reason"):
+        return SectionRemoval(0, str(report["reason"]), report)
+    removed = report.get("replaced")
+    if not isinstance(removed, int) or isinstance(removed, bool):
+        return SectionRemoval(0, "the section script reported no count of sections removed", report)
+    return SectionRemoval(removed, None, report)
+
+
+def _run_section_script(
+    artifact: Path,
+    data: bytes | None,
+    env: envs.StageEnv,
+    auto_provision: bool,
+    events: EventStream | None,
+    timeout: int,
+) -> tuple[dict[str, Any], str | None]:
+    """Run `SECTION_SCRIPT` on `artifact`: its report, or why there is none.
+
+    `data` is the payload to write, or `None` to take the section out.
+    """
     from litetune.export import _REPACK_SCRIPT
 
     if auto_provision:
@@ -188,10 +255,7 @@ def write_section(
             env.provision(events=events)
         except Exception as exc:  # noqa: BLE001 - reported as the reason
             logger.exception("could not provision environment %r", env.name)
-            return SectionWrite(
-                False, f"the {env.name} environment could not be provisioned: {exc}", {}
-            )
-    data = payload_bytes(payload)
+            return {}, f"the {env.name} environment could not be provisioned: {exc}"
     # Beside the artifact, never in the system temp: the script's last step is
     # an `os.replace` onto the artifact, which fails across filesystems (a tmpfs
     # /tmp), and the unpacks are a model's size each. As `export`'s repack.
@@ -203,7 +267,8 @@ def write_section(
         (work / "repack.py").write_text(_REPACK_SCRIPT, encoding="utf-8")
         script = work / "section.py"
         script.write_text(SECTION_SCRIPT, encoding="utf-8")
-        (work / "payload.json").write_bytes(data)
+        if data is not None:
+            (work / "payload.json").write_bytes(data)
         spec = work / "spec.json"
         result = work / "result.json"
         spec.write_text(
@@ -212,7 +277,7 @@ def write_section(
                     "artifact": str(artifact),
                     "work": str(work),
                     "name": SECTION_NAME,
-                    "payload": str(work / "payload.json"),
+                    "payload": None if data is None else str(work / "payload.json"),
                     "header_max": HEADER_MAX,
                 }
             ),
@@ -227,29 +292,21 @@ def write_section(
             if isinstance(killed, bytes):
                 killed = killed.decode("utf-8", "surrogateescape")
             tail = killed[-STDERR_TAIL_CHARS:].strip()
-            return SectionWrite(
-                False,
+            return {}, (
                 f"no result after {timeout} s (timeout)"
-                + (f"; its stderr ended: {tail}" if tail else ""),
-                {},
+                + (f"; its stderr ended: {tail}" if tail else "")
             )
         except OSError as exc:
             logger.exception("could not start the section script in environment %r", env.name)
-            return SectionWrite(
-                False, f"the section script could not be started: {type(exc).__name__}: {exc}", {}
-            )
+            return {}, f"the section script could not be started: {type(exc).__name__}: {exc}"
         if proc.returncode != 0 or not result.is_file():
             last = next(
                 (ln for ln in reversed((proc.stderr or "").splitlines()) if ln.strip()),
                 "no stderr",
             )
-            return SectionWrite(False, f"the section script exited {proc.returncode}: {last}", {})
+            return {}, f"the section script exited {proc.returncode}: {last}"
         report = json.loads(result.read_text(encoding="utf-8"))
-    if not report.get("written"):
-        return SectionWrite(False, str(report.get("reason") or "no reason given"), report)
-    if report.get("payload_sha256") != hashlib.sha256(data).hexdigest():
-        return SectionWrite(False, "the section read back is not the payload written", report)
-    return SectionWrite(True, None, report)
+    return report, None
 
 
 def dart_string(text: str) -> str:
