@@ -783,14 +783,24 @@ def test_a_decision_whose_verify_failed_is_not_given_its_section(toy, tmp_path, 
 
     result = _bundled(tmp_path, shim, model, status=RunStatus(status))
 
-    section = _check(result, "decision section")
+    section = result.withheld_section
+    assert section is not None
     assert section.outcome.value == "failed"
     assert f"verify's status is {status}" in section.detail
     assert "createDecider would refuse the file" in section.detail
+    assert section.observed == {"verify_status": status}
     assert not _has_section(tmp_path / "bundle" / model.name)
     report = json.loads((tmp_path / "bundle" / "report.json").read_text())
     assert report["use"] is None
+    assert report["withheld_section"]["outcome"] == "failed"
     assert "with the decision section" not in _check(result, "model included").detail
+    assert any("has no litetune.decision section" in t for t in report["limitations"])
+    # Verify's verdict, carried: withholding the section is not a bundle that
+    # could not be assembled, so it is kept out of the packaging checks.
+    assert "decision section" not in [c.name for c in result.checks.checks]
+    assert result.complete
+    assert result.status.value == status
+    assert report["status"] == status
 
 
 def test_an_inconclusive_verify_still_gets_its_section(toy, tmp_path):
@@ -895,9 +905,12 @@ def test_the_cli_gives_a_failed_verify_no_section_and_prints_no_call(
 
     code = main(_bundle_argv(tmp_path, model, manifest))
 
-    out = capsys.readouterr().out
-    assert code != 0, out
-    assert "verify's status is failed_gate" in out
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert code == 1, out
+    # The check's own line, not the limitation that repeats its reason.
+    assert "decision section — verify's status is failed_gate" in out
+    assert "bundle: failed_gate" in out
     assert "use it with:" not in out
     assert not _has_section(tmp_path / "bundle" / model.name)
 

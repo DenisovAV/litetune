@@ -418,6 +418,11 @@ class BundleResult:
     checks: CheckSet
     # ... which is recorded here instead, three-valued and reported in full.
     coverage: Check | None = None
+    # A decision model's section that verify's status withholds. Also a fact
+    # about the run, kept out of `checks` for the same reason: a decision that
+    # failed its gate carries that `failed_gate`, not a `failed_harness` that
+    # says litetune could not assemble the bundle.
+    withheld_section: Check | None = None
     members: list[Member] = field(default_factory=list)
     missing_measurements: list[str] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
@@ -469,6 +474,9 @@ class BundleResult:
                 for name in self.missing_measurements
             ],
             "measurement_coverage": self.coverage.as_dict() if self.coverage else None,
+            "withheld_section": (
+                self.withheld_section.as_dict() if self.withheld_section else None
+            ),
             "attribution": dict(self.request.attribution),
             "checks": self.checks.as_dict(),
             "limitations": list(self.limitations),
@@ -843,8 +851,11 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     # caller's file: the question, the trained options and the calibration travel
     # inside the `.litertlm`, where the 2026-10-16 design has flutter_edge_ai's
     # `createDecider` read them.
+    withheld = _withheld_section(request)
     section_check = (
-        _write_decision_section(request, copied, events) if request.decision is not None else None
+        _write_decision_section(request, copied, events)
+        if request.decision is not None and withheld is None
+        else None
     )
     if copied is not None:
         members = (
@@ -888,6 +899,14 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
 
     # -- a decision model's section ---------------------------------------
     # Written above, before the model was recorded; its check is reported here.
+    if withheld is not None:
+        # Recorded and emitted, but kept out of `result.checks`: see `BundleResult`.
+        result.withheld_section = withheld
+        result.limitation(
+            f"the shipped .litertlm has no {SECTION_NAME} section, because verify's status is "
+            f"{request.status.value}: it is bundled as an ordinary chat model"
+        )
+        events.check(withheld)
     if section_check is not None:
         if section_check.outcome is Outcome.PASSED and section_check.observed:
             request = replace(
@@ -1033,6 +1052,19 @@ def build_bundle(request: BundleRequest, events: EventStream | None = None) -> B
     return result
 
 
+def _withheld_section(request: BundleRequest) -> Check | None:
+    """The decision section's check when verify's status withholds it, else `None`."""
+    if request.decision is None or request.status in SECTION_STATUSES:
+        return None
+    return Check.failed(
+        "decision section",
+        f"verify's status is {request.status.value}; a decision whose verify failed is not "
+        "given its section, so createDecider would refuse the file rather than decide like a "
+        "verified one",
+        observed={"verify_status": request.status.value},
+    )
+
+
 def _write_decision_section(
     request: BundleRequest, copied: Path | None, events: EventStream
 ) -> Check:
@@ -1046,13 +1078,6 @@ def _write_decision_section(
             f"{copied.name} is not a .litertlm; the decision section is part of the bundle "
             "file the 2026-10-16 design has createDecider load, so a decision model is bundled "
             "as its converted file",
-        )
-    if request.status not in SECTION_STATUSES:
-        return Check.failed(
-            name,
-            f"verify's status is {request.status.value}; a decision whose verify failed is not "
-            "given its section, so createDecider would refuse the file rather than decide like a "
-            "verified one",
         )
     if request.verified_sha256 is None:
         return Check.failed(

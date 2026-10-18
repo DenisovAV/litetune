@@ -623,7 +623,9 @@ What each stage does differently for a decision:
   a prefill; a self-check finds out whether the runtime does, and scores
   accordingly.
 - **bundle** writes the decision and its calibration into the `.litertlm` as a
-  `litetune.decision` section, and prints the call:
+  `litetune.decision` section when verify passed or could not tell. After a
+  failed verify it bundles the file without the section and carries verify's
+  status, so a failed gate exits 1. With the section, it prints the call:
 
   ```dart
   final decider = await model.createDecider(
