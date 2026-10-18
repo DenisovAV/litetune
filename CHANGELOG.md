@@ -3,6 +3,12 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.5.0 — 2026-10-18
+- `prepare --questions`, `tune --decision`, `verify` and `bundle` train, measure and package a model that answers with one of the options an app passes, for flutter_edge_ai's proposed `InferenceModel.createDecider`: one `.litertlm` that carries the question, the options and the calibration in a `litetune.decision` section, measured on `google/gemma-3-270m-it` only (#82).
+- `convert` exports a checkpoint that records a decision with `--prefill_lengths=8,128` unless the caller sets it (#82).
+- `bundle` writes a decision's section only when verify passed or was inconclusive; with any other status it ships the file without one, taking out a section an earlier bundle left, and exits with verify's status (#82, #83).
+- `convert` reports a `litetune.json` beside the checkpoint that is there but cannot be read -- a directory, a dangling link, a FIFO or a device -- as a limitation, where it took it for absent (#80).
+
 ## 0.4.3 — 2026-10-14
 - **Convert a Qwen3 bundle again if an application holds a conversation with it: every Qwen3 bundle earlier litetune converted without a template of the caller's carries Qwen's own chat template, which LiteRT-LM's conversation cannot render past the first message, so the second message fails (#78).**
 - `convert` checks that each bundle's chat template renders single turns as the checkpoint was trained and holds a LiteRT-LM conversation, says in its report when one does not, and gives Qwen3 LiteRT-LM's own Qwen 3 template (#78).

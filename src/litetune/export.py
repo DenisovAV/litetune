@@ -505,7 +505,14 @@ class ExportRequest:
         decision = _recorded_decision(self.model)
         prefill_source: str | None = None
         if decision is not None:
-            if any(models.flag_key(t) == models.flag_key(PREFILL_FLAG) for t in requested):
+            # Read by Fire's rules, as the plan reads them: a bare
+            # `--noprefill_lengths` sets the keyword too, to False, and a default
+            # appended after it would win. Tokens the plan refuses, it refuses.
+            try:
+                caller_set = models.parse_exporter_flags(self.model, requested)
+            except models.FlagRefused:
+                caller_set = {}
+            if models.flag_key(PREFILL_FLAG) in caller_set:
                 prefill_source = "caller"
             else:
                 requested.append(f"{PREFILL_FLAG}={DECISION_PREFILL_LENGTHS}")

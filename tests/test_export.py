@@ -3902,7 +3902,12 @@ def test_a_decision_checkpoint_is_exported_with_the_small_prefill_signature(tmp_
     assert record["decision_sha256"].startswith("sha256:")
 
 
-def test_the_callers_prefill_lengths_are_kept_and_said_to_be_theirs(tmp_path):
+@pytest.mark.parametrize(
+    "token", ["--prefill-lengths=16,128", "--noprefill_lengths", "--noprefill-lengths"]
+)
+def test_the_callers_prefill_lengths_are_kept_and_said_to_be_theirs(tmp_path, token):
+    """Fire reads a bare `--no<name>` as `<name>=False`: an opt-out is the caller's
+    setting too, and a default appended after it would replace it."""
     from litetune.export import ExportRequest
 
     checkpoint = _decision_checkpoint(tmp_path)
@@ -3911,11 +3916,14 @@ def test_the_callers_prefill_lengths_are_kept_and_said_to_be_theirs(tmp_path):
         model=str(checkpoint),
         output_dir=tmp_path / "out",
         recipes=["dynamic_wi8_afp32"],
-        extra_flags=["--prefill-lengths=16,128"],
+        extra_flags=[token],
     )
 
     assert not any(f.startswith("--prefill_lengths=8,128") for f in request.extra_flags)
-    assert request.as_dict()["decision"]["prefill_lengths_source"] == "caller"
+    assert token in request.argv("dynamic_wi8_afp32")
+    record = request.as_dict()["decision"]
+    assert record["prefill_lengths_source"] == "caller"
+    assert record["prefill_lengths"] == token
 
 
 def test_a_checkpoint_without_a_decision_gets_no_prefill_flag(tmp_path):

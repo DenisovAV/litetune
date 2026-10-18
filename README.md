@@ -244,7 +244,7 @@ tool path only and the CPU nowhere.
 | 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
 | 0.2.0 – 0.3.0 | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
 | 0.4.0 – 0.4.1 | `litert-lm==0.18.0` | `litert-lm==0.18.0` and `litert-lm-builder==0.18.0`; `litert-torch-nightly` and the LiteRT, quantizer and converter pins unchanged | unchanged |
-| 0.4.2 – 0.4.3 | `litert-lm==0.18.0` | unchanged | unchanged on Python 3.10 – 3.12; `sentencepiece==0.2.1` in place of 0.2.0 on Python 3.13 |
+| 0.4.2 – 0.5.0 | `litert-lm==0.18.0` | unchanged | unchanged on Python 3.10 – 3.12; `sentencepiece==0.2.1` in place of 0.2.0 on Python 3.13 |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
@@ -644,8 +644,12 @@ What has and has not been measured:
 
 - Decisions are trained and measured on `google/gemma-3-270m-it` only;
   another family is refused, and another Gemma 3 text model is accepted with a
-  limitation saying it was not measured. Only `choice` questions have been
-  measured; `noul` and `score` follow the same contract and are not.
+  limitation saying it was not measured. `choice` questions have been
+  measured on several tasks, `noul` and `score` on one each: irony as `noul`,
+  whose eight-bit bundle answered as the reference did on 0.9367 of 300 rows
+  and was refused by verify's 0.95 gate, and SST-5's five levels as `score`,
+  which passed at 0.9567
+  ([MEASUREMENTS.md](MEASUREMENTS.md#decisions-a-model-that-chooses-among-options)).
 - It needs training on the task: the untuned model, and a model trained on
   other tasks, chose far worse.
 - Scoring is measured on the CPU backend, and against the float reference on
@@ -942,7 +946,7 @@ incompatible dependencies and cannot share an interpreter.
 ## Results
 
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
-runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and 0.4.0 – 0.4.3 pin 0.18.0.
+runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and 0.4.0 – 0.5.0 pin 0.18.0.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
 0.17.1 re-measurements beside the originals where there are any, and the same
 again on 0.18.0.

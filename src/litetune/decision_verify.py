@@ -103,9 +103,9 @@ TEMPERATURE_CARRIED = (
     "reported here of the reference's; whether a temperature fitted on the runtime would differ "
     "is not measured"
 )
-TYPE_UNMEASURED = (
-    "this is a {kind} question; only Choice questions have been trained and measured by option "
-    "scoring"
+TYPE_ONE_TASK = (
+    "this is a {kind} question; option scoring has trained and measured {kind} on one task only, "
+    "and Choice on several"
 )
 
 
@@ -541,7 +541,7 @@ def verify_decision(
         )
     fields["decision"] = {"decision": decision.as_dict(), "decision_sha256": decision.digest()}
     if decision.type != "choice":
-        state.limitations.append(TYPE_UNMEASURED.format(kind=decision.type))
+        state.limitations.append(TYPE_ONE_TASK.format(kind=decision.type))
     if job.backend != "cpu":
         return refuse(
             RUNTIME_CHECK,

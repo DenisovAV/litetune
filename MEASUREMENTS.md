@@ -7,8 +7,10 @@ section after them is another family: `gemma-3-270m-it` with the second scorer,
 `gemma-4-E2B-it`, converted from its base weights and then fine-tuned,
 `Qwen3-0.6B`, the first that is not a Gemma, `gemma-3-1b-it`, the other size one export rule claims, and
 `Qwen2.5-0.5B-Instruct`, the one checkpoint here on which channelwise four bits
-produced a score. The last returns to `functiongemma-270m-it`, measured
-through the runtime's tool path the way an application calls it.
+produced a score. Then `functiongemma-270m-it` again, measured through the
+runtime's tool path the way an application calls it, and last
+`gemma-3-270m-it` trained to choose one of an application's options rather
+than to write an answer.
 
 This file exists so the README can be a usage guide. It is the longer story:
 what reproduced, what did not, and which published claims were withdrawn.
@@ -96,7 +98,7 @@ four-bit recipes on the same four checkpoints, in *Four bits on litert-lm
 0.17.1*; the tuned Gemma 4 E2B's two eight-bit bundles, in *Gemma 4 E2B on
 litert-lm 0.17.1*; and FunctionGemma's tool path, in *The same checkpoint on
 litert-lm 0.17.1*. Each of those was taken again on litert-lm 0.18.0, the runtime
-0.4.0 – 0.4.3 pin, in *The 0.17.1 re-measurements again on litert-lm 0.18.0*, after the
+0.4.0 – 0.5.0 pin, in *The 0.17.1 re-measurements again on litert-lm 0.18.0*, after the
 banking77 sections. The rest has not been; among it the headline FunctionGemma
 runs, the conversions of Gemma 4's base weights and the runs on untuned bases
 are `verify` numbers taken on 0.16.1, and the phone runs ran on the device.
@@ -1665,3 +1667,65 @@ measurement could see, because the text scorer finds `call:` anywhere:
   refuses constrained decoding without one. So there is no training gain here.
 - Without declarations in the prompt the text path measures nothing useful for
   this model: the reference itself degenerated on 50 of 640 generations.
+
+## Decisions: a model that chooses among options
+
+`google/gemma-3-270m-it` at `ac82b4e8`, trained to answer a question about a
+text with one of a fixed list of options and scored the way flutter_edge_ai's
+proposed `createDecider` is to use it: every option's log-probability through
+the runtime, with no generation (the README's *Decisions* section). Three
+tasks, each one question over its own options. Every row of each dataset was
+used, split by `prepare` (seed 0) into the sizes of the dataset's own splits:
+
+| task | question | dataset | train / calibration / held-out |
+|---|---|---|---|
+| emotion | `choice`, six options | `dair-ai/emotion`, config `split`, at `cab853a1` | 16,000 / 2,000 / 2,000 |
+| irony | `noul` | `cardiffnlp/tweet_eval`, config `irony`, at `b3a375ba` | 2,862 / 955 / 784 |
+| SST-5 | `score`, five levels | `SetFit/sst5` at `e51bdcd8` | 8,544 / 1,101 / 2,210 |
+
+Each ran `tune --method lora --epochs 2 --prompt-mode runtime_rendered
+--max-seq-length 2048 --micro-batch-size 4` (LoRA rank 16 on the seven
+projections, bfloat16), `convert --recipe dynamic_wi8_afp32 --recipe none`,
+which added `--prefill_lengths=8,128`, `verify --engine-rows 300 --threads 4`
+with the `none` file as `--float-twin`, and `bundle`. Emotion was prepared,
+tuned and its eight-bit file converted on #82's branch at `d0833f1`; its float
+twin was converted, and it was verified and bundled, at `b49aaab`, the commit
+that merged #82. Irony and SST-5 ran every stage at `b49aaab`.
+
+The candidate is the eight-bit file on litert-lm 0.18.0's CPU backend, on four
+threads of an Intel Xeon @ 2.20GHz, scoring 300 held-out rows spread through
+the split. The reference is the float checkpoint in PyTorch on an NVIDIA A100,
+scoring every held-out row. Agreement below is therefore between a runtime on a
+CPU and a reference on a GPU.
+
+| | emotion | irony | SST-5 |
+|---|---|---|---|
+| verify | passed | **failed_gate** | passed |
+| reference accuracy, every held-out row | 0.9335 | 0.6901 | 0.5330 |
+| runtime's top option is the reference's, of 300 rows | **1.0000** | **0.9367** | **0.9567** |
+| runtime's answer is the reference's, abstentions included | 0.9933 | 0.9367 | 0.9567 |
+| runtime accuracy on its 300 rows (reference on the same rows) | 0.9533 (0.9533) | 0.6767 (0.7000) | 0.5267 (0.5167) |
+| ms per decision, median | 370.1 | 234.8 | 394.9 |
+| float twin against the reference, largest per-token difference on 4 rows | 2.96e-05 nats | 3.30e-04 nats | 2.97e-05 nats |
+
+- `verify` refused irony's eight-bit bundle: 0.9367 is under its 0.95 floor.
+  The 19 rows where the runtime chose otherwise were near-ties for the
+  reference: its best option led its second by at most 0.637 nats on them
+  (median 0.162), against a median of 1.426 on the 281 rows where the two
+  agreed. On those 300 rows the runtime's accuracy differed from the
+  reference's by −0.0233 ± 0.0285, which does not resolve a difference.
+- Emotion's threshold abstains: the reference answered 0.9805 of the held-out
+  rows, and was wrong on 0.0571 of those it answered. A `noul` or `score`
+  question never abstains.
+- `bundle` wrote emotion's `litetune.decision` section. For irony, `b49aaab`
+  bundled the file without one, as it should, but reported `failed_harness`
+  rather than verify's `failed_gate`; #83 carries verify's status.
+
+### Limitations carried by the decision numbers
+
+- One run per task, on one model, one recipe and the CPU backend of one CPU
+  model. No phone has run a decision.
+- The temperature, and for emotion the threshold, were fitted on the
+  reference's calibration scores and are applied to the runtime's.
+- The runtime scored 300 of the held-out rows: all 2,000, 784 and 2,210 went
+  through the reference only.
