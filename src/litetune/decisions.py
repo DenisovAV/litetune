@@ -62,6 +62,15 @@ QUESTION_TYPES = ("choice", "noul", "score")
 # The answer is P(yes), read by id.
 NOUL_IDS = ("no", "yes")
 
+# How far option scoring has trained and measured each type but `choice`,
+# which it has on several tasks: irony and SST-2 as `noul`, SST-5 as `score`
+# (MEASUREMENTS.md, "Decisions"). `prepare` and `verify` carry it as a
+# limitation.
+TYPE_MEASURED = {
+    "noul": "on two",
+    "score": "on one only",
+}
+
 ANSWER_LINE = "Answer with the id of one option."
 
 # The question a split is rendered with when no `--questions` names one. The

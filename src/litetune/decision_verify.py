@@ -47,7 +47,13 @@ from litetune import calibration, envs
 from litetune.checks import Check, CheckSet, Outcome
 from litetune.decision_scripts import ENGINE_SCRIPT, REFERENCE_SCRIPT
 from litetune.decision_section import SECTION_NAME, payload_bytes
-from litetune.decisions import CONTRACT_KEYS, Decision, DecisionError, decision_from
+from litetune.decisions import (
+    CONTRACT_KEYS,
+    TYPE_MEASURED,
+    Decision,
+    DecisionError,
+    decision_from,
+)
 from litetune.events import EventStream
 from litetune.metrics import paired_difference
 from litetune.storage import hash_file
@@ -103,9 +109,9 @@ TEMPERATURE_CARRIED = (
     "reported here of the reference's; whether a temperature fitted on the runtime would differ "
     "is not measured"
 )
-TYPE_ONE_TASK = (
-    "this is a {kind} question; option scoring has trained and measured {kind} on one task only, "
-    "and Choice on several"
+TYPE_LESS_MEASURED = (
+    "this is a {kind} question; option scoring has trained and measured Choice on several tasks, "
+    "and {kind} {measured}"
 )
 
 
@@ -541,7 +547,9 @@ def verify_decision(
         )
     fields["decision"] = {"decision": decision.as_dict(), "decision_sha256": decision.digest()}
     if decision.type != "choice":
-        state.limitations.append(TYPE_ONE_TASK.format(kind=decision.type))
+        state.limitations.append(
+            TYPE_LESS_MEASURED.format(kind=decision.type, measured=TYPE_MEASURED[decision.type])
+        )
     if job.backend != "cpu":
         return refuse(
             RUNTIME_CHECK,

@@ -1637,10 +1637,25 @@ def test_what_was_and_was_not_measured_is_said_per_model(write_jsonl, request_fo
     assert DECISION_MODEL_UNMEASURED.format(model=one_b) in limitations(base_model=one_b)
 
 
-@pytest.mark.parametrize("kind", ["noul", "score"])
-def test_a_question_type_measured_on_one_task_says_so(write_jsonl, request_for, questions, kind):
-    from litetune.prepare import DECISION_TYPE_ONE_TASK
-
+@pytest.mark.parametrize(
+    ("kind", "text"),
+    [
+        (
+            "noul",
+            "this is a noul question. Option scoring has trained and measured Choice on several "
+            "tasks, and noul on two",
+        ),
+        (
+            "score",
+            "this is a score question. Option scoring has trained and measured Choice on several "
+            "tasks, and score on one only",
+        ),
+    ],
+)
+def test_a_question_type_measured_on_fewer_tasks_says_how_many(
+    write_jsonl, request_for, questions, kind, text
+):
+    """Spelled out: MEASUREMENTS.md's decisions section is what this sentence claims."""
     obj: dict[str, Any] = {"type": kind, "question": "Q?"}
     ids = list(NOUL_IDS) if kind == "noul" else ["0", "1"]
     if kind == "score":
@@ -1649,16 +1664,23 @@ def test_a_question_type_measured_on_one_task_says_so(write_jsonl, request_for, 
 
     result = prepare(request_for(write_jsonl(data), questions=questions(obj)))
 
-    assert DECISION_TYPE_ONE_TASK.format(kind=kind) in result.limitations
+    assert text in result.limitations
     assert result.decision.decision.ids == tuple(ids)
 
 
 def test_a_choice_question_carries_no_type_limitation(write_jsonl, request_for, questions):
+    from litetune.prepare import DECISION_TYPE_LESS_MEASURED
+
     result = prepare(
         request_for(write_jsonl(decision_rows(n_per_option=10)), questions=questions())
     )
 
-    assert not any("Only Choice questions" in text for text in result.limitations)
+    # Every wording so far: "Only Choice questions ...", "this is a choice question ...".
+    phrase = DECISION_TYPE_LESS_MEASURED.split("{kind}")[1]
+    assert phrase.strip()
+    assert not any(
+        phrase in text or "choice question" in text.lower() for text in result.limitations
+    )
 
 
 def test_the_length_check_counts_the_rendered_prompt(write_jsonl, request_for, questions):

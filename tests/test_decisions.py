@@ -13,6 +13,8 @@ from litetune.decisions import (
     CONTRACT_VERSION,
     GENERIC_QUESTION,
     NOUL_IDS,
+    QUESTION_TYPES,
+    TYPE_MEASURED,
     Decision,
     DecisionError,
     Option,
@@ -312,3 +314,8 @@ def test_read_questions_names_the_file_it_cannot_read(tmp_path, content, message
 def test_a_missing_questions_file_is_named(tmp_path):
     with pytest.raises(DecisionError, match="could not be read"):
         read_questions(tmp_path / "absent.json")
+
+
+def test_every_type_but_choice_says_how_far_it_was_measured():
+    """`prepare` and `verify` look the phrase up by type; a new type without one would raise."""
+    assert set(TYPE_MEASURED) == set(QUESTION_TYPES) - {"choice"}

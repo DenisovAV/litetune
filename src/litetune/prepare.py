@@ -54,6 +54,7 @@ from typing import Any, Protocol
 from litetune import envs, jsonfile
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.decisions import (
+    TYPE_MEASURED,
     Decision,
     DecisionError,
     inferred_decision,
@@ -188,9 +189,9 @@ DECISION_INFERRED = (
     "the question, the options' order and their descriptions"
 )
 
-DECISION_TYPE_ONE_TASK = (
-    "this is a {kind} question. Option scoring has trained and measured {kind} on one task only, "
-    "and Choice on several"
+DECISION_TYPE_LESS_MEASURED = (
+    "this is a {kind} question. Option scoring has trained and measured Choice on several tasks, "
+    "and {kind} {measured}"
 )
 
 DECISION_MODEL_UNMEASURED = (
@@ -1679,7 +1680,10 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         if request.questions is None:
             result.limitation(DECISION_INFERRED.format(question=decision.decision.question))
         if decision.decision.type != "choice":
-            result.limitation(DECISION_TYPE_ONE_TASK.format(kind=decision.decision.type))
+            kind = decision.decision.type
+            result.limitation(
+                DECISION_TYPE_LESS_MEASURED.format(kind=kind, measured=TYPE_MEASURED[kind])
+            )
     events.metric("rows", len(rows), source=str(request.data))
 
     # -- lengths -----------------------------------------------------------
