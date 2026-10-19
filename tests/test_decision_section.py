@@ -847,6 +847,8 @@ def test_the_bundle_says_the_shipped_file_was_not_scored_again(toy, tmp_path):
 def test_a_decision_bundle_carries_the_bundle_limitations_whether_or_not_it_gets_a_section(
     toy, tmp_path, verified
 ):
+    # Their wording is pinned in test_bundle.py; this holds that the decision
+    # path carries the same two texts, not texts of its own.
     from litetune.bundle import NO_MANIFEST, NOT_VERIFIED
 
     shim, model = toy
