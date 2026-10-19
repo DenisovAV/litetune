@@ -10,7 +10,10 @@ void main() {
   test('measurement summary keeps devices and measured subsets scoped', () {
     expect(WhyItExists.measurementSummary, contains('converted candidate'));
     expect(WhyItExists.measurementSummary, contains('float references'));
-    expect(WhyItExists.measurementSummary, contains('Four models'));
+    expect(
+      WhyItExists.measurementSummary,
+      contains('Four of the fine-tuned models'),
+    );
     expect(
       WhyItExists.measurementSummary,
       contains("candidates on LiteRT-LM's CPU backend"),

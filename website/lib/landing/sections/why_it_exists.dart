@@ -46,8 +46,8 @@ typedef MeasuredRun = ({
 ///
 /// The note under the cards keeps the two execution sides separate: every
 /// headline candidate ran on LiteRT-LM's CPU backend, while some float
-/// references ran on CUDA. Four-bit results cover four models rather than all
-/// eight. The separate Qwen3 phone run is named because its CPU and GPU results
+/// references ran on CUDA. Four-bit results cover four of the fine-tuned
+/// models rather than all eight (Gemma 4's is on its base weights). The separate Qwen3 phone run is named because its CPU and GPU results
 /// resolve in opposite directions between the eight-bit and mixed four-bit
 /// recipes; a blanket "four bits cost more" would therefore be false.
 ///
@@ -92,7 +92,8 @@ class WhyItExists extends StatelessComponent {
   static const measurementSummary =
       'Across the eight headline runs, every converted candidate ran on '
       "LiteRT-LM's CPU backend; some float references ran on CUDA. The "
-      'eight-bit gap was small on all eight and often unresolved. Four models '
+      'eight-bit gap was small on all eight and often unresolved. Four of the '
+      'fine-tuned models '
       'also have blockwise four-bit results with the candidates on LiteRT-LM\'s '
       'CPU backend, where the gap was larger. A separate Qwen3 phone run shows '
       'that the backend can change the answer. ';
@@ -237,7 +238,7 @@ class WhyItExists extends StatelessComponent {
       hubId: 'google/gemma-4-E2B-it',
       // Null although MEASUREMENTS.md names a commit: that run passed no
       // `--revision` and the hash was read back from the cache afterwards.
-      // Showing it here in the same slot as four pinned ones would give it a
+      // Showing it here in the same slot as six pinned ones would give it a
       // parity the section it links to explicitly denies.
       revision: null,
       anchor: 'end-to-end-on-the-seven-projection-checkpoint',
@@ -254,7 +255,7 @@ class WhyItExists extends StatelessComponent {
   static const closeTarget = 'measured';
 
   /// The panel's id, and what the card links to. Taken from the Hub id rather
-  /// than the display name: the six last segments are already unique and are
+  /// than the display name: the eight last segments are already unique and are
   /// the thing that identifies the run, while two cards could one day differ
   /// in name alone. The `.` two Qwen ids carry is legal in an id and in a
   /// fragment, and is inert only because nothing selects these by id -- the
