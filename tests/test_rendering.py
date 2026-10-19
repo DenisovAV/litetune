@@ -141,6 +141,8 @@ def test_a_rendering_that_lost_the_prompt_names_the_018_cause():
     assert "converting it again" in detail
     # Not only 0.3.0's: 0.4.0 gave no block to a name its rules did not claim.
     assert "or litetune 0.4.0 under a name 0.4.0 did not claim" in detail
+    # The larger sizes went unclaimed, so without a block, until after 0.5.1.
+    assert "1.7B or Qwen2.5 1.5B Instruct bundle when litetune 0.5.1 or earlier" in detail
 
 
 def test_a_rendering_the_runtime_could_not_make_is_not_a_short_one():

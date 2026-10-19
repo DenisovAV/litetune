@@ -876,9 +876,11 @@ was converted with a template of your own, when:
   `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-0.6B-Base` and `Qwen/Qwen2.5-0.5B-Instruct` -- as
   Hub ids, local snapshots, paths ending in one of those names and what `tune` made
   from them -- so another organisation's copy, or a fine-tune under its own name,
-  carries its template alone too.
+  carries its template alone too;
+- litetune 0.5.1 or earlier converted a Qwen3-1.7B or Qwen2.5-1.5B-Instruct
+  checkpoint: no release up to 0.5.1 claimed those names.
 
-`verify` refuses a bundle of either kind at its rendering check and names this as a
+`verify` refuses a bundle of any of these kinds at its rendering check and names this as a
 possible cause.
 
 A bundle litetune 0.4.0 converted from a checkpoint it claimed carries the template

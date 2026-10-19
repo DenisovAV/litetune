@@ -1042,8 +1042,8 @@ different device from their candidates, so both carry that difference.
 from litetune, and the tuned checkpoint's `config.json` names `model_type: qwen3`.
 That is the model-type trap `models.py` describes, seen from the other side: `qwen3`
 is on the exporter's own list, so the config's `model_type` selects the right type
-with no override. `models.py` records it as `qwen-3`, scoped to 0.6B, the one size
-run; from LiteRT-LM 0.18.0 that rule puts a block in front of the checkpoint's own
+with no override. `models.py` records it as `qwen-3`, scoped then to 0.6B, the one size
+run (it has also claimed 1.7B since its template was found to be 0.6B's byte for byte); from LiteRT-LM 0.18.0 that rule puts a block in front of the checkpoint's own
 template, for the runtime rather than the exporter (*The 0.17.1 re-measurements again on
 litert-lm 0.18.0*).
 

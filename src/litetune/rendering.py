@@ -363,7 +363,8 @@ class RenderingComparison:
         (Qwen2.5), because from 0.18.0 the runtime hands a template each
         message's content as a list of parts (`models._TEXT_PARTS_REASON`).
         The names litetune 0.4.0 claimed are its two Qwen patterns
-        (`models.py` at v0.4.0).
+        (`models.py` at v0.4.0); Qwen3-1.7B and Qwen2.5-1.5B-Instruct were
+        first claimed after 0.5.1, and ship the smaller sizes' templates.
         """
         lost = [m for m in self.mismatches if m.prompt_missing or m.kind == "unrendered"]
         if not lost:
@@ -376,7 +377,9 @@ class RenderingComparison:
             "with no template of the caller's is such a bundle when litetune 0.3.0 or earlier "
             "converted it, or litetune 0.4.0 under a name 0.4.0 did not claim (it claimed only "
             "Qwen/Qwen3-0.6B, Qwen/Qwen3-0.6B-Base and Qwen/Qwen2.5-0.5B-Instruct, their local "
-            "snapshots, paths ending in those names and what `tune` made from them); converting "
+            "snapshots, paths ending in those names and what `tune` made from them), and a Qwen3 "
+            "1.7B or Qwen2.5 1.5B Instruct bundle when litetune 0.5.1 or earlier converted it "
+            "(no earlier litetune claimed those names); converting "
             "it again with this litetune puts a block that reads a list of parts in front of its "
             "checkpoint's own template"
         )

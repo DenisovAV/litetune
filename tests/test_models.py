@@ -380,7 +380,9 @@ QWEN_MARKERS = {
 @pytest.mark.parametrize(("model", "family"), QWEN_RULES)
 def test_a_qwen_export_asks_for_its_own_template_composed_and_no_type_override(model, family):
     """The exporter types both Qwen checkpoints from their own `config.json`
-    (measured 2026-09-14 and 2026-09-20), so no type override. What LiteRT-LM
+    (measured 2026-09-14 on Qwen3-0.6B and 2026-09-20 on Qwen2.5-0.5B-Instruct;
+    Qwen3-1.7B and Qwen2.5-1.5B-Instruct declare the same `model_type` and were
+    not exported), so no type override. What LiteRT-LM
     0.18.0 needs is a template that reads content as a list of parts: on it a
     Qwen3 bundle carrying the checkpoint's template rendered an empty user turn
     with no error (2026-10-08). So the plan adds exactly that one flag, as the
