@@ -1010,7 +1010,8 @@ RULES: tuple[ModelRules, ...] = (
         # banking77 (MEASUREMENTS.md, "The two Qwen families, one size up"): both
         # int8 recipes exported with this rule's template override and convert's
         # default --externalize_embedder, no other flag, packed the
-        # canonical template, verified, and held a LiteRT-LM conversation.
+        # canonical template and verified; the dynamic_wi8_afp32 bundle held a
+        # LiteRT-LM conversation (the other was not run in one).
         #
         # Not by organisation, variant or revision, but by name, as every rule
         # here matches: a Hub id is matched on its spelling alone, and
@@ -1113,8 +1114,9 @@ RULES: tuple[ModelRules, ...] = (
         # claimed, as the base 0.5B is not. Measured 2026-10-19 on banking77
         # (MEASUREMENTS.md, "The two Qwen families, one size up"): both int8
         # recipes exported with this rule's template override and convert's default
-        # --externalize_embedder, no other flag, composed, verified, and
-        # held a LiteRT-LM conversation.
+        # --externalize_embedder, no other flag, composed and verified; the
+        # dynamic_wi8_afp32 bundle held a LiteRT-LM conversation (the other was
+        # not run in one).
         #
         # No `min_transformers` -- the pinned 5.16.1 loaded it, and nothing
         # here establishes a floor, which is not the same as there being none.
