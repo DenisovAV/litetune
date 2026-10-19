@@ -32,7 +32,8 @@ version: models trained on the old text keep the old one.
 its options. A Noul question has the options `no` and `yes`, in that order, and
 its answer is P(yes). A Score question lists its levels lowest first; a level's
 id is its index as a string and the text given is its description, which Jev's
-Score answer returns as its legend. Only Choice has been measured.
+Score answer returns as its legend. How far option scoring has measured each
+type is `TYPE_MEASURED`.
 
 **The record.** `canonical_text` is what `prepare` writes to `decision.json`
 and what `read_questions` reads back to the same decision, so a later stage
