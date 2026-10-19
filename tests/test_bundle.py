@@ -368,6 +368,9 @@ def test_a_failed_run_still_produces_a_manifest_and_a_report(tmp_path, request_f
     report = json.loads((root / REPORT_NAME).read_text(encoding="utf-8"))
     assert report["status"] == "failed_gate"
     assert report["verified"] is False
+    # A run manifest was supplied, so none is synthesised and none is said to be.
+    assert report["limitations"][0] == ASSEMBLED
+    assert NO_RUN_MANIFEST not in report["limitations"]
     # Not a decision model, so no decision section was withheld from it.
     assert result.withheld_section is None
     assert report["withheld_section"] is None
@@ -407,11 +410,29 @@ NO_RUN_MANIFEST = (
     "status is inconclusive: it does not record which stages produced or measured this model. "
     "The measurements the bundle stage was given are in `report.json`"
 )
+ASSEMBLED = (
+    "this bundle was assembled from the files and records the bundle stage was given; "
+    "assembling it establishes nothing about the model. Read `report.json` for which "
+    "measurements were taken and which were not."
+)
+# Whatever the bundle was given, and whether or not it could be assembled.
+BUNDLES = pytest.mark.parametrize(
+    ("measurements", "missing_model", "status"),
+    [
+        ({}, False, "passed"),
+        (all_measurements(), False, "passed"),
+        (all_measurements(), True, "failed_harness"),
+    ],
+    ids=["none", "verify's", "model missing"],
+)
 
 
-@pytest.mark.parametrize("measurements", [{}, all_measurements()], ids=["none", "verify's"])
-def test_a_bundle_with_no_run_manifest_synthesises_one_and_says_so(request_for, measurements):
-    result = build_bundle(request_for(status=RunStatus.PASSED, measurements=measurements))
+@BUNDLES
+def test_a_bundle_with_no_run_manifest_synthesises_one_and_says_so(
+    tmp_path, request_for, measurements, missing_model, status
+):
+    model = {"model": tmp_path / "gone.litertlm"} if missing_model else {}
+    result = build_bundle(request_for(status=RunStatus.PASSED, measurements=measurements, **model))
 
     out = result.request.output_dir
     recorded = json.loads((out / MANIFEST_NAME).read_text(encoding="utf-8"))
@@ -421,7 +442,7 @@ def test_a_bundle_with_no_run_manifest_synthesises_one_and_says_so(request_for, 
     # What the limitation says of the synthesised manifest, and of the report.
     assert recorded["stages"] == []
     assert recorded["status"] == "inconclusive"
-    assert report["status"] == "passed"
+    assert report["status"] == status
     assert report["measurements"] == measurements
     assert NO_RUN_MANIFEST in result.limitations
     assert NO_RUN_MANIFEST in report["limitations"]
@@ -430,19 +451,18 @@ def test_a_bundle_with_no_run_manifest_synthesises_one_and_says_so(request_for, 
     assert not any("what was measured" in text for text in report["limitations"])
 
 
-@pytest.mark.parametrize("measurements", [{}, all_measurements()], ids=["none", "verify's"])
-def test_a_bundle_says_it_was_assembled_from_what_it_was_given(request_for, measurements):
-    result = build_bundle(request_for(measurements=measurements))
+@BUNDLES
+def test_a_bundle_says_it_was_assembled_from_what_it_was_given(
+    tmp_path, request_for, measurements, missing_model, status
+):
+    model = {"model": tmp_path / "gone.litertlm"} if missing_model else {}
+    result = build_bundle(request_for(status=RunStatus.PASSED, measurements=measurements, **model))
 
     report = json.loads((result.request.output_dir / REPORT_NAME).read_text(encoding="utf-8"))
-    text = (
-        "this bundle was assembled from the files and records the bundle stage was given; "
-        "assembling it establishes nothing about the model. Read `report.json` for which "
-        "measurements were taken and which were not."
-    )
+    assert report["status"] == status
     assert report["verified"] is False
-    assert report["unverified_reason"] == text
-    assert report["limitations"][0] == text
+    assert report["unverified_reason"] == ASSEMBLED
+    assert report["limitations"][0] == ASSEMBLED
     # Up to 0.5.0 it said "from what the run recorded", of a bundle that may
     # have been given no run's record at all.
     assert not any("what the run recorded" in t for t in report["limitations"])
