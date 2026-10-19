@@ -71,6 +71,8 @@ E2B_TEMPLATE = "--jinja_chat_template_override=litert-community/gemma-4-E2B-it-l
         ("google/gemma-4-it", "gemma-4"),
         ("Qwen/Qwen3.5-4B-Instruct", "qwen-3.5"),
         ("Qwen/Qwen3-0.6B", "qwen-3"),
+        ("Qwen/Qwen3-1.7B", "qwen-3"),
+        ("Qwen/Qwen2.5-1.5B-Instruct", "qwen-2.5"),
     ],
 )
 def test_families_are_recognised(model, family):
@@ -88,15 +90,19 @@ def test_families_are_recognised(model, family):
         # Qwen3-0.6B sat here until its export and conversion cost were
         # measured, and Qwen2.5-0.5B-Instruct until 2026-09-20. Both rules now
         # compose the checkpoint's own template behind the text-parts block at
-        # export; the rest of both families stays below.
-        "Qwen/Qwen2.5-1.5B-Instruct",
+        # export; the rest of both families stays below. Qwen3-1.7B and
+        # Qwen2.5-1.5B-Instruct left on 2026-10-19: their templates are the
+        # smaller sizes' byte for byte.
+        "Qwen/Qwen2.5-3B-Instruct",
         "Qwen/Qwen2.5-0.5B",
-        # Claimed by size, and only the size that was measured. The TTS model is
-        # here because its name ends in 0.6B too.
-        "Qwen/Qwen3-1.7B",
+        "Qwen/Qwen2.5-1.5B",
+        # Claimed by size, and only the sizes added. The TTS models are here
+        # because their names end in 0.6B and 1.7B too.
+        "Qwen/Qwen3-4B",
         "Qwen/Qwen3-30B-A3B",
         "Qwen/Qwen3-VL-2B-Instruct",
         "litert-community/Qwen3-TTS-12Hz-0.6B-Base",
+        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         # A size suffix is not the generation number: matching these would
         # refuse an export for a family these rules say nothing about.
         "org/gemma-40m",
@@ -351,14 +357,19 @@ def test_an_export_request_carries_the_required_flags_into_its_argv(tmp_path):
 
 
 def test_a_family_with_no_rules_has_its_flags_left_alone(tmp_path):
-    plan = plan_export("Qwen/Qwen2.5-1.5B-Instruct", ("--some_flag=1",), ("dynamic_wi8_afp32",))
+    plan = plan_export("Qwen/Qwen2.5-3B-Instruct", ("--some_flag=1",), ("dynamic_wi8_afp32",))
     assert plan.flags == ("--some_flag=1",)
     assert plan.added == ()
     assert plan.usable
     assert "no per-model rules" in " ".join(plan.notes)
 
 
-QWEN_RULES = [("Qwen/Qwen3-0.6B", "qwen-3"), ("Qwen/Qwen2.5-0.5B-Instruct", "qwen-2.5")]
+QWEN_RULES = [
+    ("Qwen/Qwen3-0.6B", "qwen-3"),
+    ("Qwen/Qwen3-1.7B", "qwen-3"),
+    ("Qwen/Qwen2.5-0.5B-Instruct", "qwen-2.5"),
+    ("Qwen/Qwen2.5-1.5B-Instruct", "qwen-2.5"),
+]
 # The template override each Qwen rule adds: Qwen 3 may get LiteRT-LM's own.
 QWEN_MARKERS = {
     "qwen-3": models.CANONICAL_OR_COMPOSED_TEMPLATE,
@@ -632,7 +643,7 @@ def test_the_reason_says_the_checkpoints_own_template_is_kept(model, family):
 
 
 def test_an_unknown_family_is_told_about_the_list_of_parts():
-    model = "Qwen/Qwen2.5-1.5B-Instruct"
+    model = "Qwen/Qwen2.5-3B-Instruct"
     notes = " ".join(plan_export(model, (), ("dynamic_wi8_afp32",)).notes)
     assert "no per-model rules" in notes
     assert "from LiteRT-LM 0.18.0" in notes and "list of parts" in notes and "run verify" in notes
@@ -674,12 +685,22 @@ def test_the_qwen3_rule_claims_a_name_that_still_contains_its_size():
         "someorg/Qwen3-0.6B-sql-assistant",
         # What a name cannot show: a format not spelled after the size.
         "mlx-community/Qwen3-0.6B-bf16",
+        "Qwen/Qwen3-1.7B",
+        "Qwen/Qwen3-1.7B-Base",
+        _SNAPSHOT.format("Qwen3-1.7B"),
+        "someorg/Qwen3-1.7B-sql-assistant",
     ):
         assert identify(claimed).family == "qwen-3", claimed
         plan = plan_export(claimed, (), ("dynamic_wi8_afp32",))
         marker = models.CANONICAL_OR_COMPOSED_TEMPLATE
         assert f"--jinja_chat_template_override={marker}" in plan.flags
-    for unclaimed in (*_QWEN3_REPACKS, "acme/banking77-assistant", "Qwen/Qwen3-1.7B"):
+    for unclaimed in (
+        *_QWEN3_REPACKS,
+        *(name.replace("0.6B", "1.7B") for name in _QWEN3_REPACKS),
+        "acme/banking77-assistant",
+        "Qwen/Qwen3-4B",
+        "Qwen/Qwen3-ASR-1.7B",
+    ):
         assert identify(unclaimed) is None, unclaimed
 
 
@@ -799,7 +820,7 @@ def test_the_qwen25_rule_claims_the_checkpoint_that_was_run_and_not_its_repacks(
     """A size suffix is not a licence over the family, and neither is a prefix.
 
     `Qwen2-5B` is a Qwen 2 of five billion parameters, not a Qwen 2.5; the
-    1.5B and the base 0.5B were never exported here; and the AWQ, GPTQ and
+    base 0.5B and 1.5B, the 3B and the 7B are not claimed; and the AWQ, GPTQ and
     bnb repacks are already-quantized checkpoints that no run in this
     repository touched. `identify` searches rather than matches, so an
     unanchored pattern claims every one of those and silences the
@@ -813,13 +834,23 @@ def test_the_qwen25_rule_claims_the_checkpoint_that_was_run_and_not_its_repacks(
         "someorg/Qwen2.5-0.5B-Instruct",
         # What a name cannot show: an ONNX export under the bare name.
         "onnx-community/Qwen2.5-0.5B-Instruct",
+        "Qwen/Qwen2.5-1.5B-Instruct",
+        _SNAPSHOT.format("Qwen2.5-1.5B-Instruct"),
+        "someorg/Qwen2.5-1.5B-Instruct",
     ):
         assert identify(claimed).family == "qwen-2.5", claimed
     for unclaimed in (
         "Qwen/Qwen2-5B",
         "Qwen/Qwen2.5-0.5B",
-        "Qwen/Qwen2.5-1.5B-Instruct",
+        "Qwen/Qwen2.5-1.5B",
+        "Qwen/Qwen2.5-3B-Instruct",
         "Qwen/Qwen2.5-7B-Instruct",
+        "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+        "Qwen/Qwen2.5-Math-1.5B-Instruct",
+        "Qwen/Qwen2.5-1.5B-Instruct-AWQ",
+        "Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int8",
+        "someorg/Qwen2.5-1.5B-Instruct-qwen2-GGUF",
+        "me/Qwen2.5-1.5B-Instruct-banking77",
         "Qwen/Qwen2.5-0.5B-Instruct-AWQ",
         "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4",
         "Qwen/Qwen2.5-0.5B-Instruct-GGUF",

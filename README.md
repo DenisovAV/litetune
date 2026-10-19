@@ -748,8 +748,8 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 | `gemma-3-text` | `--litert_lm_model_type_override=gemma3` |
 | `gemma-4-e2b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm` |
 | `gemma-4-e4b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E4B-it-litert-lm` |
-| `qwen-3` (Qwen3 0.6B) | `--jinja_chat_template_override=<LiteRT-LM's canonical chat template if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
-| `qwen-2.5` (Qwen2.5 0.5B Instruct) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
+| `qwen-3` (Qwen3 0.6B and 1.7B) | `--jinja_chat_template_override=<LiteRT-LM's canonical chat template if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
+| `qwen-2.5` (Qwen2.5 0.5B and 1.5B Instruct) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
 
 **A LoRA scope keyed on model identity.** On a multimodal checkpoint the
 vision and audio towers use the same projection names as the text layers, so
@@ -807,7 +807,8 @@ where 0.17.1 gave it the string, and a template written for a string may print t
 list, drop the user's text or fail: measured on 2026-10-08, a Qwen3 0.6B bundle
 rendered `<|im_start|>user\n<|im_end|>` with no error and every send to a Qwen2.5
 0.5B Instruct bundle failed. For a checkpoint either rule claims -- a name that
-contains Qwen3-0.6B, Base included, or ends in Qwen2.5-0.5B-Instruct, under any
+contains Qwen3-0.6B or Qwen3-1.7B, Base included, or ends in Qwen2.5-0.5B-Instruct or
+Qwen2.5-1.5B-Instruct, under any
 organisation, a local snapshot of either and what `tune` made from either, but not
 a Hub repack named for its format, such as `-FP8`, `-GGUF` or `-bnb-4bit`, nor a
 local checkpoint whose `config.json` has a `quantization_config` -- `convert`
@@ -835,7 +836,7 @@ through the template alone with transformers, as training did, and as parts thro
 block with the export environment's Jinja2 configured as LiteRT-LM's MiniJinja, and each
 pair must print the same; a template using what that renderer does not vouch for is not
 checked, and nothing is exported. Neither renderer is LiteRT-LM; `verify`'s rendering
-check is what checks the runtime. For Qwen3 0.6B the bundle carries LiteRT-LM v0.18.0's
+check is what checks the runtime. For Qwen3 0.6B and 1.7B the bundle carries LiteRT-LM v0.18.0's
 own Qwen 3 template instead, because Qwen3's template breaks a LiteRT-LM conversation at
 its second message -- when that template prints those prompts as the checkpoint's own does,
 and either the `litetune.json` beside the checkpoint records that `tune` trained it

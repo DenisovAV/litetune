@@ -698,7 +698,8 @@ CANONICAL_HEADER_END = "-#}\n"
 # Read from the Hub on 2026-10-14: Qwen/Qwen3-1.7B (70d244c), -4B (1cfa9a7),
 # -8B (b968826), -14B (40c0698), -32B (9216db5) and -30B-A3B (ad44e77) ship
 # these same bytes, so the one digest is theirs too -- though the qwen-3 rule
-# claims only names containing Qwen3-0.6B, so none of them reaches this.
+# claims only names containing Qwen3-0.6B or Qwen3-1.7B, so of them only the
+# 1.7B reaches this.
 # Qwen/Qwen3-0.6B-Base at da87bfb ships other bytes (sha256 87a2728c...), and
 # is left out: nothing here establishes which format a base model is in.
 CANONICAL_UPSTREAM: dict[str, dict[str, str]] = {
@@ -1000,6 +1001,13 @@ RULES: tuple[ModelRules, ...] = (
         # project has run. No `min_transformers` either -- none was measured.
         # Sizes are added here as they are.
         #
+        # Qwen3-1.7B: Qwen/Qwen3-1.7B at 70d244c declares the same
+        # `model_type` (`qwen3`) and architecture (`Qwen3ForCausalLM`) as the
+        # 0.6B, and its tokenizer_config.json's chat template is the 0.6B's at
+        # c1899de byte for byte (`CANONICAL_UPSTREAM`, read 2026-10-14 and
+        # again 2026-10-19), so what this rule adds -- the template choice and
+        # its refusals -- is decided on the same bytes.
+        #
         # Not by organisation, variant or revision, but by name, as every rule
         # here matches: a Hub id is matched on its spelling alone, and
         # `hint_for` reads `config.json` and `tune`'s sidecar only for a local
@@ -1035,7 +1043,7 @@ RULES: tuple[ModelRules, ...] = (
         # from the checkpoint: a `quantization_config` in its `config.json`. A
         # full-precision merge whose config's `_name_or_path` names the bnb
         # repack it was tuned from is claimed, which a name read would refuse.
-        patterns=(r"qwen-?3-0-6b",),
+        patterns=(r"qwen-?3-(?:0-6b|1-7b)",),
         repack_guard=True,
         required_flags=(
             RequiredFlag(
@@ -1092,6 +1100,14 @@ RULES: tuple[ModelRules, ...] = (
         # is claimed whatever its repository holds, and if that is not weights
         # transformers loads the exporter fails at its model load.
         #
+        # Qwen2.5-1.5B-Instruct, by the same size-and-variant rule:
+        # Qwen/Qwen2.5-1.5B-Instruct at 989aa79 declares `model_type: "qwen2"`
+        # and `Qwen2ForCausalLM`, as the 0.5B does, and its tokenizer_config.json's
+        # chat template is the 0.5B's at 7ae5576 byte for byte (read
+        # 2026-10-19), so the composition and the two reasons below for no
+        # `canonical_template` rest on the same bytes. The base 1.5B is not
+        # claimed, as the base 0.5B is not.
+        #
         # No `min_transformers` -- the pinned 5.16.1 loaded it, and nothing
         # here establishes a floor, which is not the same as there being none.
         #
@@ -1117,7 +1133,7 @@ RULES: tuple[ModelRules, ...] = (
         # by Alibaba Cloud. You are a helpful assistant.") and LiteRT-LM's
         # prints none, so 48 of the 96 single-turn renderings differ: exactly
         # those without a system message, in every context.
-        patterns=(r"qwen-?2-5-0-5b-instruct(?:-snapshots-[0-9a-f]{40})?(?:$|-qwen2\b)",),
+        patterns=(r"qwen-?2-5-(?:0-5b|1-5b)-instruct(?:-snapshots-[0-9a-f]{40})?(?:$|-qwen2\b)",),
         repack_guard=True,
         required_flags=(
             RequiredFlag(
