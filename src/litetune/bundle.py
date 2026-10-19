@@ -95,9 +95,12 @@ DECLARATIONS_NAME = "declarations.json"
 MODEL_DIR_NAME = "model"
 ADAPTER_DIR_NAME = "adapter"
 
+# `bundle` also runs with no verify manifest and no training record, the
+# contract given as flags; then there is no run record to assemble it from.
 NOT_VERIFIED = (
-    "this bundle was assembled from what the run recorded; assembling it establishes nothing "
-    "about the model. Read `report.json` for which measurements were taken and which were not."
+    "this bundle was assembled from the files and records the bundle stage was given; assembling "
+    "it establishes nothing about the model. Read `report.json` for which measurements were taken "
+    "and which were not."
 )
 
 # Said of `manifest.json` alone. Said of the bundle as a whole, as it was up to

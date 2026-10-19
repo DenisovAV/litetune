@@ -430,6 +430,24 @@ def test_a_bundle_with_no_run_manifest_synthesises_one_and_says_so(request_for, 
     assert not any("what was measured" in text for text in report["limitations"])
 
 
+@pytest.mark.parametrize("measurements", [{}, all_measurements()], ids=["none", "verify's"])
+def test_a_bundle_says_it_was_assembled_from_what_it_was_given(request_for, measurements):
+    result = build_bundle(request_for(measurements=measurements))
+
+    report = json.loads((result.request.output_dir / REPORT_NAME).read_text(encoding="utf-8"))
+    text = (
+        "this bundle was assembled from the files and records the bundle stage was given; "
+        "assembling it establishes nothing about the model. Read `report.json` for which "
+        "measurements were taken and which were not."
+    )
+    assert report["verified"] is False
+    assert report["unverified_reason"] == text
+    assert report["limitations"][0] == text
+    # Up to 0.5.0 it said "from what the run recorded", of a bundle that may
+    # have been given no run's record at all.
+    assert not any("what the run recorded" in t for t in report["limitations"])
+
+
 def test_an_unknown_measurement_point_is_refused(request_for):
     with pytest.raises(BundleError):
         request_for(measurements={"tuned_gpu": {}})
