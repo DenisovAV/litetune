@@ -1318,6 +1318,61 @@ rows is not attributed to the runtime.
 Neither cost resolves in either run; the discordant rows are 8 and 3, against
 16 and 10.
 
+## The two Qwen families, one size up
+
+`Qwen/Qwen3-1.7B` @ `70d244cc`, 1,720,574,976 parameters, and
+`Qwen/Qwen2.5-1.5B-Instruct` @ `989aa798`, 1,543,714,304 parameters, run on
+2026-10-19 with the code that first claims them in the `qwen-3` and `qwen-2.5`
+rules, before it was merged: commit 1e42ebb, which reports 0.5.1. Each ships its smaller size's chat template
+byte for byte -- `a55ee1b1…` and `cd8e9439…`, the digests `convert` read back from
+the checkpoints -- and declares the same `model_type` and architecture, which is
+what the rules were widened on. This run is what they then did.
+
+The task, the rows and the scorer are the fifth family's: LoRA α32, rank 16, lr
+2e-4, one epoch, batch 8, bfloat16, `max_seq_length` 256, the same 2,400 rows of
+`mteb/banking77` and the same 600 held-out rows of split `0c7505b2b6f69ab1`,
+`--scorer exact-text`, prompt mode `runtime_rendered`, which `tune` inferred and
+`verify` read back from beside the checkpoint. On all four verifies the runtime and
+the reference rendered identical token ids on all 600 prompts, with the runtime's
+prefill count equal to the reference's on the 8 it was sent. Trained parameters
+17,432,576 (Qwen3) and 18,464,768 (Qwen2.5), final loss 0.6226 and 0.3756.
+Training and the float reference ran on one A100-SXM4-40GB, every candidate on
+litert-lm 0.18.0's CPU backend on `Intel(R) Xeon(R) CPU @ 2.20GHz`, 12 vCPU.
+Training environment `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0`;
+export environment `litert-torch-nightly` 0.10.0.dev20260926,
+`ai-edge-quantizer-nightly` 0.10.0.dev20260926, litert-lm-builder 0.18.0.
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| Qwen3-1.7B, fine-tuned | **0.7400** ±0.0351 | 0.7383 ±0.0352 | 0.7383 ±0.0352 |
+| Cost of conversion | — | +0.0017 ±0.0098 *(unresolved, 9 discordant)* | +0.0017 ±0.0086 *(unresolved, 7 discordant)* |
+| Qwen2.5-1.5B-Instruct, fine-tuned | **0.7683** ±0.0338 | 0.7717 ±0.0336 | 0.7733 ±0.0335 |
+| Cost of conversion | — | −0.0033 ±0.0113 *(unresolved, 12 discordant)* | −0.0050 ±0.0073 *(unresolved, 5 discordant)* |
+
+On litert-lm 0.18.0. Sizes are 2,056,778,672 and 2,057,090,176 bytes for Qwen3,
+1,802,859,440 and 1,803,072,640 for Qwen2.5. The untuned base was not scored.
+
+**The template each rule chose is the one it chooses for the smaller size.** For
+Qwen3-1.7B `convert` packed LiteRT-LM v0.18.0's canonical Qwen 3 template
+(`chat_template.source` `canonical`), offered because `tune`'s record says the
+checkpoint was trained `runtime_rendered` without declarations, and chosen after
+its 96 single-turn renderings matched the checkpoint's own. For
+Qwen2.5-1.5B-Instruct it composed the checkpoint's own template behind the
+text-parts block (`composed`). Every bundle passed the conversation check after
+export (72 cases, each a prefix of the next), and the bundles read back as
+`llm_model_type` `qwen3` and `qwen2p5`, with no type override.
+
+**Both hold a LiteRT-LM conversation.** On litert-lm-api 0.18.0's CPU backend each
+`dynamic_wi8_afp32` bundle answered three messages in one `Conversation` and two
+held-out prompts in another, every send returning a reply -- the second message is
+where a Qwen3 bundle failed before #78.
+
+**Neither model is shown to be better or worse than its smaller size.** Qwen3-1.7B's
+float 0.7400 and Qwen2.5-1.5B-Instruct's 0.7683 sit beside Qwen3-0.6B's 0.6983 and
+Qwen2.5-0.5B-Instruct's 0.7700 on these rows, and litetune computes no interval for a
+difference between two models. No conversion cost resolves, as for the smaller sizes
+on 0.17.1 and 0.18.0.
+
 ## What four bits cost
 
 Everything above is 8-bit, except the Gemma 4 table, whose `dynamic_wi4b32_afp32`

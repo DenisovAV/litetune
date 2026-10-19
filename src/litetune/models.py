@@ -1006,7 +1006,11 @@ RULES: tuple[ModelRules, ...] = (
         # 0.6B, and its tokenizer_config.json's chat template is the 0.6B's at
         # c1899de byte for byte (`CANONICAL_UPSTREAM`, read 2026-10-14 and
         # again 2026-10-19), so what this rule adds -- the template choice and
-        # its refusals -- is decided on the same bytes.
+        # its refusals -- is decided on the same bytes. Measured 2026-10-19 on
+        # banking77 (MEASUREMENTS.md, "The two Qwen families, one size up"): both
+        # int8 recipes exported with this rule's template override and convert's
+        # default --externalize_embedder, no other flag, packed the
+        # canonical template, verified, and held a LiteRT-LM conversation.
         #
         # Not by organisation, variant or revision, but by name, as every rule
         # here matches: a Hub id is matched on its spelling alone, and
@@ -1106,7 +1110,11 @@ RULES: tuple[ModelRules, ...] = (
         # chat template is the 0.5B's at 7ae5576 byte for byte (read
         # 2026-10-19), so the composition and the two reasons below for no
         # `canonical_template` rest on the same bytes. The base 1.5B is not
-        # claimed, as the base 0.5B is not.
+        # claimed, as the base 0.5B is not. Measured 2026-10-19 on banking77
+        # (MEASUREMENTS.md, "The two Qwen families, one size up"): both int8
+        # recipes exported with this rule's template override and convert's default
+        # --externalize_embedder, no other flag, composed, verified, and
+        # held a LiteRT-LM conversation.
         #
         # No `min_transformers` -- the pinned 5.16.1 loaded it, and nothing
         # here establishes a floor, which is not the same as there being none.
