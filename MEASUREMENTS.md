@@ -775,7 +775,7 @@ Paired, the difference is **+0.2400 ±0.0457, resolved**, on 196 of 600
 discordant. The interval would have to be more than five times wider to contain zero.
 
 **What it establishes.** On this task the projection set matters more than the
-model does. The five checkpoints measured on this split span 0.6717 to 0.7883 --
+model does. The seven checkpoints measured on this split span 0.6717 to 0.7883 --
 11.7 points between the smallest checkpoint and the largest -- and changing
 which projections a LoRA run adapts moved one checkpoint 24. Taking peft's
 default would have left 5.1 billion parameters scoring 0.5483, below every
@@ -1288,8 +1288,8 @@ device from its candidate.
 sides score **0.0000 on all 600 rows**, `verify` reports `unmeasured` and exits
 3, and its manifest gives the same reason as the 1B's: the reference is the
 untuned base, so training and conversion are confounded and both attribution
-fields are unavailable. Of the five models fine-tuned and measured on banking77, not
-one has a recorded training gain — two scored zero on both sides, one was refused for
+fields are unavailable. Of the five models fine-tuned and measured on banking77 up to
+this run, not one has a recorded training gain — two scored zero on both sides, one was refused for
 empty output, one was never scored, and Gemma 4's tuned run records no base figure at
 all. FunctionGemma, at the top of this file, is the only model
 here with one at all — on another task, with another scorer, and with three
@@ -1370,7 +1370,8 @@ where a Qwen3 bundle failed before #78.
 **Neither model is shown to be better or worse than its smaller size.** Qwen3-1.7B's
 float 0.7400 and Qwen2.5-1.5B-Instruct's 0.7683 sit beside Qwen3-0.6B's 0.6983 and
 Qwen2.5-0.5B-Instruct's 0.7700 on these rows, and litetune computes no interval for a
-difference between two models. No conversion cost resolves, as for the smaller sizes
+difference between two models. Neither run scored its untuned base, so neither records
+a training gain, as none of the five banking77 models before them does. No conversion cost resolves, as for the smaller sizes
 on 0.17.1 and 0.18.0.
 
 ## What four bits cost
