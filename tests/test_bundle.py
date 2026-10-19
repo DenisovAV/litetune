@@ -402,14 +402,32 @@ def test_all_three_points_present_makes_the_attribution_separable(request_for):
     assert result.complete is True
 
 
-def test_a_bundle_with_no_run_manifest_synthesises_one_and_says_so(request_for):
-    result = build_bundle(request_for())
+NO_RUN_MANIFEST = (
+    "no run manifest was supplied to the bundle stage, so `manifest.json` lists no stages and its "
+    "status is inconclusive: it does not record which stages produced or measured this model. "
+    "The measurements the bundle stage was given are in `report.json`"
+)
 
-    recorded = json.loads((result.request.output_dir / MANIFEST_NAME).read_text(encoding="utf-8"))
+
+@pytest.mark.parametrize("measurements", [{}, all_measurements()], ids=["none", "verify's"])
+def test_a_bundle_with_no_run_manifest_synthesises_one_and_says_so(request_for, measurements):
+    result = build_bundle(request_for(status=RunStatus.PASSED, measurements=measurements))
+
+    out = result.request.output_dir
+    recorded = json.loads((out / MANIFEST_NAME).read_text(encoding="utf-8"))
+    report = json.loads((out / REPORT_NAME).read_text(encoding="utf-8"))
     # A field that could not be known is marked, not omitted.
-    assert recorded["spec_hash"]["available"] is False
+    assert recorded["spec_hash"] == {"available": False, "reason": NO_RUN_MANIFEST}
+    # What the limitation says of the synthesised manifest, and of the report.
     assert recorded["stages"] == []
-    assert any("no run manifest was supplied" in text for text in result.limitations)
+    assert recorded["status"] == "inconclusive"
+    assert report["status"] == "passed"
+    assert report["measurements"] == measurements
+    assert NO_RUN_MANIFEST in result.limitations
+    assert NO_RUN_MANIFEST in report["limitations"]
+    # Up to 0.5.0 it said the bundle did not record "what was measured", beside
+    # the measurements `report.json` carried.
+    assert not any("what was measured" in text for text in report["limitations"])
 
 
 def test_an_unknown_measurement_point_is_refused(request_for):

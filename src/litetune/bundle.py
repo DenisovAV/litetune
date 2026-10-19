@@ -100,9 +100,12 @@ NOT_VERIFIED = (
     "about the model. Read `report.json` for which measurements were taken and which were not."
 )
 
+# Said of `manifest.json` alone. Said of the bundle as a whole, as it was up to
+# 0.5.0, it denied the measurements `--verify-manifest` puts in `report.json`.
 NO_MANIFEST = (
-    "no run manifest was supplied to the bundle stage, so this file records only what the bundle "
-    "stage itself observed: which files were packaged, not what produced them or what was measured"
+    f"no run manifest was supplied to the bundle stage, so `{MANIFEST_NAME}` lists no stages and "
+    "its status is inconclusive: it does not record which stages produced or measured this model. "
+    f"The measurements the bundle stage was given are in `{REPORT_NAME}`"
 )
 
 
