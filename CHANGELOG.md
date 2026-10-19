@@ -3,6 +3,10 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.5.1 — 2026-10-19
+- `prepare` and `verify` say a `noul` question has been measured on two tasks, not one, and MEASUREMENTS.md adds SST-2 as `noul` and irony trained for four and six epochs, which verify passed where two epochs were refused (#85).
+- `bundle` no longer says it records nothing that was measured beside the measurements `--verify-manifest` put in `report.json`: the limitation is now about the synthesised `manifest.json`, which lists no stages, and the bundle no longer claims a run's record it was not given (#86).
+
 ## 0.5.0 — 2026-10-18
 - `prepare --questions`, `tune --decision`, `verify` and `bundle` train, measure and package a model that answers with one of the options an app passes, for flutter_edge_ai's proposed `InferenceModel.createDecider`: one `.litertlm` that carries the question, the options and the calibration in a `litetune.decision` section, measured on `google/gemma-3-270m-it` only (#82).
 - `convert` exports a checkpoint that records a decision with `--prefill_lengths=8,128` unless the caller sets it (#82).
