@@ -99,9 +99,10 @@ CUDA comparison or completed MPS `verify` run has been measured here. Bring
 your own checkpoint and skip the first two steps, or bring a `.litertlm` and
 its float checkpoint and run only `verify`.
 
-> **Alpha.** Measured end to end on six models: `google/functiongemma-270m-it`
+> **Alpha.** Measured end to end on eight models: `google/functiongemma-270m-it`
 > with the tool-call scorer, and `google/gemma-3-270m-it`,
-> `google/gemma-3-1b-it`, `Qwen/Qwen3-0.6B`, `Qwen/Qwen2.5-0.5B-Instruct` and
+> `google/gemma-3-1b-it`, `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`,
+> `Qwen/Qwen2.5-0.5B-Instruct`, `Qwen/Qwen2.5-1.5B-Instruct` and
 > `google/gemma-4-E2B-it` with `exact-text` on the same 77-way intent task —
 > every headline candidate evaluated on LiteRT-LM's CPU backend, and two Qwen3
 > artifacts also evaluated on a phone's CPU and GPU,
@@ -1102,10 +1103,10 @@ withdrawn after re-measurement.
   phone runs.
   [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) says
   which is which.
-- **Measured on six models, all six fine-tuned here.**
+- **Measured on eight models, all eight fine-tuned here.**
   `functiongemma-270m-it` with the tool-call scorer, and `gemma-3-270m-it`,
-  `gemma-3-1b-it`, `Qwen3-0.6B`, `Qwen2.5-0.5B-Instruct` and
-  `gemma-4-E2B-it` with `exact-text`, each with a conversion
+  `gemma-3-1b-it`, `Qwen3-0.6B`, `Qwen3-1.7B`, `Qwen2.5-0.5B-Instruct`,
+  `Qwen2.5-1.5B-Instruct` and `gemma-4-E2B-it` with `exact-text`, each with a conversion
   cost against its own float twin. Only FunctionGemma also has a training gain:
   no banking77 run has an untuned base figure to subtract — Gemma 3 270M's base
   was run and refused to score, the 1B's and Qwen2.5's scored 0.0000 on both

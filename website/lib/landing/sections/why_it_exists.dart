@@ -47,15 +47,15 @@ typedef MeasuredRun = ({
 /// The note under the cards keeps the two execution sides separate: every
 /// headline candidate ran on LiteRT-LM's CPU backend, while some float
 /// references ran on CUDA. Four-bit results cover four models rather than all
-/// six. The separate Qwen3 phone run is named because its CPU and GPU results
+/// eight. The separate Qwen3 phone run is named because its CPU and GPU results
 /// resolve in opposite directions between the eight-bit and mixed four-bit
 /// recipes; a blanket "four bits cost more" would therefore be false.
 ///
 /// The size is in the card name because `models.py` scopes the `gemma-3-text`
 /// family to the 270M and the 1B, and both are now measured -- two cards that
-/// differ in nothing but size. Qwen3's card carries its size because its rule
-/// is scoped to the one size that was run, and Qwen2.5's for the same reason,
-/// where the rule is scoped to the one size *and* variant.
+/// differ in nothing but size. Qwen3's cards carry their sizes because its rule
+/// is scoped to the sizes that were run, and Qwen2.5's for the same reason,
+/// where the rule is scoped to the sizes *and* variant.
 ///
 /// Each card opens a panel. It says what the model is and what it is for,
 /// names the checkpoint the run actually used -- the Hub id and, where
@@ -90,9 +90,9 @@ class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
   static const measurementSummary =
-      'Across the six headline runs, every converted candidate ran on '
+      'Across the eight headline runs, every converted candidate ran on '
       "LiteRT-LM's CPU backend; some float references ran on CUDA. The "
-      'eight-bit gap was small on all six and often unresolved. Four models '
+      'eight-bit gap was small on all eight and often unresolved. Four models '
       'also have blockwise four-bit results with the candidates on LiteRT-LM\'s '
       'CPU backend, where the gap was larger. A separate Qwen3 phone run shows '
       'that the backend can change the answer. ';
@@ -188,6 +188,18 @@ class WhyItExists extends StatelessComponent {
       anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
     ),
     (
+      name: 'Qwen3 1.7B',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          '1.7B parameters, text only, and the same chat template as the '
+          "0.6B byte for byte, so its rule hands it LiteRT-LM's own Qwen 3 "
+          'template on the same terms. Measured on litert-lm 0.18.0, with '
+          'neither eight-bit conversion cost resolved.',
+      hubId: 'Qwen/Qwen3-1.7B',
+      revision: '70d244cc',
+      anchor: 'the-two-qwen-families-one-size-up',
+    ),
+    (
       name: 'Qwen2.5 0.5B Instruct',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
@@ -199,6 +211,18 @@ class WhyItExists extends StatelessComponent {
       revision: '7ae55760',
       anchor:
           'a-fifth-family-and-the-first-where-channelwise-four-bits-answered',
+    ),
+    (
+      name: 'Qwen2.5 1.5B Instruct',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          '1.5B parameters, text only, and the same chat template as the '
+          '0.5B Instruct byte for byte, composed behind the same text-parts '
+          'block. Measured on litert-lm 0.18.0 with eight bits only, '
+          'neither conversion cost resolved.',
+      hubId: 'Qwen/Qwen2.5-1.5B-Instruct',
+      revision: '989aa798',
+      anchor: 'the-two-qwen-families-one-size-up',
     ),
     (
       name: 'Gemma 4 E2B',

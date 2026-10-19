@@ -40,10 +40,10 @@ import '../../theme/brand.dart';
 /// unlike the Gemma 3 one, which enumerates. So if a second size ships, no
 /// check here will notice, and this line needs a size too.
 ///
-/// Qwen3 carries its size for the Gemma 3 reason: `models.py` claims `qwen-3`
-/// by size, and 0.6B is the only one run. Its other sizes, and the Qwen 3
+/// Qwen3 carries its sizes for the Gemma 3 reason: `models.py` claims `qwen-3`
+/// by size, and 0.6B and 1.7B are the ones run. Its other sizes, and the Qwen 3
 /// models built on other architectures, match no rule and export under the
-/// unknown-family note.
+/// unknown-family note. Qwen2.5 likewise: 0.5B and 1.5B Instruct.
 ///
 /// The acceleration row names NPU only as a platform-specific LiteRT-LM
 /// capability. litetune does not compile or verify an NPU bundle: the
@@ -65,7 +65,8 @@ class Formats extends StatelessComponent {
 
   static const measuredQualifier =
       ' — measured end to end on FunctionGemma, Gemma 3 270M, Gemma 3 1B, '
-      'Qwen3 0.6B, Qwen2.5 0.5B Instruct and Gemma 4 E2B so far';
+      'Qwen3 0.6B and 1.7B, Qwen2.5 0.5B and 1.5B Instruct and Gemma 4 E2B '
+      'so far';
 
   @override
   Component build(BuildContext context) {
@@ -91,8 +92,8 @@ class Formats extends StatelessComponent {
         ]),
         _row('Models', [
           Component.text(
-            'Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3 0.6B, '
-            'Qwen2.5 0.5B Instruct, Qwen3.5, FunctionGemma',
+            'Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3 0.6B/1.7B, '
+            'Qwen2.5 0.5B/1.5B Instruct, Qwen3.5, FunctionGemma',
           ),
           span(classes: 'qualifier', [Component.text(measuredQualifier)]),
         ]),
