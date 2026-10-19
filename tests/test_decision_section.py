@@ -843,6 +843,27 @@ def test_the_bundle_says_the_shipped_file_was_not_scored_again(toy, tmp_path):
     )
 
 
+@pytest.mark.parametrize("verified", ["the bundled file", "another file"])
+def test_a_decision_bundle_carries_the_bundle_limitations_whether_or_not_it_gets_a_section(
+    toy, tmp_path, verified
+):
+    # Their wording is pinned in test_bundle.py; this holds that the decision
+    # path carries the same two texts, not texts of its own.
+    from litetune.bundle import NO_MANIFEST, NOT_VERIFIED
+
+    shim, model = toy
+    other = {} if verified == "the bundled file" else {"verified_sha256": "sha256:" + "0" * 64}
+
+    result = _bundled(tmp_path, shim, model, **other)
+
+    assert _check(result, "decision section").outcome.value == (
+        "passed" if verified == "the bundled file" else "failed"
+    )
+    report = json.loads((tmp_path / "bundle" / "report.json").read_text())
+    assert report["limitations"][0] == NOT_VERIFIED
+    assert NO_MANIFEST in report["limitations"]
+
+
 def test_a_section_that_was_not_written_is_not_claimed_by_the_model_check(toy, tmp_path):
     shim, model = toy
     events = RecordingEvents()
