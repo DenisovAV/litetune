@@ -1395,8 +1395,9 @@ def test_the_runtime_script_refuses_a_prompt_rendered_as_empty_text(tmp_path):
     empty = FAKE_LITERT_LM.replace("return before + prompt + after", 'return ""')
     assert empty != FAKE_LITERT_LM
 
+    # In a mode given, not picked: the self-check renders through the same call.
     proc, rows, _ = _run_engine_script(
-        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_source=empty
+        tmp_path, True, ["text 1 about joy"], OPTIONS, mode="once", fake_source=empty
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -1920,3 +1921,53 @@ def test_the_runtime_script_reports_its_session_prefix_and_scores_after_it(tmp_p
     assert [r["token_scores"] for r in rows] == _expected(
         tmp_path, prompts, options, template=template, bos=bos, term=term
     )
+
+
+# -- the self-check's pair, from the bundle's own template ---------------------------
+
+
+def test_on_gemma_3_the_self_check_pair_is_the_measured_one(tmp_path):
+    proc, _, report = _run_engine_script(tmp_path, True, ["text 1 about joy"], OPTIONS)
+
+    assert proc.returncode == 0, proc.stderr
+    assert report["selfcheck"]["pair"] == [
+        "<start_of_turn>user\nAnswer with one word.<end_of_turn>\n<start_of_turn>model\n",
+        "<start_of_turn>user\nAnswer with one word.<end_of_turn>\n<start_of_turn>user\n",
+    ]
+
+
+@pytest.mark.parametrize(("drops", "mode"), [(True, "once"), (False, "plain")])
+def test_on_chatml_the_self_check_renders_its_own_pair_and_picks_the_mode(tmp_path, drops, mode):
+    prompts = ["text 1 about joy", "text 22 about fear"]
+    options = ("joy", "anger", "fear")
+    env = {"FAKE_TEMPLATE": "chatml", "FAKE_BOS": "none"}
+
+    proc, rows, report = _run_engine_script(
+        tmp_path, drops, prompts, options, fake_env=env, term="<|im_end|>"
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    a, b = report["selfcheck"]["pair"]
+    assert a == "<|im_start|>user\nAnswer with one word.<|im_end|>\n<|im_start|>assistant\n"
+    assert b == "<|im_start|>user\nAnswer with one word.<|im_end|>\n<|im_start|>user\n"
+    assert report["selfcheck"]["comparisons"] > 0 and report["mode"] == mode
+    assert [r["token_scores"] for r in rows] == _expected(
+        tmp_path, prompts, options, template="chatml", bos="none", term="<|im_end|>"
+    )
+
+
+def test_a_rendering_with_no_pair_is_no_comparisons_and_a_harness_failure(tmp_path):
+    # A template that renders the message as one token cannot differ at its second-to-last.
+    one = FAKE_LITERT_LM.replace(
+        "return before + prompt + after",
+        'return "<bos>" if prompt == "Answer with one word." else before + prompt + after',
+    )
+    assert one != FAKE_LITERT_LM
+
+    proc, rows, report = _run_engine_script(
+        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_source=one
+    )
+
+    assert proc.returncode == 3
+    assert report["selfcheck"]["verdict"] == "no comparisons"
+    assert report["selfcheck"]["pair"] is None and rows == []

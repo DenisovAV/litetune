@@ -264,7 +264,8 @@ from pathlib import Path
 
 import litert_lm as L
 
-FIXED = "<start_of_turn>user\nAnswer with one word.<end_of_turn>\n<start_of_turn>model\n"
+# The self-check's message, rendered by the bundle's own template.
+SELFCHECK_MESSAGE = "Answer with one word."
 '''
     + SESSION_IDS_SOURCE
     + r'''
@@ -357,6 +358,32 @@ def main():
                 c_call(s, "litert_lm_session_rewind_to_checkpoint", b"p")
         return out, (time.perf_counter() - t0) * 1000
 
+    def selfcheck_pair(engine):
+        """Two prompts of one length that differ only in their second-to-last token, or None.
+
+        The first is the self-check's message as the bundle's template renders
+        it. The second puts another id of that rendering in place of its
+        second-to-last, the first one, from the second id on, that gives text
+        which tokenises back to exactly those ids. On Gemma 3 that is `user` for
+        `model`: the pair the flutter_edge_ai design fixed and 2026-10-16
+        measured. On another template it is whatever its rendering holds, and
+        the gap it shows is not measured; only a gap of exactly 0.0 is read as
+        dropped.
+        """
+        with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
+            a = conv.render_message_to_string(SELFCHECK_MESSAGE)
+        ia = list(engine.tokenize(a)) if a else []
+        if len(ia) < 2:
+            return None
+        for other in dict.fromkeys(ia[1:] + ia[:1]):
+            if other == ia[-2]:
+                continue
+            ib = ia[:-2] + [other] + ia[-1:]
+            b = engine.detokenize(ib)
+            if list(engine.tokenize(b)) == ib:
+                return a, b
+        return None
+
     def one_token(engine, prompt, z):
         with session(engine) as s:
             s.run_prefill([prompt])
@@ -382,23 +409,20 @@ def main():
                 z = engine.detokenize([cont_ids[j][0]])
                 if list(engine.tokenize(z)) == [cont_ids[j][0]]:
                     zs.append(z)
-            # The fixed pair only, as the flutter_edge_ai design has it run:
-            # measured 2026-10-16, its gap was 0.0 on 0.18.0 and at least 0.135
-            # with the fix, where a task's own prompts gave a gap as small as
-            # 2.1e-5 with a near-certain target. The two must never pick
+            # One pair, as the flutter_edge_ai design has it run: measured
+            # 2026-10-16 on Gemma 3, its gap was 0.0 on 0.18.0 and at least
+            # 0.135 with the fix, where a task's own prompts gave a gap as small
+            # as 2.1e-5 with a near-certain target. The two must never pick
             # different modes.
             diffs, checked = [], []
-            for a in [FIXED]:
-                b = a[: -len("model\n")] + "user\n"
-                ia, ib = list(engine.tokenize(a)), list(engine.tokenize(b))
-                differing = [i for i in range(min(len(ia), len(ib))) if ia[i] != ib[i]]
-                if len(ia) != len(ib) or differing != [len(ia) - 2]:
-                    continue
+            pair = selfcheck_pair(engine)
+            if pair is not None:
+                a, b = pair
                 for z in zs:
                     for _ in range(2):
                         d = abs(one_token(engine, a, z) - one_token(engine, b, z))
                         diffs.append(d)
-                checked.append(len(ia))
+                checked.append(len(engine.tokenize(a)))
             verdict = (
                 "no comparisons" if not diffs
                 else "dropped" if max(diffs) == 0.0
@@ -411,6 +435,7 @@ def main():
                 "max_abs_diff": max(diffs) if diffs else None,
                 "min_abs_diff": min(diffs) if diffs else None,
                 "prompt_lengths": checked,
+                "pair": list(pair) if pair else None,
             }
             if verdict not in ("dropped", "not dropped"):
                 report["error"] = f"the self-check could not tell the engine apart: {verdict}"
