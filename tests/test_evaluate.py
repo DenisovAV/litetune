@@ -3888,3 +3888,17 @@ def test_init_times_are_summarised():
         "max": 3.0,
         "total": 6.0,
     }
+
+
+@pytest.mark.parametrize(("reason", "expected"), [("", False), ("state carries over", True)])
+def test_the_script_is_told_to_build_an_engine_per_prompt(tmp_path, monkeypatch, reason, expected):
+    specs: list[dict] = []
+    write = _writes_results([{"index": 0, "text": "a"}, {"index": 1, "text": "b"}])
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        specs.append(json.loads(Path(args[2]).read_text(encoding="utf-8")))
+        return write(self, args, timeout, **kwargs)
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    _litertlm(tmp_path, engine_per_prompt_reason=reason).generate(["one", "two"])
+    assert [spec["engine_per_prompt"] for spec in specs] == [expected]
