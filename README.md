@@ -107,8 +107,11 @@ its float checkpoint and run only `verify`.
 > every headline candidate evaluated on LiteRT-LM's CPU backend, and two Qwen3
 > artifacts also evaluated on a phone's CPU and GPU,
 > all in [MEASUREMENTS.md](MEASUREMENTS.md).
-> Qwen3.5 exports and needs no flags from litetune, only a `transformers`
-> floor, and has no quality number. Gemma 4 exports once you name the variant
+> Qwen3.5 exports with LiteRT-LM's Qwen 3.5 chat template, edited so that it
+> renders a single turn as the checkpoint's own does, needs a `transformers`
+> floor, and gets an Engine of its own for every prompt `verify` scores
+> (google-ai-edge/LiteRT-LM#3165); it has no quality number. MiniCPM5-1B and
+> granite-4.1-3b have rules that no export has exercised yet. Gemma 4 exports once you name the variant
 > — `E2B` or `E4B` — because the chat template override is per-variant; a bare
 > `gemma-4` is refused rather than guessed at, and the refusal names the flag
 > to pass if you want to choose the template yourself. It carries two numbers
@@ -751,6 +754,9 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 | `gemma-4-e4b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E4B-it-litert-lm` |
 | `qwen-3` (Qwen3 0.6B and 1.7B) | `--jinja_chat_template_override=<LiteRT-LM's canonical chat template if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
 | `qwen-2.5` (Qwen2.5 0.5B and 1.5B Instruct) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
+| `qwen-3.5` | `--jinja_chat_template_override=<LiteRT-LM's Qwen 3.5 template with four edits if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
+| `minicpm5` (MiniCPM5 1B) | `--jinja_chat_template_override=<LiteRT-LM's MiniCPM5 template with one edit if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
+| `granite-4.1` (granite-4.1 3B) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
 
 **A LoRA scope keyed on model identity.** On a multimodal checkpoint the
 vision and audio towers use the same projection names as the text layers, so
@@ -1118,7 +1124,8 @@ withdrawn after re-measurement.
   the float reference, on prompts that list all 77 labels rather than the
   prompts the tuned runs use, so that figure is not comparable with the seven
   above it.
-  Qwen3.5 exports but has no quality figure, and a Gemma 4 without its variant
+  Qwen3.5 exports but has no quality figure, MiniCPM5-1B and granite-4.1-3b
+  have rules that no export has exercised yet, and a Gemma 4 without its variant
   is still refused unless you supply the template override yourself.
 - **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
   the liveness checks both trim against a fixed set of strings, recorded
