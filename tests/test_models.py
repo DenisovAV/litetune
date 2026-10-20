@@ -224,6 +224,8 @@ def test_only_a_multimodal_family_scopes_lora_at_all():
         "gemma-4",
         "gemma-4-e2b",
         "gemma-4-e4b",
+        "granite-4.1",
+        "minicpm5",
         "qwen-2.5",
         "qwen-3",
         "qwen-3.5",
@@ -402,15 +404,20 @@ def test_a_qwen_export_asks_for_its_own_template_composed_and_no_type_override(m
 
 def test_no_checkpoints_template_ships_in_the_package():
     """A checkpoint's template is read at export, never packaged: the package
-    carries litetune's block, FunctionGemma's template and LiteRT-LM's Qwen 3
-    template, which the qwen-3 rule hands over only when it renders single
-    turns as the checkpoint's own does."""
+    carries litetune's block, FunctionGemma's template and LiteRT-LM's Qwen 3,
+    MiniCPM5 and Qwen 3.5 templates, the last two edited (`CANONICAL_EDITS`),
+    which their rules hand over only when they render single turns as the
+    checkpoint's own does."""
     templates = Path(models.packaged_template(models.TEXT_PARTS_BLOCK)).parent
-    assert sorted(p.name for p in templates.iterdir()) == [
-        "functiongemma.jinja",
-        models.QWEN3_CANONICAL_TEMPLATE,
-        models.TEXT_PARTS_BLOCK,
-    ]
+    assert sorted(p.name for p in templates.iterdir()) == sorted(
+        [
+            "functiongemma.jinja",
+            models.MINICPM5_CANONICAL_TEMPLATE,
+            models.QWEN35_CANONICAL_TEMPLATE,
+            models.QWEN3_CANONICAL_TEMPLATE,
+            models.TEXT_PARTS_BLOCK,
+        ]
+    )
 
 
 def test_the_text_parts_block_can_print_nothing():
@@ -2053,3 +2060,88 @@ def test_a_broken_junction_on_the_way_to_the_checkpoint_is_not_an_absent_record(
     target.rmdir()
     with pytest.raises(FileNotFoundError, match="a link on the way to"):
         read_training_record(str(junction))
+
+
+def test_the_granite_rule_claims_the_3b_and_not_its_base_or_repacks(tmp_path):
+    """By size and with the qwen-2.5 rule's tail: the base model's template was
+    never read, and a repack is not the checkpoint the template was read from."""
+    for claimed in (
+        "ibm-granite/granite-4.1-3b",
+        _SNAPSHOT.format("granite-4.1-3b"),
+        "someorg/granite-4.1-3b",
+    ):
+        assert identify(claimed).family == "granite-4.1", claimed
+        plan = plan_export(claimed, (), ("dynamic_wi8_afp32",))
+        assert plan.added == (f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}",)
+        assert "joins its text parts with a newline" in plan.rules.required_flags[0].reason
+    for unclaimed in (
+        "ibm-granite/granite-4.1-3b-base",
+        "ibm-granite/granite-4.1-8b",
+        "ibm-granite/granite-4.0-micro",
+        "ibm-granite/granite-4.0-h-1b",
+        "ibm-granite/granite-4.1-3b-GGUF",
+        "someorg/granite-4.1-3b-granite-GGUF",
+        "me/granite-4.1-3b-banking77",
+    ):
+        assert identify(unclaimed) is None, unclaimed
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": "ibm-granite/granite-4.1-3b"}), encoding="utf-8"
+    )
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "granite", "architectures": ["GraniteForCausalLM"]}),
+        encoding="utf-8",
+    )
+    assert models.hint_for(str(checkpoint)).text == (
+        "ibm-granite-granite-4-1-3b-granite-graniteforcausallm"
+    )
+    assert identify(str(checkpoint)).family == "granite-4.1"
+
+
+def test_the_minicpm5_rule_claims_the_1b_and_not_its_siblings(tmp_path):
+    """openbmb publishes -Base, -SFT, -MLX and -GGUF beside the 1B; none of their
+    templates was read here."""
+    for claimed in ("openbmb/MiniCPM5-1B", _SNAPSHOT.format("MiniCPM5-1B"), "someorg/MiniCPM5-1B"):
+        assert identify(claimed).family == "minicpm5", claimed
+        plan = plan_export(claimed, (), ("dynamic_wi8_afp32",))
+        marker = models.CANONICAL_OR_COMPOSED_TEMPLATE
+        assert plan.added == (f"--jinja_chat_template_override={marker}",)
+        assert plan.rules.canonical_template == models.MINICPM5_CANONICAL_TEMPLATE
+        reason = plan.rules.required_flags[0].reason
+        assert "google-ai-edge/LiteRT-LM#3576" in reason
+        assert models.MINICPM5_CANONICAL_TEMPLATE in reason
+        assert "openbmb/MiniCPM5-1B's own, byte for byte" in reason
+    for unclaimed in (
+        "openbmb/MiniCPM5-1B-Base",
+        "openbmb/MiniCPM5-1B-SFT",
+        "openbmb/MiniCPM5-1B-MLX",
+        "openbmb/MiniCPM5-1B-GGUF",
+        "openbmb/MiniCPM5-2B",
+        "someorg/MiniCPM5-1B-llama-GGUF",
+        "me/MiniCPM5-1B-banking77",
+    ):
+        assert identify(unclaimed) is None, unclaimed
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": "openbmb/MiniCPM5-1B"}), encoding="utf-8"
+    )
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "llama", "architectures": ["LlamaForCausalLM"]}),
+        encoding="utf-8",
+    )
+    assert models.hint_for(str(checkpoint)).text == "openbmb-minicpm5-1b-llama-llamaforcausallm"
+    assert identify(str(checkpoint)).family == "minicpm5"
+
+
+def test_the_qwen35_rule_offers_its_edited_template():
+    for model in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"):
+        plan = plan_export(model, (), ("dynamic_wi8_afp32",))
+        assert plan.rules.family == "qwen-3.5"
+        marker = models.CANONICAL_OR_COMPOSED_TEMPLATE
+        assert plan.added == (f"--jinja_chat_template_override={marker}",)
+        assert plan.rules.canonical_template == models.QWEN35_CANONICAL_TEMPLATE
+        reason = plan.rules.required_flags[0].reason
+        assert "google-ai-edge/LiteRT-LM#3166" in reason
+        assert "Qwen/Qwen3.5-0.8B's own, byte for byte" in reason
