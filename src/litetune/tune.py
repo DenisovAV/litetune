@@ -66,13 +66,11 @@ from litetune.models import (
 )
 from litetune.prepare import (
     CONTROL_TEXT,
-    DECISION_FAMILY,
-    DECISION_MEASURED_MODEL,
-    DECISION_MODEL_UNMEASURED,
     PrepareError,
     Row,
     control_text_held,
-    is_measured_decision_model,
+    decision_model_limitation,
+    decision_model_refusal,
     read_rows,
     refuse_undeclared_tools,
     render_call,
@@ -134,17 +132,9 @@ def _check_decision(
             ),
             None,
         )
-    rules = identify(request.model)
-    if rules is None or rules.family != DECISION_FAMILY:
-        return (
-            Check.failed(
-                DECISION_CHECK,
-                f"{request.model} is not a Gemma 3 text model. Decisions by option scoring have "
-                f"been trained and measured on {DECISION_MEASURED_MODEL} only",
-                observed=where,
-            ),
-            None,
-        )
+    refusal = decision_model_refusal(request.model)
+    if refusal is not None:
+        return Check.failed(DECISION_CHECK, refusal, observed=where), None
     suffix = asked.render("")
     for row in rows:
         if not row.prompt.endswith(suffix) or len(row.prompt) == len(suffix):
@@ -2271,10 +2261,10 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         if checked.outcome is not Outcome.PASSED or asked is None:
             return _refused(result, events, checked)
         result.trained_decision = asked
-        # The same limitation `prepare` records for a split made for another model; a
-        # Gemma 3 text model that is not the measured one passes the family check.
-        if not is_measured_decision_model(request.model):
-            result.limitation(DECISION_MODEL_UNMEASURED.format(model=request.model))
+        # The same limitation `prepare` records for a split made for another model:
+        # another family, or a Gemma 3 text model that is not the measured one.
+        if (unmeasured := decision_model_limitation(request.model)) is not None:
+            result.limitation(unmeasured)
         result.checks.add(checked)
         events.check(checked)
 

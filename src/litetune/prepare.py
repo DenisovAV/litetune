@@ -170,6 +170,8 @@ OPTIONS_CHECK = "every option has a training row"
 
 # The one family whose decisions have been trained and scored by option
 # scoring: google/gemma-3-270m-it, on 2026-10-15, as four models on three tasks (6 to 151 options).
+# Every other family with a rule in `models.RULES` is accepted with a limitation
+# saying so (`DECISION_FAMILY_UNMEASURED`), and `verify` asks it for a float twin.
 DECISION_FAMILY = "gemma-3-text"
 DECISION_MEASURED_MODEL = "google/gemma-3-270m-it"
 
@@ -178,8 +180,9 @@ THIN_CALIBRATION_OOS = 10
 
 DECISION_MODEL_UNNAMED = (
     "no --base-model was named, so the model this split trains was not checked. Decisions by "
-    f"option scoring have been trained and measured on {DECISION_MEASURED_MODEL} only, and "
-    "this stage refuses a named model of another family"
+    f"option scoring have been trained and measured on {DECISION_MEASURED_MODEL} only; this "
+    "stage refuses a named model litetune has no family rule for, and says so for a named "
+    "model of another family"
 )
 
 DECISION_INFERRED = (
@@ -200,10 +203,59 @@ DECISION_MODEL_UNMEASURED = (
     "measured"
 )
 
+DECISION_FAMILY_UNMEASURED = (
+    "{model} is {family}, a family decisions by option scoring have not been trained or "
+    f"measured on: that was {DECISION_MEASURED_MODEL} ({DECISION_FAMILY}) only. How its chat "
+    "template renders the decision's prompt, the end of turn its options are scored with, "
+    "whether the runtime's scoring method holds on its caches, and its accuracy and cost are not "
+    "measured. `verify` refuses its decision without --float-twin, the float32 export that "
+    "checks the method on it"
+)
+
+DECISION_NO_RULE = (
+    "{model} is a model litetune has no family rule for. Decisions need one: `verify` reads "
+    "from the rule whether the runtime may rewind a session between options "
+    "(`ModelRules.engine_per_prompt_reason`), and with no rule that is unknown. Name the base "
+    "model of a family `litetune` lists"
+)
+
+DECISION_CONFIG_ONLY = (
+    "{model} is identified only by its config.json, as {family}: a gemma3_text checkpoint "
+    "whose name does not say which model it is, which `convert` refuses because the type "
+    "override cannot be derived from it (`models.RULES`, the gemma3-text-unidentified rule). "
+    "Name the model it was tuned from"
+)
+
 
 def is_measured_decision_model(model: str) -> bool:
     """Whether `model` names the one model decisions were trained and measured on."""
     return re.search(r"gemma-?3-270m", hint_for(model).text, re.IGNORECASE) is not None
+
+
+def decision_model_refusal(model: str) -> str | None:
+    """Why `model` cannot be trained or measured on a decision, or `None` when it can.
+
+    Every family with a rule can; the one without a rule, and the rule that only
+    a `config.json` matched, cannot.
+    """
+    rules = identify(model)
+    if rules is None:
+        return DECISION_NO_RULE.format(model=model)
+    if rules.config_only:
+        return DECISION_CONFIG_ONLY.format(model=model, family=rules.family)
+    return None
+
+
+def decision_model_limitation(model: str) -> str | None:
+    """What was not measured for a decision on `model`, which `decision_model_refusal` accepts."""
+    rules = identify(model)
+    if rules is None or rules.config_only:
+        return None
+    if rules.family != DECISION_FAMILY:
+        return DECISION_FAMILY_UNMEASURED.format(model=model, family=rules.family)
+    if not is_measured_decision_model(model):
+        return DECISION_MODEL_UNMEASURED.format(model=model)
+    return None
 
 
 NO_SCOREABILITY_FOR_DECISIONS = (
@@ -713,19 +765,6 @@ def read_decision_rows(
     except DecisionError as exc:
         raise PrepareError(str(exc)) from exc
     return decision, digest, rows
-
-
-def refuse_unmeasured_decision_model(base_model: str) -> None:
-    """Refuse a model outside the one family decisions have been measured on."""
-    rules = identify(base_model)
-    if rules is None or rules.family != DECISION_FAMILY:
-        family = rules.family if rules is not None else "a family litetune has no entry for"
-        raise PrepareError(
-            f"{base_model} is {family}. Decisions by option scoring have been trained and "
-            f"measured on {DECISION_MEASURED_MODEL} only, and another family is refused until it "
-            "has been measured: its template, its end of turn and its accuracy on the task are "
-            "all unknown"
-        )
 
 
 def _count_by_option(decision: Decision, rows: Sequence[Row]) -> dict[str, int]:
@@ -1631,8 +1670,9 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 "answers with the id of an option, never with a tool call, so there is nothing "
                 "for a tool list to check"
             )
-        if request.base_model is not None:
-            refuse_unmeasured_decision_model(request.base_model)
+        refusal = decision_model_refusal(request.base_model) if request.base_model else None
+        if refusal is not None:
+            raise PrepareError(refusal)
         asked, questions_sha256, rows = read_decision_rows(request.data, objects, request.questions)
         decision = DecisionProfile(
             decision=asked,
@@ -1675,8 +1715,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     if decision is not None:
         if request.base_model is None:
             result.limitation(DECISION_MODEL_UNNAMED)
-        elif not is_measured_decision_model(request.base_model):
-            result.limitation(DECISION_MODEL_UNMEASURED.format(model=request.base_model))
+        elif (unmeasured := decision_model_limitation(request.base_model)) is not None:
+            result.limitation(unmeasured)
         if request.questions is None:
             result.limitation(DECISION_INFERRED.format(question=decision.decision.question))
         if decision.decision.type != "choice":

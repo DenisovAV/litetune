@@ -1612,14 +1612,56 @@ def test_decision_rows_with_declarations_are_refused(tmp_path, write_jsonl, requ
         )
 
 
-@pytest.mark.parametrize(
-    "model", ["Qwen/Qwen2.5-0.5B-Instruct", FUNCTIONGEMMA, "meta-llama/Llama-3.2-1B"]
-)
-def test_a_decision_split_for_an_unmeasured_family_is_refused(
-    write_jsonl, request_for, questions, model
+def test_a_decision_split_for_a_model_with_no_family_rule_is_refused(
+    write_jsonl, request_for, questions
 ):
-    with pytest.raises(PrepareError, match="measured on google/gemma-3-270m-it only"):
-        prepare(request_for(write_jsonl(decision_rows()), questions=questions(), base_model=model))
+    with pytest.raises(PrepareError, match="has no family rule for"):
+        prepare(
+            request_for(
+                write_jsonl(decision_rows()),
+                questions=questions(),
+                base_model="meta-llama/Llama-3.2-1B",
+            )
+        )
+
+
+def test_a_decision_split_for_a_checkpoint_only_its_config_names_is_refused(
+    tmp_path, write_jsonl, request_for, questions
+):
+    checkpoint = tmp_path / "tuned"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text('{"model_type": "gemma3_text"}', encoding="utf-8")
+    with pytest.raises(PrepareError, match="identified only by its config.json"):
+        prepare(
+            request_for(
+                write_jsonl(decision_rows()), questions=questions(), base_model=str(checkpoint)
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "family"),
+    [
+        (FUNCTIONGEMMA, "functiongemma"),
+        ("google/gemma-4-E4B-it", "gemma-4-e4b"),
+        ("Qwen/Qwen3-1.7B", "qwen-3"),
+        ("Qwen/Qwen2.5-0.5B-Instruct", "qwen-2.5"),
+        ("Qwen/Qwen3.5-0.8B", "qwen-3.5"),
+        ("openbmb/MiniCPM5-1B", "minicpm5"),
+        ("ibm-granite/granite-4.1-3b", "granite-4.1"),
+    ],
+)
+def test_a_decision_split_for_another_family_is_written_with_a_limitation(
+    write_jsonl, request_for, questions, model, family
+):
+    from litetune.prepare import DECISION_FAMILY_UNMEASURED
+
+    result = prepare(
+        request_for(write_jsonl(decision_rows()), questions=questions(), base_model=model)
+    )
+
+    assert result.decision is not None
+    assert DECISION_FAMILY_UNMEASURED.format(model=model, family=family) in result.limitations
 
 
 def test_what_was_and_was_not_measured_is_said_per_model(write_jsonl, request_for, questions):
