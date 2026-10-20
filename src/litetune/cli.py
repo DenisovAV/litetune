@@ -378,7 +378,8 @@ def _add_verify(sub) -> None:
         help=(
             "decision checkpoints: a --recipe none export of the same checkpoint. Its per-token "
             "option scores are compared with the reference's, and more than 1e-3 nats apart is "
-            "refused: the check that the runtime's scoring method is right on this runtime"
+            "refused: the check that the runtime's scoring method is right on this runtime. "
+            "Required for a family other than Gemma 3 text, on which the method is unmeasured"
         ),
     )
     verify.add_argument(

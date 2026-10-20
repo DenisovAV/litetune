@@ -647,10 +647,16 @@ of writing; until it ships, that call throws `DeciderUnsupportedException`.
 
 What has and has not been measured:
 
-- Decisions are trained and measured on `google/gemma-3-270m-it` only;
-  another family is refused, and another Gemma 3 text model is accepted with a
-  limitation saying it was not measured. `choice` questions have been
-  measured on several tasks, `noul` on two and `score` on one. As `noul`,
+- Decisions are trained and measured on `google/gemma-3-270m-it` only.
+  Another Gemma 3 text model, and a model of any other family litetune has a
+  rule for, is accepted with a limitation saying it was not measured; for
+  another family `verify` also needs `--float-twin`, since the runtime's
+  scoring method was measured on Gemma 3 only. A model with no family rule is
+  refused. Qwen 3.5, whose rule gives every prompt an Engine of its own, has
+  each option scored on an Engine of its own, never rewound, which costs an
+  Engine load per option; the section tells the decider so. `choice`
+  questions have been measured on several tasks, `noul` on two and `score` on
+  one. As `noul`,
   SST-2's eight-bit bundle answered as the reference did on 0.9767 of 300 rows
   and passed verify's 0.95 gate. Irony's, trained for two epochs, did so on
   0.9367 and was refused; trained for four or six, it passed at 0.9667 and
