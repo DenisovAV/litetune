@@ -704,15 +704,25 @@ _SPECIAL = r"<start_of_turn>|<end_of_turn>|<bos>|<\|im_start\|>|<\|im_end\|>"
 _TEMPLATES = {
     "gemma": ("<start_of_turn>user\n", "<end_of_turn>\n<start_of_turn>model\n"),
     "chatml": ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"),
+    # A template that prints the BOS string itself, as MiniCPM5's own does.
+    "gemma_bos": ("<bos><start_of_turn>user\n", "<end_of_turn>\n<start_of_turn>model\n"),
+    # Made up for the self-check's pair: its second id is its second-to-last,
+    # and its third, put there, runs into the last as one word.
+    "tricky": ("<start_of_turn>:a\n", "<end_of_turn>\n<start_of_turn>:b"),
 }
 _WORDS = {}
 _SCORINGS = 0
 
 
-def _ids(text):
-    """One id per piece, the same in every process: crc32 of the piece."""
+def _ids(text, bos_special=True):
+    """One id per piece, the same in every process: crc32 of the piece.
+
+    `Engine.tokenize` reads the BOS string as text, as LiteRT-LM's tokenizer
+    does (`rendering.prefill_ids`); a session's prefill reads it as the BOS.
+    """
     out = []
-    for piece in re.findall(_SPECIAL + r"|[A-Za-z_]+|.", text, flags=re.S):
+    special = _SPECIAL if bos_special else _SPECIAL.replace("|<bos>", "")
+    for piece in re.findall(special + r"|[A-Za-z_]+|.", text, flags=re.S):
         token = zlib.crc32(piece.encode("utf-8")) % 1_000_003 + 1
         _WORDS[token] = piece
         out.append(token)
@@ -773,8 +783,9 @@ class _Result:
 
 
 class _Session:
-    def __init__(self, prefix=()):
-        self.tokens = list(prefix)
+    def __init__(self, bos=None):
+        self.bos = bos
+        self.tokens = [] if bos is None else [bos]
         self.prefills = 0
         self._lib = _Lib()
         self._ptr = self
@@ -789,7 +800,11 @@ class _Session:
 
     def run_prefill(self, parts):
         for part in parts:
-            self.tokens += _ids(part)
+            bos_text = None if self.bos is None else _WORDS[self.bos]
+            if bos_text and part.startswith(bos_text):
+                self.tokens += [self.bos] + _ids(part[len(bos_text) :], False)
+            else:
+                self.tokens += _ids(part, False)
         self.prefills += 1
 
     def _context(self):
@@ -842,13 +857,13 @@ class Engine:
         return False
 
     def tokenize(self, text):
-        return _ids(text)
+        return _ids(text, False)
 
     def detokenize(self, ids):
         return "".join(_WORDS[i] for i in ids)
 
     def create_session(self, apply_prompt_template=True, sampler_config=None):
-        return _Session([] if self.bos_token_id is None else [self.bos_token_id])
+        return _Session(self.bos_token_id)
 
     def create_conversation(self, sampler_config=None, max_output_tokens=None):
         return _Conversation()
@@ -2029,7 +2044,7 @@ def test_a_rendering_with_no_pair_is_no_comparisons_and_a_harness_failure(tmp_pa
     # A template that renders the message as one token cannot differ at its second-to-last.
     one = FAKE_LITERT_LM.replace(
         "return before + prompt + after",
-        'return "<bos>" if prompt == "Answer with one word." else before + prompt + after',
+        'return "x" if prompt == "Answer with one word." else before + prompt + after',
     )
     assert one != FAKE_LITERT_LM
 
@@ -2124,3 +2139,30 @@ def test_rewind_loads_one_engine(tmp_path):
 
     assert proc.returncode == 0, proc.stderr
     assert report["engine_loads"] == 1 == len(loads.read_text().splitlines())
+
+
+def test_a_rendering_that_starts_with_the_bos_string_is_read_as_prefill_reads_it(tmp_path):
+    """The runtime's tokenizer reads the BOS string as text, and prefill as the
+    BOS: the ids returned are prefill's, so the prompt check sees the second BOS
+    the session would read."""
+    proc, rows, report = _run_engine_script(
+        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_env={"FAKE_TEMPLATE": "gemma_bos"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    bos = report["session_prefix"]
+    assert len(bos) == 1 and rows[0]["prompt_ids"][:1] == bos
+    assert rows[0]["prompt_ids"] == bos + _fake_module(tmp_path)._ids(
+        "<start_of_turn>user\ntext 1 about joy<end_of_turn>\n<start_of_turn>model\n"
+    )
+
+
+def test_the_self_check_pair_skips_ids_that_change_nothing_or_do_not_round_trip(tmp_path):
+    proc, _, report = _run_engine_script(
+        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_env={"FAKE_TEMPLATE": "tricky"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    # Not ":" (the id already there), not "a" ("ab" is one word): the newline.
+    head = "<start_of_turn>:a\nAnswer with one word.<end_of_turn>\n<start_of_turn>"
+    assert report["selfcheck"]["pair"] == [head + ":b", head + "\nb"]
