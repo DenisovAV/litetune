@@ -73,7 +73,6 @@ DEFAULT_THREADS = 4
 PROBE_ROWS = 4
 AGREEMENT_FLOOR = 0.95
 TWIN_TOLERANCE = 1e-3
-DEFAULT_TERMINATOR = "<end_of_turn>"
 # The runtime the method was measured correct on, against PyTorch, on a float32
 # bundle (2026-10-16). On another, only a float twin shows it still is.
 MEASURED_RUNTIME = "0.18.0"
@@ -608,30 +607,15 @@ def verify_decision(
     )
     fields["data"] = {"heldout": heldout.as_dict(), "calibration": calib.as_dict()}
     none_index = decision.ids.index(decision.none_option) if decision.none_option else None
-    # The scorers' terminator is the first token of the end of turn, as
-    # measured: `<end_of_turn>` for Gemma 3. `tune` records the whole end of
-    # turn as text and ids (`<end_of_turn>\n` for gemma-3-270m-it), so it is
-    # checked against that record, never handed over as it is.
-    recorded_turn = record.get("turn_terminator")
-    turn_text = (
-        recorded_turn.get("text")
-        if isinstance(recorded_turn, dict)
-        else recorded_turn
-        if isinstance(recorded_turn, str)
-        else None
-    )
-    if turn_text is None:
-        state.limitations.append(
-            "the checkpoint records no end of turn, so the scorers take Gemma 3's "
-            f"{DEFAULT_TERMINATOR!r}, the family `tune --decision` accepts"
-        )
-    elif not turn_text.startswith(DEFAULT_TERMINATOR):
-        return refuse(
-            ROWS_CHECK,
-            f"the checkpoint's turn ends with {turn_text!r}; option scoring is measured with "
-            f"{DEFAULT_TERMINATOR!r} as the token after the id, the end of a Gemma 3 turn",
-        )
-    terminator = DEFAULT_TERMINATOR
+    # The scorers' terminator is the first token of the end of turn `tune`
+    # recorded (`tune.turn_terminator`: the ids the chat template puts after an
+    # assistant answer, and their text), as measured on Gemma 3, where it is
+    # `<end_of_turn>` of `<end_of_turn>\n`. The reference reads that token's text
+    # off the checkpoint's tokenizer, and the runtime scores the same text.
+    turn = _recorded_turn(record.get("turn_terminator"))
+    if isinstance(turn, str):
+        return refuse(ROWS_CHECK, turn)
+    turn_ids, turn_text = turn
 
     if job.engine_rows < 1:
         return refuse(
@@ -656,7 +640,8 @@ def verify_decision(
             "model": job.reference,
             "rows": [{"index": i, "prompt": p} for i, p in enumerate(prompts)],
             "options": list(decision.ids),
-            "terminator": terminator,
+            "turn_ids": turn_ids,
+            "turn_text": turn_text,
             "check_indices": [longest],
             "ids_for": [calib_n + i for i in engine_rows],
             "device": job.device,
@@ -675,6 +660,13 @@ def verify_decision(
     unusable = _not_finite(ref.scores)
     if unusable is not None:
         return refuse(REFERENCE_CHECK, f"row {unusable} has a reference score that is not finite")
+    terminator = ref.report.get("terminator")
+    if not isinstance(terminator, str) or not terminator or not turn_text.startswith(terminator):
+        return refuse(
+            REFERENCE_CHECK,
+            f"the reference reported {terminator!r} as the first token of the recorded end of "
+            f"turn {turn_text!r}, which it does not begin with",
+        )
     cont_ids = ref.report.get("cont_ids")
     try:
         ks = unique_lengths(cont_ids or [])
@@ -972,6 +964,35 @@ def verify_decision(
     if state.unchecked:
         return finish("inconclusive")
     return finish("passed")
+
+
+def _recorded_turn(recorded: Any) -> tuple[list[int], str] | str:
+    """The end of turn `tune` recorded, as (ids, text), or why it cannot be scored with."""
+    if not isinstance(recorded, dict):
+        return (
+            "the checkpoint records no end of turn in the shape `tune` writes ({ids, source, "
+            f"text}}), got {json.dumps(recorded)[:200]}; option scoring scores each option "
+            "followed by the first token of the turn's end, and nothing else says which it is"
+        )
+    ids, text, source = recorded.get("ids"), recorded.get("text"), recorded.get("source")
+    if source != "chat_template":
+        return (
+            f"`tune` took this checkpoint's end of turn from {source!r}, not from its chat "
+            "template; a decision is trained and scored through the template's turn, and the "
+            "token that closes it is what each option is scored with"
+        )
+    if (
+        not isinstance(ids, list)
+        or not ids
+        or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids)
+        or not isinstance(text, str)
+        or not text
+    ):
+        return (
+            "the checkpoint's recorded end of turn has no ids or no text: "
+            f"{json.dumps(recorded)[:200]}"
+        )
+    return list(ids), text
 
 
 def _ids_text(ids: list[int] | None) -> str:

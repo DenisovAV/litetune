@@ -80,6 +80,10 @@ def default_scores(index: int, prompt: str, option: str, ids: list[int]) -> list
 
 BOS = 2
 
+# What each family's recorded end-of-turn ids decode to: gemma-3-270m-it's
+# (E5's record, below), and ChatML's and Granite's, with made-up ids.
+VOCAB = {106: TERM, 107: "\n", 151645: "<|im_end|>", 100257: "<|end_of_text|>"}
+
 
 def prompt_ids(prompt: str) -> list[int]:
     """A stand-in for the runtime's tokenisation of a rendered prompt, without the BOS."""
@@ -114,6 +118,8 @@ class FakeScoringEnv:
     # How the runtime tokenises a row's prompt. The reference returns the BOS
     # and then `prompt_ids`, as a chat template that writes the BOS does.
     prompt_ids_of: Callable[[str], list[int]] = prompt_ids
+    # The reference's tokenizer, for the end of turn: what each recorded id decodes to.
+    vocab: dict[int, str] = field(default_factory=lambda: dict(VOCAB))
     specs: list[dict[str, Any]] = field(default_factory=list)
     provisioned: int = 0
 
@@ -148,7 +154,14 @@ class FakeScoringEnv:
                 }
             )
         else:
-            report.update({"device": "cpu", "bos_id": BOS, "cache_variant": "position_ids"})
+            report.update(
+                {
+                    "device": "cpu",
+                    "bos_id": BOS,
+                    "cache_variant": "position_ids",
+                    "terminator": self.vocab[spec["turn_ids"][0]],
+                }
+            )
         report.update(self.report_extra)
         with open(spec["out"], "w", encoding="utf-8") as out:
             for row in spec["rows"]:
@@ -313,7 +326,8 @@ def test_the_reference_scores_every_calibration_and_heldout_row_and_the_runtime_
     assert len(ref_spec["rows"]) == calib_n + held_n
     assert ref_spec["model"] == job.reference
     assert ref_spec["options"] == list(s["decision"].ids)
-    assert ref_spec["terminator"] == TERM
+    assert (ref_spec["turn_ids"], ref_spec["turn_text"]) == ([106, 107], "<end_of_turn>\n")
+    assert "terminator" not in ref_spec and eng_spec["terminator"] == TERM
     assert len(eng_spec["rows"]) == 5
     assert eng_spec["mode"] == "auto" and eng_spec["targets"] == "unique"
     held = [json.loads(line)["prompt"] for line in s["heldout"].read_text().splitlines()]
@@ -976,22 +990,76 @@ def test_the_scorers_get_the_first_token_of_the_recorded_end_of_turn(split, tmp_
     s = split()
     job = job_for(s, tmp_path)
 
-    status, _ = run(job, s["record"])
+    status, fields = run(job, s["record"])
 
     assert status == "passed"
-    assert job.train_env.specs[0]["terminator"] == "<end_of_turn>"
     assert job.runtime_env.specs[0]["terminator"] == "<end_of_turn>"
+    assert fields["decision"]["section"]["payload"]["terminator"] == "<end_of_turn>"
 
 
-def test_a_checkpoint_whose_turn_ends_otherwise_is_refused(split, tmp_path):
+@pytest.mark.parametrize(
+    ("ids", "text", "first"),
+    [
+        ([151645, 107], "<|im_end|>\n", "<|im_end|>"),
+        ([100257, 107], "<|end_of_text|>\n", "<|end_of_text|>"),
+    ],
+    ids=["ChatML", "Granite"],
+)
+def test_another_familys_end_of_turn_is_scored_with_its_own_first_token(
+    split, tmp_path, ids, text, first
+):
     s = split()
-    record = dict(s["record"], turn_terminator={"text": "<|im_end|>\n", "ids": [1]})
+    record = dict(
+        s["record"], turn_terminator={"ids": ids, "source": "chat_template", "text": text}
+    )
+    job = job_for(s, tmp_path)
 
-    status, fields = run(job_for(s, tmp_path), record)
+    status, fields = run(job, record)
+
+    assert status == "passed", fields["checks"]
+    assert job.train_env.specs[0]["turn_ids"] == ids
+    assert job.runtime_env.specs[0]["terminator"] == first
+    assert fields["decision"]["section"]["payload"]["terminator"] == first
+
+
+@pytest.mark.parametrize(
+    ("recorded", "said"),
+    [
+        (None, "records no end of turn"),
+        ("<end_of_turn>\n", "records no end of turn"),
+        (
+            {"ids": [1], "source": "tokenizer_eos", "text": "<eos>"},
+            "from 'tokenizer_eos', not from its chat template",
+        ),
+        ({"ids": [], "source": "chat_template", "text": ""}, "has no ids or no text"),
+    ],
+    ids=["none", "a string", "the tokenizer's EOS", "empty"],
+)
+def test_an_end_of_turn_not_from_the_template_is_refused_before_scoring(
+    split, tmp_path, recorded, said
+):
+    s = split()
+    record = dict(s["record"], turn_terminator=recorded)
+    job = job_for(s, tmp_path)
+
+    status, fields = run(job, record)
 
     assert status == "failed_harness"
-    failed = [c for c in fields["checks"]["checks"] if c["outcome"] == "failed"]
-    assert len(failed) == 1 and "'<|im_end|>\\n'" in failed[0]["detail"]
+    assert said in failed(fields, ROWS_CHECK)["detail"]
+    assert job.train_env.specs == [] and job.runtime_env.specs == []
+
+
+def test_a_reference_whose_terminator_does_not_begin_the_recorded_turn_is_refused(split, tmp_path):
+    s = split()
+    job = job_for(
+        s, tmp_path, train_env=FakeScoringEnv("train", vocab={**VOCAB, 106: "<|im_end|>"})
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "which it does not begin with" in failed(fields, REFERENCE_CHECK)["detail"]
+    assert job.train_env.specs and job.runtime_env.specs == []
 
 
 def test_options_scored_in_full_on_the_runtime_are_scored_in_full_on_both_sides(split, tmp_path):
@@ -1585,3 +1653,148 @@ def test_run_verify_hands_the_rules_engine_per_prompt_reason_over(
     model.write_bytes(b"bundle")
     run_verify(VerifyRequest(model=model, reference=str(cp), data=tmp_path / "heldout.jsonl"))
     assert bool(seen["job"].engine_per_prompt_reason) is needs
+
+
+# -- the reference script's end of turn, with torch and transformers faked -----------
+
+FAKE_TORCH = """
+__version__ = "fake"
+float32 = "float32"
+
+
+class _Flags:
+    allow_tf32 = True
+
+
+class backends:
+    class cuda:
+        matmul = _Flags()
+
+    cudnn = _Flags()
+
+
+class cuda:
+    @staticmethod
+    def is_available():
+        return False
+
+
+def no_grad():
+    return lambda f: f
+"""
+
+FAKE_TRANSFORMERS = """
+import json
+import os
+
+__version__ = "fake"
+# One id per piece; a piece is a special token or one character.
+VOCAB = json.loads(os.environ["FAKE_VOCAB"])
+IDS = {v: int(k) for k, v in VOCAB.items()}
+
+
+class _Tokenizer:
+    pad_token_id = 0
+    bos_token_id = None
+
+    def __call__(self, text, add_special_tokens=True):
+        out, i = [], 0
+        while i < len(text):
+            longest = sorted(IDS, key=len, reverse=True)
+            piece = next((p for p in longest if text.startswith(p, i)), None)
+            if piece is None:
+                piece = text[i]
+                IDS.setdefault(piece, 1000 + ord(piece))
+            out.append(IDS[piece])
+            i += len(piece)
+        return {"input_ids": out}
+
+    def decode(self, ids):
+        names = {v: k for k, v in IDS.items()}
+        return "".join(VOCAB.get(str(i)) or names[i] for i in ids)
+
+
+class AutoTokenizer:
+    @staticmethod
+    def from_pretrained(name, **kw):
+        return _Tokenizer()
+
+
+class _Model:
+    class config:
+        final_logit_softcapping = None
+
+    def to(self, device):
+        return self
+
+    def eval(self):
+        return self
+
+
+class AutoModelForCausalLM:
+    @staticmethod
+    def from_pretrained(name, **kw):
+        return _Model()
+"""
+
+
+def _run_reference_script(tmp_path, vocab, turn_ids, turn_text):
+    import os
+    import sys
+
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    fake = tmp_path / "fake"
+    fake.mkdir(exist_ok=True)
+    (fake / "torch.py").write_text(FAKE_TORCH, encoding="utf-8")
+    (fake / "transformers.py").write_text(FAKE_TRANSFORMERS, encoding="utf-8")
+    script = tmp_path / "reference.py"
+    script.write_text(REFERENCE_SCRIPT, encoding="utf-8")
+    report = tmp_path / "report.json"
+    spec = tmp_path / "spec.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "model": "checkpoint",
+                "rows": [],
+                "options": ["joy", "anger"],
+                "turn_ids": turn_ids,
+                "turn_text": turn_text,
+                "device": "cpu",
+                "out": str(tmp_path / "out.jsonl"),
+                "report": str(report),
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_VOCAB=json.dumps(vocab))
+    proc = subprocess.run(
+        [sys.executable, str(script), str(spec)], env=env, capture_output=True, text=True
+    )
+    return proc, json.loads(report.read_text()) if report.exists() else None
+
+
+@pytest.mark.parametrize(
+    ("vocab", "ids", "text", "first"),
+    [
+        ({"106": "<end_of_turn>", "107": "\n"}, [106, 107], "<end_of_turn>\n", "<end_of_turn>"),
+        ({"151645": "<|im_end|>", "198": "\n"}, [151645, 198], "<|im_end|>\n", "<|im_end|>"),
+    ],
+    ids=["Gemma 3", "ChatML"],
+)
+def test_the_reference_script_reports_the_first_token_of_the_recorded_turn(
+    tmp_path, vocab, ids, text, first
+):
+    proc, report = _run_reference_script(tmp_path, vocab, ids, text)
+
+    assert proc.returncode == 0, proc.stderr
+    assert report["terminator"] == first
+    assert all(c[-1] == ids[0] for c in report["cont_ids"])
+
+
+def test_the_reference_script_refuses_a_first_token_that_does_not_tokenise_back(tmp_path):
+    # Id 5 decodes to text the tokenizer reads as id 6.
+    proc, report = _run_reference_script(tmp_path, {"5": "a", "6": "a"}, [5], "a")
+
+    assert proc.returncode != 0 and report is None
+    assert "not that one token" in proc.stderr

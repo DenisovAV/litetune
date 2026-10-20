@@ -80,10 +80,16 @@ def main():
         )
     model = model.to(device).eval()
     cap = getattr(model.config, "final_logit_softcapping", None)
-    term = spec["terminator"]
+    # The first token of the end of turn tune recorded, as this tokenizer
+    # writes it; the runtime is handed the text and must tokenise it alike.
+    first = spec["turn_ids"][0]
+    term = tok.decode([first])
     term_ids = tok(term, add_special_tokens=False)["input_ids"]
-    if len(term_ids) != 1:
-        raise SystemExit(f"the terminator {term!r} is {term_ids}, not one token")
+    if term_ids != [first] or not spec["turn_text"].startswith(term):
+        raise SystemExit(
+            f"the end of turn's first token {first} decodes to {term!r}, which tokenises to "
+            f"{term_ids} and begins {spec['turn_text']!r}: not that one token"
+        )
     conts = [tok(o, add_special_tokens=False)["input_ids"] + term_ids for o in spec["options"]]
     if len({tuple(c) for c in conts}) != len(conts):
         raise SystemExit("two options tokenise to the same ids")
@@ -217,6 +223,7 @@ def main():
         json.dumps(
             {
                 "device": device,
+                "terminator": term,
                 "bos_id": tok.bos_token_id,
                 "torch": torch.__version__,
                 "transformers": __import__("transformers").__version__,
