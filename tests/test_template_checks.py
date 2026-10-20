@@ -747,7 +747,11 @@ def test_every_rule_offering_a_canonical_template_names_a_pinned_one():
 
 
 def _compose(
-    tmp_path: Path, checkpoint: str, canonical: str | None, special: dict | None = None
+    tmp_path: Path,
+    checkpoint: str,
+    canonical: str | None,
+    special: dict | None = None,
+    add_bos: bool = False,
 ) -> dict:
     """`export._COMPOSE_SCRIPT` on a checkpoint carrying `checkpoint`: the
     checkpoint's side through transformers -- the conftest fake renders as
@@ -769,7 +773,11 @@ def _compose(
         encoding="utf-8",
     )
     proc, _ = run_compose_script(
-        ["python", str(script), str(spec), str(result)], 60, checkpoint, special_tokens=special
+        ["python", str(script), str(spec), str(result)],
+        60,
+        checkpoint,
+        special_tokens=special,
+        add_bos=add_bos,
     )
     assert proc.returncode == 0, proc.stderr
     report = json.loads(result.read_text(encoding="utf-8"))
@@ -1376,3 +1384,15 @@ def test_granites_composed_template_gets_no_start_token(tmp_path):
     renders = _compose(tmp_path, GRANITE, GRANITE, GRANITE_SPECIAL_TOKENS)
     assert renders["start_tokens"] == {"composed": None, "canonical": None}
     assert single_turn_differences(renders["reference"], renders["candidates"]["composed"]) == []
+
+
+def test_a_tokenizer_that_prepends_its_bos_gets_a_start_token_whatever_the_template(tmp_path):
+    """The exporter's first probe: a tokenizer whose own tokenisation begins with the
+    BOS (`add_bos_token: true`) gets it as the start token even from a template that
+    prints none -- and then the runtime's prompt begins with a BOS training never saw
+    through that template, so every case differs and the composition is refused."""
+    renders = _compose(tmp_path, QWEN25, None, {"bos_token": "<s>", "eos_token": "</s>"}, True)
+    assert renders["start_tokens"] == {"composed": "<s>"}
+    differences = single_turn_differences(renders["reference"], renders["candidates"]["composed"])
+    assert len(differences) == len(SINGLE_TURNS) * len(FORMS)
+    assert export._choose_template("m", renders, None).refusal is not None
