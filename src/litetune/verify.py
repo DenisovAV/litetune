@@ -996,6 +996,7 @@ def _verify_decision(
         model=request.model,
         reference=request.reference,
         engine_per_prompt_reason=rules.engine_per_prompt_reason if rules else "",
+        family=rules.family if rules else None,
         heldout=request.data,
         calibration=request.calibration,
         float_twin=request.float_twin,

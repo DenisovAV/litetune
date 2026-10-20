@@ -265,6 +265,8 @@ def job_for(split_: dict[str, Any], tmp_path, **kwargs) -> DecisionVerify:
         "calibration": split_["calibration"],
         "train_env": FakeScoringEnv("train"),
         "runtime_env": FakeScoringEnv("runtime"),
+        # The record's google/gemma-3-270m-it, as `run_verify` looks it up.
+        "family": "gemma-3-text",
     }
     params.update(kwargs)
     return DecisionVerify(**params)
@@ -921,6 +923,8 @@ def test_run_verify_measures_a_decision_checkpoint_by_option_scoring(split, tmp_
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "litetune.json").write_text(json.dumps(s["record"]), encoding="utf-8")
+    # As `tune` leaves it: the family is read from the record's base model.
+    (checkpoint / "config.json").write_text('{"model_type": "gemma3_text"}', encoding="utf-8")
     model = tmp_path / "model.litertlm"
     model.write_bytes(b"bundle")
     fake = FakeScoringEnv("any")
@@ -1689,6 +1693,7 @@ def test_run_verify_hands_the_rules_engine_per_prompt_reason_over(
     model.write_bytes(b"bundle")
     run_verify(VerifyRequest(model=model, reference=str(cp), data=tmp_path / "heldout.jsonl"))
     assert bool(seen["job"].engine_per_prompt_reason) is needs
+    assert seen["job"].family == ("qwen-3.5" if needs else "gemma-3-text")
 
 
 # -- the reference script's end of turn, with torch and transformers faked -----------
@@ -1971,3 +1976,42 @@ def test_a_rendering_with_no_pair_is_no_comparisons_and_a_harness_failure(tmp_pa
     assert proc.returncode == 3
     assert report["selfcheck"]["verdict"] == "no comparisons"
     assert report["selfcheck"]["pair"] is None and rows == []
+
+
+# -- a family the method was not measured on -----------------------------------------
+
+
+@pytest.mark.parametrize("family", ["qwen-3", "functiongemma", None])
+def test_another_family_without_a_float_twin_is_refused_before_anything_runs(
+    split, tmp_path, family
+):
+    s = split()
+    job = job_for(s, tmp_path, family=family)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    detail = failed(fields, TWIN_CHECK)["detail"]
+    assert "measured against PyTorch on gemma-3-text only" in detail and "--float-twin" in detail
+    assert job.train_env.specs == [] and job.runtime_env.specs == []
+
+
+def test_another_family_with_a_float_twin_is_measured_and_says_it_is_unmeasured(split, tmp_path):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(s, tmp_path, family="qwen-3", float_twin=twin)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert check(fields, TWIN_CHECK)["outcome"] == "passed"
+    assert any("have not been trained or measured on qwen-3" in t for t in fields["limitations"])
+
+
+def test_the_measured_family_says_nothing_about_being_unmeasured(split, tmp_path):
+    s = split()
+
+    _, fields = run(job_for(s, tmp_path), s["record"])
+
+    assert not any("have not been trained or measured on" in t for t in fields["limitations"])

@@ -56,6 +56,7 @@ from litetune.decisions import (
 )
 from litetune.events import EventStream
 from litetune.metrics import paired_difference
+from litetune.prepare import DECISION_FAMILY
 from litetune.storage import hash_file
 
 logger = logging.getLogger(__name__)
@@ -437,6 +438,9 @@ class DecisionVerify:
     # The family rule's `engine_per_prompt_reason`: option scoring rewinds
     # within one session, which no Engine of its own per prompt can make safe.
     engine_per_prompt_reason: str = ""
+    # The family rule that claims the checkpoint, `None` for none. Only
+    # `prepare.DECISION_FAMILY` has had the scoring method measured on it.
+    family: str | None = None
     # What `verify` was asked that the decision path does not do: refused rather
     # than ignored, so a manifest never records a role or a limit nobody applied.
     reference_role: str = "float_twin"
@@ -565,6 +569,25 @@ def verify_decision(
             "every option, and this family's rule gives an Engine of its own to every prompt "
             f"verify generates for: {job.engine_per_prompt_reason}. A rewind that moves only "
             "the step counter is the mechanism behind that, so no decision is measured on it",
+        )
+    # The method -- a rewind that resets only the step while the re-prefilled
+    # cell stays (decision_scripts.ENGINE_SCRIPT, mode `once`) -- was measured
+    # against PyTorch on Gemma 3's caches only, on 2026-10-16. On another family
+    # nothing has shown it holds, and a float twin is what shows it.
+    if job.family != DECISION_FAMILY:
+        if job.float_twin is None:
+            return refuse(
+                TWIN_CHECK,
+                f"this checkpoint's family is {job.family or 'one litetune has no rule for'}, "
+                "and the runtime's option-scoring method was measured against PyTorch on "
+                f"{DECISION_FAMILY} only (2026-10-16). On another family a decision is "
+                "verified with --float-twin, which checks the method on this checkpoint: "
+                "convert with --recipe none as well and pass that file",
+            )
+        state.limitations.append(
+            f"decisions by option scoring have not been trained or measured on {job.family}; "
+            "the float twin checks the runtime's method on this checkpoint, and nothing here "
+            "measures how well the family answers such a question"
         )
     if job.calibration is None:
         return refuse(
