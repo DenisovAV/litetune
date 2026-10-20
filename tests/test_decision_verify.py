@@ -151,6 +151,7 @@ class FakeScoringEnv:
                     "cpu": "fake CPU",
                     "threads": spec["threads"],
                     "mode": "once" if spec["mode"] == "auto" else spec["mode"],
+                    "method": spec["method"],
                     "selfcheck": {"verdict": "dropped", "comparisons": 18, "max_abs_diff": 0.0},
                     "k": ks,
                     "scored_lengths": lengths,
@@ -301,6 +302,7 @@ def test_a_decision_that_scores_alike_on_both_sides_passes(split, tmp_path):
         "options": [{"id": o} for o in OPTIONS],
         "none_option": "none_of_these",
         "scoring": "unique_prefix",
+        "method": "rewind",
         "terminator": TERM,
         "scored_lengths": fields["decision"]["scored_lengths"],
         "temperature": fit["temperature"],
@@ -437,19 +439,79 @@ def test_the_gpu_backend_is_refused(split, tmp_path):
     assert "CPU backend only" in check(fields, RUNTIME_CHECK)["detail"]
 
 
-def test_a_family_that_needs_an_engine_per_prompt_is_refused(split, tmp_path):
+def test_a_family_that_needs_an_engine_per_prompt_is_scored_on_fresh_engines(split, tmp_path):
     """Option scoring rewinds within one session, which is the mechanism an
-    Engine per prompt exists to avoid; refused before anything is scored."""
+    Engine per prompt exists to avoid; such a family is scored on an Engine per
+    option instead, and the section says so."""
     s = split()
-    job = job_for(s, tmp_path, engine_per_prompt_reason="state survives a rewind")
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(
+        s,
+        tmp_path,
+        engine_per_prompt_reason="state survives a rewind",
+        family="qwen-3.5",
+        float_twin=twin,
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert [spec["method"] for spec in job.runtime_env.specs] == ["fresh_engine"] * 2
+    assert fields["decision"]["section"]["payload"]["method"] == "fresh_engine"
+    assert fields["cost"]["method"] == "fresh_engine"
+    assert "for every option: an Engine load" in fields["cost"]["measures"]
+    said = [t for t in fields["limitations"] if "state survives a rewind" in t]
+    assert len(said) == 1 and "an Engine load per option per decision" in said[0]
+
+
+def test_without_an_engine_per_prompt_the_section_says_rewind(split, tmp_path):
+    s = split()
+    job = job_for(s, tmp_path)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed"
+    assert [spec["method"] for spec in job.runtime_env.specs] == ["rewind"]
+    assert fields["cost"]["method"] == "rewind"
+    assert not any("an Engine of its own" in t for t in fields["limitations"])
+
+
+def test_a_runtime_that_scored_by_another_method_is_refused(split, tmp_path):
+    s = split()
+    eng = FakeScoringEnv("runtime", report_extra={"method": "rewind"})
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(
+        s,
+        tmp_path,
+        runtime_env=eng,
+        engine_per_prompt_reason="state survives a rewind",
+        family="qwen-3.5",
+        float_twin=twin,
+    )
 
     status, fields = run(job, s["record"])
 
     assert status == "failed_harness"
-    detail = check(fields, RUNTIME_CHECK)["detail"]
-    assert "rewinds to it within one session" in detail
-    assert "state survives a rewind" in detail
-    assert job.runtime_env.specs == [] and job.train_env.specs == []
+    assert "'fresh_engine' was asked for" in failed(fields, RUNTIME_CHECK)["detail"]
+
+
+def test_fresh_engines_get_time_for_every_load():
+    from litetune.decision_verify import (
+        ENGINE_LOAD_TIMEOUT_S,
+        ENGINE_ROW_TIMEOUT_S,
+        SELFCHECK_LOADS,
+        STARTUP_TIMEOUT_S,
+        _engine_timeout,
+    )
+
+    assert _engine_timeout(10, 6, "rewind") == STARTUP_TIMEOUT_S + 10 * ENGINE_ROW_TIMEOUT_S
+    assert _engine_timeout(10, 6, "fresh_engine") == (
+        STARTUP_TIMEOUT_S
+        + SELFCHECK_LOADS * ENGINE_LOAD_TIMEOUT_S
+        + 10 * (ENGINE_ROW_TIMEOUT_S + 6 * ENGINE_LOAD_TIMEOUT_S)
+    )
 
 
 def test_rows_rendered_with_another_decision_are_refused_by_line(split, tmp_path):
@@ -802,6 +864,7 @@ def _run_engine_script(
     fake_source=FAKE_LITERT_LM,
     fake_env: dict[str, str] | None = None,
     term: str = TERM,
+    method: str = "rewind",
     **spec_extra: Any,
 ):
     import os
@@ -826,6 +889,7 @@ def _run_engine_script(
                 "threads": 2,
                 "targets": "unique",
                 "mode": mode,
+                "method": method,
                 "out": str(out),
                 "report": str(report),
                 **spec_extra,
@@ -2015,3 +2079,48 @@ def test_the_measured_family_says_nothing_about_being_unmeasured(split, tmp_path
     _, fields = run(job_for(s, tmp_path), s["record"])
 
     assert not any("have not been trained or measured on" in t for t in fields["limitations"])
+
+
+# -- the runtime script on fresh engines ---------------------------------------------
+
+
+@pytest.mark.parametrize(("drops", "mode"), [(True, "once"), (False, "plain")])
+def test_fresh_engine_loads_an_engine_per_option_and_never_rewinds(tmp_path, drops, mode):
+    prompts = ["text 1 about joy", "text 22 about fear"]
+    options = ("joy", "anger", "fear")
+    loads = tmp_path / "loads.txt"
+    # A fake whose rewind fails the run: fresh_engine must never call it.
+    no_rewind = FAKE_LITERT_LM.replace(
+        "        if not ptr.saved:\n            return -1",
+        "        raise AssertionError('rewound')",
+    )
+    assert no_rewind != FAKE_LITERT_LM
+
+    proc, rows, report = _run_engine_script(
+        tmp_path,
+        drops,
+        prompts,
+        options,
+        fake_source=no_rewind,
+        fake_env={"FAKE_LOADS": str(loads)},
+        method="fresh_engine",
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert report["method"] == "fresh_engine" and report["mode"] == mode
+    comparisons = report["selfcheck"]["comparisons"]
+    # One to render and tokenise, two per self-check comparison, one per option per row.
+    want = 1 + 2 * comparisons + len(options) * len(prompts)
+    assert report["engine_loads"] == want == len(loads.read_text().splitlines())
+    assert [r["token_scores"] for r in rows] == _expected(tmp_path, prompts, options)
+
+
+def test_rewind_loads_one_engine(tmp_path):
+    loads = tmp_path / "loads.txt"
+
+    proc, _, report = _run_engine_script(
+        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_env={"FAKE_LOADS": str(loads)}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert report["engine_loads"] == 1 == len(loads.read_text().splitlines())

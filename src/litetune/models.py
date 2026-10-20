@@ -367,8 +367,9 @@ class ModelRules:
 
     # Why `verify` builds a LiteRT-LM Engine for every prompt instead of one per
     # split, for a family whose state a session on a shared Engine may not
-    # reset; empty for every other family. `verify` refuses a decision for such
-    # a family, whose scoring rewinds within one session.
+    # reset; empty for every other family. A decision for such a family is
+    # scored on an Engine of its own per option, never rewound
+    # (`decision_verify.METHOD_FRESH_ENGINE`), and its section says so.
     engine_per_prompt_reason: str = ""
 
     def matches(self, text: str) -> bool:

@@ -30,7 +30,15 @@ fix and wrong on 0.18.0. The self-check picks between them: two prompts that
 differ only in their second-to-last token score identically on 0.18.0 and
 differently with the fix. Measured 2026-10-16: 0.0 in all 42 comparisons on
 0.18.0, at least 0.135 on a nightly with the fix; each mode within 8.2e-4 nats
-of PyTorch on a float32 bundle, and wrong on the other engine.
+of PyTorch on a float32 bundle, and wrong on the other engine. Those
+measurements were Gemma 3's; the self-check's pair is rendered by the bundle's
+own template, which on Gemma 3 is the pair measured.
+
+That is method `rewind`. Method `fresh_engine`, for a family whose rule gives
+every prompt an Engine of its own (`models.ModelRules.engine_per_prompt_reason`),
+scores each option on a new Engine and session with no checkpoint and no
+rewind, the self-check's prompts too; mode `once` then prefills the last token
+again in each.
 
 Targets are each option's shortest unique prefix: the first k ids of
 `id + terminator`, k the smallest no other option shares. A truncated target
@@ -300,7 +308,16 @@ def main():
     greedy = L.SamplerConfig(top_k=1, top_p=1.0, temperature=1.0, seed=0)
     term = spec["terminator"]
     options = spec["options"]
-    report = {"runtime": {}, "python": platform.python_version(), "threads": spec["threads"]}
+    method = spec["method"]
+    if method not in ("rewind", "fresh_engine"):
+        raise SystemExit(f"unknown method {method!r}")
+    report = {
+        "runtime": {},
+        "python": platform.python_version(),
+        "threads": spec["threads"],
+        "method": method,
+        "engine_loads": 0,
+    }
     for dist in ("litert-lm", "litert-lm-api", "litert-lm-nightly", "litert-lm-api-nightly"):
         try:
             report["runtime"][dist] = importlib.metadata.version(dist)
@@ -339,9 +356,31 @@ def main():
             raise RuntimeError(f"the last prompt token {ids[-1]} does not round-trip as {last!r}")
         return rendered, ids, last
 
+    kw = {"backend": L.Backend.CPU(thread_count=int(spec["threads"])), "cache_dir": ":nocache"}
+
+    def open_engine():
+        report["engine_loads"] += 1
+        return L.Engine(spec["model"], **kw)
+
     def decide(engine, mode, rendered, last, texts):
         out = []
         t0 = time.perf_counter()
+        if method == "fresh_engine":
+            # An Engine and a session of their own for every option, and no
+            # rewind: for a family whose state a rewind does not reset
+            # (`models.ModelRules.engine_per_prompt_reason`). The prompt, then
+            # in mode `once` its last token again, then the option, as E7's
+            # `fresh` and `fresh_nofix` (a session per option on one Engine)
+            # did, each within 6e-4 nats of PyTorch on Gemma 3 on the engine
+            # whose self-check verdict picks it (2026-10-16). `engine` only
+            # renders and tokenises; it never prefills, so it holds no state.
+            for text in texts:
+                with open_engine() as fresh, session(fresh) as s:
+                    s.run_prefill([rendered])
+                    if mode == "once":
+                        s.run_prefill([last])
+                    out.append(score(s, text))
+            return out, (time.perf_counter() - t0) * 1000
         with session(engine) as s:
             s.run_prefill([rendered])
             c_call(s, "litert_lm_session_save_checkpoint", b"p")
@@ -385,16 +424,21 @@ def main():
         return None
 
     def one_token(engine, prompt, z):
-        with session(engine) as s:
-            s.run_prefill([prompt])
-            per = score(s, z)
+        if method == "fresh_engine":
+            # On an Engine of its own, as every option is scored then.
+            with open_engine() as fresh, session(fresh) as s:
+                s.run_prefill([prompt])
+                per = score(s, z)
+        else:
+            with session(engine) as s:
+                s.run_prefill([prompt])
+                per = score(s, z)
         if per is None or len(per) != 1:
             raise RuntimeError(f"the one-token target {z!r} scored {per}")
         return per[0]
 
     t0 = time.perf_counter()
-    kw = {"backend": L.Backend.CPU(thread_count=int(spec["threads"])), "cache_dir": ":nocache"}
-    with L.Engine(spec["model"], **kw) as engine:
+    with open_engine() as engine:
         report["init_seconds"] = round(time.perf_counter() - t0, 3)
         # What every session here reads before its prompt's ids, as a first turn.
         report["session_prefix"] = session_prefix(engine)
