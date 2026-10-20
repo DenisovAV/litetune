@@ -1,8 +1,9 @@
-{#- litetune: LiteRT-LM's canonical chat template for MiniCPM5, from the line after this comment to the end of the file, with one edit.
+{#- litetune: LiteRT-LM's canonical chat template for MiniCPM5, from the line after this comment to the end of the file, with two edits.
   Source: https://github.com/google-ai-edge/LiteRT-LM at tag v0.18.0 (commit b2f686e2ed4718fb84ec398a61dd59ca0f0aff27), models/minicpm5/chat_template.jinja, git blob c4184e05132f0bc3fda1a39a15775ca41ca5c5f8, sha256 a634466cb817628316761c75829c01b5315038c3ed23f626f43026fafcda9535.
-  Edit: the generation prompt follows openbmb/MiniCPM5-1B's own template at 87179e5c1f455ef22e6223592d2d61351b525bfc. With enable_thinking undefined it ends at '<|im_start|>assistant\n', where the source adds an empty think block; false adds the empty think block and true opens one, as in the source. The edit is `models.CANONICAL_EDITS`.
+  Edits: it begins by printing bos_token, as openbmb/MiniCPM5-1B's own template at 87179e5c1f455ef22e6223592d2d61351b525bfc does, so that the exporter writes the start token LiteRT-LM's own MiniCPM5 metadata carries; and the generation prompt follows openbmb/MiniCPM5-1B's own template at 87179e5c1f455ef22e6223592d2d61351b525bfc. With enable_thinking undefined it ends at '<|im_start|>assistant\n', where the source adds an empty think block; false adds the empty think block and true opens one, as in the source. The edits are `models.CANONICAL_EDITS`.
   Licence: Apache-2.0, as LiteRT-LM.
   Why a bundle carries it: the minicpm5 rule in litetune/models.py. -#}
+{{- bos_token -}}
 {%- macro format_content(content) -%}
     {%- for item in content -%}
         {%- if item['type'] == 'text' -%}

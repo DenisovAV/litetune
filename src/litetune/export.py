@@ -1005,6 +1005,36 @@ def render(tokenizer, template, messages, context=None):
     return {"text": text}
 
 
+def exporter_prepends_bos(tokenizer, template):
+    """Whether the exporter writes the BOS as the bundle's start token when handed
+    `template`: `_tokenizer_prepends_bos` and its caller in litert-torch-nightly
+    0.10.0.dev20260926 (`generative/export_hf/core/litert_lm_builder.py:119-199`),
+    restated. The runtime hands the template an empty `bos_token` and prepends the
+    start token itself (that function's docstring; `PromptTemplateInput`), so a BOS
+    the checkpoint's template prints reaches the runtime's prompt only this way."""
+    if not getattr(tokenizer, "bos_token", None):
+        return False
+    try:
+        bos_id = getattr(tokenizer, "bos_token_id", None)
+        if bos_id is None and isinstance(tokenizer.bos_token, int):
+            bos_id = tokenizer.bos_token
+        if bos_id is None:
+            return False
+        ids = tokenizer("x").input_ids
+        if len(ids) > 0 and ids[0] == bos_id:
+            return True
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "x"}],
+            chat_template=template,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        ids = tokenizer(rendered, add_special_tokens=False).input_ids
+        return len(ids) > 0 and ids[0] == bos_id
+    except Exception:  # the exporter's own fallback: trust the declared BOS
+        return True
+
+
 def report(found, **fields):
     """This script's whole result. The exit status says only whether the script
     itself ran; every outcome the parent tells apart is in here."""
@@ -1058,6 +1088,18 @@ def main(spec):
     if spec.get("canonical") is not None:
         candidates["canonical"] = spec["canonical"]
     forms = [form for form in cases[0] if form not in ("strings", "context")]
+    # The start token each candidate's bundle would carry, which the runtime puts
+    # in front of what it renders: the runtime's prompt is that and the rendering.
+    start_tokens = {
+        name: str(tokenizer.bos_token) if exporter_prepends_bos(tokenizer, text) else None
+        for name, text in candidates.items()
+    }
+
+    def at_runtime(rendering, start):
+        if start is None or "text" not in rendering:
+            return rendering
+        return {**rendering, "text": start + rendering["text"]}
+
     return report(
         "text",
         sha256=hashlib.sha256(template.encode("utf-8")).hexdigest(),
@@ -1069,13 +1111,17 @@ def main(spec):
             "candidates": {
                 name: [
                     {
-                        form: runtime_render(text, case[form], True, **case["context"])
+                        form: at_runtime(
+                            runtime_render(text, case[form], True, **case["context"]),
+                            start_tokens[name],
+                        )
                         for form in forms
                     }
                     for case in cases
                 ]
                 for name, text in candidates.items()
             },
+            "start_tokens": start_tokens,
             "unvouched": {name: unvouched(text) for name, text in candidates.items()},
             "parts_alone": render(tokenizer, template, cases[0]["one_part"]),
         },
@@ -1425,6 +1471,10 @@ class ComposedTemplate:
     # rule's canonical template, whether it was offered, chosen or neither.
     source: str = "composed"
     canonical: str | None = None
+    # The start token the exporter writes for this file, as `_COMPOSE_SCRIPT`
+    # predicted it from the checkpoint's tokenizer, and which the single turns
+    # were checked with in front of the runtime's rendering; None for none.
+    start_token: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1433,6 +1483,7 @@ class ComposedTemplate:
             "composed_sha256": self.composed_sha256,
             "source": self.source,
             "canonical": self.canonical,
+            "start_token": self.start_token,
         }
 
 
@@ -1653,6 +1704,8 @@ def _compose_chat_template(
     composed_sha256 = hashlib.sha256(written).hexdigest()
     final = request.composed_template_path(composed_sha256)
     os.replace(partial, final)
+    starts = renders.get("start_tokens") if isinstance(renders, dict) else None
+    start = starts.get(choice.source) if isinstance(starts, dict) else None
     composed = ComposedTemplate(
         path=final,
         text=written.decode("utf-8"),
@@ -1660,6 +1713,7 @@ def _compose_chat_template(
         composed_sha256=composed_sha256,
         source=choice.source,
         canonical=request.canonical_template,
+        start_token=start if isinstance(start, str) else None,
     )
     observed |= {
         "composed": str(final),
@@ -1723,7 +1777,8 @@ says why the bundle itself is unsound, found before anything was unpacked.
 
 With `template_out` set, the bundle's LlmMetadata `jinja_prompt_template` is
 written there as JSON as soon as the first unpack has it --
-  {"sections": <int>, "present": <bool>, "template": <str|null>}
+  {"sections": <int>, "present": <bool>, "template": <str|null>,
+   "start_token": <str|[int]|null>}
 -- and a rebuild that would change it is refused, so it describes the file
 that is left at `artifact` whatever happens after.
 """
@@ -1854,10 +1909,15 @@ def chat_template_in(directory, doc):
     )
     meta = text_format.Parse(text, llm_metadata_pb2.LlmMetadata())
     present = meta.HasField("jinja_prompt_template")
+    start = None
+    if meta.HasField("start_token"):
+        token = meta.start_token
+        start = token.token_str if token.HasField("token_str") else list(token.token_ids.ids)
     return {
         "sections": 1,
         "present": present,
         "template": meta.jinja_prompt_template if present else None,
+        "start_token": start,
     }
 
 
@@ -2009,6 +2069,8 @@ class BundleTemplate:
     sections: int = 1
     unread: str | None = None
     empty: bool = False
+    # The section's `start_token`: its `token_str`, its ids, or None for none.
+    start_token: str | list[int] | None = None
 
 
 @dataclass(frozen=True)
@@ -2153,7 +2215,12 @@ def _bundle_template(path: Path | None, note: str | None) -> BundleTemplate:
     text = data.get("template") if isinstance(data, dict) else None
     if not isinstance(sections, int) or not (text is None or isinstance(text, str)):
         return BundleTemplate(unread=f"the repack script's reading is not one this reads: {data!r}")
-    return BundleTemplate(text=text if data.get("present") else None, sections=sections)
+    start = data.get("start_token")
+    if not (start is None or isinstance(start, str) or isinstance(start, list)):
+        return BundleTemplate(unread=f"the repack script's reading is not one this reads: {data!r}")
+    return BundleTemplate(
+        text=text if data.get("present") else None, sections=sections, start_token=start
+    )
 
 
 def _template_carried(
@@ -2208,6 +2275,17 @@ def _template_carried(
             f"{artifact.name} carries a jinja_prompt_template with sha256 {carried_sha256[:12]}, "
             f"not {composed.path.name}'s {composed.composed_sha256[:12]} that it was handed",
             observed=observed | {"bundle_template_sha256": carried_sha256},
+        )
+    # The runtime renders the template with an empty `bos_token` and prepends the
+    # start token: the single turns were checked with the one predicted in front.
+    if carried.start_token != composed.start_token:
+        return Check.failed(
+            name,
+            f"{artifact.name} carries the start token {carried.start_token!r}, where its single "
+            f"turns were checked with {composed.start_token!r} in front of the runtime's "
+            "rendering: the runtime's prompt would not begin as training's did",
+            observed=observed
+            | {"start_token": carried.start_token, "start_token_checked": composed.start_token},
         )
     return None
 

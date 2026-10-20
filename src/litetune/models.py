@@ -698,7 +698,7 @@ QWEN3_CANONICAL_TEMPLATE = "litert-lm-v0.18.0-qwen3.jinja"
 """LiteRT-LM v0.18.0's `models/qwen3/chat_template.jinja`, as packaged here."""
 
 MINICPM5_CANONICAL_TEMPLATE = "litert-lm-v0.18.0-minicpm5-litetune.jinja"
-"""LiteRT-LM v0.18.0's `models/minicpm5/chat_template.jinja` with `CANONICAL_EDITS`' edit."""
+"""LiteRT-LM v0.18.0's `models/minicpm5/chat_template.jinja` with `CANONICAL_EDITS`' edits."""
 
 QWEN35_CANONICAL_TEMPLATE = "litert-lm-v0.18.0-qwen3_5-litetune.jinja"
 """LiteRT-LM v0.18.0's `models/qwen3_5/chat_template.jinja` with `CANONICAL_EDITS`' edits."""
@@ -709,7 +709,7 @@ QWEN35_CANONICAL_TEMPLATE = "litert-lm-v0.18.0-qwen3_5-litetune.jinja"
 # `canonical_template_text` refuses a packaged file that is not.
 CANONICAL_TEMPLATES = {
     QWEN3_CANONICAL_TEMPLATE: "4315c96833e8b2a21b878d70e8d2f6415416d5e23ed8ee0ae0a111a540d844f7",
-    MINICPM5_CANONICAL_TEMPLATE: "e9d0abefd2c9261b2ad585fff7ba9323aa865e96817b5bbfac9de568baa9b7ba",
+    MINICPM5_CANONICAL_TEMPLATE: "4ef4aad4540889fa9904246ac89261940ac3c9d397c85a4aaeec2c6be5f81d8d",
     QWEN35_CANONICAL_TEMPLATE: "a25cb17845462872f17aee8f7debdc26b40ee8d155f2c499f38a3a4721e8f6d7",
 }
 
@@ -721,10 +721,21 @@ CANONICAL_TEMPLATES = {
 # these edits applied to the upstream fixture give the packaged text.
 CANONICAL_EDITS: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {
     # LiteRT-LM's adds an empty think block when enable_thinking is undefined;
-    # MiniCPM5-1B's own adds nothing then.
+    # MiniCPM5-1B's own adds nothing then. And MiniCPM5-1B's own begins with
+    # `{{- bos_token }}`, which LiteRT-LM's does not: the runtime renders it empty
+    # either way, but the exporter writes the BOS as the bundle's start token, which
+    # the runtime then prepends, only when the template it is handed prints one
+    # (litert-torch-nightly 0.10.0.dev20260926,
+    # `generative/export_hf/core/litert_lm_builder.py:119-199`). LiteRT-LM's own
+    # metadata for the family carries that start token, `<s>`
+    # (`models/minicpm5/LlmMetadataProto.pbtext` at v0.18.0, git blob 5b65487e).
     MINICPM5_CANONICAL_TEMPLATE: (
         "a634466cb817628316761c75829c01b5315038c3ed23f626f43026fafcda9535",
         (
+            (
+                "{%- macro format_content(content) -%}",
+                "{{- bos_token -}}\n{%- macro format_content(content) -%}",
+            ),
             (
                 "    {%- if enable_thinking | default(false) -%}\n"
                 "        {{- '<think>\\n' -}}\n"
@@ -981,9 +992,12 @@ _MINICPM5_TEMPLATE_REASON = (
     "the next message arrives, which LiteRT-LM refuses from a conversation's second message. "
     "LiteRT-LM v0.18.0 publishes its own MiniCPM5 template (models/minicpm5/chat_template.jinja), "
     "which reads parts and holds a conversation, but with enable_thinking undefined adds an "
-    "empty think block the checkpoint's own does not add. litetune packages it as "
-    f"{MINICPM5_CANONICAL_TEMPLATE} with that one edit, so that it renders as the checkpoint's "
-    "own, its sha256 pinned. "
+    "empty think block the checkpoint's own does not add, and prints no BOS where the "
+    "checkpoint's own prints `<s>`, so the exporter would write no start token for the "
+    "runtime to prepend in its place. litetune packages it as "
+    f"{MINICPM5_CANONICAL_TEMPLATE} with those two edits, so that it renders as the "
+    "checkpoint's own, its sha256 pinned, and refuses a bundle whose start token is not the "
+    "one the template was checked with. "
 ) + _canonical_said(
     "that template",
     "it",
@@ -1397,7 +1411,7 @@ RULES: tuple[ModelRules, ...] = (
         # generic path and packs as `generic_model`. LiteRT-LM 0.18.0 has a
         # `minicpm5` type, reachable only by a metadata override, which litetune
         # refuses, or a repack; what it adds is a tool-call parser litetune's text
-        # path does not use. The template is LiteRT-LM's with one edit: see
+        # path does not use. The template is LiteRT-LM's with two edits: see
         # `_MINICPM5_TEMPLATE_REASON`.
         #
         # By size and with the qwen-2.5 rule's tail, for its reasons: openbmb

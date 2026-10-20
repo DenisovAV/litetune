@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import run_compose_script
+from conftest import (
+    GRANITE_SPECIAL_TOKENS,
+    MINICPM5_SPECIAL_TOKENS,
+    run_compose_script,
+)
 from minijinja_runtime import MINIJINJA_EDITS, minijinja_render_native
 
 from litetune import export, models, template_checks
@@ -742,7 +746,9 @@ def test_every_rule_offering_a_canonical_template_names_a_pinned_one():
 # ---------------------------------------------------------------------------
 
 
-def _compose(tmp_path: Path, checkpoint: str, canonical: str | None) -> dict:
+def _compose(
+    tmp_path: Path, checkpoint: str, canonical: str | None, special: dict | None = None
+) -> dict:
     """`export._COMPOSE_SCRIPT` on a checkpoint carrying `checkpoint`: the
     checkpoint's side through transformers -- the conftest fake renders as
     5.16.1 does -- and each candidate through the runtime's renderer."""
@@ -762,7 +768,9 @@ def _compose(tmp_path: Path, checkpoint: str, canonical: str | None) -> dict:
         ),
         encoding="utf-8",
     )
-    proc, _ = run_compose_script(["python", str(script), str(spec), str(result)], 60, checkpoint)
+    proc, _ = run_compose_script(
+        ["python", str(script), str(spec), str(result)], 60, checkpoint, special_tokens=special
+    )
     assert proc.returncode == 0, proc.stderr
     report = json.loads(result.read_text(encoding="utf-8"))
     assert report["found"] == "text"
@@ -1335,3 +1343,36 @@ def test_qwen35s_trim_keeps_the_prefix_for_a_reply_with_whitespace(reply):
     after = _render(template, [*history, {"role": "user", "content": part("and?")}], True)["text"]
     assert after.startswith(before)
     assert "assistant\nanswer<|im_end|>" in before
+
+
+def test_minicpm5s_bos_is_the_start_token_the_runtime_prepends(tmp_path):
+    """The checkpoint's template prints `{{ bos_token }}`, `<s>`, which training
+    tokenises as the BOS. The runtime hands the template an empty `bos_token` and
+    prepends the bundle's start token instead, which the exporter writes only when
+    the template it is handed prints the BOS (`litert_lm_builder._tokenizer_prepends_bos`).
+    With MiniCPM5-1B's own tokens, the edited template renders every case as the
+    checkpoint's does, the start token included, and is chosen."""
+    edited = models.canonical_template_text(models.MINICPM5_CANONICAL_TEMPLATE)
+    renders = _compose(tmp_path, MINICPM5, edited, MINICPM5_SPECIAL_TOKENS)
+    assert all(r["text"].startswith("<s>") for r in renders["reference"])
+    assert single_turn_differences(renders["reference"], renders["candidates"]["canonical"]) == []
+    assert renders["start_tokens"]["canonical"] == "<s>"
+    choice = export._choose_template("m", renders, models.MINICPM5_CANONICAL_TEMPLATE)
+    assert choice.source == "canonical"
+
+
+def test_litert_lms_minicpm5_template_would_lose_the_bos(tmp_path):
+    """Unedited, LiteRT-LM's template prints no BOS, so the exporter writes no start
+    token and the runtime's prompt lacks the `<s>` training saw: every case differs."""
+    renders = _compose(tmp_path, MINICPM5, LITERT_MINICPM5, MINICPM5_SPECIAL_TOKENS)
+    assert renders["start_tokens"]["canonical"] is None
+    differences = single_turn_differences(renders["reference"], renders["candidates"]["canonical"])
+    assert len(differences) == len(SINGLE_TURNS) * len(FORMS)
+
+
+def test_granites_composed_template_gets_no_start_token(tmp_path):
+    """granite-4.1-3b's BOS is its EOS, its tokenizer prepends none and its template
+    prints none, so no start token is written and none is needed."""
+    renders = _compose(tmp_path, GRANITE, GRANITE, GRANITE_SPECIAL_TOKENS)
+    assert renders["start_tokens"] == {"composed": None, "canonical": None}
+    assert single_turn_differences(renders["reference"], renders["candidates"]["composed"]) == []
