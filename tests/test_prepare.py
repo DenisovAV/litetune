@@ -1981,20 +1981,61 @@ def test_rows_that_are_not_a_decision_are_not_asked_about_special_tokens(write_j
 
 FAKE_TRANSFORMERS_TOKENIZER = """
 class _Added:
-    def __init__(self, content, special):
-        self.content, self.special = content, special
+    def __init__(self, content, special, single_word=False):
+        self.content, self.special, self.single_word = content, special, single_word
 
 
 class _Tokenizer:
     all_special_tokens = ["<|im_end|>", "<|endoftext|>"]
+    all_special_ids = [10, 11]
     added_tokens_decoder = {
         1: _Added("<|vision_start|>", True),
         2: _Added("<think>", False),
         3: _Added("<|vision", True),
+        4: _Added("assistant", True, single_word=True),
     }
 
+    def _pieces(self):
+        pieces = {"<|im_end|>": 10, "<|endoftext|>": 11}
+        pieces.update({a.content: i for i, a in self.added_tokens_decoder.items()})
+        return pieces
+
     def __call__(self, text, add_special_tokens=True):
-        return {"input_ids": text.split()}
+        # A special or added token by longest match -- a single_word one only
+        # between non-word characters -- and otherwise one id per run of other
+        # non-space characters, as a word.
+        pieces, out, i = self._pieces(), [], 0
+        while i < len(text):
+            if text[i].isspace():
+                i += 1
+                continue
+            hit = None
+            for piece in sorted(pieces, key=len, reverse=True):
+                if not text.startswith(piece, i):
+                    continue
+                added = self.added_tokens_decoder.get(pieces[piece])
+                end = i + len(piece)
+                if added is not None and added.single_word and (
+                    (i > 0 and text[i - 1].isalnum()) or (end < len(text) and text[end].isalnum())
+                ):
+                    continue
+                hit = piece
+                break
+            if hit is not None:
+                out.append(pieces[hit])
+                i += len(hit)
+                continue
+            j = i
+            while j < len(text) and not text[j].isspace() and not any(
+                text.startswith(p, j) for p in pieces if p.startswith("<")
+            ):
+                j += 1
+            out.append(1000 + len(out))
+            i = max(j, i + 1)
+        return {"input_ids": out}
+
+    def convert_ids_to_tokens(self, token_id):
+        return {v: k for k, v in self._pieces().items()}.get(token_id, "?")
 
 
 class AutoTokenizer:
@@ -2022,6 +2063,8 @@ def test_the_token_script_reports_the_first_special_and_added_special_token(tmp_
         "a <think> b",
         "x<|vision_start|>y<|im_end|>",
         "<|endoftext|> then <|vision_start|>",
+        "an assistantship",
+        "the assistant said",
     ]
     spec = tmp_path / "spec.json"
     spec.write_text(
@@ -2043,6 +2086,9 @@ def test_the_token_script_reports_the_first_special_and_added_special_token(tmp_
         None,
         "<|vision_start|>",
         "<|endoftext|>",
+        # `single_word`: the tokenizer emits no special id inside a word.
+        None,
+        "assistant",
     ]
 
 

@@ -1010,24 +1010,26 @@ def main() -> int:
     return 0
 
 
-def special_tokens(tok):
-    """`all_special_tokens`, and every added token `added_tokens_decoder` marks special."""
-    found = {str(t) for t in tok.all_special_tokens}
-    for added in (getattr(tok, "added_tokens_decoder", None) or {}).values():
+def special_ids(tok):
+    """`all_special_ids`, and the id of every added token `added_tokens_decoder` marks special."""
+    found = set(tok.all_special_ids)
+    for token_id, added in (getattr(tok, "added_tokens_decoder", None) or {}).items():
         if getattr(added, "special", False):
-            found.add(str(added.content))
-    found.discard("")
+            found.add(int(token_id))
     return found
 
 
 def first_special(tok, text):
-    """The special token that starts earliest in `text`, the longest at one place."""
-    best = None
-    for token in special_tokens(tok):
-        at = text.find(token)
-        if at >= 0 and (best is None or (at, -len(token)) < (best[0], -len(best[1]))):
-            best = (at, token)
-    return best[1] if best else None
+    """The first special token the tokenizer emits for `text`, as the tokenizer spells it.
+
+    Read off the ids, not the spelling: an added token's `single_word` and the
+    tokenizer's normalisation decide whether a substring becomes the special id,
+    and only the ids say what the model is handed.
+    """
+    ids = tok(text, add_special_tokens=False)["input_ids"]
+    special = special_ids(tok)
+    hit = next((i for i in ids if i in special), None)
+    return None if hit is None else str(tok.convert_ids_to_tokens(hit))
 
 
 if __name__ == "__main__":

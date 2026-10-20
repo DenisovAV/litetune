@@ -2229,3 +2229,14 @@ def test_the_reference_scores_through_each_familys_own_logit_transform(tmp_path)
     assert out["plain"] == [None, None]
     assert out["granite_value"] == 2.5
     assert out["capped_value"] == math.tanh(2.0) * 30.0
+
+
+def test_every_head_the_reference_scores_through_goes_through_the_transform():
+    """The scoring reads lm_head's output in one place, `head_logp`; the other paths
+    read the model's own forward, which applies the transform itself. So the one
+    place must apply it, and must take it from the model's config."""
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    assert REFERENCE_SCRIPT.count("model.lm_head(") == 1
+    assert "transformed(model.lm_head(hidden).float(), scale, cap)" in REFERENCE_SCRIPT
+    assert "scale, cap = head_transform(model.config)" in REFERENCE_SCRIPT
