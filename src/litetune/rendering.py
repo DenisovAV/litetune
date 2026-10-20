@@ -59,11 +59,21 @@ DEFAULT_PREFILL_SAMPLE = 8
 # prompt is where a template difference shows first.
 _TAIL = 120
 
-_RUNTIME_SCRIPT = r'''
-"""What the runtime puts in front of the model for each prompt. Writes JSON."""
-import json
-import sys
-from pathlib import Path
+# The ids a LiteRT-LM session reads for a rendered first turn, in every script
+# that compares them with the reference's: this rendering check, and the
+# runtime side of option scoring (`decision_scripts.ENGINE_SCRIPT`). Pasted into
+# each as source, as `prompt_mode.RENDERING_SOURCE` is.
+SESSION_IDS_SOURCE = r'''
+def session_prefix(engine):
+    """The ids a session puts before the first turn's text: the BOS, when the model has one.
+
+    A session pushes the BOS string first on a first turn when its start
+    token is a valid id (runtime/core/session_utils.cc, ApplyPromptTemplates,
+    v0.18.0 as v0.17.1, as `runtime_ids` below reads it), and prefill turns it
+    into that id. A model without a BOS gets nothing.
+    """
+    bos = engine.bos_token_id
+    return [bos] if bos is not None and bos >= 0 and engine.detokenize([bos]) else []
 
 
 def prefill_ids(engine, text):
@@ -95,10 +105,22 @@ def runtime_ids(engine, rendered):
     rendering that carries its own BOS string gets a second one here, as it
     would in the runtime. A model without a BOS gets nothing added.
     """
-    bos = engine.bos_token_id
-    first_turn = [bos] if bos is not None and bos >= 0 and engine.detokenize([bos]) else []
-    return first_turn + prefill_ids(engine, rendered)
+    return session_prefix(engine) + prefill_ids(engine, rendered)
+'''
 
+_RUNTIME_SCRIPT_HEAD = r'''
+"""What the runtime puts in front of the model for each prompt. Writes JSON."""
+import json
+import sys
+from pathlib import Path
+
+
+'''
+
+_RUNTIME_SCRIPT = (
+    _RUNTIME_SCRIPT_HEAD
+    + SESSION_IDS_SOURCE
+    + r'''
 
 def main():
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
@@ -180,6 +202,7 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 '''
+)
 
 _REFERENCE_SCRIPT = (
     r'''

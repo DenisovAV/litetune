@@ -115,9 +115,13 @@ class FakeScoringEnv:
     # Options whose unique prefix "does not round-trip": scored in full, as the
     # runtime script does.
     full_for: set[str] = field(default_factory=set)
-    # How the runtime tokenises a row's prompt. The reference returns the BOS
-    # and then `prompt_ids`, as a chat template that writes the BOS does.
+    # How the runtime tokenises a row's prompt. The reference returns
+    # `ref_prefix` and then `prompt_ids`: [BOS], as a chat template that writes
+    # the BOS does (Gemma 3), or [] for one that writes none (ChatML).
     prompt_ids_of: Callable[[str], list[int]] = prompt_ids
+    ref_prefix: list[int] = field(default_factory=lambda: [BOS])
+    # What the runtime reports its session puts first; None reports nothing.
+    session_prefix: list[int] | None = field(default_factory=lambda: [BOS])
     # The reference's tokenizer, for the end of turn: what each recorded id decodes to.
     vocab: dict[int, str] = field(default_factory=lambda: dict(VOCAB))
     specs: list[dict[str, Any]] = field(default_factory=list)
@@ -153,6 +157,8 @@ class FakeScoringEnv:
                     "mismatches": [{"option": o} for o in spec["options"] if o in self.full_for],
                 }
             )
+            if self.session_prefix is not None:
+                report["session_prefix"] = self.session_prefix
         else:
             report.update(
                 {
@@ -178,7 +184,7 @@ class FakeScoringEnv:
                 if engine:
                     rec["prompt_ids"] = self.prompt_ids_of(row["prompt"])
                 elif row["index"] in spec.get("ids_for", []):
-                    rec["prompt_ids"] = [BOS, *prompt_ids(row["prompt"])]
+                    rec["prompt_ids"] = [*self.ref_prefix, *prompt_ids(row["prompt"])]
                 out.write(json.dumps(rec) + "\n")
         Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
         return subprocess.CompletedProcess(argv, self.returncode, "", "fake stderr")
@@ -619,12 +625,22 @@ it the session reads what was prefilled, as an engine with the fix does; with
 FAKE_DROPS=alternate it drops on every other pair of scorings, an engine nobody
 has measured. Scoring an option advances the session past it until a rewind,
 and a rewind needs a saved checkpoint, so the order of the calls matters.
+
+FAKE_TEMPLATE picks the bundle's template: Gemma 3's (the default) or ChatML
+("chatml", as Qwen's). FAKE_BOS picks its start token: "<bos>" (the default),
+or "none" for a bundle with none, as Qwen's. A session reads the BOS first on
+its first prefill, as LiteRT-LM's does. With FAKE_LOADS set, every Engine
+appends a line to that file, so a test can count loads.
 """
 import os
 import re
 import zlib
 
-_SPECIAL = r"<start_of_turn>|<end_of_turn>|<bos>"
+_SPECIAL = r"<start_of_turn>|<end_of_turn>|<bos>|<\|im_start\|>|<\|im_end\|>"
+_TEMPLATES = {
+    "gemma": ("<start_of_turn>user\n", "<end_of_turn>\n<start_of_turn>model\n"),
+    "chatml": ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"),
+}
 _WORDS = {}
 _SCORINGS = 0
 
@@ -693,8 +709,8 @@ class _Result:
 
 
 class _Session:
-    def __init__(self):
-        self.tokens = []
+    def __init__(self, prefix=()):
+        self.tokens = list(prefix)
         self.prefills = 0
         self._lib = _Lib()
         self._ptr = self
@@ -742,12 +758,18 @@ class _Conversation:
         return False
 
     def render_message_to_string(self, prompt):
-        return "<start_of_turn>user\n" + prompt + "<end_of_turn>\n<start_of_turn>model\n"
+        before, after = _TEMPLATES[os.environ.get("FAKE_TEMPLATE", "gemma")]
+        return before + prompt + after
 
 
 class Engine:
     def __init__(self, path, backend=None, cache_dir=None):
         self.path = path
+        bos = os.environ.get("FAKE_BOS", "<bos>")
+        self.bos_token_id = None if bos == "none" else _ids(bos)[0]
+        if os.environ.get("FAKE_LOADS"):
+            with open(os.environ["FAKE_LOADS"], "a") as fh:
+                fh.write("load\n")
 
     def __enter__(self):
         return self
@@ -762,7 +784,7 @@ class Engine:
         return "".join(_WORDS[i] for i in ids)
 
     def create_session(self, apply_prompt_template=True, sampler_config=None):
-        return _Session()
+        return _Session([] if self.bos_token_id is None else [self.bos_token_id])
 
     def create_conversation(self, sampler_config=None, max_output_tokens=None):
         return _Conversation()
@@ -770,7 +792,15 @@ class Engine:
 
 
 def _run_engine_script(
-    tmp_path, drops: bool | str, prompts, options, mode="auto", fake_source=FAKE_LITERT_LM
+    tmp_path,
+    drops: bool | str,
+    prompts,
+    options,
+    mode="auto",
+    fake_source=FAKE_LITERT_LM,
+    fake_env: dict[str, str] | None = None,
+    term: str = TERM,
+    **spec_extra: Any,
 ):
     import os
     import sys
@@ -790,18 +820,19 @@ def _run_engine_script(
                 "model": "m.litertlm",
                 "rows": [{"index": i, "prompt": p} for i, p in enumerate(prompts)],
                 "options": list(options),
-                "terminator": TERM,
+                "terminator": term,
                 "threads": 2,
                 "targets": "unique",
                 "mode": mode,
                 "out": str(out),
                 "report": str(report),
+                **spec_extra,
             }
         ),
         encoding="utf-8",
     )
     drops_value = drops if isinstance(drops, str) else "1" if drops else "0"
-    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_DROPS=drops_value)
+    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_DROPS=drops_value, **(fake_env or {}))
     proc = subprocess.run(
         [sys.executable, str(script), str(spec)], env=env, capture_output=True, text=True
     )
@@ -809,8 +840,7 @@ def _run_engine_script(
     return proc, rows, json.loads(report.read_text())
 
 
-def _expected(tmp_path, prompts, options):
-    """Each option's unique-prefix token scores on the whole rendered prompt."""
+def _fake_module(tmp_path):
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
@@ -818,11 +848,19 @@ def _expected(tmp_path, prompts, options):
     )
     fake = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fake)
-    cont = [fake._ids(o + TERM) for o in options]
+    return fake
+
+
+def _expected(tmp_path, prompts, options, template="gemma", bos="<bos>", term=TERM):
+    """Each option's unique-prefix token scores on the BOS and the whole rendered prompt."""
+    fake = _fake_module(tmp_path)
+    cont = [fake._ids(o + term) for o in options]
     ks = unique_lengths(cont)
+    before, after = fake._TEMPLATES[template]
+    first = [] if bos == "none" else fake._ids(bos)
     out = []
     for p in prompts:
-        ctx = fake._ids("<start_of_turn>user\n" + p + "<end_of_turn>\n<start_of_turn>model\n")
+        ctx = first + fake._ids(before + p + after)
         out.append(
             [
                 [fake.true_score(ctx + c[:i], c[i]) for i in range(k)]
@@ -1354,10 +1392,7 @@ def test_a_runtime_that_scores_another_prompt_is_refused(split, tmp_path, tokeni
 
 
 def test_the_runtime_script_refuses_a_prompt_rendered_as_empty_text(tmp_path):
-    empty = FAKE_LITERT_LM.replace(
-        'return "<start_of_turn>user\\n" + prompt + "<end_of_turn>\\n<start_of_turn>model\\n"',
-        'return ""',
-    )
+    empty = FAKE_LITERT_LM.replace("return before + prompt + after", 'return ""')
     assert empty != FAKE_LITERT_LM
 
     proc, rows, _ = _run_engine_script(
@@ -1798,3 +1833,90 @@ def test_the_reference_script_refuses_a_first_token_that_does_not_tokenise_back(
 
     assert proc.returncode != 0 and report is None
     assert "not that one token" in proc.stderr
+
+
+# -- what the session puts before the prompt ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ref_prefix", "session_prefix"),
+    [([BOS], [BOS]), ([], [])],
+    ids=["Gemma 3: the template's BOS, the session's BOS", "ChatML: no BOS on either side"],
+)
+def test_the_prompt_check_adds_what_the_session_puts_first(
+    split, tmp_path, ref_prefix, session_prefix
+):
+    s = split()
+    job = job_for(
+        s,
+        tmp_path,
+        train_env=FakeScoringEnv("train", ref_prefix=ref_prefix),
+        runtime_env=FakeScoringEnv("runtime", session_prefix=session_prefix),
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert check(fields, PROMPT_CHECK)["outcome"] == "passed"
+    assert fields["decision"]["session_prefix"] == session_prefix
+
+
+@pytest.mark.parametrize(
+    ("ref_prefix", "session_prefix"),
+    [([BOS], []), ([], [7])],
+    ids=[
+        "the template prints a BOS the session does not add (MiniCPM5's shape)",
+        "the session adds a BOS the template does not print (Granite's shape)",
+    ],
+)
+def test_a_bos_on_one_side_only_is_refused(split, tmp_path, ref_prefix, session_prefix):
+    s = split()
+    job = job_for(
+        s,
+        tmp_path,
+        train_env=FakeScoringEnv("train", ref_prefix=ref_prefix),
+        runtime_env=FakeScoringEnv("runtime", session_prefix=session_prefix),
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    detail = failed(fields, PROMPT_CHECK)["detail"]
+    assert "is not the reference's" in detail and f"session prefix {session_prefix}" in detail
+
+
+def test_a_runtime_that_does_not_say_what_its_session_puts_first_is_refused(split, tmp_path):
+    s = split()
+    job = job_for(s, tmp_path, runtime_env=FakeScoringEnv("runtime", session_prefix=None))
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "did not report the ids its session puts" in failed(fields, PROMPT_CHECK)["detail"]
+
+
+@pytest.mark.parametrize(
+    ("template", "bos"), [("gemma", "<bos>"), ("chatml", "none")], ids=["Gemma 3", "ChatML"]
+)
+def test_the_runtime_script_reports_its_session_prefix_and_scores_after_it(tmp_path, template, bos):
+    prompts = ["text 1 about joy", "text 22 about fear"]
+    options = ("joy", "anger", "fear")
+    term = "<end_of_turn>" if template == "gemma" else "<|im_end|>"
+
+    proc, rows, report = _run_engine_script(
+        tmp_path,
+        True,
+        prompts,
+        options,
+        fake_env={"FAKE_TEMPLATE": template, "FAKE_BOS": bos},
+        term=term,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    fake = _fake_module(tmp_path)
+    assert report["session_prefix"] == ([] if bos == "none" else fake._ids(bos))
+    before, after = fake._TEMPLATES[template]
+    assert rows[0]["prompt_ids"] == fake._ids(before + prompts[0] + after)
+    assert [r["token_scores"] for r in rows] == _expected(
+        tmp_path, prompts, options, template=template, bos=bos, term=term
+    )

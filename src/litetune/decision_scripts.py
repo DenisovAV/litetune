@@ -44,6 +44,7 @@ that `verify` can check the two sides scored the same prompt.
 from __future__ import annotations
 
 from litetune.prompt_mode import RENDERING_SOURCE
+from litetune.rendering import SESSION_IDS_SOURCE
 
 REFERENCE_SCRIPT = (
     r'''
@@ -245,7 +246,8 @@ if __name__ == "__main__":
 )
 
 
-ENGINE_SCRIPT = r'''
+ENGINE_SCRIPT = (
+    r'''
 """Per-token option scores through LiteRT-LM's session API. Spec: argv[1].
 
 See litetune.decision_scripts.
@@ -263,6 +265,9 @@ from pathlib import Path
 import litert_lm as L
 
 FIXED = "<start_of_turn>user\nAnswer with one word.<end_of_turn>\n<start_of_turn>model\n"
+'''
+    + SESSION_IDS_SOURCE
+    + r'''
 
 
 def last_error(lib):
@@ -322,11 +327,12 @@ def main():
     def render(engine, prompt):
         with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
             rendered = conv.render_message_to_string(prompt)
-        ids = list(engine.tokenize(rendered))
         # 0.18.0 returns "" when the render fails in C, and "" tokenises to no
         # ids, which every check below would pass.
-        if not ids:
+        if not rendered:
             raise RuntimeError("the runtime rendered the prompt as empty text")
+        # As prefill reads the text; the session puts `session_prefix` first.
+        ids = prefill_ids(engine, rendered)
         last = engine.detokenize(ids[-1:])
         if not rendered.endswith(last) or list(engine.tokenize(last)) != ids[-1:]:
             raise RuntimeError(f"the last prompt token {ids[-1]} does not round-trip as {last!r}")
@@ -363,6 +369,8 @@ def main():
     kw = {"backend": L.Backend.CPU(thread_count=int(spec["threads"])), "cache_dir": ":nocache"}
     with L.Engine(spec["model"], **kw) as engine:
         report["init_seconds"] = round(time.perf_counter() - t0, 3)
+        # What every session here reads before its prompt's ids, as a first turn.
+        report["session_prefix"] = session_prefix(engine)
         cont_ids = [list(engine.tokenize(o + term)) for o in options]
         report["cont_ids"] = cont_ids
 
@@ -467,3 +475,4 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 '''
+)

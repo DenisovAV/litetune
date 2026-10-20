@@ -760,17 +760,31 @@ def verify_decision(
         ),
         events,
     )
-    # The same prompt on both sides: the reference's ids, which its chat
-    # template starts with the BOS, against the runtime's after the BOS its
-    # session adds. An empty render, a second BOS or another tokenisation of
-    # the text would otherwise show only as disagreement, if at all.
-    bos = ref.report.get("bos_id")
+    # The same prompt on both sides: the reference's ids, as its chat template
+    # renders them, against what the runtime's session reads -- the ids it puts
+    # first on a first turn (`session_prefix`: the BOS, for a bundle whose
+    # metadata has a start token), then the rendering's. Which of the two
+    # writes a BOS differs by family: Gemma 3's template prints it and LiteRT-LM
+    # hands its template none, so the session adds it; Qwen's tokenizers have
+    # none (`bos_token` null in Qwen3-0.6B's and Qwen2.5-0.5B-Instruct's
+    # tokenizer_config.json). An empty render, a BOS on one side only, a second
+    # BOS or another tokenisation of the text would otherwise show only as
+    # disagreement, if at all.
+    prefix = eng.report.get("session_prefix")
+    if not isinstance(prefix, list) or not all(
+        isinstance(i, int) and not isinstance(i, bool) for i in prefix
+    ):
+        return refuse(
+            PROMPT_CHECK,
+            "the runtime did not report the ids its session puts before the prompt "
+            f"(session_prefix: {json.dumps(prefix)[:100]}), so its prompt cannot be compared "
+            "with the reference's",
+        )
     differing = [
         j
         for j, i in enumerate(engine_rows)
-        if bos is None
-        or eng.prompt_ids.get(j) is None
-        or ref.prompt_ids.get(calib_n + i) != [bos, *eng.prompt_ids[j]]
+        if eng.prompt_ids.get(j) is None
+        or ref.prompt_ids.get(calib_n + i) != [*prefix, *eng.prompt_ids[j]]
     ]
     if differing:
         j = differing[0]
@@ -779,13 +793,16 @@ def verify_decision(
             PROMPT_CHECK,
             f"on {len(differing)} of {n_engine} rows the runtime's prompt is not the "
             f"reference's. First, held-out row {engine_rows[j]}: the reference's "
-            f"{_ids_text(want)}, the runtime's BOS {bos} and then {_ids_text(got)}",
+            f"{_ids_text(want)}, the runtime's session prefix {prefix} and then "
+            f"{_ids_text(got)}",
         )
+    fields["decision"]["session_prefix"] = prefix
     state.add(
         Check.passed(
             PROMPT_CHECK,
-            f"on all {n_engine} rows the runtime's prompt ids, after the BOS its session adds, "
-            "are the reference's",
+            f"on all {n_engine} rows the runtime's prompt ids, after "
+            + (f"the ids {prefix} its session puts first" if prefix else "nothing put first")
+            + ", are the reference's",
         ),
         events,
     )
