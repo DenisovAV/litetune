@@ -435,6 +435,9 @@ class DecisionVerify:
     engine_rows: int = DEFAULT_ENGINE_ROWS
     threads: int = DEFAULT_THREADS
     backend: str = "cpu"
+    # The family rule's `engine_per_prompt_reason`: option scoring rewinds
+    # within one session, which no Engine of its own per prompt can make safe.
+    engine_per_prompt_reason: str = ""
     # What `verify` was asked that the decision path does not do: refused rather
     # than ignored, so a manifest never records a role or a limit nobody applied.
     reference_role: str = "float_twin"
@@ -555,6 +558,14 @@ def verify_decision(
             RUNTIME_CHECK,
             f"option scoring is measured on the CPU backend only; --backend {job.backend} is "
             "refused rather than measured with a method nobody has checked there",
+        )
+    if job.engine_per_prompt_reason:
+        return refuse(
+            RUNTIME_CHECK,
+            "option scoring prefills a prompt once and rewinds to it within one session for "
+            "every option, and this family's rule gives an Engine of its own to every prompt "
+            f"verify generates for: {job.engine_per_prompt_reason}. A rewind that moves only "
+            "the step counter is the mechanism behind that, so no decision is measured on it",
         )
     if job.calibration is None:
         return refuse(

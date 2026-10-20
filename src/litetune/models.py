@@ -365,6 +365,12 @@ class ModelRules:
     # the composed one when it renders single turns as the checkpoint's own.
     canonical_template: str | None = None
 
+    # Why `verify` builds a LiteRT-LM Engine for every prompt instead of one per
+    # split, for a family whose state a session on a shared Engine may not
+    # reset; empty for every other family. `verify` refuses a decision for such
+    # a family, whose scoring rewinds within one session.
+    engine_per_prompt_reason: str = ""
+
     def matches(self, text: str) -> bool:
         return any(re.search(pattern, text) for pattern in self.patterns)
 
@@ -510,6 +516,19 @@ _NO_CONTAINER_GRANITE = (
 )
 
 # And the one family that mapping does not cover at all.
+# Sourced: google-ai-edge/LiteRT-LM#3165 and its fix #3945, both open when read
+# on 2026-10-20.
+_ENGINE_PER_PROMPT_REASON = (
+    "Qwen3.5's gated-delta-net layers carry recurrent state, and on a shared LiteRT-LM Engine "
+    "a new conversation that shares a prefix with the previous one skips the shared tokens and "
+    "rewinds only the step counter, not that state, so it can continue from the previous "
+    "conversation's (google-ai-edge/LiteRT-LM#3165, open, its fix #3945 unmerged): held-out "
+    "prompts share their instructions, so one answer could depend on the prompts scored before "
+    "it. verify builds an Engine for every "
+    "prompt and closes it before the next, which costs an engine load per prompt and is "
+    "recorded in the manifest"
+)
+
 _NO_CONTAINER_NOT_ESTABLISHED = (
     "no container is needed: `AutoModelForCausalLM` loads this architecture as a text-only "
     "model and its vision projections are named qkv/proj/linear_fc1/linear_fc2, which none of "
@@ -1161,6 +1180,7 @@ RULES: tuple[ModelRules, ...] = (
             ),
         ),
         canonical_template=QWEN35_CANONICAL_TEMPLATE,
+        engine_per_prompt_reason=_ENGINE_PER_PROMPT_REASON,
     ),
     ModelRules(
         family="qwen-3",

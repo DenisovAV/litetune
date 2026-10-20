@@ -614,11 +614,13 @@ def _candidate_backend(request: VerifyRequest, declarations: list | None) -> Gen
             decode=request.decode,
             backend_flag=request.backend,
         )
+    _, rules = _model_rules(request)
     return LiteRtLmBackend(
         model=request.model,
         decode=request.decode,
         declared_prompt_mode=request.prompt_mode,
         backend_flag=request.backend,
+        engine_per_prompt_reason=rules.engine_per_prompt_reason if rules else "",
     )
 
 
@@ -989,9 +991,11 @@ def _verify_decision(
         device = device_setting(os.environ)
     except DeviceSettingError as exc:
         device_error = str(exc)
+    _, rules = _model_rules(request)
     job = DecisionVerify(
         model=request.model,
         reference=request.reference,
+        engine_per_prompt_reason=rules.engine_per_prompt_reason if rules else "",
         heldout=request.data,
         calibration=request.calibration,
         float_twin=request.float_twin,

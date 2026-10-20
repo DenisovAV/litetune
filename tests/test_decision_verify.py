@@ -415,6 +415,21 @@ def test_the_gpu_backend_is_refused(split, tmp_path):
     assert "CPU backend only" in check(fields, RUNTIME_CHECK)["detail"]
 
 
+def test_a_family_that_needs_an_engine_per_prompt_is_refused(split, tmp_path):
+    """Option scoring rewinds within one session, which is the mechanism an
+    Engine per prompt exists to avoid; refused before anything is scored."""
+    s = split()
+    job = job_for(s, tmp_path, engine_per_prompt_reason="state survives a rewind")
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    detail = check(fields, RUNTIME_CHECK)["detail"]
+    assert "rewinds to it within one session" in detail
+    assert "state survives a rewind" in detail
+    assert job.runtime_env.specs == [] and job.train_env.specs == []
+
+
 def test_rows_rendered_with_another_decision_are_refused_by_line(split, tmp_path):
     s = split()
     other = decision_from({"question": "Which mood?", "options": [{"id": "joy"}, {"id": "x"}]}, "q")
