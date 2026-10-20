@@ -1801,6 +1801,12 @@ class cuda:
 
 def no_grad():
     return lambda f: f
+
+
+def tanh(x):
+    import math
+
+    return math.tanh(x)
 """
 
 FAKE_TRANSFORMERS = """
@@ -2166,3 +2172,60 @@ def test_the_self_check_pair_skips_ids_that_change_nothing_or_do_not_round_trip(
     # Not ":" (the id already there), not "a" ("ab" is one word): the newline.
     head = "<start_of_turn>:a\nAnswer with one word.<end_of_turn>\n<start_of_turn>"
     assert report["selfcheck"]["pair"] == [head + ":b", head + "\nb"]
+
+
+_HEAD_DRIVER = """
+import json, runpy, sys, types
+ns = runpy.run_path(sys.argv[1], run_name="reference_under_test")
+def cfg(**kw):
+    text = kw.pop("text", None)
+    c = types.SimpleNamespace(**kw)
+    if text is not None:
+        c.get_text_config = lambda: types.SimpleNamespace(**text)
+    return c
+cases = {
+    "granite": cfg(logits_scaling=10.0),
+    "gemma3": cfg(final_logit_softcapping=None),
+    "gemma2": cfg(final_logit_softcapping=30.0),
+    "gemma4": cfg(text={"final_logit_softcapping": 30.0}),
+    "plain": cfg(),
+}
+out = {k: ns["head_transform"](v) for k, v in cases.items()}
+out["granite_value"] = ns["transformed"](25.0, 10.0, None)
+out["capped_value"] = ns["transformed"](60.0, None, 30.0)
+print(json.dumps(out))
+"""
+
+
+def test_the_reference_scores_through_each_familys_own_logit_transform(tmp_path):
+    """lm_head's output is what the scoring reads, and a causal LM's own forward
+    changes it: Granite divides by logits_scaling, Gemma soft-caps, Gemma 4 from
+    its text config. Without them a Granite or Gemma 4 reference disagrees with
+    its own float twin."""
+    import math
+    import os
+    import sys
+
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "torch.py").write_text(FAKE_TORCH, encoding="utf-8")
+    (fake / "transformers.py").write_text(FAKE_TRANSFORMERS, encoding="utf-8")
+    script = tmp_path / "reference.py"
+    script.write_text(REFERENCE_SCRIPT, encoding="utf-8")
+    driver = tmp_path / "driver.py"
+    driver.write_text(_HEAD_DRIVER, encoding="utf-8")
+    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_VOCAB="{}")
+    proc = subprocess.run(
+        [sys.executable, str(driver), str(script)], env=env, capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["granite"] == [10.0, None]
+    assert out["gemma3"] == [None, None]
+    assert out["gemma2"] == [None, 30.0]
+    assert out["gemma4"] == [None, 30.0]
+    assert out["plain"] == [None, None]
+    assert out["granite_value"] == 2.5
+    assert out["capped_value"] == math.tanh(2.0) * 30.0

@@ -71,6 +71,28 @@ VARIANTS = ("cache_position+position_ids", "position_ids", "plain")
     + RENDERING_SOURCE
     + r"""
 
+def head_transform(config):
+    # What a causal LM's own forward does to lm_head's output, which the scoring
+    # below calls directly: Granite divides by `logits_scaling`
+    # (transformers 5.16.1 modeling_granite.py:497), Gemma 2 and 3 soft-cap with
+    # `final_logit_softcapping` on their config, and Gemma 4 with the one on its
+    # text config (modeling_gemma4.py:2587).
+    text = config.get_text_config() if hasattr(config, "get_text_config") else config
+    scale = getattr(config, "logits_scaling", None) or getattr(text, "logits_scaling", None)
+    cap = getattr(text, "final_logit_softcapping", None)
+    if cap is None:
+        cap = getattr(config, "final_logit_softcapping", None)
+    return scale, cap
+
+
+def transformed(logits, scale, cap):
+    if scale:
+        logits = logits / scale
+    if cap:
+        logits = torch.tanh(logits / cap) * cap
+    return logits
+
+
 def main():
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -88,7 +110,7 @@ def main():
             spec["model"], torch_dtype=torch.float32, attn_implementation="eager", **kwargs
         )
     model = model.to(device).eval()
-    cap = getattr(model.config, "final_logit_softcapping", None)
+    scale, cap = head_transform(model.config)
     # The first token of the end of turn tune recorded, as this tokenizer
     # writes it; the runtime is handed the text and must tokenise it alike.
     first = spec["turn_ids"][0]
@@ -113,9 +135,7 @@ def main():
         return tok(text, add_special_tokens=add_special)["input_ids"]
 
     def head_logp(hidden):
-        logits = model.lm_head(hidden).float()
-        if cap:
-            logits = torch.tanh(logits / cap) * cap
+        logits = transformed(model.lm_head(hidden).float(), scale, cap)
         return torch.log_softmax(logits, dim=-1)
 
     def expand(cache, n):
@@ -238,6 +258,7 @@ def main():
                 "transformers": __import__("transformers").__version__,
                 "cont_ids": conts,
                 "final_logit_softcapping": cap,
+                "logits_scaling": scale,
                 "cache_variant": state["variant"] or "no_cache",
                 "variant_trials": trials,
                 "seconds": round(time.time() - started, 1),
