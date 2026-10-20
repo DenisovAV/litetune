@@ -107,10 +107,11 @@ its float checkpoint and run only `verify`.
 > every headline candidate evaluated on LiteRT-LM's CPU backend, and two Qwen3
 > artifacts also evaluated on a phone's CPU and GPU,
 > all in [MEASUREMENTS.md](MEASUREMENTS.md).
-> Qwen3.5 exports with LiteRT-LM's Qwen 3.5 chat template, edited so that it
-> renders a single turn as the checkpoint's own does, needs a `transformers`
-> floor, and gets an Engine of its own for every prompt `verify` scores
-> (google-ai-edge/LiteRT-LM#3165); it has no quality number. MiniCPM5-1B and
+> Qwen3.5's rule hands the exporter LiteRT-LM's Qwen 3.5 chat template, edited
+> so that it renders a single turn as the checkpoint's own does, needs a
+> `transformers` floor, and gives every prompt `verify` scores an Engine of its
+> own (google-ai-edge/LiteRT-LM#3165); no export with that template has run yet,
+> and it has no quality number. MiniCPM5-1B and
 > granite-4.1-3b have rules that no export has exercised yet. Gemma 4 exports once you name the variant
 > — `E2B` or `E4B` — because the chat template override is per-variant; a bare
 > `gemma-4` is refused rather than guessed at, and the refusal names the flag
@@ -1124,8 +1125,8 @@ withdrawn after re-measurement.
   the float reference, on prompts that list all 77 labels rather than the
   prompts the tuned runs use, so that figure is not comparable with the seven
   above it.
-  Qwen3.5 exports but has no quality figure, MiniCPM5-1B and granite-4.1-3b
-  have rules that no export has exercised yet, and a Gemma 4 without its variant
+  Qwen3.5, MiniCPM5-1B and granite-4.1-3b have rules that no export has
+  exercised yet, and a Gemma 4 without its variant
   is still refused unless you supply the template override yourself.
 - **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
   the liveness checks both trim against a fixed set of strings, recorded

@@ -3902,3 +3902,21 @@ def test_the_script_is_told_to_build_an_engine_per_prompt(tmp_path, monkeypatch,
     monkeypatch.setattr(envs.StageEnv, "run", fake_run)
     _litertlm(tmp_path, engine_per_prompt_reason=reason).generate(["one", "two"])
     assert [spec["engine_per_prompt"] for spec in specs] == [expected]
+
+
+def test_a_split_that_dies_part_way_reports_every_engine_it_built(tmp_path, monkeypatch):
+    report = tmp_path / "device.json"
+    with pytest.raises(MemoryError):
+        _run_script(
+            tmp_path,
+            ["one", "two", "three"],
+            monkeypatch=monkeypatch,
+            report=report,
+            engine_per_prompt=True,
+            raise_on={"two": MemoryError()},
+        )
+    written = json.loads(report.read_text(encoding="utf-8"))
+    assert len(written["engine_init_seconds"]) == 2
+    assert [
+        json.loads(line)["index"] for line in (tmp_path / "out.jsonl").read_text().splitlines()
+    ] == [0]

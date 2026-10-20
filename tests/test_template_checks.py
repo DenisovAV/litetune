@@ -1317,3 +1317,21 @@ def test_qwen35s_own_template_breaks_a_conversation():
 def test_an_edited_template_holds_every_conversation(family):
     name = EDITED[family][0]
     assert _breaks(models.canonical_template_text(name)) == ([], [])
+
+
+@pytest.mark.parametrize("reply", [" answer ", "answer\n", "\n\nanswer"])
+def test_qwen35s_trim_keeps_the_prefix_for_a_reply_with_whitespace(reply):
+    """The edit trims an assistant reply, as the checkpoint's own template does: the
+    history ending in it and that history with the next message both print it
+    trimmed, so the one is still a prefix of the other -- the invariant the
+    runtime holds a conversation to from its second message."""
+    template = models.canonical_template_text(models.QWEN35_CANONICAL_TEMPLATE)
+    part = lambda text: [{"type": "text", "text": text}]  # noqa: E731
+    history = [
+        {"role": "user", "content": part("hi")},
+        {"role": "assistant", "content": part(reply)},
+    ]
+    before = _render(template, history, False)["text"]
+    after = _render(template, [*history, {"role": "user", "content": part("and?")}], True)["text"]
+    assert after.startswith(before)
+    assert "assistant\nanswer<|im_end|>" in before

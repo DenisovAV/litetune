@@ -1736,9 +1736,12 @@ def main(spec_path):
                     init.append(time.monotonic() - started)
                     if at_engine is None:
                         at_engine = device_report()
-                        write_report(at_engine, init=init)
+                    # After every Engine, so a split that dies part-way still
+                    # reports every load it paid for.
+                    last = index == len(prompts) - 1
+                    write_report(at_engine, None, init)
                     score_one(engine, runtime_rendered, index, prompt, out)
-                    if index == len(prompts) - 1:
+                    if last:
                         write_report(at_engine, device_report(), init)
             return
         with litert_lm.Engine(spec["model"], cache_dir="", **engine_args) as engine:

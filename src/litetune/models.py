@@ -1004,7 +1004,9 @@ _QWEN35_TEMPLATE_REASON = (
     "message's text as the checkpoint's own does, and with enable_thinking undefined opens a "
     "think block where the 0.8B's and 2B's close an empty one. litetune packages it as "
     f"{QWEN35_CANONICAL_TEMPLATE} with those four edits, so that it renders as the checkpoint's "
-    "own, its sha256 pinned. "
+    "own, its sha256 pinned. Like LiteRT-LM's, it prints a message's text and tool-response "
+    "parts only, where the checkpoint's own prints image and video placeholders: litetune's "
+    "text path sends neither, and a bundle carrying it reads no media. "
 ) + _canonical_said(
     "that template",
     "it",
