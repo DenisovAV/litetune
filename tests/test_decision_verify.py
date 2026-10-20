@@ -1556,3 +1556,32 @@ def test_a_litetune_device_litetune_does_not_accept_stops_a_decision_run(
     assert result.status.value == "failed_harness"
     details = [c["detail"] for c in result.manifest["checks"]["checks"]]
     assert any("verification was not attempted" in d and "LITETUNE_DEVICE" in d for d in details)
+
+
+@pytest.mark.parametrize(
+    ("base", "needs"), [("Qwen/Qwen3.5-0.8B", True), ("google/gemma-3-270m-it", False)]
+)
+def test_run_verify_hands_the_rules_engine_per_prompt_reason_over(
+    tmp_path, monkeypatch, base, needs
+):
+    import litetune.decision_verify as dv
+    from litetune.verify import VerifyRequest, run_verify
+
+    seen = {}
+
+    def capture(job, record, events):
+        seen["job"] = job
+        return "failed_harness", {"scorer": {"name": "option-scoring"}, "limitations": []}
+
+    monkeypatch.setattr(dv, "verify_decision", capture)
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    cp = _checkpoint(
+        tmp_path,
+        {"base_model": base, "decision": {"question": "Q?", "options": [{"id": "a"}]}},
+    )
+    config = {"model_type": "qwen3_5"} if needs else {"model_type": "gemma3_text"}
+    (cp / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"bundle")
+    run_verify(VerifyRequest(model=model, reference=str(cp), data=tmp_path / "heldout.jsonl"))
+    assert bool(seen["job"].engine_per_prompt_reason) is needs
