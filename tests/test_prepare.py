@@ -61,6 +61,10 @@ class FakeTokenCounter:
 
     raises: BaseException | None = None
     calls: list[list[str]] = field(default_factory=list)
+    # The tokenizer's special tokens, as `first_special` matches them.
+    specials: tuple[str, ...] = ("<bos>", "<eos>", "<start_of_turn>", "<end_of_turn>")
+    special_raises: BaseException | None = None
+    special_calls: list[list[str]] = field(default_factory=list)
 
     name = "fake"
 
@@ -72,6 +76,16 @@ class FakeTokenCounter:
         if self.raises is not None:
             raise self.raises
         return [len(text.split()) for text in texts]
+
+    def first_special(self, texts: Sequence[str]) -> list[str | None]:
+        self.special_calls.append(list(texts))
+        if self.special_raises is not None:
+            raise self.special_raises
+        out: list[str | None] = []
+        for text in texts:
+            hits = [(text.find(t), -len(t), t) for t in self.specials if t in text]
+            out.append(min(hits)[2] if hits else None)
+        return out
 
 
 @dataclass
@@ -1880,3 +1894,183 @@ def test_a_decision_without_a_none_option_has_no_thin_calibration_limitation(
     )
 
     assert not any("out-of-scope row(s)" in text for text in result.limitations)
+
+
+# -- the tokenizer's own special tokens in a decision --------------------------------
+
+# Special in Qwen/Qwen3.5-0.8B's tokenizer_config.json at 2fc0636, and in no
+# hand list `decisions.CONTROL_TEXT` holds.
+QWEN35_VISION = ("<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>")
+
+
+def _vision_counter(**kwargs) -> FakeTokenCounter:
+    return FakeTokenCounter(specials=(*FakeTokenCounter().specials, *QWEN35_VISION), **kwargs)
+
+
+def test_a_state_holding_a_special_token_only_the_tokenizer_knows_is_refused(
+    write_jsonl, request_for, questions
+):
+    from litetune.decisions import state_problem
+
+    data = decision_rows()
+    data[5]["prompt"] = "look <|image_pad|> here"
+    assert state_problem(data[5]["prompt"]) is None  # the hand list lets it through
+
+    with pytest.raises(
+        PrepareError, match=r"data.jsonl:6: the decision prompt holds '<\|image_pad\|>'"
+    ):
+        prepare(request_for(write_jsonl(data), questions=questions(), tokens=_vision_counter()))
+
+
+def test_an_option_description_holding_a_special_token_is_refused(
+    write_jsonl, request_for, questions
+):
+    obj = {
+        "question": "Which emotion?",
+        "options": [
+            {"id": "sadness"},
+            {"id": "joy", "description": "<|vision_start|>happy"},
+            {"id": "anger"},
+        ],
+    }
+
+    with pytest.raises(PrepareError, match=r"holds '<\|vision_start\|>'.*reads as a special"):
+        prepare(
+            request_for(
+                write_jsonl(decision_rows()), questions=questions(obj), tokens=_vision_counter()
+            )
+        )
+
+
+def test_the_first_special_token_asked_for_is_of_every_decision_prompt_and_answer(
+    write_jsonl, request_for, questions
+):
+    counter = _vision_counter()
+
+    result = prepare(
+        request_for(write_jsonl(decision_rows()), questions=questions(), tokens=counter)
+    )
+
+    assert result.decision is not None
+    (asked,) = counter.special_calls
+    assert len(asked) == 2 * result.n_rows
+    assert set(asked[result.n_rows :]) == {"sadness", "joy", "anger"}
+
+
+def test_a_tokenizer_that_cannot_say_leaves_the_hand_list_and_a_limitation(
+    write_jsonl, request_for, questions
+):
+    from litetune.prepare import SPECIALS_UNCHECKED, TokenCountUnavailable
+
+    counter = _vision_counter(special_raises=TokenCountUnavailable("no tokenizer here"))
+
+    result = prepare(
+        request_for(write_jsonl(decision_rows()), questions=questions(), tokens=counter)
+    )
+
+    assert SPECIALS_UNCHECKED.format(why="no tokenizer here") in result.limitations
+
+
+def test_rows_that_are_not_a_decision_are_not_asked_about_special_tokens(write_jsonl, request_for):
+    counter = _vision_counter()
+
+    prepare(request_for(write_jsonl(rows(40)), tokens=counter))
+
+    assert counter.special_calls == []
+
+
+FAKE_TRANSFORMERS_TOKENIZER = """
+class _Added:
+    def __init__(self, content, special):
+        self.content, self.special = content, special
+
+
+class _Tokenizer:
+    all_special_tokens = ["<|im_end|>", "<|endoftext|>"]
+    added_tokens_decoder = {
+        1: _Added("<|vision_start|>", True),
+        2: _Added("<think>", False),
+        3: _Added("<|vision", True),
+    }
+
+    def __call__(self, text, add_special_tokens=True):
+        return {"input_ids": text.split()}
+
+
+class AutoTokenizer:
+    @staticmethod
+    def from_pretrained(name, **kw):
+        return _Tokenizer()
+"""
+
+
+def test_the_token_script_reports_the_first_special_and_added_special_token(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    from litetune.prepare import _TOKEN_COUNT_SCRIPT
+
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "transformers.py").write_text(FAKE_TRANSFORMERS_TOKENIZER, encoding="utf-8")
+    script = tmp_path / "count.py"
+    script.write_text(_TOKEN_COUNT_SCRIPT, encoding="utf-8")
+    out = tmp_path / "out.json"
+    texts = [
+        "plain",
+        "a <think> b",
+        "x<|vision_start|>y<|im_end|>",
+        "<|endoftext|> then <|vision_start|>",
+    ]
+    spec = tmp_path / "spec.json"
+    spec.write_text(
+        json.dumps({"model": "m", "texts": texts, "specials": True, "out": str(out)}),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(script), str(spec)],
+        env=dict(os.environ, PYTHONPATH=str(fake)),
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    # Not `<think>`, an added token not marked special; at one place the longest.
+    assert json.loads(out.read_text())["specials"] == [
+        None,
+        None,
+        "<|vision_start|>",
+        "<|endoftext|>",
+    ]
+
+
+def test_the_counter_runs_the_script_for_special_tokens_and_for_counts(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    from litetune.prepare import HuggingFaceTokenCounter
+
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "transformers.py").write_text(FAKE_TRANSFORMERS_TOKENIZER, encoding="utf-8")
+
+    class LocalEnv:
+        name = "local"
+        requirements = ()
+
+        def run(self, argv, timeout=None):
+            return subprocess.run(
+                [sys.executable, *argv[1:]],
+                env=dict(os.environ, PYTHONPATH=str(fake)),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+
+    counter = HuggingFaceTokenCounter(model="m", env=LocalEnv(), auto_provision=False)
+
+    assert counter.first_special(["a <|vision_start|>", "b"]) == ["<|vision_start|>", None]
+    assert counter.count(["one two", "three"]) == [2, 1]

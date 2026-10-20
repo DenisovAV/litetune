@@ -87,6 +87,11 @@ GENERIC_QUESTION = "Which option applies?"
 # One list for every family: a split is rendered before the model is fixed
 # (`prepare` without --base-model), and a decision moves between models.
 #
+# This is the fallback. Where a tokenizer is in hand, `prepare` asks it for its
+# own special tokens (`prepare.refuse_tokenizer_specials`), which is
+# authoritative: a tokenizer has specials no hand list holds. `tune`'s own check,
+# `verify` and a `prepare` without --tokenizer have only this list.
+#
 # Gemma 3 and FunctionGemma, the family this direction has measured:
 # `<end_of_turn>`, `<bos>`, `<eos>`, `<pad>`.
 # ChatML, which Qwen 2.5, Qwen 3, Qwen 3.5 and MiniCPM5 close turns with:

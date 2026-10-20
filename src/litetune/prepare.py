@@ -767,6 +767,53 @@ def read_decision_rows(
     return decision, digest, rows
 
 
+SPECIALS_UNCHECKED = (
+    "the tokenizer could not be asked which special tokens the decision's prompts hold ({why}), "
+    "so only litetune's own list of control text (`decisions.CONTROL_TEXT`) was checked, and a "
+    "special token the tokenizer has beyond it would reach the model as a control id"
+)
+
+
+def refuse_tokenizer_specials(
+    rows: Sequence[Row], path: Path, counter: TokenCounter, result: PrepareResult
+) -> None:
+    """Refuse a decision row whose prompt or answer holds one of the tokenizer's special tokens.
+
+    The authoritative check, where a tokenizer is in hand: `decisions.CONTROL_TEXT`
+    is a hand list, the fallback for `tune` and `verify` and for a `prepare` run
+    without --tokenizer, and a tokenizer has specials it does not hold (Qwen
+    3.5's `<|vision_start|>`, `<|image_pad|>`, `<|audio_start|>`: special in
+    Qwen/Qwen3.5-0.8B's tokenizer_config.json at 2fc0636). A rendered decision
+    prompt holds no special token of its own -- the chat template adds them
+    later -- so one here came from a state, the question or an option, and
+    would reach the model as a control id rather than as the text written.
+    Records a limitation, rather than refusing, when the tokenizer cannot answer.
+    """
+    texts = [*(row.prompt for row in rows), *(row.completion for row in rows)]
+    try:
+        found = counter.first_special(texts)
+    except TokenCountUnavailable as exc:
+        logger.warning("could not ask the tokenizer for special tokens: %s", exc)
+        result.limitation(SPECIALS_UNCHECKED.format(why=exc))
+        return
+    if len(found) != len(texts):
+        raise PrepareError(
+            f"the tokenizer answered for {len(found)} of {len(texts)} texts; which special "
+            "tokens the decision's rows hold cannot be checked on a partial answer"
+        )
+    for i, token in enumerate(found):
+        if token is None:
+            continue
+        row = rows[i % len(rows)]
+        where = "prompt" if i < len(rows) else "answer"
+        raise PrepareError(
+            f"{path}:{row.lineno}: the decision {where} holds {token!r}, which the tokenizer "
+            f"{counter.describe().get('tokenizer')!r} reads as a special token, so the model "
+            "would be handed a control id where the text says something else. Remove it from "
+            "the state, the question or the option"
+        )
+
+
 def _count_by_option(decision: Decision, rows: Sequence[Row]) -> dict[str, int]:
     counts = dict.fromkeys(decision.ids, 0)
     for row in rows:
@@ -927,6 +974,14 @@ class TokenCounter(Protocol):
     def count(self, texts: Sequence[str]) -> list[int]:
         """One count per text, in order. Raises `TokenCountUnavailable` if it could not run."""
 
+    def first_special(self, texts: Sequence[str]) -> list[str | None]:
+        """Per text, the tokenizer's special token that occurs first in it, or `None`.
+
+        Special: every token in `all_special_tokens` and every added token its
+        `added_tokens_decoder` marks special. Raises `TokenCountUnavailable` if it
+        could not run.
+        """
+
 
 # Runs inside envs.TRAIN. transformers only -- no torch import -- because the
 # whole point of a separate environment is that the parent never loads either.
@@ -944,11 +999,35 @@ def main() -> int:
 
     kwargs = {"revision": spec["revision"]} if spec.get("revision") else {}
     tok = AutoTokenizer.from_pretrained(spec["model"], **kwargs)
+    if spec.get("specials"):
+        found = [first_special(tok, text) for text in spec["texts"]]
+        Path(spec["out"]).write_text(json.dumps({"specials": found}), encoding="utf-8")
+        return 0
     counts = [len(tok(text, add_special_tokens=False)["input_ids"]) for text in spec["texts"]]
     Path(spec["out"]).write_text(
         json.dumps({"counts": counts, "tokenizer": type(tok).__name__}), encoding="utf-8"
     )
     return 0
+
+
+def special_tokens(tok):
+    """`all_special_tokens`, and every added token `added_tokens_decoder` marks special."""
+    found = {str(t) for t in tok.all_special_tokens}
+    for added in (getattr(tok, "added_tokens_decoder", None) or {}).values():
+        if getattr(added, "special", False):
+            found.add(str(added.content))
+    found.discard("")
+    return found
+
+
+def first_special(tok, text):
+    """The special token that starts earliest in `text`, the longest at one place."""
+    best = None
+    for token in special_tokens(tok):
+        at = text.find(token)
+        if at >= 0 and (best is None or (at, -len(token)) < (best[0], -len(best[1]))):
+            best = (at, token)
+    return best[1] if best else None
 
 
 if __name__ == "__main__":
@@ -983,6 +1062,24 @@ class HuggingFaceTokenCounter:
         }
 
     def count(self, texts: Sequence[str]) -> list[int]:
+        payload = self._run(texts, specials=False)
+        counts = [int(c) for c in payload["counts"]]
+        if len(counts) != len(texts):
+            raise TokenCountUnavailable(
+                f"the tokenizer returned {len(counts)} counts for {len(texts)} texts"
+            )
+        return counts
+
+    def first_special(self, texts: Sequence[str]) -> list[str | None]:
+        payload = self._run(texts, specials=True)
+        found = payload.get("specials")
+        if not isinstance(found, list) or len(found) != len(texts):
+            raise TokenCountUnavailable(
+                f"the tokenizer returned no special token per text for {len(texts)} texts"
+            )
+        return [None if f is None else str(f) for f in found]
+
+    def _run(self, texts: Sequence[str], specials: bool) -> dict[str, Any]:
         if self.auto_provision:
             try:
                 self.env.provision()
@@ -1004,6 +1101,7 @@ class HuggingFaceTokenCounter:
                         "model": self.model,
                         "revision": self.revision,
                         "texts": list(texts),
+                        "specials": specials,
                         "out": str(out),
                     }
                 ),
@@ -1031,14 +1129,8 @@ class HuggingFaceTokenCounter:
                     f"the tokenizer was {reading.describe('the data')} without counts: "
                     f"{(proc.stderr or '').strip()[-300:] or 'no stderr'}"
                 )
-            payload = json.loads(out.read_text(encoding="utf-8"))
-
-        counts = [int(c) for c in payload["counts"]]
-        if len(counts) != len(texts):
-            raise TokenCountUnavailable(
-                f"the tokenizer returned {len(counts)} counts for {len(texts)} texts"
-            )
-        return counts
+            payload: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+        return payload
 
 
 @dataclass(frozen=True)
@@ -1725,6 +1817,9 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 DECISION_TYPE_LESS_MEASURED.format(kind=kind, measured=TYPE_MEASURED[kind])
             )
     events.metric("rows", len(rows), source=str(request.data))
+
+    if decision is not None and request.tokens is not None:
+        refuse_tokenizer_specials(rows, request.data, request.tokens, result)
 
     # -- lengths -----------------------------------------------------------
     measured: list[LengthStats] = []

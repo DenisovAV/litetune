@@ -2217,6 +2217,9 @@ def test_prepare_feeds_tune_feeds_bundle(trainer, tmp_path):
         def count(self, texts):
             return [len(text.split()) for text in texts]
 
+        def first_special(self, texts):
+            return [None for _ in texts]
+
     declarations = tmp_path / "tools.json"
     declarations.write_text(
         json.dumps(
