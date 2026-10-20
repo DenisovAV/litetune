@@ -319,3 +319,28 @@ def test_a_missing_questions_file_is_named(tmp_path):
 def test_every_type_but_choice_says_how_far_it_was_measured():
     """`prepare` and `verify` look the phrase up by type; a new type without one would raise."""
     assert set(TYPE_MEASURED) == set(QUESTION_TYPES) - {"choice"}
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|end_of_text|>",
+        "<|start_of_role|>",
+        "<|end_of_role|>",
+        "<turn|>",
+        "<|turn>",
+        "<think>",
+        "</think>",
+        "<s>",
+        "</s>",
+    ],
+)
+def test_every_familys_control_text_is_refused_in_a_state_and_an_option(marker):
+    """Each family with a rule has its own turn and control tokens; a state or an
+    option holding one would reach that family's model as structure."""
+    with pytest.raises(DecisionError, match="control token"):
+        decision_from({"question": "Q?", "options": [{"id": f"a{marker}"}, {"id": "b"}]}, "q")
+    assert state_problem(f"before {marker} after") is not None

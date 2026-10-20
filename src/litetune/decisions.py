@@ -80,10 +80,52 @@ ANSWER_LINE = "Answer with the id of one option."
 GENERIC_QUESTION = "Which option applies?"
 
 # Text that a template or a tokenizer reads as structure rather than as words:
-# the turn markers `prompt_mode` recognises, and Gemma 3's own control tokens,
-# the one family this direction has measured. A state or an option carrying one
-# would close the user turn early in one renderer and not in the other.
-CONTROL_TEXT = tuple(dict.fromkeys((*TURN_MARKERS, "<end_of_turn>", "<bos>", "<eos>", "<pad>")))
+# the turn markers `prompt_mode` recognises, and each family's own control
+# tokens, for every family with a rule in `models.RULES`. A state or an option
+# carrying one would close the user turn early in one renderer and not in the
+# other, or reach the model as a control token rather than as the text written.
+# One list for every family: a split is rendered before the model is fixed
+# (`prepare` without --base-model), and a decision moves between models.
+#
+# Gemma 3 and FunctionGemma, the family this direction has measured:
+# `<end_of_turn>`, `<bos>`, `<eos>`, `<pad>`.
+# ChatML, which Qwen 2.5, Qwen 3, Qwen 3.5 and MiniCPM5 close turns with:
+# `<|im_start|>` (in `TURN_MARKERS`) and `<|im_end|>`, in each of their
+# templates under tests/fixtures; `<|endoftext|>` is the Qwen tokenizers'
+# `pad_token` (`metrics.TERMINATORS` lists it too).
+# Qwen 3, Qwen 3.5 and MiniCPM5 templates write reasoning between `<think>`
+# and `</think>` (tests/fixtures/qwen3-0.6b-c1899de.chat_template.jinja,
+# qwen3.5-0.8b-2fc0636, minicpm5-1b-87179e5).
+# Granite 4.1: `<|start_of_role|>`, `<|end_of_role|>` and `<|end_of_text|>`,
+# its BOS and EOS (tests/fixtures/granite-4.1-3b-c065040.chat_template.jinja;
+# `models.RULES`, the granite-4.1 rule).
+# MiniCPM5: `<s>` and `</s>`, its tokenizer's `bos_token` and `eos_token`
+# (openbmb/MiniCPM5-1B's tokenizer_config.json at 87179e5, read 2026-10-20);
+# its template prints the `bos_token` first
+# (tests/fixtures/minicpm5-1b-87179e5.chat_template.jinja).
+# Gemma 4: `<|turn>` (in `TURN_MARKERS`) and `<turn|>`, which closes its turn
+# (`models._gemma4`'s stop tokens).
+CONTROL_TEXT = tuple(
+    dict.fromkeys(
+        (
+            *TURN_MARKERS,
+            "<end_of_turn>",
+            "<bos>",
+            "<eos>",
+            "<pad>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<think>",
+            "</think>",
+            "<|start_of_role|>",
+            "<|end_of_role|>",
+            "<|end_of_text|>",
+            "<s>",
+            "</s>",
+            "<turn|>",
+        )
+    )
+)
 
 # The keys a decision has: in `--questions`, in `decision.json`, in the checkpoint's
 # record, and first in the bundle's section, which adds how the options were scored.
