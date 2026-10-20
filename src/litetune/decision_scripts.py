@@ -8,7 +8,8 @@ row, flushed as it is scored, and a report.
 **The reference** (`REFERENCE_SCRIPT`, `envs.TRAIN`) is the scorer the
 option-scoring measurements of 2026-10-15 and 2026-10-16 ran: float32, eager
 attention, TF32 off, on the GPU when there is one and `LITETUNE_DEVICE` allows
-it. Each row's prompt is rendered as `tune` trains it, and every option is
+it. Each row's prompt is rendered as `tune` trains it, by the same
+`prompt_mode.RENDERING_SOURCE`, pasted in, and every option is
 scored as its id followed by the turn terminator, teacher-forced, every token's
 log-probability kept. One forward over the prompt keeps its cache, and the
 options go in batches over copies of it. On the first row each way of passing
@@ -42,7 +43,10 @@ that `verify` can check the two sides scored the same prompt.
 
 from __future__ import annotations
 
-REFERENCE_SCRIPT = r'''
+from litetune.prompt_mode import RENDERING_SOURCE
+
+REFERENCE_SCRIPT = (
+    r'''
 """Float32 per-token option scores for each row. Spec: argv[1]. See litetune.decision_scripts."""
 import copy
 import json
@@ -54,7 +58,9 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 VARIANTS = ("cache_position+position_ids", "position_ids", "plain")
-
+'''
+    + RENDERING_SOURCE
+    + r"""
 
 def main():
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
@@ -87,10 +93,9 @@ def main():
     state = {"variant": None}
 
     def render(prompt):
-        text = tok.apply_chat_template(
-            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
-        )
-        return tok(text, add_special_tokens=False)["input_ids"]
+        # As `tune` trained it: a decision is trained runtime_rendered.
+        text, add_special = render_prompt(tok, prompt, True)
+        return tok(text, add_special_tokens=add_special)["input_ids"]
 
     def head_logp(hidden):
         logits = model.lm_head(hidden).float()
@@ -229,7 +234,8 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-'''
+"""
+)
 
 
 ENGINE_SCRIPT = r'''
