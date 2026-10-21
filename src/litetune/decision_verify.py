@@ -456,6 +456,10 @@ class DecisionVerify:
     # The family rule's `engine_per_prompt_reason`: option scoring rewinds
     # within one session, which no Engine of its own per prompt can make safe.
     engine_per_prompt_reason: str = ""
+    # The family rule's `decision_twin_tolerance`, and why, for a family whose
+    # float32 bundle is measured further from its model than `TWIN_TOLERANCE`.
+    twin_tolerance: float = TWIN_TOLERANCE
+    twin_tolerance_reason: str = ""
     # The family rule that claims the checkpoint, `None` for none. Only
     # `prepare.DECISION_FAMILY` has had the scoring method measured on it without
     # a float twin.
@@ -619,6 +623,11 @@ def verify_decision(
                 f"task only: {' and '.join(measured)}, on an emotion question with six options "
                 "(2026-10-20); the float twin checks the runtime's method on this checkpoint"
             )
+    if job.twin_tolerance != TWIN_TOLERANCE:
+        state.limitations.append(
+            f"the float twin is held to {job.twin_tolerance} nats per token, not "
+            f"{TWIN_TOLERANCE}: {job.twin_tolerance_reason}"
+        )
     if job.calibration is None:
         return refuse(
             CALIBRATION_CHECK,
@@ -1187,9 +1196,9 @@ def _twin_check(
             worst = max(worst, max(abs(x - y) for x, y in zip(a, b, strict=True)))
     detail = (
         f"largest per-token difference {worst:.2e} nats on {n} rows, every option, in mode "
-        f"{mode!r} (refused above {TWIN_TOLERANCE})"
+        f"{mode!r} (refused above {job.twin_tolerance})"
     )
     observed = {"max_abs_token": worst, "rows": n, "mode": mode}
-    return (Check.passed if worst <= TWIN_TOLERANCE else Check.failed)(
+    return (Check.passed if worst <= job.twin_tolerance else Check.failed)(
         TWIN_CHECK, detail, observed=observed
     )

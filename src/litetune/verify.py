@@ -969,7 +969,7 @@ def _verify_decision(
     run: _Run,
     events: EventStream,
 ) -> VerifyResult:
-    from litetune.decision_verify import DecisionVerify, verify_decision
+    from litetune.decision_verify import TWIN_TOLERANCE, DecisionVerify, verify_decision
 
     # What a generative run reads and this one does not: refused by name rather
     # than dropped, so that no manifest records a gate or a mode nobody applied.
@@ -996,6 +996,8 @@ def _verify_decision(
         model=request.model,
         reference=request.reference,
         engine_per_prompt_reason=rules.engine_per_prompt_reason if rules else "",
+        twin_tolerance=(rules.decision_twin_tolerance if rules else None) or TWIN_TOLERANCE,
+        twin_tolerance_reason=rules.decision_twin_tolerance_reason if rules else "",
         family=rules.family if rules else None,
         heldout=request.data,
         calibration=request.calibration,

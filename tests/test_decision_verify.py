@@ -32,6 +32,7 @@ from litetune.decision_verify import (
     RUNTIME_CHECK,
     TARGETS_CHECK,
     TWIN_CHECK,
+    TWIN_TOLERANCE,
     TYPE_LESS_MEASURED,
     DecisionVerify,
     run_script,
@@ -571,6 +572,59 @@ def test_a_float_twin_that_drifts_is_a_harness_failure(split, tmp_path):
     assert status == "failed_harness"
     assert check(fields, TWIN_CHECK)["outcome"] == "failed"
     assert "1.00e-02" in check(fields, TWIN_CHECK)["detail"]
+
+
+def _drifting_twin(by):
+    calls = {"n": 0}
+
+    def drifting(index, prompt, option, ids):
+        base = default_scores(index, prompt, option, ids)
+        return [base[0] + by, *base[1:]] if calls["n"] else base
+
+    eng = FakeScoringEnv("runtime", scores=drifting)
+    real_run = eng.run
+
+    def counting(argv, timeout=None, env=None):
+        proc = real_run(argv, timeout, env)
+        calls["n"] += 1
+        return proc
+
+    eng.run = counting
+    return eng
+
+
+@pytest.mark.parametrize(("drift", "outcome"), [(0.02, "passed"), (0.06, "failed")])
+def test_a_family_tolerance_holds_the_twin_to_its_own_bound_and_says_why(
+    split, tmp_path, drift, outcome
+):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(
+        s,
+        tmp_path,
+        float_twin=twin,
+        runtime_env=_drifting_twin(drift),
+        twin_tolerance=5e-2,
+        twin_tolerance_reason="measured so",
+    )
+
+    _, fields = run(job, s["record"])
+
+    assert check(fields, TWIN_CHECK)["outcome"] == outcome
+    assert "refused above 0.05" in check(fields, TWIN_CHECK)["detail"]
+    said = [t for t in fields["limitations"] if "the float twin is held to 0.05" in t]
+    assert len(said) == 1 and said[0].endswith("measured so")
+
+
+def test_the_default_tolerance_says_nothing_about_a_tolerance(split, tmp_path):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+
+    _, fields = run(job_for(s, tmp_path, float_twin=twin, family="qwen-3"), s["record"])
+
+    assert not any("the float twin is held to" in t for t in fields["limitations"])
 
 
 def test_another_runtime_without_a_twin_cannot_be_called_correct(split, tmp_path):
@@ -1772,6 +1826,12 @@ def test_run_verify_hands_the_rules_engine_per_prompt_reason_over(
     model.write_bytes(b"bundle")
     run_verify(VerifyRequest(model=model, reference=str(cp), data=tmp_path / "heldout.jsonl"))
     assert bool(seen["job"].engine_per_prompt_reason) is needs
+    if needs:
+        assert seen["job"].twin_tolerance == 5e-2
+        assert "2.65e-02" in seen["job"].twin_tolerance_reason
+    else:
+        assert seen["job"].twin_tolerance == TWIN_TOLERANCE
+        assert seen["job"].twin_tolerance_reason == ""
     assert seen["job"].family == ("qwen-3.5" if needs else "gemma-3-text")
 
 

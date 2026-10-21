@@ -372,6 +372,13 @@ class ModelRules:
     # (`decision_verify.METHOD_FRESH_ENGINE`), and its section says so.
     engine_per_prompt_reason: str = ""
 
+    # The largest per-token difference, in nats, a decision's float twin may
+    # have from the reference, for a family whose float32 bundle is measured
+    # further from its model than `decision_verify.TWIN_TOLERANCE`; `None` for
+    # that tolerance. The reason says what measured it, and `verify` records it.
+    decision_twin_tolerance: float | None = None
+    decision_twin_tolerance_reason: str = ""
+
     def matches(self, text: str) -> bool:
         return any(re.search(pattern, text) for pattern in self.patterns)
 
@@ -528,6 +535,17 @@ _ENGINE_PER_PROMPT_REASON = (
     "it. verify builds an Engine for every "
     "prompt and closes it before the next, which costs an engine load per prompt and is "
     "recorded in the manifest"
+)
+
+_QWEN35_TWIN_REASON = (
+    "Qwen 3.5's float32 bundle is further from the model than its float32 PyTorch is. On the "
+    "four twin rows of a tuned Qwen3.5-0.8B (2026-10-21, 60 option tokens) the runtime, on an "
+    "Engine per option, was up to 2.65e-02 nats per token from a float64 reference, where "
+    "PyTorch in float32 was 1.2e-05 from it on a GPU and 2.7e-05 on a CPU; on Qwen3-0.6B the "
+    "runtime was 3.8e-04 from it. The largest differences were on options' first tokens at "
+    "log-probabilities of -11 to -17, and the six options' normalised probabilities differed by "
+    "at most 1.4e-03. Scoring the same rows with the other prefill mode moved a score by 9.1 "
+    "nats, which a twin tolerance of 5e-02 still refuses"
 )
 
 _NO_CONTAINER_NOT_ESTABLISHED = (
@@ -1198,6 +1216,8 @@ RULES: tuple[ModelRules, ...] = (
         ),
         canonical_template=QWEN35_CANONICAL_TEMPLATE,
         engine_per_prompt_reason=_ENGINE_PER_PROMPT_REASON,
+        decision_twin_tolerance=5e-2,
+        decision_twin_tolerance_reason=_QWEN35_TWIN_REASON,
     ),
     ModelRules(
         family="qwen-3",

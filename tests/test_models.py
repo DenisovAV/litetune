@@ -2145,3 +2145,17 @@ def test_the_qwen35_rule_offers_its_edited_template():
         reason = plan.rules.required_flags[0].reason
         assert "google-ai-edge/LiteRT-LM#3166" in reason
         assert "Qwen/Qwen3.5-0.8B's own, byte for byte" in reason
+
+
+def test_only_qwen35_holds_a_decision_twin_to_its_own_tolerance():
+    from litetune import models
+
+    loose = {r.family: r for r in models.RULES if r.decision_twin_tolerance is not None}
+    assert set(loose) == {"qwen-3.5"}
+    assert loose["qwen-3.5"].decision_twin_tolerance == 5e-2
+    assert loose["qwen-3.5"].decision_twin_tolerance_reason
+    assert all(
+        not r.decision_twin_tolerance_reason
+        for r in models.RULES
+        if r.decision_twin_tolerance is None
+    )
