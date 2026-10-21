@@ -72,16 +72,17 @@ VARIANTS = ("cache_position+position_ids", "position_ids", "plain")
     + r"""
 
 def head_transform(config):
-    # What a causal LM's own forward does to lm_head's output, which the scoring
-    # below calls directly: Granite divides by `logits_scaling`
-    # (transformers 5.16.1 modeling_granite.py:497), Gemma 2 and 3 soft-cap with
-    # `final_logit_softcapping` on their config, and Gemma 4 with the one on its
-    # text config (modeling_gemma4.py:2587).
+    # What the bundle's head does to lm_head's output, which the scoring below
+    # calls directly: Granite divides by `logits_scaling`
+    # (transformers 5.16.1 modeling_granite.py:497), and a config with
+    # `final_logit_softcapping` at its top soft-caps. Gemma 4's forward soft-caps
+    # with the one on its text config (modeling_gemma4.py:2587), but its exported
+    # bundle does not: on 2026-10-20 a gemma-4-E2B float twin was 5.5e-05 nats from
+    # the uncapped head and 3.13e+01 from the capped one. The reference follows the
+    # bundle, and the cached paths, which read the capped forward, fail their trial.
     text = config.get_text_config() if hasattr(config, "get_text_config") else config
     scale = getattr(config, "logits_scaling", None) or getattr(text, "logits_scaling", None)
-    cap = getattr(text, "final_logit_softcapping", None)
-    if cap is None:
-        cap = getattr(config, "final_logit_softcapping", None)
+    cap = getattr(config, "final_logit_softcapping", None)
     return scale, cap
 
 

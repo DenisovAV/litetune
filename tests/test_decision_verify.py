@@ -2198,10 +2198,11 @@ print(json.dumps(out))
 
 
 def test_the_reference_scores_through_each_familys_own_logit_transform(tmp_path):
-    """lm_head's output is what the scoring reads, and a causal LM's own forward
-    changes it: Granite divides by logits_scaling, Gemma soft-caps, Gemma 4 from
-    its text config. Without them a Granite or Gemma 4 reference disagrees with
-    its own float twin."""
+    """lm_head's output is what the scoring reads, and the bundle's head changes
+    it: Granite divides by logits_scaling, a top-level final_logit_softcapping
+    soft-caps. Gemma 4's text-config cap is in its forward but not in its bundle,
+    so the reference leaves it out; with it a Gemma 4 reference disagrees with its
+    own float twin, as without the division a Granite one does."""
     import math
     import os
     import sys
@@ -2225,7 +2226,7 @@ def test_the_reference_scores_through_each_familys_own_logit_transform(tmp_path)
     assert out["granite"] == [10.0, None]
     assert out["gemma3"] == [None, None]
     assert out["gemma2"] == [None, 30.0]
-    assert out["gemma4"] == [None, 30.0]
+    assert out["gemma4"] == [None, None]
     assert out["plain"] == [None, None]
     assert out["granite_value"] == 2.5
     assert out["capped_value"] == math.tanh(2.0) * 30.0
@@ -2233,8 +2234,9 @@ def test_the_reference_scores_through_each_familys_own_logit_transform(tmp_path)
 
 def test_every_head_the_reference_scores_through_goes_through_the_transform():
     """The scoring reads lm_head's output in one place, `head_logp`; the other paths
-    read the model's own forward, which applies the transform itself. So the one
-    place must apply it, and must take it from the model's config."""
+    read the model's own forward, and a variant trial against `head_logp` decides
+    whether they are used. So the one place must apply the transform, and must
+    take it from the model's config."""
     from litetune.decision_scripts import REFERENCE_SCRIPT
 
     assert REFERENCE_SCRIPT.count("model.lm_head(") == 1
