@@ -1374,6 +1374,86 @@ difference between two models. Neither run scored its untuned base, so neither r
 a training gain, as none of the five banking77 models before them does. No conversion cost resolves, as for the smaller sizes
 on 0.17.1 and 0.18.0.
 
+## Three more families: Granite 4.1, MiniCPM5 and Qwen 3.5
+
+`ibm-granite/granite-4.1-3b` @ `c0650403`, 3,402,836,480 parameters,
+`openbmb/MiniCPM5-1B` @ `87179e5c`, 1,080,632,832, `Qwen/Qwen3.5-0.8B` @
+`2fc06364`, 752,393,024, and `Qwen/Qwen3.5-2B` @ `15852e8c`, 1,881,825,088, run
+on 2026-10-20 with the code that first claims them in the `granite-4.1`,
+`minicpm5` and `qwen-3.5` rules, before it was merged. Qwen3.5-0.8B and granite
+ran every stage at 382925e; MiniCPM5 and Qwen3.5-2B at 1d6dee8, which adds the
+start-token check below. Both report 0.5.1. From 1d6dee8 to the branch's head
+only the decision path changed, and `rendering.py`'s runtime-ids script moved
+into a shared function with the same body.
+
+The task, the rows, the recipe and the environments are the previous section's:
+the same 2,400 training and 600 held-out rows of split `0c7505b2b6f69ab1`,
+`--scorer exact-text`, prompt mode `runtime_rendered`. On all eight verifies the
+runtime and the reference rendered identical token ids on all 600 prompts.
+Trained parameters 31,129,600 (granite), 11,206,656 (MiniCPM5), 6,389,760 and
+10,911,744 (Qwen3.5); final loss 0.3506, 0.4297, 0.4143 and 0.3502.
+
+| | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
+|---|---|---|---|
+| granite-4.1-3b, fine-tuned | **0.7800** ±0.0331 | 0.7883 ±0.0327 | 0.7783 ±0.0332 |
+| Cost of conversion | — | −0.0083 ±0.0135 *(unresolved, 17 discordant)* | +0.0017 ±0.0057 *(unresolved, 3 discordant)* |
+| MiniCPM5-1B, fine-tuned | **0.7167** ±0.0361 | 0.7067 ±0.0364 | 0.7167 ±0.0361 |
+| Cost of conversion | — | +0.0100 ±0.0122 *(unresolved, 14 discordant)* | +0.0000 ±0.0092 *(unresolved, 8 discordant)* |
+| Qwen3.5-0.8B, fine-tuned | **0.7800** ±0.0331 | 0.7767 ±0.0333 | 0.7917 ±0.0325 |
+| Cost of conversion | — | +0.0033 ±0.0113 *(unresolved, 12 discordant)* | **−0.0117** ±0.0098 *(resolved, 9 discordant)* |
+| Qwen3.5-2B, fine-tuned | **0.8000** ±0.0320 | 0.7833 ±0.0330 | 0.7967 ±0.0322 |
+| Cost of conversion | — | **+0.0167** ±0.0122 *(resolved, 14 discordant)* | +0.0033 ±0.0046 *(unresolved, 2 discordant)* |
+
+On litert-lm 0.18.0. Sizes are 3,693,186,992 and 3,693,645,952 bytes for
+granite, 1,098,211,248 and 1,098,440,832 for MiniCPM5, 1,036,844,976 and
+1,037,303,936 for Qwen3.5-0.8B, 2,424,750,064 and 2,425,209,040 for Qwen3.5-2B.
+The untuned bases were not scored.
+
+**Two costs resolve, in opposite directions.** Qwen3.5-0.8B's `weight_only`
+file scored above its float reference, on 9 discordant rows; Qwen3.5-2B's
+`dynamic` file scored below its own, on 14. Each is one run's paired interval,
+and neither says which way the next checkpoint will go.
+
+**Each rule's template holds a conversation.** granite composes the checkpoint's
+own template behind the text-parts block (`composed`). MiniCPM5 and both Qwen 3.5
+sizes pack LiteRT-LM v0.18.0's canonical template with litetune's edits
+(`litert-lm-v0.18.0-minicpm5-litetune.jinja`,
+`litert-lm-v0.18.0-qwen3_5-litetune.jinja`), each chosen after its single-turn
+renderings matched the checkpoint's. Every bundle passed the conversation check
+after export, and on litert-lm-api 0.18.0's CPU backend each `dynamic_wi8_afp32`
+bundle answered three messages in one `Conversation` and two held-out prompts in
+another.
+
+**MiniCPM5's first convert refused, and was right to.** The checkpoint's
+template prints `<s>`; the runtime hands a template an empty `bos_token` and
+puts the bundle's start token in front of what it renders. At 382925e `convert`
+compared single turns without that start token and could not check them. The
+litetune template now prints `{{- bos_token -}}`, and the single-turn check
+predicts the start token the exporter will write, renders with it in front, and
+reads it back from the bundle afterwards (`<s>` for MiniCPM5).
+
+**A shared Engine carries Qwen 3.5's state from one prompt into the next**
+(LiteRT-LM#3165). The first 50 held-out prompts through `verify`'s own driver
+script on the `dynamic` Qwen3.5-0.8B file, against a process per prompt, which
+shares nothing:
+
+| | Qwen3.5-0.8B, prompts answered otherwise | Qwen3-0.6B, the control |
+|---|---|---|
+| one Engine for every prompt | 22 of 50 (2,342 s) | 0 of 50 (69 s) |
+| the same, prompts in reverse order | 29 of 50 (2,881 s) | 0 of 50 (52 s) |
+| an Engine per prompt | **0 of 50** (88 s) | 0 of 50 (81 s) |
+
+The `qwen-3.5` rule therefore has `verify` build an Engine for every prompt
+(0.79-0.92 s each on this CPU), and the eight Qwen 3.5 numbers above were taken
+that way, which is also the faster of the two here. This measures `verify`'s
+driver, not an app.
+
+**LoRA reaches a quarter of Qwen 3.5's attention.** Six of its 24 layers are
+`full_attention` and carry `self_attn.{q,k,v,o}_proj`; the other 18 are
+`linear_attention`, whose projections are not among the seven names `tune`
+targets. The adapter covers every layer's MLP and those six layers' attention:
+96 modules on both sizes.
+
 ## What four bits cost
 
 Everything above is 8-bit, except the Gemma 4 table, whose `dynamic_wi4b32_afp32`
@@ -1820,10 +1900,65 @@ rows:
   than the accuracy did: the four-epoch reference answered otherwise than the
   two-epoch one on 418 of the rows, and was right on 200 of them.
 
+### Every family on emotion
+
+The emotion task again, from the same split, on one or two models of every
+family litetune has a rule for, each from its Hub revision through the same
+five stages with the flags above: prepare, tune, convert, verify with the
+`none` file as `--float-twin`, bundle. Every family but Gemma 3 text needs that
+twin to be verified. Each model ran at `d686851` but Gemma 4, whose reference
+this run showed to be wrong and which ran again at `eab4cf0` (below); the two
+commits differ in nothing else a decision executes. The candidate and the
+reference are as above: the eight-bit file on four threads of the same CPU
+model, the float checkpoint on an A100.
+
+| model @ revision | verify | reference accuracy, 2,000 rows | runtime accuracy, 300 rows | runtime's top option is the reference's | runtime's answer is the reference's | mean KL | ms per decision, median | float twin, largest per-token difference |
+|---|---|---|---|---|---|---|---|---|
+| gemma-3-270m-it @ ac82b4e8 | passed | 0.9335 | 0.9533 | 1.0000 | 0.9933 | 0.0007 | 415.8 | 2.96e-05 |
+| gemma-3-1b-it @ dcc83ea8 | **failed_gate** | 0.9305 | 0.9467 | 0.9933 | 0.9900 | 0.0005 | 935.6 | 7.63e-05 |
+| functiongemma-270m-it @ 39eccb09 | passed | 0.9305 | 0.9567 | 0.9933 | 0.9833 | 0.0014 | 371.8 | 1.79e-04 |
+| gemma-4-E2B-it @ 3e22461f | passed | 0.9405 | 0.9600 | 0.9967 | 0.9933 | 0.0005 | 1069.8 | 5.50e-05 |
+| Qwen3-0.6B @ c1899de2 | passed | 0.9380 | 0.9467 | 0.9900 | 0.9833 | 0.0013 | 1497.8 | 3.80e-04 |
+| Qwen3-1.7B @ 70d244cc | passed | 0.9395 | 0.9567 | 0.9967 | 0.9900 | 0.0006 | 2084.6 | 1.05e-04 |
+| Qwen2.5-0.5B-Instruct @ 7ae55760 | passed | 0.9330 | 0.9467 | 1.0000 | 0.9933 | 0.0004 | 550.5 | 5.96e-05 |
+| Qwen2.5-1.5B-Instruct @ 989aa798 | passed | 0.9335 | 0.9533 | 0.9900 | 0.9867 | 0.0007 | 1332.8 | 2.43e-04 |
+| MiniCPM5-1B @ 87179e5c | passed | 0.9355 | 0.9600 | 1.0000 | 0.9867 | 0.0006 | 921.5 | 1.23e-04 |
+| granite-4.1-3b @ c0650403 | passed | 0.9325 | 0.9567 | 0.9967 | 0.9933 | 0.0003 | 2836.4 | 7.35e-05 |
+| Qwen3.5-0.8B @ 2fc06364 | **failed_harness** | 0.9295 | 0.9433 | 0.9967 | 0.9867 | 0.0005 | 39642.9 | 2.65e-02 |
+
+- Every family but Qwen 3.5 had its options scored by rewinding one session,
+  the method measured on Gemma 3, and every one of their twins was within
+  3.80e-04 nats of the reference, under the 1e-3 the check allows.
+- gemma-3-1b was refused by the abstain rule, not by the runtime: the
+  reference was wrong on 0.0629 of the 1,971 held-out rows it answered, a 95 %
+  lower bound of 0.0541 against the 0.05 the threshold was fitted to keep. The
+  runtime agreed with it as closely as every other model's did.
+- Gemma 4's forward soft-caps lm_head's output at 30, with the
+  `final_logit_softcapping` of its text config; its exported bundle does not.
+  A reference that applied the cap differed from the float twin by up to
+  3.13e+01 nats per token and was refused; without it, by 5.50e-05. The
+  reference follows the bundle. Greedy text is the same either way, since the
+  cap keeps the order of the logits; sampled text is not.
+- The seven other models a first run measured at an earlier commit, `e59d7bc`,
+  gave the same status, accuracies, agreements, mean KL and twin difference
+  again at `d686851`, field for field. ms per decision moved by up to 15 %
+  (gemma-3-1b: 816.5, then 935.6).
+- Qwen3.5-0.8B was refused at `d686851` by the float twin alone: the
+  runtime agreed with the reference as closely as the other models did, but the
+  twin differed from it by up to 2.65e-02 nats per token, above the 1e-3 the
+  check then allowed. On the same rows PyTorch in float32 was within 2.7e-05 of
+  a float64 reference and the bundle was 2.65e-02 from it, so the difference is
+  the exported bundle's own arithmetic; `39ba2c2` holds this family's twin to
+  5e-02 and says so in the manifest. Its verify at that commit has not
+  finished, and this row is to be replaced by it. Each option is scored on an
+  Engine of its own (`fresh_engine`, LiteRT-LM#3165): this verify loaded an
+  Engine 1,813 times, and a decision took 39.6 s.
+
 ### Limitations carried by the decision numbers
 
 - One training run per task and epoch count, on one model, one recipe and the
-  CPU backend of one CPU model. No phone has run a decision.
+  CPU backend of one CPU model; on the other families, one task, emotion. No
+  phone's numbers are reported here.
 - The temperature, and for emotion the threshold, were fitted on the
   reference's calibration scores and are applied to the runtime's.
 - The runtime scored 300 of each task's held-out rows. The reference scored

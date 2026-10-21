@@ -99,10 +99,12 @@ CUDA comparison or completed MPS `verify` run has been measured here. Bring
 your own checkpoint and skip the first two steps, or bring a `.litertlm` and
 its float checkpoint and run only `verify`.
 
-> **Alpha.** Measured end to end on eight models: `google/functiongemma-270m-it`
+> **Alpha.** Measured end to end on twelve models: `google/functiongemma-270m-it`
 > with the tool-call scorer, and `google/gemma-3-270m-it`,
 > `google/gemma-3-1b-it`, `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`,
-> `Qwen/Qwen2.5-0.5B-Instruct`, `Qwen/Qwen2.5-1.5B-Instruct` and
+> `Qwen/Qwen2.5-0.5B-Instruct`, `Qwen/Qwen2.5-1.5B-Instruct`,
+> `Qwen/Qwen3.5-0.8B`, `Qwen/Qwen3.5-2B`, `openbmb/MiniCPM5-1B`,
+> `ibm-granite/granite-4.1-3b` and
 > `google/gemma-4-E2B-it` with `exact-text` on the same 77-way intent task —
 > every headline candidate evaluated on LiteRT-LM's CPU backend, and two Qwen3
 > artifacts also evaluated on a phone's CPU and GPU,
@@ -110,15 +112,13 @@ its float checkpoint and run only `verify`.
 > Qwen3.5's rule hands the exporter LiteRT-LM's Qwen 3.5 chat template, edited
 > so that it renders a single turn as the checkpoint's own does, needs a
 > `transformers` floor, and gives every prompt `verify` scores an Engine of its
-> own (google-ai-edge/LiteRT-LM#3165); no export with that template has run yet,
-> and it has no quality number. MiniCPM5-1B and
-> granite-4.1-3b have rules that no export has exercised yet. Gemma 4 exports once you name the variant
+> own (google-ai-edge/LiteRT-LM#3165). Gemma 4 exports once you name the variant
 > — `E2B` or `E4B` — because the chat template override is per-variant; a bare
 > `gemma-4` is refused rather than guessed at, and the refusal names the flag
 > to pass if you want to choose the template yourself. It carries two numbers
 > the others do not: an earlier conversion cost measured on its untouched base
 > weights, which used prompts listing all 77 labels and so does not sit beside
-> the seven above it, and a comparison of two LoRA runs that differ only in
+> the eleven above it, and a comparison of two LoRA runs that differ only in
 > which projections they adapt — the seven litetune names against the two peft
 > would have chosen, which is 24 points apart. On a multimodal checkpoint
 > litetune keeps a LoRA run inside the text tower; `tune` says so in its own
@@ -647,14 +647,19 @@ of writing; until it ships, that call throws `DeciderUnsupportedException`.
 
 What has and has not been measured:
 
-- Decisions are trained and measured on `google/gemma-3-270m-it` only.
-  Another Gemma 3 text model, and a model of any other family litetune has a
-  rule for, is accepted with a limitation saying it was not measured; for
-  another family `verify` also needs `--float-twin`, since the runtime's
-  scoring method was measured on Gemma 3 only. A model with no family rule is
-  refused. Qwen 3.5, whose rule gives every prompt an Engine of its own, has
-  each option scored on an Engine of its own, never rewound, which costs an
-  Engine load per option; the section tells the decider so. `choice`
+- Decisions are trained and measured on several tasks on
+  `google/gemma-3-270m-it`, and on one task, emotion with six options, on
+  `gemma-3-1b-it`, `functiongemma-270m-it`, `gemma-4-E2B-it`, Qwen3 0.6B and
+  1.7B, Qwen2.5 0.5B and 1.5B Instruct, `MiniCPM5-1B` and `granite-4.1-3b`.
+  Each passed `verify` but `gemma-3-1b-it`, whose abstain rule was wrong on
+  more held-out rows than its budget allowed
+  ([MEASUREMENTS.md](MEASUREMENTS.md#every-family-on-emotion)). Another model
+  of a family litetune has a rule for is accepted with a limitation saying
+  which of its family's models were measured; for every family but Gemma 3
+  text `verify` also needs `--float-twin`, which checks the runtime's scoring
+  method on the checkpoint. A model with no family rule is refused. Qwen3.5-0.8B's run was refused by its
+  float twin at a bound this release relaxes for the family; its verify at the
+  new bound has not finished. `choice`
   questions have been measured on several tasks, `noul` on two and `score` on
   one. As `noul`,
   SST-2's eight-bit bundle answered as the reference did on 0.9767 of 300 rows
@@ -1116,23 +1121,24 @@ withdrawn after re-measurement.
   phone runs.
   [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) says
   which is which.
-- **Measured on eight models, all eight fine-tuned here.**
+- **Measured on twelve models, all twelve fine-tuned here.**
   `functiongemma-270m-it` with the tool-call scorer, and `gemma-3-270m-it`,
   `gemma-3-1b-it`, `Qwen3-0.6B`, `Qwen3-1.7B`, `Qwen2.5-0.5B-Instruct`,
-  `Qwen2.5-1.5B-Instruct` and `gemma-4-E2B-it` with `exact-text`, each with a conversion
+  `Qwen2.5-1.5B-Instruct`, `Qwen3.5-0.8B`, `Qwen3.5-2B`, `MiniCPM5-1B`,
+  `granite-4.1-3b` and `gemma-4-E2B-it` with `exact-text`, each with a conversion
   cost against its own float twin. Only FunctionGemma also has a training gain:
   no banking77 run has an untuned base figure to subtract — Gemma 3 270M's base
   was run and refused to score, the 1B's and Qwen2.5 0.5B's scored 0.0000 on
   both sides, Qwen3 0.6B's never reached the base step at all, the Qwen3 1.7B
-  and Qwen2.5 1.5B runs did not score one, and Gemma 4's tuned run records no
+  and Qwen2.5 1.5B runs did not score one, nor did the Qwen3.5, MiniCPM5 and
+  granite runs, and Gemma 4's tuned run records no
   base figure either — and every one of those manifests
   records the gain as unavailable. `gemma-4-E2B-it` carries a second,
   earlier run as well: two conversions of its untouched base weights against
   the float reference, on prompts that list all 77 labels rather than the
-  prompts the tuned runs use, so that figure is not comparable with the seven
+  prompts the tuned runs use, so that figure is not comparable with the eleven
   above it.
-  Qwen3.5, MiniCPM5-1B and granite-4.1-3b have rules that no export has
-  exercised yet, and a Gemma 4 without its variant
+  A Gemma 4 without its variant
   is still refused unless you supply the template override yourself.
 - **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
   the liveness checks both trim against a fixed set of strings, recorded
@@ -1301,7 +1307,7 @@ Wiring `|| exit 1` on anything non-zero throws all of this away.
 ## Contributing
 
 Issues and pull requests welcome, particularly measurements on models other
-than the eight above — that is the gap this alpha most needs closed.
+than the twelve above — that is the gap this alpha most needs closed.
 
 Run the checks with `pytest`, `ruff check`, `ruff format --check` and `mypy src`.
 

@@ -92,7 +92,7 @@ GENERIC_QUESTION = "Which option applies?"
 # authoritative: a tokenizer has specials no hand list holds. `tune`'s own check,
 # `verify` and a `prepare` without --tokenizer have only this list.
 #
-# Gemma 3 and FunctionGemma, the family this direction has measured:
+# Gemma 3 and FunctionGemma:
 # `<end_of_turn>`, `<bos>`, `<eos>`, `<pad>`.
 # ChatML, which Qwen 2.5, Qwen 3, Qwen 3.5 and MiniCPM5 close turns with:
 # `<|im_start|>` (in `TURN_MARKERS`) and `<|im_end|>`, in each of their

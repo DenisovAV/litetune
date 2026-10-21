@@ -36,7 +36,7 @@ void main() {
   });
 
   test('measured-model copy covers every card and names the variant', () {
-    expect(WhyItExists.measured, hasLength(8));
+    expect(WhyItExists.measured, hasLength(12));
     expect(Formats.measuredQualifier, contains('Gemma 4 E2B'));
     expect(
       WhyItExists.measured.map((model) => model.name),

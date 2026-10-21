@@ -65,8 +65,8 @@ class Formats extends StatelessComponent {
 
   static const measuredQualifier =
       ' — measured end to end on FunctionGemma, Gemma 3 270M, Gemma 3 1B, '
-      'Qwen3 0.6B and 1.7B, Qwen2.5 0.5B and 1.5B Instruct and Gemma 4 E2B '
-      'so far';
+      'Qwen3 0.6B and 1.7B, Qwen2.5 0.5B and 1.5B Instruct, Qwen3.5 0.8B '
+      'and 2B, MiniCPM5 1B, Granite 4.1 3B and Gemma 4 E2B so far';
 
   @override
   Component build(BuildContext context) {
