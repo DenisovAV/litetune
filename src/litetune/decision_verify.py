@@ -56,7 +56,7 @@ from litetune.decisions import (
 )
 from litetune.events import EventStream
 from litetune.metrics import paired_difference
-from litetune.prepare import DECISION_FAMILY
+from litetune.prepare import DECISION_FAMILY, DECISION_MEASURED_ONCE
 from litetune.storage import hash_file
 
 logger = logging.getLogger(__name__)
@@ -457,7 +457,8 @@ class DecisionVerify:
     # within one session, which no Engine of its own per prompt can make safe.
     engine_per_prompt_reason: str = ""
     # The family rule that claims the checkpoint, `None` for none. Only
-    # `prepare.DECISION_FAMILY` has had the scoring method measured on it.
+    # `prepare.DECISION_FAMILY` has had the scoring method measured on it without
+    # a float twin.
     family: str | None = None
     # What `verify` was asked that the decision path does not do: refused rather
     # than ignored, so a manifest never records a role or a limit nobody applied.
@@ -600,16 +601,24 @@ def verify_decision(
             return refuse(
                 TWIN_CHECK,
                 f"this checkpoint's family is {job.family or 'one litetune has no rule for'}, "
-                "and the runtime's option-scoring method was measured against PyTorch on "
-                f"{DECISION_FAMILY} only (2026-10-16). On another family a decision is "
-                "verified with --float-twin, which checks the method on this checkpoint: "
-                "convert with --recipe none as well and pass that file",
+                "and the runtime's option-scoring method was measured against PyTorch without "
+                f"a float twin on {DECISION_FAMILY} only (2026-10-16). On another family a "
+                "decision is verified with --float-twin, which checks the method on this "
+                "checkpoint: convert with --recipe none as well and pass that file",
             )
-        state.limitations.append(
-            f"decisions by option scoring have not been trained or measured on {job.family}; "
-            "the float twin checks the runtime's method on this checkpoint, and nothing here "
-            "measures how well the family answers such a question"
-        )
+        measured = DECISION_MEASURED_ONCE.get(job.family or "")
+        if measured is None:
+            state.limitations.append(
+                f"decisions by option scoring have not been trained or measured on {job.family}; "
+                "the float twin checks the runtime's method on this checkpoint, and nothing here "
+                "measures how well the family answers such a question"
+            )
+        else:
+            state.limitations.append(
+                f"decisions by option scoring on {job.family} were trained and verified for one "
+                f"task only: {' and '.join(measured)}, on an emotion question with six options "
+                "(2026-10-20); the float twin checks the runtime's method on this checkpoint"
+            )
     if job.calibration is None:
         return refuse(
             CALIBRATION_CHECK,

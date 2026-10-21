@@ -5100,6 +5100,7 @@ def test_a_decision_for_every_family_with_a_rule_trains_and_says_what_is_unmeasu
     tmp_path, request_for, trainer, model, family
 ):
     from litetune.models import identify
+    from litetune.prepare import DECISION_MEASURED_ONCE
 
     assert identify(model).family == family
     data, decision = _decision_split(tmp_path)
@@ -5117,6 +5118,8 @@ def test_a_decision_for_every_family_with_a_rule_trains_and_says_what_is_unmeasu
     assert len(said) == 1
     if family == "gemma-3-text":
         assert "is a Gemma 3 text model, the family decisions were measured on" in said[0]
+    elif family in DECISION_MEASURED_ONCE:
+        assert f"is {family}, a family decisions by option scoring were trained and" in said[0]
     else:
         assert f"is {family}, a family decisions by option scoring have not been" in said[0]
         assert "--float-twin" in said[0]

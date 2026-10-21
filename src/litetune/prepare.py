@@ -169,20 +169,33 @@ DECLARATIONS_NOT_COUNTED = (
 OPTIONS_CHECK = "every option has a training row"
 
 # The one family whose decisions have been trained and scored by option
-# scoring: google/gemma-3-270m-it, on 2026-10-15, as four models on three tasks (6 to 151 options).
-# Every other family with a rule in `models.RULES` is accepted with a limitation
-# saying so (`DECISION_FAMILY_UNMEASURED`), and `verify` asks it for a float twin.
+# scoring on several tasks: google/gemma-3-270m-it, on 2026-10-15, as four models
+# on three tasks (6 to 151 options). Every other family with a rule in
+# `models.RULES` is accepted with a limitation, and `verify` asks it for a float twin.
 DECISION_FAMILY = "gemma-3-text"
 DECISION_MEASURED_MODEL = "google/gemma-3-270m-it"
+
+# The families whose decisions were trained and passed `verify`, float twin
+# included, on one task: an emotion question with six options, 2,000 held-out
+# rows, on 2026-10-20 and 21 (MEASUREMENTS.md). They are accepted with
+# `DECISION_FAMILY_MEASURED_ONCE`, every other one with `DECISION_FAMILY_UNMEASURED`.
+DECISION_MEASURED_ONCE = {
+    "functiongemma": ("google/functiongemma-270m-it",),
+    "gemma-4-e2b": ("google/gemma-4-E2B-it",),
+    "qwen-3": ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B"),
+    "qwen-2.5": ("Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"),
+    "granite-4.1": ("ibm-granite/granite-4.1-3b",),
+    "minicpm5": ("openbmb/MiniCPM5-1B",),
+}
 
 # Out-of-scope calibration rows below which the threshold rule answers none of them.
 THIN_CALIBRATION_OOS = 10
 
 DECISION_MODEL_UNNAMED = (
     "no --base-model was named, so the model this split trains was not checked. Decisions by "
-    f"option scoring have been trained and measured on {DECISION_MEASURED_MODEL} only; this "
-    "stage refuses a named model litetune has no family rule for, and says so for a named "
-    "model of another family"
+    f"option scoring have been trained and measured on several tasks on {DECISION_MEASURED_MODEL} "
+    "only; this stage refuses a named model litetune has no family rule for, and says what was "
+    "measured for a named model of another family"
 )
 
 DECISION_INFERRED = (
@@ -210,6 +223,14 @@ DECISION_FAMILY_UNMEASURED = (
     "whether the runtime's scoring method holds on its caches, and its accuracy and cost are not "
     "measured. `verify` refuses its decision without --float-twin, the float32 export that "
     "checks the method on it"
+)
+
+DECISION_FAMILY_MEASURED_ONCE = (
+    "{model} is {family}, a family decisions by option scoring were trained and verified on "
+    "for one task only: {measured}, on an emotion question with six options (2026-10-20). "
+    "Other tasks, option counts and models of the family are not measured. `verify` refuses "
+    "its decision without --float-twin, the float32 export that checks the runtime's scoring "
+    "method on the checkpoint"
 )
 
 DECISION_NO_RULE = (
@@ -251,6 +272,10 @@ def decision_model_limitation(model: str) -> str | None:
     rules = identify(model)
     if rules is None or rules.config_only:
         return None
+    if (measured := DECISION_MEASURED_ONCE.get(rules.family)) is not None:
+        return DECISION_FAMILY_MEASURED_ONCE.format(
+            model=model, family=rules.family, measured=" and ".join(measured)
+        )
     if rules.family != DECISION_FAMILY:
         return DECISION_FAMILY_UNMEASURED.format(model=model, family=rules.family)
     if not is_measured_decision_model(model):

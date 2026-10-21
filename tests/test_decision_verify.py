@@ -2077,11 +2077,24 @@ def test_another_family_without_a_float_twin_is_refused_before_anything_runs(
 
     assert status == "failed_harness"
     detail = failed(fields, TWIN_CHECK)["detail"]
-    assert "measured against PyTorch on gemma-3-text only" in detail and "--float-twin" in detail
+    assert "without a float twin on gemma-3-text only" in detail and "--float-twin" in detail
     assert job.train_env.specs == [] and job.runtime_env.specs == []
 
 
 def test_another_family_with_a_float_twin_is_measured_and_says_it_is_unmeasured(split, tmp_path):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(s, tmp_path, family="qwen-3.5", float_twin=twin)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert check(fields, TWIN_CHECK)["outcome"] == "passed"
+    assert any("have not been trained or measured on qwen-3.5" in t for t in fields["limitations"])
+
+
+def test_a_family_measured_on_one_task_says_which_models_and_which_task(split, tmp_path):
     s = split()
     twin = tmp_path / "twin.litertlm"
     twin.write_bytes(b"float")
@@ -2090,8 +2103,10 @@ def test_another_family_with_a_float_twin_is_measured_and_says_it_is_unmeasured(
     status, fields = run(job, s["record"])
 
     assert status == "passed", fields["checks"]
-    assert check(fields, TWIN_CHECK)["outcome"] == "passed"
-    assert any("have not been trained or measured on qwen-3" in t for t in fields["limitations"])
+    said = [t for t in fields["limitations"] if "on qwen-3 were trained and verified" in t]
+    assert len(said) == 1
+    assert "Qwen/Qwen3-0.6B and Qwen/Qwen3-1.7B" in said[0] and "six options" in said[0]
+    assert not any("have not been trained or measured on" in t for t in fields["limitations"])
 
 
 def test_the_measured_family_says_nothing_about_being_unmeasured(split, tmp_path):

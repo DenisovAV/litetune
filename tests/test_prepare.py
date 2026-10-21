@@ -1656,16 +1656,11 @@ def test_a_decision_split_for_a_checkpoint_only_its_config_names_is_refused(
 @pytest.mark.parametrize(
     ("model", "family"),
     [
-        (FUNCTIONGEMMA, "functiongemma"),
         ("google/gemma-4-E4B-it", "gemma-4-e4b"),
-        ("Qwen/Qwen3-1.7B", "qwen-3"),
-        ("Qwen/Qwen2.5-0.5B-Instruct", "qwen-2.5"),
         ("Qwen/Qwen3.5-0.8B", "qwen-3.5"),
-        ("openbmb/MiniCPM5-1B", "minicpm5"),
-        ("ibm-granite/granite-4.1-3b", "granite-4.1"),
     ],
 )
-def test_a_decision_split_for_another_family_is_written_with_a_limitation(
+def test_a_decision_split_for_an_unmeasured_family_is_written_with_a_limitation(
     write_jsonl, request_for, questions, model, family
 ):
     from litetune.prepare import DECISION_FAMILY_UNMEASURED
@@ -1676,6 +1671,36 @@ def test_a_decision_split_for_another_family_is_written_with_a_limitation(
 
     assert result.decision is not None
     assert DECISION_FAMILY_UNMEASURED.format(model=model, family=family) in result.limitations
+
+
+@pytest.mark.parametrize(
+    ("model", "family", "measured"),
+    [
+        (FUNCTIONGEMMA, "functiongemma", "google/functiongemma-270m-it"),
+        ("google/gemma-4-E2B-it", "gemma-4-e2b", "google/gemma-4-E2B-it"),
+        ("Qwen/Qwen3-1.7B", "qwen-3", "Qwen/Qwen3-0.6B and Qwen/Qwen3-1.7B"),
+        (
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "qwen-2.5",
+            "Qwen/Qwen2.5-0.5B-Instruct and Qwen/Qwen2.5-1.5B-Instruct",
+        ),
+        ("openbmb/MiniCPM5-1B", "minicpm5", "openbmb/MiniCPM5-1B"),
+        ("ibm-granite/granite-4.1-3b", "granite-4.1", "ibm-granite/granite-4.1-3b"),
+    ],
+)
+def test_a_decision_split_for_a_family_measured_on_one_task_says_which_models(
+    write_jsonl, request_for, questions, model, family, measured
+):
+    from litetune.prepare import DECISION_FAMILY_MEASURED_ONCE, DECISION_FAMILY_UNMEASURED
+
+    result = prepare(
+        request_for(write_jsonl(decision_rows()), questions=questions(), base_model=model)
+    )
+
+    assert result.decision is not None
+    said = DECISION_FAMILY_MEASURED_ONCE.format(model=model, family=family, measured=measured)
+    assert said in result.limitations
+    assert DECISION_FAMILY_UNMEASURED.format(model=model, family=family) not in result.limitations
 
 
 def test_what_was_and_was_not_measured_is_said_per_model(write_jsonl, request_for, questions):
