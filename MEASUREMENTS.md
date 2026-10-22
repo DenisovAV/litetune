@@ -1951,13 +1951,55 @@ model, the float checkpoint on an A100.
   reference and the bundle 2.65e-02 from it, so the difference is the exported
   bundle's own arithmetic. Each option is scored on an
   Engine of its own (`fresh_engine`, LiteRT-LM#3165): this verify loaded an
-  Engine 1,813 times, and a decision took 39.6 s.
+  Engine 1,813 times, and a decision took a median of 39,766.0 ms.
+
+### The three passing bundles on a phone
+
+The bundles verify passed for emotion, SST-2 and SST-5 above, the same files,
+scored on a Galaxy S24 (`SC-51E`, SM8650, Android 16) through Firebase Test
+Lab, on its CPU (four threads) and on its GPU. The phone ran verify's runtime
+scoring, ported step for step to LiteRT-LM 0.18.0's C API (`libLiteRtLm.so`
+from flutter_gemma's native-v0.18.0-a build), on the same 300 held-out rows
+and the same prompt ids, and its scores were compared with the server
+runtime's and the reference's with litetune 0.5.1's own functions. The port is
+not part of litetune, and a decider in an app may score otherwise. The server
+column is the verify that bundled each file; SST-5's is litetune 0.5.0's, whose
+median of 390.9 ms differs from the 394.9 of `b49aaab`'s run above with the
+same scores.
+
+| | emotion | SST-2 | SST-5 |
+|---|---|---|---|
+| runtime's top option is the reference's: server / phone CPU / phone GPU | 1.0000 / 1.0000 / 0.9967 | 0.9767 / 0.9867 / 0.9967 | 0.9567 / **0.9433** / **0.9433** |
+| phone's top option is the server's, of 300: CPU / GPU | 300 / 299 | 295 / 294 | 286 / 284 |
+| ms per decision, median: server / CPU / GPU | 370.1 / 437.3 / 697.2 | 235.4 / 291.0 / 405.3 | 390.9 / 499.7 / 356.4 |
+| engine init: CPU / GPU | 0.831 s / 5.171 s | 0.957 s / 4.451 s | 1.024 s / 4.117 s |
+| peak RSS of the test process: CPU / GPU | 1,135,532 / 680,180 kB | 1,146,528 / 676,756 kB | 1,141,700 / 681,624 kB |
+
+- No phone option score equalled the server's but one, and none of the
+  paired accuracy differences, phone against server or against the reference,
+  resolved: every 95 % interval contains 0. The self-check picked `once` on
+  both backends for every bundle, as on the server, and a repeat session gave
+  bit-identical scores on all 300 rows.
+- SST-5 is under verify's 0.95 floor on both backends, and its disagreements
+  are near-ties. Its reference's best level led its second by under 0.2 nats
+  on 54 of the 300 rows, where emotion's did on 2 and SST-2's on 5. Every row
+  on which the server or the phone's CPU chose otherwise than the reference
+  was among those 54 (13 and 17 rows), and 14 of the GPU's 17; its other three
+  had margins of 0.2813, 0.3059 and 0.6728 nats. On the 246 rows with a margin
+  of at least 0.2 nats the server and the phone's CPU agreed with the
+  reference on all, the GPU on 0.9878.
+- The GPU was faster than the CPU on SST-5 and slower on emotion and SST-2.
+  A repeat of the GPU emotion session took a median of 435.8 ms, with the same
+  scores; why the first was slower was not measured. Engine init includes
+  writing a weight cache: every session was a fresh install.
+- Not measured: thermal state and clock frequencies, GPU memory, another phone
+  model, the NPU, and reading the section out of the file on the phone.
 
 ### Limitations carried by the decision numbers
 
 - One training run per task and epoch count, on one model, one recipe and the
-  CPU backend of one CPU model; on the other families, one task, emotion. No
-  phone's numbers are reported here.
+  CPU backend of one CPU model; on the other families, one task, emotion. One
+  phone, for three of the tasks, above.
 - The temperature, and for emotion the threshold, were fitted on the
   reference's calibration scores and are applied to the runtime's.
 - The runtime scored 300 of each task's held-out rows. The reference scored
