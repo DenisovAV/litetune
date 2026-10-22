@@ -669,12 +669,16 @@ What has and has not been measured:
   ([MEASUREMENTS.md](MEASUREMENTS.md#decisions-a-model-that-chooses-among-options)).
 - It needs training on the task: the untuned model, and a model trained on
   other tasks, chose far worse.
-- Scoring is measured on the CPU backend, and against the float reference on
-  LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561 fix only. On
-  another runtime, `verify` needs `--float-twin` to say more than "could not
-  check".
+- `verify` measures scoring on the CPU backend, and against the float
+  reference on LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561
+  fix only. On another runtime, `verify` needs `--float-twin` to say more than
+  "could not check". One phone, a Galaxy S24, scored three bundles on its CPU
+  and GPU with a port of verify's runtime scoring: SST-5's agreed with the
+  reference on 0.9433 of the rows on both, under the 0.95 floor, on rows whose
+  best two levels were near-ties
+  ([MEASUREMENTS.md](MEASUREMENTS.md#the-three-passing-bundles-on-a-phone)).
 - A decision costs one scoring pass per option, so the cost grows with the
-  option count, and no phone has run it yet. On CLINC150 (150 intents), a
+  option count. On CLINC150 (150 intents), a
   frozen embedding model with a linear head was more accurate (0.954 against
   0.903); with 55 options the difference was not resolved.
 - Without out-of-scope rows (`label: null`) in the calibration split, the
