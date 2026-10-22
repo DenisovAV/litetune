@@ -1924,7 +1924,7 @@ model, the float checkpoint on an A100.
 | Qwen2.5-1.5B-Instruct @ 989aa798 | passed | 0.9335 | 0.9533 | 0.9900 | 0.9867 | 0.0007 | 1332.8 | 2.43e-04 |
 | MiniCPM5-1B @ 87179e5c | passed | 0.9355 | 0.9600 | 1.0000 | 0.9867 | 0.0006 | 921.5 | 1.23e-04 |
 | granite-4.1-3b @ c0650403 | passed | 0.9325 | 0.9567 | 0.9967 | 0.9933 | 0.0003 | 2836.4 | 7.35e-05 |
-| Qwen3.5-0.8B @ 2fc06364 | **failed_harness** | 0.9295 | 0.9433 | 0.9967 | 0.9867 | 0.0005 | 39642.9 | 2.65e-02 |
+| Qwen3.5-0.8B @ 2fc06364 | passed | 0.9295 | 0.9433 | 0.9967 | 0.9867 | 0.0005 | 39766.0 | 2.65e-02 |
 
 - Every family but Qwen 3.5 had its options scored by rewinding one session,
   the method measured on Gemma 3, and every one of their twins was within
@@ -1943,14 +1943,13 @@ model, the float checkpoint on an A100.
   gave the same status, accuracies, agreements, mean KL and twin difference
   again at `d686851`, field for field. ms per decision moved by up to 15 %
   (gemma-3-1b: 816.5, then 935.6).
-- Qwen3.5-0.8B was refused at `d686851` by the float twin alone: the
-  runtime agreed with the reference as closely as the other models did, but the
-  twin differed from it by up to 2.65e-02 nats per token, above the 1e-3 the
-  check then allowed. On the same rows PyTorch in float32 was within 2.7e-05 of
-  a float64 reference and the bundle was 2.65e-02 from it, so the difference is
-  the exported bundle's own arithmetic; `39ba2c2` holds this family's twin to
-  5e-02 and says so in the manifest. Its verify at that commit has not
-  finished, and this row is to be replaced by it. Each option is scored on an
+- Qwen3.5-0.8B's row is its verify at `39ba2c2`, which holds this family's
+  twin to 5e-02 nats per token and says so in the manifest. At `d686851`,
+  under the 1e-3 every other family is held to, the same checkpoint was
+  refused by the twin alone, with the same accuracies, agreements and mean KL. On
+  the twin's rows PyTorch in float32 was within 2.7e-05 of a float64
+  reference and the bundle 2.65e-02 from it, so the difference is the exported
+  bundle's own arithmetic. Each option is scored on an
   Engine of its own (`fresh_engine`, LiteRT-LM#3165): this verify loaded an
   Engine 1,813 times, and a decision took 39.6 s.
 

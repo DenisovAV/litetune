@@ -2145,13 +2145,15 @@ def test_another_family_with_a_float_twin_is_measured_and_says_it_is_unmeasured(
     s = split()
     twin = tmp_path / "twin.litertlm"
     twin.write_bytes(b"float")
-    job = job_for(s, tmp_path, family="qwen-3.5", float_twin=twin)
+    job = job_for(s, tmp_path, family="gemma-4-e4b", float_twin=twin)
 
     status, fields = run(job, s["record"])
 
     assert status == "passed", fields["checks"]
     assert check(fields, TWIN_CHECK)["outcome"] == "passed"
-    assert any("have not been trained or measured on qwen-3.5" in t for t in fields["limitations"])
+    assert any(
+        "have not been trained or measured on gemma-4-e4b" in t for t in fields["limitations"]
+    )
 
 
 def test_a_family_measured_on_one_task_says_which_models_and_which_task(split, tmp_path):

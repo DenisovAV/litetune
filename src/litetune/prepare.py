@@ -186,6 +186,7 @@ DECISION_MEASURED_ONCE = {
     "qwen-2.5": ("Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"),
     "granite-4.1": ("ibm-granite/granite-4.1-3b",),
     "minicpm5": ("openbmb/MiniCPM5-1B",),
+    "qwen-3.5": ("Qwen/Qwen3.5-0.8B",),
 }
 
 # Out-of-scope calibration rows below which the threshold rule answers none of them.

@@ -650,16 +650,15 @@ What has and has not been measured:
 - Decisions are trained and measured on several tasks on
   `google/gemma-3-270m-it`, and on one task, emotion with six options, on
   `gemma-3-1b-it`, `functiongemma-270m-it`, `gemma-4-E2B-it`, Qwen3 0.6B and
-  1.7B, Qwen2.5 0.5B and 1.5B Instruct, `MiniCPM5-1B` and `granite-4.1-3b`.
+  1.7B, Qwen2.5 0.5B and 1.5B Instruct, `MiniCPM5-1B`, `granite-4.1-3b` and
+  `Qwen3.5-0.8B`.
   Each passed `verify` but `gemma-3-1b-it`, whose abstain rule was wrong on
   more held-out rows than its budget allowed
   ([MEASUREMENTS.md](MEASUREMENTS.md#every-family-on-emotion)). Another model
   of a family litetune has a rule for is accepted with a limitation saying
   which of its family's models were measured; for every family but Gemma 3
   text `verify` also needs `--float-twin`, which checks the runtime's scoring
-  method on the checkpoint. A model with no family rule is refused. Qwen3.5-0.8B's run was refused by its
-  float twin at a bound this release relaxes for the family; its verify at the
-  new bound has not finished. `choice`
+  method on the checkpoint. A model with no family rule is refused. `choice`
   questions have been measured on several tasks, `noul` on two and `score` on
   one. As `noul`,
   SST-2's eight-bit bundle answered as the reference did on 0.9767 of 300 rows

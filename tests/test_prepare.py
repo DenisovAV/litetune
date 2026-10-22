@@ -1655,10 +1655,7 @@ def test_a_decision_split_for_a_checkpoint_only_its_config_names_is_refused(
 
 @pytest.mark.parametrize(
     ("model", "family"),
-    [
-        ("google/gemma-4-E4B-it", "gemma-4-e4b"),
-        ("Qwen/Qwen3.5-0.8B", "qwen-3.5"),
-    ],
+    [("google/gemma-4-E4B-it", "gemma-4-e4b")],
 )
 def test_a_decision_split_for_an_unmeasured_family_is_written_with_a_limitation(
     write_jsonl, request_for, questions, model, family
@@ -1686,6 +1683,7 @@ def test_a_decision_split_for_an_unmeasured_family_is_written_with_a_limitation(
         ),
         ("openbmb/MiniCPM5-1B", "minicpm5", "openbmb/MiniCPM5-1B"),
         ("ibm-granite/granite-4.1-3b", "granite-4.1", "ibm-granite/granite-4.1-3b"),
+        ("Qwen/Qwen3.5-2B", "qwen-3.5", "Qwen/Qwen3.5-0.8B"),
     ],
 )
 def test_a_decision_split_for_a_family_measured_on_one_task_says_which_models(
