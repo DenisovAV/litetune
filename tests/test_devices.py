@@ -305,13 +305,25 @@ def test_a_budget_of_exactly_one_gib_runs():
     assert policy.variables[HIGH_WATERMARK] == "0.062500"
 
 
-@pytest.mark.parametrize(("level", "name"), [(2, "warn"), (4, "critical")])
-def test_a_mac_under_memory_pressure_is_refused_whatever_is_available(level, name):
+def test_a_mac_at_critical_pressure_is_refused_whatever_is_available():
     with pytest.raises(MpsMemoryRefused) as raised:
-        _policy(available=64 * GIB, pressure=level)
+        _policy(available=64 * GIB, pressure=4)
     message = str(raised.value)
-    assert f"kern.memorystatus_vm_pressure_level is {level} ({name})" in message
+    assert "kern.memorystatus_vm_pressure_level is 4 (critical)" in message
     assert "LITETUNE_DEVICE=cpu" in message
+
+
+def test_a_mac_at_warn_starts_and_the_report_says_the_level_it_started_at():
+    policy = _policy(pressure=2)
+    assert policy.budget == 13 * GIB
+    assert policy.as_dict()["pressure_level"] == 2
+    [said] = policy.limitations
+    assert "kern.memorystatus_vm_pressure_level was 2 (warn)" in said
+    assert "measured no run under warn" in said
+
+
+def test_a_mac_at_normal_pressure_carries_no_pressure_limitation():
+    assert _policy(pressure=1).limitations == []
 
 
 @pytest.mark.parametrize("level", [0, 3, 8])
@@ -388,9 +400,9 @@ def test_the_operators_high_ratio_owns_the_limit_and_skips_the_budget_floor():
     assert policy.limitations == []
 
 
-def test_pressure_is_refused_even_under_the_operators_high_ratio():
-    with pytest.raises(MpsMemoryRefused, match="pressure_level is 2"):
-        _policy({HIGH_WATERMARK: "0.5"}, pressure=2)
+def test_critical_pressure_is_refused_even_under_the_operators_high_ratio():
+    with pytest.raises(MpsMemoryRefused, match="pressure_level is 4"):
+        _policy({HIGH_WATERMARK: "0.5"}, pressure=4)
 
 
 @pytest.mark.parametrize("value", ["0", "0.0", "0.000"])
