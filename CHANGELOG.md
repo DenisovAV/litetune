@@ -3,6 +3,14 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.6.0 — 2026-10-22
+- `tune`, `convert` and `verify` take Qwen3-1.7B and Qwen2.5-1.5B-Instruct, measured on banking77 (#88).
+- Three new families: Granite 4.1, MiniCPM5 and Qwen 3.5, each measured on banking77; `verify` gives a Qwen 3.5 bundle an Engine per prompt, since a shared one leaks state between prompts (#88).
+- A template's single turns are checked with the start token the runtime prepends, so a template that prints its own BOS is converted rather than refused (#88).
+- Decisions are accepted for every family with a rule, and measured on emotion on one or two models of each; `verify` needs `--float-twin` for every family but Gemma 3 text (#88).
+- A decision's states and options are refused when they hold any supported family's control text, or one of the tokenizer's own special tokens when `prepare` has it (#88).
+- The `litetune.decision` section records how the runtime scored the options, `rewind` or `fresh_engine` (#88).
+
 ## 0.5.1 — 2026-10-19
 - `prepare` and `verify` say a `noul` question has been measured on two tasks, not one, and MEASUREMENTS.md adds SST-2 as `noul` and irony trained for four and six epochs, which verify passed where two epochs were refused (#85).
 - `bundle` no longer says it records nothing that was measured beside the measurements `--verify-manifest` put in `report.json`: the limitation is now about the synthesised `manifest.json`, which lists no stages, and the bundle no longer claims a run's record it was not given (#86).
