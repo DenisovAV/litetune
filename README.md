@@ -674,8 +674,9 @@ What has and has not been measured:
   fix only. On another runtime, `verify` needs `--float-twin` to say more than
   "could not check". One phone, a Galaxy S24, scored three bundles on its CPU
   and GPU with a port of verify's runtime scoring: SST-5's agreed with the
-  reference on 0.9433 of the rows on both, under the 0.95 floor, on rows whose
-  best two levels were near-ties
+  reference on 0.9433 of the rows on both, under the 0.95 floor. Every row
+  where its CPU chose otherwise, and 14 of the 17 on its GPU, was one where the
+  reference's best two levels were under 0.2 nats apart
   ([MEASUREMENTS.md](MEASUREMENTS.md#the-three-passing-bundles-on-a-phone)).
 - A decision costs one scoring pass per option, so the cost grows with the
   option count. On CLINC150 (150 intents), a
