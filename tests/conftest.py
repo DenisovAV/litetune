@@ -486,7 +486,22 @@ def _tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False
 
 
 class _Tokenizer:
-    special_tokens_map = {"eos_token": "<|im_end|>", "pad_token": "<|endoftext|>"}
+    # A Qwen-shaped tokenizer by default, which declares no BOS; `_SPECIAL` and
+    # `_ADD_BOS` give the run another, as `run_compose_script` is told.
+    special_tokens_map = _SPECIAL
+    bos_token = _SPECIAL.get("bos_token")
+    bos_token_id = 1 if bos_token else None
+
+    def __call__(self, text, add_special_tokens=True):
+        # Enough of a tokenizer for what the exporter probes: whether the ids
+        # begin with the BOS -- prepended when `add_bos_token` is set, or read
+        # off text that begins with the BOS token's string. 1 is the BOS.
+        ids = [1] if add_special_tokens and _ADD_BOS and self.bos_token else []
+        if self.bos_token and text.startswith(self.bos_token):
+            ids.append(1)
+            text = text[len(self.bos_token) :]
+        ids += [ord(character) + 10 for character in text]
+        return type("Encoding", (), {"input_ids": ids})()
 
     def apply_chat_template(
         self,
@@ -633,6 +648,16 @@ def fifo_released_after(fifo: Path, seconds: float, payload: bytes) -> Iterator[
         raise failures[0]
 
 
+# What transformers hands a template as keywords besides the messages: the
+# tokenizer's special tokens (`special_tokens_map`). Qwen's declare no BOS.
+QWEN_SPECIAL_TOKENS = {"eos_token": "<|im_end|>", "pad_token": "<|endoftext|>"}
+# openbmb/MiniCPM5-1B's tokenizer_config.json at 87179e5: bos `<s>`, eos `</s>`,
+# add_bos_token false.
+MINICPM5_SPECIAL_TOKENS = {"bos_token": "<s>", "eos_token": "</s>"}
+# ibm-granite/granite-4.1-3b's at c065040: the BOS is the EOS, add_bos_token false.
+GRANITE_SPECIAL_TOKENS = {"bos_token": "<|end_of_text|>", "eos_token": "<|end_of_text|>"}
+
+
 def run_compose_script(
     args: Sequence[str],
     timeout: int,
@@ -641,6 +666,8 @@ def run_compose_script(
     hub_files: dict[str, str] | None = None,
     hub_fault: str = "",
     render_raises: str = "",
+    special_tokens: dict[str, str] | None = None,
+    add_bos: bool = False,
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
     """`export._COMPOSE_SCRIPT`, run for real with the host interpreter.
 
@@ -660,7 +687,9 @@ def run_compose_script(
     loads = shim / "loads.jsonl"
     (package / "__init__.py").write_text(
         f"__version__ = {version!r}\n_TEMPLATE = {chat_template!r}\n_LOADS = {str(loads)!r}\n"
-        f"_RAISE = {render_raises!r}\n" + _FAKE_TRANSFORMERS,
+        f"_RAISE = {render_raises!r}\n"
+        f"_SPECIAL = {dict(special_tokens or QWEN_SPECIAL_TOKENS)!r}\n_ADD_BOS = {add_bos!r}\n"
+        + _FAKE_TRANSFORMERS,
         encoding="utf-8",
     )
     hub = shim / "huggingface_hub"

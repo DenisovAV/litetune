@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import run_compose_script
+from conftest import (
+    GRANITE_SPECIAL_TOKENS,
+    MINICPM5_SPECIAL_TOKENS,
+    run_compose_script,
+)
 from minijinja_runtime import MINIJINJA_EDITS, minijinja_render_native
 
 from litetune import export, models, template_checks
@@ -58,6 +62,11 @@ QWEN25 = _fixture("qwen2.5-0.5b-instruct-7ae5576.chat_template.jinja")
 LITERT_QWEN25 = _fixture("litert-lm-v0.18.0-qwen2_5.chat_template.jinja")
 BLOCK = _packaged(models.TEXT_PARTS_BLOCK)
 LITERT_QWEN3 = models.canonical_template_text(models.QWEN3_CANONICAL_TEMPLATE)
+GRANITE = _fixture("granite-4.1-3b-c065040.chat_template.jinja")
+MINICPM5 = _fixture("minicpm5-1b-87179e5.chat_template.jinja")
+QWEN35 = _fixture("qwen3.5-0.8b-2fc0636.chat_template.jinja")
+LITERT_MINICPM5 = _fixture("litert-lm-v0.18.0-minicpm5.chat_template.jinja")
+LITERT_QWEN35 = _fixture("litert-lm-v0.18.0-qwen3_5.chat_template.jinja")
 FUNCTIONGEMMA = _packaged("functiongemma.jinja")
 
 # Every template a check here renders for a bundle, by what it is.
@@ -706,7 +715,7 @@ def test_a_packaged_canonical_template_that_is_not_the_pinned_one_is_refused(
     copy = tmp_path / models.QWEN3_CANONICAL_TEMPLATE
     copy.write_bytes(damage(LITERT_QWEN3).encode("utf-8"))
     monkeypatch.setattr(models, "packaged_template", lambda name: str(tmp_path / name))
-    with pytest.raises(ValueError, match="is not the upstream template its sha256 is pinned to"):
+    with pytest.raises(ValueError, match="is not the template its sha256 is pinned to"):
         models.canonical_template_text(models.QWEN3_CANONICAL_TEMPLATE)
 
 
@@ -737,7 +746,13 @@ def test_every_rule_offering_a_canonical_template_names_a_pinned_one():
 # ---------------------------------------------------------------------------
 
 
-def _compose(tmp_path: Path, checkpoint: str, canonical: str | None) -> dict:
+def _compose(
+    tmp_path: Path,
+    checkpoint: str,
+    canonical: str | None,
+    special: dict | None = None,
+    add_bos: bool = False,
+) -> dict:
     """`export._COMPOSE_SCRIPT` on a checkpoint carrying `checkpoint`: the
     checkpoint's side through transformers -- the conftest fake renders as
     5.16.1 does -- and each candidate through the runtime's renderer."""
@@ -757,7 +772,13 @@ def _compose(tmp_path: Path, checkpoint: str, canonical: str | None) -> dict:
         ),
         encoding="utf-8",
     )
-    proc, _ = run_compose_script(["python", str(script), str(spec), str(result)], 60, checkpoint)
+    proc, _ = run_compose_script(
+        ["python", str(script), str(spec), str(result)],
+        60,
+        checkpoint,
+        special_tokens=special,
+        add_bos=add_bos,
+    )
     assert proc.returncode == 0, proc.stderr
     report = json.loads(result.read_text(encoding="utf-8"))
     assert report["found"] == "text"
@@ -1172,3 +1193,206 @@ def test_a_rendering_reads_as_written(entry, reads):
 def test_a_rendering_in_another_shape_is_refused(entry):
     with pytest.raises(ValueError):
         Rendering.read(entry)
+
+
+def test_granites_own_template_joins_text_parts_with_a_newline(tmp_path):
+    """Why the granite-4.1 rule composes: through the runtime's renderer the
+    checkpoint's template alone prints the two-part cases otherwise than
+    transformers prints the string -- exactly those -- and behind the block it
+    prints every case as transformers does."""
+    renders = _compose(tmp_path, GRANITE, GRANITE)
+    alone = single_turn_differences(renders["reference"], renders["candidates"]["canonical"])
+    assert alone and {d.form for d in alone} == {"two_parts"}
+    assert len(alone) == len(SINGLE_TURNS)
+    assert single_turn_differences(renders["reference"], renders["candidates"]["composed"]) == []
+    assert renders["unvouched"] == {"composed": [], "canonical": []}
+    choice = export._choose_template("m", renders, None)
+    assert choice.source == "composed"
+    assert choice.refusal is None and choice.unchecked is None
+
+
+def test_granites_own_template_holds_every_conversation():
+    assert _breaks(GRANITE) == ([], [])
+
+
+def test_granites_composed_template_holds_every_conversation():
+    assert _breaks(BLOCK + GRANITE) == ([], [])
+
+
+# ---------------------------------------------------------------------------
+# The edited canonical templates: MiniCPM5 and Qwen 3.5
+# ---------------------------------------------------------------------------
+
+EDITED = {
+    "minicpm5": (
+        models.MINICPM5_CANONICAL_TEMPLATE,
+        LITERT_MINICPM5,
+        "c4184e05132f0bc3fda1a39a15775ca41ca5c5f8",
+        "models/minicpm5/chat_template.jinja",
+        MINICPM5,
+    ),
+    "qwen3.5": (
+        models.QWEN35_CANONICAL_TEMPLATE,
+        LITERT_QWEN35,
+        "cb0fb5fc820fc7cb70cfb1f7d507cd1882fed84e",
+        "models/qwen3_5/chat_template.jinja",
+        QWEN35,
+    ),
+}
+
+
+@pytest.mark.parametrize("family", list(EDITED))
+def test_an_edited_template_is_litert_lms_with_exactly_its_listed_edits(family):
+    name, upstream, blob, path, _ = EDITED[family]
+    assert _git_blob(upstream.encode("utf-8")) == blob
+    upstream_sha, edits = models.CANONICAL_EDITS[name]
+    assert hashlib.sha256(upstream.encode("utf-8")).hexdigest() == upstream_sha
+    edited = upstream
+    for text, replacement in edits:
+        assert edited.count(text) == 1, text
+        edited = edited.replace(text, replacement)
+    raw = models.canonical_template_text(name)
+    header, found, body = raw.partition(models.CANONICAL_HEADER_END)
+    assert found and body == edited
+    assert hashlib.sha256(body.encode("utf-8")).hexdigest() == models.CANONICAL_TEMPLATES[name]
+    for fact in (
+        "https://github.com/google-ai-edge/LiteRT-LM",
+        "tag v0.18.0",
+        "b2f686e2ed4718fb84ec398a61dd59ca0f0aff27",
+        path,
+        blob,
+        upstream_sha,
+        "Apache-2.0",
+        "models.CANONICAL_EDITS",
+    ):
+        assert fact in header, fact
+    assert _script("renderer")["edit_for_minijinja"](header) == header
+    assert _render(header + "-#}", [], True) == {"text": ""}
+
+
+@pytest.mark.parametrize("family", list(EDITED))
+def test_a_checkpoints_own_template_is_pinned_as_the_fixture_holds_it(family):
+    name, *_, own = EDITED[family]
+    digest = hashlib.sha256(own.encode("utf-8")).hexdigest()
+    assert list(models.CANONICAL_UPSTREAM[name]) == [digest]
+
+
+def test_litert_lms_minicpm5_template_adds_a_think_block_minicpm5s_does_not(tmp_path):
+    """Why the edit: with enable_thinking undefined LiteRT-LM's adds an empty think
+    block to the generation prompt and the checkpoint's adds nothing -- in exactly
+    those cases -- and the edited one renders every case as the checkpoint's."""
+    renders = _compose(tmp_path, MINICPM5, LITERT_MINICPM5)
+    upstream = single_turn_differences(renders["reference"], renders["candidates"]["canonical"])
+    assert {d.case.context.thinking for d in upstream} == {None}
+    assert len(upstream) == len([c for c in SINGLE_TURNS if c.context.thinking is None]) * 2
+    assert all(d.candidate.text.endswith("<think>\n\n</think>\n\n") for d in upstream)
+    edited = models.canonical_template_text(models.MINICPM5_CANONICAL_TEMPLATE)
+    renders = _compose(tmp_path, MINICPM5, edited)
+    assert single_turn_differences(renders["reference"], renders["candidates"]["canonical"]) == []
+    assert renders["unvouched"]["canonical"] == []
+    choice = export._choose_template("m", renders, models.MINICPM5_CANONICAL_TEMPLATE)
+    assert choice.source == "canonical"
+
+
+def test_minicpm5s_own_template_needs_more_than_the_block(tmp_path):
+    """What the reason says of the checkpoint's template: alone it drops text
+    handed as parts; behind the block the tools cases raise and a reply with a
+    think block breaks the conversation."""
+    alone = _render(MINICPM5, [{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    assert alone["text"] is not None and "hi" not in alone["text"]
+    renders = _compose(tmp_path, MINICPM5, LITERT_MINICPM5)
+    composed = single_turn_differences(renders["reference"], renders["candidates"]["composed"])
+    assert composed and all(d.case.context.tools for d in composed)
+    assert all(d.candidate.text is None for d in composed)
+    breaks, _ = _breaks(BLOCK + MINICPM5)
+    assert breaks and all("think" in b.case.reply.name for b in breaks)
+
+
+def test_litert_lms_qwen35_template_neither_trims_nor_defaults_as_qwen35s_does(tmp_path):
+    renders = _compose(tmp_path, QWEN35, LITERT_QWEN35)
+    upstream = single_turn_differences(renders["reference"], renders["candidates"]["canonical"])
+    undefined = [d for d in upstream if d.case.context.thinking is None]
+    defined = [d for d in upstream if d.case.context.thinking is not None]
+    assert len(undefined) == len([c for c in SINGLE_TURNS if c.context.thinking is None]) * 2
+    assert defined and all(d.case.text != d.case.text.strip() for d in defined)
+    edited = models.canonical_template_text(models.QWEN35_CANONICAL_TEMPLATE)
+    renders = _compose(tmp_path, QWEN35, edited)
+    assert single_turn_differences(renders["reference"], renders["candidates"]["canonical"]) == []
+    assert renders["unvouched"]["canonical"] == []
+    choice = export._choose_template("m", renders, models.QWEN35_CANONICAL_TEMPLATE)
+    assert choice.source == "canonical"
+
+
+def test_qwen35s_own_template_breaks_a_conversation():
+    breaks, refused = _breaks(QWEN35)
+    assert refused == [] and breaks
+    assert any(b.case.reply.name == "a plain reply" and b.case.turns == 2 for b in breaks)
+
+
+@pytest.mark.parametrize("family", list(EDITED))
+def test_an_edited_template_holds_every_conversation(family):
+    name = EDITED[family][0]
+    assert _breaks(models.canonical_template_text(name)) == ([], [])
+
+
+@pytest.mark.parametrize("reply", [" answer ", "answer\n", "\n\nanswer"])
+def test_qwen35s_trim_keeps_the_prefix_for_a_reply_with_whitespace(reply):
+    """The edit trims an assistant reply, as the checkpoint's own template does: the
+    history ending in it and that history with the next message both print it
+    trimmed, so the one is still a prefix of the other -- the invariant the
+    runtime holds a conversation to from its second message."""
+    template = models.canonical_template_text(models.QWEN35_CANONICAL_TEMPLATE)
+    part = lambda text: [{"type": "text", "text": text}]  # noqa: E731
+    history = [
+        {"role": "user", "content": part("hi")},
+        {"role": "assistant", "content": part(reply)},
+    ]
+    before = _render(template, history, False)["text"]
+    after = _render(template, [*history, {"role": "user", "content": part("and?")}], True)["text"]
+    assert after.startswith(before)
+    assert "assistant\nanswer<|im_end|>" in before
+
+
+def test_minicpm5s_bos_is_the_start_token_the_runtime_prepends(tmp_path):
+    """The checkpoint's template prints `{{ bos_token }}`, `<s>`, which training
+    tokenises as the BOS. The runtime hands the template an empty `bos_token` and
+    prepends the bundle's start token instead, which the exporter writes only when
+    the template it is handed prints the BOS (`litert_lm_builder._tokenizer_prepends_bos`).
+    With MiniCPM5-1B's own tokens, the edited template renders every case as the
+    checkpoint's does, the start token included, and is chosen."""
+    edited = models.canonical_template_text(models.MINICPM5_CANONICAL_TEMPLATE)
+    renders = _compose(tmp_path, MINICPM5, edited, MINICPM5_SPECIAL_TOKENS)
+    assert all(r["text"].startswith("<s>") for r in renders["reference"])
+    assert single_turn_differences(renders["reference"], renders["candidates"]["canonical"]) == []
+    assert renders["start_tokens"]["canonical"] == "<s>"
+    choice = export._choose_template("m", renders, models.MINICPM5_CANONICAL_TEMPLATE)
+    assert choice.source == "canonical"
+
+
+def test_litert_lms_minicpm5_template_would_lose_the_bos(tmp_path):
+    """Unedited, LiteRT-LM's template prints no BOS, so the exporter writes no start
+    token and the runtime's prompt lacks the `<s>` training saw: every case differs."""
+    renders = _compose(tmp_path, MINICPM5, LITERT_MINICPM5, MINICPM5_SPECIAL_TOKENS)
+    assert renders["start_tokens"]["canonical"] is None
+    differences = single_turn_differences(renders["reference"], renders["candidates"]["canonical"])
+    assert len(differences) == len(SINGLE_TURNS) * len(FORMS)
+
+
+def test_granites_composed_template_gets_no_start_token(tmp_path):
+    """granite-4.1-3b's BOS is its EOS, its tokenizer prepends none and its template
+    prints none, so no start token is written and none is needed."""
+    renders = _compose(tmp_path, GRANITE, GRANITE, GRANITE_SPECIAL_TOKENS)
+    assert renders["start_tokens"] == {"composed": None, "canonical": None}
+    assert single_turn_differences(renders["reference"], renders["candidates"]["composed"]) == []
+
+
+def test_a_tokenizer_that_prepends_its_bos_gets_a_start_token_whatever_the_template(tmp_path):
+    """The exporter's first probe: a tokenizer whose own tokenisation begins with the
+    BOS (`add_bos_token: true`) gets it as the start token even from a template that
+    prints none -- and then the runtime's prompt begins with a BOS training never saw
+    through that template, so every case differs and the composition is refused."""
+    renders = _compose(tmp_path, QWEN25, None, {"bos_token": "<s>", "eos_token": "</s>"}, True)
+    assert renders["start_tokens"] == {"composed": "<s>"}
+    differences = single_turn_differences(renders["reference"], renders["candidates"]["composed"])
+    assert len(differences) == len(SINGLE_TURNS) * len(FORMS)
+    assert export._choose_template("m", renders, None).refusal is not None

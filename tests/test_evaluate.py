@@ -41,6 +41,7 @@ from litetune.evaluate import (
     assemble_generations,
     bundle_activation_error_of,
     device_mismatch,
+    engine_init_of,
     evaluate,
     gpu_observed,
     gpu_unused,
@@ -2329,10 +2330,14 @@ def test_the_reference_script_renders_the_prompt_with_the_declarations(tmp_path,
 class _FakeRunner:
     """One conversation or session. Records what it was asked."""
 
-    def __init__(self, registry, raise_on):
+    def __init__(self, registry, raise_on, leaks=False):
         self.registry = registry
         self.raise_on = raise_on
         self.closed = False
+        # A model whose state a new runner on the same engine inherits
+        # (google-ai-edge/LiteRT-LM#3165): the answer says how many runners this
+        # engine had served before it.
+        self.inherited = len(registry) if leaks else None
         registry.append(self)
 
     def __enter__(self):
@@ -2345,6 +2350,8 @@ class _FakeRunner:
     def _answer(self, prompt):
         if prompt in self.raise_on:
             raise self.raise_on[prompt]
+        if self.inherited:
+            return f"answer to {prompt} after {self.inherited}"
         return "answer to " + prompt
 
     def run_prefill(self, prompts):
@@ -2366,12 +2373,15 @@ class _FakeEngine:
         self.kwargs = kwargs
         self.runners: list[_FakeRunner] = []
         self.raise_on: dict[str, BaseException] = {}
+        self.leaks = False
         # The fake module, so a test can see whether an engine is open at the
         # moment something else runs.
         self.module = None
 
     def __enter__(self):
         if self.module is not None:
+            # Two at once is what an Engine per prompt must never do.
+            assert not self.module.engine_open, "an engine opened while another was open"
             self.module.engine_open = True
         return self
 
@@ -2381,13 +2391,13 @@ class _FakeEngine:
         return False
 
     def create_session(self, **kwargs):
-        return _FakeRunner(self.runners, self.raise_on)
+        return _FakeRunner(self.runners, self.raise_on, self.leaks)
 
     def create_conversation(self, **kwargs):
-        return _FakeRunner(self.runners, self.raise_on)
+        return _FakeRunner(self.runners, self.raise_on, self.leaks)
 
 
-def _fake_litert_lm(monkeypatch, raise_on=None):
+def _fake_litert_lm(monkeypatch, raise_on=None, leaks=False):
     """A `litert_lm` the script can import, and the engine it hands back."""
     engines: list[_FakeEngine] = []
 
@@ -2415,6 +2425,7 @@ def _fake_litert_lm(monkeypatch, raise_on=None):
     def make_engine(path, backend=None, **kwargs):
         engine = _FakeEngine(path, backend, **kwargs)
         engine.raise_on = raise_on or {}
+        engine.leaks = leaks
         engine.module = module
         engines.append(engine)
         return engine
@@ -2439,8 +2450,10 @@ def _run_script(
     monkeypatch=None,
     engine=None,
     report=None,
+    engine_per_prompt=None,
+    leaks=False,
 ):
-    engines = _fake_litert_lm(monkeypatch, raise_on)
+    engines = _fake_litert_lm(monkeypatch, raise_on, leaks)
     spec = tmp_path / "spec.json"
     out = tmp_path / "out.jsonl"
     spec.write_text(
@@ -2452,6 +2465,11 @@ def _run_script(
                 **(engine if engine is not None else runtime_engine_spec("cpu")),
                 "out": str(out),
                 **({"report": str(report)} if report is not None else {}),
+                **(
+                    {"engine_per_prompt": engine_per_prompt}
+                    if engine_per_prompt is not None
+                    else {}
+                ),
             }
         ),
         encoding="utf-8",
@@ -3801,3 +3819,104 @@ def test_an_mps_reference_leaves_the_parents_environment_as_it_was(monkeypatch):
     HuggingFaceBackend(model="org/model", auto_provision=False).generate(["a"])
 
     assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize("runtime_rendered", [True, False])
+@pytest.mark.parametrize("per_prompt", [False, True])
+def test_an_engine_per_prompt_keeps_one_prompts_state_from_the_next(
+    tmp_path, monkeypatch, runtime_rendered, per_prompt
+):
+    """The harness can tell the two apart: on an engine whose runners inherit
+    state, one engine for the split answers the second and third prompts from
+    what came before, and an engine per prompt -- each closed before the next
+    opens, which the fake asserts -- answers every prompt fresh."""
+    report = tmp_path / "device.json"
+    rows, engines = _run_script(
+        tmp_path,
+        ["one", "two", "three"],
+        runtime_rendered,
+        monkeypatch=monkeypatch,
+        report=report,
+        engine_per_prompt=per_prompt,
+        leaks=True,
+    )
+    texts = [r["text"] for r in rows]
+    init = json.loads(report.read_text(encoding="utf-8"))["engine_init_seconds"]
+    if per_prompt:
+        assert texts == ["answer to one", "answer to two", "answer to three"]
+        assert len(engines) == 3 and all(len(e.runners) == 1 for e in engines)
+        assert len(init) == 3 and all(t >= 0 for t in init)
+        assert engine_init_of({"engine_init_seconds": init})["n"] == 3
+    else:
+        assert texts == ["answer to one", "answer to two after 1", "answer to three after 2"]
+        assert len(engines) == 1
+        assert init is None
+    report_after = json.loads(report.read_text(encoding="utf-8"))
+    assert report_after["after_generation"] is not None
+
+
+def test_the_backend_asks_for_an_engine_per_prompt_only_when_its_rule_does(tmp_path):
+    plain = LiteRtLmBackend(model=tmp_path / "m.litertlm")
+    assert plain.describe()["engine_per_prompt"] is False
+    assert plain.describe()["transport"] == "litert_lm python api, one process per split"
+    fresh = LiteRtLmBackend(model=tmp_path / "m.litertlm", engine_per_prompt_reason="because")
+    described = fresh.describe()
+    assert described["engine_per_prompt"] is True
+    assert described["engine_per_prompt_reason"] == "because"
+    assert described["transport"].endswith(", one engine per prompt")
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        None,
+        {},
+        {"engine_init_seconds": None},
+        {"engine_init_seconds": []},
+        {"engine_init_seconds": [1, "x"]},
+        {"engine_init_seconds": [True]},
+    ],
+)
+def test_init_times_that_are_not_a_list_of_seconds_are_not_reported(report):
+    assert engine_init_of(report) is None
+
+
+def test_init_times_are_summarised():
+    assert engine_init_of({"engine_init_seconds": [1.0, 3.0, 2.0]}) == {
+        "n": 3,
+        "median": 2.0,
+        "max": 3.0,
+        "total": 6.0,
+    }
+
+
+@pytest.mark.parametrize(("reason", "expected"), [("", False), ("state carries over", True)])
+def test_the_script_is_told_to_build_an_engine_per_prompt(tmp_path, monkeypatch, reason, expected):
+    specs: list[dict] = []
+    write = _writes_results([{"index": 0, "text": "a"}, {"index": 1, "text": "b"}])
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        specs.append(json.loads(Path(args[2]).read_text(encoding="utf-8")))
+        return write(self, args, timeout, **kwargs)
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    _litertlm(tmp_path, engine_per_prompt_reason=reason).generate(["one", "two"])
+    assert [spec["engine_per_prompt"] for spec in specs] == [expected]
+
+
+def test_a_split_that_dies_part_way_reports_every_engine_it_built(tmp_path, monkeypatch):
+    report = tmp_path / "device.json"
+    with pytest.raises(MemoryError):
+        _run_script(
+            tmp_path,
+            ["one", "two", "three"],
+            monkeypatch=monkeypatch,
+            report=report,
+            engine_per_prompt=True,
+            raise_on={"two": MemoryError()},
+        )
+    written = json.loads(report.read_text(encoding="utf-8"))
+    assert len(written["engine_init_seconds"]) == 2
+    assert [
+        json.loads(line)["index"] for line in (tmp_path / "out.jsonl").read_text().splitlines()
+    ] == [0]

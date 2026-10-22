@@ -32,6 +32,7 @@ from litetune.decision_verify import (
     RUNTIME_CHECK,
     TARGETS_CHECK,
     TWIN_CHECK,
+    TWIN_TOLERANCE,
     TYPE_LESS_MEASURED,
     DecisionVerify,
     run_script,
@@ -80,6 +81,10 @@ def default_scores(index: int, prompt: str, option: str, ids: list[int]) -> list
 
 BOS = 2
 
+# What each family's recorded end-of-turn ids decode to: gemma-3-270m-it's
+# (E5's record, below), and ChatML's and Granite's, with made-up ids.
+VOCAB = {106: TERM, 107: "\n", 151645: "<|im_end|>", 100257: "<|end_of_text|>"}
+
 
 def prompt_ids(prompt: str) -> list[int]:
     """A stand-in for the runtime's tokenisation of a rendered prompt, without the BOS."""
@@ -111,9 +116,15 @@ class FakeScoringEnv:
     # Options whose unique prefix "does not round-trip": scored in full, as the
     # runtime script does.
     full_for: set[str] = field(default_factory=set)
-    # How the runtime tokenises a row's prompt. The reference returns the BOS
-    # and then `prompt_ids`, as a chat template that writes the BOS does.
+    # How the runtime tokenises a row's prompt. The reference returns
+    # `ref_prefix` and then `prompt_ids`: [BOS], as a chat template that writes
+    # the BOS does (Gemma 3), or [] for one that writes none (ChatML).
     prompt_ids_of: Callable[[str], list[int]] = prompt_ids
+    ref_prefix: list[int] = field(default_factory=lambda: [BOS])
+    # What the runtime reports its session puts first; None reports nothing.
+    session_prefix: list[int] | None = field(default_factory=lambda: [BOS])
+    # The reference's tokenizer, for the end of turn: what each recorded id decodes to.
+    vocab: dict[int, str] = field(default_factory=lambda: dict(VOCAB))
     specs: list[dict[str, Any]] = field(default_factory=list)
     provisioned: int = 0
 
@@ -141,14 +152,24 @@ class FakeScoringEnv:
                     "cpu": "fake CPU",
                     "threads": spec["threads"],
                     "mode": "once" if spec["mode"] == "auto" else spec["mode"],
+                    "method": spec["method"],
                     "selfcheck": {"verdict": "dropped", "comparisons": 18, "max_abs_diff": 0.0},
                     "k": ks,
                     "scored_lengths": lengths,
                     "mismatches": [{"option": o} for o in spec["options"] if o in self.full_for],
                 }
             )
+            if self.session_prefix is not None:
+                report["session_prefix"] = self.session_prefix
         else:
-            report.update({"device": "cpu", "bos_id": BOS, "cache_variant": "position_ids"})
+            report.update(
+                {
+                    "device": "cpu",
+                    "bos_id": BOS,
+                    "cache_variant": "position_ids",
+                    "terminator": self.vocab[spec["turn_ids"][0]],
+                }
+            )
         report.update(self.report_extra)
         with open(spec["out"], "w", encoding="utf-8") as out:
             for row in spec["rows"]:
@@ -165,7 +186,7 @@ class FakeScoringEnv:
                 if engine:
                     rec["prompt_ids"] = self.prompt_ids_of(row["prompt"])
                 elif row["index"] in spec.get("ids_for", []):
-                    rec["prompt_ids"] = [BOS, *prompt_ids(row["prompt"])]
+                    rec["prompt_ids"] = [*self.ref_prefix, *prompt_ids(row["prompt"])]
                 out.write(json.dumps(rec) + "\n")
         Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
         return subprocess.CompletedProcess(argv, self.returncode, "", "fake stderr")
@@ -246,6 +267,8 @@ def job_for(split_: dict[str, Any], tmp_path, **kwargs) -> DecisionVerify:
         "calibration": split_["calibration"],
         "train_env": FakeScoringEnv("train"),
         "runtime_env": FakeScoringEnv("runtime"),
+        # The record's google/gemma-3-270m-it, as `run_verify` looks it up.
+        "family": "gemma-3-text",
     }
     params.update(kwargs)
     return DecisionVerify(**params)
@@ -280,6 +303,7 @@ def test_a_decision_that_scores_alike_on_both_sides_passes(split, tmp_path):
         "options": [{"id": o} for o in OPTIONS],
         "none_option": "none_of_these",
         "scoring": "unique_prefix",
+        "method": "rewind",
         "terminator": TERM,
         "scored_lengths": fields["decision"]["scored_lengths"],
         "temperature": fit["temperature"],
@@ -313,7 +337,8 @@ def test_the_reference_scores_every_calibration_and_heldout_row_and_the_runtime_
     assert len(ref_spec["rows"]) == calib_n + held_n
     assert ref_spec["model"] == job.reference
     assert ref_spec["options"] == list(s["decision"].ids)
-    assert ref_spec["terminator"] == TERM
+    assert (ref_spec["turn_ids"], ref_spec["turn_text"]) == ([106, 107], "<end_of_turn>\n")
+    assert "terminator" not in ref_spec and eng_spec["terminator"] == TERM
     assert len(eng_spec["rows"]) == 5
     assert eng_spec["mode"] == "auto" and eng_spec["targets"] == "unique"
     held = [json.loads(line)["prompt"] for line in s["heldout"].read_text().splitlines()]
@@ -415,6 +440,81 @@ def test_the_gpu_backend_is_refused(split, tmp_path):
     assert "CPU backend only" in check(fields, RUNTIME_CHECK)["detail"]
 
 
+def test_a_family_that_needs_an_engine_per_prompt_is_scored_on_fresh_engines(split, tmp_path):
+    """Option scoring rewinds within one session, which is the mechanism an
+    Engine per prompt exists to avoid; such a family is scored on an Engine per
+    option instead, and the section says so."""
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(
+        s,
+        tmp_path,
+        engine_per_prompt_reason="state survives a rewind",
+        family="qwen-3.5",
+        float_twin=twin,
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert [spec["method"] for spec in job.runtime_env.specs] == ["fresh_engine"] * 2
+    assert fields["decision"]["section"]["payload"]["method"] == "fresh_engine"
+    assert fields["cost"]["method"] == "fresh_engine"
+    assert "for every option: an Engine load" in fields["cost"]["measures"]
+    said = [t for t in fields["limitations"] if "state survives a rewind" in t]
+    assert len(said) == 1 and "an Engine load per option per decision" in said[0]
+
+
+def test_without_an_engine_per_prompt_the_section_says_rewind(split, tmp_path):
+    s = split()
+    job = job_for(s, tmp_path)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed"
+    assert [spec["method"] for spec in job.runtime_env.specs] == ["rewind"]
+    assert fields["cost"]["method"] == "rewind"
+    assert not any("an Engine of its own" in t for t in fields["limitations"])
+
+
+def test_a_runtime_that_scored_by_another_method_is_refused(split, tmp_path):
+    s = split()
+    eng = FakeScoringEnv("runtime", report_extra={"method": "rewind"})
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(
+        s,
+        tmp_path,
+        runtime_env=eng,
+        engine_per_prompt_reason="state survives a rewind",
+        family="qwen-3.5",
+        float_twin=twin,
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "'fresh_engine' was asked for" in failed(fields, RUNTIME_CHECK)["detail"]
+
+
+def test_fresh_engines_get_time_for_every_load():
+    from litetune.decision_verify import (
+        ENGINE_LOAD_TIMEOUT_S,
+        ENGINE_ROW_TIMEOUT_S,
+        SELFCHECK_LOADS,
+        STARTUP_TIMEOUT_S,
+        _engine_timeout,
+    )
+
+    assert _engine_timeout(10, 6, "rewind") == STARTUP_TIMEOUT_S + 10 * ENGINE_ROW_TIMEOUT_S
+    assert _engine_timeout(10, 6, "fresh_engine") == (
+        STARTUP_TIMEOUT_S
+        + SELFCHECK_LOADS * ENGINE_LOAD_TIMEOUT_S
+        + 10 * (ENGINE_ROW_TIMEOUT_S + 6 * ENGINE_LOAD_TIMEOUT_S)
+    )
+
+
 def test_rows_rendered_with_another_decision_are_refused_by_line(split, tmp_path):
     s = split()
     other = decision_from({"question": "Which mood?", "options": [{"id": "joy"}, {"id": "x"}]}, "q")
@@ -472,6 +572,59 @@ def test_a_float_twin_that_drifts_is_a_harness_failure(split, tmp_path):
     assert status == "failed_harness"
     assert check(fields, TWIN_CHECK)["outcome"] == "failed"
     assert "1.00e-02" in check(fields, TWIN_CHECK)["detail"]
+
+
+def _drifting_twin(by):
+    calls = {"n": 0}
+
+    def drifting(index, prompt, option, ids):
+        base = default_scores(index, prompt, option, ids)
+        return [base[0] + by, *base[1:]] if calls["n"] else base
+
+    eng = FakeScoringEnv("runtime", scores=drifting)
+    real_run = eng.run
+
+    def counting(argv, timeout=None, env=None):
+        proc = real_run(argv, timeout, env)
+        calls["n"] += 1
+        return proc
+
+    eng.run = counting
+    return eng
+
+
+@pytest.mark.parametrize(("drift", "outcome"), [(0.02, "passed"), (0.06, "failed")])
+def test_a_family_tolerance_holds_the_twin_to_its_own_bound_and_says_why(
+    split, tmp_path, drift, outcome
+):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(
+        s,
+        tmp_path,
+        float_twin=twin,
+        runtime_env=_drifting_twin(drift),
+        twin_tolerance=5e-2,
+        twin_tolerance_reason="measured so",
+    )
+
+    _, fields = run(job, s["record"])
+
+    assert check(fields, TWIN_CHECK)["outcome"] == outcome
+    assert "refused above 0.05" in check(fields, TWIN_CHECK)["detail"]
+    said = [t for t in fields["limitations"] if "the float twin is held to 0.05" in t]
+    assert len(said) == 1 and said[0].endswith("measured so")
+
+
+def test_the_default_tolerance_says_nothing_about_a_tolerance(split, tmp_path):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+
+    _, fields = run(job_for(s, tmp_path, float_twin=twin, family="qwen-3"), s["record"])
+
+    assert not any("the float twin is held to" in t for t in fields["limitations"])
 
 
 def test_another_runtime_without_a_twin_cannot_be_called_correct(split, tmp_path):
@@ -590,20 +743,40 @@ it the session reads what was prefilled, as an engine with the fix does; with
 FAKE_DROPS=alternate it drops on every other pair of scorings, an engine nobody
 has measured. Scoring an option advances the session past it until a rewind,
 and a rewind needs a saved checkpoint, so the order of the calls matters.
+
+FAKE_TEMPLATE picks the bundle's template: Gemma 3's (the default) or ChatML
+("chatml", as Qwen's). FAKE_BOS picks its start token: "<bos>" (the default),
+or "none" for a bundle with none, as Qwen's. A session reads the BOS first on
+its first prefill, as LiteRT-LM's does. With FAKE_LOADS set, every Engine
+appends a line to that file, so a test can count loads.
 """
 import os
 import re
 import zlib
 
-_SPECIAL = r"<start_of_turn>|<end_of_turn>|<bos>"
+_SPECIAL = r"<start_of_turn>|<end_of_turn>|<bos>|<\|im_start\|>|<\|im_end\|>"
+_TEMPLATES = {
+    "gemma": ("<start_of_turn>user\n", "<end_of_turn>\n<start_of_turn>model\n"),
+    "chatml": ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"),
+    # A template that prints the BOS string itself, as MiniCPM5's own does.
+    "gemma_bos": ("<bos><start_of_turn>user\n", "<end_of_turn>\n<start_of_turn>model\n"),
+    # Made up for the self-check's pair: its second id is its second-to-last,
+    # and its third, put there, runs into the last as one word.
+    "tricky": ("<start_of_turn>:a\n", "<end_of_turn>\n<start_of_turn>:b"),
+}
 _WORDS = {}
 _SCORINGS = 0
 
 
-def _ids(text):
-    """One id per piece, the same in every process: crc32 of the piece."""
+def _ids(text, bos_special=True):
+    """One id per piece, the same in every process: crc32 of the piece.
+
+    `Engine.tokenize` reads the BOS string as text, as LiteRT-LM's tokenizer
+    does (`rendering.prefill_ids`); a session's prefill reads it as the BOS.
+    """
     out = []
-    for piece in re.findall(_SPECIAL + r"|[A-Za-z_]+|.", text, flags=re.S):
+    special = _SPECIAL if bos_special else _SPECIAL.replace("|<bos>", "")
+    for piece in re.findall(special + r"|[A-Za-z_]+|.", text, flags=re.S):
         token = zlib.crc32(piece.encode("utf-8")) % 1_000_003 + 1
         _WORDS[token] = piece
         out.append(token)
@@ -664,8 +837,9 @@ class _Result:
 
 
 class _Session:
-    def __init__(self):
-        self.tokens = []
+    def __init__(self, bos=None):
+        self.bos = bos
+        self.tokens = [] if bos is None else [bos]
         self.prefills = 0
         self._lib = _Lib()
         self._ptr = self
@@ -680,7 +854,11 @@ class _Session:
 
     def run_prefill(self, parts):
         for part in parts:
-            self.tokens += _ids(part)
+            bos_text = None if self.bos is None else _WORDS[self.bos]
+            if bos_text and part.startswith(bos_text):
+                self.tokens += [self.bos] + _ids(part[len(bos_text) :], False)
+            else:
+                self.tokens += _ids(part, False)
         self.prefills += 1
 
     def _context(self):
@@ -713,12 +891,18 @@ class _Conversation:
         return False
 
     def render_message_to_string(self, prompt):
-        return "<start_of_turn>user\n" + prompt + "<end_of_turn>\n<start_of_turn>model\n"
+        before, after = _TEMPLATES[os.environ.get("FAKE_TEMPLATE", "gemma")]
+        return before + prompt + after
 
 
 class Engine:
     def __init__(self, path, backend=None, cache_dir=None):
         self.path = path
+        bos = os.environ.get("FAKE_BOS", "<bos>")
+        self.bos_token_id = None if bos == "none" else _ids(bos)[0]
+        if os.environ.get("FAKE_LOADS"):
+            with open(os.environ["FAKE_LOADS"], "a") as fh:
+                fh.write("load\n")
 
     def __enter__(self):
         return self
@@ -727,13 +911,13 @@ class Engine:
         return False
 
     def tokenize(self, text):
-        return _ids(text)
+        return _ids(text, False)
 
     def detokenize(self, ids):
         return "".join(_WORDS[i] for i in ids)
 
     def create_session(self, apply_prompt_template=True, sampler_config=None):
-        return _Session()
+        return _Session(self.bos_token_id)
 
     def create_conversation(self, sampler_config=None, max_output_tokens=None):
         return _Conversation()
@@ -741,7 +925,16 @@ class Engine:
 
 
 def _run_engine_script(
-    tmp_path, drops: bool | str, prompts, options, mode="auto", fake_source=FAKE_LITERT_LM
+    tmp_path,
+    drops: bool | str,
+    prompts,
+    options,
+    mode="auto",
+    fake_source=FAKE_LITERT_LM,
+    fake_env: dict[str, str] | None = None,
+    term: str = TERM,
+    method: str = "rewind",
+    **spec_extra: Any,
 ):
     import os
     import sys
@@ -761,18 +954,20 @@ def _run_engine_script(
                 "model": "m.litertlm",
                 "rows": [{"index": i, "prompt": p} for i, p in enumerate(prompts)],
                 "options": list(options),
-                "terminator": TERM,
+                "terminator": term,
                 "threads": 2,
                 "targets": "unique",
                 "mode": mode,
+                "method": method,
                 "out": str(out),
                 "report": str(report),
+                **spec_extra,
             }
         ),
         encoding="utf-8",
     )
     drops_value = drops if isinstance(drops, str) else "1" if drops else "0"
-    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_DROPS=drops_value)
+    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_DROPS=drops_value, **(fake_env or {}))
     proc = subprocess.run(
         [sys.executable, str(script), str(spec)], env=env, capture_output=True, text=True
     )
@@ -780,8 +975,7 @@ def _run_engine_script(
     return proc, rows, json.loads(report.read_text())
 
 
-def _expected(tmp_path, prompts, options):
-    """Each option's unique-prefix token scores on the whole rendered prompt."""
+def _fake_module(tmp_path):
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
@@ -789,11 +983,19 @@ def _expected(tmp_path, prompts, options):
     )
     fake = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fake)
-    cont = [fake._ids(o + TERM) for o in options]
+    return fake
+
+
+def _expected(tmp_path, prompts, options, template="gemma", bos="<bos>", term=TERM):
+    """Each option's unique-prefix token scores on the BOS and the whole rendered prompt."""
+    fake = _fake_module(tmp_path)
+    cont = [fake._ids(o + term) for o in options]
     ks = unique_lengths(cont)
+    before, after = fake._TEMPLATES[template]
+    first = [] if bos == "none" else fake._ids(bos)
     out = []
     for p in prompts:
-        ctx = fake._ids("<start_of_turn>user\n" + p + "<end_of_turn>\n<start_of_turn>model\n")
+        ctx = first + fake._ids(before + p + after)
         out.append(
             [
                 [fake.true_score(ctx + c[:i], c[i]) for i in range(k)]
@@ -854,6 +1056,8 @@ def test_run_verify_measures_a_decision_checkpoint_by_option_scoring(split, tmp_
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "litetune.json").write_text(json.dumps(s["record"]), encoding="utf-8")
+    # As `tune` leaves it: the family is read from the record's base model.
+    (checkpoint / "config.json").write_text('{"model_type": "gemma3_text"}', encoding="utf-8")
     model = tmp_path / "model.litertlm"
     model.write_bytes(b"bundle")
     fake = FakeScoringEnv("any")
@@ -961,22 +1165,76 @@ def test_the_scorers_get_the_first_token_of_the_recorded_end_of_turn(split, tmp_
     s = split()
     job = job_for(s, tmp_path)
 
-    status, _ = run(job, s["record"])
+    status, fields = run(job, s["record"])
 
     assert status == "passed"
-    assert job.train_env.specs[0]["terminator"] == "<end_of_turn>"
     assert job.runtime_env.specs[0]["terminator"] == "<end_of_turn>"
+    assert fields["decision"]["section"]["payload"]["terminator"] == "<end_of_turn>"
 
 
-def test_a_checkpoint_whose_turn_ends_otherwise_is_refused(split, tmp_path):
+@pytest.mark.parametrize(
+    ("ids", "text", "first"),
+    [
+        ([151645, 107], "<|im_end|>\n", "<|im_end|>"),
+        ([100257, 107], "<|end_of_text|>\n", "<|end_of_text|>"),
+    ],
+    ids=["ChatML", "Granite"],
+)
+def test_another_familys_end_of_turn_is_scored_with_its_own_first_token(
+    split, tmp_path, ids, text, first
+):
     s = split()
-    record = dict(s["record"], turn_terminator={"text": "<|im_end|>\n", "ids": [1]})
+    record = dict(
+        s["record"], turn_terminator={"ids": ids, "source": "chat_template", "text": text}
+    )
+    job = job_for(s, tmp_path)
 
-    status, fields = run(job_for(s, tmp_path), record)
+    status, fields = run(job, record)
+
+    assert status == "passed", fields["checks"]
+    assert job.train_env.specs[0]["turn_ids"] == ids
+    assert job.runtime_env.specs[0]["terminator"] == first
+    assert fields["decision"]["section"]["payload"]["terminator"] == first
+
+
+@pytest.mark.parametrize(
+    ("recorded", "said"),
+    [
+        (None, "records no end of turn"),
+        ("<end_of_turn>\n", "records no end of turn"),
+        (
+            {"ids": [1], "source": "tokenizer_eos", "text": "<eos>"},
+            "from 'tokenizer_eos', not from its chat template",
+        ),
+        ({"ids": [], "source": "chat_template", "text": ""}, "has no ids or no text"),
+    ],
+    ids=["none", "a string", "the tokenizer's EOS", "empty"],
+)
+def test_an_end_of_turn_not_from_the_template_is_refused_before_scoring(
+    split, tmp_path, recorded, said
+):
+    s = split()
+    record = dict(s["record"], turn_terminator=recorded)
+    job = job_for(s, tmp_path)
+
+    status, fields = run(job, record)
 
     assert status == "failed_harness"
-    failed = [c for c in fields["checks"]["checks"] if c["outcome"] == "failed"]
-    assert len(failed) == 1 and "'<|im_end|>\\n'" in failed[0]["detail"]
+    assert said in failed(fields, ROWS_CHECK)["detail"]
+    assert job.train_env.specs == [] and job.runtime_env.specs == []
+
+
+def test_a_reference_whose_terminator_does_not_begin_the_recorded_turn_is_refused(split, tmp_path):
+    s = split()
+    job = job_for(
+        s, tmp_path, train_env=FakeScoringEnv("train", vocab={**VOCAB, 106: "<|im_end|>"})
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "which it does not begin with" in failed(fields, REFERENCE_CHECK)["detail"]
+    assert job.train_env.specs and job.runtime_env.specs == []
 
 
 def test_options_scored_in_full_on_the_runtime_are_scored_in_full_on_both_sides(split, tmp_path):
@@ -1271,14 +1529,12 @@ def test_a_runtime_that_scores_another_prompt_is_refused(split, tmp_path, tokeni
 
 
 def test_the_runtime_script_refuses_a_prompt_rendered_as_empty_text(tmp_path):
-    empty = FAKE_LITERT_LM.replace(
-        'return "<start_of_turn>user\\n" + prompt + "<end_of_turn>\\n<start_of_turn>model\\n"',
-        'return ""',
-    )
+    empty = FAKE_LITERT_LM.replace("return before + prompt + after", 'return ""')
     assert empty != FAKE_LITERT_LM
 
+    # In a mode given, not picked: the self-check renders through the same call.
     proc, rows, _ = _run_engine_script(
-        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_source=empty
+        tmp_path, True, ["text 1 about joy"], OPTIONS, mode="once", fake_source=empty
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -1541,3 +1797,525 @@ def test_a_litetune_device_litetune_does_not_accept_stops_a_decision_run(
     assert result.status.value == "failed_harness"
     details = [c["detail"] for c in result.manifest["checks"]["checks"]]
     assert any("verification was not attempted" in d and "LITETUNE_DEVICE" in d for d in details)
+
+
+@pytest.mark.parametrize(
+    ("base", "needs"), [("Qwen/Qwen3.5-0.8B", True), ("google/gemma-3-270m-it", False)]
+)
+def test_run_verify_hands_the_rules_engine_per_prompt_reason_over(
+    tmp_path, monkeypatch, base, needs
+):
+    import litetune.decision_verify as dv
+    from litetune.verify import VerifyRequest, run_verify
+
+    seen = {}
+
+    def capture(job, record, events):
+        seen["job"] = job
+        return "failed_harness", {"scorer": {"name": "option-scoring"}, "limitations": []}
+
+    monkeypatch.setattr(dv, "verify_decision", capture)
+    monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
+    cp = _checkpoint(
+        tmp_path,
+        {"base_model": base, "decision": {"question": "Q?", "options": [{"id": "a"}]}},
+    )
+    config = {"model_type": "qwen3_5"} if needs else {"model_type": "gemma3_text"}
+    (cp / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"bundle")
+    run_verify(VerifyRequest(model=model, reference=str(cp), data=tmp_path / "heldout.jsonl"))
+    assert bool(seen["job"].engine_per_prompt_reason) is needs
+    if needs:
+        assert seen["job"].twin_tolerance == 5e-2
+        assert "2.65e-02" in seen["job"].twin_tolerance_reason
+    else:
+        assert seen["job"].twin_tolerance == TWIN_TOLERANCE
+        assert seen["job"].twin_tolerance_reason == ""
+    assert seen["job"].family == ("qwen-3.5" if needs else "gemma-3-text")
+
+
+# -- the reference script's end of turn, with torch and transformers faked -----------
+
+FAKE_TORCH = """
+__version__ = "fake"
+float32 = "float32"
+
+
+class _Flags:
+    allow_tf32 = True
+
+
+class backends:
+    class cuda:
+        matmul = _Flags()
+
+    cudnn = _Flags()
+
+
+class cuda:
+    @staticmethod
+    def is_available():
+        return False
+
+
+def no_grad():
+    return lambda f: f
+
+
+def tanh(x):
+    import math
+
+    return math.tanh(x)
+"""
+
+FAKE_TRANSFORMERS = """
+import json
+import os
+
+__version__ = "fake"
+# One id per piece; a piece is a special token or one character.
+VOCAB = json.loads(os.environ["FAKE_VOCAB"])
+IDS = {v: int(k) for k, v in VOCAB.items()}
+
+
+class _Tokenizer:
+    pad_token_id = 0
+    bos_token_id = None
+
+    def __call__(self, text, add_special_tokens=True):
+        out, i = [], 0
+        while i < len(text):
+            longest = sorted(IDS, key=len, reverse=True)
+            piece = next((p for p in longest if text.startswith(p, i)), None)
+            if piece is None:
+                piece = text[i]
+                IDS.setdefault(piece, 1000 + ord(piece))
+            out.append(IDS[piece])
+            i += len(piece)
+        return {"input_ids": out}
+
+    def decode(self, ids):
+        names = {v: k for k, v in IDS.items()}
+        return "".join(VOCAB.get(str(i)) or names[i] for i in ids)
+
+
+class AutoTokenizer:
+    @staticmethod
+    def from_pretrained(name, **kw):
+        return _Tokenizer()
+
+
+class _Model:
+    class config:
+        final_logit_softcapping = None
+
+    def to(self, device):
+        return self
+
+    def eval(self):
+        return self
+
+
+class AutoModelForCausalLM:
+    @staticmethod
+    def from_pretrained(name, **kw):
+        return _Model()
+"""
+
+
+def _run_reference_script(tmp_path, vocab, turn_ids, turn_text):
+    import os
+    import sys
+
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    fake = tmp_path / "fake"
+    fake.mkdir(exist_ok=True)
+    (fake / "torch.py").write_text(FAKE_TORCH, encoding="utf-8")
+    (fake / "transformers.py").write_text(FAKE_TRANSFORMERS, encoding="utf-8")
+    script = tmp_path / "reference.py"
+    script.write_text(REFERENCE_SCRIPT, encoding="utf-8")
+    report = tmp_path / "report.json"
+    spec = tmp_path / "spec.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "model": "checkpoint",
+                "rows": [],
+                "options": ["joy", "anger"],
+                "turn_ids": turn_ids,
+                "turn_text": turn_text,
+                "device": "cpu",
+                "out": str(tmp_path / "out.jsonl"),
+                "report": str(report),
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_VOCAB=json.dumps(vocab))
+    proc = subprocess.run(
+        [sys.executable, str(script), str(spec)], env=env, capture_output=True, text=True
+    )
+    return proc, json.loads(report.read_text()) if report.exists() else None
+
+
+@pytest.mark.parametrize(
+    ("vocab", "ids", "text", "first"),
+    [
+        ({"106": "<end_of_turn>", "107": "\n"}, [106, 107], "<end_of_turn>\n", "<end_of_turn>"),
+        ({"151645": "<|im_end|>", "198": "\n"}, [151645, 198], "<|im_end|>\n", "<|im_end|>"),
+    ],
+    ids=["Gemma 3", "ChatML"],
+)
+def test_the_reference_script_reports_the_first_token_of_the_recorded_turn(
+    tmp_path, vocab, ids, text, first
+):
+    proc, report = _run_reference_script(tmp_path, vocab, ids, text)
+
+    assert proc.returncode == 0, proc.stderr
+    assert report["terminator"] == first
+    assert all(c[-1] == ids[0] for c in report["cont_ids"])
+
+
+def test_the_reference_script_refuses_a_first_token_that_does_not_tokenise_back(tmp_path):
+    # Id 5 decodes to text the tokenizer reads as id 6.
+    proc, report = _run_reference_script(tmp_path, {"5": "a", "6": "a"}, [5], "a")
+
+    assert proc.returncode != 0 and report is None
+    assert "not that one token" in proc.stderr
+
+
+# -- what the session puts before the prompt ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ref_prefix", "session_prefix"),
+    [([BOS], [BOS]), ([], [])],
+    ids=["Gemma 3: the template's BOS, the session's BOS", "ChatML: no BOS on either side"],
+)
+def test_the_prompt_check_adds_what_the_session_puts_first(
+    split, tmp_path, ref_prefix, session_prefix
+):
+    s = split()
+    job = job_for(
+        s,
+        tmp_path,
+        train_env=FakeScoringEnv("train", ref_prefix=ref_prefix),
+        runtime_env=FakeScoringEnv("runtime", session_prefix=session_prefix),
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert check(fields, PROMPT_CHECK)["outcome"] == "passed"
+    assert fields["decision"]["session_prefix"] == session_prefix
+
+
+@pytest.mark.parametrize(
+    ("ref_prefix", "session_prefix"),
+    [([BOS], []), ([], [7])],
+    ids=[
+        "the template prints a BOS the session does not add (MiniCPM5's shape)",
+        "the session adds a BOS the template does not print (Granite's shape)",
+    ],
+)
+def test_a_bos_on_one_side_only_is_refused(split, tmp_path, ref_prefix, session_prefix):
+    s = split()
+    job = job_for(
+        s,
+        tmp_path,
+        train_env=FakeScoringEnv("train", ref_prefix=ref_prefix),
+        runtime_env=FakeScoringEnv("runtime", session_prefix=session_prefix),
+    )
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    detail = failed(fields, PROMPT_CHECK)["detail"]
+    assert "is not the reference's" in detail and f"session prefix {session_prefix}" in detail
+
+
+def test_a_runtime_that_does_not_say_what_its_session_puts_first_is_refused(split, tmp_path):
+    s = split()
+    job = job_for(s, tmp_path, runtime_env=FakeScoringEnv("runtime", session_prefix=None))
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "did not report the ids its session puts" in failed(fields, PROMPT_CHECK)["detail"]
+
+
+@pytest.mark.parametrize(
+    ("template", "bos"), [("gemma", "<bos>"), ("chatml", "none")], ids=["Gemma 3", "ChatML"]
+)
+def test_the_runtime_script_reports_its_session_prefix_and_scores_after_it(tmp_path, template, bos):
+    prompts = ["text 1 about joy", "text 22 about fear"]
+    options = ("joy", "anger", "fear")
+    term = "<end_of_turn>" if template == "gemma" else "<|im_end|>"
+
+    proc, rows, report = _run_engine_script(
+        tmp_path,
+        True,
+        prompts,
+        options,
+        fake_env={"FAKE_TEMPLATE": template, "FAKE_BOS": bos},
+        term=term,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    fake = _fake_module(tmp_path)
+    assert report["session_prefix"] == ([] if bos == "none" else fake._ids(bos))
+    before, after = fake._TEMPLATES[template]
+    assert rows[0]["prompt_ids"] == fake._ids(before + prompts[0] + after)
+    assert [r["token_scores"] for r in rows] == _expected(
+        tmp_path, prompts, options, template=template, bos=bos, term=term
+    )
+
+
+# -- the self-check's pair, from the bundle's own template ---------------------------
+
+
+def test_on_gemma_3_the_self_check_pair_is_the_measured_one(tmp_path):
+    proc, _, report = _run_engine_script(tmp_path, True, ["text 1 about joy"], OPTIONS)
+
+    assert proc.returncode == 0, proc.stderr
+    assert report["selfcheck"]["pair"] == [
+        "<start_of_turn>user\nAnswer with one word.<end_of_turn>\n<start_of_turn>model\n",
+        "<start_of_turn>user\nAnswer with one word.<end_of_turn>\n<start_of_turn>user\n",
+    ]
+
+
+@pytest.mark.parametrize(("drops", "mode"), [(True, "once"), (False, "plain")])
+def test_on_chatml_the_self_check_renders_its_own_pair_and_picks_the_mode(tmp_path, drops, mode):
+    prompts = ["text 1 about joy", "text 22 about fear"]
+    options = ("joy", "anger", "fear")
+    env = {"FAKE_TEMPLATE": "chatml", "FAKE_BOS": "none"}
+
+    proc, rows, report = _run_engine_script(
+        tmp_path, drops, prompts, options, fake_env=env, term="<|im_end|>"
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    a, b = report["selfcheck"]["pair"]
+    assert a == "<|im_start|>user\nAnswer with one word.<|im_end|>\n<|im_start|>assistant\n"
+    assert b == "<|im_start|>user\nAnswer with one word.<|im_end|>\n<|im_start|>user\n"
+    assert report["selfcheck"]["comparisons"] > 0 and report["mode"] == mode
+    assert [r["token_scores"] for r in rows] == _expected(
+        tmp_path, prompts, options, template="chatml", bos="none", term="<|im_end|>"
+    )
+
+
+def test_a_rendering_with_no_pair_is_no_comparisons_and_a_harness_failure(tmp_path):
+    # A template that renders the message as one token cannot differ at its second-to-last.
+    one = FAKE_LITERT_LM.replace(
+        "return before + prompt + after",
+        'return "x" if prompt == "Answer with one word." else before + prompt + after',
+    )
+    assert one != FAKE_LITERT_LM
+
+    proc, rows, report = _run_engine_script(
+        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_source=one
+    )
+
+    assert proc.returncode == 3
+    assert report["selfcheck"]["verdict"] == "no comparisons"
+    assert report["selfcheck"]["pair"] is None and rows == []
+
+
+# -- a family the method was not measured on -----------------------------------------
+
+
+@pytest.mark.parametrize("family", ["qwen-3", "functiongemma", None])
+def test_another_family_without_a_float_twin_is_refused_before_anything_runs(
+    split, tmp_path, family
+):
+    s = split()
+    job = job_for(s, tmp_path, family=family)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    detail = failed(fields, TWIN_CHECK)["detail"]
+    assert "without a float twin on gemma-3-text only" in detail and "--float-twin" in detail
+    assert job.train_env.specs == [] and job.runtime_env.specs == []
+
+
+def test_another_family_with_a_float_twin_is_measured_and_says_it_is_unmeasured(split, tmp_path):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(s, tmp_path, family="gemma-4-e4b", float_twin=twin)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert check(fields, TWIN_CHECK)["outcome"] == "passed"
+    assert any(
+        "have not been trained or measured on gemma-4-e4b" in t for t in fields["limitations"]
+    )
+
+
+def test_a_family_measured_on_one_task_says_which_models_and_which_task(split, tmp_path):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(s, tmp_path, family="qwen-3", float_twin=twin)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    said = [t for t in fields["limitations"] if "on qwen-3 were trained and verified" in t]
+    assert len(said) == 1
+    assert "Qwen/Qwen3-0.6B and Qwen/Qwen3-1.7B" in said[0] and "six options" in said[0]
+    assert not any("have not been trained or measured on" in t for t in fields["limitations"])
+
+
+def test_the_measured_family_says_nothing_about_being_unmeasured(split, tmp_path):
+    s = split()
+
+    _, fields = run(job_for(s, tmp_path), s["record"])
+
+    assert not any("have not been trained or measured on" in t for t in fields["limitations"])
+
+
+# -- the runtime script on fresh engines ---------------------------------------------
+
+
+@pytest.mark.parametrize(("drops", "mode"), [(True, "once"), (False, "plain")])
+def test_fresh_engine_loads_an_engine_per_option_and_never_rewinds(tmp_path, drops, mode):
+    prompts = ["text 1 about joy", "text 22 about fear"]
+    options = ("joy", "anger", "fear")
+    loads = tmp_path / "loads.txt"
+    # A fake whose rewind fails the run: fresh_engine must never call it.
+    no_rewind = FAKE_LITERT_LM.replace(
+        "        if not ptr.saved:\n            return -1",
+        "        raise AssertionError('rewound')",
+    )
+    assert no_rewind != FAKE_LITERT_LM
+
+    proc, rows, report = _run_engine_script(
+        tmp_path,
+        drops,
+        prompts,
+        options,
+        fake_source=no_rewind,
+        fake_env={"FAKE_LOADS": str(loads)},
+        method="fresh_engine",
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert report["method"] == "fresh_engine" and report["mode"] == mode
+    comparisons = report["selfcheck"]["comparisons"]
+    # One to render and tokenise, two per self-check comparison, one per option per row.
+    want = 1 + 2 * comparisons + len(options) * len(prompts)
+    assert report["engine_loads"] == want == len(loads.read_text().splitlines())
+    assert [r["token_scores"] for r in rows] == _expected(tmp_path, prompts, options)
+
+
+def test_rewind_loads_one_engine(tmp_path):
+    loads = tmp_path / "loads.txt"
+
+    proc, _, report = _run_engine_script(
+        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_env={"FAKE_LOADS": str(loads)}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert report["engine_loads"] == 1 == len(loads.read_text().splitlines())
+
+
+def test_a_rendering_that_starts_with_the_bos_string_is_read_as_prefill_reads_it(tmp_path):
+    """The runtime's tokenizer reads the BOS string as text, and prefill as the
+    BOS: the ids returned are prefill's, so the prompt check sees the second BOS
+    the session would read."""
+    proc, rows, report = _run_engine_script(
+        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_env={"FAKE_TEMPLATE": "gemma_bos"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    bos = report["session_prefix"]
+    assert len(bos) == 1 and rows[0]["prompt_ids"][:1] == bos
+    assert rows[0]["prompt_ids"] == bos + _fake_module(tmp_path)._ids(
+        "<start_of_turn>user\ntext 1 about joy<end_of_turn>\n<start_of_turn>model\n"
+    )
+
+
+def test_the_self_check_pair_skips_ids_that_change_nothing_or_do_not_round_trip(tmp_path):
+    proc, _, report = _run_engine_script(
+        tmp_path, True, ["text 1 about joy"], OPTIONS, fake_env={"FAKE_TEMPLATE": "tricky"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    # Not ":" (the id already there), not "a" ("ab" is one word): the newline.
+    head = "<start_of_turn>:a\nAnswer with one word.<end_of_turn>\n<start_of_turn>"
+    assert report["selfcheck"]["pair"] == [head + ":b", head + "\nb"]
+
+
+_HEAD_DRIVER = """
+import json, runpy, sys, types
+ns = runpy.run_path(sys.argv[1], run_name="reference_under_test")
+def cfg(**kw):
+    text = kw.pop("text", None)
+    c = types.SimpleNamespace(**kw)
+    if text is not None:
+        c.get_text_config = lambda: types.SimpleNamespace(**text)
+    return c
+cases = {
+    "granite": cfg(logits_scaling=10.0),
+    "gemma3": cfg(final_logit_softcapping=None),
+    "gemma2": cfg(final_logit_softcapping=30.0),
+    "gemma4": cfg(text={"final_logit_softcapping": 30.0}),
+    "plain": cfg(),
+}
+out = {k: ns["head_transform"](v) for k, v in cases.items()}
+out["granite_value"] = ns["transformed"](25.0, 10.0, None)
+out["capped_value"] = ns["transformed"](60.0, None, 30.0)
+print(json.dumps(out))
+"""
+
+
+def test_the_reference_scores_through_each_familys_own_logit_transform(tmp_path):
+    """lm_head's output is what the scoring reads, and the bundle's head changes
+    it: Granite divides by logits_scaling, a top-level final_logit_softcapping
+    soft-caps. Gemma 4's text-config cap is in its forward but not in its bundle,
+    so the reference leaves it out; with it a Gemma 4 reference disagrees with its
+    own float twin, as without the division a Granite one does."""
+    import math
+    import os
+    import sys
+
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "torch.py").write_text(FAKE_TORCH, encoding="utf-8")
+    (fake / "transformers.py").write_text(FAKE_TRANSFORMERS, encoding="utf-8")
+    script = tmp_path / "reference.py"
+    script.write_text(REFERENCE_SCRIPT, encoding="utf-8")
+    driver = tmp_path / "driver.py"
+    driver.write_text(_HEAD_DRIVER, encoding="utf-8")
+    env = dict(os.environ, PYTHONPATH=str(fake), FAKE_VOCAB="{}")
+    proc = subprocess.run(
+        [sys.executable, str(driver), str(script)], env=env, capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["granite"] == [10.0, None]
+    assert out["gemma3"] == [None, None]
+    assert out["gemma2"] == [None, 30.0]
+    assert out["gemma4"] == [None, None]
+    assert out["plain"] == [None, None]
+    assert out["granite_value"] == 2.5
+    assert out["capped_value"] == math.tanh(2.0) * 30.0
+
+
+def test_every_head_the_reference_scores_through_goes_through_the_transform():
+    """The scoring reads lm_head's output in one place, `head_logp`; the other paths
+    read the model's own forward, and a variant trial against `head_logp` decides
+    whether they are used. So the one place must apply the transform, and must
+    take it from the model's config."""
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    assert REFERENCE_SCRIPT.count("model.lm_head(") == 1
+    assert "transformed(model.lm_head(hidden).float(), scale, cap)" in REFERENCE_SCRIPT
+    assert "scale, cap = head_transform(model.config)" in REFERENCE_SCRIPT

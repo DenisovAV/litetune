@@ -61,6 +61,10 @@ class FakeTokenCounter:
 
     raises: BaseException | None = None
     calls: list[list[str]] = field(default_factory=list)
+    # The tokenizer's special tokens, as `first_special` matches them.
+    specials: tuple[str, ...] = ("<bos>", "<eos>", "<start_of_turn>", "<end_of_turn>")
+    special_raises: BaseException | None = None
+    special_calls: list[list[str]] = field(default_factory=list)
 
     name = "fake"
 
@@ -72,6 +76,16 @@ class FakeTokenCounter:
         if self.raises is not None:
             raise self.raises
         return [len(text.split()) for text in texts]
+
+    def first_special(self, texts: Sequence[str]) -> list[str | None]:
+        self.special_calls.append(list(texts))
+        if self.special_raises is not None:
+            raise self.special_raises
+        out: list[str | None] = []
+        for text in texts:
+            hits = [(text.find(t), -len(t), t) for t in self.specials if t in text]
+            out.append(min(hits)[2] if hits else None)
+        return out
 
 
 @dataclass
@@ -1612,14 +1626,79 @@ def test_decision_rows_with_declarations_are_refused(tmp_path, write_jsonl, requ
         )
 
 
-@pytest.mark.parametrize(
-    "model", ["Qwen/Qwen2.5-0.5B-Instruct", FUNCTIONGEMMA, "meta-llama/Llama-3.2-1B"]
-)
-def test_a_decision_split_for_an_unmeasured_family_is_refused(
-    write_jsonl, request_for, questions, model
+def test_a_decision_split_for_a_model_with_no_family_rule_is_refused(
+    write_jsonl, request_for, questions
 ):
-    with pytest.raises(PrepareError, match="measured on google/gemma-3-270m-it only"):
-        prepare(request_for(write_jsonl(decision_rows()), questions=questions(), base_model=model))
+    with pytest.raises(PrepareError, match="has no family rule for"):
+        prepare(
+            request_for(
+                write_jsonl(decision_rows()),
+                questions=questions(),
+                base_model="meta-llama/Llama-3.2-1B",
+            )
+        )
+
+
+def test_a_decision_split_for_a_checkpoint_only_its_config_names_is_refused(
+    tmp_path, write_jsonl, request_for, questions
+):
+    checkpoint = tmp_path / "tuned"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text('{"model_type": "gemma3_text"}', encoding="utf-8")
+    with pytest.raises(PrepareError, match="identified only by its config.json"):
+        prepare(
+            request_for(
+                write_jsonl(decision_rows()), questions=questions(), base_model=str(checkpoint)
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "family"),
+    [("google/gemma-4-E4B-it", "gemma-4-e4b")],
+)
+def test_a_decision_split_for_an_unmeasured_family_is_written_with_a_limitation(
+    write_jsonl, request_for, questions, model, family
+):
+    from litetune.prepare import DECISION_FAMILY_UNMEASURED
+
+    result = prepare(
+        request_for(write_jsonl(decision_rows()), questions=questions(), base_model=model)
+    )
+
+    assert result.decision is not None
+    assert DECISION_FAMILY_UNMEASURED.format(model=model, family=family) in result.limitations
+
+
+@pytest.mark.parametrize(
+    ("model", "family", "measured"),
+    [
+        (FUNCTIONGEMMA, "functiongemma", "google/functiongemma-270m-it"),
+        ("google/gemma-4-E2B-it", "gemma-4-e2b", "google/gemma-4-E2B-it"),
+        ("Qwen/Qwen3-1.7B", "qwen-3", "Qwen/Qwen3-0.6B and Qwen/Qwen3-1.7B"),
+        (
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "qwen-2.5",
+            "Qwen/Qwen2.5-0.5B-Instruct and Qwen/Qwen2.5-1.5B-Instruct",
+        ),
+        ("openbmb/MiniCPM5-1B", "minicpm5", "openbmb/MiniCPM5-1B"),
+        ("ibm-granite/granite-4.1-3b", "granite-4.1", "ibm-granite/granite-4.1-3b"),
+        ("Qwen/Qwen3.5-2B", "qwen-3.5", "Qwen/Qwen3.5-0.8B"),
+    ],
+)
+def test_a_decision_split_for_a_family_measured_on_one_task_says_which_models(
+    write_jsonl, request_for, questions, model, family, measured
+):
+    from litetune.prepare import DECISION_FAMILY_MEASURED_ONCE, DECISION_FAMILY_UNMEASURED
+
+    result = prepare(
+        request_for(write_jsonl(decision_rows()), questions=questions(), base_model=model)
+    )
+
+    assert result.decision is not None
+    said = DECISION_FAMILY_MEASURED_ONCE.format(model=model, family=family, measured=measured)
+    assert said in result.limitations
+    assert DECISION_FAMILY_UNMEASURED.format(model=model, family=family) not in result.limitations
 
 
 def test_what_was_and_was_not_measured_is_said_per_model(write_jsonl, request_for, questions):
@@ -1838,3 +1917,229 @@ def test_a_decision_without_a_none_option_has_no_thin_calibration_limitation(
     )
 
     assert not any("out-of-scope row(s)" in text for text in result.limitations)
+
+
+# -- the tokenizer's own special tokens in a decision --------------------------------
+
+# Special in Qwen/Qwen3.5-0.8B's tokenizer_config.json at 2fc0636, and in no
+# hand list `decisions.CONTROL_TEXT` holds.
+QWEN35_VISION = ("<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>")
+
+
+def _vision_counter(**kwargs) -> FakeTokenCounter:
+    return FakeTokenCounter(specials=(*FakeTokenCounter().specials, *QWEN35_VISION), **kwargs)
+
+
+def test_a_state_holding_a_special_token_only_the_tokenizer_knows_is_refused(
+    write_jsonl, request_for, questions
+):
+    from litetune.decisions import state_problem
+
+    data = decision_rows()
+    data[5]["prompt"] = "look <|image_pad|> here"
+    assert state_problem(data[5]["prompt"]) is None  # the hand list lets it through
+
+    with pytest.raises(
+        PrepareError, match=r"data.jsonl:6: the decision prompt holds '<\|image_pad\|>'"
+    ):
+        prepare(request_for(write_jsonl(data), questions=questions(), tokens=_vision_counter()))
+
+
+def test_an_option_description_holding_a_special_token_is_refused(
+    write_jsonl, request_for, questions
+):
+    obj = {
+        "question": "Which emotion?",
+        "options": [
+            {"id": "sadness"},
+            {"id": "joy", "description": "<|vision_start|>happy"},
+            {"id": "anger"},
+        ],
+    }
+
+    with pytest.raises(PrepareError, match=r"holds '<\|vision_start\|>'.*reads as a special"):
+        prepare(
+            request_for(
+                write_jsonl(decision_rows()), questions=questions(obj), tokens=_vision_counter()
+            )
+        )
+
+
+def test_the_first_special_token_asked_for_is_of_every_decision_prompt_and_answer(
+    write_jsonl, request_for, questions
+):
+    counter = _vision_counter()
+
+    result = prepare(
+        request_for(write_jsonl(decision_rows()), questions=questions(), tokens=counter)
+    )
+
+    assert result.decision is not None
+    (asked,) = counter.special_calls
+    assert len(asked) == 2 * result.n_rows
+    assert set(asked[result.n_rows :]) == {"sadness", "joy", "anger"}
+
+
+def test_a_tokenizer_that_cannot_say_leaves_the_hand_list_and_a_limitation(
+    write_jsonl, request_for, questions
+):
+    from litetune.prepare import SPECIALS_UNCHECKED, TokenCountUnavailable
+
+    counter = _vision_counter(special_raises=TokenCountUnavailable("no tokenizer here"))
+
+    result = prepare(
+        request_for(write_jsonl(decision_rows()), questions=questions(), tokens=counter)
+    )
+
+    assert SPECIALS_UNCHECKED.format(why="no tokenizer here") in result.limitations
+
+
+def test_rows_that_are_not_a_decision_are_not_asked_about_special_tokens(write_jsonl, request_for):
+    counter = _vision_counter()
+
+    prepare(request_for(write_jsonl(rows(40)), tokens=counter))
+
+    assert counter.special_calls == []
+
+
+FAKE_TRANSFORMERS_TOKENIZER = """
+class _Added:
+    def __init__(self, content, special, single_word=False):
+        self.content, self.special, self.single_word = content, special, single_word
+
+
+class _Tokenizer:
+    all_special_tokens = ["<|im_end|>", "<|endoftext|>"]
+    all_special_ids = [10, 11]
+    added_tokens_decoder = {
+        1: _Added("<|vision_start|>", True),
+        2: _Added("<think>", False),
+        3: _Added("<|vision", True),
+        4: _Added("assistant", True, single_word=True),
+    }
+
+    def _pieces(self):
+        pieces = {"<|im_end|>": 10, "<|endoftext|>": 11}
+        pieces.update({a.content: i for i, a in self.added_tokens_decoder.items()})
+        return pieces
+
+    def __call__(self, text, add_special_tokens=True):
+        # A special or added token by longest match -- a single_word one only
+        # between non-word characters -- and otherwise one id per run of other
+        # non-space characters, as a word.
+        pieces, out, i = self._pieces(), [], 0
+        while i < len(text):
+            if text[i].isspace():
+                i += 1
+                continue
+            hit = None
+            for piece in sorted(pieces, key=len, reverse=True):
+                if not text.startswith(piece, i):
+                    continue
+                added = self.added_tokens_decoder.get(pieces[piece])
+                end = i + len(piece)
+                if added is not None and added.single_word and (
+                    (i > 0 and text[i - 1].isalnum()) or (end < len(text) and text[end].isalnum())
+                ):
+                    continue
+                hit = piece
+                break
+            if hit is not None:
+                out.append(pieces[hit])
+                i += len(hit)
+                continue
+            j = i
+            while j < len(text) and not text[j].isspace() and not any(
+                text.startswith(p, j) for p in pieces if p.startswith("<")
+            ):
+                j += 1
+            out.append(1000 + len(out))
+            i = max(j, i + 1)
+        return {"input_ids": out}
+
+    def convert_ids_to_tokens(self, token_id):
+        return {v: k for k, v in self._pieces().items()}.get(token_id, "?")
+
+
+class AutoTokenizer:
+    @staticmethod
+    def from_pretrained(name, **kw):
+        return _Tokenizer()
+"""
+
+
+def test_the_token_script_reports_the_first_special_and_added_special_token(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    from litetune.prepare import _TOKEN_COUNT_SCRIPT
+
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "transformers.py").write_text(FAKE_TRANSFORMERS_TOKENIZER, encoding="utf-8")
+    script = tmp_path / "count.py"
+    script.write_text(_TOKEN_COUNT_SCRIPT, encoding="utf-8")
+    out = tmp_path / "out.json"
+    texts = [
+        "plain",
+        "a <think> b",
+        "x<|vision_start|>y<|im_end|>",
+        "<|endoftext|> then <|vision_start|>",
+        "an assistantship",
+        "the assistant said",
+    ]
+    spec = tmp_path / "spec.json"
+    spec.write_text(
+        json.dumps({"model": "m", "texts": texts, "specials": True, "out": str(out)}),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(script), str(spec)],
+        env=dict(os.environ, PYTHONPATH=str(fake)),
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    # Not `<think>`, an added token not marked special; at one place the longest.
+    assert json.loads(out.read_text())["specials"] == [
+        None,
+        None,
+        "<|vision_start|>",
+        "<|endoftext|>",
+        # `single_word`: the tokenizer emits no special id inside a word.
+        None,
+        "assistant",
+    ]
+
+
+def test_the_counter_runs_the_script_for_special_tokens_and_for_counts(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    from litetune.prepare import HuggingFaceTokenCounter
+
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "transformers.py").write_text(FAKE_TRANSFORMERS_TOKENIZER, encoding="utf-8")
+
+    class LocalEnv:
+        name = "local"
+        requirements = ()
+
+        def run(self, argv, timeout=None):
+            return subprocess.run(
+                [sys.executable, *argv[1:]],
+                env=dict(os.environ, PYTHONPATH=str(fake)),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+
+    counter = HuggingFaceTokenCounter(model="m", env=LocalEnv(), auto_provision=False)
+
+    assert counter.first_special(["a <|vision_start|>", "b"]) == ["<|vision_start|>", None]
+    assert counter.count(["one two", "three"]) == [2, 1]

@@ -459,13 +459,16 @@ def test_training_the_reference_and_the_rendering_check_render_from_one_source()
     # Training learns from this text and the rendering check compares the
     # reference's ids with the runtime's: a copy in any one script renders a
     # prompt the others may not.
+    from litetune.decision_scripts import REFERENCE_SCRIPT as DECISION_REFERENCE
     from litetune.evaluate import _HF_GENERATE_SCRIPT
     from litetune.rendering import _REFERENCE_SCRIPT
     from litetune.tune import _TRAIN_SCRIPT
 
-    for script in (_TRAIN_SCRIPT, _HF_GENERATE_SCRIPT, _REFERENCE_SCRIPT):
+    for script in (_TRAIN_SCRIPT, _HF_GENERATE_SCRIPT, _REFERENCE_SCRIPT, DECISION_REFERENCE):
         assert script.count(RENDERING_SOURCE) == 1
         assert script.count("def render_prompt(") == 1
+    # The decision reference renders nothing else, so no hand copy sits beside it.
+    assert DECISION_REFERENCE.replace(RENDERING_SOURCE, "").count("apply_chat_template(") == 0
 
 
 def test_every_generated_script_is_valid_python():
@@ -475,6 +478,8 @@ def test_every_generated_script_is_valid_python():
     seven failures in tests about dtype and device -- every test that execs a
     script -- and none of them said the script would not compile. This says it.
     """
+    from litetune.decision_scripts import ENGINE_SCRIPT
+    from litetune.decision_scripts import REFERENCE_SCRIPT as DECISION_REFERENCE
     from litetune.evaluate import _HF_GENERATE_SCRIPT
     from litetune.rendering import _REFERENCE_SCRIPT
     from litetune.tune import _TRAIN_SCRIPT
@@ -483,6 +488,8 @@ def test_every_generated_script_is_valid_python():
         ("train", _TRAIN_SCRIPT),
         ("generate", _HF_GENERATE_SCRIPT),
         ("reference", _REFERENCE_SCRIPT),
+        ("decision reference", DECISION_REFERENCE),
+        ("decision engine", ENGINE_SCRIPT),
     ]:
         compile(script, f"{name}_script.py", "exec")
 

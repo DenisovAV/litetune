@@ -10,7 +10,10 @@ void main() {
   test('measurement summary keeps devices and measured subsets scoped', () {
     expect(WhyItExists.measurementSummary, contains('converted candidate'));
     expect(WhyItExists.measurementSummary, contains('float references'));
-    expect(WhyItExists.measurementSummary, contains('Four models'));
+    expect(
+      WhyItExists.measurementSummary,
+      contains('Four of the fine-tuned models'),
+    );
     expect(
       WhyItExists.measurementSummary,
       contains("candidates on LiteRT-LM's CPU backend"),
@@ -33,7 +36,7 @@ void main() {
   });
 
   test('measured-model copy covers every card and names the variant', () {
-    expect(WhyItExists.measured, hasLength(6));
+    expect(WhyItExists.measured, hasLength(12));
     expect(Formats.measuredQualifier, contains('Gemma 4 E2B'));
     expect(
       WhyItExists.measured.map((model) => model.name),

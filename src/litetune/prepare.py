@@ -169,17 +169,34 @@ DECLARATIONS_NOT_COUNTED = (
 OPTIONS_CHECK = "every option has a training row"
 
 # The one family whose decisions have been trained and scored by option
-# scoring: google/gemma-3-270m-it, on 2026-10-15, as four models on three tasks (6 to 151 options).
+# scoring on several tasks: google/gemma-3-270m-it, on 2026-10-15, as four models
+# on three tasks (6 to 151 options). Every other family with a rule in
+# `models.RULES` is accepted with a limitation, and `verify` asks it for a float twin.
 DECISION_FAMILY = "gemma-3-text"
 DECISION_MEASURED_MODEL = "google/gemma-3-270m-it"
+
+# The families whose decisions were trained and passed `verify`, float twin
+# included, on one task: an emotion question with six options, 2,000 held-out
+# rows, on 2026-10-20 and 21 (MEASUREMENTS.md). They are accepted with
+# `DECISION_FAMILY_MEASURED_ONCE`, every other one with `DECISION_FAMILY_UNMEASURED`.
+DECISION_MEASURED_ONCE = {
+    "functiongemma": ("google/functiongemma-270m-it",),
+    "gemma-4-e2b": ("google/gemma-4-E2B-it",),
+    "qwen-3": ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B"),
+    "qwen-2.5": ("Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"),
+    "granite-4.1": ("ibm-granite/granite-4.1-3b",),
+    "minicpm5": ("openbmb/MiniCPM5-1B",),
+    "qwen-3.5": ("Qwen/Qwen3.5-0.8B",),
+}
 
 # Out-of-scope calibration rows below which the threshold rule answers none of them.
 THIN_CALIBRATION_OOS = 10
 
 DECISION_MODEL_UNNAMED = (
     "no --base-model was named, so the model this split trains was not checked. Decisions by "
-    f"option scoring have been trained and measured on {DECISION_MEASURED_MODEL} only, and "
-    "this stage refuses a named model of another family"
+    f"option scoring have been trained and measured on several tasks on {DECISION_MEASURED_MODEL} "
+    "only; this stage refuses a named model litetune has no family rule for, and says what was "
+    "measured for a named model of another family"
 )
 
 DECISION_INFERRED = (
@@ -200,10 +217,71 @@ DECISION_MODEL_UNMEASURED = (
     "measured"
 )
 
+DECISION_FAMILY_UNMEASURED = (
+    "{model} is {family}, a family decisions by option scoring have not been trained or "
+    f"measured on: that was {DECISION_MEASURED_MODEL} ({DECISION_FAMILY}) only. How its chat "
+    "template renders the decision's prompt, the end of turn its options are scored with, "
+    "whether the runtime's scoring method holds on its caches, and its accuracy and cost are not "
+    "measured. `verify` refuses its decision without --float-twin, the float32 export that "
+    "checks the method on it"
+)
+
+DECISION_FAMILY_MEASURED_ONCE = (
+    "{model} is {family}, a family decisions by option scoring were trained and verified on "
+    "for one task only: {measured}, on an emotion question with six options (2026-10-20). "
+    "Other tasks, option counts and models of the family are not measured. `verify` refuses "
+    "its decision without --float-twin, the float32 export that checks the runtime's scoring "
+    "method on the checkpoint"
+)
+
+DECISION_NO_RULE = (
+    "{model} is a model litetune has no family rule for. Decisions need one: `verify` reads "
+    "from the rule whether the runtime may rewind a session between options "
+    "(`ModelRules.engine_per_prompt_reason`), and with no rule that is unknown. Name the base "
+    "model of a family `litetune` lists"
+)
+
+DECISION_CONFIG_ONLY = (
+    "{model} is identified only by its config.json, as {family}: a gemma3_text checkpoint "
+    "whose name does not say which model it is, which `convert` refuses because the type "
+    "override cannot be derived from it (`models.RULES`, the gemma3-text-unidentified rule). "
+    "Name the model it was tuned from"
+)
+
 
 def is_measured_decision_model(model: str) -> bool:
     """Whether `model` names the one model decisions were trained and measured on."""
     return re.search(r"gemma-?3-270m", hint_for(model).text, re.IGNORECASE) is not None
+
+
+def decision_model_refusal(model: str) -> str | None:
+    """Why `model` cannot be trained or measured on a decision, or `None` when it can.
+
+    Every family with a rule can; the one without a rule, and the rule that only
+    a `config.json` matched, cannot.
+    """
+    rules = identify(model)
+    if rules is None:
+        return DECISION_NO_RULE.format(model=model)
+    if rules.config_only:
+        return DECISION_CONFIG_ONLY.format(model=model, family=rules.family)
+    return None
+
+
+def decision_model_limitation(model: str) -> str | None:
+    """What was not measured for a decision on `model`, which `decision_model_refusal` accepts."""
+    rules = identify(model)
+    if rules is None or rules.config_only:
+        return None
+    if (measured := DECISION_MEASURED_ONCE.get(rules.family)) is not None:
+        return DECISION_FAMILY_MEASURED_ONCE.format(
+            model=model, family=rules.family, measured=" and ".join(measured)
+        )
+    if rules.family != DECISION_FAMILY:
+        return DECISION_FAMILY_UNMEASURED.format(model=model, family=rules.family)
+    if not is_measured_decision_model(model):
+        return DECISION_MODEL_UNMEASURED.format(model=model)
+    return None
 
 
 NO_SCOREABILITY_FOR_DECISIONS = (
@@ -715,16 +793,50 @@ def read_decision_rows(
     return decision, digest, rows
 
 
-def refuse_unmeasured_decision_model(base_model: str) -> None:
-    """Refuse a model outside the one family decisions have been measured on."""
-    rules = identify(base_model)
-    if rules is None or rules.family != DECISION_FAMILY:
-        family = rules.family if rules is not None else "a family litetune has no entry for"
+SPECIALS_UNCHECKED = (
+    "the tokenizer could not be asked which special tokens the decision's prompts hold ({why}), "
+    "so only litetune's own list of control text (`decisions.CONTROL_TEXT`) was checked, and a "
+    "special token the tokenizer has beyond it would reach the model as a control id"
+)
+
+
+def refuse_tokenizer_specials(
+    rows: Sequence[Row], path: Path, counter: TokenCounter, result: PrepareResult
+) -> None:
+    """Refuse a decision row whose prompt or answer holds one of the tokenizer's special tokens.
+
+    The authoritative check, where a tokenizer is in hand: `decisions.CONTROL_TEXT`
+    is a hand list, the fallback for `tune` and `verify` and for a `prepare` run
+    without --tokenizer, and a tokenizer has specials it does not hold (Qwen
+    3.5's `<|vision_start|>`, `<|image_pad|>`, `<|audio_start|>`: special in
+    Qwen/Qwen3.5-0.8B's tokenizer_config.json at 2fc0636). A rendered decision
+    prompt holds no special token of its own -- the chat template adds them
+    later -- so one here came from a state, the question or an option, and
+    would reach the model as a control id rather than as the text written.
+    Records a limitation, rather than refusing, when the tokenizer cannot answer.
+    """
+    texts = [*(row.prompt for row in rows), *(row.completion for row in rows)]
+    try:
+        found = counter.first_special(texts)
+    except TokenCountUnavailable as exc:
+        logger.warning("could not ask the tokenizer for special tokens: %s", exc)
+        result.limitation(SPECIALS_UNCHECKED.format(why=exc))
+        return
+    if len(found) != len(texts):
         raise PrepareError(
-            f"{base_model} is {family}. Decisions by option scoring have been trained and "
-            f"measured on {DECISION_MEASURED_MODEL} only, and another family is refused until it "
-            "has been measured: its template, its end of turn and its accuracy on the task are "
-            "all unknown"
+            f"the tokenizer answered for {len(found)} of {len(texts)} texts; which special "
+            "tokens the decision's rows hold cannot be checked on a partial answer"
+        )
+    for i, token in enumerate(found):
+        if token is None:
+            continue
+        row = rows[i % len(rows)]
+        where = "prompt" if i < len(rows) else "answer"
+        raise PrepareError(
+            f"{path}:{row.lineno}: the decision {where} holds {token!r}, which the tokenizer "
+            f"{counter.describe().get('tokenizer')!r} reads as a special token, so the model "
+            "would be handed a control id where the text says something else. Remove it from "
+            "the state, the question or the option"
         )
 
 
@@ -888,6 +1000,14 @@ class TokenCounter(Protocol):
     def count(self, texts: Sequence[str]) -> list[int]:
         """One count per text, in order. Raises `TokenCountUnavailable` if it could not run."""
 
+    def first_special(self, texts: Sequence[str]) -> list[str | None]:
+        """Per text, the tokenizer's special token that occurs first in it, or `None`.
+
+        Special: every token in `all_special_tokens` and every added token its
+        `added_tokens_decoder` marks special. Raises `TokenCountUnavailable` if it
+        could not run.
+        """
+
 
 # Runs inside envs.TRAIN. transformers only -- no torch import -- because the
 # whole point of a separate environment is that the parent never loads either.
@@ -905,11 +1025,37 @@ def main() -> int:
 
     kwargs = {"revision": spec["revision"]} if spec.get("revision") else {}
     tok = AutoTokenizer.from_pretrained(spec["model"], **kwargs)
+    if spec.get("specials"):
+        found = [first_special(tok, text) for text in spec["texts"]]
+        Path(spec["out"]).write_text(json.dumps({"specials": found}), encoding="utf-8")
+        return 0
     counts = [len(tok(text, add_special_tokens=False)["input_ids"]) for text in spec["texts"]]
     Path(spec["out"]).write_text(
         json.dumps({"counts": counts, "tokenizer": type(tok).__name__}), encoding="utf-8"
     )
     return 0
+
+
+def special_ids(tok):
+    """`all_special_ids`, and the id of every added token `added_tokens_decoder` marks special."""
+    found = set(tok.all_special_ids)
+    for token_id, added in (getattr(tok, "added_tokens_decoder", None) or {}).items():
+        if getattr(added, "special", False):
+            found.add(int(token_id))
+    return found
+
+
+def first_special(tok, text):
+    """The first special token the tokenizer emits for `text`, as the tokenizer spells it.
+
+    Read off the ids, not the spelling: an added token's `single_word` and the
+    tokenizer's normalisation decide whether a substring becomes the special id,
+    and only the ids say what the model is handed.
+    """
+    ids = tok(text, add_special_tokens=False)["input_ids"]
+    special = special_ids(tok)
+    hit = next((i for i in ids if i in special), None)
+    return None if hit is None else str(tok.convert_ids_to_tokens(hit))
 
 
 if __name__ == "__main__":
@@ -944,6 +1090,24 @@ class HuggingFaceTokenCounter:
         }
 
     def count(self, texts: Sequence[str]) -> list[int]:
+        payload = self._run(texts, specials=False)
+        counts = [int(c) for c in payload["counts"]]
+        if len(counts) != len(texts):
+            raise TokenCountUnavailable(
+                f"the tokenizer returned {len(counts)} counts for {len(texts)} texts"
+            )
+        return counts
+
+    def first_special(self, texts: Sequence[str]) -> list[str | None]:
+        payload = self._run(texts, specials=True)
+        found = payload.get("specials")
+        if not isinstance(found, list) or len(found) != len(texts):
+            raise TokenCountUnavailable(
+                f"the tokenizer returned no special token per text for {len(texts)} texts"
+            )
+        return [None if f is None else str(f) for f in found]
+
+    def _run(self, texts: Sequence[str], specials: bool) -> dict[str, Any]:
         if self.auto_provision:
             try:
                 self.env.provision()
@@ -965,6 +1129,7 @@ class HuggingFaceTokenCounter:
                         "model": self.model,
                         "revision": self.revision,
                         "texts": list(texts),
+                        "specials": specials,
                         "out": str(out),
                     }
                 ),
@@ -992,14 +1157,8 @@ class HuggingFaceTokenCounter:
                     f"the tokenizer was {reading.describe('the data')} without counts: "
                     f"{(proc.stderr or '').strip()[-300:] or 'no stderr'}"
                 )
-            payload = json.loads(out.read_text(encoding="utf-8"))
-
-        counts = [int(c) for c in payload["counts"]]
-        if len(counts) != len(texts):
-            raise TokenCountUnavailable(
-                f"the tokenizer returned {len(counts)} counts for {len(texts)} texts"
-            )
-        return counts
+            payload: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
+        return payload
 
 
 @dataclass(frozen=True)
@@ -1631,8 +1790,9 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 "answers with the id of an option, never with a tool call, so there is nothing "
                 "for a tool list to check"
             )
-        if request.base_model is not None:
-            refuse_unmeasured_decision_model(request.base_model)
+        refusal = decision_model_refusal(request.base_model) if request.base_model else None
+        if refusal is not None:
+            raise PrepareError(refusal)
         asked, questions_sha256, rows = read_decision_rows(request.data, objects, request.questions)
         decision = DecisionProfile(
             decision=asked,
@@ -1675,8 +1835,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     if decision is not None:
         if request.base_model is None:
             result.limitation(DECISION_MODEL_UNNAMED)
-        elif not is_measured_decision_model(request.base_model):
-            result.limitation(DECISION_MODEL_UNMEASURED.format(model=request.base_model))
+        elif (unmeasured := decision_model_limitation(request.base_model)) is not None:
+            result.limitation(unmeasured)
         if request.questions is None:
             result.limitation(DECISION_INFERRED.format(question=decision.decision.question))
         if decision.decision.type != "choice":
@@ -1685,6 +1845,9 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 DECISION_TYPE_LESS_MEASURED.format(kind=kind, measured=TYPE_MEASURED[kind])
             )
     events.metric("rows", len(rows), source=str(request.data))
+
+    if decision is not None and request.tokens is not None:
+        refuse_tokenizer_specials(rows, request.data, request.tokens, result)
 
     # -- lengths -----------------------------------------------------------
     measured: list[LengthStats] = []

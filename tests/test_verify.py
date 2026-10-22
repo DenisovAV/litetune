@@ -21,7 +21,7 @@ from conftest import (
     probe_answer,
 )
 
-from litetune import envs
+from litetune import envs, models
 from litetune.evaluate import (
     BACKEND_OBSERVED,
     Generation,
@@ -2299,3 +2299,23 @@ def test_a_reference_refused_for_memory_reaches_the_manifest(write_split, monkey
         "not started on mps" in text and "LITETUNE_DEVICE=cpu" in text
         for text in result.manifest["limitations"]
     ), result.manifest["limitations"]
+
+
+def test_a_qwen35_candidate_gets_an_engine_per_prompt(write_split):
+    from litetune.verify import build_backends
+
+    data = write_split(labelled_rows(2))
+    qwen35 = VerifyRequest(model=Path("m.litertlm"), reference="Qwen/Qwen3.5-0.8B", data=data)
+    candidate = build_backends(qwen35).candidate
+    assert (
+        candidate.engine_per_prompt_reason
+        == models.identify("Qwen/Qwen3.5-0.8B").engine_per_prompt_reason
+    )
+    assert "google-ai-edge/LiteRT-LM#3165" in candidate.engine_per_prompt_reason
+    for reference in ("Qwen/Qwen3-0.6B", "org/unknown-model"):
+        request = VerifyRequest(model=Path("m.litertlm"), reference=reference, data=data)
+        assert build_backends(request).candidate.engine_per_prompt_reason == ""
+
+
+def test_only_qwen35_needs_an_engine_per_prompt():
+    assert {r.family for r in models.RULES if r.engine_per_prompt_reason} == {"qwen-3.5"}

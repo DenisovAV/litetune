@@ -46,16 +46,16 @@ typedef MeasuredRun = ({
 ///
 /// The note under the cards keeps the two execution sides separate: every
 /// headline candidate ran on LiteRT-LM's CPU backend, while some float
-/// references ran on CUDA. Four-bit results cover four models rather than all
-/// six. The separate Qwen3 phone run is named because its CPU and GPU results
+/// references ran on CUDA. Four-bit results cover four of the fine-tuned
+/// models rather than all twelve (Gemma 4's is on its base weights). The separate Qwen3 phone run is named because its CPU and GPU results
 /// resolve in opposite directions between the eight-bit and mixed four-bit
 /// recipes; a blanket "four bits cost more" would therefore be false.
 ///
 /// The size is in the card name because `models.py` scopes the `gemma-3-text`
 /// family to the 270M and the 1B, and both are now measured -- two cards that
-/// differ in nothing but size. Qwen3's card carries its size because its rule
-/// is scoped to the one size that was run, and Qwen2.5's for the same reason,
-/// where the rule is scoped to the one size *and* variant.
+/// differ in nothing but size. Qwen3's cards carry their sizes because its rule
+/// is scoped to the sizes that were run, and Qwen2.5's for the same reason,
+/// where the rule is scoped to the sizes *and* variant.
 ///
 /// Each card opens a panel. It says what the model is and what it is for,
 /// names the checkpoint the run actually used -- the Hub id and, where
@@ -90,9 +90,10 @@ class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
   static const measurementSummary =
-      'Across the six headline runs, every converted candidate ran on '
+      'Across the twelve headline runs, every converted candidate ran on '
       "LiteRT-LM's CPU backend; some float references ran on CUDA. The "
-      'eight-bit gap was small on all six and often unresolved. Four models '
+      'eight-bit gap was small on all twelve and often unresolved. Four of the '
+      'fine-tuned models '
       'also have blockwise four-bit results with the candidates on LiteRT-LM\'s '
       'CPU backend, where the gap was larger. A separate Qwen3 phone run shows '
       'that the backend can change the answer. ';
@@ -188,6 +189,18 @@ class WhyItExists extends StatelessComponent {
       anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
     ),
     (
+      name: 'Qwen3 1.7B',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          '1.7B parameters, text only, and the same chat template as the '
+          "0.6B byte for byte, so its rule hands it LiteRT-LM's own Qwen 3 "
+          'template on the same terms. Measured on litert-lm 0.18.0, with '
+          'neither eight-bit conversion cost resolved.',
+      hubId: 'Qwen/Qwen3-1.7B',
+      revision: '70d244cc',
+      anchor: 'the-two-qwen-families-one-size-up',
+    ),
+    (
       name: 'Qwen2.5 0.5B Instruct',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
@@ -199,6 +212,67 @@ class WhyItExists extends StatelessComponent {
       revision: '7ae55760',
       anchor:
           'a-fifth-family-and-the-first-where-channelwise-four-bits-answered',
+    ),
+    (
+      name: 'Qwen2.5 1.5B Instruct',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          '1.5B parameters, text only, and the same chat template as the '
+          '0.5B Instruct byte for byte, composed behind the same text-parts '
+          'block. Measured on litert-lm 0.18.0 with eight bits only, '
+          'neither conversion cost resolved.',
+      hubId: 'Qwen/Qwen2.5-1.5B-Instruct',
+      revision: '989aa798',
+      anchor: 'the-two-qwen-families-one-size-up',
+    ),
+    (
+      name: 'Qwen3.5 0.8B',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          '0.8B parameters, text only, and most of its layers are not '
+          'attention: 18 of its 24 are linear attention. It takes '
+          "LiteRT-LM's own Qwen 3.5 template, edited to render a single "
+          'turn as the checkpoint does, and verify gives every prompt an '
+          'Engine of its own.',
+      hubId: 'Qwen/Qwen3.5-0.8B',
+      revision: '2fc06364',
+      anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+    ),
+    (
+      name: 'Qwen3.5 2B',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          '2B parameters, text only, under the same rule as the 0.8B: its '
+          'bundle carries the same edited template, byte for byte. Measured '
+          'on litert-lm 0.18.0, where its eight-bit dynamic conversion '
+          'cost resolved.',
+      hubId: 'Qwen/Qwen3.5-2B',
+      revision: '15852e8c',
+      anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+    ),
+    (
+      name: 'MiniCPM5 1B',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          "1B parameters, text only. It takes LiteRT-LM's own MiniCPM5 "
+          'template, edited for the start token its checkpoint template '
+          'prints itself: the runtime puts that token in front of what it '
+          'renders, and the first export of it could not check that.',
+      hubId: 'openbmb/MiniCPM5-1B',
+      revision: '87179e5c',
+      anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+    ),
+    (
+      name: 'Granite 4.1 3B',
+      how: 'exact-text scoring, the same 600 held-out rows',
+      what:
+          '3.4B parameters, text only, and the largest text-only model '
+          "measured here. Its own chat template, composed behind litetune's "
+          'text-parts block. Measured on litert-lm 0.18.0 with eight bits '
+          'only, neither conversion cost resolved.',
+      hubId: 'ibm-granite/granite-4.1-3b',
+      revision: 'c0650403',
+      anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
     ),
     (
       name: 'Gemma 4 E2B',
@@ -213,7 +287,7 @@ class WhyItExists extends StatelessComponent {
       hubId: 'google/gemma-4-E2B-it',
       // Null although MEASUREMENTS.md names a commit: that run passed no
       // `--revision` and the hash was read back from the cache afterwards.
-      // Showing it here in the same slot as four pinned ones would give it a
+      // Showing it here in the same slot as ten pinned ones would give it a
       // parity the section it links to explicitly denies.
       revision: null,
       anchor: 'end-to-end-on-the-seven-projection-checkpoint',
@@ -230,9 +304,9 @@ class WhyItExists extends StatelessComponent {
   static const closeTarget = 'measured';
 
   /// The panel's id, and what the card links to. Taken from the Hub id rather
-  /// than the display name: the six last segments are already unique and are
+  /// than the display name: the twelve last segments are already unique and are
   /// the thing that identifies the run, while two cards could one day differ
-  /// in name alone. The `.` two Qwen ids carry is legal in an id and in a
+  /// in name alone. The `.` five ids carry is legal in an id and in a
   /// fragment, and is inert only because nothing selects these by id -- the
   /// stylesheet matches on class.
   static String slugFor(MeasuredRun model) =>

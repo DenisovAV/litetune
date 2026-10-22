@@ -2217,6 +2217,9 @@ def test_prepare_feeds_tune_feeds_bundle(trainer, tmp_path):
         def count(self, texts):
             return [len(text.split()) for text in texts]
 
+        def first_special(self, texts):
+            return [None for _ in texts]
+
     declarations = tmp_path / "tools.json"
     declarations.write_text(
         json.dumps(
@@ -5079,20 +5082,61 @@ def test_a_row_the_decision_did_not_render_is_refused_by_line(
     assert result.model_dir is None
 
 
-def test_a_decision_for_another_family_is_refused(tmp_path, request_for, trainer):
+# Every family `models.RULES` has a rule for, by a model it claims.
+DECISION_FAMILIES = (
+    ("google/functiongemma-270m-it", "functiongemma"),
+    ("google/gemma-3-1b-it", "gemma-3-text"),
+    ("google/gemma-4-E2B-it", "gemma-4-e2b"),
+    ("Qwen/Qwen3-0.6B", "qwen-3"),
+    ("Qwen/Qwen2.5-0.5B-Instruct", "qwen-2.5"),
+    ("Qwen/Qwen3.5-0.8B", "qwen-3.5"),
+    ("openbmb/MiniCPM5-1B", "minicpm5"),
+    ("ibm-granite/granite-4.1-3b", "granite-4.1"),
+)
+
+
+@pytest.mark.parametrize(("model", "family"), DECISION_FAMILIES)
+def test_a_decision_for_every_family_with_a_rule_trains_and_says_what_is_unmeasured(
+    tmp_path, request_for, trainer, model, family
+):
+    from litetune.models import identify
+    from litetune.prepare import DECISION_MEASURED_ONCE
+
+    assert identify(model).family == family
     data, decision = _decision_split(tmp_path)
 
     result = run_tune(
         request_for(
-            model="Qwen/Qwen2.5-0.5B-Instruct",
-            data=data,
-            decision=decision,
-            prompt_mode=PromptMode.RUNTIME_RENDERED,
+            model=model, data=data, decision=decision, prompt_mode=PromptMode.RUNTIME_RENDERED
         )
     )
 
-    failed = [c for c in result.checks.checks if c.outcome is Outcome.FAILED]
-    assert any("not a Gemma 3 text model" in c.detail for c in failed)
+    check = next(c for c in result.checks.checks if c.name == "decision")
+    assert check.outcome is Outcome.PASSED, check.detail
+    assert trainer.configs[-1]["decision"] is not None
+    said = [text for text in result.limitations if model in text]
+    assert len(said) == 1
+    if family == "gemma-3-text":
+        assert "is a Gemma 3 text model, the family decisions were measured on" in said[0]
+    elif family in DECISION_MEASURED_ONCE:
+        assert f"is {family}, a family decisions by option scoring were trained and" in said[0]
+    else:
+        assert f"is {family}, a family decisions by option scoring have not been" in said[0]
+        assert "--float-twin" in said[0]
+
+
+def test_a_decision_for_the_measured_model_says_nothing_about_its_family(
+    tmp_path, request_for, trainer
+):
+    data, decision = _decision_split(tmp_path)
+
+    result = run_tune(
+        request_for(
+            model=GEMMA_270M, data=data, decision=decision, prompt_mode=PromptMode.RUNTIME_RENDERED
+        )
+    )
+
+    assert not any(GEMMA_270M in text for text in result.limitations)
 
 
 def test_a_decision_beside_declarations_is_refused(tmp_path, request_for, trainer):
@@ -5179,7 +5223,8 @@ def test_a_decision_for_a_model_with_no_known_rules_is_refused(tmp_path, request
     )
 
     assert result.outcome is Outcome.FAILED
-    assert any("not a Gemma 3 text model" in c.detail for c in result.checks.checks)
+    assert any("has no family rule for" in c.detail for c in result.checks.checks)
+    assert trainer.configs == []
 
 
 def test_a_row_that_is_only_the_suffix_has_no_state_and_is_refused(tmp_path, request_for, trainer):

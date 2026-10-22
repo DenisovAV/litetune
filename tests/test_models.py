@@ -71,6 +71,8 @@ E2B_TEMPLATE = "--jinja_chat_template_override=litert-community/gemma-4-E2B-it-l
         ("google/gemma-4-it", "gemma-4"),
         ("Qwen/Qwen3.5-4B-Instruct", "qwen-3.5"),
         ("Qwen/Qwen3-0.6B", "qwen-3"),
+        ("Qwen/Qwen3-1.7B", "qwen-3"),
+        ("Qwen/Qwen2.5-1.5B-Instruct", "qwen-2.5"),
     ],
 )
 def test_families_are_recognised(model, family):
@@ -88,15 +90,19 @@ def test_families_are_recognised(model, family):
         # Qwen3-0.6B sat here until its export and conversion cost were
         # measured, and Qwen2.5-0.5B-Instruct until 2026-09-20. Both rules now
         # compose the checkpoint's own template behind the text-parts block at
-        # export; the rest of both families stays below.
-        "Qwen/Qwen2.5-1.5B-Instruct",
+        # export; the rest of both families stays below. Qwen3-1.7B and
+        # Qwen2.5-1.5B-Instruct left on 2026-10-19: their templates are the
+        # smaller sizes' byte for byte.
+        "Qwen/Qwen2.5-3B-Instruct",
         "Qwen/Qwen2.5-0.5B",
-        # Claimed by size, and only the size that was measured. The TTS model is
-        # here because its name ends in 0.6B too.
-        "Qwen/Qwen3-1.7B",
+        "Qwen/Qwen2.5-1.5B",
+        # Claimed by size, and only the sizes added. The TTS models are here
+        # because their names end in 0.6B and 1.7B too.
+        "Qwen/Qwen3-4B",
         "Qwen/Qwen3-30B-A3B",
         "Qwen/Qwen3-VL-2B-Instruct",
         "litert-community/Qwen3-TTS-12Hz-0.6B-Base",
+        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         # A size suffix is not the generation number: matching these would
         # refuse an export for a family these rules say nothing about.
         "org/gemma-40m",
@@ -218,6 +224,8 @@ def test_only_a_multimodal_family_scopes_lora_at_all():
         "gemma-4",
         "gemma-4-e2b",
         "gemma-4-e4b",
+        "granite-4.1",
+        "minicpm5",
         "qwen-2.5",
         "qwen-3",
         "qwen-3.5",
@@ -351,14 +359,19 @@ def test_an_export_request_carries_the_required_flags_into_its_argv(tmp_path):
 
 
 def test_a_family_with_no_rules_has_its_flags_left_alone(tmp_path):
-    plan = plan_export("Qwen/Qwen2.5-1.5B-Instruct", ("--some_flag=1",), ("dynamic_wi8_afp32",))
+    plan = plan_export("Qwen/Qwen2.5-3B-Instruct", ("--some_flag=1",), ("dynamic_wi8_afp32",))
     assert plan.flags == ("--some_flag=1",)
     assert plan.added == ()
     assert plan.usable
     assert "no per-model rules" in " ".join(plan.notes)
 
 
-QWEN_RULES = [("Qwen/Qwen3-0.6B", "qwen-3"), ("Qwen/Qwen2.5-0.5B-Instruct", "qwen-2.5")]
+QWEN_RULES = [
+    ("Qwen/Qwen3-0.6B", "qwen-3"),
+    ("Qwen/Qwen3-1.7B", "qwen-3"),
+    ("Qwen/Qwen2.5-0.5B-Instruct", "qwen-2.5"),
+    ("Qwen/Qwen2.5-1.5B-Instruct", "qwen-2.5"),
+]
 # The template override each Qwen rule adds: Qwen 3 may get LiteRT-LM's own.
 QWEN_MARKERS = {
     "qwen-3": models.CANONICAL_OR_COMPOSED_TEMPLATE,
@@ -369,7 +382,8 @@ QWEN_MARKERS = {
 @pytest.mark.parametrize(("model", "family"), QWEN_RULES)
 def test_a_qwen_export_asks_for_its_own_template_composed_and_no_type_override(model, family):
     """The exporter types both Qwen checkpoints from their own `config.json`
-    (measured 2026-09-14 and 2026-09-20), so no type override. What LiteRT-LM
+    (measured 2026-09-14 on Qwen3-0.6B, 2026-09-20 on Qwen2.5-0.5B-Instruct and
+    2026-10-19 on Qwen3-1.7B and Qwen2.5-1.5B-Instruct), so no type override. What LiteRT-LM
     0.18.0 needs is a template that reads content as a list of parts: on it a
     Qwen3 bundle carrying the checkpoint's template rendered an empty user turn
     with no error (2026-10-08). So the plan adds exactly that one flag, as the
@@ -390,15 +404,20 @@ def test_a_qwen_export_asks_for_its_own_template_composed_and_no_type_override(m
 
 def test_no_checkpoints_template_ships_in_the_package():
     """A checkpoint's template is read at export, never packaged: the package
-    carries litetune's block, FunctionGemma's template and LiteRT-LM's Qwen 3
-    template, which the qwen-3 rule hands over only when it renders single
-    turns as the checkpoint's own does."""
+    carries litetune's block, FunctionGemma's template and LiteRT-LM's Qwen 3,
+    MiniCPM5 and Qwen 3.5 templates, the last two edited (`CANONICAL_EDITS`),
+    which their rules hand over only when they render single turns as the
+    checkpoint's own does."""
     templates = Path(models.packaged_template(models.TEXT_PARTS_BLOCK)).parent
-    assert sorted(p.name for p in templates.iterdir()) == [
-        "functiongemma.jinja",
-        models.QWEN3_CANONICAL_TEMPLATE,
-        models.TEXT_PARTS_BLOCK,
-    ]
+    assert sorted(p.name for p in templates.iterdir()) == sorted(
+        [
+            "functiongemma.jinja",
+            models.MINICPM5_CANONICAL_TEMPLATE,
+            models.QWEN35_CANONICAL_TEMPLATE,
+            models.QWEN3_CANONICAL_TEMPLATE,
+            models.TEXT_PARTS_BLOCK,
+        ]
+    )
 
 
 def test_the_text_parts_block_can_print_nothing():
@@ -632,7 +651,7 @@ def test_the_reason_says_the_checkpoints_own_template_is_kept(model, family):
 
 
 def test_an_unknown_family_is_told_about_the_list_of_parts():
-    model = "Qwen/Qwen2.5-1.5B-Instruct"
+    model = "Qwen/Qwen2.5-3B-Instruct"
     notes = " ".join(plan_export(model, (), ("dynamic_wi8_afp32",)).notes)
     assert "no per-model rules" in notes
     assert "from LiteRT-LM 0.18.0" in notes and "list of parts" in notes and "run verify" in notes
@@ -674,12 +693,22 @@ def test_the_qwen3_rule_claims_a_name_that_still_contains_its_size():
         "someorg/Qwen3-0.6B-sql-assistant",
         # What a name cannot show: a format not spelled after the size.
         "mlx-community/Qwen3-0.6B-bf16",
+        "Qwen/Qwen3-1.7B",
+        "Qwen/Qwen3-1.7B-Base",
+        _SNAPSHOT.format("Qwen3-1.7B"),
+        "someorg/Qwen3-1.7B-sql-assistant",
     ):
         assert identify(claimed).family == "qwen-3", claimed
         plan = plan_export(claimed, (), ("dynamic_wi8_afp32",))
         marker = models.CANONICAL_OR_COMPOSED_TEMPLATE
         assert f"--jinja_chat_template_override={marker}" in plan.flags
-    for unclaimed in (*_QWEN3_REPACKS, "acme/banking77-assistant", "Qwen/Qwen3-1.7B"):
+    for unclaimed in (
+        *_QWEN3_REPACKS,
+        *(name.replace("0.6B", "1.7B") for name in _QWEN3_REPACKS),
+        "acme/banking77-assistant",
+        "Qwen/Qwen3-4B",
+        "Qwen/Qwen3-ASR-1.7B",
+    ):
         assert identify(unclaimed) is None, unclaimed
 
 
@@ -799,7 +828,7 @@ def test_the_qwen25_rule_claims_the_checkpoint_that_was_run_and_not_its_repacks(
     """A size suffix is not a licence over the family, and neither is a prefix.
 
     `Qwen2-5B` is a Qwen 2 of five billion parameters, not a Qwen 2.5; the
-    1.5B and the base 0.5B were never exported here; and the AWQ, GPTQ and
+    base 0.5B and 1.5B, the 3B and the 7B are not claimed; and the AWQ, GPTQ and
     bnb repacks are already-quantized checkpoints that no run in this
     repository touched. `identify` searches rather than matches, so an
     unanchored pattern claims every one of those and silences the
@@ -813,13 +842,23 @@ def test_the_qwen25_rule_claims_the_checkpoint_that_was_run_and_not_its_repacks(
         "someorg/Qwen2.5-0.5B-Instruct",
         # What a name cannot show: an ONNX export under the bare name.
         "onnx-community/Qwen2.5-0.5B-Instruct",
+        "Qwen/Qwen2.5-1.5B-Instruct",
+        _SNAPSHOT.format("Qwen2.5-1.5B-Instruct"),
+        "someorg/Qwen2.5-1.5B-Instruct",
     ):
         assert identify(claimed).family == "qwen-2.5", claimed
     for unclaimed in (
         "Qwen/Qwen2-5B",
         "Qwen/Qwen2.5-0.5B",
-        "Qwen/Qwen2.5-1.5B-Instruct",
+        "Qwen/Qwen2.5-1.5B",
+        "Qwen/Qwen2.5-3B-Instruct",
         "Qwen/Qwen2.5-7B-Instruct",
+        "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+        "Qwen/Qwen2.5-Math-1.5B-Instruct",
+        "Qwen/Qwen2.5-1.5B-Instruct-AWQ",
+        "Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int8",
+        "someorg/Qwen2.5-1.5B-Instruct-qwen2-GGUF",
+        "me/Qwen2.5-1.5B-Instruct-banking77",
         "Qwen/Qwen2.5-0.5B-Instruct-AWQ",
         "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4",
         "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
@@ -2021,3 +2060,102 @@ def test_a_broken_junction_on_the_way_to_the_checkpoint_is_not_an_absent_record(
     target.rmdir()
     with pytest.raises(FileNotFoundError, match="a link on the way to"):
         read_training_record(str(junction))
+
+
+def test_the_granite_rule_claims_the_3b_and_not_its_base_or_repacks(tmp_path):
+    """By size and with the qwen-2.5 rule's tail: the base model's template was
+    never read, and a repack is not the checkpoint the template was read from."""
+    for claimed in (
+        "ibm-granite/granite-4.1-3b",
+        _SNAPSHOT.format("granite-4.1-3b"),
+        "someorg/granite-4.1-3b",
+    ):
+        assert identify(claimed).family == "granite-4.1", claimed
+        plan = plan_export(claimed, (), ("dynamic_wi8_afp32",))
+        assert plan.added == (f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}",)
+        assert "joins its text parts with a newline" in plan.rules.required_flags[0].reason
+    for unclaimed in (
+        "ibm-granite/granite-4.1-3b-base",
+        "ibm-granite/granite-4.1-8b",
+        "ibm-granite/granite-4.0-micro",
+        "ibm-granite/granite-4.0-h-1b",
+        "ibm-granite/granite-4.1-3b-GGUF",
+        "someorg/granite-4.1-3b-granite-GGUF",
+        "me/granite-4.1-3b-banking77",
+    ):
+        assert identify(unclaimed) is None, unclaimed
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": "ibm-granite/granite-4.1-3b"}), encoding="utf-8"
+    )
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "granite", "architectures": ["GraniteForCausalLM"]}),
+        encoding="utf-8",
+    )
+    assert models.hint_for(str(checkpoint)).text == (
+        "ibm-granite-granite-4-1-3b-granite-graniteforcausallm"
+    )
+    assert identify(str(checkpoint)).family == "granite-4.1"
+
+
+def test_the_minicpm5_rule_claims_the_1b_and_not_its_siblings(tmp_path):
+    """openbmb publishes -Base, -SFT, -MLX and -GGUF beside the 1B; none of their
+    templates was read here."""
+    for claimed in ("openbmb/MiniCPM5-1B", _SNAPSHOT.format("MiniCPM5-1B"), "someorg/MiniCPM5-1B"):
+        assert identify(claimed).family == "minicpm5", claimed
+        plan = plan_export(claimed, (), ("dynamic_wi8_afp32",))
+        marker = models.CANONICAL_OR_COMPOSED_TEMPLATE
+        assert plan.added == (f"--jinja_chat_template_override={marker}",)
+        assert plan.rules.canonical_template == models.MINICPM5_CANONICAL_TEMPLATE
+        reason = plan.rules.required_flags[0].reason
+        assert "google-ai-edge/LiteRT-LM#3576" in reason
+        assert models.MINICPM5_CANONICAL_TEMPLATE in reason
+        assert "openbmb/MiniCPM5-1B's own, byte for byte" in reason
+    for unclaimed in (
+        "openbmb/MiniCPM5-1B-Base",
+        "openbmb/MiniCPM5-1B-SFT",
+        "openbmb/MiniCPM5-1B-MLX",
+        "openbmb/MiniCPM5-1B-GGUF",
+        "openbmb/MiniCPM5-2B",
+        "someorg/MiniCPM5-1B-llama-GGUF",
+        "me/MiniCPM5-1B-banking77",
+    ):
+        assert identify(unclaimed) is None, unclaimed
+    checkpoint = tmp_path / "model"
+    checkpoint.mkdir()
+    (checkpoint / "litetune.json").write_text(
+        json.dumps({"base_model": "openbmb/MiniCPM5-1B"}), encoding="utf-8"
+    )
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "llama", "architectures": ["LlamaForCausalLM"]}),
+        encoding="utf-8",
+    )
+    assert models.hint_for(str(checkpoint)).text == "openbmb-minicpm5-1b-llama-llamaforcausallm"
+    assert identify(str(checkpoint)).family == "minicpm5"
+
+
+def test_the_qwen35_rule_offers_its_edited_template():
+    for model in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"):
+        plan = plan_export(model, (), ("dynamic_wi8_afp32",))
+        assert plan.rules.family == "qwen-3.5"
+        marker = models.CANONICAL_OR_COMPOSED_TEMPLATE
+        assert plan.added == (f"--jinja_chat_template_override={marker}",)
+        assert plan.rules.canonical_template == models.QWEN35_CANONICAL_TEMPLATE
+        reason = plan.rules.required_flags[0].reason
+        assert "google-ai-edge/LiteRT-LM#3166" in reason
+        assert "Qwen/Qwen3.5-0.8B's own, byte for byte" in reason
+
+
+def test_only_qwen35_holds_a_decision_twin_to_its_own_tolerance():
+    from litetune import models
+
+    loose = {r.family: r for r in models.RULES if r.decision_twin_tolerance is not None}
+    assert set(loose) == {"qwen-3.5"}
+    assert loose["qwen-3.5"].decision_twin_tolerance == 5e-2
+    assert loose["qwen-3.5"].decision_twin_tolerance_reason
+    assert all(
+        not r.decision_twin_tolerance_reason
+        for r in models.RULES
+        if r.decision_twin_tolerance is None
+    )

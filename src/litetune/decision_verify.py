@@ -56,6 +56,7 @@ from litetune.decisions import (
 )
 from litetune.events import EventStream
 from litetune.metrics import paired_difference
+from litetune.prepare import DECISION_FAMILY, DECISION_MEASURED_ONCE
 from litetune.storage import hash_file
 
 logger = logging.getLogger(__name__)
@@ -67,13 +68,19 @@ SCORER_MEANS = (
     "the fitted threshold or on the none_option"
 )
 SCORING = "unique_prefix"
+# How the runtime scores one decision's options, which the section carries so
+# that a decider scores them the same way: `rewind`, one session prefilled once
+# and rewound to a checkpoint after each option; `fresh_engine`, an Engine and
+# a session of their own for each option, never rewound, for a family whose
+# rule gives every prompt an Engine (`models.ModelRules.engine_per_prompt_reason`).
+METHOD_REWIND = "rewind"
+METHOD_FRESH_ENGINE = "fresh_engine"
 
 DEFAULT_ENGINE_ROWS = 200
 DEFAULT_THREADS = 4
 PROBE_ROWS = 4
 AGREEMENT_FLOOR = 0.95
 TWIN_TOLERANCE = 1e-3
-DEFAULT_TERMINATOR = "<end_of_turn>"
 # The runtime the method was measured correct on, against PyTorch, on a float32
 # bundle (2026-10-16). On another, only a float twin shows it still is.
 MEASURED_RUNTIME = "0.18.0"
@@ -83,6 +90,12 @@ MEASURED_RUNTIME = "0.18.0"
 STARTUP_TIMEOUT_S = 900
 REFERENCE_ROW_TIMEOUT_S = 30
 ENGINE_ROW_TIMEOUT_S = 120
+# Per Engine load, under `fresh_engine`: one per option per row, and at most
+# twelve for the self-check (two prompts, three targets, twice each). Creating
+# an Engine took 1.17 s for a gemma-3-270m bundle on LiteRT-LM 0.18.0 (E7,
+# 2026-10-16); a bigger model takes longer.
+ENGINE_LOAD_TIMEOUT_S = 60
+SELFCHECK_LOADS = 12
 
 ROWS_CHECK = "rows are the decision's prompts"
 REFERENCE_CHECK = "reference option scores"
@@ -389,6 +402,7 @@ def section_payload(
     fit: calibration.Fit,
     scored_lengths: Sequence[int],
     terminator: str,
+    method: str,
 ) -> dict[str, Any]:
     """What the bundle carries in its `litetune.decision` section, for flutter_edge_ai to read.
 
@@ -397,11 +411,15 @@ def section_payload(
     tokens (the shortest unique prefix, or the whole target where that prefix
     does not tokenise back to itself), the `none_option` last. The temperature
     and the threshold were fitted on exactly those scores, so a reader that
-    tokenises the options differently is scoring something else.
+    tokenises the options differently is scoring something else. `method` is how
+    the runtime scored them (`METHOD_REWIND` or `METHOD_FRESH_ENGINE`): a
+    decider that rewinds where `fresh_engine` is written scores options on a
+    state the runtime was never measured on.
     """
     return {
         **decision.as_dict(),
         "scoring": SCORING,
+        "method": method,
         "terminator": terminator,
         "scored_lengths": list(scored_lengths),
         "temperature": fit.temperature,
@@ -435,6 +453,17 @@ class DecisionVerify:
     engine_rows: int = DEFAULT_ENGINE_ROWS
     threads: int = DEFAULT_THREADS
     backend: str = "cpu"
+    # The family rule's `engine_per_prompt_reason`: option scoring rewinds
+    # within one session, which no Engine of its own per prompt can make safe.
+    engine_per_prompt_reason: str = ""
+    # The family rule's `decision_twin_tolerance`, and why, for a family whose
+    # float32 bundle is measured further from its model than `TWIN_TOLERANCE`.
+    twin_tolerance: float = TWIN_TOLERANCE
+    twin_tolerance_reason: str = ""
+    # The family rule that claims the checkpoint, `None` for none. Only
+    # `prepare.DECISION_FAMILY` has had the scoring method measured on it without
+    # a float twin.
+    family: str | None = None
     # What `verify` was asked that the decision path does not do: refused rather
     # than ignored, so a manifest never records a role or a limit nobody applied.
     reference_role: str = "float_twin"
@@ -556,6 +585,49 @@ def verify_decision(
             f"option scoring is measured on the CPU backend only; --backend {job.backend} is "
             "refused rather than measured with a method nobody has checked there",
         )
+    method = METHOD_FRESH_ENGINE if job.engine_per_prompt_reason else METHOD_REWIND
+    if method == METHOD_FRESH_ENGINE:
+        state.limitations.append(
+            "this family's rule gives every prompt an Engine of its own: "
+            f"{job.engine_per_prompt_reason}. Option scoring rewinds a session to the prompt "
+            "for every option, so here each option is scored on an Engine and a session of "
+            f"its own, never rewound (method {METHOD_FRESH_ENGINE}, which the section carries "
+            "for the decider): an Engine load per option per decision, here and on a device. "
+            "Creating an Engine took 1.17 s for a gemma-3-270m bundle on LiteRT-LM 0.18.0 "
+            "(2026-10-16); this family's load time is not measured"
+        )
+    # The method -- a rewind that resets only the step while the re-prefilled
+    # cell stays (decision_scripts.ENGINE_SCRIPT, mode `once`) -- was measured
+    # against PyTorch on Gemma 3's caches only, on 2026-10-16. On another family
+    # nothing has shown it holds, and a float twin is what shows it.
+    if job.family != DECISION_FAMILY:
+        if job.float_twin is None:
+            return refuse(
+                TWIN_CHECK,
+                f"this checkpoint's family is {job.family or 'one litetune has no rule for'}, "
+                "and the runtime's option-scoring method was measured against PyTorch without "
+                f"a float twin on {DECISION_FAMILY} only (2026-10-16). On another family a "
+                "decision is verified with --float-twin, which checks the method on this "
+                "checkpoint: convert with --recipe none as well and pass that file",
+            )
+        measured = DECISION_MEASURED_ONCE.get(job.family or "")
+        if measured is None:
+            state.limitations.append(
+                f"decisions by option scoring have not been trained or measured on {job.family}; "
+                "the float twin checks the runtime's method on this checkpoint, and nothing here "
+                "measures how well the family answers such a question"
+            )
+        else:
+            state.limitations.append(
+                f"decisions by option scoring on {job.family} were trained and verified for one "
+                f"task only: {' and '.join(measured)}, on an emotion question with six options "
+                "(2026-10-20); the float twin checks the runtime's method on this checkpoint"
+            )
+    if job.twin_tolerance != TWIN_TOLERANCE:
+        state.limitations.append(
+            f"the float twin is held to {job.twin_tolerance} nats per token, not "
+            f"{TWIN_TOLERANCE}: {job.twin_tolerance_reason}"
+        )
     if job.calibration is None:
         return refuse(
             CALIBRATION_CHECK,
@@ -597,30 +669,15 @@ def verify_decision(
     )
     fields["data"] = {"heldout": heldout.as_dict(), "calibration": calib.as_dict()}
     none_index = decision.ids.index(decision.none_option) if decision.none_option else None
-    # The scorers' terminator is the first token of the end of turn, as
-    # measured: `<end_of_turn>` for Gemma 3. `tune` records the whole end of
-    # turn as text and ids (`<end_of_turn>\n` for gemma-3-270m-it), so it is
-    # checked against that record, never handed over as it is.
-    recorded_turn = record.get("turn_terminator")
-    turn_text = (
-        recorded_turn.get("text")
-        if isinstance(recorded_turn, dict)
-        else recorded_turn
-        if isinstance(recorded_turn, str)
-        else None
-    )
-    if turn_text is None:
-        state.limitations.append(
-            "the checkpoint records no end of turn, so the scorers take Gemma 3's "
-            f"{DEFAULT_TERMINATOR!r}, the family `tune --decision` accepts"
-        )
-    elif not turn_text.startswith(DEFAULT_TERMINATOR):
-        return refuse(
-            ROWS_CHECK,
-            f"the checkpoint's turn ends with {turn_text!r}; option scoring is measured with "
-            f"{DEFAULT_TERMINATOR!r} as the token after the id, the end of a Gemma 3 turn",
-        )
-    terminator = DEFAULT_TERMINATOR
+    # The scorers' terminator is the first token of the end of turn `tune`
+    # recorded (`tune.turn_terminator`: the ids the chat template puts after an
+    # assistant answer, and their text), as measured on Gemma 3, where it is
+    # `<end_of_turn>` of `<end_of_turn>\n`. The reference reads that token's text
+    # off the checkpoint's tokenizer, and the runtime scores the same text.
+    turn = _recorded_turn(record.get("turn_terminator"))
+    if isinstance(turn, str):
+        return refuse(ROWS_CHECK, turn)
+    turn_ids, turn_text = turn
 
     if job.engine_rows < 1:
         return refuse(
@@ -645,7 +702,8 @@ def verify_decision(
             "model": job.reference,
             "rows": [{"index": i, "prompt": p} for i, p in enumerate(prompts)],
             "options": list(decision.ids),
-            "terminator": terminator,
+            "turn_ids": turn_ids,
+            "turn_text": turn_text,
             "check_indices": [longest],
             "ids_for": [calib_n + i for i in engine_rows],
             "device": job.device,
@@ -664,6 +722,13 @@ def verify_decision(
     unusable = _not_finite(ref.scores)
     if unusable is not None:
         return refuse(REFERENCE_CHECK, f"row {unusable} has a reference score that is not finite")
+    terminator = ref.report.get("terminator")
+    if not isinstance(terminator, str) or not terminator or not turn_text.startswith(terminator):
+        return refuse(
+            REFERENCE_CHECK,
+            f"the reference reported {terminator!r} as the first token of the recorded end of "
+            f"turn {turn_text!r}, which it does not begin with",
+        )
     cont_ids = ref.report.get("cont_ids")
     try:
         ks = unique_lengths(cont_ids or [])
@@ -699,8 +764,9 @@ def verify_decision(
             "threads": job.threads,
             "targets": "unique",
             "mode": "auto",
+            "method": method,
         },
-        timeout=STARTUP_TIMEOUT_S + ENGINE_ROW_TIMEOUT_S * n_engine,
+        timeout=_engine_timeout(n_engine, len(decision.ids), method),
         auto_provision=job.auto_provision,
         events=events,
     )
@@ -717,6 +783,12 @@ def verify_decision(
         )
         return refuse(RUNTIME_CHECK, detail)
     mode = eng.report.get("mode")
+    if eng.report.get("method") != method:
+        return refuse(
+            RUNTIME_CHECK,
+            f"the runtime scored by method {eng.report.get('method')!r}, and {method!r} was "
+            "asked for: the scores would describe another decider",
+        )
     if eng.report.get("cont_ids") != cont_ids or eng.report.get("k") != ks:
         return refuse(
             TARGETS_CHECK,
@@ -751,23 +823,37 @@ def verify_decision(
     state.add(
         Check.passed(
             RUNTIME_CHECK,
-            f"{n_engine} rows in mode {mode!r}, picked by the runtime self-check "
-            f"({(eng.report.get('selfcheck') or {}).get('verdict')})",
+            f"{n_engine} rows by method {method!r} in mode {mode!r}, picked by the runtime "
+            f"self-check ({(eng.report.get('selfcheck') or {}).get('verdict')})",
             observed=eng.report.get("selfcheck"),
         ),
         events,
     )
-    # The same prompt on both sides: the reference's ids, which its chat
-    # template starts with the BOS, against the runtime's after the BOS its
-    # session adds. An empty render, a second BOS or another tokenisation of
-    # the text would otherwise show only as disagreement, if at all.
-    bos = ref.report.get("bos_id")
+    # The same prompt on both sides: the reference's ids, as its chat template
+    # renders them, against what the runtime's session reads -- the ids it puts
+    # first on a first turn (`session_prefix`: the BOS, for a bundle whose
+    # metadata has a start token), then the rendering's. Which of the two
+    # writes a BOS differs by family: Gemma 3's template prints it and LiteRT-LM
+    # hands its template none, so the session adds it; Qwen's tokenizers have
+    # none (`bos_token` null in Qwen3-0.6B's and Qwen2.5-0.5B-Instruct's
+    # tokenizer_config.json). An empty render, a BOS on one side only, a second
+    # BOS or another tokenisation of the text would otherwise show only as
+    # disagreement, if at all.
+    prefix = eng.report.get("session_prefix")
+    if not isinstance(prefix, list) or not all(
+        isinstance(i, int) and not isinstance(i, bool) for i in prefix
+    ):
+        return refuse(
+            PROMPT_CHECK,
+            "the runtime did not report the ids its session puts before the prompt "
+            f"(session_prefix: {json.dumps(prefix)[:100]}), so its prompt cannot be compared "
+            "with the reference's",
+        )
     differing = [
         j
         for j, i in enumerate(engine_rows)
-        if bos is None
-        or eng.prompt_ids.get(j) is None
-        or ref.prompt_ids.get(calib_n + i) != [bos, *eng.prompt_ids[j]]
+        if eng.prompt_ids.get(j) is None
+        or ref.prompt_ids.get(calib_n + i) != [*prefix, *eng.prompt_ids[j]]
     ]
     if differing:
         j = differing[0]
@@ -776,13 +862,16 @@ def verify_decision(
             PROMPT_CHECK,
             f"on {len(differing)} of {n_engine} rows the runtime's prompt is not the "
             f"reference's. First, held-out row {engine_rows[j]}: the reference's "
-            f"{_ids_text(want)}, the runtime's BOS {bos} and then {_ids_text(got)}",
+            f"{_ids_text(want)}, the runtime's session prefix {prefix} and then "
+            f"{_ids_text(got)}",
         )
+    fields["decision"]["session_prefix"] = prefix
     state.add(
         Check.passed(
             PROMPT_CHECK,
-            f"on all {n_engine} rows the runtime's prompt ids, after the BOS its session adds, "
-            "are the reference's",
+            f"on all {n_engine} rows the runtime's prompt ids, after "
+            + (f"the ids {prefix} its session puts first" if prefix else "nothing put first")
+            + ", are the reference's",
         ),
         events,
     )
@@ -822,7 +911,7 @@ def verify_decision(
             f"than {THIN_OUT_OF_SCOPE}, the rejection rule lets none of them be answered, so the "
             "most confidently misread one sets the threshold"
         )
-    payload = section_payload(decision, fit, lengths, terminator)
+    payload = section_payload(decision, fit, lengths, terminator, method)
     fields["decision"].update(
         {
             "fit": fit.as_dict(),
@@ -890,7 +979,12 @@ def verify_decision(
         "measures": (
             "per decision: the session's prefill, the re-prefill of mode 'once', and every "
             "option's scoring; not rendering or tokenising the prompt"
+            if method == METHOD_REWIND
+            else "per decision, for every option: an Engine load, a session, the prompt's "
+            "prefill, the re-prefill of mode 'once' and the option's scoring; not rendering "
+            "or tokenising the prompt"
         ),
+        "method": method,
         "ms_per_decision_median": statistics.median(ms),
         "ms_per_decision_max": max(ms),
         "options": len(decision.ids),
@@ -948,7 +1042,7 @@ def verify_decision(
     else:
         state.add(
             _twin_check(
-                job, decision, terminator, heldout, engine_rows, calib_n, ref, mode, events
+                job, decision, terminator, heldout, engine_rows, calib_n, ref, mode, method, events
             ),
             events,
             harness=True,
@@ -961,6 +1055,43 @@ def verify_decision(
     if state.unchecked:
         return finish("inconclusive")
     return finish("passed")
+
+
+def _recorded_turn(recorded: Any) -> tuple[list[int], str] | str:
+    """The end of turn `tune` recorded, as (ids, text), or why it cannot be scored with."""
+    if not isinstance(recorded, dict):
+        return (
+            "the checkpoint records no end of turn in the shape `tune` writes ({ids, source, "
+            f"text}}), got {json.dumps(recorded)[:200]}; option scoring scores each option "
+            "followed by the first token of the turn's end, and nothing else says which it is"
+        )
+    ids, text, source = recorded.get("ids"), recorded.get("text"), recorded.get("source")
+    if source != "chat_template":
+        return (
+            f"`tune` took this checkpoint's end of turn from {source!r}, not from its chat "
+            "template; a decision is trained and scored through the template's turn, and the "
+            "token that closes it is what each option is scored with"
+        )
+    if (
+        not isinstance(ids, list)
+        or not ids
+        or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids)
+        or not isinstance(text, str)
+        or not text
+    ):
+        return (
+            "the checkpoint's recorded end of turn has no ids or no text: "
+            f"{json.dumps(recorded)[:200]}"
+        )
+    return list(ids), text
+
+
+def _engine_timeout(rows: int, options: int, method: str) -> int:
+    """Seconds for the runtime script: start-up, the self-check's loads, and every row's."""
+    if method == METHOD_FRESH_ENGINE:
+        per_row = ENGINE_ROW_TIMEOUT_S + ENGINE_LOAD_TIMEOUT_S * options
+        return STARTUP_TIMEOUT_S + ENGINE_LOAD_TIMEOUT_S * SELFCHECK_LOADS + per_row * rows
+    return STARTUP_TIMEOUT_S + ENGINE_ROW_TIMEOUT_S * rows
 
 
 def _ids_text(ids: list[int] | None) -> str:
@@ -1025,6 +1156,7 @@ def _twin_check(
     calib_n: int,
     ref: ScoreRun,
     mode: str | None,
+    method: str,
     events: EventStream,
 ) -> Check:
     """The float twin's per-token scores against the reference's, on a few of the runtime's rows."""
@@ -1041,8 +1173,9 @@ def _twin_check(
             "threads": job.threads,
             "targets": "full",
             "mode": mode or "auto",
+            "method": method,
         },
-        timeout=STARTUP_TIMEOUT_S + ENGINE_ROW_TIMEOUT_S * n,
+        timeout=_engine_timeout(n, len(decision.ids), method),
         auto_provision=False,
         events=events,
     )
@@ -1063,9 +1196,9 @@ def _twin_check(
             worst = max(worst, max(abs(x - y) for x, y in zip(a, b, strict=True)))
     detail = (
         f"largest per-token difference {worst:.2e} nats on {n} rows, every option, in mode "
-        f"{mode!r} (refused above {TWIN_TOLERANCE})"
+        f"{mode!r} (refused above {job.twin_tolerance})"
     )
     observed = {"max_abs_token": worst, "rows": n, "mode": mode}
-    return (Check.passed if worst <= TWIN_TOLERANCE else Check.failed)(
+    return (Check.passed if worst <= job.twin_tolerance else Check.failed)(
         TWIN_CHECK, detail, observed=observed
     )

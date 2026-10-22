@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import re
+import statistics
 import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -722,6 +723,9 @@ class LiteRtLmBackend:
     # recorded as undeclared in `describe()`. `verify` always sets it, from the
     # contract or from `resolve_prompt_mode`.
     declared_prompt_mode: PromptMode | None = None
+    # Why each prompt gets an Engine of its own, from the family's rule
+    # (`ModelRules.engine_per_prompt_reason`); empty for one Engine per split.
+    engine_per_prompt_reason: str = ""
 
     name = "litert-lm"
     # litetune passes no decoding parameters to the runtime, so `decode` is a
@@ -807,7 +811,11 @@ class LiteRtLmBackend:
             # backend used to build. A manifest that recorded `argv` for a run
             # that never spawned one would be describing a transport by name
             # only.
-            "transport": "litert_lm python api, one process per split",
+            "transport": "litert_lm python api, one process per split"
+            + (", one engine per prompt" if self.engine_per_prompt_reason else ""),
+            "engine_per_prompt": bool(self.engine_per_prompt_reason),
+            "engine_per_prompt_reason": self.engine_per_prompt_reason or None,
+            "engine_init_seconds": engine_init_of(self.device_report),
             "runner_call": self.runner_call,
             "prompt_mode": self.prompt_mode.value,
             "prompt_mode_declared": self.declared_prompt_mode is not None,
@@ -851,6 +859,7 @@ class LiteRtLmBackend:
                         "model": str(self.model),
                         "prompts": list(prompts),
                         "runtime_rendered": self.uses_template,
+                        "engine_per_prompt": bool(self.engine_per_prompt_reason),
                         **runtime_engine_spec(self.backend_flag),
                         "out": str(results),
                         "report": str(report),
@@ -1141,6 +1150,24 @@ def cpu_of(report: Any) -> dict[str, Any] | None:
     if isinstance(report, dict) and isinstance(report.get("cpu"), dict):
         return report["cpu"]
     return None
+
+
+def engine_init_of(report: Any) -> dict[str, Any] | None:
+    """How long each Engine took to build, when the driver script built one per
+    prompt: count, median, max and total seconds; None otherwise."""
+    if not isinstance(report, dict):
+        return None
+    times = report.get("engine_init_seconds")
+    if not isinstance(times, list) or not times:
+        return None
+    if not all(isinstance(t, int | float) and not isinstance(t, bool) for t in times):
+        return None
+    return {
+        "n": len(times),
+        "median": statistics.median(times),
+        "max": max(times),
+        "total": sum(times),
+    }
 
 
 def runtime_version_of(report: Any) -> str | None:
@@ -1616,12 +1643,78 @@ def text_from_conversation(conversation, prompt):
     return "".join(parts)
 
 
+def score_one(engine, runtime_rendered, index, prompt, out):
+    """One prompt on `engine`, its row written and flushed."""
+    # A runner per prompt, not one per split. A conversation keeps
+    # its history, so the second prompt would be answered with the
+    # first still in context -- the CLI started a process per
+    # prompt and could not get this wrong; this script can, and a
+    # split scored with drifting context looks like nothing.
+    try:
+        if runtime_rendered:
+            with engine.create_conversation(sampler_config=None) as runner:
+                text = text_from_conversation(runner, prompt)
+        else:
+            with engine.create_session(
+                apply_prompt_template=False, sampler_config=None
+            ) as runner:
+                text = text_from_session(runner, prompt)
+    except MemoryError:
+        # Not one prompt's problem. The engine that could not
+        # allocate for this prompt will not allocate for the next
+        # one either, so containing it here turns one fatal
+        # condition into `len(prompts)` attempts at it, each slower
+        # than the last on a box that is already thrashing, under a
+        # parent budget of `timeout_s * len(prompts)`. Let it end
+        # the process: the rows already flushed are salvaged by the
+        # non-zero-exit path, which is what that path is for.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # One prompt, not the rest of the split. The runtime
+        # raises `RuntimeError` when a prefill or a decode call
+        # fails (`litert_lm/session.py:72` and `:101` at v0.17.1 and
+        # v0.18.0) and when a streamed send fails (`conversation.py:421`,
+        # or the stream's own error re-raised at `:433`, v0.18.0), and
+        # without this the first of those ends the process: every
+        # later prompt comes back as "the script exited 1".
+        #
+        # What this does not buy is the measurement. Any generation
+        # carrying a `harness_error` makes `liveness.exit_status_check`
+        # return UNCHECKED, and `verify` turns that into
+        # `failed_harness` -- so the run is still refused, exactly
+        # as MEASUREMENTS.md records for the split that generated
+        # 599 of 600. What it buys is that the manifest names the
+        # prompt and the reason, and carries the 599 rows, instead
+        # of saying the script exited 1 about all six hundred.
+        #
+        # The CLI contained it differently and worse -- it caught
+        # everything at the top of the command, printed "An error
+        # occurred" to stdout and exited 0, so the old transport
+        # scored that sentence as the model's answer. A row that
+        # says it failed is neither that nor a lost split.
+        row = {"index": index, "error": "%s: %s" % (type(exc).__name__, exc)}
+    else:
+        row = {"index": index, "text": text}
+    out.write(json.dumps(row) + "\n")
+    out.flush()
+
+
 def main(spec_path):
+    import time
+
     import litert_lm
 
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     runtime_rendered = bool(spec["runtime_rendered"])
     engine_args = engine_kwargs(spec)
+    prompts = spec["prompts"]
+
+    def write_report(at_engine, after=None, init=None):
+        if spec.get("report"):
+            report = run_report(spec, at_engine, after)
+            report["engine_init_seconds"] = init
+            Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
+
     with Path(spec["out"]).open("w", encoding="utf-8") as out:
         # `cache_dir=""` is what the CLI passes on its default `--cache`:
         # `cache_dir_value_from_cache_mode` (common.py) maps both `None` and
@@ -1631,75 +1724,38 @@ def main(spec_path):
         # CLI's behaviour but a fourth state beside disk, memory and none.
         # Which of the three that fourth state resolves to is decided in the
         # C++ the binding calls, not in anything readable from here.
+        if spec.get("engine_per_prompt"):
+            # An Engine per prompt, each closed before the next opens: for a
+            # model whose state a session on a shared Engine does not reset
+            # (google-ai-edge/LiteRT-LM#3165), the second prompt would
+            # otherwise be answered from the first one's state.
+            at_engine, init = None, []
+            for index, prompt in enumerate(prompts):
+                started = time.monotonic()
+                with litert_lm.Engine(spec["model"], cache_dir="", **engine_args) as engine:
+                    init.append(time.monotonic() - started)
+                    if at_engine is None:
+                        at_engine = device_report()
+                    # After every Engine, so a split that dies part-way still
+                    # reports every load it paid for.
+                    last = index == len(prompts) - 1
+                    write_report(at_engine, None, init)
+                    score_one(engine, runtime_rendered, index, prompt, out)
+                    if last:
+                        write_report(at_engine, device_report(), init)
+            return
         with litert_lm.Engine(spec["model"], cache_dir="", **engine_args) as engine:
             # Before the first prompt, so a run killed part-way still says
             # where it was running -- the same reason the transformers script
             # writes its report before generating.
             at_engine = device_report()
-            if spec.get("report"):
-                Path(spec["report"]).write_text(
-                    json.dumps(run_report(spec, at_engine)), encoding="utf-8"
-                )
-            for index, prompt in enumerate(spec["prompts"]):
-                # A runner per prompt, not one per split. A conversation keeps
-                # its history, so the second prompt would be answered with the
-                # first still in context -- the CLI started a process per
-                # prompt and could not get this wrong; this script can, and a
-                # split scored with drifting context looks like nothing.
-                try:
-                    if runtime_rendered:
-                        with engine.create_conversation(sampler_config=None) as runner:
-                            text = text_from_conversation(runner, prompt)
-                    else:
-                        with engine.create_session(
-                            apply_prompt_template=False, sampler_config=None
-                        ) as runner:
-                            text = text_from_session(runner, prompt)
-                except MemoryError:
-                    # Not one prompt's problem. The engine that could not
-                    # allocate for this prompt will not allocate for the next
-                    # one either, so containing it here turns one fatal
-                    # condition into `len(prompts)` attempts at it, each slower
-                    # than the last on a box that is already thrashing, under a
-                    # parent budget of `timeout_s * len(prompts)`. Let it end
-                    # the process: the rows already flushed are salvaged by the
-                    # non-zero-exit path, which is what that path is for.
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    # One prompt, not the rest of the split. The runtime
-                    # raises `RuntimeError` when a prefill or a decode call
-                    # fails (`litert_lm/session.py:72` and `:101` at v0.17.1 and
-                    # v0.18.0) and when a streamed send fails (`conversation.py:421`,
-                    # or the stream's own error re-raised at `:433`, v0.18.0), and
-                    # without this the first of those ends the process: every
-                    # later prompt comes back as "the script exited 1".
-                    #
-                    # What this does not buy is the measurement. Any generation
-                    # carrying a `harness_error` makes `liveness.exit_status_check`
-                    # return UNCHECKED, and `verify` turns that into
-                    # `failed_harness` -- so the run is still refused, exactly
-                    # as MEASUREMENTS.md records for the split that generated
-                    # 599 of 600. What it buys is that the manifest names the
-                    # prompt and the reason, and carries the 599 rows, instead
-                    # of saying the script exited 1 about all six hundred.
-                    #
-                    # The CLI contained it differently and worse -- it caught
-                    # everything at the top of the command, printed "An error
-                    # occurred" to stdout and exited 0, so the old transport
-                    # scored that sentence as the model's answer. A row that
-                    # says it failed is neither that nor a lost split.
-                    row = {"index": index, "error": "%s: %s" % (type(exc).__name__, exc)}
-                else:
-                    row = {"index": index, "text": text}
-                out.write(json.dumps(row) + "\n")
-                out.flush()
+            write_report(at_engine)
+            for index, prompt in enumerate(prompts):
+                score_one(engine, runtime_rendered, index, prompt, out)
             # Again after generating, with the engine still alive: a client
             # shows the runtime opened the GPU, and only its GPU time growing
             # across the split shows work was done there.
-            if spec.get("report"):
-                Path(spec["report"]).write_text(
-                    json.dumps(run_report(spec, at_engine, device_report())), encoding="utf-8"
-                )
+            write_report(at_engine, device_report())
 
 if __name__ == "__main__":
     main(sys.argv[1])

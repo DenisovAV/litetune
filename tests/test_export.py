@@ -160,6 +160,10 @@ class FakeToolchain:
     # What the exporter embeds as the bundle's template, and how a test changes it.
     embedded: dict[str, str | None] = field(default_factory=dict)
     template_embedded: Callable[[str | None], str | None] | None = None
+    # The start token the exporter writes into each bundle's LlmMetadata, and the
+    # special tokens the checkpoint's tokenizer declares to the compose script.
+    start_token_embedded: str | None = None
+    special_tokens: dict[str, str] | None = None
     repack_pack_rewrites_template: bool = False
     # The conversation script's knobs: its exit code, or its result, in place
     # of running it.
@@ -252,6 +256,7 @@ class FakeToolchain:
             hub_files=self.hub_files,
             hub_fault=self.hub_fault,
             render_raises=self.render_raises,
+            special_tokens=self.special_tokens,
         )
         self.template_loads.extend(loads)
         if self.template_overwrite is not None:
@@ -283,6 +288,7 @@ class FakeToolchain:
                 pack_drifts=self.repack_pack_drifts,
                 pack_misplaces=self.repack_pack_misplaces,
                 pack_rewrites_template=self.repack_pack_rewrites_template,
+                start_token=self.start_token_embedded,
                 embedded_path=str(embedded),
             ),
             encoding="utf-8",
@@ -340,6 +346,7 @@ PACK_FAILS = {pack_fails}
 PACK_DRIFTS = {pack_drifts}
 PACK_MISPLACES = {pack_misplaces}
 PACK_REWRITES_TEMPLATE = {pack_rewrites_template}
+START_TOKEN = {start_token!r}
 EMBEDDED = json.loads(Path({embedded_path!r}).read_text(encoding="utf-8"))
 # The LlmMetadata text of each bundle `pack` wrote, by path: kept beside the
 # fake rather than inside the bundle, so that a bundle's size stays the
@@ -356,9 +363,12 @@ def _packed():
 
 
 def _metadata_text(template):
+    start = "" if START_TOKEN is None else (
+        "start_token: " + json.dumps({{"token_str": START_TOKEN}}) + "\\n"
+    )
     if template is None:
-        return ""
-    return "jinja_prompt_template: " + json.dumps(template) + "\\n"
+        return start
+    return start + "jinja_prompt_template: " + json.dumps(template) + "\\n"
 
 
 def _contents_of(bundle_path):
@@ -518,6 +528,27 @@ class LlmMetadata:
     @property
     def jinja_prompt_template(self):
         return self.fields.get("jinja_prompt_template", "")
+
+    @property
+    def start_token(self):
+        token = _Token()
+        token.fields = self.fields.get("start_token", {})
+        return token
+
+
+class _Token:
+    fields = {}
+
+    def HasField(self, name):
+        return name in self.fields
+
+    @property
+    def token_str(self):
+        return self.fields.get("token_str", "")
+
+    @property
+    def token_ids(self):
+        return type("Ids", (), {"ids": self.fields.get("ids", [])})()
 """
 
 FAKE_TEXT_FORMAT = """
@@ -2242,6 +2273,8 @@ def test_a_qwen_export_carries_its_checkpoints_template_behind_the_block(
         "composed_sha256": digest,
         "source": "composed",
         "canonical": canonical,
+        # Qwen's tokenizer declares no BOS, so the exporter writes no start token.
+        "start_token": None,
     }
     # Read once, from what the exporter is given as --model, in the stage's time.
     (composition,) = toolchain.compositions
@@ -3937,3 +3970,26 @@ def test_a_checkpoint_without_a_decision_gets_no_prefill_flag(tmp_path):
 
     assert not any("prefill" in f for f in request.extra_flags)
     assert request.as_dict()["decision"] is None
+
+
+@pytest.mark.parametrize(("carried", "passes"), [("<s>", True), (None, False), ("</s>", False)])
+def test_a_minicpm5_bundle_must_carry_the_start_token_its_turns_were_checked_with(
+    toolchain, qwen_request, carried, passes
+):
+    """MiniCPM5-1B's template prints `<s>`; the edited canonical template is chosen
+    only because the exporter is predicted to write `<s>` as the start token, which the
+    runtime prepends. A bundle that carries another start token, or none, fails."""
+    toolchain.chat_template = (
+        Path(__file__).parent / "fixtures" / "minicpm5-1b-87179e5.chat_template.jinja"
+    ).read_text(encoding="utf-8")
+    toolchain.special_tokens = {"bos_token": "<s>", "eos_token": "</s>"}
+    toolchain.start_token_embedded = carried
+    result = run_export(qwen_request(model="openbmb/MiniCPM5-1B", recipes=("dynamic_wi8_afp32",)))
+
+    assert result.chat_template is not None
+    assert result.chat_template.source == "canonical"
+    assert result.chat_template.start_token == "<s>"
+    (export,) = result.exports
+    assert (export.check.outcome is Outcome.PASSED) is passes, export.check.detail
+    if not passes:
+        assert f"carries the start token {carried!r}" in export.check.detail

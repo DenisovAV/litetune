@@ -8,7 +8,8 @@ row, flushed as it is scored, and a report.
 **The reference** (`REFERENCE_SCRIPT`, `envs.TRAIN`) is the scorer the
 option-scoring measurements of 2026-10-15 and 2026-10-16 ran: float32, eager
 attention, TF32 off, on the GPU when there is one and `LITETUNE_DEVICE` allows
-it. Each row's prompt is rendered as `tune` trains it, and every option is
+it. Each row's prompt is rendered as `tune` trains it, by the same
+`prompt_mode.RENDERING_SOURCE`, pasted in, and every option is
 scored as its id followed by the turn terminator, teacher-forced, every token's
 log-probability kept. One forward over the prompt keeps its cache, and the
 options go in batches over copies of it. On the first row each way of passing
@@ -29,7 +30,15 @@ fix and wrong on 0.18.0. The self-check picks between them: two prompts that
 differ only in their second-to-last token score identically on 0.18.0 and
 differently with the fix. Measured 2026-10-16: 0.0 in all 42 comparisons on
 0.18.0, at least 0.135 on a nightly with the fix; each mode within 8.2e-4 nats
-of PyTorch on a float32 bundle, and wrong on the other engine.
+of PyTorch on a float32 bundle, and wrong on the other engine. Those
+measurements were Gemma 3's; the self-check's pair is rendered by the bundle's
+own template, which on Gemma 3 is the pair measured.
+
+That is method `rewind`. Method `fresh_engine`, for a family whose rule gives
+every prompt an Engine of its own (`models.ModelRules.engine_per_prompt_reason`),
+scores each option on a new Engine and session with no checkpoint and no
+rewind, the self-check's prompts too; mode `once` then prefills the last token
+again in each.
 
 Targets are each option's shortest unique prefix: the first k ids of
 `id + terminator`, k the smallest no other option shares. A truncated target
@@ -42,7 +51,11 @@ that `verify` can check the two sides scored the same prompt.
 
 from __future__ import annotations
 
-REFERENCE_SCRIPT = r'''
+from litetune.prompt_mode import RENDERING_SOURCE
+from litetune.rendering import SESSION_IDS_SOURCE
+
+REFERENCE_SCRIPT = (
+    r'''
 """Float32 per-token option scores for each row. Spec: argv[1]. See litetune.decision_scripts."""
 import copy
 import json
@@ -54,6 +67,31 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 VARIANTS = ("cache_position+position_ids", "position_ids", "plain")
+'''
+    + RENDERING_SOURCE
+    + r"""
+
+def head_transform(config):
+    # What the bundle's head does to lm_head's output, which the scoring below
+    # calls directly: Granite divides by `logits_scaling`
+    # (transformers 5.16.1 modeling_granite.py:497), and a config with
+    # `final_logit_softcapping` at its top soft-caps. Gemma 4's forward soft-caps
+    # with the one on its text config (modeling_gemma4.py:2587), but its exported
+    # bundle does not: on 2026-10-20 a gemma-4-E2B float twin was 5.5e-05 nats from
+    # the uncapped head and 3.13e+01 from the capped one. The reference follows the
+    # bundle, and the cached paths, which read the capped forward, fail their trial.
+    text = config.get_text_config() if hasattr(config, "get_text_config") else config
+    scale = getattr(config, "logits_scaling", None) or getattr(text, "logits_scaling", None)
+    cap = getattr(config, "final_logit_softcapping", None)
+    return scale, cap
+
+
+def transformed(logits, scale, cap):
+    if scale:
+        logits = logits / scale
+    if cap:
+        logits = torch.tanh(logits / cap) * cap
+    return logits
 
 
 def main():
@@ -73,11 +111,17 @@ def main():
             spec["model"], torch_dtype=torch.float32, attn_implementation="eager", **kwargs
         )
     model = model.to(device).eval()
-    cap = getattr(model.config, "final_logit_softcapping", None)
-    term = spec["terminator"]
+    scale, cap = head_transform(model.config)
+    # The first token of the end of turn tune recorded, as this tokenizer
+    # writes it; the runtime is handed the text and must tokenise it alike.
+    first = spec["turn_ids"][0]
+    term = tok.decode([first])
     term_ids = tok(term, add_special_tokens=False)["input_ids"]
-    if len(term_ids) != 1:
-        raise SystemExit(f"the terminator {term!r} is {term_ids}, not one token")
+    if term_ids != [first] or not spec["turn_text"].startswith(term):
+        raise SystemExit(
+            f"the end of turn's first token {first} decodes to {term!r}, which tokenises to "
+            f"{term_ids} and begins {spec['turn_text']!r}: not that one token"
+        )
     conts = [tok(o, add_special_tokens=False)["input_ids"] + term_ids for o in spec["options"]]
     if len({tuple(c) for c in conts}) != len(conts):
         raise SystemExit("two options tokenise to the same ids")
@@ -87,15 +131,12 @@ def main():
     state = {"variant": None}
 
     def render(prompt):
-        text = tok.apply_chat_template(
-            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
-        )
-        return tok(text, add_special_tokens=False)["input_ids"]
+        # As `tune` trained it: a decision is trained runtime_rendered.
+        text, add_special = render_prompt(tok, prompt, True)
+        return tok(text, add_special_tokens=add_special)["input_ids"]
 
     def head_logp(hidden):
-        logits = model.lm_head(hidden).float()
-        if cap:
-            logits = torch.tanh(logits / cap) * cap
+        logits = transformed(model.lm_head(hidden).float(), scale, cap)
         return torch.log_softmax(logits, dim=-1)
 
     def expand(cache, n):
@@ -212,11 +253,13 @@ def main():
         json.dumps(
             {
                 "device": device,
+                "terminator": term,
                 "bos_id": tok.bos_token_id,
                 "torch": torch.__version__,
                 "transformers": __import__("transformers").__version__,
                 "cont_ids": conts,
                 "final_logit_softcapping": cap,
+                "logits_scaling": scale,
                 "cache_variant": state["variant"] or "no_cache",
                 "variant_trials": trials,
                 "seconds": round(time.time() - started, 1),
@@ -229,10 +272,12 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-'''
+"""
+)
 
 
-ENGINE_SCRIPT = r'''
+ENGINE_SCRIPT = (
+    r'''
 """Per-token option scores through LiteRT-LM's session API. Spec: argv[1].
 
 See litetune.decision_scripts.
@@ -249,7 +294,11 @@ from pathlib import Path
 
 import litert_lm as L
 
-FIXED = "<start_of_turn>user\nAnswer with one word.<end_of_turn>\n<start_of_turn>model\n"
+# The self-check's message, rendered by the bundle's own template.
+SELFCHECK_MESSAGE = "Answer with one word."
+'''
+    + SESSION_IDS_SOURCE
+    + r'''
 
 
 def last_error(lib):
@@ -281,7 +330,16 @@ def main():
     greedy = L.SamplerConfig(top_k=1, top_p=1.0, temperature=1.0, seed=0)
     term = spec["terminator"]
     options = spec["options"]
-    report = {"runtime": {}, "python": platform.python_version(), "threads": spec["threads"]}
+    method = spec["method"]
+    if method not in ("rewind", "fresh_engine"):
+        raise SystemExit(f"unknown method {method!r}")
+    report = {
+        "runtime": {},
+        "python": platform.python_version(),
+        "threads": spec["threads"],
+        "method": method,
+        "engine_loads": 0,
+    }
     for dist in ("litert-lm", "litert-lm-api", "litert-lm-nightly", "litert-lm-api-nightly"):
         try:
             report["runtime"][dist] = importlib.metadata.version(dist)
@@ -309,19 +367,42 @@ def main():
     def render(engine, prompt):
         with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
             rendered = conv.render_message_to_string(prompt)
-        ids = list(engine.tokenize(rendered))
         # 0.18.0 returns "" when the render fails in C, and "" tokenises to no
         # ids, which every check below would pass.
-        if not ids:
+        if not rendered:
             raise RuntimeError("the runtime rendered the prompt as empty text")
+        # As prefill reads the text; the session puts `session_prefix` first.
+        ids = prefill_ids(engine, rendered)
         last = engine.detokenize(ids[-1:])
         if not rendered.endswith(last) or list(engine.tokenize(last)) != ids[-1:]:
             raise RuntimeError(f"the last prompt token {ids[-1]} does not round-trip as {last!r}")
         return rendered, ids, last
 
+    kw = {"backend": L.Backend.CPU(thread_count=int(spec["threads"])), "cache_dir": ":nocache"}
+
+    def open_engine():
+        report["engine_loads"] += 1
+        return L.Engine(spec["model"], **kw)
+
     def decide(engine, mode, rendered, last, texts):
         out = []
         t0 = time.perf_counter()
+        if method == "fresh_engine":
+            # An Engine and a session of their own for every option, and no
+            # rewind: for a family whose state a rewind does not reset
+            # (`models.ModelRules.engine_per_prompt_reason`). The prompt, then
+            # in mode `once` its last token again, then the option, as E7's
+            # `fresh` and `fresh_nofix` (a session per option on one Engine)
+            # did, each within 6e-4 nats of PyTorch on Gemma 3 on the engine
+            # whose self-check verdict picks it (2026-10-16). `engine` only
+            # renders and tokenises; it never prefills, so it holds no state.
+            for text in texts:
+                with open_engine() as fresh, session(fresh) as s:
+                    s.run_prefill([rendered])
+                    if mode == "once":
+                        s.run_prefill([last])
+                    out.append(score(s, text))
+            return out, (time.perf_counter() - t0) * 1000
         with session(engine) as s:
             s.run_prefill([rendered])
             c_call(s, "litert_lm_session_save_checkpoint", b"p")
@@ -338,18 +419,51 @@ def main():
                 c_call(s, "litert_lm_session_rewind_to_checkpoint", b"p")
         return out, (time.perf_counter() - t0) * 1000
 
+    def selfcheck_pair(engine):
+        """Two prompts of one length that differ only in their second-to-last token, or None.
+
+        The first is the self-check's message as the bundle's template renders
+        it. The second puts another id of that rendering in place of its
+        second-to-last, the first one, from the second id on, that gives text
+        which tokenises back to exactly those ids. On Gemma 3 that is `user` for
+        `model`: the pair the flutter_edge_ai design fixed and 2026-10-16
+        measured. On another template it is whatever its rendering holds, and
+        the gap it shows is not measured; only a gap of exactly 0.0 is read as
+        dropped.
+        """
+        with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
+            a = conv.render_message_to_string(SELFCHECK_MESSAGE)
+        ia = list(engine.tokenize(a)) if a else []
+        if len(ia) < 2:
+            return None
+        for other in dict.fromkeys(ia[1:] + ia[:1]):
+            if other == ia[-2]:
+                continue
+            ib = ia[:-2] + [other] + ia[-1:]
+            b = engine.detokenize(ib)
+            if list(engine.tokenize(b)) == ib:
+                return a, b
+        return None
+
     def one_token(engine, prompt, z):
-        with session(engine) as s:
-            s.run_prefill([prompt])
-            per = score(s, z)
+        if method == "fresh_engine":
+            # On an Engine of its own, as every option is scored then.
+            with open_engine() as fresh, session(fresh) as s:
+                s.run_prefill([prompt])
+                per = score(s, z)
+        else:
+            with session(engine) as s:
+                s.run_prefill([prompt])
+                per = score(s, z)
         if per is None or len(per) != 1:
             raise RuntimeError(f"the one-token target {z!r} scored {per}")
         return per[0]
 
     t0 = time.perf_counter()
-    kw = {"backend": L.Backend.CPU(thread_count=int(spec["threads"])), "cache_dir": ":nocache"}
-    with L.Engine(spec["model"], **kw) as engine:
+    with open_engine() as engine:
         report["init_seconds"] = round(time.perf_counter() - t0, 3)
+        # What every session here reads before its prompt's ids, as a first turn.
+        report["session_prefix"] = session_prefix(engine)
         cont_ids = [list(engine.tokenize(o + term)) for o in options]
         report["cont_ids"] = cont_ids
 
@@ -361,23 +475,20 @@ def main():
                 z = engine.detokenize([cont_ids[j][0]])
                 if list(engine.tokenize(z)) == [cont_ids[j][0]]:
                     zs.append(z)
-            # The fixed pair only, as the flutter_edge_ai design has it run:
-            # measured 2026-10-16, its gap was 0.0 on 0.18.0 and at least 0.135
-            # with the fix, where a task's own prompts gave a gap as small as
-            # 2.1e-5 with a near-certain target. The two must never pick
+            # One pair, as the flutter_edge_ai design has it run: measured
+            # 2026-10-16 on Gemma 3, its gap was 0.0 on 0.18.0 and at least
+            # 0.135 with the fix, where a task's own prompts gave a gap as small
+            # as 2.1e-5 with a near-certain target. The two must never pick
             # different modes.
             diffs, checked = [], []
-            for a in [FIXED]:
-                b = a[: -len("model\n")] + "user\n"
-                ia, ib = list(engine.tokenize(a)), list(engine.tokenize(b))
-                differing = [i for i in range(min(len(ia), len(ib))) if ia[i] != ib[i]]
-                if len(ia) != len(ib) or differing != [len(ia) - 2]:
-                    continue
+            pair = selfcheck_pair(engine)
+            if pair is not None:
+                a, b = pair
                 for z in zs:
                     for _ in range(2):
                         d = abs(one_token(engine, a, z) - one_token(engine, b, z))
                         diffs.append(d)
-                checked.append(len(ia))
+                checked.append(len(engine.tokenize(a)))
             verdict = (
                 "no comparisons" if not diffs
                 else "dropped" if max(diffs) == 0.0
@@ -390,6 +501,7 @@ def main():
                 "max_abs_diff": max(diffs) if diffs else None,
                 "min_abs_diff": min(diffs) if diffs else None,
                 "prompt_lengths": checked,
+                "pair": list(pair) if pair else None,
             }
             if verdict not in ("dropped", "not dropped"):
                 report["error"] = f"the self-check could not tell the engine apart: {verdict}"
@@ -454,3 +566,4 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 '''
+)

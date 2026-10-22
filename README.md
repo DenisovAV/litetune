@@ -99,21 +99,26 @@ CUDA comparison or completed MPS `verify` run has been measured here. Bring
 your own checkpoint and skip the first two steps, or bring a `.litertlm` and
 its float checkpoint and run only `verify`.
 
-> **Alpha.** Measured end to end on six models: `google/functiongemma-270m-it`
+> **Alpha.** Measured end to end on twelve models: `google/functiongemma-270m-it`
 > with the tool-call scorer, and `google/gemma-3-270m-it`,
-> `google/gemma-3-1b-it`, `Qwen/Qwen3-0.6B`, `Qwen/Qwen2.5-0.5B-Instruct` and
+> `google/gemma-3-1b-it`, `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`,
+> `Qwen/Qwen2.5-0.5B-Instruct`, `Qwen/Qwen2.5-1.5B-Instruct`,
+> `Qwen/Qwen3.5-0.8B`, `Qwen/Qwen3.5-2B`, `openbmb/MiniCPM5-1B`,
+> `ibm-granite/granite-4.1-3b` and
 > `google/gemma-4-E2B-it` with `exact-text` on the same 77-way intent task —
 > every headline candidate evaluated on LiteRT-LM's CPU backend, and two Qwen3
 > artifacts also evaluated on a phone's CPU and GPU,
 > all in [MEASUREMENTS.md](MEASUREMENTS.md).
-> Qwen3.5 exports and needs no flags from litetune, only a `transformers`
-> floor, and has no quality number. Gemma 4 exports once you name the variant
+> Qwen3.5's rule hands the exporter LiteRT-LM's Qwen 3.5 chat template, edited
+> so that it renders a single turn as the checkpoint's own does, needs a
+> `transformers` floor, and gives every prompt `verify` scores an Engine of its
+> own (google-ai-edge/LiteRT-LM#3165). Gemma 4 exports once you name the variant
 > — `E2B` or `E4B` — because the chat template override is per-variant; a bare
 > `gemma-4` is refused rather than guessed at, and the refusal names the flag
 > to pass if you want to choose the template yourself. It carries two numbers
 > the others do not: an earlier conversion cost measured on its untouched base
 > weights, which used prompts listing all 77 labels and so does not sit beside
-> the five above it, and a comparison of two LoRA runs that differ only in
+> the eleven above it, and a comparison of two LoRA runs that differ only in
 > which projections they adapt — the seven litetune names against the two peft
 > would have chosen, which is 24 points apart. On a multimodal checkpoint
 > litetune keeps a LoRA run inside the text tower; `tune` says so in its own
@@ -642,10 +647,20 @@ of writing; until it ships, that call throws `DeciderUnsupportedException`.
 
 What has and has not been measured:
 
-- Decisions are trained and measured on `google/gemma-3-270m-it` only;
-  another family is refused, and another Gemma 3 text model is accepted with a
-  limitation saying it was not measured. `choice` questions have been
-  measured on several tasks, `noul` on two and `score` on one. As `noul`,
+- Decisions are trained and measured on several tasks on
+  `google/gemma-3-270m-it`, and on one task, emotion with six options, on
+  `gemma-3-1b-it`, `functiongemma-270m-it`, `gemma-4-E2B-it`, Qwen3 0.6B and
+  1.7B, Qwen2.5 0.5B and 1.5B Instruct, `MiniCPM5-1B`, `granite-4.1-3b` and
+  `Qwen3.5-0.8B`.
+  Each passed `verify` but `gemma-3-1b-it`, whose abstain rule was wrong on
+  more held-out rows than its budget allowed
+  ([MEASUREMENTS.md](MEASUREMENTS.md#every-family-on-emotion)). Another model
+  of a family litetune has a rule for is accepted with a limitation saying
+  which of its family's models were measured; for every family but Gemma 3
+  text `verify` also needs `--float-twin`, which checks the runtime's scoring
+  method on the checkpoint. A model with no family rule is refused. `choice`
+  questions have been measured on several tasks, `noul` on two and `score` on
+  one. As `noul`,
   SST-2's eight-bit bundle answered as the reference did on 0.9767 of 300 rows
   and passed verify's 0.95 gate. Irony's, trained for two epochs, did so on
   0.9367 and was refused; trained for four or six, it passed at 0.9667 and
@@ -748,8 +763,11 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 | `gemma-3-text` | `--litert_lm_model_type_override=gemma3` |
 | `gemma-4-e2b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm` |
 | `gemma-4-e4b` | `--externalize_embedder`, `--jinja_chat_template_override=litert-community/gemma-4-E4B-it-litert-lm` |
-| `qwen-3` (Qwen3 0.6B) | `--jinja_chat_template_override=<LiteRT-LM's canonical chat template if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
-| `qwen-2.5` (Qwen2.5 0.5B Instruct) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
+| `qwen-3` (Qwen3 0.6B and 1.7B) | `--jinja_chat_template_override=<LiteRT-LM's canonical chat template if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
+| `qwen-2.5` (Qwen2.5 0.5B and 1.5B Instruct) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
+| `qwen-3.5` | `--jinja_chat_template_override=<LiteRT-LM's Qwen 3.5 template with four edits if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
+| `minicpm5` (MiniCPM5 1B) | `--jinja_chat_template_override=<LiteRT-LM's MiniCPM5 template with one edit if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
+| `granite-4.1` (granite-4.1 3B) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
 
 **A LoRA scope keyed on model identity.** On a multimodal checkpoint the
 vision and audio towers use the same projection names as the text layers, so
@@ -807,7 +825,8 @@ where 0.17.1 gave it the string, and a template written for a string may print t
 list, drop the user's text or fail: measured on 2026-10-08, a Qwen3 0.6B bundle
 rendered `<|im_start|>user\n<|im_end|>` with no error and every send to a Qwen2.5
 0.5B Instruct bundle failed. For a checkpoint either rule claims -- a name that
-contains Qwen3-0.6B, Base included, or ends in Qwen2.5-0.5B-Instruct, under any
+contains Qwen3-0.6B or Qwen3-1.7B, Base included, or ends in Qwen2.5-0.5B-Instruct or
+Qwen2.5-1.5B-Instruct, under any
 organisation, a local snapshot of either and what `tune` made from either, but not
 a Hub repack named for its format, such as `-FP8`, `-GGUF` or `-bnb-4bit`, nor a
 local checkpoint whose `config.json` has a `quantization_config` -- `convert`
@@ -835,7 +854,7 @@ through the template alone with transformers, as training did, and as parts thro
 block with the export environment's Jinja2 configured as LiteRT-LM's MiniJinja, and each
 pair must print the same; a template using what that renderer does not vouch for is not
 checked, and nothing is exported. Neither renderer is LiteRT-LM; `verify`'s rendering
-check is what checks the runtime. For Qwen3 0.6B the bundle carries LiteRT-LM v0.18.0's
+check is what checks the runtime. For Qwen3 0.6B and 1.7B the bundle carries LiteRT-LM v0.18.0's
 own Qwen 3 template instead, because Qwen3's template breaks a LiteRT-LM conversation at
 its second message -- when that template prints those prompts as the checkpoint's own does,
 and either the `litetune.json` beside the checkpoint records that `tune` trained it
@@ -875,9 +894,11 @@ was converted with a template of your own, when:
   `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-0.6B-Base` and `Qwen/Qwen2.5-0.5B-Instruct` -- as
   Hub ids, local snapshots, paths ending in one of those names and what `tune` made
   from them -- so another organisation's copy, or a fine-tune under its own name,
-  carries its template alone too.
+  carries its template alone too;
+- litetune 0.5.1 or earlier converted a Qwen3-1.7B or Qwen2.5-1.5B-Instruct
+  checkpoint: no release up to 0.5.1 claimed those names.
 
-`verify` refuses a bundle of either kind at its rendering check and names this as a
+`verify` refuses a bundle of any of these kinds at its rendering check and names this as a
 possible cause.
 
 A bundle litetune 0.4.0 converted from a checkpoint it claimed carries the template
@@ -1099,21 +1120,24 @@ withdrawn after re-measurement.
   phone runs.
   [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) says
   which is which.
-- **Measured on six models, all six fine-tuned here.**
+- **Measured on twelve models, all twelve fine-tuned here.**
   `functiongemma-270m-it` with the tool-call scorer, and `gemma-3-270m-it`,
-  `gemma-3-1b-it`, `Qwen3-0.6B`, `Qwen2.5-0.5B-Instruct` and
-  `gemma-4-E2B-it` with `exact-text`, each with a conversion
+  `gemma-3-1b-it`, `Qwen3-0.6B`, `Qwen3-1.7B`, `Qwen2.5-0.5B-Instruct`,
+  `Qwen2.5-1.5B-Instruct`, `Qwen3.5-0.8B`, `Qwen3.5-2B`, `MiniCPM5-1B`,
+  `granite-4.1-3b` and `gemma-4-E2B-it` with `exact-text`, each with a conversion
   cost against its own float twin. Only FunctionGemma also has a training gain:
   no banking77 run has an untuned base figure to subtract — Gemma 3 270M's base
-  was run and refused to score, the 1B's and Qwen2.5's scored 0.0000 on both
-  sides, Qwen3's never reached the base step at all, and Gemma 4's tuned run
-  records no base figure either — and every one of those manifests
+  was run and refused to score, the 1B's and Qwen2.5 0.5B's scored 0.0000 on
+  both sides, Qwen3 0.6B's never reached the base step at all, the Qwen3 1.7B
+  and Qwen2.5 1.5B runs did not score one, nor did the Qwen3.5, MiniCPM5 and
+  granite runs, and Gemma 4's tuned run records no
+  base figure either — and every one of those manifests
   records the gain as unavailable. `gemma-4-E2B-it` carries a second,
   earlier run as well: two conversions of its untouched base weights against
   the float reference, on prompts that list all 77 labels rather than the
-  prompts the tuned runs use, so that figure is not comparable with the five
+  prompts the tuned runs use, so that figure is not comparable with the eleven
   above it.
-  Qwen3.5 exports but has no quality figure, and a Gemma 4 without its variant
+  A Gemma 4 without its variant
   is still refused unless you supply the template override yourself.
 - **The turn-terminator vocabulary is a static list.** `exact-text` scoring and
   the liveness checks both trim against a fixed set of strings, recorded
@@ -1282,7 +1306,7 @@ Wiring `|| exit 1` on anything non-zero throws all of this away.
 ## Contributing
 
 Issues and pull requests welcome, particularly measurements on models other
-than the six above — that is the gap this alpha most needs closed.
+than the twelve above — that is the gap this alpha most needs closed.
 
 Run the checks with `pytest`, `ruff check`, `ruff format --check` and `mypy src`.
 
