@@ -195,20 +195,22 @@ def host_record(
 # is `AVAILABLE_NON_COMPRESSED_MEMORY` -- active + inactive + free +
 # speculative (the `AVAILABLE_NON_COMPRESSED_MEMORY` macro and the
 # `XNU_TARGET_OS_OSX` branch of `VM_CHECK_MEMORYSTATUS` in vm_page.h). So it counts
-# other processes' active memory as available. Read on 2026-10-02 at 09:19 UTC
-# on a 24 GiB Mac (macOS 26.5.1, arm64): `kern.memorystatus_level` 54, which
-# the old formula made 12.96 GiB available and a 9.96 GiB budget, while the
-# sum above came to 3.23 GiB (7818 free and 203553 pageable external 16 KiB
-# pages) -- under the 1 GiB floor once the headroom is taken -- with
-# `kern.memorystatus_vm_pressure_level` at 1 and `vm.swapusage` showing
-# 25687 of 26624 MB in use. Every key above answered `sysctl -n` there.
+# other processes' active memory as available.
 #
-# A Mac the kernel already reports under memory pressure is refused outright,
-# whatever the sum says: `kern.memorystatus_vm_pressure_level` answers 1, 2 or 4
-# for normal, warn and critical -- the values `DISPATCH_MEMORYPRESSURE_NORMAL`,
-# `_WARN` and `_CRITICAL` carry in the SDK's dispatch/source.h; that the sysctl
-# reports in those values is from XNU's kern_memorystatus_notify.c and
-# sys/event.h, as the review read them. Anything but 1 is refused.
+# `kern.memorystatus_vm_pressure_level` answers 1, 2 or 4 for normal, warn and
+# critical -- the values `DISPATCH_MEMORYPRESSURE_NORMAL`, `_WARN` and
+# `_CRITICAL` carry in the SDK's dispatch/source.h; that the sysctl reports in
+# those values is from XNU's kern_memorystatus_notify.c and sys/event.h, as the
+# review read them. A Mac at critical is refused outright, whatever the sum
+# says, and so is a level litetune does not know.
+#
+# A Mac at warn starts, and the report says so. Warn can be a standing state
+# on a Mac whose memory is held by something idle, and refusing there refused
+# every MPS run on such a Mac. The level says the kernel judged memory short
+# when the run started, not that it was swapping; litetune has measured no run
+# under warn, so it claims nothing about what warn changes in one. The report
+# says the level the run started at, so a reader can set it apart from runs
+# started at normal.
 #
 # The high ratio is budget / R, never above 1 since the budget is at most R.
 # The low ratio has to be set as well, and not above the high one: the header
@@ -265,7 +267,9 @@ AVAILABLE_PAGES = (
 )
 PRESSURE_LEVEL = "kern.memorystatus_vm_pressure_level"
 PRESSURE_NORMAL = 1
-PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}
+PRESSURE_WARN = 2
+PRESSURE_CRITICAL = 4
+PRESSURE_NAMES = {PRESSURE_NORMAL: "normal", PRESSURE_WARN: "warn", PRESSURE_CRITICAL: "critical"}
 # Every key `read_memory` reads, for a test that asks this Mac's own sysctl.
 MEMORY_SYSCTLS = (PAGE_SIZE, *AVAILABLE_PAGES, PRESSURE_LEVEL)
 
@@ -378,6 +382,14 @@ class MpsMemory:
                 "any operation MPS does not implement ran on the CPU instead of raising (torch's "
                 'own message offers the variable "to use the CPU as a fallback for this op"). '
                 "`device: mps` does not mean every operation of this run ran on MPS"
+            )
+        if self.reading.pressure_level == PRESSURE_WARN:
+            said.append(
+                f"{PRESSURE_LEVEL} was {PRESSURE_WARN} ({PRESSURE_NAMES[PRESSURE_WARN]}) when this "
+                "run started on MPS: the kernel judged memory short when it started. litetune has "
+                "measured no run under warn, so this run's times and memory are not to be read as "
+                f"those of a run started at {PRESSURE_NORMAL} ({PRESSURE_NAMES[PRESSURE_NORMAL]}). "
+                "Swap use at the start is in the memory record"
             )
         return said
 
@@ -494,8 +506,9 @@ def _pressure_refusal(level: int) -> str:
     said = f"{level} ({name})" if name else f"{level}, which is not a level litetune knows"
     return (
         f"{PRESSURE_LEVEL} is {said}: litetune starts an MPS run only at level "
-        f"{PRESSURE_NORMAL} ({PRESSURE_NAMES[PRESSURE_NORMAL]}). Quit what is holding memory "
-        f"and run again, or set {DEVICE_VARIABLE}=cpu to run on the CPU"
+        f"{PRESSURE_NORMAL} ({PRESSURE_NAMES[PRESSURE_NORMAL]}) or {PRESSURE_WARN} "
+        f"({PRESSURE_NAMES[PRESSURE_WARN]}). Quit what is holding memory and run again, or set "
+        f"{DEVICE_VARIABLE}=cpu to run on the CPU"
     )
 
 
@@ -509,7 +522,8 @@ def mps_memory_policy(
 ) -> MpsMemory:
     """The watermark ratios for a child about to use MPS. Pure: every input is passed in.
 
-    Raises `MpsMemoryRefused` when the kernel reports memory pressure, when
+    Raises `MpsMemoryRefused` when the kernel reports critical memory pressure
+    or a level litetune does not know, when
     litetune sets the limit and the budget is under `MPS_MIN_BUDGET_BYTES`, or
     when a value the operator set is not one litetune can check.
     """
@@ -518,7 +532,7 @@ def mps_memory_policy(
             f"torch reported a recommended MPS working set of {recommended_max_memory} bytes, "
             "which no budget can be a share of"
         )
-    if reading.pressure_level != PRESSURE_NORMAL:
+    if reading.pressure_level not in (PRESSURE_NORMAL, PRESSURE_WARN):
         raise MpsMemoryRefused(_pressure_refusal(reading.pressure_level))
     available = reading.available_bytes
     budget = min(recommended_max_memory, available - MPS_HEADROOM_BYTES)

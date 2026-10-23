@@ -4393,6 +4393,41 @@ def test_an_mps_run_leaves_the_parents_environment_as_it_was(trainer, request_fo
     assert dict(os.environ) == before
 
 
+def test_an_mps_run_at_warn_pressure_trains_and_its_report_says_so(
+    trainer, request_for, monkeypatch
+):
+    from litetune import devices
+
+    _mps_trainer(trainer)
+    monkeypatch.setattr(
+        devices, "read_sysctl", fake_sysctl(sysctl_available(16 * 1024**3, pressure=2))
+    )
+
+    result = run_tune(request_for())
+
+    assert _training_call(trainer).env is not None
+    assert result.as_dict()["mps_memory"]["pressure_level"] == 2
+    assert [t for t in result.limitations if "pressure_level was 2 (warn)" in t]
+
+
+def test_an_mps_run_at_critical_pressure_does_not_train(trainer, request_for, monkeypatch):
+    from litetune import devices
+
+    _mps_trainer(trainer)
+    monkeypatch.setattr(
+        devices, "read_sysctl", fake_sysctl(sysctl_available(16 * 1024**3, pressure=4))
+    )
+
+    result = run_tune(request_for())
+
+    assert [c for c in trainer.calls if not FakeTrainer.is_probe(c.argv)] == []
+    assert result.mps_memory is None
+    assert any(
+        t.startswith("training was not attempted: kern.memorystatus_vm_pressure_level is 4")
+        for t in result.limitations
+    ), result.limitations
+
+
 def test_two_runs_in_one_process_each_read_the_memory_they_start_with(
     trainer, request_for, monkeypatch
 ):

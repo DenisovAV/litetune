@@ -80,8 +80,10 @@ below does not apply to it; the report records litetune's computed budget
 beside the limit in force, and says so when your `0.0` removed the limit or
 your non-zero fallback let operations run on the CPU. A budget litetune
 computes under 1 GiB is refused rather than started, and so is a Mac whose
-`kern.memorystatus_vm_pressure_level` is not 1 (normal): quit what is holding
-memory, or set `LITETUNE_DEVICE=cpu`. On `mps`, `tune` trains in float32
+`kern.memorystatus_vm_pressure_level` is 4 (critical) or a level litetune does
+not know: quit what is holding memory, or set `LITETUNE_DEVICE=cpu`. At 2
+(warn) the run starts, and its report says the level it started at, since no
+run under warn has been measured. On `mps`, `tune` trains in float32
 unless you pass `--dtype`, pads each batch to a multiple of 32 tokens (never
 past `--max-seq-length`), and defaults to one example per forward pass while
 accumulating the gradients for the `--batch-size` optimiser batch. CPU and
