@@ -195,13 +195,7 @@ def host_record(
 # is `AVAILABLE_NON_COMPRESSED_MEMORY` -- active + inactive + free +
 # speculative (the `AVAILABLE_NON_COMPRESSED_MEMORY` macro and the
 # `XNU_TARGET_OS_OSX` branch of `VM_CHECK_MEMORYSTATUS` in vm_page.h). So it counts
-# other processes' active memory as available. Read on 2026-10-02 at 09:19 UTC
-# on a 24 GiB Mac (macOS 26.5.1, arm64): `kern.memorystatus_level` 54, which
-# the old formula made 12.96 GiB available and a 9.96 GiB budget, while the
-# sum above came to 3.23 GiB (7818 free and 203553 pageable external 16 KiB
-# pages) -- under the 1 GiB floor once the headroom is taken -- with
-# `kern.memorystatus_vm_pressure_level` at 1 and `vm.swapusage` showing
-# 25687 of 26624 MB in use. Every key above answered `sysctl -n` there.
+# other processes' active memory as available.
 #
 # `kern.memorystatus_vm_pressure_level` answers 1, 2 or 4 for normal, warn and
 # critical -- the values `DISPATCH_MEMORYPRESSURE_NORMAL`, `_WARN` and
