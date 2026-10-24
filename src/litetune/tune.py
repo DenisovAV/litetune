@@ -2500,8 +2500,9 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
             events.stage_finished(result.outcome.value, attempted=False)
             return result
         child_env = result.mps_memory.child_env
-        # An operator's high ratio of 0.0 and an operator's CPU fallback are
-        # theirs to set, and each changes what `device: mps` can be read as.
+        # What the memory policy says a report must carry: the operator's
+        # settings that change what `device: mps` can be read as, the pressure
+        # level at warn, and a margin narrower than the full headroom.
         for text in result.mps_memory.limitations:
             result.limitation(text)
         events.note(

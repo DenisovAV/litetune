@@ -63,35 +63,39 @@ Before a training or reference run starts on `mps`, litetune sets torch's MPS
 allocator limits from the memory the Mac has available at that moment. The
 budget is the smaller of Metal's recommended working set
 (`torch.mps.recommended_max_memory()`) and the larger of 1 GiB and the
-available memory less 3 GiB, where available is the free and the pageable external page counts
-(`vm.page_free_count`, `vm.page_pageable_external_count`) times `hw.pagesize`
+available memory less 3 GiB, where available is the free and the pageable
+external page counts (`vm.page_free_count`, `vm.page_pageable_external_count`) times `hw.pagesize`
 — litetune's own measure, built from two of the counters XNU's jetsam path
 sums (`VM_CHECK_MEMORYSTATUS` in osfmk/vm/vm_page.h), not a figure macOS
-reports; it counts neither other apps' memory nor pages that would have to go
-to swap, though it does not predict which pages the kernel frees first; `PYTORCH_MPS_HIGH_WATERMARK_RATIO` is the budget over the
-working set, `PYTORCH_MPS_LOW_WATERMARK_RATIO` is 0.8 of that, and
+reports; it counts no app's anonymous memory and no page that would have to go
+to swap, but its file-backed pages include those other apps have read, and it
+does not predict which pages the kernel frees first;
+`PYTORCH_MPS_HIGH_WATERMARK_RATIO` is the budget over the working set, rounded
+down to six decimals, `PYTORCH_MPS_LOW_WATERMARK_RATIO` is 0.8 of that, and
 `PYTORCH_ENABLE_MPS_FALLBACK=0` — torch's own default, written out — makes
 an operation MPS does not implement raise instead of running on the CPU. A
 value you set for any of the three is kept and recorded as yours, after a
 check: the ratios must be plain decimals from 0 to 2.0, the low one no higher
 than the high one, and the fallback a plain integer; anything else is refused
-before the run starts. A high ratio you set is the limit, so the refusals for
-available memory below do not apply to it, though the report says when
-litetune would have refused; the report records litetune's computed budget
-beside the limit in force, and says so when your `0.0` removed the limit or
-your non-zero fallback let operations run on the CPU. When litetune sets the
-limit, a Metal working set under 1 GiB is refused. Otherwise, with less than 4 GiB available the budget
-is the 1 GiB floor and everything else keeps less than 3 GiB; the run starts, and its report says how much was left and that the
-narrower margin is litetune's choice, not a measured safe one: the run may
-push other memory into swap and run slower. Under 2 GiB available, which
-would leave everything else under 1 GiB, the run is refused rather than
-started: quit what is holding memory, or set `LITETUNE_DEVICE=cpu`. A Mac
-whose `kern.memorystatus_vm_pressure_level` is 4 (critical) is refused with
-the same two ways out, and one at a level litetune does not know with
-`LITETUNE_DEVICE=cpu`, whoever set the ratios. The level is read once, before
-the run, and not watched while it goes on. The report of every run that
-starts on `mps` records it; at 2 (warn) the run starts and its limitations say
-it was warn, since no run under warn has been measured. On `mps`, `tune` trains in float32
+before the run starts. A high ratio you set is the limit, so the two memory
+refusals below (a working set under 1 GiB, under 2 GiB available) do not
+apply to it, though the report says when litetune would have refused; the
+report records litetune's computed budget beside the limit in force, and says
+so when your `0.0` removed the limit or your non-zero fallback let operations
+run on the CPU. When litetune sets the limit, a Metal working set under 1 GiB
+is refused. With a working set of at least 1 GiB and less than 4 GiB
+available, the budget is the 1 GiB floor and everything else keeps less than
+3 GiB: the run starts, and its report says how much was left. Neither this
+margin nor the 3 GiB one has been measured on a run; the narrower one is
+litetune's choice to start more runs, and the run may push other memory into
+swap. Under 2 GiB available, which would leave everything else under 1 GiB,
+the run is refused rather than started: quit what is holding memory, or set
+`LITETUNE_DEVICE=cpu`. A Mac whose `kern.memorystatus_vm_pressure_level` is 4
+(critical) is refused with the same two ways out, and one at a level litetune
+does not know with `LITETUNE_DEVICE=cpu`, whoever set the ratios. The level is
+read once, before the run, and not watched while it goes on. The report of
+every run that starts on `mps` records it; at 2 (warn) the run starts, and its
+limitations say so: no run under warn has been measured. On `mps`, `tune` trains in float32
 unless you pass `--dtype`, pads each batch to a multiple of 32 tokens (never
 past `--max-seq-length`), and defaults to one example per forward pass while
 accumulating the gradients for the `--batch-size` optimiser batch. CPU and

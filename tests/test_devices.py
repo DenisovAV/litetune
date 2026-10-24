@@ -324,14 +324,15 @@ def test_a_mac_short_of_the_full_headroom_starts_at_the_floor_and_says_so(availa
     assert record["minimum_headroom_bytes"] == GIB
     [said] = policy.limitations
     left, of = ((n * 100 // GIB) / 100 for n in (available - GIB, available))
-    assert f"litetune left {left:.2f} GiB of the {of:.2f} GiB available to everything else" in (
+    assert f"Of the {of:.2f} GiB available, litetune left {left:.2f} GiB to everything else" in (
         said
     )
     # Rounded down: a margin just under 3 GiB is not printed as the full one.
     assert "left 3.00 GiB" not in said
     assert "with the 1 GiB minimum budget" in said
     assert "under the 3 GiB it leaves when memory allows" in said
-    assert "not a measured safe one" in said
+    assert "Neither margin has been measured on a run" in said
+    assert "slower" not in said
 
 
 def test_a_mac_with_the_full_headroom_records_three_gib_left():
@@ -486,6 +487,9 @@ def test_the_operators_high_ratio_owns_the_limit_and_skips_the_budget_floor():
     [said] = policy.limitations
     assert "litetune would not have started this run on MPS with a limit of its own" in said
     assert "this Mac has 1.50 GiB available" in said
+    # A report of a run that went ahead gives the reason, not the way out.
+    assert "Quit what is holding memory" not in said
+    assert "LITETUNE_DEVICE=cpu" not in said
     assert f"did not refuse it because {HIGH_WATERMARK} was set in this environment" in said
     # The policy is set before the child starts, so it does not say the run started.
     assert "it started" not in said
