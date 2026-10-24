@@ -169,16 +169,18 @@ def host_record(
 # Bytes) at the time we initialize the allocator"; where the variables are read
 # is MPSAllocator.mm, which the wheel does not ship.
 #
-# budget = min(R, available - headroom)
+# budget = min(R, max(available - headroom, floor))
 #
 # where R is `torch.mps.recommended_max_memory()` from the probe and
 # `available` is
 #
 #   (vm.page_free_count + vm.page_pageable_external_count) * hw.pagesize
 #
-# free pages and file-backed pages the kernel can drop without writing them to
-# swap. It is litetune's own conservative measure, built from two of the
-# counters XNU's jetsam path sums, and not a figure macOS reports. In
+# free pages and file-backed pages, which need no write to swap to be freed;
+# whether the kernel frees them before it compresses or swaps other memory is
+# the kernel's choice, and this sum does not predict it. It is litetune's own
+# measure, built from two of the counters XNU's jetsam path sums, and not a
+# figure macOS reports. In
 # osfmk/vm/vm_page.h (apple-oss-distributions/xnu, read 2026-10-02; cited by
 # macro name because line numbers move between revisions), the
 # `CONFIG_JETSAM` branch of `VM_CHECK_MEMORYSTATUS` sums
@@ -189,28 +191,37 @@ def host_record(
 # embedded option (XNU config/MASTER: "enable jetsam - used on embedded"), and
 # on macOS the kernel reports `AVAILABLE_NON_COMPRESSED_MEMORY` instead (below).
 #
-# It is not `kern.memorystatus_level`, which an earlier draft used. On macOS
+# It is not `kern.memorystatus_level`. On macOS
 # that is XNU's pressure level: `vm_pressure_response` in vm_pageout.c sets it
 # to available pages over total pages, and without jetsam the available count
 # is `AVAILABLE_NON_COMPRESSED_MEMORY` -- active + inactive + free +
 # speculative (the `AVAILABLE_NON_COMPRESSED_MEMORY` macro and the
 # `XNU_TARGET_OS_OSX` branch of `VM_CHECK_MEMORYSTATUS` in vm_page.h). So it counts
-# other processes' active memory as available. Read on 2026-10-02 at 09:19 UTC
-# on a 24 GiB Mac (macOS 26.5.1, arm64): `kern.memorystatus_level` 54, which
-# the old formula made 12.96 GiB available and a 9.96 GiB budget, while the
-# sum above came to 3.23 GiB (7818 free and 203553 pageable external 16 KiB
-# pages) -- under the 1 GiB floor once the headroom is taken -- with
-# `kern.memorystatus_vm_pressure_level` at 1 and `vm.swapusage` showing
-# 25687 of 26624 MB in use. Every key above answered `sysctl -n` there.
+# other processes' active memory as available.
 #
-# A Mac the kernel already reports under memory pressure is refused outright,
-# whatever the sum says: `kern.memorystatus_vm_pressure_level` answers 1, 2 or 4
-# for normal, warn and critical -- the values `DISPATCH_MEMORYPRESSURE_NORMAL`,
-# `_WARN` and `_CRITICAL` carry in the SDK's dispatch/source.h; that the sysctl
-# reports in those values is from XNU's kern_memorystatus_notify.c and
-# sys/event.h, as the review read them. Anything but 1 is refused.
+# `kern.memorystatus_vm_pressure_level` answers 1, 2 or 4 for normal, warn and
+# critical -- the values `DISPATCH_MEMORYPRESSURE_NORMAL`, `_WARN` and
+# `_CRITICAL` carry in the SDK's dispatch/source.h; that the sysctl reports in
+# those values is from XNU's kern_memorystatus_notify.c. A Mac at critical is
+# refused outright, whatever the sum says, and so is a level litetune does not
+# know.
 #
-# The high ratio is budget / R, never above 1 since the budget is at most R.
+# A Mac at warn starts, and the report says so. Refusing at warn refused MPS
+# runs that the budget above would have admitted. litetune has measured no run
+# under warn, so it claims nothing about what warn changes in one. The level is
+# read once, before the run; nothing watches it while the run goes on. The
+# report says the level litetune read, so a reader can set the run apart from
+# runs that started at normal.
+#
+# The headroom is at least 3 GiB when the memory allows it. When it does not
+# -- less than 4 GiB available -- the budget is the 1 GiB floor and the
+# headroom is whatever is left, down to `MPS_MIN_HEADROOM_BYTES`; under that a
+# run litetune sets the limit for is refused. Neither margin has been measured
+# on a run: the narrower one is litetune's choice to start more runs, and a run
+# started with one says so in its report.
+#
+# The high ratio is budget / R rounded down to six places (`mps_memory_policy`),
+# never above 1 since the budget is at most R.
 # The low ratio has to be set as well, and not above the high one: the header
 # documents it as a value "between 0 to m_high_watermark_ratio", the 1.4
 # default is above any high ratio this policy produces, and libtorch_cpu in
@@ -224,8 +235,9 @@ def host_record(
 #
 # The operator may set any of the three, and what they set is theirs: passed
 # through, never overridden, and recorded as theirs. A high ratio they set is
-# the limit, so the 1 GiB floor on the computed budget does not apply to it;
-# the computed budget is still recorded beside it. Each value is checked
+# the limit, so neither refusal in `_memory_refusal` applies to it; the
+# computed budget is still recorded beside it, and a limitation says when
+# litetune would have refused the run with a limit of its own. Each value is checked
 # before anything starts, and one litetune cannot read is refused as a fact
 # about the configuration, not passed on. The ranges are torch 2.5.1's. The
 # upper bound of 2.0 on the high ratio is `default_high_watermark_upper_bound`
@@ -245,6 +257,7 @@ def host_record(
 GIB = 1024**3
 MPS_HEADROOM_BYTES = 3 * GIB
 MPS_MIN_BUDGET_BYTES = 1 * GIB
+MPS_MIN_HEADROOM_BYTES = 1 * GIB
 MPS_LOW_OVER_HIGH = 0.8
 HIGH_WATERMARK = "PYTORCH_MPS_HIGH_WATERMARK_RATIO"
 LOW_WATERMARK = "PYTORCH_MPS_LOW_WATERMARK_RATIO"
@@ -265,7 +278,9 @@ AVAILABLE_PAGES = (
 )
 PRESSURE_LEVEL = "kern.memorystatus_vm_pressure_level"
 PRESSURE_NORMAL = 1
-PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}
+PRESSURE_WARN = 2
+PRESSURE_CRITICAL = 4
+PRESSURE_NAMES = {PRESSURE_NORMAL: "normal", PRESSURE_WARN: "warn", PRESSURE_CRITICAL: "critical"}
 # Every key `read_memory` reads, for a test that asks this Mac's own sysctl.
 MEMORY_SYSCTLS = (PAGE_SIZE, *AVAILABLE_PAGES, PRESSURE_LEVEL)
 
@@ -310,7 +325,7 @@ class MpsMemory:
 
     recommended_max_memory: int
     reading: MemoryReading
-    # min(R, available - headroom), computed whoever set the high ratio. When
+    # min(R, max(available - headroom, floor)), computed whoever set the high ratio. When
     # the operator set it, this is what litetune would have set, not the limit.
     budget: int
     # The value of each of `MPS_VARIABLES` that reaches the child. `None` for a
@@ -379,7 +394,55 @@ class MpsMemory:
                 'own message offers the variable "to use the CPU as a fallback for this op"). '
                 "`device: mps` does not mean every operation of this run ran on MPS"
             )
+        if self.reading.pressure_level == PRESSURE_WARN:
+            swap = (
+                f"Swap use when it was read: {self.swapusage}"
+                if self.swapusage is not None
+                else f"Swap use could not be read: {self.swapusage_error}"
+            )
+            said.append(
+                f"{PRESSURE_LEVEL} was {PRESSURE_WARN} ({PRESSURE_NAMES[PRESSURE_WARN]}) when "
+                "litetune read this Mac's memory: the kernel reported elevated memory "
+                "pressure. It was read once, before the work on MPS, and not watched after. "
+                "litetune has measured no run under warn, so the times and memory of the work "
+                "on MPS are not to be read as those of one started at "
+                f"{PRESSURE_NORMAL} ({PRESSURE_NAMES[PRESSURE_NORMAL]}). {swap}"
+            )
+        left = self.headroom_left
+        if left is not None and left < MPS_HEADROOM_BYTES:
+            # Rounded down, so a margin just under 3 GiB never prints as 3.00.
+            said.append(
+                f"Of the {_gib_floor(self.reading.available_bytes)} GiB available, litetune "
+                f"left {_gib_floor(left)} GiB to everything else, under the "
+                f"{MPS_HEADROOM_BYTES / GIB:.0f} GiB it leaves when memory allows, to start this "
+                f"run with the {MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB minimum budget. Neither "
+                "margin has been measured on a run; the narrower one is litetune's choice to "
+                "start more runs, and the work on MPS may push other memory into swap"
+            )
+        if self.budget_source == "user":
+            refusal = _memory_refusal(
+                self.recommended_max_memory, self.reading.available_bytes, self.budget
+            )
+            if refusal is not None:
+                reason, _ = refusal
+                said.append(
+                    f"litetune would not have started this run on MPS with a limit of its own -- "
+                    f"{reason} -- and did not refuse it because {HIGH_WATERMARK} was set in "
+                    "this environment"
+                )
         return said
+
+    @property
+    def headroom_left(self) -> int | None:
+        """What litetune's limit leaves of the available memory; `None` under the operator's."""
+        if self.budget_source != "litetune":
+            return None
+        limit = self.effective_high
+        # litetune's high ratio is budget / R rounded down to six places, with
+        # 1 GiB <= budget <= R: never 0.0 for a working set under 10^6 GiB, so
+        # the limit is bytes and not "unlimited".
+        assert isinstance(limit, int)
+        return self.reading.available_bytes - limit
 
     def summary(self) -> str:
         """One line for the event stream, worded by who set the limit."""
@@ -409,6 +472,8 @@ class MpsMemory:
             "memory_reading": self.reading.as_dict(),
             "pressure_level": self.reading.pressure_level,
             "headroom_bytes": MPS_HEADROOM_BYTES,
+            "minimum_headroom_bytes": MPS_MIN_HEADROOM_BYTES,
+            "headroom_left_bytes": self.headroom_left,
             "minimum_budget_bytes": MPS_MIN_BUDGET_BYTES,
             "swapusage": self.swapusage,
             "swapusage_error": self.swapusage_error,
@@ -492,11 +557,46 @@ def _fallback(text: str) -> int:
 def _pressure_refusal(level: int) -> str:
     name = PRESSURE_NAMES.get(level)
     said = f"{level} ({name})" if name else f"{level}, which is not a level litetune knows"
+    # Quitting what holds memory is advice for a level that says memory is
+    # short; for a level litetune does not know, it would be a guess.
+    forward = "Quit what is holding memory and run again, or set " if name else "Set "
     return (
         f"{PRESSURE_LEVEL} is {said}: litetune starts an MPS run only at level "
-        f"{PRESSURE_NORMAL} ({PRESSURE_NAMES[PRESSURE_NORMAL]}). Quit what is holding memory "
-        f"and run again, or set {DEVICE_VARIABLE}=cpu to run on the CPU"
+        f"{PRESSURE_NORMAL} ({PRESSURE_NAMES[PRESSURE_NORMAL]}) or {PRESSURE_WARN} "
+        f"({PRESSURE_NAMES[PRESSURE_WARN]}). {forward}"
+        f"{DEVICE_VARIABLE}=cpu to run on the CPU"
     )
+
+
+def _gib_floor(size: int) -> str:
+    return f"{size * 100 // GIB / 100:.2f}"
+
+
+def _memory_refusal(
+    recommended_max_memory: int, available: int, budget: int
+) -> tuple[str, str] | None:
+    """Why litetune refuses to set this budget as the limit, and the way forward.
+
+    `None` when it does not refuse. The reason and the way forward are apart
+    because a report of a run that went ahead says the reason alone.
+    """
+    if budget < MPS_MIN_BUDGET_BYTES:
+        return (
+            f"the MPS memory budget is {budget / GIB:.2f} GiB, under the "
+            f"{MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB litetune starts an MPS run with: Metal "
+            f"recommends {recommended_max_memory / GIB:.2f} GiB on this Mac",
+            f"Set {DEVICE_VARIABLE}=cpu to run on the CPU",
+        )
+    if available - budget < MPS_MIN_HEADROOM_BYTES:
+        return (
+            f"this Mac has {available / GIB:.2f} GiB available ({AVAILABLE_MEASURE}): the "
+            f"{MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB minimum MPS budget would leave "
+            f"{max(available - budget, 0) / GIB:.2f} GiB to everything else, under the "
+            f"{MPS_MIN_HEADROOM_BYTES / GIB:.0f} GiB litetune leaves at least",
+            f"Quit what is holding memory and run again, or set {DEVICE_VARIABLE}=cpu to run "
+            "on the CPU",
+        )
+    return None
 
 
 def mps_memory_policy(
@@ -509,19 +609,22 @@ def mps_memory_policy(
 ) -> MpsMemory:
     """The watermark ratios for a child about to use MPS. Pure: every input is passed in.
 
-    Raises `MpsMemoryRefused` when the kernel reports memory pressure, when
-    litetune sets the limit and the budget is under `MPS_MIN_BUDGET_BYTES`, or
-    when a value the operator set is not one litetune can check.
+    Raises `MpsMemoryRefused` when the kernel reports critical memory pressure
+    or a level litetune does not know; when litetune sets the limit and the
+    budget is under `MPS_MIN_BUDGET_BYTES` or leaves under
+    `MPS_MIN_HEADROOM_BYTES` to everything else; when torch reports a working
+    set of zero bytes or less; or when a value the operator set is not one
+    litetune can check.
     """
     if recommended_max_memory <= 0:
         raise MpsMemoryRefused(
             f"torch reported a recommended MPS working set of {recommended_max_memory} bytes, "
             "which no budget can be a share of"
         )
-    if reading.pressure_level != PRESSURE_NORMAL:
+    if reading.pressure_level not in (PRESSURE_NORMAL, PRESSURE_WARN):
         raise MpsMemoryRefused(_pressure_refusal(reading.pressure_level))
     available = reading.available_bytes
-    budget = min(recommended_max_memory, available - MPS_HEADROOM_BYTES)
+    budget = min(recommended_max_memory, max(available - MPS_HEADROOM_BYTES, MPS_MIN_BUDGET_BYTES))
     user_set = tuple(name for name in MPS_VARIABLES if name in environ)
 
     # The high ratio first: the low one is checked against it, and is never
@@ -530,16 +633,15 @@ def mps_memory_policy(
         high_text = environ[HIGH_WATERMARK]
         high = _decimal(HIGH_WATERMARK, high_text, HIGH_RATIO_UPPER_BOUND)
     else:
-        if budget < MPS_MIN_BUDGET_BYTES:
-            raise MpsMemoryRefused(
-                f"the MPS memory budget is {budget / GIB:.2f} GiB, under the "
-                f"{MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB litetune starts an MPS run with: this Mac "
-                f"has {available / GIB:.2f} GiB available ({AVAILABLE_MEASURE}), less "
-                f"{MPS_HEADROOM_BYTES / GIB:.0f} GiB left to everything else, against the "
-                f"{recommended_max_memory / GIB:.1f} GiB Metal recommends. Quit what is holding "
-                f"memory and run again, or set {DEVICE_VARIABLE}=cpu to run on the CPU"
-            )
-        high_text = _RATIO_FORMAT.format(budget / recommended_max_memory)
+        refusal = _memory_refusal(recommended_max_memory, available, budget)
+        if refusal is not None:
+            reason, forward = refusal
+            raise MpsMemoryRefused(f"{reason}. {forward}")
+        # Rounded down to the six places written out, so ratio x R, as torch
+        # computes the limit (MPSAllocator.mm at v2.5.1, as the review read it),
+        # is never above the budget, and what is left to everything else never
+        # under what the check above admitted.
+        high_text = _RATIO_FORMAT.format(budget * 10**6 // recommended_max_memory / 10**6)
         high = float(high_text)
 
     low_text: str | None

@@ -3595,7 +3595,7 @@ def test_an_mps_reference_without_the_memory_is_not_started(monkeypatch):
     from litetune import devices
 
     calls = _reference_env(monkeypatch, "mps")
-    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(15 * 1024**3 // 10)))
 
     backend = HuggingFaceBackend(model="org/model", auto_provision=False)
     (generation,) = backend.generate(["a"])
@@ -3772,7 +3772,7 @@ def test_a_reused_backend_forgets_a_refusal_once_the_memory_is_back(monkeypatch)
     from litetune import devices
 
     calls = _reference_env(monkeypatch, "mps")
-    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(15 * 1024**3 // 10)))
     backend = HuggingFaceBackend(model="org/model", auto_provision=False)
     (refused,) = backend.generate(["a"])
     assert refused.harness_error is not None

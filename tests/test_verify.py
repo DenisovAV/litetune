@@ -2192,6 +2192,39 @@ def test_the_reference_engine_records_the_host_and_the_mps_memory(
     assert memory["variables"]["PYTORCH_MPS_LOW_WATERMARK_RATIO"]["value"] == "0.650000"
 
 
+def test_a_reference_at_warn_pressure_runs_and_the_manifest_says_the_level(
+    write_split, monkeypatch, tmp_path
+):
+    from conftest import fake_sysctl, sysctl_available
+
+    from litetune import devices
+
+    _ready_train_env(monkeypatch, tmp_path)
+    rows = text_rows(5)
+    monkeypatch.setattr(
+        envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer("mps"))
+    )
+    monkeypatch.setattr(
+        devices, "read_sysctl", fake_sysctl(sysctl_available(16 * 1024**3, pressure=2))
+    )
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=CpuCandidateBackend(texts=[r["target"] for r in rows]),
+        reference=HuggingFaceBackend(model="org/reference", auto_provision=False),
+        scorer="exact-text",
+    )
+
+    assert result.status is Status.PASSED
+    engine = result.manifest["measurements"]["reference"]["engine"]
+    assert engine["mps_memory"]["pressure_level"] == 2
+    assert any(
+        "pressure_level was 2 (warn)" in text and "measured no run under warn" in text
+        for text in result.manifest["limitations"]
+    ), result.manifest["limitations"]
+
+
 def test_litetune_device_cpu_on_the_reference_is_on_the_record(write_split, monkeypatch, tmp_path):
     _ready_train_env(monkeypatch, tmp_path)
     monkeypatch.setenv("LITETUNE_DEVICE", "cpu")
@@ -2284,7 +2317,7 @@ def test_a_reference_refused_for_memory_reaches_the_manifest(write_split, monkey
     monkeypatch.setattr(
         envs.StageEnv, "run", _fake_reference_run(rows, probe_stdout=probe_answer("mps"))
     )
-    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(15 * 1024**3 // 10)))
 
     result = verify(
         write_split,
