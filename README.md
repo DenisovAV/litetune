@@ -79,8 +79,8 @@ before the run starts. A high ratio you set is the limit, so the refusals for
 available memory below do not apply to it, though the report says when
 litetune would have refused; the report records litetune's computed budget
 beside the limit in force, and says so when your `0.0` removed the limit or
-your non-zero fallback let operations run on the CPU. A Metal working set
-under 1 GiB is refused. Otherwise, with less than 4 GiB available the budget
+your non-zero fallback let operations run on the CPU. When litetune sets the
+limit, a Metal working set under 1 GiB is refused. Otherwise, with less than 4 GiB available the budget
 is the 1 GiB floor and everything else keeps less than 3 GiB; the run starts, and its report says how much was left and that the
 narrower margin is litetune's choice, not a measured safe one: the run may
 push other memory into swap and run slower. Under 2 GiB available, which

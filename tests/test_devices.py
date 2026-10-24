@@ -486,7 +486,30 @@ def test_the_operators_high_ratio_owns_the_limit_and_skips_the_budget_floor():
     [said] = policy.limitations
     assert "litetune would not have started this run on MPS with a limit of its own" in said
     assert "this Mac has 1.50 GiB available" in said
-    assert f"because {HIGH_WATERMARK} was set in this environment" in said
+    assert f"did not refuse it because {HIGH_WATERMARK} was set in this environment" in said
+    # The policy is set before the child starts, so it does not say the run started.
+    assert "it started" not in said
+
+
+def test_a_metal_working_set_under_the_floor_starts_under_the_operators_ratio_and_says_so():
+    policy = _policy({HIGH_WATERMARK: "0.5"}, recommended=GIB // 2)
+    [said] = policy.limitations
+    assert "Metal recommends 0.50 GiB" in said
+
+
+@pytest.mark.parametrize("recommended", [6 * GIB, 7 * GIB, 10 * GIB + 12345 * PAGE])
+@pytest.mark.parametrize("available", [2 * GIB, 25 * GIB // 10, 4 * GIB, 9 * GIB + 7 * PAGE])
+def test_the_limit_torch_rebuilds_from_the_ratio_keeps_the_margin_litetune_admitted(
+    recommended, available
+):
+    # torch multiplies the six-place ratio back by R; written out rounded to
+    # nearest, 1/6 of 6 GiB would come back 2,147 bytes over the budget.
+    policy = _policy(recommended=recommended, available=available)
+    limit = policy.effective_high
+    assert isinstance(limit, int)
+    assert limit <= policy.budget
+    assert policy.as_dict()["headroom_left_bytes"] == available - limit
+    assert available - limit >= GIB
 
 
 def test_the_operators_high_ratio_on_a_mac_with_the_memory_says_nothing_of_a_refusal():

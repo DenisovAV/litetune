@@ -406,10 +406,11 @@ class MpsMemory:
                 "on MPS are not to be read as those of one started at "
                 f"{PRESSURE_NORMAL} ({PRESSURE_NAMES[PRESSURE_NORMAL]}). {swap}"
             )
-        if self.budget_source == "litetune" and self.headroom_left < MPS_HEADROOM_BYTES:
+        left = self.headroom_left
+        if left is not None and left < MPS_HEADROOM_BYTES:
             # Rounded down, so a margin just under 3 GiB never prints as 3.00.
             said.append(
-                f"litetune left {_gib_floor(self.headroom_left)} GiB of the "
+                f"litetune left {_gib_floor(left)} GiB of the "
                 f"{_gib_floor(self.reading.available_bytes)} GiB available to everything else, "
                 f"under the {MPS_HEADROOM_BYTES / GIB:.0f} GiB it leaves when memory allows, to "
                 f"start this run with the {MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB minimum budget. "
@@ -423,15 +424,20 @@ class MpsMemory:
             if refusal is not None:
                 said.append(
                     f"litetune would not have started this run on MPS with a limit of its own -- "
-                    f"{refusal} -- and it started because {HIGH_WATERMARK} was set in this "
-                    "environment"
+                    f"{refusal} -- and did not refuse it because {HIGH_WATERMARK} was set in "
+                    "this environment"
                 )
         return said
 
     @property
-    def headroom_left(self) -> int:
-        """What the computed budget leaves of the available memory to everything else."""
-        return self.reading.available_bytes - self.budget
+    def headroom_left(self) -> int | None:
+        """What litetune's limit leaves of the available memory; `None` under the operator's."""
+        if self.budget_source != "litetune":
+            return None
+        limit = self.effective_high
+        # litetune's high ratio is budget / R with a budget of at least 1 GiB.
+        assert isinstance(limit, int)
+        return self.reading.available_bytes - limit
 
     def summary(self) -> str:
         """One line for the event stream, worded by who set the limit."""
@@ -462,11 +468,7 @@ class MpsMemory:
             "pressure_level": self.reading.pressure_level,
             "headroom_bytes": MPS_HEADROOM_BYTES,
             "minimum_headroom_bytes": MPS_MIN_HEADROOM_BYTES,
-            # What litetune's budget left, which is only what this run left
-            # when litetune set the limit.
-            "headroom_left_bytes": (
-                self.headroom_left if self.budget_source == "litetune" else None
-            ),
+            "headroom_left_bytes": self.headroom_left,
             "minimum_budget_bytes": MPS_MIN_BUDGET_BYTES,
             "swapusage": self.swapusage,
             "swapusage_error": self.swapusage_error,
@@ -621,7 +623,10 @@ def mps_memory_policy(
         refusal = _memory_refusal(recommended_max_memory, available, budget)
         if refusal is not None:
             raise MpsMemoryRefused(refusal)
-        high_text = _RATIO_FORMAT.format(budget / recommended_max_memory)
+        # Rounded down to the six places written out, so the limit torch
+        # rebuilds from the ratio is never above the budget, and what is left
+        # to everything else never under what the check above admitted.
+        high_text = _RATIO_FORMAT.format(budget * 10**6 // recommended_max_memory / 10**6)
         high = float(high_text)
 
     low_text: str | None
