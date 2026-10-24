@@ -292,6 +292,11 @@ def test_a_mac_that_would_keep_under_one_gib_is_refused_with_both_ways_out(avail
     message = str(raised.value)
     assert "Quit what is holding memory" in message
     assert "under the 1 GiB litetune leaves at least" in message
+    left = max(available - GIB, 0) / GIB
+    assert "-0.00" not in message and "-1.00" not in message
+    assert f"the 1 GiB minimum MPS budget would leave {left:.2f} GiB to everything else" in (
+        message
+    )
     assert "LITETUNE_DEVICE=cpu" in message
     assert f"{available / GIB:.2f} GiB available" in message
     # The measure is named, so the reader can recompute it.
@@ -318,9 +323,29 @@ def test_a_mac_short_of_the_full_headroom_starts_at_the_floor_and_says_so(availa
     assert record["headroom_bytes"] == 3 * GIB
     assert record["minimum_headroom_bytes"] == GIB
     [said] = policy.limitations
-    assert f"litetune left {(available - GIB) / GIB:.2f} GiB" in said
+    left, of = ((n * 100 // GIB) / 100 for n in (available - GIB, available))
+    assert f"litetune left {left:.2f} GiB of the {of:.2f} GiB available to everything else" in (
+        said
+    )
+    # Rounded down: a margin just under 3 GiB is not printed as the full one.
+    assert "left 3.00 GiB" not in said
+    assert "with the 1 GiB minimum budget" in said
     assert "under the 3 GiB it leaves when memory allows" in said
     assert "not a measured safe one" in said
+
+
+def test_a_mac_with_the_full_headroom_records_three_gib_left():
+    policy = _policy(available=16 * GIB)
+    assert policy.budget == 13 * GIB
+    assert policy.as_dict()["headroom_left_bytes"] == 3 * GIB
+
+
+def test_a_mac_at_warn_short_of_the_full_headroom_says_both():
+    policy = _policy(available=25 * GIB // 10, pressure=2)
+    assert policy.budget == GIB
+    warn, narrow = policy.limitations
+    assert "pressure_level was 2 (warn)" in warn
+    assert "litetune left 1.50 GiB" in narrow
 
 
 def test_a_recommended_working_set_under_the_floor_is_refused_without_blaming_other_apps():
@@ -452,8 +477,21 @@ def test_the_operators_high_ratio_owns_the_limit_and_skips_the_budget_floor():
     record = policy.as_dict()
     assert record["budget_source"] == "user"
     assert record["computed_budget_bytes"] == GIB
+    # litetune's budget was not the limit, so what it would have left is not
+    # what this run left.
+    assert record["headroom_left_bytes"] is None
     assert record["effective_high_bytes"] == 8 * GIB
     assert record["effective_low_bytes"] == int(0.4 * 16 * GIB)
+    # Started because of the operator's ratio, and the report says so.
+    [said] = policy.limitations
+    assert "litetune would not have started this run on MPS with a limit of its own" in said
+    assert "this Mac has 1.50 GiB available" in said
+    assert f"because {HIGH_WATERMARK} was set in this environment" in said
+
+
+def test_the_operators_high_ratio_on_a_mac_with_the_memory_says_nothing_of_a_refusal():
+    policy = _policy({HIGH_WATERMARK: "0.5"}, available=25 * GIB // 10)
+    assert policy.budget == GIB
     assert policy.limitations == []
 
 

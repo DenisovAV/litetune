@@ -233,8 +233,9 @@ def host_record(
 #
 # The operator may set any of the three, and what they set is theirs: passed
 # through, never overridden, and recorded as theirs. A high ratio they set is
-# the limit, so the 1 GiB floor on the computed budget does not apply to it;
-# the computed budget is still recorded beside it. Each value is checked
+# the limit, so the refusals for available memory do not apply to it; the
+# computed budget is still recorded beside it, and a limitation says when
+# litetune would have refused the run with a limit of its own. Each value is checked
 # before anything starts, and one litetune cannot read is refused as a fact
 # about the configuration, not passed on. The ranges are torch 2.5.1's. The
 # upper bound of 2.0 on the high ratio is `default_high_watermark_upper_bound`
@@ -399,21 +400,32 @@ class MpsMemory:
             )
             said.append(
                 f"{PRESSURE_LEVEL} was {PRESSURE_WARN} ({PRESSURE_NAMES[PRESSURE_WARN]}) when "
-                "litetune set the MPS memory budget: the kernel reported elevated memory "
+                "litetune read this Mac's memory: the kernel reported elevated memory "
                 "pressure. It was read once, before the work on MPS, and not watched after. "
                 "litetune has measured no run under warn, so the times and memory of the work "
                 "on MPS are not to be read as those of one started at "
                 f"{PRESSURE_NORMAL} ({PRESSURE_NAMES[PRESSURE_NORMAL]}). {swap}"
             )
         if self.budget_source == "litetune" and self.headroom_left < MPS_HEADROOM_BYTES:
+            # Rounded down, so a margin just under 3 GiB never prints as 3.00.
             said.append(
-                f"litetune left {self.headroom_left / GIB:.2f} GiB of the "
-                f"{self.reading.available_bytes / GIB:.2f} GiB available to everything else, "
+                f"litetune left {_gib_floor(self.headroom_left)} GiB of the "
+                f"{_gib_floor(self.reading.available_bytes)} GiB available to everything else, "
                 f"under the {MPS_HEADROOM_BYTES / GIB:.0f} GiB it leaves when memory allows, to "
                 f"start this run with the {MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB minimum budget. "
                 "The narrower margin is not a measured safe one: the work on MPS may push other "
                 "memory into swap and run slower than with the full margin"
             )
+        if self.budget_source == "user":
+            refusal = _memory_refusal(
+                self.recommended_max_memory, self.reading.available_bytes, self.budget
+            )
+            if refusal is not None:
+                said.append(
+                    f"litetune would not have started this run on MPS with a limit of its own -- "
+                    f"{refusal} -- and it started because {HIGH_WATERMARK} was set in this "
+                    "environment"
+                )
         return said
 
     @property
@@ -450,7 +462,11 @@ class MpsMemory:
             "pressure_level": self.reading.pressure_level,
             "headroom_bytes": MPS_HEADROOM_BYTES,
             "minimum_headroom_bytes": MPS_MIN_HEADROOM_BYTES,
-            "headroom_left_bytes": self.headroom_left,
+            # What litetune's budget left, which is only what this run left
+            # when litetune set the limit.
+            "headroom_left_bytes": (
+                self.headroom_left if self.budget_source == "litetune" else None
+            ),
             "minimum_budget_bytes": MPS_MIN_BUDGET_BYTES,
             "swapusage": self.swapusage,
             "swapusage_error": self.swapusage_error,
@@ -545,6 +561,30 @@ def _pressure_refusal(level: int) -> str:
     )
 
 
+def _gib_floor(size: int) -> str:
+    return f"{size * 100 // GIB / 100:.2f}"
+
+
+def _memory_refusal(recommended_max_memory: int, available: int, budget: int) -> str | None:
+    """Why litetune refuses to set this budget as the limit, or `None` when it does not."""
+    if budget < MPS_MIN_BUDGET_BYTES:
+        return (
+            f"the MPS memory budget is {budget / GIB:.2f} GiB, under the "
+            f"{MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB litetune starts an MPS run with: Metal "
+            f"recommends {recommended_max_memory / GIB:.2f} GiB on this Mac. Set "
+            f"{DEVICE_VARIABLE}=cpu to run on the CPU"
+        )
+    if available - budget < MPS_MIN_HEADROOM_BYTES:
+        return (
+            f"this Mac has {available / GIB:.2f} GiB available ({AVAILABLE_MEASURE}): the "
+            f"{MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB minimum MPS budget would leave "
+            f"{max(available - budget, 0) / GIB:.2f} GiB to everything else, under the "
+            f"{MPS_MIN_HEADROOM_BYTES / GIB:.0f} GiB litetune leaves at least. Quit what is "
+            f"holding memory and run again, or set {DEVICE_VARIABLE}=cpu to run on the CPU"
+        )
+    return None
+
+
 def mps_memory_policy(
     *,
     recommended_max_memory: int,
@@ -578,21 +618,9 @@ def mps_memory_policy(
         high_text = environ[HIGH_WATERMARK]
         high = _decimal(HIGH_WATERMARK, high_text, HIGH_RATIO_UPPER_BOUND)
     else:
-        if budget < MPS_MIN_BUDGET_BYTES:
-            raise MpsMemoryRefused(
-                f"the MPS memory budget is {budget / GIB:.2f} GiB, under the "
-                f"{MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB litetune starts an MPS run with: Metal "
-                f"recommends {recommended_max_memory / GIB:.2f} GiB on this Mac. Set "
-                f"{DEVICE_VARIABLE}=cpu to run on the CPU"
-            )
-        if available - budget < MPS_MIN_HEADROOM_BYTES:
-            raise MpsMemoryRefused(
-                f"this Mac has {available / GIB:.2f} GiB available ({AVAILABLE_MEASURE}): the "
-                f"{MPS_MIN_BUDGET_BYTES / GIB:.0f} GiB minimum MPS budget would leave "
-                f"{(available - budget) / GIB:.2f} GiB to everything else, under the "
-                f"{MPS_MIN_HEADROOM_BYTES / GIB:.0f} GiB litetune leaves at least. Quit what is "
-                f"holding memory and run again, or set {DEVICE_VARIABLE}=cpu to run on the CPU"
-            )
+        refusal = _memory_refusal(recommended_max_memory, available, budget)
+        if refusal is not None:
+            raise MpsMemoryRefused(refusal)
         high_text = _RATIO_FORMAT.format(budget / recommended_max_memory)
         high = float(high_text)
 
