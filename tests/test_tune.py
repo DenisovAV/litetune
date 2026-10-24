@@ -4313,7 +4313,7 @@ def test_an_mps_run_refused_for_memory_records_no_dtype_and_says_it_did_not_trai
     from litetune import devices
 
     _mps_trainer(trainer)
-    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(15 * 1024**3 // 10)))
 
     result = run_tune(request_for())
 
@@ -4323,7 +4323,7 @@ def test_an_mps_run_refused_for_memory_records_no_dtype_and_says_it_did_not_trai
     assert not [t for t in result.limitations for w in _DTYPE_LIMITATION_WORDS if w in t]
     # M12: the refusal is in the limitations as well as the check.
     assert any(
-        t.startswith("training was not attempted: the MPS memory budget is")
+        t.startswith("training was not attempted: this Mac has 1.50 GiB available")
         for t in result.limitations
     ), result.limitations
 
@@ -4490,15 +4490,15 @@ def test_the_operators_high_ratio_owns_the_limit_on_a_mac_short_of_memory(
 
     _mps_trainer(trainer)
     monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")
-    # 2 GiB available: litetune's own budget would be refused.
-    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(2 * 1024**3)))
+    # 1.5 GiB available: litetune's own budget would be refused.
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(15 * 1024**3 // 10)))
 
     result = run_tune(request_for())
 
     assert check_named(result, TRAINING_CHECK).outcome is Outcome.PASSED
     recorded = result.as_dict()["mps_memory"]
     assert recorded["budget_source"] == "user"
-    assert recorded["computed_budget_bytes"] == -1 * 1024**3
+    assert recorded["computed_budget_bytes"] == 1024**3
     assert recorded["effective_high_bytes"] == 8 * 1024**3
     assert _training_call(trainer).env == {
         "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.400000",
@@ -4542,8 +4542,8 @@ def test_an_mps_run_without_the_memory_is_refused_before_it_starts(
     from litetune import devices
 
     _mps_trainer(trainer)
-    # 3.2 GiB available, less 3 GiB: 0.2 GiB.
-    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(32 * 1024**3 // 10)))
+    # 1.5 GiB available: the 1 GiB floor would leave 0.5 GiB to everything else.
+    monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(sysctl_available(15 * 1024**3 // 10)))
 
     result = run_tune(request_for())
 

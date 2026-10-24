@@ -285,12 +285,13 @@ def test_the_low_ratio_is_never_above_the_high_one():
         assert float(policy.variables[LOW_WATERMARK]) <= float(policy.variables[HIGH_WATERMARK])
 
 
-@pytest.mark.parametrize("available", [32 * GIB // 10, 3 * GIB, 2 * GIB, 0])
-def test_a_budget_under_one_gib_is_refused_with_both_ways_out(available):
+@pytest.mark.parametrize("available", [2 * GIB - PAGE, 19 * GIB // 10, GIB, 0])
+def test_a_mac_that_would_keep_under_one_gib_is_refused_with_both_ways_out(available):
     with pytest.raises(MpsMemoryRefused) as raised:
         _policy(available=available)
     message = str(raised.value)
     assert "Quit what is holding memory" in message
+    assert "under the 1 GiB litetune leaves at least" in message
     assert "LITETUNE_DEVICE=cpu" in message
     assert f"{available / GIB:.2f} GiB available" in message
     # The measure is named, so the reader can recompute it.
@@ -303,6 +304,33 @@ def test_a_budget_of_exactly_one_gib_runs():
     policy = _policy(available=4 * GIB)
     assert policy.budget == GIB
     assert policy.variables[HIGH_WATERMARK] == "0.062500"
+    # The full 3 GiB is left, so nothing is said about a narrower one.
+    assert policy.as_dict()["headroom_left_bytes"] == 3 * GIB
+    assert policy.limitations == []
+
+
+@pytest.mark.parametrize("available", [25 * GIB // 10, 2 * GIB, 4 * GIB - PAGE])
+def test_a_mac_short_of_the_full_headroom_starts_at_the_floor_and_says_so(available):
+    policy = _policy(available=available)
+    assert policy.budget == GIB
+    record = policy.as_dict()
+    assert record["headroom_left_bytes"] == available - GIB
+    assert record["headroom_bytes"] == 3 * GIB
+    assert record["minimum_headroom_bytes"] == GIB
+    [said] = policy.limitations
+    assert f"litetune left {(available - GIB) / GIB:.2f} GiB" in said
+    assert "under the 3 GiB it leaves when memory allows" in said
+    assert "not a measured safe one" in said
+
+
+def test_a_recommended_working_set_under_the_floor_is_refused_without_blaming_other_apps():
+    with pytest.raises(MpsMemoryRefused) as raised:
+        _policy(recommended=GIB // 2)
+    message = str(raised.value)
+    assert "under the 1 GiB litetune starts an MPS run with" in message
+    assert "Metal recommends 0.50 GiB" in message
+    assert "LITETUNE_DEVICE=cpu" in message
+    assert "Quit what is holding memory" not in message
 
 
 def test_a_mac_at_critical_pressure_is_refused_whatever_is_available():
@@ -310,6 +338,8 @@ def test_a_mac_at_critical_pressure_is_refused_whatever_is_available():
         _policy(available=64 * GIB, pressure=4)
     message = str(raised.value)
     assert "kern.memorystatus_vm_pressure_level is 4 (critical)" in message
+    assert "only at level 1 (normal) or 2 (warn)" in message
+    assert "Quit what is holding memory" in message
     assert "LITETUNE_DEVICE=cpu" in message
 
 
@@ -319,7 +349,30 @@ def test_a_mac_at_warn_starts_and_the_report_says_the_level_it_started_at():
     assert policy.as_dict()["pressure_level"] == 2
     [said] = policy.limitations
     assert "kern.memorystatus_vm_pressure_level was 2 (warn)" in said
+    assert "the kernel reported elevated memory pressure" in said
+    assert "read once, before the work on MPS, and not watched after" in said
     assert "measured no run under warn" in said
+    assert "not to be read as those of one started at 1 (normal)" in said
+    assert said.endswith("Swap use when it was read: total = 0.00M")
+
+
+def test_a_mac_at_warn_whose_swap_could_not_be_read_says_that_instead():
+    policy = mps_memory_policy(
+        recommended_max_memory=16 * GIB,
+        reading=_reading(pressure=2),
+        environ={},
+        swapusage_error="sysctl vm.swapusage exited 1",
+    )
+    [said] = policy.limitations
+    assert said.endswith("Swap use could not be read: sysctl vm.swapusage exited 1")
+    assert "when it was read" not in said
+
+
+def test_a_mac_at_warn_starts_under_the_operators_high_ratio_and_says_the_level():
+    policy = _policy({HIGH_WATERMARK: "0.5"}, pressure=2)
+    assert policy.budget_source == "user"
+    [said] = policy.limitations
+    assert "pressure_level was 2 (warn)" in said
 
 
 def test_a_mac_at_normal_pressure_carries_no_pressure_limitation():
@@ -328,8 +381,12 @@ def test_a_mac_at_normal_pressure_carries_no_pressure_limitation():
 
 @pytest.mark.parametrize("level", [0, 3, 8])
 def test_a_pressure_level_litetune_does_not_know_is_refused(level):
-    with pytest.raises(MpsMemoryRefused, match="not a level litetune knows"):
+    with pytest.raises(MpsMemoryRefused, match="not a level litetune knows") as raised:
         _policy(pressure=level)
+    message = str(raised.value)
+    assert "LITETUNE_DEVICE=cpu" in message
+    # An unknown level does not say memory is short.
+    assert "Quit what is holding memory" not in message
 
 
 def test_the_operators_variables_are_kept_and_recorded_as_theirs():
@@ -388,13 +445,13 @@ def test_an_invalid_high_ratio_is_refused_before_a_low_one_is_derived_from_it():
 
 
 def test_the_operators_high_ratio_owns_the_limit_and_skips_the_budget_floor():
-    # 2 GiB available would be refused for a budget litetune computed.
-    policy = _policy({HIGH_WATERMARK: "0.5"}, available=2 * GIB)
+    # 1.5 GiB available would be refused for a budget litetune computed.
+    policy = _policy({HIGH_WATERMARK: "0.5"}, available=15 * GIB // 10)
     assert policy.budget_source == "user"
-    assert policy.budget == -1 * GIB
+    assert policy.budget == GIB
     record = policy.as_dict()
     assert record["budget_source"] == "user"
-    assert record["computed_budget_bytes"] == -1 * GIB
+    assert record["computed_budget_bytes"] == GIB
     assert record["effective_high_bytes"] == 8 * GIB
     assert record["effective_low_bytes"] == int(0.4 * 16 * GIB)
     assert policy.limitations == []
