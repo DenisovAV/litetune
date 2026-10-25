@@ -756,8 +756,7 @@ def _add_convert(sub) -> None:
         help=(
             "embedding checkpoints only (a `tune --model google/embeddinggemma-2` output): how "
             "the fine-tune's weights are quantized into Google's file. int8: both graphs int8; "
-            "int4: both int4, Google's own size; int4-e8: the encoder int4, the embedder int8 "
-            f"(default {DEFAULT_WEIGHTS})"
+            f"int4: both int4, Google's own size (default {DEFAULT_WEIGHTS})"
         ),
     )
     convert.add_argument(

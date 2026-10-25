@@ -684,15 +684,6 @@ def test_int4_rewrites_the_codes_in_place_at_googles_size(toolchain, tmp_path, m
     assert out.stat().st_size == case.path.stat().st_size
 
 
-def test_int4_e8_writes_the_embedder_int8_and_the_encoder_int4(toolchain, case, tmp_path):
-    out = tmp_path / "tuned.litertlm"
-    result = run(case, out, "int4-e8")
-    assert {k for k, _, _ in written(case, out, "embedder").values()} == {INT8}
-    assert {k for k, _, _ in written(case, out, "text_encoder").values()} == {INT4}
-    assert result.parts["embedder"]["bits"] == 8
-    assert result.parts["text_encoder"]["bits"] == 4
-
-
 def test_the_fold_found_against_the_base_is_applied_to_the_fine_tune(toolchain, case, tmp_path):
     out = tmp_path / "tuned.litertlm"
     result = run(case, out, "int8")

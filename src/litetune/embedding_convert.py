@@ -25,9 +25,10 @@ other norm, told apart by cosine to the base values. The two v_norm constants
 have no HF weight and are left alone. `layer_scalar` is a buffer in HF, not
 trained; the fine-tune's must equal the base's.
 
-**Three weight modes**, the spike's variants: `int8` (`i8n_e8`: both graphs
-int8, 300,089,344 bytes in the spike), `int4` (`i4n`: both int4, Google's size)
-and `int4-e8` (`i4n_e8`: the encoder int4, the embedder int8). int8 changes each
+**Two weight modes**, the spike's variants: `int8` (`i8n_e8`: both graphs int8,
+300,089,344 bytes in the spike) and `int4` (`i4n`: both int4, Google's size). The
+spike's third, an int4 encoder with an int8 embedder, was no more accurate than
+int4 on 77 and 150 labels (s5), and is not offered. int8 changes each
 tensor's type and moves its data to a 64-byte-aligned offset in a new weights
 section; int4 rewrites the codes in place. Scales come from a per-row search over
 141 clip ratios for the smallest squared error.
@@ -76,11 +77,10 @@ GOOGLE_SHA256 = "2d079ee2f6f066b1f368e8d7c819f55214eaef1d0513b312321901f30ab286f
 BASE_MODEL = "google/embeddinggemma-2"
 BASE_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
 
-WeightMode = Literal["int8", "int4", "int4-e8"]
+WeightMode = Literal["int8", "int4"]
 WEIGHT_BITS: dict[str, dict[str, int]] = {
     "int8": {"embedder": 8, "text_encoder": 8},
     "int4": {"embedder": 4, "text_encoder": 4},
-    "int4-e8": {"embedder": 8, "text_encoder": 4},
 }
 # The lengths of the norm constants the topology mapping looks at: EmbeddingGemma
 # 2's head dimension and hidden size, as `graft_s2.py` has them.

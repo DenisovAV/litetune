@@ -63,10 +63,12 @@ GOOGLE_REVISION = "9be6e8b90982095dc05c2bd162e4b954ee4dbac7"
 BASE_FILE = "model.safetensors"
 
 WEIGHT_MODES: tuple[str, ...] = get_args(WeightMode)
-# Set from measurement s5 (lora_project measurements/2026-10-25-eg2-many-labels/),
-# which compares the modes on the decider at 77 and 150 labels. int8 until its
-# result is read in.
-DEFAULT_WEIGHTS: WeightMode = "int8"
+# int4: on banking77 (77 labels) and CLINC150 (150) it cost 0.0027 and 0.0017 of
+# the decider's accuracy (centroid of 10 examples per label) against the float
+# fine-tune, int8 0.0002 on both, at 165 MB against 300 MB (measurement s5,
+# 2026-10-25). `verify` measures the file written, and int8 is there for a task
+# where int4 does not pass.
+DEFAULT_WEIGHTS: WeightMode = "int4"
 
 ARTIFACT_NAME = "model.litertlm"
 REPORT_NAME = "convert.json"

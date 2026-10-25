@@ -197,9 +197,9 @@ def test_an_embedding_checkpoint_is_grafted_not_exported(hub, grafter, llm_expor
     assert _convert(model, tmp_path / "out") == 0
     assert llm_export == []
     call = grafter.calls[0]
-    assert call["weights"] == DEFAULT_WEIGHTS == "int8"
+    assert call["weights"] == DEFAULT_WEIGHTS == "int4"
     assert call["tuned"] == model / BASE_FILE
-    assert call["out"] == tmp_path / "out" / "int8" / ARTIFACT_NAME
+    assert call["out"] == tmp_path / "out" / DEFAULT_WEIGHTS / ARTIFACT_NAME
     assert call["google"].name == GOOGLE_FILE
     assert call["base"].name == BASE_FILE
 
@@ -214,7 +214,7 @@ def test_both_hub_files_are_asked_for_at_their_pinned_revisions(hub, grafter, tm
     ]
 
 
-@pytest.mark.parametrize("weights", ["int8", "int4", "int4-e8"])
+@pytest.mark.parametrize("weights", ["int8", "int4"])
 def test_each_weight_mode_writes_its_own_directory(hub, grafter, tmp_path, weights):
     assert _convert(_checkpoint(tmp_path), tmp_path / "out", "--weights", weights) == 0
     assert (tmp_path / "out" / weights / ARTIFACT_NAME).is_file()
@@ -288,7 +288,7 @@ def test_the_report_lands_beside_the_file(hub, grafter, tmp_path):
 def test_the_json_output_is_the_report(hub, grafter, tmp_path, capsys):
     _convert(_checkpoint(tmp_path), tmp_path / "out", "--json")
     printed = json.loads(capsys.readouterr().out)
-    assert printed["direction"] == "embedding" and printed["weights"] == "int8"
+    assert printed["direction"] == "embedding" and printed["weights"] == DEFAULT_WEIGHTS
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +336,7 @@ def test_a_failed_download_is_could_not_check(hub, grafter, tmp_path):
     assert result.outcome is Outcome.UNCHECKED
     assert grafter.calls == []
     assert "gated repository" in result.checks.checks[-1].detail
-    assert (tmp_path / "out" / "int8" / REPORT_NAME).is_file()
+    assert (tmp_path / "out" / DEFAULT_WEIGHTS / REPORT_NAME).is_file()
 
 
 def test_a_graft_refusal_is_a_failure_naming_its_cause(hub, grafter, tmp_path):
@@ -353,7 +353,7 @@ def test_a_graft_that_could_not_run_is_could_not_check(hub, grafter, tmp_path):
 
 
 def test_an_existing_output_is_refused_before_anything_runs(hub, grafter, tmp_path):
-    out = tmp_path / "out" / "int8" / ARTIFACT_NAME
+    out = tmp_path / "out" / DEFAULT_WEIGHTS / ARTIFACT_NAME
     out.parent.mkdir(parents=True)
     out.write_bytes(b"earlier")
     with pytest.raises(EmbeddingExportError, match="already exists"):
