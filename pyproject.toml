@@ -87,6 +87,10 @@ dev = [
     # the version a provisioned export environment holds (`jinja2-3.1.6.dist-info`
     # there; `envs.EXPORT` does not pin it).
     "jinja2==3.1.6",
+    # The EmbeddingGemma graft script runs inside the export env (numpy 2.0.2
+    # there); the tests run it with the host interpreter. 2.0.2 has no wheel for
+    # Python 3.13, which CI also tests; 2.2.6 has wheels for 3.10 to 3.13.
+    "numpy==2.2.6",
 ]
 
 [project.scripts]

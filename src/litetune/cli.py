@@ -52,6 +52,15 @@ from litetune.decision_verify import (
 )
 from litetune.decisions import DecisionError
 from litetune.declarations import DeclarationsError
+from litetune.embedding_tune import (
+    EMBEDDING_MODEL,
+    EMBEDDING_REVISION,
+    EmbeddingTuneError,
+    EmbeddingTuneRequest,
+    run_embedding_tune,
+)
+from litetune.embedding_tune import summarise as summarise_embedding_tune
+from litetune.embedding_tune import write_report as write_embedding_report
 from litetune.envs import cached_environments, env_cache_root, remove_cached
 from litetune.evaluate import CANDIDATE_BACKENDS, GREEDY, DataError
 from litetune.events import EventStream, TerminalRenderer
@@ -116,6 +125,9 @@ REFUSALS = (
     NoRecipesRequested,
     BundleError,
     TuneError,
+    # `tune --model google/embeddinggemma-2` with a flag its recipe does not
+    # read, a decision it does not train, or rows that are not that decision's.
+    EmbeddingTuneError,
     PrepareError,
     TowersError,
     # A declarations file the runtime or the reference template would render
@@ -493,13 +505,26 @@ def _add_tune(sub) -> None:
         description=(
             "Fine-tune inside the pinned training environment. Training completing is not "
             f"evidence: a run that scored nine times worse than its base finished cleanly with a "
-            f"lower loss. {STAGE_EXIT_CODE_HELP}"
+            f"lower loss. --model {EMBEDDING_MODEL} trains an embedding model for a choice "
+            "--decision instead, with its measured recipe and none of the LLM flags. "
+            f"{STAGE_EXIT_CODE_HELP}"
         ),
     )
     tune.add_argument("--model", required=True, help="HF id or path of the base checkpoint")
     tune.add_argument("--data", required=True, type=Path, help="training JSONL")
     tune.add_argument("--output-dir", required=True, type=Path)
-    tune.add_argument("--method", choices=list(METHODS), default="full")
+    tune.add_argument(
+        "--heldout",
+        type=Path,
+        help=(
+            f"only with --model {EMBEDDING_MODEL}: the held-out split the discarded head is "
+            "scored on; default heldout.jsonl beside --data, where prepare writes it"
+        ),
+    )
+    # The LLM-only flags below default to None, not to their values, so that the
+    # embedding path can tell a flag that was given from one that was not and
+    # refuse it rather than ignore it. `_tune` fills in `TuneRequest`'s defaults.
+    tune.add_argument("--method", choices=list(METHODS), help="default full")
     tune.add_argument("--revision", help="pin the base checkpoint's revision")
     tune.add_argument(
         "--prompt-mode",
@@ -549,8 +574,8 @@ def _add_tune(sub) -> None:
         type=float,
         help="default is per method: 1e-5 for full, 2e-4 for lora",
     )
-    tune.add_argument("--epochs", type=float, default=1.0)
-    tune.add_argument("--batch-size", type=int, default=8)
+    tune.add_argument("--epochs", type=float, help="default 1")
+    tune.add_argument("--batch-size", type=int, help="default 8")
     tune.add_argument(
         "--micro-batch-size",
         type=int,
@@ -559,11 +584,11 @@ def _add_tune(sub) -> None:
             "--batch-size on CPU/CUDA and 1 on MPS"
         ),
     )
-    tune.add_argument("--max-seq-length", type=int, default=1024)
-    tune.add_argument("--seed", type=int, default=0)
-    tune.add_argument("--lora-rank", type=int, default=16)
-    tune.add_argument("--lora-alpha", type=int, default=32)
-    tune.add_argument("--lora-dropout", type=float, default=0.05)
+    tune.add_argument("--max-seq-length", type=int, help="default 1024")
+    tune.add_argument("--seed", type=int, help="default 0")
+    tune.add_argument("--lora-rank", type=int, help="default 16")
+    tune.add_argument("--lora-alpha", type=int, help="default 32")
+    tune.add_argument("--lora-dropout", type=float, help="default 0.05")
     # `choices`, not just a default: spec.py's `DTYPES` excludes float16
     # because a 270M model's loss goes to NaN in it while bfloat16 holds. The
     # spec file was closed and this line was not, so the path everyone actually
@@ -584,7 +609,7 @@ def _add_tune(sub) -> None:
             "and what the run trained in"
         ),
     )
-    tune.add_argument("--attn-implementation", default="eager")
+    tune.add_argument("--attn-implementation", help="default eager")
     tune.add_argument("--timeout-s", type=int, default=TuneRequest.timeout_s)
     tune.add_argument(
         "--no-provision",
@@ -1265,31 +1290,63 @@ def summarise_prepare(result: PrepareResult) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# The `tune` flags only the LLM recipe reads, by `argparse` dest, with how they
+# are typed. Each is None (False for the switch) unless it was given.
+_LLM_ONLY_TUNE_FLAGS = (
+    ("method", "--method"),
+    ("prompt_mode", "--prompt-mode"),
+    ("force_prompt_mode", "--force-prompt-mode"),
+    ("declarations", "--declarations"),
+    ("learning_rate", "--learning-rate"),
+    ("epochs", "--epochs"),
+    ("batch_size", "--batch-size"),
+    ("micro_batch_size", "--micro-batch-size"),
+    ("max_seq_length", "--max-seq-length"),
+    ("seed", "--seed"),
+    ("lora_rank", "--lora-rank"),
+    ("lora_alpha", "--lora-alpha"),
+    ("lora_dropout", "--lora-dropout"),
+    ("attn_implementation", "--attn-implementation"),
+)
+
+# What `TuneRequest` takes for the flags above when they were not given.
+_TUNE_DEFAULTED = (
+    "method",
+    "epochs",
+    "batch_size",
+    "max_seq_length",
+    "seed",
+    "lora_rank",
+    "lora_alpha",
+    "lora_dropout",
+    "attn_implementation",
+)
+
+
 def _tune(args: argparse.Namespace) -> int:
+    if args.model == EMBEDDING_MODEL:
+        return _tune_embedding(args)
+    if args.heldout is not None:
+        raise TuneError(f"--heldout is read only with --model {EMBEDDING_MODEL}")
     events = _stream()
+    given = {
+        name: getattr(args, name) for name in _TUNE_DEFAULTED if getattr(args, name) is not None
+    }
     request = TuneRequest(
         model=args.model,
         data=args.data,
         output_dir=args.output_dir,
-        method=args.method,
         revision=args.revision,
         learning_rate=args.learning_rate,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
         micro_batch_size=args.micro_batch_size,
-        max_seq_length=args.max_seq_length,
-        seed=args.seed,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
         dtype=args.dtype,
-        attn_implementation=args.attn_implementation,
         prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
         force_prompt_mode=args.force_prompt_mode,
         declarations=args.declarations,
         decision=args.decision,
         timeout_s=args.timeout_s,
         auto_provision=not args.no_provision,
+        **given,
     )
     result = run_tune(request, events=events)
     report = write_report(result)
@@ -1340,6 +1397,55 @@ def summarise_tune(result: TuneResult) -> list[str]:
     for text in result.limitations:
         lines.append(f"  note: {text}")
     return lines
+
+
+def _tune_embedding(args: argparse.Namespace) -> int:
+    """`tune --model google/embeddinggemma-2`: the measured embedding recipe, nothing else.
+
+    Every LLM flag that was given is refused by name rather than ignored: the
+    recipe takes no overrides (`embedding_tune.RECIPE`), and a flag that
+    silently changed nothing reads as one that took effect.
+    """
+    given = [
+        flag for name, flag in _LLM_ONLY_TUNE_FLAGS if getattr(args, name) not in (None, False)
+    ]
+    if given:
+        raise EmbeddingTuneError(
+            f"{', '.join(given)}: --model {EMBEDDING_MODEL} trains with the measured embedding "
+            "recipe (full fine-tune with a classifier head, lr 2e-5, batch 8, 2 epochs, at most "
+            "128 tokens, seed 0, float32), which these flags do not apply to"
+        )
+    if args.dtype not in (None, "float32"):
+        raise EmbeddingTuneError(
+            f"--dtype {args.dtype}: the embedding recipe trains in float32 on every device; "
+            "float16 is documented to give NaN embeddings and bfloat16 was not measured"
+        )
+    if args.decision is None:
+        raise EmbeddingTuneError(
+            f"--model {EMBEDDING_MODEL} needs --decision, the decision.json prepare wrote beside "
+            "the split: its options are the labels the model is trained to separate"
+        )
+    if args.revision is not None and args.revision != EMBEDDING_REVISION:
+        raise EmbeddingTuneError(
+            f"--revision {args.revision}: the embedding recipe and convert's tensor mapping were "
+            f"established on {EMBEDDING_REVISION}; leave it out or pass that one"
+        )
+    events = _stream()
+    request = EmbeddingTuneRequest(
+        data=args.data,
+        heldout=args.heldout if args.heldout is not None else args.data.parent / "heldout.jsonl",
+        decision=args.decision,
+        output_dir=args.output_dir,
+        revision=args.revision,
+        timeout_s=args.timeout_s,
+        auto_provision=not args.no_provision,
+    )
+    result = run_embedding_tune(request, events=events)
+    report = write_embedding_report(result)
+    events.artifact(str(report), name="tune.json")
+    if not _report(result.as_dict(), lambda: summarise_embedding_tune(result), args.json):
+        return EXIT_CODES[Status.ERROR]
+    return OUTCOME_EXIT_CODES[result.outcome]
 
 
 # ---------------------------------------------------------------------------

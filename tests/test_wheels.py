@@ -19,7 +19,7 @@ from packaging.utils import parse_wheel_filename
 from litetune import envs, wheels
 from litetune.wheels import PUBLISHED, Host, Release, canonical, gaps
 
-STAGES = (envs.RUNTIME, envs.EXPORT, envs.TRAIN)
+STAGES = (envs.RUNTIME, envs.EXPORT, envs.TRAIN, envs.EMBED_TRAIN)
 
 
 def _blocking(env: envs.StageEnv, name: str, minor: int) -> list[str]:

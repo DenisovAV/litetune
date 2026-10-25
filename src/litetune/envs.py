@@ -2831,7 +2831,7 @@ def cached_environments() -> list[CachedEnv]:
     root = _cache_root()
     if not root.is_dir():
         return []
-    claimed = {env.path.name: env.name for env in (RUNTIME, TRAIN, EXPORT)}
+    claimed = {env.path.name: env.name for env in (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN)}
     out = [
         CachedEnv(
             path=child,
@@ -3680,5 +3680,26 @@ TRAIN = StageEnv(
         # definition under 3.12 and 3.13.
         'sentencepiece==0.2.0; python_version < "3.13"',
         'sentencepiece==0.2.1; python_version >= "3.13"',
+    ),
+)
+
+# The environment `tune` fine-tunes google/embeddinggemma-2 in
+# (`embedding_tune`). Its own, because TRAIN's transformers 5.16.1 predates the
+# `embedding_gemma2` model type, and moving TRAIN would change every measured
+# LLM baseline. The pins are the ones the EG2 fine-tunes that passed were trained
+# with (lora_project measurements/2026-10-22-eg2-graft, README "Environment", and
+# out-s4/pip-freeze.txt): torch 2.9.1 and torchvision 0.24.1 (+cpu builds there;
+# PyPI's here), transformers 5.19.0, sentence-transformers 6.1.0, pillow 12.3.0.
+# Pillow is pinned because with 13.0.0 `EmbeddingGemma2Processor` would not
+# import (same README). torchvision is pinned because the measured environment
+# had it and no run without it was made.
+EMBED_TRAIN = StageEnv(
+    name="embed-train",
+    requirements=(
+        "torch==2.9.1",
+        "torchvision==0.24.1",
+        "transformers==5.19.0",
+        "sentence-transformers==6.1.0",
+        "pillow==12.3.0",
     ),
 )
