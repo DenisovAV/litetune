@@ -660,6 +660,21 @@ def read_embedding_record(model_dir: Path) -> EmbeddingRecord | None:
     return EmbeddingRecord.from_dict(data, str(sidecar))
 
 
+def model_dir_hint(path: str | Path) -> str:
+    """For a refusal naming `path`: the sentence that points at the model
+    directory when `path` is `tune`'s output directory, whose `model/` holds the
+    record; empty otherwise."""
+    try:
+        record = read_embedding_record(Path(path) / "model")
+    except (OSError, ValueError):
+        return ""
+    if record is None:
+        return ""
+    return (
+        f" -- {Path(path) / 'model'} is: `tune` writes the model to model/ in its output directory"
+    )
+
+
 @dataclass
 class EmbeddingTuneResult:
     """What the run produced. `verified` is a property, and False."""

@@ -67,6 +67,7 @@ from litetune.embedding_tune import (
     EmbeddingRecord,
     EmbeddingTuneError,
     EmbeddingTuneRequest,
+    model_dir_hint,
     run_embedding_tune,
 )
 from litetune.embedding_tune import summarise as summarise_embedding_tune
@@ -1675,8 +1676,8 @@ def _convert(args: argparse.Namespace) -> int:
     if args.weights is not None or args.base_litertlm is not None:
         raise EmbeddingExportError(
             "--weights and --base-litertlm are for an embedding checkpoint, one whose "
-            f"litetune.json `tune --model {EMBEDDING_MODEL}` wrote; {args.model} is not one. "
-            "Pick an LLM's quantization with --recipe"
+            f"litetune.json `tune --model {EMBEDDING_MODEL}` wrote; {args.model} is not one"
+            f"{model_dir_hint(args.model)}. Pick an LLM's quantization with --recipe"
         )
     events = _stream()
     # Explicit beats recorded: a caller who names the base model has a reason,

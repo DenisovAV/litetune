@@ -1148,12 +1148,15 @@ def run_verify(
     if decision_record is not None or request.calibration is not None or request.float_twin:
         return _verify_decision(request, decision_record, unreadable, run, events)
     if request.embedding_flags:
+        from litetune.embedding_tune import model_dir_hint
+
         run.record(
             Check.failed(
                 "request",
                 f"{', '.join(request.embedding_flags)} apply to an embedding checkpoint, one "
                 "whose litetune.json `tune --model google/embeddinggemma-2` wrote; "
-                f"{request.reference} records none. Refused rather than ignored",
+                f"{request.reference} records none{model_dir_hint(request.reference)}. "
+                "Refused rather than ignored",
             )
         )
         return run.finish(Status.FAILED_HARNESS)

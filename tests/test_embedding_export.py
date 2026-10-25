@@ -391,3 +391,18 @@ def test_a_malformed_embedding_record_is_refused_on_the_command_line(
 def test_an_unknown_weight_mode_is_refused_by_the_request(tmp_path):
     with pytest.raises(EmbeddingExportError, match="--weights int2"):
         EmbeddingExportRequest(model=tmp_path, output_dir=tmp_path, weights="int2")
+
+
+def test_a_tune_output_directory_is_pointed_at_its_model_directory(tmp_path):
+    from litetune.embedding_tune import model_dir_hint
+
+    assert model_dir_hint(tmp_path) == ""
+    model = _checkpoint(tmp_path)
+    assert model_dir_hint(model) == ""
+    assert str(model) in model_dir_hint(model.parent)
+
+
+def test_weights_on_a_tune_output_directory_name_its_model_directory(tmp_path, capsys):
+    model = _checkpoint(tmp_path)
+    assert _convert(model.parent, tmp_path / "out", "--weights", "int8") == 4
+    assert f"{model} is" in capsys.readouterr().err
