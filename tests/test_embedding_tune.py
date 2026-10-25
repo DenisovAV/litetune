@@ -323,7 +323,7 @@ def test_the_parent_imports_no_training_stack(toolchain, split, tmp_path):
     assert "sentence_transformers" not in sys.modules
 
 
-def test_a_none_option_is_trained_as_a_label_and_said_to_be_unmeasured(toolchain, tmp_path):
+def test_a_none_option_is_refused_before_the_environment(toolchain, tmp_path):
     decision = _decision(none_option="other")
     s = _split(
         tmp_path,
@@ -331,9 +331,9 @@ def test_a_none_option_is_trained_as_a_label_and_said_to_be_unmeasured(toolchain
         train=_rows(20, (*OPTIONS, "other")),
         heldout=_rows(4, (*OPTIONS, "other")),
     )
-    result = run_embedding_tune(_request(s, tmp_path))
-    assert result.labels == ("balance", "card_lost", "other", "refund")
-    assert any("none_option 'other'" in t for t in result.limitations)
+    with pytest.raises(EmbeddingTuneError, match="none_option \\('other'\\)"):
+        run_embedding_tune(_request(s, tmp_path))
+    assert toolchain.calls == []
 
 
 # ---------------------------------------------------------------------------

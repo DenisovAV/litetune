@@ -93,9 +93,14 @@ NOT_VERIFIED = (
     "accuracy is the discarded head's, not the centroid decider's the application builds from "
     "the embeddings; `litetune verify` measures that"
 )
-NONE_OPTION_UNMEASURED = (
-    "the decision's none_option {none!r} is trained as one more label. The recipe was measured on "
-    "decisions without one, so how its rows embed is not measured"
+# Refused, not trained as one more label: the recipe and the decider were
+# measured on decisions without one, and flutter_edge_ai's embedding decider
+# abstains by a threshold on the similarity, not by an option.
+NONE_OPTION_REFUSED = (
+    "the decision has a none_option ({none!r}). The embedding recipe was measured on decisions "
+    "without one, and flutter_edge_ai's embedding decider abstains by a threshold, not by an "
+    "option, so a none_option trained as one more label is a decider nobody has measured. Leave "
+    "the none_option out of the decision, and its rows out of the split"
 )
 
 _STDOUT_TAIL = 4000
@@ -765,6 +770,8 @@ def _check_request(
             "question only, the type it was measured on and the one flutter_edge_ai's embedding "
             "decider answers"
         )
+    if decision.none_option is not None:
+        raise EmbeddingTuneError(NONE_OPTION_REFUSED.format(none=decision.none_option))
     train = _read_split(request.data, decision, "training")
     heldout = _read_split(request.heldout, decision, "held-out")
     return decision, train, heldout, labels_for(decision, train)
@@ -806,8 +813,6 @@ def run_embedding_tune(
     result.labels = labels
     result.rows = {"train": len(train), "heldout": len(heldout)}
     result.limitation(NOT_VERIFIED)
-    if decision.none_option is not None:
-        result.limitation(NONE_OPTION_UNMEASURED.format(none=decision.none_option))
     rows_check = Check.passed(
         DATA_CHECK,
         f"{len(train)} training and {len(heldout)} held-out rows over {len(labels)} options of "

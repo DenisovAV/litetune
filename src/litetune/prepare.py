@@ -68,6 +68,7 @@ from litetune.declarations import (
     recorded_digest,
     tool_names,
 )
+from litetune.embedding_convert import BASE_MODEL as EMBEDDING_MODEL
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.liveness import SkippedCheck
@@ -281,6 +282,43 @@ def decision_model_limitation(model: str) -> str | None:
         return DECISION_FAMILY_UNMEASURED.format(model=model, family=rules.family)
     if not is_measured_decision_model(model):
         return DECISION_MODEL_UNMEASURED.format(model=model)
+    return None
+
+
+EMBEDDING_NOT_A_DECISION = (
+    f"{EMBEDDING_MODEL} is trained by litetune on a decision only (`tune --decision`): its rows "
+    "are states labelled with an option. These rows give completions or targets; pass "
+    "--questions with rows of a state and a label"
+)
+EMBEDDING_TYPE_REFUSED = (
+    f"the decision is a {{kind}} question. {EMBEDDING_MODEL} is trained for a choice question "
+    "only, the type its recipe was measured on and the one flutter_edge_ai's embedding decider "
+    "answers"
+)
+EMBEDDING_NONE_OPTION_REFUSED = (
+    "the decision has a none_option ({none!r}). The embedding recipe was measured on decisions "
+    "without one, and flutter_edge_ai's embedding decider abstains by a threshold, not by an "
+    "option; `tune` refuses it. Leave the none_option out of the decision, and its rows out of "
+    "the split"
+)
+EMBEDDING_LENGTHS = (
+    f"for {EMBEDDING_MODEL} each row is measured as `tune` embeds it: the decider's prefix and "
+    "the state, without the decision's question and options, counted with the tokenizer's own "
+    "special tokens, against the smaller of --context-length and the recipe's "
+    "max_seq_length ({max_seq})"
+)
+EMBEDDING_CALIBRATION_UNUSED = (
+    "the calibration split is written as for every decision, and the embedding path does not "
+    "read it: `tune` trains on train.jsonl and `verify` fits the decider on train.jsonl"
+)
+
+
+def embedding_decision_refusal(decision: Decision) -> str | None:
+    """Why `decision` cannot be trained on google/embeddinggemma-2, or `None` when it can."""
+    if decision.type != "choice":
+        return EMBEDDING_TYPE_REFUSED.format(kind=decision.type)
+    if decision.none_option is not None:
+        return EMBEDDING_NONE_OPTION_REFUSED.format(none=decision.none_option)
     return None
 
 
@@ -1029,7 +1067,8 @@ def main() -> int:
         found = [first_special(tok, text) for text in spec["texts"]]
         Path(spec["out"]).write_text(json.dumps({"specials": found}), encoding="utf-8")
         return 0
-    counts = [len(tok(text, add_special_tokens=False)["input_ids"]) for text in spec["texts"]]
+    specials = bool(spec.get("add_special_tokens"))
+    counts = [len(tok(text, add_special_tokens=specials)["input_ids"]) for text in spec["texts"]]
     Path(spec["out"]).write_text(
         json.dumps({"counts": counts, "tokenizer": type(tok).__name__}), encoding="utf-8"
     )
@@ -1078,6 +1117,11 @@ class HuggingFaceTokenCounter:
     env: envs.StageEnv = envs.TRAIN
     timeout_s: int = TOKEN_COUNT_TIMEOUT_S
     auto_provision: bool = True
+    # Count each text with the tokenizer's own special tokens, as a plain
+    # `tokenizer(text)` call adds them. Off for the LLM path, which adds
+    # `SEQUENCE_OVERHEAD_TOKENS` itself; on for the embedding path, which
+    # measures one text per row.
+    special_tokens: bool = False
 
     name = "transformers"
 
@@ -1087,6 +1131,7 @@ class HuggingFaceTokenCounter:
             "revision": self.revision,
             "environment": self.env.name,
             "requirements": envs.shown_requirements(self.env.requirements),
+            "special_tokens": self.special_tokens,
         }
 
     def count(self, texts: Sequence[str]) -> list[int]:
@@ -1130,6 +1175,7 @@ class HuggingFaceTokenCounter:
                         "revision": self.revision,
                         "texts": list(texts),
                         "specials": specials,
+                        "add_special_tokens": self.special_tokens,
                         "out": str(out),
                     }
                 ),
@@ -1203,6 +1249,9 @@ class LengthStats:
     supervised_tokens: int
     total_tokens: int
     over_length: tuple[OverLength, ...] = ()
+    # The embedding path's lengths (`measure_embedded_lengths`): one text per
+    # row, no completion and nothing supervised in the LLM sense.
+    embedded: bool = False
 
     @property
     def available(self) -> bool:
@@ -1220,6 +1269,16 @@ class LengthStats:
         return self.supervised_tokens / self.total_tokens if self.total_tokens else 0.0
 
     def as_dict(self) -> dict[str, Any]:
+        if self.embedded:
+            return {
+                "available": True,
+                "n": self.n,
+                "context_length": self.context_length,
+                "counter": self.counter,
+                "measures": "the decider's prefix and the state, with the tokenizer's specials",
+                "embedded_tokens": self.total,
+                "over_length": [o.as_dict() for o in self.over_length],
+            }
         return {
             "available": True,
             "n": self.n,
@@ -1273,6 +1332,47 @@ def measure_lengths(rows: Sequence[Row], counter: TokenCounter, context_length: 
         supervised_tokens=sum(completion_counts),
         total_tokens=sum(totals),
         over_length=over,
+    )
+
+
+def measure_embedded_lengths(
+    rows: Sequence[Row], decision: Decision, counter: TokenCounter, limit: int
+) -> LengthStats:
+    """Token lengths of what the embedding path embeds: `prefix + state`, one text a row.
+
+    The state is the row's prompt with the decision's question and options cut
+    off (`Decision.render` puts them after it); `tune` embeds it behind the
+    decider's prefix. Counted with the tokenizer's specials when the counter
+    adds them (`HuggingFaceTokenCounter.special_tokens`), and nothing is added
+    here.
+    """
+    from litetune.embedding_tune import DECIDER_PREFIX
+
+    suffix = decision.render("")
+    texts = [DECIDER_PREFIX + row.prompt[: len(row.prompt) - len(suffix)] for row in rows]
+    counts = counter.count(texts)
+    if len(counts) != len(rows):
+        raise PrepareError(
+            f"the token counter returned {len(counts)} counts for {len(rows)} texts; "
+            "the over-length check cannot be performed on a partial answer"
+        )
+    over = tuple(
+        OverLength(lineno=row.lineno, tokens=n, prompt_tokens=n, completion_tokens=0)
+        for row, n in zip(rows, counts, strict=True)
+        if n > limit
+    )
+    summary = _summary(counts)
+    return LengthStats(
+        n=len(rows),
+        context_length=limit,
+        counter=counter.describe(),
+        prompt=summary,
+        completion=_summary([0]),
+        total=summary,
+        supervised_tokens=0,
+        total_tokens=sum(counts),
+        over_length=over,
+        embedded=True,
     )
 
 
@@ -1781,6 +1881,9 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     # from the model rather than asked of the caller. A run that named no
     # model gets `None`: FunctionGemma's format, and a limitation saying so.
     wire = wire_format_for(request.base_model) if request.base_model else None
+    # google/embeddinggemma-2 is no LLM family: it has no rule, and its rows
+    # are embedded, not scored (`embedding_tune`).
+    embedding = request.base_model == EMBEDDING_MODEL
     objects = read_objects(request.data)
     decision: DecisionProfile | None = None
     if is_decision_split(objects, request.questions):
@@ -1790,10 +1893,16 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 "answers with the id of an option, never with a tool call, so there is nothing "
                 "for a tool list to check"
             )
-        refusal = decision_model_refusal(request.base_model) if request.base_model else None
+        refusal = (
+            decision_model_refusal(request.base_model)
+            if request.base_model and not embedding
+            else None
+        )
         if refusal is not None:
             raise PrepareError(refusal)
         asked, questions_sha256, rows = read_decision_rows(request.data, objects, request.questions)
+        if embedding and (refusal := embedding_decision_refusal(asked)) is not None:
+            raise PrepareError(refusal)
         decision = DecisionProfile(
             decision=asked,
             questions=request.questions,
@@ -1801,6 +1910,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             rows=_count_by_option(asked, rows),
         )
     else:
+        if embedding:
+            raise PrepareError(EMBEDDING_NOT_A_DECISION)
         if request.calibration_fraction is not None or request.calibration_size is not None:
             raise PrepareError(
                 "a calibration split is set aside for decision rows only, and these rows are not "
@@ -1833,7 +1944,9 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
         result.limitation(ASSUMED_WIRE_FORMAT)
     if decision is not None:
-        if request.base_model is None:
+        if embedding:
+            result.limitation(EMBEDDING_CALIBRATION_UNUSED)
+        elif request.base_model is None:
             result.limitation(DECISION_MODEL_UNNAMED)
         elif (unmeasured := decision_model_limitation(request.base_model)) is not None:
             result.limitation(unmeasured)
@@ -1851,18 +1964,27 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
 
     # -- lengths -----------------------------------------------------------
     measured: list[LengthStats] = []
+    window = request.context_length
+    if embedding:
+        from litetune.embedding_tune import RECIPE
+
+        window = min(window, RECIPE.max_seq_length)
+        result.limitation(EMBEDDING_LENGTHS.format(max_seq=RECIPE.max_seq_length))
     with guard(LENGTH_CHECK) as sink:
         if request.tokens is None:
             sink.append(
                 Check.unchecked(
                     LENGTH_CHECK,
                     "no tokenizer was supplied, so no example was measured against the "
-                    f"{request.context_length}-token context window",
-                    observed={"context_length": request.context_length},
+                    f"{window}-token context window",
+                    observed={"context_length": window},
                 )
             )
         else:
-            stats = measure_lengths(rows, request.tokens, request.context_length)
+            if embedding and decision is not None:
+                stats = measure_embedded_lengths(rows, decision.decision, request.tokens, window)
+            else:
+                stats = measure_lengths(rows, request.tokens, request.context_length)
             measured.append(stats)
             if stats.over_length:
                 named = ", ".join(
@@ -1874,12 +1996,12 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                     Check.failed(
                         LENGTH_CHECK,
                         f"{len(stats.over_length)}/{len(rows)} rows exceed the "
-                        f"{request.context_length}-token context window: {named}{more}. They are "
+                        f"{window}-token context window: {named}{more}. They are "
                         "named rather than dropped: truncating an example removes its supervised "
                         "span, so the row still costs a training step and teaches nothing",
                         observed={
                             "over_length": [o.as_dict() for o in stats.over_length],
-                            "context_length": request.context_length,
+                            "context_length": window,
                         },
                     )
                 )
@@ -1888,14 +2010,14 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                     Check.passed(
                         LENGTH_CHECK,
                         f"longest example is {stats.total['max']} tokens against a "
-                        f"{request.context_length}-token window",
+                        f"{window}-token window",
                         observed=stats.as_dict(),
                     )
                 )
     length_check = result.checks.add(sink[0])
     events.check(length_check)
     result.lengths = measured[0] if measured else Unavailable(length_check.detail)
-    if isinstance(result.lengths, LengthStats):
+    if isinstance(result.lengths, LengthStats) and not result.lengths.embedded:
         events.metric(
             "expected_supervised_token_fraction",
             round(result.lengths.expected_supervised_fraction, 6),
@@ -1913,9 +2035,16 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     if not length_check.conclusive:
         result.limitation(
             f"token lengths were not measured ({length_check.detail}); whether every example fits "
-            "the context window is unknown here. `tune`'s training script measures the rendered "
-            "sequence and refuses a row over max_seq_length rather than truncating it, after the "
-            "training environment is provisioned"
+            "the context window is unknown here. "
+            + (
+                "The embedding training script has no length check of its own: it sets "
+                "sentence-transformers' max_seq_length and embeds what that leaves. Pass "
+                f"--tokenizer {EMBEDDING_MODEL} to measure the rows"
+                if embedding
+                else "`tune`'s training script measures the rendered sequence and refuses a row "
+                "over max_seq_length rather than truncating it, after the training environment "
+                "is provisioned"
+            )
         )
 
     # -- scoreability, before anyone pays for a GPU -------------------------
