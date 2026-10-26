@@ -95,8 +95,11 @@ class FakeGraft:
     cause: str | None = None
     # An exception the graft is not expected to raise.
     raises: BaseException | None = None
-    # Bytes written over the fine-tune while it is grafted.
-    rewrite_tuned: bytes | None = None
+    # (path, bytes): a file written over while the graft runs -- the original
+    # checkpoint, standing for a change made beside the run.
+    rewrite: tuple[Path, bytes] | None = None
+    # What the graft read at the fine-tune path it was given.
+    read_tuned: bytes | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
 
     def __call__(
@@ -108,8 +111,9 @@ class FakeGraft:
         )
         if self.raises is not None:
             raise self.raises
-        if self.rewrite_tuned is not None:
-            Path(tuned).write_bytes(self.rewrite_tuned)
+        if self.rewrite is not None:
+            self.rewrite[0].write_bytes(self.rewrite[1])
+        self.read_tuned = Path(tuned).read_bytes()
         if self.cause is not None:
             raise EmbeddingConvertError(self.cause, f"refused for {self.cause}")
         out = Path(out_path)
@@ -385,10 +389,12 @@ def test_an_unexpected_graft_error_is_not_reported_as_passed(hub, grafter, tmp_p
 def test_the_graft_reads_a_copy_and_the_report_names_the_copys_bytes(hub, grafter, tmp_path):
     # A checkpoint rewritten while the graft runs does not change what was read,
     # nor the digest `verify` binds the file to.
-    grafter.rewrite_tuned = b"another checkpoint"
     model = _checkpoint(tmp_path)
     original = (model / "model.safetensors").read_bytes()
+    grafter.rewrite = (model / "model.safetensors", b"another checkpoint")
     result = _run(tmp_path, model=model)
+    assert (model / "model.safetensors").read_bytes() == b"another checkpoint"
+    assert grafter.read_tuned == original
     assert result.outcome is Outcome.PASSED
     read = grafter.calls[0]["tuned"]
     assert read != model / "model.safetensors"
