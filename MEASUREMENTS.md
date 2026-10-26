@@ -2004,3 +2004,131 @@ same scores.
   reference's calibration scores and are applied to the runtime's.
 - The runtime scored 300 of each task's held-out rows. The reference scored
   every one of them: 2,000, 784, 1,821 and 2,210.
+
+## EmbeddingGemma 2: a decider fine-tuned and grafted into Google's file
+
+`tune --model google/embeddinggemma-2` fine-tunes the text tower for one
+decision, and `convert` writes the result into Google's own
+`embeddinggemma-2-text-270m.litertlm`
+(litert-community/embeddinggemma-2-text-270m-litert-lm, revision `9be6e8b9`,
+164,626,432 bytes) in place of Google's weights: nobody publishes a path from
+a PyTorch checkpoint to an EmbeddingGemma 2 `.litertlm`. The application uses
+the file through flutter_edge_ai's `EmbeddingModel.createDecider`, which
+embeds every input behind `task: sentence similarity | query: ` and answers
+with the option whose centroid of examples is nearest. Every number below was
+taken on a 32-vCPU Linux machine, Intel Xeon @ 2.20GHz, with LiteRT-LM 0.18.0's
+`EmbeddingEngine` on the CPU backend against sentence-transformers 6.1.0 in
+float32 (torch 2.9.1, transformers 5.19.0). The measurements were driven by
+scripts outside this repository (`graft_s2.py`, `train_s5.py`, `emb_s5.py`,
+`eval_s5.py`); litetune's own code is what the last subsection measures.
+
+### The graft
+
+- Google's file holds the text tower as two TFLite sections, an embedder (a
+  262,144×512 table) and a text encoder with six signatures, one per input
+  length. Its 219 two-dimensional weights are int4, one scale per output row,
+  symmetric, and map one to one by name onto the Hugging Face checkpoint
+  (`google/embeddinggemma-2` at `914f7f89`). One of them carries a folded
+  constant of 1/512. The RMSNorm weights are inline float32 constants, each
+  shared by the six signatures and placed by tracing it back through the
+  graph: 170 of them take the checkpoint's norms, and two belong to a value
+  norm that has no weight in the checkpoint and are left as Google wrote them.
+- Google's weights read out and written back by the graft reproduce Google's
+  file to a mean cosine of 0.9993 (int4) and 0.9987 (int8) on 200 texts, so
+  the writer loses nothing beyond re-rounding.
+- The base checkpoint grafted in int8 is 0.9975 (mean cosine) from
+  sentence-transformers; Google's own file is 0.9690. Grafted in int4 without
+  quantization-aware training it is 0.9451 (that run kept Google's norms;
+  with the checkpoint's own, 0.9382): four bits cost the base model's vectors
+  more than Google's file does.
+- Fine-tuned on emotion (six labels, 16,000 rows; a Linear-GELU-Linear head on
+  the sentence embedding, cross-entropy + Brier, the head discarded) the
+  centroid and linear accuracies on 2,000 test rows were:
+
+  | embeddings | centroid | linear |
+  |---|---|---|
+  | Google's file | 0.6035 | 0.7435 |
+  | fine-tuned, float32 | 0.9325 | 0.9295 |
+  | fine-tuned, int8 graft (300,089,344 bytes) | 0.9330 | 0.9300 |
+  | fine-tuned, int4 graft, no QAT (164,626,432 bytes) | 0.9330 | 0.9340 |
+  | QAT, int4 graft | 0.9335 | 0.9325 |
+
+  Quantization-aware training added nothing measurable there. int4 still moves
+  the vectors: mean cosine 0.960, minimum 0.687, to the float32 fine-tune.
+- A soft-margin triplet loss tried first collapsed: its loss settled at ln 2
+  and its linear probe answered the largest label.
+- Of the 173 inline float32 constants of a norm's length in the text encoder's
+  1,458 subgraphs, 172 are those norms; the remaining one is read by a
+  multiplication inside the composites' decompositions and runs geometrically
+  from 1.06e-6 to 1.0, a table of inverse frequencies, not a norm.
+- Four engine processes sharing one model file failed with XNNPack's "could not
+  verify buffer list mapping": the runtime writes its weight cache beside the
+  model unless given a directory. `verify` gives each run a directory of its
+  own.
+
+### Many labels
+
+The same recipe with the decider's prefix on every text, on banking77 (77
+labels, 10,003 training and 3,080 test rows) and CLINC150's in-scope intents
+(150 labels, 15,000 and 4,500), accuracy on the test rows; the k-shot centroid
+is fitted on k rows per label, five seeded draws, the same rows for every
+embedding:
+
+| banking77 | all rows | k=5 mean | k=10 mean | linear | cosine to float32, mean / min |
+|---|---|---|---|---|---|
+| Google's file | 0.9110 | 0.8801 | 0.8951 | 0.9364 | |
+| fine-tuned, float32 | 0.9341 | 0.9322 | 0.9345 | 0.9367 | |
+| int8 | 0.9341 | 0.9311 | 0.9343 | 0.9377 | 0.9993 / 0.9923 |
+| int4 | 0.9321 | 0.9294 | 0.9318 | 0.9344 | 0.9693 / 0.8612 |
+
+| CLINC150 | all rows | k=5 mean | k=10 mean | linear | cosine to float32, mean / min |
+|---|---|---|---|---|---|
+| Google's file | 0.9487 | 0.9138 | 0.9372 | 0.9660 | |
+| fine-tuned, float32 | 0.9680 | 0.9682 | 0.9676 | 0.9693 | |
+| int8 | 0.9684 | 0.9679 | 0.9674 | 0.9696 | 0.9994 / 0.9957 |
+| int4 | 0.9662 | 0.9666 | 0.9659 | 0.9693 | 0.9754 / 0.8876 |
+
+- int4 cost 0.0027 (banking77) and 0.0017 (CLINC150) of the 10-shot centroid's
+  accuracy, int8 0.0002 on both; no interval was computed for these (litetune's
+  `verify` computes a paired one). So `convert` writes int4 by default.
+- An int4 encoder with an int8 embedder (231,735,296 bytes) scored within
+  0.0007 of int4 on both, and is not offered.
+- The fine-tune gains most where the decider has few examples: +0.0521 and
+  +0.0544 at k=5, +0.0394 and +0.0304 at k=10. With a linear layer on every
+  training row the gain is 0.0003 and 0.0033.
+- int4 moves the vectors (minimum cosine 0.86 to 0.89): a decider threshold
+  set on one file does not carry over to another, and tasks that read
+  distances directly, retrieval among them, were not measured.
+- Training took 2,880 s (banking77) and 3,189 s (CLINC150) on the 32 vCPUs,
+  in float32. Nothing was trained on a GPU.
+
+### litetune end to end
+
+litetune's own stages, `prepare` → `tune` → `convert` (int8 and int4) →
+`verify --with-base`, on banking77 through `prepare`'s split: 9,158 training
+and 2,617 held-out rows (so not s5's official split, and not the same numbers).
+All six stages exited 0. `tune` took 2,347 s.
+
+| embeddings | all rows | k=5 mean | k=10 mean | linear | cosine to float32, mean / min |
+|---|---|---|---|---|---|
+| Google's file | 0.9270 | 0.8936 | 0.9137 | 0.9534 | |
+| fine-tuned, float32 | 0.9316 | 0.9300 | 0.9312 | 0.9389 | |
+| int8 file | 0.9308 | 0.9299 | 0.9314 | 0.9392 | 0.9993 / 0.9869 |
+| int4 file | 0.9289 | 0.9260 | 0.9276 | 0.9400 | 0.9688 / 0.7768 |
+
+- Both files passed `verify`'s gate. The conversion cost on the 10-shot centroid
+  decider was -0.0002 for int8 (every draw within ±0.0021) and +0.0037 for int4
+  (per draw +0.0019 to +0.0050, each interval about ±0.004, all under 0.01).
+- The fine-tune's gain over Google's file at k=10 was +0.0177 (int8) and +0.0138
+  (int4). With a linear layer on every training row Google's file scored
+  higher than the fine-tune, 0.9534 against 0.9389.
+- `verify` embedded the file and Google's side by side, each at 4 threads, on
+  11,775 texts: 47 minutes for int8 and 35 for int4 from start to exit, where
+  the previous run, one side after another, took 76 and 62. Per text the
+  int4 file took a median 135.8 ms and Google's 134.2 ms; the int8 file 196.3
+  ms beside Google's 134.3 ms.
+- The int4 file's 10-shot draws equal the previous run's, draw for draw. The
+  int8 file's 10-shot mean moved from 0.9318 to 0.9314; between the two runs
+  int8 codes changed to stop at -127, as TFLite's quantization specification
+  has them, instead of -128, and nothing else in the int8 path changed that
+  the int4 path did not share.

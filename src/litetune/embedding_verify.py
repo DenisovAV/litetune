@@ -40,13 +40,11 @@ two runs -- of this verify or of another one -- share a cache path.
 
 The candidate and Google's file are embedded side by side, one process each
 (`ENGINES_SCRIPT`), when they are two files and the machine has the CPUs for
-both at `threads` each; otherwise one after another. One after another is what
-was measured: on a 32-vCPU Intel Xeon @ 2.20GHz, LiteRT-LM 0.18.0 at 4
-threads, 11,775 texts, the three sides ran in turn and `verify` took 76 min
-(int8) and 62 min (int4), the int4 run's harness reporting 464.4 s for the
-reference, 1611.6 s for the candidate and 1610.2 s for Google's file
-(MEASUREMENTS.md, "EmbeddingGemma 2: litetune end to end"). Side by side is not
-yet measured. The side-by-side processes are started by one child of
+both at `threads` each; otherwise one after another. On a 32-vCPU Intel Xeon @
+2.20GHz, LiteRT-LM 0.18.0 at 4 threads, 11,775 texts, `verify` took 76 and 62
+minutes (int8, int4) one side after another and 47 and 35 side by side
+(MEASUREMENTS.md, "EmbeddingGemma 2: litetune end to end"). The side-by-side
+processes are started by one child of
 `StageEnv.run`, not by threads here: `envs`' signal guard works on the main
 thread only, and a grandchild stays in the child's session and job object, so
 `envs` stops it with the child.
