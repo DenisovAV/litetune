@@ -447,6 +447,23 @@ def _run(
         logger.exception("a graft input went missing")
         _add(result, events, Check.unchecked(GRAFT_CHECK, f"an input went missing: {exc}"))
         return
+    # The digest convert.json records, and `verify` binds the file to, must be
+    # the file the graft read: taken before the downloads, it is taken again here.
+    after = hash_file(request.tuned_safetensors)
+    if after != result.checkpoint_sha256:
+        Path(grafted.output).unlink(missing_ok=True)
+        _add(
+            result,
+            events,
+            Check.failed(
+                GRAFT_CHECK,
+                f"{request.tuned_safetensors} changed while it was grafted (sha256 "
+                f"{result.checkpoint_sha256} before, {after} after); the file was removed, "
+                "since no one digest names what it was grafted from",
+            ),
+        )
+        result.checkpoint_sha256 = None
+        return
     result.graft = grafted
     _add(
         result,

@@ -95,6 +95,8 @@ class FakeGraft:
     cause: str | None = None
     # An exception the graft is not expected to raise.
     raises: BaseException | None = None
+    # Bytes written over the fine-tune while it is grafted.
+    rewrite_tuned: bytes | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
 
     def __call__(
@@ -106,6 +108,8 @@ class FakeGraft:
         )
         if self.raises is not None:
             raise self.raises
+        if self.rewrite_tuned is not None:
+            Path(tuned).write_bytes(self.rewrite_tuned)
         if self.cause is not None:
             raise EmbeddingConvertError(self.cause, f"refused for {self.cause}")
         out = Path(out_path)
@@ -373,6 +377,15 @@ def test_an_unexpected_graft_error_is_not_reported_as_passed(hub, grafter, tmp_p
     assert report["checks"]["checks"][-1]["detail"] == "KeyError: 'parts'"
     finished = [e.data["status"] for e in seen if e.kind == "stage_finished"]
     assert finished == [Outcome.UNCHECKED.value]
+
+
+def test_a_fine_tune_that_changes_while_grafted_fails_and_leaves_no_file(hub, grafter, tmp_path):
+    grafter.rewrite_tuned = b"another checkpoint"
+    result = _run(tmp_path)
+    assert result.outcome is Outcome.FAILED
+    assert "changed while it was grafted" in result.checks.checks[-1].detail
+    assert result.checkpoint_sha256 is None
+    assert not (tmp_path / "out" / DEFAULT_WEIGHTS / "model.litertlm").exists()
 
 
 def test_a_missing_local_base_file_is_refused(hub, grafter, tmp_path):

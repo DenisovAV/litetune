@@ -230,12 +230,12 @@ is not the decider's prefix, or a vector with a non-finite value or a zero norm,
 is {"error": ...} and exit 3. As the measurement's sentence-transformers side
 (MEASUREMENTS.md, "EmbeddingGemma 2: many labels").
 
-The report's "tokens" counts each text's tokens with the prompt, through the
-model's own `tokenize`, and how many reach `max_seq_length`: sentence-transformers
-cuts a text there, so such a row's reference vector is of a shorter text than
-the one the engine embeds. A row is counted when it reaches `max_seq_length`,
-not only past it, so the count holds whether or not `tokenize` itself cuts at
-that length (prepare's `measure_embedded_lengths` counts `n >= limit` too).
+The report's "tokens" counts each text's tokens with the prompt and the
+tokenizer's specials, through the model's tokenizer without truncation, and how
+many exceed `max_seq_length`: sentence-transformers cuts a text there, so such a
+row's reference vector is of a shorter text than the one the engine embeds. A
+text of exactly `max_seq_length` tokens fits, as prepare's
+`measure_embedded_lengths` counts it (`n > limit` is over).
 """
 import importlib.metadata
 import json
