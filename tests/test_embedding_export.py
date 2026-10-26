@@ -217,7 +217,10 @@ def test_an_embedding_checkpoint_is_grafted_not_exported(hub, grafter, llm_expor
     assert llm_export == []
     call = grafter.calls[0]
     assert call["weights"] == DEFAULT_WEIGHTS == "int4"
-    assert call["tuned"] == model / BASE_FILE
+    # A copy of the fine-tune, in a directory of the run's own beside the output.
+    assert call["tuned"].name == BASE_FILE and call["tuned"].parent.name.startswith(
+        ".litetune-checkpoint-"
+    )
     assert call["out"] == tmp_path / "out" / DEFAULT_WEIGHTS / ARTIFACT_NAME
     assert call["google"].name == GOOGLE_FILE
     assert call["base"].name == BASE_FILE
@@ -379,13 +382,19 @@ def test_an_unexpected_graft_error_is_not_reported_as_passed(hub, grafter, tmp_p
     assert finished == [Outcome.UNCHECKED.value]
 
 
-def test_a_fine_tune_that_changes_while_grafted_fails_and_leaves_no_file(hub, grafter, tmp_path):
+def test_the_graft_reads_a_copy_and_the_report_names_the_copys_bytes(hub, grafter, tmp_path):
+    # A checkpoint rewritten while the graft runs does not change what was read,
+    # nor the digest `verify` binds the file to.
     grafter.rewrite_tuned = b"another checkpoint"
-    result = _run(tmp_path)
-    assert result.outcome is Outcome.FAILED
-    assert "changed while it was grafted" in result.checks.checks[-1].detail
-    assert result.checkpoint_sha256 is None
-    assert not (tmp_path / "out" / DEFAULT_WEIGHTS / "model.litertlm").exists()
+    model = _checkpoint(tmp_path)
+    original = (model / "model.safetensors").read_bytes()
+    result = _run(tmp_path, model=model)
+    assert result.outcome is Outcome.PASSED
+    read = grafter.calls[0]["tuned"]
+    assert read != model / "model.safetensors"
+    assert result.checkpoint_sha256 == "sha256:" + hashlib.sha256(original).hexdigest()
+    assert not read.exists()  # the copy goes with the run
+    assert not list((tmp_path / "out" / DEFAULT_WEIGHTS).glob(".litetune-checkpoint-*"))
 
 
 def test_a_missing_local_base_file_is_refused(hub, grafter, tmp_path):

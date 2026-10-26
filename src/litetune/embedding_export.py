@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -342,7 +343,14 @@ def run_embedding_export(
         request=request, record=record, checks=CheckSet(name=f"convert:{request.weights}")
     )
     try:
-        _run(request, result, events)
+        # The graft reads a copy of the fine-tune, and the digest convert.json
+        # records -- the one `verify` binds the file to -- is the copy's: the
+        # bytes the graft read, whatever happens to the checkpoint meanwhile.
+        request.report_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".litetune-checkpoint-", dir=request.report_path.parent
+        ) as snapshot:
+            _run(request, result, events, Path(snapshot))
     except BaseException as exc:
         # Whatever `_run` did not turn into a check: the report must not say
         # passed for a file the graft did not finish.
@@ -366,10 +374,15 @@ def _add(result: EmbeddingExportResult, events: EventStream, check: Check) -> Ch
 
 
 def _run(
-    request: EmbeddingExportRequest, result: EmbeddingExportResult, events: EventStream
+    request: EmbeddingExportRequest,
+    result: EmbeddingExportResult,
+    events: EventStream,
+    snapshot: Path,
 ) -> None:
     env = request.env
-    result.checkpoint_sha256 = hash_file(request.tuned_safetensors)
+    tuned = snapshot / request.tuned_safetensors.name
+    shutil.copyfile(request.tuned_safetensors, tuned)
+    result.checkpoint_sha256 = hash_file(tuned)
     with guard(ENV_CHECK) as sink:
         if request.auto_provision:
             env.provision(events=events)
@@ -429,7 +442,7 @@ def _run(
             env,
             google,
             base,
-            request.tuned_safetensors,
+            tuned,
             request.output,
             request.weights,  # type: ignore[arg-type]
             events=events,
@@ -446,23 +459,6 @@ def _run(
     except FileNotFoundError as exc:
         logger.exception("a graft input went missing")
         _add(result, events, Check.unchecked(GRAFT_CHECK, f"an input went missing: {exc}"))
-        return
-    # The digest convert.json records, and `verify` binds the file to, must be
-    # the file the graft read: taken before the downloads, it is taken again here.
-    after = hash_file(request.tuned_safetensors)
-    if after != result.checkpoint_sha256:
-        Path(grafted.output).unlink(missing_ok=True)
-        _add(
-            result,
-            events,
-            Check.failed(
-                GRAFT_CHECK,
-                f"{request.tuned_safetensors} changed while it was grafted (sha256 "
-                f"{result.checkpoint_sha256} before, {after} after); the file was removed, "
-                "since no one digest names what it was grafted from",
-            ),
-        )
-        result.checkpoint_sha256 = None
         return
     result.graft = grafted
     _add(
