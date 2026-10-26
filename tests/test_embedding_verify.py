@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from typing import Any
 import pytest
 from conftest import mark_provisioned
 
-from litetune import embedding_export, envs
+from litetune import embedding_export, embedding_verify, envs
 from litetune.checks import Outcome
 from litetune.cli import main
 from litetune.decisions import Decision, Option
@@ -36,9 +37,11 @@ from litetune.embedding_tune import (
     write_embedding_record,
 )
 from litetune.embedding_verify import (
+    BASE_EMBED_CHECK,
     DEFAULT_MAX_CONVERSION_COST,
     DRAWS,
     ENGINE_SCRIPT,
+    ENGINES_SCRIPT,
     EVAL_SCRIPT,
     GATE_CHECK,
     GATED_K,
@@ -49,6 +52,7 @@ from litetune.embedding_verify import (
     gate,
     kshot_costs,
     labels_short_of,
+    side_by_side,
     weights_of,
 )
 from litetune.metrics import Difference, paired_difference
@@ -229,7 +233,7 @@ def test_the_evaluation_script_refuses_vectors_that_do_not_cover_the_rows(
     assert "3 vectors for 4 rows" in (tmp_path / "r.json").read_text()
 
 
-@pytest.mark.parametrize("source", [REFERENCE_SCRIPT, ENGINE_SCRIPT, EVAL_SCRIPT])
+@pytest.mark.parametrize("source", [REFERENCE_SCRIPT, ENGINE_SCRIPT, ENGINES_SCRIPT, EVAL_SCRIPT])
 def test_every_script_compiles(source):
     compile(source, "script.py", "exec")
 
@@ -344,6 +348,10 @@ class FakeEmbedEnvs:
     runs: list[tuple[str, str]] = field(default_factory=list)
     specs: dict[str, dict[str, Any]] = field(default_factory=dict)
     texts: dict[str, list[str]] = field(default_factory=dict)
+    launches: list[dict[str, Any]] = field(default_factory=list)
+    timeouts: dict[str, int] = field(default_factory=dict)
+    # Sides the launcher reports as stopped (returncode null) without running them.
+    stopped: set[str] = field(default_factory=set)
     hub: Path | None = None
 
     def vectors(self, texts: list[str], kind: str) -> Any:
@@ -356,11 +364,31 @@ class FakeEmbedEnvs:
             v = np.eye(6)[labels] + 0.05 * rng.standard_normal((len(texts), 6))
         return v / np.linalg.norm(v, axis=1, keepdims=True)
 
+    def embed(self, name: str, spec: dict[str, Any]) -> None:
+        texts = json.loads(Path(spec["texts"]).read_text(encoding="utf-8"))
+        self.texts[name] = texts
+        kind = {"candidate": self.candidate, "base": "random"}.get(name, "same")
+        np.save(spec["out"], self.vectors(texts, kind).astype(np.float32))
+        Path(spec["report"]).write_text(
+            json.dumps(
+                {
+                    "rows": len(texts),
+                    "dim": 6,
+                    "runtime": {"litert-lm": "0.18.0"},
+                    "cpu": "fake",
+                    "ms_median": 1.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def __call__(self, env, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         name = Path(args[1]).stem
         spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
-        self.runs.append((name, env.name))
-        self.specs[name] = spec
+        self.timeouts[name] = timeout
+        if name != "engines":  # the sides it runs are recorded one by one below
+            self.runs.append((name, env.name))
+            self.specs[name] = spec
         if name in self.fail:
             return subprocess.CompletedProcess(args, 1, "", f"{name}: RuntimeError: boom")
         if name == "download":
@@ -371,25 +399,34 @@ class FakeEmbedEnvs:
             Path(spec["out"]).write_text(json.dumps({"paths": [str(path)]}), encoding="utf-8")
             return subprocess.CompletedProcess(args, 0, "", "")
         report = Path(spec["report"])
-        if name in ("reference", "candidate", "base"):
-            texts = json.loads(Path(spec["texts"]).read_text(encoding="utf-8"))
-            self.texts[name] = texts
-            kind = self.candidate if name == "candidate" else "same"
-            if name == "base":
-                kind = "random"
-            v = self.vectors(texts, kind)
-            np.save(spec["out"], v.astype(np.float32))
+        if name == "reference":
+            self.embed(name, spec)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if name == "engines":
+            # ENGINES_SCRIPT's contract: a failed run stops the ones after it.
+            self.launches.append(spec)
+            results: dict[str, Any] = {}
+            stopped = False
+            for run in spec["runs"]:
+                side = run["name"]
+                if stopped:
+                    results[side] = {"returncode": None, "seconds": None}
+                    continue
+                if side in self.stopped:
+                    results[side] = {"returncode": None, "seconds": None}
+                    continue
+                sub = json.loads(Path(run["spec"]).read_text(encoding="utf-8"))
+                self.runs.append((side, env.name))
+                self.specs[side] = sub
+                if side in self.fail:
+                    Path(run["stderr"]).write_text(f"{side}: RuntimeError: boom", encoding="utf-8")
+                    results[side] = {"returncode": 1, "seconds": 1.0}
+                    stopped = True
+                    continue
+                self.embed(side, sub)
+                results[side] = {"returncode": 0, "seconds": 1.0}
             report.write_text(
-                json.dumps(
-                    {
-                        "rows": len(texts),
-                        "dim": 6,
-                        "runtime": {"litert-lm": "0.18.0"},
-                        "cpu": "fake",
-                        "ms_median": 1.0,
-                    }
-                ),
-                encoding="utf-8",
+                json.dumps({"runs": results, "parallel": spec["parallel"]}), encoding="utf-8"
             )
             return subprocess.CompletedProcess(args, 0, "", "")
         assert name == "evaluate"
@@ -621,6 +658,149 @@ def test_a_script_that_fails_is_a_harness_failure_naming_it(fake, tmp_path, scri
     assert result.status is Status.FAILED_HARNESS
     failed = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
     assert "boom" in failed[0]["detail"]
+
+
+def _google(tmp_path: Path) -> Path:
+    local = tmp_path / "google.litertlm"
+    local.write_bytes(GOOGLE_BYTES)
+    return local
+
+
+def test_the_files_are_embedded_side_by_side_when_the_cores_allow(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(embedding_verify.os, "cpu_count", lambda: 8)
+    m = _verify(_setup(tmp_path), base_litertlm=_google(tmp_path)).manifest
+    assert [launch["parallel"] for launch in fake.launches] == [True]
+    assert [r["name"] for r in fake.launches[0]["runs"]] == ["candidate", "base"]
+    assert fake.timeouts["engines"] == fake.timeouts["reference"]
+    assert m["embedding"]["engines_side_by_side"] is True
+    assert any("embedded at the same time" in t for t in m["limitations"])
+
+
+def test_too_few_cores_embed_the_files_one_after_another(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(embedding_verify.os, "cpu_count", lambda: 7)
+    m = _verify(_setup(tmp_path), base_litertlm=_google(tmp_path)).manifest
+    assert [launch["parallel"] for launch in fake.launches] == [False]
+    # One after another, the launcher has a file's allowance per file.
+    assert fake.timeouts["engines"] == 2 * fake.timeouts["reference"]
+    assert m["embedding"]["engines_side_by_side"] is False
+    assert not any("embedded at the same time" in t for t in m["limitations"])
+
+
+def test_googles_file_failing_is_named_as_its_own_check(fake, tmp_path):
+    fake.fail = {"base"}
+    result = _verify(_setup(tmp_path), base_litertlm=_google(tmp_path))
+    assert result.status is Status.FAILED_HARNESS
+    failed = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
+    assert failed[0]["name"] == BASE_EMBED_CHECK and "boom" in failed[0]["detail"]
+
+
+def test_the_failure_reported_is_the_side_that_failed_not_the_one_it_stopped(fake, tmp_path):
+    fake.fail, fake.stopped = {"base"}, {"candidate"}
+    result = _verify(_setup(tmp_path), base_litertlm=_google(tmp_path))
+    failed = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
+    assert [c["name"] for c in failed] == [BASE_EMBED_CHECK]
+    assert "boom" in failed[0]["detail"]
+
+
+def test_a_side_only_stopped_is_still_a_harness_failure(fake, tmp_path):
+    fake.stopped = {"base"}
+    result = _verify(_setup(tmp_path), base_litertlm=_google(tmp_path))
+    assert result.status is Status.FAILED_HARNESS
+    failed = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
+    assert failed[0]["name"] == BASE_EMBED_CHECK and "stopped" in failed[0]["detail"]
+
+
+@pytest.mark.parametrize(
+    "files, threads, cpus, expected",
+    [
+        (["a"], 4, 64, False),
+        (["a", "b"], 4, 8, True),
+        (["a", "b"], 4, 7, False),
+        (["a", "b"], 4, None, False),
+    ],
+)
+def test_side_by_side_needs_two_files_and_the_cores_for_both(files, threads, cpus, expected):
+    assert side_by_side([Path(f) for f in files], threads, cpus) is expected
+
+
+def test_one_file_under_two_names_is_not_embedded_side_by_side(tmp_path):
+    # Both names reach one file, so one XNNPack cache: s5's failure.
+    (tmp_path / "model.litertlm").write_bytes(b"x")
+    try:
+        (tmp_path / "link.litertlm").symlink_to(tmp_path / "model.litertlm")
+    except OSError as exc:  # Windows without the symlink privilege
+        pytest.skip(f"no symlink here: {exc}")
+    files = [tmp_path / "model.litertlm", tmp_path / "link.litertlm"]
+    assert side_by_side(files, 4, 64) is False
+
+
+# A stand-in for ENGINE_SCRIPT: records when it ran, sleeps, exits as told.
+_STAND_IN = r"""
+import json, sys, time
+from pathlib import Path
+spec = json.loads(Path(sys.argv[1]).read_text())
+Path(spec["mark"]).write_text(str(time.time()))
+time.sleep(spec["sleep"])
+Path(spec["mark"]).write_text(Path(spec["mark"]).read_text() + " " + str(time.time()))
+sys.exit(spec["code"])
+"""
+
+
+def _launch(tmp_path: Path, parallel: bool, runs: dict[str, tuple[float, int]]):
+    script = tmp_path / "stand_in.py"
+    script.write_text(_STAND_IN)
+    entries = []
+    for name, (sleep, code) in runs.items():
+        spec = tmp_path / f"{name}.json"
+        spec.write_text(
+            json.dumps({"mark": str(tmp_path / f"{name}.mark"), "sleep": sleep, "code": code})
+        )
+        entries.append({"name": name, "spec": str(spec), "stderr": str(tmp_path / f"{name}.err")})
+    launcher_spec = tmp_path / "engines.json"
+    report = tmp_path / "engines.out"
+    launcher_spec.write_text(
+        json.dumps(
+            {"script": str(script), "runs": entries, "parallel": parallel, "report": str(report)}
+        )
+    )
+    launcher = tmp_path / "engines.py"
+    launcher.write_text(ENGINES_SCRIPT)
+    proc = subprocess.run([sys.executable, str(launcher), str(launcher_spec)], timeout=60)
+    assert proc.returncode == 0
+    return json.loads(report.read_text())["runs"]
+
+
+def _span(tmp_path: Path, name: str) -> tuple[float, float]:
+    start, end = (tmp_path / f"{name}.mark").read_text().split()
+    return float(start), float(end)
+
+
+def test_the_launcher_runs_side_by_side_when_told(tmp_path):
+    runs = _launch(tmp_path, True, {"candidate": (1.5, 0), "base": (1.5, 0)})
+    assert {r["returncode"] for r in runs.values()} == {0}
+    (a0, a1), (b0, b1) = _span(tmp_path, "candidate"), _span(tmp_path, "base")
+    assert b0 < a1 and a0 < b1  # the two runs overlapped
+
+
+def test_the_launcher_runs_one_after_another_when_told(tmp_path):
+    _launch(tmp_path, False, {"candidate": (0.3, 0), "base": (0.3, 0)})
+    assert _span(tmp_path, "candidate")[1] <= _span(tmp_path, "base")[0]
+
+
+def test_a_failed_run_stops_the_one_beside_it(tmp_path):
+    runs = _launch(tmp_path, True, {"candidate": (30, 0), "base": (0, 2)})
+    assert runs["base"]["returncode"] == 2
+    assert runs["candidate"]["returncode"] is None
+    assert len((tmp_path / "candidate.mark").read_text().split()) == 1  # never finished
+
+
+def test_a_failed_run_keeps_the_next_from_starting(tmp_path):
+    runs = _launch(tmp_path, False, {"candidate": (0, 1), "base": (0, 0)})
+    assert runs == {
+        "candidate": {"returncode": 1, "seconds": runs["candidate"]["seconds"]},
+        "base": {"returncode": None, "seconds": None},
+    }
+    assert not (tmp_path / "base.mark").exists()
 
 
 def test_too_few_training_rows_for_the_gated_k_is_refused_before_any_run(fake, tmp_path):

@@ -33,14 +33,23 @@ them would count each row `DRAWS` times.
 The engine hazard: LiteRT-LM writes the XNNPack weight cache beside the model,
 and four processes sharing one cache failed with "could not verify buffer list
 mapping" (lora_project measurements/2026-10-25-eg2-many-labels/run_s5.sh). Here
-one process embeds one file, and the files are embedded one after another; the
-cache is left beside each file, as there.
+one process embeds one file; the cache is left beside each file, as there.
+
+The candidate and Google's file are embedded side by side, one process each
+(`ENGINES_SCRIPT`), when they are two files and the machine has the cores for
+both at `threads` each; otherwise one after another. Each pass is ~1,600 s on
+11,775 texts at 4 threads (eg2-graft out-e2e2), so this halves the wait with
+the base. The side-by-side processes are started by one child of
+`StageEnv.run`, not by threads here: `envs`' signal guard works on the main
+thread only, and a grandchild stays in the child's session and job object, so
+`envs` stops it with the child.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import tempfile
 from collections.abc import Sequence
@@ -127,6 +136,10 @@ LINEAR_NOT_GATED = (
 NO_BASE = (
     "the gain over Google's file was not measured; pass --base-litertlm or --with-base to measure "
     "it on these rows"
+)
+SIDE_BY_SIDE = (
+    "the candidate and Google's file were embedded at the same time, each on its own {threads} "
+    "threads; each file's time per text was measured with the other running"
 )
 REFERENCE_ON_CPU = (
     "the reference ran on the CPU in float32 through sentence-transformers, whatever "
@@ -313,6 +326,73 @@ if __name__ == "__main__":
     sys.exit(main())
 '''
 
+ENGINES_SCRIPT = r'''
+"""Run the engine script once per file: side by side, or one after another.
+
+Reads JSON {script, runs: [{name, spec, stderr}], parallel, report} from
+argv[1]. Starts `python script spec` for each run, its stderr to the run's
+file; side by side when `parallel`, else in order. A run that exits non-zero
+stops the rest: a run still going is terminated and one not yet started is not
+started, and both report returncode null. Writes {runs: {name: {returncode,
+seconds}}, parallel} to spec["report"] and exits 0; reading each run's own
+report is the caller's.
+"""
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+POLL_S = 1.0
+
+
+def start(script, run):
+    err = open(run["stderr"], "w", encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, script, run["spec"]], stdout=subprocess.DEVNULL, stderr=err
+    )
+    return proc, err, time.time()
+
+
+def main():
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    runs = spec["runs"]
+    results = {run["name"]: {"returncode": None, "seconds": None} for run in runs}
+    waiting = list(runs)
+    live = {}
+    failed = False
+    while waiting or live:
+        while waiting and not failed and (spec["parallel"] or not live):
+            run = waiting.pop(0)
+            live[run["name"]] = start(spec["script"], run)
+        if failed:
+            waiting.clear()
+        for name, (proc, err, began) in list(live.items()):
+            code = proc.poll()
+            if code is None:
+                continue
+            err.close()
+            del live[name]
+            results[name] = {"returncode": code, "seconds": round(time.time() - began, 1)}
+            if code != 0 and not failed:
+                failed = True
+                for oproc, oerr, _ in live.values():
+                    oproc.terminate()
+                    oproc.wait()
+                    oerr.close()
+                live.clear()
+        if live:
+            time.sleep(POLL_S)
+    Path(spec["report"]).write_text(
+        json.dumps({"runs": results, "parallel": bool(spec["parallel"])}), encoding="utf-8"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
 # Its helpers above `main` use numpy alone (the linear layer is handed torch),
 # so the tests run them in this process.
 EVAL_SCRIPT = r'''
@@ -463,20 +543,95 @@ def run_script(
     except OSError as exc:
         run.failure = f"the script could not be started: {type(exc).__name__}: {exc}"
         return run
+    return read_run(report, proc.returncode, proc.stderr)
+
+
+def read_run(report: Path, returncode: int, stderr: str | None) -> ScriptRun:
+    """One finished script's report, or why there is none."""
+    run = ScriptRun()
     if report.is_file():
         try:
             run.report = json.loads(report.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             run.failure = f"the script's report could not be read: {exc}"
             return run
-    if proc.returncode != 0:
-        said = run.report.get("error") or _tail(proc.stderr) or "no stderr"
-        run.failure = f"the script exited {proc.returncode}: {said}"
+    if returncode != 0:
+        said = run.report.get("error") or _tail(stderr) or "no stderr"
+        run.failure = f"the script exited {returncode}: {said}"
     elif not report.is_file():
-        run.failure = "the script wrote no report" + (
-            f": {_tail(proc.stderr)}" if _tail(proc.stderr) else ""
-        )
+        run.failure = "the script wrote no report" + (f": {_tail(stderr)}" if _tail(stderr) else "")
     return run
+
+
+STOPPED = "the launcher reports no exit for this file: it was stopped or never started"
+
+
+def side_by_side(files: Sequence[Path], threads: int, cpus: int | None) -> bool:
+    """Whether the engine files can be embedded at once without sharing a cache or the cores.
+
+    Two paths to one file would share its XNNPack cache, which broke in s5; a
+    machine without `threads` cores per file would have them compete, and
+    each file's time per text is reported.
+    """
+    if len(files) < 2:
+        return False
+    if len({Path(f).resolve() for f in files}) < len(files):
+        return False
+    return (cpus or 1) >= threads * len(files)
+
+
+def run_engines(
+    env: envs.StageEnv,
+    sides: Sequence[tuple[str, Path]],
+    common: dict[str, Any],
+    work: Path,
+    parallel: bool,
+    timeout: int,
+) -> tuple[dict[str, ScriptRun], str | None]:
+    """Embed each (name, file) with `ENGINE_SCRIPT` through one `ENGINES_SCRIPT` child.
+
+    Returns each side's run and, when the launcher itself gave no result, why.
+    A side the launcher stopped or never started has the failure `STOPPED`.
+    """
+    script = work / "engine.py"
+    script.write_text(ENGINE_SCRIPT, encoding="utf-8")
+    runs, reports = [], {}
+    for name, model in sides:
+        spec_path, report = work / f"{name}.json", work / f"{name}.out"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    **common,
+                    "model": str(model),
+                    "out": str(work / f"{name}.npy"),
+                    "report": str(report),
+                }
+            ),
+            encoding="utf-8",
+        )
+        runs.append({"name": name, "spec": str(spec_path), "stderr": str(work / f"{name}.err")})
+        reports[name] = report
+    launched = run_script(
+        env,
+        ENGINES_SCRIPT,
+        {"script": str(script), "runs": runs, "parallel": parallel},
+        work,
+        "engines",
+        timeout,
+    )
+    if launched.failure is not None:
+        return {}, launched.failure
+    out: dict[str, ScriptRun] = {}
+    for name, _ in sides:
+        entry = _mapping(_mapping(launched.report.get("runs")).get(name))
+        code = entry.get("returncode")
+        if not isinstance(code, int):
+            out[name] = ScriptRun(failure=STOPPED)
+            continue
+        err = work / f"{name}.err"
+        stderr = err.read_text(encoding="utf-8", errors="replace") if err.is_file() else None
+        out[name] = read_run(reports[name], code, stderr)
+    return out, None
 
 
 # ---------------------------------------------------------------------------
@@ -785,71 +940,85 @@ def verify_embedding(
         work = Path(tmp)
         texts_path = work / "texts.json"
         texts_path.write_text(json.dumps(texts, ensure_ascii=False), encoding="utf-8")
-        sides: list[tuple[str, str, envs.StageEnv, str, dict[str, Any]]] = [
-            (
-                "reference",
-                REFERENCE_CHECK,
-                job.train_env,
-                REFERENCE_SCRIPT,
-                {
-                    "model": job.reference,
-                    "prompt_name": record.prompt_name,
-                    "prefix": record.prefix,
-                    "batch_size": REFERENCE_BATCH,
-                },
-            ),
-            (
-                "candidate",
-                CANDIDATE_CHECK,
-                job.runtime_env,
-                ENGINE_SCRIPT,
-                {"model": str(job.model)},
-            ),
-        ]
+        common = {"texts": str(texts_path), "threads": job.threads, "prefix": record.prefix}
+        engine_sides: list[tuple[str, Path]] = [("candidate", Path(job.model))]
         if google is not None:
-            sides.append(
-                ("base", BASE_EMBED_CHECK, job.runtime_env, ENGINE_SCRIPT, {"model": str(google)})
-            )
+            engine_sides.append(("base", google))
+        engine_checks = {"candidate": CANDIDATE_CHECK, "base": BASE_EMBED_CHECK}
+        parallel = side_by_side([f for _, f in engine_sides], job.threads, os.cpu_count())
+        fields["embedding"]["engines_side_by_side"] = parallel
+
+        for env, check_name in (
+            (job.train_env, REFERENCE_CHECK),
+            (job.runtime_env, CANDIDATE_CHECK),
+        ):
+            if not job.auto_provision:
+                continue
+            try:
+                env.provision(events=events)
+            except Exception as exc:  # noqa: BLE001 - a failed environment is a harness failure
+                logger.exception("could not provision environment %r", env.name)
+                return refuse(
+                    check_name, f"the {env.name} environment could not be provisioned: {exc}"
+                )
+
         vectors: dict[str, str] = {}
         harness: dict[str, Any] = {}
-        for name, check_name, env, source, extra in sides:
-            if job.auto_provision:
-                try:
-                    env.provision(events=events)
-                except Exception as exc:  # noqa: BLE001 - a failed environment is a harness failure
-                    logger.exception("could not provision environment %r", env.name)
-                    return refuse(
-                        check_name, f"the {env.name} environment could not be provisioned: {exc}"
-                    )
+
+        def accept(name: str, check_name: str, run: ScriptRun) -> str | None:
+            """Record one side's vectors; the failure, when they are not there."""
             out = work / f"{name}.npy"
-            events.note(f"embedding {len(texts)} texts: {name}", env=env.name)
-            run = run_script(
-                env,
-                source,
-                {
-                    "texts": str(texts_path),
-                    "threads": job.threads,
-                    "prefix": record.prefix,
-                    "out": str(out),
-                    **extra,
-                },
-                work,
-                name,
-                budget,
-            )
             if run.failure is not None:
-                return refuse(check_name, run.failure)
+                return run.failure
             if run.report.get("rows") != len(texts) or not out.is_file():
-                return refuse(
-                    check_name,
-                    f"the script reports {run.report.get('rows')} vectors for {len(texts)} texts",
-                )
+                return f"the script reports {run.report.get('rows')} vectors for {len(texts)} texts"
             harness[name] = run.report
             vectors[name] = str(out)
             state.add(
                 Check.passed(check_name, f"{len(texts)} vectors of {run.report.get('dim')} values"),
                 events,
             )
+            return None
+
+        events.note(f"embedding {len(texts)} texts: reference", env=job.train_env.name)
+        reference_run = run_script(
+            job.train_env,
+            REFERENCE_SCRIPT,
+            {
+                **common,
+                "model": job.reference,
+                "prompt_name": record.prompt_name,
+                "batch_size": REFERENCE_BATCH,
+                "out": str(work / "reference.npy"),
+            },
+            work,
+            "reference",
+            budget,
+        )
+        if (problem := accept("reference", REFERENCE_CHECK, reference_run)) is not None:
+            return refuse(REFERENCE_CHECK, problem)
+
+        names = " and ".join(name for name, _ in engine_sides)
+        how = ", side by side" if parallel else ""
+        events.note(f"embedding {len(texts)} texts: {names}{how}", env=job.runtime_env.name)
+        engine_runs, launch_failure = run_engines(
+            job.runtime_env,
+            engine_sides,
+            common,
+            work,
+            parallel,
+            budget if parallel else budget * len(engine_sides),
+        )
+        if launch_failure is not None:
+            return refuse(CANDIDATE_CHECK, launch_failure)
+        # The side that failed, not one stopped because of it.
+        order = sorted(
+            (name for name, _ in engine_sides),
+            key=lambda n: engine_runs[n].failure == STOPPED,
+        )
+        for name in order:
+            if (problem := accept(name, engine_checks[name], engine_runs[name])) is not None:
+                return refuse(engine_checks[name], problem)
         fields["harness"] = harness
 
         pairs = [["reference", "candidate"]] + ([["candidate", "base"]] if google else [])
@@ -937,6 +1106,8 @@ def verify_embedding(
         | {"threshold": threshold, "mean": round(mean_value(k_costs), 6)}
     )
     state.limitation(CPU_ONLY.format(threads=job.threads))
+    if parallel:
+        state.limitation(SIDE_BY_SIDE.format(threads=job.threads))
     state.limitation(FITTED_ON_EXAMPLES.format(ks=" and ".join(f"k={k}" for k in KS), draws=DRAWS))
     state.limitation(REFERENCE_ON_CPU)
     state.limitation(LINEAR_NOT_GATED)
