@@ -7,7 +7,7 @@ file (`litert-community/embeddinggemma-2-text-270m-litert-lm`,
 So this takes that file, rewrites the weights of its two TFLite graphs --
 `embedder` and `text_encoder` -- with the fine-tune's, and repacks it with
 litert-lm-builder. Everything here is the graft spike's `graft_s2.py`
-(`measurements/2026-10-22-eg2-graft/`, its README for every figure below),
+(MEASUREMENTS.md, "EmbeddingGemma 2: the graft"), for every figure below),
 productized; where it differs, the script's docstring says so.
 
 **What Google's file holds.** Every two-dimensional text-tower weight is an int4
@@ -22,24 +22,31 @@ buffer each, shared by all subgraphs: each is an input of a `STABLEHLO_COMPOSITE
 and tracing that op back to the nearest `FULLY_CONNECTED` names the layer and the
 sub-block. That fixes q_norm and k_norm, and leaves at most two candidates for any
 other norm, told apart by cosine to the base values. The two v_norm constants
-have no HF weight and are left alone. `layer_scalar` is a buffer in HF, not
-trained; the fine-tune's must equal the base's.
+have no HF weight and are left alone. A norm-sized constant that a composite in
+any other subgraph reads must be one of those placed or left. HF holds
+`layer_scalar` as a buffer, and nothing writes one into the graph, so the
+fine-tune must leave it as the base's.
 
 **Two weight modes**, the spike's variants: `int8` (`i8n_e8`: both graphs int8,
 300,089,344 bytes in the spike) and `int4` (`i4n`: both int4, Google's size). The
-spike's third, an int4 encoder with an int8 embedder, was no more accurate than
-int4 on 77 and 150 labels (s5), and is not offered. int8 changes each
-tensor's type and moves its data to a 64-byte-aligned offset in a new weights
-section; int4 rewrites the codes in place. Scales come from a per-row search over
-141 clip ratios for the smallest squared error.
+spike's third, an int4 encoder with an int8 embedder, scored within 0.0007 of
+int4 on 77 and 150 labels in s5 (10-shot centroid, mean of the draws: banking77
+0.9320 against 0.9318, CLINC150 0.9652 against 0.9659; s5 computed no
+confidence interval), and is not offered. int8 changes each tensor's
+type and moves its data to a 64-byte-aligned offset in a new weights section;
+int4 rewrites the codes in place. Scales come from a per-row search over 141
+clip ratios for the smallest squared error; int8 codes span [-127, 127].
 
 **Refusals name their cause** (`EmbeddingConvertError.cause`): a base file whose
-sha256 is not Google's, a tensor that maps to no HF parameter or whose fold
-factor is not a power of two, a norm that cannot be placed one to one, a
-`layer_scalar` the fine-tune changed, a field to patch that the flatbuffer does
-not carry, and a pack that does not read back -- section by section, byte for
-byte (the towers script's `rebuild`), then every written tensor, scale vector and
-norm re-read from the packed file.
+sha256 is not Google's; a tensor that maps to no HF parameter, whose fold factor
+is not a power of two, or whose quantization is not per-row scales with zero
+point 0; a norm that cannot be placed one to one; a `layer_scalar` the
+fine-tune changed, or another parameter it changed that the file holds nowhere;
+a non-finite value to be written; a field to patch that the flatbuffer does not
+carry; and a pack that does not read back -- section by section, byte for byte
+(the towers script's `rebuild`), then each graph against Google's outside the
+bytes the graft wrote, then every written tensor, scale vector and norm re-read
+from the packed file.
 
 The work runs in `envs.EXPORT`, which has litert-lm-builder 0.18.0 and numpy
 2.0.2 pinned and no torch requirement of this script: the safetensors files are
@@ -70,14 +77,26 @@ logger = logging.getLogger(__name__)
 
 GOOGLE_REPO = "litert-community/embeddinggemma-2-text-270m-litert-lm"
 GOOGLE_FILE = "embeddinggemma-2-text-270m.litertlm"
-# measurements/2026-10-22-eg2-graft/out-g2/graft.json, `google.sha256`.
+# The sha256 the graft measurement recorded for this file
+# (MEASUREMENTS.md, "EmbeddingGemma 2: the graft").
 GOOGLE_SHA256 = "2d079ee2f6f066b1f368e8d7c819f55214eaef1d0513b312321901f30ab286fb"
 # The base checkpoint the mapping and fold factors were established against (the
-# spike's README). Not checked here: this module is given the file.
+# spike's README). Not checked here: this module is given the file, and
+# `embedding_export` checks it against `BASE_SHA256` before the graft.
 BASE_MODEL = "google/embeddinggemma-2"
 BASE_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
+# model.safetensors of BASE_MODEL at BASE_REVISION, 1,488,915,288 bytes: its LFS
+# oid in https://huggingface.co/api/models/google/embeddinggemma-2/tree/<BASE_REVISION>,
+# read 2026-10-26.
+BASE_SHA256 = "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
 
 WeightMode = Literal["int8", "int4"]
+# int4: on banking77 (77 labels) and CLINC150 (150) it cost 0.0027 and 0.0017 of
+# the decider's accuracy (centroid of 10 examples per label) against the float
+# fine-tune, int8 0.0002 on both, at 165 MB against 300 MB
+# (MEASUREMENTS.md, "EmbeddingGemma 2: many labels"). `verify` measures the file
+# written, and int8 is there for a task where int4 does not pass.
+DEFAULT_WEIGHTS: WeightMode = "int4"
 WEIGHT_BITS: dict[str, dict[str, int]] = {
     "int8": {"embedder": 8, "text_encoder": 8},
     "int4": {"embedder": 4, "text_encoder": 4},
@@ -129,7 +148,11 @@ SUBGRAPH_TENSORS, SUBGRAPH_OPERATORS = 4, 10
 OP_OPCODE, OP_INPUTS, OP_OUTPUTS = 4, 6, 8
 TENSOR_SHAPE, TENSOR_TYPE, TENSOR_BUFFER, TENSOR_NAME = 4, 6, 8, 10
 TENSOR_QUANTIZATION, TENSOR_EXTERNAL = 12, 24
-QUANT_SCALE = 8
+# QuantizationParameters: min, max, scale, zero_point ([long]), details (a union:
+# its uint8 type, then its table), quantized_dimension (int) -- the offsets the
+# generated tflite package's QuantizationParameters.py reads.
+QUANT_SCALE, QUANT_ZERO_POINT, QUANT_DETAILS_TYPE, QUANT_DETAILS, QUANT_DIMENSION = (
+    8, 10, 12, 14, 16)
 BUFFER_DATA = 4
 EXT_ID, EXT_OFFSET, EXT_LENGTH = 4, 8, 10
 FLOAT32, INT8, INT4 = 0, 9, 17
@@ -267,10 +290,25 @@ def scan(buf, where):
             w["types"].append(fb.scalar(t, TENSOR_TYPE, "<b"))
             w["type_pos"].append(fb.field(t, TENSOR_TYPE))
             quant = fb.field(t, TENSOR_QUANTIZATION)
-            scale = None if quant is None else fb.vector(fb.ref(quant), QUANT_SCALE, 4)
+            q = None if quant is None else fb.ref(quant)
+            scale = None if q is None else fb.vector(q, QUANT_SCALE, 4)
             if scale is None:
                 raise Refused("field", f"{where}: tensor {name!r} in subgraph {si} carries no "
                               "scale vector to write its scales into")
+            # What is written is one scale per output row, zero point 0, and no
+            # other scheme: a file that says otherwise would read the codes another way.
+            zero = fb.vector(q, QUANT_ZERO_POINT, 8)
+            if fb.scalar(q, QUANT_DIMENSION, "<i") != 0:
+                raise Refused("input", f"{where}: tensor {name!r} in subgraph {si} is quantized "
+                              f"along dimension {fb.scalar(q, QUANT_DIMENSION, '<i')}, not "
+                              "per output row")
+            if zero is not None and np.frombuffer(buf, "<i8", zero[1], zero[0]).any():
+                raise Refused("input", f"{where}: tensor {name!r} in subgraph {si} has a "
+                              "non-zero zero point")
+            if (fb.scalar(q, QUANT_DETAILS_TYPE, "<B")
+                    or fb.field(q, QUANT_DETAILS) is not None):
+                raise Refused("input", f"{where}: tensor {name!r} in subgraph {si} carries "
+                              "quantization details, a scheme other than per-row scales")
             w["scales"].append(scale)
     referred = set(weights)
     stray = sorted(set(at_offset) - referred)
@@ -377,14 +415,27 @@ def search_ratios(bits):
     return np.linspace(lo, 1.0, SEARCH_STEPS).astype(np.float32)
 
 
+def code_range(bits):
+    """(qmin, qmax) of a symmetric per-row code. int8: [-127, 127], the range
+    TFLite's quantization spec gives int8 per-axis weights with zero point 0
+    (graft_s2.py used -128). int4: [-8, 7] as graft_s2.py has it; that range
+    was not checked against Google's file."""
+    qmax = 2 ** (bits - 1) - 1
+    return (-qmax if bits == 8 else -(2 ** (bits - 1))), qmax
+
+
 def quant_rows(w, bits):
     """Per-row symmetric codes and float32 scales: for each row, the scale
     absmax * c / qmax over the search ratios c with the smallest squared error,
-    the first such c on a tie."""
-    qmax, qmin = 2 ** (bits - 1) - 1, -(2 ** (bits - 1))
+    the first such c on a tie. Refused for a non-finite value; with every value
+    finite, absmax is finite and at least 1e-12 and c is in (0, 1], so no scale
+    is NaN, infinite or zero."""
+    qmin, qmax = code_range(bits)
     fmax = np.float32(qmax)
     ratios = search_ratios(bits)
     w = np.asarray(w, np.float32)
+    if not np.isfinite(w).all():
+        raise Refused("nonfinite", "a tensor to quantize holds non-finite values")
     codes = np.empty(w.shape, np.int8)
     scales = np.empty(w.shape[0], np.float32)
     for start in range(0, w.shape[0], CHUNK_ROWS):
@@ -449,34 +500,80 @@ def fold_factor(google, base, name):
     alpha = float(google.reshape(-1).astype(np.float64) @ b / (b ** 2).sum())
     if abs(alpha - 1) <= FOLD_TOLERANCE:
         return 1.0
+    # `round` of a NaN raises, so a factor at or below zero is refused before it.
     e = math.log2(alpha) if alpha > 0 else math.nan
-    if not abs(e - round(e)) < FOLD_EXPONENT_TOLERANCE:
+    if not alpha > 0 or not abs(e - round(e)) < FOLD_EXPONENT_TOLERANCE:
         raise Refused("unmapped", f"{name}: Google's tensor is {alpha:.6g} times the base's, "
                       "not a power of two, so it does not hold this parameter as mapped")
     return float(2.0 ** round(e))
 
 
+def opcodes(fb, model):
+    """Each operator code's builtin code."""
+    return [max(fb.scalar(c, OPCODE_DEPRECATED, "<b"), fb.scalar(c, OPCODE_BUILTIN, "<i"))
+            for c in fb.tables(model, MODEL_OPCODES)]
+
+
+def op_code(fb, op, codes):
+    index = fb.scalar(op, OP_OPCODE, "<I")
+    if index >= len(codes):
+        raise Refused("input", f"{fb.where}: an operator names opcode {index} of {len(codes)}")
+    return codes[index]
+
+
 def topology(fb, model):
     """Subgraph 0's operators as (builtin code, inputs, outputs), which op makes
     each tensor, which ops read it, and its tensors' table positions."""
-    codes = [max(fb.scalar(c, OPCODE_DEPRECATED, "<b"), fb.scalar(c, OPCODE_BUILTIN, "<i"))
-             for c in fb.tables(model, MODEL_OPCODES)]
+    codes = opcodes(fb, model)
     subgraphs = fb.tables(model, MODEL_SUBGRAPHS)
     if not subgraphs:
         raise Refused("input", f"{fb.where} has no subgraph")
     ops, made_by, read_by = [], {}, {}
     for i, op in enumerate(fb.tables(subgraphs[0], SUBGRAPH_OPERATORS)):
-        index = fb.scalar(op, OP_OPCODE, "<I")
-        if index >= len(codes):
-            raise Refused("input", f"{fb.where}: an operator names opcode {index} of "
-                          f"{len(codes)}")
         ins, outs = fb.ints(op, OP_INPUTS), fb.ints(op, OP_OUTPUTS)
-        ops.append((codes[index], ins, outs))
+        ops.append((op_code(fb, op, codes), ins, outs))
         for o in outs:
             made_by[o] = i
         for t in ins:
             read_by.setdefault(t, []).append(i)
     return ops, made_by, read_by, fb.tables(subgraphs[0], SUBGRAPH_TENSORS)
+
+
+def inline_float32(fb, model, t, sizes):
+    """(buffer index, value count) of tensor table `t` when it is an inline
+    float32 constant of one of `sizes` values, else None."""
+    buffer = fb.scalar(t, TENSOR_BUFFER, "<I")
+    if fb.scalar(t, TENSOR_EXTERNAL, "<I") or not buffer:
+        return None
+    if fb.scalar(t, TENSOR_TYPE, "<b") != FLOAT32:
+        return None
+    data = buffer_data(fb, model, buffer)
+    n = 0 if data is None else data[1] // 4
+    return (buffer, n) if n in sizes else None
+
+
+def composite_constants(fb, model, sizes):
+    """Every subgraph's inline float32 constants of a norm's length that a
+    STABLEHLO_COMPOSITE reads: buffer index -> (subgraph, tensor name), the
+    first subgraph that reads it."""
+    codes = opcodes(fb, model)
+    found = {}
+    for si, sub in enumerate(fb.tables(model, MODEL_SUBGRAPHS)):
+        tensors = fb.tables(sub, SUBGRAPH_TENSORS)
+        read = set()
+        for op in fb.tables(sub, SUBGRAPH_OPERATORS):
+            if op_code(fb, op, codes) == STABLEHLO_COMPOSITE:
+                read.update(fb.ints(op, OP_INPUTS))
+        for j in sorted(read):
+            if j < 0:  # an optional input left out
+                continue
+            if j >= len(tensors):
+                raise Refused("input", f"{fb.where}: an operator in subgraph {si} reads tensor "
+                              f"{j} of {len(tensors)}")
+            hit = inline_float32(fb, model, tensors[j], sizes)
+            if hit is not None and hit[0] not in found:
+                found[hit[0]] = (si, fb.string(tensors[j], TENSOR_NAME))
+    return found
 
 
 def back_fc(fb, ops, made_by, tensors, start):
@@ -506,15 +603,11 @@ def norm_constants(fb, model, sizes):
     ops, made_by, read_by, tensors = topology(fb, model)
     found = {}
     for j, t in enumerate(tensors):
-        buffer = fb.scalar(t, TENSOR_BUFFER, "<I")
-        if fb.scalar(t, TENSOR_EXTERNAL, "<I") or not buffer:
+        hit = inline_float32(fb, model, t, sizes)
+        if hit is None or j not in read_by:
             continue
-        if fb.scalar(t, TENSOR_TYPE, "<b") != FLOAT32:
-            continue
+        buffer, n = hit
         data = buffer_data(fb, model, buffer)
-        n = 0 if data is None else data[1] // 4
-        if n not in sizes or j not in read_by:
-            continue
         for o in read_by[j]:
             if ops[o][0] != STABLEHLO_COMPOSITE:
                 continue
@@ -613,9 +706,11 @@ def find_parts(doc, where):
 def write_part(part, bits, graph, weights_in, weights_out, base, tuned, names, where):
     """Quantize the fine-tune's tensors into `graph` (a bytearray, patched in place)
     and write the new weights section to `weights_out`. Returns what the read-back
-    expects and this part's statistics."""
+    expects, this part's statistics, the folds, the HF parameters written, and
+    every (position, byte count) of `graph` patched."""
     fb, _, found = scan(graph, where)
     expected, cos_src, cos_google, folds, mapped, changed = {}, [], [], {}, {}, 0
+    patched = []
     written = 0
     with open(weights_in, "rb") as src, open(weights_out, "wb") as dst:
         for offset in sorted(found):
@@ -661,6 +756,10 @@ def write_part(part, bits, graph, weights_in, weights_out, base, tuned, names, w
             changed += int(not np.array_equal(t, b))
             del b
             t = t * fold
+            if not np.isfinite(t).all():
+                raise Refused("nonfinite", f"the fine-tune's {names[hf]} holds non-finite "
+                              "values" + (f" once multiplied by its fold {fold}" if fold != 1.0
+                                          else ""))
             codes, scales = quant_rows(t, bits)
             approx = codes.astype(np.float32) * scales[:, None]
             cos_src.append(cosine(approx, t))
@@ -669,6 +768,7 @@ def write_part(part, bits, graph, weights_in, weights_out, base, tuned, names, w
             scale_bytes = scales.astype("<f4").tobytes()
             for pos, _ in w["scales"]:
                 graph[pos:pos + 4 * rows] = scale_bytes
+                patched.append((pos, 4 * rows))
             if bits == 4:
                 data = pack_int4(codes)
                 if offset < written:
@@ -679,6 +779,7 @@ def write_part(part, bits, graph, weights_in, weights_out, base, tuned, names, w
                 new_offset = -(-written // INT8_ALIGN) * INT8_ALIGN
                 for pos in w["type_pos"]:
                     graph[pos] = INT8
+                    patched.append((pos, 1))
                 for e in w["ext_pos"]:
                     at_offset, at_length = fb.field(e, EXT_OFFSET), fb.field(e, EXT_LENGTH)
                     # An unset offset reads as 0: left so only where 0 is the new one.
@@ -687,7 +788,9 @@ def write_part(part, bits, graph, weights_in, weights_out, base, tuned, names, w
                                       "carries no field to write its new offset or length to")
                     if at_offset is not None:
                         struct.pack_into("<Q", graph, at_offset, new_offset)
+                        patched.append((at_offset, 8))
                     struct.pack_into("<Q", graph, at_length, len(data))
+                    patched.append((at_length, 8))
             dst.write(bytes(new_offset - written))
             dst.write(data)
             written = new_offset + len(data)
@@ -700,13 +803,34 @@ def write_part(part, bits, graph, weights_in, weights_out, base, tuned, names, w
              "cos_to_source_mean": float(np.mean(cos_src)), "cos_to_source_min": min(cos_src),
              "cos_to_google_mean": float(np.mean(cos_google)),
              "cos_to_google_min": min(cos_google)}
-    return expected, stats, folds
+    return expected, stats, folds, set(mapped), patched
 
 
-def read_back(part, graph, weights_path, expected, norms, where):
+def unpatched_difference(graph, original, patched):
+    """The first byte position where `graph` differs from `original` outside
+    every (position, byte count) in `patched`, or None; -1 for another length."""
+    if len(graph) != len(original):
+        return -1
+    differs = np.frombuffer(graph, np.uint8) != np.frombuffer(original, np.uint8)
+    for pos, count in patched:
+        differs[pos:pos + count] = False
+    hits = np.flatnonzero(differs)
+    return int(hits[0]) if hits.size else None
+
+
+def read_back(part, graph, weights_path, expected, norms, where, original, patched):
     """Refused unless the packed graph, scanned afresh, holds what was written:
-    every external tensor in every place, of its type, at its offset and length,
-    with its scales and its bytes; and every norm constant written."""
+    Google's graph `original`, byte for byte, outside the ranges the graft patched
+    (`patched`: type bytes, scale vectors, external offsets and lengths, norm
+    buffers); every external tensor in every place, of its type, at its offset and
+    length, with its scales and its bytes; and every norm constant written."""
+    at = unpatched_difference(graph, original, patched)
+    if at == -1:
+        raise Refused("readback", f"{where} is {len(graph)} bytes where Google's is "
+                      f"{len(original)}; the graft patches it in place")
+    if at is not None:
+        raise Refused("readback", f"{where} differs from Google's at byte {at}, which the "
+                      "graft did not write")
     fb, model, found = scan(graph, where)
     if sorted(found) != sorted(expected):
         raise Refused("readback", f"{where}: external data sits at {len(found)} offsets "
@@ -783,8 +907,11 @@ def graft(spec, T):
             raise Refused("layer_scalar", f"the fine-tune has no {k} of the base's shape")
         diff = float(np.abs(tuned.get(names[k]) - base.get(k)).max(initial=0.0))
         if diff:
+            # Nothing writes a layer_scalar into the graph, so a changed one
+            # would not reach the file.
             raise Refused("layer_scalar", f"the fine-tune changed {k} (by up to {diff:.6g}); "
-                          "it is a buffer in HF, not trained, and the graph's is the base's")
+                          "HF holds it as a buffer, which the fine-tune must leave as the "
+                          "base's")
         worst = max(worst, diff)
 
     out_dir = work / "graft"
@@ -792,37 +919,65 @@ def graft(spec, T):
     composed = json.loads(json.dumps(doc))
     sources = list(sources)
     expected, parts, folds, norms_bytes = {}, {}, {}, {}
-    placed, skipped = {}, []
+    placed, skipped, written_hf, originals, patches = {}, [], set(), {}, {}
+    sizes = set(spec["norm_sizes"])
     for part in PARTS:
         gi, wi = sections[(part, "TFLiteModel")], sections[(part, "TFLiteWeights")]
         where = f"Google's {part} graph"
         graph = bytearray(Path(doc["section"][gi]["data_path"]).read_bytes())
+        original = bytes(graph)
         if part == "text_encoder":
             fb = Flat(graph, where)
-            found = norm_constants(fb, fb.ref(0), set(spec["norm_sizes"]))
+            found = norm_constants(fb, fb.ref(0), sizes)
             placed, skipped = place_norms(found, base, layers)
+            left = {b for b, g in found.items() if not candidates(g, layers)}
+            # The norms are found in subgraph 0; one that only another subgraph
+            # reads would keep Google's value.
+            for buffer, (si, name) in sorted(composite_constants(fb, fb.ref(0), sizes).items()):
+                if buffer not in placed and buffer not in left:
+                    raise Refused("norm", f"{where}: subgraph {si}'s {name!r} (buffer "
+                                  f"{buffer}) is a norm-sized constant a STABLEHLO_COMPOSITE "
+                                  "reads, and no norm was placed on it")
         new_weights = out_dir / os.path.basename(doc["section"][wi]["data_path"])
-        expected[part], parts[part], more = write_part(
+        expected[part], parts[part], more, mapped, patched = write_part(
             part, spec["bits"][part], graph, doc["section"][wi]["data_path"], new_weights,
             base, tuned, names, where)
         folds.update(more)
+        written_hf |= mapped
         if part == "text_encoder":
             fb = Flat(graph, where)
             model = fb.ref(0)
             for buffer, k in placed.items():
                 if k not in names:
                     raise Refused("unmapped", f"the fine-tune has no tensor for {k}")
-                value = tuned.get(names[k]).astype("<f4").tobytes()
+                values = tuned.get(names[k])
+                if not np.isfinite(values).all():
+                    raise Refused("nonfinite", f"the fine-tune's {names[k]} holds non-finite "
+                                  "values")
+                value = values.astype("<f4").tobytes()
                 pos, count = buffer_data(fb, model, buffer)
                 if count != len(value):
                     raise Refused("norm", f"{k} is {len(value)} bytes and its constant {count}")
                 graph[pos:pos + count] = value
                 norms_bytes[buffer] = value
+                patched.append((pos, count))
+        originals[part], patches[part] = original, patched
         new_graph = out_dir / os.path.basename(doc["section"][gi]["data_path"])
         new_graph.write_bytes(graph)
         for i, path in ((gi, new_graph), (wi, new_weights)):
             composed["section"][i]["data_path"] = str(path)
             sources[i] = (str(path), (0, path.stat().st_size))
+
+    # A parameter the fine-tune changed that the file holds nowhere would be lost
+    # without a word.
+    kept = written_hf | set(placed.values()) | set(scalars)
+    for k in base_keys:
+        if k in kept or k not in names:
+            continue
+        if tuned.shape(names[k]) != base.shape(k) or not np.array_equal(tuned.get(names[k]),
+                                                                        base.get(k)):
+            raise Refused("unmapped", f"the fine-tune changed {k}, which the graft writes "
+                          "nowhere in Google's file")
 
     try:
         report = T.rebuild(work, composed, sources, [before_dir])
@@ -837,7 +992,8 @@ def graft(spec, T):
         graph = (after_dir / os.path.basename(after["section"][gi]["data_path"])).read_bytes()
         weights = after_dir / os.path.basename(after["section"][wi]["data_path"])
         parts[part]["types"] = read_back(part, graph, weights, expected[part],
-                                         norms_bytes if part == "text_encoder" else {}, where)
+                                         norms_bytes if part == "text_encoder" else {}, where,
+                                         originals[part], patches[part])
     rebuilt = report["rebuilt"]
     return {
         "ok": True, "rebuilt": rebuilt, "bytes": os.path.getsize(rebuilt),
@@ -873,7 +1029,8 @@ if __name__ == "__main__":
 
 class EmbeddingConvertError(Exception):
     """A graft this module will not write, and its cause: `base_sha256`,
-    `unmapped`, `norm`, `layer_scalar`, `field`, `readback`, `input` or `run`."""
+    `unmapped`, `norm`, `layer_scalar`, `nonfinite`, `field`, `readback`, `input`
+    or `run`."""
 
     def __init__(self, cause: str, message: str) -> None:
         super().__init__(message)
@@ -922,7 +1079,7 @@ def graft(
     base_safetensors: Path,
     tuned_safetensors: Path,
     out_path: Path,
-    weights: WeightMode = "int8",
+    weights: WeightMode = DEFAULT_WEIGHTS,
     *,
     events: EventStream | None = None,
     auto_provision: bool = True,
@@ -1005,19 +1162,13 @@ def graft(
                 str(report.get("cause") or "run"),
                 f"{report.get('reason') or 'the graft wrote nothing'}; nothing was written",
             )
-        rebuilt = Path(report["rebuilt"])
-        _publish(rebuilt, output)
+        digest = _publish(Path(report["rebuilt"]), output, report["sha256"])
     finally:
         leaked: list[str] = []
         shutil.rmtree(work, onerror=lambda _fn, path, _exc: leaked.append(str(path)))
         if leaked:
             logger.warning("%d scratch file(s) left under %s", len(leaked), work)
 
-    digest = hash_file(output)
-    if digest != f"sha256:{report['sha256']}":
-        raise EmbeddingConvertError(
-            "readback", f"{output} hashes to {digest}, not the {report['sha256']} packed"
-        )
     norms = report["norms"]
     return GraftResult(
         output=output,
@@ -1034,9 +1185,16 @@ def graft(
     )
 
 
-def _publish(rebuilt: Path, output: Path) -> None:
-    """Put the packed file at `output`, never over a file already there: a hard
-    link fails if the name exists, and the file appears whole (as `towers`)."""
+def _publish(rebuilt: Path, output: Path, packed_sha256: str) -> str:
+    """Put the packed file at `output` and return its digest, once it hashes to
+    the `packed_sha256` the script read back -- checked before the name exists,
+    so a mismatch leaves nothing at `output`. Never over a file already there: a
+    hard link fails if the name exists, and the file appears whole (as `towers`)."""
+    digest = hash_file(rebuilt)
+    if digest != f"sha256:{packed_sha256}":
+        raise EmbeddingConvertError(
+            "readback", f"{rebuilt.name} hashes to {digest}, not the {packed_sha256} packed"
+        )
     try:
         os.link(rebuilt, output)
     except FileExistsError:
@@ -1047,3 +1205,4 @@ def _publish(rebuilt: Path, output: Path) -> None:
         raise EmbeddingConvertError(
             "run", f"could not link the packed file to {output} ({exc})"
         ) from None
+    return digest

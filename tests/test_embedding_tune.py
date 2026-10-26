@@ -815,3 +815,147 @@ def test_embed_train_installs_where_its_pins_have_wheels():
     assert wheels.gaps(pins, machine("macosx_arm64", (3, 12))) == []
     blocked = [g.release.requirement for g in wheels.gaps(pins, machine("macosx_x86_64", (3, 12)))]
     assert "torch==2.9.1" in blocked
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: what the record binds, a rerun, the recipe's words, other devices
+# ---------------------------------------------------------------------------
+
+
+def test_the_record_carries_the_hash_of_the_training_split_tune_read(toolchain, split, tmp_path):
+    from litetune.storage import hash_file
+
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert result.record is not None
+    assert result.record.train_sha256 == hash_file(split.train)
+    on_disk = json.loads((tmp_path / "tuned" / "model" / "litetune.json").read_text())
+    assert on_disk["train_sha256"] == hash_file(split.train)
+    assert read_embedding_record(tmp_path / "tuned" / "model") == result.record
+
+
+def test_a_record_without_a_train_hash_reads_as_none(tmp_path):
+    data = _record().as_dict()
+    del data["train_sha256"]
+    (tmp_path / "litetune.json").write_text(json.dumps(data))
+    record = read_embedding_record(tmp_path)
+    assert record is not None and record.train_sha256 is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("train_sha256", 7, "train_sha256"),
+        ("rows", {"train": 10, "heldout": True}, "heldout"),
+        ("rows", {"train": 10.5, "heldout": 4}, "train"),
+        ("labels", ["a", "a"], "repeats"),
+        ("steps_done", 5, "steps_done"),
+    ],
+)
+def test_a_record_that_contradicts_itself_is_refused(tmp_path, key, value, message):
+    data = _record(steps_planned=4).as_dict()
+    data[key] = value
+    (tmp_path / "litetune.json").write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=message):
+        read_embedding_record(tmp_path)
+
+
+def test_a_failed_rerun_into_the_same_directory_leaves_no_old_record(toolchain, split, tmp_path):
+    first = run_embedding_tune(_request(split, tmp_path))
+    record_path = tmp_path / "tuned" / "model" / "litetune.json"
+    assert first.ok and record_path.is_file()
+
+    toolchain.returncode = 1
+    toolchain.stderr = "Traceback: ValueError: boom"
+    second = run_embedding_tune(_request(split, tmp_path))
+    assert second.outcome is Outcome.FAILED
+    assert not record_path.exists()
+    assert read_embedding_record(tmp_path / "tuned" / "model") is None
+
+
+def test_the_recipes_schedule_text_is_derived_from_its_fraction():
+    from litetune.embedding_tune import Recipe
+
+    assert "10%" in RECIPE.schedule
+    other = Recipe(warmup_fraction=0.25)
+    assert "25%" in other.schedule and "10%" not in other.schedule
+    assert other.as_dict()["schedule"] == other.schedule
+
+
+@pytest.mark.parametrize("device", ["cuda", "mps"])
+def test_a_run_off_the_cpu_records_that_the_recipe_was_measured_on_the_cpu(
+    toolchain, split, tmp_path, device
+):
+    toolchain.probe_device = device
+    if device == "cuda":
+        toolchain.probe_fields = {"cuda_build": "12.8", "device_count": 1}
+    result = run_embedding_tune(_request(split, tmp_path))
+    texts = [t for t in result.limitations if "measured in float32 on the CPU only" in t]
+    assert len(texts) == 1 and device in texts[0]
+    assert 'MEASUREMENTS.md, "EmbeddingGemma 2: many labels"' in texts[0]
+
+
+def test_a_cpu_run_makes_no_such_limitation(toolchain, split, tmp_path):
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert not [t for t in result.limitations if "CPU only" in t]
+
+
+def test_a_device_the_script_chose_is_noted_from_its_metrics(toolchain, split, tmp_path):
+    toolchain.probe_device = None
+    toolchain.probe_fields = {}
+    toolchain.metrics_overrides = {"device": "cuda"}
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert any("trained on cuda" in t for t in result.limitations)
+
+
+def test_metrics_with_another_prefix_than_given_are_a_failure(toolchain, split, tmp_path):
+    toolchain.metrics_overrides = {"prefix": "task: classification | query: "}
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert result.outcome is Outcome.FAILED
+    assert result.record is None
+    assert "task: classification" in _check(result, TRAINING_CHECK).detail
+    assert not (tmp_path / "tuned" / "model" / "litetune.json").exists()
+
+
+def test_the_script_embeds_every_text_with_the_deciders_prefix():
+    assert "st.tokenize([prefix + t for t in texts])" in _EMBED_TRAIN_SCRIPT
+    assert 'prefix = spec["prefix"]' in _EMBED_TRAIN_SCRIPT
+    # Both the training and the held-out pass go through `embed`.
+    assert _EMBED_TRAIN_SCRIPT.count("embed([r[") == 2
+    assert 'prefix_refusal(st.prompts, spec["prompt_name"], spec["prefix"])' in _EMBED_TRAIN_SCRIPT
+
+
+def test_a_stale_complete_metrics_file_is_not_read_as_this_run(toolchain, split, tmp_path):
+    out = tmp_path / "tuned"
+    out.mkdir()
+    stale = {
+        "base_model": EMBEDDING_MODEL,
+        "base_model_revision": EMBEDDING_REVISION,
+        "prefix": DECIDER_PREFIX,
+        "labels": sorted(OPTIONS),
+        "rows": {"train": 20, "heldout": 6},
+        "steps_done": 6,
+        "steps_planned": 6,
+        "train_seconds": 1.0,
+        "device": "cpu",
+        "dtype": "float32",
+        "head_heldout_accuracy": 0.9,
+        "mps_environment": None,
+    }
+    (out / "embed_metrics.json").write_text(json.dumps(stale))
+    toolchain.write_metrics = False
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert result.outcome is Outcome.FAILED
+    assert result.record is None
+    assert "no readable metrics" in _check(result, TRAINING_CHECK).detail
+    assert "no metrics file" in _check(result, TRAINING_CHECK).detail
+
+
+def test_a_row_whose_prompt_is_the_bare_question_has_no_state_and_is_refused(
+    toolchain, split, tmp_path
+):
+    bare = _decision().render("")
+    split.train.write_text(
+        json.dumps({"prompt": bare, "completion": "refund", "source_line": 1}) + "\n"
+    )
+    with pytest.raises(EmbeddingTuneError, match=r"train\.jsonl:1.*not a state"):
+        run_embedding_tune(_request(split, tmp_path))

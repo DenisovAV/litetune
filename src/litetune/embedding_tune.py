@@ -9,8 +9,8 @@ SentenceTransformer is kept: `convert` grafts its text tower into Google's
 `.litertlm` (`embedding_convert`).
 
 **The recipe is the measured one, and takes no overrides** (`RECIPE`). It is
-`train_s5.py` of lora_project `measurements/2026-10-25-eg2-many-labels/`, which is
-s3/s4's recipe of `measurements/2026-10-22-eg2-graft/`: the whole model trained
+the one measured (MEASUREMENTS.md, "EmbeddingGemma 2: many labels"), which is
+the graft measurement's (MEASUREMENTS.md, "EmbeddingGemma 2: the graft"): the whole model trained
 with a Linear(768,256)-GELU-Linear(256,K) head on the sentence embedding,
 cross-entropy + Brier, AdamW at 2e-5 (head 1e-3) with no weight decay, batch 8,
 2 epochs, 10% linear warmup then linear decay, seed 0, at most 128 tokens,
@@ -55,6 +55,7 @@ from litetune.embedding_convert import BASE_MODEL, BASE_REVISION
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.prepare import PrepareError, Row, read_rows
+from litetune.storage import hash_file
 from litetune.tune import (
     _GPU_FAILURE_RE,
     DEFAULT_TIMEOUT_S,
@@ -81,6 +82,9 @@ EMBEDDING_MODEL_TYPE = "embedding_gemma2"
 # script refuses a checkpoint whose prompt of that name is another text.
 PROMPT_NAME = "SentenceSimilarity"
 DECIDER_PREFIX = "task: sentence similarity | query: "
+
+# The one device the recipe was measured on.
+MEASURED_DEVICE = "cpu"
 
 MODEL_CHECK = "embedding model"
 DATA_CHECK = "decision rows"
@@ -127,7 +131,14 @@ class Recipe:
     eval_batch_size: int = 64
     dtype: str = "float32"
     loss: str = "cross_entropy + brier"
-    schedule: str = "linear warmup over the first 10% of steps, then linear decay to 0"
+
+    @property
+    def schedule(self) -> str:
+        """The learning-rate schedule in words, from the fraction the script is given."""
+        return (
+            f"linear warmup over the first {self.warmup_fraction:.0%} of steps, "
+            "then linear decay to 0"
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -566,6 +577,9 @@ class EmbeddingRecord:
     recipe: Mapping[str, Any]
     decision: Mapping[str, Any]
     decision_sha256: str
+    # `storage.hash_file` of the training split tune read; `None` in a record
+    # that does not carry it. `verify` compares it with the split it is given.
+    train_sha256: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -585,6 +599,7 @@ class EmbeddingRecord:
             "recipe": dict(self.recipe),
             "decision": dict(self.decision),
             "decision_sha256": self.decision_sha256,
+            "train_sha256": self.train_sha256,
         }
 
     @classmethod
@@ -618,6 +633,19 @@ class EmbeddingRecord:
         labels = data["labels"]
         if not all(isinstance(label, str) for label in labels):
             raise ValueError(f"{where}: 'labels' holds a label that is not a string: {labels!r}")
+        if len(set(labels)) != len(labels):
+            raise ValueError(f"{where}: 'labels' repeats a label: {labels!r}")
+        for name, count in data["rows"].items():
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise ValueError(f"{where}: 'rows' has {name!r}: {count!r}, which is not an int")
+        if data["steps_done"] > data["steps_planned"]:
+            raise ValueError(
+                f"{where}: 'steps_done' {data['steps_done']} is more than 'steps_planned' "
+                f"{data['steps_planned']}"
+            )
+        train_sha256 = data.get("train_sha256")
+        if train_sha256 is not None and not isinstance(train_sha256, str):
+            raise ValueError(f"{where}: 'train_sha256' is {train_sha256!r}, which is not a str")
         return cls(
             base_model=data["base_model"],
             base_model_revision=data["base_model_revision"],
@@ -634,6 +662,7 @@ class EmbeddingRecord:
             recipe=dict(data["recipe"]),
             decision=dict(data["decision"]),
             decision_sha256=data["decision_sha256"],
+            train_sha256=train_sha256,
         )
 
 
@@ -670,9 +699,7 @@ def model_dir_hint(path: str | Path) -> str:
         return ""
     if record is None:
         return ""
-    return (
-        f" -- {Path(path) / 'model'} is: `tune` writes the model to model/ in its output directory"
-    )
+    return f"; {Path(path) / 'model'} is the model directory, where `tune` writes it"
 
 
 @dataclass
@@ -800,6 +827,16 @@ def _write_rows(path: Path, rows: Sequence[LabelledText]) -> None:
     )
 
 
+def _note_unmeasured_device(result: EmbeddingTuneResult, device: str) -> None:
+    """Record as a limitation that `device` is not the one the recipe was measured on."""
+    if device != MEASURED_DEVICE:
+        result.limitation(
+            "the recipe was measured in float32 on the CPU only (MEASUREMENTS.md, "
+            '"EmbeddingGemma 2: many labels"); this run trained on '
+            f"{device}, a device nothing measured the recipe on"
+        )
+
+
 def _finish(
     result: EmbeddingTuneResult, events: EventStream, check: Check, attempted: bool
 ) -> EmbeddingTuneResult:
@@ -819,6 +856,7 @@ def run_embedding_tune(
 
     # -- the request and its rows, before the environment is touched --------
     decision, train, heldout, labels = _check_request(request)
+    train_sha256 = hash_file(request.data)
 
     events.stage_started("train", model=request.model, direction=DIRECTION)
     result = EmbeddingTuneResult(
@@ -893,6 +931,8 @@ def run_embedding_tune(
         result.limitation(probe.detail)
         events.note(probe.detail, device=probe.device, source=probe.source)
     result.host = devices.host_record(probe)
+    if probe.answered and probe.device is not None:
+        _note_unmeasured_device(result, probe.device)
 
     child_env: dict[str, str] | None = None
     if probe.device == "mps":
@@ -944,6 +984,9 @@ def run_embedding_tune(
     )
     # A previous attempt's metrics would be read as this one's.
     metrics_out.unlink(missing_ok=True)
+    # Likewise a previous run's record: if this run fails after the script
+    # overwrote the weights, the old record would sit beside weights it does not describe.
+    (request.model_dir / models.PROVENANCE_NAME).unlink(missing_ok=True)
 
     events.note(
         f"training {request.model} on {len(train)} rows, {len(labels)} options",
@@ -1084,6 +1127,9 @@ def run_embedding_tune(
         )
         if mismatch is not None:
             result.limitation(mismatch)
+    device_reported = result.metrics.get("device")
+    if isinstance(device_reported, str):
+        _note_unmeasured_device(result, device_reported)
 
     try:
         record = EmbeddingRecord.from_dict(
@@ -1104,6 +1150,7 @@ def run_embedding_tune(
                 "recipe": RECIPE.as_dict(),
                 "decision": decision.as_dict(),
                 "decision_sha256": decision.digest(),
+                "train_sha256": train_sha256,
             },
             str(metrics_out),
         )

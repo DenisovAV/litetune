@@ -114,8 +114,8 @@ data_path = "Section5_TFLiteWeights_tf_lite_text_encoder.weight"
 
 # -- a flatbuffer, written by hand, every patched position recorded ---------------
 
-SCALARS = {"i8": "<b", "u32": "<I", "i32": "<i", "u64": "<Q"}
-VECTORS = {"ints": "<i4", "floats": "<f4", "bytes": "u1"}
+SCALARS = {"i8": "<b", "u8": "<B", "u32": "<I", "i32": "<i", "u64": "<Q"}
+VECTORS = {"ints": "<i4", "longs": "<i8", "floats": "<f4", "bytes": "u1"}
 
 
 def flatbuffer(root: tuple) -> tuple[bytes, dict[str, int]]:
@@ -179,11 +179,16 @@ def flatbuffer(root: tuple) -> tuple[bytes, dict[str, int]]:
 
 
 def tensor(name: str, shape: list[int], *, type_: int | None = None, buffer: int = 0,
-           scales: Any = None, ext: int = 0, label: str = "") -> tuple:  # fmt: skip
+           scales: Any = None, ext: int = 0, label: str = "",
+           quant_more: Sequence[Any] = ()) -> tuple:  # fmt: skip
     """A Tensor table: shape, type, buffer, name, quantization, then
-    external_buffer as the eleventh field."""
+    external_buffer as the eleventh field. QuantizationParameters is min, max,
+    scale, then `quant_more`: zero_point, details_type, details,
+    quantized_dimension, in schema order."""
     quant = (
-        None if scales is None else ("table", [None, None, ("floats", scales, label + ":scale")])
+        None
+        if scales is None
+        else ("table", [None, None, ("floats", scales, label + ":scale"), *quant_more])
     )
     fields: list[Any] = [
         ("ints", shape),
@@ -325,11 +330,17 @@ class Google:
 
 def google_file(base: dict[str, Any], *, rename: dict[str, str] | None = None,
                 scale_pmp: float = FOLD, drop_composite: str | None = None,
-                without_length: str | None = None) -> Google:  # fmt: skip
+                without_length: str | None = None, types: dict[str, int] | None = None,
+                short_scales: str | None = None,
+                sub1_composite: str | None = None) -> Google:  # fmt: skip
     """Both graphs and their weights. `rename` gives a graph tensor another
     name; `scale_pmp` is the constant folded into per_layer_model_projection;
     `drop_composite` leaves the norm of that name unread by any composite;
-    `without_length` leaves that tensor's external buffer without a length."""
+    `without_length` leaves that tensor's external buffer without a length;
+    `types` gives an encoder tensor another type in both subgraphs;
+    `short_scales` gives that encoder tensor one scale too few in subgraph 1;
+    `sub1_composite` has a composite in subgraph 1 read a norm-sized constant:
+    in a buffer of its own ("own"), or in the buffer of that norm's constant."""
     rng = np.random.default_rng(7)
     graphs, weights, marks, tensors = {}, {}, {}, {}
 
@@ -380,13 +391,15 @@ def google_file(base: dict[str, Any], *, rename: dict[str, str] | None = None,
     buffers: list[tuple] = [("table", [])]
     constants: dict[str, Any] = {}
     index: dict[str, int] = {}
+    types = types or {}
     for i, (name, _, shape, _, _, scales) in enumerate(placed):
         index[name] = len(sub0)
-        sub0.append(tensor(name, list(shape), type_=INT4, scales=scales, ext=i + 1,
-                           label=f"0:{name}"))  # fmt: skip
+        sub0.append(tensor(name, list(shape), type_=types.get(name, INT4), scales=scales,
+                           ext=i + 1, label=f"0:{name}"))  # fmt: skip
 
     v_norms = [f"v_norm.{layer}" for layer in range(LAYERS)]
     near = dict(base, **{v: np.full(HEAD, 0.5, np.float32) for v in v_norms})
+    buffer_of: dict[str, int] = {}
 
     def constant(norm: str) -> int:
         """A norm constant near the base's value, in a buffer of its own."""
@@ -394,6 +407,7 @@ def google_file(base: dict[str, Any], *, rename: dict[str, str] | None = None,
         value = (near[norm] + rng.normal(0, 0.01, near[norm].shape)).astype(np.float32)
         constants[cname] = value
         buffers.append(("table", [("bytes", value.view(np.uint8), cname)]))
+        buffer_of[norm] = len(buffers) - 1
         sub0.append(tensor(cname, [value.size], buffer=len(buffers) - 1))
         return len(sub0) - 1
 
@@ -441,15 +455,32 @@ def google_file(base: dict[str, Any], *, rename: dict[str, str] | None = None,
 
     # Subgraph 1: the same weights, scale vectors of its own.
     sub1 = [
-        tensor(name, list(shape), type_=INT4, scales=scales, ext=i + 1, label=f"1:{name}")
+        tensor(
+            name,
+            list(shape),
+            type_=types.get(name, INT4),
+            scales=scales[:-1] if name == short_scales else scales,
+            ext=i + 1,
+            label=f"1:{name}",
+        )
         for i, (name, _, shape, _, _, scales) in enumerate(placed)
     ]
+    ops1: list[tuple] = []
+    if sub1_composite is not None:
+        if sub1_composite == "own":
+            buffers.append(("table", [("bytes", np.ones(HIDDEN, np.float32).view(np.uint8))]))
+            shared = len(buffers) - 1
+        else:
+            shared = buffer_of[sub1_composite]
+        sub1.append(tensor("sub1/constant", [HIDDEN], buffer=shared))
+        sub1.append(tensor("sub1/out", [1, HIDDEN]))
+        ops1.append(operator(COMPOSITE, [len(sub1) - 2], [len(sub1) - 1]))
     ext = [
         external(i + 1, offset, length, name, with_length=name != without_length)
         for i, (name, _, _, offset, length, _) in enumerate(placed)
     ]
     graphs["text_encoder"], marks["text_encoder"] = flatbuffer(
-        model([subgraph(sub0, ops), subgraph(sub1)], buffers, ext, OPCODES)
+        model([subgraph(sub0, ops), subgraph(sub1, ops1)], buffers, ext, OPCODES)
     )
     return Google(graphs, weights, marks, tensors, {which[k]: v for k, v in constants.items()})
 
@@ -487,6 +518,7 @@ class FakeToolchain:
     """`StageEnv.run`: the graft script, run for real against the fake builder."""
 
     pack_alters_encoder: bool = False
+    corrupt_rebuilt: bool = False
     calls: list[list[str]] = field(default_factory=list)
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
@@ -515,13 +547,20 @@ class FakeToolchain:
         (dist / "METADATA").write_text(
             "Metadata-Version: 2.1\nName: litert-lm-builder\nVersion: 0.18.0\n"
         )
-        return subprocess.run(
+        proc = subprocess.run(
             [sys.executable, script, spec, result],
             capture_output=True,
             text=True,
             timeout=timeout,
             env={**os.environ, "PYTHONPATH": str(shim)},
         )
+        if self.corrupt_rebuilt:
+            # The packed file changes after the script hashed it.
+            rebuilt = Path(json.loads(Path(result).read_text(encoding="utf-8"))["rebuilt"])
+            data = bytearray(rebuilt.read_bytes())
+            data[-1] ^= 1
+            rebuilt.write_bytes(data)
+        return proc
 
 
 @pytest.fixture
@@ -554,8 +593,9 @@ def case(tmp_path, monkeypatch) -> Case:
 
 
 def make_case(tmp_path: Path, monkeypatch, tuned: dict[str, Any] | None = None,
-              tuned_prefix: str = "", **google_kwargs) -> Case:  # fmt: skip
-    base = base_checkpoint()
+              tuned_prefix: str = "", base: dict[str, Any] | None = None,
+              **google_kwargs) -> Case:  # fmt: skip
+    base = base_checkpoint() if base is None else base
     tuned = fine_tune(base) if tuned is None else tuned
     google = google_file(base, **google_kwargs)
     path = bundle(tmp_path / "embeddinggemma-2-text-270m.litertlm", google)
@@ -743,8 +783,9 @@ def test_a_parameter_the_fine_tune_lacks_is_refused(toolchain, tmp_path, monkeyp
     refused(case, tmp_path / "o.litertlm", "unmapped", r"layers\.1\.mlp\.up_proj")
 
 
-def test_a_fold_that_is_not_a_power_of_two_is_refused(toolchain, tmp_path, monkeypatch):
-    case = make_case(tmp_path, monkeypatch, scale_pmp=0.3)
+@pytest.mark.parametrize("scale", [0.3, -FOLD])
+def test_a_fold_that_is_not_a_power_of_two_is_refused(toolchain, tmp_path, monkeypatch, scale):
+    case = make_case(tmp_path, monkeypatch, scale_pmp=scale)
     refused(case, tmp_path / "o.litertlm", "unmapped", "not a power of two")
 
 
@@ -758,7 +799,12 @@ def test_a_changed_layer_scalar_is_refused(toolchain, tmp_path, monkeypatch):
     tuned = fine_tune(base_checkpoint())
     tuned[f"{P}layers.1.layer_scalar"] = tuned[f"{P}layers.1.layer_scalar"] + 1e-3
     case = make_case(tmp_path, monkeypatch, tuned=tuned)
-    refused(case, tmp_path / "o.litertlm", "layer_scalar", r"layers\.1\.layer_scalar")
+    refused(
+        case,
+        tmp_path / "o.litertlm",
+        "layer_scalar",
+        r"layers\.1\.layer_scalar .*HF holds it as a buffer, which the fine-tune must leave",
+    )
 
 
 def test_an_external_buffer_without_a_length_is_refused_for_int8(toolchain, tmp_path, monkeypatch):
@@ -787,6 +833,113 @@ def test_an_unknown_weight_mode_is_refused_before_anything_runs(toolchain, case,
     assert toolchain.calls == []
 
 
+def test_the_default_weight_mode_is_convert_s(toolchain, case, tmp_path):
+    out = tmp_path / "o.litertlm"
+    result = graft(envs.EXPORT, case.path, case.base_file, case.tuned_file, out)
+    assert result.weights == embedding_convert.DEFAULT_WEIGHTS == "int4"
+    assert result.parts["text_encoder"]["types"] == [INT4]
+
+
+def test_a_packed_file_that_hashes_otherwise_is_not_left_at_the_output(toolchain, case, tmp_path):
+    toolchain.corrupt_rebuilt = True
+    refused(case, tmp_path / "o.litertlm", "readback", "hashes to sha256:")
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf])
+def test_a_non_finite_weight_is_refused_by_name(toolchain, tmp_path, monkeypatch, value):
+    tuned = fine_tune(base_checkpoint())
+    name = f"{P}layers.0.self_attn.q_proj.weight"
+    tuned[name][2, 3] = value
+    case = make_case(tmp_path, monkeypatch, tuned=tuned)
+    refused(case, tmp_path / "o.litertlm", "nonfinite", re.escape(f"{name} holds non-finite"))
+
+
+def test_a_non_finite_norm_is_refused_by_name(toolchain, tmp_path, monkeypatch):
+    tuned = fine_tune(base_checkpoint())
+    name = norm_names(1)["post_ff"]
+    tuned[name][0] = np.inf
+    case = make_case(tmp_path, monkeypatch, tuned=tuned)
+    refused(case, tmp_path / "o.litertlm", "nonfinite", re.escape(f"{name} holds non-finite"))
+
+
+def test_a_norm_with_no_constant_is_refused(toolchain, tmp_path, monkeypatch):
+    # q_norm has one candidate; with no composite reading its constant, nothing is
+    # placed on it, and no set comes up short.
+    q_norm = norm_names(0)["q"]
+    case = make_case(tmp_path, monkeypatch, drop_composite=q_norm)
+    match = re.escape(f"no norm constant in the encoder graph was placed for {q_norm}")
+    refused(case, tmp_path / "o.litertlm", "norm", match)
+
+
+def test_a_norm_constant_only_another_subgraph_reads_is_refused(toolchain, tmp_path, monkeypatch):
+    case = make_case(tmp_path, monkeypatch, sub1_composite="own")
+    refused(case, tmp_path / "o.litertlm", "norm", r"subgraph 1's 'sub1/constant' \(buffer \d+\)")
+
+
+@pytest.mark.parametrize("norm", [P + "norm.weight", "v_norm.0"])
+def test_a_norm_constant_another_subgraph_shares_is_fine(toolchain, tmp_path, monkeypatch, norm):
+    case = make_case(tmp_path, monkeypatch, sub1_composite=norm)
+    assert run(case, tmp_path / "o.litertlm").norms_written == 7 * LAYERS + 2
+
+
+def test_a_parameter_changed_and_written_nowhere_is_refused(toolchain, tmp_path, monkeypatch):
+    base = base_checkpoint()
+    base[P + "extra.bias"] = bf16(np.ones(COLS))
+    tuned = fine_tune(base)
+    case = make_case(tmp_path, monkeypatch, tuned=tuned, base=base)
+    refused(case, tmp_path / "o.litertlm", "unmapped", re.escape(f"changed {P}extra.bias,"))
+
+
+def test_a_parameter_written_nowhere_but_unchanged_is_fine(toolchain, tmp_path, monkeypatch):
+    base = base_checkpoint()
+    base[P + "extra.bias"] = bf16(np.ones(COLS))
+    tuned = fine_tune(base)
+    tuned[P + "extra.bias"] = base[P + "extra.bias"]
+    case = make_case(tmp_path, monkeypatch, tuned=tuned, base=base)
+    assert run(case, tmp_path / "o.litertlm").output.is_file()
+
+
+def test_a_tensor_not_of_int4_is_refused(toolchain, tmp_path, monkeypatch):
+    name = "text_encoder/layer_0/mlp/linear/w;fused"
+    case = make_case(tmp_path, monkeypatch, types={name: INT8})
+    refused(case, tmp_path / "o.litertlm", "input", re.escape(f"{name!r} is of type [{INT8}, "))
+
+
+def test_a_scale_vector_of_another_length_is_refused(toolchain, tmp_path, monkeypatch):
+    name = "text_encoder/layer_1/attn/k_einsum/w;fused"
+    case = make_case(tmp_path, monkeypatch, short_scales=name)
+    refused(
+        case,
+        tmp_path / "o.litertlm",
+        "field",
+        re.escape(f"{name!r} has a scale vector of {ROWS - 1} values for its {ROWS} rows"),
+    )
+
+
+def test_two_tensors_that_map_to_one_parameter_are_refused(toolchain, tmp_path, monkeypatch):
+    # The PLE gate, after mlp.up_proj in the weights, renamed to read as it.
+    gate = "text_encoder/layer_1/ple/per_layer_embedding_gate/w;fused"
+    case = make_case(
+        tmp_path, monkeypatch, rename={gate: "text_encoder/layer_1/mlp/gating_einsum2/w;other"}
+    )
+    refused(
+        case, tmp_path / "o.litertlm", "unmapped", re.escape(f"both map to {P}layers.1.mlp.up_proj")
+    )
+
+
+def test_a_fine_tune_tensor_of_another_shape_is_refused(toolchain, tmp_path, monkeypatch):
+    tuned = fine_tune(base_checkpoint())
+    name = f"{P}layers.1.self_attn.v_proj.weight"
+    tuned[name] = tuned[name].T.copy()
+    case = make_case(tmp_path, monkeypatch, tuned=tuned)
+    refused(
+        case,
+        tmp_path / "o.litertlm",
+        "unmapped",
+        re.escape(f"the fine-tune's {[COLS, ROWS]}"),
+    )
+
+
 # -- the script's parts -----------------------------------------------------------
 
 
@@ -804,20 +957,87 @@ def test_the_scale_search_clips_an_outlier_row_and_never_loses_to_absmax(bits):
     w[0, 0] = 40.0
     codes, scales = SCRIPT["quant_rows"](w, bits)
     qmax = 2 ** (bits - 1) - 1
+    qmin = -qmax if bits == 8 else -qmax - 1
     amax = np.abs(w).max(axis=1) / qmax
-    assert codes.dtype == np.int8 and codes.min() >= -qmax - 1 and codes.max() <= qmax
+    assert codes.dtype == np.int8 and codes.min() >= qmin and codes.max() <= qmax
 
     def err(s: Any) -> Any:
-        q = np.clip(np.round(w / s[:, None]), -qmax - 1, qmax)
+        q = np.clip(np.round(w / s[:, None]), qmin, qmax)
         return ((q * s[:, None] - w) ** 2).sum(axis=1)
 
     assert np.all(err(scales) <= err(amax))
     assert scales[0] < amax[0] if bits == 4 else scales[0] == amax[0]
-    assert np.array_equal(codes, np.clip(np.round(w / scales[:, None]), -qmax - 1, qmax))
+    assert np.array_equal(codes, np.clip(np.round(w / scales[:, None]), qmin, qmax))
     # Every scale is absmax times one of the search ratios.
     ratios = SCRIPT["search_ratios"](bits)
     for row in range(6):
         assert np.isclose(scales[row] / amax[row], ratios, rtol=1e-6).any()
+
+
+def test_int8_codes_stay_within_127():
+    # Random rows: with -128 allowed, the search picks it in 538 of these 2,000.
+    w = np.random.default_rng(0).normal(size=(2000, 8)).astype(np.float32)
+    codes, _ = SCRIPT["quant_rows"](w, 8)
+    assert codes.min() == -127 and codes.max() == 127
+    codes, _ = SCRIPT["quant_rows"](w, 4)
+    assert codes.min() == -8 and codes.max() == 7
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+def test_the_quantizer_refuses_a_non_finite_value(value):
+    w = np.ones((3, 4), np.float32)
+    w[1, 2] = value
+    with pytest.raises(SCRIPT["Refused"], match="non-finite") as info:
+        SCRIPT["quant_rows"](w, 4)
+    assert info.value.cause == "nonfinite"
+
+
+def test_the_search_ratios_are_graft_s2s():
+    # graft_s2.py (MEASUREMENTS.md, "EmbeddingGemma 2: the graft"), quant_rows:
+    # lo = 0.3 if bits == 4 else 0.6; torch.linspace(lo, 1.0, 141).
+    for bits, lo in ((4, 0.3), (8, 0.6)):
+        ratios = SCRIPT["search_ratios"](bits)
+        assert ratios.dtype == np.float32 and len(ratios) == 141
+        assert ratios[0] == np.float32(lo) and ratios[-1] == np.float32(1.0)
+        assert np.allclose(np.diff(ratios), (1.0 - lo) / 140, rtol=1e-4)
+
+
+def scan_one(**quant: Any) -> None:
+    """`scan` on a graph of one external int4 tensor whose quantization carries
+    `quant`: zero_point, details_type, details, quantized_dimension."""
+    fields = [quant.get(k) for k in ("zero_point", "details_type", "details", "dimension")]
+    graph, _ = flatbuffer(
+        model(
+            [
+                subgraph(
+                    [tensor("w", [2, 4], type_=INT4, scales=[1.0, 1.0], ext=1, quant_more=fields)]
+                )
+            ],
+            [("table", [])],
+            [external(1, 0, 4, "w")],
+        )
+    )
+    SCRIPT["scan"](graph, "g")
+
+
+def test_scan_takes_per_row_scales_with_a_zero_zero_point():
+    scan_one()
+    scan_one(zero_point=("longs", [0, 0]), dimension=("i32", 0))
+
+
+@pytest.mark.parametrize(
+    ("quant", "match"),
+    [
+        ({"dimension": ("i32", 1)}, "quantized along dimension 1"),
+        ({"zero_point": ("longs", [0, 3])}, "non-zero zero point"),
+        ({"details_type": ("u8", 1)}, "carries quantization details"),
+        ({"details": ("table", [])}, "carries quantization details"),
+    ],
+)
+def test_scan_refuses_another_quantization(quant, match):
+    with pytest.raises(SCRIPT["Refused"], match=f"tensor 'w' in subgraph 0 .*{match}") as info:
+        scan_one(**quant)
+    assert info.value.cause == "input"
 
 
 def test_rows_are_quantized_alike_in_one_block_or_many(monkeypatch):
@@ -843,7 +1063,30 @@ def test_a_safetensors_tensor_past_the_end_is_refused(tmp_path):
         SCRIPT["Safetensors"](str(path), "w")
 
 
-def test_the_read_back_refuses_a_scale_vector_that_differs(tmp_path):
+@dataclass
+class Written:
+    """`write_part` run on the made-up encoder graph, at int8, with no norms."""
+
+    google: Google
+    graph: bytearray
+    weights: Path
+    expected: dict[int, Any]
+    patched: list[tuple[int, int]]
+
+    def read_back(self, graph: bytes, norms: dict[int, bytes] | None = None) -> Any:
+        return SCRIPT["read_back"](
+            "text_encoder",
+            graph,
+            str(self.weights),
+            self.expected,
+            norms or {},
+            "g",
+            self.google.graphs["text_encoder"],
+            self.patched,
+        )
+
+
+def write_encoder(tmp_path: Path) -> Written:
     base = base_checkpoint()
     google = google_file(base)
     weights_in = tmp_path / "in.weight"
@@ -852,13 +1095,48 @@ def test_the_read_back_refuses_a_scale_vector_that_differs(tmp_path):
     graph = bytearray(google.graphs["text_encoder"])
     names = {k: k for k in store.keys()}
     out = tmp_path / "w.bin"
-    expected, _, _ = SCRIPT["write_part"](
+    expected, _, _, mapped, patched = SCRIPT["write_part"](
         "text_encoder", 8, graph, str(weights_in), str(out), store, store, names, "g"
     )
-    assert SCRIPT["read_back"]("text_encoder", bytes(graph), str(out), expected, {}, "g") == [INT8]
+    assert mapped == {hf for hf, _, _, _ in google.tensors["text_encoder"].values()}
+    return Written(google, graph, out, expected, patched)
+
+
+def test_the_read_back_refuses_a_scale_vector_that_differs(tmp_path):
+    w = write_encoder(tmp_path)
+    assert w.read_back(bytes(w.graph)) == [INT8]
     name = "text_encoder/layer_1/attn/q_einsum/w;fused"
-    graph[google.marks["text_encoder"][f"1:{name}:scale"]] ^= 1
+    w.graph[w.google.marks["text_encoder"][f"1:{name}:scale"]] ^= 1
     with pytest.raises(
         SCRIPT["Refused"], match=re.escape(f"{name!r} reads back with other scales")
     ):
-        SCRIPT["read_back"]("text_encoder", bytes(graph), str(out), expected, {}, "g")
+        w.read_back(bytes(w.graph))
+
+
+def test_the_read_back_refuses_a_byte_the_graft_did_not_write(tmp_path):
+    w = write_encoder(tmp_path)
+    # A byte of a tensor's name: no patch covers it, and the scan does not read it.
+    name = "text_encoder/layer_1/attn/q_einsum/w;fused"
+    at = bytes(w.graph).index(name.encode()) + 5
+    w.graph[at] ^= 1
+    with pytest.raises(SCRIPT["Refused"], match=f"differs from Google's at byte {at},"):
+        w.read_back(bytes(w.graph))
+
+
+def test_the_read_back_refuses_a_graph_of_another_length(tmp_path):
+    w = write_encoder(tmp_path)
+    with pytest.raises(SCRIPT["Refused"], match="patches it in place"):
+        w.read_back(bytes(w.graph) + bytes(8))
+
+
+def test_the_read_back_refuses_a_norm_buffer_that_differs_from_what_was_written(tmp_path):
+    w = write_encoder(tmp_path)
+    marks = w.google.marks["text_encoder"]
+    # arith.constant0 sits in buffer 1, the first after the empty buffer 0.
+    pos, value = marks["arith.constant0"], np.ones(HIDDEN, np.float32).tobytes()
+    w.graph[pos : pos + len(value)] = value
+    w.patched.append((pos, len(value)))
+    assert w.read_back(bytes(w.graph), {1: value}) == [INT8]
+    w.graph[pos] ^= 1
+    with pytest.raises(SCRIPT["Refused"], match="norm buffer 1 reads back with other bytes"):
+        w.read_back(bytes(w.graph), {1: value})

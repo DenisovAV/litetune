@@ -317,7 +317,8 @@ def gaps(
 # ---------------------------------------------------------------------------
 # What PyPI lists for every pin in `envs.RUNTIME`, `envs.EXPORT`, `envs.TRAIN`
 # and `envs.EMBED_TRAIN`, and for every `==` requirement behind one. Read from
-# the URL in each entry on 2026-10-12, and `envs.EMBED_TRAIN`'s on 2026-10-25.
+# the URL in each entry on 2026-10-12, and `envs.EMBED_TRAIN`'s on 2026-10-25
+# and 2026-10-26.
 # To read a new pin in: its `urls[].filename`, sorted,
 # and the entries of `info.requires_dist` that are `name==version` with no `;`.
 # ---------------------------------------------------------------------------
@@ -816,6 +817,70 @@ _RELEASES = (
             "pillow-12.3.0-pp311-pypy311_pp73-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
             "pillow-12.3.0-pp311-pypy311_pp73-win_amd64.whl",
             "pillow-12.3.0.tar.gz",
+        ),
+    ),
+    # The rest of the closure the graft was measured with
+    # (MEASUREMENTS.md, "EmbeddingGemma 2: the graft"), read from the URL in each
+    # entry on 2026-10-26.
+    Release(
+        "tokenizers==0.23.3",
+        "https://pypi.org/pypi/tokenizers/0.23.3/json",
+        files=(
+            "tokenizers-0.23.3-cp310-abi3-macosx_10_12_x86_64.whl",
+            "tokenizers-0.23.3-cp310-abi3-macosx_11_0_arm64.whl",
+            "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl",
+            "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_i686.manylinux2014_i686.whl",
+            "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl",
+            "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl",
+            "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "tokenizers-0.23.3-cp310-abi3-manylinux_2_31_riscv64.whl",
+            "tokenizers-0.23.3-cp310-abi3-musllinux_1_2_aarch64.whl",
+            "tokenizers-0.23.3-cp310-abi3-musllinux_1_2_armv7l.whl",
+            "tokenizers-0.23.3-cp310-abi3-musllinux_1_2_i686.whl",
+            "tokenizers-0.23.3-cp310-abi3-musllinux_1_2_x86_64.whl",
+            "tokenizers-0.23.3-cp310-abi3-win32.whl",
+            "tokenizers-0.23.3-cp310-abi3-win_amd64.whl",
+            "tokenizers-0.23.3-cp310-abi3-win_arm64.whl",
+            "tokenizers-0.23.3-cp314-cp314t-macosx_10_12_x86_64.whl",
+            "tokenizers-0.23.3-cp314-cp314t-macosx_11_0_arm64.whl",
+            "tokenizers-0.23.3-cp314-cp314t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            "tokenizers-0.23.3-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "tokenizers-0.23.3-cp314-cp314t-musllinux_1_2_aarch64.whl",
+            "tokenizers-0.23.3-cp314-cp314t-musllinux_1_2_x86_64.whl",
+            "tokenizers-0.23.3-cp314-cp314t-win_amd64.whl",
+            "tokenizers-0.23.3.tar.gz",
+        ),
+    ),
+    Release(
+        "huggingface-hub==1.33.0",
+        "https://pypi.org/pypi/huggingface-hub/1.33.0/json",
+        files=(
+            "huggingface_hub-1.33.0-py3-none-any.whl",
+            "huggingface_hub-1.33.0.tar.gz",
+        ),
+    ),
+    Release(
+        "safetensors==0.8.0",
+        "https://pypi.org/pypi/safetensors/0.8.0/json",
+        files=(
+            "safetensors-0.8.0-cp310-abi3-macosx_10_12_x86_64.whl",
+            "safetensors-0.8.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "safetensors-0.8.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+            "safetensors-0.8.0-cp310-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl",
+            "safetensors-0.8.0-cp310-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl",
+            "safetensors-0.8.0-cp310-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl",
+            "safetensors-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "safetensors-0.8.0-cp310-abi3-manylinux_2_31_riscv64.whl",
+            "safetensors-0.8.0-cp310-abi3-manylinux_2_5_i686.manylinux1_i686.whl",
+            "safetensors-0.8.0-cp310-abi3-musllinux_1_2_aarch64.whl",
+            "safetensors-0.8.0-cp310-abi3-musllinux_1_2_armv7l.whl",
+            "safetensors-0.8.0-cp310-abi3-musllinux_1_2_i686.whl",
+            "safetensors-0.8.0-cp310-abi3-musllinux_1_2_x86_64.whl",
+            "safetensors-0.8.0-cp310-abi3-win32.whl",
+            "safetensors-0.8.0-cp310-abi3-win_amd64.whl",
+            "safetensors-0.8.0-cp310-abi3-win_arm64.whl",
+            "safetensors-0.8.0.tar.gz",
         ),
     ),
 )

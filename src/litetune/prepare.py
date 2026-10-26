@@ -307,6 +307,11 @@ EMBEDDING_LENGTHS = (
     "special tokens, against the smaller of --context-length and the recipe's "
     "max_seq_length ({max_seq})"
 )
+EMBEDDING_THIN_OPTIONS = (
+    "{count} option(s) have fewer than {k} training rows: {named}. `tune` trains on them, and "
+    "`verify`'s {k}-shot gate draws {k} rows per option, so it will refuse this split. Add "
+    "training rows for them or leave them out of the decision"
+)
 EMBEDDING_CALIBRATION_UNUSED = (
     "the calibration split is written as for every decision, and the embedding path does not "
     "read it: `tune` trains on train.jsonl and `verify` fits the decider on train.jsonl"
@@ -2110,6 +2115,20 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         decision.heldout = _count_by_option(decision.decision, halves[1])
         options_check = result.checks.add(_options_check(decision))
         events.check(options_check)
+        if embedding:
+            # Lazy: embedding_verify imports this module.
+            from litetune.embedding_verify import GATED_K
+
+            thin = {o: n for o, n in decision.train.items() if n < GATED_K}
+            if thin:
+                shown = ", ".join(f"{o!r} ({n})" for o, n in sorted(thin.items())[:12])
+                result.limitation(
+                    EMBEDDING_THIN_OPTIONS.format(
+                        count=len(thin),
+                        k=GATED_K,
+                        named=shown + (" and more" if len(thin) > 12 else ""),
+                    )
+                )
         none_option = decision.decision.none_option
         if none_option is not None and (
             0 < (oos_rows := decision.calibration[none_option]) < THIN_CALIBRATION_OOS

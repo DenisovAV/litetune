@@ -49,10 +49,18 @@ from litetune.embedding_tune import (
     PROMPT_NAME,
     RECIPE,
     EmbeddingRecord,
+    read_embedding_record,
     write_embedding_record,
 )
+from litetune.events import EventStream
 
 GOOGLE_BYTES = b"not google's file, a stand-in"
+BASE_BYTES = b"base weights"
+TUNED_BYTES = b"tuned weights"
+
+
+def _digest(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
 @dataclass
@@ -72,7 +80,7 @@ class FakeHub:
         for f in spec["files"]:
             path = self.root / f["repo"].replace("/", "--") / f["revision"] / f["filename"]
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(GOOGLE_BYTES if f["filename"] == GOOGLE_FILE else b"base weights")
+            path.write_bytes(GOOGLE_BYTES if f["filename"] == GOOGLE_FILE else BASE_BYTES)
             paths.append(str(path))
         Path(spec["out"]).write_text(
             json.dumps({"paths": paths, "huggingface_hub": "0.0-fake"}), encoding="utf-8"
@@ -85,13 +93,19 @@ class FakeGraft:
     """`embedding_convert.graft`: writes the output, or refuses with `cause`."""
 
     cause: str | None = None
+    # An exception the graft is not expected to raise.
+    raises: BaseException | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def __call__(self, env, google, base, tuned, out_path, weights="int8", **kwargs) -> GraftResult:
+    def __call__(
+        self, env, google, base, tuned, out_path, weights=DEFAULT_WEIGHTS, **kwargs
+    ) -> GraftResult:
         self.calls.append(
             {"google": Path(google), "base": Path(base), "tuned": Path(tuned), "out": out_path}
             | {"weights": weights}
         )
+        if self.raises is not None:
+            raise self.raises
         if self.cause is not None:
             raise EmbeddingConvertError(self.cause, f"refused for {self.cause}")
         out = Path(out_path)
@@ -124,6 +138,7 @@ def hub(monkeypatch, tmp_path) -> FakeHub:
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
     monkeypatch.setattr(envs.StageEnv, "run", fake)
     monkeypatch.setattr(embedding_export, "GOOGLE_SHA256", hashlib.sha256(GOOGLE_BYTES).hexdigest())
+    monkeypatch.setattr(embedding_export, "BASE_SHA256", hashlib.sha256(BASE_BYTES).hexdigest())
     return fake
 
 
@@ -164,7 +179,7 @@ def _checkpoint(tmp_path: Path, record: EmbeddingRecord | None = None, weights=T
     model = tmp_path / "tuned" / "model"
     model.mkdir(parents=True)
     if weights:
-        (model / BASE_FILE).write_bytes(b"tuned weights")
+        (model / BASE_FILE).write_bytes(TUNED_BYTES)
     write_embedding_record(model, record or _record())
     return model
 
@@ -283,6 +298,11 @@ def test_the_report_lands_beside_the_file(hub, grafter, tmp_path):
     assert report["google_file"]["source"] == "downloaded"
     assert report["base_checkpoint"]["revision"] == BASE_REVISION
     assert any("has not been measured" in t for t in report["limitations"])
+    # Each digest is of the file used, read from it.
+    assert report["google_file"]["sha256"] == _digest(GOOGLE_BYTES)
+    assert report["base_checkpoint"]["sha256"] == _digest(BASE_BYTES)
+    assert report["checkpoint"]["sha256"] == _digest(TUNED_BYTES)
+    assert report["checkpoint"]["decision_sha256"] == _decision().digest()
 
 
 def test_the_json_output_is_the_report(hub, grafter, tmp_path, capsys):
@@ -323,6 +343,36 @@ def test_a_local_base_file_with_another_sha256_is_a_failure(hub, grafter, tmp_pa
     assert result.outcome is Outcome.FAILED
     assert grafter.calls == []
     assert "not sha256:" in result.checks.checks[-1].detail
+    report = json.loads(result.request.report_path.read_text(encoding="utf-8"))
+    assert report["google_file"]["sha256"] == _digest(b"someone else's file")
+
+
+def test_a_base_checkpoint_with_another_sha256_is_a_failure(hub, grafter, tmp_path, monkeypatch):
+    monkeypatch.setattr(embedding_export, "BASE_SHA256", "0" * 64)
+    result = _run(tmp_path)
+    assert result.outcome is Outcome.FAILED
+    assert grafter.calls == []
+    last = result.checks.checks[-1]
+    assert last.name == embedding_export.BASE_CHECKPOINT_CHECK
+    assert f"{_digest(BASE_BYTES)}, not sha256:{'0' * 64}" in last.detail
+
+
+def test_an_unexpected_graft_error_is_not_reported_as_passed(hub, grafter, tmp_path):
+    grafter.raises = KeyError("parts")
+    seen: list[Any] = []
+    events = EventStream(echo_json=False)
+    events.subscribe(seen.append)
+    model = _checkpoint(tmp_path)
+    record = read_embedding_record(model)
+    assert record is not None
+    request = EmbeddingExportRequest(model=model, output_dir=tmp_path / "out")
+    with pytest.raises(KeyError):
+        run_embedding_export(request, record, events)
+    report = json.loads(request.report_path.read_text(encoding="utf-8"))
+    assert report["outcome"] == Outcome.UNCHECKED.value
+    assert report["checks"]["checks"][-1]["detail"] == "KeyError: 'parts'"
+    finished = [e.data["status"] for e in seen if e.kind == "stage_finished"]
+    assert finished == [Outcome.UNCHECKED.value]
 
 
 def test_a_missing_local_base_file_is_refused(hub, grafter, tmp_path):

@@ -43,6 +43,8 @@ from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.decision_verify import DEFAULT_ENGINE_ROWS, DEFAULT_THREADS
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
 from litetune.devices import DEVICE_VARIABLE, DeviceSettingError, device_setting
+from litetune.embedding_tune import DIRECTION as EMBEDDING_DIRECTION
+from litetune.embedding_tune import EMBEDDING_MODEL, model_dir_hint
 from litetune.evaluate import (
     GENERATION_SETTINGS_NOT_APPLIED,
     GREEDY,
@@ -992,7 +994,7 @@ def _embedding_record(reference: str) -> tuple[dict[str, Any], str] | None:
         read = read_training_record(reference)
     except (OSError, ValueError):
         return None
-    if read is None or read[0].get("direction") != "embedding":
+    if read is None or read[0].get("direction") != EMBEDDING_DIRECTION:
         return None
     return read[0], str(read[1])
 
@@ -1148,15 +1150,14 @@ def run_verify(
     if decision_record is not None or request.calibration is not None or request.float_twin:
         return _verify_decision(request, decision_record, unreadable, run, events)
     if request.embedding_flags:
-        from litetune.embedding_tune import model_dir_hint
-
+        flags = request.embedding_flags
         run.record(
             Check.failed(
                 "request",
-                f"{', '.join(request.embedding_flags)} apply to an embedding checkpoint, one "
-                "whose litetune.json `tune --model google/embeddinggemma-2` wrote; "
-                f"{request.reference} records none{model_dir_hint(request.reference)}. "
-                "Refused rather than ignored",
+                f"{', '.join(flags)} {'does' if len(flags) == 1 else 'do'} not apply here: "
+                "they are for an embedding checkpoint, one whose litetune.json "
+                f"`tune --model {EMBEDDING_MODEL}` wrote, and {request.reference} records "
+                f"none{model_dir_hint(request.reference)}. Refused rather than ignored",
             )
         )
         return run.finish(Status.FAILED_HARNESS)

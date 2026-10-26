@@ -5,8 +5,8 @@
 `EmbeddingModel.createDecider` embeds every input behind `DECIDER_PREFIX` and
 answers with the option whose centroid -- the mean of its examples' vectors,
 L2-normalised -- is nearest by cosine. So that is what is measured, the way
-lora_project `measurements/2026-10-25-eg2-many-labels/` (`emb_s5.py`,
-`eval_s5.py`) measured it:
+the measurement this path rests on measured it
+(MEASUREMENTS.md, "EmbeddingGemma 2: many labels"):
 
 - **the reference**, the fine-tune in float32 through sentence-transformers on
   the CPU, prompt `PROMPT_NAME`, normalised (`REFERENCE_SCRIPT`, in
@@ -30,19 +30,30 @@ entirely above it, and is inconclusive otherwise, as `verify._gate` reads one
 interval. Per draw, not pooled: the draws share rows and vectors, so pooling
 them would count each row `DRAWS` times.
 
-The engine hazard: LiteRT-LM writes the XNNPack weight cache beside the model,
-and four processes sharing one cache failed with "could not verify buffer list
-mapping" (lora_project measurements/2026-10-25-eg2-many-labels/run_s5.sh). Here
-one process embeds one file; the cache is left beside each file, as there.
+The engine hazard: LiteRT-LM writes the XNNPack weight cache beside the model
+unless it is given a cache directory, and processes writing one cache path at
+once failed with "could not verify buffer list mapping"
+(MEASUREMENTS.md, "EmbeddingGemma 2: many labels"). Here each engine run
+gets its own cache directory under this run's temporary directory
+(`cache_dir`), so nothing is written beside the user's file or Google's, and no
+two runs -- of this verify or of another one -- share a cache path.
 
 The candidate and Google's file are embedded side by side, one process each
-(`ENGINES_SCRIPT`), when they are two files and the machine has the cores for
-both at `threads` each; otherwise one after another. Each pass is ~1,600 s on
-11,775 texts at 4 threads (eg2-graft out-e2e2), so this halves the wait with
-the base. The side-by-side processes are started by one child of
+(`ENGINES_SCRIPT`), when they are two files and the machine has the CPUs for
+both at `threads` each; otherwise one after another. One after another is what
+was measured: on a 32-vCPU Intel Xeon @ 2.20GHz, LiteRT-LM 0.18.0 at 4
+threads, 11,775 texts, the three sides ran in turn and `verify` took 76 min
+(int8) and 62 min (int4), the int4 run's harness reporting 464.4 s for the
+reference, 1611.6 s for the candidate and 1610.2 s for Google's file
+(MEASUREMENTS.md, "EmbeddingGemma 2: litetune end to end"). Side by side is not
+yet measured. The side-by-side processes are started by one child of
 `StageEnv.run`, not by threads here: `envs`' signal guard works on the main
 thread only, and a grandchild stays in the child's session and job object, so
 `envs` stops it with the child.
+
+Only the candidate decides the verdict. When Google's file cannot be embedded,
+that is a limitation and the gain is not reported; the candidate is still
+gated.
 """
 
 from __future__ import annotations
@@ -78,6 +89,7 @@ from litetune.embedding_tune import (
     LabelledText,
     states_of,
 )
+from litetune.evaluate import RUNTIME_ENGINE_SOURCE
 from litetune.events import EventStream
 from litetune.metrics import Difference, paired_difference
 from litetune.prepare import PrepareError, read_rows
@@ -87,9 +99,10 @@ logger = logging.getLogger(__name__)
 
 SCORER = "embedding-centroid"
 SCORER_MEANS = (
-    "the option whose centroid -- the mean of its examples' embeddings, L2-normalised -- has the "
-    "highest cosine to the input's embedding, as flutter_edge_ai's EmbeddingModel.createDecider "
-    "answers; every text embedded behind the decider's prefix"
+    "flutter_edge_ai's EmbeddingModel.createDecider's centroid answer with no abstention: the "
+    "option whose centroid -- the mean of its examples' embeddings, L2-normalised -- has the "
+    "highest cosine to the input's embedding, every input answered; every text embedded behind "
+    "the decider's prefix"
 )
 
 # eval_s5.py's `KS` and `DRAWS`; the gate reads the larger k.
@@ -102,11 +115,18 @@ LINEAR_DECAY = 1e-5
 DEFAULT_MAX_CONVERSION_COST = 0.01
 DEFAULT_THREADS = 4
 REFERENCE_BATCH = 64
+# flutter_edge_ai's input cap (litert_lm_embedding_pass.dart, "The input cap is
+# set explicitly to 1024 tokens").
+MAX_INPUT_TOKENS = 1024
+# Only these runs stop the others when they fail: Google's file is not gated.
+STOP_ON = ("candidate",)
 
 # Allowances, not measurements: a start-up, then a budget per text.
 STARTUP_TIMEOUT_S = 900
 ROW_TIMEOUT_S = 2
 EVAL_TIMEOUT_S = 3600
+# How long a terminated engine run gets to exit before it is killed.
+STOP_TIMEOUT_S = 30
 
 RECORD_CHECK = "the reference is an embedding checkpoint"
 ROWS_CHECK = "rows are the decision's states"
@@ -118,8 +138,17 @@ EVAL_CHECK = "decider accuracy"
 GATE_CHECK = "conversion cost within threshold"
 
 CPU_ONLY = (
-    "measured on the CPU backend of LiteRT-LM's EmbeddingEngine, {threads} threads; the GPU and "
-    "the NPU are not measured"
+    "measured on the CPU backend of LiteRT-LM's EmbeddingEngine, {threads} threads, from the "
+    "litert-lm package on PyPI on this host's CPU -- not the application's own build of the "
+    "runtime on a device's CPU; the GPU and the NPU are not measured"
+)
+CALIBRATION_UNMEASURED = (
+    "the application's default calibration, EmbeddingDeciderCalibration.crossFit keeping 0.95 "
+    "(flutter_edge_ai lib/src/decision/decider_method.dart:99, "
+    "lib/src/embedding/embedding_model.dart:181-182), abstains below a cosine threshold; "
+    "abstention is not measured here, every input is answered. A similarity threshold picked on "
+    "another file does not carry over to this one: int4 moves the cosines (MEASUREMENTS.md, "
+    '"EmbeddingGemma 2: many labels")'
 )
 FITTED_ON_EXAMPLES = (
     "the application's decider is fitted on the examples it is given at run time. Here it is "
@@ -131,8 +160,14 @@ DESCRIPTIONS_UNUSED = (
     "that passes them to the decider is not measured"
 )
 LINEAR_NOT_GATED = (
-    "the linear decider (LBFGS, cross-entropy, weight decay 1e-5) is reported and not gated"
+    f"the linear decider (LBFGS, cross-entropy, weight decay {LINEAR_DECAY:g}) is fitted on every "
+    "training row, and is reported and not gated"
 )
+BASE_FAILED = (
+    "Google's file could not be embedded, so the gain over it is not reported; the candidate is "
+    "gated as without it: {reason}"
+)
+NOT_TIED = "the file is not tied to the reference checkpoint: {reason}"
 NO_BASE = (
     "the gain over Google's file was not measured; pass --base-litertlm or --with-base to measure "
     "it on these rows"
@@ -191,8 +226,16 @@ REFERENCE_SCRIPT = r'''
 Reads JSON {model, prompt_name, prefix, texts, threads, batch_size, out, report}
 from argv[1]. Writes the L2-normalised vectors, float32, one row per text, to
 spec["out"] (numpy.save) and JSON to spec["report"]. A checkpoint whose prompt
-is not the decider's prefix is {"error": ...} and exit 3. As emb_s5.py's
-sentence-transformers branch (lora_project measurements/2026-10-25-eg2-many-labels/).
+is not the decider's prefix, or a vector with a non-finite value or a zero norm,
+is {"error": ...} and exit 3. As the measurement's sentence-transformers side
+(MEASUREMENTS.md, "EmbeddingGemma 2: many labels").
+
+The report's "tokens" counts each text's tokens with the prompt, through the
+model's own `tokenize`, and how many reach `max_seq_length`: sentence-transformers
+cuts a text there, so such a row's reference vector is of a shorter text than
+the one the engine embeds. A row is counted when it reaches `max_seq_length`,
+not only past it, so the count holds whether or not `tokenize` itself cuts at
+that length (prepare's `measure_embedded_lengths` counts `n >= limit` too).
 """
 import importlib.metadata
 import json
@@ -201,6 +244,25 @@ import time
 from pathlib import Path
 
 REFUSED_EXIT = 3
+
+
+def unusable_rows(np, v):
+    """Indices of the rows with a non-finite value or a zero (or overflowing) norm."""
+    with np.errstate(invalid="ignore", over="ignore"):
+        norms = np.linalg.norm(v, axis=1)
+    return np.flatnonzero(~np.isfinite(v).all(axis=1) | ~(np.isfinite(norms) & (norms > 0)))
+
+
+def token_counts(st, prompt, texts, batch_size):
+    """Each text's token count behind `prompt`, with the tokenizer's specials and
+    without truncation: `st.tokenize` cuts at max_seq_length, so its count could
+    never show a text longer than that."""
+    counts = []
+    for start in range(0, len(texts), batch_size):
+        batch = [prompt + text for text in texts[start : start + batch_size]]
+        ids = st.tokenizer(batch, add_special_tokens=True, truncation=False)["input_ids"]
+        counts.extend(len(row) for row in ids)
+    return counts
 
 
 def main():
@@ -226,7 +288,9 @@ def main():
             f"prefix {spec['prefix']!r}")}), encoding="utf-8")
         return REFUSED_EXIT
     texts = json.loads(Path(spec["texts"]).read_text(encoding="utf-8"))
-    v = st.encode(
+    counts = token_counts(st, found, texts, spec["batch_size"])
+    limit = st.max_seq_length
+    raw = st.encode(
         texts,
         prompt_name=spec["prompt_name"],
         batch_size=spec["batch_size"],
@@ -234,7 +298,13 @@ def main():
         normalize_embeddings=True,
         show_progress_bar=False,
     ).astype(np.float64)
-    v = v / np.linalg.norm(v, axis=1, keepdims=True)
+    bad = unusable_rows(np, raw)
+    if len(bad):
+        report.write_text(json.dumps({"error": (
+            f"{len(bad)} of {raw.shape[0]} reference vectors have a non-finite value or a zero "
+            f"norm (rows {bad[:10].tolist()})")}), encoding="utf-8")
+        return REFUSED_EXIT
+    v = raw / np.linalg.norm(raw, axis=1, keepdims=True)
     np.save(spec["out"], v.astype(np.float32))
     report.write_text(json.dumps({
         "rows": int(v.shape[0]),
@@ -243,7 +313,11 @@ def main():
         "device": "cpu",
         "dtype": "float32",
         "threads": torch.get_num_threads(),
-        "max_seq_length": st.max_seq_length,
+        "max_seq_length": limit,
+        "tokens": {
+            "max": max(counts) if counts else None,
+            "over_max_seq_length": sum(1 for n in counts if n > limit),
+        },
         "versions": {name: importlib.metadata.version(name) for name in (
             "torch", "transformers", "sentence-transformers", "numpy")},
     }), encoding="utf-8")
@@ -254,13 +328,22 @@ if __name__ == "__main__":
     sys.exit(main())
 '''
 
-ENGINE_SCRIPT = r'''
+ENGINE_SCRIPT = (
+    r'''
 """Embed texts with a .litertlm through LiteRT-LM's EmbeddingEngine on the CPU backend.
 
-Reads JSON {model, prefix, texts, threads, out, report} from argv[1]. Writes the
-L2-normalised vectors, float32, one row per text, to spec["out"] (numpy.save)
-and JSON to spec["report"]. As emb_s5.py's engine branch (lora_project
-measurements/2026-10-25-eg2-many-labels/).
+Reads JSON {model, prefix, texts, threads, cache_dir, max_input_length, out,
+report} from argv[1]. The engine's XNNPack weight cache goes to
+spec["cache_dir"], not beside the model. The settings flutter_edge_ai's
+litert_lm_embedding_pass.dart pins are set here as the 0.18.0 wrapper names
+them: max_input_length, normalize, insert_special_tokens; an input past
+max_input_length is an error (InputOverflowStrategy.ERROR) where the app
+truncates and refuses the truncated response, a getter the PyPI wrapper does
+not have. Writes the L2-normalised vectors, float32, one row per text, to
+spec["out"] (numpy.save) and JSON to spec["report"], with what was set. A text
+the engine refuses, or a vector with a non-finite value or a zero norm, is
+{"error": ...} and exit 3. As the measurement's engine side
+(MEASUREMENTS.md, "EmbeddingGemma 2: many labels").
 """
 import importlib.metadata
 import json
@@ -272,35 +355,66 @@ from pathlib import Path
 
 import numpy as np
 
+REFUSED_EXIT = 3
 
-def cpu_model():
-    try:
-        with open("/proc/cpuinfo", encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("model name"):
-                    return line.split(":", 1)[1].strip()
-    except OSError:
-        return None
-    return None
 
+def unusable_rows(v):
+    """Indices of the rows with a non-finite value or a zero (or overflowing) norm."""
+    with np.errstate(invalid="ignore", over="ignore"):
+        norms = np.linalg.norm(v, axis=1)
+    return np.flatnonzero(~np.isfinite(v).all(axis=1) | ~(np.isfinite(norms) & (norms > 0)))
+
+'''
+    + RUNTIME_ENGINE_SOURCE
+    + r"""
 
 def main():
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    report = Path(spec["report"])
     import litert_lm
 
     texts = json.loads(Path(spec["texts"]).read_text(encoding="utf-8"))
+    settings = {
+        "cache_dir": spec["cache_dir"],
+        "max_input_length": spec["max_input_length"],
+        "normalize": True,
+        "insert_special_tokens": True,
+        "input_overflow_strategy": "ERROR",
+    }
     started = time.time()
     out, times = [], []
     backend = litert_lm.Backend.CPU(thread_count=spec["threads"])
-    with litert_lm.EmbeddingEngine(spec["model"], backend=backend) as engine:
-        options = litert_lm.EmbeddingOptions(normalize=True)
-        for text in texts:
+    with litert_lm.EmbeddingEngine(
+        spec["model"],
+        backend=backend,
+        cache_dir=spec["cache_dir"],
+        max_input_length=spec["max_input_length"],
+    ) as engine:
+        options = litert_lm.EmbeddingOptions(
+            normalize=True,
+            insert_special_tokens=True,
+            input_overflow_strategy=litert_lm.InputOverflowStrategy.ERROR,
+        )
+        for i, text in enumerate(texts):
             t1 = time.perf_counter()
-            answer = engine.compute_embedding(spec["prefix"] + text, options=options)
+            try:
+                answer = engine.compute_embedding(spec["prefix"] + text, options=options)
+            except RuntimeError as exc:
+                report.write_text(json.dumps({"error": (
+                    f"the engine refused text {i} ({len(text)} characters): {exc}; an input "
+                    f"longer than {spec['max_input_length']} tokens is refused here")}),
+                    encoding="utf-8")
+                return REFUSED_EXIT
             out.append(list(answer.embedding))
             times.append(time.perf_counter() - t1)
-    v = np.array(out, dtype=np.float64)
-    v = v / np.linalg.norm(v, axis=1, keepdims=True)
+    raw = np.array(out, dtype=np.float64)
+    bad = unusable_rows(raw)
+    if len(bad):
+        report.write_text(json.dumps({"error": (
+            f"{len(bad)} of {raw.shape[0]} engine vectors have a non-finite value or a zero "
+            f"norm (rows {bad[:10].tolist()})")}), encoding="utf-8")
+        return REFUSED_EXIT
+    v = raw / np.linalg.norm(raw, axis=1, keepdims=True)
     np.save(spec["out"], v.astype(np.float32))
     runtime = {}
     for dist in ("litert-lm", "litert-lm-api"):
@@ -308,15 +422,16 @@ def main():
             runtime[dist] = importlib.metadata.version(dist)
         except importlib.metadata.PackageNotFoundError:
             pass
-    Path(spec["report"]).write_text(json.dumps({
+    report.write_text(json.dumps({
         "rows": int(v.shape[0]),
         "dim": int(v.shape[1]),
         "seconds": round(time.time() - started, 1),
         "ms_median": round(1000 * statistics.median(times), 2) if times else None,
         "backend": "cpu",
         "threads": spec["threads"],
+        "settings": settings,
         "runtime": runtime,
-        "cpu": cpu_model(),
+        "cpu": cpu_report(),
         "python": platform.python_version(),
     }), encoding="utf-8")
     return 0
@@ -324,18 +439,21 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-'''
+"""
+)
 
 ENGINES_SCRIPT = r'''
 """Run the engine script once per file: side by side, or one after another.
 
-Reads JSON {script, runs: [{name, spec, stderr}], parallel, report} from
-argv[1]. Starts `python script spec` for each run, its stderr to the run's
-file; side by side when `parallel`, else in order. A run that exits non-zero
-stops the rest: a run still going is terminated and one not yet started is not
-started, and both report returncode null. Writes {runs: {name: {returncode,
-seconds}}, parallel} to spec["report"] and exits 0; reading each run's own
-report is the caller's.
+Reads JSON {script, runs: [{name, spec, stderr}], parallel, stop_on, stop_s,
+report} from argv[1]. Starts `python script spec` for each run, its stderr to
+the run's file; side by side when `parallel`, else in order. A run named in
+`stop_on` that exits non-zero stops the rest: a run still going is terminated
+and one not yet started is not started, and both report returncode null. Any
+other run's failure is only reported. A run stopped here, or still going when
+this script ends for any reason, is terminated, given `stop_s` seconds, then
+killed. Writes {runs: {name: {returncode, seconds}}, parallel} to
+spec["report"] and exits 0; reading each run's own report is the caller's.
 """
 import json
 import subprocess
@@ -354,35 +472,53 @@ def start(script, run):
     return proc, err, time.time()
 
 
+def stop(proc, err, stop_s):
+    """Terminate one run, wait `stop_s` seconds for it, then kill it."""
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=stop_s)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+    finally:
+        err.close()
+
+
 def main():
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     runs = spec["runs"]
+    stop_on = set(spec["stop_on"])
     results = {run["name"]: {"returncode": None, "seconds": None} for run in runs}
     waiting = list(runs)
     live = {}
-    failed = False
-    while waiting or live:
-        while waiting and not failed and (spec["parallel"] or not live):
-            run = waiting.pop(0)
-            live[run["name"]] = start(spec["script"], run)
-        if failed:
-            waiting.clear()
-        for name, (proc, err, began) in list(live.items()):
-            code = proc.poll()
-            if code is None:
-                continue
-            err.close()
-            del live[name]
-            results[name] = {"returncode": code, "seconds": round(time.time() - began, 1)}
-            if code != 0 and not failed:
-                failed = True
-                for oproc, oerr, _ in live.values():
-                    oproc.terminate()
-                    oproc.wait()
-                    oerr.close()
-                live.clear()
-        if live:
-            time.sleep(POLL_S)
+    stopping = False
+    try:
+        while waiting or live:
+            while waiting and not stopping and (spec["parallel"] or not live):
+                run = waiting.pop(0)
+                live[run["name"]] = start(spec["script"], run)
+            if stopping:
+                waiting.clear()
+            for name in list(live):
+                proc, err, began = live[name]
+                code = proc.poll()
+                if code is None:
+                    continue
+                err.close()
+                del live[name]
+                results[name] = {"returncode": code, "seconds": round(time.time() - began, 1)}
+                if code != 0 and name in stop_on:
+                    stopping = True
+                    while live:
+                        stop(*live.popitem()[1][:2], spec["stop_s"])
+                    break
+            if live:
+                time.sleep(POLL_S)
+    finally:
+        while live:
+            stop(*live.popitem()[1][:2], spec["stop_s"])
     Path(spec["report"]).write_text(
         json.dumps({"runs": results, "parallel": bool(spec["parallel"])}), encoding="utf-8"
     )
@@ -396,20 +532,29 @@ if __name__ == "__main__":
 # Its helpers above `main` use numpy alone (the linear layer is handed torch),
 # so the tests run them in this process.
 EVAL_SCRIPT = r'''
-"""The deciders on each side's vectors (eval_s5.py, lora_project
-measurements/2026-10-25-eg2-many-labels/).
+"""The deciders on each side's vectors, as the measurement computed them
+(MEASUREMENTS.md, "EmbeddingGemma 2: many labels").
 
 Reads JSON {vectors: {name: path}, train_labels, heldout_labels, n_labels, ks,
 draws, decay, pairs, report} from argv[1]. Each vectors file holds the train
 rows, then the held-out rows. Writes to spec["report"]: per side the accuracy
 of every decider and, per held-out row, whether each centroid decider was
 right; and the per-row cosine between each pair of sides on the held-out rows.
+A side with too few or too many vectors, or with a vector that has a
+non-finite value or a zero norm, is {"error": ...} and exit 3.
 """
 import json
 import sys
 from pathlib import Path
 
 import numpy as np
+
+
+def unusable_rows(v):
+    """Indices of the rows with a non-finite value or a zero (or overflowing) norm."""
+    with np.errstate(invalid="ignore", over="ignore"):
+        norms = np.linalg.norm(v, axis=1)
+    return np.flatnonzero(~np.isfinite(v).all(axis=1) | ~(np.isfinite(norms) & (norms > 0)))
 
 
 def kshot_picks(ytr, n_labels, k, draw):
@@ -489,6 +634,12 @@ def main():
             Path(spec["report"]).write_text(json.dumps({"error": (
                 f"{name}: {v.shape[0]} vectors for {ntr + len(yte)} rows")}), encoding="utf-8")
             return 3
+        bad = unusable_rows(v)
+        if len(bad):
+            Path(spec["report"]).write_text(json.dumps({"error": (
+                f"{name}: {len(bad)} vectors have a non-finite value or a zero norm "
+                f"(rows {bad[:10].tolist()})")}), encoding="utf-8")
+            return 3
         vectors[name] = v
     out = {"accuracy": {}, "correct": {}, "cosine": {},
            "versions": {"numpy": np.__version__, "torch": torch.__version__}}
@@ -566,16 +717,30 @@ def read_run(report: Path, returncode: int, stderr: str | None) -> ScriptRun:
 STOPPED = "the launcher reports no exit for this file: it was stopped or never started"
 
 
-def side_by_side(files: Sequence[Path], threads: int, cpus: int | None) -> bool:
-    """Whether the engine files can be embedded at once without sharing a cache or the cores.
+def usable_cpus() -> int | None:
+    """The CPUs this process may use: `os.process_cpu_count` where it exists
+    (3.13+), else the affinity mask's size where there is one, else
+    `os.cpu_count`. `None` when none of them can say."""
+    counter = getattr(os, "process_cpu_count", None)
+    if counter is not None:
+        return counter()
+    affinity = getattr(os, "sched_getaffinity", None)
+    if affinity is not None:
+        return len(affinity(0))
+    return os.cpu_count()
 
-    Two paths to one file would share its XNNPack cache, which broke in s5; a
-    machine without `threads` cores per file would have them compete, and
-    each file's time per text is reported.
+
+def side_by_side(files: Sequence[Path], threads: int, cpus: int | None) -> bool:
+    """Whether the engine files can be embedded at once: two of them, and the CPUs for both.
+
+    Each run has its own XNNPack cache directory (`run_engines`), so two runs
+    never write one cache path -- the hazard measured as "could not verify
+    buffer list mapping" in an earlier measurement
+    (MEASUREMENTS.md, "EmbeddingGemma 2: many labels"). A machine
+    without `threads` CPUs per file would have the runs compete, and each
+    file's time per text is reported.
     """
     if len(files) < 2:
-        return False
-    if len({Path(f).resolve() for f in files}) < len(files):
         return False
     return (cpus or 1) >= threads * len(files)
 
@@ -590,6 +755,10 @@ def run_engines(
 ) -> tuple[dict[str, ScriptRun], str | None]:
     """Embed each (name, file) with `ENGINE_SCRIPT` through one `ENGINES_SCRIPT` child.
 
+    Each side's engine gets its own XNNPack cache directory, `work/cache-<name>`,
+    created here, so no cache is written beside the file and no two runs share
+    one. Only a failure of a side in `STOP_ON` stops the others.
+
     Returns each side's run and, when the launcher itself gave no result, why.
     A side the launcher stopped or never started has the failure `STOPPED`.
     """
@@ -598,11 +767,15 @@ def run_engines(
     runs, reports = [], {}
     for name, model in sides:
         spec_path, report = work / f"{name}.json", work / f"{name}.out"
+        cache = work / f"cache-{name}"
+        cache.mkdir()
         spec_path.write_text(
             json.dumps(
                 {
                     **common,
                     "model": str(model),
+                    "cache_dir": str(cache),
+                    "max_input_length": MAX_INPUT_TOKENS,
                     "out": str(work / f"{name}.npy"),
                     "report": str(report),
                 }
@@ -614,7 +787,13 @@ def run_engines(
     launched = run_script(
         env,
         ENGINES_SCRIPT,
-        {"script": str(script), "runs": runs, "parallel": parallel},
+        {
+            "script": str(script),
+            "runs": runs,
+            "parallel": parallel,
+            "stop_on": list(STOP_ON),
+            "stop_s": STOP_TIMEOUT_S,
+        },
         work,
         "engines",
         timeout,
@@ -705,8 +884,44 @@ def labels_short_of(train: Sequence[LabelledText], labels: Sequence[str], k: int
     return [label for label in labels if counts[label] < k]
 
 
-def weights_of(model: Path) -> tuple[str | None, str]:
-    """The weight mode `convert` recorded for `model`, and where that came from.
+def truncated(run: ScriptRun, texts: int) -> str | None:
+    """Why the reference cannot stand for the engine on these texts, when its report says so.
+
+    `REFERENCE_SCRIPT` counts the texts whose tokens, with the prompt and the
+    tokenizer's specials, exceed the checkpoint's `max_seq_length`, as
+    `prepare.measure_embedded_lengths` counts them: sentence-transformers cuts
+    those, the engine (`MAX_INPUT_TOKENS`) does not, so the two sides would embed
+    different texts. A run that failed is left to its own check.
+    """
+    if run.failure is not None:
+        return None
+    tokens = _mapping(run.report.get("tokens"))
+    over = tokens.get("over_max_seq_length")
+    if not isinstance(over, int) or isinstance(over, bool):
+        return "the reference script reports no token counts, so truncation cannot be ruled out"
+    if over:
+        return (
+            f"{over} of {texts} texts exceed the reference's max_seq_length of "
+            f"{run.report.get('max_seq_length')} tokens with the prompt (longest "
+            f"{tokens.get('max')}); sentence-transformers cuts them and the engine does not, so "
+            "the two sides would embed different texts. `litetune prepare --tokenizer` measures "
+            "this before training"
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class ConvertFacts:
+    """What `convert.json` records about the file it wrote: `None` where it records nothing."""
+
+    weights: str | None
+    # `storage.hash_file` of the tuned checkpoint's model.safetensors.
+    checkpoint_sha256: str | None
+    decision_sha256: str | None
+
+
+def convert_facts(model: Path) -> tuple[ConvertFacts | None, str]:
+    """What `convert` recorded for `model`, and where that came from (or why nothing).
 
     Read from `convert.json` beside the file, and only when that report names
     this file's sha256.
@@ -719,13 +934,32 @@ def weights_of(model: Path) -> tuple[str | None, str]:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         logger.warning("could not read %s: %s", report_path, exc)
         return None, f"{report_path} could not be read: {exc}"
-    graft = report.get("graft") if isinstance(report, dict) else None
+    if not isinstance(report, dict):
+        return None, f"{report_path} is not a JSON object"
+    graft = report.get("graft")
     if report.get("schema") != EMBEDDING_CONVERT_SCHEMA or not isinstance(graft, dict):
         return None, f"{report_path} is not an embedding convert report with a graft"
     if graft.get("sha256") != hash_file(model):
         return None, f"{report_path} describes another file than {model}"
-    weights = graft.get("weights")
-    return (weights if isinstance(weights, str) else None), str(report_path)
+    checkpoint = _mapping(report.get("checkpoint"))
+
+    def text(value: object) -> str | None:
+        return value if isinstance(value, str) else None
+
+    return (
+        ConvertFacts(
+            weights=text(graft.get("weights")),
+            checkpoint_sha256=text(checkpoint.get("sha256")),
+            decision_sha256=text(checkpoint.get("decision_sha256")),
+        ),
+        str(report_path),
+    )
+
+
+def weights_of(model: Path) -> tuple[str | None, str]:
+    """The weight mode `convert` recorded for `model`, and where that came from."""
+    facts, source = convert_facts(model)
+    return (facts.weights if facts is not None else None), source
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +1015,8 @@ def verify_embedding(
     """Measure an embedding checkpoint and its file. Returns (status, manifest fields).
 
     The status is one of `verify.Status`'s values; `verify` wraps the fields in
-    its manifest. Raises nothing about the model.
+    its manifest. Whatever is wrong with the request, the files, the rows or a
+    script's run comes back as a failed check and a status, not as an exception.
     """
     state = _State()
     threshold = job.threshold
@@ -851,6 +1086,36 @@ def verify_embedding(
             RECORD_CHECK,
             f"the checkpoint's labels {labels[:6]} are not the decision's options",
         )
+    if not Path(job.model).is_file():
+        return refuse(CANDIDATE_CHECK, f"--model {job.model}: no such file")
+    facts, weights_source = convert_facts(job.model)
+    weights = facts.weights if facts is not None else None
+    if facts is None:
+        state.limitation(NOT_TIED.format(reason=weights_source))
+    else:
+        if facts.decision_sha256 is not None and facts.decision_sha256 != record.decision_sha256:
+            return refuse(
+                RECORD_CHECK,
+                f"{weights_source} says the file was converted from a checkpoint of decision "
+                f"{facts.decision_sha256}; the reference's litetune.json records "
+                f"{record.decision_sha256}",
+            )
+        safetensors = Path(job.reference) / "model.safetensors"
+        if facts.checkpoint_sha256 is None:
+            state.limitation(
+                NOT_TIED.format(reason=f"{weights_source} records no checkpoint sha256")
+            )
+        elif not safetensors.is_file():
+            state.limitation(NOT_TIED.format(reason=f"there is no {safetensors} to compare"))
+        elif (found := hash_file(safetensors)) != facts.checkpoint_sha256:
+            return refuse(
+                RECORD_CHECK,
+                f"{weights_source} says the file was grafted from a model.safetensors of "
+                f"{facts.checkpoint_sha256}; {safetensors} is {found}: the file was not "
+                "converted from this reference",
+            )
+        if facts.decision_sha256 is None:
+            state.limitation(NOT_TIED.format(reason=f"{weights_source} records no decision sha256"))
     state.add(
         Check.passed(
             RECORD_CHECK,
@@ -858,12 +1123,13 @@ def verify_embedding(
         ),
         events,
     )
-    weights, weights_source = weights_of(job.model)
     fields["embedding"] = {
         "prefix": record.prefix,
         "prompt_name": record.prompt_name,
         "weights": weights,
         "weights_source": weights_source,
+        # What convert.json says the file was grafted from; None when it says nothing.
+        "checkpoint_sha256": facts.checkpoint_sha256 if facts is not None else None,
         "labels": labels,
         "decision_sha256": record.decision_sha256,
         "ks": list(KS),
@@ -888,18 +1154,22 @@ def verify_embedding(
             f"({', '.join(map(repr, short[:12]))}); the {max(KS)}-shot decider the gate reads "
             "cannot be drawn",
         )
+    train_sha256, heldout_sha256 = hash_file(job.train_path), hash_file(job.heldout)
+    if train_sha256 == heldout_sha256:
+        return refuse(
+            ROWS_CHECK,
+            f"the training split {job.train_path} and the held-out split {job.heldout} are the "
+            f"same content ({train_sha256}); the decider would be measured on its own examples",
+        )
+    if record.train_sha256 is not None and record.train_sha256 != train_sha256:
+        state.limitation(
+            f"the training split here is {train_sha256}; the one tune read was "
+            f"{record.train_sha256}"
+        )
     index = {label: i for i, label in enumerate(labels)}
     fields["data"] = {
-        "train": {
-            "path": str(job.train_path),
-            "rows": len(train),
-            "sha256": hash_file(job.train_path),
-        },
-        "heldout": {
-            "path": str(job.heldout),
-            "rows": len(heldout),
-            "sha256": hash_file(job.heldout),
-        },
+        "train": {"path": str(job.train_path), "rows": len(train), "sha256": train_sha256},
+        "heldout": {"path": str(job.heldout), "rows": len(heldout), "sha256": heldout_sha256},
     }
     for what, rows in (("train", train), ("heldout", heldout)):
         trained = record.rows.get(what)
@@ -944,8 +1214,7 @@ def verify_embedding(
         engine_sides: list[tuple[str, Path]] = [("candidate", Path(job.model))]
         if google is not None:
             engine_sides.append(("base", google))
-        engine_checks = {"candidate": CANDIDATE_CHECK, "base": BASE_EMBED_CHECK}
-        parallel = side_by_side([f for _, f in engine_sides], job.threads, os.cpu_count())
+        parallel = side_by_side([f for _, f in engine_sides], job.threads, usable_cpus())
         fields["embedding"]["engines_side_by_side"] = parallel
 
         for env, check_name in (
@@ -970,8 +1239,10 @@ def verify_embedding(
             out = work / f"{name}.npy"
             if run.failure is not None:
                 return run.failure
-            if run.report.get("rows") != len(texts) or not out.is_file():
+            if run.report.get("rows") != len(texts):
                 return f"the script reports {run.report.get('rows')} vectors for {len(texts)} texts"
+            if not out.is_file():
+                return f"the script reports {len(texts)} vectors but wrote no {out.name}"
             harness[name] = run.report
             vectors[name] = str(out)
             state.add(
@@ -995,6 +1266,8 @@ def verify_embedding(
             "reference",
             budget,
         )
+        if (problem := truncated(reference_run, len(texts))) is not None:
+            return refuse(REFERENCE_CHECK, problem)
         if (problem := accept("reference", REFERENCE_CHECK, reference_run)) is not None:
             return refuse(REFERENCE_CHECK, problem)
 
@@ -1011,17 +1284,18 @@ def verify_embedding(
         )
         if launch_failure is not None:
             return refuse(CANDIDATE_CHECK, launch_failure)
-        # The side that failed, not one stopped because of it.
-        order = sorted(
-            (name for name, _ in engine_sides),
-            key=lambda n: engine_runs[n].failure == STOPPED,
-        )
-        for name in order:
-            if (problem := accept(name, engine_checks[name], engine_runs[name])) is not None:
-                return refuse(engine_checks[name], problem)
+        # The candidate first: when it failed, Google's file was stopped
+        # because of it, and the failure to report is the candidate's.
+        if (problem := accept("candidate", CANDIDATE_CHECK, engine_runs["candidate"])) is not None:
+            return refuse(CANDIDATE_CHECK, problem)
+        with_base = google is not None
+        if with_base and (problem := accept("base", BASE_EMBED_CHECK, engine_runs["base"])):
+            state.add(Check.unchecked(BASE_EMBED_CHECK, problem), events)
+            state.limitation(BASE_FAILED.format(reason=problem))
+            with_base = False
         fields["harness"] = harness
 
-        pairs = [["reference", "candidate"]] + ([["candidate", "base"]] if google else [])
+        pairs = [["reference", "candidate"]] + ([["candidate", "base"]] if with_base else [])
         evaluated = run_script(
             job.train_env,
             EVAL_SCRIPT,
@@ -1066,8 +1340,10 @@ def verify_embedding(
         "api": "EmbeddingEngine",
         "backend": "cpu",
         "runtime_version": (candidate_report.get("runtime") or {}).get("litert-lm"),
-        "cpu": {"model": candidate_report.get("cpu")},
+        # `evaluate.cpu_report`, run by the engine script on the CPU it computed on.
+        "cpu": _mapping(candidate_report.get("cpu")),
         "threads": job.threads,
+        "settings": _mapping(candidate_report.get("settings")),
         "ms_per_text_median": candidate_report.get("ms_median"),
     }
     fields["quality"] = {
@@ -1082,7 +1358,7 @@ def verify_embedding(
             "centroid": all_cost.as_dict(),
         },
     }
-    if google is not None:
+    if with_base:
         try:
             gain_k = kshot_costs(correct, "candidate", "base", GATED_K)
             gain_all = centroid_cost(correct, "candidate", "base")
@@ -1112,6 +1388,7 @@ def verify_embedding(
     state.limitation(REFERENCE_ON_CPU)
     state.limitation(LINEAR_NOT_GATED)
     state.limitation(DESCRIPTIONS_UNUSED)
+    state.limitation(CALIBRATION_UNMEASURED)
     if job.max_conversion_cost is None:
         state.limitation(
             f"no --max-conversion-cost was given; the gate used {DEFAULT_MAX_CONVERSION_COST}, "

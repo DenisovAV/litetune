@@ -10,9 +10,11 @@ finds its three inputs and writes its report:
   `huggingface_hub` inside `envs.EXPORT`, or `--base-litertlm PATH`. Either way
   its sha256 must be `embedding_convert.GOOGLE_SHA256`;
 - **the base checkpoint**, `BASE_FILE` of `embedding_convert.BASE_MODEL` at
-  `embedding_convert.BASE_REVISION`, downloaded the same way. The graft reads
-  the tensor mapping and the fold factors against it;
-- **the fine-tune**, `BASE_FILE` in the checkpoint directory `tune` wrote.
+  `embedding_convert.BASE_REVISION`, downloaded the same way; its sha256 must be
+  `embedding_convert.BASE_SHA256`. The graft reads the tensor mapping and the
+  fold factors against it;
+- **the fine-tune**, `BASE_FILE` in the checkpoint directory `tune` wrote; its
+  sha256 is recorded in the report as `checkpoint.sha256`.
 
 The file is written to `<output-dir>/<weights>/model.litertlm`, one directory
 per weight mode as `convert` writes one per recipe (`export.ExportRequest.dir_for`),
@@ -36,6 +38,8 @@ from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.embedding_convert import (
     BASE_MODEL,
     BASE_REVISION,
+    BASE_SHA256,
+    DEFAULT_WEIGHTS,
     GOOGLE_FILE,
     GOOGLE_REPO,
     GOOGLE_SHA256,
@@ -54,21 +58,17 @@ logger = logging.getLogger(__name__)
 
 EMBEDDING_CONVERT_SCHEMA = "litetune.convert-embedding/1"
 
-# The revision of `GOOGLE_REPO` the design pins (lora_project
-# docs/specs/2026-10-25-tune-embeddinggemma2-design.md). The file fetched at it is
-# checked against `GOOGLE_SHA256` all the same.
+# The revision of `GOOGLE_REPO` the graft was built and measured on
+# (MEASUREMENTS.md, "EmbeddingGemma 2: the graft"). The file fetched at it is checked against
+# `GOOGLE_SHA256` all the same.
 GOOGLE_REVISION = "9be6e8b90982095dc05c2bd162e4b954ee4dbac7"
 # The checkpoint file the graft reads, in the base repository and in the
 # directory `tune` saved the fine-tune to.
 BASE_FILE = "model.safetensors"
 
 WEIGHT_MODES: tuple[str, ...] = get_args(WeightMode)
-# int4: on banking77 (77 labels) and CLINC150 (150) it cost 0.0027 and 0.0017 of
-# the decider's accuracy (centroid of 10 examples per label) against the float
-# fine-tune, int8 0.0002 on both, at 165 MB against 300 MB (measurement s5,
-# 2026-10-25). `verify` measures the file written, and int8 is there for a task
-# where int4 does not pass.
-DEFAULT_WEIGHTS: WeightMode = "int4"
+# `DEFAULT_WEIGHTS` is `embedding_convert`'s, imported above, so that `graft`
+# defaults to it too; this module's name for it stays.
 
 ARTIFACT_NAME = "model.litertlm"
 REPORT_NAME = "convert.json"
@@ -180,11 +180,23 @@ def download(
 
 def check_google_file(path: Path) -> str | None:
     """Why `path` is not Google's file, or `None` when its sha256 is `GOOGLE_SHA256`."""
-    digest = hash_file(path)
+    return _google_file_problem(path, hash_file(path))
+
+
+def _google_file_problem(path: Path, digest: str) -> str | None:
     if digest != f"sha256:{GOOGLE_SHA256}":
         return (
             f"{path} has {digest}, not sha256:{GOOGLE_SHA256}, the {GOOGLE_FILE} of {GOOGLE_REPO} "
             f"at {GOOGLE_REVISION} that the graft's mapping was established on"
+        )
+    return None
+
+
+def _base_checkpoint_problem(path: Path, digest: str) -> str | None:
+    if digest != f"sha256:{BASE_SHA256}":
+        return (
+            f"{path} has {digest}, not sha256:{BASE_SHA256}, the {BASE_FILE} of {BASE_MODEL} "
+            f"at {BASE_REVISION} that the graft's mapping and fold factors were established on"
         )
     return None
 
@@ -248,6 +260,8 @@ class EmbeddingExportResult:
     base: dict[str, Any] = field(default_factory=dict)
     graft: GraftResult | None = None
     limitations: list[str] = field(default_factory=list)
+    # `hash_file` of the fine-tune's safetensors, taken before the graft reads it.
+    checkpoint_sha256: str | None = None
 
     @property
     def outcome(self) -> Outcome:
@@ -275,6 +289,7 @@ class EmbeddingExportResult:
             "base_checkpoint": self.base,
             "checkpoint": {
                 "path": str(self.request.model),
+                "sha256": self.checkpoint_sha256,
                 "base_model": self.record.base_model,
                 "base_model_revision": self.record.base_model_revision,
                 "labels": len(self.record.labels),
@@ -328,6 +343,12 @@ def run_embedding_export(
     )
     try:
         _run(request, result, events)
+    except BaseException as exc:
+        # Whatever `_run` did not turn into a check: the report must not say
+        # passed for a file the graft did not finish.
+        logger.exception("convert stopped on an unexpected %s", type(exc).__name__)
+        _add(result, events, Check.unchecked(GRAFT_CHECK, f"{type(exc).__name__}: {exc}"))
+        raise
     finally:
         request.report_path.parent.mkdir(parents=True, exist_ok=True)
         request.report_path.write_text(
@@ -348,6 +369,7 @@ def _run(
     request: EmbeddingExportRequest, result: EmbeddingExportResult, events: EventStream
 ) -> None:
     env = request.env
+    result.checkpoint_sha256 = hash_file(request.tuned_safetensors)
     with guard(ENV_CHECK) as sink:
         if request.auto_provision:
             env.provision(events=events)
@@ -371,14 +393,15 @@ def _run(
         return
     google = request.base_litertlm or fetched[0]
     base = fetched[-1]
+    google_digest = hash_file(google)
     result.google = {
         "path": str(google),
         "source": "--base-litertlm" if request.base_litertlm else "downloaded",
         **GOOGLE_HUB_FILE.as_dict(),
-        "sha256": GOOGLE_SHA256,
+        "sha256": google_digest,
     }
     result.base = {"path": str(base), **BASE_HUB_FILE.as_dict()}
-    problem = check_google_file(google)
+    problem = _google_file_problem(google, google_digest)
     if problem is not None:
         _add(result, events, Check.failed(BASE_FILE_CHECK, problem, observed=result.google))
         return
@@ -387,7 +410,18 @@ def _run(
         events,
         Check.passed(BASE_FILE_CHECK, f"{google.name}, sha256 {GOOGLE_SHA256[:16]}…"),
     )
-    _add(result, events, Check.passed(BASE_CHECKPOINT_CHECK, f"{BASE_MODEL} at {BASE_REVISION}"))
+    result.base["sha256"] = hash_file(base)
+    problem = _base_checkpoint_problem(base, result.base["sha256"])
+    if problem is not None:
+        _add(result, events, Check.failed(BASE_CHECKPOINT_CHECK, problem, observed=result.base))
+        return
+    _add(
+        result,
+        events,
+        Check.passed(
+            BASE_CHECKPOINT_CHECK, f"{BASE_MODEL} at {BASE_REVISION}, sha256 {BASE_SHA256[:16]}…"
+        ),
+    )
 
     # -- the graft ---------------------------------------------------------------
     try:

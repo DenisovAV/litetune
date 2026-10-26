@@ -52,13 +52,19 @@ from litetune.decision_verify import (
 )
 from litetune.decisions import DecisionError
 from litetune.declarations import DeclarationsError
+from litetune.embedding_convert import GRAFT_TIMEOUT_S
+from litetune.embedding_export import (
+    ARTIFACT_NAME as EMBEDDING_ARTIFACT_NAME,
+)
 from litetune.embedding_export import (
     DEFAULT_WEIGHTS,
+    EMBEDDING_CONVERT_SCHEMA,
     WEIGHT_MODES,
     EmbeddingExportError,
     EmbeddingExportRequest,
     run_embedding_export,
 )
+from litetune.embedding_export import REPORT_NAME as EMBEDDING_REPORT_NAME
 from litetune.embedding_export import summarise as summarise_embedding_convert
 from litetune.embedding_tune import (
     DIRECTION,
@@ -769,7 +775,17 @@ def _add_convert(sub) -> None:
             "downloaded at the pinned revision"
         ),
     )
-    convert.add_argument("--timeout-s", type=int, default=ExportRequest.timeout_s)
+    # No default here: the LLM export and the embedding graft have their own
+    # (`ExportRequest.timeout_s`, `embedding_convert.GRAFT_TIMEOUT_S`).
+    convert.add_argument(
+        "--timeout-s",
+        type=int,
+        default=None,
+        help=(
+            f"seconds the conversion may run (default {ExportRequest.timeout_s}; "
+            f"{GRAFT_TIMEOUT_S} for an embedding checkpoint)"
+        ),
+    )
     convert.add_argument(
         "--no-provision",
         action="store_true",
@@ -1692,7 +1708,7 @@ def _convert(args: argparse.Namespace) -> int:
         recipes=args.recipe or (),
         externalize_embedder=args.externalize_embedder,
         extra_flags=tuple(args.flag),
-        timeout_s=args.timeout_s,
+        timeout_s=args.timeout_s if args.timeout_s is not None else ExportRequest.timeout_s,
         auto_provision=not args.no_provision,
     )
     result = run_export(request, events=events)
@@ -1726,7 +1742,7 @@ def _convert_embedding(args: argparse.Namespace, record: EmbeddingRecord) -> int
         output_dir=args.output_dir,
         weights=args.weights or DEFAULT_WEIGHTS,
         base_litertlm=args.base_litertlm,
-        timeout_s=args.timeout_s,
+        timeout_s=args.timeout_s if args.timeout_s is not None else GRAFT_TIMEOUT_S,
         auto_provision=not args.no_provision,
     )
     result = run_embedding_export(request, record, events=events)
@@ -2027,8 +2043,44 @@ def _bundle_prompt_mode(
     )
 
 
+EMBEDDING_BUNDLE_REFUSED = (
+    "{model} is an embedding fine-tune's {what}. The embedding path ends at `convert` and "
+    "`verify`: `bundle` assembles a generative model's deliverable (declarations, calling "
+    "contract), which an embedding model has none of. The application loads the "
+    "{artifact} that `convert` wrote through EmbeddingModel.createDecider"
+)
+
+
+def _embedding_bundle_input(model: Path) -> str | None:
+    """What `model` is, when it is an embedding checkpoint or the file `convert` wrote from one.
+
+    The file is recognised by the `convert.json` beside it (`embedding_export`
+    writes the report next to the artifact). A report that cannot be read
+    proves nothing either way, so such a file goes on to `bundle`'s own checks.
+    """
+    if _embedding_record(str(model)) is not None:
+        return "checkpoint"
+    report = model.parent / EMBEDDING_REPORT_NAME
+    if model.is_file() and report.is_file():
+        try:
+            loaded = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logger.warning("%s could not be read as a convert report", report, exc_info=True)
+            return None
+        if isinstance(loaded, dict) and loaded.get("schema") == EMBEDDING_CONVERT_SCHEMA:
+            return "converted file"
+    return None
+
+
 def _bundle(args: argparse.Namespace) -> int:
     events = _stream()
+
+    if (what := _embedding_bundle_input(args.model)) is not None:
+        raise BundleInputError(
+            EMBEDDING_BUNDLE_REFUSED.format(
+                model=args.model, what=what, artifact=EMBEDDING_ARTIFACT_NAME
+            )
+        )
 
     # The same refusal a spec file gets. `--base-model-revision main` was
     # accepted here while `base_model.revision: main` was refused there, so the

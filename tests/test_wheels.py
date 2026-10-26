@@ -245,6 +245,33 @@ def test_a_pypy_wheel_installs_on_no_cpython():
     )
 
 
+def test_embed_train_pins_the_measured_closure():
+    pins = envs.EMBED_TRAIN.requirements
+    """The versions the graft was measured with (MEASUREMENTS.md, "EmbeddingGemma 2: the graft")."""
+    measured = {
+        "torch": "2.9.1",
+        "torchvision": "0.24.1",
+        "transformers": "5.19.0",
+        "sentence-transformers": "6.1.0",
+        "pillow": "12.3.0",
+        "tokenizers": "0.23.3",
+        "huggingface-hub": "1.33.0",
+        "safetensors": "0.8.0",
+    }
+    pinned = {canonical(name): version for name, version in map(wheels.pin, pins)}
+    assert pinned == {canonical(n): v for n, v in measured.items()}
+
+
+def test_embed_train_installs_on_the_machines_its_comments_say_and_not_on_the_others():
+    """The floors `envs.EMBED_TRAIN`'s comment states, from the files on record."""
+    for name, minor in (("linux_x86_64", 10), ("linux_aarch64", 12), ("macosx_arm64", 12)):
+        assert _blocking(envs.EMBED_TRAIN, name, minor) == [], (name, minor)
+    # torch and torchvision: no macOS wheel for Intel, manylinux_2_28 only.
+    torch_pair = ["torch==2.9.1", "torchvision==0.24.1"]
+    assert _blocking(envs.EMBED_TRAIN, "macosx_x86_64", 12) == torch_pair
+    assert _blocking(envs.EMBED_TRAIN, "linux_x86_64_glibc_2_27", 12) == torch_pair
+
+
 # Every tag a wheel on record carries: what a host's tags are asked about.
 _TAGS_ON_RECORD = sorted(
     {str(tag) for release in PUBLISHED.values() for tags in release.wheels() for tag in tags}

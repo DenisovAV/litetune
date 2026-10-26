@@ -289,3 +289,99 @@ def test_the_command_line_counts_in_embed_train_with_add_special_tokens(monkeypa
     counting = [s for s in fake.specs if not s.get("specials")]
     assert counting and all(s["add_special_tokens"] is True for s in counting)
     assert all(s["revision"] == EMBEDDING_REVISION for s in fake.specs)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: the window's boundary, and options verify's gate cannot draw from
+# ---------------------------------------------------------------------------
+
+
+def _rows_with_one_of_length(words: int) -> list[dict[str, Any]]:
+    rows = [
+        {"prompt": f"message {i} about {option}", "label": option}
+        for option in OPTIONS
+        for i in range(12)
+    ]
+    rows[0]["prompt"] = " ".join(["word"] * words)
+    return rows
+
+
+def test_a_row_of_exactly_the_window_fits_and_one_token_more_does_not(tmp_path):
+    prefix_words = len(DECIDER_PREFIX.split())
+    exact = RECIPE.max_seq_length - prefix_words
+    fits = prepare(
+        _request(
+            tmp_path,
+            data=_data(tmp_path, _rows_with_one_of_length(exact), "fits.jsonl"),
+            tokens=FakeEmbedTokenCounter(),
+        )
+    )
+    check = _check(fits, LENGTH_CHECK)
+    assert check.outcome is Outcome.PASSED, check.detail
+    assert fits.lengths.total["max"] == RECIPE.max_seq_length
+
+    over = prepare(
+        _request(
+            tmp_path,
+            data=_data(tmp_path, _rows_with_one_of_length(exact + 1), "over.jsonl"),
+            output_dir=tmp_path / "out-over",
+            tokens=FakeEmbedTokenCounter(),
+        )
+    )
+    assert _check(over, LENGTH_CHECK).outcome is Outcome.FAILED
+    assert over.lengths.over_length[0].tokens == RECIPE.max_seq_length + 1
+
+
+def test_measure_embedded_lengths_counts_the_limit_itself_as_fitting():
+    from litetune.decisions import Decision, Option
+    from litetune.prepare import Row, measure_embedded_lengths
+
+    decision = Decision("choice", "Which?", (Option("a"), Option("b")))
+    row = Row(lineno=1, prompt=decision.render("one two three"), completion="a", target="a")
+    counter = FakeEmbedTokenCounter()
+    words = len(DECIDER_PREFIX.split()) + 3
+    assert measure_embedded_lengths([row], decision, counter, words).over_length == ()
+    assert len(measure_embedded_lengths([row], decision, counter, words - 1).over_length) == 1
+
+
+def _thin_rows(thin_count: int) -> list[dict[str, Any]]:
+    return [
+        {"prompt": f"message {i} about {option}", "label": option}
+        for option, n in (("refund", 400), ("card_lost", 400), ("balance", thin_count))
+        for i in range(n)
+    ]
+
+
+def test_an_option_with_fewer_training_rows_than_verifys_gate_draws_is_named(tmp_path):
+    from litetune.embedding_verify import GATED_K
+
+    result = prepare(
+        _request(tmp_path, data=_data(tmp_path, _thin_rows(GATED_K - 1), "thin.jsonl"))
+    )
+    note = next(t for t in result.limitations if "will refuse this split" in t)
+    assert "'balance'" in note
+    assert "'refund'" not in note and "'card_lost'" not in note
+    assert f"{GATED_K}-shot gate" in note
+
+
+def test_an_option_with_exactly_the_gates_k_training_rows_is_not_named(tmp_path):
+    from litetune.embedding_verify import GATED_K
+
+    # The split is seeded by content, so find the size at which 'balance' keeps exactly k.
+    for size in range(GATED_K, 4 * GATED_K):
+        result = prepare(
+            _request(
+                tmp_path,
+                data=_data(tmp_path, _thin_rows(size), f"k{size}.jsonl"),
+                output_dir=tmp_path / f"out-{size}",
+            )
+        )
+        if result.decision.train["balance"] == GATED_K:
+            assert not any("will refuse this split" in t for t in result.limitations)
+            return
+    pytest.fail(f"no size in range kept exactly {GATED_K} training rows of 'balance'")
+
+
+def test_no_such_note_when_every_option_has_enough_training_rows(tmp_path):
+    result = prepare(_request(tmp_path, data=_data(tmp_path, _thin_rows(400), "ok.jsonl")))
+    assert not any("will refuse this split" in t for t in result.limitations)

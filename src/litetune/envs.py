@@ -3687,12 +3687,24 @@ TRAIN = StageEnv(
 # (`embedding_tune`). Its own, because TRAIN's transformers 5.16.1 predates the
 # `embedding_gemma2` model type, and moving TRAIN would change every measured
 # LLM baseline. The pins are the ones the EG2 fine-tunes that passed were trained
-# with (lora_project measurements/2026-10-22-eg2-graft, README "Environment", and
-# out-s4/pip-freeze.txt): torch 2.9.1 and torchvision 0.24.1 (+cpu builds there;
-# PyPI's here), transformers 5.19.0, sentence-transformers 6.1.0, pillow 12.3.0.
+# with (MEASUREMENTS.md, "EmbeddingGemma 2: the graft"): torch 2.9.1 and
+# torchvision 0.24.1 (+cpu builds there; PyPI's here), transformers 5.19.0,
+# sentence-transformers 6.1.0, pillow 12.3.0.
 # Pillow is pinned because with 13.0.0 `EmbeddingGemma2Processor` would not
 # import (same README). torchvision is pinned because the measured environment
 # had it and no run without it was made.
+#
+# The three after pillow are the rest of that freeze that the recipe's code
+# loads through (tokenizers, huggingface_hub, safetensors), at the versions in
+# it; its other packages (numpy, scikit-learn, scipy, ...) are not pinned.
+# numpy is left to the resolver on purpose: the freeze's 2.4.6 publishes wheels
+# from CPython 3.11 only (PyPI `requires_python` >=3.11), and litetune runs on
+# 3.10. Their wheels are on record in `wheels` like the first five's.
+#
+# A floor comes with the pins, readable in `wheels.PUBLISHED`: torch 2.9.1 and
+# torchvision 0.24.1 publish Linux wheels as `manylinux_2_28` only and a macOS
+# wheel for arm64 only, so this environment does not install on Intel macOS or
+# on a glibc older than 2.28.
 EMBED_TRAIN = StageEnv(
     name="embed-train",
     requirements=(
@@ -3701,5 +3713,8 @@ EMBED_TRAIN = StageEnv(
         "transformers==5.19.0",
         "sentence-transformers==6.1.0",
         "pillow==12.3.0",
+        "tokenizers==0.23.3",
+        "huggingface-hub==1.33.0",
+        "safetensors==0.8.0",
     ),
 )

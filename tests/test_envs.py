@@ -111,6 +111,19 @@ def test_shipped_environments_are_pinned():
         assert env.identity, env.name
 
 
+def test_embed_train_pins_every_requirement_exactly_and_moves_with_the_closure():
+    names = {wheels.canonical(wheels.pin(r)[0]) for r in EMBED_TRAIN.requirements}
+    assert {"tokenizers", "huggingface-hub", "safetensors"} <= names
+    # numpy is left to the resolver: the measured 2.4.6 has no CPython 3.10 wheel.
+    assert "numpy" not in names
+    without_tokenizers = StageEnv(
+        name=EMBED_TRAIN.name,
+        requirements=tuple(r for r in EMBED_TRAIN.requirements if not r.startswith("tokenizers")),
+    )
+    # An environment built before the closure was pinned is not this one.
+    assert without_tokenizers.identity != EMBED_TRAIN.identity
+
+
 def test_identity_changes_with_requirements():
     a = StageEnv(name="x", requirements=("litert-lm==0.16.1",))
     b = StageEnv(name="x", requirements=("litert-lm==0.16.2",))
