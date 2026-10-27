@@ -33,7 +33,7 @@ them would count each row `DRAWS` times.
 The engine hazard: LiteRT-LM writes the XNNPack weight cache beside the model
 unless it is given a cache directory, and processes writing one cache path at
 once failed with "could not verify buffer list mapping"
-(MEASUREMENTS.md, "EmbeddingGemma 2: many labels"). Here each engine run
+(MEASUREMENTS.md, "EmbeddingGemma 2: the graft"). Here each engine run
 gets its own cache directory under this run's temporary directory
 (`cache_dir`), so nothing is written beside the user's file or Google's, and no
 two runs -- of this verify or of another one -- share a cache path.
@@ -734,7 +734,7 @@ def side_by_side(files: Sequence[Path], threads: int, cpus: int | None) -> bool:
     Each run has its own XNNPack cache directory (`run_engines`), so two runs
     never write one cache path -- the hazard measured as "could not verify
     buffer list mapping" in an earlier measurement
-    (MEASUREMENTS.md, "EmbeddingGemma 2: many labels"). A machine
+    (MEASUREMENTS.md, "EmbeddingGemma 2: the graft"). A machine
     without `threads` CPUs per file would have the runs compete, and each
     file's time per text is reported.
     """

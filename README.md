@@ -706,11 +706,12 @@ What has and has not been measured:
 ### Decisions on EmbeddingGemma 2: an embedding model fine-tuned for your options
 
 The other decider flutter_edge_ai has, `EmbeddingModel.createDecider`, embeds
-the input and answers with the option whose examples' centroid is nearest. Its
-model is Google's EmbeddingGemma 2 text tower, a 270M-parameter `.litertlm`.
-litetune fine-tunes that model on a decision's rows and writes the result into
-Google's own file, so the app loads one `.litertlm` and calls the same
-`createDecider` it already does. Nothing ships beside it.
+the input and answers with the option whose examples' centroid is nearest; any
+embedding model can serve it. litetune's path is for Google's EmbeddingGemma 2
+text tower, a 270M-parameter `.litertlm`: it fine-tunes that model on a
+decision's rows and writes the result into Google's own file, so the app loads
+one `.litertlm` and calls the same `createDecider` it already does. Nothing
+ships beside it.
 
 ```bash
 litetune prepare --data rows.jsonl --questions questions.json --output-dir data \
@@ -732,9 +733,11 @@ The rows and `questions.json` are the ones in the section above, for a
 `none_option` are refused, since the embedding decider does not define them.
 
 - **prepare** measures every row's length behind the decider's prefix
-  (`task: sentence similarity | query: `) when given the tokenizer, and stops
-  the split when one is over 128 tokens. It names any option with fewer than ten training rows:
-  verify fits its gated decider on ten per option.
+  (`task: sentence similarity | query: `) when given the tokenizer, and writes
+  no split when one is longer than `--context-length` or the recipe's 128
+  tokens, whichever is smaller. It names any option with fewer than ten
+  training rows, and says `verify` will refuse that split: its gated decider
+  is fitted on ten per option.
 - **tune** fine-tunes the whole text tower with a throwaway classification
   head, in float32, with the one recipe that was measured: there are no
   training flags, and the LLM ones are refused. It runs in an environment of
@@ -751,9 +754,12 @@ The rows and `questions.json` are the ones in the section above, for a
   fine-tune (sentence-transformers) and with the file (LiteRT-LM's
   `EmbeddingEngine`, CPU), and with `--with-base` with Google's file too. It
   fits the centroid decider on ten examples per option, five draws, and gates
-  on the paired accuracy difference between the fine-tune and the file: every
-  draw within `--max-conversion-cost` (0.01). It refuses a file `convert`
-  grafted from another checkpoint.
+  on the paired accuracy difference between the fine-tune and the file: it
+  passes when every draw's upper 95 % bound is within `--max-conversion-cost`
+  (0.01), fails when any draw's lower bound is above it, and is inconclusive
+  otherwise. With the `convert.json` that `convert` wrote beside the file, it
+  refuses a file grafted from another checkpoint; without it, it says the
+  file is not tied to the reference.
 - **bundle** does not apply: the path ends at `verify`, and the app loads
   `model.litertlm`.
 
@@ -761,48 +767,64 @@ In the app:
 
 ```dart
 // ignore_for_file: experimental_member_use
-final decider = await embedder.createDecider(options: [
-  DeciderOption('card_lost', examples: [
-    EmbeddingInput.text('I think I left my card in the shop'),
-  ]),
-  DeciderOption('refund', examples: [
-    EmbeddingInput.text('I want my money back for this order'),
-  ]),
-], embedderId: 'banking-v1');
+final decider = await embedder.createDecider(
+  options: [
+    DeciderOption('card_lost', examples: [
+      EmbeddingInput.text('I think I left my card in the shop'),
+      EmbeddingInput.text('my card is gone and I need to block it'),
+    ]),
+    DeciderOption('refund', examples: [
+      EmbeddingInput.text('I want my money back for this order'),
+      EmbeddingInput.text('please refund the duplicate charge'),
+    ]),
+  ],
+  embedderId: 'banking-v1',
+);
 ```
 
 `embedder` is the `EmbeddingModel` loaded from the file (flutter_edge_ai's
-README, "Pick one of N options"). The examples are the app's own: verify
-measured ten per option.
+README, "Pick one of N options"). The examples are the app's own; verify
+measured ten per option. The default calibration, `crossFit`, needs at least
+two inputs per option and abstains below a threshold it fits on them; verify
+measured no abstention, which is
+`calibration: const EmbeddingDeciderCalibration.none()`.
 
 Every int4 file is the same size and is named `model.litertlm`, so two
-fine-tunes are told apart only by their bytes: give a saved decider an
-`embedderId` that changes with the file, and rename the file before shipping
-more than one.
+fine-tunes are told apart only by their bytes: give the decider an
+`embedderId` that changes with the file, the same one to `loadDecider` for a
+saved decider, and rename the file before shipping more than one.
 
 What has and has not been measured
 ([MEASUREMENTS.md](MEASUREMENTS.md#embeddinggemma-2-a-decider-fine-tuned-and-grafted-into-googles-file)):
 
-- On emotion, banking77 and CLINC150 the int4 file kept the fine-tune's
-  accuracy within 0.004, and int8 within 0.0005 (the centroid decider; ten
-  examples per option on banking77 and CLINC150, every training row on
-  emotion).
-  litetune's own stages, end to end on banking77, passed `verify` with both:
-  a conversion cost of -0.0002 (int8) and +0.0037 (int4) on the gated decider.
-- The fine-tune helps where the decider has few examples: +0.030 to +0.054
-  over Google's file at five or ten per option on banking77 and CLINC150. A linear
-  layer fitted on every training row gained almost nothing.
-- The app's default calibration abstains below a similarity threshold; verify
-  answers every row, so abstention is not measured, and int4 moves the cosines
-  enough that a threshold chosen on one file does not carry over.
+- litetune's own stages, end to end on banking77 (77 options), passed
+  `verify` with both files: a conversion cost of -0.0002 (int8) and +0.0037
+  (int4) on the 10-shot centroid decider, the int4 cost resolved in three of
+  five draws and under 0.01 in all of them. On banking77 and CLINC150 with the
+  decider's prefix, an earlier measurement gave int4 costs of 0.0027 and
+  0.0017 and int8 0.0002; on emotion (six options), behind a classification
+  prefix, both files' centroid of every training row was within 0.0005 of the
+  fine-tune's.
+- The fine-tune helps where the decider has few examples: at ten per option
+  the files beat Google's by +0.014 (int4) and +0.018 (int8) in litetune's
+  run, and the float32 fine-tune beat it by +0.030 to +0.054 at five or ten
+  per option in the earlier measurement. A linear layer fitted on every training row did not help:
+  Google's file scored 0.9534 against the fine-tune's 0.9389 in litetune's
+  run.
+- The app's default calibration abstains below a similarity threshold;
+  verify answers every row, so abstention is not measured. int4 moves the
+  vectors (minimum cosine to the fine-tune 0.78 in litetune's run), so a
+  threshold chosen on one file may not carry over to another; that is not
+  measured either.
 - Option descriptions, which the app adds to an option's centroid, were not
   used in training and are not measured.
 - CPU only, on LiteRT-LM 0.18.0 from PyPI on an x86 host; the app's own
   runtime build, a phone's CPU, the GPU, the NPU files and the web are not
   measured. Training was measured on the CPU only.
-- verify took 47 minutes (int8) and 35 (int4) on 11,775 rows at four threads
-  with `--with-base`, Google's file embedded beside the candidate; one after
-  another, on a machine without the CPUs for both, it took 76 and 62.
+- On a 32-vCPU Intel Xeon, at four threads, verify took 47 minutes (int8) and
+  35 (int4) on 11,775 rows with `--with-base`, Google's file embedded beside
+  the candidate; the previous litetune, embedding one after the other on the
+  same machine, took 76 and 62.
 
 ### Gemma 4 towers: drop them, or take them from another bundle
 

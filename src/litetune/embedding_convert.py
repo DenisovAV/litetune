@@ -30,9 +30,10 @@ fine-tune must leave it as the base's.
 **Two weight modes**, the spike's variants: `int8` (`i8n_e8`: both graphs int8,
 300,089,344 bytes in the spike) and `int4` (`i4n`: both int4, Google's size). The
 spike's third, an int4 encoder with an int8 embedder, scored within 0.0007 of
-int4 on 77 and 150 labels in s5 (10-shot centroid, mean of the draws: banking77
-0.9320 against 0.9318, CLINC150 0.9652 against 0.9659; s5 computed no
-confidence interval), and is not offered. int8 changes each tensor's
+int4 on 77 and 150 labels (10-shot centroid, mean of the draws: banking77
+0.9320 against 0.9318, CLINC150 0.9652 against 0.9659; no confidence interval
+was computed; MEASUREMENTS.md, "EmbeddingGemma 2: many labels"), and is not
+offered. int8 changes each tensor's
 type and moves its data to a 64-byte-aligned offset in a new weights section;
 int4 rewrites the codes in place. Scales come from a per-row search over 141
 clip ratios for the smallest squared error; int8 codes span [-127, 127].

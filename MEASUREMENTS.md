@@ -2011,8 +2011,11 @@ same scores.
 decision, and `convert` writes the result into Google's own
 `embeddinggemma-2-text-270m.litertlm`
 (litert-community/embeddinggemma-2-text-270m-litert-lm, revision `9be6e8b9`,
-164,626,432 bytes) in place of Google's weights: nobody publishes a path from
-a PyTorch checkpoint to an EmbeddingGemma 2 `.litertlm`. The application uses
+164,626,432 bytes) in place of Google's weights: we found no published path
+from a PyTorch checkpoint to an EmbeddingGemma 2 `.litertlm` as of October 2026
+(litert-torch's `embedding_gemma` example converts the first EmbeddingGemma to
+a bare `.tflite`, and its Hugging Face export has no embedding task). The
+application uses
 the file through flutter_edge_ai's `EmbeddingModel.createDecider`, which
 embeds every input behind `task: sentence similarity | query: ` and answers
 with the option whose centroid of examples is nearest. Every number below was
@@ -2024,6 +2027,10 @@ scripts outside this repository (`graft_s2.py`, `train_s5.py`, `emb_s5.py`,
 
 ### The graft
 
+Everything in this subsection was embedded behind
+`task: classification | query: `, the prefix the first experiments used, not
+the decider's; the next subsection uses the decider's.
+
 - Google's file holds the text tower as two TFLite sections, an embedder (a
   262,144×512 table) and a text encoder with six signatures, one per input
   length. Its 219 two-dimensional weights are int4, one scale per output row,
@@ -2034,8 +2041,9 @@ scripts outside this repository (`graft_s2.py`, `train_s5.py`, `emb_s5.py`,
   graph: 170 of them take the checkpoint's norms, and two belong to a value
   norm that has no weight in the checkpoint and are left as Google wrote them.
 - Google's weights read out and written back by the graft reproduce Google's
-  file to a mean cosine of 0.9993 (int4) and 0.9987 (int8) on 200 texts, so
-  the writer loses nothing beyond re-rounding.
+  file to a mean cosine of 0.9993 (all int4) and 0.9987 (an int8 encoder with
+  the embedder in int4) on 200 texts, so the writer loses nothing beyond
+  re-rounding.
 - The base checkpoint grafted in int8 is 0.9975 (mean cosine) from
   sentence-transformers; Google's own file is 0.9690. Grafted in int4 without
   quantization-aware training it is 0.9451 (that run kept Google's norms;
@@ -2092,13 +2100,15 @@ embedding:
   accuracy, int8 0.0002 on both; no interval was computed for these (litetune's
   `verify` computes a paired one). So `convert` writes int4 by default.
 - An int4 encoder with an int8 embedder (231,735,296 bytes) scored within
-  0.0007 of int4 on both, and is not offered.
+  0.0007 of int4 on the 10-shot centroid on both (within 0.0013 on every
+  decider), and is not offered.
 - The fine-tune gains most where the decider has few examples: +0.0521 and
   +0.0544 at k=5, +0.0394 and +0.0304 at k=10. With a linear layer on every
   training row the gain is 0.0003 and 0.0033.
-- int4 moves the vectors (minimum cosine 0.86 to 0.89): a decider threshold
-  set on one file does not carry over to another, and tasks that read
-  distances directly, retrieval among them, were not measured.
+- int4 moves the vectors (minimum cosine 0.86 to 0.89), so a decider
+  threshold set on one file may not carry over to another; thresholds were not
+  measured, nor were tasks that read distances directly, retrieval among
+  them.
 - Training took 2,880 s (banking77) and 3,189 s (CLINC150) on the 32 vCPUs,
   in float32. Nothing was trained on a GPU.
 
@@ -2106,7 +2116,8 @@ embedding:
 
 litetune's own stages, `prepare` → `tune` → `convert` (int8 and int4) →
 `verify --with-base`, on banking77 through `prepare`'s split: 9,158 training
-and 2,617 held-out rows (so not s5's official split, and not the same numbers).
+and 2,617 held-out rows (so not the official split the previous subsection
+used, and not the same numbers).
 All six stages exited 0. `tune` took 2,347 s.
 
 | embeddings | all rows | k=5 mean | k=10 mean | linear | cosine to float32, mean / min |
@@ -2117,10 +2128,12 @@ All six stages exited 0. `tune` took 2,347 s.
 | int4 file | 0.9289 | 0.9260 | 0.9276 | 0.9400 | 0.9688 / 0.7768 |
 
 - Both files passed `verify`'s gate. The conversion cost on the 10-shot centroid
-  decider was -0.0002 for int8 (every draw within ±0.0021) and +0.0037 for int4
-  (per draw +0.0019 to +0.0050, each interval about ±0.004, all under 0.01).
-- The fine-tune's gain over Google's file at k=10 was +0.0177 (int8) and +0.0138
-  (int4). With a linear layer on every training row Google's file scored
+  decider was -0.0002 for int8 (per draw 0 to -0.0011, intervals up to
+  ±0.0021) and +0.0037 for int4 (per draw +0.0019 to +0.0050, intervals about
+  ±0.004). Three of the five int4 draws resolve the cost as above zero; every
+  draw's upper bound is under 0.01.
+- The files' gain over Google's at k=10 was +0.0177 (int8) and +0.0138
+  (int4), the float32 fine-tune's +0.0175. With a linear layer on every training row Google's file scored
   higher than the fine-tune, 0.9534 against 0.9389.
 - `verify` embedded the file and Google's side by side, each at 4 threads, on
   11,775 texts: 47 minutes for int8 and 35 for int4 from start to exit, where
