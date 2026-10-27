@@ -21,7 +21,7 @@ import pytest
 from conftest import PROBE_FIELDS, FakeJobApi, machine, mark_provisioned, probe_answer
 
 from litetune import envs, wheels
-from litetune.envs import EXPORT, RUNTIME, TRAIN, StageEnv, UnpinnedRequirement
+from litetune.envs import EMBED_TRAIN, EXPORT, RUNTIME, TRAIN, StageEnv, UnpinnedRequirement
 
 
 def _fake_venv(self, path):
@@ -107,8 +107,21 @@ def test_a_pin_that_does_not_apply_changes_no_identity(monkeypatch):
 
 
 def test_shipped_environments_are_pinned():
-    for env in (RUNTIME, EXPORT, TRAIN):
+    for env in (RUNTIME, EXPORT, TRAIN, EMBED_TRAIN):
         assert env.identity, env.name
+
+
+def test_embed_train_pins_every_requirement_exactly_and_moves_with_the_closure():
+    names = {wheels.canonical(wheels.pin(r)[0]) for r in EMBED_TRAIN.requirements}
+    assert {"tokenizers", "huggingface-hub", "safetensors"} <= names
+    # numpy is left to the resolver: the measured 2.4.6 has no CPython 3.10 wheel.
+    assert "numpy" not in names
+    without_tokenizers = StageEnv(
+        name=EMBED_TRAIN.name,
+        requirements=tuple(r for r in EMBED_TRAIN.requirements if not r.startswith("tokenizers")),
+    )
+    # An environment built before the closure was pinned is not this one.
+    assert without_tokenizers.identity != EMBED_TRAIN.identity
 
 
 def test_identity_changes_with_requirements():
@@ -1277,11 +1290,12 @@ def test_an_environment_for_another_interpreter_is_not_reported_as_junk():
     junk, it is the one that works over there. Reporting it as "unused" would
     invite deleting exactly the caches worth keeping.
     """
-    from litetune.envs import EXPORT, RUNTIME, TRAIN
+    from litetune.envs import EMBED_TRAIN, EXPORT, RUNTIME, TRAIN
 
-    identities = {env.path.name for env in (RUNTIME, TRAIN, EXPORT)}
-    assert len(identities) == 3, "each stage owns a distinct directory"
-    for env in (RUNTIME, TRAIN, EXPORT):
+    stages = (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN)
+    identities = {env.path.name for env in stages}
+    assert len(identities) == len(stages), "each stage owns a distinct directory"
+    for env in stages:
         assert env.identity in env.path.name
         # The interpreter is in the hash, which is why the CLI says "not for
         # pythonX.Y" rather than "unclaimed".

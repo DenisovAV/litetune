@@ -43,6 +43,8 @@ from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.decision_verify import DEFAULT_ENGINE_ROWS, DEFAULT_THREADS
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
 from litetune.devices import DEVICE_VARIABLE, DeviceSettingError, device_setting
+from litetune.embedding_tune import DIRECTION as EMBEDDING_DIRECTION
+from litetune.embedding_tune import EMBEDDING_MODEL, model_dir_hint
 from litetune.evaluate import (
     GENERATION_SETTINGS_NOT_APPLIED,
     GREEDY,
@@ -238,6 +240,26 @@ class VerifyRequest:
     float_twin: Path | None = None
     engine_rows: int = DEFAULT_ENGINE_ROWS
     threads: int = DEFAULT_THREADS
+    # An embedding checkpoint (`tune --model google/embeddinggemma-2`) only. The
+    # split the decider's examples are drawn from (`None`: train.jsonl beside
+    # `data`), and Google's file to measure the gain over: a local copy, or
+    # downloaded with `with_base`.
+    train_data: Path | None = None
+    base_litertlm: Path | None = None
+    with_base: bool = False
+
+    @property
+    def embedding_flags(self) -> tuple[str, ...]:
+        """The embedding-only flags given, by their CLI names."""
+        return tuple(
+            flag
+            for flag, given in (
+                ("--train-data", self.train_data is not None),
+                ("--base-litertlm", self.base_litertlm is not None),
+                ("--with-base", self.with_base),
+            )
+            if given
+        )
 
 
 @dataclass(frozen=True)
@@ -962,6 +984,76 @@ def _decision_record(reference: str) -> tuple[dict[str, Any] | None, str | None]
     return read[0], None
 
 
+def _embedding_record(reference: str) -> tuple[dict[str, Any], str] | None:
+    """The reference's record and where it was read, when it is an embedding record.
+
+    A record that cannot be read is `None` here: the decision and generative
+    paths read it again and say what is wrong with it.
+    """
+    try:
+        read = read_training_record(reference)
+    except (OSError, ValueError):
+        return None
+    if read is None or read[0].get("direction") != EMBEDDING_DIRECTION:
+        return None
+    return read[0], str(read[1])
+
+
+def _verify_embedding(
+    request: VerifyRequest, record: tuple[dict[str, Any], str], run: _Run, events: EventStream
+) -> VerifyResult:
+    from litetune.embedding_tune import EmbeddingRecord
+    from litetune.embedding_verify import RECORD_CHECK, EmbeddingVerify, verify_embedding
+
+    manifest = run.manifest
+    for key in ("harness", "measurements", "quality", "gates"):
+        manifest.pop(key, None)
+    try:
+        parsed = EmbeddingRecord.from_dict(record[0], record[1])
+    except ValueError as exc:
+        check = Check.failed(RECORD_CHECK, f"the reference's embedding record is malformed: {exc}")
+        run.record(check)
+        manifest["status"] = Status.FAILED_HARNESS.value
+        events.stage_finished(Status.FAILED_HARNESS.value)
+        return VerifyResult(status=Status.FAILED_HARNESS, manifest=manifest)
+    not_applicable = tuple(
+        flag
+        for flag, given in (
+            ("--scorer", request.scorer != VerifyRequest.scorer),
+            ("--prompt-mode", request.prompt_mode is not None),
+            ("--contract", request.contract is not None),
+            ("--declarations", request.declarations is not None),
+            ("--max-tokens", request.decode != GREEDY),
+            ("the liveness thresholds", request.thresholds != DEFAULT_THRESHOLDS),
+            ("--calibration", request.calibration is not None),
+            ("--float-twin", request.float_twin is not None),
+            ("--engine-rows", request.engine_rows != DEFAULT_ENGINE_ROWS),
+        )
+        if given
+    )
+    job = EmbeddingVerify(
+        model=request.model,
+        reference=request.reference,
+        heldout=request.data,
+        train=request.train_data,
+        base_litertlm=request.base_litertlm,
+        with_base=request.with_base,
+        threads=request.threads,
+        max_conversion_cost=request.max_conversion_cost,
+        backend=request.backend,
+        reference_role=request.reference_role.value,
+        limit=request.limit,
+        not_applicable=not_applicable,
+    )
+    status, fields = verify_embedding(job, parsed, events)
+    checks = fields.pop("checks")
+    manifest["checks"] = list(manifest.get("checks") or []) + checks["checks"]
+    manifest.update(fields)
+    manifest["status"] = status
+    events.stage_finished(status)
+    return VerifyResult(status=Status(status), manifest=manifest)
+
+
 def _verify_decision(
     request: VerifyRequest,
     record: dict[str, Any] | None,
@@ -973,18 +1065,21 @@ def _verify_decision(
 
     # What a generative run reads and this one does not: refused by name rather
     # than dropped, so that no manifest records a gate or a mode nobody applied.
-    not_applicable = tuple(
-        flag
-        for flag, given in (
-            ("--scorer", request.scorer != VerifyRequest.scorer),
-            ("--max-conversion-cost", request.max_conversion_cost is not None),
-            ("--prompt-mode", request.prompt_mode is not None),
-            ("--contract", request.contract is not None),
-            ("--declarations", request.declarations is not None),
-            ("--max-tokens", request.decode != GREEDY),
-            ("the liveness thresholds", request.thresholds != DEFAULT_THRESHOLDS),
+    not_applicable = (
+        tuple(
+            flag
+            for flag, given in (
+                ("--scorer", request.scorer != VerifyRequest.scorer),
+                ("--max-conversion-cost", request.max_conversion_cost is not None),
+                ("--prompt-mode", request.prompt_mode is not None),
+                ("--contract", request.contract is not None),
+                ("--declarations", request.declarations is not None),
+                ("--max-tokens", request.decode != GREEDY),
+                ("the liveness thresholds", request.thresholds != DEFAULT_THRESHOLDS),
+            )
+            if given
         )
-        if given
+        + request.embedding_flags
     )
     device, device_error = "auto", None
     try:
@@ -1046,9 +1141,26 @@ def run_verify(
     # -- a decision checkpoint is measured by option scoring --------------------
     # Before anything generative: such a model never generates in use, and the
     # checks below are about generations.
+    # An embedding checkpoint records a decision too, and is measured by the
+    # decider the application builds from its vectors: first.
+    embedding_record = _embedding_record(request.reference)
+    if embedding_record is not None:
+        return _verify_embedding(request, embedding_record, run, events)
     decision_record, unreadable = _decision_record(request.reference)
     if decision_record is not None or request.calibration is not None or request.float_twin:
         return _verify_decision(request, decision_record, unreadable, run, events)
+    if request.embedding_flags:
+        flags = request.embedding_flags
+        run.record(
+            Check.failed(
+                "request",
+                f"{', '.join(flags)} {'does' if len(flags) == 1 else 'do'} not apply here: "
+                "they are for an embedding checkpoint, one whose litetune.json "
+                f"`tune --model {EMBEDDING_MODEL}` wrote, and {request.reference} records "
+                f"none{model_dir_hint(request.reference)}. Refused rather than ignored",
+            )
+        )
+        return run.finish(Status.FAILED_HARNESS)
 
     # -- did the operator ask for a device litetune knows? ---------------------
     # First, because it costs nothing and everything after it costs minutes: a

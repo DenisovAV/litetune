@@ -52,6 +52,34 @@ from litetune.decision_verify import (
 )
 from litetune.decisions import DecisionError
 from litetune.declarations import DeclarationsError
+from litetune.embedding_convert import GRAFT_TIMEOUT_S
+from litetune.embedding_export import (
+    ARTIFACT_NAME as EMBEDDING_ARTIFACT_NAME,
+)
+from litetune.embedding_export import (
+    DEFAULT_WEIGHTS,
+    EMBEDDING_CONVERT_SCHEMA,
+    WEIGHT_MODES,
+    EmbeddingExportError,
+    EmbeddingExportRequest,
+    run_embedding_export,
+)
+from litetune.embedding_export import REPORT_NAME as EMBEDDING_REPORT_NAME
+from litetune.embedding_export import summarise as summarise_embedding_convert
+from litetune.embedding_tune import (
+    DIRECTION,
+    EMBEDDING_MODEL,
+    EMBEDDING_REVISION,
+    EmbeddingRecord,
+    EmbeddingTuneError,
+    EmbeddingTuneRequest,
+    model_dir_hint,
+    run_embedding_tune,
+)
+from litetune.embedding_tune import summarise as summarise_embedding_tune
+from litetune.embedding_tune import write_report as write_embedding_report
+from litetune.embedding_verify import SCORER as EMBEDDING_SCORER
+from litetune.embedding_verify import summarise as summarise_embedding_verify
 from litetune.envs import cached_environments, env_cache_root, remove_cached
 from litetune.evaluate import CANDIDATE_BACKENDS, GREEDY, DataError
 from litetune.events import EventStream, TerminalRenderer
@@ -116,6 +144,12 @@ REFUSALS = (
     NoRecipesRequested,
     BundleError,
     TuneError,
+    # `tune --model google/embeddinggemma-2` with a flag its recipe does not
+    # read, a decision it does not train, or rows that are not that decision's.
+    EmbeddingTuneError,
+    # `convert` of an embedding checkpoint with an LLM flag, or `--weights` for
+    # an LLM; a malformed embedding record; an output already there.
+    EmbeddingExportError,
     PrepareError,
     TowersError,
     # A declarations file the runtime or the reference template would render
@@ -191,7 +225,17 @@ class _Parser(argparse.ArgumentParser):
         # writes to, stderr where it names none.
         if message:
             message = _encodable(message, file if file is not None else sys.stderr)
-        super()._print_message(message, file)
+        try:
+            super()._print_message(message, file)
+        except OSError as exc:
+            # A reader that has gone. argparse swallows this itself from 3.11;
+            # on 3.10 it raised out of `parse_args` as soon as a message was
+            # longer than the stream's 8 KiB buffer -- `verify --help` grew
+            # past it -- and `main` reported a help request as a refusal.
+            # Swallowed here as 3.11 does, the `SystemExit` argparse raises
+            # next carries what it decided, and `main` flushes and silences.
+            if not _a_closed_pipe(exc):
+                raise
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
@@ -301,7 +345,9 @@ def _add_verify(sub) -> None:
         type=float,
         help=(
             "fail if conversion costs more than this much exact match. A threshold finer than "
-            "the split's confidence interval returns inconclusive, not a verdict"
+            "the split's confidence interval returns inconclusive, not a verdict. For an "
+            "embedding checkpoint: accuracy of the 10-shot centroid decider, every draw "
+            "(default 0.01 there)"
         ),
     )
     verify.add_argument(
@@ -397,7 +443,34 @@ def _add_verify(sub) -> None:
         "--threads",
         type=_positive,
         default=DEFAULT_THREADS,
-        help=f"decision checkpoints: the runtime's CPU threads (default {DEFAULT_THREADS})",
+        help=(
+            "decision and embedding checkpoints: the runtime's CPU threads (default "
+            f"{DEFAULT_THREADS})"
+        ),
+    )
+    verify.add_argument(
+        "--train-data",
+        type=Path,
+        help=(
+            "embedding checkpoints: the split the decider's examples are drawn from, k per option "
+            "and all of them (default train.jsonl beside --data, where prepare writes it)"
+        ),
+    )
+    verify.add_argument(
+        "--base-litertlm",
+        type=Path,
+        help=(
+            "embedding checkpoints: a local copy of Google's embeddinggemma-2-text-270m.litertlm, "
+            "checked by its sha256, measured on the same rows for the gain over it"
+        ),
+    )
+    verify.add_argument(
+        "--with-base",
+        action="store_true",
+        help=(
+            "embedding checkpoints: download Google's file at the pinned revision and measure "
+            "the gain over it"
+        ),
     )
     verify.add_argument("--json", action="store_true", help="write the manifest to stdout")
 
@@ -493,13 +566,26 @@ def _add_tune(sub) -> None:
         description=(
             "Fine-tune inside the pinned training environment. Training completing is not "
             f"evidence: a run that scored nine times worse than its base finished cleanly with a "
-            f"lower loss. {STAGE_EXIT_CODE_HELP}"
+            f"lower loss. --model {EMBEDDING_MODEL} trains an embedding model for a choice "
+            "--decision instead, with its measured recipe and none of the LLM flags. "
+            f"{STAGE_EXIT_CODE_HELP}"
         ),
     )
     tune.add_argument("--model", required=True, help="HF id or path of the base checkpoint")
     tune.add_argument("--data", required=True, type=Path, help="training JSONL")
     tune.add_argument("--output-dir", required=True, type=Path)
-    tune.add_argument("--method", choices=list(METHODS), default="full")
+    tune.add_argument(
+        "--heldout",
+        type=Path,
+        help=(
+            f"only with --model {EMBEDDING_MODEL}: the held-out split the discarded head is "
+            "scored on; default heldout.jsonl beside --data, where prepare writes it"
+        ),
+    )
+    # The LLM-only flags below default to None, not to their values, so that the
+    # embedding path can tell a flag that was given from one that was not and
+    # refuse it rather than ignore it. `_tune` fills in `TuneRequest`'s defaults.
+    tune.add_argument("--method", choices=list(METHODS), help="default full")
     tune.add_argument("--revision", help="pin the base checkpoint's revision")
     tune.add_argument(
         "--prompt-mode",
@@ -549,8 +635,8 @@ def _add_tune(sub) -> None:
         type=float,
         help="default is per method: 1e-5 for full, 2e-4 for lora",
     )
-    tune.add_argument("--epochs", type=float, default=1.0)
-    tune.add_argument("--batch-size", type=int, default=8)
+    tune.add_argument("--epochs", type=float, help="default 1")
+    tune.add_argument("--batch-size", type=int, help="default 8")
     tune.add_argument(
         "--micro-batch-size",
         type=int,
@@ -559,11 +645,11 @@ def _add_tune(sub) -> None:
             "--batch-size on CPU/CUDA and 1 on MPS"
         ),
     )
-    tune.add_argument("--max-seq-length", type=int, default=1024)
-    tune.add_argument("--seed", type=int, default=0)
-    tune.add_argument("--lora-rank", type=int, default=16)
-    tune.add_argument("--lora-alpha", type=int, default=32)
-    tune.add_argument("--lora-dropout", type=float, default=0.05)
+    tune.add_argument("--max-seq-length", type=int, help="default 1024")
+    tune.add_argument("--seed", type=int, help="default 0")
+    tune.add_argument("--lora-rank", type=int, help="default 16")
+    tune.add_argument("--lora-alpha", type=int, help="default 32")
+    tune.add_argument("--lora-dropout", type=float, help="default 0.05")
     # `choices`, not just a default: spec.py's `DTYPES` excludes float16
     # because a 270M model's loss goes to NaN in it while bfloat16 holds. The
     # spec file was closed and this line was not, so the path everyone actually
@@ -584,7 +670,7 @@ def _add_tune(sub) -> None:
             "and what the run trained in"
         ),
     )
-    tune.add_argument("--attn-implementation", default="eager")
+    tune.add_argument("--attn-implementation", help="default eager")
     tune.add_argument("--timeout-s", type=int, default=TuneRequest.timeout_s)
     tune.add_argument(
         "--no-provision",
@@ -681,7 +767,35 @@ def _add_convert(sub) -> None:
             "longer the one the CPU figures describe; the report records it as fp32_fp16"
         ),
     )
-    convert.add_argument("--timeout-s", type=int, default=ExportRequest.timeout_s)
+    convert.add_argument(
+        "--weights",
+        choices=WEIGHT_MODES,
+        help=(
+            "embedding checkpoints only (a `tune --model google/embeddinggemma-2` output): how "
+            "the fine-tune's weights are quantized into Google's file. int8: both graphs int8; "
+            f"int4: both int4, Google's own size (default {DEFAULT_WEIGHTS})"
+        ),
+    )
+    convert.add_argument(
+        "--base-litertlm",
+        type=Path,
+        help=(
+            "embedding checkpoints only: a local copy of Google's "
+            "embeddinggemma-2-text-270m.litertlm, checked by its sha256; without it the file is "
+            "downloaded at the pinned revision"
+        ),
+    )
+    # No default here: the LLM export and the embedding graft have their own
+    # (`ExportRequest.timeout_s`, `embedding_convert.GRAFT_TIMEOUT_S`).
+    convert.add_argument(
+        "--timeout-s",
+        type=int,
+        default=None,
+        help=(
+            f"seconds the conversion may run (default {ExportRequest.timeout_s}; "
+            f"{GRAFT_TIMEOUT_S} for an embedding checkpoint)"
+        ),
+    )
     convert.add_argument(
         "--no-provision",
         action="store_true",
@@ -979,6 +1093,9 @@ def _verify(args: argparse.Namespace) -> int:
         float_twin=args.float_twin,
         engine_rows=args.engine_rows,
         threads=args.threads,
+        train_data=args.train_data,
+        base_litertlm=args.base_litertlm,
+        with_base=args.with_base,
         # `is not None`, not truthiness: `--max-tokens 0` is a request this
         # cannot honour, and silently substituting the default would report a
         # limit the run did not use.
@@ -1080,6 +1197,8 @@ def summarise(manifest: dict) -> list[str]:
     """The human-readable result. Every number printed carries n and its interval."""
     if _mapping(manifest.get("scorer")).get("name") == SCORER:
         return summarise_decision(manifest)
+    if _mapping(manifest.get("scorer")).get("name") == EMBEDDING_SCORER:
+        return summarise_embedding_verify(manifest)
     status = manifest.get("status")
     lines = [f"status: {status}"]
 
@@ -1188,13 +1307,41 @@ def summarise(manifest: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _token_counter(args: argparse.Namespace) -> HuggingFaceTokenCounter | None:
+    """The tokenizer `prepare` counts with, in the environment that can load it.
+
+    google/embeddinggemma-2's tokenizer is counted in EMBED_TRAIN, at the
+    pinned revision: TRAIN's transformers predates the model
+    (`envs.EMBED_TRAIN`). A split for that model counted with another
+    tokenizer would measure rows the model never sees, and is refused.
+    """
+    if args.base_model == EMBEDDING_MODEL and args.tokenizer not in (None, EMBEDDING_MODEL):
+        raise PrepareError(
+            f"--tokenizer {args.tokenizer}: a split for {EMBEDDING_MODEL} is measured with its "
+            "own tokenizer; pass that one, or none"
+        )
+    if args.tokenizer is None:
+        return None
+    if args.tokenizer != EMBEDDING_MODEL:
+        return HuggingFaceTokenCounter(model=args.tokenizer, revision=args.tokenizer_revision)
+    if args.tokenizer_revision not in (None, EMBEDDING_REVISION):
+        raise PrepareError(
+            f"--tokenizer-revision {args.tokenizer_revision}: {EMBEDDING_MODEL} is trained at "
+            f"{EMBEDDING_REVISION}; leave it out or pass that one"
+        )
+    return HuggingFaceTokenCounter(
+        model=EMBEDDING_MODEL,
+        revision=EMBEDDING_REVISION,
+        env=envs.EMBED_TRAIN,
+        # Only the embedding path measures one text with its specials; the LLM
+        # path adds `prepare.SEQUENCE_OVERHEAD_TOKENS` to a count without them.
+        special_tokens=args.base_model == EMBEDDING_MODEL,
+    )
+
+
 def _prepare(args: argparse.Namespace) -> int:
     events = _stream()
-    counter = (
-        HuggingFaceTokenCounter(model=args.tokenizer, revision=args.tokenizer_revision)
-        if args.tokenizer
-        else None
-    )
+    counter = _token_counter(args)
     request = PrepareRequest(
         data=args.data,
         output_dir=args.output_dir,
@@ -1265,31 +1412,63 @@ def summarise_prepare(result: PrepareResult) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# The `tune` flags only the LLM recipe reads, by `argparse` dest, with how they
+# are typed. Each is None (False for the switch) unless it was given.
+_LLM_ONLY_TUNE_FLAGS = (
+    ("method", "--method"),
+    ("prompt_mode", "--prompt-mode"),
+    ("force_prompt_mode", "--force-prompt-mode"),
+    ("declarations", "--declarations"),
+    ("learning_rate", "--learning-rate"),
+    ("epochs", "--epochs"),
+    ("batch_size", "--batch-size"),
+    ("micro_batch_size", "--micro-batch-size"),
+    ("max_seq_length", "--max-seq-length"),
+    ("seed", "--seed"),
+    ("lora_rank", "--lora-rank"),
+    ("lora_alpha", "--lora-alpha"),
+    ("lora_dropout", "--lora-dropout"),
+    ("attn_implementation", "--attn-implementation"),
+)
+
+# What `TuneRequest` takes for the flags above when they were not given.
+_TUNE_DEFAULTED = (
+    "method",
+    "epochs",
+    "batch_size",
+    "max_seq_length",
+    "seed",
+    "lora_rank",
+    "lora_alpha",
+    "lora_dropout",
+    "attn_implementation",
+)
+
+
 def _tune(args: argparse.Namespace) -> int:
+    if args.model == EMBEDDING_MODEL:
+        return _tune_embedding(args)
+    if args.heldout is not None:
+        raise TuneError(f"--heldout is read only with --model {EMBEDDING_MODEL}")
     events = _stream()
+    given = {
+        name: getattr(args, name) for name in _TUNE_DEFAULTED if getattr(args, name) is not None
+    }
     request = TuneRequest(
         model=args.model,
         data=args.data,
         output_dir=args.output_dir,
-        method=args.method,
         revision=args.revision,
         learning_rate=args.learning_rate,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
         micro_batch_size=args.micro_batch_size,
-        max_seq_length=args.max_seq_length,
-        seed=args.seed,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
         dtype=args.dtype,
-        attn_implementation=args.attn_implementation,
         prompt_mode=PromptMode(args.prompt_mode) if args.prompt_mode else None,
         force_prompt_mode=args.force_prompt_mode,
         declarations=args.declarations,
         decision=args.decision,
         timeout_s=args.timeout_s,
         auto_provision=not args.no_provision,
+        **given,
     )
     result = run_tune(request, events=events)
     report = write_report(result)
@@ -1340,6 +1519,55 @@ def summarise_tune(result: TuneResult) -> list[str]:
     for text in result.limitations:
         lines.append(f"  note: {text}")
     return lines
+
+
+def _tune_embedding(args: argparse.Namespace) -> int:
+    """`tune --model google/embeddinggemma-2`: the measured embedding recipe, nothing else.
+
+    Every LLM flag that was given is refused by name rather than ignored: the
+    recipe takes no overrides (`embedding_tune.RECIPE`), and a flag that
+    silently changed nothing reads as one that took effect.
+    """
+    given = [
+        flag for name, flag in _LLM_ONLY_TUNE_FLAGS if getattr(args, name) not in (None, False)
+    ]
+    if given:
+        raise EmbeddingTuneError(
+            f"{', '.join(given)}: --model {EMBEDDING_MODEL} trains with the measured embedding "
+            "recipe (full fine-tune with a classifier head, lr 2e-5, batch 8, 2 epochs, at most "
+            "128 tokens, seed 0, float32), which these flags do not apply to"
+        )
+    if args.dtype not in (None, "float32"):
+        raise EmbeddingTuneError(
+            f"--dtype {args.dtype}: the embedding recipe trains in float32 on every device; "
+            "float16 is documented to give NaN embeddings and bfloat16 was not measured"
+        )
+    if args.decision is None:
+        raise EmbeddingTuneError(
+            f"--model {EMBEDDING_MODEL} needs --decision, the decision.json prepare wrote beside "
+            "the split: its options are the labels the model is trained to separate"
+        )
+    if args.revision is not None and args.revision != EMBEDDING_REVISION:
+        raise EmbeddingTuneError(
+            f"--revision {args.revision}: the embedding recipe and convert's tensor mapping were "
+            f"established on {EMBEDDING_REVISION}; leave it out or pass that one"
+        )
+    events = _stream()
+    request = EmbeddingTuneRequest(
+        data=args.data,
+        heldout=args.heldout if args.heldout is not None else args.data.parent / "heldout.jsonl",
+        decision=args.decision,
+        output_dir=args.output_dir,
+        revision=args.revision,
+        timeout_s=args.timeout_s,
+        auto_provision=not args.no_provision,
+    )
+    result = run_embedding_tune(request, events=events)
+    report = write_embedding_report(result)
+    events.artifact(str(report), name="tune.json")
+    if not _report(result.as_dict(), lambda: summarise_embedding_tune(result), args.json):
+        return EXIT_CODES[Status.ERROR]
+    return OUTCOME_EXIT_CODES[result.outcome]
 
 
 # ---------------------------------------------------------------------------
@@ -1437,7 +1665,46 @@ def _read_base_model(metrics: Path | None) -> str | None:
     return base
 
 
+def _embedding_record(model: str) -> EmbeddingRecord | None:
+    """The embedding record beside `model`, `None` for any other checkpoint.
+
+    A record that cannot be read at all is left to the LLM path, which reads it
+    again and says what is wrong with it, as it did before the embedding path
+    existed. One that says it is an embedding record and is malformed is
+    refused here.
+    """
+    try:
+        read = models.read_training_record(model)
+    except (OSError, ValueError):
+        return None
+    if read is None or read[0].get("direction") != DIRECTION:
+        return None
+    try:
+        return EmbeddingRecord.from_dict(read[0], str(read[1]))
+    except ValueError as exc:
+        raise EmbeddingExportError(str(exc)) from exc
+
+
+# `convert`'s flags for an LLM, which an embedding checkpoint's graft does not read.
+_LLM_ONLY_CONVERT_FLAGS = (
+    ("recipe", "--recipe"),
+    ("flag", "--flag"),
+    ("externalize_embedder", "--externalize-embedder"),
+    ("train_metrics", "--train-metrics"),
+    ("base_model", "--base-model"),
+)
+
+
 def _convert(args: argparse.Namespace) -> int:
+    record = _embedding_record(args.model)
+    if record is not None:
+        return _convert_embedding(args, record)
+    if args.weights is not None or args.base_litertlm is not None:
+        raise EmbeddingExportError(
+            "--weights and --base-litertlm are for an embedding checkpoint, one whose "
+            f"litetune.json `tune --model {EMBEDDING_MODEL}` wrote; {args.model} is not one"
+            f"{model_dir_hint(args.model)}. Pick an LLM's quantization with --recipe"
+        )
     events = _stream()
     # Explicit beats recorded: a caller who names the base model has a reason,
     # and the recorded one is only ever a convenience for the common case.
@@ -1451,7 +1718,7 @@ def _convert(args: argparse.Namespace) -> int:
         recipes=args.recipe or (),
         externalize_embedder=args.externalize_embedder,
         extra_flags=tuple(args.flag),
-        timeout_s=args.timeout_s,
+        timeout_s=args.timeout_s if args.timeout_s is not None else ExportRequest.timeout_s,
         auto_provision=not args.no_provision,
     )
     result = run_export(request, events=events)
@@ -1459,6 +1726,37 @@ def _convert(args: argparse.Namespace) -> int:
     if not delivered:
         # The report is the deliverable when `--json` is on, and a run whose
         # result could not be written has not been reported.
+        return EXIT_CODES[Status.ERROR]
+    return OUTCOME_EXIT_CODES[result.outcome]
+
+
+def _convert_embedding(args: argparse.Namespace, record: EmbeddingRecord) -> int:
+    """`convert` of an embedding checkpoint: the graft into Google's file, nothing else.
+
+    Every LLM flag given is refused by name rather than ignored.
+    """
+    given = [
+        flag
+        for name, flag in _LLM_ONLY_CONVERT_FLAGS
+        # `False` is `--no-externalize-embedder`, given; `[]` is no `--flag`.
+        if getattr(args, name) is not None and getattr(args, name) != []
+    ]
+    if given:
+        raise EmbeddingExportError(
+            f"{', '.join(given)}: {args.model} is an embedding checkpoint, which convert grafts "
+            "into Google's EmbeddingGemma 2 file; pick its quantization with --weights"
+        )
+    events = _stream()
+    request = EmbeddingExportRequest(
+        model=Path(args.model),
+        output_dir=args.output_dir,
+        weights=args.weights or DEFAULT_WEIGHTS,
+        base_litertlm=args.base_litertlm,
+        timeout_s=args.timeout_s if args.timeout_s is not None else GRAFT_TIMEOUT_S,
+        auto_provision=not args.no_provision,
+    )
+    result = run_embedding_export(request, record, events=events)
+    if not _report(result.as_dict(), lambda: summarise_embedding_convert(result), args.json):
         return EXIT_CODES[Status.ERROR]
     return OUTCOME_EXIT_CODES[result.outcome]
 
@@ -1755,8 +2053,44 @@ def _bundle_prompt_mode(
     )
 
 
+EMBEDDING_BUNDLE_REFUSED = (
+    "{model} is an embedding fine-tune's {what}. The embedding path ends at `convert` and "
+    "`verify`: `bundle` assembles a generative model's deliverable (declarations, calling "
+    "contract), which an embedding model has none of. The application loads the "
+    "{artifact} that `convert` wrote through EmbeddingModel.createDecider"
+)
+
+
+def _embedding_bundle_input(model: Path) -> str | None:
+    """What `model` is, when it is an embedding checkpoint or the file `convert` wrote from one.
+
+    The file is recognised by the `convert.json` beside it (`embedding_export`
+    writes the report next to the artifact). A report that cannot be read
+    proves nothing either way, so such a file goes on to `bundle`'s own checks.
+    """
+    if _embedding_record(str(model)) is not None:
+        return "checkpoint"
+    report = model.parent / EMBEDDING_REPORT_NAME
+    if model.is_file() and report.is_file():
+        try:
+            loaded = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logger.warning("%s could not be read as a convert report", report, exc_info=True)
+            return None
+        if isinstance(loaded, dict) and loaded.get("schema") == EMBEDDING_CONVERT_SCHEMA:
+            return "converted file"
+    return None
+
+
 def _bundle(args: argparse.Namespace) -> int:
     events = _stream()
+
+    if (what := _embedding_bundle_input(args.model)) is not None:
+        raise BundleInputError(
+            EMBEDDING_BUNDLE_REFUSED.format(
+                model=args.model, what=what, artifact=EMBEDDING_ARTIFACT_NAME
+            )
+        )
 
     # The same refusal a spec file gets. `--base-model-revision main` was
     # accepted here while `base_model.revision: main` was refused there, so the
