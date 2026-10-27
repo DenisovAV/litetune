@@ -225,7 +225,17 @@ class _Parser(argparse.ArgumentParser):
         # writes to, stderr where it names none.
         if message:
             message = _encodable(message, file if file is not None else sys.stderr)
-        super()._print_message(message, file)
+        try:
+            super()._print_message(message, file)
+        except OSError as exc:
+            # A reader that has gone. argparse swallows this itself from 3.11;
+            # on 3.10 it raised out of `parse_args` as soon as a message was
+            # longer than the stream's 8 KiB buffer -- `verify --help` grew
+            # past it -- and `main` reported a help request as a refusal.
+            # Swallowed here as 3.11 does, the `SystemExit` argparse raises
+            # next carries what it decided, and `main` flushes and silences.
+            if not _a_closed_pipe(exc):
+                raise
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)

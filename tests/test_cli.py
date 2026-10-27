@@ -2033,6 +2033,23 @@ def test_help_to_a_closed_pipe_is_not_a_failure():
         assert b"BrokenPipeError" not in stderr
 
 
+def test_help_longer_than_the_buffer_to_a_closed_pipe_answers_as_3_11_does(monkeypatch, capsys):
+    """argparse 3.10 writes without a guard, so a help text past the stream's
+    buffer raised out of `parse_args` and `main` exited 4. Forced here on any
+    version by a write that raises as 3.10's does."""
+    import argparse
+
+    def closed(self, message, file=None):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(argparse.ArgumentParser, "_print_message", closed)
+    monkeypatch.setattr("litetune.cli._silence_streams", lambda: None)
+    assert main(["verify", "--help"]) == 0
+    from litetune.cli import EXIT_CODES
+
+    assert main(["verify", "--no-such-flag"]) == EXIT_CODES[Status.ERROR]
+
+
 def test_a_closed_stderr_does_not_turn_a_failure_into_a_pass(tmp_path):
     """The single thing this tool exists to prevent, arriving from inside it.
 

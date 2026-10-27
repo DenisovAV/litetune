@@ -45,7 +45,7 @@ import re
 import statistics
 import subprocess
 import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -316,6 +316,18 @@ EMBEDDING_CALIBRATION_UNUSED = (
     "the calibration split is written as for every decision, and the embedding path does not "
     "read it: `tune` trains on train.jsonl and `verify` fits the decider on train.jsonl"
 )
+
+
+def thin_options_note(train: Mapping[str, int], k: int) -> str | None:
+    """`EMBEDDING_THIN_OPTIONS` for the options with fewer than `k` training rows, or
+    `None` when every option has `k`: verify's gate draws `k` rows per option."""
+    thin = {o: n for o, n in train.items() if n < k}
+    if not thin:
+        return None
+    shown = ", ".join(f"{o!r} ({n})" for o, n in sorted(thin.items())[:12])
+    return EMBEDDING_THIN_OPTIONS.format(
+        count=len(thin), k=k, named=shown + (" and more" if len(thin) > 12 else "")
+    )
 
 
 def embedding_decision_refusal(decision: Decision) -> str | None:
@@ -2119,16 +2131,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             # Lazy: embedding_verify imports this module.
             from litetune.embedding_verify import GATED_K
 
-            thin = {o: n for o, n in decision.train.items() if n < GATED_K}
-            if thin:
-                shown = ", ".join(f"{o!r} ({n})" for o, n in sorted(thin.items())[:12])
-                result.limitation(
-                    EMBEDDING_THIN_OPTIONS.format(
-                        count=len(thin),
-                        k=GATED_K,
-                        named=shown + (" and more" if len(thin) > 12 else ""),
-                    )
-                )
+            if (note := thin_options_note(decision.train, GATED_K)) is not None:
+                result.limitation(note)
         none_option = decision.decision.none_option
         if none_option is not None and (
             0 < (oos_rows := decision.calibration[none_option]) < THIN_CALIBRATION_OOS

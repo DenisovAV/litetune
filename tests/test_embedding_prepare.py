@@ -364,22 +364,17 @@ def test_an_option_with_fewer_training_rows_than_verifys_gate_draws_is_named(tmp
     assert f"{GATED_K}-shot gate" in note
 
 
-def test_an_option_with_exactly_the_gates_k_training_rows_is_not_named(tmp_path):
+def test_an_option_with_exactly_the_gates_k_training_rows_is_not_named():
+    # The boundary on the counts themselves: the split is seeded by the file's
+    # bytes, which differ by platform (line endings), so no row count gives k
+    # training rows everywhere.
     from litetune.embedding_verify import GATED_K
+    from litetune.prepare import thin_options_note
 
-    # The split is seeded by content, so find the size at which 'balance' keeps exactly k.
-    for size in range(GATED_K, 4 * GATED_K):
-        result = prepare(
-            _request(
-                tmp_path,
-                data=_data(tmp_path, _thin_rows(size), f"k{size}.jsonl"),
-                output_dir=tmp_path / f"out-{size}",
-            )
-        )
-        if result.decision.train["balance"] == GATED_K:
-            assert not any("will refuse this split" in t for t in result.limitations)
-            return
-    pytest.fail(f"no size in range kept exactly {GATED_K} training rows of 'balance'")
+    assert thin_options_note({"balance": GATED_K, "refund": 400}, GATED_K) is None
+    note = thin_options_note({"balance": GATED_K - 1, "refund": 400}, GATED_K)
+    assert note is not None and f"'balance' ({GATED_K - 1})" in note
+    assert "'refund'" not in note
 
 
 def test_no_such_note_when_every_option_has_enough_training_rows(tmp_path):
