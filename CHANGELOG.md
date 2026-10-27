@@ -3,6 +3,11 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.7.0 — 2026-10-27
+- `tune`, `convert` and `verify` fine-tune EmbeddingGemma 2 for one decision and write it into Google's own `.litertlm`, for flutter_edge_ai's `EmbeddingModel.createDecider`; measured on banking77 end to end (#92).
+- An MPS run on a Mac starts at warn memory pressure and on 2 GiB available, and says so in its report (#91).
+- MEASUREMENTS.md reports the three passing decision bundles on a Galaxy S24, CPU and GPU (#90).
+
 ## 0.6.0 — 2026-10-22
 - `tune`, `convert` and `verify` take Qwen3-1.7B and Qwen2.5-1.5B-Instruct, measured on banking77 (#88).
 - Three new families: Granite 4.1, MiniCPM5 and Qwen 3.5, each measured on banking77; `verify` gives a Qwen 3.5 bundle an Engine per prompt, since a shared one leaks state between prompts (#88).
