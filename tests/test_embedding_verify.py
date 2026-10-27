@@ -224,7 +224,7 @@ def test_the_evaluation_script_main_writes_what_the_host_reads(ev, tmp_path, mon
             }
         )
     )
-    stub = types.ModuleType("torch")
+    stub: Any = types.ModuleType("torch")
     stub.__version__ = "stub"
     monkeypatch.setitem(sys.modules, "torch", stub)
     monkeypatch.setitem(ev, "linear_correct", lambda torch, xtr, ytr, xte, yte, n, d: yte == yte)
@@ -292,7 +292,7 @@ def _eval_main(ev, tmp_path, monkeypatch, vectors: dict[str, Any], ytr, yte, pai
             }
         )
     )
-    stub = types.ModuleType("torch")
+    stub: Any = types.ModuleType("torch")
     stub.__version__ = "stub"
     monkeypatch.setitem(sys.modules, "torch", stub)
     monkeypatch.setitem(ev, "linear_correct", lambda torch, xtr, ytr, xte, yte, n, d: yte == yte)
@@ -366,7 +366,7 @@ def _stub_litert_lm(answers: list[Any]) -> tuple[types.ModuleType, dict[str, lis
     """litert_lm 0.18.0's names, with its keyword arguments and no `**kwargs`, so
     a misspelt setting fails here (the real `EmbeddingEngine` swallows them)."""
     calls: dict[str, list[Any]] = {"engine": [], "options": [], "texts": []}
-    mod = types.ModuleType("litert_lm")
+    mod: Any = types.ModuleType("litert_lm")
     replies = iter(answers)
 
     class Backend:
@@ -527,7 +527,7 @@ def _reference_main(
     seen: dict[str, Any] = {"tokenized": [], "encode": None, "model": None}
     counts = iter(lengths)
 
-    torch = types.ModuleType("torch")
+    torch: Any = types.ModuleType("torch")
     torch.float32 = "float32"
     torch.set_num_threads = lambda n: None
     torch.get_num_threads = lambda: 2
@@ -551,7 +551,7 @@ def _reference_main(
             seen["encode"] = kwargs
             return np.asarray(vectors, dtype=np.float32)
 
-    st = types.ModuleType("sentence_transformers")
+    st: Any = types.ModuleType("sentence_transformers")
     st.SentenceTransformer = SentenceTransformer
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "sentence_transformers", st)
