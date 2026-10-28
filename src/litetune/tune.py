@@ -407,16 +407,17 @@ EXPECTED_SUPERVISED_FRACTION = 0.07
 # `labels` were never masked. This is the 0.0625-against-0.5625 signature.
 MASKING_NOT_APPLIED_ABOVE = 0.95
 
-# Eager attention, because the export and evaluation paths use it too:
-# evaluate.py's `_HF_GENERATE_SCRIPT` passes the training attention
-# implementation through unconditionally, and a checkpoint served under a
-# different implementation than it was trained with produces fluent garbage
-# that every label-free check passes. Gemma-family models are documented as
-# requiring eager.
+# Eager attention, because every generative fine-tune in the README used it.
+# The choice ends with training: `save_pretrained` does not write it into
+# `config.json`, `verify`'s float reference loads eager whatever training used
+# (`evaluate.HuggingFaceBackend`), and `export` builds the attention LiteRT
+# runs. None of the families litetune supports softcaps its text attention,
+# the step sdpa would leave out (Gemma 2 does; it is not supported). The
+# choice is recorded with the run, in `litetune.json` and the metrics.
 #
 # bfloat16 is the training default for a different reason -- see the two
 # limitations below, at the point a run actually trains in it or departs from
-# it. Unlike attention, there is no pair here for it to match: evaluate.py's
+# it. Like attention, there is no pair here for it to match: evaluate.py's
 # `_HF_GENERATE_SCRIPT` loads the float reference at an unconditional float32
 # regardless of the training dtype, and export.py passes no dtype to the
 # exporter at all.
@@ -626,6 +627,12 @@ _GPU_FAILURE_RE = re.compile(
 # leftmost match: `torch.OutOfMemoryError: MPS backend out of memory` matches
 # `OutOfMemoryError` first, and reading the advice off that would drop it.
 _MPS_OOM_RE = re.compile(r"MPS backend out of memory", re.IGNORECASE)
+# The same for CUDA, worded the ways torch and its libraries raise it.
+_CUDA_OOM_RE = re.compile(
+    r"CUDA out of memory|CUDA error: out of memory|CUBLAS_STATUS_ALLOC_FAILED"
+    r"|CUDNN_STATUS_ALLOC_FAILED",
+    re.IGNORECASE,
+)
 _MPS_DEVICE_FACT_RE = re.compile("|".join(_MPS_DEVICE_FACTS), re.IGNORECASE)
 MPS_DEVICE_ADVICE = f"set {devices.DEVICE_VARIABLE}=cpu to train on the CPU"
 
@@ -1051,6 +1058,7 @@ def main() -> int:
     )
     model.config.use_cache = False
     device = training_device(torch, spec.get("device"))
+    on_cuda = str(device).startswith("cuda")
     model.to(device)
 
     trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1225,6 +1233,9 @@ def main() -> int:
                 # handed a file that could be another one.
                 "decision": spec.get("decision"),
                 "decision_sha256": spec.get("decision_sha256"),
+                # Recorded, not used downstream: the checkpoint's config does
+                # not carry it, and nothing after training reads it.
+                "attn_implementation": spec["attn_implementation"],
             },
             indent=2,
         ),
@@ -1275,6 +1286,14 @@ def main() -> int:
                 "mps_memory": spec.get("mps_memory"),
                 "pad_to_multiple_of": pad_multiple,
                 "mps_memory_sampled_max": finished_mps_samples(mps_samples),
+                # torch's own CUDA peaks over the run, in bytes: allocated by
+                # tensors, and reserved by its caching allocator. `None` off cuda.
+                "cuda_max_memory_allocated": (
+                    torch.cuda.max_memory_allocated(device) if on_cuda else None
+                ),
+                "cuda_max_memory_reserved": (
+                    torch.cuda.max_memory_reserved(device) if on_cuda else None
+                ),
                 # The three MPS variables as this process read them, for the
                 # parent to compare with what it sent and passed on.
                 "mps_environment": environment_seen(),
@@ -1430,12 +1449,10 @@ def decide_prompt_mode(
 class TuneRequest:
     """One training run.
 
-    `attn_implementation` defaults to the implementation the export and
-    evaluation paths use too: `evaluate.py` passes the training attention
-    implementation through unconditionally, so a checkpoint trained under one
-    and served under another produces output that is fluent, wrong, and
-    passes every check that does not involve held-out labels. `dtype` has no
-    such pair to default to -- `evaluate.py`'s float reference loads at an
+    `attn_implementation` defaults to eager, the attention every generative
+    fine-tune in the README used. It does not travel past training: the float reference
+    loads eager and the export builds LiteRT's own attention. `dtype` has no
+    pair to default to either -- `evaluate.py`'s float reference loads at an
     unconditional `float32` regardless of the training dtype, and
     `export.py` passes no dtype to the exporter at all -- so the `bfloat16`
     default matches nothing downstream and is not derived from anything here.
@@ -1797,6 +1814,10 @@ class TrainingMetrics:
     # counting them -- not a peak, which nothing between samples observed.
     # `None` off mps and when no step ran.
     mps_memory_sampled_max: Mapping[str, Any] | None = None
+    # torch's CUDA peaks over the run, in bytes. `None` off cuda and from a
+    # script that predates the fields.
+    cuda_max_memory_allocated: int | None = None
+    cuda_max_memory_reserved: int | None = None
     # The three MPS variables as the script read them (`None` for one unset),
     # for the parent to compare with what it sent. `None` from a script that
     # predates the field.
@@ -1844,6 +1865,8 @@ class TrainingMetrics:
             dtype_source=data.get("dtype_source"),
             pad_to_multiple_of=data.get("pad_to_multiple_of"),
             mps_memory_sampled_max=data.get("mps_memory_sampled_max"),
+            cuda_max_memory_allocated=data.get("cuda_max_memory_allocated"),
+            cuda_max_memory_reserved=data.get("cuda_max_memory_reserved"),
             mps_environment=data.get("mps_environment"),
             raw=dict(data),
         )
@@ -1875,6 +1898,8 @@ class TrainingMetrics:
                 if self.mps_memory_sampled_max is not None
                 else None
             ),
+            "cuda_max_memory_allocated": self.cuda_max_memory_allocated,
+            "cuda_max_memory_reserved": self.cuda_max_memory_reserved,
             "mps_environment": (
                 dict(self.mps_environment) if self.mps_environment is not None else None
             ),
@@ -2154,6 +2179,33 @@ def _dtype_limitations(result: TuneResult, dtype: DtypeDecision) -> None:
         )
 
 
+def _cuda_oom_advice(stderr: str, request: TuneRequest, micro_batch_size: int) -> str:
+    """ " (what the run used, and what lowers it)" for a CUDA out-of-memory
+    ending in `stderr`, or "" for any other ending.
+
+    Memory follows the longest row a step holds, not `max_seq_length`: a batch
+    is padded to its own longest row, and a row over the limit is refused, not
+    cut, so lowering the limit only refuses rows. The levers named are the ones
+    this run has not already pulled.
+    """
+    if not _CUDA_OOM_RE.search(stderr or ""):
+        return ""
+    levers = []
+    if micro_batch_size > 1:
+        levers.append("a smaller --micro-batch-size")
+    if request.attn_implementation == "eager":
+        levers.append(
+            "--attn-implementation sdpa, which on CUDA can use a kernel that does not "
+            "keep the attention weights eager keeps for the backward pass"
+        )
+    levers.append("shorter training rows")
+    return (
+        f" (this run used micro-batch {micro_batch_size}, attention "
+        f"{request.attn_implementation!r}, max_seq_length {request.max_seq_length}; "
+        f"what lowers the memory a step needs: {', '.join(levers)})"
+    )
+
+
 def _mps_advice(stderr: str, memory: devices.MpsMemory | None) -> str:
     """ " (what to do)" for an MPS ending in `stderr`, or "" for any other ending."""
     if _MPS_OOM_RE.search(stderr or ""):
@@ -2197,11 +2249,10 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     if request.attn_implementation != DEFAULT_ATTN_IMPLEMENTATION:
         result.limitation(
             f"this run trains with attention {request.attn_implementation!r}, not "
-            f"{DEFAULT_ATTN_IMPLEMENTATION!r}: evaluate.py passes the training attention "
-            "implementation through unconditionally (evaluate.py's `_HF_GENERATE_SCRIPT`), so a "
-            "checkpoint served under a different implementation than it was trained with "
-            "produces output that is fluent, wrong, and passes every check that does not "
-            "involve held-out labels"
+            f"{DEFAULT_ATTN_IMPLEMENTATION!r}, which every generative fine-tune in the README "
+            "used. "
+            "The choice ends with training: verify's float reference loads eager and the "
+            "export builds LiteRT's own attention"
         )
     if request.rate_is_default:
         events.note(
@@ -2761,7 +2812,9 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         # An MPS ending carries the ways forward -- out of memory worded by
         # who set the limit that ran out -- and every other ending reads as it
         # always has.
-        advice = _mps_advice(result.stderr, result.mps_memory)
+        advice = _mps_advice(result.stderr, result.mps_memory) or _cuda_oom_advice(
+            result.stderr, request, micro_batch.size
+        )
         accelerator = Check.unchecked(
             TRAINING_CHECK,
             f"training exited {proc.returncode} on a machine failure "

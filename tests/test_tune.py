@@ -1020,8 +1020,6 @@ def test_the_dtype_and_attention_the_export_path_uses_are_passed_through(trainer
     run_tune(request_for())
 
     config = trainer.configs[0]
-    # Mismatching either against what export and evaluation load produces output
-    # that is fluent, wrong, and passes every label-free check.
     assert config["dtype"] == DEFAULT_DTYPE == "bfloat16"
     assert config["attn_implementation"] == DEFAULT_ATTN_IMPLEMENTATION == "eager"
 
@@ -1045,7 +1043,7 @@ def test_a_different_dtype_is_allowed_and_named_as_a_limitation(trainer, request
     assert len(departure) == 1, result.limitations
     assert "MEASUREMENTS.md" in departure[0]
     assert "every published number" not in departure[0]
-    assert not any("fluent, wrong" in text for text in result.limitations)
+    assert not any("trains with attention" in text for text in result.limitations)
 
 
 def test_scoping_lora_to_a_container_is_named_as_a_limitation(trainer, request_for):
@@ -1206,7 +1204,11 @@ def test_a_different_attention_implementation_is_named_as_a_limitation(trainer, 
     result = run_tune(request_for(attn_implementation="sdpa"))
 
     assert trainer.configs[0]["attn_implementation"] == "sdpa"
-    assert any("fluent, wrong" in text for text in result.limitations)
+    (departure,) = [t for t in result.limitations if "trains with attention 'sdpa'" in t]
+    assert "verify's float reference loads eager" in departure
+    # The old wording described a mechanism that does not exist: nothing past
+    # training reads the attention a run trained with.
+    assert "fluent" not in departure
 
 
 def test_training_at_the_default_dtype_states_what_is_and_is_not_established(trainer, request_for):
@@ -1230,9 +1232,10 @@ def test_the_default_dtype_comment_does_not_claim_export_loads_in_bfloat16():
     """A pure comment, not a runtime value -- pinned by reading the module's
     own source, the way `test_manifest.py` pins `pyproject.toml`'s text.
     `DEFAULT_DTYPE`'s comment used to claim the export and evaluation paths
-    use bfloat16 the same way they use eager attention; only the attention
-    half is true (evaluate.py:653 passes it through; evaluate.py:652 is an
-    unconditional `torch_dtype=torch.float32`).
+    use bfloat16 the same way they use eager attention. Neither half was true:
+    evaluate.py's reference is an unconditional `torch_dtype=torch.float32`,
+    and `verify` never threads the training attention to it either -- the
+    reference loads eager whatever training used.
     """
     import inspect
 
@@ -1240,15 +1243,16 @@ def test_the_default_dtype_comment_does_not_claim_export_loads_in_bfloat16():
 
     source = inspect.getsource(tune_module)
     assert "bfloat16 and eager attention, because the export and evaluation paths use" not in source
-    assert "Eager attention, because the export and evaluation paths use it too" in source
+    assert "Eager attention, because the export and evaluation paths use it too" not in source
+    assert "Eager attention, because every generative fine-tune in the README used it" in source
 
 
 def test_the_tune_request_docstring_does_not_claim_dtype_has_a_pair():
     """R6's sixth copy of the claim: `help(TuneRequest)` used to say `dtype`
     and `attn_implementation` "default to the pair the export and evaluation
-    paths use". Only `attn_implementation` has a pair to match -- evaluate.py
-    loads the float reference at an unconditional `float32` regardless of
-    training dtype, and export.py passes no dtype to the exporter at all.
+    paths use". Neither has one: evaluate.py loads the float reference at an
+    unconditional `float32` and eager attention whatever training used, and
+    export.py passes neither to the exporter.
     """
     import inspect
 
@@ -1256,7 +1260,8 @@ def test_the_tune_request_docstring_does_not_claim_dtype_has_a_pair():
 
     doc = inspect.getdoc(TuneRequest) or ""
     assert "default to the pair the export and evaluation paths use" not in doc
-    assert "such pair to default to" in doc
+    assert "pair to default to either" in doc
+    assert "passes the training attention" not in doc
 
 
 def test_a_completed_run_is_never_reported_as_verified(trainer, request_for):
@@ -1360,6 +1365,16 @@ class _Cuda:
         # boolean that can say "there is a GPU", which `run_real_script`'s
         # `cuda` parameter sets before the subprocess starts.
         return os.environ.get("LITETUNE_STUB_CUDA") == "1"
+
+    # Two different numbers, so a script that records one under the other's
+    # name is visible.
+    @staticmethod
+    def max_memory_allocated(device=None):
+        return 7_000
+
+    @staticmethod
+    def max_memory_reserved(device=None):
+        return 9_000
 
 
 cuda = _Cuda()
@@ -3167,6 +3182,16 @@ def test_the_real_script_records_the_decision_beside_the_checkpoint(request_for,
         assert record["prompt_mode_decision"] == decision.as_dict()
 
 
+@pytest.mark.parametrize("attention", ["eager", "sdpa"])
+def test_the_checkpoint_records_the_attention_it_was_trained_with(request_for, stub_env, attention):
+    request = request_for(attn_implementation=attention)
+    proc = run_real_script(request, stub_env)
+    assert proc.returncode == 0, proc.stderr
+
+    sidecar = json.loads((request.model_dir / "litetune.json").read_text(encoding="utf-8"))
+    assert sidecar["attn_implementation"] == attention
+
+
 def test_the_training_script_refuses_a_prompt_mode_it_was_not_given():
     """`spec["prompt_mode"] == "runtime_rendered"` read a missing mode as
     prerendered -- silently training the other convention, which is the failure
@@ -4738,6 +4763,52 @@ def test_a_cuda_out_of_memory_carries_no_mps_advice(trainer, request_for):
     assert "LITETUNE_DEVICE" not in check.detail
 
 
+def _cuda_oom_detail(trainer, request_for, **kwargs):
+    trainer.probe_device = "cuda"
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = (
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.63 GiB. GPU 0 has a "
+        "total capacity of 39.49 GiB of which 1.10 GiB is free."
+    )
+    check = check_named(run_tune(request_for(**kwargs)), TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED
+    # The advice sits before the quoted stderr, not inside it.
+    return check.detail.split(": torch.OutOfMemoryError")[0]
+
+
+def test_a_cuda_out_of_memory_says_what_the_run_used_and_what_lowers_it(trainer, request_for):
+    advice = _cuda_oom_detail(trainer, request_for, micro_batch_size=1, max_seq_length=4096)
+
+    assert "micro-batch 1, attention 'eager', max_seq_length 4096" in advice
+    assert "--attn-implementation sdpa" in advice
+    assert "shorter training rows" in advice
+    # Already at one row a step: there is no smaller micro-batch to offer.
+    assert "--micro-batch-size" not in advice
+
+
+def test_a_cuda_out_of_memory_offers_only_the_levers_not_yet_pulled(trainer, request_for):
+    advice = _cuda_oom_detail(
+        trainer, request_for, attn_implementation="sdpa", micro_batch_size=2, batch_size=4
+    )
+
+    assert "micro-batch 2, attention 'sdpa'" in advice
+    assert "a smaller --micro-batch-size" in advice
+    assert "--attn-implementation sdpa" not in advice
+
+
+def test_a_machine_failure_that_is_not_out_of_memory_gets_no_memory_advice(trainer, request_for):
+    trainer.probe_device = "cuda"
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = "RuntimeError: no CUDA-capable device is detected"
+
+    check = check_named(run_tune(request_for()), TRAINING_CHECK)
+
+    assert check.outcome is Outcome.UNCHECKED
+    assert "what lowers the memory" not in check.detail
+
+
 def test_the_metrics_carry_the_new_fields_through_to_the_report():
     metrics = TrainingMetrics.from_dict(
         {
@@ -4752,10 +4823,14 @@ def test_the_metrics_carry_the_new_fields_through_to_the_report():
             "dtype_source": MPS_DTYPE_SOURCE,
             "pad_to_multiple_of": 32,
             "mps_memory_sampled_max": {"current_allocated_bytes": 1, "samples": 3},
+            "cuda_max_memory_allocated": 7_000,
+            "cuda_max_memory_reserved": 9_000,
             "mps_environment": {"PYTORCH_ENABLE_MPS_FALLBACK": "0"},
         }
     )
     record = metrics.as_dict()
+    assert record["cuda_max_memory_allocated"] == 7_000
+    assert record["cuda_max_memory_reserved"] == 9_000
     assert record["dtype"] == "float32"
     assert record["dtype_source"] == MPS_DTYPE_SOURCE
     assert record["pad_to_multiple_of"] == 32
@@ -4795,6 +4870,9 @@ def test_the_real_script_pads_to_the_longest_row_off_mps(request_for, stub_env, 
     recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
     assert recorded["pad_to_multiple_of"] is None
     assert recorded["mps_memory_sampled_max"] is None
+    on_cuda = device == "cuda"
+    assert recorded["cuda_max_memory_allocated"] == (7_000 if on_cuda else None)
+    assert recorded["cuda_max_memory_reserved"] == (9_000 if on_cuda else None)
     events = {e["event"] for e in stub_log(stub_env)}
     assert not events & {"mps_current_allocated", "mps_driver_allocated", "mps_empty_cache"}
 
