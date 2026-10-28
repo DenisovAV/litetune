@@ -2145,3 +2145,34 @@ All six stages exited 0. `tune` took 2,347 s.
   int8 codes changed to stop at -127, as TFLite's quantization specification
   has them, instead of -128, and nothing else in the int8 path changed that
   the int4 path did not share.
+
+### Abstention, as the app calibrates it
+
+The app's `createDecider` abstains by default: `EmbeddingDeciderCalibration.crossFit`
+(keep 0.95) fits a threshold on the options' own examples and refuses a request
+whose best cosine is below it. `verify` now fits it the same way on each draw's
+k examples. Measured again on the files of the run above (the same rows, five
+draws), at k=10; every held-out row is in scope:
+
+| embeddings | answered | right when answered | answered and right | right, answering every row |
+|---|---|---|---|---|
+| Google's file | 0.9558 | 0.9268 | 0.8857 | 0.9137 |
+| fine-tuned, float32 | 0.9068 | 0.9702 | 0.8798 | 0.9312 |
+| int8 file | 0.9086 | 0.9698 | 0.8812 | 0.9314 |
+| int4 file | 0.9094 | 0.9660 | 0.8784 | 0.9276 |
+
+- With the fine-tune the decider answers fewer requests and is right on more
+  of those it answers: 0.97 against 0.93 for Google's file. Of all requests,
+  the share answered and right is about the same (0.878–0.886).
+- Google's file answers 0.956 of the held-out requests, close to the 0.95
+  the calibration keeps; the fine-tune answers about 0.91. The examples the
+  threshold is fitted on are training rows, which the fine-tune was trained
+  on; a likely cause is that they score higher against their centroids than
+  requests it has not seen, which sets the threshold higher. That cause was
+  not tested.
+- At k=5 the pattern is the same: the fine-tune answers 0.8995 (float32) to
+  0.9052 (int4), right on 0.9645–0.9699 of them; Google's file 0.9541 and
+  0.9081.
+- Out-of-scope requests were not in the rows, so how many of those the
+  threshold refuses is not measured. `verify` reports these numbers and does
+  not gate on them.
