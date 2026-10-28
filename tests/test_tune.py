@@ -4763,8 +4763,9 @@ def test_a_cuda_out_of_memory_carries_no_mps_advice(trainer, request_for):
     assert "LITETUNE_DEVICE" not in check.detail
 
 
-def _cuda_oom_detail(trainer, request_for, **kwargs):
+def _cuda_oom_detail(trainer, request_for, monkeypatch, **kwargs):
     trainer.probe_device = "cuda"
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     trainer.returncode = 1
     trainer.write_model = False
     trainer.stderr = (
@@ -4777,24 +4778,50 @@ def _cuda_oom_detail(trainer, request_for, **kwargs):
     return check.detail.split(": torch.OutOfMemoryError")[0]
 
 
-def test_a_cuda_out_of_memory_says_what_the_run_used_and_what_lowers_it(trainer, request_for):
-    advice = _cuda_oom_detail(trainer, request_for, micro_batch_size=1, max_seq_length=4096)
+def test_a_cuda_out_of_memory_says_what_the_run_used_and_what_lowers_it(
+    trainer, request_for, monkeypatch
+):
+    advice = _cuda_oom_detail(
+        trainer, request_for, monkeypatch, micro_batch_size=1, max_seq_length=4096
+    )
 
     assert "micro-batch 1, attention 'eager', max_seq_length 4096" in advice
     assert "--attn-implementation sdpa" in advice
     assert "shorter training rows" in advice
+    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in advice
     # Already at one row a step: there is no smaller micro-batch to offer.
     assert "--micro-batch-size" not in advice
 
 
-def test_a_cuda_out_of_memory_offers_only_the_levers_not_yet_pulled(trainer, request_for):
+def test_a_cuda_out_of_memory_offers_only_the_levers_not_yet_pulled(
+    trainer, request_for, monkeypatch
+):
     advice = _cuda_oom_detail(
-        trainer, request_for, attn_implementation="sdpa", micro_batch_size=2, batch_size=4
+        trainer,
+        request_for,
+        monkeypatch,
+        attn_implementation="sdpa",
+        micro_batch_size=2,
+        batch_size=4,
     )
 
     assert "micro-batch 2, attention 'sdpa'" in advice
     assert "a smaller --micro-batch-size" in advice
     assert "--attn-implementation sdpa" not in advice
+
+
+@pytest.mark.parametrize(
+    "setting", ["expandable_segments:True", "max_split_size_mb:128,expandable_segments:true"]
+)
+def test_a_cuda_out_of_memory_under_expandable_segments_does_not_offer_them(
+    trainer, request_for, monkeypatch, setting
+):
+    advice = _cuda_oom_detail(trainer, request_for, monkeypatch)
+    assert "expandable_segments" in advice
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", setting)
+    trainer.stderr = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.63 GiB."
+    check = check_named(run_tune(request_for()), TRAINING_CHECK)
+    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments" not in check.detail.split(": torch.")[0]
 
 
 def test_a_machine_failure_that_is_not_out_of_memory_gets_no_memory_advice(trainer, request_for):

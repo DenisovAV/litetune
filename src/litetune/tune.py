@@ -627,6 +627,8 @@ _GPU_FAILURE_RE = re.compile(
 # leftmost match: `torch.OutOfMemoryError: MPS backend out of memory` matches
 # `OutOfMemoryError` first, and reading the advice off that would drop it.
 _MPS_OOM_RE = re.compile(r"MPS backend out of memory", re.IGNORECASE)
+# torch's CUDA caching-allocator setting, named in the out-of-memory advice.
+CUDA_ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
 # The same for CUDA, worded the ways torch and its libraries raise it.
 _CUDA_OOM_RE = re.compile(
     r"CUDA out of memory|CUDA error: out of memory|CUBLAS_STATUS_ALLOC_FAILED"
@@ -2179,9 +2181,17 @@ def _dtype_limitations(result: TuneResult, dtype: DtypeDecision) -> None:
         )
 
 
-def _cuda_oom_advice(stderr: str, request: TuneRequest, micro_batch_size: int) -> str:
+def _cuda_oom_advice(
+    stderr: str, request: TuneRequest, micro_batch_size: int, environ: Mapping[str, str]
+) -> str:
     """ " (what the run used, and what lowers it)" for a CUDA out-of-memory
     ending in `stderr`, or "" for any other ending.
+
+    `expandable_segments` lets torch's caching allocator grow a segment rather
+    than look for a free block of the right size, so memory it has reserved
+    but cannot hand out stops counting against the run; torch's own message
+    names it when that reserve is large. The variable reaches the training
+    process: `envs` drops interpreter and installer overrides, not torch's.
 
     Memory follows the longest row a step holds, not `max_seq_length`: a batch
     is padded to its own longest row, and a row over the limit is refused, not
@@ -2191,6 +2201,8 @@ def _cuda_oom_advice(stderr: str, request: TuneRequest, micro_batch_size: int) -
     if not _CUDA_OOM_RE.search(stderr or ""):
         return ""
     levers = []
+    if "expandable_segments:true" not in environ.get(CUDA_ALLOC_CONF, "").replace(" ", "").lower():
+        levers.append(f"{CUDA_ALLOC_CONF}=expandable_segments:True")
     if micro_batch_size > 1:
         levers.append("a smaller --micro-batch-size")
     if request.attn_implementation == "eager":
@@ -2813,7 +2825,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         # who set the limit that ran out -- and every other ending reads as it
         # always has.
         advice = _mps_advice(result.stderr, result.mps_memory) or _cuda_oom_advice(
-            result.stderr, request, micro_batch.size
+            result.stderr, request, micro_batch.size, os.environ
         )
         accelerator = Check.unchecked(
             TRAINING_CHECK,
