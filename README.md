@@ -786,9 +786,10 @@ final decider = await embedder.createDecider(
 `embedder` is the `EmbeddingModel` loaded from the file (flutter_edge_ai's
 README, "Pick one of N options"). The examples are the app's own; verify
 measured ten per option. The default calibration, `crossFit`, needs at least
-two inputs per option and abstains below a threshold it fits on them; verify
-measured no abstention, which is
-`calibration: const EmbeddingDeciderCalibration.none()`.
+two inputs per option and abstains below a threshold it fits on them. verify
+gates on every request answered, which is
+`calibration: const EmbeddingDeciderCalibration.none()`, and reports the
+`crossFit` abstention beside it, ungated, for options without a description.
 
 Every int4 file is the same size and is named `model.litertlm`, so two
 fine-tunes are told apart only by their bytes: give the decider an
@@ -801,7 +802,9 @@ What has and has not been measured
 - litetune's own stages, end to end on banking77 (77 options), passed
   `verify` with both files: a conversion cost of -0.0002 (int8) and +0.0037
   (int4) on the 10-shot centroid decider, the int4 cost resolved in three of
-  five draws and under 0.01 in all of them. On banking77 and CLINC150 with the
+  five draws and under 0.01 in all of them. On CLINC150 (150 options), run
+  from the published 0.7.0, both passed too: -0.0001 (int8) and +0.0026
+  (int4). On banking77 and CLINC150 with the
   decider's prefix, an earlier measurement gave int4 costs of 0.0027 and
   0.0017 and int8 0.0002; on emotion (six options), behind a classification
   prefix, both files' centroid of every training row was within 0.0005 of the
@@ -812,11 +815,18 @@ What has and has not been measured
   per option in the earlier measurement. A linear layer fitted on every training row did not help:
   Google's file scored 0.9534 against the fine-tune's 0.9389 in litetune's
   run.
-- The app's default calibration abstains below a similarity threshold;
-  verify answers every row, so abstention is not measured. int4 moves the
-  vectors (minimum cosine to the fine-tune 0.78 in litetune's run), so a
-  threshold chosen on one file may not carry over to another; that is not
-  measured either.
+- The app's default calibration, `crossFit`, abstains below a threshold it
+  fits on the examples. verify fits it the same way and reports it, ungated:
+  at ten per option the fine-tuned files answered about 0.91 of the requests
+  and were right on 0.966–0.970 of those on banking77 and 0.994–0.995 on
+  CLINC150, where Google's file answered 0.956 and 0.958 and was right on
+  0.927 and 0.959. The rows verify scores are all in scope.
+- With a fine-tuned file, `crossFit` with keep 0.98 answered 0.954 (banking77)
+  and 0.947 (CLINC150) and refused 0.950 of CLINC150's out-of-scope requests,
+  against 0.906 for Google's file at the default; `fromLabelled` fitted on
+  in-scope requests refused 0.099 of them, and `minSimilarity` 0.875 answered
+  0.839 of banking77. Measured at ten per option, out-of-scope on CLINC150
+  only; see [MEASUREMENTS.md](MEASUREMENTS.md).
 - Option descriptions, which the app adds to an option's centroid, were not
   used in training and are not measured.
 - CPU only, on LiteRT-LM 0.18.0 from PyPI on an x86 host; the app's own

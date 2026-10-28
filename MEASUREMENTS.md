@@ -2106,9 +2106,9 @@ embedding:
   +0.0544 at k=5, +0.0394 and +0.0304 at k=10. With a linear layer on every
   training row the gain is 0.0003 and 0.0033.
 - int4 moves the vectors (minimum cosine 0.86 to 0.89), so a decider
-  threshold set on one file may not carry over to another; thresholds were not
-  measured, nor were tasks that read distances directly, retrieval among
-  them.
+  threshold set on one file may not carry over to another. Carrying one over
+  was not measured (the next subsections fit each file's own), nor were tasks
+  that read distances directly, retrieval among them.
 - Training took 2,880 s (banking77) and 3,189 s (CLINC150) on the 32 vCPUs,
   in float32. Nothing was trained on a GPU.
 
@@ -2145,3 +2145,120 @@ All six stages exited 0. `tune` took 2,347 s.
   int8 codes changed to stop at -127, as TFLite's quantization specification
   has them, instead of -128, and nothing else in the int8 path changed that
   the int4 path did not share.
+
+### CLINC150, from the published package
+
+The same stages run from litetune 0.7.0 as installed from PyPI, on CLINC150's
+in-scope intents (150 options) through `prepare`'s split: 13,650 training and
+3,900 held-out rows. All six stages exited 0; `tune` took 3,241 s.
+
+| embeddings | all rows | k=5 mean | k=10 mean | linear | cosine to float32, mean / min |
+|---|---|---|---|---|---|
+| Google's file | 0.9592 | 0.9298 | 0.9493 | 0.9787 | |
+| fine-tuned, float32 | 0.9792 | 0.9796 | 0.9791 | 0.9803 | |
+| int8 file | 0.9790 | 0.9796 | 0.9792 | 0.9808 | 0.9994 / 0.9913 |
+| int4 file | 0.9764 | 0.9770 | 0.9765 | 0.9787 | 0.9749 / 0.8574 |
+
+- Both files passed: a conversion cost of -0.0001 (int8) and +0.0026 (int4)
+  on the 10-shot centroid decider, every draw's upper bound under 0.01. The
+  files' gain over Google's at k=10 was +0.0299 (int8) and +0.0272 (int4).
+
+### Abstention, as the app calibrates it
+
+The app's `createDecider` abstains by default: `EmbeddingDeciderCalibration.crossFit`
+(keep 0.95) fits a threshold on the options' own examples and refuses a request
+whose best cosine is below it. `verify` now fits it the same way on each draw's
+k examples. Measured again on the files of the two runs above (the same rows,
+five draws), at k=10; every held-out row is in scope:
+
+| banking77 | answered | right when answered | answered and right | right, answering every row |
+|---|---|---|---|---|
+| Google's file | 0.9558 | 0.9268 | 0.8857 | 0.9137 |
+| fine-tuned, float32 | 0.9068 | 0.9702 | 0.8798 | 0.9312 |
+| int8 file | 0.9086 | 0.9698 | 0.8812 | 0.9314 |
+| int4 file | 0.9094 | 0.9660 | 0.8784 | 0.9276 |
+
+| CLINC150 | answered | right when answered | answered and right | right, answering every row |
+|---|---|---|---|---|
+| Google's file | 0.9581 | 0.9594 | 0.9192 | 0.9493 |
+| fine-tuned, float32 | 0.9082 | 0.9948 | 0.9035 | 0.9791 |
+| int8 file | 0.9081 | 0.9948 | 0.9034 | 0.9792 |
+| int4 file | 0.9061 | 0.9942 | 0.9008 | 0.9765 |
+
+- With the fine-tune the decider answers fewer requests and is right on more
+  of those it answers: 0.97 against 0.93 on banking77, 0.99 against 0.96 on
+  CLINC150. Of all requests, the share answered and right is about the same
+  on banking77 (0.878–0.886) and lower with the fine-tune on CLINC150
+  (0.901–0.904 against 0.919).
+- Google's file answers 0.956 and 0.958 of the held-out requests, close to the
+  0.95 the calibration keeps; the fine-tune answers about 0.91 on both. The
+  examples the threshold is fitted on are training rows, which the fine-tune
+  was trained on, and the threshold sits high against the scores of the
+  held-out requests; that is consistent with the examples scoring higher
+  against their centroids than requests the fine-tune has not seen, which the
+  next section tests. In absolute terms the fine-tune's thresholds were lower than
+  Google's on banking77 (about 0.82 against 0.89) and about the same on
+  CLINC150 (0.88–0.89 against 0.88).
+- At k=5 the pattern is the same on both tasks.
+- Out-of-scope requests were not in the rows, so how many of those the
+  threshold refuses is not measured here; the next section measures it on
+  CLINC150. No option had a description, which the app would add as one more
+  input and which changes the folds. `verify` reports these numbers and does
+  not gate on them.
+
+### Which calibration, with a fine-tuned file
+
+Besides `none`, the app offers three calibrations: `crossFit` with a chosen keep,
+`fromLabelled` (a threshold fitted on labelled requests to an error budget),
+and `minSimilarity` (a fixed threshold; the app documents 0.875 for Google's
+int4 file). Measured on the int8 files and Google's file of the two runs
+above, embedded again, at k=10 examples from the training rows, five draws.
+`fromLabelled` was fitted on the run's calibration split (rows never trained
+on, all in scope: the app accepts only labels that are options) with a 0.05
+budget. On CLINC150, out-of-scope requests are its 1,000 test `oos` rows.
+This embedding run's numbers for the default `crossFit` differ from the
+section above by up to 0.002.
+
+| banking77 | calibration | answered | right when answered | answered and right |
+|---|---|---|---|---|
+| fine-tuned | crossFit 0.95 | 0.9067 | 0.9701 | 0.8796 |
+| fine-tuned | crossFit 0.98 | 0.9541 | 0.9557 | 0.9118 |
+| fine-tuned | crossFit 0.99 | 0.9744 | 0.9471 | 0.9228 |
+| fine-tuned | minSimilarity 0.875 | 0.8389 | 0.9802 | 0.8223 |
+| fine-tuned | fromLabelled 0.05 | 0.9695 | 0.9499 | 0.9209 |
+| Google's file | crossFit 0.95 | 0.9570 | 0.9263 | 0.8864 |
+| Google's file | crossFit 0.98 | 0.9814 | 0.9194 | 0.9023 |
+| Google's file | minSimilarity 0.875 | 0.9880 | 0.9175 | 0.9065 |
+| Google's file | fromLabelled 0.05 | 0.8029 | 0.9545 | 0.7663 |
+
+| CLINC150 | calibration | answered | right when answered | answered and right | out of scope refused |
+|---|---|---|---|---|---|
+| fine-tuned | crossFit 0.95 | 0.9083 | 0.9949 | 0.9036 | 0.9714 |
+| fine-tuned | crossFit 0.98 | 0.9470 | 0.9918 | 0.9392 | 0.9500 |
+| fine-tuned | crossFit 0.99 | 0.9644 | 0.9894 | 0.9542 | 0.9210 |
+| fine-tuned | minSimilarity 0.875 | 0.9274 | 0.9934 | 0.9213 | 0.9668 |
+| fine-tuned | fromLabelled 0.05 | 1.0000 | 0.9791 | 0.9791 | 0.0988 |
+| Google's file | crossFit 0.95 | 0.9579 | 0.9588 | 0.9185 | 0.9062 |
+| Google's file | crossFit 0.98 | 0.9841 | 0.9542 | 0.9390 | 0.8250 |
+| Google's file | minSimilarity 0.875 | 0.9754 | 0.9560 | 0.9325 | 0.8676 |
+| Google's file | fromLabelled 0.05 | 0.9939 | 0.9512 | 0.9454 | 0.5140 |
+
+- With examples the fine-tune was not trained on (six per option from the
+  calibration split, the most its smallest option has), the default
+  `crossFit` 0.95 answered 0.9505 of banking77 and 0.9433 of CLINC150, against
+  0.9067 and 0.9083 with training examples; Google's file answered 0.9537 and
+  0.9649. The examples differ in k as well as in source, but the result is
+  what the training-row explanation above predicts.
+- The fine-tuned file at `crossFit` 0.98 against Google's file at the default:
+  on CLINC150, answered and right 0.9392 against 0.9185, out of scope refused
+  0.9500 against 0.9062; on banking77, answered and right 0.9118 against
+  0.8864. Raising keep on Google's file to 0.98 refused 0.8250 of out-of-scope
+  requests.
+- `fromLabelled` on in-scope requests alone refused 0.0988 (fine-tuned) and
+  0.5140 (Google's file) of out-of-scope requests: when the decider errs less
+  than the budget on in-scope requests, the threshold it fits can be as low as
+  answering everything.
+- `minSimilarity` 0.875 answered 0.8389 of banking77 with the fine-tuned file:
+  a threshold set for Google's file does not carry over.
+- Out-of-scope requests were measured on CLINC150 only, at k=10 only, without
+  option descriptions.
