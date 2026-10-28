@@ -2208,7 +2208,7 @@ five draws), at k=10; every held-out row is in scope:
 
 ### Which calibration, with a fine-tuned file
 
-The app offers three calibrations: `crossFit` with a chosen keep,
+Besides `none`, the app offers three calibrations: `crossFit` with a chosen keep,
 `fromLabelled` (a threshold fitted on labelled requests to an error budget),
 and `minSimilarity` (a fixed threshold; the app documents 0.875 for Google's
 int4 file). Measured on the int8 files and Google's file of the two runs
