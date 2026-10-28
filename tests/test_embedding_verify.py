@@ -162,28 +162,52 @@ def test_the_crossfit_threshold_holds_each_rank_out_against_the_other_folds(ev):
     # fold 1's against the rank-0 centroids 0.8 and 0.96.
     x = np.array([[1.0, 0.0], [0.0, 1.0], [0.6, 0.8], [0.28, 0.96]])
     y = np.array([0, 1, 0, 1])
-    assert ev["crossfit_threshold"](x, y, 2, 0.95, 5) == pytest.approx(0.6)
-    assert ev["crossfit_threshold"](x, y, 2, 0.75, 5) == pytest.approx(0.8)
-    assert ev["crossfit_threshold"](x, y, 2, 0.5, 5) == pytest.approx(0.96)
+    assert ev["crossfit_threshold"](x, y, 2, 0.95) == pytest.approx(0.6)
+    assert ev["crossfit_threshold"](x, y, 2, 0.75) == pytest.approx(0.8)
+    assert ev["crossfit_threshold"](x, y, 2, 0.5) == pytest.approx(0.96)
 
 
 def test_the_crossfit_ranks_follow_the_order_the_inputs_are_given(ev):
-    # Swapping which input of option 1 comes first changes the folds, and so
-    # the signal: the app ranks inputs in the order the caller lists them.
     # Worked by hand: the signals are 0.6, 0.936, 0.96 and 0.96, where the
     # order of the previous test gave 0.6, 0.8, 0.96 and 0.96.
     x = np.array([[1.0, 0.0], [0.28, 0.96], [0.6, 0.8], [0.0, 1.0]])
     y = np.array([0, 1, 0, 1])
-    assert ev["crossfit_threshold"](x, y, 2, 0.75, 5) == pytest.approx(0.936)
+    assert ev["crossfit_threshold"](x, y, 2, 0.75) == pytest.approx(0.936)
+
+
+def test_the_crossfit_has_the_apps_five_folds(ev):
+    # Six inputs of one option: with five folds rank 5 shares fold 0 with rank
+    # 0, so input 5 is held out together with input 0 and scored against ranks
+    # 1-4 only. Any other fold count groups them otherwise.
+    assert ev["CROSSFIT_FOLDS"] == 5
+    a = np.array([[1.0, 0.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [1.0, 0.0]])
+    b = np.array([[-1.0, 0.0]] * 6)
+    x, y = np.vstack([a, b]), np.array([0] * 6 + [1] * 6)
+    # Ranks 0 and 5 of option 0 ([1, 0]) against the mean of ranks 1-4 ([0, 1]):
+    # cosine 0 to option 0, -1 to option 1, so their signal is 0; every other
+    # input of option 0 is 1 or above 0. Option 1's inputs are all 1.
+    assert ev["crossfit_threshold"](x, y, 2, 0.95) == pytest.approx(0.0)
 
 
 def test_the_crossfit_centroids_are_renormalised_as_the_apps_are(ev):
-    # Two different unit inputs average to a vector shorter than 1; the app's
-    # optionCentroids renormalises it, so the signal stays a cosine.
     x = np.array([[1.0, 0.0], [0.0, 1.0], [0.6, 0.8], [0.6, 0.8], [0.0, 1.0], [0.28, 0.96]])
     y = np.array([0, 1, 0, 1, 0, 1])
     c = ev["centroids"](x, y, 2)
     assert np.linalg.norm(c, axis=1) == pytest.approx([1.0, 1.0])
+
+
+@pytest.mark.parametrize(
+    "x, y, why",
+    [
+        # One input of option 1: the app's crossFit needs two.
+        ([[1.0, 0.0], [0.6, 0.8], [0.0, 1.0]], [0, 0, 1], "fewer than two inputs"),
+        # Option 0's two inputs are opposite: their centroid has no direction.
+        ([[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, 1.0]], [0, 0, 1, 1], "cancel out"),
+    ],
+)
+def test_the_crossfit_refuses_what_the_app_refuses(ev, x, y, why):
+    with pytest.raises(ev["Uncalibrated"], match=why):
+        ev["abstention"](np.array(x), np.array(y), np.array([[1.0, 0.0]]), np.array([0]), 2, 0.95)
 
 
 def test_keep_threshold_picks_the_apps_index_including_the_float_edge(ev):
@@ -195,18 +219,53 @@ def test_keep_threshold_picks_the_apps_index_including_the_float_edge(ev):
     assert ev["keep_threshold"](np.array([0.3]), 0.5) == 0.3
 
 
-def test_a_row_at_the_threshold_is_answered_and_one_below_is_not(ev, monkeypatch):
-    # Centroids [1, 0] and [0, 1]; a threshold of 0.8 set directly. The first
-    # row's best cosine is exactly 0.8, the second's 0.7999.
+def test_a_row_at_the_threshold_is_answered_and_the_next_float_below_is_not(ev, monkeypatch):
+    # Centroids [1, 0] and [0, 1] (exact in float32); a threshold of 0.8 set
+    # directly. The first row's best cosine is 0.8, the second's the float
+    # just below it.
     xs = np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]])
     ys = np.array([0, 0, 1, 1])
     monkeypatch.setitem(ev, "crossfit_threshold", lambda *a: 0.8)
-    under = 0.7999
+    monkeypatch.setitem(ev, "unit_rows", lambda x: np.asarray(x, dtype=np.float64))
+    under = np.nextafter(0.8, 0.0)
     xte = np.array([[0.6, 0.8], [np.sqrt(1 - under * under), under]])
-    t, answered, right = ev["abstention"](xs, ys, xte, np.array([1, 1]), 2, 0.95, 5)
+    t, answered, right = ev["abstention"](xs, ys, xte, np.array([1, 1]), 2, 0.95)
     assert t == 0.8
     assert answered.tolist() == [True, False]
     assert right.tolist() == [True, True]
+
+
+def test_requests_are_scored_against_float32_centroids_as_the_app_stores_them(ev, monkeypatch):
+    # A centroid whose float32 rounding moves a request's cosine across the
+    # threshold: answered against the float32 centroid, which is what the app
+    # scores against, whatever float64 would say.
+    c64 = np.array([0.6000000001, 0.8], dtype=np.float64)
+    c64 /= np.linalg.norm(c64)
+    c32 = c64.astype(np.float32).astype(np.float64)
+    req = c32  # the request points exactly along the stored centroid
+    monkeypatch.setitem(ev, "centroids", lambda x, y, n: np.vstack([c64, [-c64[1], c64[0]]]))
+    monkeypatch.setitem(ev, "crossfit_threshold", lambda *a: float(req @ c32))
+    # The request as given: renormalising it would move it off the centroid.
+    monkeypatch.setitem(ev, "unit_rows", lambda x: np.asarray(x, dtype=np.float64))
+    _, answered, _ = ev["abstention"](
+        np.eye(2), np.array([0, 1]), req[None, :], np.array([0]), 2, 0.95
+    )
+    assert float(req @ c64) < float(req @ c32)  # float64 alone would refuse it
+    assert answered.tolist() == [True]
+
+
+def test_rows_are_renormalised_before_the_crossfit_as_the_app_does(ev):
+    # The app renormalises every engine vector (unitRowInto); rows a little
+    # off unit length must give what their unit rows give.
+    rng = np.random.default_rng(3)
+    ytr = np.array([0, 1, 2] * 5)
+    v = _clusters(rng, [*ytr.tolist(), 0, 1, 2, 0], noise=0.5)
+    xs, xte, yte = v[:15], v[15:], np.array([0, 1, 2, 0])
+    scale = rng.uniform(0.5, 2.0, size=(len(v), 1))
+    unit = ev["abstention"](xs, ytr, xte, yte, 3, 0.95)
+    scaled = ev["abstention"](xs * scale[:15], ytr, xte * scale[15:], yte, 3, 0.95)
+    assert scaled[0] == pytest.approx(unit[0])
+    assert scaled[1].tolist() == unit[1].tolist() and scaled[2].tolist() == unit[2].tolist()
 
 
 def test_evaluate_reports_the_crossfit_abstention_per_k(ev):
@@ -214,21 +273,62 @@ def test_evaluate_reports_the_crossfit_abstention_per_k(ev):
     ytr = np.array([0, 1, 2] * 12)
     yte = np.array([0, 1, 2] * 6)
     v = _clusters(rng, [*ytr.tolist(), *yte.tolist()], noise=0.6)
-    acc, _ = ev["evaluate"](v, ytr, yte, 3, (5, 10), 3, None, 0.95, 5)
+    acc, _ = ev["evaluate"](v, ytr, yte, 3, (5, 10), 3, None, 0.95)
+    masked = False
     for k in (5, 10):
         got = acc[f"crossfit_k{k}"]
-        assert got["keep"] == 0.95 and len(got["threshold"]) == 3
+        assert got["keep"] == 0.95 and got["folds"] == 5 and len(got["threshold"]) == 3
         for d in range(3):
             idx = ev["kshot_picks"](ytr, 3, k, d)
-            t, answered, right = ev["abstention"](v[:36][idx], ytr[idx], v[36:], yte, 3, 0.95, 5)
+            xs, xte = v[:36][idx], v[36:]
+            t, answered, right = ev["abstention"](xs, ytr[idx], xte, yte, 3, 0.95)
+            # `right` checked on its own: the decider's answer is the nearest centroid.
+            assert right.tolist() == ev["centroid_correct"](xs, ytr[idx], xte, yte, 3).tolist()
             assert got["threshold"][d] == round(t, 6)
             assert got["answered"]["draws"][d] == round(float(np.mean(answered)), 4)
+            assert got["right_when_answered"]["draws"][d] == round(
+                float(np.mean(right[answered])), 4
+            )
             assert got["answered_and_right"]["draws"][d] == round(
                 float(np.mean(answered & right)), 4
             )
-    # Without keep, no abstention is reported (the gate's path is unchanged).
+            masked = masked or (not answered.all() and np.mean(right[answered]) != np.mean(right))
+    assert masked, "the fixture must tell right-when-answered from plain accuracy"
     plain, _ = ev["evaluate"](v, ytr, yte, 3, (5,), 2)
     assert "crossfit_k5" not in plain
+
+
+def test_a_draw_that_answers_nothing_reports_no_right_when_answered(ev, monkeypatch):
+    rng = np.random.default_rng(5)
+    ytr = np.array([0, 1, 2] * 12)
+    yte = np.array([0, 1, 2] * 6)
+    v = _clusters(rng, [*ytr.tolist(), *yte.tolist()])
+    monkeypatch.setitem(ev, "crossfit_threshold", lambda *a: 2.0)  # above every cosine
+    acc, _ = ev["evaluate"](v, ytr, yte, 3, (5,), 2, None, 0.95)
+    got = acc["crossfit_k5"]
+    assert got["answered"]["draws"] == [0.0, 0.0]
+    assert got["right_when_answered"] == {
+        "mean": None,
+        "min": None,
+        "draws": [None, None],
+        "missing": 2,
+    }
+
+
+def test_a_crossfit_the_app_would_refuse_is_reported_not_raised(ev, monkeypatch):
+    rng = np.random.default_rng(5)
+    ytr = np.array([0, 1, 2] * 12)
+    yte = np.array([0, 1, 2] * 6)
+    v = _clusters(rng, [*ytr.tolist(), *yte.tolist()])
+
+    def refuse(*a):
+        raise ev["Uncalibrated"]("option 1's inputs cancel out")
+
+    monkeypatch.setitem(ev, "crossfit_threshold", refuse)
+    acc, correct = ev["evaluate"](v, ytr, yte, 3, (5,), 2, None, 0.95)
+    assert acc["crossfit_k5"]["error"] == "draw 0: option 1's inputs cancel out"
+    # The gated decider is untouched.
+    assert acc["centroid_k5"]["mean"] == 1.0 and len(correct["centroid_k5"]) == 2
 
 
 def test_the_kshot_decider_is_fitted_on_its_drawn_rows_alone(ev):
@@ -295,7 +395,6 @@ def test_the_evaluation_script_main_writes_what_the_host_reads(ev, tmp_path, mon
                 "draws": 5,
                 "decay": 1e-5,
                 "keep": 0.95,
-                "folds": 5,
                 "pairs": [["reference", "candidate"]],
                 "report": str(report),
             }
@@ -311,6 +410,9 @@ def test_the_evaluation_script_main_writes_what_the_host_reads(ev, tmp_path, mon
     assert out["accuracy"]["candidate"]["linear"] == 1.0
     assert out["accuracy"]["reference"]["centroid_k10"]["mean"] == 1.0
     assert len(out["correct"]["candidate"]["centroid_k10"]) == 5
+    # The real script fits the app's crossFit: keep from the spec, five folds.
+    assert out["accuracy"]["candidate"]["crossfit_k10"]["keep"] == 0.95
+    assert out["accuracy"]["candidate"]["crossfit_k10"]["folds"] == 5
     assert out["cosine"]["reference|candidate"]["mean"] == pytest.approx(1.0)
     assert out["versions"]["torch"] == "stub"
     correct = out["correct"]
@@ -337,7 +439,6 @@ def test_the_evaluation_script_refuses_vectors_that_do_not_cover_the_rows(
                 "draws": 1,
                 "decay": 1e-5,
                 "keep": 0.95,
-                "folds": 5,
                 "pairs": [],
                 "report": str(tmp_path / "r.json"),
             }
@@ -367,7 +468,6 @@ def _eval_main(ev, tmp_path, monkeypatch, vectors: dict[str, Any], ytr, yte, pai
                 "draws": 1,
                 "decay": 1e-5,
                 "keep": 0.95,
-                "folds": 5,
                 "pairs": pairs,
                 "report": str(report),
             }
@@ -913,7 +1013,6 @@ class FakeEmbedEnvs:
                 spec["draws"],
                 None,
                 spec["keep"],
-                spec["folds"],
             )
         for a, b in spec["pairs"]:
             out["cosine"][f"{a}|{b}"] = self.ev["cosine_rows"](

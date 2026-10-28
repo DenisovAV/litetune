@@ -2106,9 +2106,9 @@ embedding:
   +0.0544 at k=5, +0.0394 and +0.0304 at k=10. With a linear layer on every
   training row the gain is 0.0003 and 0.0033.
 - int4 moves the vectors (minimum cosine 0.86 to 0.89), so a decider
-  threshold set on one file may not carry over to another; thresholds were not
-  measured, nor were tasks that read distances directly, retrieval among
-  them.
+  threshold set on one file may not carry over to another. Carrying one over
+  was not measured (the next subsections fit each file's own), nor were tasks
+  that read distances directly, retrieval among them.
 - Training took 2,880 s (banking77) and 3,189 s (CLINC150) on the 32 vCPUs,
   in float32. Nothing was trained on a GPU.
 
@@ -2167,12 +2167,15 @@ draws), at k=10; every held-out row is in scope:
 - Google's file answers 0.956 of the held-out requests, close to the 0.95
   the calibration keeps; the fine-tune answers about 0.91. The examples the
   threshold is fitted on are training rows, which the fine-tune was trained
-  on; a likely cause is that they score higher against their centroids than
-  requests it has not seen, which sets the threshold higher. That cause was
+  on. The fine-tune's thresholds are lower than Google's in absolute terms
+  (about 0.82 against 0.89 at k=10) but high relative to the scores of the
+  held-out requests; that is consistent with the examples scoring higher
+  against their centroids than requests the fine-tune has not seen, which was
   not tested.
 - At k=5 the pattern is the same: the fine-tune answers 0.8995 (float32) to
   0.9052 (int4), right on 0.9645–0.9699 of them; Google's file 0.9541 and
   0.9081.
 - Out-of-scope requests were not in the rows, so how many of those the
-  threshold refuses is not measured. `verify` reports these numbers and does
-  not gate on them.
+  threshold refuses is not measured. No option had a description, which the
+  app would add as one more input and which changes the folds. `verify`
+  reports these numbers and does not gate on them.

@@ -786,9 +786,10 @@ final decider = await embedder.createDecider(
 `embedder` is the `EmbeddingModel` loaded from the file (flutter_edge_ai's
 README, "Pick one of N options"). The examples are the app's own; verify
 measured ten per option. The default calibration, `crossFit`, needs at least
-two inputs per option and abstains below a threshold it fits on them; verify
-measured no abstention, which is
-`calibration: const EmbeddingDeciderCalibration.none()`.
+two inputs per option and abstains below a threshold it fits on them. verify
+gates on every request answered, which is
+`calibration: const EmbeddingDeciderCalibration.none()`, and reports the
+`crossFit` abstention beside it, ungated, for options without a description.
 
 Every int4 file is the same size and is named `model.litertlm`, so two
 fine-tunes are told apart only by their bytes: give the decider an
