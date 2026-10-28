@@ -802,7 +802,9 @@ What has and has not been measured
 - litetune's own stages, end to end on banking77 (77 options), passed
   `verify` with both files: a conversion cost of -0.0002 (int8) and +0.0037
   (int4) on the 10-shot centroid decider, the int4 cost resolved in three of
-  five draws and under 0.01 in all of them. On banking77 and CLINC150 with the
+  five draws and under 0.01 in all of them. On CLINC150 (150 options), run
+  from the published 0.7.0, both passed too: -0.0001 (int8) and +0.0026
+  (int4). On banking77 and CLINC150 with the
   decider's prefix, an earlier measurement gave int4 costs of 0.0027 and
   0.0017 and int8 0.0002; on emotion (six options), behind a classification
   prefix, both files' centroid of every training row was within 0.0005 of the
@@ -815,10 +817,11 @@ What has and has not been measured
   run.
 - The app's default calibration, `crossFit`, abstains below a threshold it
   fits on the examples. verify fits it the same way and reports it, ungated:
-  on banking77 at ten per option the fine-tuned files answered about 0.91 of
-  the requests and were right on 0.966–0.970 of those, where Google's file
-  answered 0.956 and was right on 0.927. The rows were all in scope, so
-  refusals of out-of-scope requests are not measured.
+  at ten per option the fine-tuned files answered about 0.91 of the requests
+  and were right on 0.966–0.970 of those on banking77 and 0.994–0.995 on
+  CLINC150, where Google's file answered 0.956 and 0.958 and was right on
+  0.927 and 0.959. The rows were all in scope, so refusals of out-of-scope
+  requests are not measured.
 - Option descriptions, which the app adds to an option's centroid, were not
   used in training and are not measured.
 - CPU only, on LiteRT-LM 0.18.0 from PyPI on an x86 host; the app's own

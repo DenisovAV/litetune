@@ -2146,35 +2146,60 @@ All six stages exited 0. `tune` took 2,347 s.
   has them, instead of -128, and nothing else in the int8 path changed that
   the int4 path did not share.
 
+### CLINC150, from the published package
+
+The same stages run from litetune 0.7.0 as installed from PyPI, on CLINC150's
+in-scope intents (150 options) through `prepare`'s split: 13,650 training and
+3,900 held-out rows. All six stages exited 0; `tune` took 3,241 s.
+
+| embeddings | all rows | k=5 mean | k=10 mean | linear | cosine to float32, mean / min |
+|---|---|---|---|---|---|
+| Google's file | 0.9592 | 0.9298 | 0.9493 | 0.9787 | |
+| fine-tuned, float32 | 0.9792 | 0.9796 | 0.9791 | 0.9803 | |
+| int8 file | 0.9790 | 0.9796 | 0.9792 | 0.9808 | 0.9994 / 0.9913 |
+| int4 file | 0.9764 | 0.9770 | 0.9765 | 0.9787 | 0.9749 / 0.8574 |
+
+- Both files passed: a conversion cost of -0.0001 (int8) and +0.0026 (int4)
+  on the 10-shot centroid decider, every draw's upper bound under 0.01. The
+  files' gain over Google's at k=10 was +0.0299 (int8) and +0.0272 (int4).
+
 ### Abstention, as the app calibrates it
 
 The app's `createDecider` abstains by default: `EmbeddingDeciderCalibration.crossFit`
 (keep 0.95) fits a threshold on the options' own examples and refuses a request
 whose best cosine is below it. `verify` now fits it the same way on each draw's
-k examples. Measured again on the files of the run above (the same rows, five
-draws), at k=10; every held-out row is in scope:
+k examples. Measured again on the files of the two runs above (the same rows,
+five draws), at k=10; every held-out row is in scope:
 
-| embeddings | answered | right when answered | answered and right | right, answering every row |
+| banking77 | answered | right when answered | answered and right | right, answering every row |
 |---|---|---|---|---|
 | Google's file | 0.9558 | 0.9268 | 0.8857 | 0.9137 |
 | fine-tuned, float32 | 0.9068 | 0.9702 | 0.8798 | 0.9312 |
 | int8 file | 0.9086 | 0.9698 | 0.8812 | 0.9314 |
 | int4 file | 0.9094 | 0.9660 | 0.8784 | 0.9276 |
 
+| CLINC150 | answered | right when answered | answered and right | right, answering every row |
+|---|---|---|---|---|
+| Google's file | 0.9581 | 0.9594 | 0.9192 | 0.9493 |
+| fine-tuned, float32 | 0.9082 | 0.9948 | 0.9035 | 0.9791 |
+| int8 file | 0.9081 | 0.9948 | 0.9034 | 0.9792 |
+| int4 file | 0.9061 | 0.9942 | 0.9008 | 0.9765 |
+
 - With the fine-tune the decider answers fewer requests and is right on more
-  of those it answers: 0.97 against 0.93 for Google's file. Of all requests,
-  the share answered and right is about the same (0.878–0.886).
-- Google's file answers 0.956 of the held-out requests, close to the 0.95
-  the calibration keeps; the fine-tune answers about 0.91. The examples the
-  threshold is fitted on are training rows, which the fine-tune was trained
-  on. The fine-tune's thresholds are lower than Google's in absolute terms
-  (about 0.82 against 0.89 at k=10) but high relative to the scores of the
+  of those it answers: 0.97 against 0.93 on banking77, 0.99 against 0.96 on
+  CLINC150. Of all requests, the share answered and right is about the same
+  on banking77 (0.878–0.886) and lower with the fine-tune on CLINC150
+  (0.901–0.904 against 0.919).
+- Google's file answers 0.956 and 0.958 of the held-out requests, close to the
+  0.95 the calibration keeps; the fine-tune answers about 0.91 on both. The
+  examples the threshold is fitted on are training rows, which the fine-tune
+  was trained on, and the threshold sits high against the scores of the
   held-out requests; that is consistent with the examples scoring higher
   against their centroids than requests the fine-tune has not seen, which was
-  not tested.
-- At k=5 the pattern is the same: the fine-tune answers 0.8995 (float32) to
-  0.9052 (int4), right on 0.9645–0.9699 of them; Google's file 0.9541 and
-  0.9081.
+  not tested. In absolute terms the fine-tune's thresholds were lower than
+  Google's on banking77 (about 0.82 against 0.89) and about the same on
+  CLINC150 (0.88–0.89 against 0.88).
+- At k=5 the pattern is the same on both tasks.
 - Out-of-scope requests were not in the rows, so how many of those the
   threshold refuses is not measured. No option had a description, which the
   app would add as one more input and which changes the folds. `verify`
