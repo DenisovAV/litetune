@@ -109,6 +109,11 @@ DRAWS = 5
 GATED_K = 10
 # eval_s5.py's linear layer.
 LINEAR_DECAY = 1e-5
+# flutter_edge_ai's default calibration, EmbeddingDeciderCalibration.crossFit:
+# keep 0.95 (lib/src/decision/decider_method.dart:99), five folds
+# (decider_fit.dart crossFitSignal).
+CROSSFIT_KEEP = 0.95
+CROSSFIT_FOLDS = 5
 # The spike's criterion (the design, "Gate").
 DEFAULT_MAX_CONVERSION_COST = 0.01
 DEFAULT_THREADS = 4
@@ -140,13 +145,14 @@ CPU_ONLY = (
     "litert-lm package on PyPI on this host's CPU -- not the application's own build of the "
     "runtime on a device's CPU; the GPU and the NPU are not measured"
 )
-CALIBRATION_UNMEASURED = (
-    "the application's default calibration, EmbeddingDeciderCalibration.crossFit keeping 0.95 "
+CALIBRATION_MEASURED = (
+    "the application's default calibration, EmbeddingDeciderCalibration.crossFit keeping {keep} "
     "(flutter_edge_ai lib/src/decision/decider_method.dart:99, "
-    "lib/src/embedding/embedding_model.dart:181-182), abstains below a cosine threshold; "
-    "abstention is not measured here, every input is answered. A similarity threshold picked on "
-    "another file does not carry over to this one: int4 moves the cosines (MEASUREMENTS.md, "
-    '"EmbeddingGemma 2: many labels")'
+    "lib/src/embedding/embedding_model.dart:181-182), is fitted here as the app fits it, on the "
+    "k examples per option of each draw, and reported as crossfit_k*: how many held-out inputs "
+    "it answers and how many of those it answers right; it is not gated. The gated accuracy "
+    "answers every input. The held-out rows are in scope only, so how many out-of-scope inputs "
+    "it refuses is not measured, nor are the minSimilarity and fromLabelled calibrations"
 )
 FITTED_ON_EXAMPLES = (
     "the application's decider is fitted on the examples it is given at run time. Here it is "
@@ -534,10 +540,12 @@ EVAL_SCRIPT = r'''
 (MEASUREMENTS.md, "EmbeddingGemma 2: many labels").
 
 Reads JSON {vectors: {name: path}, train_labels, heldout_labels, n_labels, ks,
-draws, decay, pairs, report} from argv[1]. Each vectors file holds the train
-rows, then the held-out rows. Writes to spec["report"]: per side the accuracy
-of every decider and, per held-out row, whether each centroid decider was
-right; and the per-row cosine between each pair of sides on the held-out rows.
+draws, decay, keep, folds, pairs, report} from argv[1]. Each vectors file holds
+the train rows, then the held-out rows. Writes to spec["report"]: per side the
+accuracy of every decider, the k-shot decider's crossFit abstention (the
+app's default calibration, fitted on the same k examples), and, per held-out
+row, whether each centroid decider was right; and the per-row cosine between
+each pair of sides on the held-out rows.
 A side with too few or too many vectors, or with a vector that has a
 non-finite value or a zero norm, is {"error": ...} and exit 3.
 """
@@ -590,7 +598,57 @@ def linear_correct(torch, xtr, ytr, xte, yte, n_labels, decay):
         return (torch.tensor(xte) @ W + b).numpy().argmax(1) == yte
 
 
-def evaluate(v, ytr, yte, n_labels, ks, draws, linear=None):
+def centroids(x, y, n_labels):
+    """Each label's mean row, L2-normalised: flutter_edge_ai's optionCentroids."""
+    c = np.stack([x[y == k].mean(0) for k in range(n_labels)])
+    return c / np.linalg.norm(c, axis=1, keepdims=True)
+
+
+def crossfit_threshold(x, y, n_labels, keep, folds):
+    """flutter_edge_ai's default calibration, EmbeddingDeciderCalibration.crossFit:
+    input i of each option sits in fold i % folds, in the order the inputs are
+    given; each held-out input's highest cosine to the centroids of the other
+    folds; the threshold is that signal, sorted ascending, at
+    floor((1 - keep) * n + 1e-9) (decider_fit.dart crossFitSignal, keepThreshold).
+    """
+    ranks = np.empty(len(y), dtype=int)
+    for k in range(n_labels):
+        rows = np.flatnonzero(y == k)
+        ranks[rows] = np.arange(len(rows))
+    signal = np.empty(len(y))
+    for f in range(folds):
+        held = np.flatnonzero(ranks % folds == f)
+        if not len(held):
+            continue
+        rest = ranks % folds != f
+        signal[held] = (x[held] @ centroids(x[rest], y[rest], n_labels).T).max(1)
+    return keep_threshold(signal, keep)
+
+
+def keep_threshold(signal, keep):
+    """decider_fit.dart keepThreshold: the ascending signal at
+    floor((1 - keep) * n + 1e-9); the 1e-9 because (1 - 0.9) * 10 is
+    0.9999999999999998 in doubles, which would floor to 0 and keep every input."""
+    ordered = np.sort(signal)
+    return float(ordered[min(int(np.floor((1 - keep) * len(ordered) + 1e-9)), len(ordered) - 1)])
+
+
+def abstention(xs, ys, xte, yte, n_labels, keep, folds):
+    """The k-shot decider with the crossFit threshold fitted on its own examples:
+    (threshold, per held-out row whether it was answered, and whether right).
+    A row is answered when its highest cosine is not below the threshold, as
+    the app's EmbeddingDecider.choose decides."""
+    t = crossfit_threshold(xs, ys, n_labels, keep, folds)
+    scores = xte @ centroids(xs, ys, n_labels).T
+    return t, scores.max(1) >= t, scores.argmax(1) == yte
+
+
+def summary(values):
+    return {"mean": round(float(np.mean(values)), 4), "min": round(float(min(values)), 4),
+            "draws": [round(float(x), 4) for x in values]}
+
+
+def evaluate(v, ytr, yte, n_labels, ks, draws, linear=None, keep=None, folds=5):
     """(accuracies, per-row correctness) of every decider on one side's vectors."""
     ntr = len(ytr)
     xtr, xte = v[:ntr], v[ntr:]
@@ -601,14 +659,26 @@ def evaluate(v, ytr, yte, n_labels, ks, draws, linear=None):
     if linear is not None:
         acc["linear"] = round(float(np.mean(linear(xtr, ytr, xte, yte))), 4)
     for k in ks:
-        hits = []
+        hits, thresholds, coverage, answered_right, right_share = [], [], [], [], []
         for d in range(draws):
             idx = kshot_picks(ytr, n_labels, k, d)
             hits.append(centroid_correct(xtr[idx], ytr[idx], xte, yte, n_labels))
-        accs = [float(np.mean(h)) for h in hits]
-        acc[f"centroid_k{k}"] = {"mean": round(float(np.mean(accs)), 4), "min": round(min(accs), 4),
-                                 "draws": [round(x, 4) for x in accs]}
+            if keep is not None:
+                t, answered, right = abstention(xtr[idx], ytr[idx], xte, yte, n_labels, keep, folds)
+                thresholds.append(t)
+                coverage.append(float(np.mean(answered)))
+                answered_right.append(float(np.mean(right[answered])) if answered.any() else 0.0)
+                right_share.append(float(np.mean(answered & right)))
+        acc[f"centroid_k{k}"] = summary([float(np.mean(h)) for h in hits])
         correct[f"centroid_k{k}"] = [h.astype(int).tolist() for h in hits]
+        if keep is not None:
+            acc[f"crossfit_k{k}"] = {
+                "keep": keep,
+                "threshold": [round(t, 6) for t in thresholds],
+                "answered": summary(coverage),
+                "right_when_answered": summary(answered_right),
+                "answered_and_right": summary(right_share),
+            }
     return acc, correct
 
 
@@ -647,7 +717,7 @@ def main():
 
     for name, v in vectors.items():
         out["accuracy"][name], out["correct"][name] = evaluate(
-            v, ytr, yte, n, spec["ks"], spec["draws"], linear)
+            v, ytr, yte, n, spec["ks"], spec["draws"], linear, spec["keep"], spec["folds"])
     for a, b in spec["pairs"]:
         out["cosine"][f"{a}|{b}"] = cosine_rows(vectors[a][ntr:], vectors[b][ntr:])
     Path(spec["report"]).write_text(json.dumps(out), encoding="utf-8")
@@ -1305,6 +1375,8 @@ def verify_embedding(
                 "ks": list(KS),
                 "draws": DRAWS,
                 "decay": LINEAR_DECAY,
+                "keep": CROSSFIT_KEEP,
+                "folds": CROSSFIT_FOLDS,
                 "pairs": pairs,
             },
             work,
@@ -1386,7 +1458,7 @@ def verify_embedding(
     state.limitation(REFERENCE_ON_CPU)
     state.limitation(LINEAR_NOT_GATED)
     state.limitation(DESCRIPTIONS_UNUSED)
-    state.limitation(CALIBRATION_UNMEASURED)
+    state.limitation(CALIBRATION_MEASURED.format(keep=CROSSFIT_KEEP))
     if job.max_conversion_cost is None:
         state.limitation(
             f"no --max-conversion-cost was given; the gate used {DEFAULT_MAX_CONVERSION_COST}, "
