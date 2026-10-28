@@ -2195,12 +2195,70 @@ five draws), at k=10; every held-out row is in scope:
   examples the threshold is fitted on are training rows, which the fine-tune
   was trained on, and the threshold sits high against the scores of the
   held-out requests; that is consistent with the examples scoring higher
-  against their centroids than requests the fine-tune has not seen, which was
-  not tested. In absolute terms the fine-tune's thresholds were lower than
+  against their centroids than requests the fine-tune has not seen, which the
+  next section tests. In absolute terms the fine-tune's thresholds were lower than
   Google's on banking77 (about 0.82 against 0.89) and about the same on
   CLINC150 (0.88–0.89 against 0.88).
 - At k=5 the pattern is the same on both tasks.
 - Out-of-scope requests were not in the rows, so how many of those the
-  threshold refuses is not measured. No option had a description, which the
-  app would add as one more input and which changes the folds. `verify`
-  reports these numbers and does not gate on them.
+  threshold refuses is not measured here; the next section measures it on
+  CLINC150. No option had a description, which the app would add as one more
+  input and which changes the folds. `verify` reports these numbers and does
+  not gate on them.
+
+### Which calibration, with a fine-tuned file
+
+The app offers three calibrations: `crossFit` with a chosen keep,
+`fromLabelled` (a threshold fitted on labelled requests to an error budget),
+and `minSimilarity` (a fixed threshold; the app documents 0.875 for Google's
+int4 file). Measured on the int8 files and Google's file of the two runs
+above, embedded again, at k=10 examples from the training rows, five draws.
+`fromLabelled` was fitted on the run's calibration split (rows never trained
+on, all in scope: the app accepts only labels that are options) with a 0.05
+budget. On CLINC150, out-of-scope requests are its 1,000 test `oos` rows.
+This embedding run's numbers for the default `crossFit` differ from the
+section above by up to 0.002.
+
+| banking77 | calibration | answered | right when answered | answered and right |
+|---|---|---|---|---|
+| fine-tuned | crossFit 0.95 | 0.9067 | 0.9701 | 0.8796 |
+| fine-tuned | crossFit 0.98 | 0.9541 | 0.9557 | 0.9118 |
+| fine-tuned | crossFit 0.99 | 0.9744 | 0.9471 | 0.9228 |
+| fine-tuned | minSimilarity 0.875 | 0.8389 | 0.9802 | 0.8223 |
+| fine-tuned | fromLabelled 0.05 | 0.9695 | 0.9499 | 0.9209 |
+| Google's file | crossFit 0.95 | 0.9570 | 0.9263 | 0.8864 |
+| Google's file | crossFit 0.98 | 0.9814 | 0.9194 | 0.9023 |
+| Google's file | minSimilarity 0.875 | 0.9880 | 0.9175 | 0.9065 |
+| Google's file | fromLabelled 0.05 | 0.8029 | 0.9545 | 0.7663 |
+
+| CLINC150 | calibration | answered | right when answered | answered and right | out of scope refused |
+|---|---|---|---|---|---|
+| fine-tuned | crossFit 0.95 | 0.9083 | 0.9949 | 0.9036 | 0.9714 |
+| fine-tuned | crossFit 0.98 | 0.9470 | 0.9918 | 0.9392 | 0.9500 |
+| fine-tuned | crossFit 0.99 | 0.9644 | 0.9894 | 0.9542 | 0.9210 |
+| fine-tuned | minSimilarity 0.875 | 0.9274 | 0.9934 | 0.9213 | 0.9668 |
+| fine-tuned | fromLabelled 0.05 | 1.0000 | 0.9791 | 0.9791 | 0.0988 |
+| Google's file | crossFit 0.95 | 0.9579 | 0.9588 | 0.9185 | 0.9062 |
+| Google's file | crossFit 0.98 | 0.9841 | 0.9542 | 0.9390 | 0.8250 |
+| Google's file | minSimilarity 0.875 | 0.9754 | 0.9560 | 0.9325 | 0.8676 |
+| Google's file | fromLabelled 0.05 | 0.9939 | 0.9512 | 0.9454 | 0.5140 |
+
+- With examples the fine-tune was not trained on (six per option from the
+  calibration split, the most its smallest option has), the default
+  `crossFit` 0.95 answered 0.9505 of banking77 and 0.9433 of CLINC150, against
+  0.9067 and 0.9083 with training examples; Google's file answered 0.9537 and
+  0.9649. The examples differ in k as well as in source, but the result is
+  what the training-row explanation above predicts.
+- The fine-tuned file at `crossFit` 0.98 against Google's file at the default:
+  on CLINC150, answered and right 0.9392 against 0.9185, out of scope refused
+  0.9500 against 0.9062; on banking77, answered and right 0.9118 against
+  0.8864. Raising keep on Google's file to 0.98 refused 0.8250 of out-of-scope
+  requests.
+- `fromLabelled` on in-scope requests alone refused 0.0988 (fine-tuned) and
+  0.5140 (Google's file) of out-of-scope requests: when the decider errs less
+  than the budget on in-scope requests, the threshold it fits can be as low as
+  answering everything.
+- `minSimilarity` 0.875 answered 0.8389 of banking77 with the fine-tuned file:
+  a threshold set for Google's file does not carry over.
+- Out-of-scope requests were measured on CLINC150 only, at k=10 only, without
+  option descriptions.

@@ -820,8 +820,13 @@ What has and has not been measured
   at ten per option the fine-tuned files answered about 0.91 of the requests
   and were right on 0.966–0.970 of those on banking77 and 0.994–0.995 on
   CLINC150, where Google's file answered 0.956 and 0.958 and was right on
-  0.927 and 0.959. The rows were all in scope, so refusals of out-of-scope
-  requests are not measured.
+  0.927 and 0.959. The rows verify scores are all in scope.
+- With a fine-tuned file, `crossFit` with keep 0.98 answered 0.954 (banking77)
+  and 0.947 (CLINC150) and refused 0.950 of CLINC150's out-of-scope requests,
+  against 0.906 for Google's file at the default; `fromLabelled` fitted on
+  in-scope requests refused 0.099 of them, and `minSimilarity` 0.875 answered
+  0.839 of banking77. Measured at ten per option, out-of-scope on CLINC150
+  only; see [MEASUREMENTS.md](MEASUREMENTS.md).
 - Option descriptions, which the app adds to an option's centroid, were not
   used in training and are not measured.
 - CPU only, on LiteRT-LM 0.18.0 from PyPI on an x86 host; the app's own
