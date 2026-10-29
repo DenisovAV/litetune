@@ -1351,9 +1351,53 @@ class _Tensor(list):
             return self
         return _Tensor(list(self), device=device)
 
+    def tolist(self):
+        return [list(row) if isinstance(row, list) else row for row in self]
+
+    def reshape(self, *shape):
+        return self
+
 
 def tensor(values, dtype=None):
     return _Tensor(values)
+
+
+class _Loss:
+    def __init__(self, value):
+        self.value = value
+
+    def backward(self):
+        _log({"event": "backward"})
+
+    def __mul__(self, weight):
+        _log({"event": "loss_weight", "weight": weight})
+        return _Loss(self.value * weight)
+
+    def detach(self):
+        return self
+
+    def __float__(self):
+        return self.value
+
+
+class _Functional:
+    @staticmethod
+    def cross_entropy(logits, targets, ignore_index=None):
+        # What the loss was taken over: the targets at the kept positions, and
+        # where they were when it was.
+        _log({
+            "event": "cross_entropy",
+            "targets": list(targets),
+            "targets_device": getattr(targets, "device", None),
+            "logits_rows": logits.rows,
+            "logits_positions": logits.positions,
+            "ignore_index": ignore_index,
+        })
+        return _Loss(1.45)
+
+
+class nn:
+    functional = _Functional
 
 
 class _Cuda:
@@ -1493,9 +1537,22 @@ class _Loss:
         return self.value
 
 
+class _Logits:
+    def __init__(self, rows, positions):
+        self.rows = rows
+        self.positions = positions
+        self.shape = (rows, positions, 7)
+
+    def float(self):
+        return self
+
+    def reshape(self, *shape):
+        return self
+
+
 class _Output:
-    def __init__(self, loss, step):
-        self.loss = loss
+    def __init__(self, logits, step):
+        self.logits = logits
         self.step = step
 
     def __del__(self):
@@ -1533,21 +1590,26 @@ class _Model:
         _log({"event": "to", "device": device})
         return self
 
-    def __call__(self, input_ids=None, attention_mask=None, labels=None):
+    def gradient_checkpointing_enable(self):
+        _log({"event": "gradient_checkpointing"})
+
+    def __call__(self, input_ids=None, attention_mask=None, logits_to_keep=None, labels=None):
         _log({
             "event": "forward",
-            "rows": len(labels),
-            "width": len(labels[0]),
-            # Where each of the three actually arrived, not just that `.to()`
-            # was called on it -- the doubles hand back a new object only
-            # when the device changed, so a dropped `.to()` call shows up
-            # here as "cpu" while the model sits on something else.
+            "rows": len(input_ids),
+            "width": len(input_ids[0]),
+            "kept": None if logits_to_keep is None else list(logits_to_keep),
+            "labels_given": labels is not None,
+            # Where each actually arrived, not just that `.to()` was called on
+            # it -- the doubles hand back a new object only when the device
+            # changed, so a dropped `.to()` call shows up here as "cpu" while
+            # the model sits on something else.
             "input_ids_device": getattr(input_ids, "device", None),
             "attention_mask_device": getattr(attention_mask, "device", None),
-            "labels_device": getattr(labels, "device", None),
+            "kept_device": getattr(logits_to_keep, "device", None),
         })
         self.forwards += 1
-        return _Output(_Loss(1.45), self.forwards)
+        return _Output(_Logits(len(input_ids), len(logits_to_keep or [])), self.forwards)
 
     def save_pretrained(self, path):
         Path(path).mkdir(parents=True, exist_ok=True)
@@ -2104,7 +2166,9 @@ def test_the_real_script_trains_on_cuda_when_the_stub_says_there_is_one(request_
     forward = next(e for e in log if e["event"] == "forward")
     assert forward["input_ids_device"] == "cuda"
     assert forward["attention_mask_device"] == "cuda"
-    assert forward["labels_device"] == "cuda"
+    assert forward["kept_device"] == "cuda"
+    loss = next(e for e in log if e["event"] == "cross_entropy")
+    assert loss["targets_device"] == "cuda"
 
     assert read_metrics(request.output_dir / "metrics.json").device == "cuda"
 
@@ -4763,9 +4827,8 @@ def test_a_cuda_out_of_memory_carries_no_mps_advice(trainer, request_for):
     assert "LITETUNE_DEVICE" not in check.detail
 
 
-def _cuda_oom_detail(trainer, request_for, monkeypatch, **kwargs):
+def _cuda_oom_detail(trainer, request_for, **kwargs):
     trainer.probe_device = "cuda"
-    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     trainer.returncode = 1
     trainer.write_model = False
     trainer.stderr = (
@@ -4778,50 +4841,23 @@ def _cuda_oom_detail(trainer, request_for, monkeypatch, **kwargs):
     return check.detail.split(": torch.OutOfMemoryError")[0]
 
 
-def test_a_cuda_out_of_memory_says_what_the_run_used_and_what_lowers_it(
-    trainer, request_for, monkeypatch
-):
-    advice = _cuda_oom_detail(
-        trainer, request_for, monkeypatch, micro_batch_size=1, max_seq_length=4096
-    )
+def test_a_cuda_out_of_memory_says_what_the_run_used_and_what_lowers_it(trainer, request_for):
+    advice = _cuda_oom_detail(trainer, request_for, micro_batch_size=1, max_seq_length=4096)
 
-    assert "micro-batch 1, attention 'eager', max_seq_length 4096" in advice
-    assert "--attn-implementation sdpa" in advice
-    assert "shorter training rows" in advice
-    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in advice
+    assert "micro-batch 1, max_seq_length 4096" in advice
+    assert "shorter rows" in advice
     # Already at one row a step: there is no smaller micro-batch to offer.
     assert "--micro-batch-size" not in advice
+    # Nothing to configure in torch: litetune's defaults are the levers.
+    assert "PYTORCH_" not in advice
+    assert "--attn-implementation" not in advice
 
 
-def test_a_cuda_out_of_memory_offers_only_the_levers_not_yet_pulled(
-    trainer, request_for, monkeypatch
-):
-    advice = _cuda_oom_detail(
-        trainer,
-        request_for,
-        monkeypatch,
-        attn_implementation="sdpa",
-        micro_batch_size=2,
-        batch_size=4,
-    )
+def test_a_cuda_out_of_memory_offers_a_smaller_micro_batch_when_there_is_one(trainer, request_for):
+    advice = _cuda_oom_detail(trainer, request_for, micro_batch_size=2, batch_size=4)
 
-    assert "micro-batch 2, attention 'sdpa'" in advice
+    assert "micro-batch 2" in advice
     assert "a smaller --micro-batch-size" in advice
-    assert "--attn-implementation sdpa" not in advice
-
-
-@pytest.mark.parametrize(
-    "setting", ["expandable_segments:True", "max_split_size_mb:128,expandable_segments:true"]
-)
-def test_a_cuda_out_of_memory_under_expandable_segments_does_not_offer_them(
-    trainer, request_for, monkeypatch, setting
-):
-    advice = _cuda_oom_detail(trainer, request_for, monkeypatch)
-    assert "expandable_segments" in advice
-    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", setting)
-    trainer.stderr = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.63 GiB."
-    check = check_named(run_tune(request_for()), TRAINING_CHECK)
-    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments" not in check.detail.split(": torch.")[0]
 
 
 def test_a_machine_failure_that_is_not_out_of_memory_gets_no_memory_advice(trainer, request_for):
@@ -4988,14 +5024,17 @@ def test_the_real_script_records_the_largest_mps_samples_and_where_they_were_tak
     # sampled once per effective batch.
     sample = ["mps_current_allocated", "mps_driver_allocated"]
     first = log.index("forward")
-    assert log[first : first + 8] == [
+    # The loss is taken from the kept logits before the forward sample: the
+    # logits it reads are the forward pass's memory.
+    assert log[first : first + 9] == [
         "forward",
+        "cross_entropy",
         *sample,
         "loss_weight",
         "backward",
         *sample,
         "released",
-    ], log[first : first + 8]
+    ], log[first : first + 9]
     assert log.count("mps_current_allocated") == 2 * forwards + optimiser_steps
     # The stub's sequences peak in the middle, so the last sample is not the
     # largest: the record is the maximum over the samples.
@@ -5433,3 +5472,58 @@ def test_tune_reads_decision_json_once(tmp_path, request_for, trainer, monkeypat
 
     assert result.trained_decision is not None
     assert reads == [decision]
+
+
+def test_scored_targets_keeps_the_positions_whose_next_token_is_supervised(script_namespace):
+    """Worked by hand: position p is kept when any row's label at p + 1 is a
+    target. Row one supervises tokens 3 and 4, row two token 2; padding and
+    the prompt are IGNORE_INDEX."""
+    ignore = script_namespace["IGNORE_INDEX"]
+    rows = [
+        [ignore, ignore, ignore, 30, 40, ignore],
+        [ignore, ignore, 20, ignore, ignore, ignore],
+    ]
+
+    keep, targets = script_namespace["scored_targets"](rows)
+
+    assert keep == [1, 2, 3]
+    assert targets == [[ignore, 30, 40], [20, ignore, ignore]]
+
+
+def test_scored_targets_never_keeps_the_last_position(script_namespace):
+    """The last position has no next token: a target there would shift past
+    the row, so it is never kept, even when everything else is."""
+    rows = [[5, 6, 7]]
+
+    keep, targets = script_namespace["scored_targets"](rows)
+
+    assert keep == [0, 1]
+    assert targets == [[6, 7]]
+
+
+def test_the_real_script_checkpoints_and_scores_only_the_supervised_positions(
+    request_for, stub_env
+):
+    request = request_for()
+    proc = run_real_script(request, stub_env)
+    assert proc.returncode == 0, proc.stderr
+
+    log = stub_log(stub_env)
+    events = [e["event"] for e in log]
+    # On the loaded model, before LoRA wraps it, as b2 measured it.
+    assert events.count("gradient_checkpointing") == 1
+    assert events.index("gradient_checkpointing") < events.index("forward")
+    forwards = [e for e in log if e["event"] == "forward"]
+    losses = [e for e in log if e["event"] == "cross_entropy"]
+    assert forwards and len(forwards) == len(losses)
+    for forward, loss in zip(forwards, losses, strict=True):
+        # The model computes no loss of its own and no logit row past the kept
+        # positions; the loss is taken over exactly those.
+        assert forward["labels_given"] is False
+        assert forward["kept"], forward
+        assert max(forward["kept"]) < forward["width"] - 1
+        assert loss["logits_positions"] == len(forward["kept"])
+        assert loss["logits_rows"] == forward["rows"]
+        assert len(loss["targets"]) == forward["rows"]
+        assert all(len(row) == len(forward["kept"]) for row in loss["targets"])
+        assert loss["ignore_index"] == -100

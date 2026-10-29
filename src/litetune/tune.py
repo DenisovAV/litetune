@@ -627,8 +627,6 @@ _GPU_FAILURE_RE = re.compile(
 # leftmost match: `torch.OutOfMemoryError: MPS backend out of memory` matches
 # `OutOfMemoryError` first, and reading the advice off that would drop it.
 _MPS_OOM_RE = re.compile(r"MPS backend out of memory", re.IGNORECASE)
-# torch's CUDA caching-allocator setting, named in the out-of-memory advice.
-CUDA_ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
 # The same for CUDA, worded the ways torch and its libraries raise it.
 _CUDA_OOM_RE = re.compile(
     r"CUDA out of memory|CUDA error: out of memory|CUBLAS_STATUS_ALLOC_FAILED"
@@ -945,6 +943,18 @@ def supervised_shifted_tokens(examples):
     return sum(label != IGNORE_INDEX for _, labels in examples for label in labels[1:])
 
 
+def scored_targets(rows):
+    """The positions whose next token is supervised in any row, and each row's targets there.
+
+    `rows` are a batch's padded labels. The logits and the loss are computed at
+    these positions only: every other position's target is IGNORE_INDEX, so
+    the loss and its gradient are the ones the full sequence gives, without a
+    vocabulary-wide logit row for every prompt token.
+    """
+    keep = [p for p in range(len(rows[0]) - 1) if any(r[p + 1] != IGNORE_INDEX for r in rows)]
+    return keep, [[r[p + 1] for p in keep] for r in rows]
+
+
 def micro_batches(examples, size):
     """Yield microbatches and their share of the effective batch's token loss."""
     total = supervised_shifted_tokens(examples)
@@ -1059,6 +1069,11 @@ def main() -> int:
         **from_kwargs
     )
     model.config.use_cache = False
+    # Each layer's activations are recomputed in the backward pass instead of
+    # kept from the forward one, so a long row fits where it otherwise would
+    # not, whatever the attention, the device or the family. The loss is the
+    # same; a step takes longer.
+    model.gradient_checkpointing_enable()
     device = training_device(torch, spec.get("device"))
     on_cuda = str(device).startswith("cuda")
     model.to(device)
@@ -1156,30 +1171,39 @@ def main() -> int:
                     pad_multiple,
                     spec["max_seq_length"],
                 )
-                # The mask is applied here and nowhere else: transformers computes a
-                # shifted cross-entropy that skips every IGNORE_INDEX position, so
-                # the prompt contributes no gradient. A split batch has to weight
-                # each mean by its share of those tokens; averaging microbatch means
-                # would give a short completion the same vote as a long one.
+                # The mask is applied here and nowhere else: the loss is the mean
+                # cross-entropy over the supervised targets, the shifted one
+                # transformers computes, taken only at the positions that have one
+                # (`scored_targets`), so the prompt contributes no gradient. A split
+                # batch has to weight each mean by its share of those tokens;
+                # averaging microbatch means would give a short completion the same
+                # vote as a long one.
+                keep, targets = scored_targets(labels.tolist())
                 out = model(
                     input_ids=input_ids.to(device),
                     attention_mask=attention.to(device),
-                    labels=labels.to(device),
+                    logits_to_keep=torch.tensor(keep, dtype=torch.long).to(device),
+                )
+                logits = out.logits.float()
+                loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    torch.tensor(targets, dtype=torch.long).to(device).reshape(-1),
+                    ignore_index=IGNORE_INDEX,
                 )
                 if mps_samples is not None:
                     sample_mps_memory(torch, mps_samples)
-                batch_loss += float(out.loss.detach()) * loss_weight
+                batch_loss += float(loss.detach()) * loss_weight
                 if len(micro_batch) == len(effective_batch):
                     # The old CPU/CUDA path: do not insert even a multiply by one
                     # into an unchanged run.
-                    out.loss.backward()
+                    loss.backward()
                 else:
-                    (out.loss * loss_weight).backward()
+                    (loss * loss_weight).backward()
                 if mps_samples is not None:
                     sample_mps_memory(torch, mps_samples)
                 # Do not keep this microbatch's logits alive while the next one
                 # allocates its own -- that is the memory peak this split removes.
-                del out
+                del out, logits, loss
             optimiser.step()
             if mps_samples is not None:
                 sample_mps_memory(torch, mps_samples)
@@ -2181,40 +2205,21 @@ def _dtype_limitations(result: TuneResult, dtype: DtypeDecision) -> None:
         )
 
 
-def _cuda_oom_advice(
-    stderr: str, request: TuneRequest, micro_batch_size: int, environ: Mapping[str, str]
-) -> str:
+def _cuda_oom_advice(stderr: str, request: TuneRequest, micro_batch_size: int) -> str:
     """ " (what the run used, and what lowers it)" for a CUDA out-of-memory
     ending in `stderr`, or "" for any other ending.
 
-    `expandable_segments` lets torch's caching allocator grow a segment rather
-    than look for a free block of the right size, so memory it has reserved
-    but cannot hand out stops counting against the run; torch's own message
-    names it when that reserve is large. The variable reaches the training
-    process: `envs` drops interpreter and installer overrides, not torch's.
-
     Memory follows the longest row a step holds, not `max_seq_length`: a batch
     is padded to its own longest row, and a row over the limit is refused, not
-    cut, so lowering the limit only refuses rows. The levers named are the ones
-    this run has not already pulled.
+    cut, so lowering the limit only refuses rows.
     """
     if not _CUDA_OOM_RE.search(stderr or ""):
         return ""
-    levers = []
-    if "expandable_segments:true" not in environ.get(CUDA_ALLOC_CONF, "").replace(" ", "").lower():
-        levers.append(f"{CUDA_ALLOC_CONF}=expandable_segments:True")
-    if micro_batch_size > 1:
-        levers.append("a smaller --micro-batch-size")
-    if request.attn_implementation == "eager":
-        levers.append(
-            "--attn-implementation sdpa, which on CUDA can use a kernel that does not "
-            "keep the attention weights eager keeps for the backward pass"
-        )
-    levers.append("shorter training rows")
+    smaller = " or a smaller --micro-batch-size" if micro_batch_size > 1 else ""
     return (
-        f" (this run used micro-batch {micro_batch_size}, attention "
-        f"{request.attn_implementation!r}, max_seq_length {request.max_seq_length}; "
-        f"what lowers the memory a step needs: {', '.join(levers)})"
+        f" (micro-batch {micro_batch_size}, max_seq_length {request.max_seq_length}: the longest "
+        f"training row needs more memory than this GPU has; shorter rows{smaller} or a GPU with "
+        "more memory)"
     )
 
 
@@ -2825,7 +2830,7 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
         # who set the limit that ran out -- and every other ending reads as it
         # always has.
         advice = _mps_advice(result.stderr, result.mps_memory) or _cuda_oom_advice(
-            result.stderr, request, micro_batch.size, os.environ
+            result.stderr, request, micro_batch.size
         )
         accelerator = Check.unchecked(
             TRAINING_CHECK,
