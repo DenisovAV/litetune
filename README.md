@@ -102,7 +102,13 @@ accumulating the gradients for the `--batch-size` optimiser batch. CPU and
 CUDA keep the previous default of one forward per optimiser batch. Pass
 `--micro-batch-size` to choose another split on any device; it cannot exceed
 `--batch-size`. The report records both sizes and the number of accumulation
-steps. litetune also records the largest MPS memory counters it sampled. An
+steps. On every device the logits and the loss are computed only at the
+positions whose next token is supervised, and a model of 400 million
+parameters or more trains with gradient checkpointing, which recomputes each
+layer's activations in the backward pass instead of keeping them. Neither
+changes the loss; checkpointing lowers the memory a step needs and makes it
+slower. There is no flag for either, and the metrics record whether
+checkpointing was on and the parameter count that decided it. litetune also records the largest MPS memory counters it sampled. An
 MPS out-of-memory error is reported as the machine's, not the recipe's, and so
 are an operation MPS does not implement, bfloat16 refused before macOS 14 and
 a watermark ratio torch rejected — each with `LITETUNE_DEVICE=cpu` as the way
