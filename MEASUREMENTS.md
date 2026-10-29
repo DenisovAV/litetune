@@ -1995,6 +1995,54 @@ same scores.
 - Not measured: thermal state and clock frequencies, GPU memory, another phone
   model, the NPU, and reading the section out of the file on the phone.
 
+### The reference, sixteen rows at a time
+
+`verify`'s float reference used to score a decision one row at a time: one
+forward over the prompt, one over its options. It now scores sixteen rows of a
+similar length together (`decision_scripts`). Its first batch is checked row by
+row against each row scored alone with no cache, and it falls back to one row
+at a time if they differ.
+
+The emotion decision of "Every family on emotion" was retrained with litetune
+0.7.1 (gemma-3-270m-it, the same splits and flags) and verified on a Mac with an
+M5 Pro, on the CPU. The command was the same before and after: `--calibration
+--float-twin --engine-rows 300 --threads 4`, with 4,000 reference rows.
+
+| | one row at a time | sixteen at a time |
+|---|---|---|
+| reference stage | 1,044 s | 156 s |
+| whole `verify` | 18 min 27 s | 3 min 23 s |
+| runtime's top option / answer is the reference's | 0.9967 / 0.9933 | 0.9967 / 0.9933 |
+| temperature, abstain below | 1.2838772, 0.5074026 | 1.2838769, 0.5074019 |
+| mean KL | 3.9384e-04 | 3.9384e-04 |
+
+The same script, old and new, on the first 100 held-out rows of the same task
+for other families' base checkpoints. The times are milliseconds per row,
+without the rows the script checked against uncached scoring. "Largest
+difference" is the largest per-token difference between the old scores and the
+new.
+
+| checkpoint | one at a time | sixteen at a time | largest difference | top option changed |
+|---|---|---|---|---|
+| gemma-3-270m-it, tuned (300 rows) | 184.1 | 46.1 | 4.2e-05 | 0 rows |
+| Qwen2.5-0.5B-Instruct | 466.8 | 272.4 | 9.0e-05 | 0 rows |
+| Qwen3-0.6B | 606.4 | 358.7 | 1.4e-04 | 0 rows |
+| MiniCPM5-1B | 716.0 | 368.0 | 7.4e-05 | 0 rows |
+| granite-4.1-3b | 3,582.8 | 818.1 | 4.9e-04 | 0 rows |
+| Qwen3.5-0.8B | one at a time | one at a time | 0 | 0 rows |
+
+- On Qwen3.5-0.8B no way of passing the cache matched uncached scoring on the
+  first row, before or after, so every row is scored in full. With no cache
+  the script does not batch, and the scores were bit-identical.
+- No first batch fell back to one row at a time, and the largest difference a
+  check found was 1.99e-04 nats against `check_tol` 3e-03.
+- The Mac was running other work throughout, with load averages from 4 to 62.
+  Each pair of timings is one run, and the 300-row gemma pair was repeated
+  once, alternating: 37.6 s and 139.4 s one at a time against 20.4 s and 21.0 s
+  batched.
+- Not measured: FunctionGemma and gemma-4-E2B, whose checkpoints are gated;
+  CUDA; a batch on MPS, which the reference does not use.
+
 ### Limitations carried by the decision numbers
 
 - One training run per task and epoch count, on one model, one recipe and the

@@ -11,12 +11,19 @@ attention, TF32 off, on the GPU when there is one and `LITETUNE_DEVICE` allows
 it. Each row's prompt is rendered as `tune` trains it, by the same
 `prompt_mode.RENDERING_SOURCE`, pasted in, and every option is
 scored as its id followed by the turn terminator, teacher-forced, every token's
-log-probability kept. One forward over the prompt keeps its cache, and the
-options go in batches over copies of it. On the first row each way of passing
-the cache is checked against scoring with no cache, and the first within
-`check_tol` is used; when none is, every row is scored with no cache. On the
-first three rows and the longest the check is repeated, and a difference above
-`check_tol` stops the run.
+log-probability kept. On the first row each way of passing the cache is checked
+against scoring with no cache, and the first within `check_tol` is used; when
+none is, every row is scored with no cache.
+
+Rows of a similar length go `row_batch` at a time: one forward over their
+prompts, padded on the left and given their positions, keeps the cache, and the
+(row, option) pairs go in chunks over copies of their row's part of it. A way
+of passing the cache that takes no positions scores one row at a time, as does
+a first batch whose rows are not within `check_tol` of the same rows scored
+alone with no cache. That check covers every row of the first batch, then the
+first three rows and the longest; a difference above `check_tol` after the
+first batch stops the run. MEASUREMENTS.md has what batching changed in time
+and in the scores.
 
 **The runtime** (`ENGINE_SCRIPT`, `envs.RUNTIME`) scores through LiteRT-LM's
 session API on the CPU, as the flutter_edge_ai design of 2026-10-16 has its
@@ -126,7 +133,7 @@ def main():
     if len({tuple(c) for c in conts}) != len(conts):
         raise SystemExit("two options tokenise to the same ids")
     pad = tok.pad_token_id if tok.pad_token_id is not None else term_ids[0]
-    chunk = int(spec.get("chunk", 64))
+    chunk = int(spec.get("chunk", 96))
     tol = float(spec.get("check_tol", 3e-3))
     state = {"variant": None}
 
@@ -214,41 +221,156 @@ def main():
             del o2, lp
         return res
 
+    def select(cache, rows):
+        # The cache rows the continuations extend, one per (row, option) pair:
+        # the selection beam search makes, so every cache type has it.
+        c = copy.deepcopy(cache)
+        idx = torch.tensor(rows, device=device)
+        if hasattr(c, "reorder_cache"):
+            c.reorder_cache(idx)
+            return c
+        for layer in c.layers:
+            layer.keys = layer.keys.index_select(0, idx)
+            layer.values = layer.values.index_select(0, idx)
+        return c
+
+    @torch.no_grad()
+    def score_batch(prompts_ids, how):
+        # Several rows in one forward: prompts padded on the left so that every
+        # one ends in the last column, each row's positions counted from its
+        # first real token; then the (row, option) pairs in chunks over copies
+        # of their row's cache. An option's last token is not fed: no score
+        # reads the logits after it.
+        b = len(prompts_ids)
+        width = max(len(x) for x in prompts_ids)
+        ids = torch.full((b, width), pad, dtype=torch.long, device=device)
+        mask = torch.zeros((b, width), dtype=torch.long, device=device)
+        for i, x in enumerate(prompts_ids):
+            ids[i, width - len(x) :] = torch.tensor(x, device=device)
+            mask[i, width - len(x) :] = 1
+        kw = {
+            "input_ids": ids,
+            "attention_mask": mask,
+            "position_ids": (mask.cumsum(-1) - 1).clamp(min=0),
+            "use_cache": True,
+        }
+        try:
+            out = model(**kw, logits_to_keep=1)
+        except TypeError:
+            out = model(**kw)
+        first = torch.log_softmax(out.logits[:, -1].float(), dim=-1)
+        cache = out.past_key_values
+        lens = mask.sum(-1)
+        pairs = [(i, j) for i in range(b) for j in range(len(conts))]
+        res = [[None] * len(conts) for _ in range(b)]
+        heads = first[[i for i, _ in pairs], [conts[j][0] for _, j in pairs]].tolist()
+        for (i, j), h in zip(pairs, heads):
+            res[i][j] = [h]
+        for s in range(0, len(pairs), chunk):
+            part = pairs[s : s + chunk]
+            n = len(part)
+            length = max(len(conts[j]) for _, j in part) - 1
+            if length == 0:
+                continue
+            rows = [i for i, _ in part]
+            inp = torch.full((n, length), pad, dtype=torch.long, device=device)
+            for k, (_, j) in enumerate(part):
+                c = conts[j][:-1]
+                inp[k, : len(c)] = torch.tensor(c, device=device)
+            pos = torch.arange(length, device=device)
+            kw = {
+                "input_ids": inp,
+                "past_key_values": select(cache, rows),
+                "use_cache": True,
+                "attention_mask": torch.cat(
+                    [mask[rows], torch.ones((n, length), dtype=torch.long, device=device)], dim=1
+                ),
+                "position_ids": lens[rows].unsqueeze(1) + pos.unsqueeze(0),
+            }
+            if how == "cache_position+position_ids":
+                kw["cache_position"] = width + pos
+            lp = torch.log_softmax(model(**kw).logits.float(), dim=-1)
+            at = [
+                (k, t - 1, conts[j][t])
+                for k, (_, j) in enumerate(part)
+                for t in range(1, len(conts[j]))
+            ]
+            vals = iter(lp[tuple(torch.tensor(at, device=device).T)].tolist())
+            for i, j in part:
+                res[i][j].extend(next(vals) for _ in range(1, len(conts[j])))
+            del lp
+        return res
+
     def worst(a, b):
         return max(abs(x - y) for f, c in zip(a, b) for x, y in zip(f, c))
 
     started = time.time()
     trials = {}
     ids_for = set(spec.get("ids_for", []))
+    check = set(spec.get("check_indices", []))
+    batch = int(spec.get("row_batch", 16))
+    rows = spec["rows"]
+    rendered = {r["index"]: render(r["prompt"]) for r in rows}
+    # Rows of a length together, so that a batch pads little; records still
+    # carry their index.
+    first3 = {r["index"] for r in rows[:3]}
+    rows = sorted(rows, key=lambda r: len(rendered[r["index"]]))
     with open(spec["out"], "w", encoding="utf-8") as out:
-        for n_done, row in enumerate(spec["rows"]):
+        if rows:
+            prompt_ids0 = rendered[spec["rows"][0]["index"]]
+            full0 = score_full(prompt_ids0)
+            for how in VARIANTS:
+                try:
+                    d = worst(full0, score_cached(prompt_ids0, how))
+                except Exception as exc:  # noqa: BLE001 - recorded; the next one is tried
+                    d = f"{type(exc).__name__}: {str(exc)[:200]}"
+                trials[how] = d
+                if isinstance(d, float) and d <= tol:
+                    state["variant"] = how
+                    break
+        # Padding on the left needs the positions passed; without them, or
+        # with no cache at all, a row is scored alone.
+        if state["variant"] not in ("cache_position+position_ids", "position_ids"):
+            batch = 1
+        batch_trial = None
+        s = 0
+        while s < len(rows):
+            part = rows[s : s + batch]
             t0 = time.perf_counter()
-            prompt_ids = render(row["prompt"])
-            if n_done == 0:
-                full0 = score_full(prompt_ids)
-                for how in VARIANTS:
-                    try:
-                        d = worst(full0, score_cached(prompt_ids, how))
-                    except Exception as exc:  # noqa: BLE001 - recorded; the next one is tried
-                        d = f"{type(exc).__name__}: {str(exc)[:200]}"
-                    trials[how] = d
-                    if isinstance(d, float) and d <= tol:
-                        state["variant"] = how
-                        break
-            per = score_cached(prompt_ids, state["variant"])
-            rec = {"index": row["index"], "prompt_len": len(prompt_ids), "token_scores": per}
-            if row["index"] in ids_for:
-                rec["prompt_ids"] = prompt_ids
-            if row["index"] in set(spec.get("check_indices", [])) or n_done < 3:
-                d = worst(score_full(prompt_ids), per)
-                rec["check_max_abs_token"] = d
-                if d > tol:
-                    raise SystemExit(
-                        f"row {row['index']}: cached and uncached scores differ by {d}"
-                    )
-            rec["seconds"] = round(time.perf_counter() - t0, 4)
-            out.write(json.dumps(rec) + "\n")
+            pids = [rendered[r["index"]] for r in part]
+            if batch > 1:
+                pers = score_batch(pids, state["variant"])
+            else:
+                pers = [score_cached(pids[0], state["variant"])]
+            recs = []
+            for row, prompt_ids, per in zip(part, pids, pers):
+                rec = {"index": row["index"], "prompt_len": len(prompt_ids), "token_scores": per}
+                if row["index"] in ids_for:
+                    rec["prompt_ids"] = prompt_ids
+                # The first batch in full, then the first three rows and the
+                # longest: each against the row scored alone with no cache.
+                if s == 0 or row["index"] in first3 or row["index"] in check:
+                    rec["check_max_abs_token"] = worst(score_full(prompt_ids), per)
+                recs.append(rec)
+            bad = [r for r in recs if r.get("check_max_abs_token", 0.0) > tol]
+            if bad and s == 0 and batch > 1:
+                # Rows scored together drift from rows scored alone: score
+                # one at a time, as before batching.
+                drift = max(r["check_max_abs_token"] for r in bad)
+                batch_trial = {"row_batch": batch, "max_abs_token": drift}
+                batch = 1
+                continue
+            if bad:
+                raise SystemExit(
+                    f"row {bad[0]['index']}: cached and uncached scores differ by "
+                    f"{bad[0]['check_max_abs_token']}"
+                )
+            each = round((time.perf_counter() - t0) / len(part), 4)
+            for rec in recs:
+                rec["seconds"] = each
+                out.write(json.dumps(rec) + "\n")
             out.flush()
+            s += len(part)
     Path(spec["report"]).write_text(
         json.dumps(
             {
@@ -261,6 +383,8 @@ def main():
                 "final_logit_softcapping": cap,
                 "logits_scaling": scale,
                 "cache_variant": state["variant"] or "no_cache",
+                "row_batch": batch,
+                "batch_trial": batch_trial,
                 "variant_trials": trials,
                 "seconds": round(time.time() - started, 1),
             }
