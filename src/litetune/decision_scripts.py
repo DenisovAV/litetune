@@ -17,12 +17,13 @@ none is, every row is scored with no cache.
 
 Rows of a similar length go `row_batch` at a time: one forward over their
 prompts, padded on the left and given their positions, keeps the cache, and the
-(row, option) pairs go in chunks over copies of their row's part of it. A way
-of passing the cache that takes no positions scores one row at a time, as does
-a first batch whose rows are not within `check_tol` of the same rows scored
-alone with no cache. That check covers every row of the first batch, then the
-first three rows and the longest; a difference above `check_tol` after the
-first batch stops the run. MEASUREMENTS.md has what batching changed in time
+(row, option) pairs go in chunks of at most `pair_tokens` tokens of cache over
+copies of their row's part of it. A way of passing the cache that takes no
+positions scores one row at a time, as does a first batch that raises or whose
+rows are not within `check_tol` of the same rows scored alone with no cache.
+That check covers every row of the first batch, then the first three rows, the
+longest, and the row with the most padding; a difference above `check_tol`, or
+a NaN, after the first batch stops the run. MEASUREMENTS.md has what batching changed in time
 and in the scores.
 
 **The runtime** (`ENGINE_SCRIPT`, `envs.RUNTIME`) scores through LiteRT-LM's
@@ -133,7 +134,11 @@ def main():
     if len({tuple(c) for c in conts}) != len(conts):
         raise SystemExit("two options tokenise to the same ids")
     pad = tok.pad_token_id if tok.pad_token_id is not None else term_ids[0]
-    chunk = int(spec.get("chunk", 96))
+    chunk = int(spec.get("chunk", 64))
+    # A batch's continuation step holds this many tokens of cache at most:
+    # about 96 pairs over the ~85-token prompts measured, and fewer over long
+    # ones, where a fixed count of pairs would multiply the memory.
+    pair_tokens = int(spec.get("pair_tokens", 8192))
     tol = float(spec.get("check_tol", 3e-3))
     state = {"variant": None}
 
@@ -266,8 +271,9 @@ def main():
         heads = first[[i for i, _ in pairs], [conts[j][0] for _, j in pairs]].tolist()
         for (i, j), h in zip(pairs, heads):
             res[i][j] = [h]
-        for s in range(0, len(pairs), chunk):
-            part = pairs[s : s + chunk]
+        step = max(1, pair_tokens // (width + max(len(c) for c in conts)))
+        for s in range(0, len(pairs), step):
+            part = pairs[s : s + step]
             n = len(part)
             length = max(len(conts[j]) for _, j in part) - 1
             if length == 0:
@@ -302,7 +308,9 @@ def main():
         return res
 
     def worst(a, b):
-        return max(abs(x - y) for f, c in zip(a, b) for x, y in zip(f, c))
+        # NaN when any score is: `max` would keep or drop it by its place.
+        d = [abs(x - y) for f, c in zip(a, b) for x, y in zip(f, c)]
+        return float("nan") if any(v != v for v in d) else max(d)
 
     started = time.time()
     trials = {}
@@ -315,6 +323,15 @@ def main():
     # carry their index.
     first3 = {r["index"] for r in rows[:3]}
     rows = sorted(rows, key=lambda r: len(rendered[r["index"]]))
+    # The most padded row of all, checked too: the first batch, of the
+    # shortest rows, is padded little.
+    padded = None
+    for s in range(0, len(rows), batch):
+        part = rows[s : s + batch]
+        widest = len(rendered[part[-1]["index"]])
+        gap = widest - len(rendered[part[0]["index"]])
+        if padded is None or gap > padded[1]:
+            padded = (part[0]["index"], gap)
     with open(spec["out"], "w", encoding="utf-8") as out:
         if rows:
             prompt_ids0 = rendered[spec["rows"][0]["index"]]
@@ -339,7 +356,15 @@ def main():
             t0 = time.perf_counter()
             pids = [rendered[r["index"]] for r in part]
             if batch > 1:
-                pers = score_batch(pids, state["variant"])
+                try:
+                    pers = score_batch(pids, state["variant"])
+                except Exception as exc:  # noqa: BLE001 - recorded; scored one at a time
+                    if s:
+                        raise
+                    error = f"{type(exc).__name__}: {str(exc)[:200]}"
+                    batch_trial = {"row_batch": batch, "error": error}
+                    batch = 1
+                    continue
             else:
                 pers = [score_cached(pids[0], state["variant"])]
             recs = []
@@ -347,12 +372,15 @@ def main():
                 rec = {"index": row["index"], "prompt_len": len(prompt_ids), "token_scores": per}
                 if row["index"] in ids_for:
                     rec["prompt_ids"] = prompt_ids
-                # The first batch in full, then the first three rows and the
-                # longest: each against the row scored alone with no cache.
-                if s == 0 or row["index"] in first3 or row["index"] in check:
+                # The first batch in full, then the first three rows, the
+                # longest and the most padded: each against the row scored
+                # alone with no cache.
+                most_padded = batch > 1 and padded is not None and row["index"] == padded[0]
+                if s == 0 or row["index"] in first3 or row["index"] in check or most_padded:
                     rec["check_max_abs_token"] = worst(score_full(prompt_ids), per)
                 recs.append(rec)
-            bad = [r for r in recs if r.get("check_max_abs_token", 0.0) > tol]
+            # `not <=`, so that a NaN is a difference too.
+            bad = [r for r in recs if not r.get("check_max_abs_token", 0.0) <= tol]
             if bad and s == 0 and batch > 1:
                 # Rows scored together drift from rows scored alone: score
                 # one at a time, as before batching.
@@ -385,6 +413,7 @@ def main():
                 "cache_variant": state["variant"] or "no_cache",
                 "row_batch": batch,
                 "batch_trial": batch_trial,
+                "most_padding_checked": padded[1] if padded and batch > 1 else None,
                 "variant_trials": trials,
                 "seconds": round(time.time() - started, 1),
             }

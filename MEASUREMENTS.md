@@ -1999,9 +1999,10 @@ same scores.
 
 `verify`'s float reference used to score a decision one row at a time: one
 forward over the prompt, one over its options. It now scores sixteen rows of a
-similar length together (`decision_scripts`). Its first batch is checked row by
-row against each row scored alone with no cache, and it falls back to one row
-at a time if they differ.
+similar length together (`decision_scripts`). Its first batch, and the row
+with the most padding, are checked against each row scored alone with no
+cache. It falls back to one row at a time if the first batch differs or
+raises.
 
 The emotion decision of "Every family on emotion" was retrained with litetune
 0.7.1 (gemma-3-270m-it, the same splits and flags) and verified on a Mac with an

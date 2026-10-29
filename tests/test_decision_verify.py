@@ -2319,3 +2319,178 @@ def test_every_head_the_reference_scores_through_goes_through_the_transform():
     assert REFERENCE_SCRIPT.count("model.lm_head(") == 1
     assert "transformed(model.lm_head(hidden).float(), scale, cap)" in REFERENCE_SCRIPT
     assert "scale, cap = head_transform(model.config)" in REFERENCE_SCRIPT
+
+
+# -- the reference on a real model, rows in batches ----------------------------------
+#
+# These run the reference script in the training environment, on a small random
+# Llama and a word-level tokenizer built here; without that environment they are
+# skipped. Every row's prompt has a length of its own, so every batch is padded.
+
+_TINY_MODEL = r"""
+import json, sys
+import torch
+from tokenizers import Tokenizer, models, pre_tokenizers
+from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
+
+out = sys.argv[1]
+words = ["<pad>", "<unk>", "<s>", "<eot>", "[U]", "[A]", "joy", "anger", "fear", "surprise"]
+words += [f"w{i}" for i in range(60)]
+inner = Tokenizer(models.WordLevel({w: i for i, w in enumerate(words)}, unk_token="<unk>"))
+inner.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+tok = PreTrainedTokenizerFast(
+    tokenizer_object=inner, pad_token="<pad>", unk_token="<unk>", bos_token="<s>",
+    additional_special_tokens=["<eot>"],
+)
+tok.chat_template = (
+    "<s>{% for m in messages %}{% if m['role'] == 'user' %}[U] {{ m['content'] }} <eot> "
+    "{% else %}[A] {{ m['content'] }} <eot> {% endif %}{% endfor %}"
+    "{% if add_generation_prompt %}[A] {% endif %}"
+)
+tok.save_pretrained(out)
+torch.manual_seed(0)
+config = LlamaConfig(
+    vocab_size=len(words), hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+    num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128,
+    pad_token_id=0, bos_token_id=2, eos_token_id=3, initializer_range=0.3,
+)
+LlamaForCausalLM(config).save_pretrained(out)
+print(json.dumps({"eot": tok.convert_tokens_to_ids("<eot>")}))
+"""
+
+
+def _real_train_python():
+    # Read at import, before conftest points LITETUNE_ENV_DIR at a temporary
+    # directory for every test.
+    from litetune import envs
+
+    return str(envs.TRAIN.python) if envs.TRAIN.ready else None
+
+
+_TRAIN_PYTHON = _real_train_python()
+
+
+def _in_train_env(args):
+    if _TRAIN_PYTHON is None:
+        pytest.skip("the training environment is not provisioned")
+    return subprocess.run([_TRAIN_PYTHON, *args], capture_output=True, text=True, timeout=600)
+
+
+def _words(i):
+    # Longest first, so that only sorting puts rows of a length together: from
+    # row 7 down, three words fewer per row, then one: sorted into batches of
+    # eight, rows 7 to 0 are padded by up to 21 tokens, the others by 7.
+    k = 23 - i
+    return k + 1 if k < 16 else 17 + 3 * (k - 16)
+
+
+def _reference_on_tiny_model(tmp_path, script, row_batch, n_rows=24):
+    model = tmp_path / "model"
+    if not model.exists():
+        make = tmp_path / "make.py"
+        make.write_text(_TINY_MODEL, encoding="utf-8")
+        made = _in_train_env([str(make), str(model)])
+        assert made.returncode == 0, made.stderr
+    tag = f"b{row_batch}-{abs(hash(script)) % 10**8}"
+    spec = tmp_path / f"spec-{tag}.json"
+    out, report = tmp_path / f"out-{tag}.jsonl", tmp_path / f"report-{tag}.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "model": str(model),
+                "rows": [
+                    {"index": i, "prompt": " ".join(f"w{j}" for j in range(_words(i)))}
+                    for i in range(n_rows)
+                ],
+                "options": ["joy", "anger", "fear surprise"],
+                "turn_ids": [3],
+                "turn_text": "<eot>",
+                "device": "cpu",
+                "row_batch": row_batch,
+                "out": str(out),
+                "report": str(report),
+            }
+        ),
+        encoding="utf-8",
+    )
+    path = tmp_path / f"reference-{tag}.py"
+    path.write_text(script, encoding="utf-8")
+    proc = _in_train_env([str(path), str(spec)])
+    assert proc.returncode == 0, proc.stderr
+    rows = {r["index"]: r for r in map(json.loads, out.read_text().splitlines())}
+    return rows, json.loads(report.read_text())
+
+
+def _largest_difference(a, b):
+    assert a.keys() == b.keys()
+    return max(
+        abs(x - y)
+        for i in a
+        for f, g in zip(a[i]["token_scores"], b[i]["token_scores"], strict=True)
+        for x, y in zip(f, g, strict=True)
+    )
+
+
+def test_rows_scored_in_batches_match_rows_scored_one_at_a_time(tmp_path):
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    alone, alone_report = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 1)
+    batched, report = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 8)
+
+    assert alone_report["row_batch"] == 1 and report["row_batch"] == 8
+    assert report["batch_trial"] is None
+    assert report["most_padding_checked"] == 21
+    assert _largest_difference(alone, batched) < 1e-5
+    # The first batch, the eight shortest rows (16 to 23), checked row by row;
+    # then the first three, and the most padded: row 7, of rows 0 to 7.
+    checked = sorted(i for i, r in batched.items() if "check_max_abs_token" in r)
+    assert checked == [0, 1, 2, 7, *range(16, 24)]
+    # Every option scored, each token of it: "fear surprise" is two words.
+    assert [len(f) for f in batched[0]["token_scores"]] == [2, 2, 3]
+
+
+def test_a_first_batch_that_drifts_is_scored_again_one_row_at_a_time(tmp_path):
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    good = '"position_ids": (mask.cumsum(-1) - 1).clamp(min=0),'
+    assert REFERENCE_SCRIPT.count(good) == 1
+    # Positions counted from the first column: wrong on every padded row.
+    drifting = REFERENCE_SCRIPT.replace(
+        good, '"position_ids": torch.arange(width, device=device).expand(b, -1),'
+    )
+    alone, _ = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 1)
+    rows, report = _reference_on_tiny_model(tmp_path, drifting, 8)
+
+    assert report["row_batch"] == 1
+    assert report["batch_trial"]["row_batch"] == 8
+    assert report["batch_trial"]["max_abs_token"] > 3e-3
+    assert _largest_difference(alone, rows) < 1e-5
+
+
+def test_a_first_batch_that_raises_is_scored_again_one_row_at_a_time(tmp_path):
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    head = "    def score_batch(prompts_ids, how):\n"
+    assert REFERENCE_SCRIPT.count(head) == 1
+    raising = REFERENCE_SCRIPT.replace(head, head + '        raise RuntimeError("no room")\n')
+    alone, _ = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 1)
+    rows, report = _reference_on_tiny_model(tmp_path, raising, 8)
+
+    assert report["row_batch"] == 1
+    assert report["batch_trial"] == {"row_batch": 8, "error": "RuntimeError: no room"}
+    assert _largest_difference(alone, rows) < 1e-5
+
+
+def test_a_first_batch_with_a_nan_is_scored_again_one_row_at_a_time(tmp_path):
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    # NaN on the options' later tokens only, after finite first ones.
+    later = "lp = torch.log_softmax(model(**kw).logits.float(), dim=-1)"
+    assert REFERENCE_SCRIPT.count(later) == 1
+    nan = REFERENCE_SCRIPT.replace(later, later + ' * float("nan")')
+    alone, _ = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 1)
+    rows, report = _reference_on_tiny_model(tmp_path, nan, 8)
+
+    assert report["row_batch"] == 1
+    assert math.isnan(report["batch_trial"]["max_abs_token"])
+    assert _largest_difference(alone, rows) < 1e-5
