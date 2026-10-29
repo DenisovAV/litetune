@@ -619,12 +619,19 @@ def _stub_litert_lm(answers: list[Any]) -> tuple[types.ModuleType, dict[str, lis
     return mod, calls
 
 
-def _engine_main(tmp_path, monkeypatch, answers, texts):
+def _engine_main(tmp_path, monkeypatch, answers, texts, backend=None):
     ns: dict[str, Any] = {"__name__": "engine_script"}
     exec(compile(ENGINE_SCRIPT, "engine.py", "exec"), ns)
     stub, calls = _stub_litert_lm(answers)
     monkeypatch.setitem(sys.modules, "litert_lm", stub)
+    # `backend_for` imports these two from litert_lm.interfaces.
+    interfaces: Any = types.ModuleType("litert_lm.interfaces")
+    interfaces.CPU = lambda: ("cpu", None)
+    interfaces.GPU = lambda: ("gpu", None)
+    monkeypatch.setitem(sys.modules, "litert_lm.interfaces", interfaces)
     monkeypatch.setitem(ns, "cpu_report", lambda: {"model": "stub cpu", "count": 2})
+    readings = iter([{"reading": "at engine"}, {"reading": "after"}])
+    monkeypatch.setitem(ns, "device_report", lambda: next(readings))
     (tmp_path / "texts.json").write_text(json.dumps(texts))
     spec = {
         "model": "/models/m.litertlm",
@@ -636,6 +643,8 @@ def _engine_main(tmp_path, monkeypatch, answers, texts):
         "out": str(tmp_path / "out.npy"),
         "report": str(tmp_path / "report.json"),
     }
+    if backend is not None:
+        spec["backend"] = backend
     (tmp_path / "spec.json").write_text(json.dumps(spec))
     monkeypatch.setattr(sys, "argv", ["engine.py", str(tmp_path / "spec.json")])
     code = ns["main"]()
@@ -888,6 +897,25 @@ def _label_of(text: str) -> str:
     return text.rsplit(" ", 1)[1]
 
 
+def _reading(time_: int) -> dict[str, Any]:
+    return {
+        "platform": "darwin",
+        "looked": True,
+        "gpu_client": "pid 1, python3",
+        "gpu_time": time_,
+        "gpu_clients": {"0x1": time_},
+    }
+
+
+# The kernel's two readings around a run that worked on the GPU, and one that did not.
+GPU_WORKED = {"at_engine": _reading(10), "after_generation": _reading(500)}
+GPU_IDLE = {"at_engine": _reading(10), "after_generation": _reading(10)}
+NOT_LOOKED = {
+    "at_engine": {"platform": "linux", "looked": False},
+    "after_generation": {"platform": "linux", "looked": False},
+}
+
+
 @dataclass
 class FakeEmbedEnvs:
     """`StageEnv.run` for the embedding, evaluation and download scripts."""
@@ -914,6 +942,8 @@ class FakeEmbedEnvs:
     # Each engine side's cache directory, and whether it existed when it ran.
     caches: dict[str, tuple[str, bool]] = field(default_factory=dict)
     hub: Path | None = None
+    # What an engine side on the GPU reports from the kernel; the default shows GPU work.
+    gpu_device: dict[str, Any] | None = None
 
     def vectors(self, texts: list[str], kind: str) -> Any:
         if kind == "random":
@@ -941,6 +971,8 @@ class FakeEmbedEnvs:
                 report["tokens"] = {"max": 9, "over_max_seq_length": self.over_max_seq_length}
         else:
             self.caches[name] = (spec["cache_dir"], Path(spec["cache_dir"]).is_dir())
+            if spec.get("backend") == "gpu":
+                report["device"] = self.gpu_device if self.gpu_device is not None else GPU_WORKED
             report |= {
                 "runtime": {"litert-lm": "0.18.0"},
                 "cpu": {"model": "fake", "count": 4},
@@ -1748,8 +1780,78 @@ def test_a_flag_of_another_path_is_refused_not_ignored(fake, tmp_path, kwargs, f
     assert fake.runs == []
 
 
-def test_the_gpu_backend_is_refused(fake, tmp_path):
-    assert _verify(_setup(tmp_path), backend="gpu").status is Status.FAILED_HARNESS
+def test_the_gpu_backend_runs_each_engine_file_on_the_gpu_one_at_a_time(fake, tmp_path):
+    result = _verify(_setup(tmp_path), backend="gpu", with_base=True)
+
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    for side in ("candidate", "base"):
+        assert fake.specs[side]["backend"] == "gpu"
+    assert fake.specs["reference"].get("backend") is None
+    # Two files on one GPU at once is not measured.
+    assert fake.launches[-1]["parallel"] is False
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert engine["backend"] == "gpu"
+    assert engine["backend_observed"] is True
+    assert engine["threads"] is None
+    limitations = " ".join(result.manifest["limitations"])
+    assert "GPU backend of LiteRT-LM's EmbeddingEngine" in limitations
+    assert "deletes the keyword arguments" in limitations
+    assert "CPU backend of LiteRT-LM's EmbeddingEngine" not in limitations
+    assert "recorded as asked for" not in limitations
+
+
+def test_the_cpu_backend_is_passed_and_stated_as_before(fake, tmp_path):
+    result = _verify(_setup(tmp_path))
+
+    assert result.status is Status.PASSED
+    assert fake.specs["candidate"]["backend"] == "cpu"
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert engine["backend"] == "cpu" and engine["backend_observed"] is False
+    assert engine["threads"] is not None
+    limitations = " ".join(result.manifest["limitations"])
+    assert "CPU backend of LiteRT-LM's EmbeddingEngine" in limitations
+    assert "GPU backend of LiteRT-LM's EmbeddingEngine" not in limitations
+
+
+def test_a_gpu_run_the_kernel_shows_idle_is_refused(fake, tmp_path):
+    fake.gpu_device = GPU_IDLE
+    result = _verify(_setup(tmp_path), backend="gpu")
+
+    assert result.status is Status.FAILED_HARNESS
+    assert "did no GPU work" in json.dumps(result.manifest["checks"])
+
+
+def test_a_gpu_run_nobody_could_observe_is_recorded_as_asked_for(fake, tmp_path):
+    fake.gpu_device = NOT_LOOKED
+    result = _verify(_setup(tmp_path), backend="gpu")
+
+    assert result.status is Status.PASSED
+    assert result.manifest["measurements"]["candidate"]["engine"]["backend_observed"] is False
+    assert "recorded as asked for" in " ".join(result.manifest["limitations"])
+
+
+def test_a_backend_other_than_cpu_or_gpu_is_refused(fake, tmp_path):
+    result = _verify(_setup(tmp_path), backend="npu")
+
+    assert result.status is Status.FAILED_HARNESS
+    assert fake.runs == []
+
+
+def test_the_engine_script_builds_a_gpu_engine_and_reads_the_kernel_around_the_work(
+    tmp_path, monkeypatch
+):
+    code, report, calls = _engine_main(
+        tmp_path, monkeypatch, [[3.0, 4.0], [0.0, 2.0]], ["a", "b"], backend="gpu"
+    )
+
+    assert code == 0
+    assert calls["engine"][0]["backend"] == ("gpu", None)
+    assert report["backend"] == "gpu"
+    assert report["threads"] is None
+    assert report["device"] == {
+        "at_engine": {"reading": "at engine"},
+        "after_generation": {"reading": "after"},
+    }
 
 
 def test_a_record_trained_with_another_prefix_is_refused(fake, tmp_path):

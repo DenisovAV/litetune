@@ -582,8 +582,11 @@ def verify_decision(
     if job.backend != "cpu":
         return refuse(
             RUNTIME_CHECK,
-            f"option scoring is measured on the CPU backend only; --backend {job.backend} is "
-            "refused rather than measured with a method nobody has checked there",
+            f"option scoring runs on the CPU backend only; --backend {job.backend} is refused. On "
+            "the GPU the scores are not repeatable: on an Apple M5 Pro with litert-lm 0.18.0 "
+            "each run of 300 decisions gave one to three rows another prompt's scores, at "
+            "different rows each time, where the CPU repeated bit for bit (MEASUREMENTS.md, "
+            '"The CPU and the GPU on a Mac")',
         )
     method = METHOD_FRESH_ENGINE if job.engine_per_prompt_reason else METHOD_REWIND
     if method == METHOD_FRESH_ENGINE:

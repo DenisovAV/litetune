@@ -2323,3 +2323,58 @@ section above by up to 0.002.
   a threshold set for Google's file does not carry over.
 - Out-of-scope requests were measured on CLINC150 only, at k=10 only, without
   option descriptions.
+
+## The CPU and the GPU on a Mac
+
+Each path was run through the script `verify` runs for it, unchanged except for
+the backend, on an Apple M5 Pro with litert-lm 0.18.0 from PyPI: once or twice on
+the CPU and three times on the GPU. For each GPU run the kernel's GPU time for
+the process grew during the run. The text and option-scoring runs used the
+emotion bundle from *The three passing bundles on a phone* and its 300 rows.
+The tool runs used `google/functiongemma-270m-it` converted by litetune 0.7.1
+(`dynamic_wi8_afp32`) and 20 single-turn requests, each with its own
+declarations: constrained decoding off, 128 tokens at most. The EmbeddingGemma 2
+runs used the banking77 int8 file from *litetune end to end*.
+
+| path | the CPU against the GPU | the GPU, run against run |
+|---|---|---|
+| text, one-word answers (300) | the same text on 300 | identical |
+| text, longer answers (20, median 225 characters) | the same text on 3 | identical |
+| the same 20 through litert-lm's own CLI | the same text on 3 | identical |
+| tools (20) | the same reply on 15 | identical |
+| option scoring (300) | the same top option on 299 or 300 | 1 to 3 rows per run with another prompt's scores, up to 13.8 nats away |
+| EmbeddingGemma 2 vectors (300) | cosine median 0.990460, minimum 0.975487 | identical |
+
+- On every backend, the CLI and `verify`'s text script gave the same text as
+  each other on all 20 longer answers. The difference between the CPU and the
+  GPU is litert-lm's, not litetune's. The longer GPU answers usually part from
+  the CPU's within the first sentence and then read as different text.
+- On the five tool requests where the CPU and the GPU differed, the GPU:
+  - dropped a "." from an e-mail address and a "," from a place;
+  - added a word to a message body;
+  - lengthened a map query;
+  - on one request, called the tool where the CPU asked for the date.
+
+  Where both called a tool, it was the same function.
+- The CPU repeated its option scores bit for bit; the GPU did not. Its bad rows
+  fell at different places in each of four runs, and the top option changed on
+  1 of 1,200 decisions. Scoring each option on an Engine of its own, with no
+  rewind, gave six rows more than 5 nats from the CPU's scores. The rewind is
+  therefore not the cause. Over the 300 decisions, the GPU took a median of 69.55 ms
+  per decision and the CPU 179.8 ms. Option scoring stays refused on the GPU.
+- `verify --backend gpu` on the EmbeddingGemma 2 file passed the same gate as on
+  the CPU, both on this Mac:
+
+  | | CPU | GPU |
+  |---|---|---|
+  | candidate, 10-shot | 0.9317 | 0.9311 |
+  | reference | 0.9312 | 0.9312 |
+  | per-draw conversion cost | -0.0011 to +0.0004 | -0.0011 to +0.0023 |
+  | cosine to the reference, mean / minimum | 0.99928 / 0.98909 | 0.9969 / 0.944174 |
+  | median per text | 43.43 ms | 11.71 ms |
+  | verify, wall time | 12 min 33 s | 6 min 21 s |
+
+  The Python EmbeddingEngine takes no activation data type, so the GPU computes
+  in the precision litert-lm picks.
+- One Mac and one runtime version. The phone in *The three passing bundles on a
+  phone* repeated its GPU option scores bit for bit.

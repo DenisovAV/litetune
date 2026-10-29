@@ -439,7 +439,10 @@ def test_the_gpu_backend_is_refused(split, tmp_path):
     status, fields = run(job_for(s, tmp_path, backend="gpu"), s["record"])
 
     assert status == "failed_harness"
-    assert "CPU backend only" in check(fields, RUNTIME_CHECK)["detail"]
+    detail = check(fields, RUNTIME_CHECK)["detail"]
+    assert "CPU backend only" in detail
+    # The refusal says what was measured, and where to read it.
+    assert "not repeatable" in detail and "The CPU and the GPU on a Mac" in detail
 
 
 def test_a_family_that_needs_an_engine_per_prompt_is_scored_on_fresh_engines(split, tmp_path):
