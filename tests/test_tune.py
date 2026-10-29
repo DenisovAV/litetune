@@ -1581,7 +1581,7 @@ class _Model:
         self.forwards = 0
 
     def parameters(self):
-        return [_Parameter(1000)]
+        return [_Parameter(int(os.environ.get("LITETUNE_STUB_PARAMETERS", "1000")))]
 
     def train(self):
         return self
@@ -5501,18 +5501,38 @@ def test_scored_targets_never_keeps_the_last_position(script_namespace):
     assert targets == [[6, 7]]
 
 
-def test_the_real_script_checkpoints_and_scores_only_the_supervised_positions(
-    request_for, stub_env
+@pytest.mark.parametrize(
+    ("parameters", "checkpointed"),
+    [(999_999_999, False), (1_000_000_000, True), (5_000_000_000, True)],
+)
+def test_the_real_script_checkpoints_a_model_of_a_billion_parameters_or_more(
+    request_for, stub_env, parameters, checkpointed
 ):
+    request = request_for()
+    proc = run_real_script(
+        request, stub_env, extra_env={"LITETUNE_STUB_PARAMETERS": str(parameters)}
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    events = [e["event"] for e in stub_log(stub_env)]
+    assert events.count("gradient_checkpointing") == (1 if checkpointed else 0)
+    if checkpointed:
+        # On the loaded model, before LoRA wraps it.
+        assert events.index("gradient_checkpointing") < events.index("forward")
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["gradient_checkpointing"] is checkpointed
+    assert recorded["model_parameters"] == parameters
+    metrics = TrainingMetrics.from_dict(recorded).as_dict()
+    assert metrics["gradient_checkpointing"] is checkpointed
+    assert metrics["model_parameters"] == parameters
+
+
+def test_the_real_script_scores_only_the_supervised_positions(request_for, stub_env):
     request = request_for()
     proc = run_real_script(request, stub_env)
     assert proc.returncode == 0, proc.stderr
 
     log = stub_log(stub_env)
-    events = [e["event"] for e in log]
-    # On the loaded model, before LoRA wraps it, as b2 measured it.
-    assert events.count("gradient_checkpointing") == 1
-    assert events.index("gradient_checkpointing") < events.index("forward")
     forwards = [e for e in log if e["event"] == "forward"]
     losses = [e for e in log if e["event"] == "cross_entropy"]
     assert forwards and len(forwards) == len(losses)

@@ -710,6 +710,11 @@ IGNORE_INDEX = -100
 # nothing changes.
 PAD_MULTIPLE_ON_MPS = 32
 
+# Gradient checkpointing for a model of at least this many parameters. A
+# choice, not a measured boundary: gemma-3-270m and Qwen3-0.6B train without
+# it, Qwen3-1.7B, Gemma 4 and the rest with it.
+CHECKPOINT_FROM_PARAMETERS = 1_000_000_000
+
 # Where each step reads torch's MPS counters on mps (`sample_mps_memory`).
 MPS_SAMPLE_POINTS = ("after forward", "after backward", "after optimiser step")
 '''
@@ -1069,11 +1074,15 @@ def main() -> int:
         **from_kwargs
     )
     model.config.use_cache = False
-    # Each layer's activations are recomputed in the backward pass instead of
-    # kept from the forward one, so a long row fits where it otherwise would
-    # not, whatever the attention, the device or the family. The loss is the
-    # same; a step takes longer.
-    model.gradient_checkpointing_enable()
+    # From CHECKPOINT_FROM_PARAMETERS up, each layer's activations are
+    # recomputed in the backward pass instead of kept from the forward one, so
+    # a long row fits where it otherwise would not, whatever the attention or
+    # the device. The loss is the same; a step takes longer, which a small
+    # model, whose activations fit anyway, is not made to pay.
+    parameters = sum(p.numel() for p in model.parameters())
+    checkpointing = parameters >= CHECKPOINT_FROM_PARAMETERS
+    if checkpointing:
+        model.gradient_checkpointing_enable()
     device = training_device(torch, spec.get("device"))
     on_cuda = str(device).startswith("cuda")
     model.to(device)
@@ -1351,6 +1360,10 @@ def main() -> int:
                 "turn_terminator": terminator,
                 "trainable_parameters": trainable,
                 "base_parameters": trainable_before,
+                # Whether each layer's activations were recomputed in the
+                # backward pass, and the parameter count that decided it.
+                "gradient_checkpointing": checkpointing,
+                "model_parameters": parameters,
                 # What peft was actually given: the projection list, or the
                 # regex that restricts it to one container. Recorded because
                 # two runs called `lora` are only the same method if this is
@@ -1840,6 +1853,11 @@ class TrainingMetrics:
     # counting them -- not a peak, which nothing between samples observed.
     # `None` off mps and when no step ran.
     mps_memory_sampled_max: Mapping[str, Any] | None = None
+    # Whether the run recomputed activations in the backward pass, and the
+    # model's parameter count that decided it. `None` from a script that
+    # predates the fields.
+    gradient_checkpointing: bool | None = None
+    model_parameters: int | None = None
     # torch's CUDA peaks over the run, in bytes. `None` off cuda and from a
     # script that predates the fields.
     cuda_max_memory_allocated: int | None = None
@@ -1891,6 +1909,8 @@ class TrainingMetrics:
             dtype_source=data.get("dtype_source"),
             pad_to_multiple_of=data.get("pad_to_multiple_of"),
             mps_memory_sampled_max=data.get("mps_memory_sampled_max"),
+            gradient_checkpointing=data.get("gradient_checkpointing"),
+            model_parameters=data.get("model_parameters"),
             cuda_max_memory_allocated=data.get("cuda_max_memory_allocated"),
             cuda_max_memory_reserved=data.get("cuda_max_memory_reserved"),
             mps_environment=data.get("mps_environment"),
@@ -1924,6 +1944,8 @@ class TrainingMetrics:
                 if self.mps_memory_sampled_max is not None
                 else None
             ),
+            "gradient_checkpointing": self.gradient_checkpointing,
+            "model_parameters": self.model_parameters,
             "cuda_max_memory_allocated": self.cuda_max_memory_allocated,
             "cuda_max_memory_reserved": self.cuda_max_memory_reserved,
             "mps_environment": (
