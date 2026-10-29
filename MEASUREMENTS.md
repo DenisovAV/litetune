@@ -2366,10 +2366,36 @@ runs used the banking77 int8 file from *litetune end to end*.
   same Mac's GPU repeated its scores bit for bit. It ran four times on the same
   emotion file and 300 rows, and four times each on three other decision
   bundles (300, 60 and 60 rows). The bad rows come from the path through
-  litert-lm's Python package, which `verify` runs, and not from the GPU. Which
-  difference between the two paths causes them is not established. Option
-  scoring stays refused on the GPU in `verify`, which cannot measure it
-  repeatably through that package.
+  litert-lm's Python package, which `verify` runs, and not from the GPU.
+- The package links LiteRT's GPU accelerator statically, and on macOS it is the
+  WebGPU one, which loading `libLiteRtMetalAccelerator.dylib` from disk does not
+  replace (litert-lm 0.18.0 and 0.19.0). flutter_edge_ai's own build of the
+  runtime, a v0.18.0 libLiteRtLm that loads its accelerator from a file, ran
+  the same option-scoring script, four runs of the same 300 rows with each
+  accelerator from LiteRT-LM's v0.18.0 `prebuilt/macos_arm64`. With the WebGPU
+  accelerator 298 rows were identical in all four runs; with the Metal
+  accelerator all 300 were. litert-lm 0.18.1 and 0.19.0, no fp32 override and
+  another `cache_dir` left the bad rows in place.
+- `verify --backend gpu` therefore scores a decision bundle on macOS twice. The
+  rows the two runs differ on are scored in a third run, three times each, and
+  `verify` keeps the scores two of those runs or copies agree on: a row's right
+  scores repeat bit for bit, and its wrong ones differ every time. On an emotion
+  checkpoint trained and converted with F1's flags and splits (litetune 0.7.1),
+  `verify` on this Mac:
+
+  | | CPU | GPU |
+  |---|---|---|
+  | status | passed | passed |
+  | top option equal to the reference's (300 rows) | 0.9967 | 1.0000 |
+  | answer equal to the reference's, abstentions included | 0.9933 | 0.9900 |
+  | mean KL, reference to runtime | 3.94e-04 | 1.38e-04 |
+  | rows the two GPU runs differed on | | 0 |
+
+  An earlier GPU run of the same files differed on 9 of the 300 rows between its
+  first two runs, and a third run of one row each did not settle row 253. That
+  row, scored 36 times in three processes, gave the same scores 33 times and
+  another prompt's once in each process. This is why the third run scores each
+  row three times.
 - `verify --backend gpu` on the EmbeddingGemma 2 file passed the same gate as on
   the CPU, both on this Mac:
 

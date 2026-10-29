@@ -36,6 +36,7 @@ import logging
 import math
 import statistics
 import subprocess
+import sys
 import tempfile
 from collections import Counter
 from collections.abc import Sequence
@@ -54,6 +55,7 @@ from litetune.decisions import (
     DecisionError,
     decision_from,
 )
+from litetune.evaluate import gpu_observed, gpu_unused
 from litetune.events import EventStream
 from litetune.metrics import paired_difference
 from litetune.prepare import DECISION_FAMILY, DECISION_MEASURED_ONCE
@@ -208,6 +210,100 @@ def _tail(text: str | bytes | None, limit: int = 2000) -> str:
     if isinstance(text, bytes):
         text = text.decode("utf-8", "replace")
     return (text or "").strip()[-limit:]
+
+
+# Runs of the GPU scoring, in all; the last scores each row still in question this many
+# times in one process.
+GPU_MAX_RUNS = 3
+GPU_COPIES_IN_LAST_RUN = 3
+GPU_REPEAT = (
+    "on the GPU every decision was scored twice, and each row the two runs scored differently "
+    "three more times in a third run, keeping the scores two of its runs or copies agreed on: "
+    "through litert-lm's package on macOS, which runs LiteRT's WebGPU accelerator, a few rows of "
+    "300 got another prompt's scores in a run, at different rows each time, and flutter_edge_ai "
+    "on a Mac loads LiteRT's Metal accelerator, whose scores repeated (MEASUREMENTS.md, \"The "
+    'CPU and the GPU on a Mac"); {rows} of {n} rows needed the third run'
+)
+
+
+def settle(runs: Sequence[dict[int, Any]], rows: Sequence[int]) -> tuple[dict[int, Any], list[int]]:
+    """Per row, the scores at least two of `runs` gave, and the rows where no two agree."""
+    settled: dict[int, Any] = {}
+    unresolved = []
+    for i in rows:
+        seen = [run[i] for run in runs if i in run]
+        agreed = next((a for k, a in enumerate(seen) if a in seen[k + 1 :]), None)
+        if agreed is None:
+            unresolved.append(i)
+        else:
+            settled[i] = agreed
+    return settled, unresolved
+
+
+def _repeat_on_gpu(
+    job: Any,
+    spec: dict[str, Any],
+    first: ScoreRun,
+    n_rows: int,
+    n_options: int,
+    method: str,
+    events: EventStream,
+) -> dict[str, Any] | str:
+    """Score every row a second time, and the rows the two runs differ on in a third run,
+    `GPU_COPIES_IN_LAST_RUN` copies of each.
+
+    Replaces `first.scores` with the scores two runs agree on. Returns what was
+    done, or why it could not be: a run that failed, or a row no two runs agreed
+    on. The repeats take the mode the first run's self-check chose. A row's
+    right scores repeat bit for bit and the wrong ones are another prompt's,
+    different each time, so two runs that agree have the right ones.
+    """
+    again_spec = {**spec, "mode": first.report.get("mode") or spec["mode"]}
+    events.note(f"runtime: scoring the {n_rows} rows again, on the GPU")
+    second = run_script(
+        job.runtime_env,
+        ENGINE_SCRIPT,
+        again_spec,
+        timeout=_engine_timeout(n_rows, n_options, method),
+        auto_provision=False,
+        events=events,
+    )
+    if second.failure or len(second.scores) < n_rows:
+        return "the second GPU run left rows unscored: " + (
+            second.failure or f"{n_rows - len(second.scores)} rows"
+        )
+    differ = [i for i in range(n_rows) if second.scores.get(i) != first.scores.get(i)]
+    runs: list[dict[int, Any]] = [first.scores, second.scores]
+    if differ:
+        events.note(f"runtime: {len(differ)} rows scored differently twice; a third GPU run")
+        # Each row in question, `GPU_COPIES_IN_LAST_RUN` times: a run's wrong
+        # scores fall on a few rows, so copies in one process mostly agree.
+        by_index = {r["index"]: r for r in spec["rows"]}
+        copies = [
+            {"index": n_rows * (c + 1) + i, "prompt": by_index[i]["prompt"]}
+            for c in range(GPU_COPIES_IN_LAST_RUN)
+            for i in differ
+        ]
+        third = run_script(
+            job.runtime_env,
+            ENGINE_SCRIPT,
+            {**again_spec, "rows": copies},
+            timeout=_engine_timeout(len(copies), n_options, method),
+            auto_provision=False,
+            events=events,
+        )
+        if third.failure or any(c["index"] not in third.scores for c in copies):
+            return "the third GPU run left rows unscored: " + (third.failure or "some rows")
+        for c in range(GPU_COPIES_IN_LAST_RUN):
+            runs.append({i: third.scores[n_rows * (c + 1) + i] for i in differ})
+    settled, unresolved = settle(runs, differ)
+    if unresolved:
+        return (
+            f"{len(unresolved)} rows got no score twice in {GPU_MAX_RUNS} GPU runs (rows "
+            f"{unresolved[:10]}): no two runs agree, so there is no score to measure"
+        )
+    first.scores.update(settled)
+    return {"runs": 3 if differ else 2, "rows_rescored": len(differ), "rows": differ[:50]}
 
 
 def run_script(
@@ -579,16 +675,17 @@ def verify_decision(
         state.limitations.append(
             TYPE_LESS_MEASURED.format(kind=decision.type, measured=TYPE_MEASURED[decision.type])
         )
-    if job.backend != "cpu":
+    if job.backend not in ("cpu", "gpu"):
         return refuse(
             RUNTIME_CHECK,
-            f"option scoring runs on the CPU backend only; --backend {job.backend} is refused. "
-            "Through the litert-lm package verify runs, GPU scores are not repeatable: on an Apple "
-            "M5 Pro with litert-lm 0.18.0 from PyPI each run of 300 decisions gave one to three "
-            "rows another prompt's scores, at different rows each time, where the CPU repeated "
-            "bit for bit. flutter_edge_ai's own build of the runtime repeated its GPU scores on "
-            "the same Mac, so this is the package's path, not the GPU's (MEASUREMENTS.md, "
-            '"The CPU and the GPU on a Mac")',
+            f"--backend {job.backend}: option scoring runs on LiteRT-LM's CPU or GPU backend",
+        )
+    if job.backend == "gpu" and sys.platform != "darwin":
+        return refuse(
+            RUNTIME_CHECK,
+            f"--backend gpu: option scoring on the GPU is measured on macOS only, and this is "
+            f"{sys.platform}; on Linux litert-lm's GPU path needs a Vulkan driver, and Windows "
+            'is not measured (MEASUREMENTS.md, "The CPU and the GPU on a Mac")',
         )
     method = METHOD_FRESH_ENGINE if job.engine_per_prompt_reason else METHOD_REWIND
     if method == METHOD_FRESH_ENGINE:
@@ -767,19 +864,21 @@ def verify_decision(
     n_engine = len(engine_rows)
     engine_prompts = [heldout.prompts[i] for i in engine_rows]
     events.note(f"runtime: scoring {len(decision.ids)} options on {n_engine} held-out rows")
+    engine_spec = {
+        "model": str(job.model),
+        "rows": [{"index": i, "prompt": p} for i, p in enumerate(engine_prompts)],
+        "options": list(decision.ids),
+        "terminator": terminator,
+        "threads": job.threads,
+        "targets": "unique",
+        "mode": "auto",
+        "method": method,
+        "backend": job.backend,
+    }
     eng = run_script(
         job.runtime_env,
         ENGINE_SCRIPT,
-        {
-            "model": str(job.model),
-            "rows": [{"index": i, "prompt": p} for i, p in enumerate(engine_prompts)],
-            "options": list(decision.ids),
-            "terminator": terminator,
-            "threads": job.threads,
-            "targets": "unique",
-            "mode": "auto",
-            "method": method,
-        },
+        engine_spec,
         timeout=_engine_timeout(n_engine, len(decision.ids), method),
         auto_provision=job.auto_provision,
         events=events,
@@ -796,6 +895,20 @@ def verify_decision(
             + (f": {next(iter(eng.errors.values()))}" if eng.errors else "")
         )
         return refuse(RUNTIME_CHECK, detail)
+    if job.backend == "gpu":
+        if gpu_unused("gpu", eng.report.get("device")):
+            return refuse(
+                RUNTIME_CHECK,
+                "the GPU backend was asked for and the kernel shows this process did no GPU "
+                "work: the scores came from somewhere else",
+            )
+        repeated = _repeat_on_gpu(
+            job, engine_spec, eng, n_engine, len(decision.ids), method, events
+        )
+        if isinstance(repeated, str):
+            return refuse(RUNTIME_CHECK, repeated)
+        fields["harness"]["gpu_repeat"] = repeated
+        state.limitations.append(GPU_REPEAT.format(rows=repeated["rows_rescored"], n=n_engine))
     mode = eng.report.get("mode")
     if eng.report.get("method") != method:
         return refuse(
@@ -965,10 +1078,12 @@ def verify_decision(
     # and the CPU these numbers were taken on the same way.
     fields["measurements"]["candidate"]["engine"] = {
         "engine": "litert-lm",
-        "backend": "cpu",
+        "backend": job.backend,
+        # Whether the kernel showed the GPU work (macOS); False on the CPU.
+        "backend_observed": gpu_observed(job.backend, eng.report.get("device")),
         "runtime_version": (eng.report.get("runtime") or {}).get("litert-lm"),
         "cpu": {"model": eng.report.get("cpu")},
-        "threads": job.threads,
+        "threads": job.threads if job.backend == "cpu" else None,
     }
     fields["measurements"]["reference_on_runtime_rows"] = outcome_metrics(
         sub_ref, targets, fit, none_index, decision.type

@@ -66,6 +66,7 @@ that `verify` can check the two sides scored the same prompt.
 
 from __future__ import annotations
 
+from litetune.evaluate import RUNTIME_ENGINE_SOURCE
 from litetune.prompt_mode import RENDERING_SOURCE
 from litetune.rendering import SESSION_IDS_SOURCE
 
@@ -483,6 +484,7 @@ import litert_lm as L
 SELFCHECK_MESSAGE = "Answer with one word."
 '''
     + SESSION_IDS_SOURCE
+    + RUNTIME_ENGINE_SOURCE
     + r'''
 
 
@@ -563,7 +565,14 @@ def main():
             raise RuntimeError(f"the last prompt token {ids[-1]} does not round-trip as {last!r}")
         return rendered, ids, last
 
-    kw = {"backend": L.Backend.CPU(thread_count=int(spec["threads"])), "cache_dir": ":nocache"}
+    on_gpu = spec.get("backend", "cpu") == "gpu"
+    report["backend"] = "gpu" if on_gpu else "cpu"
+    if on_gpu:
+        # As the text path asks for the GPU: fp32 activations (export.GPU_ACTIVATION).
+        kw = dict(engine_kwargs({"backend": "gpu", "activation_data_type": "fp32"}))
+        kw["cache_dir"] = ":nocache"
+    else:
+        kw = {"backend": L.Backend.CPU(thread_count=int(spec["threads"])), "cache_dir": ":nocache"}
 
     def open_engine():
         report["engine_loads"] += 1
@@ -647,6 +656,12 @@ def main():
     t0 = time.perf_counter()
     with open_engine() as engine:
         report["init_seconds"] = round(time.perf_counter() - t0, 3)
+        # On the GPU, the kernel's GPU time for this process now and after the
+        # rows, with the engine open: what evaluate.gpu_observed reads (macOS).
+        device = {}
+        if on_gpu:
+            device["at_engine"] = device_report()
+        report["device"] = device
         # What every session here reads before its prompt's ids, as a first turn.
         report["session_prefix"] = session_prefix(engine)
         cont_ids = [list(engine.tokenize(o + term)) for o in options]
@@ -744,6 +759,8 @@ def main():
                     rec["token_scores"] = per
                 out.write(json.dumps(rec) + "\n")
                 out.flush()
+        if on_gpu:
+            device["after_generation"] = device_report()
     write_report()
     return 0
 

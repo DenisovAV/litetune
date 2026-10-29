@@ -408,7 +408,9 @@ def _add_verify(sub) -> None:
             "prompt and stops if it gets no answer within one prompt's budget; the tool path "
             "has no such check. An EmbeddingGemma 2 file runs on gpu on macOS only, where it was "
             "measured, and without the fp32 option, which its engine does not take; on Linux and "
-            "Windows it is refused on gpu, as is a decision bundle's option scoring everywhere. "
+            "Windows it is refused on gpu. A decision bundle's option scoring runs on gpu on "
+            "macOS only, every row scored twice and the rows the two runs differ on three more "
+            "times in a third run, keeping scores two of them agree on; elsewhere it is refused. "
             "This is not a torch device: the float reference resolves its own"
         ),
     )

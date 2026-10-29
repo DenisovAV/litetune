@@ -14,6 +14,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,7 @@ from litetune.decision_verify import (
     TYPE_LESS_MEASURED,
     DecisionVerify,
     run_script,
+    settle,
     summed,
     unique_lengths,
     verify_decision,
@@ -105,6 +107,20 @@ def expected_accuracy(rows: list[dict[str, Any]]) -> float:
     return sum(not near_miss(r["prompt"]) for r in in_scope) / len(in_scope)
 
 
+def _reading(time_: int) -> dict[str, Any]:
+    return {
+        "platform": "darwin",
+        "looked": True,
+        "gpu_client": "pid 1, python3",
+        "gpu_time": time_,
+        "gpu_clients": {"0x1": time_},
+    }
+
+
+GPU_WORKED = {"at_engine": _reading(10), "after_generation": _reading(500)}
+GPU_IDLE = {"at_engine": _reading(10), "after_generation": _reading(10)}
+
+
 @dataclass
 class FakeScoringEnv:
     """A stage environment that answers either scoring script with chosen scores."""
@@ -129,6 +145,11 @@ class FakeScoringEnv:
     vocab: dict[int, str] = field(default_factory=lambda: dict(VOCAB))
     specs: list[dict[str, Any]] = field(default_factory=list)
     provisioned: int = 0
+    # A GPU run's kernel readings, and which (engine run, row) pairs it scores
+    # wrongly: (1, 3) is the first engine run's row 3.
+    device: dict[str, Any] | None = None
+    glitch: set[tuple[int, int]] = field(default_factory=set)
+    engine_runs: int = 0
 
     def provision(self, events=None, force: bool = False) -> Path:
         self.provisioned += 1
@@ -143,6 +164,9 @@ class FakeScoringEnv:
         ks = unique_lengths(cont)
         report: dict[str, Any] = {"cont_ids": cont}
         if engine:
+            self.engine_runs += 1
+            if spec.get("backend") == "gpu":
+                report["device"] = self.device if self.device is not None else GPU_WORKED
             full = spec["targets"] == "full"
             lengths = [
                 len(c) if full or o in self.full_for else k
@@ -183,6 +207,11 @@ class FakeScoringEnv:
                 ]
                 if engine:
                     per = [p[:n] for p, n in zip(per, lengths, strict=True)]
+                    if (self.engine_runs, row["index"]) in self.glitch:
+                        # Another prompt's scores: every option moved, differently for
+                        # each run and each row, as the real wrong scores differ every time.
+                        shift = 3.0 * self.engine_runs + 0.001 * row["index"]
+                        per = [[v - shift for v in p] for p in per]
                 rec = {"index": row["index"], "token_scores": per}
                 rec["ms" if engine else "seconds"] = 10.0
                 if engine:
@@ -433,16 +462,145 @@ def test_a_decision_record_whose_digest_is_not_its_own_is_refused(split, tmp_pat
     assert "not its own" in check(fields, ROWS_CHECK)["detail"]
 
 
-def test_the_gpu_backend_is_refused(split, tmp_path):
-    s = split()
+@pytest.fixture
+def on_macos(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
 
-    status, fields = run(job_for(s, tmp_path, backend="gpu"), s["record"])
+
+def _engine_specs(job):
+    return [s for s in job.runtime_env.specs if "terminator" in s and "turn_ids" not in s]
+
+
+def test_on_macos_the_gpu_scores_every_row_twice_and_passes_when_they_agree(
+    split, tmp_path, on_macos
+):
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    candidate = [x for x in _engine_specs(job) if x["targets"] == "unique"]
+    assert [x["backend"] for x in candidate] == ["gpu", "gpu"]
+    # The repeat takes the mode the first run's self-check chose.
+    assert [x["mode"] for x in candidate] == ["auto", "once"]
+    assert fields["harness"]["gpu_repeat"] == {"runs": 2, "rows_rescored": 0, "rows": []}
+    engine = fields["measurements"]["candidate"]["engine"]
+    assert engine["backend"] == "gpu" and engine["backend_observed"] is True
+    assert engine["threads"] is None
+    assert any("0 of " in t and "third run" in t for t in fields["limitations"])
+
+
+def test_a_row_the_two_gpu_runs_disagree_on_is_settled_by_a_third(split, tmp_path, on_macos):
+    s = split()
+    clean_status, clean = run(job_for(s, tmp_path, backend="gpu"), s["record"])
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.glitch = {(1, 3)}
+
+    status, fields = run(job, s["record"])
+
+    assert clean_status == status == "passed"
+    candidate = [x for x in _engine_specs(job) if x["targets"] == "unique"]
+    assert len(candidate) == 3
+    n = len(candidate[0]["rows"])
+    # Row 3, three times, under indices of their own.
+    assert [r["index"] for r in candidate[2]["rows"]] == [n + 3, 2 * n + 3, 3 * n + 3]
+    assert len({r["prompt"] for r in candidate[2]["rows"]}) == 1
+    assert fields["harness"]["gpu_repeat"] == {"runs": 3, "rows_rescored": 1, "rows": [3]}
+    # The glitch is gone from what is measured: the clean run's numbers exactly.
+    assert fields["quality"] == clean["quality"]
+    assert any("1 of " in t and "third run" in t for t in fields["limitations"])
+
+
+def _engine_row_count(s, tmp_path) -> int:
+    probe = job_for(s, tmp_path)
+    run(probe, s["record"])
+    return len(next(x for x in _engine_specs(probe) if x["targets"] == "unique")["rows"])
+
+
+def test_a_row_hit_in_both_runs_is_settled_by_the_copies_in_the_third(split, tmp_path, on_macos):
+    s = split()
+    n = _engine_row_count(s, tmp_path)
+    clean_status, clean = run(job_for(s, tmp_path, backend="gpu"), s["record"])
+    job = job_for(s, tmp_path, backend="gpu")
+    # Hit in the first two runs and in the first of the third run's copies.
+    job.runtime_env.glitch = {(1, 3), (2, 3), (3, n + 3)}
+
+    status, fields = run(job, s["record"])
+
+    assert clean_status == status == "passed"
+    candidate = [x for x in _engine_specs(job) if x["targets"] == "unique"]
+    assert len(candidate) == 3
+    assert fields["harness"]["gpu_repeat"] == {"runs": 3, "rows_rescored": 1, "rows": [3]}
+    assert fields["quality"] == clean["quality"]
+
+
+def test_no_two_agreeing_scores_in_three_runs_is_a_harness_failure(split, tmp_path, on_macos):
+    s = split()
+    n = _engine_row_count(s, tmp_path)
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.glitch = {(1, 3), (2, 3)} | {(3, n * c + 3) for c in (1, 2, 3)}
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "no score twice in 3 GPU runs" in check(fields, RUNTIME_CHECK)["detail"]
+    assert len([x for x in _engine_specs(job) if x["targets"] == "unique"]) == 3
+
+
+def test_a_gpu_run_the_kernel_shows_idle_is_refused(split, tmp_path, on_macos):
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.device = GPU_IDLE
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "did no GPU work" in check(fields, RUNTIME_CHECK)["detail"]
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_the_gpu_backend_off_macos_is_refused_before_scoring(
+    split, tmp_path, monkeypatch, platform
+):
+    monkeypatch.setattr(sys, "platform", platform)
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+
+    status, fields = run(job, s["record"])
 
     assert status == "failed_harness"
     detail = check(fields, RUNTIME_CHECK)["detail"]
-    assert "CPU backend only" in detail
-    # The refusal says what was measured, and where to read it.
-    assert "not repeatable" in detail and "The CPU and the GPU on a Mac" in detail
+    assert "measured on macOS only" in detail and platform in detail
+    assert _engine_specs(job) == []
+
+
+def test_a_backend_other_than_cpu_or_gpu_is_refused(split, tmp_path):
+    s = split()
+    status, fields = run(job_for(s, tmp_path, backend="npu"), s["record"])
+    assert status == "failed_harness"
+
+
+def test_the_cpu_scores_once_and_records_the_cpu(split, tmp_path):
+    s = split()
+    job = job_for(s, tmp_path)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed"
+    candidate = [x for x in _engine_specs(job) if x["targets"] == "unique"]
+    assert [x["backend"] for x in candidate] == ["cpu"]
+    assert "gpu_repeat" not in fields["harness"]
+    engine = fields["measurements"]["candidate"]["engine"]
+    assert engine["backend"] == "cpu" and engine["backend_observed"] is False
+    assert engine["threads"] == job.threads
+
+
+def test_settle_keeps_what_two_runs_agree_on():
+    a, b, c = {0: [1.0], 1: [2.0]}, {0: [1.0], 1: [9.0]}, {1: [2.0]}
+    assert settle([a, b, c], [1]) == ({1: [2.0]}, [])
+    assert settle([a, b, {1: [7.0]}], [1]) == ({}, [1])
+    assert settle([a, b], [0]) == ({0: [1.0]}, [])
 
 
 def test_a_family_that_needs_an_engine_per_prompt_is_scored_on_fresh_engines(split, tmp_path):
@@ -2635,3 +2793,21 @@ def test_the_first_batch_is_the_most_padded_and_the_longest_row_is_checked(tiny)
     checked = sorted(i for i, r in rows.items() if "check_max_abs_token" in r)
     assert checked == [0, 1, 2, 7, *range(8, 16)]
     assert _largest_difference(_alone(tiny, words=_padded_middle)[0], rows) < 1e-5
+
+
+def test_the_engine_script_asks_for_the_gpu_as_the_text_path_does_and_reads_the_kernel():
+    """The option-scoring script's GPU branch: the backend the spec names, fp32
+    activations through the shared `engine_kwargs`, and the kernel's two readings
+    around the rows with the engine open -- what `gpu_observed` takes as GPU work."""
+    from litetune.decision_scripts import ENGINE_SCRIPT
+
+    assert 'on_gpu = spec.get("backend", "cpu") == "gpu"' in ENGINE_SCRIPT
+    assert 'engine_kwargs({"backend": "gpu", "activation_data_type": "fp32"})' in ENGINE_SCRIPT
+    assert "def engine_kwargs" in ENGINE_SCRIPT and "def device_report" in ENGINE_SCRIPT
+    at_engine = ENGINE_SCRIPT.index('device["at_engine"] = device_report()')
+    rows = ENGINE_SCRIPT.index('for row in spec["rows"]:')
+    after = ENGINE_SCRIPT.index('device["after_generation"] = device_report()')
+    assert at_engine < rows < after
+    # Both readings only on the GPU.
+    assert ENGINE_SCRIPT.count("if on_gpu:") >= 3
+    compile(ENGINE_SCRIPT, "engine.py", "exec")
