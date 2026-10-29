@@ -5503,9 +5503,9 @@ def test_scored_targets_never_keeps_the_last_position(script_namespace):
 
 @pytest.mark.parametrize(
     ("parameters", "checkpointed"),
-    [(999_999_999, False), (1_000_000_000, True), (5_000_000_000, True)],
+    [(270_000_000, False), (399_999_999, False), (400_000_000, True), (5_000_000_000, True)],
 )
-def test_the_real_script_checkpoints_a_model_of_a_billion_parameters_or_more(
+def test_the_real_script_checkpoints_a_model_of_400_million_parameters_or_more(
     request_for, stub_env, parameters, checkpointed
 ):
     request = request_for()

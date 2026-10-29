@@ -711,9 +711,9 @@ IGNORE_INDEX = -100
 PAD_MULTIPLE_ON_MPS = 32
 
 # Gradient checkpointing for a model of at least this many parameters. A
-# choice, not a measured boundary: gemma-3-270m and Qwen3-0.6B train without
-# it, Qwen3-1.7B, Gemma 4 and the rest with it.
-CHECKPOINT_FROM_PARAMETERS = 1_000_000_000
+# choice, not a measured boundary: the 270M models train without it, Qwen2.5-0.5B,
+# Qwen3-0.6B and everything larger with it.
+CHECKPOINT_FROM_PARAMETERS = 400_000_000
 
 # Where each step reads torch's MPS counters on mps (`sample_mps_memory`).
 MPS_SAMPLE_POINTS = ("after forward", "after backward", "after optimiser step")
