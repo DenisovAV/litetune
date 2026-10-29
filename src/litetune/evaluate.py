@@ -1930,12 +1930,10 @@ def main() -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(spec["model"])
-    # attn_implementation must match what training used. Gemma's default is
-    # sdpa; training loads eager, and the reference notebooks warn three
-    # separate times that a mismatch here produces garbage output. Leaving it
-    # unset makes the float reference a different computation from the model
-    # under test, which is a harness difference wearing a conversion cost's
-    # clothes.
+    # Named, not left to transformers' per-model default, so the float
+    # reference is one stated computation. `HuggingFaceBackend` sends eager;
+    # the training attention is not threaded here, and does not need to be:
+    # it is not in the checkpoint, and the export builds LiteRT's own.
     model = AutoModelForCausalLM.from_pretrained(
         spec["model"],
         torch_dtype=torch.float32,
@@ -2018,8 +2016,9 @@ class HuggingFaceBackend:
     # environment, which cannot read the caller's file. `None` renders the bare
     # user turn this rendered before declarations were an input.
     declarations: list | None = None
-    # Must match training. `spec.BaseModel.attn_implementation` carries the
-    # same default and exists to be threaded here.
+    # The float reference's attention. `verify` leaves it at eager whatever
+    # training used: the choice is not saved with the checkpoint, and the
+    # model under test runs the attention the export built.
     attn_implementation: str = "eager"
     # Set by `verify` from the contract or from `resolve_prompt_mode`. It wins
     # over `runtime_rendered`, which is the low-level switch this backend has

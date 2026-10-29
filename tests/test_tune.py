@@ -1020,8 +1020,6 @@ def test_the_dtype_and_attention_the_export_path_uses_are_passed_through(trainer
     run_tune(request_for())
 
     config = trainer.configs[0]
-    # Mismatching either against what export and evaluation load produces output
-    # that is fluent, wrong, and passes every label-free check.
     assert config["dtype"] == DEFAULT_DTYPE == "bfloat16"
     assert config["attn_implementation"] == DEFAULT_ATTN_IMPLEMENTATION == "eager"
 
@@ -1045,7 +1043,7 @@ def test_a_different_dtype_is_allowed_and_named_as_a_limitation(trainer, request
     assert len(departure) == 1, result.limitations
     assert "MEASUREMENTS.md" in departure[0]
     assert "every published number" not in departure[0]
-    assert not any("fluent, wrong" in text for text in result.limitations)
+    assert not any("trains with attention" in text for text in result.limitations)
 
 
 def test_scoping_lora_to_a_container_is_named_as_a_limitation(trainer, request_for):
@@ -1206,7 +1204,11 @@ def test_a_different_attention_implementation_is_named_as_a_limitation(trainer, 
     result = run_tune(request_for(attn_implementation="sdpa"))
 
     assert trainer.configs[0]["attn_implementation"] == "sdpa"
-    assert any("fluent, wrong" in text for text in result.limitations)
+    (departure,) = [t for t in result.limitations if "trains with attention 'sdpa'" in t]
+    assert "verify's float reference loads eager" in departure
+    # The old wording described a mechanism that does not exist: nothing past
+    # training reads the attention a run trained with.
+    assert "fluent" not in departure
 
 
 def test_training_at_the_default_dtype_states_what_is_and_is_not_established(trainer, request_for):
@@ -1230,9 +1232,10 @@ def test_the_default_dtype_comment_does_not_claim_export_loads_in_bfloat16():
     """A pure comment, not a runtime value -- pinned by reading the module's
     own source, the way `test_manifest.py` pins `pyproject.toml`'s text.
     `DEFAULT_DTYPE`'s comment used to claim the export and evaluation paths
-    use bfloat16 the same way they use eager attention; only the attention
-    half is true (evaluate.py:653 passes it through; evaluate.py:652 is an
-    unconditional `torch_dtype=torch.float32`).
+    use bfloat16 the same way they use eager attention. Neither half was true:
+    evaluate.py's reference is an unconditional `torch_dtype=torch.float32`,
+    and `verify` never threads the training attention to it either -- the
+    reference loads eager whatever training used.
     """
     import inspect
 
@@ -1240,15 +1243,16 @@ def test_the_default_dtype_comment_does_not_claim_export_loads_in_bfloat16():
 
     source = inspect.getsource(tune_module)
     assert "bfloat16 and eager attention, because the export and evaluation paths use" not in source
-    assert "Eager attention, because the export and evaluation paths use it too" in source
+    assert "Eager attention, because the export and evaluation paths use it too" not in source
+    assert "Eager attention, because every generative fine-tune in the README used it" in source
 
 
 def test_the_tune_request_docstring_does_not_claim_dtype_has_a_pair():
     """R6's sixth copy of the claim: `help(TuneRequest)` used to say `dtype`
     and `attn_implementation` "default to the pair the export and evaluation
-    paths use". Only `attn_implementation` has a pair to match -- evaluate.py
-    loads the float reference at an unconditional `float32` regardless of
-    training dtype, and export.py passes no dtype to the exporter at all.
+    paths use". Neither has one: evaluate.py loads the float reference at an
+    unconditional `float32` and eager attention whatever training used, and
+    export.py passes neither to the exporter.
     """
     import inspect
 
@@ -1256,7 +1260,8 @@ def test_the_tune_request_docstring_does_not_claim_dtype_has_a_pair():
 
     doc = inspect.getdoc(TuneRequest) or ""
     assert "default to the pair the export and evaluation paths use" not in doc
-    assert "such pair to default to" in doc
+    assert "pair to default to either" in doc
+    assert "passes the training attention" not in doc
 
 
 def test_a_completed_run_is_never_reported_as_verified(trainer, request_for):
@@ -1346,9 +1351,53 @@ class _Tensor(list):
             return self
         return _Tensor(list(self), device=device)
 
+    def tolist(self):
+        return [list(row) if isinstance(row, list) else row for row in self]
+
+    def reshape(self, *shape):
+        return self
+
 
 def tensor(values, dtype=None):
     return _Tensor(values)
+
+
+class _Loss:
+    def __init__(self, value):
+        self.value = value
+
+    def backward(self):
+        _log({"event": "backward"})
+
+    def __mul__(self, weight):
+        _log({"event": "loss_weight", "weight": weight})
+        return _Loss(self.value * weight)
+
+    def detach(self):
+        return self
+
+    def __float__(self):
+        return self.value
+
+
+class _Functional:
+    @staticmethod
+    def cross_entropy(logits, targets, ignore_index=None):
+        # What the loss was taken over: the targets at the kept positions, and
+        # where they were when it was.
+        _log({
+            "event": "cross_entropy",
+            "targets": list(targets),
+            "targets_device": getattr(targets, "device", None),
+            "logits_rows": logits.rows,
+            "logits_positions": logits.positions,
+            "ignore_index": ignore_index,
+        })
+        return _Loss(1.45)
+
+
+class nn:
+    functional = _Functional
 
 
 class _Cuda:
@@ -1360,6 +1409,16 @@ class _Cuda:
         # boolean that can say "there is a GPU", which `run_real_script`'s
         # `cuda` parameter sets before the subprocess starts.
         return os.environ.get("LITETUNE_STUB_CUDA") == "1"
+
+    # Two different numbers, so a script that records one under the other's
+    # name is visible.
+    @staticmethod
+    def max_memory_allocated(device=None):
+        return 7_000
+
+    @staticmethod
+    def max_memory_reserved(device=None):
+        return 9_000
 
 
 cuda = _Cuda()
@@ -1478,9 +1537,22 @@ class _Loss:
         return self.value
 
 
+class _Logits:
+    def __init__(self, rows, positions):
+        self.rows = rows
+        self.positions = positions
+        self.shape = (rows, positions, 7)
+
+    def float(self):
+        return self
+
+    def reshape(self, *shape):
+        return self
+
+
 class _Output:
-    def __init__(self, loss, step):
-        self.loss = loss
+    def __init__(self, logits, step):
+        self.logits = logits
         self.step = step
 
     def __del__(self):
@@ -1509,7 +1581,7 @@ class _Model:
         self.forwards = 0
 
     def parameters(self):
-        return [_Parameter(1000)]
+        return [_Parameter(int(os.environ.get("LITETUNE_STUB_PARAMETERS", "1000")))]
 
     def train(self):
         return self
@@ -1518,21 +1590,26 @@ class _Model:
         _log({"event": "to", "device": device})
         return self
 
-    def __call__(self, input_ids=None, attention_mask=None, labels=None):
+    def gradient_checkpointing_enable(self):
+        _log({"event": "gradient_checkpointing"})
+
+    def __call__(self, input_ids=None, attention_mask=None, logits_to_keep=None, labels=None):
         _log({
             "event": "forward",
-            "rows": len(labels),
-            "width": len(labels[0]),
-            # Where each of the three actually arrived, not just that `.to()`
-            # was called on it -- the doubles hand back a new object only
-            # when the device changed, so a dropped `.to()` call shows up
-            # here as "cpu" while the model sits on something else.
+            "rows": len(input_ids),
+            "width": len(input_ids[0]),
+            "kept": None if logits_to_keep is None else list(logits_to_keep),
+            "labels_given": labels is not None,
+            # Where each actually arrived, not just that `.to()` was called on
+            # it -- the doubles hand back a new object only when the device
+            # changed, so a dropped `.to()` call shows up here as "cpu" while
+            # the model sits on something else.
             "input_ids_device": getattr(input_ids, "device", None),
             "attention_mask_device": getattr(attention_mask, "device", None),
-            "labels_device": getattr(labels, "device", None),
+            "kept_device": getattr(logits_to_keep, "device", None),
         })
         self.forwards += 1
-        return _Output(_Loss(1.45), self.forwards)
+        return _Output(_Logits(len(input_ids), len(logits_to_keep or [])), self.forwards)
 
     def save_pretrained(self, path):
         Path(path).mkdir(parents=True, exist_ok=True)
@@ -2089,7 +2166,9 @@ def test_the_real_script_trains_on_cuda_when_the_stub_says_there_is_one(request_
     forward = next(e for e in log if e["event"] == "forward")
     assert forward["input_ids_device"] == "cuda"
     assert forward["attention_mask_device"] == "cuda"
-    assert forward["labels_device"] == "cuda"
+    assert forward["kept_device"] == "cuda"
+    loss = next(e for e in log if e["event"] == "cross_entropy")
+    assert loss["targets_device"] == "cuda"
 
     assert read_metrics(request.output_dir / "metrics.json").device == "cuda"
 
@@ -3165,6 +3244,16 @@ def test_the_real_script_records_the_decision_beside_the_checkpoint(request_for,
     for record in (metrics, sidecar):
         assert record["prompt_mode"] == "prerendered"
         assert record["prompt_mode_decision"] == decision.as_dict()
+
+
+@pytest.mark.parametrize("attention", ["eager", "sdpa"])
+def test_the_checkpoint_records_the_attention_it_was_trained_with(request_for, stub_env, attention):
+    request = request_for(attn_implementation=attention)
+    proc = run_real_script(request, stub_env)
+    assert proc.returncode == 0, proc.stderr
+
+    sidecar = json.loads((request.model_dir / "litetune.json").read_text(encoding="utf-8"))
+    assert sidecar["attn_implementation"] == attention
 
 
 def test_the_training_script_refuses_a_prompt_mode_it_was_not_given():
@@ -4738,6 +4827,51 @@ def test_a_cuda_out_of_memory_carries_no_mps_advice(trainer, request_for):
     assert "LITETUNE_DEVICE" not in check.detail
 
 
+def _cuda_oom_detail(trainer, request_for, **kwargs):
+    trainer.probe_device = "cuda"
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = (
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.63 GiB. GPU 0 has a "
+        "total capacity of 39.49 GiB of which 1.10 GiB is free."
+    )
+    check = check_named(run_tune(request_for(**kwargs)), TRAINING_CHECK)
+    assert check.outcome is Outcome.UNCHECKED
+    # The advice sits before the quoted stderr, not inside it.
+    return check.detail.split(": torch.OutOfMemoryError")[0]
+
+
+def test_a_cuda_out_of_memory_says_what_the_run_used_and_what_lowers_it(trainer, request_for):
+    advice = _cuda_oom_detail(trainer, request_for, micro_batch_size=1, max_seq_length=4096)
+
+    assert "micro-batch 1, max_seq_length 4096" in advice
+    assert "shorter rows" in advice
+    # Already at one row a step: there is no smaller micro-batch to offer.
+    assert "--micro-batch-size" not in advice
+    # Nothing to configure in torch: litetune's defaults are the levers.
+    assert "PYTORCH_" not in advice
+    assert "--attn-implementation" not in advice
+
+
+def test_a_cuda_out_of_memory_offers_a_smaller_micro_batch_when_there_is_one(trainer, request_for):
+    advice = _cuda_oom_detail(trainer, request_for, micro_batch_size=2, batch_size=4)
+
+    assert "micro-batch 2" in advice
+    assert "a smaller --micro-batch-size" in advice
+
+
+def test_a_machine_failure_that_is_not_out_of_memory_gets_no_memory_advice(trainer, request_for):
+    trainer.probe_device = "cuda"
+    trainer.returncode = 1
+    trainer.write_model = False
+    trainer.stderr = "RuntimeError: no CUDA-capable device is detected"
+
+    check = check_named(run_tune(request_for()), TRAINING_CHECK)
+
+    assert check.outcome is Outcome.UNCHECKED
+    assert "what lowers the memory" not in check.detail
+
+
 def test_the_metrics_carry_the_new_fields_through_to_the_report():
     metrics = TrainingMetrics.from_dict(
         {
@@ -4752,10 +4886,14 @@ def test_the_metrics_carry_the_new_fields_through_to_the_report():
             "dtype_source": MPS_DTYPE_SOURCE,
             "pad_to_multiple_of": 32,
             "mps_memory_sampled_max": {"current_allocated_bytes": 1, "samples": 3},
+            "cuda_max_memory_allocated": 7_000,
+            "cuda_max_memory_reserved": 9_000,
             "mps_environment": {"PYTORCH_ENABLE_MPS_FALLBACK": "0"},
         }
     )
     record = metrics.as_dict()
+    assert record["cuda_max_memory_allocated"] == 7_000
+    assert record["cuda_max_memory_reserved"] == 9_000
     assert record["dtype"] == "float32"
     assert record["dtype_source"] == MPS_DTYPE_SOURCE
     assert record["pad_to_multiple_of"] == 32
@@ -4795,6 +4933,9 @@ def test_the_real_script_pads_to_the_longest_row_off_mps(request_for, stub_env, 
     recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
     assert recorded["pad_to_multiple_of"] is None
     assert recorded["mps_memory_sampled_max"] is None
+    on_cuda = device == "cuda"
+    assert recorded["cuda_max_memory_allocated"] == (7_000 if on_cuda else None)
+    assert recorded["cuda_max_memory_reserved"] == (9_000 if on_cuda else None)
     events = {e["event"] for e in stub_log(stub_env)}
     assert not events & {"mps_current_allocated", "mps_driver_allocated", "mps_empty_cache"}
 
@@ -4883,14 +5024,17 @@ def test_the_real_script_records_the_largest_mps_samples_and_where_they_were_tak
     # sampled once per effective batch.
     sample = ["mps_current_allocated", "mps_driver_allocated"]
     first = log.index("forward")
-    assert log[first : first + 8] == [
+    # The loss is taken from the kept logits before the forward sample: the
+    # logits it reads are the forward pass's memory.
+    assert log[first : first + 9] == [
         "forward",
+        "cross_entropy",
         *sample,
         "loss_weight",
         "backward",
         *sample,
         "released",
-    ], log[first : first + 8]
+    ], log[first : first + 9]
     assert log.count("mps_current_allocated") == 2 * forwards + optimiser_steps
     # The stub's sequences peak in the middle, so the last sample is not the
     # largest: the record is the maximum over the samples.
@@ -5328,3 +5472,78 @@ def test_tune_reads_decision_json_once(tmp_path, request_for, trainer, monkeypat
 
     assert result.trained_decision is not None
     assert reads == [decision]
+
+
+def test_scored_targets_keeps_the_positions_whose_next_token_is_supervised(script_namespace):
+    """Worked by hand: position p is kept when any row's label at p + 1 is a
+    target. Row one supervises tokens 3 and 4, row two token 2; padding and
+    the prompt are IGNORE_INDEX."""
+    ignore = script_namespace["IGNORE_INDEX"]
+    rows = [
+        [ignore, ignore, ignore, 30, 40, ignore],
+        [ignore, ignore, 20, ignore, ignore, ignore],
+    ]
+
+    keep, targets = script_namespace["scored_targets"](rows)
+
+    assert keep == [1, 2, 3]
+    assert targets == [[ignore, 30, 40], [20, ignore, ignore]]
+
+
+def test_scored_targets_never_keeps_the_last_position(script_namespace):
+    """The last position has no next token: a target there would shift past
+    the row, so it is never kept, even when everything else is."""
+    rows = [[5, 6, 7]]
+
+    keep, targets = script_namespace["scored_targets"](rows)
+
+    assert keep == [0, 1]
+    assert targets == [[6, 7]]
+
+
+@pytest.mark.parametrize(
+    ("parameters", "checkpointed"),
+    [(270_000_000, False), (399_999_999, False), (400_000_000, True), (5_000_000_000, True)],
+)
+def test_the_real_script_checkpoints_a_model_of_400_million_parameters_or_more(
+    request_for, stub_env, parameters, checkpointed
+):
+    request = request_for()
+    proc = run_real_script(
+        request, stub_env, extra_env={"LITETUNE_STUB_PARAMETERS": str(parameters)}
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    events = [e["event"] for e in stub_log(stub_env)]
+    assert events.count("gradient_checkpointing") == (1 if checkpointed else 0)
+    if checkpointed:
+        # On the loaded model, before LoRA wraps it.
+        assert events.index("gradient_checkpointing") < events.index("forward")
+    recorded = json.loads((request.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert recorded["gradient_checkpointing"] is checkpointed
+    assert recorded["model_parameters"] == parameters
+    metrics = TrainingMetrics.from_dict(recorded).as_dict()
+    assert metrics["gradient_checkpointing"] is checkpointed
+    assert metrics["model_parameters"] == parameters
+
+
+def test_the_real_script_scores_only_the_supervised_positions(request_for, stub_env):
+    request = request_for()
+    proc = run_real_script(request, stub_env)
+    assert proc.returncode == 0, proc.stderr
+
+    log = stub_log(stub_env)
+    forwards = [e for e in log if e["event"] == "forward"]
+    losses = [e for e in log if e["event"] == "cross_entropy"]
+    assert forwards and len(forwards) == len(losses)
+    for forward, loss in zip(forwards, losses, strict=True):
+        # The model computes no loss of its own and no logit row past the kept
+        # positions; the loss is taken over exactly those.
+        assert forward["labels_given"] is False
+        assert forward["kept"], forward
+        assert max(forward["kept"]) < forward["width"] - 1
+        assert loss["logits_positions"] == len(forward["kept"])
+        assert loss["logits_rows"] == forward["rows"]
+        assert len(loss["targets"]) == forward["rows"]
+        assert all(len(row) == len(forward["kept"]) for row in loss["targets"])
+        assert loss["ignore_index"] == -100

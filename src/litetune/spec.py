@@ -91,8 +91,8 @@ _RECIPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # rather than an error. Admitting it here and defaulting elsewhere to bfloat16
 # would let a spec file quietly pick the one dtype the design forbids.
 DTYPES = ("float32", "bfloat16")
-# Gemma-family models are documented as needing eager attention for correct
-# results; the alternatives are accepted but the default is the measured one.
+# Eager is the default because the README's numbers were trained with it; the
+# alternatives are accepted (see `tune.DEFAULT_ATTN_IMPLEMENTATION`).
 ATTN_IMPLEMENTATIONS = ("eager", "sdpa", "flash_attention_2")
 DATASET_FORMATS = ("jsonl",)
 TRAIN_MODES = ("full", "lora", "skip")
