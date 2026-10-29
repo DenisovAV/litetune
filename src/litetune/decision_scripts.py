@@ -15,16 +15,17 @@ log-probability kept. On the first row each way of passing the cache is checked
 against scoring with no cache, and the first within `check_tol` is used; when
 none is, every row is scored with no cache.
 
-Rows of a similar length go `row_batch` at a time: one forward over their
-prompts, padded on the left and given their positions, keeps the cache, and the
-(row, option) pairs go in chunks of at most `pair_tokens` tokens of cache over
-copies of their row's part of it. A way of passing the cache that takes no
+Rows of a similar length go up to `row_batch` at a time: one forward over
+their prompts, padded on the left and given their positions, keeps the cache,
+and the (row, option) pairs go in chunks over copies of their row's part of it.
+Either forward holds at most `batch_tokens` tokens of cache, prompts padded; a
+row longer than that is scored alone. A way of passing the cache that takes no
 positions scores one row at a time, as does a first batch that raises or whose
 rows are not within `check_tol` of the same rows scored alone with no cache.
 That check covers every row of the first batch, then the first three rows, the
 longest, and the row with the most padding; a difference above `check_tol`, or
-a NaN, after the first batch stops the run. MEASUREMENTS.md has what batching changed in time
-and in the scores.
+a NaN, after the first batch stops the run. MEASUREMENTS.md has what batching
+changed in time and in the scores.
 
 **The runtime** (`ENGINE_SCRIPT`, `envs.RUNTIME`) scores through LiteRT-LM's
 session API on the CPU, as the flutter_edge_ai design of 2026-10-16 has its
@@ -135,12 +136,13 @@ def main():
         raise SystemExit("two options tokenise to the same ids")
     pad = tok.pad_token_id if tok.pad_token_id is not None else term_ids[0]
     chunk = int(spec.get("chunk", 64))
-    # A batch's continuation step holds this many tokens of cache at most:
-    # about 96 pairs over the ~85-token prompts measured, and fewer over long
-    # ones, where a fixed count of pairs would multiply the memory.
-    pair_tokens = int(spec.get("pair_tokens", 8192))
+    # Tokens of cache a batch holds at most, in its prompts' forward and in
+    # each continuation step: about 96 pairs over the ~85-token prompts
+    # measured, and fewer rows and pairs over long ones, where a fixed count
+    # would multiply the memory. A row longer than this is scored alone.
+    batch_tokens = int(spec.get("batch_tokens", 8192))
     tol = float(spec.get("check_tol", 3e-3))
-    state = {"variant": None}
+    state = {"variant": None, "batch_tokens_held": 0}
 
     def render(prompt):
         # As `tune` trained it: a decision is trained runtime_rendered.
@@ -259,6 +261,7 @@ def main():
             "position_ids": (mask.cumsum(-1) - 1).clamp(min=0),
             "use_cache": True,
         }
+        state["batch_tokens_held"] = max(state["batch_tokens_held"], b * width)
         try:
             out = model(**kw, logits_to_keep=1)
         except TypeError:
@@ -271,7 +274,7 @@ def main():
         heads = first[[i for i, _ in pairs], [conts[j][0] for _, j in pairs]].tolist()
         for (i, j), h in zip(pairs, heads):
             res[i][j] = [h]
-        step = max(1, pair_tokens // (width + max(len(c) for c in conts)))
+        step = max(1, batch_tokens // (width + max(len(c) for c in conts)))
         for s in range(0, len(pairs), step):
             part = pairs[s : s + step]
             n = len(part)
@@ -279,6 +282,8 @@ def main():
             if length == 0:
                 continue
             rows = [i for i, _ in part]
+            held = n * (width + length)
+            state["batch_tokens_held"] = max(state["batch_tokens_held"], held)
             inp = torch.full((n, length), pad, dtype=torch.long, device=device)
             for k, (_, j) in enumerate(part):
                 c = conts[j][:-1]
@@ -307,10 +312,12 @@ def main():
             del lp
         return res
 
+    def nan_max(values):
+        # NaN when any value is: `max` would keep or drop it by its place.
+        return float("nan") if any(v != v for v in values) else max(values)
+
     def worst(a, b):
-        # NaN when any score is: `max` would keep or drop it by its place.
-        d = [abs(x - y) for f, c in zip(a, b) for x, y in zip(f, c)]
-        return float("nan") if any(v != v for v in d) else max(d)
+        return nan_max([abs(x - y) for f, c in zip(a, b) for x, y in zip(f, c)])
 
     started = time.time()
     trials = {}
@@ -323,15 +330,27 @@ def main():
     # carry their index.
     first3 = {r["index"] for r in rows[:3]}
     rows = sorted(rows, key=lambda r: len(rendered[r["index"]]))
+
+    def groups_of(most):
+        # Consecutive rows, at most `most` of them and at most `batch_tokens`
+        # tokens once padded to the longest; a row longer than that goes alone.
+        groups, part = [], []
+        for r in rows:
+            n = len(rendered[r["index"]])
+            if part and (len(part) == most or (len(part) + 1) * n > batch_tokens):
+                groups.append(part)
+                part = []
+            part.append(r)
+        return [*groups, part] if part else groups
+
+    def gap(group):
+        return len(rendered[group[-1]["index"]]) - len(rendered[group[0]["index"]])
+
+    groups = groups_of(batch)
     # The most padded row of all, checked too: the first batch, of the
     # shortest rows, is padded little.
-    padded = None
-    for s in range(0, len(rows), batch):
-        part = rows[s : s + batch]
-        widest = len(rendered[part[-1]["index"]])
-        gap = widest - len(rendered[part[0]["index"]])
-        if padded is None or gap > padded[1]:
-            padded = (part[0]["index"], gap)
+    widest_gap = max(groups, key=gap, default=None)
+    padded = (widest_gap[0]["index"], gap(widest_gap)) if widest_gap else None
     with open(spec["out"], "w", encoding="utf-8") as out:
         if rows:
             prompt_ids0 = rendered[spec["rows"][0]["index"]]
@@ -347,23 +366,24 @@ def main():
                     break
         # Padding on the left needs the positions passed; without them, or
         # with no cache at all, a row is scored alone.
-        if state["variant"] not in ("cache_position+position_ids", "position_ids"):
-            batch = 1
+        batched = batch > 1 and state["variant"] in ("cache_position+position_ids", "position_ids")
+        if not batched:
+            groups = groups_of(1)
         batch_trial = None
-        s = 0
-        while s < len(rows):
-            part = rows[s : s + batch]
+        g = 0
+        while g < len(groups):
+            part = groups[g]
             t0 = time.perf_counter()
             pids = [rendered[r["index"]] for r in part]
-            if batch > 1:
+            if batched:
                 try:
                     pers = score_batch(pids, state["variant"])
                 except Exception as exc:  # noqa: BLE001 - recorded; scored one at a time
-                    if s:
+                    if g:
                         raise
                     error = f"{type(exc).__name__}: {str(exc)[:200]}"
                     batch_trial = {"row_batch": batch, "error": error}
-                    batch = 1
+                    batched, groups = False, groups_of(1)
                     continue
             else:
                 pers = [score_cached(pids[0], state["variant"])]
@@ -375,18 +395,18 @@ def main():
                 # The first batch in full, then the first three rows, the
                 # longest and the most padded: each against the row scored
                 # alone with no cache.
-                most_padded = batch > 1 and padded is not None and row["index"] == padded[0]
-                if s == 0 or row["index"] in first3 or row["index"] in check or most_padded:
+                most_padded = batched and padded is not None and row["index"] == padded[0]
+                if g == 0 or row["index"] in first3 or row["index"] in check or most_padded:
                     rec["check_max_abs_token"] = worst(score_full(prompt_ids), per)
                 recs.append(rec)
             # `not <=`, so that a NaN is a difference too.
             bad = [r for r in recs if not r.get("check_max_abs_token", 0.0) <= tol]
-            if bad and s == 0 and batch > 1:
+            if bad and g == 0 and batched:
                 # Rows scored together drift from rows scored alone: score
                 # one at a time, as before batching.
-                drift = max(r["check_max_abs_token"] for r in bad)
+                drift = nan_max([r["check_max_abs_token"] for r in bad])
                 batch_trial = {"row_batch": batch, "max_abs_token": drift}
-                batch = 1
+                batched, groups = False, groups_of(1)
                 continue
             if bad:
                 raise SystemExit(
@@ -398,7 +418,7 @@ def main():
                 rec["seconds"] = each
                 out.write(json.dumps(rec) + "\n")
             out.flush()
-            s += len(part)
+            g += 1
     Path(spec["report"]).write_text(
         json.dumps(
             {
@@ -411,9 +431,14 @@ def main():
                 "final_logit_softcapping": cap,
                 "logits_scaling": scale,
                 "cache_variant": state["variant"] or "no_cache",
-                "row_batch": batch,
+                "row_batch": batch if batched else 1,
+                "batches": len(groups),
                 "batch_trial": batch_trial,
-                "most_padding_checked": padded[1] if padded and batch > 1 else None,
+                "most_padding_checked": padded[1] if padded and batched else None,
+                # The most tokens of cache, prompts padded, one batched forward
+                # held, a first batch that fell back included; `batches` counts
+                # the groups that were kept.
+                "batch_tokens_held": state["batch_tokens_held"] or None,
                 "variant_trials": trials,
                 "seconds": round(time.time() - started, 1),
             }

@@ -2011,8 +2011,9 @@ M5 Pro, on the CPU. The command was the same before and after: `--calibration
 
 | | one row at a time | sixteen at a time |
 |---|---|---|
-| reference stage | 1,044 s | 156 s |
-| whole `verify` | 18 min 27 s | 3 min 23 s |
+| reference stage | 1,044 s | 156 s; 402 s at load 25 |
+| whole `verify` | 18 min 27 s | 3 min 23 s; 7 min 29 s at load 25 |
+| CPU time of the whole `verify`, user + system | 2,623 s | 1,051 s; 1,099 s |
 | runtime's top option / answer is the reference's | 0.9967 / 0.9933 | 0.9967 / 0.9933 |
 | temperature, abstain below | 1.2838772, 0.5074026 | 1.2838769, 0.5074019 |
 | mean KL | 3.9384e-04 | 3.9384e-04 |
@@ -2035,6 +2036,14 @@ new.
 - On Qwen3.5-0.8B no way of passing the cache matched uncached scoring on the
   first row, before or after, so every row is scored in full. With no cache
   the script does not batch, and the scores were bit-identical.
+- The second figure in each batched cell is the version committed, which
+  also caps a batch at 8,192 tokens of cache and checks the most padded row:
+  run when the Mac's load average was 25, against 4 for the first. Its fit was
+  the first version's to every digit printed.
+- The table above was measured on the first version, which chunked 96 pairs
+  whatever the prompt's length; over these prompts both versions chunk about
+  the same number. On the committed version the 300 gemma rows were again
+  within 4.2e-05 nats of the old scores, at 48.8 ms a row at load 25.
 - No first batch fell back to one row at a time, and the largest difference a
   check found was 1.99e-04 nats against `check_tol` 3e-03.
 - The Mac was running other work throughout, with load averages from 4 to 62.

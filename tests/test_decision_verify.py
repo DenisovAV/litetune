@@ -2384,14 +2384,14 @@ def _words(i):
     return k + 1 if k < 16 else 17 + 3 * (k - 16)
 
 
-def _reference_on_tiny_model(tmp_path, script, row_batch, n_rows=24):
+def _reference_on_tiny_model(tmp_path, script, row_batch, n_rows=24, extra=None, ok=True):
     model = tmp_path / "model"
     if not model.exists():
         make = tmp_path / "make.py"
         make.write_text(_TINY_MODEL, encoding="utf-8")
         made = _in_train_env([str(make), str(model)])
         assert made.returncode == 0, made.stderr
-    tag = f"b{row_batch}-{abs(hash(script)) % 10**8}"
+    tag = f"b{row_batch}-{abs(hash((script, json.dumps(extra)))) % 10**8}"
     spec = tmp_path / f"spec-{tag}.json"
     out, report = tmp_path / f"out-{tag}.jsonl", tmp_path / f"report-{tag}.json"
     spec.write_text(
@@ -2407,6 +2407,7 @@ def _reference_on_tiny_model(tmp_path, script, row_batch, n_rows=24):
                 "turn_text": "<eot>",
                 "device": "cpu",
                 "row_batch": row_batch,
+                **(extra or {}),
                 "out": str(out),
                 "report": str(report),
             }
@@ -2416,6 +2417,8 @@ def _reference_on_tiny_model(tmp_path, script, row_batch, n_rows=24):
     path = tmp_path / f"reference-{tag}.py"
     path.write_text(script, encoding="utf-8")
     proc = _in_train_env([str(path), str(spec)])
+    if not ok:
+        return proc
     assert proc.returncode == 0, proc.stderr
     rows = {r["index"]: r for r in map(json.loads, out.read_text().splitlines())}
     return rows, json.loads(report.read_text())
@@ -2438,6 +2441,8 @@ def test_rows_scored_in_batches_match_rows_scored_one_at_a_time(tmp_path):
     batched, report = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 8)
 
     assert alone_report["row_batch"] == 1 and report["row_batch"] == 8
+    assert report["batches"] == 3
+    assert report["batch_tokens_held"] > 100
     assert report["batch_trial"] is None
     assert report["most_padding_checked"] == 21
     assert _largest_difference(alone, batched) < 1e-5
@@ -2493,4 +2498,36 @@ def test_a_first_batch_with_a_nan_is_scored_again_one_row_at_a_time(tmp_path):
 
     assert report["row_batch"] == 1
     assert math.isnan(report["batch_trial"]["max_abs_token"])
+    assert _largest_difference(alone, rows) < 1e-5
+
+
+def test_a_batch_after_the_first_that_raises_stops_the_run(tmp_path):
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    head = "    def score_batch(prompts_ids, how):\n"
+    second = (
+        '        globals()["calls"] = globals().get("calls", 0) + 1\n'
+        '        if globals()["calls"] == 2:\n'
+        '            raise RuntimeError("second batch")\n'
+    )
+    proc = _reference_on_tiny_model(
+        tmp_path, REFERENCE_SCRIPT.replace(head, head + second), 8, ok=False
+    )
+
+    assert proc.returncode != 0
+    assert "RuntimeError: second batch" in proc.stderr
+
+
+def test_a_token_budget_makes_smaller_batches_with_the_same_scores(tmp_path):
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    alone, _ = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 1)
+    rows, report = _reference_on_tiny_model(
+        tmp_path, REFERENCE_SCRIPT, 8, extra={"batch_tokens": 100}
+    )
+
+    # Prompts of 5 to 42 tokens: eight fit 100 tokens only among the shortest.
+    assert report["row_batch"] == 8 and report["batches"] > 3
+    assert 0 < report["batch_tokens_held"] <= 100
+    assert report["batch_trial"] is None
     assert _largest_difference(alone, rows) < 1e-5
