@@ -1782,7 +1782,13 @@ def test_a_flag_of_another_path_is_refused_not_ignored(fake, tmp_path, kwargs, f
     assert fake.runs == []
 
 
-def test_the_gpu_backend_runs_each_engine_file_on_the_gpu_one_at_a_time(fake, tmp_path):
+@pytest.fixture
+def on_macos(monkeypatch) -> None:
+    """The GPU path for an embedding file is measured on macOS only, and runs there only."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+
+def test_the_gpu_backend_runs_each_engine_file_on_the_gpu_one_at_a_time(fake, tmp_path, on_macos):
     result = _verify(_setup(tmp_path), backend="gpu", with_base=True)
 
     assert result.status is Status.PASSED, result.manifest["checks"]
@@ -1815,7 +1821,32 @@ def test_the_cpu_backend_is_passed_and_stated_as_before(fake, tmp_path):
     assert "GPU backend of LiteRT-LM's EmbeddingEngine" not in limitations
 
 
-def test_a_gpu_run_the_kernel_shows_idle_is_refused(fake, tmp_path):
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_the_gpu_backend_is_refused_off_macos_where_it_was_not_measured(
+    fake, tmp_path, monkeypatch, platform
+):
+    monkeypatch.setattr(sys, "platform", platform)
+    result = _verify(_setup(tmp_path), backend="gpu", with_base=True)
+
+    assert result.status is Status.FAILED_HARNESS
+    failed = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
+    assert [c["name"] for c in failed] == [CANDIDATE_CHECK]
+    assert f"--backend gpu on {platform}" in failed[0]["detail"]
+    assert "measured on macOS only" in failed[0]["detail"]
+    assert "The CPU and the GPU on a Mac" in failed[0]["detail"]
+    assert fake.runs == []
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_the_cpu_backend_still_runs_off_macos(fake, tmp_path, monkeypatch, platform):
+    monkeypatch.setattr(sys, "platform", platform)
+    result = _verify(_setup(tmp_path))
+
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    assert fake.specs["candidate"]["backend"] == "cpu"
+
+
+def test_a_gpu_run_the_kernel_shows_idle_is_refused(fake, tmp_path, on_macos):
     fake.gpu_device = GPU_IDLE
     result = _verify(_setup(tmp_path), backend="gpu")
 
@@ -1823,7 +1854,7 @@ def test_a_gpu_run_the_kernel_shows_idle_is_refused(fake, tmp_path):
     assert "did no GPU work" in json.dumps(result.manifest["checks"])
 
 
-def test_a_gpu_run_nobody_could_observe_is_recorded_as_asked_for(fake, tmp_path):
+def test_a_gpu_run_nobody_could_observe_is_recorded_as_asked_for(fake, tmp_path, on_macos):
     fake.gpu_device = NOT_LOOKED
     result = _verify(_setup(tmp_path), backend="gpu")
 

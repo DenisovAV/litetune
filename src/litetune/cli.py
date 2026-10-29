@@ -406,9 +406,10 @@ def _add_verify(sub) -> None:
             "whether its process did GPU work and records the run as measured on the GPU only "
             "then, and elsewhere as asked for. On the text path a GPU split starts with one "
             "prompt and stops if it gets no answer within one prompt's budget; the tool path "
-            "has no such check. An EmbeddingGemma 2 file runs on gpu without the fp32 option, "
-            "which its engine does not take; a decision bundle's option scoring is refused on "
-            "gpu. This is not a torch device: the float reference resolves its own"
+            "has no such check. An EmbeddingGemma 2 file runs on gpu on macOS only, where it was "
+            "measured, and without the fp32 option, which its engine does not take; on Linux and "
+            "Windows it is refused on gpu, as is a decision bundle's option scoring everywhere. "
+            "This is not a torch device: the float reference resolves its own"
         ),
     )
     verify.add_argument(

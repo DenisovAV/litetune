@@ -844,8 +844,10 @@ What has and has not been measured
   `verify --backend gpu` on a Mac's GPU, which passed the same gate (0.9311
   against the reference's 0.9312) with vectors further from the reference
   (cosine 0.9969 against 0.99928 on the CPU); see *The CPU and the GPU on a
-  Mac* in MEASUREMENTS.md. The app's own runtime build, a phone, the NPU files
-  and the web are not measured. Training was measured on the CPU only.
+  Mac* in MEASUREMENTS.md. The GPU on Linux and Windows is not measured, and
+  `verify --backend gpu` refuses there. The app's own runtime build, a phone,
+  the NPU files and the web are not measured. Training was measured on the CPU
+  only.
 - On a 32-vCPU Intel Xeon, at four threads, verify took 47 minutes (int8) and
   35 (int4) on 11,775 rows with `--with-base`, Google's file embedded beside
   the candidate; the previous litetune, embedding one after the other on the

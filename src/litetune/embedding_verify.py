@@ -60,6 +60,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -180,7 +181,7 @@ NO_BASE = (
 )
 GPU_MEASURED = (
     "measured on the GPU backend of LiteRT-LM's EmbeddingEngine, from the litert-lm package on "
-    "PyPI on this host's GPU, one file at a time -- not the "
+    "PyPI on this Mac's GPU, one file at a time -- not the "
     "application's own build of the runtime on a device's GPU; the CPU and the NPU are not "
     "measured in this run. The Python EmbeddingEngine takes no activation data type: litert-lm "
     "0.18.0's embedding_engine.py deletes the keyword arguments it is given, so the GPU computes "
@@ -188,7 +189,12 @@ GPU_MEASURED = (
 )
 GPU_ASKED_FOR = (
     "the GPU is recorded as asked for, not as observed: the kernel's GPU time for the engine "
-    "process is read on macOS only, and was not read or did not settle the question here"
+    "process was not read or did not settle the question here"
+)
+GPU_NOT_MEASURED_HERE = (
+    "--backend gpu on {platform}: LiteRT-LM's GPU path for an EmbeddingGemma 2 file is measured "
+    'on macOS only (MEASUREMENTS.md, "The CPU and the GPU on a Mac"); on Linux and Windows it is '
+    "not measured, so it is refused here"
 )
 SIDE_BY_SIDE = (
     "the candidate and Google's file were embedded at the same time, each on its own {threads} "
@@ -1207,6 +1213,8 @@ def verify_embedding(
             CANDIDATE_CHECK,
             f"--backend {job.backend}: the embedding path runs on LiteRT-LM's CPU or GPU backend",
         )
+    if job.backend == "gpu" and sys.platform != "darwin":
+        return refuse(CANDIDATE_CHECK, GPU_NOT_MEASURED_HERE.format(platform=sys.platform))
     if job.not_applicable:
         return refuse(
             RECORD_CHECK,
