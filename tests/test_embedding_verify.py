@@ -681,6 +681,8 @@ def test_the_engine_script_sets_the_apps_settings_and_its_own_cache(tmp_path, mo
     }
     assert report["cpu"] == {"model": "stub cpu", "count": 2}
     assert report["rows"] == 2 and report["dim"] == 2
+    # The CPU run does not ask the kernel about the GPU.
+    assert report["device"] == {}
 
 
 def test_the_engine_script_normalises_what_the_engine_returns(tmp_path, monkeypatch):

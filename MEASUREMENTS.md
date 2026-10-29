@@ -2328,7 +2328,7 @@ section above by up to 0.002.
 
 Each path was run through the script `verify` runs for it, unchanged except for
 the backend, on an Apple M5 Pro with litert-lm 0.18.0 from PyPI: once or twice on
-the CPU and three times on the GPU. For each GPU run the kernel's GPU time for
+the CPU and three times on the GPU, four for option scoring. For each GPU run the kernel's GPU time for
 the process grew during the run. The text and option-scoring runs used the
 emotion bundle from *The three passing bundles on a phone* and its 300 rows.
 The tool runs used `google/functiongemma-270m-it` converted by litetune 0.7.1

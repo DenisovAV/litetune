@@ -410,10 +410,12 @@ def main():
         cache_dir=spec["cache_dir"],
         max_input_length=spec["max_input_length"],
     ) as engine:
-        # The kernel's GPU time for this process once the engine exists and
-        # again after the last text, with the engine still open: the reading
-        # evaluate.gpu_observed takes as GPU work, on macOS.
-        device["at_engine"] = device_report()
+        # On the GPU, the kernel's GPU time for this process once the engine
+        # exists and again after the last text, with the engine still open: the
+        # reading evaluate.gpu_observed takes as GPU work, on macOS. Not asked on
+        # the CPU, where it would only cost the probe's time.
+        if on_gpu:
+            device["at_engine"] = device_report()
         options = litert_lm.EmbeddingOptions(
             normalize=True,
             insert_special_tokens=True,
@@ -431,7 +433,8 @@ def main():
                 return REFUSED_EXIT
             out.append(list(answer.embedding))
             times.append(time.perf_counter() - t1)
-        device["after_generation"] = device_report()
+        if on_gpu:
+            device["after_generation"] = device_report()
     raw = np.array(out, dtype=np.float64)
     bad = unusable_rows(raw)
     if len(bad):
