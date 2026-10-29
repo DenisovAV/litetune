@@ -212,6 +212,10 @@ def _tail(text: str | bytes | None, limit: int = 2000) -> str:
     return (text or "").strip()[-limit:]
 
 
+GPU_IDLE = (
+    "the GPU backend was asked for and the kernel shows the {run} run did no GPU work: its "
+    "scores came from somewhere else"
+)
 # Runs of the GPU scoring, in all; the last scores each row still in question this many
 # times in one process.
 GPU_MAX_RUNS = 3
@@ -272,6 +276,8 @@ def _repeat_on_gpu(
         return "the second GPU run left rows unscored: " + (
             second.failure or f"{n_rows - len(second.scores)} rows"
         )
+    if gpu_unused("gpu", second.report.get("device")):
+        return GPU_IDLE.format(run="second")
     differ = [i for i in range(n_rows) if second.scores.get(i) != first.scores.get(i)]
     runs: list[dict[int, Any]] = [first.scores, second.scores]
     if differ:
@@ -294,6 +300,8 @@ def _repeat_on_gpu(
         )
         if third.failure or any(c["index"] not in third.scores for c in copies):
             return "the third GPU run left rows unscored: " + (third.failure or "some rows")
+        if gpu_unused("gpu", third.report.get("device")):
+            return GPU_IDLE.format(run="third")
         for c in range(GPU_COPIES_IN_LAST_RUN):
             runs.append({i: third.scores[n_rows * (c + 1) + i] for i in differ})
     settled, unresolved = settle(runs, differ)

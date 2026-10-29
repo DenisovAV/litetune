@@ -148,6 +148,8 @@ class FakeScoringEnv:
     # A GPU run's kernel readings, and which (engine run, row) pairs it scores
     # wrongly: (1, 3) is the first engine run's row 3.
     device: dict[str, Any] | None = None
+    # A reading for one engine run only, by its number; the rest use `device`.
+    device_for_run: dict[int, dict[str, Any]] = field(default_factory=dict)
     glitch: set[tuple[int, int]] = field(default_factory=set)
     engine_runs: int = 0
 
@@ -166,7 +168,8 @@ class FakeScoringEnv:
         if engine:
             self.engine_runs += 1
             if spec.get("backend") == "gpu":
-                report["device"] = self.device if self.device is not None else GPU_WORKED
+                default = self.device if self.device is not None else GPU_WORKED
+                report["device"] = self.device_for_run.get(self.engine_runs, default)
             full = spec["targets"] == "full"
             lengths = [
                 len(c) if full or o in self.full_for else k
@@ -557,6 +560,23 @@ def test_a_gpu_run_the_kernel_shows_idle_is_refused(split, tmp_path, on_macos):
 
     assert status == "failed_harness"
     assert "did no GPU work" in check(fields, RUNTIME_CHECK)["detail"]
+
+
+@pytest.mark.parametrize(
+    ("run_no", "glitch", "word"), [(2, set(), "second"), (3, {(1, 3)}, "third")]
+)
+def test_a_repeat_the_kernel_shows_idle_is_refused(split, tmp_path, on_macos, run_no, glitch, word):
+    """Each GPU run is held to the kernel's reading, not only the first: an idle
+    repeat's scores would otherwise outvote the GPU's."""
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.glitch = glitch
+    job.runtime_env.device_for_run = {run_no: GPU_IDLE}
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert f"the {word} run did no GPU work" in check(fields, RUNTIME_CHECK)["detail"]
 
 
 @pytest.mark.parametrize("platform", ["linux", "win32"])
