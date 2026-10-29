@@ -3,6 +3,11 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.7.1 — 2026-10-29
+- `tune` computes the logits and the loss only where a token is supervised, and trains a model of 400 million parameters or more with gradient checkpointing, so gemma-4-E2B-it fits a 40 GB GPU on long rows; no flag, the loss is unchanged (#95).
+- `tune` and `verify` comments and reports no longer say the training attention reaches evaluation or export; a CUDA out-of-memory ending names the run's micro-batch and length (#95).
+- `verify` reports the app's default abstention for an EmbeddingGemma 2 decider, and MEASUREMENTS.md which calibration suits a fine-tuned file (#94).
+
 ## 0.7.0 — 2026-10-27
 - `tune`, `convert` and `verify` fine-tune EmbeddingGemma 2 for one decision and write it into Google's own `.litertlm`, for flutter_edge_ai's `EmbeddingModel.createDecider`; measured on banking77 end to end (#92).
 - An MPS run on a Mac starts at warn memory pressure and on 2 GiB available, and says so in its report (#91).

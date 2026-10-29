@@ -270,7 +270,7 @@ tool path only and the CPU nowhere.
 | 0.2.0 – 0.3.0 | `litert-lm==0.17.1` | `litert-torch-nightly==0.10.0.dev20260926`, `litert-lm-builder==0.17.1`, and the LiteRT, quantizer and converter packages it requires pinned | unchanged |
 | 0.4.0 – 0.4.1 | `litert-lm==0.18.0` | `litert-lm==0.18.0` and `litert-lm-builder==0.18.0`; `litert-torch-nightly` and the LiteRT, quantizer and converter pins unchanged | unchanged |
 | 0.4.2 – 0.6.0 | `litert-lm==0.18.0` | unchanged | unchanged on Python 3.10 – 3.12; `sentencepiece==0.2.1` in place of 0.2.0 on Python 3.13 |
-| 0.7.0 | `litert-lm==0.18.0` | unchanged | unchanged; EmbeddingGemma 2 trains in an environment of its own: `torch==2.9.1`, `torchvision==0.24.1`, `transformers==5.19.0`, `sentence-transformers==6.1.0`, `pillow==12.3.0`, `tokenizers==0.23.3`, `huggingface-hub==1.33.0`, `safetensors==0.8.0` |
+| 0.7.0 – 0.7.1 | `litert-lm==0.18.0` | unchanged | unchanged; EmbeddingGemma 2 trains in an environment of its own: `torch==2.9.1`, `torchvision==0.24.1`, `transformers==5.19.0`, `sentence-transformers==6.1.0`, `pillow==12.3.0`, `tokenizers==0.23.3`, `huggingface-hub==1.33.0`, `safetensors==0.8.0` |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
@@ -823,15 +823,16 @@ What has and has not been measured
   run.
 - The app's default calibration, `crossFit`, abstains below a threshold it
   fits on the examples. verify fits it the same way and reports it, ungated:
-  at ten per option the fine-tuned files answered about 0.91 of the requests
-  and were right on 0.966–0.970 of those on banking77 and 0.994–0.995 on
-  CLINC150, where Google's file answered 0.956 and 0.958 and was right on
-  0.927 and 0.959. The rows verify scores are all in scope.
-- With a fine-tuned file, `crossFit` with keep 0.98 answered 0.954 (banking77)
-  and 0.947 (CLINC150) and refused 0.950 of CLINC150's out-of-scope requests,
-  against 0.906 for Google's file at the default; `fromLabelled` fitted on
-  in-scope requests refused 0.099 of them, and `minSimilarity` 0.875 answered
-  0.839 of banking77. Measured at ten per option, out-of-scope on CLINC150
+  at ten per option the fine-tuned files answered 0.9068–0.9094 of the
+  requests on banking77 and 0.9061–0.9082 on CLINC150, and were right on
+  0.9660–0.9702 and 0.9942–0.9948 of those, where Google's file answered
+  0.9558 and 0.9581 and was right on 0.9268 and 0.9594. The rows verify
+  scores are all in scope.
+- With a fine-tuned file, `crossFit` with keep 0.98 answered 0.9541
+  (banking77) and 0.9470 (CLINC150) and refused 0.9500 of CLINC150's
+  out-of-scope requests, against 0.9062 for Google's file at the default;
+  `fromLabelled` fitted on in-scope requests refused 0.0988 of them, and
+  `minSimilarity` 0.875 answered 0.8389 of banking77. Measured at ten per option, out-of-scope on CLINC150
   only; see [MEASUREMENTS.md](MEASUREMENTS.md).
 - Option descriptions, which the app adds to an option's centroid, were not
   used in training and are not measured.
@@ -1128,7 +1129,7 @@ incompatible dependencies and cannot share an interpreter.
 ## Results
 
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
-runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and 0.4.0 – 0.7.0 pin 0.18.0.
+runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and 0.4.0 – 0.7.1 pin 0.18.0.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
 0.17.1 re-measurements beside the originals where there are any, and the same
 again on 0.18.0.
