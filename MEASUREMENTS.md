@@ -2361,7 +2361,15 @@ runs used the banking77 int8 file from *litetune end to end*.
   1 of 1,200 decisions. Scoring each option on an Engine of its own, with no
   rewind, gave six rows more than 5 nats from the CPU's scores. The rewind is
   therefore not the cause. Over the 300 decisions, the GPU took a median of 69.55 ms
-  per decision and the CPU 179.8 ms. Option scoring stays refused on the GPU.
+  per decision and the CPU 179.8 ms.
+- flutter_edge_ai's `createDecider`, on its own build of the runtime, on the
+  same Mac's GPU repeated its scores bit for bit. It ran four times on the same
+  emotion file and 300 rows, and four times each on three other decision
+  bundles (300, 60 and 60 rows). The bad rows come from the path through
+  litert-lm's Python package, which `verify` runs, and not from the GPU. Which
+  difference between the two paths causes them is not established. Option
+  scoring stays refused on the GPU in `verify`, which cannot measure it
+  repeatably through that package.
 - `verify --backend gpu` on the EmbeddingGemma 2 file passed the same gate as on
   the CPU, both on this Mac:
 

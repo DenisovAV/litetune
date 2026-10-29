@@ -582,10 +582,12 @@ def verify_decision(
     if job.backend != "cpu":
         return refuse(
             RUNTIME_CHECK,
-            f"option scoring runs on the CPU backend only; --backend {job.backend} is refused. On "
-            "the GPU the scores are not repeatable: on an Apple M5 Pro with litert-lm 0.18.0 "
-            "each run of 300 decisions gave one to three rows another prompt's scores, at "
-            "different rows each time, where the CPU repeated bit for bit (MEASUREMENTS.md, "
+            f"option scoring runs on the CPU backend only; --backend {job.backend} is refused. "
+            "Through the litert-lm package verify runs, GPU scores are not repeatable: on an Apple "
+            "M5 Pro with litert-lm 0.18.0 from PyPI each run of 300 decisions gave one to three "
+            "rows another prompt's scores, at different rows each time, where the CPU repeated "
+            "bit for bit. flutter_edge_ai's own build of the runtime repeated its GPU scores on "
+            "the same Mac, so this is the package's path, not the GPU's (MEASUREMENTS.md, "
             '"The CPU and the GPU on a Mac")',
         )
     method = METHOD_FRESH_ENGINE if job.engine_per_prompt_reason else METHOD_REWIND
