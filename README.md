@@ -42,7 +42,9 @@ them.
 `tune` and `verify`'s float reference resolve the device once per run, by
 asking the stage environment's own torch, in this order: CUDA if
 `torch.cuda.is_available()`, then Apple's GPU through Metal (`mps`) if
-`torch.backends.mps.is_available()`, then the CPU. When a Mac lands on the CPU
+`torch.backends.mps.is_available()`, then the CPU. A decision's float
+reference is the exception: it runs on CUDA or on the CPU, never on `mps`.
+When a Mac lands on the CPU
 the report carries what torch answered for `is_built()` and `is_available()`
 and names no cause beyond them, since `is_available()` gives none. Every run
 records the operating system, its version — macOS's product version on a Mac,
@@ -639,7 +641,9 @@ What each stage does differently for a decision:
 - **convert** adds `--prefill_lengths=8,128`: scoring re-prefills one token per
   decision, which ran padded to 128 tokens without it.
 - **verify** scores every option on every calibration and held-out row with the
-  float checkpoint, fits a temperature and, for `choice`, the threshold below
+  float checkpoint, sixteen rows of a similar length at a time (the most
+  padded batch is checked row by row first, and falls back to one row at a
+  time if it differs), fits a temperature and, for `choice`, the threshold below
   which an answer abstains, then scores 200 held-out rows, spread through the
   split, through the runtime and compares. It refuses a runtime that scored
   another prompt than the reference, a runtime whose answers agree with the
