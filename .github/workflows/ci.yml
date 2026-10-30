@@ -33,6 +33,31 @@ jobs:
       # check a killed process group -- but nothing reaches the network.
       - run: pytest -q
 
+  # The decision reference batches rows on a real model, which the fakes above
+  # cannot run: its tests skip without an interpreter that has torch. This job
+  # gives them one, with the training environment's pins (`envs.TRAIN`), on a
+  # small random Llama built by the tests themselves. The selection names every
+  # one of those tests, and a skip fails the job.
+  reference-on-a-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: |
+          python -m venv /tmp/train
+          /tmp/train/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          /tmp/train/bin/pip install transformers==5.16.1
+      # `shell: bash` sets pipefail, so a failing pytest is not hidden by tee.
+      - shell: bash
+        env:
+          LITETUNE_TEST_TRAIN_PYTHON: /tmp/train/bin/python
+        run: |
+          pytest -q -rs tests/test_decision_verify.py -k "tiny or batch or batches or alone or positions" | tee /tmp/out.txt
+          ! grep -q "SKIPPED" /tmp/out.txt
+
   # Stage environments are virtualenvs of whatever interpreter litetune runs
   # under, and nothing above runs on macOS or on a uv-managed Python. The
   # CPython 3.11.14 uv 0.10.6 installs on macOS finds libpython by a path

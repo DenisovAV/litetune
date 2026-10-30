@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import subprocess
 from collections.abc import Callable
@@ -25,6 +26,7 @@ from litetune.decision_section import payload_bytes
 from litetune.decision_verify import (
     AGREEMENT_CHECK,
     CALIBRATION_CHECK,
+    PROBE_ROWS,
     PROMPT_CHECK,
     REFERENCE_CHECK,
     ROWS_CHECK,
@@ -2321,11 +2323,26 @@ def test_every_head_the_reference_scores_through_goes_through_the_transform():
     assert "scale, cap = head_transform(model.config)" in REFERENCE_SCRIPT
 
 
+def test_the_twin_rows_are_scored_alone_by_the_reference(split, tmp_path):
+    """The float twin is held to 1e-3 nats against the reference; on its rows the
+    reference scores each row alone with no cache, so batching is not in it."""
+    s = split()
+    job = job_for(s, tmp_path)
+
+    status, _ = run(job, s["record"])
+
+    assert status == "passed"
+    spec = job.train_env.specs[0]
+    assert spec["alone_for"] == spec["ids_for"][:PROBE_ROWS]
+    assert len(spec["alone_for"]) == PROBE_ROWS
+
+
 # -- the reference on a real model, rows in batches ----------------------------------
 #
 # These run the reference script in the training environment, on a small random
 # Llama and a word-level tokenizer built here; without that environment they are
 # skipped. Every row's prompt has a length of its own, so every batch is padded.
+# CI runs them in a job of their own (`LITETUNE_TEST_TRAIN_PYTHON`).
 
 _TINY_MODEL = r"""
 import json, sys
@@ -2361,9 +2378,13 @@ print(json.dumps({"eot": tok.convert_tokens_to_ids("<eot>")}))
 
 def _real_train_python():
     # Read at import, before conftest points LITETUNE_ENV_DIR at a temporary
-    # directory for every test.
+    # directory for every test. CI names an interpreter with torch and
+    # transformers instead, and there a missing one is an error, not a skip.
     from litetune import envs
 
+    named = os.environ.get("LITETUNE_TEST_TRAIN_PYTHON")
+    if named:
+        return named
     return str(envs.TRAIN.python) if envs.TRAIN.ready else None
 
 
@@ -2377,30 +2398,48 @@ def _in_train_env(args):
 
 
 def _words(i):
-    # Longest first, so that only sorting puts rows of a length together: from
-    # row 7 down, three words fewer per row, then one: sorted into batches of
-    # eight, rows 7 to 0 are padded by up to 21 tokens, the others by 7.
+    # Longest first, so that only sorting puts rows of a length together: up
+    # to row 7 three words fewer per row, then one fewer: sorted into batches
+    # of eight, rows 0 to 7 are padded by up to 21 tokens, the others by 7.
     k = 23 - i
     return k + 1 if k < 16 else 17 + 3 * (k - 16)
 
 
-def _reference_on_tiny_model(tmp_path, script, row_batch, n_rows=24, extra=None, ok=True):
-    model = tmp_path / "model"
-    if not model.exists():
-        make = tmp_path / "make.py"
-        make.write_text(_TINY_MODEL, encoding="utf-8")
-        made = _in_train_env([str(make), str(model)])
-        assert made.returncode == 0, made.stderr
-    tag = f"b{row_batch}-{abs(hash((script, json.dumps(extra)))) % 10**8}"
-    spec = tmp_path / f"spec-{tag}.json"
-    out, report = tmp_path / f"out-{tag}.jsonl", tmp_path / f"report-{tag}.json"
+def _shortest_alike(i):
+    # Real data's shape: the eight shortest rows of one length, not padded at
+    # all, the rest as above.
+    return 2 if i >= 16 else _words(i)
+
+
+def _padded_middle(i):
+    # The longest rows, 0 to 7, all of one length; the most padded batch is rows
+    # 8 to 15 (10 to 31 words); the shortest, 16 to 23, are 1 to 8 words.
+    return 40 if i < 8 else 10 + 3 * (i - 8) if i < 16 else i - 15
+
+
+@pytest.fixture(scope="module")
+def tiny(tmp_path_factory):
+    """One small random Llama for the module, and its one-at-a-time scores."""
+    work = tmp_path_factory.mktemp("tiny")
+    make = work / "make.py"
+    make.write_text(_TINY_MODEL, encoding="utf-8")
+    made = _in_train_env([str(make), str(work / "model")])
+    assert made.returncode == 0, made.stderr
+    return {"work": work, "alone": {}}
+
+
+def _run(tiny, script, row_batch, words=_words, extra=None, ok=True):
+    work = tiny["work"]
+    tag = f"b{row_batch}-{abs(hash((script, words.__name__, json.dumps(extra)))) % 10**10}"
+    spec = work / f"spec-{tag}.json"
+    out, report = work / f"out-{tag}.jsonl", work / f"report-{tag}.json"
     spec.write_text(
         json.dumps(
             {
-                "model": str(model),
+                "model": str(work / "model"),
                 "rows": [
-                    {"index": i, "prompt": " ".join(f"w{j}" for j in range(_words(i)))}
-                    for i in range(n_rows)
+                    {"index": i, "prompt": " ".join(f"w{j}" for j in range(words(i)))}
+                    for i in range(24)
                 ],
                 "options": ["joy", "anger", "fear surprise"],
                 "turn_ids": [3],
@@ -2414,7 +2453,7 @@ def _reference_on_tiny_model(tmp_path, script, row_batch, n_rows=24, extra=None,
         ),
         encoding="utf-8",
     )
-    path = tmp_path / f"reference-{tag}.py"
+    path = work / f"reference-{tag}.py"
     path.write_text(script, encoding="utf-8")
     proc = _in_train_env([str(path), str(spec)])
     if not ok:
@@ -2422,6 +2461,16 @@ def _reference_on_tiny_model(tmp_path, script, row_batch, n_rows=24, extra=None,
     assert proc.returncode == 0, proc.stderr
     rows = {r["index"]: r for r in map(json.loads, out.read_text().splitlines())}
     return rows, json.loads(report.read_text())
+
+
+def _alone(tiny, words=_words, extra=None):
+    """The unchanged script, one row at a time: what batching must reproduce."""
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    key = (words.__name__, json.dumps(extra))
+    if key not in tiny["alone"]:
+        tiny["alone"][key] = _run(tiny, REFERENCE_SCRIPT, 1, words, extra)
+    return tiny["alone"][key]
 
 
 def _largest_difference(a, b):
@@ -2434,11 +2483,29 @@ def _largest_difference(a, b):
     )
 
 
-def test_rows_scored_in_batches_match_rows_scored_one_at_a_time(tmp_path):
+def _replaced(old, new):
     from litetune.decision_scripts import REFERENCE_SCRIPT
 
-    alone, alone_report = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 1)
-    batched, report = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 8)
+    assert REFERENCE_SCRIPT.count(old) == 1, old
+    return REFERENCE_SCRIPT.replace(old, new)
+
+
+_VARIANTS = 'VARIANTS = ("cache_position+position_ids", "position_ids", "plain")'
+_SCORE_BATCH = "    def score_batch(prompts_ids, how):\n"
+_SCORE_BATCH_END = "            del lp\n        return res\n"
+_GOOD_POSITIONS = "position_ids=(mask.cumsum(-1) - 1).clamp(min=0)"
+# Positions counted from the first column: wrong on every padded row.
+_DRIFTING = _GOOD_POSITIONS.replace(
+    "(mask.cumsum(-1) - 1).clamp(min=0)", "torch.arange(width, device=device).expand(b, -1)"
+)
+
+
+def test_rows_scored_in_batches_match_rows_scored_one_at_a_time(tiny):
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    extra = {"ids_for": [5, 20], "check_indices": [10]}
+    alone, alone_report = _alone(tiny, extra=extra)
+    batched, report = _run(tiny, REFERENCE_SCRIPT, 8, extra=extra)
 
     assert alone_report["row_batch"] == 1 and report["row_batch"] == 8
     assert report["batches"] == 3
@@ -2446,88 +2513,122 @@ def test_rows_scored_in_batches_match_rows_scored_one_at_a_time(tmp_path):
     assert report["batch_trial"] is None
     assert report["most_padding_checked"] == 21
     assert _largest_difference(alone, batched) < 1e-5
-    # The first batch, the eight shortest rows (16 to 23), checked row by row;
-    # then the first three, and the most padded: row 7, of rows 0 to 7.
+    # The first batch is the most padded, rows 0 to 7, checked row by row; it
+    # holds the first three rows and the longest, row 0. Then row 10, asked for.
     checked = sorted(i for i, r in batched.items() if "check_max_abs_token" in r)
-    assert checked == [0, 1, 2, 7, *range(16, 24)]
+    assert checked == [*range(8), 10]
+    # The prompt ids of the rows asked for, and of no other.
+    assert sorted(i for i, r in batched.items() if "prompt_ids" in r) == [5, 20]
+    for i in (5, 20):
+        assert batched[i]["prompt_ids"] == alone[i]["prompt_ids"]
+        assert len(batched[i]["prompt_ids"]) == batched[i]["prompt_len"] == _words(i) + 4
     # Every option scored, each token of it: "fear surprise" is two words.
     assert [len(f) for f in batched[0]["token_scores"]] == [2, 2, 3]
 
 
-def test_a_first_batch_that_drifts_is_scored_again_one_row_at_a_time(tmp_path):
+def test_the_rows_asked_for_alone_are_recorded_as_scored_with_no_cache(tiny):
     from litetune.decision_scripts import REFERENCE_SCRIPT
 
-    good = '"position_ids": (mask.cumsum(-1) - 1).clamp(min=0),'
-    assert REFERENCE_SCRIPT.count(good) == 1
-    # Positions counted from the first column: wrong on every padded row.
-    drifting = REFERENCE_SCRIPT.replace(
-        good, '"position_ids": torch.arange(width, device=device).expand(b, -1),'
-    )
-    alone, _ = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 1)
-    rows, report = _reference_on_tiny_model(tmp_path, drifting, 8)
+    # With no way of passing the cache every row is scored alone, uncached.
+    uncached, _ = _run(tiny, _replaced(_VARIANTS, "VARIANTS = ()"), 8)
+    batched, report = _run(tiny, REFERENCE_SCRIPT, 8, extra={"alone_for": [20]})
 
-    assert report["row_batch"] == 1
+    assert report["row_batch"] == 8
+    assert batched[20]["token_scores"] == uncached[20]["token_scores"]
+    assert "check_max_abs_token" in batched[20]
+    assert batched[21]["token_scores"] != uncached[21]["token_scores"]
+
+
+def test_a_way_of_passing_the_cache_without_positions_never_batches(tiny):
+    rows, report = _run(tiny, _replaced(_VARIANTS, 'VARIANTS = ("plain",)'), 8)
+
+    assert report["cache_variant"] == "plain"
+    assert report["row_batch"] == 1 and report["batches"] == 24
+    assert report["batch_trial"] is None and report["most_padding_checked"] is None
+    assert report["batch_tokens_held"] is None
+    assert _largest_difference(_alone(tiny)[0], rows) < 1e-5
+
+
+def test_a_first_batch_that_drifts_is_scored_again_one_row_at_a_time(tiny):
+    # The eight shortest rows are of one length, as in real data: a trial on
+    # them would see no padding and pass, and the drift would stop the run.
+    drifting = _replaced(_GOOD_POSITIONS, _DRIFTING)
+    rows, report = _run(tiny, drifting, 8, words=_shortest_alike)
+
+    assert report["row_batch"] == 1 and report["batches"] == 24
     assert report["batch_trial"]["row_batch"] == 8
     assert report["batch_trial"]["max_abs_token"] > 3e-3
-    assert _largest_difference(alone, rows) < 1e-5
+    assert report["most_padding_checked"] is None
+    assert _largest_difference(_alone(tiny, words=_shortest_alike)[0], rows) < 1e-5
 
 
-def test_a_first_batch_that_raises_is_scored_again_one_row_at_a_time(tmp_path):
-    from litetune.decision_scripts import REFERENCE_SCRIPT
-
-    head = "    def score_batch(prompts_ids, how):\n"
-    assert REFERENCE_SCRIPT.count(head) == 1
-    raising = REFERENCE_SCRIPT.replace(head, head + '        raise RuntimeError("no room")\n')
-    alone, _ = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 1)
-    rows, report = _reference_on_tiny_model(tmp_path, raising, 8)
+def test_a_first_batch_that_raises_is_scored_again_one_row_at_a_time(tiny):
+    raising = _replaced(_SCORE_BATCH, _SCORE_BATCH + '        raise RuntimeError("no room")\n')
+    rows, report = _run(tiny, raising, 8)
 
     assert report["row_batch"] == 1
     assert report["batch_trial"] == {"row_batch": 8, "error": "RuntimeError: no room"}
-    assert _largest_difference(alone, rows) < 1e-5
+    assert _largest_difference(_alone(tiny)[0], rows) < 1e-5
 
 
-def test_a_first_batch_with_a_nan_is_scored_again_one_row_at_a_time(tmp_path):
-    from litetune.decision_scripts import REFERENCE_SCRIPT
-
+def test_a_first_batch_with_a_nan_is_scored_again_one_row_at_a_time(tiny):
     # NaN on the options' later tokens only, after finite first ones.
     later = "lp = torch.log_softmax(model(**kw).logits.float(), dim=-1)"
-    assert REFERENCE_SCRIPT.count(later) == 1
-    nan = REFERENCE_SCRIPT.replace(later, later + ' * float("nan")')
-    alone, _ = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 1)
-    rows, report = _reference_on_tiny_model(tmp_path, nan, 8)
+    rows, report = _run(tiny, _replaced(later, later + ' * float("nan")'), 8)
 
     assert report["row_batch"] == 1
-    assert math.isnan(report["batch_trial"]["max_abs_token"])
-    assert _largest_difference(alone, rows) < 1e-5
+    # As a string: JSON has no NaN, and the manifest is read by strict parsers.
+    assert report["batch_trial"] == {"row_batch": 8, "max_abs_token": "nan"}
+    assert _largest_difference(_alone(tiny)[0], rows) < 1e-5
 
 
-def test_a_batch_after_the_first_that_raises_stops_the_run(tmp_path):
-    from litetune.decision_scripts import REFERENCE_SCRIPT
+_ON_THE_SECOND_BATCH = '        globals()["calls"] = globals().get("calls", 0) + 1\n'
 
-    head = "    def score_batch(prompts_ids, how):\n"
-    second = (
-        '        globals()["calls"] = globals().get("calls", 0) + 1\n'
-        '        if globals()["calls"] == 2:\n'
-        '            raise RuntimeError("second batch")\n'
+
+def test_a_batch_after_the_first_that_raises_stops_the_run(tiny):
+    second = _ON_THE_SECOND_BATCH + (
+        '        if globals()["calls"] == 2:\n            raise RuntimeError("second batch")\n'
     )
-    proc = _reference_on_tiny_model(
-        tmp_path, REFERENCE_SCRIPT.replace(head, head + second), 8, ok=False
-    )
+    proc = _run(tiny, _replaced(_SCORE_BATCH, _SCORE_BATCH + second), 8, ok=False)
 
     assert proc.returncode != 0
     assert "RuntimeError: second batch" in proc.stderr
 
 
-def test_a_token_budget_makes_smaller_batches_with_the_same_scores(tmp_path):
+def test_a_checked_row_that_drifts_after_the_first_batch_stops_the_run(tiny):
+    # The second batch scored is rows 16 to 23; row 20 is checked.
+    wrong = _ON_THE_SECOND_BATCH + (
+        '        if globals()["calls"] == 2:\n'
+        "            res = [[[v + 1.0 for v in f] for f in r] for r in res]\n"
+    )
+    script = _replaced(_SCORE_BATCH_END, "            del lp\n" + wrong + "        return res\n")
+    proc = _run(tiny, script, 8, extra={"check_indices": [20]}, ok=False)
+
+    assert proc.returncode != 0
+    assert "row 20: scored in a batch and alone, the scores differ by" in proc.stderr
+
+
+def test_a_token_budget_makes_smaller_batches_with_the_same_scores(tiny):
     from litetune.decision_scripts import REFERENCE_SCRIPT
 
-    alone, _ = _reference_on_tiny_model(tmp_path, REFERENCE_SCRIPT, 1)
-    rows, report = _reference_on_tiny_model(
-        tmp_path, REFERENCE_SCRIPT, 8, extra={"batch_tokens": 100}
-    )
+    rows, report = _run(tiny, REFERENCE_SCRIPT, 8, extra={"batch_tokens": 100})
 
     # Prompts of 5 to 42 tokens: eight fit 100 tokens only among the shortest.
     assert report["row_batch"] == 8 and report["batches"] > 3
     assert 0 < report["batch_tokens_held"] <= 100
     assert report["batch_trial"] is None
-    assert _largest_difference(alone, rows) < 1e-5
+    assert _largest_difference(_alone(tiny)[0], rows) < 1e-5
+
+
+def test_the_first_batch_is_the_most_padded_and_the_longest_row_is_checked(tiny):
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    rows, report = _run(tiny, REFERENCE_SCRIPT, 8, words=_padded_middle)
+
+    assert report["row_batch"] == 8 and report["batches"] == 3
+    assert report["most_padding_checked"] == 21
+    # The first batch, rows 8 to 15, row by row; the first three rows; and the
+    # longest by tokens, row 7, the last of rows of one length once sorted.
+    checked = sorted(i for i, r in rows.items() if "check_max_abs_token" in r)
+    assert checked == [0, 1, 2, 7, *range(8, 16)]
+    assert _largest_difference(_alone(tiny, words=_padded_middle)[0], rows) < 1e-5

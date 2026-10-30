@@ -706,6 +706,9 @@ def verify_decision(
             "turn_text": turn_text,
             "check_indices": [longest],
             "ids_for": [calib_n + i for i in engine_rows],
+            # The rows the float twin is compared on, scored alone with no
+            # cache: the twin's 1e-3 then measures the bundle, not batching.
+            "alone_for": [calib_n + i for i in engine_rows[:PROBE_ROWS]],
             "device": job.device,
         },
         timeout=STARTUP_TIMEOUT_S + REFERENCE_ROW_TIMEOUT_S * len(prompts),
@@ -736,11 +739,17 @@ def verify_decision(
         return refuse(REFERENCE_CHECK, str(exc))
     if len(ks) != len(decision.ids):
         return refuse(REFERENCE_CHECK, "the reference reported no tokenisation of the options")
+    row_batch = ref.report.get("row_batch")
+    batching = f", {row_batch} rows at a time" if isinstance(row_batch, int) else ""
+    fell_back = ref.report.get("batch_trial")
+    if fell_back:
+        # Slower, not wrong: said here so a sixfold slowdown has a reason.
+        batching += f"; batching fell back to one row at a time ({fell_back})"
     state.add(
         Check.passed(
             REFERENCE_CHECK,
             f"{len(prompts)} rows on {ref.report.get('device')}, "
-            f"{ref.report.get('cache_variant')} scoring",
+            f"{ref.report.get('cache_variant')} scoring{batching}",
         ),
         events,
     )

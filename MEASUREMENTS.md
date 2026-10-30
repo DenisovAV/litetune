@@ -1998,60 +1998,63 @@ same scores.
 ### The reference, sixteen rows at a time
 
 `verify`'s float reference used to score a decision one row at a time: one
-forward over the prompt, one over its options. It now scores sixteen rows of a
-similar length together (`decision_scripts`). Its first batch, and the row
-with the most padding, are checked against each row scored alone with no
-cache. It falls back to one row at a time if the first batch differs or
-raises.
+forward over the prompt, one over its options. It now scores up to sixteen
+rows of a similar length together (`decision_scripts`). The most padded batch
+goes first and every row of it is checked against the row scored alone with
+no cache; if it differs or raises, the reference falls back to one row at a
+time. The rows the float twin is compared on are recorded as scored alone.
 
 The emotion decision of "Every family on emotion" was retrained with litetune
 0.7.1 (gemma-3-270m-it, the same splits and flags) and verified on a Mac with an
-M5 Pro, on the CPU. The command was the same before and after: `--calibration
---float-twin --engine-rows 300 --threads 4`, with 4,000 reference rows.
+M5 Pro, on the CPU, with `--calibration --float-twin --engine-rows 300
+--threads 4` and 4,000 reference rows. The Mac was running other work, so CPU
+time is the comparable figure; the wall times are given with the load average.
 
 | | one row at a time | sixteen at a time |
 |---|---|---|
-| reference stage | 1,044 s | 156 s; 402 s at load 25 |
-| whole `verify` | 18 min 27 s | 3 min 23 s; 7 min 29 s at load 25 |
-| CPU time of the whole `verify`, user + system | 2,623 s | 1,051 s; 1,099 s |
+| CPU time of the whole `verify`, user + system | 2,623 s | 1,175 s |
+| reference stage, wall | 1,044 s | 1,257 s at load 30 to 50 (156 s for the first version at load 4) |
+| whole `verify`, wall | 18 min 27 s | 25 min 21 s at load 30 to 50 (3 min 23 s for the first version at load 4) |
 | runtime's top option / answer is the reference's | 0.9967 / 0.9933 | 0.9967 / 0.9933 |
 | temperature, abstain below | 1.2838772, 0.5074026 | 1.2838769, 0.5074019 |
-| mean KL | 3.9384e-04 | 3.9384e-04 |
+| mean KL | 3.9384e-04 | 3.9383e-04 |
+| float twin, largest per-token difference | 5.15e-05 | 4.58e-05 |
 
-The same script, old and new, on the first 100 held-out rows of the same task
-for other families' base checkpoints. The times are milliseconds per row,
-without the rows the script checked against uncached scoring. "Largest
+The same script before and after batching, on the first 100 held-out rows of
+the same task for other families' base checkpoints, measured on the first
+batched version, which chunked a fixed 96 pairs; over these prompts the
+committed version chunks about as many. The times are approximately
+milliseconds per row: the rows the script checked against uncached scoring are
+left out, and a batched row carries a share of its batch's checks. "Largest
 difference" is the largest per-token difference between the old scores and the
 new.
 
 | checkpoint | one at a time | sixteen at a time | largest difference | top option changed |
 |---|---|---|---|---|
-| gemma-3-270m-it, tuned (300 rows) | 184.1 | 46.1 | 4.2e-05 | 0 rows |
+| gemma-3-270m-it, tuned (300 rows) | 184.1 | 59.0 at load 45 | 4.2e-05 | 0 rows |
 | Qwen2.5-0.5B-Instruct | 466.8 | 272.4 | 9.0e-05 | 0 rows |
 | Qwen3-0.6B | 606.4 | 358.7 | 1.4e-04 | 0 rows |
 | MiniCPM5-1B | 716.0 | 368.0 | 7.4e-05 | 0 rows |
 | granite-4.1-3b | 3,582.8 | 818.1 | 4.9e-04 | 0 rows |
-| Qwen3.5-0.8B | one at a time | one at a time | 0 | 0 rows |
+| Qwen3.5-0.8B | 2,969.5 | 4,941.2 | 0 | 0 rows |
 
+- The gemma row is the committed version; the others are the first version.
 - On Qwen3.5-0.8B no way of passing the cache matched uncached scoring on the
-  first row, before or after, so every row is scored in full. With no cache
-  the script does not batch, and the scores were bit-identical.
-- The second figure in each batched cell is the version committed, which
-  also caps a batch at 8,192 tokens of cache and checks the most padded row:
-  run when the Mac's load average was 25, against 4 for the first. Its fit was
-  the first version's to every digit printed.
-- The table above was measured on the first version, which chunked 96 pairs
-  whatever the prompt's length; over these prompts both versions chunk about
-  the same number. On the committed version the 300 gemma rows were again
-  within 4.2e-05 nats of the old scores, at 48.8 ms a row at load 25.
-- No first batch fell back to one row at a time, and the largest difference a
-  check found was 1.99e-04 nats against `check_tol` 3e-03.
-- The Mac was running other work throughout, with load averages from 4 to 62.
-  Each pair of timings is one run, and the 300-row gemma pair was repeated
-  once, alternating: 37.6 s and 139.4 s one at a time against 20.4 s and 21.0 s
-  batched.
-- Not measured: FunctionGemma and gemma-4-E2B, whose checkpoints are gated;
-  CUDA; a batch on MPS, which the reference does not use.
+  first row, so it is scored one row at a time, uncached, before and after,
+  and the scores were bit-identical. Its two times are the same code path
+  under different load.
+- No first batch fell back to one row at a time.
+- On small random Gemma 3 (a sliding window shorter than the prompts), Granite
+  and Qwen3 models, batched scores were within 4e-06 of one row at a time.
+- gemma-4-E2B was not run here. In its verify for "Every family on emotion"
+  (on CUDA) every way of passing the cache missed uncached scoring by 34.8
+  nats, because its forward soft-caps the logits and its bundle does not, so
+  it was scored with no cache. The script does not batch without a cache, so
+  by the code it scores one row at a time as before; that is not measured.
+- On MPS, an experiment script (not wired in) scored the 300 gemma rows at
+  29.5 ms a row in batches of 16 and 14.7 ms in batches of 128, within
+  8.3e-05 of the CPU; the reference runs on CUDA or the CPU.
+- Not measured: FunctionGemma and gemma-4-E2B, whose checkpoints are gated, and CUDA.
 
 ### Limitations carried by the decision numbers
 
