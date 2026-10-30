@@ -34,8 +34,8 @@ recorded as scored alone with no cache, whatever the batch gave. MEASUREMENTS.md
 has what batching changed in time and in the scores.
 
 **The runtime** (`ENGINE_SCRIPT`, `envs.RUNTIME`) scores through LiteRT-LM's
-session API on the CPU, as the flutter_edge_ai design of 2026-10-16 has its
-decider do. It renders with
+session API on the CPU, or on macOS the GPU, as the flutter_edge_ai design of
+2026-10-16 has its decider do. It renders with
 `Conversation.render_message_to_string`, prefills the prompt, saves a
 checkpoint, and per option scores and rewinds. LiteRT-LM 0.18.0 scores right
 after a prefill without the prompt's second-to-last token (#3561): mode `once`
@@ -568,11 +568,17 @@ def main():
     on_gpu = spec.get("backend", "cpu") == "gpu"
     report["backend"] = "gpu" if on_gpu else "cpu"
     if on_gpu:
-        # As the text path asks for the GPU: fp32 activations (export.GPU_ACTIVATION).
-        kw = dict(engine_kwargs({"backend": "gpu", "activation_data_type": "fp32"}))
-        kw["cache_dir"] = ":nocache"
+        # As the text path asks for the GPU: fp32 activations (export.GPU_ACTIVATION),
+        # and what the bundle alone declares, which an app without the override gets.
+        kw = engine_kwargs({"backend": "gpu", "activation_data_type": "fp32"})
+        try:
+            report["bundle_activation"] = bundle_activation(spec["model"])
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not end a run
+            report["bundle_activation"] = None
+            report["bundle_activation_error"] = f"{type(exc).__name__}: {exc}"
     else:
-        kw = {"backend": L.Backend.CPU(thread_count=int(spec["threads"])), "cache_dir": ":nocache"}
+        kw = {"backend": L.Backend.CPU(thread_count=int(spec["threads"]))}
+    kw["cache_dir"] = ":nocache"
 
     def open_engine():
         report["engine_loads"] += 1

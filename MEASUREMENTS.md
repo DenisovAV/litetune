@@ -2328,8 +2328,10 @@ section above by up to 0.002.
 
 Each path was run through the script `verify` runs for it, unchanged except for
 the backend, on an Apple M5 Pro with litert-lm 0.18.0 from PyPI: once or twice on
-the CPU and three times on the GPU, four for option scoring. For each GPU run the kernel's GPU time for
-the process grew during the run. The text and option-scoring runs used the
+the CPU and three times on the GPU, four for option scoring. The kernel showed
+the GPU working for every GPU run it was read on: a reading at the engine's end
+in the runs of the table, and in the verify runs below a reading before and
+after that grew. The text and option-scoring runs used the
 emotion bundle from *The three passing bundles on a phone* and its 300 rows.
 The tool runs used `google/functiongemma-270m-it` converted by litetune 0.7.1
 (`dynamic_wi8_afp32`) and 20 single-turn requests, each with its own
@@ -2342,7 +2344,7 @@ runs used the banking77 int8 file from *litetune end to end*.
 | text, longer answers (20, median 225 characters) | the same text on 3 | identical |
 | the same 20 through litert-lm's own CLI | the same text on 3 | identical |
 | tools (20) | the same reply on 15 | identical |
-| option scoring (300) | the same top option on 299 or 300 | 1 to 3 rows per run with another prompt's scores, up to 13.8 nats away |
+| option scoring (300) | the same top option on 299 or 300 | 1 to 3 rows per run with wrong scores, up to 13.8 nats away |
 | EmbeddingGemma 2 vectors (300) | cosine median 0.990460, minimum 0.975487 | identical |
 
 - On every backend, the CLI and `verify`'s text script gave the same text as
@@ -2365,8 +2367,8 @@ runs used the banking77 int8 file from *litetune end to end*.
 - flutter_edge_ai's `createDecider`, on its own build of the runtime, on the
   same Mac's GPU repeated its scores bit for bit. It ran four times on the same
   emotion file and 300 rows, and four times each on three other decision
-  bundles (300, 60 and 60 rows). The bad rows come from the path through
-  litert-lm's Python package, which `verify` runs, and not from the GPU.
+  bundles (300, 60 and 60 rows). So the bad rows are not the GPU's whatever runs
+  on it; the next bullet finds them with one accelerator.
 - The package links LiteRT's GPU accelerator statically, and on macOS it is the
   WebGPU one, which loading `libLiteRtMetalAccelerator.dylib` from disk does not
   replace (litert-lm 0.18.0 and 0.19.0). flutter_edge_ai's own build of the
@@ -2376,12 +2378,20 @@ runs used the banking77 int8 file from *litetune end to end*.
   accelerator 298 rows were identical in all four runs; with the Metal
   accelerator all 300 were. litert-lm 0.18.1 and 0.19.0, no fp32 override and
   another `cache_dir` left the bad rows in place.
-- `verify --backend gpu` therefore scores a decision bundle on macOS twice. The
-  rows the two runs differ on are scored in a third run, three times each, and
-  `verify` keeps the scores two of those runs or copies agree on: a row's right
-  scores repeat bit for bit, and its wrong ones differ every time. On an emotion
-  checkpoint trained and converted with F1's flags and splits (litetune 0.7.1),
-  `verify` on this Mac:
+- `verify --backend gpu` therefore scores a decision bundle on macOS twice, the
+  second time in reverse order. The rows the two runs differ on are scored in a
+  third run, five times each in a shuffled order, and `verify` keeps the scores
+  most of a row's seven readings gave, when no other did as often; a tie, or no
+  two alike, fails the harness. In every run measured a row's right scores
+  repeated bit for bit and its wrong ones were never the same twice; whether two
+  wrong readings can coincide is not measured. A family that scores each option
+  on an Engine of its own (Qwen 3.5) is refused on the GPU: its GPU work is on
+  Engines that close, the kernel's reading does not show it, and the rule was
+  measured with one Engine that rewinds. The scores are the WebGPU
+  accelerator's; flutter_edge_ai's Metal scores were not compared with them, and
+  the float twin is checked on the CPU. On an emotion checkpoint trained and
+  converted with F1's flags and splits (litetune 0.7.1), `verify` on this Mac,
+  with three copies in the third run then:
 
   | | CPU | GPU |
   |---|---|---|
@@ -2391,11 +2401,13 @@ runs used the banking77 int8 file from *litetune end to end*.
   | mean KL, reference to runtime | 3.94e-04 | 1.38e-04 |
   | rows the two GPU runs differed on | | 0 |
 
-  An earlier GPU run of the same files differed on 9 of the 300 rows between its
-  first two runs, and a third run of one row each did not settle row 253. That
-  row, scored 36 times in three processes, gave the same scores 33 times and
-  another prompt's once in each process. This is why the third run scores each
-  row three times.
+  An earlier GPU run of the same files, with tests running beside it, differed
+  on 9 of the 300 rows between its first two runs, and a third run of one row
+  each did not settle row 253. That row, scored 36 times in three processes, gave
+  the same scores 33 times and other scores once in each process: a process got
+  a wrong reading however few rows it scored. So the third run scores each row
+  several times, five now, which spreads a process's few wrong readings over
+  more of them.
 - `verify --backend gpu` on the EmbeddingGemma 2 file passed the same gate as on
   the CPU, both on this Mac:
 
@@ -2409,6 +2421,7 @@ runs used the banking77 int8 file from *litetune end to end*.
   | verify, wall time | 12 min 33 s | 6 min 21 s |
 
   The Python EmbeddingEngine takes no activation data type, so the GPU computes
-  in the precision litert-lm picks.
+  in the precision litert-lm picks: the file's own `prefer_activation_type` if
+  it declares one, F16 otherwise.
 - One Mac and one runtime version. The phone in *The three passing bundles on a
-  phone* repeated its GPU option scores bit for bit.
+  phone* gave the same GPU option scores on a repeat of the emotion session.

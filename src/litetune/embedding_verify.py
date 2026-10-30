@@ -180,21 +180,23 @@ NO_BASE = (
     "it on these rows"
 )
 GPU_MEASURED = (
-    "measured on the GPU backend of LiteRT-LM's EmbeddingEngine, from the litert-lm package on "
+    "{how} the GPU backend of LiteRT-LM's EmbeddingEngine, from the litert-lm package on "
     "PyPI on this Mac's GPU, one file at a time -- not the "
     "application's own build of the runtime on a device's GPU; the CPU and the NPU are not "
     "measured in this run. The Python EmbeddingEngine takes no activation data type: litert-lm "
     "0.18.0's embedding_engine.py deletes the keyword arguments it is given, so the GPU computes "
-    "in the precision the runtime picks, which can differ from the application's"
+    "in the precision the runtime picks -- the file's own prefer_activation_type when it declares "
+    "one, F16 otherwise -- which can differ from the application's"
 )
-GPU_ASKED_FOR = (
-    "the GPU is recorded as asked for, not as observed: the kernel's GPU time for the engine "
-    "process was not read or did not settle the question here"
-)
+GPU_SEEN = "measured on"
+# Not observed: the kernel's GPU time for the engine process was not read or did not
+# settle the question.
+GPU_ASKED_FOR = "asked of, and not observed on,"
 GPU_NOT_MEASURED_HERE = (
     "--backend gpu on {platform}: LiteRT-LM's GPU path for an EmbeddingGemma 2 file is measured "
-    'on macOS only (MEASUREMENTS.md, "The CPU and the GPU on a Mac"); on Linux and Windows it is '
-    "not measured, so it is refused here"
+    'on macOS only (MEASUREMENTS.md, "The CPU and the GPU on a Mac"): on Linux the 0.18.0 '
+    "package's GPU engine did not start in the one container tried, and Windows is not "
+    "measured, so it is refused here"
 )
 SIDE_BY_SIDE = (
     "the candidate and Google's file were embedded at the same time, each on its own {threads} "
@@ -356,11 +358,11 @@ ENGINE_SCRIPT = (
     r'''
 """Embed texts with a .litertlm through LiteRT-LM's EmbeddingEngine on spec["backend"].
 
-Reads JSON {model, prefix, texts, threads, cache_dir, max_input_length, out,
-report} from argv[1]. The engine's XNNPack weight cache goes to
-spec["cache_dir"], not beside the model. The settings flutter_edge_ai's
-litert_lm_embedding_pass.dart pins are set here as the 0.18.0 wrapper names
-them: max_input_length, normalize, insert_special_tokens; an input past
+Reads JSON {model, prefix, texts, backend, threads, cache_dir, max_input_length,
+out, report} from argv[1]. The engine's cache -- XNNPack's weights on the CPU, the
+GPU's programs on the GPU -- goes to spec["cache_dir"], not beside the model.
+The settings flutter_edge_ai's litert_lm_embedding_pass.dart pins are set here
+as the 0.18.0 wrapper names them: max_input_length, normalize, insert_special_tokens; an input past
 max_input_length is an error (InputOverflowStrategy.ERROR) where the app
 truncates and refuses the truncated response, a getter the PyPI wrapper does
 not have. Writes the L2-normalised vectors, float32, one row per text, to
@@ -913,7 +915,7 @@ def run_engines(
 ) -> tuple[dict[str, ScriptRun], str | None]:
     """Embed each (name, file) with `ENGINE_SCRIPT` on `backend` through one `ENGINES_SCRIPT` child.
 
-    Each side's engine gets its own XNNPack cache directory, `work/cache-<name>`,
+    Each side's engine gets its own cache directory, `work/cache-<name>`,
     created here, so no cache is written beside the file and no two runs share
     one. Only a failure of a side in `STOP_ON` stops the others.
 
@@ -1546,6 +1548,12 @@ def verify_embedding(
                 "draws": [d.as_dict() for d in gain_k],
             },
             "centroid": gain_all.as_dict(),
+            # Google's file on the same backend; whether the kernel showed its GPU
+            # work, as for the candidate.
+            "base_backend": job.backend,
+            "base_backend_observed": gpu_observed(
+                job.backend, (harness.get("base") or {}).get("device")
+            ),
         }
 
     # -- the gate --------------------------------------------------------------------
@@ -1556,9 +1564,8 @@ def verify_embedding(
         | {"threshold": threshold, "mean": round(mean_value(k_costs), 6)}
     )
     if job.backend == "gpu":
-        state.limitation(GPU_MEASURED)
-        if not gpu_observed("gpu", candidate_report.get("device")):
-            state.limitation(GPU_ASKED_FOR)
+        seen = gpu_observed("gpu", candidate_report.get("device"))
+        state.limitation(GPU_MEASURED.format(how=GPU_SEEN if seen else GPU_ASKED_FOR))
     else:
         state.limitation(CPU_ONLY.format(threads=job.threads))
     if parallel:

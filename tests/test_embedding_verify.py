@@ -946,6 +946,8 @@ class FakeEmbedEnvs:
     hub: Path | None = None
     # What an engine side on the GPU reports from the kernel; the default shows GPU work.
     gpu_device: dict[str, Any] | None = None
+    # The same for one side only, by its name.
+    gpu_device_for: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def vectors(self, texts: list[str], kind: str) -> Any:
         if kind == "random":
@@ -974,7 +976,8 @@ class FakeEmbedEnvs:
         else:
             self.caches[name] = (spec["cache_dir"], Path(spec["cache_dir"]).is_dir())
             if spec.get("backend") == "gpu":
-                report["device"] = self.gpu_device if self.gpu_device is not None else GPU_WORKED
+                default = self.gpu_device if self.gpu_device is not None else GPU_WORKED
+                report["device"] = self.gpu_device_for.get(name, default)
             report |= {
                 "runtime": {"litert-lm": "0.18.0"},
                 "cpu": {"model": "fake", "count": 4},
@@ -1801,6 +1804,9 @@ def test_the_gpu_backend_runs_each_engine_file_on_the_gpu_one_at_a_time(fake, tm
     assert engine["backend"] == "gpu"
     assert engine["backend_observed"] is True
     assert engine["threads"] is None
+    assert engine["device"] == GPU_WORKED
+    gain = result.manifest["quality"]["gain_over_base"]
+    assert gain["base_backend"] == "gpu" and gain["base_backend_observed"] is True
     limitations = " ".join(result.manifest["limitations"])
     assert "GPU backend of LiteRT-LM's EmbeddingEngine" in limitations
     assert "deletes the keyword arguments" in limitations
@@ -1854,13 +1860,26 @@ def test_a_gpu_run_the_kernel_shows_idle_is_refused(fake, tmp_path, on_macos):
     assert "did no GPU work" in json.dumps(result.manifest["checks"])
 
 
+def test_google_s_file_idle_on_the_gpu_is_not_compared(fake, tmp_path, on_macos):
+    """Google's file is held to the kernel's reading as the candidate is: its
+    vectors feed the gain over it."""
+    fake.gpu_device_for = {"base": GPU_IDLE}
+    result = _verify(_setup(tmp_path), backend="gpu", with_base=True)
+
+    assert "did no GPU work" in json.dumps(result.manifest["checks"])
+    assert "gain_over_base" not in result.manifest.get("quality", {})
+
+
 def test_a_gpu_run_nobody_could_observe_is_recorded_as_asked_for(fake, tmp_path, on_macos):
     fake.gpu_device = NOT_LOOKED
     result = _verify(_setup(tmp_path), backend="gpu")
 
     assert result.status is Status.PASSED
     assert result.manifest["measurements"]["candidate"]["engine"]["backend_observed"] is False
-    assert "recorded as asked for" in " ".join(result.manifest["limitations"])
+    limitations = " ".join(result.manifest["limitations"])
+    assert "asked of, and not observed on, the GPU backend" in limitations
+    # Not both: a manifest that says the GPU was measured and was not observed.
+    assert "measured on the GPU backend" not in limitations
 
 
 def test_a_backend_other_than_cpu_or_gpu_is_refused(fake, tmp_path):

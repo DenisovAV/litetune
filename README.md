@@ -694,8 +694,12 @@ What has and has not been measured:
   ([MEASUREMENTS.md](MEASUREMENTS.md#decisions-a-model-that-chooses-among-options)).
 - It needs training on the task: the untuned model, and a model trained on
   other tasks, chose far worse.
-- `verify` measures scoring on the CPU backend, and against the float
-  reference on LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561
+- `verify` measures scoring on the CPU backend, and on macOS with `--backend
+  gpu` on the GPU: there LiteRT-LM's package gives a few rows wrong scores, at
+  different rows in each run, so every row is scored twice, the rows that differ five more times,
+  and the scores most of the readings gave are kept (a family that scores each
+  option on an Engine of its own is refused on the GPU). It is measured against
+  the float reference on LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561
   fix only. On another runtime, `verify` needs `--float-twin` to say more than
   "could not check". One phone, a Galaxy S24, scored three bundles on its CPU
   and GPU with a port of verify's runtime scoring: SST-5's agreed with the
@@ -1366,9 +1370,11 @@ withdrawn after re-measurement.
   activation override gets the F16 default. litetune cannot drive a phone GPU
   from a laptop, so a device run is a separate job.
 - **`verify --backend gpu` measures on this machine's GPU, with fp32 passed
-  by litetune.** The activation type is passed on every GPU run, so a bundle
+  by litetune.** The activation type is passed on every GPU run of a text,
+  tool or decision bundle (an EmbeddingGemma 2 file's engine takes none), so a
+  bundle
   without the key is measured rather than flooding — upstream calls the
-  option experimental. On an M4 Pro's Metal with litert-lm 0.16.1, the
+  option experimental. On an M4 Pro's GPU with litert-lm 0.16.1, the
   FunctionGemma bundles above, 40 held-out rows through the tool path with
   grammar off: a bundle without the key answered identically to one with it
   on all 40 rows, and the same bundle with the override withheld flooded
@@ -1382,7 +1388,9 @@ withdrawn after re-measurement.
   client's GPU time grew while it generated — measured on the same M4 Pro,
   where a CPU engine owned none. A run the kernel shows doing no GPU work is
   said, in the limitations, not to have used the GPU. Off macOS nothing is
-  looked at yet, and the manifest records the GPU as asked for. On a host
+  looked at yet, and on the text and tool paths the manifest records the GPU as
+  asked for; a decision bundle and an EmbeddingGemma 2 file are refused on the
+  GPU off macOS. On a host
   without a usable GPU, a GPU engine has been measured to produce nothing, so
   a GPU split on the text path first runs one prompt within one prompt's
   budget and stops there if it gets no answer. The tool path has no such
