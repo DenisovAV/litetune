@@ -3,6 +3,10 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.7.2 — 2026-10-30
+- `verify --backend gpu` runs on macOS for an EmbeddingGemma 2 file and for a decision bundle, whose option scoring is repeated until the scores settle; refused elsewhere (#98).
+- `verify` scores a decision's float reference sixteen rows at a time, the most padded batch first, checked row by row, falling back to one row at a time if it differs (#97).
+
 ## 0.7.1 — 2026-10-29
 - `tune` computes the logits and the loss only where a token is supervised, and trains a model of 400 million parameters or more with gradient checkpointing, so gemma-4-E2B-it fits a 40 GB GPU on long rows; no flag, the loss is unchanged (#95).
 - `tune` and `verify` comments and reports no longer say the training attention reaches evaluation or export; a CUDA out-of-memory ending names the run's micro-batch and length (#95).
