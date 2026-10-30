@@ -2323,3 +2323,105 @@ section above by up to 0.002.
   a threshold set for Google's file does not carry over.
 - Out-of-scope requests were measured on CLINC150 only, at k=10 only, without
   option descriptions.
+
+## The CPU and the GPU on a Mac
+
+Each path was run through the script `verify` runs for it, unchanged except for
+the backend, on an Apple M5 Pro with litert-lm 0.18.0 from PyPI: once or twice on
+the CPU and three times on the GPU, four for option scoring. The kernel showed
+the GPU working for every GPU run it was read on: a reading at the engine's end
+in the runs of the table, and in the verify runs below a reading before and
+after that grew. The text and option-scoring runs used the
+emotion bundle from *The three passing bundles on a phone* and its 300 rows.
+The tool runs used `google/functiongemma-270m-it` converted by litetune 0.7.1
+(`dynamic_wi8_afp32`) and 20 single-turn requests, each with its own
+declarations: constrained decoding off, 128 tokens at most. The EmbeddingGemma 2
+runs used the banking77 int8 file from *litetune end to end*.
+
+| path | the CPU against the GPU | the GPU, run against run |
+|---|---|---|
+| text, one-word answers (300) | the same text on 300 | identical |
+| text, longer answers (20, median 225 characters) | the same text on 3 | identical |
+| the same 20 through litert-lm's own CLI | the same text on 3 | identical |
+| tools (20) | the same reply on 15 | identical |
+| option scoring (300) | the same top option on 299 or 300 | 1 to 3 rows per run with wrong scores, up to 13.8 nats away |
+| EmbeddingGemma 2 vectors (300) | cosine median 0.990460, minimum 0.975487 | identical |
+
+- On every backend, the CLI and `verify`'s text script gave the same text as
+  each other on all 20 longer answers. The difference between the CPU and the
+  GPU is litert-lm's, not litetune's. The longer GPU answers usually part from
+  the CPU's within the first sentence and then read as different text.
+- On the five tool requests where the CPU and the GPU differed, the GPU:
+  - dropped a "." from an e-mail address and a "," from a place;
+  - added a word to a message body;
+  - lengthened a map query;
+  - on one request, called the tool where the CPU asked for the date.
+
+  Where both called a tool, it was the same function.
+- The CPU repeated its option scores bit for bit; the GPU did not. Its bad rows
+  fell at different places in each of four runs, and the top option changed on
+  1 of 1,200 decisions. Scoring each option on an Engine of its own, with no
+  rewind, gave six rows more than 5 nats from the CPU's scores. The rewind is
+  therefore not the cause. Over the 300 decisions, the GPU took a median of 69.55 ms
+  per decision and the CPU 179.8 ms.
+- flutter_edge_ai's `createDecider`, on its own build of the runtime, on the
+  same Mac's GPU repeated its scores bit for bit. It ran four times on the same
+  emotion file and 300 rows, and four times each on three other decision
+  bundles (300, 60 and 60 rows). So the bad rows are not the GPU's whatever runs
+  on it; the next bullet finds them with one accelerator.
+- The package links LiteRT's GPU accelerator statically, and on macOS it is the
+  WebGPU one, which loading `libLiteRtMetalAccelerator.dylib` from disk does not
+  replace (litert-lm 0.18.0 and 0.19.0). flutter_edge_ai's own build of the
+  runtime, a v0.18.0 libLiteRtLm that loads its accelerator from a file, ran
+  the same option-scoring script, four runs of the same 300 rows with each
+  accelerator from LiteRT-LM's v0.18.0 `prebuilt/macos_arm64`. With the WebGPU
+  accelerator 298 rows were identical in all four runs; with the Metal
+  accelerator all 300 were. litert-lm 0.18.1 and 0.19.0, no fp32 override and
+  another `cache_dir` left the bad rows in place.
+- `verify --backend gpu` therefore scores a decision bundle on macOS twice, the
+  second time in reverse order. The rows the two runs differ on are scored in a
+  third run, five times each in a shuffled order, and `verify` keeps the scores
+  most of a row's seven readings gave, when no other did as often; a tie, or no
+  two alike, fails the harness. In every run measured a row's right scores
+  repeated bit for bit and its wrong ones were never the same twice; whether two
+  wrong readings can coincide is not measured. A family that scores each option
+  on an Engine of its own (Qwen 3.5) is refused on the GPU: its GPU work is on
+  Engines that close, the kernel's reading does not show it, and the rule was
+  measured with one Engine that rewinds. The scores are the WebGPU
+  accelerator's; flutter_edge_ai's Metal scores were not compared with them, and
+  the float twin is checked on the CPU. On an emotion checkpoint trained and
+  converted with F1's flags and splits (litetune 0.7.1), `verify` on this Mac,
+  with three copies in the third run then:
+
+  | | CPU | GPU |
+  |---|---|---|
+  | status | passed | passed |
+  | top option equal to the reference's (300 rows) | 0.9967 | 1.0000 |
+  | answer equal to the reference's, abstentions included | 0.9933 | 0.9900 |
+  | mean KL, reference to runtime | 3.94e-04 | 1.38e-04 |
+  | rows the two GPU runs differed on | | 0 |
+
+  An earlier GPU run of the same files, with tests running beside it, differed
+  on 9 of the 300 rows between its first two runs, and a third run of one row
+  each did not settle row 253. That row, scored 36 times in three processes, gave
+  the same scores 33 times and other scores once in each process: a process got
+  a wrong reading however few rows it scored. So the third run scores each row
+  several times, five now, which spreads a process's few wrong readings over
+  more of them.
+- `verify --backend gpu` on the EmbeddingGemma 2 file passed the same gate as on
+  the CPU, both on this Mac:
+
+  | | CPU | GPU |
+  |---|---|---|
+  | candidate, 10-shot | 0.9317 | 0.9311 |
+  | reference | 0.9312 | 0.9312 |
+  | per-draw conversion cost | -0.0011 to +0.0004 | -0.0011 to +0.0023 |
+  | cosine to the reference, mean / minimum | 0.99928 / 0.98909 | 0.9969 / 0.944174 |
+  | median per text | 43.43 ms | 11.71 ms |
+  | verify, wall time | 12 min 33 s | 6 min 21 s |
+
+  The Python EmbeddingEngine takes no activation data type, so the GPU computes
+  in the precision litert-lm picks: the file's own `prefer_activation_type` if
+  it declares one, F16 otherwise.
+- One Mac and one runtime version. The phone in *The three passing bundles on a
+  phone* gave the same GPU option scores on a repeat of the emotion session.

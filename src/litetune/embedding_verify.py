@@ -60,6 +60,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -87,7 +88,7 @@ from litetune.embedding_tune import (
     LabelledText,
     states_of,
 )
-from litetune.evaluate import RUNTIME_ENGINE_SOURCE
+from litetune.evaluate import RUNTIME_ENGINE_SOURCE, gpu_observed, gpu_unused
 from litetune.events import EventStream
 from litetune.metrics import Difference, paired_difference
 from litetune.prepare import PrepareError, read_rows
@@ -177,6 +178,25 @@ NOT_TIED = "the file is not tied to the reference checkpoint: {reason}"
 NO_BASE = (
     "the gain over Google's file was not measured; pass --base-litertlm or --with-base to measure "
     "it on these rows"
+)
+GPU_MEASURED = (
+    "{how} the GPU backend of LiteRT-LM's EmbeddingEngine, from the litert-lm package on "
+    "PyPI on this Mac's GPU, one file at a time -- not the "
+    "application's own build of the runtime on a device's GPU; the CPU and the NPU are not "
+    "measured in this run. The Python EmbeddingEngine takes no activation data type: litert-lm "
+    "0.18.0's embedding_engine.py deletes the keyword arguments it is given, so the GPU computes "
+    "in the precision the runtime picks -- the file's own prefer_activation_type when it declares "
+    "one, F16 otherwise -- which can differ from the application's"
+)
+GPU_SEEN = "measured on"
+# Not observed: the kernel's GPU time for the engine process was not read or did not
+# settle the question.
+GPU_ASKED_FOR = "asked of, and not observed on,"
+GPU_NOT_MEASURED_HERE = (
+    "--backend gpu on {platform}: LiteRT-LM's GPU path for an EmbeddingGemma 2 file is measured "
+    'on macOS only (MEASUREMENTS.md, "The CPU and the GPU on a Mac"): on Linux the 0.18.0 '
+    "package's GPU engine did not start in the one container tried, and Windows is not "
+    "measured, so it is refused here"
 )
 SIDE_BY_SIDE = (
     "the candidate and Google's file were embedded at the same time, each on its own {threads} "
@@ -336,13 +356,13 @@ if __name__ == "__main__":
 
 ENGINE_SCRIPT = (
     r'''
-"""Embed texts with a .litertlm through LiteRT-LM's EmbeddingEngine on the CPU backend.
+"""Embed texts with a .litertlm through LiteRT-LM's EmbeddingEngine on spec["backend"].
 
-Reads JSON {model, prefix, texts, threads, cache_dir, max_input_length, out,
-report} from argv[1]. The engine's XNNPack weight cache goes to
-spec["cache_dir"], not beside the model. The settings flutter_edge_ai's
-litert_lm_embedding_pass.dart pins are set here as the 0.18.0 wrapper names
-them: max_input_length, normalize, insert_special_tokens; an input past
+Reads JSON {model, prefix, texts, backend, threads, cache_dir, max_input_length,
+out, report} from argv[1]. The engine's cache -- XNNPack's weights on the CPU, the
+GPU's programs on the GPU -- goes to spec["cache_dir"], not beside the model.
+The settings flutter_edge_ai's litert_lm_embedding_pass.dart pins are set here
+as the 0.18.0 wrapper names them: max_input_length, normalize, insert_special_tokens; an input past
 max_input_length is an error (InputOverflowStrategy.ERROR) where the app
 truncates and refuses the truncated response, a getter the PyPI wrapper does
 not have. Writes the L2-normalised vectors, float32, one row per text, to
@@ -389,13 +409,21 @@ def main():
     }
     started = time.time()
     out, times = [], []
-    backend = litert_lm.Backend.CPU(thread_count=spec["threads"])
+    on_gpu = spec.get("backend", "cpu") == "gpu"
+    backend = backend_for("gpu") if on_gpu else litert_lm.Backend.CPU(thread_count=spec["threads"])
+    device = {}
     with litert_lm.EmbeddingEngine(
         spec["model"],
         backend=backend,
         cache_dir=spec["cache_dir"],
         max_input_length=spec["max_input_length"],
     ) as engine:
+        # On the GPU, the kernel's GPU time for this process once the engine
+        # exists and again after the last text, with the engine still open: the
+        # reading evaluate.gpu_observed takes as GPU work, on macOS. Not asked on
+        # the CPU, where it would only cost the probe's time.
+        if on_gpu:
+            device["at_engine"] = device_report()
         options = litert_lm.EmbeddingOptions(
             normalize=True,
             insert_special_tokens=True,
@@ -413,6 +441,8 @@ def main():
                 return REFUSED_EXIT
             out.append(list(answer.embedding))
             times.append(time.perf_counter() - t1)
+        if on_gpu:
+            device["after_generation"] = device_report()
     raw = np.array(out, dtype=np.float64)
     bad = unusable_rows(raw)
     if len(bad):
@@ -433,8 +463,9 @@ def main():
         "dim": int(v.shape[1]),
         "seconds": round(time.time() - started, 1),
         "ms_median": round(1000 * statistics.median(times), 2) if times else None,
-        "backend": "cpu",
-        "threads": spec["threads"],
+        "backend": "gpu" if on_gpu else "cpu",
+        "threads": None if on_gpu else spec["threads"],
+        "device": device,
         "settings": settings,
         "runtime": runtime,
         "cpu": cpu_report(),
@@ -880,10 +911,11 @@ def run_engines(
     work: Path,
     parallel: bool,
     timeout: int,
+    backend: str = "cpu",
 ) -> tuple[dict[str, ScriptRun], str | None]:
-    """Embed each (name, file) with `ENGINE_SCRIPT` through one `ENGINES_SCRIPT` child.
+    """Embed each (name, file) with `ENGINE_SCRIPT` on `backend` through one `ENGINES_SCRIPT` child.
 
-    Each side's engine gets its own XNNPack cache directory, `work/cache-<name>`,
+    Each side's engine gets its own cache directory, `work/cache-<name>`,
     created here, so no cache is written beside the file and no two runs share
     one. Only a failure of a side in `STOP_ON` stops the others.
 
@@ -901,6 +933,7 @@ def run_engines(
             json.dumps(
                 {
                     **common,
+                    "backend": backend,
                     "model": str(model),
                     "cache_dir": str(cache),
                     "max_input_length": MAX_INPUT_TOKENS,
@@ -1177,11 +1210,13 @@ def verify_embedding(
             "--limit does not apply to an embedding checkpoint: every train and held-out row is "
             "embedded, because the decider is fitted on the training rows",
         )
-    if job.backend != "cpu":
+    if job.backend not in ("cpu", "gpu"):
         return refuse(
             CANDIDATE_CHECK,
-            f"--backend {job.backend}: the embedding path is measured on the CPU backend only",
+            f"--backend {job.backend}: the embedding path runs on LiteRT-LM's CPU or GPU backend",
         )
+    if job.backend == "gpu" and sys.platform != "darwin":
+        return refuse(CANDIDATE_CHECK, GPU_NOT_MEASURED_HERE.format(platform=sys.platform))
     if job.not_applicable:
         return refuse(
             RECORD_CHECK,
@@ -1342,7 +1377,10 @@ def verify_embedding(
         engine_sides: list[tuple[str, Path]] = [("candidate", Path(job.model))]
         if google is not None:
             engine_sides.append(("base", google))
-        parallel = side_by_side([f for _, f in engine_sides], job.threads, usable_cpus())
+        # One GPU engine at a time: two files on one GPU at once is not measured.
+        parallel = job.backend == "cpu" and side_by_side(
+            [f for _, f in engine_sides], job.threads, usable_cpus()
+        )
         fields["embedding"]["engines_side_by_side"] = parallel
 
         for env, check_name in (
@@ -1371,6 +1409,11 @@ def verify_embedding(
                 return f"the script reports {run.report.get('rows')} vectors for {len(texts)} texts"
             if not out.is_file():
                 return f"the script reports {len(texts)} vectors but wrote no {out.name}"
+            if name != "reference" and gpu_unused(job.backend, run.report.get("device")):
+                return (
+                    "the GPU backend was asked for and the kernel shows this process did no GPU "
+                    "work: the vectors came from somewhere else"
+                )
             harness[name] = run.report
             vectors[name] = str(out)
             state.add(
@@ -1409,6 +1452,7 @@ def verify_embedding(
             work,
             parallel,
             budget if parallel else budget * len(engine_sides),
+            job.backend,
         )
         if launch_failure is not None:
             return refuse(CANDIDATE_CHECK, launch_failure)
@@ -1467,11 +1511,14 @@ def verify_embedding(
     fields["measurements"]["candidate"]["engine"] = {
         "engine": "litert-lm",
         "api": "EmbeddingEngine",
-        "backend": "cpu",
+        "backend": job.backend,
+        # Whether the kernel showed the GPU work (macOS only); False on the CPU.
+        "backend_observed": gpu_observed(job.backend, candidate_report.get("device")),
+        "device": _mapping(candidate_report.get("device")),
         "runtime_version": (candidate_report.get("runtime") or {}).get("litert-lm"),
         # `evaluate.cpu_report`, run by the engine script on the CPU it computed on.
         "cpu": _mapping(candidate_report.get("cpu")),
-        "threads": job.threads,
+        "threads": job.threads if job.backend == "cpu" else None,
         "settings": _mapping(candidate_report.get("settings")),
         "ms_per_text_median": candidate_report.get("ms_median"),
     }
@@ -1501,6 +1548,12 @@ def verify_embedding(
                 "draws": [d.as_dict() for d in gain_k],
             },
             "centroid": gain_all.as_dict(),
+            # Google's file on the same backend; whether the kernel showed its GPU
+            # work, as for the candidate.
+            "base_backend": job.backend,
+            "base_backend_observed": gpu_observed(
+                job.backend, (harness.get("base") or {}).get("device")
+            ),
         }
 
     # -- the gate --------------------------------------------------------------------
@@ -1510,7 +1563,11 @@ def verify_embedding(
         {"name": "conversion_cost", "outcome": check.outcome.value, "detail": check.detail}
         | {"threshold": threshold, "mean": round(mean_value(k_costs), 6)}
     )
-    state.limitation(CPU_ONLY.format(threads=job.threads))
+    if job.backend == "gpu":
+        seen = gpu_observed("gpu", candidate_report.get("device"))
+        state.limitation(GPU_MEASURED.format(how=GPU_SEEN if seen else GPU_ASKED_FOR))
+    else:
+        state.limitation(CPU_ONLY.format(threads=job.threads))
     if parallel:
         state.limitation(SIDE_BY_SIDE.format(threads=job.threads))
     state.limitation(FITTED_ON_EXAMPLES.format(ks=" and ".join(f"k={k}" for k in KS), draws=DRAWS))

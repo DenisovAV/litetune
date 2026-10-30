@@ -404,10 +404,15 @@ def _add_verify(sub) -> None:
             "records what the bundle alone declares, since an app that passes no override gets "
             "that instead. litert-lm reports no device back; on macOS litetune asks the kernel "
             "whether its process did GPU work and records the run as measured on the GPU only "
-            "then, and elsewhere as asked for. On the text path a GPU split starts with one "
+            "then, and otherwise as asked for. On the text path a GPU split starts with one "
             "prompt and stops if it gets no answer within one prompt's budget; the tool path "
-            "has no such check. This is not a torch device: the "
-            "float reference resolves its own"
+            "has no such check. An EmbeddingGemma 2 file runs on gpu on macOS only, where it was "
+            "measured, and without the fp32 option, which its engine does not take; on Linux and "
+            "Windows it is refused on gpu. A decision bundle's option scoring runs on gpu on "
+            "macOS only, every row scored twice and the rows the two runs differ on five more "
+            "times in a third run, keeping the scores most readings gave; elsewhere, and for a "
+            "family that scores each option on an Engine of its own, it is refused. "
+            "This is not a torch device: the float reference resolves its own"
         ),
     )
     verify.add_argument(
@@ -1182,7 +1187,11 @@ def summarise_decision(manifest: dict) -> list[str]:
         lines.append(
             f"  cost: {_num(cost.get('ms_per_decision_median'))} ms per decision (median), "
             f"{cost.get('options', '?')} options, mode {cost.get('mode')}, "
-            f"{cost.get('threads', '?')} threads, {cost.get('cpu') or 'CPU not reported'}"
+            + (
+                "on the GPU backend"
+                if cost.get("backend") == "gpu"
+                else f"{cost.get('threads', '?')} threads, {cost.get('cpu') or 'CPU not reported'}"
+            )
         )
     for check in _mapping(manifest.get("checks")).get("checks") or []:
         check = _mapping(check)

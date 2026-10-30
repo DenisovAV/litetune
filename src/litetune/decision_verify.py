@@ -34,8 +34,10 @@ from __future__ import annotations
 import json
 import logging
 import math
+import random
 import statistics
 import subprocess
+import sys
 import tempfile
 from collections import Counter
 from collections.abc import Sequence
@@ -53,6 +55,12 @@ from litetune.decisions import (
     Decision,
     DecisionError,
     decision_from,
+)
+from litetune.evaluate import (
+    bundle_activation_error_of,
+    bundle_activation_of,
+    gpu_observed,
+    gpu_unused,
 )
 from litetune.events import EventStream
 from litetune.metrics import paired_difference
@@ -208,6 +216,161 @@ def _tail(text: str | bytes | None, limit: int = 2000) -> str:
     if isinstance(text, bytes):
         text = text.decode("utf-8", "replace")
     return (text or "").strip()[-limit:]
+
+
+GPU_IDLE = (
+    "the GPU backend was asked for and the kernel shows the {run} run did no GPU work: its "
+    "scores came from somewhere else"
+)
+# Copies of each row still in question, in the third and last GPU run. More copies
+# spread the run's few wrong scores over more calls: a process gets a few wrong
+# rows however few rows it scores (row 253 of dv1 went wrong once in each of three
+# processes of 12 copies).
+GPU_COPIES_IN_LAST_RUN = 5
+GPU_REPEAT = (
+    "on the GPU every decision was scored twice, the second time in reverse order, and each "
+    "row the two runs scored differently five more times in a third run, keeping the scores "
+    "most of its seven readings gave, when no other did as often: through litert-lm's package "
+    "on macOS, which runs LiteRT's WebGPU accelerator, a few rows of 300 got wrong scores in a "
+    "run, at different rows each time and not repeated in any run measured "
+    '(MEASUREMENTS.md, "The CPU and the GPU on a Mac"). These are the WebGPU accelerator\'s '
+    "scores; flutter_edge_ai on a Mac loads LiteRT's Metal accelerator, whose scores repeated "
+    "but were not compared with these. The float twin was checked on the CPU backend. "
+    "{rows} of {n} rows needed the third run"
+)
+GPU_NOT_SEEN = (
+    "the GPU backend was asked for and the kernel did not establish that this process did GPU "
+    "work in the {runs} run: the numbers are the GPU backend's as asked for, not as observed"
+)
+
+
+def _bundle_activation_limit(report: dict[str, Any]) -> str | None:
+    """What the GPU numbers are for, when the bundle alone would not get fp32 activations.
+
+    The scoring script passes fp32 itself, as the text path does (`verify`); an
+    app that loads the bundle without that override gets what the bundle declares.
+    """
+    unread = bundle_activation_error_of(report)
+    if unread:
+        return (
+            "litetune passed fp32 activations on the GPU and could not read what the bundle "
+            f"declares ({unread}), so whether an app that loads it without an override gets "
+            "the same activations is not established"
+        )
+    declared = bundle_activation_of(report)
+    if declared == "fp32":
+        return None
+    return (
+        "litetune passed fp32 activations on the GPU; the bundle declares "
+        + (f"{declared!r}" if declared else "none, and the runtime's default on a GPU is F16")
+        + ". These numbers are for the bundle plus that override, not for the bundle as an app "
+        "without it loads it -- `convert` writes the key"
+    )
+
+
+def settle(runs: Sequence[dict[int, Any]], rows: Sequence[int]) -> tuple[dict[int, Any], list[int]]:
+    """Per row, the scores most of `runs` gave, and the rows where that is not one value.
+
+    A row settles on the scores at least two readings gave and no other gave as
+    often; a tie, or no two readings alike, leaves it unresolved.
+    """
+    settled: dict[int, Any] = {}
+    unresolved = []
+    for i in rows:
+        seen = [run[i] for run in runs if i in run]
+        # One key for counting and for telling leaders apart: the JSON the
+        # scores came in as.
+        votes = Counter(json.dumps(a) for a in seen)
+        top = max(votes.values(), default=0)
+        leaders = [key for key, n in votes.items() if n == top]
+        if top < 2 or len(leaders) > 1:
+            unresolved.append(i)
+        else:
+            settled[i] = json.loads(leaders[0])
+    return settled, unresolved
+
+
+def _repeat_on_gpu(
+    job: Any,
+    spec: dict[str, Any],
+    first: ScoreRun,
+    n_rows: int,
+    n_options: int,
+    method: str,
+    events: EventStream,
+) -> dict[str, Any] | str:
+    """Score every row a second time, in reverse order, and the rows the two runs differ
+    on in a third run, `GPU_COPIES_IN_LAST_RUN` copies of each in a shuffled order.
+
+    Replaces `first.scores` with the scores `settle` keeps. Returns what was done,
+    or why it could not be: a run that failed, a run the kernel shows idle, or a
+    row with no settled scores. The repeats take the mode the first run's
+    self-check chose. A row's right scores repeated bit for bit in every run
+    measured, and its wrong scores were never the same twice. The changed orders
+    put rows after other rows where there are enough to differ; whether a wrong
+    score depends on the row before it is not measured.
+    """
+    again_spec = {**spec, "mode": first.report.get("mode") or spec["mode"]}
+    events.note(f"runtime: scoring the {n_rows} rows again, on the GPU")
+    second = run_script(
+        job.runtime_env,
+        ENGINE_SCRIPT,
+        {**again_spec, "rows": list(reversed(spec["rows"]))},
+        timeout=_engine_timeout(n_rows, n_options, method),
+        auto_provision=False,
+        events=events,
+    )
+    if second.failure or len(second.scores) < n_rows:
+        return "the second GPU run left rows unscored: " + (
+            second.failure or f"{n_rows - len(second.scores)} rows"
+        )
+    if gpu_unused("gpu", second.report.get("device")):
+        return GPU_IDLE.format(run="second")
+    observed = [gpu_observed("gpu", first.report.get("device"))]
+    observed.append(gpu_observed("gpu", second.report.get("device")))
+    differ = [i for i in range(n_rows) if second.scores.get(i) != first.scores.get(i)]
+    runs: list[dict[int, Any]] = [first.scores, second.scores]
+    if differ:
+        events.note(f"runtime: {len(differ)} rows scored differently twice; a third GPU run")
+        by_index = {r["index"]: r for r in spec["rows"]}
+        copies = [
+            {"index": n_rows * (c + 1) + i, "prompt": by_index[i]["prompt"]}
+            for c in range(GPU_COPIES_IN_LAST_RUN)
+            for i in differ
+        ]
+        # A fixed shuffle, so copies mostly follow other rows than in the first
+        # two runs; with two rows in question some must follow the same one.
+        random.Random(len(copies)).shuffle(copies)
+        third = run_script(
+            job.runtime_env,
+            ENGINE_SCRIPT,
+            {**again_spec, "rows": copies},
+            timeout=_engine_timeout(len(copies), n_options, method),
+            auto_provision=False,
+            events=events,
+        )
+        if third.failure or any(c["index"] not in third.scores for c in copies):
+            return "the third GPU run left rows unscored: " + (third.failure or "some rows")
+        if gpu_unused("gpu", third.report.get("device")):
+            return GPU_IDLE.format(run="third")
+        observed.append(gpu_observed("gpu", third.report.get("device")))
+        for c in range(GPU_COPIES_IN_LAST_RUN):
+            runs.append({i: third.scores[n_rows * (c + 1) + i] for i in differ})
+    settled, unresolved = settle(runs, differ)
+    if unresolved:
+        return (
+            f"{len(unresolved)} rows got no settled score in three GPU runs (rows "
+            f"{unresolved[:10]}): of the {2 + GPU_COPIES_IN_LAST_RUN} readings of each, no "
+            "score was given by two and more often than any other"
+        )
+    first.scores.update(settled)
+    return {
+        "runs": 3 if differ else 2,
+        # Engine row positions, 0 to n - 1, not held-out row numbers.
+        "rows_rescored": len(differ),
+        "engine_rows": differ[:50],
+        "observed": observed,
+    }
 
 
 def run_script(
@@ -579,13 +742,30 @@ def verify_decision(
         state.limitations.append(
             TYPE_LESS_MEASURED.format(kind=decision.type, measured=TYPE_MEASURED[decision.type])
         )
-    if job.backend != "cpu":
+    if job.backend not in ("cpu", "gpu"):
         return refuse(
             RUNTIME_CHECK,
-            f"option scoring is measured on the CPU backend only; --backend {job.backend} is "
-            "refused rather than measured with a method nobody has checked there",
+            f"--backend {job.backend}: option scoring runs on LiteRT-LM's CPU or GPU backend",
+        )
+    if job.backend == "gpu" and sys.platform != "darwin":
+        return refuse(
+            RUNTIME_CHECK,
+            f"--backend gpu: option scoring on the GPU is measured on macOS only, and this is "
+            f"{sys.platform}; on Linux the 0.18.0 package's GPU engine did not start in the one "
+            "container tried (no Vulkan driver), and Windows is not measured "
+            '(MEASUREMENTS.md, "The CPU and the GPU on a Mac")',
         )
     method = METHOD_FRESH_ENGINE if job.engine_per_prompt_reason else METHOD_REWIND
+    if job.backend == "gpu" and method == METHOD_FRESH_ENGINE:
+        # Its GPU work is on Engines opened and closed per option, whose kernel
+        # time leaves with them: the reading would not show where the scores came
+        # from, and the repeat rule was measured on one Engine that rewinds.
+        return refuse(
+            RUNTIME_CHECK,
+            f"--backend gpu: this family scores each option on an Engine of its own (method "
+            f"{METHOD_FRESH_ENGINE}), and option scoring on the GPU is measured only with one "
+            "Engine that rewinds; use --backend cpu",
+        )
     if method == METHOD_FRESH_ENGINE:
         state.limitations.append(
             "this family's rule gives every prompt an Engine of its own: "
@@ -762,19 +942,21 @@ def verify_decision(
     n_engine = len(engine_rows)
     engine_prompts = [heldout.prompts[i] for i in engine_rows]
     events.note(f"runtime: scoring {len(decision.ids)} options on {n_engine} held-out rows")
+    engine_spec = {
+        "model": str(job.model),
+        "rows": [{"index": i, "prompt": p} for i, p in enumerate(engine_prompts)],
+        "options": list(decision.ids),
+        "terminator": terminator,
+        "threads": job.threads,
+        "targets": "unique",
+        "mode": "auto",
+        "method": method,
+        "backend": job.backend,
+    }
     eng = run_script(
         job.runtime_env,
         ENGINE_SCRIPT,
-        {
-            "model": str(job.model),
-            "rows": [{"index": i, "prompt": p} for i, p in enumerate(engine_prompts)],
-            "options": list(decision.ids),
-            "terminator": terminator,
-            "threads": job.threads,
-            "targets": "unique",
-            "mode": "auto",
-            "method": method,
-        },
+        engine_spec,
         timeout=_engine_timeout(n_engine, len(decision.ids), method),
         auto_provision=job.auto_provision,
         events=events,
@@ -812,6 +994,28 @@ def verify_decision(
         or any(not k <= n <= len(c) for k, n, c in zip(ks, lengths, cont_ids or [], strict=False))
     ):
         return refuse(TARGETS_CHECK, f"the runtime reported unusable scored lengths: {lengths}")
+    # After the first run's method and targets are checked: a run refused on
+    # those does not cost two more on the GPU.
+    if job.backend == "gpu":
+        if gpu_unused("gpu", eng.report.get("device")):
+            return refuse(RUNTIME_CHECK, GPU_IDLE.format(run="first"))
+        repeated = _repeat_on_gpu(
+            job, engine_spec, eng, n_engine, len(decision.ids), method, events
+        )
+        if isinstance(repeated, str):
+            return refuse(RUNTIME_CHECK, repeated)
+        fields["harness"]["gpu_repeat"] = repeated
+        state.limitations.append(GPU_REPEAT.format(rows=repeated["rows_rescored"], n=n_engine))
+        unseen = [
+            n
+            for n, seen in zip(("first", "second", "third"), repeated["observed"], strict=False)
+            if not seen
+        ]
+        if unseen:
+            state.limitations.append(GPU_NOT_SEEN.format(runs=" and ".join(unseen)))
+        activation = _bundle_activation_limit(eng.report)
+        if activation:
+            state.limitations.append(activation)
     mismatched = eng.report.get("mismatches") or []
     fields["decision"].update({"k": ks, "scored_lengths": lengths, "option_tokens": cont_ids})
     state.add(
@@ -960,10 +1164,12 @@ def verify_decision(
     # and the CPU these numbers were taken on the same way.
     fields["measurements"]["candidate"]["engine"] = {
         "engine": "litert-lm",
-        "backend": "cpu",
+        "backend": job.backend,
+        # Whether the kernel showed the GPU work (macOS); False on the CPU.
+        "backend_observed": gpu_observed(job.backend, eng.report.get("device")),
         "runtime_version": (eng.report.get("runtime") or {}).get("litert-lm"),
         "cpu": {"model": eng.report.get("cpu")},
-        "threads": job.threads,
+        "threads": job.threads if job.backend == "cpu" else None,
     }
     fields["measurements"]["reference_on_runtime_rows"] = outcome_metrics(
         sub_ref, targets, fit, none_index, decision.type
@@ -999,8 +1205,11 @@ def verify_decision(
         "options": len(decision.ids),
         "scored_tokens_per_decision": sum(lengths),
         "mode": mode,
-        "threads": job.threads,
-        "cpu": eng.report.get("cpu"),
+        # The first run's times. On the GPU the threads do not apply, and the CPU
+        # model is not what computed.
+        "backend": job.backend,
+        "threads": job.threads if job.backend == "cpu" else None,
+        "cpu": eng.report.get("cpu") if job.backend == "cpu" else None,
         "runtime": eng.report.get("runtime"),
         "rows": n_engine,
     }
