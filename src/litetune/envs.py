@@ -32,6 +32,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import venv
@@ -1286,6 +1287,39 @@ def _kill_break_only(
     return max(reached, _signal_tree(proc, None, None))
 
 
+def _handle_pending_signals() -> None:
+    """Run, on the main thread, any signal handler still pending after a slice.
+
+    Coming back to the interpreter is not always enough on Windows. A signal
+    arrives there on another thread, and CPython sets the eval breaker for
+    whichever thread runs next (`_PyEval_SignalReceived`, bpo-42296, in
+    `Python/ceval.c` of 3.10); that thread recomputes it for itself
+    (`eval_frame_handle_pending`), and when it is not the main thread the
+    breaker comes back cleared, so the main thread runs on without the
+    handler. On Windows CI with Python 3.10 an `interrupt_main` sent while a
+    60-second stage was waiting reached the wait 59 s later, once the stage
+    had ended, in 10 of 43 runs read; on 3.12 and 3.13 it took 0.11 to 0.20 s
+    in all 38 of each, for reasons not established.
+
+    `signal.signal` checks every pending signal itself before it changes a
+    handler (`signal_signal_impl`, `Modules/signalmodule.c`), whatever the
+    breaker says, so putting a handler back runs them here. The one put back
+    is SIGBREAK's, which the guard owns for the whole wait
+    (`_kill_child_if_we_are_told_to_exit`): putting SIGINT's back instead
+    would undo whatever a caller's own SIGINT handler had just done to SIGINT,
+    since the pending handlers run before the handler is set. Main thread
+    only, where `signal.signal` works, and only a Python handler -- the
+    guard's: where the guard could not install one, SIGBREAK keeps a
+    disposition this does not touch, and its wait is as it was before this.
+    """
+    sig = getattr(signal, "SIGBREAK", None)
+    if sig is None or threading.current_thread() is not threading.main_thread():
+        return
+    handler = signal.getsignal(sig)
+    if callable(handler):
+        signal.signal(sig, handler)
+
+
 def _communicate_in_slices(
     proc: subprocess.Popen,
     timeout: float,
@@ -1327,6 +1361,7 @@ def _communicate_in_slices(
         try:
             result = proc.communicate(timeout=wait)
         except subprocess.TimeoutExpired:
+            _handle_pending_signals()
             if after_first_wait is not None:
                 then, after_first_wait = after_first_wait, None
                 then()

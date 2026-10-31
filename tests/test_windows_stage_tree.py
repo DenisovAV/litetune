@@ -18,6 +18,7 @@ import logging
 import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 from typing import Any
@@ -1117,6 +1118,85 @@ def test_an_interrupt_reaches_a_windows_wait_within_a_slice(windows):
     assert time.monotonic() - started < 2, "the interrupt waited for the stage's deadline"
     assert len(stage.waits) == 1, "it landed as the first slice returned"
     assert ("send_ctrl_break", PID) in log, "and the stage was stopped on its way out"
+
+
+def test_every_slice_that_times_out_runs_what_is_pending(monkeypatch):
+    """After each slice the pending signal handlers are run on purpose: on
+    Windows a signal set from another thread may never wake the main thread's
+    loop by itself (`envs._handle_pending_signals`)."""
+    clock = FakeClock()
+    checks: list[int] = []
+    stage = FakeStage(answers=("wait", "wait", ("out", "err")), clock=clock)
+    monkeypatch.setattr(envs, "_handle_pending_signals", lambda: checks.append(len(stage.waits)))
+
+    envs._communicate_in_slices(stage, timeout=5, clock=clock)
+
+    assert checks == [1, 2], "once after each slice that timed out, not after the last"
+
+
+def test_pending_signals_are_run_by_putting_sigbreaks_own_handler_back(monkeypatch):
+    """`signal.signal` runs every pending handler before it sets one, so the
+    handler set is SIGBREAK's own, which the guard owns for the wait -- and
+    SIGINT, whose handler may be a caller's, is not touched."""
+    sig = _a_sigbreak(monkeypatch)
+    real_signal = signal.signal
+
+    def the_guards(signum, frame):  # a Python handler, as the guard's is
+        raise AssertionError("not called: nothing is pending")
+
+    previous = real_signal(sig, the_guards)
+    try:
+        put: list[tuple[int, Any]] = []
+
+        def spy(signum, handler):
+            put.append((signum, handler))
+            return real_signal(signum, handler)
+
+        monkeypatch.setattr(signal, "signal", spy)
+        sigint_before = signal.getsignal(signal.SIGINT)
+
+        envs._handle_pending_signals()
+
+        assert put == [(sig, the_guards)]
+        assert signal.getsignal(sig) is the_guards
+        assert signal.getsignal(signal.SIGINT) is sigint_before
+    finally:
+        real_signal(sig, previous)
+
+
+def test_without_sigbreak_nothing_is_put_back(monkeypatch):
+    put: list[Any] = []
+    monkeypatch.delattr(signal, "SIGBREAK", raising=False)
+    monkeypatch.setattr(signal, "signal", lambda *args: put.append(args))
+    envs._handle_pending_signals()
+    assert put == []
+
+
+def test_pending_signals_are_left_alone_off_the_main_thread(monkeypatch):
+    """Even with a Python handler there to put back: `signal.signal` works on
+    the main thread only."""
+    _a_sigbreak(monkeypatch)
+    put: list[Any] = []
+    monkeypatch.setattr(signal, "getsignal", lambda sig: lambda signum, frame: None)
+    monkeypatch.setattr(signal, "signal", lambda *args: put.append(args))
+    worker = threading.Thread(target=envs._handle_pending_signals)
+    worker.start()
+    worker.join()
+    assert put == []
+
+
+@pytest.mark.parametrize(
+    "disposition", [None, signal.SIG_DFL, signal.SIG_IGN], ids=["from C", "default", "ignored"]
+)
+def test_only_a_python_handler_is_put_back(monkeypatch, disposition):
+    """Where the guard could not install its handler, SIGBREAK's disposition is
+    not one this puts back, and nothing is set."""
+    _a_sigbreak(monkeypatch)
+    put: list[Any] = []
+    monkeypatch.setattr(signal, "getsignal", lambda sig: disposition)
+    monkeypatch.setattr(signal, "signal", lambda *args: put.append(args))
+    envs._handle_pending_signals()
+    assert put == []
 
 
 # ---------------------------------------------------------------------------

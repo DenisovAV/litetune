@@ -661,6 +661,43 @@ def test_ctrl_break_to_litetune_reports_an_interrupted_stage(tmp_path):
         real.end()
 
 
+def _run_keyboard_driver(
+    driver_file: Path,
+    mode: str,
+    tree: _Tree,
+    seconds: int,
+    drivers: list[subprocess.Popen],
+    capsys: Any,
+) -> tuple[dict[str, float], str]:
+    """One `DRIVER_KEYBOARD` run: its times, and what it said on stderr."""
+    driver = subprocess.Popen(
+        [
+            sys.executable,
+            str(driver_file),
+            mode,
+            str(tree.grandchild_file),
+            str(tree.child_file),
+            "default",
+            str(seconds),
+            "120",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    drivers.append(driver)
+    tree.up()
+    out, err = driver.communicate(timeout=90)
+    assert driver.returncode == 43, f"no KeyboardInterrupt: exit {driver.returncode}, {out!r}"
+    words = out.split()
+    said = dict(zip(words[0::2], words[1::2], strict=False))
+    with capsys.disabled():
+        print(f"\n[measured] {mode}: {out.strip()}")
+    times = {key: float(said[key]) for key in ("T_START", "SENT", "ENTERED")}
+    times["RUNNING"] = 1.0 if said["RUNNING"] == "True" else 0.0
+    return times, err
+
+
 @on_windows
 def test_an_interrupt_reaches_the_wait(tmp_path, capsys):
     """`_thread.interrupt_main()` a second after the tree is up, while
@@ -676,36 +713,8 @@ def test_an_interrupt_reaches_the_wait(tmp_path, capsys):
     driver_file.write_text(DRIVER_KEYBOARD)
     drivers: list[subprocess.Popen] = []
 
-    def run(mode: str, tree: _Tree, seconds: int) -> tuple[dict[str, float], str]:
-        driver = subprocess.Popen(
-            [
-                sys.executable,
-                str(driver_file),
-                mode,
-                str(tree.grandchild_file),
-                str(tree.child_file),
-                "default",
-                str(seconds),
-                "120",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        drivers.append(driver)
-        tree.up()
-        out, err = driver.communicate(timeout=90)
-        assert driver.returncode == 43, f"no KeyboardInterrupt: exit {driver.returncode}, {out!r}"
-        words = out.split()
-        said = dict(zip(words[0::2], words[1::2], strict=False))
-        with capsys.disabled():
-            print(f"\n[measured] {mode}: {out.strip()}")
-        times = {key: float(said[key]) for key in ("T_START", "SENT", "ENTERED")}
-        times["RUNNING"] = 1.0 if said["RUNNING"] == "True" else 0.0
-        return times, err
-
     try:
-        times, _ = run("control", control, 20)
+        times, _ = _run_keyboard_driver(driver_file, "control", control, 20, drivers, capsys)
         if sys.version_info < (3, 14):
             floor = 20 - (times["SENT"] - times["T_START"]) - 0.5
             assert times["ENTERED"] - times["SENT"] >= floor, (
@@ -716,7 +725,7 @@ def test_an_interrupt_reaches_the_wait(tmp_path, capsys):
             control.grandchild is not None and control.grandchild.alive()
         ), "without the job the grandchild survives the interrupt, or this test cannot fail"
 
-        times, err = run("real", real, 60)
+        times, err = _run_keyboard_driver(driver_file, "real", real, 60, drivers, capsys)
         _assert_the_job_was_made(err)
         assert times["RUNNING"] == 1.0, "the stage had already ended, so nothing was interrupted"
         assert (
@@ -730,6 +739,38 @@ def test_an_interrupt_reaches_the_wait(tmp_path, capsys):
                 driver.kill()
         control.end()
         real.end()
+
+
+INTERRUPT_REPEATS = 10
+
+
+@on_windows
+def test_an_interrupt_reaches_the_wait_every_time(tmp_path, capsys):
+    """The same interrupt, ten times. On Python 3.10 it was lost in 10 of 43
+    CI runs read, reaching the wait only when the 60-second stage ended
+    (`envs._handle_pending_signals`): one run per job let that pass about
+    three times in four, ten runs about once in fourteen."""
+    driver_file = tmp_path / "driver_keyboard.py"
+    driver_file.write_text(DRIVER_KEYBOARD)
+    drivers: list[subprocess.Popen] = []
+    trees: list[_Tree] = []
+    try:
+        for n in range(INTERRUPT_REPEATS):
+            tree = _Tree(tmp_path, f"real-{n}")
+            trees.append(tree)
+            times, err = _run_keyboard_driver(driver_file, "real", tree, 60, drivers, capsys)
+            _assert_the_job_was_made(err)
+            took = times["ENTERED"] - times["SENT"]
+            assert times["RUNNING"] == 1.0 and took < 2, (
+                f"run {n + 1} of {INTERRUPT_REPEATS}: the interrupt took {took:.2f} s to reach "
+                "the wait"
+            )
+    finally:
+        for driver in drivers:
+            if driver.poll() is None:
+                driver.kill()
+        for tree in trees:
+            tree.end()
 
 
 @on_windows
