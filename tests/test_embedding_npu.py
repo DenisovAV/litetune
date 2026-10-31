@@ -1101,8 +1101,8 @@ def test_an_interrupt_after_the_first_soc_is_reported_from_the_disk(
 ):
     monkeypatch.setattr(
         embedding_export,
-        "_rename",
-        _rename_failing(embedding_export._rename, 3, KeyboardInterrupt()),
+        "_place",
+        _rename_failing(embedding_export._place, 3, KeyboardInterrupt()),
     )
     out = tmp_path / "out"
     with pytest.raises(KeyboardInterrupt):
@@ -1122,8 +1122,8 @@ def test_a_failure_moving_the_second_socs_report_leaves_both_and_names_the_parti
 ):
     monkeypatch.setattr(
         embedding_export,
-        "_rename",
-        _rename_failing(embedding_export._rename, 4, OSError("no space")),
+        "_place",
+        _rename_failing(embedding_export._place, 4, OSError("no space")),
     )
     out = tmp_path / "out"
     assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
@@ -1143,14 +1143,14 @@ def test_a_failure_moving_the_second_socs_report_leaves_both_and_names_the_parti
 def test_a_model_that_does_not_match_its_report_is_not_counted(
     hub, grafter, compiler, monkeypatch, tmp_path
 ):
-    real = embedding_export._rename
+    real = embedding_export._place
 
     def rename(source, target):
         real(source, target)
         if target.name == "model.litertlm" and target.parent.name == "int8-npu-SM8650":
             target.write_bytes(b"other bytes")
 
-    monkeypatch.setattr(embedding_export, "_rename", rename)
+    monkeypatch.setattr(embedding_export, "_place", rename)
     out = tmp_path / "out"
     _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
     report = _report(out)
@@ -1172,3 +1172,53 @@ def test_nothing_is_published_when_a_soc_did_not_compile(hub, grafter, compiler,
     _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
     assert not (out / "int8-npu-SM8750").exists() and not (out / "int8-npu-SM8650").exists()
     assert not list(out.glob(".litetune-npu-stage-*"))
+
+
+def test_a_file_that_appears_in_the_new_directory_is_not_replaced(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    real = embedding_export._mkdir
+
+    def mkdir_and_meddle(target):
+        real(target)
+        if target.name == "int8-npu-SM8650":
+            (target / "model.litertlm").write_bytes(b"someone else's")
+
+    monkeypatch.setattr(embedding_export, "_mkdir", mkdir_and_meddle)
+    out = tmp_path / "out"
+    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
+    second = out / "int8-npu-SM8650"
+    assert (second / "model.litertlm").read_bytes() == b"someone else's", "not replaced"
+    report = _report(out)
+    assert [n["soc"] for n in report["npu"]] == ["SM8750"]
+    check = _publish_check(out)
+    assert "FileExistsError" in check["detail"] and str(second) in check["detail"]
+
+
+def test_an_interrupt_right_after_the_mkdir_still_names_the_directory(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    real = embedding_export._mkdir
+
+    def mkdir_then_interrupt(target):
+        real(target)
+        if target.name == "int8-npu-SM8650":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(embedding_export, "_mkdir", mkdir_then_interrupt)
+    out = tmp_path / "out"
+    with pytest.raises(KeyboardInterrupt):
+        _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
+    check = _publish_check(out)
+    assert "written in part" in check["detail"] and str(out / "int8-npu-SM8650") in check["detail"]
+
+
+def test_the_staged_copy_is_gone_once_a_file_is_placed(tmp_path):
+    source, target = tmp_path / "a", tmp_path / "b"
+    source.write_bytes(b"x")
+    embedding_export._place(source, target)
+    assert target.read_bytes() == b"x" and not source.exists()
+    source.write_bytes(b"y")
+    with pytest.raises(FileExistsError):
+        embedding_export._place(source, target)
+    assert target.read_bytes() == b"x" and source.exists()

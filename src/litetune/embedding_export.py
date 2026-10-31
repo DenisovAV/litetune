@@ -601,9 +601,13 @@ def _mkdir(target: Path) -> None:
     os.mkdir(target)
 
 
-def _rename(source: Path, target: Path) -> None:
-    """One staged file moved into the SoC's new directory; a name so a test can fail it."""
-    source.rename(target)
+def _place(source: Path, target: Path) -> None:
+    """One staged file put into the SoC's new directory without replacing anything: a
+    hard link fails with FileExistsError where a file of that name appeared, which a
+    rename would overwrite. Then the staged name is removed. Staging is inside the
+    output directory, so both are on one filesystem."""
+    os.link(source, target)
+    source.unlink()
 
 
 def _write_report(path: Path, report: dict[str, Any]) -> None:
@@ -614,7 +618,7 @@ def _publish_npus(
     request: EmbeddingExportRequest, result: EmbeddingExportResult, staged: list[NpuResult]
 ) -> None:
     """Each staged SoC published in turn: its report written in staging, its directory
-    created exclusively, the model and then the report moved into it. The first failure
+    created exclusively, the model and then the report linked into it. The first failure
     stops the rest; an OSError is recorded, anything else (an interrupt) goes on once it
     is. Nothing is rolled back: what reached the disk is what the report says, read from
     the disk (`_npus_on_disk`)."""
@@ -624,10 +628,18 @@ def _publish_npus(
             published = compiled.moved_to(target / ARTIFACT_NAME)
             staged_report = compiled.output.parent / REPORT_NAME
             _write_report(staged_report, npu_report(result, published))
-            _mkdir(target)
+            # Recorded before the mkdir, so an interrupt right after it still names the
+            # directory; taken back if the directory was not ours to make. The directory is
+            # identified by its path: one deleted and recreated by someone else meanwhile
+            # would read as this run's.
             result.npu_created[compiled.soc] = published
-            _rename(compiled.output, target / ARTIFACT_NAME)
-            _rename(staged_report, target / REPORT_NAME)
+            try:
+                _mkdir(target)
+            except FileExistsError:
+                del result.npu_created[compiled.soc]
+                raise
+            _place(compiled.output, target / ARTIFACT_NAME)
+            _place(staged_report, target / REPORT_NAME)
     except BaseException as exc:
         logger.exception("publishing the NPU files stopped")
         result.npu_publish_error = f"{type(exc).__name__}: {exc}"

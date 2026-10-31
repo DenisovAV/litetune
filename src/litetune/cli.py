@@ -792,8 +792,9 @@ def _add_convert(sub) -> None:
             "libc++1 and libatomic1; the first run downloads Qualcomm's QAIRT): also compile the "
             "graft's text encoder ahead of time for this Qualcomm SoC, into "
             "<output-dir>/int8-npu-<SOC>/model.litertlm with its own convert.json; repeat for "
-            "more SoCs; a failure stops the ones after it, and the report says which were "
-            "published. verify cannot run such a file; a "
+            "more SoCs. Every SoC is compiled, a failed compile included, and publishing starts "
+            "only when all have compiled; a failure while publishing one stops the ones after "
+            "it, and the report says which were published. verify cannot run such a file; a "
             "file compiled this way for SM8750 ran on one phone, no other SoC's on any. "
             f"One of {', '.join(NPU_SOCS)}"
         ),
