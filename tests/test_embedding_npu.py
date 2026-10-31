@@ -1014,7 +1014,8 @@ def test_a_failure_moving_the_second_soc_moves_the_first_back(
     assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
     report = _nothing_published(out)
     assert any(
-        t.startswith("no NPU file was published: call 2 refused") for t in report["limitations"]
+        t.startswith("no NPU file was published: OSError: call 2 refused")
+        for t in report["limitations"]
     )
 
 
@@ -1105,3 +1106,84 @@ def test_an_installed_file_removed_after_provisioning_makes_the_environment_unre
     lib.unlink()
     assert not env.ready
     assert envs.StageEnv(name="plain", requirements=("a==1",)).missing_installed_files() == []
+
+
+def test_an_interrupt_on_the_second_move_moves_the_first_back(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    real = embedding_export._rename
+    calls = {"n": 0}
+
+    def rename(source, target):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt
+        real(source, target)
+
+    monkeypatch.setattr(embedding_export, "_rename", rename)
+    out = tmp_path / "out"
+    with pytest.raises(KeyboardInterrupt):  # the interrupt goes on once the move is undone
+        _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
+    assert not (out / "int8-npu-SM8750").exists(), "moved back before the interrupt went on"
+    report = _report(out)
+    assert report["npu"] == [] and report["npu_published"] is False
+
+
+def test_a_published_directory_whose_files_changed_is_left_and_named(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    real = embedding_export._rename
+    calls = {"n": 0}
+
+    def rename(source, target):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("call 2 refused")
+        real(source, target)
+        if calls["n"] == 1:
+            (target / "added-after.txt").write_text("someone's")
+
+    monkeypatch.setattr(embedding_export, "_rename", rename)
+    out = tmp_path / "out"
+    _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
+    assert (out / "int8-npu-SM8750" / "added-after.txt").read_text() == "someone's"
+    (publish,) = [c for c in _report(out)["checks"]["checks"] if c["name"] == "npu files"]
+    assert (
+        "remain published" in publish["detail"]
+        and "changed after it was published" in publish["detail"]
+    )
+
+
+def test_a_target_that_appears_during_publication_is_not_replaced(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    real = embedding_export._rename
+    out = tmp_path / "out"
+    appeared = out / "int8-npu-SM8650"
+
+    def rename(source, target):
+        if not appeared.exists() and target.name == "int8-npu-SM8750":
+            appeared.mkdir()
+        real(source, target)
+
+    monkeypatch.setattr(embedding_export, "_rename", rename)
+    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
+    assert (
+        appeared.is_dir() and list(appeared.iterdir()) == []
+    ), "the directory that appeared is untouched"
+    assert not (out / "int8-npu-SM8750").exists(), "the first SoC was moved back"
+    (publish,) = [c for c in _report(out)["checks"]["checks"] if c["name"] == "npu files"]
+    assert "FileExistsError" in publish["detail"] and "appeared" in publish["detail"]
+
+
+def test_an_installed_file_that_is_a_directory_does_not_count(monkeypatch, tmp_path):
+    from conftest import mark_provisioned
+
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    env = envs.NPU_QUALCOMM
+    mark_provisioned(env)
+    (lib,) = env.path.glob(env.installed_files[0])
+    lib.unlink()
+    lib.mkdir()
+    assert not env.ready
+    assert env.missing_installed_files() == [env.installed_files[0]]

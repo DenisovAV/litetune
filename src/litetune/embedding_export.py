@@ -615,7 +615,7 @@ def _publish_npus(
     """Every staged SoC's directory, its report written inside it first, renamed into
     place -- all of them, or, on any failure, none: what was already moved is moved back.
     Returns the published results, or [] after adding the check that says why."""
-    moved: list[tuple[Path, Path]] = []
+    moved: list[tuple[Path, Path, list[tuple[str, int]]]] = []
     final: list[NpuResult] = []
     try:
         for compiled in staged:
@@ -625,27 +625,54 @@ def _publish_npus(
             final.append(published)
         for compiled in staged:
             source, target = compiled.output.parent, dir_for(request.output_dir, compiled.soc)
+            # Checked before the compile and again here: on Linux a rename replaces an
+            # empty directory that appeared in between.
+            if target.exists() or target.is_symlink():
+                raise FileExistsError(f"{target} appeared while the NPU files compiled")
+            listing = _listing(source)
             _rename(source, target)
-            moved.append((target, source))
-    except OSError as exc:
+            moved.append((target, source, listing))
+    except BaseException as exc:
         logger.exception("publishing the NPU files failed")
-        stuck = []
-        for target, source in reversed(moved):
-            try:
-                _rename(target, source)
-            except OSError as back:
-                stuck.append(f"{target} ({back})")
-        detail = f"run: {exc}"
+        stuck = _move_back(moved)
+        detail = f"run: {type(exc).__name__}: {exc}"
         if stuck:
-            detail += f"; and could not be moved back, so remain published: {', '.join(stuck)}"
+            detail += f"; and not moved back, so remain published: {', '.join(stuck)}"
         _add(result, events, Check.unchecked(NPU_PUBLISH_CHECK, detail))
         result.limitations.append(
             "no NPU file was published: " + detail.removeprefix("run: ")
             if not stuck
             else f"the NPU files were not all published: {detail}"
         )
+        if not isinstance(exc, OSError):
+            raise
         return []
     return final
+
+
+def _listing(directory: Path) -> list[tuple[str, int]]:
+    """Every file under `directory`, by relative path and size."""
+    return sorted(
+        (p.relative_to(directory).as_posix(), p.stat().st_size)
+        for p in directory.rglob("*")
+        if p.is_file()
+    )
+
+
+def _move_back(moved: list[tuple[Path, Path, list[tuple[str, int]]]]) -> list[str]:
+    """What was published moved back into staging, newest first; the directories that
+    stay published, and why. One whose files changed after it was published is left
+    where it is: moving it back would take those files away with the staging area."""
+    stuck: list[str] = []
+    for target, source, listing in reversed(moved):
+        try:
+            if _listing(target) != listing:
+                stuck.append(f"{target} (its files changed after it was published)")
+                continue
+            _rename(target, source)
+        except OSError as back:
+            stuck.append(f"{target} ({back})")
+    return stuck
 
 
 def npu_report(result: EmbeddingExportResult, npu: NpuResult) -> dict[str, Any]:

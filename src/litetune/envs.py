@@ -3011,8 +3011,8 @@ class StageEnv:
         return [replaced.get(r, r) for r in self.requirements]
 
     def missing_installed_files(self) -> list[str]:
-        """The `installed_files` patterns that match nothing in this environment."""
-        return [p for p in self.installed_files if not any(self.path.glob(p))]
+        """The `installed_files` patterns that match no regular file in this environment."""
+        return [p for p in self.installed_files if not any(m.is_file() for m in self.path.glob(p))]
 
     @property
     def path(self) -> Path:
