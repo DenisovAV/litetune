@@ -15,9 +15,11 @@ for every figure below):
      `ai_edge_litert.aot.aot_compile` drives, with weight sharing on -- without it each
      signature carries its own copy of the weights (587 MB instead of 170 MB for int8);
   3. what the compiled encoder must be, or nothing is written: every signature one
-     `DISPATCH_OP`, all of them naming one bytecode range inside the section, a QNN
-     context no larger than twice the encoder's weights (weight sharing: 1.24x with it,
-     4.29x without, on the int8 graft); a 250-byte `LiteRtStamp` naming Qualcomm and the
+     `DISPATCH_OP`, all of them naming one bytecode range inside the section; a QNN
+     context no larger than twice the encoder's weight bytes -- a size gate, evidence of
+     weight sharing and not a proof of it: the int8 graft's context was 1.24x its weights
+     compiled with `--qualcomm_enable_weight_sharing=true` and 4.29x without, and a single
+     range does not tell the two apart; a 250-byte `LiteRtStamp` naming Qualcomm and the
      SoC, the length flutter_edge_ai's reader takes; every signature's inputs and outputs
      as the cut encoder's;
   4. a `.litertlm` of the graft's metadata, tokenizer and embedder, byte for byte, and the
@@ -98,7 +100,7 @@ ANSWER_KEYS: tuple[str, ...] = (
     "partitions",
     "ops_per_signature",
     "stamp",
-    "weight_sharing",
+    "qnn_context",
     "signatures",
     "qairt",
     "compiler",
@@ -107,9 +109,9 @@ ANSWER_KEYS: tuple[str, ...] = (
 
 class EmbeddingNpuError(Exception):
     """The NPU compile did not produce a file. `cause` is `run` for a failure of the run
-    itself -- the environment, the compiler process, the answer -- which says nothing
-    about the model; any other cause names what the compiled file lacked or what in the
-    script failed."""
+    itself -- the environment, the compiler process, the answer -- and `script` for an
+    error in this module's own script; neither says anything about the model. Any other
+    cause names what the compiled file lacked or what the compiler refused."""
 
     def __init__(self, cause: str, message: str) -> None:
         super().__init__(message)
@@ -176,7 +178,7 @@ class NpuResult:
             "ops_per_signature": self.report["ops_per_signature"],
             "partitions": self.report["partitions"],
             "stamp": self.report["stamp"],
-            "weight_sharing": self.report["weight_sharing"],
+            "qnn_context": self.report["qnn_context"],
             "qairt": self.report["qairt"],
             "compiler": self.report["compiler"],
             "device_run": DEVICE_RUNS.get(self.soc),
@@ -523,6 +525,17 @@ def describe(path):
     }
 
 
+def read_compiled(path):
+    """`describe` of the compiler's output; bytes it cannot read are the compiler's
+    failure (`compiled_file`), not this script's."""
+    try:
+        return describe(path)
+    except Exception as exc:  # noqa: BLE001 -- the compiler's output, not this script
+        raise Refused(
+            "compiled_file", f"the compiled encoder could not be read: {type(exc).__name__}: {exc}"
+        ) from None
+
+
 def check_compiled(
     compiled, cut_io, signatures, soc, stamp_bytes, stats, system_requirements, weight_bytes
 ):
@@ -545,28 +558,31 @@ def check_compiled(
     functions = [d["name"] for d in compiled["dispatch"]]
     if len(ranges) != 1 or None in next(iter(ranges), (None,)):
         raise Refused(
-            "weight_sharing",
+            "dispatch",
             f"the DISPATCH_OPs name {len(ranges)} bytecode ranges, not one: {compiled['dispatch']}",
         )
     ((offset, size),) = ranges
     if len(set(functions)) != len(functions) or None in functions:
         raise Refused(
-            "weight_sharing", f"the DISPATCH_OPs do not each name their own function: {functions}"
+            "dispatch", f"the DISPATCH_OPs do not each name their own function: {functions}"
         )
     if not (0 < offset and offset + size <= compiled["bytes"]):
         raise Refused(
-            "weight_sharing",
+            "dispatch",
             f"the bytecode range {offset}+{size} is not inside the "
             f"{compiled['bytes']}-byte section",
         )
-    # One range is not enough: a compile without weight sharing also leaves one context
-    # for the four functions, holding four copies of the weights. Measured on the int8
-    # graft (136,708,096 weight bytes): 169,586,688 with sharing, 586,875,872 without.
+    # A size gate, not a proof of sharing. One range is not enough: a compile without
+    # weight sharing also leaves one context for the four functions, holding four copies
+    # of the weights. Measured on the int8 graft (136,708,096 weight bytes): 169,586,688
+    # (1.24x) compiled with --qualcomm_enable_weight_sharing=true, 586,875,872 (4.29x)
+    # without.
     if size > SHARED_CONTEXT_LIMIT * weight_bytes:
         raise Refused(
-            "weight_sharing",
-            f"the QNN context is {size:,} bytes for {weight_bytes:,} bytes of weights, "
-            f"more than {SHARED_CONTEXT_LIMIT}x: the weights were not shared",
+            "context_size",
+            f"the QNN context is {size:,} bytes for {weight_bytes:,} bytes of encoder weights, "
+            f"more than {SHARED_CONTEXT_LIMIT}x (1.24x was measured with weight sharing, 4.29x "
+            "without): the weights look unshared",
         )
     raw = compiled["stamp"]
     if raw is None or len(raw) != stamp_bytes:
@@ -593,11 +609,14 @@ def check_compiled(
     return {
         "stamp": list(stamp),
         "ops_per_signature": compiled["ops"],
-        "weight_sharing": {
+        "qnn_context": {
             "bytecode_offset": offset,
             "bytecode_size": size,
             "functions": functions,
-            "weight_bytes": weight_bytes,
+            "encoder_weight_bytes": weight_bytes,
+            "to_weights": round(size / weight_bytes, 3),
+            "gate": f"at most {SHARED_CONTEXT_LIMIT}x the encoder's weight bytes",
+            "measured": "1.24x with --qualcomm_enable_weight_sharing=true, 4.29x without",
         },
         "signatures": {k: compiled["io"][k] for k in signatures},
         "qairt": compiled["qairt"],
@@ -688,7 +707,7 @@ def main(spec):
         str(cut), str(compiled), spec["soc"], str(work / "compile.log"), libs
     )
     facts = check_compiled(
-        describe(str(compiled)),
+        read_compiled(str(compiled)),
         describe(str(cut))["io"],
         spec["signatures"],
         spec["soc"],

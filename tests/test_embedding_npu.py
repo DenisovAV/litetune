@@ -231,7 +231,12 @@ def _ok(**overrides: Any) -> dict[str, Any]:
         "partitions": [[0, 1779, 1779, 1]] * 4,
         "ops_per_signature": {k: {"DISPATCH_OP": 1} for k in NPU_SIGNATURES},
         "stamp": ["Qualcomm", "SM8750"],
-        "weight_sharing": {"bytecode_offset": 3792, "bytecode_size": 169586688},
+        "qnn_context": {
+            "bytecode_offset": 3792,
+            "bytecode_size": 169586688,
+            "to_weights": 1.241,
+            "gate": "at most 2x the encoder's weight bytes",
+        },
         "signatures": {},
         "qairt": "2.50.0.260828221209",
         "compiler": {"ai-edge-litert": "2.3.0"},
@@ -310,7 +315,7 @@ def test_every_answer_key_is_recorded(monkeypatch, tmp_path, npu_env):
     monkeypatch.setattr(envs.StageEnv, "run", FakeNpuRun(_ok()))
     _, got = _compile(tmp_path, npu_env)
     recorded = got.as_dict()
-    for key in ("partitions", "ops_per_signature", "stamp", "weight_sharing", "qairt", "compiler"):
+    for key in ("partitions", "ops_per_signature", "stamp", "qnn_context", "qairt", "compiler"):
         assert recorded[key] == _ok()[key], key
     assert recorded["encoder_sha256"] == "cd" * 32
 
@@ -505,8 +510,11 @@ def _check(script, compiled, stats=None, weight_bytes=WEIGHTS):
 def test_a_whole_shared_stamped_compile_passes(script):
     facts = _check(script, _compiled())
     assert facts["stamp"] == ["Qualcomm", SOC]
-    assert facts["weight_sharing"]["bytecode_size"] == 169_586_688
-    assert facts["weight_sharing"]["functions"] == [f"qnn_partition_{i}" for i in range(4)]
+    context = facts["qnn_context"]
+    assert context["bytecode_size"] == 169_586_688
+    assert context["functions"] == [f"qnn_partition_{i}" for i in range(4)]
+    assert context["to_weights"] == 1.241 and context["encoder_weight_bytes"] == WEIGHTS
+    assert "1.24x" in context["measured"] and "4.29x" in context["measured"]
     assert facts["signatures"] == IO and facts["qairt"] == "2.50.0.260828221209"
 
 
@@ -536,17 +544,17 @@ def _dispatch_with(**changes: Any) -> list[dict[str, Any]]:
         (
             {"dispatch": _dispatch_with(bytecode_offset=9999)},
             None,
-            "weight_sharing",
+            "dispatch",
             "2 bytecode ranges",
         ),
         (
             {"dispatch": _dispatch_with(name="qnn_partition_0")},
             None,
-            "weight_sharing",
+            "dispatch",
             "own function",
         ),
-        ({"dispatch": _dispatch_with(name=None)}, None, "weight_sharing", "own function"),
-        ({"bytes": 1000}, None, "weight_sharing", "not inside"),
+        ({"dispatch": _dispatch_with(name=None)}, None, "dispatch", "own function"),
+        ({"bytes": 1000}, None, "dispatch", "not inside"),
         ({"stamp": b"Qualcomm".ljust(249, b"\0")}, None, "stamp", "249 bytes"),
         ({"stamp": None}, None, "stamp", "None bytes"),
         ({"stamp": b"\xff" * 250}, None, "stamp", "not ASCII"),
@@ -579,11 +587,11 @@ def test_a_compile_with_a_signature_more_than_asked_is_refused(script):
 
 def test_a_context_holding_unshared_weights_is_refused(script):
     unshared = [{**d, "bytecode_size": 586_875_872} for d in _compiled()["dispatch"]]
-    with pytest.raises(script["Refused"], match="not shared") as exc:
+    with pytest.raises(script["Refused"], match="look unshared") as exc:
         _check(script, _compiled(dispatch=unshared, bytes=586_879_664))
-    assert exc.value.cause == "weight_sharing"
+    assert exc.value.cause == "context_size"
     # The measured shared context passes at the same weights; the bound is 2x.
-    assert _check(script, _compiled(), weight_bytes=169_586_688 // 2)["weight_sharing"]
+    assert _check(script, _compiled(), weight_bytes=169_586_688 // 2)["qnn_context"]
     with pytest.raises(script["Refused"]):
         _check(script, _compiled(), weight_bytes=169_586_688 // 2 - 1)
 
@@ -967,3 +975,133 @@ def test_an_npu_report_of_another_file_names_no_target(tmp_path):
     report["kind"] = "graft"
     (tmp_path / REPORT_NAME).write_text(json.dumps(report))
     assert npu_target_of(model) is None
+
+
+# ---------------------------------------------------------------------------
+# Publication is all or none, readiness, and whose failure a cause is
+# ---------------------------------------------------------------------------
+
+
+def _failing_on(n: int, real):
+    """`real`, raising OSError on its `n`-th call (1-based)."""
+    calls = {"n": 0}
+
+    def wrapped(*args):
+        calls["n"] += 1
+        if calls["n"] == n:
+            raise OSError(f"call {n} refused")
+        return real(*args)
+
+    return wrapped
+
+
+def _nothing_published(out: Path) -> dict[str, Any]:
+    report = _report(out)
+    assert report["npu"] == [] and report["npu_published"] is False
+    for soc in ("SM8750", "SM8650"):
+        assert not (out / f"int8-npu-{soc}").exists(), soc
+    assert not list(out.glob(".litetune-npu-stage-*"))
+    (publish,) = [c for c in report["checks"]["checks"] if c["name"] == "npu files"]
+    assert publish["outcome"] == Outcome.UNCHECKED.value
+    return report
+
+
+def test_a_failure_moving_the_second_soc_moves_the_first_back(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(embedding_export, "_rename", _failing_on(2, embedding_export._rename))
+    out = tmp_path / "out"
+    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
+    report = _nothing_published(out)
+    assert any(
+        t.startswith("no NPU file was published: call 2 refused") for t in report["limitations"]
+    )
+
+
+def test_a_failure_writing_a_report_publishes_nothing(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        embedding_export, "_write_report", _failing_on(2, embedding_export._write_report)
+    )
+    renamed: list[Any] = []
+    monkeypatch.setattr(embedding_export, "_rename", lambda a, b: renamed.append((a, b)))
+    out = tmp_path / "out"
+    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
+    _nothing_published(out)
+    assert renamed == [], "no directory is moved before every report is written"
+
+
+def test_a_move_that_cannot_be_undone_is_named(hub, grafter, compiler, monkeypatch, tmp_path):
+    real = embedding_export._rename
+    calls = {"n": 0}
+
+    def rename(source, target):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # the second forward move and the move back
+            raise OSError(f"call {calls['n']} refused")
+        real(source, target)
+
+    monkeypatch.setattr(embedding_export, "_rename", rename)
+    out = tmp_path / "out"
+    _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
+    report = _report(out)
+    assert report["npu_published"] is False
+    (publish,) = [c for c in report["checks"]["checks"] if c["name"] == "npu files"]
+    assert "remain published" in publish["detail"] and "int8-npu-SM8750" in publish["detail"]
+    assert any(t.startswith("the NPU files were not all published") for t in report["limitations"])
+
+
+def test_each_published_soc_has_its_report_inside_its_directory(hub, grafter, compiler, tmp_path):
+    out = tmp_path / "out"
+    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) == 0
+    for soc in ("SM8750", "SM8650"):
+        assert sorted(p.name for p in (out / f"int8-npu-{soc}").iterdir()) == [
+            REPORT_NAME,
+            "model.litertlm",
+        ]
+
+
+def test_an_existing_npu_directory_is_refused_before_the_graft(hub, grafter, compiler, tmp_path):
+    out = tmp_path / "out"
+    (out / "int8-npu-SM8750").mkdir(parents=True)
+    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750")) == 4
+    assert grafter.calls == [] and compiler.calls == []
+
+
+@pytest.mark.parametrize(
+    "cause, verdict", [("script", Outcome.UNCHECKED), ("compiled_file", Outcome.FAILED)]
+)
+def test_a_script_error_is_could_not_check_and_a_bad_compiled_file_is_a_failure(
+    hub, grafter, compiler, tmp_path, cause, verdict
+):
+    compiler.causes["SM8750"] = cause
+    out = tmp_path / "out"
+    _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750"))
+    (npu,) = [c for c in _report(out)["checks"]["checks"] if c["name"] == "npu SM8750"]
+    assert npu["outcome"] == verdict.value
+
+
+def test_unreadable_compiled_bytes_are_the_compiled_files(script, monkeypatch):
+    def broken(path):
+        raise ValueError("unpack_from requires a buffer of at least 4 bytes")
+
+    monkeypatch.setitem(script, "describe", broken)
+    with pytest.raises(script["Refused"]) as exc:
+        script["read_compiled"]("encoder_npu.tflite")
+    assert exc.value.cause == "compiled_file" and "ValueError" in str(exc.value)
+
+
+def test_an_installed_file_removed_after_provisioning_makes_the_environment_unready(
+    monkeypatch, tmp_path
+):
+    from conftest import mark_provisioned
+
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    env = envs.NPU_QUALCOMM
+    mark_provisioned(env)
+    assert env.ready
+    (lib,) = env.path.glob(env.installed_files[0])
+    lib.unlink()
+    assert not env.ready
+    assert envs.StageEnv(name="plain", requirements=("a==1",)).missing_installed_files() == []

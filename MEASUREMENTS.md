@@ -2383,8 +2383,11 @@ Qualcomm file.
 | **int8 graft, weight sharing** | **1** | **169,586,688 B** | **311,705,600 B** | **233 s** |
 | Google's SM8750 file (base model) | 1 | 112,578,560 B (QAIRT 2.49) | 187,596,800 B | — |
 
-The int4 file's QNN context did not load on the phone (`Failed to create QNN context:
-1002`). SM8650 compiles the same way (224–293 s); its file has not run on a device.
+Both int8 compiles leave one QNN context that the four signatures' `DISPATCH_OP`s share; what
+tells them apart is its size against the encoder's 136,708,096 weight bytes, 1.24x with
+weight sharing and 4.29x without. `convert --npu` refuses a context larger than 2x, which is
+evidence of sharing, not a proof of it. The int4 file's QNN context did not load on the phone
+(`Failed to create QNN context: 1002`). SM8650 compiles the same way (224–293 s); its file has not run on a device.
 
 **On the phone**, through LiteRT-LM 0.18.0's EmbeddingEngine C API with the Qualcomm
 dispatch built against QAIRT 2.50.0 and Qualcomm's QNN runtime 2.50.0 (the runtime

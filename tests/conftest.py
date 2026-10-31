@@ -372,10 +372,16 @@ def mark_provisioned(env) -> Path:
 
     Nine places across seven test files used to write the marker alone, which is
     the old and wrong definition of ready taught nine times. One helper so that
-    the next change to what "provisioned" means has one place to land.
+    the next change to what "provisioned" means has one place to land. It landed:
+    an environment's `installed_files` are part of ready too, so one file per
+    pattern is left, its `*` read as `x`.
     """
     env.python.parent.mkdir(parents=True, exist_ok=True)
     env.python.touch()
+    for pattern in getattr(env, "installed_files", ()):
+        made = env.path / pattern.replace("*", "x")
+        made.parent.mkdir(parents=True, exist_ok=True)
+        made.touch()
     (env.path / ".litetune-ready").write_text(env.identity, encoding="utf-8")
     return env.path
 

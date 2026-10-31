@@ -877,7 +877,10 @@ litetune convert --model ./tuned/model --output-dir ./out --weights int8 --npu S
   `out/int8-npu-SM8750/model.litertlm` with its own `convert.json`, which names the
   file's sha256, the SoC it is stamped for, the QNN context, the QAIRT build and the
   graft it came from. `--npu` repeats; the SoCs are SM8550, SM8650, SM8750 and SM8850,
-  the four Google publishes NPU files for. All of them are published or none.
+  the four Google publishes NPU files for. All of them are published or none: each
+  SoC's directory, with its report inside, is moved into place only when every SoC has
+  compiled, and a failure while moving puts back what was already moved (and names, in
+  the report, any it could not).
 - **int8 only.** The int4 encoder's int4 FULLY_CONNECTED ops stay on the CPU (194
   partitions per signature), and that file did not load on a phone's NPU.
 - **Linux x86-64 only**, with the Debian packages `libc++1` and `libatomic1`. The first
@@ -885,8 +888,11 @@ litetune convert --model ./tuned/model --output-dir ./out --weights int8 --npu S
   2.50.0.260828 while it installs ai-edge-litert-sdk-qualcomm 2.3.0. A compile took
   215–321 s per SoC on 32 vCPUs.
 - **What it checks:** every signature (128, 256, 512 and 1024 tokens, Google's four)
-  compiled to one `DISPATCH_OP` over one shared QNN context, stamped for the SoC, its
-  inputs and outputs unchanged; the file read back section by section.
+  compiled to one `DISPATCH_OP`, all of them over one QNN context no larger than twice
+  the encoder's weight bytes, stamped for the SoC, its inputs and outputs unchanged; the
+  file read back section by section. The size bound is evidence of weight sharing, not
+  proof: the int8 graft's context was 1.24x its weights compiled with weight sharing and
+  4.29x without.
 - **What it cannot check:** `verify` runs LiteRT-LM's CPU or GPU, which cannot run a
   `DISPATCH_OP`, and refuses such a file. It needs a phone with that SoC and a
   LiteRT-LM build with the Qualcomm dispatch and a QAIRT 2.50 runtime; an older runtime

@@ -3042,7 +3042,13 @@ class StageEnv:
         something else -- and `.exists()` answered yes for it, which let an
         environment nobody finished read as ready.
         """
-        return (self.path / ".litetune-ready").is_file() and self.python.exists()
+        return (
+            (self.path / ".litetune-ready").is_file()
+            and self.python.exists()
+            # A file the install must leave (`installed_files`) removed afterwards makes
+            # the environment unready, as a missing interpreter does.
+            and not self.missing_installed_files()
+        )
 
     @property
     def unready_detail(self) -> str:

@@ -56,8 +56,8 @@ from litetune.embedding_npu import (
     EmbeddingNpuError,
     NpuResult,
     compile_for_npu,
+    dir_for,
     host_problem,
-    output_for,
     request_problem,
 )
 from litetune.embedding_tune import DECIDER_PREFIX, EmbeddingRecord
@@ -94,6 +94,9 @@ GRAFT_CHECK = "graft"
 
 
 NPU_ENV_CHECK = "npu environment"
+# Causes that say nothing about the model or the compiler: the run itself, and an error
+# in litetune's own script.
+NPU_RUN_CAUSES = ("run", "script")
 NPU_PUBLISH_CHECK = "npu files"
 
 
@@ -107,8 +110,9 @@ def npu_artifact_name(soc: str) -> str:
 
 
 NPU_NOT_VERIFIED = (
-    "the NPU file was compiled, checked (one DISPATCH_OP per signature over one shared QNN "
-    "context, stamped for its SoC, signatures unchanged) and read back section by section; "
+    "the NPU file was compiled, checked (one DISPATCH_OP per signature over one QNN context "
+    "no larger than twice the encoder's weights, stamped for its SoC, signatures unchanged) "
+    "and read back section by section; "
     "what it embeds has not been measured, and `litetune verify` cannot measure it: "
     "LiteRT-LM's CPU and GPU do not run a DISPATCH_OP. It needs a phone with that SoC and a "
     "LiteRT-LM build with the Qualcomm dispatch and a QAIRT 2.50 runtime"
@@ -382,7 +386,7 @@ def _refuse_request(request: EmbeddingExportRequest, record: EmbeddingRecord) ->
         problem = host_problem() or request.npu_env.refusal()
         if problem is not None:
             raise EmbeddingExportError(problem)
-    for target in [request.output] + [output_for(request.output_dir, soc) for soc in request.npu]:
+    for target in [request.output] + [dir_for(request.output_dir, soc) for soc in request.npu]:
         if target.exists() or target.is_symlink():
             raise EmbeddingExportError(
                 f"{target} already exists; name another --output-dir, nothing is written "
@@ -581,27 +585,67 @@ def _compile_npus(
                 "--output-dir"
             )
             return
-        try:
-            for compiled in staged:
-                final = output_for(request.output_dir, compiled.soc)
-                final.parent.mkdir(parents=True, exist_ok=True)
-                compiled.output.replace(final)
-                moved = compiled.moved_to(final)
-                result.npu.append(moved)
-                report = final.parent / REPORT_NAME
-                report.write_text(
-                    json.dumps(npu_report(result, moved), indent=2, default=str) + "\n",
-                    encoding="utf-8",
-                )
-                events.artifact(str(final), name=npu_artifact_name(moved.soc), verified=False)
-                events.artifact(str(report), name=f"{REPORT_NAME} (npu {moved.soc})")
-        except OSError as exc:
-            logger.exception("publishing the NPU files failed")
-            _add(result, events, Check.unchecked(NPU_PUBLISH_CHECK, f"run: {exc}"))
-            result.limitations.append(f"the NPU files were not all published: {exc}")
+        published = _publish_npus(request, result, events, staged, Path(tmp))
+        if not published:
             return
+    result.npu.extend(published)
+    for npu in published:
+        events.artifact(str(npu.output), name=npu_artifact_name(npu.soc), verified=False)
+        events.artifact(str(npu.output.parent / REPORT_NAME), name=f"{REPORT_NAME} (npu {npu.soc})")
     result.npu_published = True
     result.limitations.append(NPU_NOT_VERIFIED)
+
+
+def _rename(source: Path, target: Path) -> None:
+    """One directory moved into place; a name of its own so a test can fail it."""
+    source.rename(target)
+
+
+def _write_report(path: Path, report: dict[str, Any]) -> None:
+    path.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+
+
+def _publish_npus(
+    request: EmbeddingExportRequest,
+    result: EmbeddingExportResult,
+    events: EventStream,
+    staged: list[NpuResult],
+    stage: Path,
+) -> list[NpuResult]:
+    """Every staged SoC's directory, its report written inside it first, renamed into
+    place -- all of them, or, on any failure, none: what was already moved is moved back.
+    Returns the published results, or [] after adding the check that says why."""
+    moved: list[tuple[Path, Path]] = []
+    final: list[NpuResult] = []
+    try:
+        for compiled in staged:
+            target = dir_for(request.output_dir, compiled.soc)
+            published = compiled.moved_to(target / ARTIFACT_NAME)
+            _write_report(compiled.output.parent / REPORT_NAME, npu_report(result, published))
+            final.append(published)
+        for compiled in staged:
+            source, target = compiled.output.parent, dir_for(request.output_dir, compiled.soc)
+            _rename(source, target)
+            moved.append((target, source))
+    except OSError as exc:
+        logger.exception("publishing the NPU files failed")
+        stuck = []
+        for target, source in reversed(moved):
+            try:
+                _rename(target, source)
+            except OSError as back:
+                stuck.append(f"{target} ({back})")
+        detail = f"run: {exc}"
+        if stuck:
+            detail += f"; and could not be moved back, so remain published: {', '.join(stuck)}"
+        _add(result, events, Check.unchecked(NPU_PUBLISH_CHECK, detail))
+        result.limitations.append(
+            "no NPU file was published: " + detail.removeprefix("run: ")
+            if not stuck
+            else f"the NPU files were not all published: {detail}"
+        )
+        return []
+    return final
 
 
 def npu_report(result: EmbeddingExportResult, npu: NpuResult) -> dict[str, Any]:
@@ -650,7 +694,7 @@ def _compile_npu(
         )
     except EmbeddingNpuError as exc:
         logger.error("the %s compile stopped (%s): %s", soc, exc.cause, exc)
-        make = Check.unchecked if exc.cause == "run" else Check.failed
+        make = Check.unchecked if exc.cause in NPU_RUN_CAUSES else Check.failed
         _add(result, events, make(name, f"{exc.cause}: {exc}", observed={"cause": exc.cause}))
         return None
     except Exception as exc:  # noqa: BLE001 -- the SoC's own check, the others go on
@@ -661,14 +705,15 @@ def _compile_npu(
             Check.unchecked(name, f"run: {type(exc).__name__}: {exc}", observed={"cause": "run"}),
         )
         return None
-    weights = compiled.report["weight_sharing"]
+    context = compiled.report["qnn_context"]
     _add(
         result,
         events,
         Check.passed(
             name,
             f"{compiled.bytes:,} bytes; the text encoder ({compiled.encoder_bytes:,} bytes) one "
-            f"DISPATCH_OP per signature over one {weights['bytecode_size']:,}-byte QNN context, "
+            f"DISPATCH_OP per signature over one {context['bytecode_size']:,}-byte QNN context, "
+            f"{context['to_weights']}x the encoder's weight bytes (gate: {context['gate']}), "
             f"stamped for {'/'.join(compiled.report['stamp'])}, QAIRT {compiled.report['qairt']}; "
             f"compiled in {compiled.compile_s:.0f} s, read back",
             observed={"sha256": compiled.sha256, "bytes": compiled.bytes},
