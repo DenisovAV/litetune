@@ -2362,6 +2362,51 @@ section above by up to 0.002.
 - Out-of-scope requests were measured on CLINC150 only, at k=10 only, without
   option descriptions.
 
+## EmbeddingGemma 2 on a Qualcomm NPU
+
+Measured 2026-10-31. The banking77 fine-tune of *litetune end to end* above, its int8 graft
+(300,089,344 bytes), with the text encoder compiled ahead of time for SM8750, run on a
+Galaxy S25 Ultra (SM-S938U1, SM8750, Hexagon V79, Android 15).
+
+**How the file was made** (what `convert --npu` does): the graft's text encoder with its
+external weights inline and only Google's four NPU signatures (128, 256, 512 and 1024
+tokens), compiled by LiteRT's `apply_plugin_main` with the Qualcomm plugin
+(ai-edge-litert 2.3.0, ai-edge-litert-sdk-qualcomm 2.3.0, QAIRT 2.50.0.260828) and
+`--qualcomm_enable_weight_sharing=true`, on a 32-vCPU x86-64 Linux machine; packed with the
+graft's metadata, tokenizer and embedder byte for byte, in the section order of Google's
+Qualcomm file.
+
+| compiled encoder | partitions per signature | QNN context | file | compile |
+|---|---|---|---|---|
+| int4 graft | 194 (218 int4 FULLY_CONNECTED left on the CPU) | — | 332,988,416 B | 319 s |
+| int8 graft, no weight sharing | 1 | 586,875,872 B | 729,006,080 B | 215 s |
+| **int8 graft, weight sharing** | **1** | **169,586,688 B** | **311,705,600 B** | **233 s** |
+| Google's SM8750 file (base model) | 1 | 112,578,560 B (QAIRT 2.49) | 187,596,800 B | — |
+
+The int4 file's QNN context did not load on the phone (`Failed to create QNN context:
+1002`). SM8650 compiles the same way (224–293 s); its file has not run on a device.
+
+**On the phone**, through LiteRT-LM 0.18.0's EmbeddingEngine C API with the Qualcomm
+dispatch built against QAIRT 2.50.0 and Qualcomm's QNN runtime 2.50.0 (the runtime
+flutter_edge_ai's `native-v0.18.0-h` release ships), on the 2617 held-out rows and the
+4247 training rows the k-shot draws use, behind the decider's prefix. Accuracy is verify's
+k-shot centroid decider (five draws); the cost is against the float32 reference, paired.
+
+| side | k=10 mean (min) | k=5 mean | cost, k=10 | cosine to float32, mean / min | ms per text |
+|---|---|---|---|---|---|
+| float32 reference | 0.9312 (0.9301) | 0.9300 | — | 1 | — |
+| **NPU, the int8 file compiled for SM8750** | **0.9316 (0.9308)** | 0.9299 | −0.0004, unresolved in 5 of 5 draws | **0.99961 / 0.99696** | 9.86 |
+| NPU, the same graft compiled again by `convert --npu` | 0.9316 (0.9308) | 0.9299 | −0.0004 | 0.99961 / 0.99696 | 9.62 |
+| the phone's CPU, the int8 graft, 4 threads | 0.9314 (0.9305) | 0.9302 | −0.0002 | 0.99928 / 0.98907 | 57.6 |
+| an x86 CPU, the int8 graft, 4 threads | 0.9312 (0.9301) | 0.9298 | 0.0000 | 0.99927 / 0.98694 | 174 |
+| NPU, Google's SM8750 file (base model) | 0.9169 (0.9113) | 0.8974 | +0.0144, resolved in 5 of 5 | — | 6.73 |
+
+The two compiles of the same graft differ in size by 4,096 bytes of QNN context and gave
+byte-identical vectors on every one of the 6,864 texts. Google's NPU file against Google's
+CPU file on the same texts: cosine 0.787 (mean). Loading took 0.67 s on the NPU and
+1.0 s on the phone's CPU; the peak resident memory was 421–423 MiB on the NPU and 511 MiB on
+the CPU. No text was longer than 105 tokens, so only the 128-token signature ran.
+
 ## The CPU and the GPU on a Mac
 
 Each path was run through the script `verify` runs for it, unchanged except for
