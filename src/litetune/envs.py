@@ -2953,6 +2953,17 @@ class StageEnv:
     # Recorded so a missing one produces a named diagnosis rather than a dlopen
     # error; named only on Linux (`system_requirements_on`).
     system_requirements: tuple[str, ...] = field(default=())
+    # What pip is given in place of a pin, `(pin, install spec)`: a pinned name in
+    # `requirements` (which the wheel table and the identity read) installed from an
+    # exact file whose hash pip checks. Empty for every environment but NPU_QUALCOMM.
+    install_as: tuple[tuple[str, str], ...] = field(default=())
+    # Options added to this environment's `pip install`.
+    pip_options: tuple[str, ...] = field(default=())
+    # Variables set for the `pip install` only, `(name, value)`.
+    provision_variables: tuple[tuple[str, str], ...] = field(default=())
+    # Glob patterns, relative to the environment, that must each match a file once pip
+    # has finished: a package whose own build can fail quietly is not ready without them.
+    installed_files: tuple[str, ...] = field(default=())
 
     def __post_init__(self) -> None:
         unpinned = [r for r in self.requirements if not _is_pinned(r)]
@@ -2979,7 +2990,29 @@ class StageEnv:
             wheels.without_marker(r) for r in self.requirements if wheels.applies(r, environment)
         ]
         payload = "\n".join((sys.version.split()[0], *sorted(applied)))
+        # The install fields join the hash only when set, so every environment that has
+        # none keeps the identity (and the cache directory) it had before they existed.
+        extra = (self.install_as, self.pip_options, self.provision_variables, self.installed_files)
+        if any(extra):
+            payload += "\n" + json.dumps(
+                [
+                    [list(x) for x in self.install_as],
+                    list(self.pip_options),
+                    [list(x) for x in self.provision_variables],
+                    list(self.installed_files),
+                ]
+            )
         return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+    @property
+    def pip_requirements(self) -> list[str]:
+        """What `pip install` is given: `requirements`, each replaced by its `install_as`."""
+        replaced = dict(self.install_as)
+        return [replaced.get(r, r) for r in self.requirements]
+
+    def missing_installed_files(self) -> list[str]:
+        """The `installed_files` patterns that match nothing in this environment."""
+        return [p for p in self.installed_files if not any(self.path.glob(p))]
 
     @property
     def path(self) -> Path:
@@ -3205,7 +3238,8 @@ class StageEnv:
                     "pip",
                     "install",
                     "--quiet",
-                    *self.requirements,
+                    *self.pip_options,
+                    *self.pip_requirements,
                 ]
                 try:
                     # Through the same guard the stages use, and for the same
@@ -3220,7 +3254,7 @@ class StageEnv:
                     # out of reach, which would otherwise install somewhere
                     # other than this venv while `.litetune-ready` was written
                     # over it regardless.
-                    proc = _run_guarded(cmd, remaining)
+                    proc = _run_guarded(cmd, remaining, dict(self.provision_variables) or None)
                 except subprocess.TimeoutExpired:
                     raise RuntimeError(
                         f"provisioning environment {self.name!r} exceeded its {timeout}s budget "
@@ -3229,6 +3263,14 @@ class StageEnv:
                     ) from None
                 if proc.returncode != 0:
                     raise RuntimeError(self._provisioning_failed(proc.stderr))
+                missing = self.missing_installed_files()
+                if missing:
+                    said = redact_text((proc.stdout or "") + (proc.stderr or ""))
+                    raise RuntimeError(
+                        f"provisioning environment {self.name!r}: pip finished, but "
+                        f"{', '.join(missing)} matched nothing under {self.path}, so the "
+                        f"environment is not ready. pip said:\n{said[-2000:]}"
+                    )
                 # Written last, and the only thing `ready` consults: an
                 # environment interrupted anywhere above this line has no
                 # marker, so the next run rebuilds it instead of trusting a
@@ -3282,6 +3324,12 @@ class StageEnv:
         if debian:
             # Named as what they are, Debian package names, and only on Linux.
             detail += " and needs the Debian package(s) " + ", ".join(debian)
+        for requirement in self.requirements:
+            release = wheels.PUBLISHED.get(wheels.canonical_pin(requirement) or "")
+            if release is not None and release.source_build:
+                # A pin pip builds is the likeliest place for its install to fail, and
+                # what its build needs is not in pip's last lines.
+                detail += f"; {release.requirement} is built from source: {release.source_build}"
         if package and _canonical(package) in _CONVERTER_PACKAGES:
             return (
                 f"{detail}. {_CONVERTER_UNAVAILABLE.format(package=package)}. pip said:\n"
@@ -3781,23 +3829,6 @@ TRAIN = StageEnv(
 # torchvision 0.24.1 publish Linux wheels as `manylinux_2_28` only and a macOS
 # wheel for arm64 only, so this environment does not install on Intel macOS or
 # on a glibc older than 2.28.
-# `convert --npu`: LiteRT's AOT compiler with the Qualcomm plugin (embedding_npu). The
-# plugin and `apply_plugin_main` ship in ai-edge-litert's Linux x86-64 wheels only, and
-# ai-edge-litert-sdk-qualcomm 2.3.0 is a source distribution whose build downloads QAIRT
-# 2.50.0.260828 from Qualcomm -- the QAIRT flutter_edge_ai's Qualcomm dispatch is built
-# against. ai-edge-litert's own `npu-sdk` extra asks for the SDK as ~=0.2.0, so it is
-# pinned by name. The plugin dlopen()s libc++ and libatomic, which no error names.
-NPU_QUALCOMM = StageEnv(
-    name="npu-qualcomm",
-    requirements=(
-        "ai-edge-litert==2.3.0",
-        "ai-edge-litert-sdk-qualcomm==2.3.0",
-        "litert-lm-builder==0.18.0",
-        "flatbuffers==25.12.19",
-    ),
-    system_requirements=("libc++1", "libatomic1"),
-)
-
 EMBED_TRAIN = StageEnv(
     name="embed-train",
     requirements=(
@@ -3810,4 +3841,54 @@ EMBED_TRAIN = StageEnv(
         "huggingface-hub==1.33.0",
         "safetensors==0.8.0",
     ),
+)
+
+# `convert --npu` (embedding_npu): LiteRT's AOT compiler with the Qualcomm plugin. The
+# plugin and `apply_plugin_main` ship in ai-edge-litert's Linux x86-64 wheels only.
+#
+# ai-edge-litert-sdk-qualcomm 2.3.0 is published as a source distribution only. Its
+# setup.py downloads QAIRT 2.50.0.260828 from Qualcomm's software center while it builds
+# -- the QAIRT that flutter_edge_ai's Qualcomm dispatch and its QNN runtime pin are built
+# against. That download is trusted on TLS alone, and the QAIRT libraries it unpacks are
+# loaded by the compiler at compile time. The same setup.py prints an error and carries
+# on when the download or the extraction fails, and skips the download whenever
+# SKIP_SDK_DOWNLOAD is set to anything non-empty. So the variable is cleared for the
+# install, pip keeps no wheel it built from the sdist (`--no-cache-dir`; a cached one
+# would be reused without its download), and the install is followed by a check that the
+# two QNN libraries the compiler loads are there (`installed_files`). The sdist is
+# installed from its exact file, checked against the sha256 PyPI listed for it on
+# 2026-10-31; everything else must come as a wheel (`--only-binary=:all:`).
+#
+# ai-edge-litert's own `npu-sdk` extra asks for the SDK as ~=0.2.0, which is why the SDK
+# is pinned by name here. The plugin dlopen()s libc++ and libatomic; when one is missing
+# it loads no plugin and says only that.
+NPU_SDK_SDIST_SHA256 = "314831893c060a26f76691747d112a5553d45db3752341a07cbf56d0d6dee638"
+NPU_SDK_SDIST_URL = (
+    "https://files.pythonhosted.org/packages/72/01/"
+    "617db22b6ea29435db882608f6c753a79a1dd4287c01081aa1318144df2e/"
+    "ai_edge_litert_sdk_qualcomm-2.3.0.tar.gz"
+)
+_NPU_SDK_LIBS = "lib/python3*/site-packages/ai_edge_litert_sdk_qualcomm/data/lib/x86_64-linux-clang"
+NPU_QUALCOMM = StageEnv(
+    name="npu-qualcomm",
+    requirements=(
+        "ai-edge-litert==2.3.0",
+        "ai-edge-litert-sdk-qualcomm==2.3.0",
+        "litert-lm-builder==0.18.0",
+        "flatbuffers==25.12.19",
+    ),
+    system_requirements=("libc++1", "libatomic1"),
+    install_as=(
+        (
+            "ai-edge-litert-sdk-qualcomm==2.3.0",
+            f"ai-edge-litert-sdk-qualcomm @ {NPU_SDK_SDIST_URL}#sha256={NPU_SDK_SDIST_SHA256}",
+        ),
+    ),
+    pip_options=(
+        "--no-cache-dir",
+        "--only-binary=:all:",
+        "--no-binary=ai-edge-litert-sdk-qualcomm",
+    ),
+    provision_variables=(("SKIP_SDK_DOWNLOAD", ""),),
+    installed_files=(f"{_NPU_SDK_LIBS}/libQnnHtp.so", f"{_NPU_SDK_LIBS}/libQnnSystem.so"),
 )

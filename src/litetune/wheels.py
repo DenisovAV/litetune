@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import re
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from packaging.markers import default_environment
@@ -114,9 +114,18 @@ class Release:
     # The `==` requirements without a marker in this release's own metadata.
     requires: tuple[str, ...] = ()
     # Why this release is meant to be built from its source distribution, for a
-    # pin that publishes no wheel at all; empty for every other. A release with
-    # a reason here is not a gap: pip building it is the published install.
+    # pin that publishes no wheel at all; empty for every other. This table reads
+    # PyPI's file lists and calls a pin with no wheel for a host a gap; pip itself
+    # would build an sdist unless told not to. A release with a reason here is not a
+    # gap on the hosts `source_build_on` accepts, and is one everywhere else.
     source_build: str = ""
+    # Whether `host` is one this release's source build is meant for.
+    source_build_on: Callable[[Host], bool] | None = None
+
+    def built_from_source_on(self, host: Host) -> bool:
+        return bool(
+            self.source_build and self.sdist and self.source_build_on and self.source_build_on(host)
+        )
 
     @property
     def sdist(self) -> bool:
@@ -260,6 +269,11 @@ def without_marker(requirement: str) -> str:
     return str(parsed)
 
 
+def canonical_pin(requirement: str) -> str | None:
+    """`name==version` in canonical spelling, the key of `PUBLISHED`, or None."""
+    return _key(requirement)
+
+
 def _key(requirement: str) -> str | None:
     """`name==version` in canonical spelling, or None for a requirement that is not one."""
     pinned = pin(requirement)
@@ -312,7 +326,7 @@ def gaps(
         seen.add(key)
         release = table[key]
         pending.extend((r, release.requirement) for r in release.requires)
-        if release.installs_on(host) or (release.source_build and release.sdist):
+        if release.installs_on(host) or release.built_from_source_on(host):
             continue
         found.append(Gap(release, host, release.minors_on(host), required_by=parent))
     return found
@@ -326,6 +340,12 @@ def gaps(
 # To read a new pin in: its `urls[].filename`, sorted,
 # and the entries of `info.requires_dist` that are `name==version` with no `;`.
 # ---------------------------------------------------------------------------
+
+
+def linux_x86_64(host: Host) -> bool:
+    """Whether `host` accepts a Linux x86-64 wheel (a manylinux or plain linux tag)."""
+    return any("linux" in tag.platform and tag.platform.endswith("x86_64") for tag in host.tags)
+
 
 _RELEASES = (
     Release(
@@ -377,6 +397,7 @@ _RELEASES = (
         "ai-edge-litert-sdk-qualcomm==2.3.0",
         "https://pypi.org/pypi/ai-edge-litert-sdk-qualcomm/2.3.0/json",
         files=("ai_edge_litert_sdk_qualcomm-2.3.0.tar.gz",),
+        source_build_on=linux_x86_64,
         source_build=(
             "it is published as a source distribution only, and its setup.py downloads QAIRT "
             "2.50.0.260828 from Qualcomm's software center while it builds"

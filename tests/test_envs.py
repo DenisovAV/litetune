@@ -21,7 +21,15 @@ import pytest
 from conftest import PROBE_FIELDS, FakeJobApi, machine, mark_provisioned, probe_answer
 
 from litetune import envs, wheels
-from litetune.envs import EMBED_TRAIN, EXPORT, RUNTIME, TRAIN, StageEnv, UnpinnedRequirement
+from litetune.envs import (
+    EMBED_TRAIN,
+    EXPORT,
+    NPU_QUALCOMM,
+    RUNTIME,
+    TRAIN,
+    StageEnv,
+    UnpinnedRequirement,
+)
 
 
 def _fake_venv(self, path):
@@ -107,7 +115,7 @@ def test_a_pin_that_does_not_apply_changes_no_identity(monkeypatch):
 
 
 def test_shipped_environments_are_pinned():
-    for env in (RUNTIME, EXPORT, TRAIN, EMBED_TRAIN):
+    for env in (RUNTIME, EXPORT, TRAIN, EMBED_TRAIN, NPU_QUALCOMM):
         assert env.identity, env.name
 
 
@@ -1290,9 +1298,9 @@ def test_an_environment_for_another_interpreter_is_not_reported_as_junk():
     junk, it is the one that works over there. Reporting it as "unused" would
     invite deleting exactly the caches worth keeping.
     """
-    from litetune.envs import EMBED_TRAIN, EXPORT, RUNTIME, TRAIN
+    from litetune.envs import EMBED_TRAIN, EXPORT, NPU_QUALCOMM, RUNTIME, TRAIN
 
-    stages = (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN)
+    stages = (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN, NPU_QUALCOMM)
     identities = {env.path.name for env in stages}
     assert len(identities) == len(stages), "each stage owns a distinct directory"
     for env in stages:

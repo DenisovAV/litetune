@@ -2043,3 +2043,24 @@ def test_the_command_line_json_is_the_manifest(fake, tmp_path, capsys):
     assert manifest["status"] == "failed_gate"
     assert manifest["embedding"]["threads"] == 2
     assert fake.specs["candidate"]["threads"] == 2
+
+
+def test_a_file_compiled_for_an_npu_is_refused_before_any_run(fake, tmp_path):
+    """`convert --npu` writes a report of kind npu beside its file; LiteRT-LM's CPU and
+    GPU cannot run its DISPATCH_OP, so verify says that instead of failing in the engine."""
+    s = _setup(tmp_path)
+    digest = hash_file(s.model).removeprefix("sha256:")
+    (s.model.parent / REPORT_NAME).write_text(
+        json.dumps(
+            {
+                "schema": EMBEDDING_CONVERT_SCHEMA,
+                "kind": "npu",
+                "npu": {"soc": "SM8750", "sha256": digest},
+            }
+        )
+    )
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    failed = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
+    assert failed[0]["name"] == CANDIDATE_CHECK and "Qualcomm SM8750 NPU" in failed[0]["detail"]
+    assert fake.runs == []
