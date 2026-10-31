@@ -877,10 +877,11 @@ litetune convert --model ./tuned/model --output-dir ./out --weights int8 --npu S
   `out/int8-npu-SM8750/model.litertlm` with its own `convert.json`, which names the
   file's sha256, the SoC it is stamped for, the QNN context, the QAIRT build and the
   graft it came from. `--npu` repeats; the SoCs are SM8550, SM8650, SM8750 and SM8850,
-  the four Google publishes NPU files for. All of them are published or none: each
-  SoC's directory, with its report inside, is moved into place only when every SoC has
-  compiled, and a failure while moving puts back what was already moved (and names, in
-  the report, any it could not).
+  the four Google publishes NPU files for. Publishing starts once every SoC has compiled.
+  Each SoC's directory is then created new and written whole, model and report; a
+  failure stops the SoCs after it, nothing written is removed, and the main
+  `convert.json` says, from what is on disk, which SoCs were published and which
+  directories were written in part.
 - **int8 only.** The int4 encoder's int4 FULLY_CONNECTED ops stay on the CPU (194
   partitions per signature), and that file did not load on a phone's NPU.
 - **Linux x86-64 only**, with the Debian packages `libc++1` and `libatomic1`. The first

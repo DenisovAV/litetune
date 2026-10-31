@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -322,6 +323,11 @@ class EmbeddingExportResult:
     # `--npu`: one entry per SoC compiled, at its published path once all are.
     npu: list[NpuResult] = field(default_factory=list)
     npu_published: bool = False
+    # What publishing got to: each SoC whose directory this run created, with its result,
+    # and why publishing stopped. `_npus_on_disk` reads `npu` and `npu_published` from these
+    # and the disk when the report is written.
+    npu_created: dict[str, NpuResult] = field(default_factory=dict)
+    npu_publish_error: str | None = None
 
     @property
     def outcome(self) -> Outcome:
@@ -424,6 +430,8 @@ def run_embedding_export(
         _add(result, events, Check.unchecked(GRAFT_CHECK, f"{type(exc).__name__}: {exc}"))
         raise
     finally:
+        if request.npu:
+            _npus_on_disk(request, result, events)
         request.report_path.parent.mkdir(parents=True, exist_ok=True)
         request.report_path.write_text(
             json.dumps(result.as_dict(), indent=2, default=str) + "\n", encoding="utf-8"
@@ -549,9 +557,9 @@ def _compile_npus(
     events: EventStream,
     grafted: GraftResult,
 ) -> None:
-    """Every `--npu` SoC compiled into a staging directory beside the outputs, then all of
-    them published with a report each -- or none, so that no run leaves part of what it
-    was asked for (a retry would then refuse those files as existing)."""
+    """Every `--npu` SoC compiled into a staging directory beside the outputs; when all of
+    them compiled, each published into a directory of its own with its report
+    (`_publish_npus`). Nothing published is ever removed or moved again."""
     with guard(NPU_ENV_CHECK) as sink:
         if request.auto_provision:
             request.npu_env.provision(events=events)
@@ -580,24 +588,21 @@ def _compile_npus(
         if len(staged) != len(request.npu):
             failed = [soc for soc in request.npu if soc not in {r.soc for r in staged}]
             result.limitations.append(
-                f"no NPU file was published: {', '.join(failed)} did not compile, and a run "
-                "publishes all of the SoCs it was given or none. Run again with another "
-                "--output-dir"
+                f"no NPU file was published: {', '.join(failed)} did not compile. Run again "
+                "with another --output-dir"
             )
             return
-        published = _publish_npus(request, result, events, staged, Path(tmp))
-        if not published:
-            return
-    result.npu.extend(published)
-    for npu in published:
-        events.artifact(str(npu.output), name=npu_artifact_name(npu.soc), verified=False)
-        events.artifact(str(npu.output.parent / REPORT_NAME), name=f"{REPORT_NAME} (npu {npu.soc})")
-    result.npu_published = True
-    result.limitations.append(NPU_NOT_VERIFIED)
+        _publish_npus(request, result, staged)
+
+
+def _mkdir(target: Path) -> None:
+    """The SoC's directory, created by this run or not at all: an existing one -- made
+    since the check before the compile -- is a FileExistsError, and nothing is replaced."""
+    os.mkdir(target)
 
 
 def _rename(source: Path, target: Path) -> None:
-    """One directory moved into place; a name of its own so a test can fail it."""
+    """One staged file moved into the SoC's new directory; a name so a test can fail it."""
     source.rename(target)
 
 
@@ -606,73 +611,69 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
 
 
 def _publish_npus(
-    request: EmbeddingExportRequest,
-    result: EmbeddingExportResult,
-    events: EventStream,
-    staged: list[NpuResult],
-    stage: Path,
-) -> list[NpuResult]:
-    """Every staged SoC's directory, its report written inside it first, renamed into
-    place -- all of them, or, on any failure, none: what was already moved is moved back.
-    Returns the published results, or [] after adding the check that says why."""
-    moved: list[tuple[Path, Path, list[tuple[str, int]]]] = []
-    final: list[NpuResult] = []
+    request: EmbeddingExportRequest, result: EmbeddingExportResult, staged: list[NpuResult]
+) -> None:
+    """Each staged SoC published in turn: its report written in staging, its directory
+    created exclusively, the model and then the report moved into it. The first failure
+    stops the rest; an OSError is recorded, anything else (an interrupt) goes on once it
+    is. Nothing is rolled back: what reached the disk is what the report says, read from
+    the disk (`_npus_on_disk`)."""
     try:
         for compiled in staged:
             target = dir_for(request.output_dir, compiled.soc)
             published = compiled.moved_to(target / ARTIFACT_NAME)
-            _write_report(compiled.output.parent / REPORT_NAME, npu_report(result, published))
-            final.append(published)
-        for compiled in staged:
-            source, target = compiled.output.parent, dir_for(request.output_dir, compiled.soc)
-            # Checked before the compile and again here: on Linux a rename replaces an
-            # empty directory that appeared in between.
-            if target.exists() or target.is_symlink():
-                raise FileExistsError(f"{target} appeared while the NPU files compiled")
-            listing = _listing(source)
-            _rename(source, target)
-            moved.append((target, source, listing))
+            staged_report = compiled.output.parent / REPORT_NAME
+            _write_report(staged_report, npu_report(result, published))
+            _mkdir(target)
+            result.npu_created[compiled.soc] = published
+            _rename(compiled.output, target / ARTIFACT_NAME)
+            _rename(staged_report, target / REPORT_NAME)
     except BaseException as exc:
-        logger.exception("publishing the NPU files failed")
-        stuck = _move_back(moved)
-        detail = f"run: {type(exc).__name__}: {exc}"
-        if stuck:
-            detail += f"; and not moved back, so remain published: {', '.join(stuck)}"
-        _add(result, events, Check.unchecked(NPU_PUBLISH_CHECK, detail))
-        result.limitations.append(
-            "no NPU file was published: " + detail.removeprefix("run: ")
-            if not stuck
-            else f"the NPU files were not all published: {detail}"
-        )
+        logger.exception("publishing the NPU files stopped")
+        result.npu_publish_error = f"{type(exc).__name__}: {exc}"
         if not isinstance(exc, OSError):
             raise
-        return []
-    return final
 
 
-def _listing(directory: Path) -> list[tuple[str, int]]:
-    """Every file under `directory`, by relative path and size."""
-    return sorted(
-        (p.relative_to(directory).as_posix(), p.stat().st_size)
-        for p in directory.rglob("*")
-        if p.is_file()
-    )
+def _npus_on_disk(
+    request: EmbeddingExportRequest, result: EmbeddingExportResult, events: EventStream
+) -> None:
+    """`npu` and `npu_published` from the disk: an SoC counts as published when the
+    directory this run created holds a report whose `npu.sha256` is the model's there.
+    A directory it created that does not is named as partial; none is removed."""
+    published, partial = [], []
+    for npu in result.npu_created.values():
+        if _published_whole(npu.output):
+            published.append(npu)
+        else:
+            partial.append(str(npu.output.parent))
+    result.npu = published
+    result.npu_published = bool(request.npu) and len(published) == len(request.npu)
+    for npu in published:
+        events.artifact(str(npu.output), name=npu_artifact_name(npu.soc), verified=False)
+        events.artifact(str(npu.output.parent / REPORT_NAME), name=f"{REPORT_NAME} (npu {npu.soc})")
+    if published:
+        result.limitations.append(NPU_NOT_VERIFIED)
+    if result.npu_publish_error is None and not partial:
+        if published:
+            _add(result, events, Check.passed(NPU_PUBLISH_CHECK, f"{len(published)} published"))
+        return
+    detail = f"published {len(published)} of {len(request.npu)}"
+    if result.npu_publish_error:
+        detail += f"; publishing stopped on {result.npu_publish_error}"
+    if partial:
+        detail += f"; written in part, left as they are: {', '.join(partial)}"
+    _add(result, events, Check.unchecked(NPU_PUBLISH_CHECK, f"run: {detail}"))
+    result.limitations.append(f"{detail}. Run the rest with another --output-dir")
 
 
-def _move_back(moved: list[tuple[Path, Path, list[tuple[str, int]]]]) -> list[str]:
-    """What was published moved back into staging, newest first; the directories that
-    stay published, and why. One whose files changed after it was published is left
-    where it is: moving it back would take those files away with the staging area."""
-    stuck: list[str] = []
-    for target, source, listing in reversed(moved):
-        try:
-            if _listing(target) != listing:
-                stuck.append(f"{target} (its files changed after it was published)")
-                continue
-            _rename(target, source)
-        except OSError as back:
-            stuck.append(f"{target} ({back})")
-    return stuck
+def _published_whole(model: Path) -> bool:
+    """Whether `model`'s directory holds it and a report naming its sha256."""
+    try:
+        report = json.loads((model.parent / REPORT_NAME).read_text(encoding="utf-8"))
+        return model.is_file() and f"sha256:{report['npu']['sha256']}" == hash_file(model)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def npu_report(result: EmbeddingExportResult, npu: NpuResult) -> dict[str, Any]:

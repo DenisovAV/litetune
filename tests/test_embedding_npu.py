@@ -978,79 +978,8 @@ def test_an_npu_report_of_another_file_names_no_target(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Publication is all or none, readiness, and whose failure a cause is
+# Publication per SoC, readiness, and whose failure a cause is
 # ---------------------------------------------------------------------------
-
-
-def _failing_on(n: int, real):
-    """`real`, raising OSError on its `n`-th call (1-based)."""
-    calls = {"n": 0}
-
-    def wrapped(*args):
-        calls["n"] += 1
-        if calls["n"] == n:
-            raise OSError(f"call {n} refused")
-        return real(*args)
-
-    return wrapped
-
-
-def _nothing_published(out: Path) -> dict[str, Any]:
-    report = _report(out)
-    assert report["npu"] == [] and report["npu_published"] is False
-    for soc in ("SM8750", "SM8650"):
-        assert not (out / f"int8-npu-{soc}").exists(), soc
-    assert not list(out.glob(".litetune-npu-stage-*"))
-    (publish,) = [c for c in report["checks"]["checks"] if c["name"] == "npu files"]
-    assert publish["outcome"] == Outcome.UNCHECKED.value
-    return report
-
-
-def test_a_failure_moving_the_second_soc_moves_the_first_back(
-    hub, grafter, compiler, monkeypatch, tmp_path
-):
-    monkeypatch.setattr(embedding_export, "_rename", _failing_on(2, embedding_export._rename))
-    out = tmp_path / "out"
-    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
-    report = _nothing_published(out)
-    assert any(
-        t.startswith("no NPU file was published: OSError: call 2 refused")
-        for t in report["limitations"]
-    )
-
-
-def test_a_failure_writing_a_report_publishes_nothing(
-    hub, grafter, compiler, monkeypatch, tmp_path
-):
-    monkeypatch.setattr(
-        embedding_export, "_write_report", _failing_on(2, embedding_export._write_report)
-    )
-    renamed: list[Any] = []
-    monkeypatch.setattr(embedding_export, "_rename", lambda a, b: renamed.append((a, b)))
-    out = tmp_path / "out"
-    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
-    _nothing_published(out)
-    assert renamed == [], "no directory is moved before every report is written"
-
-
-def test_a_move_that_cannot_be_undone_is_named(hub, grafter, compiler, monkeypatch, tmp_path):
-    real = embedding_export._rename
-    calls = {"n": 0}
-
-    def rename(source, target):
-        calls["n"] += 1
-        if calls["n"] >= 2:  # the second forward move and the move back
-            raise OSError(f"call {calls['n']} refused")
-        real(source, target)
-
-    monkeypatch.setattr(embedding_export, "_rename", rename)
-    out = tmp_path / "out"
-    _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
-    report = _report(out)
-    assert report["npu_published"] is False
-    (publish,) = [c for c in report["checks"]["checks"] if c["name"] == "npu files"]
-    assert "remain published" in publish["detail"] and "int8-npu-SM8750" in publish["detail"]
-    assert any(t.startswith("the NPU files were not all published") for t in report["limitations"])
 
 
 def test_each_published_soc_has_its_report_inside_its_directory(hub, grafter, compiler, tmp_path):
@@ -1108,74 +1037,6 @@ def test_an_installed_file_removed_after_provisioning_makes_the_environment_unre
     assert envs.StageEnv(name="plain", requirements=("a==1",)).missing_installed_files() == []
 
 
-def test_an_interrupt_on_the_second_move_moves_the_first_back(
-    hub, grafter, compiler, monkeypatch, tmp_path
-):
-    real = embedding_export._rename
-    calls = {"n": 0}
-
-    def rename(source, target):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise KeyboardInterrupt
-        real(source, target)
-
-    monkeypatch.setattr(embedding_export, "_rename", rename)
-    out = tmp_path / "out"
-    with pytest.raises(KeyboardInterrupt):  # the interrupt goes on once the move is undone
-        _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
-    assert not (out / "int8-npu-SM8750").exists(), "moved back before the interrupt went on"
-    report = _report(out)
-    assert report["npu"] == [] and report["npu_published"] is False
-
-
-def test_a_published_directory_whose_files_changed_is_left_and_named(
-    hub, grafter, compiler, monkeypatch, tmp_path
-):
-    real = embedding_export._rename
-    calls = {"n": 0}
-
-    def rename(source, target):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise OSError("call 2 refused")
-        real(source, target)
-        if calls["n"] == 1:
-            (target / "added-after.txt").write_text("someone's")
-
-    monkeypatch.setattr(embedding_export, "_rename", rename)
-    out = tmp_path / "out"
-    _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
-    assert (out / "int8-npu-SM8750" / "added-after.txt").read_text() == "someone's"
-    (publish,) = [c for c in _report(out)["checks"]["checks"] if c["name"] == "npu files"]
-    assert (
-        "remain published" in publish["detail"]
-        and "changed after it was published" in publish["detail"]
-    )
-
-
-def test_a_target_that_appears_during_publication_is_not_replaced(
-    hub, grafter, compiler, monkeypatch, tmp_path
-):
-    real = embedding_export._rename
-    out = tmp_path / "out"
-    appeared = out / "int8-npu-SM8650"
-
-    def rename(source, target):
-        if not appeared.exists() and target.name == "int8-npu-SM8750":
-            appeared.mkdir()
-        real(source, target)
-
-    monkeypatch.setattr(embedding_export, "_rename", rename)
-    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
-    assert (
-        appeared.is_dir() and list(appeared.iterdir()) == []
-    ), "the directory that appeared is untouched"
-    assert not (out / "int8-npu-SM8750").exists(), "the first SoC was moved back"
-    (publish,) = [c for c in _report(out)["checks"]["checks"] if c["name"] == "npu files"]
-    assert "FileExistsError" in publish["detail"] and "appeared" in publish["detail"]
-
-
 def test_an_installed_file_that_is_a_directory_does_not_count(monkeypatch, tmp_path):
     from conftest import mark_provisioned
 
@@ -1187,3 +1048,127 @@ def test_an_installed_file_that_is_a_directory_does_not_count(monkeypatch, tmp_p
     lib.mkdir()
     assert not env.ready
     assert env.missing_installed_files() == [env.installed_files[0]]
+
+
+def _rename_failing(real, n: int, raised: BaseException):
+    """`real`, raising `raised` on its `n`-th call (1-based)."""
+    calls = {"n": 0}
+
+    def rename(source, target):
+        calls["n"] += 1
+        if calls["n"] == n:
+            raise raised
+        real(source, target)
+
+    return rename
+
+
+def _publish_check(out: Path) -> dict[str, Any]:
+    (check,) = [c for c in _report(out)["checks"]["checks"] if c["name"] == "npu files"]
+    return check
+
+
+def test_a_target_created_during_the_compile_is_left_untouched(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    out = tmp_path / "out"
+    foreign = out / "int8-npu-SM8650"
+    real_call = compiler.__call__
+
+    def compile_and_meddle(env, grafted, soc, output, **kwargs):
+        if soc == "SM8650":
+            foreign.mkdir(parents=True)
+            (foreign / "theirs.txt").write_text("keep")
+        return real_call(env, grafted, soc, output, **kwargs)
+
+    monkeypatch.setattr(embedding_export, "compile_for_npu", compile_and_meddle)
+    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
+    assert sorted(p.name for p in foreign.iterdir()) == ["theirs.txt"], "nothing replaced"
+    assert (foreign / "theirs.txt").read_text() == "keep"
+    report = _report(out)
+    assert [n["soc"] for n in report["npu"]] == ["SM8750"] and report["npu_published"] is False
+    check = _publish_check(out)
+    assert check["outcome"] == Outcome.UNCHECKED.value
+    assert "published 1 of 2" in check["detail"] and "FileExistsError" in check["detail"]
+    assert (
+        "written in part" not in check["detail"]
+    ), "a directory this run did not create is not named partial"
+    assert any("Run the rest with another --output-dir" in t for t in report["limitations"])
+
+
+def test_an_interrupt_after_the_first_soc_is_reported_from_the_disk(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        embedding_export,
+        "_rename",
+        _rename_failing(embedding_export._rename, 3, KeyboardInterrupt()),
+    )
+    out = tmp_path / "out"
+    with pytest.raises(KeyboardInterrupt):
+        _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
+    first = out / "int8-npu-SM8750"
+    assert sorted(p.name for p in first.iterdir()) == [REPORT_NAME, "model.litertlm"]
+    report = _report(out)
+    assert [n["soc"] for n in report["npu"]] == ["SM8750"] and report["npu_published"] is False
+    assert "KeyboardInterrupt" in _publish_check(out)["detail"]
+    # The second SoC's directory was created and holds nothing of it: named, not removed.
+    assert (out / "int8-npu-SM8650").is_dir()
+    assert str(out / "int8-npu-SM8650") in _publish_check(out)["detail"]
+
+
+def test_a_failure_moving_the_second_socs_report_leaves_both_and_names_the_partial(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        embedding_export,
+        "_rename",
+        _rename_failing(embedding_export._rename, 4, OSError("no space")),
+    )
+    out = tmp_path / "out"
+    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) != 0
+    assert sorted(p.name for p in (out / "int8-npu-SM8750").iterdir()) == [
+        REPORT_NAME,
+        "model.litertlm",
+    ]
+    second = out / "int8-npu-SM8650"
+    assert sorted(p.name for p in second.iterdir()) == ["model.litertlm"], "not deleted"
+    report = _report(out)
+    assert [n["soc"] for n in report["npu"]] == ["SM8750"] and report["npu_published"] is False
+    check = _publish_check(out)
+    assert "published 1 of 2" in check["detail"] and str(second) in check["detail"]
+    assert "OSError: no space" in check["detail"]
+
+
+def test_a_model_that_does_not_match_its_report_is_not_counted(
+    hub, grafter, compiler, monkeypatch, tmp_path
+):
+    real = embedding_export._rename
+
+    def rename(source, target):
+        real(source, target)
+        if target.name == "model.litertlm" and target.parent.name == "int8-npu-SM8650":
+            target.write_bytes(b"other bytes")
+
+    monkeypatch.setattr(embedding_export, "_rename", rename)
+    out = tmp_path / "out"
+    _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
+    report = _report(out)
+    assert [n["soc"] for n in report["npu"]] == ["SM8750"]
+    assert str(out / "int8-npu-SM8650") in _publish_check(out)["detail"]
+    assert (out / "int8-npu-SM8650" / "model.litertlm").read_bytes() == b"other bytes"
+
+
+def test_a_whole_publication_passes_its_check(hub, grafter, compiler, tmp_path):
+    out = tmp_path / "out"
+    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650")) == 0
+    assert _publish_check(out)["outcome"] == Outcome.PASSED.value
+    assert _report(out)["npu_published"] is True
+
+
+def test_nothing_is_published_when_a_soc_did_not_compile(hub, grafter, compiler, tmp_path):
+    compiler.causes["SM8650"] = "stamp"
+    out = tmp_path / "out"
+    _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750", "SM8650"))
+    assert not (out / "int8-npu-SM8750").exists() and not (out / "int8-npu-SM8650").exists()
+    assert not list(out.glob(".litetune-npu-stage-*"))
