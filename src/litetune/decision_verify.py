@@ -977,7 +977,11 @@ def verify_decision(
             )
     placed = place_reference(job, events)
     state.limitations.extend(placed.limitations)
-    fields["harness"] = {"reference_device_probe": placed.probe.as_dict()}
+    # `attempted` beside the probe's own record: an environment never asked and a
+    # probe that could not answer both have no device.
+    fields["harness"] = {
+        "reference_device_probe": {**placed.probe.as_dict(), "attempted": placed.probe.attempted}
+    }
     if placed.memory is not None:
         fields["harness"]["reference_mps_memory"] = placed.memory.as_dict()
 

@@ -2060,7 +2060,7 @@ new.
 
 On a Mac whose training environment's torch reaches MPS, `verify` runs a
 decision's float reference there, 64 rows a batch, under the memory policy
-`evaluate` uses; a reference that runs out of MPS memory, or meets an
+`evaluate` uses; a reference that runs out of MPS memory, or stops on an
 operation MPS does not implement, is scored again on the CPU. Measured
 2026-10-31 on an M5 Pro with 64 GB, on the emotion decision above
 (gemma-3-270m-it, LoRA, the `dynamic_wi8_afp32` bundle): the same verify,

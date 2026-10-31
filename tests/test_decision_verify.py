@@ -3273,7 +3273,7 @@ def test_the_probe_is_recorded(split, tmp_path, probed):
 
     _, fields = run(job_for(s, tmp_path, train_env=train), s["record"])
 
-    assert fields["harness"]["reference_device_probe"] == probe.as_dict()
+    assert fields["harness"]["reference_device_probe"] == {**probe.as_dict(), "attempted": True}
 
 
 def test_litetune_device_cpu_keeps_the_reference_off_mps_and_says_so(split, tmp_path, probed):
@@ -3349,6 +3349,7 @@ def test_an_environment_that_is_not_provisioned_is_not_asked(split, tmp_path, pr
     assert asked == [] and train.provisioned == 0
     assert reference_spec(job)["device"] == "auto"
     assert fields["harness"]["reference_device_probe"]["device"] is None
+    assert fields["harness"]["reference_device_probe"]["attempted"] is False
     assert any(m.startswith("no device probe was attempted") for m in fields["limitations"])
 
 
