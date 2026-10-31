@@ -66,6 +66,7 @@ from litetune.embedding_export import (
 )
 from litetune.embedding_export import REPORT_NAME as EMBEDDING_REPORT_NAME
 from litetune.embedding_export import summarise as summarise_embedding_convert
+from litetune.embedding_npu import NPU_SOCS
 from litetune.embedding_tune import (
     DIRECTION,
     EMBEDDING_MODEL,
@@ -779,6 +780,18 @@ def _add_convert(sub) -> None:
             "embedding checkpoints only (a `tune --model google/embeddinggemma-2` output): how "
             "the fine-tune's weights are quantized into Google's file. int8: both graphs int8; "
             f"int4: both int4, Google's own size (default {DEFAULT_WEIGHTS})"
+        ),
+    )
+    convert.add_argument(
+        "--npu",
+        action="append",
+        choices=NPU_SOCS,
+        metavar="SOC",
+        help=(
+            "embedding checkpoints only, with --weights int8, on Linux x86-64: also compile the "
+            "graft's text encoder ahead of time for this Qualcomm SoC, into "
+            "<output-dir>/int8-npu-<SOC>/model.litertlm; repeat for more SoCs. Only SM8750 has "
+            f"run on a device. One of {', '.join(NPU_SOCS)}"
         ),
     )
     convert.add_argument(
@@ -1708,9 +1721,9 @@ def _convert(args: argparse.Namespace) -> int:
     record = _embedding_record(args.model)
     if record is not None:
         return _convert_embedding(args, record)
-    if args.weights is not None or args.base_litertlm is not None:
+    if args.weights is not None or args.base_litertlm is not None or args.npu:
         raise EmbeddingExportError(
-            "--weights and --base-litertlm are for an embedding checkpoint, one whose "
+            "--weights, --npu and --base-litertlm are for an embedding checkpoint, one whose "
             f"litetune.json `tune --model {EMBEDDING_MODEL}` wrote; {args.model} is not one"
             f"{model_dir_hint(args.model)}. Pick an LLM's quantization with --recipe"
         )
@@ -1761,6 +1774,7 @@ def _convert_embedding(args: argparse.Namespace, record: EmbeddingRecord) -> int
         output_dir=args.output_dir,
         weights=args.weights or DEFAULT_WEIGHTS,
         base_litertlm=args.base_litertlm,
+        npu=tuple(args.npu or ()),
         timeout_s=args.timeout_s if args.timeout_s is not None else GRAFT_TIMEOUT_S,
         auto_provision=not args.no_provision,
     )

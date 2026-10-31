@@ -50,6 +50,15 @@ from litetune.embedding_convert import (
     WeightMode,
     graft,
 )
+from litetune.embedding_npu import (
+    NPU_TIMEOUT_S,
+    EmbeddingNpuError,
+    NpuResult,
+    compile_for_npu,
+    host_problem,
+    output_for,
+    request_problem,
+)
 from litetune.embedding_tune import DECIDER_PREFIX, EmbeddingRecord
 from litetune.events import EventStream
 from litetune.exits import read_returncode
@@ -81,6 +90,11 @@ ENV_CHECK = "export environment"
 BASE_FILE_CHECK = "Google's file"
 BASE_CHECKPOINT_CHECK = "base checkpoint"
 GRAFT_CHECK = "graft"
+
+
+def npu_check(soc: str) -> str:
+    return f"npu {soc}"
+
 
 NOT_VERIFIED = (
     "the file was written and read back section by section; what it embeds has not been "
@@ -214,6 +228,9 @@ class EmbeddingExportRequest:
     timeout_s: int = GRAFT_TIMEOUT_S
     env: envs.StageEnv = envs.EXPORT
     auto_provision: bool = True
+    # `--npu`: Qualcomm SoCs to compile the int8 graft's text encoder for (embedding_npu).
+    npu: tuple[str, ...] = ()
+    npu_env: envs.StageEnv = envs.NPU_QUALCOMM
 
     def __post_init__(self) -> None:
         if self.weights not in WEIGHT_MODES:
@@ -222,6 +239,10 @@ class EmbeddingExportRequest:
             )
         if self.timeout_s < 1:
             raise EmbeddingExportError(f"timeout_s must be at least 1, got {self.timeout_s}")
+        object.__setattr__(self, "npu", tuple(self.npu))
+        problem = request_problem(self.npu, self.weights)
+        if problem is not None:
+            raise EmbeddingExportError(problem)
         object.__setattr__(self, "model", Path(self.model))
         object.__setattr__(self, "output_dir", Path(self.output_dir))
         if self.base_litertlm is not None:
@@ -247,6 +268,10 @@ class EmbeddingExportRequest:
             "base_litertlm": str(self.base_litertlm) if self.base_litertlm else None,
             "timeout_s": self.timeout_s,
             "environment": {"name": self.env.name, "identity": self.env.identity},
+            "npu": list(self.npu),
+            "npu_environment": (
+                {"name": self.npu_env.name, "identity": self.npu_env.identity} if self.npu else None
+            ),
         }
 
 
@@ -263,6 +288,8 @@ class EmbeddingExportResult:
     limitations: list[str] = field(default_factory=list)
     # `hash_file` of the fine-tune's safetensors, taken before the graft reads it.
     checkpoint_sha256: str | None = None
+    # `--npu`: one entry per SoC compiled.
+    npu: list[NpuResult] = field(default_factory=list)
 
     @property
     def outcome(self) -> Outcome:
@@ -286,6 +313,7 @@ class EmbeddingExportResult:
             "prefix": self.record.prefix,
             "artifact": str(self.artifact) if self.artifact else None,
             "graft": self.graft.as_dict() if self.graft else None,
+            "npu": [r.as_dict() for r in self.npu],
             "google_file": self.google,
             "base_checkpoint": self.base,
             "checkpoint": {
@@ -321,11 +349,16 @@ def _refuse_request(request: EmbeddingExportRequest, record: EmbeddingRecord) ->
         )
     if request.base_litertlm is not None and not request.base_litertlm.is_file():
         raise EmbeddingExportError(f"--base-litertlm {request.base_litertlm}: no such file")
-    if request.output.exists() or request.output.is_symlink():
-        raise EmbeddingExportError(
-            f"{request.output} already exists; name another --output-dir, nothing is written "
-            "over a file"
-        )
+    if request.npu:
+        problem = host_problem()
+        if problem is not None:
+            raise EmbeddingExportError(problem)
+    for target in [request.output] + [output_for(request.output_dir, soc) for soc in request.npu]:
+        if target.exists() or target.is_symlink():
+            raise EmbeddingExportError(
+                f"{target} already exists; name another --output-dir, nothing is written "
+                "over a file"
+            )
 
 
 def run_embedding_export(
@@ -473,6 +506,59 @@ def _run(
     )
     result.limitations.append(NOT_VERIFIED)
     events.artifact(str(grafted.output), name=ARTIFACT_NAME, verified=False)
+    for soc in request.npu:
+        _compile_npu(request, result, events, grafted.output, soc)
+
+
+def _compile_npu(
+    request: EmbeddingExportRequest,
+    result: EmbeddingExportResult,
+    events: EventStream,
+    grafted: Path,
+    soc: str,
+) -> None:
+    """The int8 graft's text encoder compiled for `soc` (embedding_npu), as one check."""
+    name = npu_check(soc)
+    with guard(name) as sink:
+        if request.auto_provision:
+            request.npu_env.provision(events=events)
+        if not request.npu_env.ready:
+            sink.append(
+                Check.unchecked(
+                    name, f"environment {request.npu_env.name!r} {request.npu_env.unready_detail}"
+                )
+            )
+    if sink and not _add(result, events, sink[0]).conclusive:
+        result.limitations.append(f"the {soc} NPU file was not compiled: {sink[0].detail}")
+        return
+    try:
+        compiled = compile_for_npu(
+            request.npu_env,
+            grafted,
+            soc,
+            output_for(request.output_dir, soc),
+            events=events,
+            auto_provision=False,
+            timeout=max(request.timeout_s, NPU_TIMEOUT_S),
+        )
+    except EmbeddingNpuError as exc:
+        logger.error("the %s compile stopped (%s): %s", soc, exc.cause, exc)
+        make = Check.unchecked if exc.cause == "run" else Check.failed
+        _add(result, events, make(name, f"{exc.cause}: {exc}", observed={"cause": exc.cause}))
+        return
+    result.npu.append(compiled)
+    _add(
+        result,
+        events,
+        Check.passed(
+            name,
+            f"{compiled.bytes:,} bytes, the text encoder one DISPATCH_OP per signature "
+            f"({compiled.encoder_bytes:,} bytes), compiled in {compiled.compile_s:.0f} s, "
+            "read back",
+            observed={"sha256": compiled.sha256, "bytes": compiled.bytes},
+        ),
+    )
+    events.artifact(str(compiled.output), name=ARTIFACT_NAME, verified=False)
 
 
 def summarise(result: EmbeddingExportResult) -> list[str]:
@@ -483,6 +569,8 @@ def summarise(result: EmbeddingExportResult) -> list[str]:
     ]
     if result.graft is not None:
         lines.append(f"  {result.graft.bytes:,} bytes — {result.graft.output}")
+    for npu in result.npu:
+        lines.append(f"  {npu.soc} NPU: {npu.bytes:,} bytes — {npu.output}")
     for check in result.checks.checks:
         if check.outcome is not Outcome.PASSED:
             lines.append(f"  {check.outcome.value}: {check.name} — {check.detail}")

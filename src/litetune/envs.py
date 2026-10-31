@@ -2905,7 +2905,9 @@ def cached_environments() -> list[CachedEnv]:
     root = _cache_root()
     if not root.is_dir():
         return []
-    claimed = {env.path.name: env.name for env in (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN)}
+    claimed = {
+        env.path.name: env.name for env in (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN, NPU_QUALCOMM)
+    }
     out = [
         CachedEnv(
             path=child,
@@ -3779,6 +3781,23 @@ TRAIN = StageEnv(
 # torchvision 0.24.1 publish Linux wheels as `manylinux_2_28` only and a macOS
 # wheel for arm64 only, so this environment does not install on Intel macOS or
 # on a glibc older than 2.28.
+# `convert --npu`: LiteRT's AOT compiler with the Qualcomm plugin (embedding_npu). The
+# plugin and `apply_plugin_main` ship in ai-edge-litert's Linux x86-64 wheels only, and
+# ai-edge-litert-sdk-qualcomm 2.3.0 is a source distribution whose build downloads QAIRT
+# 2.50.0.260828 from Qualcomm -- the QAIRT flutter_edge_ai's Qualcomm dispatch is built
+# against. ai-edge-litert's own `npu-sdk` extra asks for the SDK as ~=0.2.0, so it is
+# pinned by name. The plugin dlopen()s libc++ and libatomic, which no error names.
+NPU_QUALCOMM = StageEnv(
+    name="npu-qualcomm",
+    requirements=(
+        "ai-edge-litert==2.3.0",
+        "ai-edge-litert-sdk-qualcomm==2.3.0",
+        "litert-lm-builder==0.18.0",
+        "flatbuffers==25.12.19",
+    ),
+    system_requirements=("libc++1", "libatomic1"),
+)
+
 EMBED_TRAIN = StageEnv(
     name="embed-train",
     requirements=(
