@@ -113,6 +113,10 @@ class Release:
     files: tuple[str, ...]
     # The `==` requirements without a marker in this release's own metadata.
     requires: tuple[str, ...] = ()
+    # Why this release is meant to be built from its source distribution, for a
+    # pin that publishes no wheel at all; empty for every other. A release with
+    # a reason here is not a gap: pip building it is the published install.
+    source_build: str = ""
 
     @property
     def sdist(self) -> bool:
@@ -308,7 +312,7 @@ def gaps(
         seen.add(key)
         release = table[key]
         pending.extend((r, release.requirement) for r in release.requires)
-        if release.installs_on(host):
+        if release.installs_on(host) or (release.source_build and release.sdist):
             continue
         found.append(Gap(release, host, release.minors_on(host), required_by=parent))
     return found
@@ -373,6 +377,10 @@ _RELEASES = (
         "ai-edge-litert-sdk-qualcomm==2.3.0",
         "https://pypi.org/pypi/ai-edge-litert-sdk-qualcomm/2.3.0/json",
         files=("ai_edge_litert_sdk_qualcomm-2.3.0.tar.gz",),
+        source_build=(
+            "it is published as a source distribution only, and its setup.py downloads QAIRT "
+            "2.50.0.260828 from Qualcomm's software center while it builds"
+        ),
     ),
     Release(
         "flatbuffers==25.12.19",

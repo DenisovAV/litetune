@@ -242,3 +242,25 @@ def test_npu_for_an_llm_checkpoint_is_refused(tmp_path, capsys):
     (llm / "litetune.json").write_text(json.dumps({"base_model": "google/gemma-3-270m-it"}))
     assert _convert(llm, tmp_path / "out", "--npu", "SM8750") == 4
     assert "--npu" in capsys.readouterr().err
+
+
+def test_the_qualcomm_sdk_is_a_source_build_not_a_gap():
+    from litetune import wheels
+
+    sdk = wheels.PUBLISHED["ai-edge-litert-sdk-qualcomm==2.3.0"]
+    assert sdk.sdist and sdk.source_build
+    linux = wheels.Host.of(("manylinux_2_27_x86_64", "linux_x86_64"), (3, 12))
+    assert wheels.gaps(envs.NPU_QUALCOMM.requirements, linux) == []
+
+
+def test_a_sdist_only_pin_without_a_reason_is_still_a_gap():
+    from dataclasses import replace
+
+    from litetune import wheels
+
+    sdk = wheels.PUBLISHED["ai-edge-litert-sdk-qualcomm==2.3.0"]
+    table = dict(wheels.PUBLISHED) | {sdk.requirement: replace(sdk, source_build="")}
+    linux = wheels.Host.of(("manylinux_2_27_x86_64", "linux_x86_64"), (3, 12))
+    assert [g.release.requirement for g in wheels.gaps([sdk.requirement], linux, table)] == [
+        sdk.requirement
+    ]
