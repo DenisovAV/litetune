@@ -2238,6 +2238,34 @@ def _drain_by_communicate(proc: subprocess.Popen, drain: _PipeDrain) -> tuple[st
     )
 
 
+def _clamp_negative_wait(proc: Any) -> None:
+    """Give one `Popen`'s `_wait` gh-90872's fix, where Python lacks it.
+
+    `communicate` meets a `KeyboardInterrupt` by waiting a moment more for the
+    child, `min(_sigint_wait_secs, _remaining_time(endtime))` seconds
+    (bpo-25942, `Popen.communicate` in `Lib/subprocess.py`). An interrupt that
+    surfaces after the deadline of `_communicate_in_slices`'s short wait makes
+    that negative, and before gh-90872 Windows' `_wait` passes
+    `int(timeout * 1000)` to `WaitForSingleObject` unclamped, which takes it as
+    an unsigned number of milliseconds -- weeks -- so the interrupt reaches the
+    wait only when the stage ends. Fixed in 3.11.9 and 3.12; 3.10 never got it.
+    On 3.10.11 an interrupt sent a second into a 60-second stage reached the
+    wait after 58.8 to 59.0 s in 30 of 60 runs, and on 3.12.10 within 0.07 s in
+    all 20. A wait of zero or less becomes a poll, as it is with the fix; on a
+    Python that has it, this changes nothing.
+
+    On the instance, so that `_spawn` still calls `subprocess.Popen` itself.
+    """
+    wait = getattr(proc, "_wait", None)
+    if wait is None:
+        return
+
+    def clamped(timeout: float | None) -> Any:
+        return wait(0 if timeout is not None and timeout <= 0 else timeout)
+
+    proc._wait = clamped
+
+
 def _spawn(
     argv: Sequence[str], env: Mapping[str, str] | None, creationflags: int = 0
 ) -> subprocess.Popen:
@@ -2246,7 +2274,7 @@ def _spawn(
     `_run_guarded` says what the encoding, the error handler and `env` are
     for; this is where they are passed.
     """
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         list(argv),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -2268,6 +2296,9 @@ def _spawn(
         # value on POSIX (`Lib/subprocess.py`), and 0 is its default.
         creationflags=creationflags,
     )
+    if sys.platform == "win32":
+        _clamp_negative_wait(proc)
+    return proc
 
 
 def _run_guarded(

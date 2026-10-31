@@ -744,6 +744,40 @@ def test_an_interrupt_reaches_the_wait(tmp_path, capsys):
 INTERRUPT_REPEATS = 10
 
 
+def test_a_wait_of_zero_or_less_becomes_a_poll():
+    """`_clamp_negative_wait` hands `_wait` 0 for a timeout of zero or less,
+    and every other timeout, None included, as it came."""
+    seen: list[float | None] = []
+
+    class Proc:
+        def _wait(self, timeout):
+            seen.append(timeout)
+            return 0
+
+    proc = Proc()
+    envs._clamp_negative_wait(proc)
+    for timeout in (-0.01, 0, 0.25, None):
+        proc._wait(timeout)
+    assert seen == [0, 0, 0.25, None]
+
+
+@on_windows
+def test_a_wait_past_its_deadline_is_a_poll():
+    """`communicate`'s wait after a `KeyboardInterrupt` past its deadline is
+    `_wait` with a negative timeout. Without gh-90872's fix Python 3.10 waits
+    until the child exits, here 30 s; with it, or `_spawn`'s clamp, it polls
+    and times out."""
+    proc = envs._spawn([sys.executable, "-c", "import time; time.sleep(30)"], None)
+    try:
+        started = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            proc._wait(timeout=-0.01)
+        assert time.monotonic() - started < 2
+    finally:
+        proc.kill()
+        proc.communicate(timeout=30)
+
+
 @on_windows
 def test_an_interrupt_reaches_the_wait_every_time(tmp_path, capsys):
     """The same interrupt, ten times. On Python 3.10 it was lost in 10 of 43
