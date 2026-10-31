@@ -600,12 +600,7 @@ def decide_micro_batch_size(
 # allocator rejected. The way forward for each is the CPU, and never
 # `PYTORCH_ENABLE_MPS_FALLBACK=1`, which torch's own message suggests: litetune
 # writes 0 so that a run recorded as mps ran on MPS.
-_MPS_DEVICE_FACTS = (
-    r"is not currently implemented for the MPS device",
-    r"MPS BFloat16 is only supported on MacOS 14",
-    r"invalid high watermark ratio",
-    r"invalid low watermark ratio",
-)
+_MPS_DEVICE_FACTS = devices.MPS_DEVICE_FACTS
 _GPU_FAILURE_RE = re.compile(
     r"(OutOfMemoryError"
     r"|CUDA out of memory"
@@ -626,14 +621,14 @@ _GPU_FAILURE_RE = re.compile(
 # Which advice an MPS ending gets is its own search, not the classifier's
 # leftmost match: `torch.OutOfMemoryError: MPS backend out of memory` matches
 # `OutOfMemoryError` first, and reading the advice off that would drop it.
-_MPS_OOM_RE = re.compile(r"MPS backend out of memory", re.IGNORECASE)
+_MPS_OOM_RE = devices.MPS_OOM_RE
 # The same for CUDA, worded the ways torch and its libraries raise it.
 _CUDA_OOM_RE = re.compile(
     r"CUDA out of memory|CUDA error: out of memory|CUBLAS_STATUS_ALLOC_FAILED"
     r"|CUDNN_STATUS_ALLOC_FAILED",
     re.IGNORECASE,
 )
-_MPS_DEVICE_FACT_RE = re.compile("|".join(_MPS_DEVICE_FACTS), re.IGNORECASE)
+_MPS_DEVICE_FACT_RE = devices.MPS_DEVICE_FACT_RE
 MPS_DEVICE_ADVICE = f"set {devices.DEVICE_VARIABLE}=cpu to train on the CPU"
 
 TRAINING_CHECK = "training run"

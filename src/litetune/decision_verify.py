@@ -34,18 +34,19 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import random
 import statistics
 import subprocess
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from litetune import calibration, envs
+from litetune import calibration, devices, envs
 from litetune.checks import Check, CheckSet, Outcome
 from litetune.decision_scripts import ENGINE_SCRIPT, REFERENCE_SCRIPT
 from litetune.decision_section import SECTION_NAME, payload_bytes
@@ -268,6 +269,91 @@ def _bundle_activation_limit(report: dict[str, Any]) -> str | None:
     )
 
 
+# Rows a batch of the reference takes on Apple's GPU, where larger batches paid.
+MPS_ROW_BATCH = 64
+REFERENCE_ON_MPS = (
+    "the float reference ran on this Mac's GPU through MPS, and the runtime on LiteRT-LM: the "
+    'two sides differ in hardware as well as in conversion. MEASUREMENTS.md, "The decision '
+    'reference on MPS", has one decision measured both ways'
+)
+
+
+@dataclass
+class ReferencePlacement:
+    """Where the reference is asked to run, and what the report says about it."""
+
+    # What the script is given: "mps", "cpu", or "auto" (CUDA when its own
+    # torch reaches one, otherwise the CPU).
+    device: str
+    probe: envs.DeviceProbe
+    memory: devices.MpsMemory | None = None
+    limitations: list[str] = field(default_factory=list)
+
+
+def place_reference(job: Any, events: EventStream) -> ReferencePlacement:
+    """Ask the training environment's torch where the reference can run, as `evaluate` does.
+
+    The probe (`envs.resolve_device`) with `LITETUNE_DEVICE` applied. On "mps"
+    the run gets the memory policy `evaluate` gives its reference
+    (`devices.prepare_mps`), and the policy's own limitations; a policy that
+    cannot be applied puts the reference on the CPU and says so. A probe that
+    could not answer leaves the choice to the script, and the report says that
+    too. An environment that is not provisioned is not asked.
+    """
+    env = job.train_env
+    if env.ready:
+        probe = envs.resolve_device(env, events=events)
+    else:
+        detail = (
+            f"no device probe was attempted: environment {env.name!r} is not provisioned at "
+            f"{env.path}"
+        )
+        logger.warning("%s", detail)
+        events.note(detail, environment=env.name)
+        probe = envs.DeviceProbe(device=None, detail=detail, attempted=False)
+    probe = devices.apply_device_setting(probe, job.device)
+    if probe.device is None:
+        return ReferencePlacement(
+            "auto",
+            probe,
+            limitations=[
+                f"{probe.detail}, so the reference script chose its device itself and reports "
+                "it in its own report"
+            ],
+        )
+    explained = (
+        [probe.detail]
+        if probe.cuda_build_without_a_device
+        or probe.cpu_on_macos
+        or probe.source == devices.DEVICE_VARIABLE
+        else []
+    )
+    if probe.device != "mps":
+        return ReferencePlacement(
+            "cpu" if probe.device == "cpu" else "auto", probe, limitations=explained
+        )
+    try:
+        memory = devices.prepare_mps(probe, os.environ)
+    except devices.MpsMemoryRefused as exc:
+        logger.error("the float reference is not run on MPS: %s", exc)
+        return ReferencePlacement(
+            "cpu", probe, limitations=[f"the float reference was not run on MPS: {exc}"]
+        )
+    events.note(memory.summary(), **{k: v for k, v in memory.variables.items() if v is not None})
+    return ReferencePlacement("mps", probe, memory, limitations=list(memory.limitations))
+
+
+def mps_ending(failure: str | None) -> str | None:
+    """ "out of memory" or "a device fact" when torch says an MPS run could not go on."""
+    if not failure:
+        return None
+    if devices.MPS_OOM_RE.search(failure):
+        return "out of memory"
+    if devices.MPS_DEVICE_FACT_RE.search(failure):
+        return "a device fact"
+    return None
+
+
 def settle(runs: Sequence[dict[int, Any]], rows: Sequence[int]) -> tuple[dict[int, Any], list[int]]:
     """Per row, the scores most of `runs` gave, and the rows where that is not one value.
 
@@ -380,8 +466,13 @@ def run_script(
     timeout: int,
     auto_provision: bool = True,
     events: EventStream | None = None,
+    child_env: Mapping[str, str] | None = None,
 ) -> ScoreRun:
-    """Write `source` and `spec`, run it in `env`, and read back what it wrote."""
+    """Write `source` and `spec`, run it in `env`, and read back what it wrote.
+
+    `child_env` is added to the child's environment: the MPS memory policy of a
+    reference that runs on Apple's GPU (`devices.prepare_mps`).
+    """
     run = ScoreRun()
     if auto_provision:
         try:
@@ -401,7 +492,7 @@ def run_script(
         )
         proc = None
         try:
-            proc = env.run(["python", str(script), str(spec_path)], timeout=timeout)
+            proc = env.run(["python", str(script), str(spec_path)], timeout=timeout, env=child_env)
         except subprocess.TimeoutExpired as expired:
             said = _tail(expired.stderr)
             run.failure = f"no result after {timeout} s (timeout)" + (f": {said}" if said else "")
@@ -874,28 +965,86 @@ def verify_decision(
     # Besides its first rows, the longest: a cache gone wrong past Gemma 3's
     # sliding window would not show on short ones.
     longest = max(range(len(prompts)), key=lambda i: len(prompts[i]))
-    events.note(f"reference: scoring {len(decision.ids)} options on {len(prompts)} rows")
-    ref = run_script(
-        job.train_env,
-        REFERENCE_SCRIPT,
-        {
-            "model": job.reference,
-            "rows": [{"index": i, "prompt": p} for i, p in enumerate(prompts)],
-            "options": list(decision.ids),
-            "turn_ids": turn_ids,
-            "turn_text": turn_text,
-            "check_indices": [longest],
-            "ids_for": [calib_n + i for i in engine_rows],
-            # The rows the float twin is compared on, scored alone with no
-            # cache: the twin's 1e-3 then measures the bundle, not batching.
-            "alone_for": [calib_n + i for i in engine_rows[:PROBE_ROWS]],
-            "device": job.device,
-        },
-        timeout=STARTUP_TIMEOUT_S + REFERENCE_ROW_TIMEOUT_S * len(prompts),
-        auto_provision=job.auto_provision,
-        events=events,
-    )
-    fields["harness"] = {"reference": {k: v for k, v in ref.report.items() if k != "cont_ids"}}
+    if job.auto_provision:
+        # Before the device probe, which asks the environment's own torch.
+        try:
+            job.train_env.provision(events=events)
+        except Exception as exc:  # noqa: BLE001 - a failed environment is a harness failure
+            logger.exception("could not provision environment %r", job.train_env.name)
+            return refuse(
+                REFERENCE_CHECK,
+                f"the {job.train_env.name} environment could not be provisioned: {exc}",
+            )
+    placed = place_reference(job, events)
+    state.limitations.extend(placed.limitations)
+    # `attempted` beside the probe's own record: an environment never asked and a
+    # probe that could not answer both have no device.
+    fields["harness"] = {
+        "reference_device_probe": {**placed.probe.as_dict(), "attempted": placed.probe.attempted}
+    }
+    if placed.memory is not None:
+        fields["harness"]["reference_mps_memory"] = placed.memory.as_dict()
+
+    def score_reference(device: str, memory: devices.MpsMemory | None) -> ScoreRun:
+        events.note(
+            f"reference: scoring {len(decision.ids)} options on {len(prompts)} rows"
+            + (" on Apple's GPU (MPS)" if device == "mps" else "")
+        )
+        return run_script(
+            job.train_env,
+            REFERENCE_SCRIPT,
+            {
+                "model": job.reference,
+                "rows": [{"index": i, "prompt": p} for i, p in enumerate(prompts)],
+                "options": list(decision.ids),
+                "turn_ids": turn_ids,
+                "turn_text": turn_text,
+                "check_indices": [longest],
+                "ids_for": [calib_n + i for i in engine_rows],
+                # The rows the float twin is compared on, scored alone with no
+                # cache: the twin's 1e-3 then measures the bundle, not batching.
+                "alone_for": [calib_n + i for i in engine_rows[:PROBE_ROWS]],
+                "device": device,
+                # Bigger batches on the GPU, where they paid: MEASUREMENTS.md,
+                # "The decision reference on MPS".
+                **({"row_batch": MPS_ROW_BATCH} if device == "mps" else {}),
+            },
+            timeout=STARTUP_TIMEOUT_S + REFERENCE_ROW_TIMEOUT_S * len(prompts),
+            auto_provision=False,
+            events=events,
+            child_env=memory.child_env if memory is not None else None,
+        )
+
+    ref = score_reference(placed.device, placed.memory)
+    if placed.memory is not None:
+        mismatch = devices.environment_mismatch(
+            placed.memory, ref.report.get("mps_environment"), "reference script"
+        )
+        if mismatch:
+            state.limitations.append(mismatch)
+        ending = mps_ending(ref.failure)
+        if ending is not None:
+            # What the CPU always did before the reference ran on MPS: a Mac
+            # short of memory for this model, or a torch without an operation
+            # it needs, still gets a reference, more slowly.
+            said = (
+                devices.mps_oom_advice(placed.memory)
+                if ending == "out of memory"
+                else "torch's MPS backend could not run an operation the reference needs"
+            )
+            logger.warning("the float reference stopped on MPS (%s); scoring it on the CPU", ending)
+            fields["harness"]["reference_on_mps"] = {
+                "failure": ref.failure,
+                "report": {k: v for k, v in ref.report.items() if k != "cont_ids"},
+            }
+            state.limitations.append(
+                f"the float reference stopped on MPS ({ending}) and was scored again on the CPU. "
+                f"On MPS: {said}"
+            )
+            ref = score_reference("cpu", None)
+    fields["harness"]["reference"] = {k: v for k, v in ref.report.items() if k != "cont_ids"}
+    if ref.report.get("device") == "mps":
+        state.limitations.append(REFERENCE_ON_MPS)
     missing = [i for i in range(len(prompts)) if i not in ref.scores]
     if ref.failure or missing:
         return refuse(
