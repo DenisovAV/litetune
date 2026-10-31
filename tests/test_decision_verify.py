@@ -22,14 +22,16 @@ from typing import Any
 
 import pytest
 
-from litetune import calibration
+from litetune import calibration, devices, envs
 from litetune.decision_section import payload_bytes
 from litetune.decision_verify import (
     AGREEMENT_CHECK,
     CALIBRATION_CHECK,
+    MPS_ROW_BATCH,
     PROBE_ROWS,
     PROMPT_CHECK,
     REFERENCE_CHECK,
+    REFERENCE_ON_MPS,
     ROWS_CHECK,
     RULE_CHECK,
     RUNTIME_CHECK,
@@ -154,6 +156,8 @@ class FakeScoringEnv:
     # Rows an engine run, by its number, leaves out.
     skip_for_run: dict[int, set[int]] = field(default_factory=dict)
     engine_runs: int = 0
+    # The `env` each run was given, in order.
+    child_envs: list[Any] = field(default_factory=list)
 
     def provision(self, events=None, force: bool = False) -> Path:
         self.provisioned += 1
@@ -163,6 +167,7 @@ class FakeScoringEnv:
         script = Path(argv[1]).read_text(encoding="utf-8")
         spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
         self.specs.append(spec)
+        self.child_envs.append(env)
         engine = "litert_lm" in script
         cont = [self.token_of(o) for o in spec["options"]]
         ks = unique_lengths(cont)
@@ -2876,6 +2881,31 @@ def test_rows_scored_in_batches_match_rows_scored_one_at_a_time(tiny):
     assert [len(f) for f in batched[0]["token_scores"]] == [2, 2, 3]
 
 
+def test_rows_scored_on_mps_match_rows_scored_on_the_cpu(tiny):
+    from litetune.decision_scripts import REFERENCE_SCRIPT
+
+    has_mps = _in_train_env(["-c", "import torch; print(torch.backends.mps.is_available())"])
+    if has_mps.stdout.strip() != "True":
+        pytest.skip("the training environment's torch has no MPS")
+    cpu, _ = _alone(tiny)
+    on_mps, report = _run(tiny, REFERENCE_SCRIPT, 8, extra={"device": "mps"})
+
+    assert report["device"] == "mps" and report["row_batch"] == 8
+    assert _largest_difference(cpu, on_mps) < 1e-4
+    sampled = report["mps_memory_sampled_max"]
+    assert sampled["samples"] == report["batches"] == 3
+    assert sampled["sampled_at"] == ["after each batch"]
+    assert sampled["current_allocated_bytes"] > 0
+    assert set(report["mps_environment"]) == set(devices.MPS_VARIABLES)
+
+
+def test_rows_scored_alone_on_the_cpu_sample_no_mps_memory(tiny):
+    _, report = _alone(tiny)
+
+    assert report["device"] == "cpu"
+    assert report["mps_memory_sampled_max"] is None
+
+
 def test_the_rows_asked_for_alone_are_recorded_as_scored_with_no_cache(tiny):
     from litetune.decision_scripts import REFERENCE_SCRIPT
 
@@ -3047,3 +3077,181 @@ def test_the_engine_script_on_the_gpu_opens_its_engine_so_and_reads_the_kernel(t
     loads = [json.loads(line) for line in kwargs_file.read_text().splitlines()]
     assert loads and all(x == {"backend": "GPU-STUB", "cache_dir": ":nocache"} for x in loads)
     assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# The reference on Apple's GPU
+
+
+def mps_probe(**fields: Any) -> envs.DeviceProbe:
+    values: dict[str, Any] = {
+        "detail": "this environment's torch reports mps",
+        "source": "probe",
+        "mps_recommended_max_memory": 16 * 2**30,
+        "os": "Darwin",
+        "os_version": "15.0",
+        "os_version_source": "platform.mac_ver()",
+        "machine": "arm64",
+    }
+    values.update(fields)
+    return envs.DeviceProbe(device="mps", **values)
+
+
+@pytest.fixture
+def probed(monkeypatch):
+    """`envs.resolve_device` answering `probe`, and the environments it was asked about."""
+    asked: list[str] = []
+
+    def use(probe: envs.DeviceProbe) -> list[str]:
+        def resolve(env, events=None):
+            asked.append(env.name)
+            return probe
+
+        monkeypatch.setattr(envs, "resolve_device", resolve)
+        return asked
+
+    return use
+
+
+def reference_spec(job: DecisionVerify) -> dict[str, Any]:
+    assert isinstance(job.train_env, FakeScoringEnv)
+    (spec,) = job.train_env.specs
+    return spec
+
+
+def test_a_reference_on_a_mac_with_mps_runs_there_under_the_memory_policy(split, tmp_path, probed):
+    s = split()
+    asked = probed(mps_probe())
+    train = FakeScoringEnv("train", report_extra={"device": "mps"})
+    job = job_for(s, tmp_path, train_env=train)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields
+    assert asked == ["train"]
+    spec = reference_spec(job)
+    assert spec["device"] == "mps"
+    assert spec["row_batch"] == MPS_ROW_BATCH
+    policy = devices.prepare_mps(mps_probe(), os.environ)
+    assert train.child_envs == [policy.child_env]
+    assert fields["harness"]["reference_mps_memory"] == policy.as_dict()
+    assert REFERENCE_ON_MPS in fields["limitations"]
+    # The runtime is not on the reference's device or policy.
+    assert job.runtime_env.child_envs and all(e is None for e in job.runtime_env.child_envs)
+
+
+def test_the_environment_is_provisioned_before_its_torch_is_asked(split, tmp_path, monkeypatch):
+    s = split()
+    train = FakeScoringEnv("train")
+    order: list[str] = []
+    original = train.provision
+
+    def provision(events=None, force=False):
+        order.append("provision")
+        return original(events=events, force=force)
+
+    def resolve(env, events=None):
+        order.append("probe")
+        return envs.DeviceProbe(device="cpu", detail="cpu")
+
+    monkeypatch.setattr(train, "provision", provision)
+    monkeypatch.setattr(envs, "resolve_device", resolve)
+
+    run(job_for(s, tmp_path, train_env=train), s["record"])
+
+    assert order == ["provision", "probe"]
+    assert train.provisioned == 1
+
+
+def test_an_environment_that_cannot_be_provisioned_refuses_before_any_probe(
+    split, tmp_path, monkeypatch, probed
+):
+    s = split()
+    asked = probed(mps_probe())
+    train = FakeScoringEnv("train")
+
+    def broken(events=None, force=False):
+        raise RuntimeError("no torch wheel")
+
+    monkeypatch.setattr(train, "provision", broken)
+
+    status, fields = run(job_for(s, tmp_path, train_env=train), s["record"])
+
+    assert status == "failed_harness", fields
+    detail = check(fields, REFERENCE_CHECK)["detail"]
+    assert "train environment could not be provisioned: no torch wheel" in detail
+    assert asked == [] and train.specs == []
+
+
+def test_a_mac_whose_memory_policy_is_refused_runs_the_reference_on_the_cpu(
+    split, tmp_path, probed
+):
+    s = split()
+    probed(mps_probe(mps_recommended_max_memory=None))
+    job = job_for(s, tmp_path)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields
+    spec = reference_spec(job)
+    assert spec["device"] == "cpu" and "row_batch" not in spec
+    assert job.train_env.child_envs == [None]
+    moved = [m for m in fields["limitations"] if m.startswith("the float reference ran on the CPU")]
+    assert len(moved) == 1 and "not on MPS: " in moved[0]
+    assert "reference_mps_memory" not in fields["harness"]
+    assert REFERENCE_ON_MPS not in fields["limitations"]
+
+
+def test_litetune_device_cpu_keeps_the_reference_off_mps_without_asking(split, tmp_path, probed):
+    s = split()
+    asked = probed(mps_probe())
+    # `run_verify` reads `LITETUNE_DEVICE` into the job.
+    job = job_for(s, tmp_path, device="cpu")
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields
+    assert asked == []
+    assert reference_spec(job)["device"] == "cpu"
+    assert job.train_env.child_envs == [None]
+
+
+@pytest.mark.parametrize("found", ["cuda", "cpu", None])
+def test_off_a_mac_the_reference_keeps_the_scripts_own_rule(split, tmp_path, probed, found):
+    s = split()
+    probed(envs.DeviceProbe(device=found, detail=f"torch reports {found}"))
+    job = job_for(s, tmp_path)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields
+    spec = reference_spec(job)
+    assert spec["device"] == "auto" and "row_batch" not in spec
+    assert job.train_env.child_envs == [None]
+    assert "reference_mps_memory" not in fields["harness"]
+
+
+def test_a_reference_that_did_not_see_the_mps_policy_says_so(split, tmp_path, probed):
+    s = split()
+    probed(mps_probe())
+    seen = {name: None for name in devices.MPS_VARIABLES}
+    train = FakeScoringEnv("train", report_extra={"device": "mps", "mps_environment": seen})
+
+    status, fields = run(job_for(s, tmp_path, train_env=train), s["record"])
+
+    policy = devices.prepare_mps(mps_probe(), os.environ)
+    expected = devices.environment_mismatch(policy, seen, "reference script")
+    assert expected is not None
+    assert expected in fields["limitations"]
+
+
+def test_a_reference_that_fails_on_mps_says_what_to_do(split, tmp_path, probed):
+    s = split()
+    probed(mps_probe())
+    train = FakeScoringEnv("train", returncode=1, skip_rows=set(range(10_000)))
+
+    status, fields = run(job_for(s, tmp_path, train_env=train), s["record"])
+
+    assert status == "failed_harness", fields
+    policy = devices.prepare_mps(mps_probe(), os.environ)
+    assert devices.mps_oom_advice(policy) in check(fields, REFERENCE_CHECK)["detail"]

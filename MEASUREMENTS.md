@@ -2051,10 +2051,34 @@ new.
   nats, because its forward soft-caps the logits and its bundle does not, so
   it was scored with no cache. The script does not batch without a cache, so
   by the code it scores one row at a time as before; that is not measured.
-- On MPS, an experiment script (not wired in) scored the 300 gemma rows at
-  29.5 ms a row in batches of 16 and 14.7 ms in batches of 128, within
-  8.3e-05 of the CPU; the reference runs on CUDA or the CPU.
+- On MPS, an experiment script scored the 300 gemma rows at 29.5 ms a row in
+  batches of 16, 16.3 in batches of 64 and 14.7 in batches of 128, within
+  8.3e-05 of the CPU. The next section is the reference wired onto MPS.
 - Not measured: FunctionGemma and gemma-4-E2B, whose checkpoints are gated, and CUDA.
+
+### The decision reference on MPS
+
+On a Mac whose training environment's torch reaches MPS, `verify` runs a
+decision's float reference there, 64 rows a batch, under the memory policy
+`evaluate` uses. Measured 2026-10-31 on an M5 Pro with 64 GB, litetune at
+the commit that wired it in, on the emotion decision above (gemma-3-270m-it,
+LoRA, the `dynamic_wi8_afp32` bundle): the same verify twice, one after the
+other, `--calibration --engine-rows 300 --threads 4`, no float twin, first
+with `LITETUNE_DEVICE=cpu`.
+
+| reference on | rows a batch | batches | reference | verify wall | user CPU |
+|---|---|---|---|---|---|
+| CPU | 16 | 250 | 104.0 s | 145 s | 607 s |
+| MPS | 64 | 63 | 73.3 s | 118 s | 128 s |
+
+- Both passed with the same agreement (0.9967 top option, 0.9933 answer) and
+  the same accuracies. The fit moved by 2.0e-07 in temperature
+  (1.2838769 against 1.2838767) and 1.9e-06 in the abstain threshold; mean KL
+  to the runtime 3.938340e-04 against 3.938337e-04.
+- On MPS torch's driver held up to 9.3 GB (`driver_allocated_bytes`, sampled
+  after each of the 63 batches) and 1.07 GB was allocated to tensors.
+- Load averages 2 to 8 during the runs. One run each; not measured: other
+  families, a Mac with less memory, a float twin on MPS.
 
 ### Limitations carried by the decision numbers
 

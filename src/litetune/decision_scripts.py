@@ -8,7 +8,9 @@ row, flushed as it is scored, and a report.
 **The reference** (`REFERENCE_SCRIPT`, `envs.TRAIN`) scores as the
 option-scoring measurements of 2026-10-15 and 2026-10-16 did, one row at a time
 there and in batches here: float32, eager attention, TF32 off, on CUDA when
-there is one and `LITETUNE_DEVICE` allows it, otherwise on the CPU. Each row's
+there is one and `LITETUNE_DEVICE` allows it, on Apple's GPU when `verify`
+found MPS and gave the run `evaluate`'s memory policy, otherwise on the CPU.
+Each row's
 prompt is rendered as `tune` trains it, by the same
 `prompt_mode.RENDERING_SOURCE`, pasted in, and every option is scored as its id
 followed by the turn terminator, teacher-forced, every token's log-probability
@@ -66,6 +68,7 @@ that `verify` can check the two sides scored the same prompt.
 
 from __future__ import annotations
 
+from litetune import devices
 from litetune.evaluate import RUNTIME_ENGINE_SOURCE
 from litetune.prompt_mode import RENDERING_SOURCE
 from litetune.rendering import SESSION_IDS_SOURCE
@@ -83,8 +86,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 VARIANTS = ("cache_position+position_ids", "position_ids", "plain")
+# Where the run reads torch's MPS counters on mps (`sample_mps_memory`).
+MPS_SAMPLE_POINTS = ("after each batch",)
 '''
     + RENDERING_SOURCE
+    + devices.MPS_SCRIPT_SOURCE
     + r"""
 
 def head_transform(config):
@@ -116,6 +122,10 @@ def main():
     torch.backends.cudnn.allow_tf32 = False
     wanted = spec.get("device", "auto")
     device = "cuda" if wanted == "auto" and torch.cuda.is_available() else "cpu"
+    # `verify` asks for mps only when its probe found it and the memory
+    # policy was set (`devices.prepare_mps`).
+    device = "mps" if wanted == "mps" else device
+    mps_samples = new_mps_samples(MPS_SAMPLE_POINTS) if device == "mps" else None
     kwargs = {"revision": spec["revision"]} if spec.get("revision") else {}
     tok = AutoTokenizer.from_pretrained(spec["model"], **kwargs)
     try:
@@ -423,6 +433,8 @@ def main():
                 rec["seconds"] = each
                 out.write(json.dumps(rec) + "\n")
             out.flush()
+            if mps_samples is not None:
+                sample_mps_memory(torch, mps_samples)
             g += 1
     Path(spec["report"]).write_text(
         json.dumps(
@@ -449,6 +461,8 @@ def main():
                 "batch_tokens_held": state["batch_tokens_held"] or None,
                 "variant_trials": trials,
                 "seconds": round(time.time() - started, 1),
+                "mps_environment": environment_seen(),
+                "mps_memory_sampled_max": finished_mps_samples(mps_samples),
             }
         ),
         encoding="utf-8",

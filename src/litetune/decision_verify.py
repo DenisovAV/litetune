@@ -34,18 +34,19 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import random
 import statistics
 import subprocess
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from litetune import calibration, envs
+from litetune import calibration, devices, envs
 from litetune.checks import Check, CheckSet, Outcome
 from litetune.decision_scripts import ENGINE_SCRIPT, REFERENCE_SCRIPT
 from litetune.decision_section import SECTION_NAME, payload_bytes
@@ -268,6 +269,36 @@ def _bundle_activation_limit(report: dict[str, Any]) -> str | None:
     )
 
 
+# Rows a batch of the reference takes on Apple's GPU, where larger batches paid.
+MPS_ROW_BATCH = 64
+REFERENCE_ON_MPS = (
+    "the float reference ran on this Mac's GPU through MPS, and the runtime on LiteRT-LM: the "
+    'two sides differ in hardware as well as in conversion. MEASUREMENTS.md, "The decision '
+    'reference on MPS", has one decision measured both ways'
+)
+
+
+def reference_device(job: Any, events: EventStream) -> tuple[str, Any, str | None]:
+    """Where the reference runs, the MPS memory policy it runs under, and why not on MPS.
+
+    "cpu" when `LITETUNE_DEVICE` says so. Otherwise the training environment's
+    own torch is asked (`envs.resolve_device`): on "mps" the run gets the
+    memory policy `evaluate` gives its reference (`devices.prepare_mps`) and
+    runs there; a policy that cannot be computed, or a Mac short of memory,
+    puts it on the CPU and says so. Anything else is "auto", the script's own
+    rule: CUDA when its torch reaches one, otherwise the CPU.
+    """
+    if job.device == "cpu":
+        return "cpu", None, None
+    probe = envs.resolve_device(job.train_env, events=events)
+    if probe.device != "mps":
+        return "auto", None, None
+    try:
+        return "mps", devices.prepare_mps(probe, os.environ), None
+    except devices.MpsMemoryRefused as exc:
+        return "cpu", None, f"the float reference ran on the CPU, not on MPS: {exc}"
+
+
 def settle(runs: Sequence[dict[int, Any]], rows: Sequence[int]) -> tuple[dict[int, Any], list[int]]:
     """Per row, the scores most of `runs` gave, and the rows where that is not one value.
 
@@ -380,8 +411,13 @@ def run_script(
     timeout: int,
     auto_provision: bool = True,
     events: EventStream | None = None,
+    child_env: Mapping[str, str] | None = None,
 ) -> ScoreRun:
-    """Write `source` and `spec`, run it in `env`, and read back what it wrote."""
+    """Write `source` and `spec`, run it in `env`, and read back what it wrote.
+
+    `child_env` is added to the child's environment: the MPS memory policy of a
+    reference that runs on Apple's GPU (`devices.prepare_mps`).
+    """
     run = ScoreRun()
     if auto_provision:
         try:
@@ -401,7 +437,7 @@ def run_script(
         )
         proc = None
         try:
-            proc = env.run(["python", str(script), str(spec_path)], timeout=timeout)
+            proc = env.run(["python", str(script), str(spec_path)], timeout=timeout, env=child_env)
         except subprocess.TimeoutExpired as expired:
             said = _tail(expired.stderr)
             run.failure = f"no result after {timeout} s (timeout)" + (f": {said}" if said else "")
@@ -874,7 +910,23 @@ def verify_decision(
     # Besides its first rows, the longest: a cache gone wrong past Gemma 3's
     # sliding window would not show on short ones.
     longest = max(range(len(prompts)), key=lambda i: len(prompts[i]))
-    events.note(f"reference: scoring {len(decision.ids)} options on {len(prompts)} rows")
+    if job.auto_provision:
+        # Before the device probe, which asks the environment's own torch.
+        try:
+            job.train_env.provision(events=events)
+        except Exception as exc:  # noqa: BLE001 - a failed environment is a harness failure
+            logger.exception("could not provision environment %r", job.train_env.name)
+            return refuse(
+                REFERENCE_CHECK,
+                f"the {job.train_env.name} environment could not be provisioned: {exc}",
+            )
+    device, mps_memory, moved = reference_device(job, events)
+    if moved:
+        state.limitations.append(moved)
+    events.note(
+        f"reference: scoring {len(decision.ids)} options on {len(prompts)} rows"
+        + (" on Apple's GPU (MPS)" if device == "mps" else "")
+    )
     ref = run_script(
         job.train_env,
         REFERENCE_SCRIPT,
@@ -889,13 +941,28 @@ def verify_decision(
             # The rows the float twin is compared on, scored alone with no
             # cache: the twin's 1e-3 then measures the bundle, not batching.
             "alone_for": [calib_n + i for i in engine_rows[:PROBE_ROWS]],
-            "device": job.device,
+            "device": device,
+            # Bigger batches on the GPU, where they paid: MEASUREMENTS.md, "The
+            # decision reference on MPS".
+            **({"row_batch": MPS_ROW_BATCH} if device == "mps" else {}),
         },
         timeout=STARTUP_TIMEOUT_S + REFERENCE_ROW_TIMEOUT_S * len(prompts),
-        auto_provision=job.auto_provision,
+        auto_provision=False,
         events=events,
+        child_env=mps_memory.child_env if mps_memory is not None else None,
     )
     fields["harness"] = {"reference": {k: v for k, v in ref.report.items() if k != "cont_ids"}}
+    if mps_memory is not None:
+        fields["harness"]["reference_mps_memory"] = mps_memory.as_dict()
+        mismatch = devices.environment_mismatch(
+            mps_memory, ref.report.get("mps_environment"), "reference script"
+        )
+        if mismatch:
+            state.limitations.append(mismatch)
+        if ref.failure:
+            ref.failure += f". {devices.mps_oom_advice(mps_memory)}"
+    if ref.report.get("device") == "mps":
+        state.limitations.append(REFERENCE_ON_MPS)
     missing = [i for i in range(len(prompts)) if i not in ref.scores]
     if ref.failure or missing:
         return refuse(

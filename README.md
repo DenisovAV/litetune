@@ -43,7 +43,9 @@ them.
 asking the stage environment's own torch, in this order: CUDA if
 `torch.cuda.is_available()`, then Apple's GPU through Metal (`mps`) if
 `torch.backends.mps.is_available()`, then the CPU. A decision's float
-reference is the exception: it runs on CUDA or on the CPU, never on `mps`.
+reference does the same, in batches of 64 rows on `mps` instead of 16, and a
+Mac whose MPS memory policy is refused runs it on the CPU and says so in the
+limitations.
 When a Mac lands on the CPU
 the report carries what torch answered for `is_built()` and `is_available()`
 and names no cause beyond them, since `is_available()` gives none. Every run
