@@ -87,7 +87,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 VARIANTS = ("cache_position+position_ids", "position_ids", "plain")
 # Where the run reads torch's MPS counters on mps (`sample_mps_memory`).
-MPS_SAMPLE_POINTS = ("after each batch",)
+MPS_SAMPLE_POINTS = (
+    "after loading the model",
+    "after each batch's prompt forward",
+    "at each chunk's log-probabilities, its cache copy alive",
+    "after each batch",
+)
+# What a run that stops before its report still tells the parent.
+STOPPED = {}
 '''
     + RENDERING_SOURCE
     + devices.MPS_SCRIPT_SOURCE
@@ -126,6 +133,11 @@ def main():
     # policy was set (`devices.prepare_mps`).
     device = "mps" if wanted == "mps" else device
     mps_samples = new_mps_samples(MPS_SAMPLE_POINTS) if device == "mps" else None
+    STOPPED.update(report=spec["report"], device=device, mps_samples=mps_samples)
+
+    def sample():
+        if mps_samples is not None:
+            sample_mps_memory(torch, mps_samples)
     kwargs = {"revision": spec["revision"]} if spec.get("revision") else {}
     tok = AutoTokenizer.from_pretrained(spec["model"], **kwargs)
     try:
@@ -137,6 +149,7 @@ def main():
             spec["model"], torch_dtype=torch.float32, attn_implementation="eager", **kwargs
         )
     model = model.to(device).eval()
+    sample()
     scale, cap = head_transform(model.config)
     # The first token of the end of turn tune recorded, as this tokenizer
     # writes it; the runtime is handed the text and must tokenise it alike.
@@ -241,6 +254,7 @@ def main():
                 inp[j, : len(c)] = torch.tensor(c, device=device)
             o2 = cont_forward(inp, expand(cache, n), p, length, n, how)
             lp = torch.log_softmax(o2.logits.float(), dim=-1)
+            sample()
             for j, c in enumerate(part):
                 rest = [lp[j, t - 1, c[t]].item() for t in range(1, len(c))]
                 res.append([first[c[0]].item(), *rest])
@@ -275,6 +289,7 @@ def main():
         )
         first = torch.log_softmax(out.logits[:, -1].float(), dim=-1)
         cache = out.past_key_values
+        sample()
         lens = mask.sum(-1)
         res = [[[h] for h in row] for row in first[:, [c[0] for c in conts]].tolist()]
         pairs = [(i, j) for i in range(b) for j in range(len(conts))]
@@ -305,6 +320,7 @@ def main():
             if how == "cache_position+position_ids":
                 kw["cache_position"] = width + pos
             lp = torch.log_softmax(model(**kw).logits.float(), dim=-1)
+            sample()
             at = [
                 (k, t - 1, conts[j][t])
                 for k, (_, j) in enumerate(part)
@@ -433,8 +449,7 @@ def main():
                 rec["seconds"] = each
                 out.write(json.dumps(rec) + "\n")
             out.flush()
-            if mps_samples is not None:
-                sample_mps_memory(torch, mps_samples)
+            sample()
             g += 1
     Path(spec["report"]).write_text(
         json.dumps(
@@ -470,8 +485,33 @@ def main():
     return 0
 
 
+def report_stop(exc):
+    # A run that stops writes what it knows -- the device, the MPS variables it
+    # saw, the MPS memory read so far -- unless the full report is written.
+    # Not as "error": the parent then keeps stderr's traceback as the reason.
+    path = STOPPED.get("report")
+    if not path or Path(path).exists():
+        return
+    Path(path).write_text(
+        json.dumps(
+            {
+                "stopped_by": f"{type(exc).__name__}: {str(exc)[:500]}",
+                "device": STOPPED.get("device"),
+                "mps_environment": environment_seen(),
+                "mps_memory_sampled_max": finished_mps_samples(STOPPED.get("mps_samples")),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    except BaseException as exc:
+        report_stop(exc)
+        raise
+    sys.exit(code)
 """
 )
 

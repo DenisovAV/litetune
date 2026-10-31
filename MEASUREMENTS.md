@@ -2060,25 +2060,39 @@ new.
 
 On a Mac whose training environment's torch reaches MPS, `verify` runs a
 decision's float reference there, 64 rows a batch, under the memory policy
-`evaluate` uses. Measured 2026-10-31 on an M5 Pro with 64 GB, litetune at
-the commit that wired it in, on the emotion decision above (gemma-3-270m-it,
-LoRA, the `dynamic_wi8_afp32` bundle): the same verify twice, one after the
-other, `--calibration --engine-rows 300 --threads 4`, no float twin, first
-with `LITETUNE_DEVICE=cpu`.
+`evaluate` uses; a reference that runs out of MPS memory, or meets an
+operation MPS does not implement, is scored again on the CPU. Measured
+2026-10-31 on an M5 Pro with 64 GB, on the emotion decision above
+(gemma-3-270m-it, LoRA, the `dynamic_wi8_afp32` bundle): the same verify,
+`--calibration --engine-rows 300 --threads 4`, no float twin, one run after
+another. The first pair ran the first version of the change; the second ran
+it as committed, with a third run whose MPS limit was set too low on purpose
+(`PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.01`, 531 MB).
 
-| reference on | rows a batch | batches | reference | verify wall | user CPU |
-|---|---|---|---|---|---|
-| CPU | 16 | 250 | 104.0 s | 145 s | 607 s |
-| MPS | 64 | 63 | 73.3 s | 118 s | 128 s |
+| run | reference on | rows a batch | batches | reference | verify wall | user CPU |
+|---|---|---|---|---|---|---|
+| first pair | CPU | 16 | 250 | 104.0 s | 145 s | 607 s |
+| first pair | MPS | 64 | 63 | 73.3 s | 118 s | 128 s |
+| second | CPU | 16 | 250 | 160.3 s | 204 s | 860 s |
+| second | MPS | 64 | 63 | 69.4 s | 115 s | 133 s |
+| second, 531 MB limit | MPS, then CPU | 16 | 250 | 157.4 s on the CPU | 204 s | 883 s |
 
-- Both passed with the same agreement (0.9967 top option, 0.9933 answer) and
-  the same accuracies. The fit moved by 2.0e-07 in temperature
-  (1.2838769 against 1.2838767) and 1.9e-06 in the abstain threshold; mean KL
-  to the runtime 3.938340e-04 against 3.938337e-04.
-- On MPS torch's driver held up to 9.3 GB (`driver_allocated_bytes`, sampled
-  after each of the 63 batches) and 1.07 GB was allocated to tensors.
-- Load averages 2 to 8 during the runs. One run each; not measured: other
-  families, a Mac with less memory, a float twin on MPS.
+- Every run passed with the same agreement (0.9967 top option, 0.9933
+  answer) and the same accuracies. MPS against the CPU moved the fit by
+  2.0e-07 in temperature (1.2838769 against 1.2838767) and 1.9e-06 in the
+  abstain threshold; mean KL to the runtime 3.938340e-04 against 3.938337e-04.
+- The run under 531 MB stopped on MPS when the model was moved there
+  (`MPS backend out of memory ... max allowed: 530.84 MB`), was scored again on
+  the CPU, and gave the CPU run's fit to the last digit.
+- The CPU reference took 104.0 s in one run and 160.3 s in the other, with
+  load averages of 2 to 8 from other work on the Mac; the MPS reference took
+  73.3 s and 69.4 s.
+- Under litetune's budget (27.5 GB here), torch's MPS counters read at most
+  2.57 GB allocated to tensors and 9.3 GB held by the driver, cached blocks
+  included, over 368 readings: after loading the model, after each batch's
+  prompt forward, at each chunk's log-probabilities and after each batch.
+  Between readings they were not read, so these are not peaks.
+- Not measured: other families, a Mac with less memory, a float twin on MPS.
 
 ### Limitations carried by the decision numbers
 

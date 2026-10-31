@@ -497,6 +497,23 @@ class MpsMemory:
 AVAILABLE_MEASURE = f"({' + '.join(AVAILABLE_PAGES)}) * {PAGE_SIZE}"
 
 
+# How torch says an MPS run could not go on. Out of memory: the allocator's
+# own message, whichever limit it hit. A device fact: an operation MPS does not
+# implement (two adjacent pieces of one message, joined when it is raised, so
+# the phrase is what stderr carries); bfloat16 refused before macOS 14; a
+# watermark ratio the allocator rejected. The way forward for each is the CPU,
+# never `PYTORCH_ENABLE_MPS_FALLBACK=1`, which torch's own message suggests:
+# litetune writes 0 so that a run recorded as mps ran on MPS.
+MPS_OOM_RE = re.compile(r"MPS backend out of memory", re.IGNORECASE)
+MPS_DEVICE_FACTS = (
+    r"is not currently implemented for the MPS device",
+    r"MPS BFloat16 is only supported on MacOS 14",
+    r"invalid high watermark ratio",
+    r"invalid low watermark ratio",
+)
+MPS_DEVICE_FACT_RE = re.compile("|".join(MPS_DEVICE_FACTS), re.IGNORECASE)
+
+
 def mps_oom_advice(memory: MpsMemory | None) -> str:
     """What to do about an MPS out-of-memory ending, worded by who set the limit."""
     cpu = f"set {DEVICE_VARIABLE}=cpu to run on the CPU"
@@ -753,9 +770,10 @@ def prepare_mps(
 # What the child saw and what it used
 # ---------------------------------------------------------------------------
 #
-# Source concatenated into both scripts that can run on mps --
-# `tune._TRAIN_SCRIPT` and `evaluate._HF_GENERATE_SCRIPT` -- because neither
-# may import litetune: each runs in a stage environment that has only torch.
+# Source concatenated into the scripts that can run on mps --
+# `tune._TRAIN_SCRIPT`, `evaluate._HF_GENERATE_SCRIPT` and
+# `decision_scripts.REFERENCE_SCRIPT` -- because none may import litetune: each
+# runs in a stage environment that has only torch.
 #
 # `environment_seen` is what the child itself read for the three MPS
 # variables, so the parent can compare it with what it sent and what the
