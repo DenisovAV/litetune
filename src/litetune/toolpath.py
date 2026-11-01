@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from litetune import envs
+from litetune import devices, envs
 from litetune.evaluate import (
     BACKEND_OBSERVED,
     GREEDY,
@@ -531,6 +531,9 @@ class ToolPathProbe:
     # changed, 40 of 40 rows answered and every function name agreeing with
     # the CPU run.
     backend_flag: str = "cpu"
+    # The CPU engine's thread count, from `devices.runtime_cpu_threads`; `None`
+    # passes none and leaves the runtime's default. Ignored on the GPU.
+    thread_count: int | None = None
     # What the script saw of its process after building the engine.
     device_report: dict[str, Any] | None = field(default=None, init=False)
     # Filled by `observe`, from the runtime's own metadata: which runtime
@@ -563,7 +566,7 @@ class ToolPathProbe:
                         "tools": self.declarations,
                         "max_tokens": self.max_tokens,
                         "constrained": constrained,
-                        **runtime_engine_spec(self.backend_flag),
+                        **runtime_engine_spec(self.backend_flag, self.thread_count),
                         "out": str(out),
                         "log": str(log),
                         "mark": mark,
@@ -708,6 +711,11 @@ class ToolPathBackend:
     # changed, 40 of 40 rows answered and every function name agreeing with
     # the CPU run.
     backend_flag: str = "cpu"
+    # The CPU threads asked for; `None` asks for none, the runtime's default.
+    # On a CPU with SME2 both modes get one (`devices.runtime_cpu_threads`).
+    threads: int | None = None
+    # What both modes' CPU engines used; `None` before a run and on the GPU.
+    cpu_threads: devices.CpuThreads | None = field(default=None, init=False)
     # One `ToolPathProbe.device_report` per decoding mode that ran.
     device_reports: list[dict[str, Any] | None] = field(default_factory=list, init=False)
     # Filled by `generate`: the rows from each mode, kept so the manifest can
@@ -816,6 +824,8 @@ class ToolPathBackend:
                 ]
             ),
             "cpu_by_mode": [cpu_of(r) for r in self.device_reports],
+            # Both modes' CPU engine threads, as `LiteRtLmBackend` records them.
+            "cpu_threads": self.cpu_threads.as_dict() if self.cpu_threads else None,
             "runtime_versions_by_mode": list(self.runtime_versions),
             # The pin beside what ran, as the text path records it, so verify
             # can say when the two differ.
@@ -835,6 +845,9 @@ class ToolPathBackend:
         """
         # First, before any return: this run's readings or none.
         self.device_reports = []
+        self.cpu_threads = (
+            devices.runtime_cpu_threads(self.threads) if self.backend_flag == "cpu" else None
+        )
         probe = ToolPathProbe(
             model=self.model,
             declarations=self.declarations,
@@ -843,6 +856,7 @@ class ToolPathBackend:
             auto_provision=self.auto_provision,
             timeout_s=self.timeout_s,
             backend_flag=self.backend_flag,
+            thread_count=self.cpu_threads.used if self.cpu_threads else None,
         )
         self.rows, self.unavailable, self.runtime_version = {}, {}, None
         self.runtime_versions = []

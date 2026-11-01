@@ -158,6 +158,8 @@ def _no_host_device_settings(monkeypatch):
     for name in (devices.DEVICE_VARIABLE, *devices.MPS_VARIABLES):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(devices, "read_sysctl", fake_sysctl(FAKE_SYSCTL))
+    # Read once a process in use; once a test here, so each test's sysctl answers.
+    monkeypatch.setattr(devices, "_sme2_reading", [])
 
 
 # What `fake_sysctl` answers by default: a Mac at normal memory pressure with
@@ -172,7 +174,31 @@ FAKE_SYSCTL = {
     "kern.memorystatus_vm_pressure_level": "1",
     "vm.swapusage": "total = 0.00M  used = 0.00M  free = 0.00M",
     "machdep.cpu.brand_string": "Apple M-test",
+    # No SME2, so LiteRT-LM's CPU runs keep the threads asked for
+    # (`devices.runtime_cpu_threads`); a test of an SME2 host passes its own.
+    "hw.optional.arm.FEAT_SME2": "0",
 }
+
+
+@pytest.fixture
+def sme2_host(monkeypatch):
+    """This host as a Mac on arm64 whose sysctl says its CPU has SME2, on any OS.
+
+    Through `devices.read_sme2` itself, with the platform and machine it would
+    read on such a Mac, so the path a real one takes is the path tested.
+    """
+    import functools
+
+    from litetune import devices
+
+    monkeypatch.setattr(
+        devices, "read_sysctl", fake_sysctl({**FAKE_SYSCTL, devices.SME2_SYSCTL: "1"})
+    )
+    monkeypatch.setattr(
+        devices,
+        "read_sme2",
+        functools.partial(devices.read_sme2, platform="darwin", machine="arm64"),
+    )
 
 
 def sysctl_available(available_bytes: int, pressure: int = 1) -> dict[str, str]:

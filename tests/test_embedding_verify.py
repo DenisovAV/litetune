@@ -2064,3 +2064,72 @@ def test_a_file_compiled_for_an_npu_is_refused_before_any_run(fake, tmp_path):
     failed = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
     assert failed[0]["name"] == CANDIDATE_CHECK and "Qualcomm SM8750 NPU" in failed[0]["detail"]
     assert fake.runs == []
+
+
+# -- the engines' CPU threads on a CPU with SME2 -------------------------------
+
+
+def _engine_thread_notes(m: dict[str, Any]) -> list[str]:
+    return [t for t in m["limitations"] if "on one thread" in t]
+
+
+def test_on_a_cpu_with_sme2_the_engines_run_one_thread_and_the_reference_keeps_its_own(
+    fake, tmp_path, sme2_host
+):
+    result = _verify(_setup(tmp_path), threads=4, base_litertlm=_google(tmp_path))
+    m = result.manifest
+
+    assert result.status is Status.PASSED, m["checks"]
+    assert fake.specs["reference"]["threads"] == 4
+    assert fake.specs["candidate"]["threads"] == 1 and fake.specs["base"]["threads"] == 1
+    embedding = m["embedding"]
+    assert (embedding["threads"], embedding["engine_threads"]) == (4, 1)
+    assert "this CPU has SME2" in embedding["engine_threads_reason"]
+    engine = m["measurements"]["candidate"]["engine"]
+    assert (engine["threads"], engine["threads_requested"]) == (1, 4)
+    assert engine["threads_reason"] == embedding["engine_threads_reason"]
+    (said,) = _engine_thread_notes(m)
+    assert said.startswith(
+        "each EmbeddingEngine side ran LiteRT-LM on the CPU on one thread (4 asked for): "
+        "this CPU has SME2"
+    )
+    assert any("EmbeddingEngine, 1 thread, from the" in t for t in m["limitations"])
+
+
+def test_one_thread_each_lets_two_files_run_side_by_side_on_two_cpus(
+    fake, tmp_path, monkeypatch, sme2_host
+):
+    monkeypatch.setattr(embedding_verify, "usable_cpus", lambda: 2)
+    m = _verify(_setup(tmp_path), threads=4, base_litertlm=_google(tmp_path)).manifest
+    assert [launch["parallel"] for launch in fake.launches] == [True]
+    assert any("each on its own 1 thread;" in t for t in m["limitations"])
+
+
+def test_off_such_a_cpu_the_engines_get_the_threads_asked_for(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(embedding_verify, "usable_cpus", lambda: 8)
+    m = _verify(_setup(tmp_path), threads=4, base_litertlm=_google(tmp_path)).manifest
+    assert fake.specs["candidate"]["threads"] == 4 and fake.specs["base"]["threads"] == 4
+    assert (m["embedding"]["engine_threads"], m["embedding"]["engine_threads_reason"]) == (4, None)
+    engine = m["measurements"]["candidate"]["engine"]
+    assert (engine["threads"], engine["threads_requested"], engine["threads_reason"]) == (
+        4,
+        4,
+        None,
+    )
+    assert not _engine_thread_notes(m)
+    assert any("EmbeddingEngine, 4 threads, from the" in t for t in m["limitations"])
+    assert any("each on its own 4 threads;" in t for t in m["limitations"])
+
+
+def test_on_the_gpu_the_engines_get_no_thread_count(fake, tmp_path, on_macos, sme2_host):
+    result = _verify(_setup(tmp_path), backend="gpu", threads=4)
+    m = result.manifest
+
+    assert result.status is Status.PASSED, m["checks"]
+    assert fake.specs["candidate"]["threads"] is None
+    assert fake.specs["reference"]["threads"] == 4
+    assert m["embedding"]["engine_threads"] is None
+    assert m["embedding"]["engine_threads_reason"] is None
+    engine = m["measurements"]["candidate"]["engine"]
+    assert engine["threads"] is None and engine["threads_requested"] is None
+    assert not _engine_thread_notes(m)

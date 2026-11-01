@@ -3493,3 +3493,223 @@ def test_a_reference_that_fails_off_a_mac_gets_no_mps_advice(split, tmp_path):
     detail = check(fields, REFERENCE_CHECK)["detail"]
     assert "OSError: checkpoint not found" in detail
     assert "MPS" not in detail and devices.DEVICE_VARIABLE not in detail
+
+
+# ---------------------------------------------------------------------------
+# One thread on a CPU with SME2
+# ---------------------------------------------------------------------------
+
+
+def _twin_specs(job):
+    return [s for s in _engine_specs(job) if s["targets"] == "full"]
+
+
+def _thread_notes(fields: dict[str, Any]) -> list[str]:
+    return [t for t in fields["limitations"] if "on one thread" in t]
+
+
+def test_on_a_cpu_with_sme2_the_runtime_scores_on_one_thread_and_records_it(
+    split, tmp_path, sme2_host
+):
+    s = split()
+    job = job_for(s, tmp_path, threads=4)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert [x["threads"] for x in _candidate_specs(job)] == [1]
+    engine = fields["measurements"]["candidate"]["engine"]
+    assert (engine["threads"], engine["threads_requested"]) == (1, 4)
+    assert "this CPU has SME2" in engine["threads_reason"]
+    cost = fields["cost"]
+    assert (cost["threads"], cost["threads_requested"]) == (1, 4)
+    assert cost["threads_reason"] == engine["threads_reason"]
+    recorded = fields["harness"]["runtime_cpu_threads"]
+    assert recorded == {"threads": 1, "requested": 4, "reason": engine["threads_reason"]}
+    (said,) = _thread_notes(fields)
+    assert said.startswith(
+        "the runtime's option scoring ran LiteRT-LM on the CPU on one thread (4 asked for): "
+        "this CPU has SME2 (hw.optional.arm.FEAT_SME2 = 1); on such a CPU Google's litert-lm "
+        "0.18.0 wheel gave results that depend on the thread count (XNNPACK #11789)"
+    )
+    # Not the text path's sentence: this is the path the measurement was taken on.
+    assert "generated text" not in said
+
+
+def test_more_threads_asked_for_on_such_a_cpu_are_not_refused(split, tmp_path, sme2_host):
+    """Refusing would fail every default verify on such a Mac; the run says what it did."""
+    s = split()
+    job = job_for(s, tmp_path, threads=12)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed"
+    assert [x["threads"] for x in _candidate_specs(job)] == [1]
+    assert "(12 asked for)" in _thread_notes(fields)[0]
+
+
+def test_off_such_a_cpu_the_runtime_gets_the_threads_asked_for_and_says_nothing(split, tmp_path):
+    s = split()
+    job = job_for(s, tmp_path, threads=6)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed"
+    assert [x["threads"] for x in _candidate_specs(job)] == [6]
+    engine = fields["measurements"]["candidate"]["engine"]
+    assert (engine["threads"], engine["threads_requested"], engine["threads_reason"]) == (
+        6,
+        6,
+        None,
+    )
+    assert fields["harness"]["runtime_cpu_threads"] == {
+        "threads": 6,
+        "requested": 6,
+        "reason": None,
+    }
+    assert not _thread_notes(fields)
+
+
+def test_the_float_twin_on_such_a_cpu_scores_on_one_thread_and_says_so(split, tmp_path, sme2_host):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(s, tmp_path, float_twin=twin, threads=4)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed"
+    assert [x["threads"] for x in _twin_specs(job)] == [1]
+    observed = check(fields, TWIN_CHECK)["observed"]
+    assert observed["cpu_threads"]["threads"] == 1
+    assert observed["cpu_threads"]["requested"] == 4
+    notes = _thread_notes(fields)
+    assert [n.split(" ran ")[0] for n in notes] == [
+        "the runtime's option scoring",
+        "the float twin's option scoring",
+    ]
+
+
+def test_off_such_a_cpu_the_twin_gets_the_threads_asked_for(split, tmp_path):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(s, tmp_path, float_twin=twin, threads=3)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed"
+    assert [x["threads"] for x in _twin_specs(job)] == [3]
+    assert check(fields, TWIN_CHECK)["observed"]["cpu_threads"]["reason"] is None
+    assert not _thread_notes(fields)
+
+
+def test_on_the_gpu_only_the_cpu_twin_gets_a_thread_count(split, tmp_path, on_macos, sme2_host):
+    s = split()
+    twin = tmp_path / "twin.litertlm"
+    twin.write_bytes(b"float")
+    job = job_for(s, tmp_path, backend="gpu", float_twin=twin, threads=4)
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert all(x["threads"] is None for x in _candidate_specs(job))
+    assert [x["threads"] for x in _twin_specs(job)] == [1]
+    assert "backend" not in _twin_specs(job)[0], "the twin runs on the CPU"
+    engine = fields["measurements"]["candidate"]["engine"]
+    assert engine["threads"] is None and engine["threads_requested"] is None
+    assert engine["threads_reason"] is None
+    assert fields["cost"]["threads"] is None and fields["cost"]["threads_reason"] is None
+    assert fields["harness"]["runtime_cpu_threads"] is None
+    assert [n.split(" ran ")[0] for n in _thread_notes(fields)] == [
+        "the float twin's option scoring"
+    ]
+
+
+def test_on_the_gpu_without_a_twin_nothing_is_said_of_threads(split, tmp_path, on_macos, sme2_host):
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    assert not _thread_notes(fields)
+
+
+# -- the self-check reads no gap from a number that is not one ------------------
+
+FAKE_NOT_FINITE = FAKE_LITERT_LM.replace(
+    "        ctx, target = list(self._context()) + self.pending, _ids(texts[0])\n",
+    "        ctx, target = list(self._context()) + self.pending, _ids(texts[0])\n"
+    "        if str(_SCORINGS) in os.environ.get('FAKE_BAD_AT', '').split(','):\n"
+    "            return _Result([float(os.environ['FAKE_BAD'])] * len(target))\n",
+)
+assert FAKE_NOT_FINITE != FAKE_LITERT_LM
+
+
+@pytest.mark.parametrize(
+    ("bad", "at"),
+    [
+        # The second pair's second prompt: [0.0, nan, ...], which `max` reads as 0.0.
+        ("nan", "4"),
+        # The first comparison's: nan in first place.
+        ("nan", "2"),
+        ("inf", "4"),
+        ("-inf", "1"),
+    ],
+)
+def test_a_gap_that_is_not_finite_is_refused_not_read_as_dropped(tmp_path, bad, at):
+    proc, rows, report = _run_engine_script(
+        tmp_path,
+        True,
+        ["text 1 about joy"],
+        ("joy", "anger", "fear"),
+        fake_source=FAKE_NOT_FINITE,
+        fake_env={"FAKE_BAD_AT": at, "FAKE_BAD": bad},
+    )
+
+    assert proc.returncode == 3, proc.stderr
+    assert rows == []
+    selfcheck = report["selfcheck"]
+    assert selfcheck["verdict"] == "not finite"
+    assert selfcheck["not_finite"] == 1
+    assert selfcheck["comparisons"] == 6
+    # JSON has no NaN: what is recorded is over the finite gaps.
+    assert selfcheck["max_abs_diff"] == 0.0 and selfcheck["min_abs_diff"] == 0.0
+    assert "mode" not in report
+    assert report["error"].startswith(
+        "the self-check could not tell the engine apart: 1 of its 6 comparisons gave a gap "
+        "that is not a finite number"
+    )
+
+
+def test_finite_gaps_of_zero_are_still_read_as_dropped(tmp_path):
+    """The control for the test above: the same fake, nothing made non-finite."""
+    proc, _, report = _run_engine_script(
+        tmp_path,
+        True,
+        ["text 1 about joy"],
+        ("joy", "anger", "fear"),
+        fake_source=FAKE_NOT_FINITE,
+        fake_env={"FAKE_BAD_AT": "", "FAKE_BAD": "nan"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert report["selfcheck"]["verdict"] == "dropped"
+    assert report["selfcheck"]["not_finite"] == 0
+    assert report["mode"] == "once"
+
+
+def test_the_engine_script_builds_its_cpu_backend_on_the_threads_it_is_given(tmp_path):
+    proc, _, report = _run_engine_script(
+        tmp_path,
+        True,
+        ["text 1 about joy"],
+        ("joy", "anger"),
+        fake_source=FAKE_LITERT_LM.replace(
+            "        self.path = path\n",
+            "        self.path = path\n" "        assert backend == ('cpu', 1), backend\n",
+        ),
+        threads=1,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert report["threads"] == 1

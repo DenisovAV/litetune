@@ -51,6 +51,15 @@ of PyTorch on a float32 bundle, and wrong on the other engine. Those
 measurements were Gemma 3's; the self-check's pair is rendered by the bundle's
 own template, which on Gemma 3 is the pair measured.
 
+The rule stays a gap of exactly 0.0, with no tolerance. On a Mac CPU with SME2
+a float32 bundle at 4 and 12 threads scored up to 2.5e-5 nats apart run to
+run on 0.18.0 (2026-11-01), the gap came out non-zero, and the check read
+"mixed" or "not dropped"; at one thread it read "dropped" every time. So
+`verify` runs LiteRT-LM on one thread on such a CPU
+(`devices.runtime_cpu_threads`), which makes the check repeatable again,
+rather than widening what counts as zero. A gap that is not a finite number is
+no reading at all, and the check refuses it.
+
 That is method `rewind`. Method `fresh_engine`, for a family whose rule gives
 every prompt an Engine of its own (`models.ModelRules.engine_per_prompt_reason`),
 scores each option on a new Engine and session with no checkpoint and no
@@ -749,8 +758,12 @@ def main():
                         d = abs(one_token(engine, a, z) - one_token(engine, b, z))
                         diffs.append(d)
                 checked.append(len(engine.tokenize(a)))
+            # A NaN or an infinity first: it is no gap, and `max` keeps a NaN
+            # only in first place, so [0.0, nan] would otherwise read "dropped".
+            finite = [d for d in diffs if math.isfinite(d)]
             verdict = (
                 "no comparisons" if not diffs
+                else "not finite" if len(finite) != len(diffs)
                 else "dropped" if max(diffs) == 0.0
                 else "not dropped" if min(diffs) > 0.0
                 else "mixed"
@@ -758,11 +771,22 @@ def main():
             report["selfcheck"] = {
                 "verdict": verdict,
                 "comparisons": len(diffs),
-                "max_abs_diff": max(diffs) if diffs else None,
-                "min_abs_diff": min(diffs) if diffs else None,
+                # Over the finite gaps; JSON has no NaN.
+                "max_abs_diff": max(finite) if finite else None,
+                "min_abs_diff": min(finite) if finite else None,
+                "not_finite": len(diffs) - len(finite),
                 "prompt_lengths": checked,
                 "pair": list(pair) if pair else None,
             }
+            if verdict == "not finite":
+                report["error"] = (
+                    f"the self-check could not tell the engine apart: "
+                    f"{len(diffs) - len(finite)} of its {len(diffs)} comparisons gave a gap "
+                    "that is not a finite number, which says nothing about whether the "
+                    "second-to-last prompt token is dropped"
+                )
+                write_report()
+                return 3
             if verdict not in ("dropped", "not dropped"):
                 report["error"] = f"the self-check could not tell the engine apart: {verdict}"
                 write_report()

@@ -67,7 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from litetune import envs
+from litetune import devices, envs
 from litetune.checks import Check, CheckSet, Outcome
 from litetune.decisions import Decision, DecisionError, decision_from
 from litetune.embedding_export import (
@@ -141,7 +141,7 @@ EVAL_CHECK = "decider accuracy"
 GATE_CHECK = "conversion cost within threshold"
 
 CPU_ONLY = (
-    "measured on the CPU backend of LiteRT-LM's EmbeddingEngine, {threads} threads, from the "
+    "measured on the CPU backend of LiteRT-LM's EmbeddingEngine, {threads}, from the "
     "litert-lm package on PyPI on this host's CPU -- not the application's own build of the "
     "runtime on a device's CPU; the GPU and the NPU are not measured"
 )
@@ -199,8 +199,8 @@ GPU_NOT_MEASURED_HERE = (
     "measured, so it is refused here"
 )
 SIDE_BY_SIDE = (
-    "the candidate and Google's file were embedded at the same time, each on its own {threads} "
-    "threads; each file's time per text was measured with the other running"
+    "the candidate and Google's file were embedded at the same time, each on its own {threads}; "
+    "each file's time per text was measured with the other running"
 )
 REFERENCE_ON_CPU = (
     "the reference ran on the CPU in float32 through sentence-transformers, whatever "
@@ -904,6 +904,11 @@ def side_by_side(files: Sequence[Path], threads: int, cpus: int | None) -> bool:
     return (cpus or 1) >= threads * len(files)
 
 
+def _threads_text(threads: int | None) -> str:
+    """ "1 thread", "4 threads"."""
+    return f"{threads} thread" + ("" if threads == 1 else "s")
+
+
 def run_engines(
     env: envs.StageEnv,
     sides: Sequence[tuple[str, Path]],
@@ -1314,6 +1319,8 @@ def verify_embedding(
         ),
         events,
     )
+    engine_cpu = devices.runtime_cpu_threads(job.threads) if job.backend == "cpu" else None
+    engine_threads = engine_cpu.used if engine_cpu else None
     fields["embedding"] = {
         "prefix": record.prefix,
         "prompt_name": record.prompt_name,
@@ -1326,7 +1333,13 @@ def verify_embedding(
         "ks": list(KS),
         "draws": DRAWS,
         "gated_on": f"centroid_k{GATED_K}",
+        # --threads as asked: the reference's torch threads, and what the engines
+        # were asked for. `engine_threads` is what the LiteRT-LM CPU engines
+        # used -- one on a CPU with SME2 (`devices.runtime_cpu_threads`) -- and
+        # `None` on the GPU, which takes no thread count.
         "threads": job.threads,
+        "engine_threads": engine_threads,
+        "engine_threads_reason": engine_cpu.reason if engine_cpu else None,
     }
     if weights is None:
         state.limitation(f"the weight mode of the file is not known: {weights_source}")
@@ -1406,8 +1419,8 @@ def verify_embedding(
         if google is not None:
             engine_sides.append(("base", google))
         # One GPU engine at a time: two files on one GPU at once is not measured.
-        parallel = job.backend == "cpu" and side_by_side(
-            [f for _, f in engine_sides], job.threads, usable_cpus()
+        parallel = engine_threads is not None and side_by_side(
+            [f for _, f in engine_sides], engine_threads, usable_cpus()
         )
         fields["embedding"]["engines_side_by_side"] = parallel
 
@@ -1476,12 +1489,14 @@ def verify_embedding(
         engine_runs, launch_failure = run_engines(
             job.runtime_env,
             engine_sides,
-            common,
+            {**common, "threads": engine_threads},
             work,
             parallel,
             budget if parallel else budget * len(engine_sides),
             job.backend,
         )
+        if engine_cpu is not None and (said := engine_cpu.limitation("each EmbeddingEngine side")):
+            state.limitation(said)
         if launch_failure is not None:
             return refuse(CANDIDATE_CHECK, launch_failure)
         # The candidate first: when it failed, Google's file was stopped
@@ -1546,7 +1561,9 @@ def verify_embedding(
         "runtime_version": (candidate_report.get("runtime") or {}).get("litert-lm"),
         # `evaluate.cpu_report`, run by the engine script on the CPU it computed on.
         "cpu": _mapping(candidate_report.get("cpu")),
-        "threads": job.threads if job.backend == "cpu" else None,
+        "threads": engine_threads,
+        "threads_requested": job.threads if engine_cpu else None,
+        "threads_reason": engine_cpu.reason if engine_cpu else None,
         "settings": _mapping(candidate_report.get("settings")),
         "ms_per_text_median": candidate_report.get("ms_median"),
     }
@@ -1595,9 +1612,9 @@ def verify_embedding(
         seen = gpu_observed("gpu", candidate_report.get("device"))
         state.limitation(GPU_MEASURED.format(how=GPU_SEEN if seen else GPU_ASKED_FOR))
     else:
-        state.limitation(CPU_ONLY.format(threads=job.threads))
+        state.limitation(CPU_ONLY.format(threads=_threads_text(engine_threads)))
     if parallel:
-        state.limitation(SIDE_BY_SIDE.format(threads=job.threads))
+        state.limitation(SIDE_BY_SIDE.format(threads=_threads_text(engine_threads)))
     state.limitation(FITTED_ON_EXAMPLES.format(ks=" and ".join(f"k={k}" for k in KS), draws=DRAWS))
     state.limitation(REFERENCE_ON_CPU)
     state.limitation(LINEAR_NOT_GATED)
