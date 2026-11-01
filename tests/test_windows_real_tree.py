@@ -744,12 +744,70 @@ def test_an_interrupt_reaches_the_wait(tmp_path, capsys):
 INTERRUPT_REPEATS = 10
 
 
+def test_a_wait_of_zero_or_less_becomes_a_poll():
+    """`_clamp_negative_wait` hands `_wait` 0 for a timeout of zero or less,
+    and every other timeout, None included, as it came."""
+    seen: list[float | None] = []
+
+    class Proc:
+        def _wait(self, timeout):
+            seen.append(timeout)
+            return 0
+
+    proc = Proc()
+    envs._clamp_negative_wait(proc)
+    for timeout in (-0.01, 0, 0.25, None):
+        proc._wait(timeout)
+    assert seen == [0, 0, 0.25, None]
+
+
+def test_the_clamp_keeps_no_process_alive():
+    """No reference cycle: a clamped `Popen` is freed as soon as it is let
+    go, as an unclamped one is, without the cyclic collector. On Windows its
+    process handle is closed when it is finalised."""
+    import gc
+    import weakref
+
+    class Proc:
+        def _wait(self, timeout):
+            return 0
+
+    proc = Proc()
+    envs._clamp_negative_wait(proc)
+    gone = weakref.ref(proc)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del proc
+        assert gone() is None
+    finally:
+        if enabled:
+            gc.enable()
+
+
+@on_windows
+def test_a_wait_past_its_deadline_is_a_poll():
+    """`communicate`'s wait after a `KeyboardInterrupt` past its deadline is
+    `_wait` with a negative timeout. Without gh-90872's fix Python 3.10 waits
+    until the child exits, here 30 s; with it, or `_spawn`'s clamp, it polls
+    and times out."""
+    proc = envs._spawn([sys.executable, "-c", "import time; time.sleep(30)"], None)
+    try:
+        started = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            proc._wait(timeout=-0.01)
+        assert time.monotonic() - started < 2
+    finally:
+        proc.kill()
+        proc.communicate(timeout=30)
+
+
 @on_windows
 def test_an_interrupt_reaches_the_wait_every_time(tmp_path, capsys):
-    """The same interrupt, ten times. On Python 3.10 it was lost in 10 of 43
-    CI runs read, reaching the wait only when the 60-second stage ended
-    (`envs._handle_pending_signals`): one run per job let that pass about
-    three times in four, ten runs about once in fourteen."""
+    """The same interrupt, ten times. On Python 3.10 it reached the wait only
+    when the 60-second stage ended in 30 of 60 runs on one Windows machine
+    (`envs._clamp_negative_wait`): one run per job let that pass half the
+    time, ten runs about once in a thousand."""
     driver_file = tmp_path / "driver_keyboard.py"
     driver_file.write_text(DRIVER_KEYBOARD)
     drivers: list[subprocess.Popen] = []
