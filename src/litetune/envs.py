@@ -2906,7 +2906,8 @@ def cached_environments() -> list[CachedEnv]:
     if not root.is_dir():
         return []
     claimed = {
-        env.path.name: env.name for env in (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN, NPU_QUALCOMM)
+        env.path.name: env.name
+        for env in (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN, NPU_QUALCOMM, NPU_LLM)
     }
     out = [
         CachedEnv(
@@ -3897,4 +3898,20 @@ NPU_QUALCOMM = StageEnv(
     ),
     provision_variables=(("SKIP_SDK_DOWNLOAD", ""),),
     installed_files=(f"{_NPU_SDK_LIBS}/libQnnHtp.so", f"{_NPU_SDK_LIBS}/libQnnSystem.so"),
+)
+
+# `convert --npu` of an LLM checkpoint (llm_npu): litert-torch's `npu_export` stages 1-4. The
+# export environment's pins -- the toolchain every LLM bundle of this litetune is exported
+# with, and the one the measured NPU bundles were built with -- plus the Qualcomm SDK as
+# NPU_QUALCOMM installs it, from its exact sdist. Not `--only-binary=:all:` as there: the
+# export toolchain's dependency closure is not all wheels. The compiler plugin itself comes
+# with ai-edge-litert-nightly's Linux x86-64 wheel.
+NPU_LLM = StageEnv(
+    name="npu-llm",
+    requirements=(*EXPORT.requirements, "ai-edge-litert-sdk-qualcomm==2.3.0"),
+    system_requirements=("libvulkan1", "libc++1", "libatomic1"),
+    install_as=NPU_QUALCOMM.install_as,
+    pip_options=("--no-cache-dir",),
+    provision_variables=NPU_QUALCOMM.provision_variables,
+    installed_files=NPU_QUALCOMM.installed_files,
 )

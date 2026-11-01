@@ -952,12 +952,13 @@ def test_npu_off_linux_x86_64_is_refused(hub, grafter, monkeypatch, tmp_path, ca
     assert "Linux x86-64 only" in capsys.readouterr().err
 
 
-def test_npu_for_an_llm_checkpoint_is_refused(tmp_path, capsys):
+def test_npu_for_an_llm_checkpoint_takes_the_llm_path(tmp_path, capsys):
+    """An LLM checkpoint's --npu is llm_npu's (tests/test_llm_npu.py), which needs its data."""
     llm = tmp_path / "llm"
     llm.mkdir()
     (llm / "litetune.json").write_text(json.dumps({"base_model": "google/gemma-3-270m-it"}))
     assert _convert(llm, tmp_path / "out", "--npu", "SM8750") == 4
-    assert "--npu" in capsys.readouterr().err
+    assert "--npu needs --calibration-data" in capsys.readouterr().err
 
 
 def test_an_npu_report_of_another_file_names_no_target(tmp_path):

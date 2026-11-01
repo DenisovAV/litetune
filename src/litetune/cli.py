@@ -67,6 +67,13 @@ from litetune.embedding_export import (
 from litetune.embedding_export import REPORT_NAME as EMBEDDING_REPORT_NAME
 from litetune.embedding_export import summarise as summarise_embedding_convert
 from litetune.embedding_npu import NPU_SOCS, NPU_TIMEOUT_S
+from litetune.llm_npu import (
+    DEFAULT_CACHE_LENGTH,
+    NPU_LLM_TIMEOUT_S,
+    LlmNpuRequest,
+    run_llm_npu_export,
+)
+from litetune.llm_npu import summarise as summarise_llm_npu
 from litetune.embedding_tune import (
     DIRECTION,
     EMBEDDING_MODEL,
@@ -790,8 +797,13 @@ def _add_convert(sub) -> None:
         choices=NPU_SOCS,
         metavar="SOC",
         help=(
-            "embedding checkpoints only, with --weights int8, on Linux x86-64 (Debian packages "
-            "libc++1 and libatomic1; the first run downloads Qualcomm's QAIRT): also compile the "
+            "on Linux x86-64 (Debian packages libc++1 and libatomic1; the first run downloads "
+            "Qualcomm's QAIRT). An LLM checkpoint of a measured family (gemma-3-text, "
+            "functiongemma, qwen-3, qwen-2.5, minicpm5), with --calibration-data: a generation "
+            "bundle compiled for this SoC through litert-torch's npu_export, into "
+            "<output-dir>/npu-<SOC>/model.litertlm with its own convert.json, instead of the "
+            "CPU/GPU bundles; a decision checkpoint is refused (the NPU executor rolls back one "
+            "token only). An embedding checkpoint, with --weights int8: also compile the "
             "graft's text encoder ahead of time for this Qualcomm SoC, into "
             "<output-dir>/int8-npu-<SOC>/model.litertlm with its own convert.json; repeat for "
             "more SoCs. Every SoC is compiled, a failed compile included, and publishing starts "
@@ -799,6 +811,25 @@ def _add_convert(sub) -> None:
             "it, and the report says which were published. verify cannot run such a file; a "
             "file compiled this way for SM8750 ran on one phone, no other SoC's on any. "
             f"One of {', '.join(NPU_SOCS)}"
+        ),
+    )
+    convert.add_argument(
+        "--calibration-data",
+        type=Path,
+        help=(
+            "LLM checkpoints with --npu only: the training JSONL `prepare` wrote. Half the "
+            "calibration prompts are its prompts, half long prompts packed from its examples up "
+            "to the longest prompt the bundle serves (--cache-length minus 128 for the reply); "
+            "the report names the calibrated length range, and longer prompts are outside it"
+        ),
+    )
+    convert.add_argument(
+        "--cache-length",
+        type=int,
+        default=None,
+        help=(
+            f"LLM checkpoints with --npu only: the NPU bundle's KV-cache length (default "
+            f"{DEFAULT_CACHE_LENGTH}, what every measured bundle used); a multiple of 128"
         ),
     )
     convert.add_argument(
@@ -1719,6 +1750,8 @@ def _embedding_record(model: str) -> EmbeddingRecord | None:
 
 # `convert`'s flags for an LLM, which an embedding checkpoint's graft does not read.
 _LLM_ONLY_CONVERT_FLAGS = (
+    ("calibration_data", "--calibration-data"),
+    ("cache_length", "--cache-length"),
     ("recipe", "--recipe"),
     ("flag", "--flag"),
     ("externalize_embedder", "--externalize-embedder"),
@@ -1731,9 +1764,16 @@ def _convert(args: argparse.Namespace) -> int:
     record = _embedding_record(args.model)
     if record is not None:
         return _convert_embedding(args, record)
-    if args.weights is not None or args.base_litertlm is not None or args.npu:
+    if args.npu:
+        return _convert_llm_npu(args)
+    if args.calibration_data is not None or args.cache_length is not None:
         raise EmbeddingExportError(
-            "--weights, --npu and --base-litertlm are for an embedding checkpoint, one whose "
+            "--calibration-data and --cache-length are for --npu; without it convert writes "
+            "the CPU/GPU bundles, which take neither"
+        )
+    if args.weights is not None or args.base_litertlm is not None:
+        raise EmbeddingExportError(
+            "--weights and --base-litertlm are for an embedding checkpoint, one whose "
             f"litetune.json `tune --model {EMBEDDING_MODEL}` wrote; {args.model} is not one"
             f"{model_dir_hint(args.model)}. Pick an LLM's quantization with --recipe"
         )
@@ -1758,6 +1798,52 @@ def _convert(args: argparse.Namespace) -> int:
     if not delivered:
         # The report is the deliverable when `--json` is on, and a run whose
         # result could not be written has not been reported.
+        return EXIT_CODES[Status.ERROR]
+    return OUTCOME_EXIT_CODES[result.outcome]
+
+
+# `convert`'s flags that the LLM --npu path does not read: it fixes the recipe (stage 1
+# dynamic_wi8_afp32, then A16W8) and the exporter flags (the family's own).
+_NOT_FOR_LLM_NPU = (
+    ("recipe", "--recipe"),
+    ("flag", "--flag"),
+    ("externalize_embedder", "--externalize-embedder"),
+    ("weights", "--weights"),
+    ("base_litertlm", "--base-litertlm"),
+)
+
+
+def _convert_llm_npu(args: argparse.Namespace) -> int:
+    """`convert --npu` of an LLM checkpoint: a generation bundle per SoC, nothing else."""
+    given = [
+        flag
+        for name, flag in _NOT_FOR_LLM_NPU
+        if getattr(args, name) is not None and getattr(args, name) != []
+    ]
+    if given:
+        raise EmbeddingExportError(
+            f"{', '.join(given)}: --npu exports an LLM checkpoint with npu_export's own recipe "
+            "(dynamic_wi8_afp32, then A16W8 static quantization) and its family's exporter "
+            "flags; neither is chosen here"
+        )
+    if args.calibration_data is None:
+        raise EmbeddingExportError(
+            "--npu needs --calibration-data, the training JSONL `prepare` wrote: the NPU "
+            "bundle is calibrated on prompts built from it"
+        )
+    events = _stream()
+    request = LlmNpuRequest(
+        model=args.model,
+        output_dir=args.output_dir,
+        socs=tuple(args.npu),
+        calibration_data=args.calibration_data,
+        cache_length=args.cache_length if args.cache_length is not None else DEFAULT_CACHE_LENGTH,
+        base_model=args.base_model or _read_base_model(args.train_metrics),
+        timeout_s=args.timeout_s if args.timeout_s is not None else NPU_LLM_TIMEOUT_S,
+        auto_provision=not args.no_provision,
+    )
+    result = run_llm_npu_export(request, events=events)
+    if not _report(result.as_dict(), lambda: summarise_llm_npu(result), args.json):
         return EXIT_CODES[Status.ERROR]
     return OUTCOME_EXIT_CODES[result.outcome]
 

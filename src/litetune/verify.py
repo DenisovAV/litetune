@@ -38,7 +38,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from litetune import devices, envs, metrics, models
+from litetune import devices, envs, llm_npu, metrics, models
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.decision_verify import DEFAULT_ENGINE_ROWS, DEFAULT_THREADS
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
@@ -1178,6 +1178,22 @@ def run_verify(
                 "they are for an embedding checkpoint, one whose litetune.json "
                 f"`tune --model {EMBEDDING_MODEL}` wrote, and {request.reference} records "
                 f"none{model_dir_hint(request.reference)}. Refused rather than ignored",
+            )
+        )
+        return run.finish(Status.FAILED_HARNESS)
+
+    # -- an LLM bundle compiled for an NPU cannot run here ------------------------
+    # `convert --npu` writes one with a convert.json naming its sha256; LiteRT-LM's CPU and
+    # GPU have no kernel for its DISPATCH_OPs, so a generation run would fail minutes in.
+    npu_soc = llm_npu.npu_target_of(Path(request.model))
+    if npu_soc is not None:
+        run.record(
+            Check.failed(
+                "candidate",
+                f"--model {request.model} is compiled for a Qualcomm {npu_soc} NPU (the "
+                f"{llm_npu.REPORT_NAME} beside it says so and names its sha256); verify runs "
+                "LiteRT-LM's CPU or GPU, which cannot run its DISPATCH_OPs. Verify the CPU/GPU "
+                "bundle of the same checkpoint, and measure this one on a phone with that SoC",
             )
         )
         return run.finish(Status.FAILED_HARNESS)
