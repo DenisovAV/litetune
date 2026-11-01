@@ -46,11 +46,11 @@ import '../../theme/brand.dart';
 /// unknown-family note. Qwen2.5 likewise: 0.5B and 1.5B Instruct.
 ///
 /// The acceleration row names NPU only as a platform-specific LiteRT-LM
-/// capability. litetune does not compile or verify an NPU bundle: the
-/// Snapdragon artifact in MEASUREMENTS.md was built by hand, and the Intel
-/// run has a multi-chunk limitation. Keeping those facts out of the runtime
-/// sentence stops a reader taking it as a promise about the bundle `convert`
-/// hands them.
+/// capability. The one NPU bundle litetune compiles is an EmbeddingGemma 2
+/// graft's encoder for four Qualcomm SoCs (`convert --npu`, on the embeddings
+/// page); it compiles none for a language model, and `verify` runs no NPU.
+/// Keeping that out of the runtime sentence stops a reader taking it as a
+/// promise about every bundle `convert` hands them.
 class Formats extends StatelessComponent {
   const Formats({super.key});
 
