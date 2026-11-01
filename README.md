@@ -15,13 +15,11 @@ Android, iOS, macOS, Linux and Windows, with GPU acceleration on each. The
 Google's [AI Edge Gallery](https://github.com/google-ai-edge/gallery) loads
 the file directly if you only want to try it on a device. Web exists as a
 text-only preview that supports neither function calling nor LoRA, so a
-tuned tool-calling model is native-only for now. The same model also runs on
-a Snapdragon 8 Elite NPU — hand-compiled through litert-torch's `npu_export`
-stages at the `cache_length` this project measured while isolating
-[LiteRT-LM#3508](https://github.com/google-ai-edge/LiteRT-LM/issues/3508) —
-and, for single-chunk prompts, on an Intel Lunar Lake NPU. The recipe, the
-numbers and the conditions are under [Limitations](#limitations); the compile
-is not in `convert`.
+tuned tool-calling model is native-only for now. `convert --npu` also compiles a
+generation bundle for a Qualcomm NPU, for the families that have run on one
+([below](#a-generation-bundle-for-a-qualcomm-npu-convert---npu)); an Intel Lunar
+Lake NPU ran single-chunk prompts of a hand-compiled one. The conditions are under
+[Limitations](#limitations).
 
 Any task shaped as prompt → completion works. What "correct" means is the one
 thing you choose: `--scorer tool-call` for function calling, where the operation
@@ -916,6 +914,46 @@ litetune convert --model ./tuned/model --output-dir ./out --weights int8 --npu S
   against 0.9312 for the float32 reference ([MEASUREMENTS.md](MEASUREMENTS.md#embeddinggemma-2-on-a-qualcomm-npu)).
   No other SoC's file has run on a device.
 
+### A generation bundle for a Qualcomm NPU: `convert --npu`
+
+```
+litetune convert --model ./tuned/model --output-dir ./out --npu SM8750 \
+                 --calibration-data ./prepared/train.jsonl
+```
+
+- **Writes** `out/npu-SM8750/model.litertlm` and its own `convert.json` — the file's
+  sha256, the SoC, the cache length, the calibration set's length range, the exporter
+  flags and the toolchain versions — instead of the CPU/GPU bundles. `--npu` repeats for
+  SM8550, SM8650, SM8750 and SM8850; every SoC is compiled before any is published, and
+  each SoC's directory is created new and written whole.
+- **Families:** `gemma-3-text`, `functiongemma`, `qwen-3`, `qwen-2.5` and `minicpm5`, the
+  ones that have run on an NPU this way; any other is refused, Gemma 4 and Qwen 3.5 with
+  the defect that stops them. **Generation only:** a decision checkpoint is refused —
+  option scoring rewinds the session to the prompt once per option, and LiteRT-LM's NPU
+  executor rolls back one token only.
+- **How:** litert-torch's `npu_export` stages — export with a split KV cache, prefill
+  128 and `--cache-length` (default 1024), the family's own exporter flags; static-range
+  calibration; A16W8 quantization; the Qualcomm compile per SoC.
+- **Calibration decides the longest prompt it serves.** Half the 64 calibration prompts
+  are the data's own, half are packed from its examples up to `--cache-length` minus 128
+  tokens for the reply. A bundle calibrated on short prompts answered two-chunk prompts
+  and turned five-chunk ones into repetition; calibrated on prompts that long, the same
+  model answered them, and the boundary sat at the longest calibration prompt. The report
+  names that length; do not serve longer prompts. A training prompt longer than the limit
+  is refused — raise `--cache-length`.
+- **A fix of the exporter's output:** the prefill graph never reads the last layer's KV
+  cache, so the quantizer leaves those two inputs FLOAT32 where every other graph has
+  INT16, and the bundle does not load (Qwen and MiniCPM; Gemma 3 loads anyway, for a
+  reason not traced). litetune gives the two unused inputs their decode twins' type before
+  packing, and refuses a compiled bundle whose KV inputs are not all INT16.
+- **Linux x86-64 only**, with `libc++1` and `libatomic1`; the first run builds the
+  `npu-llm` environment (the export pins plus Qualcomm's SDK, which downloads QAIRT
+  2.50.0.260828). Stages 1–3 took up to ~20 min and each compile ~2 min on 32 vCPUs.
+- **What it cannot check:** `verify` refuses the file — LiteRT-LM's CPU and GPU cannot run
+  its `DISPATCH_OP`s. Only SM8750 has run a bundle on a device
+  ([MEASUREMENTS.md](MEASUREMENTS.md#llms-on-a-qualcomm-npu)); the other three SoCs are
+  compiled, not measured.
+
 ### Gemma 4 towers: drop them, or take them from another bundle
 
 Google's Gemma 4 E2B CPU/GPU bundle carries its vision and audio towers as six
@@ -1308,6 +1346,11 @@ withdrawn after re-measurement.
   on two-chunk prompts). So the FunctionGemma NPU bundle is
   `prefill_lengths = [128]`, `cache_length` 896: about 640 tokens of
   declarations plus request, and about 250 for the reply.
+  That boundary is the earlier toolchain's (LiteRT-LM 0.16 runtime, QAIRT 2.47).
+  On the one `convert --npu` uses (litert-torch-nightly 0.10.0.dev20260926, QAIRT
+  2.50, a LiteRT-LM 0.18 runtime) a Gemma 3 270M bundle at `cache_length` 1024 kept
+  two-chunk prompts on an SM8750 phone, and five-chunk prompts once it was calibrated
+  on prompts that long ([MEASUREMENTS.md](MEASUREMENTS.md#llms-on-a-qualcomm-npu)).
 - **A Qualcomm NPU bundle loads only in an app whose QAIRT is at least as new
   as the compiler's.** The public `ai-edge-litert-sdk-qualcomm` 2.2.0 writes
   QAIRT 2.47 context binaries. An app whose QNN libraries are QAIRT 2.44

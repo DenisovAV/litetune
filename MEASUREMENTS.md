@@ -2426,6 +2426,93 @@ CPU file on the same texts: cosine 0.787 (mean). Loading took 0.67 s on the NPU 
 1.0 s on the phone's CPU; the peak resident memory was 421–423 MiB on the NPU and 511 MiB on
 the CPU. No text was longer than 105 tokens, so only the 128-token signature ran.
 
+## LLMs on a Qualcomm NPU
+
+Measured 2026-11-01 on one Galaxy S25 Ultra (SM-S938U1, SM8750, Hexagon V79), through the
+LiteRT-LM 0.18.0 C API with the Qualcomm dispatch built from the same tree and Qualcomm's
+QNN runtime 2.51.0. Every bundle was built by litert-torch-nightly 0.10.0.dev20260926's
+`npu_export` stages (ai-edge-litert-nightly 2.3.0.dev20260925, ai-edge-quantizer-nightly
+0.10.0.dev20260926, ai-edge-litert-sdk-qualcomm 2.3.0 = QAIRT 2.50.0.260828,
+transformers 5.16.1) on a 32-vCPU x86-64 Linux machine: prefill 128, `cache_length` 1024,
+stage 1 `dynamic_wi8_afp32`, 64 calibration prompts with 32 decode steps each, A16W8,
+compiled for SM8750. Greedy decoding; base weights unless a row says otherwise.
+
+**Needle prompts.** "The access code for vault X is NNNN." and filler sentences, 12 rows
+per set, each with its own code; correct means the reply contains the code. `fq`: the fact
+first, the question last; `fm`: the fact after a third to a half of the filler; `s1`: one
+prefill chunk. Two chunks are 191–210 rendered tokens, five 600–617, seven 853–861.
+
+**The last layer's KV inputs.** In the stage-1 graph, the prefill signature's
+`kv_cache_k_<last>` and `kv_cache_v_<last>` have no consuming op — prefill outputs only the
+KV slices, so the last layer's attention over the cache is gone. The quantizer leaves them
+FLOAT32 while the decode signature's and the cache-update graphs' are INT16, and the
+runtime, which re-creates a host-memory KV buffer from the decode signature, rejects the
+FLOAT32 prefill tensor (`Custom allocation is too small for tensor idx: 54` on Qwen3-0.6B,
+index 54 being `kv_cache_k_27`). Retyping the two unused inputs to their decode twins (what
+`convert --npu` does) changes no computation and no byte count of the compiled file
+(781,881,235 B for Qwen3-0.6B either way).
+
+| model | unfixed | with the two inputs retyped, two chunks (s1 / fq / ff) | float32 |
+|---|---|---|---|
+| Qwen3-0.6B | does not load | 12/12 / 12/12 / 12/12 | 36/36 |
+| Qwen2.5-0.5B-Instruct | does not load (layer 23) | 12/12 / 12/12 / 10–11/12 † | 32/36 |
+| MiniCPM5-1B, thinking off ‡ | does not load (layer 23) | 12/12 / 12/12 / 12/12 | 36/36 |
+| gemma-3-270m-it | loads (same FLOAT32 pair at layer 17; why it loads was not traced) | 12/12 / 12/12 / 11/12 | 34/36 |
+
+† Qwen2.5-0.5B's rows ask "Complete the sentence with the four digits from the text above:
+The access code for vault X is"; to "What is the access code…? Reply with the four digits
+only." even its float32 model answered 14 of 36. ‡ A template that sets `enable_thinking`
+false; with thinking on its float32 model needs about 128 output tokens to reach the code.
+
+**Calibration length decides how long a prompt the bundle serves.** The same bundles,
+differing only in their calibration prompts (rendered tokens):
+
+| bundle | calibration prompts | two chunks (fq) | five chunks (fq5 / fm5) | seven chunks (fq7 / fm7) |
+|---|---|---|---|---|
+| Qwen3-0.6B | 64 × ~200–230 | 12/12 | 0/12 / 0/12 | — |
+| Qwen3-0.6B | 64 × 332–388 | 12/12 | 0/12 / 0/12 | 0/12 / 0/12 |
+| Qwen3-0.6B | 64 × 605–859 | 12/12 | **12/12 / 12/12** | **12/12 / 12/12** |
+| Qwen3-0.6B | 32 × ~200–230 + 32 × 605–859 | — | **12/12 / 12/12** | **12/12 / 12/12** |
+| Qwen3-0.6B, float32 | — | 12/12 | 12/12 / 12/12 | 12/12 / 12/12 |
+| gemma-3-270m-it | 64 × ~200–230 | 12/12 | 0/12 / 0/12 | — |
+| gemma-3-270m-it | 64 × 613–848 | 10/12 | 11/12 / **12/12** | 3/12 / **1/12** |
+| gemma-3-270m-it, float32 | — | 11/12 | 0/12 / 12/12 | 3/12 / 12/12 |
+| Qwen2.5-0.5B-Instruct | 64 × ~200–230 | (above) | 0/12 / 0/12, 1/12 / 0/12 with HW cache update off (float32 11/12 / 7/12) | — |
+
+The failures are not lost chunks but fluent-looking repetition ("The main. The main.", a
+looping `<|im_start|>`) on rows the float32 model answers. Calibrated on prompts reaching
+the test prompts' length, they are answered; three-chunk calibration does not help five or
+seven chunks; Gemma calibrated up to 848 tokens answers 600-token prompts and fails
+857–861-token ones. Half the set long was enough for Qwen3. So `convert --npu` packs half its
+calibration prompts up to `cache_length` minus 128 and reports the longest; gemma-3's
+`fq` sets are uninformative past two chunks because its float32 model does not carry the
+code that far.
+
+**End to end through `litetune convert --npu`.** A banking77 LoRA fine-tune of
+Qwen2.5-0.5B-Instruct (the September recipe and split of *A fifth family* above, trained
+again in float32 where that run used bfloat16), converted with
+`litetune convert --model … --npu SM8750 --calibration-data train.jsonl`: calibration 32
+training prompts of 49–76 tokens and 32 packed prompts of 448–884, stages 1–3 in 288 s and
+the SM8750 compile in 53 s, 655,363,795 B, all 48 KV inputs of both signatures INT16. On the
+first 100 held-out rows, exact text:
+
+| side | exact | replies identical to float32's |
+|---|---|---|
+| float32 (transformers, the merged checkpoint) | 83/100 | — |
+| **NPU, `convert --npu`'s bundle, HW cache update on** | **81/100** | 94/100 |
+| NPU, the same bundle, HW cache update off | 81/100 | 94/100 |
+| NPU, a bundle built by hand the same way, calibrated on two-chunk prompts | 82/100 | 94/100 |
+
+Four rows are discordant with float32 (three the NPU gets wrong, one it gets right); 100
+rows cannot resolve a two-row difference. The prompts are single-chunk (at most 135
+tokens), well inside the calibrated range. Medians over the 100 rows: prefill ~1,860 tokens/s,
+decode ~47 tokens/s, time to first token 52 ms.
+
+**Not measured:** any SoC but SM8750; Gemma 3 1B, Qwen3-1.7B, Qwen2.5-1.5B and FunctionGemma
+through this toolchain (FunctionGemma ran on SM8750 on the earlier one, see *Limitations*);
+`cache_length` other than 1024; decisions, which the NPU executor cannot score (it rolls
+back one token only).
+
 ## The CPU and the GPU on a Mac
 
 Each path was run through the script `verify` runs for it, unchanged except for
