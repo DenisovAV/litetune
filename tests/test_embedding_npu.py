@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import types
@@ -647,7 +648,7 @@ def test_the_compiler_is_asked_for_the_soc_with_weight_sharing(script, monkeypat
     assert "--qualcomm_enable_weight_sharing=true" in cmd
     assert f"--soc_model={SOC}" in cmd and "--soc_manufacturer=Qualcomm" in cmd
     assert "--model=in.tflite" in cmd and "--cmd=apply" in cmd
-    assert env["LD_LIBRARY_PATH"] == f"{tmp_path / 'sdk'}:/opt/litert/libs"
+    assert env["LD_LIBRARY_PATH"] == f"{tmp_path / 'sdk'}{os.pathsep}/opt/litert/libs"
     assert stats == [[0, 1779, 1779, 1]] * 4
     assert (tmp_path / "log").read_text() == plugin.stdout
 
