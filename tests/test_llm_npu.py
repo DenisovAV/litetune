@@ -100,6 +100,9 @@ def test_the_environment_is_export_plus_the_qualcomm_sdk_on_linux_x86_64():
     tags = ("manylinux_2_27_x86_64", "manylinux_2_17_x86_64", "manylinux2014_x86_64")
     linux = wheels.Host.of((*tags, "linux_x86_64"), (3, 12))
     assert wheels.gaps(env.requirements, linux) == []
+    assert env.unprovisionable(linux) is None
+    mac = wheels.Host.of(("macosx_14_0_arm64",), (3, 12))
+    assert env.unprovisionable(mac) is not None
     assert env.identity != envs.EXPORT.identity and env.path != envs.NPU_QUALCOMM.path
 
 
