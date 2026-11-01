@@ -57,11 +57,18 @@ typedef MeasuredRun = ({
 /// it on the card behind.
 class MeasuredCards extends StatelessComponent {
   const MeasuredCards({
+    required this.page,
     required this.label,
     required this.runs,
     this.note = const [],
     super.key,
   });
+
+  /// The path of the page the cards are on. Every page carries
+  /// `<base href="/">` (jaspr's `Document.base` default, which the CSP in
+  /// firebase.json relies on), so a bare `#fragment` resolves against `/`
+  /// and would leave the page; the fragments are prefixed with this.
+  final String page;
 
   /// The line above the cards, saying what they are a list of.
   final String label;
@@ -105,8 +112,8 @@ class MeasuredCards extends StatelessComponent {
   static String slugFor(MeasuredRun model) =>
       'measured-${model.hubId.split('/').last.toLowerCase()}';
 
-  static Component _card(MeasuredRun model) =>
-      a(classes: 'measured-card', href: '#${slugFor(model)}', [
+  Component _card(MeasuredRun model) =>
+      a(classes: 'measured-card', href: '$page#${slugFor(model)}', [
         span(classes: 'measured-card-model', [Component.text(model.name)]),
         span(classes: 'measured-card-how', [Component.text(model.how)]),
         // What opening it gets you. It used to read `checkpoint`, which named
@@ -116,7 +123,7 @@ class MeasuredCards extends StatelessComponent {
         ]),
       ]);
 
-  static Component _modal(MeasuredRun model) => div(
+  Component _modal(MeasuredRun model) => div(
     classes: 'measured-modal',
     attributes: {
       'id': slugFor(model),
@@ -133,7 +140,7 @@ class MeasuredCards extends StatelessComponent {
     [
       a(
         classes: 'measured-modal-scrim',
-        href: '#$closeTarget',
+        href: '$page#$closeTarget',
         attributes: const {'aria-label': 'Close'},
         const [],
       ),
@@ -142,7 +149,7 @@ class MeasuredCards extends StatelessComponent {
           span(classes: 'measured-modal-title', [Component.text(model.name)]),
           a(
             classes: 'measured-modal-close',
-            href: '#$closeTarget',
+            href: '$page#$closeTarget',
             attributes: const {'aria-label': 'Close'},
             [Component.text('\u00d7')],
           ),
@@ -192,7 +199,9 @@ class MeasuredCards extends StatelessComponent {
       display: Display.grid,
       gap: Gap.all(0.75.rem),
       raw: const {
-        'grid-template-columns': 'repeat(auto-fit, minmax(16rem, 1fr))',
+        // auto-fill keeps the empty tracks, so a list of one card is one column
+        // wide instead of the page's width.
+        'grid-template-columns': 'repeat(auto-fill, minmax(16rem, 1fr))',
       },
     ),
     css('.measured-card').styles(

@@ -60,6 +60,25 @@
         ]
       },
       {
+        "comment": "The models pages, for the reason `/changelog` has: under cleanUrls they are requested as `/models` and `/models/embeddings`, which no extension rule matches, and the nav and the card list change with a release.",
+        "source": "/models",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=0, must-revalidate"
+          }
+        ]
+      },
+      {
+        "source": "/models/embeddings",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=0, must-revalidate"
+          }
+        ]
+      },
+      {
         "comment": "The root document. `**/*.html` does not match `/` under cleanUrls, which left index.html on Firebase's default max-age=3600.",
         "source": "/",
         "headers": [

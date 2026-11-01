@@ -225,6 +225,7 @@ class EmbeddingModels extends StatelessComponent {
   Component build(BuildContext context) {
     return div(classes: 'emb', [
       MeasuredCards(
+        page: '/models/embeddings',
         label: 'Embedding models measured end to end so far',
         runs: measured,
         note: [

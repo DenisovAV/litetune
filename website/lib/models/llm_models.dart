@@ -54,6 +54,7 @@ class LlmModels extends StatelessComponent {
   @override
   Component build(BuildContext context) {
     return MeasuredCards(
+      page: '/models',
       label: 'Language models measured end to end so far',
       runs: measured,
       note: [
