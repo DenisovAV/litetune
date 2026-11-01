@@ -36,6 +36,7 @@ import threading
 import time
 import urllib.parse
 import venv
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -2250,7 +2251,7 @@ def _clamp_negative_wait(proc: Any) -> None:
     that negative, and before gh-90872 Windows' `_wait` passes
     `int(timeout * 1000)` to `WaitForSingleObject` unclamped, which takes it as
     an unsigned number of milliseconds -- weeks -- so the interrupt reaches the
-    wait only when the stage ends. Fixed in 3.11.9 and 3.12; 3.10 never got it.
+    wait only when the stage ends. Fixed in 3.11.9 and 3.12.3; 3.10 never got it.
     On 3.10.11 an interrupt sent a second into a 60-second stage reached the
     wait after 58.8 to 59.0 s in 30 of 60 runs, and on 3.12.10 within 0.07 s in
     all 20. A wait of zero or less becomes a poll, as it is with the fix; on a
@@ -2258,12 +2259,17 @@ def _clamp_negative_wait(proc: Any) -> None:
 
     On the instance, so that `_spawn` still calls `subprocess.Popen` itself.
     """
-    wait = getattr(proc, "_wait", None)
+    # The class's function and a weak reference, not the bound method: that
+    # would make `proc -> clamped -> proc` a cycle, and on Windows the process
+    # handle is closed when the `Popen` is finalised, which a cycle puts off
+    # until the cyclic collector runs.
+    wait = getattr(type(proc), "_wait", None)
     if wait is None:
         return
+    owner = weakref.ref(proc)
 
     def clamped(timeout: float | None) -> Any:
-        return wait(0 if timeout is not None and timeout <= 0 else timeout)
+        return wait(owner(), 0 if timeout is not None and timeout <= 0 else timeout)
 
     proc._wait = clamped
 

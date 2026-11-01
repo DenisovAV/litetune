@@ -761,6 +761,30 @@ def test_a_wait_of_zero_or_less_becomes_a_poll():
     assert seen == [0, 0, 0.25, None]
 
 
+def test_the_clamp_keeps_no_process_alive():
+    """No reference cycle: a clamped `Popen` is freed as soon as it is let
+    go, as an unclamped one is, without the cyclic collector. On Windows its
+    process handle is closed when it is finalised."""
+    import gc
+    import weakref
+
+    class Proc:
+        def _wait(self, timeout):
+            return 0
+
+    proc = Proc()
+    envs._clamp_negative_wait(proc)
+    gone = weakref.ref(proc)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del proc
+        assert gone() is None
+    finally:
+        if enabled:
+            gc.enable()
+
+
 @on_windows
 def test_a_wait_past_its_deadline_is_a_poll():
     """`communicate`'s wait after a `KeyboardInterrupt` past its deadline is
