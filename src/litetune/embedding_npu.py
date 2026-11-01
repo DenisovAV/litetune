@@ -82,7 +82,7 @@ NPU_SIGNATURES: tuple[str, ...] = (
     "encoder_1x1024",
 )
 NPU_WEIGHTS = "int8"
-# 215-321 s per SoC were measured on a 32-vCPU Cloud Build machine; this is an allowance
+# 215-321 s per SoC were measured on a 32-vCPU Linux machine; this is an allowance
 # for one compile, not a measurement. `convert --timeout-s` replaces it.
 NPU_TIMEOUT_S = 3600
 # Two NUL-padded fields of 125 bytes, SoC manufacturer and model (LiteRT
