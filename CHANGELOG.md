@@ -3,6 +3,11 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.7.3 — 2026-11-01
+- `verify` runs a decision's float reference on Apple's GPU through MPS when the training environment's torch reaches it, 64 rows a batch, and scores it again on the CPU if MPS runs out of memory or lacks an operation (#101).
+- `convert --weights int8 --npu <SoC>` compiles an EmbeddingGemma 2 graft's text encoder for a Qualcomm NPU (SM8550, SM8650, SM8750, SM8850) on Linux x86-64 (#103).
+- On Windows with Python 3.10, an interrupt during a stage reaches litetune's wait at once instead of when the stage ends (#100, #102).
+
 ## 0.7.2 — 2026-10-30
 - `verify --backend gpu` runs on macOS for an EmbeddingGemma 2 file and for a decision bundle, whose option scoring is repeated until the scores settle; refused elsewhere (#98).
 - `verify` scores a decision's float reference sixteen rows at a time, the most padded batch first, checked row by row, falling back to one row at a time if it differs (#97).
