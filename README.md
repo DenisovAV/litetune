@@ -926,9 +926,10 @@ litetune convert --model ./tuned/model --output-dir ./out --npu SM8750 \
   flags and the toolchain versions — instead of the CPU/GPU bundles. `--npu` repeats for
   SM8550, SM8650, SM8750 and SM8850; every SoC is compiled before any is published, and
   each SoC's directory is created new and written whole.
-- **Families:** `gemma-3-text`, `functiongemma`, `qwen-3`, `qwen-2.5` and `minicpm5`, the
-  ones that have run on an NPU this way; any other is refused, Gemma 4 and Qwen 3.5 with
-  the defect that stops them. **Generation only:** a decision checkpoint is refused —
+- **Families:** `gemma-3-text` (270M), `qwen-3` (0.6B), `qwen-2.5` (0.5B) and `minicpm5`
+  (1B), the families and sizes that have run on an NPU this way; a larger size of the same
+  family is refused, as is any other family — Gemma 4 and Qwen 3.5 with the defect that
+  stops them, FunctionGemma because tool prompts have not been measured on this toolchain. **Generation only:** a decision checkpoint is refused —
   option scoring rewinds the session to the prompt once per option, and LiteRT-LM's NPU
   executor rolls back one token only.
 - **How:** litert-torch's `npu_export` stages — export with a split KV cache, prefill
@@ -936,23 +937,31 @@ litetune convert --model ./tuned/model --output-dir ./out --npu SM8750 \
   calibration; A16W8 quantization; the Qualcomm compile per SoC.
 - **Calibration decides the longest prompt it serves.** Half the 64 calibration prompts
   are the data's own, half are packed from its examples up to `--cache-length` minus 128
-  tokens for the reply. A bundle calibrated on short prompts answered two-chunk prompts
+  tokens for the reply; each is rendered once with the checkpoint's template and decoded
+  for 128 steps. The longest must come within one prefill chunk (128 tokens) of that
+  limit, or the run is refused. A bundle calibrated on short prompts answered two-chunk prompts
   and turned five-chunk ones into repetition; calibrated on prompts that long, the same
   model answered them, and the boundary sat at the longest calibration prompt. The report
-  names that length; do not serve longer prompts. A training prompt longer than the limit
-  is refused — raise `--cache-length`.
+  names that length (`longest_calibrated_tokens`); do not serve longer prompts. A training
+  prompt longer than the limit is refused — raise `--cache-length` (a multiple of 128 from
+  256 to 4096; only 1024 has run on a device, and any other carries a limitation).
 - **A fix of the exporter's output:** the prefill graph never reads the last layer's KV
   cache, so the quantizer leaves those two inputs FLOAT32 where every other graph has
   INT16, and the bundle does not load (Qwen and MiniCPM; Gemma 3 loads anyway, for a
   reason not traced). litetune gives the two unused inputs their decode twins' type before
   packing, and refuses a compiled bundle whose KV inputs are not all INT16.
-- **Linux x86-64 only**, with `libc++1` and `libatomic1`; the first run builds the
+- **Linux x86-64 only**, with `libc++1`, `libatomic1` and `libvulkan1`; the first run builds the
   `npu-llm` environment (the export pins plus Qualcomm's SDK, which downloads QAIRT
   2.50.0.260828). Stages 1–3 took up to ~20 min and each compile ~2 min on 32 vCPUs.
+- **What it checks:** each compiled file holds only `DISPATCH_OP`s in every signature,
+  carries the SoC's stamp, and has the same metadata and tokenizer as the file before the
+  compile; every KV input is INT16 with one quantization across graphs.
 - **What it cannot check:** `verify` refuses the file — LiteRT-LM's CPU and GPU cannot run
-  its `DISPATCH_OP`s. Only SM8750 has run a bundle on a device
-  ([MEASUREMENTS.md](MEASUREMENTS.md#llms-on-a-qualcomm-npu)); the other three SoCs are
-  compiled, not measured.
+  its `DISPATCH_OP`s. On a device, only SM8750 has run such bundles, and only from an
+  earlier revision of this path or built by hand through its stages
+  ([MEASUREMENTS.md](MEASUREMENTS.md#llms-on-a-qualcomm-npu)). No LLM has run, or been
+  compared with Google's files, for SM8550, SM8650 or SM8850; each of those bundles says so
+  in its report.
 
 ### Gemma 4 towers: drop them, or take them from another bundle
 

@@ -2508,6 +2508,17 @@ rows cannot resolve a two-row difference. The prompts are single-chunk (at most 
 tokens), well inside the calibrated range. Medians over the 100 rows: prefill ~1,860 tokens/s,
 decode ~47 tokens/s, time to first token 52 ms.
 
+**What these bundles differ in from today's `convert --npu`.** Only the fine-tune above went
+through `convert --npu`, and through an earlier revision: its calibration prompts were
+wrapped in a chat template a second time by litert-torch's `calibrate` (which formats by
+default), and every bundle here was calibrated with 32 decode steps, so no reply longer
+than 32 tokens was measured. The gemma-3, Qwen3 and MiniCPM5 bundles were built by hand:
+calibrated on needle sets rather than the packed training prompts, without
+`--externalize_embedder`, gemma-3 without the retype, MiniCPM5 with a template that turns
+thinking off. Today's path renders once, decodes 128 calibration steps and requires the
+longest calibration prompt within 128 tokens of `cache_length` minus 128; none of its
+bundles has run on a device yet.
+
 **Not measured:** any SoC but SM8750; Gemma 3 1B, Qwen3-1.7B, Qwen2.5-1.5B and FunctionGemma
 through this toolchain (FunctionGemma ran on SM8750 on the earlier one, see *Limitations*);
 `cache_length` other than 1024; decisions, which the NPU executor cannot score (it rolls

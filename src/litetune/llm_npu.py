@@ -134,8 +134,10 @@ BLOCKED: dict[str, str] = {
 # What has run on a device, per SoC: the only statement this module makes about one.
 DEVICE_RUNS: dict[str, str] = {
     "SM8750": (
-        "bundles built by `convert --npu` (gemma-3-270m-it, Qwen3-0.6B, MiniCPM5-1B and a "
-        "Qwen2.5-0.5B-Instruct fine-tune) ran on one Galaxy S25 Ultra's NPU on 2026-11-02"
+        "one Galaxy S25 Ultra's NPU ran, on 2026-11-01, a Qwen2.5-0.5B-Instruct fine-tune built "
+        "by an earlier revision of `convert --npu` and gemma-3-270m-it, Qwen3-0.6B and "
+        "MiniCPM5-1B bundles built by hand through the same stages; no bundle of this revision "
+        "has run"
     ),
 }
 NOT_RUN_SOC = (
