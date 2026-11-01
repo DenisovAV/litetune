@@ -63,10 +63,11 @@ class Formats extends StatelessComponent {
       'reference. Conversion currently uses the CPU export path; verify '
       'measures the converted model on CPU or GPU';
 
+  /// Followed by a link to `/models`, which lists the measured runs one card
+  /// apiece. The list used to be spelled out here and grew with every family.
   static const measuredQualifier =
-      ' — measured end to end on FunctionGemma, Gemma 3 270M, Gemma 3 1B, '
-      'Qwen3 0.6B and 1.7B, Qwen2.5 0.5B and 1.5B Instruct, Qwen3.5 0.8B '
-      'and 2B, MiniCPM5 1B, Granite 4.1 3B and Gemma 4 E2B so far';
+      ' — fewer have been measured end to end than export; which, and how, is '
+      'on ';
 
   @override
   Component build(BuildContext context) {
@@ -94,9 +95,12 @@ class Formats extends StatelessComponent {
           Component.text(
             'Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3 0.6B/1.7B, '
             'Qwen2.5 0.5B/1.5B Instruct, Qwen3.5, MiniCPM5 1B, Granite 4.1 3B, '
-            'FunctionGemma',
+            'FunctionGemma, and EmbeddingGemma 2 as a decider',
           ),
-          span(classes: 'qualifier', [Component.text(measuredQualifier)]),
+          span(classes: 'qualifier', [
+            Component.text(measuredQualifier),
+            a(href: '/models', [Component.text('the models page')]),
+          ]),
         ]),
       ]),
     ]);
@@ -146,6 +150,7 @@ class Formats extends StatelessComponent {
       '.def-value',
     ).styles(color: Brand.ink, fontSize: 1.rem, lineHeight: 1.55.em),
     css('.qualifier').styles(color: Brand.muted),
+    css('.qualifier a').styles(color: Brand.body),
     css('.mono').styles(fontFamily: Brand.fontMono, fontSize: 0.95.rem),
     StyleRule.media(
       query: MediaQuery.screen(maxWidth: 640.px),

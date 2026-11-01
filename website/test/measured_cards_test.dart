@@ -13,7 +13,8 @@
 // answer, and a test that pretends to would be worse than none.
 import 'dart:io';
 
-import 'package:litetune_website/landing/sections/why_it_exists.dart';
+import 'package:litetune_website/models/measured_cards.dart';
+import 'package:litetune_website/models/llm_models.dart';
 import 'package:litetune_website/measurements/measurements_page.dart';
 import 'package:test/test.dart';
 
@@ -78,7 +79,7 @@ void main() {
     // heading that is renamed fails here rather than on the live site.
     final ids = MeasurementsPage.idsIn(_measurements().readAsStringSync());
     expect(ids, isNotEmpty, reason: 'the page emitted no heading ids at all');
-    for (final model in WhyItExists.measured) {
+    for (final model in LlmModels.measured) {
       expect(
         ids,
         contains(model.anchor),
@@ -95,7 +96,7 @@ void main() {
     // blank paragraph above the checkpoint row rather than as an absence
     // anyone would notice. A record field cannot be omitted in Dart; it can be
     // left empty.
-    for (final model in WhyItExists.measured) {
+    for (final model in LlmModels.measured) {
       expect(
         model.what.trim(),
         isNotEmpty,
@@ -128,7 +129,7 @@ void main() {
     // itself, "no conversion between them" -- while sitting under the label
     // "Measured end to end so far". A cost-of-conversion row is what every
     // section behind these cards has and a training comparison does not.
-    for (final model in WhyItExists.measured) {
+    for (final model in LlmModels.measured) {
       expect(
         sections[model.anchor]?.toLowerCase(),
         contains('cost of conversion'),
@@ -144,7 +145,7 @@ void main() {
     // What pins a card to a run when it carries no revision: FunctionGemma's
     // does not, so without this its anchor could point at any section that
     // exists. The section has to name the repository the panel shows.
-    for (final model in WhyItExists.measured) {
+    for (final model in LlmModels.measured) {
       expect(
         sections[model.anchor],
         contains(model.hubId.split('/').last),
@@ -161,7 +162,7 @@ void main() {
     // above would accept `another-owner/Qwen3-0.6B`, a re-upload nobody ran,
     // and the panel's Hub link would go to it. README names all of them in
     // full.
-    for (final model in WhyItExists.measured) {
+    for (final model in LlmModels.measured) {
       expect(
         readme,
         contains(model.hubId),
@@ -174,7 +175,7 @@ void main() {
   });
 
   test('every card names a Hub repository as owner/name', () {
-    for (final model in WhyItExists.measured) {
+    for (final model in LlmModels.measured) {
       expect(
         model.hubId,
         matches(RegExp(r'^[\w.-]+/[\w.-]+$')),
@@ -187,7 +188,7 @@ void main() {
     // Not "appears somewhere in the file": every revision in MEASUREMENTS.md
     // would satisfy that, so two cards with their revisions swapped would
     // pass while the panel told a reader the wrong commit.
-    for (final model in WhyItExists.measured) {
+    for (final model in LlmModels.measured) {
       final revision = model.revision;
       if (revision == null) continue;
       expect(
@@ -215,22 +216,22 @@ void main() {
 // `google/gemma-3-1b-it` and `someone-else/gemma-3-1b-it` would collide.
 void _slugs() {
   test('closing a panel lands somewhere, and not on another panel', () {
-    // Both close links point at `#${WhyItExists.closeTarget}`, and `:target`
+    // Both close links point at `#${MeasuredCards.closeTarget}`, and `:target`
     // stops matching when the fragment names nothing -- so a container id that
     // drifts from the close links leaves a panel that cannot be closed, with
     // every test green. The second half matters too: if the close target were
     // also a panel id, closing one panel would open another.
-    expect(WhyItExists.closeTarget, isNotEmpty);
+    expect(MeasuredCards.closeTarget, isNotEmpty);
     expect(
-      [for (final model in WhyItExists.measured) WhyItExists.slugFor(model)],
-      isNot(contains(WhyItExists.closeTarget)),
+      [for (final model in LlmModels.measured) MeasuredCards.slugFor(model)],
+      isNot(contains(MeasuredCards.closeTarget)),
       reason: 'closing a panel would open another one',
     );
   });
 
   test('each card opens its own panel and no one else\'s', () {
     final slugs = [
-      for (final model in WhyItExists.measured) WhyItExists.slugFor(model),
+      for (final model in LlmModels.measured) MeasuredCards.slugFor(model),
     ];
     expect(
       slugs.toSet().length,
@@ -240,8 +241,8 @@ void _slugs() {
   });
 
   test('a panel id is usable as a URL fragment', () {
-    for (final model in WhyItExists.measured) {
-      final slug = WhyItExists.slugFor(model);
+    for (final model in LlmModels.measured) {
+      final slug = MeasuredCards.slugFor(model);
       expect(
         slug,
         matches(RegExp(r'^[a-z][a-z0-9._-]*$')),

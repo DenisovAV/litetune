@@ -26,6 +26,7 @@ class NavBar extends StatelessComponent {
           Component.text('v$version'),
         ]),
         nav(classes: 'nav-links', [
+          a(href: '/models', [Component.text('Models')]),
           a(href: '/changelog', [Component.text('Changelog')]),
           _link('https://github.com/DenisovAV/litetune', 'GitHub'),
           _link('https://pypi.org/project/litetune/', 'PyPI'),
@@ -95,7 +96,7 @@ class NavBar extends StatelessComponent {
           padding: Padding.symmetric(vertical: 1.25.rem, horizontal: 1.25.rem),
         ),
         css('.nav-links').styles(gap: Gap.all(1.1.rem), fontSize: 0.8.rem),
-        // Four links and a version do not fit one line at phone width; the
+        // Five links and a version do not fit one line at phone width; the
         // links wrap under the wordmark instead of overflowing the page.
         css(
           '.nav-inner',
