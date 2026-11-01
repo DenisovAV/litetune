@@ -2062,9 +2062,11 @@ new.
   at four threads the scores repeated run to run and differed from one thread's
   by up to 0.481 nats a token on 12 of the 50 rows, and no top option changed;
   one thread gave, bit for bit, the scores of a run with SME hidden from the
-  process. The float twin at four threads varied by up to 2.5e-05 nats run to
-  run. The 300-row agreement and mean KL above were not measured again at one
-  thread. `verify` now runs LiteRT-LM on one thread on such a CPU.
+  process. A float32 twin of an emotion decision, scored as the twin check
+  scores it, varied at four threads by up to 2.5e-05 nats run to run, under the
+  1e-03 twin tolerance. The 300-row agreement and mean KL above were not
+  measured again at one thread. `verify` now runs LiteRT-LM on one thread on
+  such a CPU.
 
 ### The decision reference on MPS
 
