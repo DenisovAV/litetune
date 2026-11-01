@@ -67,13 +67,6 @@ from litetune.embedding_export import (
 from litetune.embedding_export import REPORT_NAME as EMBEDDING_REPORT_NAME
 from litetune.embedding_export import summarise as summarise_embedding_convert
 from litetune.embedding_npu import NPU_SOCS, NPU_TIMEOUT_S
-from litetune.llm_npu import (
-    DEFAULT_CACHE_LENGTH,
-    NPU_LLM_TIMEOUT_S,
-    LlmNpuRequest,
-    run_llm_npu_export,
-)
-from litetune.llm_npu import summarise as summarise_llm_npu
 from litetune.embedding_tune import (
     DIRECTION,
     EMBEDDING_MODEL,
@@ -101,6 +94,13 @@ from litetune.export import (
     describe_gpu_activation,
     run_export,
 )
+from litetune.llm_npu import (
+    DEFAULT_CACHE_LENGTH,
+    NPU_LLM_TIMEOUT_S,
+    LlmNpuRequest,
+    run_llm_npu_export,
+)
+from litetune.llm_npu import summarise as summarise_llm_npu
 from litetune.manifest import RunStatus
 from litetune.metrics import SCORERS
 from litetune.prepare import (
@@ -797,13 +797,14 @@ def _add_convert(sub) -> None:
         choices=NPU_SOCS,
         metavar="SOC",
         help=(
-            "on Linux x86-64 (Debian packages libc++1 and libatomic1; the first run downloads "
-            "Qualcomm's QAIRT). An LLM checkpoint of a measured family (gemma-3-text, "
-            "functiongemma, qwen-3, qwen-2.5, minicpm5), with --calibration-data: a generation "
-            "bundle compiled for this SoC through litert-torch's npu_export, into "
-            "<output-dir>/npu-<SOC>/model.litertlm with its own convert.json, instead of the "
-            "CPU/GPU bundles; a decision checkpoint is refused (the NPU executor rolls back one "
-            "token only). An embedding checkpoint, with --weights int8: also compile the "
+            "on Linux x86-64 (Debian packages libc++1 and libatomic1, and libvulkan1 for an "
+            "LLM; the first run downloads Qualcomm's QAIRT). An LLM checkpoint of a measured "
+            "family and size (gemma-3-270m-it, Qwen3-0.6B, Qwen2.5-0.5B-Instruct, MiniCPM5-1B), "
+            "with --calibration-data: a generation bundle compiled for this SoC through "
+            "litert-torch's npu_export, into <output-dir>/npu-<SOC>/model.litertlm with its own "
+            "convert.json, instead of the CPU/GPU bundles; one export serves every SoC, so a "
+            "failure stops all of them; a decision checkpoint is refused (the NPU executor rolls "
+            "back one token only). An embedding checkpoint, with --weights int8: also compile the "
             "graft's text encoder ahead of time for this Qualcomm SoC, into "
             "<output-dir>/int8-npu-<SOC>/model.litertlm with its own convert.json; repeat for "
             "more SoCs. Every SoC is compiled, a failed compile included, and publishing starts "
@@ -829,7 +830,7 @@ def _add_convert(sub) -> None:
         default=None,
         help=(
             f"LLM checkpoints with --npu only: the NPU bundle's KV-cache length (default "
-            f"{DEFAULT_CACHE_LENGTH}, what every measured bundle used); a multiple of 128"
+            f"{DEFAULT_CACHE_LENGTH}, the only one measured); a multiple of 128 from 256 to 4096"
         ),
     )
     convert.add_argument(

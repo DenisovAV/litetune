@@ -1037,6 +1037,9 @@ class FakeToolchain:
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(list(args))
+        # llm_npu's script is not one this fake knows, and answering it as an export would
+        # read as a success; tests/test_llm_npu.py's FakeRun drives it.
+        assert not (len(args) > 1 and str(args[1]).endswith("npu_llm.py")), args
         if args[0] == "pip":
             return subprocess.CompletedProcess(args, 0, self.pip_stdout, "")
         if args[0] == "python" and str(args[1]).endswith("repack.py"):

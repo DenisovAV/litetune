@@ -5,13 +5,13 @@ What runs (MEASUREMENTS.md, "LLMs on a Qualcomm NPU", for every figure below):
 
   1. `npu_export` stage 1: the checkpoint exported with the split KV cache the NPU executor
      needs, `prefill_lengths` [128], `cache_length` from `--cache-length`, the flags this
-     family's plain `convert` would pass (chat template, model type);
-  2. stage 2: static-range calibration on prompts built from the training data
-     (`calibration_plan`): half of them the data's own prompts, half long prompts packed from
-     its examples up to the longest prompt the bundle is to serve;
+     family's plain `convert` passes (chat template, model type, external embedder);
+  2. stage 2: static-range calibration on prompts built from the training data and rendered
+     with the template the bundle carries (`calibration_plan`): half of them the data's own
+     prompts, half long prompts packed from its examples up to `cache_length - REPLY_TOKENS`,
+     each followed by `REPLY_TOKENS` decode steps;
   3. stage 3: A16W8 static quantization, then `retype_dead_kv` before the bundle is packed;
-  4. stage 4: the Qualcomm compile, once per SoC; every KV-cache input of the compiled graphs
-     must be INT16 or nothing is written.
+  4. stage 4: the Qualcomm compile, once per SoC, and `check_compiled` on what it wrote.
 
 Two defects of the public toolchain are worked around here, both measured on SM8750:
 
@@ -26,9 +26,9 @@ Two defects of the public toolchain are worked around here, both measured on SM8
 - **Calibration length.** A bundle calibrated on prompts up to ~230 tokens answered
   two-chunk prompts and turned five-chunk prompts into degenerate repetition (Qwen3-0.6B,
   Qwen2.5-0.5B, Gemma 3 270M); calibrated on prompts reaching the test prompts' length, the
-  same models answered them. The boundary sat at the longest calibration prompt. So the
-  calibration set reaches `max_prompt_tokens`, and the report says that longer prompts are
-  outside what this bundle was calibrated for.
+  same models answered them, and a prompt past the longest calibration prompt failed again.
+  So the calibration set must reach within one prefill chunk of the prompt limit, and the
+  report says that longer prompts are outside what the bundle was calibrated for.
 
 **Generation only.** A decision checkpoint is refused: option scoring rewinds the session
 to the prompt once per option, and the NPU executor rolls back one token only
@@ -44,10 +44,10 @@ LiteRT-LM's CPU and GPU cannot run its `DISPATCH_OP`s. `DEVICE_RUNS` says what r
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -65,6 +65,8 @@ logger = logging.getLogger(__name__)
 
 LLM_NPU_SCHEMA = "litetune.convert.llm-npu/1"
 REPORT_NAME = "convert.json"
+# The run's own report, beside the SoC directories: what was asked, what reached the disk.
+RUN_REPORT_NAME = "npu-convert.json"
 ARTIFACT_NAME = "model.litertlm"
 # The weight recipe stage 1 exports with: the one litert-torch's packaged npu_export configs
 # name (`gemma3_270m_qualcomm_sm8850.json`, `qwen3_0.6b_qualcomm_sm8750.json`); stage 3 then
@@ -75,9 +77,12 @@ STAGE1_RECIPE = "dynamic_wi8_afp32"
 PREFILL_LENGTH = 128
 # What every measured bundle used. Not a property of any SoC.
 DEFAULT_CACHE_LENGTH = 1024
+MAX_CACHE_LENGTH = 4096
 # Tokens of the cache kept free for the reply: the longest prompt the bundle is calibrated
-# for is `cache_length - REPLY_TOKENS`.
+# for is `cache_length - REPLY_TOKENS`, and calibration decodes this many steps after each
+# prompt, so the positions a reply reaches are calibrated too.
 REPLY_TOKENS = 128
+CALIBRATION_DECODE_STEPS = REPLY_TOKENS
 # The smallest cache that leaves one prefill chunk for a prompt besides the reply.
 MIN_CACHE_LENGTH = PREFILL_LENGTH + REPLY_TOKENS
 # 64 calibration prompts, as the packaged configs' calibration runs measured here used: half
@@ -86,27 +91,30 @@ CALIBRATION_SHORT = 32
 CALIBRATION_LONG = 32
 # Fewer training rows than this cannot make a calibration set worth the name.
 MIN_CALIBRATION_ROWS = 8
-CALIBRATION_DECODE_STEPS = 32
+# Python flatbuffers cannot build a buffer of 2 GiB or more; the dead-KV retype repacks the
+# stage-3 graph through it.
+MAX_REPACK_BYTES = (2 << 30) - (64 << 20)
 # Measured stage times on a 32-vCPU machine: stages 1-3 up to ~19 min with long
 # calibration prompts, ~2 min per SoC compile. An allowance, not a measurement;
 # `convert --timeout-s` replaces it.
 NPU_LLM_TIMEOUT_S = 7200
 
-# The families this path has run on SM8750, and what ran. A family not here is refused.
+# The families this path has built and run on SM8750, and the one checkpoint size each ran
+# at: `MEASURED_SIZES` gates the base model, since a larger one of the same family has not
+# compiled here and its stage-3 graph can pass what Python flatbuffers can repack.
 FAMILIES: dict[str, str] = {
-    "gemma-3-text": "gemma-3-270m-it (base weights): two-, five- and seven-chunk needle prompts",
-    "functiongemma": (
-        "the Gemma 3 270M export path with FunctionGemma's model type and template; "
-        "functiongemma-270m-it base weights ran on SM8750 on an earlier toolchain, not this one"
-    ),
-    "qwen-3": "Qwen3-0.6B (base weights): two-, five- and seven-chunk needle prompts",
-    "qwen-2.5": (
-        "Qwen2.5-0.5B-Instruct: base weights on two-chunk needle prompts, and a banking77 "
-        "LoRA fine-tune on held-out rows"
-    ),
-    "minicpm5": "MiniCPM5-1B (base weights, thinking off): two-chunk needle prompts",
+    "gemma-3-text": "gemma-3-270m-it",
+    "qwen-3": "Qwen3-0.6B",
+    "qwen-2.5": "Qwen2.5-0.5B-Instruct",
+    "minicpm5": "MiniCPM5-1B",
 }
-# Families that are known not to work here, and why.
+MEASURED_SIZES: dict[str, str] = {
+    "gemma-3-text": r"(?<![\d.])270m",
+    "qwen-3": r"(?<![\d.])0[.-]6b",
+    "qwen-2.5": r"(?<![\d.])0[.-]5b",
+    "minicpm5": r"(?<![\d.])1b",
+}
+# Families that are known not to work here, or not measured on this toolchain, and why.
 BLOCKED: dict[str, str] = {
     "gemma-4-e2b": (
         "the public exporter fuses Gemma 4's per-layer embedder into one lookup and the NPU "
@@ -117,14 +125,23 @@ BLOCKED: dict[str, str] = {
         "litert-torch-nightly 0.10.0.dev20260926's split-cache export raises "
         "AttributeError: 'Qwen3_5StaticModelHFWrapper' object has no attribute 'model'"
     ),
+    "functiongemma": (
+        "not measured on this toolchain: its five-chunk tool prompts were measured only on an "
+        "earlier one (0/20 parsed at cache_length 1024, 13/20 at 896), and the calibration "
+        "here does not render tool declarations"
+    ),
 }
 # What has run on a device, per SoC: the only statement this module makes about one.
 DEVICE_RUNS: dict[str, str] = {
     "SM8750": (
-        "bundles built this way ran on one Galaxy S25 Ultra's NPU on 2026-11-01 (Gemma 3 "
-        "270M, Qwen3-0.6B, Qwen2.5-0.5B, MiniCPM5-1B and a Qwen2.5-0.5B fine-tune)"
+        "bundles built by `convert --npu` (gemma-3-270m-it, Qwen3-0.6B, MiniCPM5-1B and a "
+        "Qwen2.5-0.5B-Instruct fine-tune) ran on one Galaxy S25 Ultra's NPU on 2026-11-02"
     ),
 }
+NOT_RUN_SOC = (
+    "{soc}: compiled, never run on a device; the calibration and prompt-length rules were "
+    "measured on SM8750 (Hexagon V79) only"
+)
 DECISION_REFUSAL = (
     "a decision checkpoint is scored option by option: the decider prefills the prompt, "
     "saves a checkpoint and rewinds to it after each option, and LiteRT-LM's NPU executor "
@@ -135,6 +152,8 @@ DECISION_REFUSAL = (
 )
 # The keys a successful answer must carry.
 ANSWER_KEYS: tuple[str, ...] = ("calibration", "socs", "versions", "stage_s", "dead_kv")
+# The keys each SoC's entry must carry (`check_compiled`'s facts and the staged file).
+SOC_KEYS: tuple[str, ...] = ("packed", "kv_types", "ops", "stamp", "qairt", "metadata")
 
 NPU_ENV_CHECK = "npu environment"
 NPU_REQUEST_CHECK = "npu request"
@@ -144,6 +163,8 @@ NOT_VERIFIED = (
     "the NPU bundle is not verified: litetune verify runs LiteRT-LM's CPU or GPU, which "
     "cannot run its DISPATCH_OPs. Measure it on a phone with that SoC"
 )
+# A cause in an answer that says the run itself failed, not the model or the data.
+RUN_CAUSES = ("run", "script")
 
 
 class LlmNpuError(Exception):
@@ -164,23 +185,33 @@ def output_for(output_dir: Path, soc: str) -> Path:
     return dir_for(output_dir, soc) / ARTIFACT_NAME
 
 
-def max_prompt_tokens(cache_length: int) -> int:
-    """The longest prompt a bundle of this cache length is calibrated for."""
+def prompt_limit_tokens(cache_length: int) -> int:
+    """The longest prompt a bundle of this cache length leaves room for, and calibrates to."""
     return cache_length - REPLY_TOKENS
 
 
-def family_problem(family: str | None, model: str) -> str | None:
-    """Why this family is refused on `--npu`, or `None`."""
-    if family in FAMILIES:
-        return None
-    measured = ", ".join(sorted(FAMILIES))
+def _normalised(text: str) -> str:
+    return re.sub(r"[^a-z0-9.]+", "-", text.lower())
+
+
+def family_problem(family: str | None, identity: str) -> str | None:
+    """Why this family, at this checkpoint size, is refused on `--npu`, or `None`."""
+    measured = ", ".join(f"{f} ({FAMILIES[f]})" for f in sorted(FAMILIES))
     if family in BLOCKED:
-        return f"--npu: {model} is {family}, which does not run this way: {BLOCKED[family]}"
-    named = f"family {family}" if family else "no family litetune knows"
-    return (
-        f"--npu: {model} is {named}; this path has run on an NPU for {measured} only, and an "
-        "unmeasured family is refused rather than compiled on trust"
-    )
+        return f"--npu: {identity} is {family}, which is refused here: {BLOCKED[family]}"
+    if family not in FAMILIES:
+        named = f"family {family}" if family else "no family litetune knows"
+        return (
+            f"--npu: {identity} is {named}; this path has run on an NPU for {measured} only, "
+            "and an unmeasured family is refused rather than compiled on trust"
+        )
+    if not re.search(MEASURED_SIZES[family], _normalised(identity)):
+        return (
+            f"--npu: {identity} is {family}, measured here at {FAMILIES[family]} only; another "
+            "size has not compiled on this path (and a stage-3 graph over 2 GiB cannot be "
+            "repacked), so it is refused rather than compiled on trust"
+        )
+    return None
 
 
 def request_problem(
@@ -188,7 +219,7 @@ def request_problem(
     cache_length: int,
     *,
     family: str | None,
-    model: str,
+    identity: str,
     decision: bool,
 ) -> str | None:
     """Why `convert --npu` of an LLM checkpoint is refused, or `None`."""
@@ -200,19 +231,19 @@ def request_problem(
     if len(set(socs)) != len(socs):
         return f"--npu names a SoC twice: {', '.join(socs)}"
     if decision:
-        return f"--npu: {model} records a decision; {DECISION_REFUSAL}"
-    if cache_length < MIN_CACHE_LENGTH:
+        return f"--npu: {identity} records a decision; {DECISION_REFUSAL}"
+    if not MIN_CACHE_LENGTH <= cache_length <= MAX_CACHE_LENGTH:
         return (
-            f"--cache-length {cache_length}: at least {MIN_CACHE_LENGTH}, one "
-            f"{PREFILL_LENGTH}-token "
-            f"prefill chunk for the prompt and {REPLY_TOKENS} tokens for the reply"
+            f"--cache-length {cache_length}: from {MIN_CACHE_LENGTH} (one {PREFILL_LENGTH}-token "
+            f"prefill chunk for the prompt and {REPLY_TOKENS} tokens for the reply) to "
+            f"{MAX_CACHE_LENGTH}"
         )
     if cache_length % PREFILL_LENGTH:
         return (
             f"--cache-length {cache_length}: a multiple of the prefill length {PREFILL_LENGTH}, "
             "as every measured bundle's was"
         )
-    return family_problem(family, model)
+    return family_problem(family, identity)
 
 
 def read_calibration_rows(path: Path) -> list[dict[str, str]]:
@@ -270,6 +301,7 @@ class LlmNpuRequest:
             "cache_length": self.cache_length,
             "prefill_length": PREFILL_LENGTH,
             "reply_tokens": REPLY_TOKENS,
+            "calibration_decode_steps": CALIBRATION_DECODE_STEPS,
             "base_model": self.base_model,
             "timeout_s": self.timeout_s,
             "environment": {
@@ -286,7 +318,7 @@ class LlmNpuBundle:
     output: Path
     bytes: int
     sha256: str
-    kv_types: dict[str, dict[str, int]]
+    compiled: dict[str, Any]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -294,7 +326,11 @@ class LlmNpuBundle:
             "output": str(self.output),
             "bytes": self.bytes,
             "sha256": self.sha256,
-            "kv_input_types": self.kv_types,
+            "kv_input_types": self.compiled.get("kv_types"),
+            "ops_per_signature": self.compiled.get("ops"),
+            "stamp": self.compiled.get("stamp"),
+            "qairt": self.compiled.get("qairt"),
+            "metadata": self.compiled.get("metadata"),
             "device_run": DEVICE_RUNS.get(self.soc),
         }
 
@@ -304,11 +340,13 @@ class LlmNpuResult:
     request: LlmNpuRequest
     checks: CheckSet = field(default_factory=lambda: CheckSet(name="convert:llm-npu"))
     family: str | None = None
+    identity: str | None = None
     prompt_mode: str | None = None
     exporter_flags: list[str] = field(default_factory=list)
     chat_template: dict[str, Any] | None = None
     answer: dict[str, Any] = field(default_factory=dict)
     bundles: list[LlmNpuBundle] = field(default_factory=list)
+    partial: list[str] = field(default_factory=list)
     publish_error: str | None = None
     limitations: list[str] = field(default_factory=list)
 
@@ -331,11 +369,12 @@ class LlmNpuResult:
             "verified": False,
             "outcome": self.outcome.value,
             "family": self.family,
+            "identity": self.identity,
             "family_measured": FAMILIES.get(self.family or ""),
             "prompt_mode": self.prompt_mode,
             "cache_length": self.request.cache_length,
             "prefill_length": PREFILL_LENGTH,
-            "max_prompt_tokens": calibration.get("longest_tokens") if calibration else None,
+            "longest_calibrated_tokens": calibration.get("longest_tokens") if calibration else None,
             "calibration": calibration,
             "exporter_flags": list(self.exporter_flags),
             "chat_template": self.chat_template,
@@ -343,6 +382,7 @@ class LlmNpuResult:
             "stage_s": self.answer.get("stage_s"),
             "versions": self.answer.get("versions"),
             "npu": [b.as_dict() for b in self.bundles],
+            "partial": list(self.partial),
             "request": self.request.as_dict(),
             "checks": self.checks.as_dict(),
             "limitations": list(self.limitations),
@@ -355,23 +395,47 @@ def _add(result: LlmNpuResult, events: EventStream, check: Check) -> Check:
     return check
 
 
-def _refuse(result: LlmNpuResult, events: EventStream, name: str, detail: str) -> LlmNpuResult:
-    _add(result, events, Check.failed(name, detail))
+def _cannot(result: LlmNpuResult, events: EventStream, name: str, detail: str) -> LlmNpuResult:
+    """A refusal that says nothing about the model: could-not-check (exit 4)."""
+    _add(result, events, Check.unchecked(name, detail))
+    events.stage_finished(result.outcome.value, attempted=0)
     return result
+
+
+def _decision_problem(record: dict[str, Any] | None) -> tuple[bool, str | None]:
+    """(records a decision, why the record cannot be read as one)."""
+    if record is None or "decision" not in record or record["decision"] is None:
+        return False, None
+    if not isinstance(record["decision"], dict):
+        return True, (
+            f"litetune.json's `decision` is a {type(record['decision']).__name__}, not an "
+            "object; it cannot be read, and a decision checkpoint is refused on --npu anyway"
+        )
+    return True, None
 
 
 def run_llm_npu_export(
     request: LlmNpuRequest, events: EventStream | None = None, *, host: str | None = None
 ) -> LlmNpuResult:
-    """`convert --npu` for an LLM checkpoint. Every failure is a check in the result."""
+    """`convert --npu` for an LLM checkpoint. Every failure is a check in the result: a
+    refusal of the request or a failure of the run is could-not-check, and only the data or
+    the compiled file being wrong is failed."""
     # Imported here: export imports nothing of this module, and the CLI imports both.
-    from litetune.export import ExportRequest, compose_chat_template
+    from litetune.export import (
+        ExportRequest,
+        compose_chat_template,
+        installed_version,
+        repair_vocab_file,
+        resolve_toolchain,
+    )
 
+    envs.forget_reported_drops()
     events = events or EventStream(echo_json=False)
+    events.stage_started("convert-npu", model=request.model, socs=list(request.socs))
     result = LlmNpuResult(request=request)
     problem = (host if host is not None else host_problem()) or request.env.refusal()
     if problem:
-        return _refuse(result, events, NPU_REQUEST_CHECK, problem)
+        return _cannot(result, events, NPU_REQUEST_CHECK, problem)
     try:
         export_request = ExportRequest(
             model=request.model,
@@ -382,47 +446,81 @@ def run_llm_npu_export(
             auto_provision=request.auto_provision,
         )
     except ValueError as exc:
-        return _refuse(result, events, NPU_REQUEST_CHECK, str(exc))
+        return _cannot(result, events, NPU_REQUEST_CHECK, str(exc))
     if export_request.identity_conflict:
-        return _refuse(result, events, NPU_REQUEST_CHECK, export_request.identity_conflict)
-    rules = export_request.plan.rules
-    result.family = rules.family if rules else None
+        return _cannot(result, events, NPU_REQUEST_CHECK, export_request.identity_conflict)
+    try:
+        read = models.read_training_record(request.model)
+    except (OSError, ValueError) as exc:
+        return _cannot(result, events, NPU_REQUEST_CHECK, f"{request.model}: {exc}")
+    record = read[0] if read else None
+    plan = export_request.plan
+    result.family = plan.rules.family if plan.rules else None
+    result.identity = request.base_model or (record or {}).get("base_model") or request.model
+    decision, unreadable = _decision_problem(record)
+    if unreadable:
+        return _cannot(result, events, NPU_REQUEST_CHECK, unreadable)
     problem = request_problem(
         request.socs,
         request.cache_length,
         family=result.family,
-        model=request.model,
-        decision=export_request.decision_record() is not None,
+        identity=result.identity,
+        decision=decision,
     )
     if problem:
-        return _refuse(result, events, NPU_REQUEST_CHECK, problem)
-    try:
-        record = models.read_training_record(request.model)
-    except (OSError, ValueError) as exc:
-        return _refuse(result, events, NPU_REQUEST_CHECK, f"{request.model}: {exc}")
-    mode = record[0].get("prompt_mode") if record else None
+        return _cannot(result, events, NPU_REQUEST_CHECK, problem)
+    mode = (record or {}).get("prompt_mode")
     if mode not in ("runtime_rendered", "prerendered"):
-        return _refuse(
+        return _cannot(
             result,
             events,
             NPU_REQUEST_CHECK,
             f"--npu: {request.model} records no prompt mode (its litetune.json, which `tune` "
             "writes); the calibration prompts are rendered by it",
         )
+    if (record or {}).get("declarations_sha256"):
+        return _cannot(
+            result,
+            events,
+            NPU_REQUEST_CHECK,
+            f"--npu: {request.model} records tool declarations; a tool-calling bundle has not "
+            "been measured on this path, and its calibration would not render them",
+        )
     result.prompt_mode = mode
     try:
         rows = read_calibration_rows(request.calibration_data)
     except LlmNpuError as exc:
-        return _refuse(result, events, NPU_REQUEST_CHECK, str(exc))
-    for soc in request.socs:
-        if dir_for(request.output_dir, soc).exists():
-            return _refuse(
+        return _cannot(result, events, NPU_REQUEST_CHECK, str(exc))
+    taken = [dir_for(request.output_dir, soc) for soc in request.socs]
+    taken.append(request.output_dir / RUN_REPORT_NAME)
+    for path in taken:
+        if path.exists() or path.is_symlink():
+            return _cannot(
                 result,
                 events,
                 NPU_REQUEST_CHECK,
-                f"{dir_for(request.output_dir, soc)} already exists; nothing is written over it",
+                f"{path} already exists; nothing is written over it. Use another --output-dir",
             )
-    _add(result, events, Check.passed(NPU_REQUEST_CHECK, f"{result.family}, {len(rows)} rows"))
+    _add(
+        result,
+        events,
+        Check.passed(NPU_REQUEST_CHECK, f"{result.family} ({result.identity}), {len(rows)} rows"),
+    )
+    broken_record = models.provenance_error(request.model)
+    if broken_record:
+        result.limitations.append(broken_record)
+        events.note(broken_record, model=request.model)
+    for text in plan.limitations:
+        result.limitations.append(text)
+    for note in plan.notes:
+        events.note(note, model=request.model, family=result.family)
+    for check in plan.checks:
+        _add(result, events, check)
+    if not plan.usable:
+        unresolved = next(c for c in plan.checks if c.outcome is Outcome.UNCHECKED)
+        result.limitations.append(f"no NPU bundle was compiled: {unresolved.detail}")
+        events.stage_finished(result.outcome.value, attempted=0)
+        return result
 
     env = request.env
     try:
@@ -430,17 +528,40 @@ def run_llm_npu_export(
             env.provision(events=events)
     except Exception as exc:  # noqa: BLE001 -- a provisioning failure is a check, not a crash
         logger.exception("provisioning %s failed", env.name)
-        _add(result, events, Check.unchecked(NPU_ENV_CHECK, f"{env.name}: {exc}"))
-        result.limitations.append("no NPU bundle was compiled: the environment is not ready")
-        return result
+        return _cannot(result, events, NPU_ENV_CHECK, f"{env.name}: {exc}")
     if not env.ready:
-        _add(
-            result,
-            events,
-            Check.unchecked(NPU_ENV_CHECK, f"environment {env.name!r} {env.unready_detail}"),
+        return _cannot(
+            result, events, NPU_ENV_CHECK, f"environment {env.name!r} {env.unready_detail}"
         )
-        return result
     _add(result, events, Check.passed(NPU_ENV_CHECK, f"{env.name} ({env.identity}) ready"))
+
+    # As run_export does before its sweep: a stale `vocab_file` kills stage 1 after the
+    # model has loaded, and the toolchain's transformers must be one this family supports.
+    model_path = Path(request.model)
+    if model_path.is_dir():
+        ok, repaired = repair_vocab_file(model_path)
+        if repaired:
+            events.note(repaired, model=request.model)
+            result.limitations.append(repaired)
+        if not ok:
+            result.limitations.append(
+                "the export below is likely to fail at `export_tokenizer` for the reason above"
+            )
+    if plan.rules is not None and plan.rules.min_transformers:
+        toolchain = resolve_toolchain(env)
+        version_check = models.transformers_check(
+            request.model,
+            plan.rules,
+            installed_version(toolchain, "transformers"),
+            f"the {env.name} environment",
+            unknown_reason=toolchain.unresolved_reason or "",
+        )
+        if version_check.outcome is Outcome.FAILED:
+            _add(result, events, version_check)
+            events.stage_finished(result.outcome.value, attempted=0)
+            return result
+        if not version_check.conclusive:
+            result.limitations.append(version_check.detail)
 
     template: Path | None = None
     if export_request.composes_chat_template:
@@ -448,6 +569,7 @@ def run_llm_npu_export(
         _add(result, events, check)
         if composed is None:
             result.limitations.append("no NPU bundle was compiled: no chat template")
+            events.stage_finished(result.outcome.value, attempted=0)
             return result
         template = composed.path
         result.chat_template = composed.as_dict()
@@ -456,34 +578,57 @@ def run_llm_npu_export(
     result.exporter_flags = list(argv[5:])
 
     request.output_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".litetune-npu-llm-", dir=request.output_dir) as tmp:
-        work = Path(tmp)
-        try:
-            answer = _compile(request, result, rows, mode, work)
-        except LlmNpuError as exc:
-            _add(result, events, Check.failed(NPU_COMPILE_CHECK, f"{exc.cause}: {exc}"))
-            result.limitations.append("no NPU bundle was compiled")
-            return result
-        result.answer = answer
-        calibration = answer["calibration"]
-        _add(
-            result,
-            events,
-            Check.passed(
-                NPU_COMPILE_CHECK,
-                f"{len(request.socs)} SoC(s); calibrated on {calibration['count']} prompts of "
-                f"{calibration['shortest_tokens']}-{calibration['longest_tokens']} tokens",
-                observed={"dead_kv": answer["dead_kv"]},
-            ),
-        )
-        _publish(request, result, events, work)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".litetune-npu-llm-", dir=request.output_dir
+        ) as tmp:
+            work = Path(tmp)
+            try:
+                result.answer = _compile(request, result, rows, mode, template, work)
+            except LlmNpuError as exc:
+                check = (Check.unchecked if exc.cause in RUN_CAUSES else Check.failed)(
+                    NPU_COMPILE_CHECK, f"{exc.cause}: {exc}"
+                )
+                _add(result, events, check)
+                result.limitations.append("no NPU bundle was compiled")
+                events.stage_finished(result.outcome.value, attempted=1)
+                return result
+            calibration = result.answer["calibration"]
+            _add(
+                result,
+                events,
+                Check.passed(
+                    NPU_COMPILE_CHECK,
+                    f"{len(request.socs)} SoC(s); calibrated on {calibration['count']} prompts "
+                    f"of {calibration['shortest_tokens']}-{calibration['longest_tokens']} tokens",
+                    observed={"dead_kv": result.answer["dead_kv"]},
+                ),
+            )
+            _limitations(request, result)
+            _publish(request, result, events, work)
+    finally:
+        _write_run_report(request, result, events)
+    events.stage_finished(result.outcome.value, attempted=1)
+    return result
+
+
+def _limitations(request: LlmNpuRequest, result: LlmNpuResult) -> None:
+    """What every SoC's report must carry, appended before any of them is written."""
+    longest = result.answer["calibration"]["longest_tokens"]
     result.limitations.append(NOT_VERIFIED)
     result.limitations.append(
-        f"prompts longer than {result.answer['calibration']['longest_tokens']} tokens (rendered) "
-        "are outside what this bundle was calibrated for: measured on SM8750, prompts past the "
-        "longest calibration prompt turned into degenerate repetition. Do not serve them"
+        f"prompts longer than {longest} tokens (rendered) are outside what this bundle was "
+        "calibrated for: measured on SM8750, prompts past the longest calibration prompt "
+        "turned into degenerate repetition. Do not serve them"
     )
-    return result
+    if request.cache_length != DEFAULT_CACHE_LENGTH:
+        result.limitations.append(
+            f"cache_length {request.cache_length} has not been measured; every measured bundle "
+            f"used {DEFAULT_CACHE_LENGTH}"
+        )
+    for soc in request.socs:
+        if soc not in DEVICE_RUNS:
+            result.limitations.append(NOT_RUN_SOC.format(soc=soc))
 
 
 def _compile(
@@ -491,6 +636,7 @@ def _compile(
     result: LlmNpuResult,
     rows: list[dict[str, str]],
     mode: str,
+    template: Path | None,
     work: Path,
 ) -> dict[str, Any]:
     script, spec, answer = work / "npu_llm.py", work / "spec.json", work / "answer.json"
@@ -502,13 +648,15 @@ def _compile(
             {
                 "model": request.model,
                 "flags": result.exporter_flags,
+                "chat_template": str(template) if template else None,
                 "socs": list(request.socs),
                 "cache_length": request.cache_length,
                 "prefill_length": PREFILL_LENGTH,
-                "max_prompt_tokens": max_prompt_tokens(request.cache_length),
+                "prompt_limit_tokens": prompt_limit_tokens(request.cache_length),
                 "short": CALIBRATION_SHORT,
                 "long": CALIBRATION_LONG,
                 "decode_steps": CALIBRATION_DECODE_STEPS,
+                "max_repack_bytes": MAX_REPACK_BYTES,
                 "prompt_mode": mode,
                 "rows": str(data),
                 "work": str(work),
@@ -547,10 +695,13 @@ def _compile(
     if not isinstance(socs, dict) or sorted(socs) != sorted(request.socs):
         raise LlmNpuError("run", f"the export's answer names SoCs {sorted(socs or {})}")
     for soc, entry in socs.items():
-        packed = Path(str(entry.get("packed")))
+        lacking = [k for k in SOC_KEYS if k not in (entry or {})]
+        if lacking:
+            raise LlmNpuError("run", f"the export's answer for {soc} has no {', '.join(lacking)}")
+        packed = Path(str(entry["packed"]))
         if not packed.is_file():
             raise LlmNpuError("run", f"the export's answer names {packed} for {soc}, not there")
-        problem = kv_types_problem(entry.get("kv_types"))
+        problem = kv_types_problem(entry["kv_types"])
         if problem:
             raise LlmNpuError("compiled", f"{soc}: {problem}")
     return got
@@ -577,49 +728,105 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
     path.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
 
 
+def _published_whole(model: Path) -> bool:
+    """Whether `model`'s directory holds it and a report naming its sha256."""
+    try:
+        report = json.loads((model.parent / REPORT_NAME).read_text(encoding="utf-8"))
+        return model.is_file() and f"sha256:{report['npu']['sha256']}" == hash_file(model)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def _publish(request: LlmNpuRequest, result: LlmNpuResult, events: EventStream, work: Path) -> None:
     """Each SoC's bundle published in turn, as `embedding_export._publish_npus` does: its
     report written beside the staged file, the SoC's directory created exclusively, the
     bundle and then the report hard-linked in. The first failure stops the rest; nothing is
-    rolled back, and the report says what reached the disk."""
-    published: list[LlmNpuBundle] = []
+    rolled back. What counts as published is read back from the disk afterwards
+    (`_published_whole`), a directory this run created that is not whole is named as partial,
+    and an interrupt is re-raised once that is recorded."""
+    created: dict[str, LlmNpuBundle] = {}
     try:
         for soc in request.socs:
             entry = result.answer["socs"][soc]
             staged = Path(str(entry["packed"]))
             target = dir_for(request.output_dir, soc)
-            sha = hash_file(staged).removeprefix("sha256:")
             bundle = LlmNpuBundle(
                 soc=soc,
                 output=target / ARTIFACT_NAME,
                 bytes=staged.stat().st_size,
-                sha256=sha,
-                kv_types=entry["kv_types"],
+                sha256=hash_file(staged).removeprefix("sha256:"),
+                compiled=entry,
             )
             staged_report = work / f"{soc}.{REPORT_NAME}"
             report = result.as_dict()
             report["npu"] = bundle.as_dict()
             _write_report(staged_report, report)
-            os.mkdir(target)
+            # Recorded before the mkdir, so an interrupt right after it still names the
+            # directory; taken back if it was not ours to make.
+            created[soc] = bundle
+            try:
+                os.mkdir(target)
+            except FileExistsError:
+                del created[soc]
+                raise
             os.link(staged, target / ARTIFACT_NAME)
             staged.unlink()
             os.link(staged_report, target / REPORT_NAME)
             staged_report.unlink()
-            published.append(bundle)
-            events.artifact(str(bundle.output), name=f"model.litertlm (npu {soc})", verified=False)
     except BaseException as exc:
         logger.exception("publishing the NPU bundles stopped")
         result.publish_error = f"{type(exc).__name__}: {exc}"
+        _on_disk(request, result, events, created)
         if not isinstance(exc, OSError):
             raise
-    finally:
-        result.bundles = published
-    if result.publish_error is None:
+        return
+    _on_disk(request, result, events, created)
+
+
+def _on_disk(
+    request: LlmNpuRequest,
+    result: LlmNpuResult,
+    events: EventStream,
+    created: dict[str, LlmNpuBundle],
+) -> None:
+    published, partial = [], []
+    for bundle in created.values():
+        if _published_whole(bundle.output):
+            published.append(bundle)
+            events.artifact(
+                str(bundle.output), name=f"{ARTIFACT_NAME} (npu {bundle.soc})", verified=False
+            )
+            events.artifact(
+                str(bundle.output.parent / REPORT_NAME), name=f"{REPORT_NAME} (npu {bundle.soc})"
+            )
+        else:
+            partial.append(str(bundle.output.parent))
+    result.bundles, result.partial = published, partial
+    if result.publish_error is None and not partial:
         _add(result, events, Check.passed(NPU_PUBLISH_CHECK, f"{len(published)} published"))
         return
-    detail = f"published {len(published)} of {len(request.socs)}; stopped on {result.publish_error}"
+    detail = f"published {len(published)} of {len(request.socs)}"
+    if result.publish_error:
+        detail += f"; publishing stopped on {result.publish_error}"
+    if partial:
+        detail += f"; written in part, left as they are: {', '.join(partial)}"
     _add(result, events, Check.unchecked(NPU_PUBLISH_CHECK, f"run: {detail}"))
     result.limitations.append(f"{detail}. Run the rest with another --output-dir")
+
+
+def _write_run_report(request: LlmNpuRequest, result: LlmNpuResult, events: EventStream) -> None:
+    """The run's report beside the SoC directories, created new: what was asked and what
+    reached the disk, whatever stopped the run after the output directory existed."""
+    if not request.output_dir.is_dir():
+        return
+    path = request.output_dir / RUN_REPORT_NAME
+    try:
+        with open(path, "x", encoding="utf-8") as f:
+            f.write(json.dumps(result.as_dict(), indent=2, default=str) + "\n")
+        events.artifact(str(path), name=RUN_REPORT_NAME)
+    except OSError as exc:
+        logger.exception("the run report was not written")
+        result.limitations.append(f"the run report {path} was not written: {exc}")
 
 
 def npu_target_of(model: Path) -> str | None:
@@ -668,17 +875,15 @@ def summarise(result: LlmNpuResult) -> list[str]:
     return lines
 
 
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 # The script that runs inside envs.NPU_LLM. Its top level imports the standard library only,
-# so tests/test_llm_npu.py runs `retype_dead_kv`, `kv_type_counts`, `long_targets`,
-# `calibration_plan` and `exporter_kwargs` for real without the toolchain.
+# so tests/test_llm_npu.py runs `retype_dead_kv`, `kv_quantization_problem`, `kv_type_counts`,
+# `long_targets`, `calibration_plan`, `exporter_kwargs` and `check_compiled` for real without
+# the toolchain.
 _NPU_LLM_SCRIPT = r'''
 """npu_export stages 1-4 for one LLM checkpoint, with calibration from its training data and
 the dead last-layer KV inputs retyped. Reads JSON spec from argv[1]; writes spec["answer"]:
-  {"ok": true, "calibration", "socs": {soc: {packed, kv_types}}, "versions", "stage_s", "dead_kv"}
+  {"ok": true, "calibration", "socs": {soc: {packed, kv_types, ops, stamp, qairt, metadata}},
+   "versions", "stage_s", "dead_kv"}
   or {"ok": false, "cause", "reason"}; exits 0 for the first and 3 for the second.
 """
 
@@ -687,11 +892,17 @@ import importlib.metadata
 import json
 import os
 import random
+import re
 import sys
 import time
 import traceback
 
 KV_PREFIX = "kv_cache_"
+# The calibration prompts are rendered already: npu_calibrate's own chat formatting would wrap
+# them a second time (`calibrate`'s enable_formatting defaults to True).
+CALIBRATE_KWARGS = {"enable_formatting": False}
+STAMP_BYTES = 250
+QAIRT = re.compile(rb"v(2\.\d+\.\d+\.\d+)")
 VERSIONED = (
     "litert-torch-nightly",
     "ai-edge-litert-nightly",
@@ -700,6 +911,8 @@ VERSIONED = (
     "litert-lm-builder",
     "transformers",
     "torch",
+    "flatbuffers",
+    "numpy",
 )
 
 
@@ -727,10 +940,21 @@ def kv_type_counts(model, type_names):
     return out
 
 
+def _read_tensors(sg, sd):
+    """Tensor indices this signature's subgraph reads or hands out: every op's inputs, the
+    subgraph's outputs and the signature's outputs."""
+    read = set()
+    for op in sg.operators or []:
+        read.update(int(i) for i in (op.inputs if op.inputs is not None else []) if int(i) >= 0)
+    read.update(int(i) for i in (sg.outputs if sg.outputs is not None else []))
+    read.update(int(o.tensorIndex) for o in sd.outputs or [])
+    return read
+
+
 def retype_dead_kv(model, type_names, copy_quantization):
-    """Every prefill KV-cache input that no op of its subgraph reads takes the type and
-    quantization of the same-named input of the decode signature. Changes `model`; returns
-    what changed. The inputs are unused, so no computation changes."""
+    """Every prefill KV-cache input that its subgraph neither reads nor hands out takes the
+    type and quantization of the same-named input of the decode signature. Changes `model`;
+    returns what changed. The inputs are unused, so no computation changes."""
     sigs = {_name(sd.signatureKey): sd for sd in model.signatureDefs or []}
     decode = sigs.get("decode")
     if decode is None:
@@ -742,7 +966,7 @@ def retype_dead_kv(model, type_names, copy_quantization):
         if not key.startswith("prefill"):
             continue
         sg = model.subgraphs[sd.subgraphIndex]
-        read = {int(i) for op in sg.operators or [] for i in op.inputs if int(i) >= 0}
+        read = _read_tensors(sg, sd)
         for i in sd.inputs or []:
             name = _name(i.name)
             if not name.startswith(KV_PREFIX) or int(i.tensorIndex) in read:
@@ -769,22 +993,52 @@ def retype_dead_kv(model, type_names, copy_quantization):
     return changed
 
 
-def long_targets(max_prompt, count):
-    """`count` target lengths spread evenly from half of `max_prompt` up to `max_prompt`
-    itself, so the longest calibration prompt reaches the longest prompt served."""
+def _quant_key(tensor, type_names):
+    q = tensor.quantization
+    scale = tuple(float(x) for x in (getattr(q, "scale", None) if q is not None else None) or [])
+    zero = tuple(int(x) for x in (getattr(q, "zeroPoint", None) if q is not None else None) or [])
+    return (type_names[tensor.type], scale, zero)
+
+
+def kv_quantization_problem(models, type_names):
+    """Why the KV-cache inputs of these graphs (the prefill/decode graph and the aux
+    cache-update graph) would not share one buffer each, or None: every input of one name
+    must have one type, scale and zero point across every signature that takes it."""
+    seen = {}
+    for model in models:
+        for sd in model.signatureDefs or []:
+            sg = model.subgraphs[sd.subgraphIndex]
+            for i in sd.inputs or []:
+                name = _name(i.name)
+                if name.startswith(KV_PREFIX):
+                    key = _quant_key(sg.tensors[i.tensorIndex], type_names)
+                    seen.setdefault(name, {}).setdefault(key, []).append(_name(sd.signatureKey))
+    for name, keys in sorted(seen.items()):
+        if len(keys) > 1:
+            return f"{name} has {len(keys)} different type/quantizations across signatures: {keys}"
+        ((kind, _, _),) = keys
+        if kind != "INT16":
+            return f"{name} is {kind}, not INT16"
+    return None
+
+
+def long_targets(limit, count):
+    """`count` target lengths spread evenly from half of `limit` up to `limit` itself."""
     if count <= 0:
         return []
-    low = max(1, max_prompt // 2)
+    low = max(1, limit // 2)
     if count == 1:
-        return [max_prompt]
-    return [low + (max_prompt - low) * k // (count - 1) for k in range(count)]
+        return [limit]
+    return [low + (limit - low) * k // (count - 1) for k in range(count)]
 
 
-def calibration_plan(rows, render, count_tokens, max_prompt, short, long, seed=0):
+def calibration_plan(rows, render, count_tokens, limit, short, long, reach, seed=0):
     """The calibration prompts: `short` of the data's own prompts, rendered, and `long`
     prompts packed from its examples (prompt and completion, one after another) followed by
-    one more prompt, each grown to its target from `long_targets`. Refuses when a data prompt
-    is longer than `max_prompt`. Returns (prompts, summary)."""
+    one more prompt, each grown towards its target from `long_targets` with whatever example
+    still fits. Refuses when a data prompt is longer than `limit`, and when the longest prompt
+    falls short of `limit - reach`: the prompts a bundle serves must not outrun its
+    calibration. Returns (prompts, summary)."""
     rng = random.Random(seed)
     order = list(range(len(rows)))
     rng.shuffle(order)
@@ -792,45 +1046,60 @@ def calibration_plan(rows, render, count_tokens, max_prompt, short, long, seed=0
     for i in order:
         text = render(rows[i]["prompt"])
         n = count_tokens(text)
-        if n > max_prompt:
+        if n > limit:
             raise Refused(
                 "data",
-                f"a training prompt renders to {n} tokens, more than the {max_prompt} this "
-                "cache length leaves for a prompt; raise --cache-length",
+                f"a training prompt renders to {n} tokens, more than the {limit} this cache "
+                "length leaves for a prompt; raise --cache-length",
             )
         rendered.append((text, n))
     shorts = rendered[:short]
-    longs = []
-    cursor = 0
-    for target in long_targets(max_prompt, long):
-        pieces, best = [], None
-        for _ in range(len(rows) * 4):
+    targets = long_targets(limit, long)
+    longs, cursor = [], 0
+    for target in targets:
+        pieces, best, misses = [], None, 0
+        while misses < len(rows):
             row = rows[order[cursor % len(order)]]
+            tail = rows[order[(cursor + 1) % len(order)]]["prompt"]
             cursor += 1
             candidate = pieces + [row["prompt"] + " " + row["completion"]]
-            tail = rows[order[cursor % len(order)]]["prompt"]
             text = render("\n\n".join(candidate + [tail]))
             n = count_tokens(text)
-            if n > max_prompt:
-                break
-            pieces, best = candidate, (text, n)
+            if n > limit:
+                misses += 1
+                continue
+            pieces, best, misses = candidate, (text, n), 0
             if n >= target:
                 break
-        if best is None:
-            break
-        longs.append(best)
+        if best is not None:
+            longs.append(best)
     prompts = [t for t, _ in shorts + longs]
     lengths = [n for _, n in shorts + longs]
+    longest = max(lengths)
+    if longest < limit - reach:
+        raise Refused(
+            "data",
+            f"the longest calibration prompt is {longest} tokens; it must reach within {reach} "
+            f"of the {limit} the cache leaves for a prompt, and the training examples could not "
+            "be packed that far",
+        )
     summary = {
         "count": len(prompts),
-        "short": {"count": len(shorts), "min_tokens": min((n for _, n in shorts), default=0),
-                  "max_tokens": max((n for _, n in shorts), default=0)},
-        "long": {"count": len(longs), "min_tokens": min((n for _, n in longs), default=0),
-                 "max_tokens": max((n for _, n in longs), default=0),
-                 "targets": [long_targets(max_prompt, long)[0], max_prompt] if long else []},
+        "short": {
+            "count": len(shorts),
+            "min_tokens": min((n for _, n in shorts), default=0),
+            "max_tokens": max((n for _, n in shorts), default=0),
+        },
+        "long": {
+            "count": len(longs),
+            "min_tokens": min((n for _, n in longs), default=0),
+            "max_tokens": max((n for _, n in longs), default=0),
+            "targets": [targets[0], targets[-1]] if targets else [],
+            "reached": sum(1 for (_, n), t in zip(longs, targets) if n >= t),
+        },
         "shortest_tokens": min(lengths),
-        "longest_tokens": max(lengths),
-        "max_prompt_tokens": max_prompt,
+        "longest_tokens": longest,
+        "prompt_limit_tokens": limit,
         "sha256": hashlib.sha256("".join(p + "\n" for p in prompts).encode("utf-8")).hexdigest(),
     }
     return prompts, summary
@@ -852,6 +1121,69 @@ def exporter_kwargs(flags):
     return out
 
 
+def check_compiled(described, soc, stamp_bytes=STAMP_BYTES):
+    """The compiled prefill/decode graph against what it must be: every signature one or
+    more DISPATCH_OPs and nothing else (no op left on the CPU), and a LiteRtStamp naming
+    Qualcomm and `soc`. Raises Refused; returns the stamp."""
+    for key, ops in described["ops"].items():
+        if not ops or set(ops) != {"DISPATCH_OP"}:
+            raise Refused(
+                "partitioned",
+                f"signature {key} compiled to {ops}, not DISPATCH_OPs only: part of it would run "
+                "on the CPU, or none of it on the NPU",
+            )
+    raw = described["stamp"]
+    if raw is None or len(raw) != stamp_bytes:
+        raise Refused(
+            "stamp",
+            f"the LiteRtStamp is {None if raw is None else len(raw)} bytes, not {stamp_bytes}",
+        )
+    half = stamp_bytes // 2
+    stamp = (raw[:half].rstrip(b"\0").decode("ascii", "replace"),
+             raw[half:].rstrip(b"\0").decode("ascii", "replace"))
+    if stamp[0] != "Qualcomm" or stamp[1].upper() != soc.upper():
+        raise Refused("stamp", f"the compiled graph is stamped {stamp}, not ('Qualcomm', {soc!r})")
+    return list(stamp)
+
+
+def describe(s, path):
+    """Per signature the op counts of a .tflite, its LiteRtStamp bytes and its QAIRT build."""
+    data = open(path, "rb").read()
+    m = s.Model.GetRootAs(bytearray(data), 0)
+    names = []
+    for i in range(m.OperatorCodesLength()):
+        oc = m.OperatorCodes(i)
+        names.append(
+            oc.CustomCode().decode() if oc.CustomCode()
+            else str(max(oc.BuiltinCode(), oc.DeprecatedBuiltinCode()))
+        )
+    ops = {}
+    for i in range(m.SignatureDefsLength()):
+        d = m.SignatureDefs(i)
+        sg = m.Subgraphs(d.SubgraphIndex())
+        counts = {}
+        for j in range(sg.OperatorsLength()):
+            n = names[sg.Operators(j).OpcodeIndex()]
+            counts[n] = counts.get(n, 0) + 1
+        ops[d.SignatureKey().decode()] = counts
+    stamp = None
+    for i in range(m.MetadataLength()):
+        md = m.Metadata(i)
+        if md.Name().decode() == "LiteRtStamp":
+            buf = m.Buffers(md.Buffer())
+            stamp = buf.DataAsNumpy().tobytes() if buf.DataLength() else b""
+    found = QAIRT.search(data)
+    return {"ops": ops, "stamp": stamp, "qairt": found.group(1).decode() if found else None}
+
+
+def _sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def main(spec):
     import copy
 
@@ -869,6 +1201,9 @@ def main(spec):
     type_names = {v: k for k, v in vars(s.TensorType).items() if not k.startswith("_")}
     work = spec["work"]
     tok = AutoTokenizer.from_pretrained(spec["model"])
+    if spec.get("chat_template"):
+        # The template the bundle carries, so the calibration prompts are what it renders.
+        tok.chat_template = open(spec["chat_template"], encoding="utf-8").read()
     if spec["prompt_mode"] == "runtime_rendered":
         def render(text):
             return tok.apply_chat_template(
@@ -883,14 +1218,9 @@ def main(spec):
 
     rows = [json.loads(l) for l in open(spec["rows"], encoding="utf-8") if l.strip()]
     prompts, calibration = calibration_plan(
-        rows, render, count_tokens, spec["max_prompt_tokens"], spec["short"], spec["long"]
+        rows, render, count_tokens, spec["prompt_limit_tokens"], spec["short"], spec["long"],
+        spec["prefill_length"],
     )
-    if calibration["longest_tokens"] < spec["max_prompt_tokens"] // 2:
-        raise Refused(
-            "data",
-            f"the longest calibration prompt is {calibration['longest_tokens']} tokens, under half "
-            f"of the {spec['max_prompt_tokens']} the cache leaves for a prompt",
-        )
     calib_dir = os.path.join(work, "calib")
     os.makedirs(calib_dir)
     with open(os.path.join(calib_dir, "ALL.jsonl"), "w", encoding="utf-8") as f:
@@ -908,21 +1238,38 @@ def main(spec):
             enable_min_max_calibration_update=True, calibration_range_scale=1.0,
         )
 
+    def load(path):
+        raw = open(path, "rb").read()
+        if len(raw) > spec["max_repack_bytes"]:
+            raise Refused(
+                "size",
+                f"the stage-3 graph is {len(raw):,} bytes; Python flatbuffers cannot repack "
+                "2 GiB, and a checkpoint this size has not been measured here",
+            )
+        m = s.ModelT.InitFromPackedBuf(bytearray(raw), 0)
+        for b in m.buffers:
+            if (b.offset or 0) > 1:
+                b.data = np.frombuffer(
+                    raw, dtype=np.uint8, count=b.size, offset=b.offset
+                ).copy()
+                b.offset, b.size = 0, 0
+        return raw, m
+
     dead = {}
 
     def packed_with_fix(original):
         def pack(**kw):
             path = kw["prefilldecode_model_path"]
-            raw = open(path, "rb").read()
-            m = s.ModelT.InitFromPackedBuf(bytearray(raw), 0)
-            for b in m.buffers:
-                if (b.offset or 0) > 1:
-                    b.data = np.frombuffer(
-                        raw, dtype=np.uint8, count=b.size, offset=b.offset
-                    ).copy()
-                    b.offset, b.size = 0, 0
+            raw, m = load(path)
             dead["before"] = kv_type_counts(m, type_names)
             dead["changed"] = retype_dead_kv(m, type_names, copy.deepcopy)
+            graphs = [m]
+            if kw.get("auxiliary_model_path"):
+                graphs.append(load(kw["auxiliary_model_path"])[1])
+                dead["aux"] = kv_type_counts(graphs[1], type_names)
+            problem = kv_quantization_problem(graphs, type_names)
+            if problem:
+                raise Refused("quantization", problem)
             if dead["changed"]:
                 builder = flatbuffers.Builder(len(raw) + (1 << 20))
                 builder.Finish(m.Pack(builder), file_identifier=b"TFL3")
@@ -943,9 +1290,11 @@ def main(spec):
 
     stage1 = timed("stage1", lambda: stages.npu_export(cfg, os.path.join(work, "stage1"), **kwargs))
     calib_result = os.path.join(work, "calib_result")
-    timed("stage2", lambda: stages.npu_calibrate(cfg, stage1, calib_dir, calib_result))
+    timed("stage2", lambda: stages.npu_calibrate(
+        cfg, stage1, calib_dir, calib_result, **CALIBRATE_KWARGS))
     stage3 = os.path.join(work, "stage3.litertlm")
     timed("stage3", lambda: stages.npu_quantize(cfg, stage1, stage3, calib_result))
+    reference = lb.unpack_litertlm(stage3, os.path.join(work, "unpacked-stage3"))
     socs = {}
     for soc in spec["socs"]:
         out = os.path.join(work, f"{soc}.litertlm")
@@ -953,9 +1302,26 @@ def main(spec):
             config(soc), stage3, out, keep_temporary_files=False,
             intermediate_dir=os.path.join(work, "tmp-" + soc)))
         unpacked = lb.unpack_litertlm(out, os.path.join(work, "unpacked-" + soc))
-        raw = open(unpacked["tf_lite_prefill_decode"], "rb").read()
-        graph = s.ModelT.InitFromPackedBuf(bytearray(raw), 0)
-        socs[soc] = {"packed": out, "kv_types": kv_type_counts(graph, type_names)}
+        main_graph = unpacked["tf_lite_prefill_decode"]
+        graph = s.ModelT.InitFromPackedBuf(bytearray(open(main_graph, "rb").read()), 0)
+        described = describe(s, main_graph)
+        stamp = check_compiled(described, soc)
+        metadata = {}
+        for key in ("LlmMetadataProto", "LlmMetadata", "SP_Tokenizer", "transformers_model_path"):
+            got, want = unpacked.get(key), reference.get(key)
+            if not want:
+                continue
+            if not got or _sha(got) != _sha(want):
+                raise Refused("metadata", f"the compiled bundle's {key} is not stage 3's")
+            metadata[key] = _sha(got)
+        socs[soc] = {
+            "packed": out,
+            "kv_types": kv_type_counts(graph, type_names),
+            "ops": described["ops"],
+            "stamp": stamp,
+            "qairt": described["qairt"],
+            "metadata": metadata,
+        }
     versions = {}
     for name in VERSIONED:
         try:

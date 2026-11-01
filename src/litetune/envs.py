@@ -3908,7 +3908,13 @@ NPU_QUALCOMM = StageEnv(
 # with ai-edge-litert-nightly's Linux x86-64 wheel.
 NPU_LLM = StageEnv(
     name="npu-llm",
-    requirements=(*EXPORT.requirements, "ai-edge-litert-sdk-qualcomm==2.3.0"),
+    # flatbuffers pinned as NPU_QUALCOMM pins it: the script repacks the stage-3 graph with it.
+    # numpy is EXPORT's own pin.
+    requirements=(
+        *EXPORT.requirements,
+        "ai-edge-litert-sdk-qualcomm==2.3.0",
+        "flatbuffers==25.12.19",
+    ),
     system_requirements=("libvulkan1", "libc++1", "libatomic1"),
     install_as=NPU_QUALCOMM.install_as,
     pip_options=("--no-cache-dir",),

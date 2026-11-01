@@ -1158,6 +1158,24 @@ def run_verify(
     events.stage_started("verify", model=str(request.model), reference=request.reference)
     run = _Run(request=request, events=events)
 
+    # -- an LLM bundle compiled for an NPU cannot run here ------------------------
+    # First, before any routing by the reference: a decision or an embedding reference would
+    # otherwise take the file to a path that only fails once it tries to run it.
+    # `convert --npu` writes one with a convert.json naming its sha256; LiteRT-LM's CPU and
+    # GPU have no kernel for its DISPATCH_OPs, so a generation run would fail minutes in.
+    npu_soc = llm_npu.npu_target_of(Path(request.model))
+    if npu_soc is not None:
+        run.record(
+            Check.failed(
+                "candidate",
+                f"--model {request.model} is compiled for a Qualcomm {npu_soc} NPU (the "
+                f"{llm_npu.REPORT_NAME} beside it says so and names its sha256); verify runs "
+                "LiteRT-LM's CPU or GPU, which cannot run its DISPATCH_OPs. Verify the CPU/GPU "
+                "bundle of the same checkpoint, and measure this one on a phone with that SoC",
+            )
+        )
+        return run.finish(Status.FAILED_HARNESS)
+
     # -- a decision checkpoint is measured by option scoring --------------------
     # Before anything generative: such a model never generates in use, and the
     # checks below are about generations.
@@ -1178,22 +1196,6 @@ def run_verify(
                 "they are for an embedding checkpoint, one whose litetune.json "
                 f"`tune --model {EMBEDDING_MODEL}` wrote, and {request.reference} records "
                 f"none{model_dir_hint(request.reference)}. Refused rather than ignored",
-            )
-        )
-        return run.finish(Status.FAILED_HARNESS)
-
-    # -- an LLM bundle compiled for an NPU cannot run here ------------------------
-    # `convert --npu` writes one with a convert.json naming its sha256; LiteRT-LM's CPU and
-    # GPU have no kernel for its DISPATCH_OPs, so a generation run would fail minutes in.
-    npu_soc = llm_npu.npu_target_of(Path(request.model))
-    if npu_soc is not None:
-        run.record(
-            Check.failed(
-                "candidate",
-                f"--model {request.model} is compiled for a Qualcomm {npu_soc} NPU (the "
-                f"{llm_npu.REPORT_NAME} beside it says so and names its sha256); verify runs "
-                "LiteRT-LM's CPU or GPU, which cannot run its DISPATCH_OPs. Verify the CPU/GPU "
-                "bundle of the same checkpoint, and measure this one on a phone with that SoC",
             )
         )
         return run.finish(Status.FAILED_HARNESS)
