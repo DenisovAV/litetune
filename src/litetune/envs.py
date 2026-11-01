@@ -1296,10 +1296,12 @@ def _handle_pending_signals() -> None:
     `Python/ceval.c` of 3.10); that thread recomputes it for itself
     (`eval_frame_handle_pending`), and when it is not the main thread the
     breaker comes back cleared, so the main thread runs on without the
-    handler. On Windows CI with Python 3.10 an `interrupt_main` sent while a
-    60-second stage was waiting reached the wait 59 s later, once the stage
-    had ended, in 10 of 43 runs read; on 3.12 and 3.13 it took 0.11 to 0.20 s
-    in all 38 of each, for reasons not established.
+    handler. That is read from the source and has not been seen happen: the
+    59-second interrupts once put down to it were `_clamp_negative_wait`'s
+    unclamped wait, and with the wait clamped, 60 interrupts on Python
+    3.10.11 each reached the wait within 0.18 s with this re-install switched
+    off, as with it on. It stays, as a guard costing one `signal.signal` a
+    slice.
 
     `signal.signal` checks every pending signal itself before it changes a
     handler (`signal_signal_impl`, `Modules/signalmodule.c`), whatever the

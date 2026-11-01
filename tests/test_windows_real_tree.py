@@ -780,10 +780,10 @@ def test_a_wait_past_its_deadline_is_a_poll():
 
 @on_windows
 def test_an_interrupt_reaches_the_wait_every_time(tmp_path, capsys):
-    """The same interrupt, ten times. On Python 3.10 it was lost in 10 of 43
-    CI runs read, reaching the wait only when the 60-second stage ended
-    (`envs._handle_pending_signals`): one run per job let that pass about
-    three times in four, ten runs about once in fourteen."""
+    """The same interrupt, ten times. On Python 3.10 it reached the wait only
+    when the 60-second stage ended in 30 of 60 runs on one Windows machine
+    (`envs._clamp_negative_wait`): one run per job let that pass half the
+    time, ten runs about once in a thousand."""
     driver_file = tmp_path / "driver_keyboard.py"
     driver_file.write_text(DRIVER_KEYBOARD)
     drivers: list[subprocess.Popen] = []
