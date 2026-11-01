@@ -1117,6 +1117,25 @@ def convert_facts(model: Path) -> tuple[ConvertFacts | None, str]:
     )
 
 
+def npu_target_of(model: Path) -> str | None:
+    """The SoC `model` was compiled for, when the report beside it is `convert --npu`'s
+    and names this file's sha256; else None."""
+    report_path = Path(model).parent / REPORT_NAME
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(report, dict) or report.get("schema") != EMBEDDING_CONVERT_SCHEMA:
+        return None
+    npu = report.get("npu")
+    if report.get("kind") != "npu" or not isinstance(npu, dict):
+        return None
+    if f"sha256:{npu.get('sha256')}" != hash_file(model):
+        return None
+    soc = npu.get("soc")
+    return soc if isinstance(soc, str) else None
+
+
 def weights_of(model: Path) -> tuple[str | None, str]:
     """The weight mode `convert` recorded for `model`, and where that came from."""
     facts, source = convert_facts(model)
@@ -1251,6 +1270,15 @@ def verify_embedding(
         )
     if not Path(job.model).is_file():
         return refuse(CANDIDATE_CHECK, f"--model {job.model}: no such file")
+    soc = npu_target_of(job.model)
+    if soc is not None:
+        return refuse(
+            CANDIDATE_CHECK,
+            f"--model {job.model} is compiled for a Qualcomm {soc} NPU (the {REPORT_NAME} beside "
+            "it says so and names its sha256); verify runs LiteRT-LM's CPU or GPU, which cannot "
+            "run its DISPATCH_OP. Verify the int8 file it was compiled from, and measure this "
+            "one on a phone with that SoC",
+        )
     facts, weights_source = convert_facts(job.model)
     weights = facts.weights if facts is not None else None
     if facts is None:

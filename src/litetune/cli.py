@@ -66,6 +66,7 @@ from litetune.embedding_export import (
 )
 from litetune.embedding_export import REPORT_NAME as EMBEDDING_REPORT_NAME
 from litetune.embedding_export import summarise as summarise_embedding_convert
+from litetune.embedding_npu import NPU_SOCS, NPU_TIMEOUT_S
 from litetune.embedding_tune import (
     DIRECTION,
     EMBEDDING_MODEL,
@@ -80,7 +81,7 @@ from litetune.embedding_tune import summarise as summarise_embedding_tune
 from litetune.embedding_tune import write_report as write_embedding_report
 from litetune.embedding_verify import SCORER as EMBEDDING_SCORER
 from litetune.embedding_verify import summarise as summarise_embedding_verify
-from litetune.envs import cached_environments, env_cache_root, remove_cached
+from litetune.envs import PROVISION_TIMEOUT_S, cached_environments, env_cache_root, remove_cached
 from litetune.evaluate import CANDIDATE_BACKENDS, GREEDY, DataError
 from litetune.events import EventStream, TerminalRenderer
 from litetune.export import (
@@ -782,6 +783,23 @@ def _add_convert(sub) -> None:
         ),
     )
     convert.add_argument(
+        "--npu",
+        action="append",
+        choices=NPU_SOCS,
+        metavar="SOC",
+        help=(
+            "embedding checkpoints only, with --weights int8, on Linux x86-64 (Debian packages "
+            "libc++1 and libatomic1; the first run downloads Qualcomm's QAIRT): also compile the "
+            "graft's text encoder ahead of time for this Qualcomm SoC, into "
+            "<output-dir>/int8-npu-<SOC>/model.litertlm with its own convert.json; repeat for "
+            "more SoCs. Every SoC is compiled, a failed compile included, and publishing starts "
+            "only when all have compiled; a failure while publishing one stops the ones after "
+            "it, and the report says which were published. verify cannot run such a file; a "
+            "file compiled this way for SM8750 ran on one phone, no other SoC's on any. "
+            f"One of {', '.join(NPU_SOCS)}"
+        ),
+    )
+    convert.add_argument(
         "--base-litertlm",
         type=Path,
         help=(
@@ -798,15 +816,18 @@ def _add_convert(sub) -> None:
         default=None,
         help=(
             f"seconds the conversion may run (default {ExportRequest.timeout_s}; "
-            f"{GRAFT_TIMEOUT_S} for an embedding checkpoint)"
+            f"{GRAFT_TIMEOUT_S} for an embedding checkpoint's graft). With --npu it also bounds "
+            f"each SoC's compile (default {NPU_TIMEOUT_S}). Provisioning an environment has its "
+            f"own budget, {PROVISION_TIMEOUT_S} s"
         ),
     )
     convert.add_argument(
         "--no-provision",
         action="store_true",
         help=(
-            "do not build the pinned export environment; use it as it is. Without it the first "
-            "run installs the toolchain, which takes minutes and needs the network"
+            "do not build the pinned export environment (and, with --npu, the npu-qualcomm one); "
+            "use them as they are. Without it the first run installs the toolchain, which takes "
+            "minutes and needs the network"
         ),
     )
     convert.add_argument("--json", action="store_true", help="write the report to stdout")
@@ -1708,9 +1729,9 @@ def _convert(args: argparse.Namespace) -> int:
     record = _embedding_record(args.model)
     if record is not None:
         return _convert_embedding(args, record)
-    if args.weights is not None or args.base_litertlm is not None:
+    if args.weights is not None or args.base_litertlm is not None or args.npu:
         raise EmbeddingExportError(
-            "--weights and --base-litertlm are for an embedding checkpoint, one whose "
+            "--weights, --npu and --base-litertlm are for an embedding checkpoint, one whose "
             f"litetune.json `tune --model {EMBEDDING_MODEL}` wrote; {args.model} is not one"
             f"{model_dir_hint(args.model)}. Pick an LLM's quantization with --recipe"
         )
@@ -1761,6 +1782,8 @@ def _convert_embedding(args: argparse.Namespace, record: EmbeddingRecord) -> int
         output_dir=args.output_dir,
         weights=args.weights or DEFAULT_WEIGHTS,
         base_litertlm=args.base_litertlm,
+        npu=tuple(args.npu or ()),
+        npu_timeout_s=args.timeout_s if args.timeout_s is not None else NPU_TIMEOUT_S,
         timeout_s=args.timeout_s if args.timeout_s is not None else GRAFT_TIMEOUT_S,
         auto_provision=not args.no_provision,
     )

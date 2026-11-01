@@ -855,13 +855,53 @@ What has and has not been measured
   (cosine 0.9969 against 0.99928 on the CPU); see *The CPU and the GPU on a
   Mac* in MEASUREMENTS.md. On Linux the 0.18.0 package's GPU engine did not
   start in the one container tried, Windows is not measured, and `verify
-  --backend gpu` refuses on both. The app's own runtime build, a phone,
-  the NPU files and the web are not measured. Training was measured on the CPU
-  only.
+  --backend gpu` refuses on both. The app's own runtime build, a phone's CPU
+  through the app, Google's NPU files and the web are not measured here (an NPU
+  file `convert --npu` wrote is, below). Training was measured on the CPU only.
 - On a 32-vCPU Intel Xeon, at four threads, verify took 47 minutes (int8) and
   35 (int4) on 11,775 rows with `--with-base`, Google's file embedded beside
   the candidate; the previous litetune, embedding one after the other on the
   same machine, took 76 and 62.
+
+#### On a Qualcomm NPU: `convert --npu`
+
+Google's NPU files of EmbeddingGemma 2 hold the text encoder compiled for one SoC, so
+the graft has nothing to rewrite in them. `--npu` compiles the int8 graft's encoder
+instead, once per SoC, and keeps everything else of the graft:
+
+```
+litetune convert --model ./tuned/model --output-dir ./out --weights int8 --npu SM8750
+```
+
+- **Writes** `out/int8/model.litertlm` (the CPU/GPU file, as without `--npu`) and
+  `out/int8-npu-SM8750/model.litertlm` with its own `convert.json`, which names the
+  file's sha256, the SoC it is stamped for, the QNN context, the QAIRT build and the
+  graft it came from. `--npu` repeats; the SoCs are SM8550, SM8650, SM8750 and SM8850,
+  the four Google publishes NPU files for. Publishing starts once every SoC has compiled.
+  Each SoC's directory is then created new and written whole, model and report; a
+  failure stops the SoCs after it, nothing written is removed, and the main
+  `convert.json` says, from what is on disk, which SoCs were published and which
+  directories were written in part.
+- **int8 only.** The int4 encoder's int4 FULLY_CONNECTED ops stay on the CPU (194
+  partitions per signature), and that file did not load on a phone's NPU.
+- **Linux x86-64 only**, with the Debian packages `libc++1` and `libatomic1`. The first
+  run builds the `npu-qualcomm` environment, which downloads Qualcomm's QAIRT
+  2.50.0.260828 while it installs ai-edge-litert-sdk-qualcomm 2.3.0. A compile took
+  215–321 s per SoC on 32 vCPUs.
+- **What it checks:** every signature (128, 256, 512 and 1024 tokens, Google's four)
+  compiled to one `DISPATCH_OP`, all of them over one QNN context no larger than twice
+  the encoder's weight bytes, stamped for the SoC, its inputs and outputs unchanged; the
+  file read back section by section. The size bound is evidence of weight sharing, not
+  proof: the int8 graft's context was 1.24x its weights compiled with weight sharing and
+  4.29x without.
+- **What it cannot check:** `verify` runs LiteRT-LM's CPU or GPU, which cannot run a
+  `DISPATCH_OP`, and refuses such a file. It needs a phone with that SoC and a
+  LiteRT-LM build with the Qualcomm dispatch and a QAIRT 2.50 runtime; an older runtime
+  was not tried.
+- **Measured once:** an SM8750 file of the banking77 fine-tune ran on a Galaxy S25
+  Ultra's NPU at a median of 9.6–10.3 ms per text over two runs, and its 10-shot centroid decider scored 0.9316
+  against 0.9312 for the float32 reference ([MEASUREMENTS.md](MEASUREMENTS.md#embeddinggemma-2-on-a-qualcomm-npu)).
+  No other SoC's file has run on a device.
 
 ### Gemma 4 towers: drop them, or take them from another bundle
 
@@ -1436,7 +1476,8 @@ withdrawn after re-measurement.
   device, so the reference is held to an explicit token limit while the device
   runs to the runtime's own. The manifest says so and counts unterminated
   generations.
-- **`convert` does not compile for an NPU.** The NPU bundle described under
+- **`convert` compiles for an NPU only for EmbeddingGemma 2** (`--npu`, above). The
+  LLM NPU bundle described under
   *Known to be broken* was built by hand: the four functions in litert-torch's
   `generative/export_hf/experimental/npu_export/stages.py` — `npu_export`,
   `npu_calibrate` on 64 tool prompts disjoint from the scored set,

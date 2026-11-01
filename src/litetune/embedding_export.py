@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -49,6 +50,16 @@ from litetune.embedding_convert import (
     GraftResult,
     WeightMode,
     graft,
+)
+from litetune.embedding_npu import (
+    NPU_SIGNATURES,
+    NPU_TIMEOUT_S,
+    EmbeddingNpuError,
+    NpuResult,
+    compile_for_npu,
+    dir_for,
+    host_problem,
+    request_problem,
 )
 from litetune.embedding_tune import DECIDER_PREFIX, EmbeddingRecord
 from litetune.events import EventStream
@@ -81,6 +92,33 @@ ENV_CHECK = "export environment"
 BASE_FILE_CHECK = "Google's file"
 BASE_CHECKPOINT_CHECK = "base checkpoint"
 GRAFT_CHECK = "graft"
+
+
+NPU_ENV_CHECK = "npu environment"
+# Causes that say nothing about the model or the compiler: the run itself, and an error
+# in litetune's own script.
+NPU_RUN_CAUSES = ("run", "script")
+NPU_PUBLISH_CHECK = "npu files"
+
+
+def npu_check(soc: str) -> str:
+    return f"npu {soc}"
+
+
+def npu_artifact_name(soc: str) -> str:
+    """The artifact event name of an NPU file, which `ARTIFACT_NAME` would not tell apart."""
+    return f"{ARTIFACT_NAME} (npu {soc})"
+
+
+NPU_NOT_VERIFIED = (
+    "the NPU file was compiled, checked (one DISPATCH_OP per signature over one QNN context "
+    "no larger than twice the encoder's weights, stamped for its SoC, signatures unchanged) "
+    "and read back section by section; "
+    "what it embeds has not been measured, and `litetune verify` cannot measure it: "
+    "LiteRT-LM's CPU and GPU do not run a DISPATCH_OP. It needs a phone with that SoC and a "
+    "LiteRT-LM build with the Qualcomm dispatch and a QAIRT 2.50 runtime"
+)
+
 
 NOT_VERIFIED = (
     "the file was written and read back section by section; what it embeds has not been "
@@ -214,6 +252,12 @@ class EmbeddingExportRequest:
     timeout_s: int = GRAFT_TIMEOUT_S
     env: envs.StageEnv = envs.EXPORT
     auto_provision: bool = True
+    # `--npu`: Qualcomm SoCs to compile the int8 graft's text encoder for (embedding_npu).
+    npu: tuple[str, ...] = ()
+    npu_env: envs.StageEnv = envs.NPU_QUALCOMM
+    # Seconds each NPU compile may run; the NPU environment's provision has its own
+    # budget, `envs.PROVISION_TIMEOUT_S`.
+    npu_timeout_s: int = NPU_TIMEOUT_S
 
     def __post_init__(self) -> None:
         if self.weights not in WEIGHT_MODES:
@@ -222,6 +266,14 @@ class EmbeddingExportRequest:
             )
         if self.timeout_s < 1:
             raise EmbeddingExportError(f"timeout_s must be at least 1, got {self.timeout_s}")
+        if self.npu_timeout_s < 1:
+            raise EmbeddingExportError(
+                f"npu_timeout_s must be at least 1, got {self.npu_timeout_s}"
+            )
+        object.__setattr__(self, "npu", tuple(self.npu))
+        problem = request_problem(self.npu, self.weights)
+        if problem is not None:
+            raise EmbeddingExportError(problem)
         object.__setattr__(self, "model", Path(self.model))
         object.__setattr__(self, "output_dir", Path(self.output_dir))
         if self.base_litertlm is not None:
@@ -247,6 +299,11 @@ class EmbeddingExportRequest:
             "base_litertlm": str(self.base_litertlm) if self.base_litertlm else None,
             "timeout_s": self.timeout_s,
             "environment": {"name": self.env.name, "identity": self.env.identity},
+            "npu": list(self.npu),
+            "npu_timeout_s": self.npu_timeout_s if self.npu else None,
+            "npu_environment": (
+                {"name": self.npu_env.name, "identity": self.npu_env.identity} if self.npu else None
+            ),
         }
 
 
@@ -263,6 +320,14 @@ class EmbeddingExportResult:
     limitations: list[str] = field(default_factory=list)
     # `hash_file` of the fine-tune's safetensors, taken before the graft reads it.
     checkpoint_sha256: str | None = None
+    # `--npu`: one entry per SoC compiled, at its published path once all are.
+    npu: list[NpuResult] = field(default_factory=list)
+    npu_published: bool = False
+    # What publishing got to: each SoC whose directory this run created, with its result,
+    # and why publishing stopped. `_npus_on_disk` reads `npu` and `npu_published` from these
+    # and the disk when the report is written.
+    npu_created: dict[str, NpuResult] = field(default_factory=dict)
+    npu_publish_error: str | None = None
 
     @property
     def outcome(self) -> Outcome:
@@ -286,6 +351,8 @@ class EmbeddingExportResult:
             "prefix": self.record.prefix,
             "artifact": str(self.artifact) if self.artifact else None,
             "graft": self.graft.as_dict() if self.graft else None,
+            "npu": [r.as_dict() for r in self.npu],
+            "npu_published": self.npu_published if self.request.npu else None,
             "google_file": self.google,
             "base_checkpoint": self.base,
             "checkpoint": {
@@ -321,11 +388,16 @@ def _refuse_request(request: EmbeddingExportRequest, record: EmbeddingRecord) ->
         )
     if request.base_litertlm is not None and not request.base_litertlm.is_file():
         raise EmbeddingExportError(f"--base-litertlm {request.base_litertlm}: no such file")
-    if request.output.exists() or request.output.is_symlink():
-        raise EmbeddingExportError(
-            f"{request.output} already exists; name another --output-dir, nothing is written "
-            "over a file"
-        )
+    if request.npu:
+        problem = host_problem() or request.npu_env.refusal()
+        if problem is not None:
+            raise EmbeddingExportError(problem)
+    for target in [request.output] + [dir_for(request.output_dir, soc) for soc in request.npu]:
+        if target.exists() or target.is_symlink():
+            raise EmbeddingExportError(
+                f"{target} already exists; name another --output-dir, nothing is written "
+                "over a file"
+            )
 
 
 def run_embedding_export(
@@ -358,6 +430,8 @@ def run_embedding_export(
         _add(result, events, Check.unchecked(GRAFT_CHECK, f"{type(exc).__name__}: {exc}"))
         raise
     finally:
+        if request.npu:
+            _npus_on_disk(request, result, events)
         request.report_path.parent.mkdir(parents=True, exist_ok=True)
         request.report_path.write_text(
             json.dumps(result.as_dict(), indent=2, default=str) + "\n", encoding="utf-8"
@@ -473,6 +547,219 @@ def _run(
     )
     result.limitations.append(NOT_VERIFIED)
     events.artifact(str(grafted.output), name=ARTIFACT_NAME, verified=False)
+    if request.npu:
+        _compile_npus(request, result, events, grafted)
+
+
+def _compile_npus(
+    request: EmbeddingExportRequest,
+    result: EmbeddingExportResult,
+    events: EventStream,
+    grafted: GraftResult,
+) -> None:
+    """Every `--npu` SoC compiled into a staging directory beside the outputs; when all of
+    them compiled, each published into a directory of its own with its report
+    (`_publish_npus`). Nothing published is ever removed or moved again."""
+    with guard(NPU_ENV_CHECK) as sink:
+        if request.auto_provision:
+            request.npu_env.provision(events=events)
+        sink.append(
+            Check.passed(
+                NPU_ENV_CHECK,
+                f"{request.npu_env.name} ({request.npu_env.identity}) ready at "
+                f"{request.npu_env.path}",
+            )
+            if request.npu_env.ready
+            else Check.unchecked(
+                NPU_ENV_CHECK,
+                f"environment {request.npu_env.name!r} {request.npu_env.unready_detail}",
+            )
+        )
+    if not _add(result, events, sink[0]).conclusive:
+        result.limitations.append(f"no NPU file was compiled: {sink[0].detail}")
+        return
+    request.output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".litetune-npu-stage-", dir=request.output_dir) as tmp:
+        staged = [
+            r
+            for soc in request.npu
+            if (r := _compile_npu(request, result, events, grafted.output, soc, Path(tmp)))
+        ]
+        if len(staged) != len(request.npu):
+            failed = [soc for soc in request.npu if soc not in {r.soc for r in staged}]
+            result.limitations.append(
+                f"no NPU file was published: {', '.join(failed)} did not compile. Run again "
+                "with another --output-dir"
+            )
+            return
+        _publish_npus(request, result, staged)
+
+
+def _mkdir(target: Path) -> None:
+    """The SoC's directory, created by this run or not at all: an existing one -- made
+    since the check before the compile -- is a FileExistsError, and nothing is replaced."""
+    os.mkdir(target)
+
+
+def _place(source: Path, target: Path) -> None:
+    """One staged file put into the SoC's new directory without replacing anything: a
+    hard link fails with FileExistsError where a file of that name appeared, which a
+    rename would overwrite. Then the staged name is removed. Staging is inside the
+    output directory, so both are on one filesystem."""
+    os.link(source, target)
+    source.unlink()
+
+
+def _write_report(path: Path, report: dict[str, Any]) -> None:
+    path.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+
+
+def _publish_npus(
+    request: EmbeddingExportRequest, result: EmbeddingExportResult, staged: list[NpuResult]
+) -> None:
+    """Each staged SoC published in turn: its report written in staging, its directory
+    created exclusively, the model and then the report linked into it. The first failure
+    stops the rest; an OSError is recorded, anything else (an interrupt) goes on once it
+    is. Nothing is rolled back: what reached the disk is what the report says, read from
+    the disk (`_npus_on_disk`)."""
+    try:
+        for compiled in staged:
+            target = dir_for(request.output_dir, compiled.soc)
+            published = compiled.moved_to(target / ARTIFACT_NAME)
+            staged_report = compiled.output.parent / REPORT_NAME
+            _write_report(staged_report, npu_report(result, published))
+            # Recorded before the mkdir, so an interrupt right after it still names the
+            # directory; taken back if the directory was not ours to make. The directory is
+            # identified by its path: one deleted and recreated by someone else meanwhile
+            # would read as this run's.
+            result.npu_created[compiled.soc] = published
+            try:
+                _mkdir(target)
+            except FileExistsError:
+                del result.npu_created[compiled.soc]
+                raise
+            _place(compiled.output, target / ARTIFACT_NAME)
+            _place(staged_report, target / REPORT_NAME)
+    except BaseException as exc:
+        logger.exception("publishing the NPU files stopped")
+        result.npu_publish_error = f"{type(exc).__name__}: {exc}"
+        if not isinstance(exc, OSError):
+            raise
+
+
+def _npus_on_disk(
+    request: EmbeddingExportRequest, result: EmbeddingExportResult, events: EventStream
+) -> None:
+    """`npu` and `npu_published` from the disk: an SoC counts as published when the
+    directory this run created holds a report whose `npu.sha256` is the model's there.
+    A directory it created that does not is named as partial; none is removed."""
+    published, partial = [], []
+    for npu in result.npu_created.values():
+        if _published_whole(npu.output):
+            published.append(npu)
+        else:
+            partial.append(str(npu.output.parent))
+    result.npu = published
+    result.npu_published = bool(request.npu) and len(published) == len(request.npu)
+    for npu in published:
+        events.artifact(str(npu.output), name=npu_artifact_name(npu.soc), verified=False)
+        events.artifact(str(npu.output.parent / REPORT_NAME), name=f"{REPORT_NAME} (npu {npu.soc})")
+    if published:
+        result.limitations.append(NPU_NOT_VERIFIED)
+    if result.npu_publish_error is None and not partial:
+        if published:
+            _add(result, events, Check.passed(NPU_PUBLISH_CHECK, f"{len(published)} published"))
+        return
+    detail = f"published {len(published)} of {len(request.npu)}"
+    if result.npu_publish_error:
+        detail += f"; publishing stopped on {result.npu_publish_error}"
+    if partial:
+        detail += f"; written in part, left as they are: {', '.join(partial)}"
+    _add(result, events, Check.unchecked(NPU_PUBLISH_CHECK, f"run: {detail}"))
+    result.limitations.append(f"{detail}. Run the rest with another --output-dir")
+
+
+def _published_whole(model: Path) -> bool:
+    """Whether `model`'s directory holds it and a report naming its sha256."""
+    try:
+        report = json.loads((model.parent / REPORT_NAME).read_text(encoding="utf-8"))
+        return model.is_file() and f"sha256:{report['npu']['sha256']}" == hash_file(model)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def npu_report(result: EmbeddingExportResult, npu: NpuResult) -> dict[str, Any]:
+    """The report beside an NPU file: what it was compiled from, what it is, and that it
+    is not verified. `kind` "npu" and `npu.sha256` are what `verify` reads to refuse it."""
+    whole = result.as_dict()
+    return {
+        "schema": EMBEDDING_CONVERT_SCHEMA,
+        "direction": "embedding",
+        "kind": "npu",
+        "verified": False,
+        "outcome": Outcome.PASSED.value,
+        "weights": result.request.weights,
+        "prefix": result.record.prefix,
+        "artifact": str(npu.output),
+        "npu": npu.as_dict(),
+        "signatures": list(NPU_SIGNATURES),
+        "source_graft": whole["graft"],
+        "google_file": result.google,
+        "checkpoint": whole["checkpoint"],
+        "request": result.request.as_dict(),
+        "limitations": [NPU_NOT_VERIFIED],
+    }
+
+
+def _compile_npu(
+    request: EmbeddingExportRequest,
+    result: EmbeddingExportResult,
+    events: EventStream,
+    grafted: Path,
+    soc: str,
+    stage: Path,
+) -> NpuResult | None:
+    """The int8 graft's text encoder compiled for `soc` into `stage`, as one check; its
+    result, or None. Anything that escapes the compile is this SoC's, as `run`."""
+    name = npu_check(soc)
+    try:
+        compiled = compile_for_npu(
+            request.npu_env,
+            grafted,
+            soc,
+            stage / soc / ARTIFACT_NAME,
+            events=events,
+            auto_provision=False,
+            timeout=request.npu_timeout_s,
+        )
+    except EmbeddingNpuError as exc:
+        logger.error("the %s compile stopped (%s): %s", soc, exc.cause, exc)
+        make = Check.unchecked if exc.cause in NPU_RUN_CAUSES else Check.failed
+        _add(result, events, make(name, f"{exc.cause}: {exc}", observed={"cause": exc.cause}))
+        return None
+    except Exception as exc:  # noqa: BLE001 -- the SoC's own check, the others go on
+        logger.exception("the %s compile raised", soc)
+        _add(
+            result,
+            events,
+            Check.unchecked(name, f"run: {type(exc).__name__}: {exc}", observed={"cause": "run"}),
+        )
+        return None
+    context = compiled.report["qnn_context"]
+    _add(
+        result,
+        events,
+        Check.passed(
+            name,
+            f"{compiled.bytes:,} bytes; the text encoder ({compiled.encoder_bytes:,} bytes) one "
+            f"DISPATCH_OP per signature over one {context['bytecode_size']:,}-byte QNN context, "
+            f"{context['to_weights']}x the encoder's weight bytes (gate: {context['gate']}), "
+            f"stamped for {'/'.join(compiled.report['stamp'])}, QAIRT {compiled.report['qairt']}; "
+            f"compiled in {compiled.compile_s:.0f} s, read back",
+            observed={"sha256": compiled.sha256, "bytes": compiled.bytes},
+        ),
+    )
+    return compiled
 
 
 def summarise(result: EmbeddingExportResult) -> list[str]:
@@ -483,6 +770,10 @@ def summarise(result: EmbeddingExportResult) -> list[str]:
     ]
     if result.graft is not None:
         lines.append(f"  {result.graft.bytes:,} bytes — {result.graft.output}")
+    for npu in result.npu:
+        lines.append(f"  {npu.soc} NPU: {npu.bytes:,} bytes — {npu.output}")
+        if npu.as_dict()["device_run"]:
+            lines.append(f"    on a device: {npu.as_dict()['device_run']}")
     for check in result.checks.checks:
         if check.outcome is not Outcome.PASSED:
             lines.append(f"  {check.outcome.value}: {check.name} — {check.detail}")

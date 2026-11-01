@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import re
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from packaging.markers import default_environment
@@ -113,6 +113,19 @@ class Release:
     files: tuple[str, ...]
     # The `==` requirements without a marker in this release's own metadata.
     requires: tuple[str, ...] = ()
+    # Why this release is meant to be built from its source distribution, for a
+    # pin that publishes no wheel at all; empty for every other. This table reads
+    # PyPI's file lists and calls a pin with no wheel for a host a gap; pip itself
+    # would build an sdist unless told not to. A release with a reason here is not a
+    # gap on the hosts `source_build_on` accepts, and is one everywhere else.
+    source_build: str = ""
+    # Whether `host` is one this release's source build is meant for.
+    source_build_on: Callable[[Host], bool] | None = None
+
+    def built_from_source_on(self, host: Host) -> bool:
+        return bool(
+            self.source_build and self.sdist and self.source_build_on and self.source_build_on(host)
+        )
 
     @property
     def sdist(self) -> bool:
@@ -256,6 +269,11 @@ def without_marker(requirement: str) -> str:
     return str(parsed)
 
 
+def canonical_pin(requirement: str) -> str | None:
+    """`name==version` in canonical spelling, the key of `PUBLISHED`, or None."""
+    return _key(requirement)
+
+
 def _key(requirement: str) -> str | None:
     """`name==version` in canonical spelling, or None for a requirement that is not one."""
     pinned = pin(requirement)
@@ -308,7 +326,7 @@ def gaps(
         seen.add(key)
         release = table[key]
         pending.extend((r, release.requirement) for r in release.requires)
-        if release.installs_on(host):
+        if release.installs_on(host) or release.built_from_source_on(host):
             continue
         found.append(Gap(release, host, release.minors_on(host), required_by=parent))
     return found
@@ -322,6 +340,12 @@ def gaps(
 # To read a new pin in: its `urls[].filename`, sorted,
 # and the entries of `info.requires_dist` that are `name==version` with no `;`.
 # ---------------------------------------------------------------------------
+
+
+def linux_x86_64(host: Host) -> bool:
+    """Whether `host` accepts a Linux x86-64 wheel (a manylinux or plain linux tag)."""
+    return any("linux" in tag.platform and tag.platform.endswith("x86_64") for tag in host.tags)
+
 
 _RELEASES = (
     Release(
@@ -341,6 +365,48 @@ _RELEASES = (
             "litert_lm_api-0.18.0-py3-none-manylinux_2_27_x86_64.whl",
             "litert_lm_api-0.18.0-py3-none-win_amd64.whl",
         ),
+    ),
+    # envs.NPU_QUALCOMM's, read 2026-10-31.
+    Release(
+        "ai-edge-litert==2.3.0",
+        "https://pypi.org/pypi/ai-edge-litert/2.3.0/json",
+        files=(
+            "ai_edge_litert-2.3.0-cp310-cp310-macosx_12_0_arm64.whl",
+            "ai_edge_litert-2.3.0-cp310-cp310-manylinux_2_27_aarch64.whl",
+            "ai_edge_litert-2.3.0-cp310-cp310-manylinux_2_27_x86_64.whl",
+            "ai_edge_litert-2.3.0-cp310-cp310-win_amd64.whl",
+            "ai_edge_litert-2.3.0-cp311-cp311-macosx_12_0_arm64.whl",
+            "ai_edge_litert-2.3.0-cp311-cp311-manylinux_2_27_aarch64.whl",
+            "ai_edge_litert-2.3.0-cp311-cp311-manylinux_2_27_x86_64.whl",
+            "ai_edge_litert-2.3.0-cp311-cp311-win_amd64.whl",
+            "ai_edge_litert-2.3.0-cp312-cp312-macosx_12_0_arm64.whl",
+            "ai_edge_litert-2.3.0-cp312-cp312-manylinux_2_27_aarch64.whl",
+            "ai_edge_litert-2.3.0-cp312-cp312-manylinux_2_27_x86_64.whl",
+            "ai_edge_litert-2.3.0-cp312-cp312-win_amd64.whl",
+            "ai_edge_litert-2.3.0-cp313-cp313-macosx_12_0_arm64.whl",
+            "ai_edge_litert-2.3.0-cp313-cp313-manylinux_2_27_aarch64.whl",
+            "ai_edge_litert-2.3.0-cp313-cp313-manylinux_2_27_x86_64.whl",
+            "ai_edge_litert-2.3.0-cp313-cp313-win_amd64.whl",
+            "ai_edge_litert-2.3.0-cp314-cp314-macosx_12_0_arm64.whl",
+            "ai_edge_litert-2.3.0-cp314-cp314-manylinux_2_27_aarch64.whl",
+            "ai_edge_litert-2.3.0-cp314-cp314-manylinux_2_27_x86_64.whl",
+            "ai_edge_litert-2.3.0-cp314-cp314-win_amd64.whl",
+        ),
+    ),
+    Release(
+        "ai-edge-litert-sdk-qualcomm==2.3.0",
+        "https://pypi.org/pypi/ai-edge-litert-sdk-qualcomm/2.3.0/json",
+        files=("ai_edge_litert_sdk_qualcomm-2.3.0.tar.gz",),
+        source_build_on=linux_x86_64,
+        source_build=(
+            "it is published as a source distribution only, and its setup.py downloads QAIRT "
+            "2.50.0.260828 from Qualcomm's software center while it builds"
+        ),
+    ),
+    Release(
+        "flatbuffers==25.12.19",
+        "https://pypi.org/pypi/flatbuffers/25.12.19/json",
+        files=("flatbuffers-25.12.19-py2.py3-none-any.whl",),
     ),
     Release(
         "litert-lm-builder==0.18.0",
