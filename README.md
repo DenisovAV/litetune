@@ -929,8 +929,8 @@ litetune convert --model ./tuned/model --output-dir ./out --npu SM8750 \
 - **Families:** `gemma-3-text` (270M), `qwen-3` (0.6B), `qwen-2.5` (0.5B) and `minicpm5`
   (1B), the families and sizes whose bundles have run on an SM8750 NPU through these stages
   (how, under *What it cannot check*). A checkpoint is sized by the parameters in its own
-  safetensors, at most twice its family's measured count, and by its name only when it has
-  none; a larger size of the same family is refused, as is any other family — Gemma 4 and Qwen 3.5 with the defect that
+  safetensors besides the output layer, within 1% of its family's measured count (room for
+  added tokens), and by its name only when it has none; a larger size of the same family is refused, as is any other family — Gemma 4 and Qwen 3.5 with the defect that
   stops them, FunctionGemma because tool prompts have not been measured on this toolchain. **Generation only:** a decision checkpoint is refused —
   option scoring rewinds the session to the prompt once per option, and LiteRT-LM's NPU
   executor rolls back one token only.

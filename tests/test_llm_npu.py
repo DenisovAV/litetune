@@ -441,22 +441,52 @@ def test_a_compiled_graph_must_be_one_dispatch_op_per_signature_and_stamped(scri
         check(good, "SM8650", sigs)
 
 
-def test_the_aux_graph_needs_its_masks_dispatched_and_keeps_its_cache_updates(script):
-    aux = {
-        "ops": {
-            "prefill_cache_update_128": {"DYNAMIC_UPDATE_SLICE": 4},
-            "decode_cache_update": {"DYNAMIC_UPDATE_SLICE": 4},
-            "prefill_mask_128": {"DISPATCH_OP": 1},
-            "decode_mask": {"DISPATCH_OP": 1},
-        },
-        "stamp": _stamp("SM8750"),
+AUX_BEFORE = {
+    "prefill_cache_update_128": {"DYNAMIC_UPDATE_SLICE": 4},
+    "decode_cache_update": {"DYNAMIC_UPDATE_SLICE": 4},
+    "prefill_mask_128": {"LESS": 1, "SELECT_V2": 1},
+    "decode_mask": {"LESS": 1, "SELECT_V2": 1},
+}
+
+
+def _aux(**ops):
+    compiled = {
+        **AUX_BEFORE,
+        "prefill_mask_128": {"DISPATCH_OP": 1},
+        "decode_mask": {"DISPATCH_OP": 1},
     }
-    assert script["check_compiled_aux"](aux, "SM8750", 128) == ["Qualcomm", "SM8750"]
-    with pytest.raises(script["Refused"], match="stamped"):
-        script["check_compiled_aux"](aux, "SM8650", 128)
-    aux["ops"]["decode_mask"] = {"LESS": 1}
-    with pytest.raises(script["Refused"], match="decode_mask"):
-        script["check_compiled_aux"](aux, "SM8750", 128)
+    return {"ops": {k: v for k, v in {**compiled, **ops}.items() if v is not None},
+            "stamp": _stamp("SM8750")}
+
+
+def test_the_aux_graph_needs_its_masks_dispatched_and_keeps_its_cache_updates(script):
+    check, refused = script["check_compiled_aux"], script["Refused"]
+    assert check(_aux(), "SM8750", 128, AUX_BEFORE) == ["Qualcomm", "SM8750"]
+    with pytest.raises(refused, match="stamped"):
+        check(_aux(), "SM8650", 128, AUX_BEFORE)
+    with pytest.raises(refused, match="decode_mask"):
+        check(_aux(decode_mask={"LESS": 1}), "SM8750", 128, AUX_BEFORE)
+    with pytest.raises(refused, match="decode_cache_update"):
+        check(_aux(decode_cache_update={"DISPATCH_OP": 1}), "SM8750", 128, AUX_BEFORE)
+
+
+@pytest.mark.parametrize(
+    "ops",
+    [
+        {"decode_cache_update": None},
+        {"prefill_mask_256": {"DISPATCH_OP": 1}},
+    ],
+)
+def test_the_aux_graph_keeps_stage_3s_signatures_exactly(script, ops):
+    with pytest.raises(script["Refused"], match="stage 3's"):
+        script["check_compiled_aux"](_aux(**ops), "SM8750", 128, AUX_BEFORE)
+
+
+def test_an_aux_graph_without_the_masks_is_refused(script):
+    before = {k: v for k, v in AUX_BEFORE.items() if "mask" not in k}
+    compiled = {"ops": dict(before), "stamp": _stamp("SM8750")}
+    with pytest.raises(script["Refused"], match="signatures are"):
+        script["check_compiled_aux"](compiled, "SM8750", 128, before)
 
 
 def test_decode_summary_says_how_far_the_calibration_replies_ran(script):
@@ -466,6 +496,8 @@ def test_decode_summary_says_how_far_the_calibration_replies_ran(script):
         "count": 3, "cap": 128, "min_steps": 7, "median_steps": 40, "max_steps": 128,
         "full": 1, "longest_position": 1000,
     }
+    record.append({"steps": 9, "position": 70})
+    assert script["decode_summary"](record, 128)["median_steps"] == 24.5
     assert script["decode_summary"]([], 128) is None
 
 
@@ -632,7 +664,9 @@ def _checkpoint(
     model.mkdir()
     (model / "config.json").write_text(json.dumps({"model_type": model_type}))
     if shapes is not False:
-        _safetensors(model / "model.safetensors", shapes or {"w": [640, 1000]})
+        family = {"gemma3_text": "gemma-3-text", "qwen2": "qwen-2.5"}.get(model_type)
+        default = {"w": [llm_npu.MEASURED_PARAMETERS[family]]} if family else {"w": [1]}
+        _safetensors(model / "model.safetensors", shapes or default)
     (model / "litetune.json").write_text(
         json.dumps({"base_model": base, "prompt_mode": "runtime_rendered", **record})
     )
@@ -995,24 +1029,59 @@ def test_an_unmeasured_family_or_size_is_refused_before_anything_runs(
     assert result.outcome is Outcome.UNCHECKED and fake.specs == []
 
 
-def test_the_checkpoints_own_parameter_count_gates_its_size(monkeypatch, tmp_path, ready_env):
-    # gemma-3-1b's weights under a 270m name: refused by what they are.
-    ceiling = llm_npu.MEASURED_PARAMETERS["gemma-3-text"] * llm_npu.PARAMETER_HEADROOM
+@pytest.mark.parametrize("offset", [-1, 1])
+def test_a_count_outside_the_band_is_refused(monkeypatch, tmp_path, ready_env, offset):
+    # Another size's weights under a 270m name: refused by what they are.
+    low, high = llm_npu.parameter_band("gemma-3-text")
+    count = low - 1 if offset < 0 else high + 1
     fake = FakeRun()
-    model = _checkpoint(tmp_path, shapes={"a": [ceiling // 2], "b": [ceiling // 2 + 1]})
+    model = _checkpoint(tmp_path, shapes={"a": [count // 2], "b": [count - count // 2]})
     result = _run(tmp_path, model, fake=fake, monkeypatch=monkeypatch)
     assert result.outcome is Outcome.UNCHECKED and fake.specs == []
-    assert f"{ceiling + 1:,} parameters" in result.checks.checks[0].detail
+    assert f"{count:,} parameters" in result.checks.checks[0].detail
 
 
-def test_a_checkpoint_at_the_ceiling_is_accepted_and_its_count_reported(
-    monkeypatch, tmp_path, ready_env
+@pytest.mark.parametrize("edge", ["low", "high"])
+def test_a_count_at_the_bands_edge_is_accepted_and_reported(
+    monkeypatch, tmp_path, ready_env, edge
 ):
-    ceiling = llm_npu.MEASURED_PARAMETERS["gemma-3-text"] * llm_npu.PARAMETER_HEADROOM
-    model = _checkpoint(tmp_path, shapes={"a": [ceiling // 2], "b": [ceiling - ceiling // 2]})
+    low, high = llm_npu.parameter_band("gemma-3-text")
+    count = low if edge == "low" else high
+    model = _checkpoint(tmp_path, shapes={"a": [count]})
     result = _run(tmp_path, model, fake=FakeRun(), monkeypatch=monkeypatch)
     assert result.outcome is Outcome.PASSED
-    assert result.as_dict()["parameters"] == ceiling
+    assert result.as_dict()["parameters"] == count
+
+
+def test_the_band_is_one_percent_around_each_measured_count():
+    for family, measured in llm_npu.MEASURED_PARAMETERS.items():
+        low, high = llm_npu.parameter_band(family)
+        assert low <= measured * 0.99 + 1 and high >= measured * 1.01 - 1
+        assert high - low <= measured * 0.02 + 2
+
+
+def test_a_stored_output_layer_does_not_count(tmp_path):
+    # Qwen3-0.6B's own file: a tied lm_head stored anyway.
+    _safetensors(tmp_path / "model.safetensors",
+                 {"model.layers": [596_049_920], "lm_head.weight": [151_936, 1_024]})
+    assert llm_npu.checkpoint_parameters(tmp_path) == llm_npu.MEASURED_PARAMETERS["qwen-3"]
+    assert llm_npu.family_problem("qwen-3", "Qwen/Qwen3-0.6B", 596_049_920) is None
+
+
+@pytest.mark.parametrize(
+    "header",
+    [b"[]", b'"x"', b'{"w": []}', b'{"w": {"shape": "640"}}', b'{"w": {"shape": [2, -1]}}',
+     b'{"w": {"shape": [true]}}', b'{"w": {}}'],
+)
+def test_a_header_that_is_not_safetensors_is_could_not_check(
+    monkeypatch, tmp_path, ready_env, header
+):
+    model = _checkpoint(tmp_path)
+    (model / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header)
+    fake = FakeRun()
+    result = _run(tmp_path, model, fake=fake, monkeypatch=monkeypatch)
+    assert result.outcome is Outcome.UNCHECKED and fake.specs == []
+    assert "safetensors header cannot be read" in result.checks.checks[0].detail
     assert not any("no safetensors" in t for t in result.limitations)
 
 

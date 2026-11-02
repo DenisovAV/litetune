@@ -118,18 +118,22 @@ MEASURED_SIZES: dict[str, str] = {
     "qwen-2.5": r"(?<![\d.])0[.-]5b",
     "minicpm5": r"(?<![\d.])1b",
 }
-# Parameters in each measured checkpoint's safetensors (the Hugging Face files of
-# FAMILIES' models, counted from their headers).
+# Parameters in each measured checkpoint's safetensors without `lm_head.*` (the Hugging Face
+# files of FAMILIES' models, counted from their headers). The output layer is left out because
+# whether a file stores it is a choice of the saver, not of the model: Qwen3-0.6B's file holds
+# a 151,936 x 1,024 `lm_head.weight` (155,582,464) although its config ties it, MiniCPM5-1B's
+# an untied 130,560 x 1,536 (200,540,160), gemma-3-270m-it's and Qwen2.5-0.5B-Instruct's none.
 MEASURED_PARAMETERS: dict[str, int] = {
     "gemma-3-text": 268_098_176,
-    "qwen-3": 751_632_384,
+    "qwen-3": 596_049_920,
     "qwen-2.5": 494_032_768,
-    "minicpm5": 1_080_632_832,
+    "minicpm5": 880_092_672,
 }
-# A checkpoint may hold up to this many times its family's measured count: room for an output
-# layer saved untied from the embedding, and still below the next published size of each
-# family (gemma-3 1B, Qwen3 1.7B, Qwen2.5 1.5B).
-PARAMETER_HEADROOM = 2
+# A fine-tune of the measured model has its count exactly; the band leaves room for a
+# vocabulary grown by added tokens, 1% being 4,189 rows of gemma-3-270m's 640-wide embedding,
+# 5,820 of Qwen3-0.6B's 1,024, 5,513 of Qwen2.5-0.5B's 896 and 5,729 of MiniCPM5-1B's 1,536.
+# Any other size of these families is far outside it.
+PARAMETER_BAND = 0.01
 # Families that are known not to work here, or not measured on this toolchain, and why.
 BLOCKED: dict[str, str] = {
     "gemma-4-e2b": (
@@ -214,8 +218,9 @@ def _normalised(text: str) -> str:
 
 
 def checkpoint_parameters(model: Path) -> int | None:
-    """The parameter count in a checkpoint directory's safetensors, read from their headers;
-    `None` when it has none. Raises `ValueError` on a header that cannot be read."""
+    """The parameter count in a checkpoint directory's safetensors without `lm_head.*`, read
+    from their headers; `None` when it has none. Raises `ValueError` on a header that cannot be
+    read or is not a safetensors header."""
     if not model.is_dir():
         return None
     files = sorted(model.glob("*.safetensors"))
@@ -229,14 +234,28 @@ def checkpoint_parameters(model: Path) -> int | None:
                 if size > 100 << 20:
                     raise ValueError(f"a {size:,}-byte header")
                 header = json.loads(f.read(size))
-            total += sum(
-                math.prod(entry["shape"])
-                for name, entry in header.items()
-                if name != "__metadata__"
-            )
-        except (OSError, struct.error, ValueError, TypeError, KeyError) as exc:
+            if not isinstance(header, dict):
+                raise ValueError(f"the header is a {type(header).__name__}, not an object")
+            for name, entry in header.items():
+                if name == "__metadata__" or name.startswith("lm_head."):
+                    continue
+                shape = entry.get("shape") if isinstance(entry, dict) else None
+                if not (
+                    isinstance(shape, list)
+                    and all(isinstance(d, int) and not isinstance(d, bool) and d >= 0
+                            for d in shape)
+                ):
+                    raise ValueError(f"tensor {name!r} has no shape of non-negative integers")
+                total += math.prod(shape)
+        except (OSError, struct.error, ValueError) as exc:
             raise ValueError(f"{path.name}: the safetensors header cannot be read: {exc}") from exc
     return total
+
+
+def parameter_band(family: str) -> tuple[int, int]:
+    """The parameter counts (without `lm_head.*`) accepted as `family`'s measured size."""
+    measured = MEASURED_PARAMETERS[family]
+    return math.floor(measured * (1 - PARAMETER_BAND)), math.ceil(measured * (1 + PARAMETER_BAND))
 
 
 def family_problem(
@@ -255,14 +274,14 @@ def family_problem(
             "family is refused rather than compiled on trust"
         )
     if parameters is not None:
-        ceiling = MEASURED_PARAMETERS[family] * PARAMETER_HEADROOM
-        if parameters > ceiling:
+        low, high = parameter_band(family)
+        if not low <= parameters <= high:
             return (
-                f"--npu: {identity} is {family} with {parameters:,} parameters; measured here "
-                f"at {FAMILIES[family]} ({MEASURED_PARAMETERS[family]:,}) only, and a checkpoint "
-                f"over {ceiling:,} is a larger size that has not compiled on this path (a "
-                "stage-3 graph over 2 GiB cannot be repacked), so it is refused rather than "
-                "compiled on trust"
+                f"--npu: {identity} is {family} with {parameters:,} parameters besides its "
+                f"output layer; measured here at {FAMILIES[family]} "
+                f"({MEASURED_PARAMETERS[family]:,}) only, and a checkpoint outside "
+                f"{low:,}-{high:,} is another size that has not compiled on this path, so it "
+                "is refused rather than compiled on trust"
             )
         return None
     if not re.search(MEASURED_SIZES[family], _normalised(identity)):
@@ -995,6 +1014,7 @@ import json
 import os
 import random
 import re
+import statistics
 import sys
 import time
 import traceback
@@ -1297,10 +1317,26 @@ def describe(s, path):
     return {"ops": ops, "stamp": stamp, "qairt": found.group(1).decode() if found else None}
 
 
-def check_compiled_aux(described, soc, prefill_length):
-    """The compiled aux graph: its two mask signatures one DISPATCH_OP each, its cache-update
-    signatures left as they are, and the SoC's stamp. Raises Refused; returns the stamp."""
-    return check_compiled(described, soc, compiled_signatures(prefill_length)[1], only=False)
+def check_compiled_aux(described, soc, prefill_length, before):
+    """The compiled aux graph against stage 3's (`before`, its op counts per signature): the
+    same signatures, the two masks one DISPATCH_OP each, every other signature (the cache
+    updates) without one, left on the CPU as the compiler chose, and the SoC's stamp. Raises
+    Refused; returns the stamp."""
+    masks = compiled_signatures(prefill_length)[1]
+    if sorted(described["ops"]) != sorted(before):
+        raise Refused(
+            "partitioned",
+            f"the compiled aux graph's signatures are {sorted(described['ops'])}, stage 3's "
+            f"{sorted(before)}",
+        )
+    stamp = check_compiled(described, soc, masks, only=False)
+    for key, ops in described["ops"].items():
+        if key not in masks and "DISPATCH_OP" in ops:
+            raise Refused(
+                "partitioned",
+                f"aux signature {key} compiled to {ops}; only {masks} are compiled for the NPU",
+            )
+    return stamp
 
 
 def decode_summary(record, cap):
@@ -1313,7 +1349,7 @@ def decode_summary(record, cap):
         "count": len(steps),
         "cap": cap,
         "min_steps": steps[0],
-        "median_steps": steps[len(steps) // 2],
+        "median_steps": statistics.median(steps),
         "max_steps": steps[-1],
         "full": sum(1 for n in steps if n >= cap),
         "longest_position": max((r["position"] for r in record), default=0),
@@ -1496,6 +1532,9 @@ def main(spec):
     timed("stage3", lambda: stages.npu_quantize(cfg, stage1, stage3, calib_result))
     reference = lb.unpack_litertlm(stage3, os.path.join(work, "unpacked-stage3"))
     main_signatures, _ = compiled_signatures(spec["prefill_length"])
+    aux_before = (
+        describe(s, reference["tf_lite_aux"])["ops"] if reference.get("tf_lite_aux") else None
+    )
 
     def read_compiled(soc, out):
         unpacked = lb.unpack_litertlm(out, os.path.join(work, "unpacked-" + soc))
@@ -1514,11 +1553,11 @@ def main(spec):
             "metadata": compare_metadata(unpacked, reference, _sha),
             "aux": None,
         }
-        if reference.get("tf_lite_aux"):
+        if aux_before is not None:
             if not unpacked.get("tf_lite_aux"):
                 raise Refused("compiled", "the compiled bundle has no aux graph; stage 3 had one")
             aux = describe(s, unpacked["tf_lite_aux"])
-            check_compiled_aux(aux, soc, spec["prefill_length"])
+            check_compiled_aux(aux, soc, spec["prefill_length"], aux_before)
             entry["aux"] = {"ops": aux["ops"]}
         return entry
 
