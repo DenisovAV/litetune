@@ -1,102 +1,36 @@
 import 'package:jaspr/dom.dart';
 import 'package:jaspr/jaspr.dart';
 
+import '../../models/embedding_models.dart';
+import '../../models/llm_models.dart';
+import '../../models/models_page.dart';
 import '../../theme/brand.dart';
 
-/// One end-to-end run, as the card and its panel say it.
-///
-/// `revision` is null where `MEASUREMENTS.md` pins none -- FunctionGemma's
-/// runs record the dataset and the split but never a base-model commit -- and
-/// the panel omits the line rather than showing an empty one or a revision
-/// nobody wrote down. `anchor` is GitHub's own heading anchor for the section
-/// that measured this model; `measured_cards_test.dart` checks that the
-/// section still exists and still names this checkpoint.
-typedef MeasuredRun = ({
-  String name,
-  String what,
-  String how,
-  String hubId,
-  String? revision,
-  String anchor,
-});
-
-/// The one paragraph that explains the tool's reason to exist, and the runs
-/// where it was actually done.
+/// The one paragraph that explains the tool's reason to exist, and a pointer
+/// to the runs where it was actually done.
 ///
 /// The paragraph carries no numbers, deliberately: the measured figures live
 /// in MEASUREMENTS.md, where a reader can see the intervals and the sample
 /// sizes next to them, and quoting a single score here would be the kind of
 /// decontextualised claim the tool exists to argue against.
 ///
-/// The cards below it hold to the same rule. The only quantity on them is a
-/// sample size, which is the thing a claim needs rather than a claim itself,
-/// and no card carries a score or a verdict. That is not squeamishness:
-/// `MEASUREMENTS.md` records the FunctionGemma conversion cost resolving in
-/// 2 of 6 recipe-runs across three runs of the same configuration, calls
-/// whether 640 examples resolve it "close to a coin flip", and says in terms
-/// that one run's verdict should not be quoted as the answer. A card is the
-/// shortest place there is to quote a verdict, so it quotes none.
-///
-/// A card carries the model, the scorer and the sample size, and stops there.
-/// It used to carry a third line apiece -- a phone run, a refused base, an
-/// export that needed no flag -- and four cards' worth of those read as
-/// footnotes rather than as one fact each, with nothing shared to compare
-/// across. What is worth saying about a single run is worth a sentence in
-/// `MEASUREMENTS.md`, which the link below the cards goes to.
-///
-/// The note under the cards keeps the two execution sides separate: every
-/// headline candidate ran on LiteRT-LM's CPU backend, while some float
-/// references ran on CUDA. Four-bit results cover four of the fine-tuned
-/// models rather than all twelve (Gemma 4's is on its base weights). The separate Qwen3 phone run is named because its CPU and GPU results
-/// resolve in opposite directions between the eight-bit and mixed four-bit
-/// recipes; a blanket "four bits cost more" would therefore be false.
-///
-/// The size is in the card name because `models.py` scopes the `gemma-3-text`
-/// family to the 270M and the 1B, and both are now measured -- two cards that
-/// differ in nothing but size. Qwen3's cards carry their sizes because its rule
-/// is scoped to the sizes that were run, and Qwen2.5's for the same reason,
-/// where the rule is scoped to the sizes *and* variant.
-///
-/// Each card opens a panel. It says what the model is and what it is for,
-/// names the checkpoint the run actually used -- the Hub id and, where
-/// `MEASUREMENTS.md` pins one, the revision -- and links to the model on the
-/// Hub and to the section that measured it. It
-/// carries no score either, for the reason the face of the card carries none:
-/// a panel one click deep is still the shortest place there is to quote a
-/// verdict, and a reader who wants the number is one link from the table with
-/// its interval, its sample size and its refusals next to it.
-///
-/// The panel opens over the page rather than under the card, and it does it
-/// with `:target` -- the card is a link to the panel's own id, and CSS shows
-/// that panel while the URL names it. No `@client` component, no island, no
-/// script: the site builds in `static` mode and this page is not the one that
-/// ends that. `<dialog>` would have been the semantically right element and
-/// needs `showModal()` to behave as one, which is the trade this makes.
-///
-/// What that costs, said plainly. There is no focus trap and no
-/// Escape-to-close, because both are JavaScript; closing is a link, of which
-/// there are two -- the scrim behind the panel and the × in its corner -- and
-/// both are reachable from the keyboard. Opening a panel puts a fragment in
-/// the URL, so a reader who opened one and shared the address shares it open.
-/// On paper nothing is open, as before.
-///
-/// `role="dialog"` labels the element. `aria-modal="true"` does not describe
-/// the styling -- it tells assistive tech to treat everything outside as
-/// inert, which nothing here makes true; it is set as the same trade as the
-/// missing focus trap. `tabindex="-1"` is what makes the panel a focusable
-/// area, so navigating to the fragment lands focus on it rather than leaving
-/// it on the card behind.
+/// The model cards that used to follow it are on `/models` now (see
+/// `lib/models/`). One card per family made this page grow with every
+/// release; what stays is one line whose counts come from the lists the
+/// models page renders, so a new card changes the count here without an edit
+/// to this file.
 class WhyItExists extends StatelessComponent {
   const WhyItExists({super.key});
 
-  static const measurementSummary =
-      'Across the twelve headline runs, every converted candidate ran on '
-      "LiteRT-LM's CPU backend; some float references ran on CUDA. The "
-      'eight-bit gap was small on all twelve and often unresolved. Four of the '
-      'fine-tuned models '
-      'also have blockwise four-bit results with the candidates on LiteRT-LM\'s '
-      'CPU backend, where the gap was larger. A separate Qwen3 phone run shows '
-      'that the backend can change the answer. ';
+  /// The line under the paragraph, counted from the cards on `/models`.
+  static String get teaser {
+    final llms = LlmModels.measured.length;
+    final embeddings = EmbeddingModels.measured.length;
+    return 'Measured end to end so far: $llms language '
+        '${llms == 1 ? 'model' : 'models'} and $embeddings embedding '
+        '${embeddings == 1 ? 'model' : 'models'}, each converted and compared '
+        'with its float reference on held-out data.';
+  }
 
   @override
   Component build(BuildContext context) {
@@ -112,282 +46,20 @@ class WhyItExists extends StatelessComponent {
             'it came from, and tells you the difference.',
           ),
         ]),
-        div(
-          classes: 'measured',
-          attributes: const {'id': closeTarget},
-          [
-            div(classes: 'measured-label', [
-              Component.text('Measured end to end so far'),
+        div(classes: 'why-models', [
+          p(classes: 'why-models-line', [Component.text(teaser)]),
+          div(classes: 'why-models-links', [
+            a(href: ModelsTab.llm.path, [Component.text('Language models')]),
+            a(href: ModelsTab.embeddings.path, [
+              Component.text('Embedding models'),
             ]),
-            div(classes: 'measured-cards', [
-              for (final model in measured) _card(model),
-            ]),
-            p(classes: 'measured-note', [
-              Component.text(measurementSummary),
-              a(href: '/measurements', [
-                Component.text('The numbers, and what they do not establish'),
-              ]),
-            ]),
-            for (final model in measured) _modal(model),
-          ],
-        ),
+            a(href: '/measurements', [Component.text('The numbers')]),
+          ]),
+        ]),
       ]),
     ]);
   }
 
-  /// The runs, in the order the cards show them.
-  static const measured = <MeasuredRun>[
-    (
-      name: 'FunctionGemma 270M',
-      how: 'tool-call scoring, 640 held-out rows',
-      what:
-          '270M parameters, text only. Google built it for tool calls: '
-          'given a list of functions it picks one and fills in its '
-          'arguments, which is the job an app needs done on the phone '
-          'rather than in a round trip to a server. Small enough that '
-          'the whole model ships inside the app.',
-      hubId: 'google/functiongemma-270m-it',
-      revision: null,
-      anchor: 'the-headline-numbers',
-    ),
-    (
-      name: 'Gemma 3 270M',
-      how: 'exact-text scoring, 600 held-out rows',
-      what:
-          '270M parameters, text only — the smallest checkpoint '
-          'measured here. In the banking77 run it was fine-tuned on 2,400 '
-          'examples and evaluated as a 77-way intent classifier, rather than '
-          'as a conversational model.',
-      hubId: 'google/gemma-3-270m-it',
-      revision: 'ac82b4e8',
-      anchor: 'a-second-family-and-the-second-scorer',
-    ),
-    (
-      name: 'Gemma 3 1B',
-      how: 'exact-text scoring, the same 600 held-out rows',
-      what:
-          '1B parameters, text only. It was measured on the same banking77 '
-          'split and through the same export rule as the 270M, providing a '
-          'second size in one family without assuming that size predicts the '
-          'conversion cost.',
-      hubId: 'google/gemma-3-1b-it',
-      revision: 'dcc83ea8',
-      anchor: 'the-same-family-four-times-the-size',
-    ),
-    (
-      name: 'Qwen3 0.6B',
-      how: 'exact-text scoring, the same 600 held-out rows',
-      what:
-          '0.6B parameters, text only. A reasonable first try when the '
-          'task is labels, and the first family measured here that '
-          'litetune had no per-model rule for — it exported with no flag '
-          'from litetune; since 0.4.3 its rule hands the base '
-          'model, and a checkpoint litetune trained on rendered prompts, '
-          "LiteRT-LM's own Qwen 3 template.",
-      hubId: 'Qwen/Qwen3-0.6B',
-      revision: 'c1899de2',
-      anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
-    ),
-    (
-      name: 'Qwen3 1.7B',
-      how: 'exact-text scoring, the same 600 held-out rows',
-      what:
-          '1.7B parameters, text only, and the same chat template as the '
-          "0.6B byte for byte, so its rule hands it LiteRT-LM's own Qwen 3 "
-          'template on the same terms. Measured on litert-lm 0.18.0, with '
-          'neither eight-bit conversion cost resolved.',
-      hubId: 'Qwen/Qwen3-1.7B',
-      revision: '70d244cc',
-      anchor: 'the-two-qwen-families-one-size-up',
-    ),
-    (
-      name: 'Qwen2.5 0.5B Instruct',
-      how: 'exact-text scoring, the same 600 held-out rows',
-      what:
-          '0.5B parameters, text only. It is the one checkpoint here on '
-          'which channelwise four bits produced a score at all, where the '
-          'others either refused or came apart, and those scores cost it '
-          '+0.2683 and +0.2500 against its float 0.7700 on litert-lm 0.17.1.',
-      hubId: 'Qwen/Qwen2.5-0.5B-Instruct',
-      revision: '7ae55760',
-      anchor:
-          'a-fifth-family-and-the-first-where-channelwise-four-bits-answered',
-    ),
-    (
-      name: 'Qwen2.5 1.5B Instruct',
-      how: 'exact-text scoring, the same 600 held-out rows',
-      what:
-          '1.5B parameters, text only, and the same chat template as the '
-          '0.5B Instruct byte for byte, composed behind the same text-parts '
-          'block. Measured on litert-lm 0.18.0 with eight bits only, '
-          'neither conversion cost resolved.',
-      hubId: 'Qwen/Qwen2.5-1.5B-Instruct',
-      revision: '989aa798',
-      anchor: 'the-two-qwen-families-one-size-up',
-    ),
-    (
-      name: 'Qwen3.5 0.8B',
-      how: 'exact-text scoring, the same 600 held-out rows',
-      what:
-          '0.8B parameters, text only, and most of its layers are not '
-          'attention: 18 of its 24 are linear attention. It takes '
-          "LiteRT-LM's own Qwen 3.5 template, edited to render a single "
-          'turn as the checkpoint does, and verify gives every prompt an '
-          'Engine of its own.',
-      hubId: 'Qwen/Qwen3.5-0.8B',
-      revision: '2fc06364',
-      anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
-    ),
-    (
-      name: 'Qwen3.5 2B',
-      how: 'exact-text scoring, the same 600 held-out rows',
-      what:
-          '2B parameters, text only, under the same rule as the 0.8B: its '
-          'bundle carries the same edited template, byte for byte. Measured '
-          'on litert-lm 0.18.0, where its eight-bit dynamic conversion '
-          'cost resolved.',
-      hubId: 'Qwen/Qwen3.5-2B',
-      revision: '15852e8c',
-      anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
-    ),
-    (
-      name: 'MiniCPM5 1B',
-      how: 'exact-text scoring, the same 600 held-out rows',
-      what:
-          "1B parameters, text only. It takes LiteRT-LM's own MiniCPM5 "
-          'template, edited for the start token its checkpoint template '
-          'prints itself: the runtime puts that token in front of what it '
-          'renders, and the first export of it could not check that.',
-      hubId: 'openbmb/MiniCPM5-1B',
-      revision: '87179e5c',
-      anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
-    ),
-    (
-      name: 'Granite 4.1 3B',
-      how: 'exact-text scoring, the same 600 held-out rows',
-      what:
-          '3.4B parameters, text only, and the largest text-only model '
-          "measured here. Its own chat template, composed behind litetune's "
-          'text-parts block. Measured on litert-lm 0.18.0 with eight bits '
-          'only, neither conversion cost resolved.',
-      hubId: 'ibm-granite/granite-4.1-3b',
-      revision: 'c0650403',
-      anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
-    ),
-    (
-      name: 'Gemma 4 E2B',
-      how: 'exact-text scoring, the same 600 held-out rows',
-      what:
-          'About 5B parameters, and multimodal — a text tower with '
-          'vision and audio towers beside it. For an assistant that has '
-          'to see or hear as well as read. A LoRA run on it is scoped '
-          'to the text tower, because all three use the same projection '
-          'names and a run scoped by name alone reaches every one of '
-          'them.',
-      hubId: 'google/gemma-4-E2B-it',
-      // Null although MEASUREMENTS.md names a commit: that run passed no
-      // `--revision` and the hash was read back from the cache afterwards.
-      // Showing it here in the same slot as ten pinned ones would give it a
-      // parity the section it links to explicitly denies.
-      revision: null,
-      anchor: 'end-to-end-on-the-seven-projection-checkpoint',
-    ),
-  ];
-
-  static const _newTab = {'target': '_blank', 'rel': 'noopener'};
-
-  /// Where both close links point, and the id of the block they land on.
-  /// A literal in three places was three chances for a panel that cannot be
-  /// closed: `:target` stops matching when the fragment names nothing, so a
-  /// renamed container leaves the × and the scrim pointing at dead air while
-  /// every test still passes.
-  static const closeTarget = 'measured';
-
-  /// The panel's id, and what the card links to. Taken from the Hub id rather
-  /// than the display name: the twelve last segments are already unique and are
-  /// the thing that identifies the run, while two cards could one day differ
-  /// in name alone. The `.` five ids carry is legal in an id and in a
-  /// fragment, and is inert only because nothing selects these by id -- the
-  /// stylesheet matches on class.
-  static String slugFor(MeasuredRun model) =>
-      'measured-${model.hubId.split('/').last.toLowerCase()}';
-
-  static Component _card(MeasuredRun model) =>
-      a(classes: 'measured-card', href: '#${slugFor(model)}', [
-        span(classes: 'measured-card-model', [Component.text(model.name)]),
-        span(classes: 'measured-card-how', [Component.text(model.how)]),
-        // What opening it gets you. It used to read `checkpoint`, which named
-        // one row of the panel rather than the reason to open it.
-        span(classes: 'measured-card-more', [
-          Component.text('what it is, and what it is for'),
-        ]),
-      ]);
-
-  static Component _modal(MeasuredRun model) => div(
-    classes: 'measured-modal',
-    attributes: {
-      'id': slugFor(model),
-      'role': 'dialog',
-      'aria-modal': 'true',
-      // Without this the div is not a focusable area, so the browser's
-      // navigate-to-fragment focusing step falls through to the viewport and
-      // a screen reader is told a dialog opened while the cursor stays outside
-      // it.
-      'tabindex': '-1',
-      'aria-label':
-          '${model.name}: what it is, and the checkpoint this run used',
-    },
-    [
-      a(
-        classes: 'measured-modal-scrim',
-        href: '#$closeTarget',
-        attributes: const {'aria-label': 'Close'},
-        const [],
-      ),
-      div(classes: 'measured-modal-box', [
-        div(classes: 'measured-modal-head', [
-          span(classes: 'measured-modal-title', [Component.text(model.name)]),
-          a(
-            classes: 'measured-modal-close',
-            href: '#$closeTarget',
-            attributes: const {'aria-label': 'Close'},
-            [Component.text('\u00d7')],
-          ),
-        ]),
-        p(classes: 'measured-modal-what', [Component.text(model.what)]),
-        div(classes: 'measured-card-fact', [
-          span(classes: 'measured-card-key', [Component.text('Checkpoint')]),
-          span(classes: 'measured-card-id', [Component.text(model.hubId)]),
-        ]),
-        if (model.revision case final revision?)
-          div(classes: 'measured-card-fact', [
-            span(classes: 'measured-card-key', [Component.text('Revision')]),
-            span(classes: 'measured-card-id', [Component.text(revision)]),
-          ]),
-        div(classes: 'measured-card-links', [
-          a(
-            href: 'https://huggingface.co/${model.hubId}',
-            attributes: _newTab,
-            [Component.text('On Hugging Face')],
-          ),
-          a(href: '/measurements#${model.anchor}', [
-            Component.text('Scores and intervals for this run'),
-          ]),
-        ]),
-      ]),
-    ],
-  );
-
-  // Every class here carries the section's `measured-` prefix, including the
-  // cards. jaspr collects each component's `@css` into one stylesheet, so a
-  // class name is global: `where_to_run.dart` also styles `.cards` and
-  // `.card`, and the two rules landed on the same elements -- whichever the
-  // bundle emitted second won each property, which is why that section's
-  // cards were drawn with this one's 1rem padding rather than their own
-  // 1.4rem. Scoping the names here ends that for these elements, and the
-  // `<details>` makes it matter more than it did: the other rule sets
-  // `display: flex` and `flex: 1 1 240px`, which would otherwise apply to a
-  // disclosure that wants neither.
   @css
   static List<StyleRule> get styles => [
     css('.why-body').styles(
@@ -403,148 +75,30 @@ class WhyItExists extends StatelessComponent {
       raw: const {'max-width': '62ch'},
       margin: Margin.zero,
     ),
-    css('.measured-label').styles(
-      color: Brand.muted,
-      fontSize: 0.9.rem,
-      margin: Margin.only(bottom: 0.75.rem),
-    ),
-    css('.measured-cards').styles(
-      display: Display.grid,
-      gap: Gap.all(0.75.rem),
-      raw: const {
-        'grid-template-columns': 'repeat(auto-fit, minmax(16rem, 1fr))',
-      },
-    ),
-    css('.measured-card').styles(
+    css('.why-models').styles(
       display: Display.flex,
       flexDirection: FlexDirection.column,
-      gap: Gap.all(0.3.rem),
+      gap: Gap.all(0.75.rem),
       padding: Padding.all(1.rem),
       backgroundColor: Brand.surface,
       radius: BorderRadius.circular(0.6.rem),
       border: Border.all(color: Brand.line, width: 1.px),
-      cursor: Cursor.pointer,
-      raw: const {'text-decoration': 'none'},
     ),
-    // The affordance, as a line of the card rather than a generated
-    // `::after`: the old one hung off `summary` and its text was read out on
-    // top of the platform's own expanded/collapsed announcement. A link needs
-    // no such announcement, so the word can simply be in the card.
-    css('.measured-card-more').styles(color: Brand.muted, fontSize: 0.85.rem),
-    // The convention the rest of the site uses for a clickable card
-    // (`where_to_run.dart`, `nav_bar.dart`, `site_footer.dart`): the border
-    // brightens. Without it the only cue that a card is a link was a muted
-    // caption -- which is the line this change is about.
-    css('.measured-card:hover').styles(
-      border: Border.all(color: Brand.muted, width: 1.px),
-    ),
-    css('.measured-card:hover .measured-card-more').styles(color: Brand.ink),
-    // Hidden until the URL names it. `:target` is the whole mechanism -- see
-    // the class docstring for what that buys and what it costs.
-    css('.measured-modal').styles(raw: const {'display': 'none'}),
-    css('.measured-modal:target').styles(
-      raw: const {
-        'display': 'flex',
-        'position': 'fixed',
-        'inset': '0',
-        'z-index': '50',
-        'align-items': 'center',
-        'justify-content': 'center',
-        'padding': '1.5rem',
-      },
-    ),
-    // The scrim is a link, so clicking beside the panel closes it. It is
-    // drawn behind the box by source order, which is why the box is `relative`
-    // rather than the scrim being negatively stacked.
-    css('.measured-modal-scrim').styles(
-      raw: const {
-        'position': 'absolute',
-        'inset': '0',
-        'background': 'rgba(0, 0, 0, 0.45)',
-      },
-    ),
-    css('.measured-modal-box').styles(
-      display: Display.flex,
-      flexDirection: FlexDirection.column,
-      gap: Gap.all(0.6.rem),
-      padding: Padding.all(1.25.rem),
-      backgroundColor: Brand.surface,
-      radius: BorderRadius.circular(0.7.rem),
-      border: Border.all(color: Brand.line, width: 1.px),
-      raw: const {
-        'position': 'relative',
-        'width': 'min(30rem, 100%)',
-        'max-height': '80dvh',
-        'overflow-y': 'auto',
-      },
-    ),
-    // Sticky, because the box scrolls and the head carries the only explicit
-    // way out. A one-line description fitted without scrolling; a paragraph
-    // does not, and on a short viewport the visitor would have scrolled the
-    // close control off the top of the thing they were trying to close. The
-    // background is the box's own, so the text passes under it rather than
-    // through it.
-    css('.measured-modal-head').styles(
-      display: Display.flex,
-      alignItems: AlignItems.center,
-      gap: Gap.all(1.rem),
-      backgroundColor: Brand.surface,
-      padding: Padding.only(bottom: 0.4.rem),
-      raw: const {
-        'justify-content': 'space-between',
-        'position': 'sticky',
-        'top': '0',
-      },
-    ),
-    css(
-      '.measured-modal-title',
-    ).styles(color: Brand.ink, fontSize: 1.05.rem, fontWeight: FontWeight.w500),
-    css('.measured-modal-close').styles(
-      color: Brand.muted,
-      fontSize: 1.3.rem,
-      lineHeight: 1.em,
-      raw: const {'text-decoration': 'none'},
-    ),
-    css(
-      '.measured-card-model',
-    ).styles(color: Brand.ink, fontSize: 1.05.rem, fontWeight: FontWeight.w500),
-    css('.measured-modal-what').styles(
+    css('.why-models-line').styles(
       color: Brand.body,
       fontSize: 0.95.rem,
-      // Both sides, not just the bottom. Nothing on this page resets `p`, so
-      // the UA's `margin-block-start: 1em` applied -- and inside a flex column
-      // margins do not collapse, so the paragraph sat further from the title
-      // than from the row under it, which is backwards.
-      margin: Margin.only(top: 0.px, bottom: 0.4.rem),
+      margin: Margin.zero,
       raw: const {'line-height': '1.55'},
     ),
-    css('.measured-card-how').styles(color: Brand.body, fontSize: 0.9.rem),
-    css('.measured-card-fact').styles(
-      display: Display.flex,
-      flexDirection: FlexDirection.column,
-      gap: Gap.all(0.1.rem),
-    ),
-    css('.measured-card-key').styles(color: Brand.muted, fontSize: 0.75.rem),
-    css('.measured-card-id').styles(
-      color: Brand.body,
-      fontFamily: Brand.fontMono,
-      fontSize: 0.85.rem,
-      raw: const {'overflow-wrap': 'anywhere'},
-    ),
-    css('.measured-card-links').styles(
+    css('.why-models-links').styles(
       display: Display.flex,
       flexWrap: FlexWrap.wrap,
-      gap: Gap.all(0.9.rem),
-      margin: Margin.only(top: 0.25.rem),
+      gap: Gap.all(1.25.rem),
+      fontFamily: Brand.fontMono,
       fontSize: 0.85.rem,
     ),
-    css('.measured-card-links a').styles(color: Brand.body),
-    css('.measured-note').styles(
-      color: Brand.muted,
-      fontSize: 0.9.rem,
-      lineHeight: 1.55.em,
-      margin: Margin.only(top: 0.75.rem, bottom: Unit.zero),
-    ),
-    css('.measured-note a').styles(color: Brand.body),
+    css(
+      '.why-models-links a',
+    ).styles(color: Brand.ink, raw: const {'text-underline-offset': '3px'}),
   ];
 }

@@ -1,6 +1,7 @@
 /// The entrypoint for the **server** environment, which for a static build is
 /// the only one that renders anything: `jaspr build` runs this once and writes
 /// one HTML file per route -- `build/jaspr/index.html`,
+/// `build/jaspr/models/index.html`, `build/jaspr/models/embeddings/index.html`,
 /// `build/jaspr/changelog/index.html` and
 /// `build/jaspr/measurements/index.html`.
 library;
@@ -11,6 +12,7 @@ import 'package:jaspr_router/jaspr_router.dart';
 import 'changelog/changelog_page.dart';
 import 'landing/landing_page.dart';
 import 'measurements/measurements_page.dart';
+import 'models/models_page.dart';
 import 'project.dart';
 import 'seo.dart';
 
@@ -36,6 +38,41 @@ const String _measurementsDescription =
 
 const String _measurementsTitle = 'Measurements — litetune';
 
+const String _modelsDescription =
+    'The language models litetune has converted and compared with their '
+    'float references end to end, each with the checkpoint its run used and '
+    'a link to its measurements.';
+
+const String _modelsTitle = 'Models — litetune';
+
+const String _embeddingsDescription =
+    'EmbeddingGemma 2 with litetune: fine-tuned as an on-device decider, '
+    "written into Google's .litertlm in int8 or int4, verified on CPU and a "
+    "Mac's GPU, and compiled for a Qualcomm NPU.";
+
+const String _embeddingsTitle = 'Embedding models — litetune';
+
+/// The two halves of `/models`. One builder, so the halves cannot drift apart
+/// in anything but what [ModelsTab] says differs.
+Route _modelsRoute(ModelsTab tab, String title, String description) => Route(
+  path: tab.path,
+  builder: (context, state) => Document(
+    title: title,
+    lang: 'en',
+    meta: {'description': description},
+    head: [
+      ...fontLinks(),
+      ...seoHead(
+        title: title,
+        description: description,
+        applicationDescription: _description,
+        path: tab.path,
+      ),
+    ],
+    body: ModelsPage(version: packageVersion, tab: tab),
+  ),
+);
+
 void main() {
   Jaspr.initializeApp(options: defaultServerOptions);
 
@@ -57,6 +94,12 @@ void main() {
             ],
             body: LandingPage(version: packageVersion),
           ),
+        ),
+        _modelsRoute(ModelsTab.llm, _modelsTitle, _modelsDescription),
+        _modelsRoute(
+          ModelsTab.embeddings,
+          _embeddingsTitle,
+          _embeddingsDescription,
         ),
         Route(
           path: '/changelog',

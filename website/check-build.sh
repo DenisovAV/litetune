@@ -56,6 +56,18 @@ sed -n '/<[Bb][Oo][Dd][Yy]/,$p' "$BUILD_DIR/index.html" \
 # The other files a deploy publishes. index.html references the first two from
 # its head, and an index pointing at an asset the build did not write goes out
 # as a page with no icon or no client bundle.
+# The models pages: the nav, the footer and the landing teaser link to both.
+for page in models models/embeddings; do
+  sed -n '/<[Bb][Oo][Dd][Yy]/,$p' "$BUILD_DIR/$page/index.html" 2>/dev/null \
+    | grep -c 'class="models-switch' >/dev/null \
+    || fail "$page/index.html is missing or rendered no page body"
+  # Every page has <base href="/">, so a bare href="#x" resolves to /#x and
+  # leaves the page: the cards' fragments must name their page.
+  if grep -o 'href="#[^"]*"' "$BUILD_DIR/$page/index.html" | grep -q .; then
+    fail "$page/index.html links a bare #fragment, which <base href=\"/\"> sends to /"
+  fi
+done
+
 for artefact in main.client.dart.js favicon.svg; do
   [ -s "$BUILD_DIR/$artefact" ] || fail "$artefact is missing or empty"
 done
