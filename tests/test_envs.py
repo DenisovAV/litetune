@@ -24,6 +24,7 @@ from litetune import envs, wheels
 from litetune.envs import (
     EMBED_TRAIN,
     EXPORT,
+    NPU_LLM,
     NPU_QUALCOMM,
     RUNTIME,
     TRAIN,
@@ -115,7 +116,7 @@ def test_a_pin_that_does_not_apply_changes_no_identity(monkeypatch):
 
 
 def test_shipped_environments_are_pinned():
-    for env in (RUNTIME, EXPORT, TRAIN, EMBED_TRAIN, NPU_QUALCOMM):
+    for env in (RUNTIME, EXPORT, TRAIN, EMBED_TRAIN, NPU_QUALCOMM, NPU_LLM):
         assert env.identity, env.name
 
 
@@ -1298,9 +1299,9 @@ def test_an_environment_for_another_interpreter_is_not_reported_as_junk():
     junk, it is the one that works over there. Reporting it as "unused" would
     invite deleting exactly the caches worth keeping.
     """
-    from litetune.envs import EMBED_TRAIN, EXPORT, NPU_QUALCOMM, RUNTIME, TRAIN
+    from litetune.envs import EMBED_TRAIN, EXPORT, NPU_LLM, NPU_QUALCOMM, RUNTIME, TRAIN
 
-    stages = (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN, NPU_QUALCOMM)
+    stages = (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN, NPU_QUALCOMM, NPU_LLM)
     identities = {env.path.name for env in stages}
     assert len(identities) == len(stages), "each stage owns a distinct directory"
     for env in stages:

@@ -2426,6 +2426,178 @@ CPU file on the same texts: cosine 0.787 (mean). Loading took 0.67 s on the NPU 
 1.0 s on the phone's CPU; the peak resident memory was 421–423 MiB on the NPU and 511 MiB on
 the CPU. No text was longer than 105 tokens, so only the 128-token signature ran.
 
+## LLMs on a Qualcomm NPU
+
+Measured 2026-11-01 on one Galaxy S25 Ultra (SM-S938U1, SM8750, Hexagon V79), through the
+LiteRT-LM 0.18.0 C API with the Qualcomm dispatch built from the same tree and Qualcomm's
+QNN runtime 2.51.0. Every bundle was built by litert-torch-nightly 0.10.0.dev20260926's
+`npu_export` stages (ai-edge-litert-nightly 2.3.0.dev20260925, ai-edge-quantizer-nightly
+0.10.0.dev20260926, ai-edge-litert-sdk-qualcomm 2.3.0 = QAIRT 2.50.0.260828,
+transformers 5.16.1) on a 32-vCPU x86-64 Linux machine: prefill 128, `cache_length` 1024,
+stage 1 `dynamic_wi8_afp32`, 64 calibration prompts with 32 decode steps each, A16W8,
+compiled for SM8750. Greedy decoding; base weights unless a row says otherwise.
+
+**Needle prompts.** "The access code for vault X is NNNN." and filler sentences, 12 rows
+per set, each with its own code; correct means the reply contains the code. `fq`: the fact
+first, the question last; `fm`: the fact after a third to a half of the filler; `s1`: one
+prefill chunk. Two chunks are 191–210 rendered tokens, five 600–617, seven 853–861.
+
+**The last layer's KV inputs.** In the stage-1 graph, the prefill signature's
+`kv_cache_k_<last>` and `kv_cache_v_<last>` have no consuming op — prefill outputs only the
+KV slices, so the last layer's attention over the cache is gone. The quantizer leaves them
+FLOAT32 while the decode signature's and the cache-update graphs' are INT16, and the
+runtime, which re-creates a host-memory KV buffer from the decode signature, rejects the
+FLOAT32 prefill tensor (`Custom allocation is too small for tensor idx: 54` on Qwen3-0.6B,
+index 54 being `kv_cache_k_27`). Retyping the two unused inputs to their decode twins (what
+`convert --npu` does) changes no computation and no byte count of the compiled file
+(781,881,235 B for Qwen3-0.6B either way).
+
+| model | unfixed | with the two inputs retyped, two chunks (s1 / fq / ff) | float32 |
+|---|---|---|---|
+| Qwen3-0.6B | does not load | 12/12 / 12/12 / 12/12 | 36/36 |
+| Qwen2.5-0.5B-Instruct | does not load (layer 23) | 12/12 / 12/12 / 10–11/12 † | 32/36 |
+| MiniCPM5-1B, thinking off ‡ | does not load (layer 23) | 12/12 / 12/12 / 12/12 | 36/36 |
+| gemma-3-270m-it | loads (same FLOAT32 pair at layer 17; why it loads was not traced) | 12/12 / 12/12 / 11/12 | 34/36 |
+
+† Qwen2.5-0.5B's rows ask "Complete the sentence with the four digits from the text above:
+The access code for vault X is"; to "What is the access code…? Reply with the four digits
+only." even its float32 model answered 14 of 36. ‡ A template that sets `enable_thinking`
+false; with thinking on its float32 model needs about 128 output tokens to reach the code.
+
+**Calibration length decides how long a prompt the bundle serves.** The same bundles,
+differing only in their calibration prompts (rendered tokens):
+
+| bundle | calibration prompts | two chunks (fq) | five chunks (fq5 / fm5) | seven chunks (fq7 / fm7) |
+|---|---|---|---|---|
+| Qwen3-0.6B | 64 × ~200–230 | 12/12 | 0/12 / 0/12 | — |
+| Qwen3-0.6B | 64 × 332–388 | 12/12 | 0/12 / 0/12 | 0/12 / 0/12 |
+| Qwen3-0.6B | 64 × 605–859 | 12/12 | **12/12 / 12/12** | **12/12 / 12/12** |
+| Qwen3-0.6B | 32 × ~200–230 + 32 × 605–859 | — | **12/12 / 12/12** | **12/12 / 12/12** |
+| Qwen3-0.6B, float32 | — | 12/12 | 12/12 / 12/12 | 12/12 / 12/12 |
+| gemma-3-270m-it | 64 × ~200–230 | 12/12 | 0/12 / 0/12 | — |
+| gemma-3-270m-it | 64 × 613–848 | 10/12 | 11/12 / **12/12** | 3/12 / **1/12** |
+| gemma-3-270m-it, float32 | — | 11/12 | 0/12 / 12/12 | 3/12 / 12/12 |
+| Qwen2.5-0.5B-Instruct | 64 × ~200–230 | (above) | 0/12 / 0/12, 1/12 / 0/12 with HW cache update off (float32 11/12 / 7/12) | — |
+
+The failures are not lost chunks but fluent-looking repetition ("The main. The main.", a
+looping `<|im_start|>`) on rows the float32 model answers. Calibrated on prompts reaching
+the test prompts' length, they are answered; three-chunk calibration does not help five or
+seven chunks; Gemma calibrated up to 848 tokens answers 600-token prompts and fails
+857–861-token ones. Half the set long was enough for Qwen3. So `convert --npu` packs half its
+calibration prompts up to `cache_length` minus 128 and reports the longest; gemma-3's
+`fq` sets are uninformative past two chunks because its float32 model does not carry the
+code that far.
+
+**End to end through `litetune convert --npu`.** A banking77 LoRA fine-tune of
+Qwen2.5-0.5B-Instruct (the September recipe and split of *A fifth family* above, trained
+again in float32 where that run used bfloat16), converted with
+`litetune convert --model … --npu SM8750 --calibration-data train.jsonl`: calibration 32
+training prompts of 49–76 tokens and 32 packed prompts of 448–884, stages 1–3 in 288 s and
+the SM8750 compile in 53 s, 655,363,795 B, all 48 KV inputs of both signatures INT16. On the
+first 100 held-out rows, exact text:
+
+| side | exact | replies identical to float32's |
+|---|---|---|
+| float32 (transformers, the merged checkpoint) | 83/100 | — |
+| **NPU, `convert --npu`'s bundle, HW cache update on** | **81/100** | 94/100 |
+| NPU, the same bundle, HW cache update off | 81/100 | 94/100 |
+| NPU, a bundle built by hand the same way, calibrated on two-chunk prompts | 82/100 | 94/100 |
+
+Four rows are discordant with float32 (three the NPU gets wrong, one it gets right); 100
+rows cannot resolve a two-row difference. The prompts are single-chunk (at most 135
+tokens), well inside the calibrated range. Medians over the 100 rows: prefill ~1,860 tokens/s,
+decode ~47 tokens/s, time to first token 52 ms.
+
+**What the bundles above differ in from `convert --npu` as it is now.** Only the fine-tune
+above went through `convert --npu`, and through an earlier revision: its calibration
+prompts were wrapped in a chat template a second time by litert-torch's `calibrate`
+(which formats by default), and every bundle above was calibrated with 32 decode steps.
+The gemma-3, Qwen3 and MiniCPM5 bundles above were built by hand: calibrated on needle
+sets rather than the packed training prompts, without `--externalize_embedder`, gemma-3
+without the retype, MiniCPM5 with a template that turns thinking off. The next part is
+bundles of the path as it is now.
+
+### Bundles `convert --npu` built, on SM8750 (2026-11-02)
+
+The same phone, runtime and harness as above, at the runtime's default NPU settings and
+`max_num_tokens` 1024, replies capped at 128 tokens. Each bundle built by
+`litetune convert --model … --npu SM8750 --calibration-data train.jsonl` (banking77's 2,400
+training rows; for the three base models a `litetune.json` that records
+`runtime_rendered`), cache_length 1024, on a 32-vCPU x86-64 Linux machine; every check in
+*What it checks* passed. The float32 references are transformers 5.16.1, greedy,
+`repetition_penalty` 1.0, 128 new tokens, rendered with the checkpoint's own template.
+LiteRT-LM returns a `<think>` block in a channel of its own; it is put back in front of the
+reply before comparing.
+
+| bundle | bytes | longest calibration prompt | calibration replies, decode steps (median / max) | stages 1–3 | compile |
+|---|---|---|---|---|---|
+| gemma-3-270m-it | 460,113,711 | 891 | 2.5 / 128 | 3.7 min | 63 s |
+| Qwen2.5-0.5B-Instruct banking77 fine-tune | 655,363,795 | 896 | 4 / 9 | 7.8 min | 99 s |
+| Qwen3-0.6B | 781,897,619 | 890 | 128 / 128 | 68.5 min | 194 s |
+| MiniCPM5-1B (thinking on: the path sets nothing) | 1,107,858,841 | 896 | 128 / 128 | 28.1 min | 164 s |
+
+**Needle prompts** (as above, 12 rows per set; `x2` two prefill chunks, `nlq`/`nlm` fact
+first or after ~45% of the filler, grown to within 40 tokens below the bundle's longest
+calibration prompt). Correct = the code appears in the reply (for MiniCPM5 within its
+128-token thinking, for both sides); identical = the same text as float32.
+
+| model | x2: NPU / float32 / identical | nlq | nlm | prompt tokens, nlq/nlm |
+|---|---|---|---|---|
+| gemma-3-270m-it | 11/12 / 12/12 / 11/12 | 12/12 / 4/12 / 1/12 | 12/12 / 11/12 / 0/12 | 857–863 |
+| Qwen3-0.6B | 12/12 / 12/12 / 8/12 | 12/12 / 12/12 / 11/12 | 12/12 / 12/12 / 11/12 | 853–857 |
+| MiniCPM5-1B | 12/12 / 12/12 / 0/12 | 12/12 / 12/12 / 0/12 | 12/12 / 12/12 / 0/12 | 856–874 |
+
+Gemma's NPU answers the long rows with a sentence holding the code where its float32
+answers "1234" on seven `nlq` rows: the NPU does not reproduce float32 there, in either
+direction.
+
+**How long a reply holds.** Prompts grown as `nlq` (or to ~190 tokens for gemma's second
+set), then "Count from 1 to 100, …" (6 rows) or "Repeat the text above word for word, …"
+(6 rows). Leading tokens shared with float32's reply, per row:
+
+| model | prompt | count: shared leading tokens (float32's reply) | copy: shared leading tokens | replies that turned into repetition |
+|---|---|---|---|---|
+| gemma-3-270m-it | 854–861 | 0 ×6 (128) | 0–47 (128) | 8 of 12 |
+| gemma-3-270m-it | 182–192 | 2 ×5, 128 ×1 (128): five NPU replies stop after "1" | 0–19 (15–128) | 0 of 12 |
+| Qwen3-0.6B | 853–867 | 33–34 (34) | 7–82 (128) | 0 of 12 |
+| MiniCPM5-1B | 857–872 | 28–127 (128) | 2–43 (128) | 0 of 12 (1 of the 36 needle rows looped) |
+
+Repetition = more than 30% of a reply's word 4-grams repeated (gemma's long-prompt replies
+0.00–0.97, float32's 0.00; Qwen3's 0.00; MiniCPM5's needle row 0.56, the rest ≤ 0.16).
+So: **gemma-3-270m-it holds classification-length answers only**; Qwen3-0.6B's replies
+stay fluent for 128 tokens but leave float32's text early on a copy; MiniCPM5-1B's
+thinking finds what float32's finds but in other words; the Qwen2.5 fine-tune below was
+measured on its labels only. Every bundle's report carries its family's line.
+
+**The banking77 fine-tune** (first 100 held-out rows, exact text): NPU 81/100, float32 83/100,
+94/100 identical — the same as the earlier revision's bundle above.
+
+Medians over each run: prefill 15.8k tokens/s (gemma), 1.9k (Qwen2.5), 2.1k (Qwen3), 2.6k
+(MiniCPM5); decode 178, —, 45 and 60 tokens/s (replies of 20 tokens or more); time to first
+token 60, 52, 429 and 347 ms. LiteRT logged one `DispatchDelegate` partition for each of
+`prefill_128`, `decode`, `prefill_mask_128` and `decode_mask` in every run.
+
+**SM8550, SM8650, SM8850: compiled, compared, not run.** The gemma-3-270m-it build also
+compiled for these three. Against Google's `gemma3-270m-it-q8.qualcomm.sm8650/8750/8850`
+files (SM8550's is gated and was not read), section by section:
+
+| | Google's | `convert --npu`'s |
+|---|---|---|
+| sections | metadata, SentencePiece, embedder, aux, prefill/decode | the same five |
+| prefill/decode graph | `prefill_128`, `decode`: one `DISPATCH_OP` each, 43 inputs | the same |
+| aux graph | masks one `DISPATCH_OP` each (2 inputs); cache updates and RoPE on the CPU | the same layout; masks take a third input, `valid_mask`; the cache updates are other ops |
+| LiteRtStamp | Qualcomm + the SoC, 250 bytes | the same |
+| QAIRT build | 2.40.0.251030114326 | 2.50.0.260828221209 |
+| KV cache | 4,096 positions (`max_num_tokens` 4096) | 1,024 |
+| LlmMetadata | 337 bytes: template by prompt prefixes, stop `<end_of_turn>` and id 1 | 2,561 bytes: a Jinja template, 14 stop strings and ids 1 and 106 |
+
+The structure matches; whether these files run on those SoCs was not measured.
+
+**Not measured:** any SoC but SM8750 on a device; Gemma 3 1B, Qwen3-1.7B, Qwen2.5-1.5B and FunctionGemma
+through this toolchain (FunctionGemma ran on SM8750 on the earlier one, see *Limitations*);
+`cache_length` other than 1024; decisions, which the NPU executor cannot score (it rolls
+back one token only).
+
 ## The CPU and the GPU on a Mac
 
 Each path was run through the script `verify` runs for it, unchanged except for
