@@ -109,8 +109,7 @@ class LlmModels extends StatelessComponent {
       name: 'Qwen3 0.6B',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
-          '0.6B parameters, text only. A reasonable first try when the '
-          'task is labels, and the first family measured here that '
+          '0.6B parameters, text only, and the first family measured here that '
           'litetune had no per-model rule for — it exported with no flag '
           'from litetune; since 0.4.3 its rule hands the base '
           'model, and a checkpoint litetune trained on rendered prompts, '
