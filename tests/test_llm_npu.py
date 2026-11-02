@@ -974,7 +974,9 @@ def _link_failing_for(target_part, error):
     real_link = os.link
 
     def link(src, dst):
-        if target_part in str(dst):
+        # Compared with "/" separators, so a part naming a file inside a
+        # directory matches on Windows too.
+        if target_part in Path(dst).as_posix():
             raise error
         return real_link(src, dst)
 
