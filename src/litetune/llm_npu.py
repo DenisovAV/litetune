@@ -998,7 +998,8 @@ def summarise(result: LlmNpuResult) -> list[str]:
 
 # The script that runs inside envs.NPU_LLM. Its top level imports the standard library only,
 # so tests/test_llm_npu.py runs `retype_dead_kv`, `kv_quantization_problem`, `kv_type_counts`,
-# `long_targets`, `calibration_plan`, `exporter_kwargs`, `check_compiled(_aux)`, `decode_summary`,
+# `make_render`, `render_problem`, `long_targets`, `calibration_plan`, `exporter_kwargs`,
+# `check_compiled(_aux)`, `decode_summary`,
 # `recording_decode` and `compare_metadata` for real without the toolchain.
 _NPU_LLM_SCRIPT = r'''
 """npu_export stages 1-4 for one LLM checkpoint, with calibration from its training data and
@@ -1144,6 +1145,35 @@ def kv_quantization_problem(models, type_names):
     return None
 
 
+def make_render(apply_chat_template, prompt_mode, parts):
+    """How a training prompt reaches the model: rendered as one user turn for
+    `runtime_rendered`, as it is for `prerendered`. With the bundle's own template (`parts`), the
+    content is a list of text parts, as LiteRT-LM from 0.18.0 hands it to the template; the
+    canonical Qwen 3 and MiniCPM5 templates iterate it, and given a string they render an empty
+    user turn."""
+    if prompt_mode != "runtime_rendered":
+        return lambda text: text
+
+    def render(text):
+        content = [{"type": "text", "text": text}] if parts else text
+        return apply_chat_template(
+            [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True
+        )
+
+    return render
+
+
+def render_problem(render, text):
+    """Why the calibration prompts would not carry the training text, or None."""
+    rendered = render(text)
+    if text not in rendered:
+        return (
+            f"the chat template renders the training prompt {text[:60]!r} as {rendered[:120]!r}, "
+            "without its text; calibrating on that would measure an empty turn"
+        )
+    return None
+
+
 def long_targets(limit, count):
     """`count` target lengths spread evenly from half of `limit` up to `limit` itself."""
     if count <= 0:
@@ -1187,7 +1217,9 @@ def calibration_plan(rows, render, count_tokens, limit, short, long, reach, seed
             candidate = pieces + [row["prompt"] + " " + row["completion"]]
             text = render("\n\n".join(candidate + [tail]))
             n = count_tokens(text)
-            if n > limit:
+            # Too long, or no longer than before (a template that drops the text): a miss, so the
+            # loop ends whatever the template does.
+            if n > limit or (best is not None and n <= best[1]):
                 misses += 1
                 continue
             pieces, best, misses = candidate, (text, n), 0
@@ -1433,19 +1465,17 @@ def main(spec):
     if spec.get("chat_template"):
         # The template the bundle carries, so the calibration prompts are what it renders.
         tok.chat_template = open(spec["chat_template"], encoding="utf-8").read()
-    if spec["prompt_mode"] == "runtime_rendered":
-        def render(text):
-            return tok.apply_chat_template(
-                [{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True
-            )
-    else:
-        def render(text):
-            return text
+    render = make_render(
+        tok.apply_chat_template, spec["prompt_mode"], parts=bool(spec.get("chat_template"))
+    )
 
     def count_tokens(text):
         return len(tok(text, add_special_tokens=False)["input_ids"])
 
     rows = [json.loads(l) for l in open(spec["rows"], encoding="utf-8") if l.strip()]
+    problem = render_problem(render, rows[0]["prompt"])
+    if problem:
+        raise Refused("template", problem)
     prompts, calibration = calibration_plan(
         rows, render, count_tokens, spec["prompt_limit_tokens"], spec["short"], spec["long"],
         spec["prefill_length"],

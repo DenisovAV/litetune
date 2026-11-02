@@ -1372,3 +1372,53 @@ def test_the_aux_graphs_ops_reach_the_report(monkeypatch, tmp_path, ready_env):
          monkeypatch=monkeypatch)
     report = json.loads((tmp_path / "out" / "npu-SM8750" / REPORT_NAME).read_text())
     assert report["npu"]["aux_ops_per_signature"] == aux["ops"]
+
+
+def _canonical_template(name):
+    jinja2 = pytest.importorskip("jinja2")
+    source = (Path(llm_npu.__file__).parent / "templates" / name).read_text(encoding="utf-8")
+    template = jinja2.Environment().from_string(source)
+
+    def apply(messages, tokenize=False, add_generation_prompt=True):
+        return template.render(messages=messages, add_generation_prompt=add_generation_prompt)
+
+    return apply
+
+
+@pytest.mark.parametrize(
+    "name", ["litert-lm-v0.18.0-qwen3.jinja", "litert-lm-v0.18.0-minicpm5-litetune.jinja"]
+)
+def test_the_bundle_template_gets_text_parts_and_would_drop_a_string(script, name):
+    apply = _canonical_template(name)
+    text = "Classify the customer's banking message."
+    with_parts = script["make_render"](apply, "runtime_rendered", parts=True)
+    assert text in with_parts(text) and script["render_problem"](with_parts, text) is None
+    # Given a string, the template iterates its characters and renders an empty turn.
+    with_string = script["make_render"](apply, "runtime_rendered", parts=False)
+    assert text not in with_string(text)
+    assert "without its text" in script["render_problem"](with_string, text)
+
+
+def test_the_checkpoints_own_template_gets_a_string_and_prerendered_is_left_alone(script):
+    seen = []
+
+    def apply(messages, tokenize, add_generation_prompt):
+        seen.append(messages[0]["content"])
+        return f"<user>{messages[0]['content']}</user>"
+
+    assert script["make_render"](apply, "runtime_rendered", parts=False)("hi") == "<user>hi</user>"
+    assert seen == ["hi"]
+    assert script["make_render"](apply, "prerendered", parts=True)("<raw>") == "<raw>"
+    assert seen == ["hi"]
+
+
+def test_packing_ends_and_refuses_when_the_template_drops_the_text(script):
+    calls = []
+
+    def count(text):
+        calls.append(text)
+        return 12  # an empty turn: the same length whatever is packed
+
+    with pytest.raises(script["Refused"], match="could not be packed that far"):
+        script["calibration_plan"](_example_rows(), lambda t: "<empty turn>", count, 200, 8, 8, 20)
+    assert len(calls) < 10_000
