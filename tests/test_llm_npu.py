@@ -196,8 +196,9 @@ def _rows(path: Path, n: int = 16, words: int = 5) -> Path:
 def test_calibration_rows_need_a_prompt_and_a_completion(tmp_path):
     bad = tmp_path / "bad.jsonl"
     bad.write_text(json.dumps({"prompt": "x"}) + "\n")
-    with pytest.raises(LlmNpuError, match="string prompt and completion"):
+    with pytest.raises(LlmNpuError, match="string prompt and completion") as raised:
         read_calibration_rows(bad)
+    assert raised.value.cause == "data"
 
 
 def test_calibration_rows_skip_blank_lines_and_need_eight(tmp_path):
@@ -209,16 +210,22 @@ def test_calibration_rows_skip_blank_lines_and_need_eight(tmp_path):
 
 
 def test_unreadable_calibration_data_is_refused(tmp_path):
-    with pytest.raises(LlmNpuError, match="calibration-data"):
+    with pytest.raises(LlmNpuError, match="calibration-data") as missing:
         read_calibration_rows(tmp_path / "missing.jsonl")
+    assert missing.value.cause == "input"
     binary = tmp_path / "binary.jsonl"
     binary.write_bytes(b"\xff\xfe\x00")
-    with pytest.raises(LlmNpuError):
+    with pytest.raises(LlmNpuError, match="not UTF-8") as undecodable:
         read_calibration_rows(binary)
+    assert undecodable.value.cause == "data"
     broken = tmp_path / "broken.jsonl"
     broken.write_text("{not json\n")
-    with pytest.raises(LlmNpuError, match="broken.jsonl:1"):
+    with pytest.raises(LlmNpuError, match="broken.jsonl:1") as bad:
         read_calibration_rows(broken)
+    assert bad.value.cause == "data"
+    with pytest.raises(LlmNpuError) as few:
+        read_calibration_rows(_rows(tmp_path / "seven.jsonl", n=7))
+    assert few.value.cause == "input"
 
 
 # ---------------------------------------------------------------------------
@@ -400,23 +407,121 @@ def _stamp(soc):
     return b"Qualcomm".ljust(125, b"\0") + soc.encode().ljust(125, b"\0")
 
 
-def test_a_compiled_graph_must_be_dispatched_whole_and_stamped(script):
+def test_the_compiled_signatures_are_the_two_graphs_and_the_two_masks(script):
+    assert script["compiled_signatures"](128) == (
+        ["prefill_128", "decode"],
+        ["prefill_mask_128", "decode_mask"],
+    )
+
+
+def test_a_compiled_graph_must_be_one_dispatch_op_per_signature_and_stamped(script):
+    check, refused = script["check_compiled"], script["Refused"]
+    sigs = ["prefill_128", "decode"]
     good = {
-        "ops": {"prefill_128": {"DISPATCH_OP": 1}, "decode": {"DISPATCH_OP": 2}},
+        "ops": {"prefill_128": {"DISPATCH_OP": 1}, "decode": {"DISPATCH_OP": 1}},
         "stamp": _stamp("SM8750"),
     }
-    assert script["check_compiled"](good, "SM8750") == ["Qualcomm", "SM8750"]
-    refused = script["Refused"]
-    with pytest.raises(refused, match="not DISPATCH_OPs only"):
-        script["check_compiled"](
-            {**good, "ops": {"decode": {"DISPATCH_OP": 1, "ADD": 1}}}, "SM8750"
-        )
-    with pytest.raises(refused, match="not DISPATCH_OPs only"):
-        script["check_compiled"]({**good, "ops": {"decode": {}}}, "SM8750")
+    assert check(good, "SM8750", sigs) == ["Qualcomm", "SM8750"]
+    for ops in (
+        {"prefill_128": {"DISPATCH_OP": 1}, "decode": {"DISPATCH_OP": 2}},
+        {"prefill_128": {"DISPATCH_OP": 1}, "decode": {"DISPATCH_OP": 1, "ADD": 1}},
+        {"prefill_128": {"DISPATCH_OP": 1}, "decode": {}},
+    ):
+        with pytest.raises(refused, match="not one DISPATCH_OP"):
+            check({**good, "ops": ops}, "SM8750", sigs)
+    with pytest.raises(refused, match="signatures are"):
+        check({**good, "ops": {"decode": {"DISPATCH_OP": 1}}}, "SM8750", sigs)
+    extra = {**good["ops"], "prefill_256": {"DISPATCH_OP": 1}}
+    with pytest.raises(refused, match="signatures are"):
+        check({**good, "ops": extra}, "SM8750", sigs)
+    assert check({**good, "ops": extra}, "SM8750", sigs, only=False) == ["Qualcomm", "SM8750"]
     with pytest.raises(refused, match="LiteRtStamp is None"):
-        script["check_compiled"]({**good, "stamp": None}, "SM8750")
+        check({**good, "stamp": None}, "SM8750", sigs)
     with pytest.raises(refused, match="stamped"):
-        script["check_compiled"](good, "SM8650")
+        check(good, "SM8650", sigs)
+
+
+def test_the_aux_graph_needs_its_masks_dispatched_and_keeps_its_cache_updates(script):
+    aux = {
+        "ops": {
+            "prefill_cache_update_128": {"DYNAMIC_UPDATE_SLICE": 4},
+            "decode_cache_update": {"DYNAMIC_UPDATE_SLICE": 4},
+            "prefill_mask_128": {"DISPATCH_OP": 1},
+            "decode_mask": {"DISPATCH_OP": 1},
+        },
+        "stamp": _stamp("SM8750"),
+    }
+    assert script["check_compiled_aux"](aux, "SM8750", 128) == ["Qualcomm", "SM8750"]
+    with pytest.raises(script["Refused"], match="stamped"):
+        script["check_compiled_aux"](aux, "SM8650", 128)
+    aux["ops"]["decode_mask"] = {"LESS": 1}
+    with pytest.raises(script["Refused"], match="decode_mask"):
+        script["check_compiled_aux"](aux, "SM8750", 128)
+
+
+def test_decode_summary_says_how_far_the_calibration_replies_ran(script):
+    record = [{"steps": 128, "position": 1000}, {"steps": 7, "position": 60},
+              {"steps": 40, "position": 200}]
+    assert script["decode_summary"](record, 128) == {
+        "count": 3, "cap": 128, "min_steps": 7, "median_steps": 40, "max_steps": 128,
+        "full": 1, "longest_position": 1000,
+    }
+    assert script["decode_summary"]([], 128) is None
+
+
+def test_recording_decode_counts_each_prompts_decode_steps(script):
+    class Executor:
+        def sample_text(self, prompt, max_sample_step=None):
+            state = SimpleNamespace(time_step=len(prompt))
+            for _ in range(max_sample_step):
+                state = self.decode_step(state)
+            return [prompt]
+
+        def decode_step(self, state):
+            return SimpleNamespace(time_step=state.time_step + 1)
+
+    record = []
+    script["recording_decode"](Executor, record)
+    assert Executor().sample_text("abcd", max_sample_step=3) == ["abcd"]
+    Executor().sample_text("ab", max_sample_step=0)
+    assert record == [{"steps": 3, "position": 7}, {"steps": 0, "position": 0}]
+
+
+def _sections(tmp_path, name, **files):
+    out = {}
+    for key, content in files.items():
+        if key in ("chat_template", "stop_token_ids"):
+            out[key] = content
+            continue
+        path = tmp_path / f"{name}-{key}"
+        path.write_bytes(content)
+        out[key] = str(path)
+    return out
+
+
+def test_the_compiled_metadata_must_be_stage_3s(script, tmp_path):
+    def sha(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    compare, refused = script["compare_metadata"], script["Refused"]
+    files = {"LlmMetadataProto": b"meta", "HF_Tokenizer": b"tok", "chat_template": "{{x}}",
+             "stop_token_ids": [1, 106]}
+    reference = _sections(tmp_path, "ref", **files)
+    got = compare(_sections(tmp_path, "npu", **files), reference, sha)
+    assert got["LlmMetadataProto"] == hashlib.sha256(b"meta").hexdigest()
+    assert got["stop_token_ids"] == [1, 106] and "SP_Tokenizer" not in got
+    with pytest.raises(refused, match="HF_Tokenizer"):
+        compare(_sections(tmp_path, "a", **{**files, "HF_Tokenizer": b"other"}), reference, sha)
+    with pytest.raises(refused, match="stop_token_ids"):
+        compare(_sections(tmp_path, "b", **{**files, "stop_token_ids": [1]}), reference, sha)
+    with pytest.raises(refused, match="chat_template"):
+        compare(_sections(tmp_path, "c", **{**files, "chat_template": None}), reference, sha)
+    no_tokenizer = {k: v for k, v in reference.items() if k != "HF_Tokenizer"}
+    with pytest.raises(refused, match="no tokenizer"):
+        compare(reference, no_tokenizer, sha)
+    no_metadata = {k: v for k, v in reference.items() if k != "LlmMetadataProto"}
+    with pytest.raises(refused, match="no LlmMetadata"):
+        compare(reference, no_metadata, sha)
 
 
 def test_long_targets_reach_the_prompt_limit(script):
@@ -510,10 +615,24 @@ def test_exporter_flags_become_keyword_arguments(script):
 # ---------------------------------------------------------------------------
 
 
-def _checkpoint(tmp_path: Path, base=GEMMA, model_type="gemma3_text", **record) -> Path:
+def _safetensors(path: Path, shapes: dict[str, list[int]]) -> Path:
+    """A safetensors file's header alone: what `checkpoint_parameters` reads."""
+    header = json.dumps(
+        {"__metadata__": {"format": "pt"}}
+        | {k: {"dtype": "F32", "shape": v, "data_offsets": [0, 0]} for k, v in shapes.items()}
+    ).encode()
+    path.write_bytes(len(header).to_bytes(8, "little") + header)
+    return path
+
+
+def _checkpoint(
+    tmp_path: Path, base=GEMMA, model_type="gemma3_text", shapes=None, **record
+) -> Path:
     model = tmp_path / "tuned"
     model.mkdir()
     (model / "config.json").write_text(json.dumps({"model_type": model_type}))
+    if shapes is not False:
+        _safetensors(model / "model.safetensors", shapes or {"w": [640, 1000]})
     (model / "litetune.json").write_text(
         json.dumps({"base_model": base, "prompt_mode": "runtime_rendered", **record})
     )
@@ -534,6 +653,10 @@ CALIBRATION = {
     "longest_tokens": 890,
     "prompt_limit_tokens": 896,
     "sha256": "ab" * 32,
+    "decode": {
+        "count": 64, "cap": 128, "min_steps": 128, "median_steps": 128, "max_steps": 128,
+        "full": 64, "longest_position": 1018,
+    },
 }
 KV_OK = {"prefill_128": {"INT16": 36}, "decode": {"INT16": 36}}
 
@@ -865,9 +988,79 @@ def test_a_decision_or_tool_checkpoint_is_refused_before_anything_runs(
 def test_an_unmeasured_family_or_size_is_refused_before_anything_runs(
     monkeypatch, tmp_path, ready_env, base
 ):
+    # No safetensors to count: the size is read from the name.
     fake = FakeRun()
-    result = _run(tmp_path, _checkpoint(tmp_path, base=base), fake=fake, monkeypatch=monkeypatch)
+    model = _checkpoint(tmp_path, base=base, shapes=False)
+    result = _run(tmp_path, model, fake=fake, monkeypatch=monkeypatch)
     assert result.outcome is Outcome.UNCHECKED and fake.specs == []
+
+
+def test_the_checkpoints_own_parameter_count_gates_its_size(monkeypatch, tmp_path, ready_env):
+    # gemma-3-1b's weights under a 270m name: refused by what they are.
+    ceiling = llm_npu.MEASURED_PARAMETERS["gemma-3-text"] * llm_npu.PARAMETER_HEADROOM
+    fake = FakeRun()
+    model = _checkpoint(tmp_path, shapes={"a": [ceiling // 2], "b": [ceiling // 2 + 1]})
+    result = _run(tmp_path, model, fake=fake, monkeypatch=monkeypatch)
+    assert result.outcome is Outcome.UNCHECKED and fake.specs == []
+    assert f"{ceiling + 1:,} parameters" in result.checks.checks[0].detail
+
+
+def test_a_checkpoint_at_the_ceiling_is_accepted_and_its_count_reported(
+    monkeypatch, tmp_path, ready_env
+):
+    ceiling = llm_npu.MEASURED_PARAMETERS["gemma-3-text"] * llm_npu.PARAMETER_HEADROOM
+    model = _checkpoint(tmp_path, shapes={"a": [ceiling // 2], "b": [ceiling - ceiling // 2]})
+    result = _run(tmp_path, model, fake=FakeRun(), monkeypatch=monkeypatch)
+    assert result.outcome is Outcome.PASSED
+    assert result.as_dict()["parameters"] == ceiling
+    assert not any("no safetensors" in t for t in result.limitations)
+
+
+def test_a_checkpoint_without_safetensors_is_sized_by_name_and_says_so(
+    monkeypatch, tmp_path, ready_env
+):
+    model = _checkpoint(tmp_path, shapes=False)
+    result = _run(tmp_path, model, fake=FakeRun(), monkeypatch=monkeypatch)
+    assert result.outcome is Outcome.PASSED and result.as_dict()["parameters"] is None
+    assert any("no safetensors" in t and GEMMA in t for t in result.limitations)
+
+
+def test_an_unreadable_safetensors_header_is_could_not_check(monkeypatch, tmp_path, ready_env):
+    model = _checkpoint(tmp_path)
+    (model / "model.safetensors").write_bytes(b"\x05\x00\x00\x00\x00\x00\x00\x00{nope")
+    fake = FakeRun()
+    result = _run(tmp_path, model, fake=fake, monkeypatch=monkeypatch)
+    assert result.outcome is Outcome.UNCHECKED and fake.specs == []
+    assert "safetensors header cannot be read" in result.checks.checks[0].detail
+
+
+def test_checkpoint_parameters_sums_every_shard(tmp_path):
+    _safetensors(tmp_path / "model-00001-of-00002.safetensors", {"a": [3, 4]})
+    _safetensors(tmp_path / "model-00002-of-00002.safetensors", {"b": [5], "c": []})
+    assert llm_npu.checkpoint_parameters(tmp_path) == 18
+    assert llm_npu.checkpoint_parameters(tmp_path / "missing") is None
+    (tmp_path / "huge.safetensors").write_bytes((200 << 20).to_bytes(8, "little"))
+    with pytest.raises(ValueError, match="huge.safetensors.*-byte header"):
+        llm_npu.checkpoint_parameters(tmp_path)
+
+
+def test_malformed_calibration_data_fails_and_too_few_rows_cannot_check(
+    monkeypatch, tmp_path, ready_env
+):
+    broken = tmp_path / "broken.jsonl"
+    broken.write_text("{not json\n")
+    result = _run(tmp_path, _checkpoint(tmp_path), fake=FakeRun(), monkeypatch=monkeypatch,
+                  data=broken)
+    assert result.outcome is Outcome.FAILED
+    assert _check(result, llm_npu.NPU_DATA_CHECK).outcome is Outcome.FAILED
+    few = _rows(tmp_path / "few.jsonl", n=7)
+    assert not (tmp_path / "out").exists()
+    model = tmp_path / "tuned"
+    result = _run(tmp_path, model, fake=FakeRun(), monkeypatch=monkeypatch, data=few)
+    assert result.outcome is Outcome.UNCHECKED
+    missing = _run(tmp_path, model, fake=FakeRun(), monkeypatch=monkeypatch,
+                   data=tmp_path / "missing.jsonl")
+    assert missing.outcome is Outcome.UNCHECKED
 
 
 def test_a_checkpoint_without_a_prompt_mode_is_refused(monkeypatch, tmp_path, ready_env):
@@ -1038,3 +1231,73 @@ def test_verify_refuses_an_llm_npu_bundle_before_routing_by_the_reference(tmp_pa
     )
     assert result.status is Status.FAILED_HARNESS
     assert "Qualcomm SM8750 NPU" in json.dumps(result.manifest)
+
+
+def _calibration_replaced(decode):
+    def make(spec):
+        answer = _good_answer(Path(spec["work"]), spec["socs"])
+        answer["calibration"] = {**CALIBRATION, "decode": decode}
+        if decode is None:
+            del answer["calibration"]["decode"]
+        return answer
+
+    return make
+
+
+def test_replies_short_of_the_decode_cap_are_a_limitation_in_every_report(
+    monkeypatch, tmp_path, ready_env
+):
+    short = {**CALIBRATION["decode"], "median_steps": 9, "max_steps": 128, "full": 3}
+    result = _run(
+        tmp_path, _checkpoint(tmp_path), fake=FakeRun(make=_calibration_replaced(short)),
+        monkeypatch=monkeypatch,
+    )
+    assert result.outcome is Outcome.PASSED
+    report = json.loads((tmp_path / "out" / "npu-SM8750" / REPORT_NAME).read_text())
+    (line,) = [t for t in report["limitations"] if "decode steps" in t]
+    assert "9 decode steps at the median" in line and "3 of 64" in line
+    assert report["calibration"]["decode"]["full"] == 3
+
+
+def test_replies_that_all_reach_the_cap_need_no_decode_limitation(
+    monkeypatch, tmp_path, ready_env
+):
+    result = _run(tmp_path, _checkpoint(tmp_path), fake=FakeRun(), monkeypatch=monkeypatch)
+    assert not any("decode steps" in t for t in result.limitations)
+
+
+def test_unrecorded_decode_steps_are_a_limitation(monkeypatch, tmp_path, ready_env):
+    result = _run(
+        tmp_path, _checkpoint(tmp_path), fake=FakeRun(make=_calibration_replaced(None)),
+        monkeypatch=monkeypatch,
+    )
+    assert any("was not recorded" in t for t in result.limitations)
+
+
+def test_a_bundle_naming_no_qairt_build_fails(monkeypatch, tmp_path, ready_env):
+    def entry(work):
+        packed = work / "SM8750.litertlm"
+        packed.write_bytes(b"npu bundle")
+        return {**_soc_entry(packed, "SM8750"), "qairt": None}
+
+    result = _run(
+        tmp_path, _checkpoint(tmp_path), fake=FakeRun(make=_soc_replaced(entry)),
+        monkeypatch=monkeypatch,
+    )
+    assert result.outcome is Outcome.FAILED
+    assert "no QAIRT build" in _check(result, llm_npu.NPU_COMPILE_CHECK).detail
+    assert not (tmp_path / "out" / "npu-SM8750").exists()
+
+
+def test_the_aux_graphs_ops_reach_the_report(monkeypatch, tmp_path, ready_env):
+    aux = {"ops": {"prefill_mask_128": {"DISPATCH_OP": 1}, "decode_mask": {"DISPATCH_OP": 1}}}
+
+    def entry(work):
+        packed = work / "SM8750.litertlm"
+        packed.write_bytes(b"npu bundle")
+        return {**_soc_entry(packed, "SM8750"), "aux": aux}
+
+    _run(tmp_path, _checkpoint(tmp_path), fake=FakeRun(make=_soc_replaced(entry)),
+         monkeypatch=monkeypatch)
+    report = json.loads((tmp_path / "out" / "npu-SM8750" / REPORT_NAME).read_text())
+    assert report["npu"]["aux_ops_per_signature"] == aux["ops"]
