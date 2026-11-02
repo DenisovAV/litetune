@@ -22,6 +22,7 @@ MPS for itself would run without it.
 from __future__ import annotations
 
 import logging
+import platform as platform_module
 import re
 import subprocess
 import sys
@@ -151,6 +152,125 @@ def host_record(
             logger.warning("could not read this Mac's chip: %s", exc)
             record["chip_error"] = str(exc)
     return record
+
+
+# ---------------------------------------------------------------------------
+# LiteRT-LM's CPU threads on a CPU with SME2
+# ---------------------------------------------------------------------------
+#
+# On a Mac whose CPU has SME2, Google's litert-lm 0.18.0 wheel from PyPI gave
+# results that depend on the thread count (measured 2026-11-01 on an Apple M5
+# Pro; upstream this is XNNPACK #11789). An int8 decision bundle scored at 4
+# and at 12 threads agreed with itself run to run, and differed from one
+# thread by up to 0.481 nats a token on 12 of 50 rows; one thread gave, bit for
+# bit, the scores of the same runs with SME hidden from the process. A float32
+# bundle at more than one thread varied by up to 2.5e-5 nats from run to run,
+# which broke the #3561 self-check (`decision_scripts`): it reads an exact
+# 0.0 gap as "dropped". So on such a host every LiteRT-LM CPU run litetune
+# drives gets one thread, and the run records how many were asked for and why.
+#
+# Read once a process, from `hw.optional.arm.FEAT_SME2`, and only on macOS on
+# arm64: an Intel Mac and every other platform have no such key to read, and
+# are taken as not having SME2. A Mac whose answer cannot be read is treated as
+# one that has it -- one thread is the setting measured repeatable -- and the
+# run says the answer was not read.
+SME2_SYSCTL = "hw.optional.arm.FEAT_SME2"
+SME2_ISSUE = "XNNPACK #11789"
+SME2_MEASURED = (
+    f"on such a CPU Google's litert-lm 0.18.0 wheel gave results that depend on the thread "
+    f"count ({SME2_ISSUE}); one thread was measured repeatable and, on an int8 decision bundle, "
+    "equal bit for bit to the result with SME hidden"
+)
+
+_sme2_reading: list[bool | None] = []
+
+
+def read_sme2(
+    platform: str | None = None, machine: str | None = None, sysctl: Sysctl | None = None
+) -> bool | None:
+    """Whether this CPU has SME2: True, False, or None when a Mac's answer could not be read.
+
+    Reads `hw.optional.arm.FEAT_SME2` on macOS on arm64 only; anywhere else
+    returns False without reading anything. "1" is True and "0" False; a read
+    that fails, or any other value, is None with a warning.
+    """
+    platform = platform if platform is not None else sys.platform
+    machine = machine if machine is not None else platform_module.machine()
+    if platform != "darwin" or machine != "arm64":
+        return False
+    read = sysctl if sysctl is not None else read_sysctl
+    try:
+        value = read(SME2_SYSCTL)
+    except HostReadError as exc:
+        logger.warning("could not read whether this CPU has SME2: %s", exc)
+        return None
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    logger.warning("sysctl %s printed %r, which is neither 0 nor 1", SME2_SYSCTL, value[:80])
+    return None
+
+
+def host_sme2() -> bool | None:
+    """`read_sme2()` for this host, read once a process."""
+    if not _sme2_reading:
+        _sme2_reading.append(read_sme2())
+    return _sme2_reading[0]
+
+
+@dataclass(frozen=True)
+class CpuThreads:
+    """The threads one LiteRT-LM CPU run used, what was asked for, and why they differ.
+
+    `requested` and `used` are `None` for "the runtime's default count", which
+    is what a run that passes no count gets. `reason` is `None` when the run got
+    what was asked for.
+    """
+
+    used: int | None
+    requested: int | None
+    reason: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"threads": self.used, "requested": self.requested, "reason": self.reason}
+
+    def limitation(self, what: str, text_output: bool = False) -> str | None:
+        """What a report says about `what` ran on these threads, or None when nothing changed."""
+        if self.reason is None:
+            return None
+        asked = (
+            f"{self.requested} asked for"
+            if self.requested is not None
+            else "no count asked for, which leaves the runtime's default"
+        )
+        said = f"{what} ran LiteRT-LM on the CPU on one thread ({asked}): {self.reason}"
+        if text_output:
+            said += (
+                ". One thread is used as on the decision path; its effect on generated text was "
+                "not measured"
+            )
+        return said
+
+
+def cpu_threads_for(requested: int | None, sme2: bool | None) -> CpuThreads:
+    """The threads a LiteRT-LM CPU run uses on a CPU with this SME2 answer. Pure."""
+    if sme2 is True:
+        reason = f"this CPU has SME2 ({SME2_SYSCTL} = 1); {SME2_MEASURED}"
+    elif sme2 is None:
+        reason = f"whether this CPU has SME2 could not be read ({SME2_SYSCTL}); {SME2_MEASURED}"
+    else:
+        return CpuThreads(used=requested, requested=requested)
+    return CpuThreads(used=1, requested=requested, reason=reason)
+
+
+def runtime_cpu_threads(requested: int | None) -> CpuThreads:
+    """The threads a LiteRT-LM CPU run on this host uses: one where SME2 is present or unknown.
+
+    `requested` is `None` for a run that passes no count, which off such a host
+    keeps the runtime's default.
+    """
+    return cpu_threads_for(requested, host_sme2())
 
 
 # ---------------------------------------------------------------------------

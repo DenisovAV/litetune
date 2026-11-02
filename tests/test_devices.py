@@ -800,3 +800,142 @@ def test_this_macs_memory_reads_into_a_reading():
     assert reading.page_size > 0
     assert reading.available_bytes >= 0
     assert reading.pressure_level in devices.PRESSURE_NAMES
+
+
+# ---------------------------------------------------------------------------
+# LiteRT-LM's CPU threads on a CPU with SME2
+# ---------------------------------------------------------------------------
+
+
+def _sme2_sysctl(value: str | None, calls: list[str] | None = None):
+    """A sysctl that answers `value` for FEAT_SME2 (raises for None) and records each read."""
+    seen = calls if calls is not None else []
+
+    def read(name: str) -> str:
+        seen.append(name)
+        if name != devices.SME2_SYSCTL or value is None:
+            raise HostReadError(f"sysctl {name} exited 1: unknown oid {name!r}")
+        return value
+
+    return read
+
+
+@pytest.mark.parametrize(("value", "present"), [("1", True), ("0", False)])
+def test_a_mac_on_arm64_reads_sme2_from_sysctl(value, present):
+    calls: list[str] = []
+    assert devices.read_sme2("darwin", "arm64", _sme2_sysctl(value, calls)) is present
+    assert calls == ["hw.optional.arm.FEAT_SME2"]
+
+
+def test_a_mac_whose_answer_cannot_be_read_is_unknown_and_says_so(caplog):
+    with caplog.at_level("WARNING", logger="litetune.devices"):
+        assert devices.read_sme2("darwin", "arm64", _sme2_sysctl(None)) is None
+    assert "could not read whether this CPU has SME2" in caplog.text
+    assert "unknown oid" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["2", "yes", "1 ", "01"])
+def test_an_answer_other_than_0_or_1_is_unknown_and_says_so(value, caplog):
+    """`read_sysctl` strips what it reads, so "1 " here is not what a Mac prints."""
+    with caplog.at_level("WARNING", logger="litetune.devices"):
+        assert devices.read_sme2("darwin", "arm64", _sme2_sysctl(value)) is None
+    assert "neither 0 nor 1" in caplog.text
+    assert repr(value) in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("platform", "machine"),
+    [("darwin", "x86_64"), ("linux", "aarch64"), ("linux", "arm64"), ("win32", "ARM64")],
+)
+def test_an_intel_mac_or_another_os_has_no_sme2_and_reads_nothing(platform, machine):
+    calls: list[str] = []
+    assert devices.read_sme2(platform, machine, _sme2_sysctl("1", calls)) is False
+    assert calls == []
+
+
+def test_by_default_it_asks_this_process_for_the_platform_and_machine(monkeypatch):
+    monkeypatch.setattr(devices.sys, "platform", "darwin")
+    monkeypatch.setattr(devices.platform_module, "machine", lambda: "arm64")
+    assert devices.read_sme2(sysctl=_sme2_sysctl("1")) is True
+    monkeypatch.setattr(devices.platform_module, "machine", lambda: "x86_64")
+    assert devices.read_sme2(sysctl=_sme2_sysctl("1")) is False
+
+
+def test_the_suites_sysctl_answers_no_sme2():
+    """So every other test keeps the threads it asks for, on a Mac as anywhere."""
+    assert FAKE_SYSCTL[devices.SME2_SYSCTL] == "0"
+    assert devices.host_sme2() is False
+
+
+def test_the_host_is_read_once_a_process(monkeypatch, caplog):
+    calls: list[str] = []
+    monkeypatch.setattr(devices, "read_sysctl", _sme2_sysctl(None, calls))
+    monkeypatch.setattr(devices.sys, "platform", "darwin")
+    monkeypatch.setattr(devices.platform_module, "machine", lambda: "arm64")
+    with caplog.at_level("WARNING", logger="litetune.devices"):
+        assert devices.host_sme2() is None
+        assert devices.host_sme2() is None
+        assert devices.runtime_cpu_threads(4).used == 1
+    assert calls == [devices.SME2_SYSCTL]
+    assert caplog.text.count("could not read whether this CPU has SME2") == 1
+
+
+def test_sme2_gets_one_thread_and_says_why():
+    threads = devices.cpu_threads_for(4, True)
+    assert (threads.used, threads.requested) == (1, 4)
+    assert threads.reason is not None
+    assert threads.reason.startswith("this CPU has SME2 (hw.optional.arm.FEAT_SME2 = 1); ")
+    assert "Google's litert-lm 0.18.0 wheel" in threads.reason
+    assert "(XNNPACK #11789)" in threads.reason
+    assert "one thread was measured repeatable" in threads.reason
+    assert "equal bit for bit to the result with SME hidden" in threads.reason
+    assert threads.as_dict() == {"threads": 1, "requested": 4, "reason": threads.reason}
+
+
+def test_an_unknown_answer_gets_one_thread_and_says_it_was_not_read():
+    threads = devices.cpu_threads_for(4, None)
+    assert (threads.used, threads.requested) == (1, 4)
+    assert threads.reason is not None
+    assert threads.reason.startswith("whether this CPU has SME2 could not be read")
+    assert devices.SME2_MEASURED in threads.reason
+
+
+@pytest.mark.parametrize("requested", [4, 1, 12, None])
+def test_without_sme2_the_run_gets_what_it_asked_for(requested):
+    threads = devices.cpu_threads_for(requested, False)
+    assert threads == devices.CpuThreads(used=requested, requested=requested, reason=None)
+    assert threads.limitation("anything") is None
+
+
+def test_a_run_that_asked_for_no_count_gets_one_on_sme2():
+    threads = devices.cpu_threads_for(None, True)
+    assert (threads.used, threads.requested) == (1, None)
+
+
+def test_runtime_cpu_threads_reads_this_host(sme2_host):
+    assert devices.runtime_cpu_threads(8) == devices.cpu_threads_for(8, True)
+
+
+def test_the_limitation_says_what_ran_on_one_thread_what_was_asked_and_why():
+    said = devices.cpu_threads_for(4, True).limitation("the runtime's option scoring")
+    assert said is not None
+    assert said.startswith(
+        "the runtime's option scoring ran LiteRT-LM on the CPU on one thread (4 asked for): "
+        "this CPU has SME2"
+    )
+    assert "generated text" not in said
+
+
+def test_the_limitation_for_no_count_names_the_runtimes_default():
+    said = devices.cpu_threads_for(None, None).limitation("x")
+    assert said is not None
+    assert "(no count asked for, which leaves the runtime's default)" in said
+
+
+def test_the_limitation_for_text_says_its_effect_on_text_was_not_measured():
+    said = devices.cpu_threads_for(None, True).limitation("x", text_output=True)
+    assert said is not None
+    assert said.endswith(
+        ". One thread is used as on the decision path; its effect on generated text was not "
+        "measured"
+    )

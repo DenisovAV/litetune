@@ -38,11 +38,11 @@ import json
 import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
-from litetune import envs
+from litetune import devices, envs
 from litetune.checks import Check
 from litetune.events import EventStream
 from litetune.exits import read_returncode
@@ -169,9 +169,14 @@ def main():
         # something nobody asked for.
         conversation_args["automatic_tool_calling"] = False
     rows = []
-    with litert_lm.Engine(
-        spec["model"], backend=litert_lm.Backend.CPU(), enable_benchmark=True
-    ) as engine:
+    # One thread on a CPU with SME2 (`devices.runtime_cpu_threads`), as every
+    # LiteRT-LM CPU run verify drives; otherwise the runtime's default count.
+    threads = spec.get("thread_count")
+    if threads is None:
+        cpu = litert_lm.Backend.CPU()
+    else:
+        cpu = litert_lm.Backend.CPU(thread_count=threads)
+    with litert_lm.Engine(spec["model"], backend=cpu, enable_benchmark=True) as engine:
         # Rendering reads the conversation's history and never adds to it, so
         # one conversation renders every prompt as the first turn it would be.
         with engine.create_conversation(**conversation_args) as renderer:
@@ -319,6 +324,8 @@ class RenderingComparison:
     # Prompts in the prefill sample the runtime script did not send because
     # their rendering was empty; not counted in `prefill_sent`.
     prefill_skipped: int = 0
+    # The threads the runtime script's CPU engine used; `None` when not recorded.
+    cpu_threads: devices.CpuThreads | None = None
 
     @property
     def agrees(self) -> bool:
@@ -415,6 +422,7 @@ class RenderingComparison:
             "prefill_sent": self.prefill_sent,
             "prefill_skipped": self.prefill_skipped,
             "prefill_sampled": [dict(row) for row in self.prefill],
+            "runtime_cpu_threads": self.cpu_threads.as_dict() if self.cpu_threads else None,
             "mismatches": len(self.mismatches),
             # The first few, which is what a reader needs to find the cause; the
             # count above says how many there were.
@@ -532,6 +540,8 @@ class RenderingProbe:
     def observe(
         self, prompts: Sequence[str], events: EventStream | None = None
     ) -> RenderingComparison:
+        # Always the CPU, which `verify --backend gpu` does not change.
+        threads = devices.runtime_cpu_threads(None)
         runtime_rows = self._run(
             self.runtime_env,
             _RUNTIME_SCRIPT,
@@ -540,6 +550,7 @@ class RenderingProbe:
                 "prompts": list(prompts),
                 "prefill_sample": self.prefill_sample,
                 "tools": self.declarations,
+                "thread_count": threads.used,
             },
             events,
         )
@@ -561,7 +572,8 @@ class RenderingProbe:
         # runtime was given. Less the rows it skipped because they did not render.
         skipped = {int(row["index"]) for row in runtime_rows if row.get("prefill_skipped")}
         sent = [i for i in range(len(prompts))[: self.prefill_sample] if i not in skipped]
-        return compare_renderings(prompts, runtime_rows, reference_rows, prefill_sent=len(sent))
+        compared = compare_renderings(prompts, runtime_rows, reference_rows, prefill_sent=len(sent))
+        return replace(compared, cpu_threads=threads)
 
     def _run(
         self,

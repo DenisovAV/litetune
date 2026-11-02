@@ -38,7 +38,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from litetune import envs, metrics, models
+from litetune import devices, envs, metrics, models
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.decision_verify import DEFAULT_ENGINE_ROWS, DEFAULT_THREADS
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
@@ -575,6 +575,26 @@ def _runtime_version_limitation(run: Any, backend: ToolPathBackend) -> None:
             "checked, so calling the grammar-off run the default is an assumption here, and a "
             "reply the runtime words differently leaves its mode unmeasured rather than scored"
         )
+
+
+def _limit_cpu_threads(run: Any, backend: GenerationBackend) -> None:
+    """Say so when the candidate's CPU engine got one thread instead of what was asked.
+
+    `devices.runtime_cpu_threads` decides it, on a CPU with SME2 or one whose
+    answer could not be read. Generated text was not measured at one thread
+    against more, so the limitation says only what was measured, and that.
+    """
+    threads = getattr(backend, "cpu_threads", None)
+    if not isinstance(threads, devices.CpuThreads):
+        return
+    what = (
+        "the candidate's generation, in each decoding mode of the tool path,"
+        if backend.scores_structurally
+        else "the candidate's generation"
+    )
+    said = threads.limitation(what, text_output=True)
+    if said:
+        run.limitation(said)
 
 
 def _limit_runtime_named(run: Any, engine: dict[str, Any]) -> None:
@@ -1347,6 +1367,13 @@ def run_verify(
             with guard(RENDERING_CHECK) as sink:
                 comparison = pair.rendering.observe(split.prompts, events=events)
                 run.manifest["harness"]["rendering_check"] = comparison.as_dict()
+                threads_said = (
+                    comparison.cpu_threads.limitation("the rendering check")
+                    if comparison.cpu_threads
+                    else None
+                )
+                if threads_said:
+                    run.limitation(threads_said)
                 sink.append(comparison.check())
             if run.record(sink[0]).outcome is not Outcome.PASSED:
                 # Could not look, or looked and found the sides differ. Neither is
@@ -1466,6 +1493,7 @@ def run_verify(
     if backend.lower() == "gpu":
         _limit_gpu_reading(run, candidate.engine)
     _limit_runtime_named(run, candidate.engine)
+    _limit_cpu_threads(run, pair.candidate)
 
     # Check 5 (divergence) is deferred: the caller decides whether it applies,
     # and generating the reference before the candidate is known alive would pay

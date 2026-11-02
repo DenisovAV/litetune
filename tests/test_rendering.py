@@ -978,3 +978,108 @@ def test_a_partly_answered_sample_does_not_call_the_answers_the_sends():
     assert "on 3 of the 8 prompts it was sent" in check.detail
     assert check.observed["prefill_sent"] == 8
     assert len(check.observed["prefill_sampled"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# The runtime script's CPU threads on a CPU with SME2
+# ---------------------------------------------------------------------------
+
+
+def _counting_cpu(module: Any) -> list[dict]:
+    """Make the fake's `Backend.CPU` record the keyword arguments of each call."""
+    calls: list[dict] = []
+
+    def cpu(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return "cpu"
+
+    module.Backend = types.SimpleNamespace(CPU=cpu)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("given", "passed"), [({"thread_count": 1}, {"thread_count": 1}), ({}, {})]
+)
+def test_the_runtime_script_passes_a_thread_count_only_when_given(
+    tmp_path, monkeypatch, given, passed
+):
+    module = _fake_litert_lm(FakeEngine(bos=2))
+    calls = _counting_cpu(module)
+    _run_script(
+        _RUNTIME_SCRIPT,
+        tmp_path,
+        monkeypatch,
+        {"litert_lm": module},
+        {"model": "m.litertlm", "prompts": ["a"], "prefill_sample": 1, **given},
+    )
+    assert calls == [passed]
+
+
+def _answering_run(seen: list[dict]):
+    def run(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        seen.append(spec)
+        written = rows([[1, 2]], prefill=[2] if "prefill_sample" in spec else None)
+        Path(spec["out"]).write_text(json.dumps(written), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    return run
+
+
+def test_on_a_cpu_with_sme2_the_probe_asks_for_one_thread_and_records_it(
+    monkeypatch, tmp_path, sme2_host
+):
+    seen: list[dict] = []
+    comparison = _probe(monkeypatch, tmp_path, _answering_run(seen)).observe(["hi"])
+
+    assert seen[0]["thread_count"] == 1
+    assert "thread_count" not in seen[1], "the reference's script runs no LiteRT-LM"
+    record = comparison.as_dict()["runtime_cpu_threads"]
+    assert record["threads"] == 1 and record["requested"] is None
+    assert "this CPU has SME2" in record["reason"]
+
+
+def test_off_such_a_cpu_the_probe_leaves_the_runtime_its_default(monkeypatch, tmp_path):
+    seen: list[dict] = []
+    comparison = _probe(monkeypatch, tmp_path, _answering_run(seen)).observe(["hi"])
+
+    assert seen[0]["thread_count"] is None
+    assert comparison.as_dict()["runtime_cpu_threads"] == {
+        "threads": None,
+        "requested": None,
+        "reason": None,
+    }
+
+
+def test_verify_says_the_rendering_check_ran_on_one_thread(write_split, sme2_host):
+    import dataclasses
+
+    from litetune import devices
+
+    class OneThread(FakeObserver):
+        def observe(self, prompts, events=None) -> RenderingComparison:
+            compared = super().observe(prompts, events)
+            return dataclasses.replace(compared, cpu_threads=devices.runtime_cpu_threads(None))
+
+    result = _verify(write_split, OneThread(prefill=2))
+
+    said = [t for t in result.manifest["limitations"] if t.startswith("the rendering check ")]
+    assert len(said) == 1
+    assert said[0].startswith(
+        "the rendering check ran LiteRT-LM on the CPU on one thread (no count asked for"
+    )
+    assert "generated text" not in said[0]
+
+
+def test_verify_says_nothing_of_threads_for_a_rendering_check_that_kept_them(write_split):
+    from litetune import devices
+
+    class Default(FakeObserver):
+        def observe(self, prompts, events=None) -> RenderingComparison:
+            import dataclasses
+
+            compared = super().observe(prompts, events)
+            return dataclasses.replace(compared, cpu_threads=devices.runtime_cpu_threads(None))
+
+    result = _verify(write_split, Default(prefill=2))
+    assert not any("one thread" in t for t in result.manifest["limitations"])

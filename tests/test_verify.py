@@ -2352,3 +2352,86 @@ def test_a_qwen35_candidate_gets_an_engine_per_prompt(write_split):
 
 def test_only_qwen35_needs_an_engine_per_prompt():
     assert {r.family for r in models.RULES if r.engine_per_prompt_reason} == {"qwen-3.5"}
+
+
+# -- the candidate's CPU threads on a CPU with SME2 ---------------------------
+
+
+def _shipped_text_candidate(monkeypatch, tmp_path, rows) -> LiteRtLmBackend:
+    """The real text backend, its driver script answered with every row right."""
+    texts = correct_texts(rows)
+    seen: list[dict] = []
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        seen.append(spec)
+        Path(spec["out"]).write_text(
+            "".join(json.dumps({"index": i, "text": texts[i]}) + "\n" for i in range(len(texts))),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    candidate = LiteRtLmBackend(model=tmp_path / "m.litertlm", auto_provision=False)
+    candidate.specs_seen = seen  # type: ignore[attr-defined]
+    return candidate
+
+
+def test_on_a_cpu_with_sme2_the_text_candidate_says_it_ran_one_thread(
+    write_split, tmp_path, monkeypatch, sme2_host
+):
+    rows = labelled_rows(4)
+    candidate = _shipped_text_candidate(monkeypatch, tmp_path, rows)
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=candidate,
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    assert candidate.specs_seen[0]["thread_count"] == 1
+    said = [t for t in result.manifest["limitations"] if "on one thread" in t]
+    assert len(said) == 1
+    assert said[0].startswith(
+        "the candidate's generation ran LiteRT-LM on the CPU on one thread (no count asked for, "
+        "which leaves the runtime's default): this CPU has SME2"
+    )
+    assert said[0].endswith(
+        "One thread is used as on the decision path; its effect on generated text was not measured"
+    )
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert engine["cpu_threads"]["threads"] == 1
+
+
+def test_off_such_a_cpu_the_text_candidate_says_nothing_of_threads(
+    write_split, tmp_path, monkeypatch
+):
+    rows = labelled_rows(4)
+    candidate = _shipped_text_candidate(monkeypatch, tmp_path, rows)
+
+    result = verify(
+        write_split,
+        rows,
+        candidate=candidate,
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+
+    assert "thread_count" not in candidate.specs_seen[0]
+    assert not any("one thread" in t for t in result.manifest["limitations"])
+
+
+def test_verifys_threads_do_not_reach_the_text_path(tmp_path):
+    """--threads is the decision and embedding paths'; text keeps the runtime's default."""
+    from litetune.verify import build_backends
+
+    request = VerifyRequest(
+        model=tmp_path / "m.litertlm",
+        reference="org/reference",
+        data=tmp_path / "heldout.jsonl",
+        prompt_mode=PromptMode.RUNTIME_RENDERED,
+        threads=8,
+    )
+    candidate = build_backends(request).candidate
+    assert isinstance(candidate, LiteRtLmBackend)
+    assert candidate.threads is None

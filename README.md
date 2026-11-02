@@ -271,6 +271,18 @@ So each litetune release pins one runtime, and from 0.2.0 every
 where the driver could read them, and says so when it could not read the version; 0.1.x recorded the version on the
 tool path only and the CPU nowhere.
 
+On a Mac whose CPU has SME2 (`sysctl hw.optional.arm.FEAT_SME2` prints 1),
+Google's litert-lm 0.18.0 wheel gave results that depend on the thread count
+(XNNPACK #11789): on an M5 Pro, an int8 decision bundle scored at four threads
+differed from one thread by up to 0.481 nats a token on 12 of 50 rows, and one
+thread gave the scores of a run with SME hidden, bit for bit. So on such a CPU,
+or a Mac whose answer litetune cannot read, every LiteRT-LM CPU run `verify`
+drives uses one thread, whatever `--threads` asks: option scoring and its float
+twin, EmbeddingGemma 2's engines, text and tool generation, and the rendering
+check. The manifest records the threads used, the threads asked for and why,
+and says so in its limitations; what one thread changes in generated text was
+not measured. Off such a CPU nothing changes.
+
 | litetune | candidate runtime | conversion | training and float reference |
 |---|---|---|---|
 | 0.1.0 – 0.1.9 | `litert-lm==0.16.1` | `litert-torch-nightly==0.10.0.dev20260826`; `litert-lm-builder==0.16.1` from 0.1.4 | `torch==2.5.1`, `transformers==5.16.1`, `peft==0.20.0` |
@@ -705,7 +717,8 @@ What has and has not been measured:
   and the scores most of the readings gave are kept (a family that scores each
   option on an Engine of its own is refused on the GPU). It is measured against
   the float reference on LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561
-  fix only. On another runtime, `verify` needs `--float-twin` to say more than
+  fix only. On a Mac CPU with SME2 it scores on one thread
+  ([Which runtime each version measures on](#which-runtime-each-version-measures-on)). On another runtime, `verify` needs `--float-twin` to say more than
   "could not check". One phone, a Galaxy S24, scored three bundles on its CPU
   and GPU with a port of verify's runtime scoring: SST-5's agreed with the
   reference on 0.9433 of the rows on both, under the 0.95 floor. Every row

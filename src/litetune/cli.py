@@ -451,7 +451,9 @@ def _add_verify(sub) -> None:
         default=DEFAULT_THREADS,
         help=(
             "decision and embedding checkpoints: the runtime's CPU threads (default "
-            f"{DEFAULT_THREADS})"
+            f"{DEFAULT_THREADS}). On a Mac whose CPU has SME2, or whose answer cannot be read, "
+            "every LiteRT-LM CPU run uses one thread instead and the manifest says so; an "
+            "embedding checkpoint's torch reference keeps this count"
         ),
     )
     verify.add_argument(

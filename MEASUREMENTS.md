@@ -2055,6 +2055,18 @@ new.
   batches of 16, 16.3 in batches of 64 and 14.7 in batches of 128, within
   8.3e-05 of the CPU. The next section is the reference wired onto MPS.
 - Not measured: FunctionGemma and gemma-4-E2B, whose checkpoints are gated, and CUDA.
+- The M5 Pro's CPU has SME2, and the runtime's scores above were taken on it at
+  four threads. On such a CPU Google's litert-lm 0.18.0 wheel gives results that
+  depend on the thread count (XNNPACK #11789). Checked 2026-11-01 on the same Mac
+  with this decision's `dynamic_wi8_afp32` bundle and 50 of its held-out rows:
+  at four threads the scores repeated run to run and differed from one thread's
+  by up to 0.481 nats a token on 12 of the 50 rows, and no top option changed;
+  one thread gave, bit for bit, the scores of a run with SME hidden from the
+  process. A float32 twin of an emotion decision, scored as the twin check
+  scores it, varied at four threads by up to 2.5e-05 nats run to run, under the
+  1e-03 twin tolerance. The 300-row agreement and mean KL above were not
+  measured again at one thread. `verify` now runs LiteRT-LM on one thread on
+  such a CPU.
 
 ### The decision reference on MPS
 
@@ -2093,6 +2105,10 @@ it as committed, with a third run whose MPS limit was set too low on purpose
   prompt forward, at each chunk's log-probabilities and after each batch.
   Between readings they were not read, so these are not peaks.
 - Not measured: other families, a Mac with less memory, a float twin on MPS.
+- The runtime's scores in these runs, and so the agreement and KL, are the M5
+  Pro's SME2 CPU at four threads; the last bullet of the previous section says
+  what that changed on 50 rows. The reference's MPS-against-CPU figures are
+  torch's and are not affected.
 
 ### Limitations carried by the decision numbers
 
@@ -2511,3 +2527,14 @@ runs used the banking77 int8 file from *litetune end to end*.
   it declares one, F16 otherwise.
 - One Mac and one runtime version. The phone in *The three passing bundles on a
   phone* gave the same GPU option scores on a repeat of the emotion session.
+- The M5 Pro's CPU has SME2. The CPU's option scores and its column of the
+  verify table were taken at four threads, the text and tool runs at the
+  runtime's default thread count. On such a CPU Google's litert-lm 0.18.0 wheel
+  gives results that depend on the thread count (XNNPACK #11789). Checked
+  2026-11-01 on the same Mac with the int8 bundle of *The decision reference on
+  MPS*: on 50 rows four threads moved per-token scores from one thread's by up
+  to 0.481 nats on 12 rows and changed no top option, and at the runtime's
+  default count 1 of 60 of its texts differed from the text with SME hidden.
+  The 300-row figures, the tool replies and the EmbeddingGemma 2 CPU figures
+  were not measured again. `verify` now runs LiteRT-LM on one thread on such a
+  CPU.

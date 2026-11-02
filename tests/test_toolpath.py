@@ -2115,3 +2115,53 @@ def test_modes_that_ran_different_runtimes_are_not_given_one(tmp_path):
     assert backend.runtime_version is None, "verify's runtime limitation reads this"
     assert described["runtime_version"] is None
     assert described["runtime_versions_by_mode"] == ["0.16.1", "0.17.1"]
+
+
+# -- the CPU engine's threads on a CPU with SME2 ------------------------------
+
+
+def test_on_a_cpu_with_sme2_both_modes_run_one_thread_and_say_so(tmp_path, sme2_host):
+    rows_ = labelled_rows(8)
+    by_mode = {"unconstrained": _rows(rows_, 8), "constrained": _rows(rows_, 8)}
+    result = _verify(tmp_path, rows_, by_mode)
+
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert engine["cpu_threads"]["threads"] == 1
+    assert engine["cpu_threads"]["requested"] is None
+    said = [t for t in result.manifest["limitations"] if "on one thread" in t]
+    assert len(said) == 1
+    assert said[0].startswith(
+        "the candidate's generation, in each decoding mode of the tool path, ran LiteRT-LM on "
+        "the CPU on one thread (no count asked for"
+    )
+    assert "XNNPACK #11789" in said[0]
+    assert said[0].endswith("its effect on generated text was not measured")
+
+
+def test_both_tool_path_modes_get_the_thread_count(tmp_path, sme2_host):
+    env = CannedEnv(by_mode={"unconstrained": [_row(0, calls=[])], "constrained": [_row(0)]})
+    backend = ToolPathBackend(model=tmp_path / "m.litertlm", declarations=DECLS, env=env)
+    backend.generate(["make it red"])
+    assert [s.get("thread_count") for s in env.specs] == [1, 1]
+
+
+def test_off_such_a_cpu_the_tool_path_passes_no_thread_count_and_says_nothing(tmp_path):
+    rows_ = labelled_rows(8)
+    by_mode = {"unconstrained": _rows(rows_, 8), "constrained": _rows(rows_, 8)}
+    env_specs: list[dict] = []
+    result = _verify(tmp_path, rows_, by_mode, specs=env_specs)
+
+    assert all("thread_count" not in s for s in env_specs) and len(env_specs) == 2
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert engine["cpu_threads"] == {"threads": None, "requested": None, "reason": None}
+    assert not any("on one thread" in t for t in result.manifest["limitations"])
+
+
+def test_the_gpu_tool_path_gets_no_thread_count(tmp_path, sme2_host):
+    env = CannedEnv(by_mode={"unconstrained": [_row(0, calls=[])], "constrained": [_row(0)]})
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    backend.generate(["make it red"])
+    assert all("thread_count" not in s for s in env.specs)
+    assert backend.describe()["cpu_threads"] is None

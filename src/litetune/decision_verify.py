@@ -1091,12 +1091,18 @@ def verify_decision(
     n_engine = len(engine_rows)
     engine_prompts = [heldout.prompts[i] for i in engine_rows]
     events.note(f"runtime: scoring {len(decision.ids)} options on {n_engine} held-out rows")
+    # The CPU threads every LiteRT-LM CPU run here uses: one on a CPU with SME2
+    # or one whose answer could not be read (`devices.runtime_cpu_threads`),
+    # whatever --threads asked. The float twin always runs on the CPU; a GPU
+    # run takes no thread count and is given none.
+    cpu = devices.runtime_cpu_threads(job.threads)
+    on_cpu = job.backend == "cpu"
     engine_spec = {
         "model": str(job.model),
         "rows": [{"index": i, "prompt": p} for i, p in enumerate(engine_prompts)],
         "options": list(decision.ids),
         "terminator": terminator,
-        "threads": job.threads,
+        "threads": cpu.used if on_cpu else None,
         "targets": "unique",
         "mode": "auto",
         "method": method,
@@ -1113,6 +1119,9 @@ def verify_decision(
     fields["harness"]["runtime"] = {
         k: v for k, v in eng.report.items() if k not in ("cont_ids", "k", "scored_lengths")
     }
+    fields["harness"]["runtime_cpu_threads"] = cpu.as_dict() if on_cpu else None
+    if on_cpu and (threads_said := cpu.limitation("the runtime's option scoring")):
+        state.limitations.append(threads_said)
     if "selfcheck" in eng.report:
         fields["decision"]["selfcheck"] = eng.report["selfcheck"]
     missing = [i for i in range(n_engine) if i not in eng.scores]
@@ -1318,7 +1327,9 @@ def verify_decision(
         "backend_observed": gpu_observed(job.backend, eng.report.get("device")),
         "runtime_version": (eng.report.get("runtime") or {}).get("litert-lm"),
         "cpu": {"model": eng.report.get("cpu")},
-        "threads": job.threads if job.backend == "cpu" else None,
+        "threads": cpu.used if on_cpu else None,
+        "threads_requested": job.threads if on_cpu else None,
+        "threads_reason": cpu.reason if on_cpu else None,
     }
     fields["measurements"]["reference_on_runtime_rows"] = outcome_metrics(
         sub_ref, targets, fit, none_index, decision.type
@@ -1357,8 +1368,10 @@ def verify_decision(
         # The first run's times. On the GPU the threads do not apply, and the CPU
         # model is not what computed.
         "backend": job.backend,
-        "threads": job.threads if job.backend == "cpu" else None,
-        "cpu": eng.report.get("cpu") if job.backend == "cpu" else None,
+        "threads": cpu.used if on_cpu else None,
+        "threads_requested": job.threads if on_cpu else None,
+        "threads_reason": cpu.reason if on_cpu else None,
+        "cpu": eng.report.get("cpu") if on_cpu else None,
         "runtime": eng.report.get("runtime"),
         "rows": n_engine,
     }
@@ -1409,7 +1422,18 @@ def verify_decision(
     else:
         state.add(
             _twin_check(
-                job, decision, terminator, heldout, engine_rows, calib_n, ref, mode, method, events
+                job,
+                decision,
+                terminator,
+                heldout,
+                engine_rows,
+                calib_n,
+                ref,
+                mode,
+                method,
+                events,
+                cpu,
+                state.limitations,
             ),
             events,
             harness=True,
@@ -1525,8 +1549,15 @@ def _twin_check(
     mode: str | None,
     method: str,
     events: EventStream,
+    cpu: devices.CpuThreads,
+    limitations: list[str],
 ) -> Check:
-    """The float twin's per-token scores against the reference's, on a few of the runtime's rows."""
+    """The float twin's per-token scores against the reference's, on a few of the runtime's rows.
+
+    The twin runs on the CPU on `cpu`'s threads whatever the main run's
+    backend, and says so in `limitations` once it has run when those are not
+    the threads asked for.
+    """
     rows = list(engine_rows[:PROBE_ROWS])
     n = len(rows)
     twin = run_script(
@@ -1537,7 +1568,7 @@ def _twin_check(
             "rows": [{"index": j, "prompt": heldout.prompts[i]} for j, i in enumerate(rows)],
             "options": list(decision.ids),
             "terminator": terminator,
-            "threads": job.threads,
+            "threads": cpu.used,
             "targets": "full",
             "mode": mode or "auto",
             "method": method,
@@ -1546,6 +1577,8 @@ def _twin_check(
         auto_provision=False,
         events=events,
     )
+    if said := cpu.limitation("the float twin's option scoring"):
+        limitations.append(said)
     if twin.failure or len(twin.scores) < n:
         said = twin.failure or (
             "the float twin left rows unscored"
@@ -1565,7 +1598,7 @@ def _twin_check(
         f"largest per-token difference {worst:.2e} nats on {n} rows, every option, in mode "
         f"{mode!r} (refused above {job.twin_tolerance})"
     )
-    observed = {"max_abs_token": worst, "rows": n, "mode": mode}
+    observed = {"max_abs_token": worst, "rows": n, "mode": mode, "cpu_threads": cpu.as_dict()}
     return (Check.passed if worst <= job.twin_tolerance else Check.failed)(
         TWIN_CHECK, detail, observed=observed
     )

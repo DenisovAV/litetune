@@ -3920,3 +3920,89 @@ def test_a_split_that_dies_part_way_reports_every_engine_it_built(tmp_path, monk
     assert [
         json.loads(line)["index"] for line in (tmp_path / "out.jsonl").read_text().splitlines()
     ] == [0]
+
+
+# -- the CPU engine's threads on a CPU with SME2 ------------------------------
+
+
+def test_a_thread_count_reaches_the_cpu_spec_only_when_given():
+    assert runtime_engine_spec("cpu", 1) == {
+        "backend": "cpu",
+        "activation_data_type": None,
+        "thread_count": 1,
+    }
+    assert "thread_count" not in runtime_engine_spec("cpu", None)
+    # A GPU engine takes no thread count, so none is written for one.
+    assert runtime_engine_spec("gpu", 1) == {"backend": "gpu", "activation_data_type": "fp32"}
+
+
+def test_the_driver_passes_a_thread_count_to_the_cpu_backend_only_when_given(tmp_path, monkeypatch):
+    _, engines = _run_script(
+        tmp_path, ["one"], monkeypatch=monkeypatch, engine=runtime_engine_spec("cpu", 1)
+    )
+    assert engines[0].backend.name == "cpu"
+    assert engines[0].backend.kwargs == {"thread_count": 1}
+    _, engines = _run_script(
+        tmp_path, ["one"], monkeypatch=monkeypatch, engine=runtime_engine_spec("cpu")
+    )
+    # `CPU()`, the runtime's default count, as before.
+    assert engines[0].backend.kwargs == {}
+
+
+def test_backend_for_gives_the_gpu_no_thread_count(tmp_path, monkeypatch):
+    _fake_litert_lm(monkeypatch)
+    backend_for = _litertlm_script()["backend_for"]
+    assert backend_for("gpu", 1).kwargs == {}
+    assert backend_for("cpu", "2").kwargs == {"thread_count": 2}
+
+
+def _spec_seen(monkeypatch) -> list[dict]:
+    seen: list[dict] = []
+    inner = _writes_results([{"index": 0, "text": "fine"}])
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        seen.append(json.loads(Path(args[2]).read_text(encoding="utf-8")))
+        return inner(self, args, timeout, **kwargs)
+
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+    return seen
+
+
+def test_on_a_cpu_with_sme2_the_text_path_runs_one_thread_and_records_it(
+    tmp_path, monkeypatch, sme2_host
+):
+    seen = _spec_seen(monkeypatch)
+    backend = _litertlm(tmp_path)
+
+    assert backend.generate(["hello"])[0].ok
+
+    assert seen[0]["thread_count"] == 1
+    recorded = backend.describe()["cpu_threads"]
+    assert recorded["threads"] == 1 and recorded["requested"] is None
+    assert "this CPU has SME2" in recorded["reason"]
+
+
+def test_off_such_a_cpu_the_text_path_passes_no_thread_count(tmp_path, monkeypatch):
+    seen = _spec_seen(monkeypatch)
+    backend = _litertlm(tmp_path)
+
+    backend.generate(["hello"])
+
+    assert "thread_count" not in seen[0]
+    assert backend.describe()["cpu_threads"] == {"threads": None, "requested": None, "reason": None}
+
+
+def test_a_text_path_given_threads_keeps_them_off_such_a_cpu(tmp_path, monkeypatch):
+    seen = _spec_seen(monkeypatch)
+    _litertlm(tmp_path, threads=6).generate(["hello"])
+    assert seen[0]["thread_count"] == 6
+
+
+def test_the_gpu_text_path_records_no_cpu_threads(tmp_path, monkeypatch, sme2_host):
+    seen = _spec_seen(monkeypatch)
+    backend = _litertlm(tmp_path, backend_flag="gpu")
+
+    backend.generate(["hello"])
+
+    assert "thread_count" not in seen[-1]
+    assert backend.describe()["cpu_threads"] is None

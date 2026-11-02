@@ -726,6 +726,10 @@ class LiteRtLmBackend:
     # Why each prompt gets an Engine of its own, from the family's rule
     # (`ModelRules.engine_per_prompt_reason`); empty for one Engine per split.
     engine_per_prompt_reason: str = ""
+    # The CPU threads asked for; `None` asks for none and leaves the runtime's
+    # default. On a CPU with SME2 the run gets one whatever this says
+    # (`devices.runtime_cpu_threads`), and `cpu_threads` records it.
+    threads: int | None = None
 
     name = "litert-lm"
     # litetune passes no decoding parameters to the runtime, so `decode` is a
@@ -740,6 +744,9 @@ class LiteRtLmBackend:
     # run, before any return, so one run's reading is never reported as the
     # next one's.
     device_report: dict[str, Any] | None = field(default=None, init=False)
+    # The threads the last run's CPU engine used, asked for and why they differ;
+    # `None` before a run and on the GPU backend, which takes no thread count.
+    cpu_threads: devices.CpuThreads | None = field(default=None, init=False)
     # Text, not structured calls; a call is whatever `parse_call` makes of it.
     scores_structurally = False
 
@@ -804,6 +811,9 @@ class LiteRtLmBackend:
             # The arithmetic depends on the CPU model as much as on the runtime,
             # so the CPU travels with the number. `None` when no report was read.
             "cpu": cpu_of(self.device_report),
+            # The CPU engine's threads: used (`None`: the runtime's default),
+            # asked for, and why they differ. `None` on the GPU and before a run.
+            "cpu_threads": self.cpu_threads.as_dict() if self.cpu_threads else None,
             "requirements": envs.shown_requirements(self.env.requirements),
             # What this platform needs: Debian names are recorded on Linux only.
             "system_requirements": list(self.env.system_requirements_on()),
@@ -836,6 +846,10 @@ class LiteRtLmBackend:
     ) -> list[Generation]:
         # First, before any return: this run's reading or none.
         self.device_report = None
+        self.cpu_threads = (
+            devices.runtime_cpu_threads(self.threads) if self.backend_flag == "cpu" else None
+        )
+        thread_count = self.cpu_threads.used if self.cpu_threads else None
         blocked = self._ensure_env(events)
         if blocked is not None:
             return [Generation(i, p, harness_error=blocked) for i, p in enumerate(prompts)]
@@ -860,7 +874,7 @@ class LiteRtLmBackend:
                         "prompts": list(prompts),
                         "runtime_rendered": self.uses_template,
                         "engine_per_prompt": bool(self.engine_per_prompt_reason),
-                        **runtime_engine_spec(self.backend_flag),
+                        **runtime_engine_spec(self.backend_flag, thread_count),
                         "out": str(results),
                         "report": str(report),
                     }
@@ -1005,7 +1019,7 @@ class LiteRtLmBackend:
 CANDIDATE_BACKENDS = ("cpu", "gpu")
 
 
-def runtime_engine_spec(backend: str) -> dict[str, Any]:
+def runtime_engine_spec(backend: str, thread_count: int | None = None) -> dict[str, Any]:
     """What a driver script needs to construct its engine, as spec keys.
 
     The activation type is stated on every GPU run rather than left to the
@@ -1024,15 +1038,23 @@ def runtime_engine_spec(backend: str) -> dict[str, Any]:
     On the CPU backend nothing is passed: the option exists to force FP32 on a
     GPU, and the CPU path has been measured with nothing passed since the
     first number in MEASUREMENTS.md.
+
+    `thread_count` reaches the CPU backend only, and only when given: the
+    count `devices.runtime_cpu_threads` settled on, one on a CPU with SME2.
+    `None` leaves the runtime its default, as every run before it had. A GPU
+    engine takes no thread count, and none is written for one.
     """
     if backend not in CANDIDATE_BACKENDS:
         raise ValueError(
             f"unknown litert-lm backend {backend!r}: expected one of {CANDIDATE_BACKENDS}"
         )
-    return {
+    spec: dict[str, Any] = {
         "backend": backend,
         "activation_data_type": GPU_ACTIVATION if backend == "gpu" else None,
     }
+    if backend == "cpu" and thread_count is not None:
+        spec["thread_count"] = thread_count
+    return spec
 
 
 def _read_device_report(path: Path) -> dict[str, Any] | None:
@@ -1211,19 +1233,21 @@ def bundle_activation_error_of(report: Any) -> str | None:
 # import from this package, so the one source is text.
 RUNTIME_ENGINE_SOURCE = r'''
 
-def backend_for(name):
+def backend_for(name, thread_count=None):
     """The engine's backend, from the same word the CLI's --backend takes.
 
     litert-lm is imported inside the functions that need it rather than at the
     top, so the parent can exec a script and test what it composes without
-    the runtime installed.
+    the runtime installed. A thread count is passed to the CPU backend only
+    when one is given (`evaluate.runtime_engine_spec`); without one it is
+    `CPU()`, the runtime's default count.
     """
     from litert_lm.interfaces import CPU, GPU
 
     if name == "gpu":
         return GPU()
     if name == "cpu":
-        return CPU()
+        return CPU() if thread_count is None else CPU(thread_count=int(thread_count))
     raise SystemExit("unsupported backend %r: this script knows cpu and gpu" % (name,))
 
 
@@ -1236,7 +1260,7 @@ def engine_kwargs(spec):
     nothing were asked -- which on a GPU is the F16 default this key exists to
     prevent -- so an unknown name ends the run instead.
     """
-    kwargs = {"backend": backend_for(spec.get("backend", "cpu"))}
+    kwargs = {"backend": backend_for(spec.get("backend", "cpu"), spec.get("thread_count"))}
     requested = spec.get("activation_data_type")
     if requested is not None:
         from litert_lm import ActivationDataType
