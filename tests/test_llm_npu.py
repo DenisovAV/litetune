@@ -455,8 +455,10 @@ def _aux(**ops):
         "prefill_mask_128": {"DISPATCH_OP": 1},
         "decode_mask": {"DISPATCH_OP": 1},
     }
-    return {"ops": {k: v for k, v in {**compiled, **ops}.items() if v is not None},
-            "stamp": _stamp("SM8750")}
+    return {
+        "ops": {k: v for k, v in {**compiled, **ops}.items() if v is not None},
+        "stamp": _stamp("SM8750"),
+    }
 
 
 def test_the_aux_graph_needs_its_masks_dispatched_and_keeps_its_cache_updates(script):
@@ -490,11 +492,19 @@ def test_an_aux_graph_without_the_masks_is_refused(script):
 
 
 def test_decode_summary_says_how_far_the_calibration_replies_ran(script):
-    record = [{"steps": 128, "position": 1000}, {"steps": 7, "position": 60},
-              {"steps": 40, "position": 200}]
+    record = [
+        {"steps": 128, "position": 1000},
+        {"steps": 7, "position": 60},
+        {"steps": 40, "position": 200},
+    ]
     assert script["decode_summary"](record, 128) == {
-        "count": 3, "cap": 128, "min_steps": 7, "median_steps": 40, "max_steps": 128,
-        "full": 1, "longest_position": 1000,
+        "count": 3,
+        "cap": 128,
+        "min_steps": 7,
+        "median_steps": 40,
+        "max_steps": 128,
+        "full": 1,
+        "longest_position": 1000,
     }
     record.append({"steps": 9, "position": 70})
     assert script["decode_summary"](record, 128)["median_steps"] == 24.5
@@ -537,8 +547,12 @@ def test_the_compiled_metadata_must_be_stage_3s(script, tmp_path):
 
     compare, refused = script["compare_metadata"], script["Refused"]
     # The unpacker reads the stop tokens into a set.
-    files = {"LlmMetadataProto": b"meta", "HF_Tokenizer": b"tok", "chat_template": "{{x}}",
-             "stop_token_ids": {106, 1}}
+    files = {
+        "LlmMetadataProto": b"meta",
+        "HF_Tokenizer": b"tok",
+        "chat_template": "{{x}}",
+        "stop_token_ids": {106, 1},
+    }
     reference = _sections(tmp_path, "ref", **files)
     got = compare(_sections(tmp_path, "npu", **files), reference, sha)
     assert got["LlmMetadataProto"] == hashlib.sha256(b"meta").hexdigest()
@@ -690,8 +704,13 @@ CALIBRATION = {
     "prompt_limit_tokens": 896,
     "sha256": "ab" * 32,
     "decode": {
-        "count": 64, "cap": 128, "min_steps": 128, "median_steps": 128, "max_steps": 128,
-        "full": 64, "longest_position": 1018,
+        "count": 64,
+        "cap": 128,
+        "min_steps": 128,
+        "median_steps": 128,
+        "max_steps": 128,
+        "full": 64,
+        "longest_position": 1018,
     },
 }
 KV_OK = {"prefill_128": {"INT16": 36}, "decode": {"INT16": 36}}
@@ -1044,9 +1063,7 @@ def test_a_count_outside_the_band_is_refused(monkeypatch, tmp_path, ready_env, o
 
 
 @pytest.mark.parametrize("edge", ["low", "high"])
-def test_a_count_at_the_bands_edge_is_accepted_and_reported(
-    monkeypatch, tmp_path, ready_env, edge
-):
+def test_a_count_at_the_bands_edge_is_accepted_and_reported(monkeypatch, tmp_path, ready_env, edge):
     low, high = llm_npu.parameter_band("gemma-3-text")
     count = low if edge == "low" else high
     model = _checkpoint(tmp_path, shapes={"a": [count]})
@@ -1064,16 +1081,25 @@ def test_the_band_is_one_percent_around_each_measured_count():
 
 def test_a_stored_output_layer_does_not_count(tmp_path):
     # Qwen3-0.6B's own file: a tied lm_head stored anyway.
-    _safetensors(tmp_path / "model.safetensors",
-                 {"model.layers": [596_049_920], "lm_head.weight": [151_936, 1_024]})
+    _safetensors(
+        tmp_path / "model.safetensors",
+        {"model.layers": [596_049_920], "lm_head.weight": [151_936, 1_024]},
+    )
     assert llm_npu.checkpoint_parameters(tmp_path) == llm_npu.MEASURED_PARAMETERS["qwen-3"]
     assert llm_npu.family_problem("qwen-3", "Qwen/Qwen3-0.6B", 596_049_920) is None
 
 
 @pytest.mark.parametrize(
     "header",
-    [b"[]", b'"x"', b'{"w": []}', b'{"w": {"shape": "640"}}', b'{"w": {"shape": [2, -1]}}',
-     b'{"w": {"shape": [true]}}', b'{"w": {}}'],
+    [
+        b"[]",
+        b'"x"',
+        b'{"w": []}',
+        b'{"w": {"shape": "640"}}',
+        b'{"w": {"shape": [2, -1]}}',
+        b'{"w": {"shape": [true]}}',
+        b'{"w": {}}',
+    ],
 )
 def test_a_header_that_is_not_safetensors_is_could_not_check(
     monkeypatch, tmp_path, ready_env, header
@@ -1120,8 +1146,9 @@ def test_malformed_calibration_data_fails_and_too_few_rows_cannot_check(
 ):
     broken = tmp_path / "broken.jsonl"
     broken.write_text("{not json\n")
-    result = _run(tmp_path, _checkpoint(tmp_path), fake=FakeRun(), monkeypatch=monkeypatch,
-                  data=broken)
+    result = _run(
+        tmp_path, _checkpoint(tmp_path), fake=FakeRun(), monkeypatch=monkeypatch, data=broken
+    )
     assert result.outcome is Outcome.FAILED
     assert _check(result, llm_npu.NPU_DATA_CHECK).outcome is Outcome.FAILED
     few = _rows(tmp_path / "few.jsonl", n=7)
@@ -1129,8 +1156,9 @@ def test_malformed_calibration_data_fails_and_too_few_rows_cannot_check(
     model = tmp_path / "tuned"
     result = _run(tmp_path, model, fake=FakeRun(), monkeypatch=monkeypatch, data=few)
     assert result.outcome is Outcome.UNCHECKED
-    missing = _run(tmp_path, model, fake=FakeRun(), monkeypatch=monkeypatch,
-                   data=tmp_path / "missing.jsonl")
+    missing = _run(
+        tmp_path, model, fake=FakeRun(), monkeypatch=monkeypatch, data=tmp_path / "missing.jsonl"
+    )
     assert missing.outcome is Outcome.UNCHECKED
 
 
@@ -1320,7 +1348,9 @@ def test_replies_short_of_the_decode_cap_are_a_limitation_in_every_report(
 ):
     short = {**CALIBRATION["decode"], "median_steps": 9, "max_steps": 128, "full": 3}
     result = _run(
-        tmp_path, _checkpoint(tmp_path), fake=FakeRun(make=_calibration_replaced(short)),
+        tmp_path,
+        _checkpoint(tmp_path),
+        fake=FakeRun(make=_calibration_replaced(short)),
         monkeypatch=monkeypatch,
     )
     assert result.outcome is Outcome.PASSED
@@ -1330,16 +1360,16 @@ def test_replies_short_of_the_decode_cap_are_a_limitation_in_every_report(
     assert report["calibration"]["decode"]["full"] == 3
 
 
-def test_replies_that_all_reach_the_cap_need_no_decode_limitation(
-    monkeypatch, tmp_path, ready_env
-):
+def test_replies_that_all_reach_the_cap_need_no_decode_limitation(monkeypatch, tmp_path, ready_env):
     result = _run(tmp_path, _checkpoint(tmp_path), fake=FakeRun(), monkeypatch=monkeypatch)
     assert not any("decode steps" in t for t in result.limitations)
 
 
 def test_unrecorded_decode_steps_are_a_limitation(monkeypatch, tmp_path, ready_env):
     result = _run(
-        tmp_path, _checkpoint(tmp_path), fake=FakeRun(make=_calibration_replaced(None)),
+        tmp_path,
+        _checkpoint(tmp_path),
+        fake=FakeRun(make=_calibration_replaced(None)),
         monkeypatch=monkeypatch,
     )
     assert any("was not recorded" in t for t in result.limitations)
@@ -1352,7 +1382,9 @@ def test_a_bundle_naming_no_qairt_build_fails(monkeypatch, tmp_path, ready_env):
         return {**_soc_entry(packed, "SM8750"), "qairt": None}
 
     result = _run(
-        tmp_path, _checkpoint(tmp_path), fake=FakeRun(make=_soc_replaced(entry)),
+        tmp_path,
+        _checkpoint(tmp_path),
+        fake=FakeRun(make=_soc_replaced(entry)),
         monkeypatch=monkeypatch,
     )
     assert result.outcome is Outcome.FAILED
@@ -1368,8 +1400,12 @@ def test_the_aux_graphs_ops_reach_the_report(monkeypatch, tmp_path, ready_env):
         packed.write_bytes(b"npu bundle")
         return {**_soc_entry(packed, "SM8750"), "aux": aux}
 
-    _run(tmp_path, _checkpoint(tmp_path), fake=FakeRun(make=_soc_replaced(entry)),
-         monkeypatch=monkeypatch)
+    _run(
+        tmp_path,
+        _checkpoint(tmp_path),
+        fake=FakeRun(make=_soc_replaced(entry)),
+        monkeypatch=monkeypatch,
+    )
     report = json.loads((tmp_path / "out" / "npu-SM8750" / REPORT_NAME).read_text())
     assert report["npu"]["aux_ops_per_signature"] == aux["ops"]
 

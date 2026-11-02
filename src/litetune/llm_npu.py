@@ -170,7 +170,7 @@ REPLY_MEASURED: dict[str, str] = {
         "gemma-3-text on SM8750: classification-length answers only. Answers of about five "
         "tokens matched float32 (11 of 12 after two-chunk prompts). Of 24 replies asked to count "
         "or copy for 128 tokens, one matched float32 throughout; after an 860-token prompt 8 of "
-        "12 turned into repetition, after a 190-token prompt five counts stopped at \"1\" and "
+        '12 turned into repetition, after a 190-token prompt five counts stopped at "1" and '
         "six copies left the text within 19 tokens"
     ),
     "qwen-3": (
@@ -272,8 +272,9 @@ def checkpoint_parameters(model: Path) -> int | None:
                 shape = entry.get("shape") if isinstance(entry, dict) else None
                 if not (
                     isinstance(shape, list)
-                    and all(isinstance(d, int) and not isinstance(d, bool) and d >= 0
-                            for d in shape)
+                    and all(
+                        isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in shape
+                    )
                 ):
                     raise ValueError(f"tensor {name!r} has no shape of non-negative integers")
                 total += math.prod(shape)
@@ -288,9 +289,7 @@ def parameter_band(family: str) -> tuple[int, int]:
     return math.floor(measured * (1 - PARAMETER_BAND)), math.ceil(measured * (1 + PARAMETER_BAND))
 
 
-def family_problem(
-    family: str | None, identity: str, parameters: int | None = None
-) -> str | None:
+def family_problem(family: str | None, identity: str, parameters: int | None = None) -> str | None:
     """Why this family, at this checkpoint size, is refused on `--npu`, or `None`. The size is
     `parameters` when the checkpoint's own count is known, otherwise read from `identity`."""
     measured = ", ".join(f"{f} ({FAMILIES[f]})" for f in sorted(FAMILIES))
