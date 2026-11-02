@@ -2390,7 +2390,7 @@ def test_on_a_cpu_with_sme2_the_text_candidate_says_it_ran_one_thread(
         reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
     )
 
-    assert candidate.specs_seen[0]["thread_count"] == 1  # type: ignore[attr-defined]
+    assert candidate.specs_seen[0]["thread_count"] == 1
     said = [t for t in result.manifest["limitations"] if "on one thread" in t]
     assert len(said) == 1
     assert said[0].startswith(
@@ -2417,7 +2417,7 @@ def test_off_such_a_cpu_the_text_candidate_says_nothing_of_threads(
         reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
     )
 
-    assert "thread_count" not in candidate.specs_seen[0]  # type: ignore[attr-defined]
+    assert "thread_count" not in candidate.specs_seen[0]
     assert not any("one thread" in t for t in result.manifest["limitations"])
 
 
