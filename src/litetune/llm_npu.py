@@ -1398,7 +1398,9 @@ def compare_metadata(unpacked, reference, sha):
     for key in METADATA_VALUES:
         if unpacked.get(key) != reference.get(key):
             raise Refused("metadata", f"the compiled bundle's {key} is not stage 3's")
-        compared[key] = reference.get(key)
+        value = reference.get(key)
+        # The unpacker reads the stop tokens into a set; the answer is JSON.
+        compared[key] = sorted(value) if isinstance(value, (set, frozenset)) else value
     return compared
 
 

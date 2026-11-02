@@ -536,16 +536,18 @@ def test_the_compiled_metadata_must_be_stage_3s(script, tmp_path):
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
     compare, refused = script["compare_metadata"], script["Refused"]
+    # The unpacker reads the stop tokens into a set.
     files = {"LlmMetadataProto": b"meta", "HF_Tokenizer": b"tok", "chat_template": "{{x}}",
-             "stop_token_ids": [1, 106]}
+             "stop_token_ids": {106, 1}}
     reference = _sections(tmp_path, "ref", **files)
     got = compare(_sections(tmp_path, "npu", **files), reference, sha)
     assert got["LlmMetadataProto"] == hashlib.sha256(b"meta").hexdigest()
     assert got["stop_token_ids"] == [1, 106] and "SP_Tokenizer" not in got
+    json.dumps(got)
     with pytest.raises(refused, match="HF_Tokenizer"):
         compare(_sections(tmp_path, "a", **{**files, "HF_Tokenizer": b"other"}), reference, sha)
     with pytest.raises(refused, match="stop_token_ids"):
-        compare(_sections(tmp_path, "b", **{**files, "stop_token_ids": [1]}), reference, sha)
+        compare(_sections(tmp_path, "b", **{**files, "stop_token_ids": {1}}), reference, sha)
     with pytest.raises(refused, match="chat_template"):
         compare(_sections(tmp_path, "c", **{**files, "chat_template": None}), reference, sha)
     no_tokenizer = {k: v for k, v in reference.items() if k != "HF_Tokenizer"}
