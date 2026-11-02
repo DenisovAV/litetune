@@ -4,7 +4,7 @@ Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
 ## 0.7.3 — 2026-11-02
-- **Ran `verify` on an M4/M5 Mac's CPU at more than one thread? Run it again (#105).**
+- Ran `verify` on an M4/M5 Mac's CPU at more than one thread? Run it again (#105).
 - `verify` uses one CPU thread on Apple M4/M5, where results depended on the thread count (#105).
 - A decision's float reference runs on a Mac's GPU (MPS) (#101).
 - `convert --npu` compiles an EmbeddingGemma 2 encoder for Qualcomm NPUs (#103).
