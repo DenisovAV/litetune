@@ -1392,11 +1392,11 @@ def test_the_bundle_template_gets_text_parts_and_would_drop_a_string(script, nam
     apply = _canonical_template(name)
     text = "Classify the customer's banking message."
     with_parts = script["make_render"](apply, "runtime_rendered", parts=True)
-    assert text in with_parts(text) and script["render_problem"](with_parts, text) is None
+    assert text in with_parts(text) and script["render_problem"](with_parts) is None
     # Given a string, the template iterates its characters and renders an empty turn.
     with_string = script["make_render"](apply, "runtime_rendered", parts=False)
     assert text not in with_string(text)
-    assert "without its text" in script["render_problem"](with_string, text)
+    assert "without its text" in script["render_problem"](with_string)
 
 
 def test_the_checkpoints_own_template_gets_a_string_and_prerendered_is_left_alone(script):
@@ -1435,3 +1435,19 @@ def test_the_measured_reply_length_reaches_every_socs_report(monkeypatch, tmp_pa
     for soc in ("SM8750", "SM8650"):
         report = json.loads((tmp_path / "out" / f"npu-{soc}" / REPORT_NAME).read_text())
         assert llm_npu.REPLY_MEASURED["gemma-3-text"] in report["limitations"]
+
+
+def test_a_template_that_trims_the_user_text_is_not_refused(script):
+    # Gemma's template trims the content: "  transfer pending  " renders as "transfer pending".
+    def apply(messages, tokenize, add_generation_prompt):
+        return f"<start_of_turn>user\n{messages[0]['content'].strip()}<end_of_turn>\n"
+
+    render = script["make_render"](apply, "runtime_rendered", parts=False)
+    assert "  transfer pending  " not in render("  transfer pending  ")
+    assert script["render_problem"](render) is None
+
+
+def test_the_device_run_separates_the_label_only_run():
+    text = llm_npu.DEVICE_RUNS["SM8750"]
+    assert "Qwen2.5-0.5B-Instruct on 100 intent labels only" in text
+    assert "replies of up to 128 tokens; a banking77 fine-tune" in text

@@ -155,11 +155,12 @@ BLOCKED: dict[str, str] = {
 # What has run on a device, per SoC: the only statement this module makes about one.
 DEVICE_RUNS: dict[str, str] = {
     "SM8750": (
-        "one Galaxy S25 Ultra's NPU ran, on 2026-11-02, bundles `convert --npu` built from "
-        "gemma-3-270m-it, Qwen3-0.6B and MiniCPM5-1B (banking77 calibration, cache_length 1024) "
-        "and from a banking77 fine-tune of Qwen2.5-0.5B-Instruct, against float32 references: "
-        "needle prompts of two prefill chunks and up to the longest calibration prompt, and "
-        "replies of up to 128 tokens; MEASUREMENTS.md has the numbers"
+        "one Galaxy S25 Ultra's NPU ran, on 2026-11-02, bundles `convert --npu` built "
+        "(cache_length 1024), against float32 references: gemma-3-270m-it, Qwen3-0.6B and "
+        "MiniCPM5-1B on needle prompts of two prefill chunks and up to the longest calibration "
+        "prompt and on replies of up to 128 tokens; a banking77 fine-tune of "
+        "Qwen2.5-0.5B-Instruct on 100 intent labels only. What this family's replies held to is "
+        "among the limitations; MEASUREMENTS.md has the numbers"
     ),
 }
 # What a reply held to on that device, per family: put in every report, so that the 128 tokens
@@ -1194,12 +1195,17 @@ def make_render(apply_chat_template, prompt_mode, parts):
     return render
 
 
-def render_problem(render, text):
+# A user turn with nothing a template trims or escapes: if a render lacks it, the template
+# dropped the content (a template may trim the user's own text, so that is not the test).
+RENDER_SENTINEL = "litetune calibration probe 7d1f"
+
+
+def render_problem(render):
     """Why the calibration prompts would not carry the training text, or None."""
-    rendered = render(text)
-    if text not in rendered:
+    rendered = render(RENDER_SENTINEL)
+    if RENDER_SENTINEL not in rendered:
         return (
-            f"the chat template renders the training prompt {text[:60]!r} as {rendered[:120]!r}, "
+            f"the chat template renders the user turn {RENDER_SENTINEL!r} as {rendered[:120]!r}, "
             "without its text; calibrating on that would measure an empty turn"
         )
     return None
@@ -1504,7 +1510,7 @@ def main(spec):
         return len(tok(text, add_special_tokens=False)["input_ids"])
 
     rows = [json.loads(l) for l in open(spec["rows"], encoding="utf-8") if l.strip()]
-    problem = render_problem(render, rows[0]["prompt"])
+    problem = render_problem(render)
     if problem:
         raise Refused("template", problem)
     prompts, calibration = calibration_plan(
