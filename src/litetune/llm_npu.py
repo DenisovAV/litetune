@@ -81,8 +81,9 @@ PREFILL_LENGTH = 128
 DEFAULT_CACHE_LENGTH = 1024
 MAX_CACHE_LENGTH = 4096
 # Tokens of the cache kept free for the reply: the longest prompt the bundle is calibrated
-# for is `cache_length - REPLY_TOKENS`, and calibration decodes this many steps after each
-# prompt, so the positions a reply reaches are calibrated too.
+# for is `cache_length - REPLY_TOKENS`, and calibration decodes up to this many steps after
+# each prompt. A cache reservation, not a reply length that works: what held on a device is
+# `REPLY_MEASURED`, per family.
 REPLY_TOKENS = 128
 CALIBRATION_DECODE_STEPS = REPLY_TOKENS
 # The smallest cache that leaves one prefill chunk for a prompt besides the reply.
@@ -154,10 +155,38 @@ BLOCKED: dict[str, str] = {
 # What has run on a device, per SoC: the only statement this module makes about one.
 DEVICE_RUNS: dict[str, str] = {
     "SM8750": (
-        "one Galaxy S25 Ultra's NPU ran, on 2026-11-01, a Qwen2.5-0.5B-Instruct fine-tune built "
-        "by an earlier revision of `convert --npu` and gemma-3-270m-it, Qwen3-0.6B and "
-        "MiniCPM5-1B bundles built by hand through the same stages; no bundle of this revision "
-        "has run"
+        "one Galaxy S25 Ultra's NPU ran, on 2026-11-02, bundles `convert --npu` built from "
+        "gemma-3-270m-it, Qwen3-0.6B and MiniCPM5-1B (banking77 calibration, cache_length 1024) "
+        "and from a banking77 fine-tune of Qwen2.5-0.5B-Instruct, against float32 references: "
+        "needle prompts of two prefill chunks and up to the longest calibration prompt, and "
+        "replies of up to 128 tokens; MEASUREMENTS.md has the numbers"
+    ),
+}
+# What a reply held to on that device, per family: put in every report, so that the 128 tokens
+# the cache keeps free (`REPLY_TOKENS`) is not read as a reply length that works.
+REPLY_MEASURED: dict[str, str] = {
+    "gemma-3-text": (
+        "gemma-3-text on SM8750: classification-length answers only. Answers of about five "
+        "tokens matched float32 (11 of 12 after two-chunk prompts). Of 24 replies asked to count "
+        "or copy for 128 tokens, one matched float32 throughout; after an 860-token prompt 8 of "
+        "12 turned into repetition, after a 190-token prompt five counts stopped at \"1\" and "
+        "six copies left the text within 19 tokens"
+    ),
+    "qwen-3": (
+        "qwen-3 on SM8750: none of 48 replies of up to 128 tokens repeated itself; 30 of 36 "
+        "short answers matched float32 exactly, six counts matched its 33 to 34 tokens, and six "
+        "copies of the prompt left float32's text after 7 to 82 tokens. Replies past 128 tokens "
+        "were not measured"
+    ),
+    "qwen-2.5": (
+        "qwen-2.5 on SM8750: classification-length answers only were measured (a banking77 "
+        "fine-tune's intent labels: 94 of 100 identical to float32); longer replies were not"
+    ),
+    "minicpm5": (
+        "minicpm5 on SM8750: replies of 128 tokens, thinking on, found the code in 36 of 36 "
+        "needle prompts as float32 did, but each left float32's wording within 2 to 127 tokens "
+        "and one, after an 860-token prompt, looped on one phrase. Replies past 128 tokens were "
+        "not measured"
     ),
 }
 NOT_RUN_SOC = (
@@ -727,6 +756,8 @@ def _limitations(request: LlmNpuRequest, result: LlmNpuResult) -> None:
         "calibrated for: measured on SM8750, prompts past the longest calibration prompt "
         "turned into degenerate repetition. Do not serve them"
     )
+    if result.family in REPLY_MEASURED:
+        result.limitations.append(REPLY_MEASURED[result.family])
     decode = result.answer["calibration"].get("decode")
     if not decode:
         result.limitations.append(

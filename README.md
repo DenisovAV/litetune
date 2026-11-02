@@ -930,8 +930,10 @@ litetune convert --model ./tuned/model --output-dir ./out --npu SM8750 \
   (1B), the families and sizes whose bundles have run on an SM8750 NPU through these stages
   (how, under *What it cannot check*). A checkpoint is sized by the parameters in its own
   safetensors besides the output layer, within 1% of its family's measured count (room for
-  added tokens), and by its name only when it has none; a larger size of the same family is refused, as is any other family — Gemma 4 and Qwen 3.5 with the defect that
-  stops them, FunctionGemma because tool prompts have not been measured on this toolchain. **Generation only:** a decision checkpoint is refused —
+  added tokens), and by its name only when it has none; a larger size of the same family
+  is refused, as is any other family — Gemma 4 and Qwen 3.5 with the defect that stops
+  them, FunctionGemma because tool prompts have not been measured on this toolchain.
+  **Generation only:** a decision checkpoint is refused —
   option scoring rewinds the session to the prompt once per option, and LiteRT-LM's NPU
   executor rolls back one token only.
 - **How:** litert-torch's `npu_export` stages — export with a split KV cache, prefill
@@ -939,16 +941,26 @@ litetune convert --model ./tuned/model --output-dir ./out --npu SM8750 \
   calibration; A16W8 quantization; the Qualcomm compile per SoC.
 - **Calibration decides the longest prompt it serves.** Half the 64 calibration prompts
   are the data's own, half are packed from its examples up to `--cache-length` minus 128
-  tokens for the reply; each is rendered once with the checkpoint's template and decoded
-  for up to 128 steps, stopping at a stop token. The report records how many steps the
+  tokens for the reply; each is rendered once with the template the bundle carries, its
+  text handed over as text parts the way LiteRT-LM hands it, and decoded for up to 128
+  steps, stopping at a stop token. The report records how many steps the
   replies ran (`calibration.decode`), and when they fell short of 128 says that longer
   replies reach positions the calibration saw less often or not at all. The longest prompt
-  must come within one prefill chunk (128 tokens) of that limit, or the run is refused. A bundle calibrated on short prompts answered two-chunk prompts
+  must come within one prefill chunk (128 tokens) of that limit, or the run is refused.
+  A bundle calibrated on short prompts answered two-chunk prompts
   and turned five-chunk ones into repetition; calibrated on prompts that long, the same
   model answered them, and the boundary sat at the longest calibration prompt. The report
   names that length (`longest_calibrated_tokens`); do not serve longer prompts. A training
   prompt longer than the limit is refused — raise `--cache-length` (a multiple of 128 from
   256 to 4096; only 1024 has run on a device, and any other carries a limitation).
+- **How long a reply holds is per family, and 128 tokens is not it.** The 128 tokens the
+  cache keeps free are a reservation. On an SM8750 NPU, Gemma 3 270M held to
+  classification-length answers (about five tokens) and turned most 128-token replies into
+  repetition; none of Qwen3-0.6B's replies of up to 128 tokens repeated itself;
+  MiniCPM5-1B's 128-token replies found what float32's found but left its wording early,
+  and one looped; the Qwen2.5 fine-tune was measured on its labels only. Each
+  report carries its family's line
+  ([MEASUREMENTS.md](MEASUREMENTS.md#llms-on-a-qualcomm-npu)).
 - **A fix of the exporter's output:** the prefill graph never reads the last layer's KV
   cache, so the quantizer leaves those two inputs FLOAT32 where every other graph has
   INT16, and the bundle does not load (Qwen and MiniCPM; Gemma 3 loads anyway, for a
@@ -956,7 +968,9 @@ litetune convert --model ./tuned/model --output-dir ./out --npu SM8750 \
   packing, and refuses a compiled bundle whose KV inputs are not all INT16.
 - **Linux x86-64 only**, with `libc++1`, `libatomic1` and `libvulkan1`; the first run builds the
   `npu-llm` environment (the export pins plus Qualcomm's SDK, which downloads QAIRT
-  2.50.0.260828). Stages 1–3 took up to ~20 min and each compile ~2 min on 32 vCPUs.
+  2.50.0.260828). On 32 vCPUs stages 1–3 took 4–8 min for a model whose calibration replies
+  stop early and 28–69 min for one that thinks through all 128 calibration steps (MiniCPM5,
+  Qwen3); each compile took 1–3 min.
 - **What it checks:** each compiled file's prefill/decode graph has exactly the `prefill_128`
   and `decode` signatures and its aux graph the two mask signatures, each one `DISPATCH_OP`;
   both graphs carry the SoC's stamp, the file names its QAIRT build, and its metadata,
@@ -964,11 +978,11 @@ litetune convert --model ./tuned/model --output-dir ./out --npu SM8750 \
   input is INT16 with one quantization across graphs. A compiled file that fails any of
   these, or cannot be read, fails the run.
 - **What it cannot check:** `verify` refuses the file — LiteRT-LM's CPU and GPU cannot run
-  its `DISPATCH_OP`s. On a device, only SM8750 has run such bundles, and only from an
-  earlier revision of this path or built by hand through its stages
-  ([MEASUREMENTS.md](MEASUREMENTS.md#llms-on-a-qualcomm-npu)). No LLM has run, or been
-  compared with Google's files, for SM8550, SM8650 or SM8850; each of those bundles says so
-  in its report.
+  its `DISPATCH_OP`s. On a device, only SM8750 has run such bundles: one Galaxy S25 Ultra,
+  bundles of all four families built by this path
+  ([MEASUREMENTS.md](MEASUREMENTS.md#llms-on-a-qualcomm-npu)). For SM8550, SM8650 and
+  SM8850 the compiled files were only compared, in structure, with Google's gemma-3-270m-it
+  NPU files; none has run, and each of those bundles says so in its report.
 
 ### Gemma 4 towers: drop them, or take them from another bundle
 

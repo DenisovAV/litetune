@@ -1422,3 +1422,16 @@ def test_packing_ends_and_refuses_when_the_template_drops_the_text(script):
     with pytest.raises(script["Refused"], match="could not be packed that far"):
         script["calibration_plan"](_example_rows(), lambda t: "<empty turn>", count, 200, 8, 8, 20)
     assert len(calls) < 10_000
+
+
+def test_every_family_carries_what_its_replies_held_to_on_a_device():
+    assert set(llm_npu.REPLY_MEASURED) == set(FAMILIES)
+    assert "classification-length answers only" in llm_npu.REPLY_MEASURED["gemma-3-text"]
+
+
+def test_the_measured_reply_length_reaches_every_socs_report(monkeypatch, tmp_path, ready_env):
+    result = _run(tmp_path, _checkpoint(tmp_path), ("SM8750", "SM8650"), FakeRun(), monkeypatch)
+    assert result.outcome is Outcome.PASSED
+    for soc in ("SM8750", "SM8650"):
+        report = json.loads((tmp_path / "out" / f"npu-{soc}" / REPORT_NAME).read_text())
+        assert llm_npu.REPLY_MEASURED["gemma-3-text"] in report["limitations"]
