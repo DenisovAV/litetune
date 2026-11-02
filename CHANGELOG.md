@@ -4,12 +4,12 @@ Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
 ## 0.7.3 — 2026-11-02
-- **If you ran `verify` on the CPU of a Mac with an M4 or M5 chip at more than one thread, run it again with 0.7.3: its scores could depend on the thread count.**
-- `verify` runs LiteRT-LM on one CPU thread on a CPU with SME2 (Apple M4, M5), where litert-lm 0.18.0's results depend on the thread count, and records it (#105).
-- `verify` runs a decision's float reference on Apple's GPU through MPS when the training environment's torch reaches it, 64 rows a batch, and scores it again on the CPU if MPS runs out of memory or lacks an operation (#101).
-- `convert --weights int8 --npu <SoC>` compiles an EmbeddingGemma 2 graft's text encoder for a Qualcomm NPU (SM8550, SM8650, SM8750, SM8850) on Linux x86-64 (#103).
-- `convert --npu <SoC> --calibration-data <rows>` compiles a generation bundle for a Qualcomm NPU from a fine-tuned Gemma 3 270M, Qwen3-0.6B, Qwen2.5-0.5B or MiniCPM5-1B on Linux x86-64; only SM8750 has run one (#107).
-- On Windows with Python 3.10, an interrupt during a stage reaches litetune's wait at once instead of when the stage ends (#100, #102).
+- Ran `verify` on an M4/M5 Mac's CPU at more than one thread? Run it again (#105).
+- `verify` uses one CPU thread on Apple M4/M5, where results depended on the thread count (#105).
+- A decision's float reference runs on a Mac's GPU (MPS) (#101).
+- `convert --npu` compiles an EmbeddingGemma 2 encoder for Qualcomm NPUs (#103).
+- `convert --npu` compiles LLM generation bundles for Qualcomm NPUs (#107).
+- Windows, Python 3.10: an interrupt during a stage takes effect at once (#100, #102).
 
 ## 0.7.2 — 2026-10-30
 - `verify --backend gpu` runs on macOS for an EmbeddingGemma 2 file and for a decision bundle, whose option scoring is repeated until the scores settle; refused elsewhere (#98).
@@ -44,7 +44,7 @@ Newest first. Full notes for each release are on
 - `convert` reports a `litetune.json` beside the checkpoint that is there but cannot be read -- a directory, a dangling link, a FIFO or a device -- as a limitation, where it took it for absent (#80).
 
 ## 0.4.3 — 2026-10-14
-- **Convert a Qwen3 bundle again if an application holds a conversation with it: every Qwen3 bundle earlier litetune converted without a template of the caller's carries Qwen's own chat template, which LiteRT-LM's conversation cannot render past the first message, so the second message fails (#78).**
+- Convert a Qwen3 bundle again if an application holds a conversation with it: every Qwen3 bundle earlier litetune converted without a template of the caller's carries Qwen's own chat template, which LiteRT-LM's conversation cannot render past the first message, so the second message fails (#78).
 - `convert` checks that each bundle's chat template renders single turns as the checkpoint was trained and holds a LiteRT-LM conversation, says in its report when one does not, and gives Qwen3 LiteRT-LM's own Qwen 3 template (#78).
 - On Windows each stage runs in a job object: a timeout, Ctrl-C, Ctrl-Break or a forced kill of litetune stops everything the stage started, and Ctrl-Break exits 4 (#77).
 - On Windows a stage that closes its pipes and then hangs keeps its output, and on Python 3.10 a usage error with stderr closed exits 4 rather than 120 (#77).
@@ -56,21 +56,21 @@ Newest first. Full notes for each release are on
 - `verify`'s float reference decodes greedily without the checkpoint's own `generation_config` penalties, and names any it left out; the Qwen2.5 references measured here applied `repetition_penalty` 1.1, and re-measured without it their figures are unchanged (#73).
 
 ## 0.4.1 — 2026-10-12
-- **A Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle litetune 0.4.0 converted from a checkpoint it did not recognise -- another organisation's copy, or a fine-tune under its own name -- has no block that reads LiteRT-LM 0.18.0's parts: convert it again; one converted from Qwen's own repositories at their current revisions, or what `tune` made from them, is unaffected (#71).**
+- A Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle litetune 0.4.0 converted from a checkpoint it did not recognise -- another organisation's copy, or a fine-tune under its own name -- has no block that reads LiteRT-LM 0.18.0's parts: convert it again; one converted from Qwen's own repositories at their current revisions, or what `tune` made from them, is unaffected (#71).
 - `convert` puts the text-parts block in front of the checkpoint's own chat template instead of a packaged copy, and reads the template back from every bundle it writes (#71).
 - Exporter flags passed with `--flag=` are read as the exporter reads them and forms it would read differently are refused; Gemma 4 refuses any model-type override and an embedder opt-out (#71).
 - Stage environments link the interpreter instead of copying it, so a Python that loads libpython relative to itself, such as uv 0.10.6's CPython on macOS, can provision them (#70).
 
 ## 0.4.0 — 2026-10-11
-- **Convert a Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle again for an app on LiteRT-LM 0.18.0, as flutter_edge_ai_litertlm 1.10.0 ships: 0.18.0 hands the template a list of parts, which their checkpoint templates do not read, and the user's text is lost or every send fails (#67).**
-- **Convert again any bundle `convert` wrote to a relative `--output-dir` on Python 3.10 or 3.11: it has no GPU activation key, which its report named, and on a GPU backend it answers wrong (#67).**
+- Convert a Qwen3 0.6B or Qwen2.5 0.5B Instruct bundle again for an app on LiteRT-LM 0.18.0, as flutter_edge_ai_litertlm 1.10.0 ships: 0.18.0 hands the template a list of parts, which their checkpoint templates do not read, and the user's text is lost or every send fails (#67).
+- Convert again any bundle `convert` wrote to a relative `--output-dir` on Python 3.10 or 3.11: it has no GPU activation key, which its report named, and on a GPU backend it answers wrong (#67).
 - `verify` runs the candidate on litert-lm 0.18.0 and `convert` packs with litert-lm-builder 0.18.0; every published number re-measured on it equals its 0.17.1 number, Qwen's on bundles converted again (#67).
 - The Qwen3 0.6B and Qwen2.5 0.5B Instruct rules pack the checkpoint's own chat template behind a block that reads 0.18.0's parts, and `verify` names a rendering that came back empty or without the prompt (#67).
 - `litetune towers` drops a Gemma 4 bundle's vision and audio towers, or adds them from another bundle (#68).
 - The site and README say which device, backend and runtime each number was measured on (#65), and FunctionGemma's measurement notes describe Flutter Edge AI's native tool path (#66).
 
 ## 0.3.0 — 2026-10-03
-- **Re-run a timed-out `verify` only if you rely on its reference-backend provenance: 0.1.5 through 0.2.1 could record `unknown` after the float-reference model had already reached a device; generated answers and scores are unaffected (#63).**
+- Re-run a timed-out `verify` only if you rely on its reference-backend provenance: 0.1.5 through 0.2.1 could record `unknown` after the float-reference model had already reached a device; generated answers and scores are unaffected (#63).
 - `tune` and `verify`'s float reference can use Apple GPUs through Metal/MPS with unified-memory safeguards; `tune --micro-batch-size` exposes gradient accumulation, and `LITETUNE_DEVICE=cpu` forces CPU execution (#63).
 
 ## 0.2.1 — 2026-09-29
@@ -79,7 +79,7 @@ Newest first. Full notes for each release are on
 - The site's Qwen2.5-0.5B card no longer calls its channelwise four-bit scores usable (#60).
 
 ## 0.2.0 — 2026-09-28
-- **Re-run `verify` for any model you ship on litert-lm 0.17.1, as flutter_gemma_litertlm 1.8.0 does — 0.1.x measured on 0.16.1, and the two runtimes do not give the same answers (#55).**
+- Re-run `verify` for any model you ship on litert-lm 0.17.1, as flutter_gemma_litertlm 1.8.0 does — 0.1.x measured on 0.16.1, and the two runtimes do not give the same answers (#55).
 - `verify` runs the candidate on litert-lm 0.17.1, and `convert` pins litert-torch-nightly 0.10.0.dev20260926 with litert-lm-builder 0.17.1 and the quantizer, LiteRT and converter packages it requires (#55).
 - Every `verify` manifest records the litert-lm version its candidate ran on and the host's CPU (only on the CPU backend is that what computed the answers), and says so when it could not read either (#55).
 - `bundle` records in `established_against` the runtime and CPU its verify manifest recorded, with the CPU's features where the manifest has them (#55, #56).
@@ -100,9 +100,9 @@ Newest first. Full notes for each release are on
 - Each measured model's card says what the model is and what it is for (#49, #51).
 
 ## 0.1.8 — 2026-09-20
-- **Re-run any `verify` whose host does not default to UTF-8 — Windows always, POSIX with a locale like `en_US.ISO8859-1`** — the runtime's generations were decoded in the host's encoding, so a non-ASCII answer scored as a wrong one (#44).
-- **Re-make any bundle or split written on Windows** — text writes turned LF into CRLF, so a bundle's declarations did not hash to its own contract and a split's `content_sha256` differed from the same rows elsewhere (#44).
-- **Re-run any stage that crashed on Windows and was reported as a failed model** — an exit code carrying a terminating NTSTATUS is now read as a kill, which is `could not check` (#44).
+- Re-run any `verify` whose host does not default to UTF-8 — Windows always, POSIX with a locale like `en_US.ISO8859-1` — the runtime's generations were decoded in the host's encoding, so a non-ASCII answer scored as a wrong one (#44).
+- Re-make any bundle or split written on Windows — text writes turned LF into CRLF, so a bundle's declarations did not hash to its own contract and a split's `content_sha256` differed from the same rows elsewhere (#44).
+- Re-run any stage that crashed on Windows and was reported as a failed model — an exit code carrying a terminating NTSTATUS is now read as a kill, which is `could not check` (#44).
 - A generation whose bytes did not decode is a harness error, not a scored answer; U+FFFD from the model still scores (#44).
 - Stage subprocesses are given UTF-8 on both sides of the pipe, and a host value that would decide it is replaced and said (#44).
 - `prepare`, `tune`, `verify` and `bundle` run on Windows; `convert` cannot, and the refusal now names `litert-converter` and what to do instead (#45).
@@ -110,10 +110,10 @@ Newest first. Full notes for each release are on
 - `gemma-3-1b-it` on banking77, measured: four bits cost it 8.83 points against the 270M's 34.83 (#43).
 
 ## 0.1.7 — 2026-09-19
-- **Re-prepare and re-train any FunctionGemma tool-call split made with 0.1.6 or earlier** — its calls carry no call markers, so the runtime's tool path returns no call (#41).
-- **Re-run any `runtime_rendered` `verify` against a reference whose chat template writes `<bos>` itself, such as Gemma 3 and FunctionGemma** — the reference was prompted with two (#40).
-- **Re-train `runtime_rendered` any checkpoint trained `prerendered` on bare prompts that an app serves through its chat template** — neither training nor `verify` saw that template (#40).
-- **Breaking:** `tune` refuses a `--prompt-mode` its training prompts contradict; `--force-prompt-mode` overrides and records it (#40).
+- Re-prepare and re-train any FunctionGemma tool-call split made with 0.1.6 or earlier — its calls carry no call markers, so the runtime's tool path returns no call (#41).
+- Re-run any `runtime_rendered` `verify` against a reference whose chat template writes `<bos>` itself, such as Gemma 3 and FunctionGemma — the reference was prompted with two (#40).
+- Re-train `runtime_rendered` any checkpoint trained `prerendered` on bare prompts that an app serves through its chat template — neither training nor `verify` saw that template (#40).
+- Breaking: `tune` refuses a `--prompt-mode` its training prompts contradict; `--force-prompt-mode` overrides and records it (#40).
 - `--prompt-mode` is optional: `tune` reads it off the prompts, `verify` and `bundle` from the training record, and each refuses a value that disagrees (#40).
 - `verify` in `runtime_rendered` checks that both sides get the same token ids before it generates (#40).
 - Reasoning blocks are removed from both sides before scoring (#40).
@@ -126,16 +126,16 @@ Newest first. Full notes for each release are on
 - The README's NPU mask boundary is per model, not a formula to carry to another (#38).
 
 ## 0.1.6 — 2026-09-13
-- **Re-run any `tune`, `convert` or `verify` done with `PYTHONPATH` set** — it outranked the stage's pinned packages while the manifest named the pin (#33).
-- **Run `litetune env --clean` if `PIP_TARGET`, `PIP_PREFIX` or `PIP_ROOT` was set when a stage first provisioned** — pip installed elsewhere and the environment was marked ready (#33).
+- Re-run any `tune`, `convert` or `verify` done with `PYTHONPATH` set — it outranked the stage's pinned packages while the manifest named the pin (#33).
+- Run `litetune env --clean` if `PIP_TARGET`, `PIP_PREFIX` or `PIP_ROOT` was set when a stage first provisioned — pip installed elsewhere and the environment was marked ready (#33).
 - A timeout, Ctrl-C, `kill` or a dropped connection stops everything the stage spawned (#33, #34).
 - A stage's last output is no longer cut off at one pipe buffer (#34).
 - `pip install` during provisioning runs under the same guard (#34).
 - Ready means the marker is a file and the interpreter exists (#33, #34).
 
 ## 0.1.5 — 2026-09-08
-- **Re-run anything scored with `--scorer exact-text` on 0.1.4 or earlier** — the reference ended in a turn marker and scored 0.0000 (#18).
-- **Re-run any `tune` done on a CUDA machine** — it trained on the CPU (#19).
+- Re-run anything scored with `--scorer exact-text` on 0.1.4 or earlier — the reference ended in a turn marker and scored 0.0000 (#18).
+- Re-run any `tune` done on a CUDA machine — it trained on the CPU (#19).
 - An accelerator failure is recorded as a fact about the machine, not a failed fine-tune (#19).
 - `gemma-3-270m-it` on banking77, measured (#22).
 
