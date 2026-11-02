@@ -8,6 +8,7 @@ Newest first. Full notes for each release are on
 - `verify` runs LiteRT-LM on one CPU thread on a CPU with SME2 (Apple M4, M5), where litert-lm 0.18.0's results depend on the thread count, and records it (#105).
 - `verify` runs a decision's float reference on Apple's GPU through MPS when the training environment's torch reaches it, 64 rows a batch, and scores it again on the CPU if MPS runs out of memory or lacks an operation (#101).
 - `convert --weights int8 --npu <SoC>` compiles an EmbeddingGemma 2 graft's text encoder for a Qualcomm NPU (SM8550, SM8650, SM8750, SM8850) on Linux x86-64 (#103).
+- `convert --npu <SoC> --calibration-data <rows>` compiles a generation bundle for a Qualcomm NPU from a fine-tuned Gemma 3 270M, Qwen3-0.6B, Qwen2.5-0.5B or MiniCPM5-1B on Linux x86-64; only SM8750 has run one (#107).
 - On Windows with Python 3.10, an interrupt during a stage reaches litetune's wait at once instead of when the stage ends (#100, #102).
 
 ## 0.7.2 — 2026-10-30
