@@ -509,11 +509,12 @@ def _add_prepare(sub) -> None:
     prep.add_argument("--output-dir", required=True, type=Path, help="where the splits are written")
     prep.add_argument(
         "--context-length",
-        required=True,
         type=int,
         help=(
-            "the binding context window: pass the smaller of export.context_length and "
-            "train.max_seq_length. Rows that do not fit are named, never truncated"
+            "text rows: required, the binding context window: pass the smaller of "
+            "export.context_length and train.max_seq_length. Rows that do not fit are named, "
+            f"never truncated. Image rows (--base-model {EMBEDDING_MODEL}) have no text to "
+            "measure and refuse it"
         ),
     )
     prep.add_argument("--seed", type=int, default=0, help="split seed (with the file's content)")
@@ -540,7 +541,8 @@ def _add_prepare(sub) -> None:
         "--tokenizer",
         help=(
             "HF id whose tokenizer measures example lengths. Without it no example is measured "
-            "against the context window and that check reports could_not_check"
+            "against the context window and that check reports could_not_check. Refused for "
+            "image rows, which have no text"
         ),
     )
     prep.add_argument("--tokenizer-revision", help="revision of --tokenizer")
@@ -563,7 +565,11 @@ def _add_prepare(sub) -> None:
             'none_option for rows labelled null. Each row is {"prompt": <the state>, '
             '"label": <option id>}, rendered into the prompt createDecider is to '
             "score (the 2026-10-16 design). Rows with labels and no completions are decisions "
-            "without it too, asked a generic question about their sorted labels"
+            "without it too, asked a generic question about their sorted labels. For --base-model "
+            f"{EMBEDDING_MODEL} a row may instead be an image row, "
+            '{"image": <a PNG or JPEG file, relative to --data or absolute>, "label": <option '
+            "id>}; the file is checked and copied into the split, and a rows file is all image "
+            "rows or all text rows"
         ),
     )
     prep.add_argument(

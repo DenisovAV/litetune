@@ -108,9 +108,10 @@ def _request(tmp_path: Path, **kwargs: Any) -> PrepareRequest:
     # The default rows only when none are given: writing them rewrites the images.
     if "data" not in kwargs:
         kwargs["data"] = _rows_file(tmp_path, _image_rows(tmp_path))
+    # No window: image rows refuse one. A text split passes its own.
     params: dict[str, Any] = {
         "output_dir": tmp_path / "split",
-        "context_length": 1024,
+        "context_length": None,
         "base_model": EMBEDDING_MODEL,
         "questions": _questions(tmp_path),
         "images": FakeImageInspector(),
@@ -185,8 +186,11 @@ def test_the_report_says_image_and_what_the_images_are(tmp_path):
 
 def test_a_text_split_reports_text(tmp_path):
     rows = [{"prompt": f"a {o} {i}", "label": o} for o in OPTIONS for i in range(12)]
-    result = prepare(_request(tmp_path, data=_rows_file(tmp_path, rows, "text.jsonl")))
+    result = prepare(
+        _request(tmp_path, data=_rows_file(tmp_path, rows, "text.jsonl"), context_length=1024)
+    )
     assert result.as_dict()["modality"] == "text"
+    assert result.as_dict()["request"]["context_length"] == 1024
     assert result.as_dict()["images"] is None
     assert not (tmp_path / "split" / "images").exists()
 
@@ -199,6 +203,7 @@ def test_decision_json_is_the_one_a_text_split_writes(tmp_path):
             tmp_path,
             data=_rows_file(tmp_path, text_rows, "text.jsonl"),
             output_dir=tmp_path / "text-split",
+            context_length=1024,
         )
     )
     assert (tmp_path / "split" / "decision.json").read_bytes() == (
@@ -225,6 +230,59 @@ def test_one_picture_used_by_several_rows_is_one_file_and_a_noted_limitation(tmp
     assert len(inspector.calls[0]) == len(set(inspector.calls[0])) == 37
 
 
+def _picture_halves(split: Path) -> dict[str, set[str]]:
+    return {
+        name: {r["image_sha256"] for r in _records(split / f"{name}.jsonl")}
+        for name in ("train", "calibration", "heldout")
+    }
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_rows_of_one_picture_are_never_in_two_splits(tmp_path, seed):
+    rows = _image_rows(tmp_path, per_option=6)
+    # Every picture of the first nine rows given three times: groups of three rows.
+    rows += [dict(r) for r in rows[:9]] + [dict(r) for r in rows[:9]]
+    result = prepare(_request(tmp_path, data=_rows_file(tmp_path, rows, "dup.jsonl"), seed=seed))
+    assert result.train is not None and result.heldout is not None
+    halves = _picture_halves(tmp_path / "split")
+    assert not halves["train"] & halves["heldout"]
+    assert not halves["train"] & halves["calibration"]
+    assert not halves["calibration"] & halves["heldout"]
+    assert result.train.n + result.heldout.n + result.calibration.n == len(rows)
+
+
+def test_without_repeated_pictures_the_split_is_the_row_split(tmp_path):
+    from litetune.prepare import Row, split_calibration, split_grouped, split_rows
+
+    rows = [Row(lineno=i, prompt=f"r{i}", completion="a", target="a") for i in range(40)]
+    digest = "sha256:" + "ab" * 32
+    train, held = split_rows(rows, digest, 3, 8)
+    train_part, aside = split_calibration(rows, digest, 3, 8, 4)
+    grouped = split_grouped(rows, [f"g{i}" for i in range(40)], digest, 3, 8, 4)
+    assert grouped == (train_part, aside, held)
+
+
+def test_a_grouped_split_keeps_a_group_for_training_and_needs_two_groups():
+    from litetune.prepare import Row, split_grouped
+
+    rows = [Row(lineno=i, prompt=f"r{i}", completion="a", target="a") for i in range(6)]
+    digest = "sha256:" + "cd" * 32
+    assert split_grouped(rows, ["one"] * 6, digest, 0, 1, 1) is None
+    train, aside, held = split_grouped(rows, ["x"] * 3 + ["y"] * 3, digest, 0, 5, 1)
+    assert len(train) == 3 and len(held) == 3 and aside == []
+
+
+def test_a_held_out_split_the_pictures_made_larger_is_said(tmp_path):
+    rows = _image_rows(tmp_path, per_option=6)
+    rows += [dict(r) for r in rows] * 3  # every picture four times
+    result = prepare(
+        _request(tmp_path, data=_rows_file(tmp_path, rows, "dup.jsonl"), heldout_size=3)
+    )
+    assert result.heldout is not None and result.heldout.n % 4 == 0
+    (said,) = [t for t in result.limitations if "rows were held out" in t]
+    assert f"{result.heldout.n} rows were held out" in said and "where 3 and" in said
+
+
 def test_an_absolute_path_is_accepted(tmp_path):
     elsewhere = _fake_image(tmp_path / "far" / "away.png", tag="far")
     rows = _image_rows(tmp_path)
@@ -243,16 +301,41 @@ def test_a_relative_path_is_read_from_the_rows_files_directory(tmp_path):
     assert result.train is not None
 
 
-def test_the_tokenizer_is_not_run_for_image_rows(tmp_path):
+def test_image_rows_measure_no_length_and_report_no_window(tmp_path):
+    result = prepare(_request(tmp_path))
+    assert LENGTH_CHECK not in [c.name for c in result.checks.checks]
+    assert any(s.name == LENGTH_CHECK and "no text" in s.reason for s in result.skipped)
+    report = result.as_dict()
+    assert report["lengths"]["reason"].startswith("image rows have no text")
+    assert "context_length" not in report["request"]
+    assert result.train is not None
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "named"),
+    [
+        ({"context_length": 1024}, "--context-length: "),
+        ({"tokens": "counter"}, "--tokenizer (and --tokenizer-revision): "),
+        ({"context_length": 1024, "tokens": "counter"}, "--context-length, --tokenizer"),
+    ],
+)
+def test_a_window_or_a_tokenizer_for_image_rows_is_refused_by_name(tmp_path, kwargs, named):
     from test_embedding_prepare import FakeEmbedTokenCounter
 
     counter = FakeEmbedTokenCounter()
-    result = prepare(_request(tmp_path, tokens=counter))
+    if "tokens" in kwargs:
+        kwargs = kwargs | {"tokens": counter}
+    with pytest.raises(PrepareError) as raised:
+        prepare(_request(tmp_path, **kwargs))
+    assert str(raised.value).startswith(named) and "these are image rows" in str(raised.value)
     assert counter.calls == []
-    assert LENGTH_CHECK not in [c.name for c in result.checks.checks]
-    assert any(s.name == LENGTH_CHECK and "no text" in s.reason for s in result.skipped)
-    assert result.as_dict()["lengths"]["reason"].startswith("image rows have no text")
-    assert result.train is not None
+    assert not (tmp_path / "split").exists()
+
+
+def test_text_rows_without_a_window_are_refused(tmp_path):
+    rows = _text_rows()
+    with pytest.raises(PrepareError, match="--context-length is required for text rows"):
+        prepare(_request(tmp_path, data=_rows_file(tmp_path, rows, "text.jsonl")))
 
 
 def test_the_thin_option_note_applies_to_image_rows(tmp_path):
@@ -305,16 +388,40 @@ def test_image_rows_after_text_rows_are_refused(tmp_path):
     _refused(tmp_path, rows, r"given\.jsonl:2: this is an image row, and line 1 is a text row")
 
 
-@pytest.mark.parametrize("key", ["prompt", "completion", "target"])
+@pytest.mark.parametrize("key", ["completion", "target"])
 def test_an_image_row_with_a_text_field_is_refused(tmp_path, key):
     rows = _image_rows(tmp_path)
     rows[3][key] = "cat"
     _refused(tmp_path, rows, rf"given\.jsonl:4: an image row is an 'image' and a 'label'.*{key}")
 
 
+def test_a_row_with_an_image_and_a_prompt_is_refused_by_name(tmp_path):
+    rows = _image_rows(tmp_path)
+    rows[3]["prompt"] = "a cat"
+    _refused(tmp_path, rows, r"given\.jsonl:4: this row gives both an 'image' and a 'prompt'")
+
+
+def test_text_rows_with_an_image_column_are_refused_for_embeddinggemma(tmp_path):
+    rows = [dict(r, image="pics/x.png") for r in _text_rows()]
+    _refused(
+        tmp_path,
+        rows,
+        r"given\.jsonl:1: this row gives both an 'image' and a 'prompt'",
+        context_length=1024,
+    )
+
+
 @pytest.mark.parametrize("model", [None, "google/gemma-3-270m-it"])
-def test_image_rows_for_another_model_are_refused(tmp_path, model):
-    _refused(tmp_path, _image_rows(tmp_path), "Image rows are trained for", base_model=model)
+def test_image_rows_for_another_model_are_refused_as_rows_without_a_prompt(tmp_path, model):
+    _refused(
+        tmp_path,
+        _image_rows(tmp_path),
+        r"given\.jsonl:1: expected an object with a 'prompt' field; a row with an 'image' and "
+        rf"no 'prompt' is an image row, which prepare reads for --base-model {EMBEDDING_MODEL} "
+        "only",
+        base_model=model,
+        context_length=1024,
+    )
 
 
 def test_a_missing_image_is_refused(tmp_path):
@@ -344,11 +451,31 @@ def test_an_undecodable_image_is_refused(tmp_path):
 
 def test_an_animated_image_is_refused(tmp_path):
     rows = _image_rows(tmp_path)
-    _fake_image(tmp_path / "pics" / "bird-0.png", fmt="GIF", frames=2)
+    _fake_image(tmp_path / "pics" / "bird-0.png", fmt="PNG", frames=2)
     _refused(tmp_path, rows, r"given\.jsonl:25: .*bird-0\.png holds 2 frames")
 
 
-@pytest.mark.parametrize("fmt", ["GIF", "WEBP", "PNG"])
+# "XVThumb" is a Pillow format name in mixed case: a row refused, not a checker failure.
+@pytest.mark.parametrize("fmt", ["GIF", "WEBP", "BMP", "TIFF", "XVThumb"])
+def test_a_format_other_than_png_or_jpeg_is_refused_naming_the_row(tmp_path, fmt):
+    rows = _image_rows(tmp_path)
+    _fake_image(tmp_path / "pics" / "dog-1.png", fmt=fmt)
+    _refused(
+        tmp_path,
+        rows,
+        rf"given\.jsonl:14: .*dog-1\.png is '{fmt}' to Pillow 0\.0-fake, not PNG or JPEG\. "
+        "LiteRT-LM decodes the picture an application gives it with stb_image",
+    )
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG", "MPO"])
+def test_png_jpeg_and_mpo_are_accepted(tmp_path, fmt):
+    rows = _image_rows(tmp_path)
+    _fake_image(tmp_path / "pics" / "dog-1.png", fmt=fmt)
+    assert prepare(_request(tmp_path, data=_rows_file(tmp_path, rows))).train is not None
+
+
+@pytest.mark.parametrize("fmt", ["JPEG", "PNG"])
 def test_only_mpo_may_hold_more_than_one_frame(tmp_path, fmt):
     rows = _image_rows(tmp_path)
     _fake_image(tmp_path / "pics" / "bird-0.png", fmt=fmt, frames=3)
@@ -463,9 +590,167 @@ def test_a_split_whose_options_check_fails_writes_no_images(tmp_path):
     assert (tmp_path / "split" / "prepare.json").is_file()
 
 
+# -- write_images on its own -----------------------------------------------------
+
+
+def _sources(tmp_path: Path, n: int = 3, tag: str = "") -> dict[str, Path]:
+    out = {}
+    for i in range(n):
+        source = tmp_path / "src" / f"{tag}{i}.png"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(f"picture {tag}{i}".encode())
+        out[f"{hashlib.sha256(source.read_bytes()).hexdigest()}.png"] = source
+    return out
+
+
+@pytest.mark.parametrize("kind", ["dir", "symlink"])
+def test_write_images_refuses_an_images_dir_holding_what_it_did_not_write(tmp_path, kind):
+    from litetune.images import ImageCopyError, write_images
+
+    out = tmp_path / "split"
+    write_images(out, _sources(tmp_path))
+    foreign = out / "images" / "mine"
+    if kind == "dir":
+        foreign.mkdir()
+    else:
+        foreign.symlink_to(tmp_path)
+    with pytest.raises(ImageCopyError, match=r"holds mine, which prepare did not write"):
+        write_images(out, _sources(tmp_path, tag="b"))
+    assert foreign.exists() or foreign.is_symlink()
+
+
+def test_a_final_rename_that_fails_puts_the_previous_images_back(tmp_path, monkeypatch):
+    from litetune.images import ImageCopyError, write_images
+
+    out = tmp_path / "split"
+    first = _sources(tmp_path)
+    write_images(out, first)
+    real = Path.rename
+
+    def rename(self, target):
+        if self.name.startswith(".images-") and Path(target).name == "images":
+            raise OSError(28, "No space left on device")
+        return real(self, target)
+
+    monkeypatch.setattr(Path, "rename", rename)
+    with pytest.raises(ImageCopyError, match="previous images are back in place") as raised:
+        write_images(out, _sources(tmp_path, tag="b"))
+    assert isinstance(raised.value.__cause__, OSError)
+    assert sorted(p.name for p in (out / "images").iterdir()) == sorted(first)
+    assert [p.name for p in out.iterdir()] == ["images"]
+
+
+def test_a_restore_that_fails_too_names_both_and_is_chained(tmp_path, monkeypatch):
+    from litetune.images import ImageCopyError, write_images
+
+    out = tmp_path / "split"
+    write_images(out, _sources(tmp_path))
+    real = Path.rename
+
+    def rename(self, target):
+        if Path(target).name == "images" and self.parent.name != "split":
+            raise OSError(13, "Permission denied: restore")
+        if self.name.startswith(".images-") and Path(target).name == "images":
+            raise OSError(28, "No space left on device")
+        return real(self, target)
+
+    monkeypatch.setattr(Path, "rename", rename)
+    with pytest.raises(ImageCopyError, match="could not be moved back") as raised:
+        write_images(out, _sources(tmp_path, tag="b"))
+    assert "restore" in str(raised.value.__cause__)
+    assert "No space left" in str(raised.value.__cause__.__context__)
+
+
+def test_leftovers_of_a_stopped_run_are_removed_before_writing(tmp_path):
+    from litetune.images import write_images
+
+    out = tmp_path / "split"
+    staging = out / (".images-" + "a" * 16)
+    retired = out / (".images-old-" + "b" * 16) / "images"
+    for directory in (staging, retired):
+        directory.mkdir(parents=True)
+        (directory / "x.png").write_bytes(b"left")
+    unrelated = out / ".images-mine"
+    unrelated.mkdir()
+    write_images(out, _sources(tmp_path))
+    assert sorted(p.name for p in out.iterdir()) == [".images-mine", "images"]
+
+
+def test_a_leftover_holding_a_tree_is_refused_not_removed(tmp_path):
+    from litetune.images import ImageCopyError, write_images
+
+    out = tmp_path / "split"
+    nested = out / (".images-" + "c" * 16) / "deeper"
+    nested.mkdir(parents=True)
+    with pytest.raises(ImageCopyError, match="earlier prepare left when it was stopped"):
+        write_images(out, _sources(tmp_path))
+    assert nested.is_dir()
+
+
+def test_a_source_that_cannot_be_read_is_an_image_copy_error_naming_it(tmp_path):
+    from litetune.images import ImageCopyError, write_images
+
+    sources = _sources(tmp_path)
+    name, victim = next(iter(sorted(sources.items())))
+    victim.unlink()
+    with pytest.raises(ImageCopyError, match=rf"{victim} could not be copied into the split"):
+        write_images(tmp_path / "split", sources)
+    assert not (tmp_path / "split" / "images").exists()
+
+
 # ---------------------------------------------------------------------------
 # Text splits are what they were
 # ---------------------------------------------------------------------------
+
+# Text rows that also carry an "image" column, split by main (3cf0652): the
+# column is ignored there, as it is now for every model but EmbeddingGemma 2.
+EXTRA_IMAGE_COLUMN_SHA256 = {
+    "decision": {
+        "train.jsonl": "5c74cdb159d9a802896933b6d658b8e16389d9d407c631f8975e0dd808e402f0",
+        "calibration.jsonl": "6b60f093bf9b5ba124513b985730e2b05afa4fbc01070b7af2096be3c17808a2",
+        "heldout.jsonl": "fdd0152269e9068f9e5be9fcad9bf35e167290d7a60e44ba64b7752c39934460",
+        "decision.json": "f71a3b29efd9b30d82d104d7a0b6649376d19177890044e0435a44e202855db1",
+    },
+    "sft": {
+        "train.jsonl": "110709ca423e64adcdafe3ea5070ebd7dac9babf3d8676f4fbbbeff1eb704e4a",
+        "heldout.jsonl": "8c53e8d84ca2910209aacd98e050ac905edf612c5d45e7fd87357a5ab62839d2",
+    },
+}
+
+
+@pytest.mark.parametrize("case", ["decision", "sft"])
+def test_text_rows_with_an_image_column_split_as_on_main_for_an_llm(tmp_path, case):
+    if case == "decision":
+        rows = [
+            {"prompt": f"photo {i} of a {o}", "label": o, "image": f"pics/{o}-{i}.png"}
+            for o in OPTIONS
+            for i in range(12)
+        ]
+        model, questions = "google/gemma-3-270m-it", _questions(tmp_path)
+    else:
+        rows = [
+            {"prompt": f"say {i}", "completion": f"ok {i}", "image": "pics/x.png"}
+            for i in range(30)
+        ]
+        model, questions = None, None
+    inspector = FakeImageInspector()
+    result = prepare(
+        PrepareRequest(
+            data=_rows_file(tmp_path, rows, f"{case}.jsonl"),
+            output_dir=tmp_path / "split",
+            context_length=1024,
+            base_model=model,
+            questions=questions,
+            images=inspector,
+        )
+    )
+    assert inspector.calls == [] and result.images is None
+    assert result.as_dict()["modality"] == "text"
+    assert not (tmp_path / "split" / "images").exists()
+    for name, digest in EXTRA_IMAGE_COLUMN_SHA256[case].items():
+        written = (tmp_path / "split" / name).read_bytes()
+        assert hashlib.sha256(written).hexdigest() == digest, name
+
 
 # sha256 of train/calibration/heldout.jsonl for `_text_rows` before image rows
 # existed (3cf0652), written from bytes so every platform splits them alike.
@@ -481,7 +766,11 @@ def _text_rows() -> list[dict[str, Any]]:
 
 
 def test_a_text_split_is_byte_identical_to_before(tmp_path):
-    prepare(_request(tmp_path, data=_rows_file(tmp_path, _text_rows(), "text.jsonl")))
+    prepare(
+        _request(
+            tmp_path, data=_rows_file(tmp_path, _text_rows(), "text.jsonl"), context_length=1024
+        )
+    )
     for name, digest in TEXT_SPLIT_SHA256.items():
         written = (tmp_path / "split" / name).read_bytes()
         assert hashlib.sha256(written).hexdigest() == digest, name
@@ -542,13 +831,9 @@ def test_the_command_line_checks_images_in_embed_train_and_counts_no_tokens(monk
             str(_rows_file(tmp_path, _image_rows(tmp_path))),
             "--output-dir",
             str(tmp_path / "split"),
-            "--context-length",
-            "1024",
             "--questions",
             str(_questions(tmp_path)),
             "--base-model",
-            EMBEDDING_MODEL,
-            "--tokenizer",
             EMBEDDING_MODEL,
         ]
     )
@@ -724,7 +1009,8 @@ def test_prepare_end_to_end_with_the_real_script(monkeypatch, tmp_path):
     }
 
     rows.append({"image": "pics/anim.webp", "label": "cat"})
-    with pytest.raises(PrepareError, match=r"anim\.webp holds 2 frames"):
+    # Pillow's own name for the format, refused for the format before its frames.
+    with pytest.raises(PrepareError, match=r"anim\.webp is 'WEBP' to Pillow .*not PNG or JPEG"):
         prepare(
             _request(
                 tmp_path,

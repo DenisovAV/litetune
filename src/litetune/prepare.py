@@ -709,8 +709,10 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
 def read_objects(path: Path, images: bool = False) -> list[tuple[int, dict[str, Any]]]:
     """Each row of a JSONL dataset as an object with a `prompt`, with its line number.
 
-    `images` also accepts a row with an `image` in place of the `prompt`: `prepare`
-    reads image decision rows (`read_image_rows`), and nothing else does.
+    `images` also accepts a row with an `image` in place of the `prompt`
+    (`is_image_row`): the EmbeddingGemma 2 path reads image decision rows, and
+    nothing else does. Without it a row with an `image` and no `prompt` is
+    refused as any row without a `prompt` is, and the refusal says why.
     """
     try:
         raw = path.read_bytes()
@@ -738,10 +740,12 @@ def read_objects(path: Path, images: bool = False) -> list[tuple[int, dict[str, 
         except json.JSONDecodeError as exc:
             raise PrepareError(f"{path}:{lineno}: not valid JSON: {exc}") from exc
         if not isinstance(obj, dict) or not ("prompt" in obj or (images and "image" in obj)):
-            raise PrepareError(
-                f"{path}:{lineno}: expected an object with a 'prompt' field"
-                + (" or an 'image' field" if images else "")
-            )
+            said = f"{path}:{lineno}: expected an object with a 'prompt' field"
+            if images:
+                said += " or an 'image' field"
+            elif isinstance(obj, dict) and "image" in obj:
+                said += f"; a row with an 'image' and no 'prompt' is an image row, {IMAGE_ROWS_FOR}"
+            raise PrepareError(said)
         objects.append((lineno, obj))
     if not objects:
         raise PrepareError(f"{path}: no examples")
@@ -895,10 +899,9 @@ def _decision_for(
 # ---------------------------------------------------------------------------
 
 
-IMAGE_ROWS_FOR_EMBEDDING_ONLY = (
-    "these are image rows, and --base-model is {model}. Image rows are trained for "
-    f"{EMBEDDING_MODEL} only, the one model litetune trains on images; pass --base-model "
-    f"{EMBEDDING_MODEL}"
+IMAGE_ROWS_FOR = (
+    f"which prepare reads for --base-model {EMBEDDING_MODEL} only, the one model litetune trains "
+    "on images"
 )
 
 IMAGE_ROWS_NOT_COUNTED = (
@@ -906,24 +909,64 @@ IMAGE_ROWS_NOT_COUNTED = (
     "length was measured and no tokenizer was run"
 )
 
+# The formats an image row may be. LiteRT-LM decodes the picture an application
+# gives it with stb_image; PNG and JPEG are what litetune accepts for it, an MPO
+# being JPEG streams one after another (`images.MULTI_FRAME_STILL`). Pillow's
+# names for them.
+IMAGE_FORMATS: tuple[str, ...] = ("PNG", "JPEG", MULTI_FRAME_STILL)
+
+IMAGE_FLAGS_FOR_TEXT = (
+    "{flags}: these are image rows, which have no text to measure, so no context window and no "
+    "tokenizer is applied to them; drop the flags rather than have a report name settings that "
+    "were never used"
+)
+CONTEXT_LENGTH_REQUIRED = (
+    "--context-length is required for text rows: the binding context window, the smaller of "
+    "export.context_length and train.max_seq_length"
+)
+
 IMAGE_DUPLICATES = (
     "{count} image row(s) give the same bytes as an earlier row with the same label. Each is "
-    "trained as a row of its own, so those pictures weigh more than the others, and copies of "
-    "one picture can land in both the training and the held-out split, where the held-out row "
-    "scores a picture the model was trained on"
+    "trained as a row of its own, so those pictures weigh more than the others. The rows of one "
+    "picture are kept in one split, so no held-out row scores a picture the model was trained on"
 )
 
 
+def is_image_row(obj: Mapping[str, Any]) -> bool:
+    """Whether a row is an image row: it has an `image` and no `prompt`.
+
+    A row with a `prompt` is a text row whatever else it carries, as it was
+    before image rows existed; `prepare` refuses one that gives both for
+    EmbeddingGemma 2 (`refuse_image_and_prompt`).
+    """
+    return "image" in obj and "prompt" not in obj
+
+
+def refuse_image_and_prompt(path: Path, objects: Sequence[tuple[int, dict[str, Any]]]) -> None:
+    """Refuse, naming the first, a row that gives both an `image` and a `prompt`.
+
+    For EmbeddingGemma 2 a row is a picture or a text, and one that names both
+    would be trained as the text with the picture dropped.
+    """
+    for lineno, obj in objects:
+        if "image" in obj and "prompt" in obj:
+            raise PrepareError(
+                f"{path}:{lineno}: this row gives both an 'image' and a 'prompt'. A row for "
+                f"{EMBEDDING_MODEL} is an image row (an 'image' and a 'label') or a text row (a "
+                "'prompt'); keep the one it is"
+            )
+
+
 def rows_are_images(path: Path, objects: Sequence[tuple[int, dict[str, Any]]]) -> bool:
-    """Whether the rows are image rows. A file is all image rows or all text rows.
+    """Whether the rows are image rows (`is_image_row`). A file is all image rows or all text rows.
 
     Mixing is refused naming the first row of the other kind: one decision
     trained on states of two kinds is not a recipe anything here was measured on.
     """
     first_line, first = objects[0]
-    images = "image" in first
+    images = is_image_row(first)
     for lineno, obj in objects:
-        if ("image" in obj) is not images:
+        if is_image_row(obj) is not images:
             this, that = ("a text row", "an image row")
             if not images:
                 this, that = that, this
@@ -952,7 +995,7 @@ def read_image_rows(
     located: list[tuple[int, Path]] = []
     for lineno, obj in objects:
         where = f"{path}:{lineno}"
-        given = [key for key in ("prompt", "completion", "target") if key in obj]
+        given = [key for key in ("completion", "target") if key in obj]
         if given:
             raise PrepareError(
                 f"{where}: an image row is an 'image' and a 'label', and this one also gives "
@@ -1049,6 +1092,13 @@ def image_rows(
             raise PrepareError(
                 f"{where}: {file} is not an image {decoder} can decode: {found.error}. `tune` "
                 "decodes it with the same Pillow"
+            )
+        if found.format not in IMAGE_FORMATS:
+            raise PrepareError(
+                f"{where}: {file} is {found.format!r} to {decoder}, not PNG or JPEG. LiteRT-LM "
+                "decodes the picture an application gives it with stb_image, and an image row is "
+                "a PNG or a JPEG file (an MPO as its first frame); save it as one of those, in "
+                "the format the application will give"
             )
         # An MPO file's later frames are not the picture: its first is, the one
         # Pillow opens and `tune` trains on (`images.MULTI_FRAME_STILL`).
@@ -1293,6 +1343,48 @@ def split_calibration(
     return (
         [row for i, row in enumerate(rows) if i not in held and i not in aside],
         [row for i, row in enumerate(rows) if i in aside],
+    )
+
+
+def split_grouped(
+    rows: Sequence[Row],
+    groups: Sequence[str],
+    content_sha256: str,
+    seed: int,
+    heldout: int,
+    calibration: int,
+) -> tuple[list[Row], list[Row], list[Row]] | None:
+    """(training, calibration, held-out) rows, the rows of one group never in two of them.
+
+    `groups[i]` is row i's group. The groups, in the order of their first row,
+    are permuted as `split_rows` permutes rows; the held-out split takes whole
+    groups from the front until it holds at least `heldout` rows, calibration
+    the next ones until it holds `calibration`, and at least one group is left
+    for training. When every group is one row this is the split `split_rows`
+    and `split_calibration` give. `None` when there are fewer than two groups.
+    """
+    order_of: dict[str, int] = {}
+    for group in groups:
+        order_of.setdefault(group, len(order_of))
+    if len(order_of) < 2:
+        return None
+    members: list[list[int]] = [[] for _ in order_of]
+    for i, group in enumerate(groups):
+        members[order_of[group]].append(i)
+    order = _permutation(len(members), split_seed(content_sha256, seed))
+    taken: list[set[int]] = []
+    place = 0
+    for wanted in (heldout, calibration):
+        part: set[int] = set()
+        while len(part) < wanted and place < len(order) - 1:
+            part.update(members[order[place]])
+            place += 1
+        taken.append(part)
+    held, aside = taken
+    return (
+        [row for i, row in enumerate(rows) if i not in held and i not in aside],
+        [row for i, row in enumerate(rows) if i in aside],
+        [row for i, row in enumerate(rows) if i in held],
     )
 
 
@@ -1833,7 +1925,8 @@ def profile_slices(rows: Sequence[Row], probe: HeadroomProbe | None) -> tuple[Sl
 
 @dataclass(frozen=True)
 class PrepareRequest:
-    """One ingestion. `context_length` is required and is the *binding* limit.
+    """One ingestion. `context_length` is required for text rows and is the *binding*
+    limit; image rows have no text to measure, and refuse one (`None` there).
 
     A sequence has to fit two windows, and they are declared in different
     sections of the spec: `export.context_length`, baked into the artifact and
@@ -1846,7 +1939,7 @@ class PrepareRequest:
 
     data: Path
     output_dir: Path
-    context_length: int
+    context_length: int | None
     seed: int = 0
     heldout_fraction: float = DEFAULT_HELDOUT_FRACTION
     heldout_size: int | None = None
@@ -1879,7 +1972,7 @@ class PrepareRequest:
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", Path(self.data))
         object.__setattr__(self, "output_dir", Path(self.output_dir))
-        if self.context_length < 1:
+        if self.context_length is not None and self.context_length < 1:
             raise ValueError(f"context_length must be at least 1, got {self.context_length}")
         if not 0.0 < self.heldout_fraction < 1.0:
             raise ValueError(
@@ -1896,10 +1989,12 @@ class PrepareRequest:
             raise ValueError(f"calibration_size must be at least 1, got {self.calibration_size}")
 
     def as_dict(self) -> dict[str, Any]:
+        # An image split has no window: it is not reported as one.
+        window = {} if self.context_length is None else {"context_length": self.context_length}
         return {
             "data": str(self.data),
             "output_dir": str(self.output_dir),
-            "context_length": self.context_length,
+            **window,
             "seed": self.seed,
             "heldout_fraction": self.heldout_fraction,
             "heldout_size": self.heldout_size,
@@ -2153,6 +2248,7 @@ def _check_scoreability(result: PrepareResult, rows: Sequence[Row], events: Even
 
 def _check_lengths(
     request: PrepareRequest,
+    context_length: int,
     result: PrepareResult,
     rows: Sequence[Row],
     decision: DecisionProfile | None,
@@ -2160,10 +2256,10 @@ def _check_lengths(
     evidence: PromptMode | None,
     events: EventStream,
 ) -> Check:
-    """Measure every row against the context window, and record the check on `result`."""
+    """Measure every row against `context_length`, and record the check on `result`."""
     embedding = request.base_model == EMBEDDING_MODEL
     measured: list[LengthStats] = []
-    window = request.context_length
+    window = context_length
     if embedding:
         from litetune.embedding_tune import RECIPE
 
@@ -2183,7 +2279,7 @@ def _check_lengths(
             if embedding and decision is not None:
                 stats = measure_embedded_lengths(rows, decision.decision, request.tokens, window)
             else:
-                stats = measure_lengths(rows, request.tokens, request.context_length)
+                stats = measure_lengths(rows, request.tokens, context_length)
             measured.append(stats)
             if stats.over_length:
                 named = ", ".join(
@@ -2248,6 +2344,55 @@ def _check_lengths(
     return length_check
 
 
+def _split_pictures(
+    result: PrepareResult,
+    rows: Sequence[Row],
+    content_sha256: str,
+    seed: int,
+    heldout: int,
+    calibration: int,
+) -> tuple[tuple[list[Row], list[Row]] | None, list[Row]]:
+    """An image split's (training, held-out) rows and its calibration rows, by picture.
+
+    Rows that give the same bytes are one group (`split_grouped`), so no picture
+    is both trained on and scored. `None` for the halves when the rows hold
+    fewer than two pictures. A held-out or calibration split that the groups
+    made larger than asked is a limitation.
+    """
+    pictures = [row.image.sha256 if row.image is not None else "" for row in rows]
+    grouped = split_grouped(rows, pictures, content_sha256, seed, heldout, calibration)
+    if grouped is None:
+        return None, []
+    train, aside, held = grouped
+    if (len(held), len(aside)) != (heldout, calibration):
+        result.limitation(
+            f"rows that give the same picture are kept in one split, so {len(held)} rows were held "
+            f"out and {len(aside)} set aside for calibration where {heldout} and {calibration} "
+            "were asked"
+        )
+    return (train, held), aside
+
+
+def _context_length_for(request: PrepareRequest, image_mode: bool) -> int | None:
+    """The window text rows are measured against; `None` for image rows, which
+    refuse a window and a tokenizer rather than report ones never applied."""
+    if image_mode:
+        flags = [
+            name
+            for name, given in (
+                ("--context-length", request.context_length is not None),
+                ("--tokenizer (and --tokenizer-revision)", request.tokens is not None),
+            )
+            if given
+        ]
+        if flags:
+            raise PrepareError(IMAGE_FLAGS_FOR_TEXT.format(flags=", ".join(flags)))
+        return None
+    if request.context_length is None:
+        raise PrepareError(CONTEXT_LENGTH_REQUIRED)
+    return request.context_length
+
+
 def prepare(request: PrepareRequest, events: EventStream | None = None) -> PrepareResult:
     """Read, measure and split a dataset. Raises only if the file is not a dataset.
 
@@ -2269,10 +2414,13 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     # google/embeddinggemma-2 is no LLM family: it has no rule, and its rows
     # are embedded, not scored (`embedding_tune`).
     embedding = request.base_model == EMBEDDING_MODEL
-    objects = read_objects(request.data, images=True)
-    image_mode = rows_are_images(request.data, objects)
-    if image_mode and not embedding:
-        raise PrepareError(IMAGE_ROWS_FOR_EMBEDDING_ONLY.format(model=request.base_model))
+    # Image rows exist on the EmbeddingGemma 2 path only. For every other model
+    # an `image` key is a field like any other, ignored as it always was.
+    objects = read_objects(request.data, images=embedding)
+    if embedding:
+        refuse_image_and_prompt(request.data, objects)
+    image_mode = embedding and rows_are_images(request.data, objects)
+    context_length = _context_length_for(request, image_mode)
     decision: DecisionProfile | None = None
     image_stats: ImageStats | None = None
     if image_mode or is_decision_split(objects, request.questions):
@@ -2369,12 +2517,12 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
 
     # -- lengths -----------------------------------------------------------
     length_check: Check | None = None
-    if image_stats is not None:
+    if context_length is None:  # image rows (`_context_length_for`)
         result.lengths = Unavailable(IMAGE_ROWS_NOT_COUNTED)
         result.skipped.append(SkippedCheck(LENGTH_CHECK, IMAGE_ROWS_NOT_COUNTED))
     else:
         length_check = _check_lengths(
-            request, result, rows, decision, declarations_sha256, evidence, events
+            request, context_length, result, rows, decision, declarations_sha256, evidence, events
         )
 
     # -- scoreability, before anyone pays for a GPU -------------------------
@@ -2431,11 +2579,17 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 f"{len(rows) - heldout_n} rows are left after the held-out split, so "
                 f"{calibration_n} were set aside"
             )
-        train_part, calibration_rows = split_calibration(
-            rows, content_sha256, request.seed, heldout_n, calibration_n
-        )
-        halves = (train_part, halves[1])
-        decision.train = _count_by_option(decision.decision, train_part)
+        if image_stats is None:
+            train_part, calibration_rows = split_calibration(
+                rows, content_sha256, request.seed, heldout_n, calibration_n
+            )
+            halves = (train_part, halves[1])
+        else:
+            halves, calibration_rows = _split_pictures(
+                result, rows, content_sha256, request.seed, heldout_n, calibration_n
+            )
+    if decision is not None and halves is not None:
+        decision.train = _count_by_option(decision.decision, halves[0])
         decision.calibration = _count_by_option(decision.decision, calibration_rows)
         decision.heldout = _count_by_option(decision.decision, halves[1])
         options_check = result.checks.add(_options_check(decision))
@@ -2464,10 +2618,11 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 "calibration split"
             )
     if halves is None:
+        pictures = f" of {image_stats.files} picture(s)" if image_stats is not None else ""
         split_check = Check.failed(
             SPLIT_CHECK,
-            f"{len(rows)} row(s) cannot be split into a training set and a held-out set; with no "
-            "held-out data nothing downstream can be measured at all",
+            f"{len(rows)} row(s){pictures} cannot be split into a training set and a held-out "
+            "set; with no held-out data nothing downstream can be measured at all",
             observed={"rows": len(rows)},
         )
         result.checks.add(split_check)

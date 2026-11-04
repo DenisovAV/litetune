@@ -12,10 +12,11 @@ decoder's error -- and the refusals are decided in `prepare`, where they name
 the row.
 
 **It is copied, never re-encoded.** The split is self-contained:
-`images/<sha256>.<ext>` beside the JSONL, the bytes the user gave. The
-fine-tuned model is sensitive to compression (the spec, 2026-11-04-eg2-image-tune:
-one crop as PNG and as JPEG embedded at cosine 0.918 on the fine-tune), so a
-split that re-encoded would train on a format the application never feeds.
+`images/<sha256>.<ext>` beside the JSONL, the bytes the user gave. A model
+fine-tuned on pictures was sensitive to compression in an unpublished run on
+game frames: 1005 crops, each embedded as PNG and as JPEG, gave a mean cosine
+of 0.918 between the two and a minimum of 0.240 (0.982 mean on the base model).
+So a split that re-encoded would train on a format the application never feeds.
 """
 
 from __future__ import annotations
@@ -47,13 +48,14 @@ IMAGE_CHECK_TIMEOUT_S = 600
 
 _CHUNK_BYTES = 1 << 20
 
-# Pillow's format names are upper-case words ("PNG", "JPEG", "WEBP"). Anything
-# else in an answer is not one, and it would become part of a file name.
-_FORMAT = re.compile(r"[A-Z0-9]{2,16}")
+# Pillow's format names are words ("PNG", "JPEG", "WEBP", and a few in mixed
+# case). Anything else in an answer is not one. Which formats an image row may
+# be is `prepare`'s decision, made per row; only those become a file extension.
+_FORMAT = re.compile(r"[A-Za-z0-9]{1,32}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 # The spellings that differ from the format name lower-cased. An MPO file
-# (Multi Picture Object, what phone cameras write) is JPEG streams one after
+# (Multi Picture Object, which some cameras write) is JPEG streams one after
 # another, its first being the primary image, so it keeps the extension of one.
 _EXTENSIONS = {"jpeg": "jpg", "mpo": "jpg"}
 
@@ -239,7 +241,17 @@ class PillowImageInspector:
                     f"the image check was {reading.describe('the images')} without an answer: "
                     f"{(proc.stderr or '').strip()[-300:] or 'no stderr'}"
                 )
-            payload = json.loads(out.read_text(encoding="utf-8"))
+            try:
+                payload = json.loads(out.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                logger.exception("the image check's answer could not be read")
+                raise ImageCheckUnavailable(
+                    f"the image check's answer could not be read: {type(exc).__name__}: {exc}"
+                ) from exc
+        if not isinstance(payload, dict):
+            raise ImageCheckUnavailable(
+                f"the image check answered {type(payload).__name__}, not an object"
+            )
         answers = payload.get("images")
         if not isinstance(answers, list) or len(answers) != len(paths):
             raise ImageCheckUnavailable(
@@ -282,10 +294,17 @@ class ImageCopyError(ValueError):
 def _copy_checked(source: Path, dest: Path, sha256: str) -> None:
     """Copy `source` to `dest`, refusing bytes that are not the ones that were checked."""
     digest = hashlib.sha256()
-    with source.open("rb") as reader, dest.open("xb") as writer:
-        for chunk in iter(lambda: reader.read(_CHUNK_BYTES), b""):
-            digest.update(chunk)
-            writer.write(chunk)
+    try:
+        with source.open("rb") as reader, dest.open("xb") as writer:
+            for chunk in iter(lambda: reader.read(_CHUNK_BYTES), b""):
+                digest.update(chunk)
+                writer.write(chunk)
+    except OSError as exc:
+        logger.exception("could not copy %s into the split as %s", source, dest)
+        raise ImageCopyError(
+            f"{source} could not be copied into the split as {dest.name}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     if digest.hexdigest() != sha256:
         raise ImageCopyError(
             f"{source} changed after it was checked: its bytes now hash to {digest.hexdigest()}, "
@@ -298,6 +317,39 @@ def _remove_flat(directory: Path) -> None:
     for entry in directory.iterdir():
         entry.unlink()
     directory.rmdir()
+
+
+# The names `write_images` gives its scratch directories beside `images`.
+_STAGING = re.compile(r"\.images-[0-9a-f]{16}")
+_RETIRED = re.compile(r"\.images-old-[0-9a-f]{16}")
+
+
+def _remove_leftovers(output_dir: Path) -> None:
+    """Remove the scratch directories an earlier `write_images` left when it was stopped.
+
+    A staging directory holds files; a retired one holds `images/` with files.
+    One holding anything else was not written here, and is refused by name.
+    """
+    for entry in sorted(output_dir.iterdir()):
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        try:
+            if _STAGING.fullmatch(entry.name):
+                _remove_flat(entry)
+            elif _RETIRED.fullmatch(entry.name):
+                inner = entry / IMAGES_DIR
+                if inner.is_dir() and not inner.is_symlink():
+                    _remove_flat(inner)
+                entry.rmdir()
+            else:
+                continue
+        except OSError as exc:
+            logger.exception("could not remove %s, left by an earlier prepare", entry)
+            raise ImageCopyError(
+                f"{entry} looks like a directory an earlier prepare left when it was stopped, and "
+                f"could not be removed ({type(exc).__name__}: {exc}); move it away"
+            ) from exc
+        logger.warning("removed %s, left by an earlier prepare that was stopped", entry)
 
 
 def _fresh_dir(parent: Path, prefix: str) -> Path:
@@ -324,6 +376,12 @@ def write_images(output_dir: Path, sources: Mapping[str, Path]) -> Path:
     that fails part way leaves the split's previous images, or none, and never
     a half of them. A previous `images` directory is replaced, not merged: its
     files may belong to rows this split no longer has.
+
+    Replacing takes two renames, the old directory aside and the new one in, and
+    between them there is no `images`; a run stopped there leaves the old one in
+    a `.images-old-*` directory. The next run removes such leftovers, and any
+    staging directory a stopped copy left, before it writes (`_remove_leftovers`).
+    Raises `ImageCopyError` for every failure it can name.
     """
     target = output_dir / IMAGES_DIR
     if target.is_symlink() or (target.exists() and not target.is_dir()):
@@ -336,6 +394,7 @@ def write_images(output_dir: Path, sources: Mapping[str, Path]) -> Path:
                 "(it writes files only); move it away"
             )
     output_dir.mkdir(parents=True, exist_ok=True)
+    _remove_leftovers(output_dir)
     staging = _fresh_dir(output_dir, ".images-")
     try:
         for name, source in sorted(sources.items()):
@@ -349,13 +408,25 @@ def write_images(output_dir: Path, sources: Mapping[str, Path]) -> Path:
         target.rename(retired)
     try:
         staging.rename(target)
-    except OSError:
+    except OSError as exc:
         logger.exception("could not move %s into place as %s", staging, target)
         if retired is not None:
-            retired.rename(target)
-            retired.parent.rmdir()
+            try:
+                retired.rename(target)
+                retired.parent.rmdir()
+            except OSError as restore:
+                logger.exception("could not move %s back to %s", retired, target)
+                raise ImageCopyError(
+                    f"the new images could not be moved into place as {target} ({exc}), and the "
+                    f"previous ones could not be moved back from {retired} ({restore}); they are "
+                    f"there, and the new ones in {staging}"
+                ) from restore
         _remove_flat(staging)
-        raise
+        raise ImageCopyError(
+            f"the new images could not be moved into place as {target}: "
+            f"{type(exc).__name__}: {exc}"
+            + ("; the previous images are back in place" if retired is not None else "")
+        ) from exc
     if retired is not None:
         _remove_flat(retired)
         retired.parent.rmdir()
