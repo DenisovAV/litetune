@@ -833,7 +833,8 @@ def _add_convert(sub) -> None:
             "embedding checkpoints only (a `tune --model google/embeddinggemma-2` output): how "
             "the fine-tune's weights are quantized into Google's file. int8: both graphs int8; "
             f"int4: both int4, Google's own size (default {DEFAULT_WEIGHTS}; for a checkpoint "
-            f"tuned on images {IMAGE_DEFAULT_WEIGHTS}, the only mode measured on images)"
+            f"tuned on images {IMAGE_DEFAULT_WEIGHTS}, the mode of every converted image file "
+            "measured so far)"
         ),
     )
     convert.add_argument(

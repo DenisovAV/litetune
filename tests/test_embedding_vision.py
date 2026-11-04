@@ -377,6 +377,120 @@ def test_a_script_that_fails_is_a_run_refusal(toolchain, tmp_path, monkeypatch):
     refused(f, tmp_path / "out" / "m.litertlm", "run", "MemoryError")
 
 
+@pytest.mark.parametrize(
+    ("written", "match"),
+    [("[1, 2]", "reported list, not an object"), ("{not json", "could not be read")],
+)
+def test_a_report_that_is_not_an_object_is_a_run_refusal(
+    toolchain, tmp_path, monkeypatch, written, match
+):
+    f = files(tmp_path, monkeypatch)
+
+    def answers(self, args, timeout: int = 0, **kwargs):
+        Path(args[3]).write_text(written, encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(envs.StageEnv, "run", answers)
+    refused(f, tmp_path / "out" / "m.litertlm", "run", match)
+
+
+# -- the frozen tensors, held to the base's ---------------------------------------
+
+
+def _st(tensors: dict[str, tuple[str, list[int], list[float]]]) -> bytes:
+    import struct
+
+    header: dict[str, Any] = {}
+    data = b""
+    for name, (dtype, shape, values) in tensors.items():
+        packed = struct.pack(f"<{len(values)}f", *values)
+        if dtype == "BF16":
+            packed = b"".join(packed[i + 2 : i + 4] for i in range(0, len(packed), 4))
+        if dtype == "F16":
+            packed = struct.pack(f"<{len(values)}e", *values)
+        header[name] = {
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [len(data), len(data) + len(packed)],
+        }
+        data += packed
+    text = json.dumps(header).encode()
+    return struct.pack("<Q", len(text)) + text + data
+
+
+BASE_TENSORS = {
+    "vision_tower.a": ("BF16", [3], [1.0, -2.0, 0.5]),
+    "embed_vision.b": ("BF16", [1], [4.0]),
+    "language_model.embed_tokens.weight": ("BF16", [2, 2], [3.0, -0.25, 8.0, 1.5]),
+    "language_model.layers.0.w": ("BF16", [1], [1.0]),
+    "audio_tower.c": ("BF16", [1], [7.0]),
+}
+
+
+def _frozen(tmp_path: Path, **tuned: Any) -> list[str]:
+    base = tmp_path / "base.safetensors"
+    base.write_bytes(_st(BASE_TENSORS))
+    as_f32 = {name: ("F32", s, v) for name, (_, s, v) in BASE_TENSORS.items()}
+    del as_f32["audio_tower.c"]  # tune saves no audio tower
+    as_f32["language_model.layers.0.w"] = ("F32", [1], [1.125])  # trained
+    for name, value in tuned.items():
+        if value is None:
+            del as_f32[name]
+        else:
+            as_f32[name] = value
+    path = tmp_path / "tuned.safetensors"
+    path.write_bytes(_st(as_f32))
+    return embedding_vision.frozen_changes(base, path)
+
+
+def test_frozen_tensors_widened_from_bf16_are_the_base_and_trained_ones_are_not_read(tmp_path):
+    assert _frozen(tmp_path) == []
+
+
+def test_a_frozen_tensor_that_moved_by_less_than_a_bf16_step_is_a_change(tmp_path):
+    # 1.0 + 2**-20 is a float32 a BF16 cannot hold: a change below BF16's resolution.
+    moved = ("F32", [3], [1.0 + 2**-20, -2.0, 0.5])
+    assert _frozen(tmp_path, **{"vision_tower.a": moved}) == ["vision_tower.a (other values)"]
+
+
+@pytest.mark.parametrize(
+    ("tuned", "said"),
+    [
+        ({"embed_vision.b": None}, "embed_vision.b (not in the fine-tune)"),
+        ({"embed_vision.extra": ("F32", [1], [0.0])}, "embed_vision.extra (not in the base)"),
+        (
+            {"language_model.embed_tokens.weight": ("F32", [4], [3.0, -0.25, 8.0, 1.5])},
+            "shape [4], the base's [2, 2]",
+        ),
+        ({"embed_vision.b": ("F16", [1], [4.0])}, "F16 against the base's BF16, not compared"),
+    ],
+)
+def test_a_frozen_tensor_missing_reshaped_or_retyped_is_a_change(tmp_path, tuned, said):
+    (change,) = _frozen(tmp_path, **tuned)
+    assert said in change
+
+
+def test_the_comparison_does_not_depend_on_the_chunk(tmp_path, monkeypatch):
+    monkeypatch.setattr(embedding_vision, "_CHUNK_VALUES", 1)
+    assert _frozen(tmp_path) == []
+    late = ("F32", [2, 2], [3.0, -0.25, 8.0, 1.75])
+    assert _frozen(tmp_path, **{"language_model.embed_tokens.weight": late}) == [
+        "language_model.embed_tokens.weight (other values)"
+    ]
+
+
+def test_files_that_are_not_safetensors_or_hold_no_frozen_tensor_are_refused(tmp_path):
+    base = tmp_path / "base.safetensors"
+    base.write_bytes(b"\x05\x00")
+    tuned = tmp_path / "tuned.safetensors"
+    tuned.write_bytes(_st({"language_model.layers.0.w": ("F32", [1], [1.0])}))
+    with pytest.raises(EmbeddingConvertError, match="too short for safetensors"):
+        embedding_vision.frozen_changes(base, tuned)
+    base.write_bytes(_st({"language_model.layers.0.w": ("BF16", [1], [1.0])}))
+    with pytest.raises(EmbeddingConvertError, match="holds a tensor under"):
+        embedding_vision.frozen_changes(base, tuned)
+
+
 # -- the read-back, against hand-made packed files ----------------------------------
 
 

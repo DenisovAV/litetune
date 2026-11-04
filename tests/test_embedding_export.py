@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,10 +60,51 @@ from litetune.embedding_vision import VISION_FILE, VISION_REPO, VISION_REVISION,
 from litetune.events import EventStream
 from litetune.storage import hash_file
 
+
+def safetensors(tensors: dict[str, tuple[str, list[int], list[float]]]) -> bytes:
+    """A safetensors file of (dtype, shape, values); BF16 as the upper half of each float32."""
+    header: dict[str, Any] = {}
+    data = b""
+    for name, (dtype, shape, values) in tensors.items():
+        packed = struct.pack(f"<{len(values)}f", *values)
+        if dtype == "BF16":
+            packed = b"".join(packed[i + 2 : i + 4] for i in range(0, len(packed), 4))
+        header[name] = {
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [len(data), len(data) + len(packed)],
+        }
+        data += packed
+    text = json.dumps(header).encode()
+    return struct.pack("<Q", len(text)) + text + data
+
+
+# Values a BF16 holds exactly, so the base's BF16 and a fine-tune's F32 of them agree.
+FROZEN = {
+    "vision_tower.encoder.weight": [1.0, -2.0],
+    "embed_vision.embedding_projection.weight": [0.5, 4.0],
+    "language_model.embed_tokens.weight": [3.0, -0.25, 8.0, 1.5],
+}
+
+
+def _weights(dtype: str, trained: float, **changed: list[float]) -> bytes:
+    """Base-shaped weights: the frozen tensors (one per prefix in `changed` replaced)
+    and one trained tensor of value `trained`."""
+    shapes = {"language_model.embed_tokens.weight": [2, 2]}
+    tensors = {
+        name: (dtype, shapes.get(name, [len(v)]), changed.get(name.split(".")[0], v))
+        for name, v in FROZEN.items()
+    }
+    tensors["language_model.layers.0.weight"] = (dtype, [1], [trained])
+    return safetensors(tensors)
+
+
 GOOGLE_BYTES = b"not google's file, a stand-in"
 VISION_BYTES = b"not google's text-vision file, a stand-in"
-BASE_BYTES = b"base weights"
+BASE_BYTES = _weights("BF16", 1.0)
 TUNED_BYTES = b"tuned weights"
+# A checkpoint tuned on images: the frozen tensors as the base's, in float32.
+TUNED_IMAGE_BYTES = _weights("F32", 1.25)
 
 
 def _digest(data: bytes) -> str:
@@ -228,9 +270,10 @@ def _record(**overrides: Any) -> EmbeddingRecord:
 def _checkpoint(tmp_path: Path, record: EmbeddingRecord | None = None, weights=True) -> Path:
     model = tmp_path / "tuned" / "model"
     model.mkdir(parents=True)
+    record = record or _record()
     if weights:
-        (model / BASE_FILE).write_bytes(TUNED_BYTES)
-    write_embedding_record(model, record or _record())
+        (model / BASE_FILE).write_bytes(TUNED_IMAGE_BYTES if record.is_image else TUNED_BYTES)
+    write_embedding_record(model, record)
     return model
 
 
@@ -611,11 +654,60 @@ def test_an_image_report_ties_to_the_spliced_file(hub, grafter, splicer, tmp_pat
         embedding_export.BASE_FILE_CHECK,
         embedding_export.VISION_FILE_CHECK,
         embedding_export.BASE_CHECKPOINT_CHECK,
+        embedding_export.FROZEN_CHECK,
         embedding_export.GRAFT_CHECK,
         embedding_export.SPLICE_CHECK,
     ]
     assert not any("int4 has not been measured" in t for t in report["limitations"])
     assert any("has not been measured" in t for t in report["limitations"])
+    # What verify reads of this report ties the file to it.
+    from litetune.embedding_verify import convert_facts
+
+    facts, source = convert_facts(artifact)
+    assert facts is not None and source == str(out / "int8" / REPORT_NAME)
+    assert (facts.modality, facts.vision_tokens, facts.weights) == ("image", 140, "int8")
+    assert facts.checkpoint_sha256 == report["checkpoint"]["sha256"]
+    assert facts.decision_sha256 == _decision().digest()
+
+
+@pytest.mark.parametrize(
+    ("changed", "named"),
+    [
+        ({"language_model": [3.0, -0.25, 8.0, 1.75]}, "language_model.embed_tokens.weight"),
+        ({"vision_tower": [1.0, -2.5]}, "vision_tower.encoder.weight"),
+        ({"embed_vision": [0.5, 4.5]}, "embed_vision.embedding_projection.weight"),
+    ],
+)
+def test_an_image_checkpoint_whose_frozen_tensors_changed_is_refused_before_the_graft(
+    hub, grafter, splicer, tmp_path, changed, named
+):
+    model = _image_checkpoint(tmp_path)
+    (model / BASE_FILE).write_bytes(_weights("F32", 1.25, **changed))
+    result = _run(tmp_path, model=model, weights="int8")
+    assert result.outcome is Outcome.FAILED
+    last = result.checks.checks[-1]
+    assert last.name == embedding_export.FROZEN_CHECK
+    assert f"{named} (other values)" in last.detail and "1 of the tensors" in last.detail
+    assert grafter.calls == [] and splicer.calls == []
+    assert result.artifact is None
+
+
+def test_an_image_checkpoint_that_is_not_safetensors_is_refused_by_the_frozen_check(
+    hub, grafter, splicer, tmp_path
+):
+    model = _image_checkpoint(tmp_path)
+    (model / BASE_FILE).write_bytes(b"tuned weights")
+    result = _run(tmp_path, model=model, weights="int8")
+    last = result.checks.checks[-1]
+    assert last.name == embedding_export.FROZEN_CHECK and last.outcome is Outcome.FAILED
+    assert last.detail.startswith("input:") and grafter.calls == []
+
+
+def test_a_text_checkpoint_is_not_held_to_the_frozen_tensors(hub, grafter, tmp_path):
+    # Its weights are no safetensors at all here, and nothing reads them but the graft.
+    result = _run(tmp_path)
+    assert result.outcome is Outcome.PASSED
+    assert embedding_export.FROZEN_CHECK not in [c.name for c in result.checks.checks]
 
 
 def test_a_text_report_carries_no_vision_and_ties_to_the_graft(hub, grafter, splicer, tmp_path):

@@ -23,11 +23,14 @@ with `convert.json` beside it. `verify` reads the weight mode from that report.
 **An image checkpoint** (`EmbeddingRecord.modality` "image") needs a fourth input,
 Google's text-vision file (`embedding_vision.VISION_FILE` at `VISION_REVISION`,
 downloaded the same way, or `--base-litertlm-440m PATH`; its sha256 must be
-`embedding_vision.VISION_SHA256`). The graft writes the text file as for a text
-checkpoint, into the run's own scratch directory, and `embedding_vision.splice`
-puts its text tower into the text-vision file at the same output path; the text
-file is removed with the scratch directory. Its weights default to int8, the only
-mode measured on images (`IMAGE_DEFAULT_WEIGHTS`). `--npu` is refused for it. Its
+`embedding_vision.VISION_SHA256`). Before the graft, its frozen tensors are held
+to the base's (`embedding_vision.frozen_changes`): the splice keeps Google's
+vision sections, which come from them. The graft writes the text file as for a
+text checkpoint, into the run's own scratch directory, and
+`embedding_vision.splice` puts its text tower into the text-vision file at the
+same output path; the text file is removed with the scratch directory. Its
+weights default to int8, the mode of every converted image file measured so far
+(`IMAGE_DEFAULT_WEIGHTS`). `--npu` is refused for it. Its
 report adds `google_vision_file` and `splice`; `splice.sha256` is the file's,
 which `verify` ties the report to, and `graft` describes the text file, whose
 `output` is `null` because it is not kept.
@@ -75,11 +78,13 @@ from litetune.embedding_npu import (
 )
 from litetune.embedding_tune import DECIDER_PREFIX, IMAGE_PREFIX, EmbeddingRecord
 from litetune.embedding_vision import (
+    FROZEN_PREFIXES,
     VISION_FILE,
     VISION_REPO,
     VISION_REVISION,
     VISION_SHA256,
     SpliceResult,
+    frozen_changes,
     splice,
 )
 from litetune.events import EventStream
@@ -113,14 +118,15 @@ BASE_FILE_CHECK = "Google's file"
 BASE_CHECKPOINT_CHECK = "base checkpoint"
 GRAFT_CHECK = "graft"
 VISION_FILE_CHECK = "Google's text-vision file"
+FROZEN_CHECK = "frozen tensors are the base's"
 SPLICE_CHECK = "splice"
 
-# An image checkpoint's weights when --weights is not given: every image model the
-# spec's measurements ran on was an int8 graft (docs/specs/2026-11-04-eg2-image-tune.md).
+# An image checkpoint's weights when --weights is not given: every converted image
+# file measured so far, in unpublished runs on game frames, was an int8 graft.
 IMAGE_DEFAULT_WEIGHTS = "int8"
 IMAGE_INT4_NOT_MEASURED = (
-    "int4 has not been measured on an image checkpoint; every image measurement behind this "
-    "path used int8. `litetune verify` measures this file"
+    "int4 has not been measured on an image checkpoint; every converted image file measured so "
+    "far was int8. `litetune verify` measures this file"
 )
 NPU_IMAGE_REFUSED = (
     "--npu: {model} was tuned on images, and convert does not compile an image model for an "
@@ -609,6 +615,8 @@ def _run(
             BASE_CHECKPOINT_CHECK, f"{BASE_MODEL} at {BASE_REVISION}, sha256 {BASE_SHA256[:16]}…"
         ),
     )
+    if image and not _frozen_checked(result, events, base, tuned):
+        return
 
     # -- the graft ---------------------------------------------------------------
     if image and request.weights == "int4":
@@ -683,6 +691,48 @@ def _vision_file_checked(
         result,
         events,
         Check.passed(VISION_FILE_CHECK, f"{vision.name}, sha256 {VISION_SHA256[:16]}…"),
+    )
+    return True
+
+
+def _frozen_checked(
+    result: EmbeddingExportResult, events: EventStream, base: Path, tuned: Path
+) -> bool:
+    """Whether the fine-tune holds the base's frozen tensors, recorded as a check either way.
+
+    The splice keeps Google's vision sections and `end_of_vision`, which are the
+    base's (`embedding_vision.frozen_changes`); a checkpoint that changed what
+    they come from would be spliced into a file that is not it.
+    """
+    try:
+        changes = frozen_changes(base, tuned)
+    except EmbeddingConvertError as exc:
+        logger.error("the frozen tensors could not be compared: %s", exc)
+        _add(result, events, Check.failed(FROZEN_CHECK, f"{exc.cause}: {exc}"))
+        return False
+    if changes:
+        more = f" and {len(changes) - 5} more" if len(changes) > 5 else ""
+        shown = ", ".join(changes[:5]) + more
+        _add(
+            result,
+            events,
+            Check.failed(
+                FROZEN_CHECK,
+                f"the fine-tune holds {len(changes)} of the tensors the image recipe freezes "
+                f"otherwise than the base: {shown}. The splice keeps Google's vision encoder, "
+                "vision adapter and end_of_vision, which hold the base's, so the file would not "
+                "be this checkpoint",
+                observed={"changed": changes},
+            ),
+        )
+        return False
+    _add(
+        result,
+        events,
+        Check.passed(
+            FROZEN_CHECK,
+            f"every tensor under {', '.join(FROZEN_PREFIXES)} holds the base's values",
+        ),
     )
     return True
 
