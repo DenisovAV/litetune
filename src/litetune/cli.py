@@ -71,6 +71,7 @@ from litetune.embedding_export import REPORT_NAME as EMBEDDING_REPORT_NAME
 from litetune.embedding_export import summarise as summarise_embedding_convert
 from litetune.embedding_npu import NPU_SOCS, NPU_TIMEOUT_S
 from litetune.embedding_tune import (
+    APP_VISION_TOKENS,
     DIRECTION,
     EMBEDDING_MODEL,
     EMBEDDING_REVISION,
@@ -594,7 +595,8 @@ def _add_tune(sub) -> None:
             "Fine-tune inside the pinned training environment. Training completing is not "
             f"evidence: a run that scored nine times worse than its base finished cleanly with a "
             f"lower loss. --model {EMBEDDING_MODEL} trains an embedding model for a choice "
-            "--decision instead, with its measured recipe and none of the LLM flags. "
+            "--decision instead, with none of the LLM flags: on text rows with its measured "
+            "recipe, on image rows with a recipe litetune has not measured yet. "
             f"{STAGE_EXIT_CODE_HELP}"
         ),
     )
@@ -614,9 +616,11 @@ def _add_tune(sub) -> None:
         type=int,
         choices=list(VISION_TOKENS),
         help=(
-            f"image splits of --model {EMBEDDING_MODEL} only, and required for them: the vision "
-            "tokens per image the model is tuned at. Give the runtime the same count in the "
-            f"application, flutter_edge_ai's {VISION_TOKENS_SETTING.format(n='N')}"
+            f"image splits of --model {EMBEDDING_MODEL} only, and required for them: at most "
+            "how many vision tokens each image becomes, the budget the model is tuned at (the "
+            "processor keeps the aspect ratio, so an image may take fewer). Give the runtime the "
+            f"same budget in the application, flutter_edge_ai's "
+            f"{VISION_TOKENS_SETTING.format(n='N')}, whose default is {APP_VISION_TOKENS}"
         ),
     )
     tune.add_argument(
@@ -679,9 +683,10 @@ def _add_tune(sub) -> None:
         "--decision",
         type=Path,
         help=(
-            "the decision.json prepare wrote beside a decision split. Every row is checked to be "
-            "that decision rendered around a state, and the decision is recorded beside the "
-            "checkpoint, where convert, verify and bundle read it"
+            "the decision.json prepare wrote beside a decision split. Every text row is checked "
+            "to be that decision rendered around a state, every image row to name one of its "
+            "options and a picture in the split that matches its digest, and the decision is "
+            "recorded beside the checkpoint, where convert, verify and bundle read it"
         ),
     )
     tune.add_argument(

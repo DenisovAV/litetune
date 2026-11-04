@@ -502,6 +502,8 @@ def _record(**overrides: Any) -> EmbeddingRecord:
         "vision_tokens": 70,
     }
     fields.update(overrides)
+    if fields["modality"] == "image":
+        fields.setdefault("soft_tokens", {"c" * 64: 54})
     return EmbeddingRecord(**fields)
 
 

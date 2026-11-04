@@ -952,8 +952,8 @@ def summarise(result: EmbeddingExportResult) -> list[str]:
     ]
     if result.record.is_image:
         lines.append(
-            f"  tuned on images at {result.record.vision_tokens} vision tokens per image; the "
-            "app must give the runtime the same count"
+            f"  tuned on images at most {result.record.vision_tokens} vision tokens per image; "
+            "the app must give the runtime the same budget"
         )
     written = result.splice if result.record.is_image else result.graft
     if written is not None:

@@ -964,6 +964,10 @@ class FakeEmbedEnvs:
     gpu_device_for: dict[str, dict[str, Any]] = field(default_factory=dict)
     # An image split's files by absolute path, and the label each was written with.
     image_labels: dict[str, str] = field(default_factory=dict)
+    # The soft tokens the fake reference makes of a picture, by path; else 63.
+    soft_tokens: dict[str, int] = field(default_factory=dict)
+    # What the candidate's second run embeds; None: what the candidate embeds.
+    repeat: str | None = None
     # Each script's source as written to run, by script stem or engine side.
     sources: dict[str, str] = field(default_factory=dict)
 
@@ -984,7 +988,11 @@ class FakeEmbedEnvs:
         if name in self.refuse:
             Path(spec["report"]).write_text(json.dumps({"error": self.refuse[name]}))
             return 3
-        kind = {"candidate": self.candidate, "base": "random"}.get(name, "same")
+        kind = {
+            "candidate": self.candidate,
+            "candidate-repeat": self.repeat or self.candidate,
+            "base": "random",
+        }.get(name, "same")
         if name not in self.no_npy:
             np.save(spec["out"], self.vectors(texts, kind).astype(np.float32))
         report: dict[str, Any] = {"rows": len(texts) + (name in self.rows_off), "dim": 6}
@@ -992,6 +1000,7 @@ class FakeEmbedEnvs:
             report["max_seq_length"] = 128
             if "images" in spec:
                 report["vision_tokens"] = spec["vision_tokens"]
+                report["soft_tokens_per_row"] = [self.soft_tokens.get(t, 63) for t in texts]
             elif self.over_max_seq_length is not None:
                 report["tokens"] = {"max": 9, "over_max_seq_length": self.over_max_seq_length}
         else:
@@ -2238,7 +2247,7 @@ def _write_image_split(
             digest = hashlib.sha256(data).hexdigest()
             file = images / f"{digest}.png"
             file.write_bytes(data)
-            fake.image_labels[str(file.absolute())] = option
+            fake.image_labels[str(file.resolve())] = option
             lines.append(
                 json.dumps(
                     {
@@ -2295,6 +2304,8 @@ def _image_setup(
         "decision_sha256": decision.digest(),
         "modality": "image",
         "vision_tokens": IMAGE_TOKENS,
+        # What tune would have recorded: the fake reference's count for every picture.
+        "soft_tokens": dict.fromkeys(_image_digests(train) + _image_digests(heldout), 63),
     }
     fields.update(record or {})
     write_embedding_record(reference, EmbeddingRecord(**fields))
@@ -2321,7 +2332,12 @@ def _image_setup(
 
 def _image_paths(path: Path) -> list[str]:
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    return [str((path.parent / row["image"]).absolute()) for row in rows]
+    return [str((path.parent / row["image"]).resolve()) for row in rows]
+
+
+def _image_digests(path: Path) -> list[str]:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    return [row["image_sha256"] for row in rows]
 
 
 def _failed(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2345,7 +2361,8 @@ def test_an_image_checkpoint_embeds_its_images_on_both_sides_and_passes(fake, tm
     assert fake.texts["reference"] == paths and fake.texts["candidate"] == paths
     ref, cand = fake.specs["reference"], fake.specs["candidate"]
     assert ref["vision_tokens"] == IMAGE_TOKENS and cand["vision_tokens"] == IMAGE_TOKENS
-    assert ref["processor"] == {"source": "checkpoint", "path": str(s.reference)}
+    assert ref["model"] == str(s.reference) and ref["image_text"] == "<|image|>"
+    assert "processor" not in ref
     assert "prefix" not in cand and "texts" not in cand and "prompt_name" not in ref
     # The budget allows for an image, not a text.
     assert fake.timeouts["reference"] == (
@@ -2354,21 +2371,143 @@ def test_an_image_checkpoint_embeds_its_images_on_both_sides_and_passes(fake, tm
 
     embedding = m["embedding"]
     assert (embedding["modality"], embedding["vision_tokens"]) == ("image", IMAGE_TOKENS)
-    assert embedding["weights"] == "int8" and embedding["processor"]["source"] == "checkpoint"
+    assert embedding["weights"] == "int8" and embedding["processor"] == str(s.reference)
+    assert embedding["vision_threads"] is None and embedding["candidate_repeated"] is False
+    assert embedding["soft_tokens"] == {"compared": 54, "unrecorded": 0, "min": 63, "max": 63}
+    assert embedding["engines_side_by_side"] is False
     engine = m["measurements"]["candidate"]["engine"]
     assert engine["ms_per_image_median"] == 1.0 and "ms_per_text_median" not in engine
     assert m["scorer"]["means"] == embedding_verify.SCORER_MEANS_IMAGES
     assert m["gates"][0]["outcome"] == "passed"
     assert _checks(m)[ROWS_CHECK]["detail"] == "36 training and 18 held-out images"
     notes = " ".join(m["limitations"])
-    assert "each image given as its file" in notes and "at 70 vision tokens per image" in notes
-    assert "sets a thread count for its main and audio backends only" in notes
-    assert "through transformers" in notes and "max_soft_tokens 70" in notes
+    assert "each image given as its file" in notes
+    assert "at a budget of at most 70 vision tokens per image" in notes
+    assert "the vision encoder ran on the runtime's default threads" in notes
+    assert "through transformers" in notes and "at most 70 soft tokens" in notes
+    assert "of each of 54 pictures the soft tokens `tune` recorded" in notes
+    assert "image path calibrates the same way was not checked" in notes
+    assert "as text, beside image examples" in notes
     assert "sentence-transformers" not in notes
     assert "not tied" not in notes
     lines = embedding_verify.summarise(m)
     assert any("embedding decider on images, 3 options" in ln for ln in lines)
-    assert any("70 vision tokens per image" in ln for ln in lines)
+    assert any("at most 70 vision tokens per image" in ln for ln in lines)
+
+
+def test_verify_reads_the_split_prepare_wrote(fake, tmp_path):
+    from test_embedding_prepare_images import FakeImageInspector, _fake_image
+
+    from litetune.prepare import PrepareRequest, prepare
+
+    rows = []
+    for option in OPTIONS:
+        for i in range(20):
+            _fake_image(tmp_path / "raw" / f"{option}-{i}.png", width=8 + i, height=4)
+            rows.append({"image": f"raw/{option}-{i}.png", "label": option})
+    # A picture given twice stays in one half.
+    rows.append(dict(rows[0]))
+    data = tmp_path / "rows.jsonl"
+    data.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    questions = tmp_path / "questions.json"
+    questions.write_text(_decision().canonical_text(), encoding="utf-8")
+    out = tmp_path / "prepared"
+    prepared = prepare(
+        PrepareRequest(
+            data=data,
+            output_dir=out,
+            context_length=None,
+            base_model=EMBEDDING_MODEL,
+            questions=questions,
+            images=FakeImageInspector(),
+        )
+    )
+    assert prepared.train is not None and prepared.heldout is not None
+    s = _image_setup(tmp_path, fake)
+    for path in (prepared.train.path, prepared.heldout.path):
+        for row in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()):
+            fake.image_labels[str((out / row["image"]).resolve())] = row["completion"]
+    record = json.loads((s.reference / "litetune.json").read_text(encoding="utf-8"))
+    pictures = _image_digests(prepared.train.path) + _image_digests(prepared.heldout.path)
+    record["soft_tokens"] = dict.fromkeys(pictures, 63)
+    record["rows"] = {"train": prepared.train.n, "heldout": prepared.heldout.n}
+    (s.reference / "litetune.json").write_text(json.dumps(record), encoding="utf-8")
+    result = run_verify(
+        VerifyRequest(model=s.model, reference=str(s.reference), data=prepared.heldout.path)
+    )
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    paths = _image_paths(prepared.train.path) + _image_paths(prepared.heldout.path)
+    assert fake.texts["reference"] == paths
+    assert result.manifest["embedding"]["soft_tokens"]["unrecorded"] == 0
+
+
+def test_an_image_checkpoint_at_140_gives_every_side_its_budget(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, record={"vision_tokens": 140}, convert={"vision_tokens": 140})
+    local = tmp_path / "vision.litertlm"
+    local.write_bytes(VISION_STAND_IN)
+    result = _verify(s, base_litertlm=local)
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    for side in ("reference", "candidate", "base"):
+        assert fake.specs[side]["vision_tokens"] == 140, side
+    assert result.manifest["embedding"]["vision_tokens"] == 140
+
+
+def test_a_picture_the_reference_makes_other_soft_tokens_of_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    victim = _image_paths(s.heldout)[2]
+    fake.soft_tokens[victim] = 54
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == REFERENCE_CHECK
+    assert f"made 54 soft tokens of {victim}" in failed["detail"]
+    assert "tune recorded 63 for it" in failed["detail"]
+    assert [r[0] for r in fake.runs] == ["reference"]
+
+
+def test_pictures_tune_did_not_record_are_counted_and_said(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    record = json.loads((s.reference / "litetune.json").read_text(encoding="utf-8"))
+    for sha in _image_digests(s.heldout)[:4]:
+        del record["soft_tokens"][sha]
+    (s.reference / "litetune.json").write_text(json.dumps(record), encoding="utf-8")
+    m = _verify(s).manifest
+    assert m["embedding"]["soft_tokens"]["unrecorded"] == 4
+    assert m["embedding"]["soft_tokens"]["compared"] == 50
+    assert any(
+        t.startswith("4 of the pictures here were not in the splits") for t in m["limitations"]
+    )
+
+
+@pytest.mark.parametrize("reported", [None, [63] * 3, ["63"] * 54])
+def test_a_reference_that_reports_no_count_per_picture_is_refused(fake, tmp_path, reported):
+    s = _image_setup(tmp_path, fake)
+    real = fake.embed
+
+    def embed(name: str, spec: dict[str, Any]) -> int:
+        code = real(name, spec)
+        if name == "reference":
+            report = json.loads(Path(spec["report"]).read_text(encoding="utf-8"))
+            report["soft_tokens_per_row"] = reported
+            Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
+        return code
+
+    fake.embed = embed
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == REFERENCE_CHECK and "not one count per picture" in failed["detail"]
+
+
+def test_a_picture_in_both_splits_is_refused_before_any_run(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    train_rows = s.train.read_text(encoding="utf-8").splitlines()
+    held_rows = s.heldout.read_text(encoding="utf-8").splitlines()
+    s.heldout.write_text("\n".join([*held_rows, train_rows[0]]) + "\n", encoding="utf-8")
+    result = _verify(s)
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert "1 picture(s) are in both the training split" in failed["detail"]
+    assert _image_digests(s.train)[0] in failed["detail"]
+    assert fake.runs == []
 
 
 def test_a_text_checkpoint_keeps_its_text_scripts_and_reports_text(fake, tmp_path):
@@ -2405,7 +2544,7 @@ def test_an_image_changed_since_prepare_is_refused_naming_its_row(fake, tmp_path
     (failed,) = _failed(result.manifest)
     assert failed["name"] == ROWS_CHECK
     assert f"{s.train}:3:" in failed["detail"]
-    assert "changed after prepare wrote the split" in failed["detail"]
+    assert "changed after `prepare` wrote the split" in failed["detail"]
     assert hashlib.sha256(b"other pixels").hexdigest() in failed["detail"]
     assert fake.runs == []
 
@@ -2415,7 +2554,7 @@ def test_an_image_changed_since_prepare_is_refused_naming_its_row(fake, tmp_path
     [
         ({"image_sha256": "not a digest"}, "'image_sha256' is 'not a digest'"),
         ({"image_sha256": "A" * 64}, "not a sha256"),
-        ({"image": ""}, "'image' is ''"),
+        ({"image": ""}, "'image' must be the image's path in the split"),
         ({"completion": "elsewhere"}, "'elsewhere' is not one of the decision's options"),
     ],
 )
@@ -2428,6 +2567,42 @@ def test_an_image_row_that_is_not_preparess_is_refused(fake, tmp_path, edit, sai
     (failed,) = _failed(result.manifest)
     assert failed["name"] == ROWS_CHECK and said in failed["detail"]
     assert f"{s.heldout}:1:" in failed["detail"]
+    assert fake.runs == []
+
+
+def _point_first_row_at(s: Setup, value: str) -> None:
+    rows = [json.loads(line) for line in s.heldout.read_text(encoding="utf-8").splitlines()]
+    rows[0]["image"] = value
+    s.heldout.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+@pytest.mark.parametrize("how", ["absolute inside", "absolute outside", "dot-dot"])
+def test_an_image_path_that_leaves_the_split_or_is_absolute_is_refused(fake, tmp_path, how):
+    s = _image_setup(tmp_path, fake)
+    first = _image_paths(s.heldout)[0]
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(Path(first).read_bytes())
+    value = {
+        "absolute inside": first,
+        "absolute outside": str(outside),
+        "dot-dot": "../outside.png",
+    }[how]
+    _point_first_row_at(s, value)
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert f"{s.heldout}:1:" in failed["detail"] and "not inside the split" in failed["detail"]
+    assert fake.runs == []
+
+
+@pytest.mark.posix
+def test_an_images_directory_linked_out_of_the_split_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    images = s.heldout.parent / "images"
+    elsewhere = tmp_path / "elsewhere"
+    images.rename(elsewhere)
+    images.symlink_to(elsewhere, target_is_directory=True)
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == ROWS_CHECK and "not inside the split" in failed["detail"]
     assert fake.runs == []
 
 
@@ -2460,7 +2635,7 @@ def test_a_file_converted_at_other_vision_tokens_is_refused(fake, tmp_path):
     result = _verify(s)
     (failed,) = _failed(result.manifest)
     assert failed["name"] == CANDIDATE_CHECK
-    assert "records 140 vision tokens per image" in failed["detail"]
+    assert "records a budget of 140 vision tokens per image" in failed["detail"]
     assert "tuned at 70" in failed["detail"]
     assert fake.runs == []
 
@@ -2468,7 +2643,8 @@ def test_a_file_converted_at_other_vision_tokens_is_refused(fake, tmp_path):
 def test_an_image_report_without_vision_tokens_is_refused(fake, tmp_path):
     s = _image_setup(tmp_path, fake, convert={"vision_tokens": None})
     (failed,) = _failed(_verify(s).manifest)
-    assert failed["name"] == CANDIDATE_CHECK and "records None vision tokens" in failed["detail"]
+    assert failed["name"] == CANDIDATE_CHECK
+    assert "records a budget of None vision tokens" in failed["detail"]
 
 
 def test_a_text_file_for_an_image_checkpoint_is_refused(fake, tmp_path):
@@ -2537,19 +2713,33 @@ def test_an_image_checkpoint_does_not_read_the_prompt_name(fake, tmp_path):
     assert _verify(s).status is Status.PASSED
 
 
-def test_a_reference_without_its_processor_uses_the_bases_and_says_so(fake, tmp_path):
+def test_the_processor_files_are_what_transformers_saves():
+    assert IMAGE_PROCESSOR_FILES == (
+        "chat_template.jinja",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    )
+    assert "preprocessor_config.json" not in IMAGE_PROCESSOR_FILES
+
+
+def test_a_reference_without_its_processor_is_refused_with_no_stand_in(fake, tmp_path):
     s = _image_setup(tmp_path, fake, processor=False)
     (s.reference / "tokenizer.json").write_text("{}", encoding="utf-8")
-    m = _verify(s).manifest
-    assert fake.specs["reference"]["processor"] == {
-        "source": "base",
-        "repo": EMBEDDING_MODEL,
-        "revision": EMBEDDING_REVISION,
-    }
-    assert m["embedding"]["processor"]["source"] == "base"
-    (said,) = [t for t in m["limitations"] if "prepared by the processor of" in t]
-    assert "processor_config.json, preprocessor_config.json, tokenizer_config.json" in said
-    assert "tokenizer.json," not in said and EMBEDDING_REVISION in said
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == REFERENCE_CHECK
+    said = failed["detail"]
+    assert "has no chat_template.jinja, processor_config.json, tokenizer_config.json" in said
+    assert "tokenizer.json," not in failed["detail"].split("has no")[1].split(":")[0]
+    assert fake.runs == []
+
+
+def test_a_reference_with_every_processor_file_is_embedded_with_its_own(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    assert _verify(s).status is Status.PASSED
+    assert fake.specs["reference"]["model"] == str(s.reference)
 
 
 def test_googles_text_vision_file_gives_the_gain_for_an_image_checkpoint(fake, tmp_path):
@@ -2582,12 +2772,66 @@ def test_the_text_path_still_downloads_the_text_file(fake, tmp_path):
     assert fake.specs["download"]["files"] == [embedding_export.GOOGLE_HUB_FILE.as_dict()]
 
 
-def test_on_a_cpu_with_sme2_the_image_engine_runs_one_thread(fake, tmp_path, sme2_host):
-    m = _verify(_image_setup(tmp_path, fake), threads=4).manifest
+def test_on_a_cpu_with_sme2_the_image_candidate_runs_one_thread_twice(fake, tmp_path, sme2_host):
+    local = tmp_path / "vision.litertlm"
+    local.write_bytes(VISION_STAND_IN)
+    result = _verify(_image_setup(tmp_path, fake), threads=4, base_litertlm=local)
+    m = result.manifest
+    assert result.status is Status.PASSED, m["checks"]
     assert fake.specs["reference"]["threads"] == 4
     assert fake.specs["candidate"]["threads"] == 1
+    assert [r[0] for r in fake.runs] == [
+        "reference",
+        "candidate",
+        "candidate-repeat",
+        "base",
+        "evaluate",
+    ]
+    assert fake.specs["candidate-repeat"]["model"] == fake.specs["candidate"]["model"]
+    assert fake.specs["candidate-repeat"]["cache_dir"] != fake.specs["candidate"]["cache_dir"]
+    (launch,) = fake.launches
+    assert launch["parallel"] is False and launch["stop_on"] == ["candidate", "candidate-repeat"]
+    assert m["embedding"]["candidate_repeated"] is True
     assert any("EmbeddingEngine, 1 thread, each image" in t for t in m["limitations"])
-    assert any("not on 1 thread" in t for t in m["limitations"])
+    assert any("1 thread applied to the text tower alone" in t for t in m["limitations"])
+    assert embedding_verify.REPEATED in m["limitations"]
+    # The evaluation gets the first run's vectors, and no vectors of the second.
+    assert "candidate-repeat" not in fake.specs["evaluate"]["vectors"]
+
+
+def test_a_second_run_that_differs_is_a_harness_failure(fake, tmp_path, sme2_host):
+    fake.repeat = "random"
+    result = _verify(_image_setup(tmp_path, fake), threads=4)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    said = failed["detail"]
+    assert "did not give the same vectors (candidate.npy and candidate-repeat.npy differ)" in said
+    assert "evaluate" not in [r[0] for r in fake.runs]
+
+
+def test_a_second_run_that_fails_is_a_harness_failure(fake, tmp_path, sme2_host):
+    fake.fail = {"candidate-repeat"}
+    (failed,) = _failed(_verify(_image_setup(tmp_path, fake), threads=4).manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    said = failed["detail"]
+    assert "the candidate's second run, which shows the first one repeatable, failed" in said
+
+
+def test_off_such_a_cpu_an_image_run_embeds_the_candidate_once_and_never_side_by_side(
+    fake, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(embedding_verify, "usable_cpus", lambda: 64)
+    local = tmp_path / "vision.litertlm"
+    local.write_bytes(VISION_STAND_IN)
+    m = _verify(_image_setup(tmp_path, fake), threads=4, base_litertlm=local).manifest
+    assert [r[0] for r in fake.runs] == ["reference", "candidate", "base", "evaluate"]
+    assert [launch["parallel"] for launch in fake.launches] == [False]
+    assert not any(
+        t.startswith("the candidate and Google's file were embedded at the same")
+        for t in m["limitations"]
+    )
+    assert embedding_verify.REPEATED not in m["limitations"]
 
 
 # -- the image engine script, run here against a stub of litert_lm ------------
@@ -2630,7 +2874,9 @@ def test_the_image_engine_script_builds_a_vision_engine_and_gives_each_file(tmp_
             "min_input_length": None,
         }
     ]
-    assert calls["vision"] == [{"vision_backend": ("cpu", 1), "vision_tokens_per_image": 140}]
+    # No thread count for the vision backend: 0.18.0 would not apply one.
+    assert calls["vision"] == [{"vision_backend": ("cpu", None), "vision_tokens_per_image": 140}]
+    assert report["vision_threads"] is None
     assert [c.absolute_path for c in calls["texts"]] == ["/p/a.png", "/p/b.png"]
     assert calls["options"] == [
         {

@@ -534,9 +534,13 @@ def test_weights_on_a_tune_output_directory_name_its_model_directory(tmp_path, c
 
 
 def _image_record(**overrides: Any) -> EmbeddingRecord:
-    return _record(
-        **({"modality": "image", "vision_tokens": 70, "prefix": IMAGE_PREFIX} | overrides)
-    )
+    image = {
+        "modality": "image",
+        "vision_tokens": 70,
+        "prefix": IMAGE_PREFIX,
+        "soft_tokens": {"a" * 64: 63},
+    }
+    return _record(**(image | overrides))
 
 
 def _image_checkpoint(tmp_path: Path, **overrides: Any) -> Path:

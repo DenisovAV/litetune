@@ -34,14 +34,16 @@ embeddings, without the head.
 
 **Images.** A split whose rows name images (`prepare` writes them with each
 picture copied into the split and its sha256 in the row) takes the image
-recipe instead (`IMAGE_RECIPE`, docs/specs/2026-11-04-eg2-image-tune.md):
-the model with its vision tower and no audio tower, the vision tower,
-`embed_vision` and the token embeddings frozen, each picture's input computed
-once at `--vision-tokens` soft tokens and cached in the output directory, a
-Linear(768, K) head on the mean pool. `--mirror` adds a flipped copy of every
-training picture, `--mirror-swap` exchanges two labels on the copies. The full
-HF checkpoint is saved, as one `model.safetensors` convert grafts from, and
-the record says `modality: "image"` with the vision tokens and the mirror.
+recipe instead (`IMAGE_RECIPE`), which litetune has not measured: the model
+with its vision tower and no audio tower, the vision tower, `embed_vision`
+and the token embeddings frozen, each picture's input computed once at a
+budget of at most `--vision-tokens` soft tokens and cached in the output
+directory, and a Linear(768, K) head -- weights and bias, not a cosine head --
+on the L2-normalised mean pool, its logits times 20. `--mirror` adds a flipped
+copy of every training picture, `--mirror-swap` exchanges two labels on the
+copies. The full HF checkpoint is saved, as one `model.safetensors` convert
+grafts from, with the processor; the record says `modality: "image"` with the
+vision-token budget, the soft tokens each picture took, and the mirror.
 
 The training runs in `envs.EMBED_TRAIN` as a generated script; this process
 imports neither torch nor sentence-transformers.
@@ -62,12 +64,20 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from litetune import devices, envs, models
+from litetune._version import __version__
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.decisions import Decision, DecisionError, read_questions
 from litetune.embedding_convert import BASE_MODEL, BASE_REVISION
 from litetune.events import EventStream
 from litetune.exits import read_returncode
-from litetune.prepare import PrepareError, Row, read_objects, read_rows, rows_are_images
+from litetune.prepare import (
+    PrepareError,
+    Row,
+    is_image_row,
+    read_objects,
+    read_rows,
+    rows_are_images,
+)
 from litetune.storage import hash_file
 from litetune.tune import (
     _GPU_FAILURE_RE,
@@ -101,17 +111,19 @@ DECIDER_PREFIX = "task: sentence similarity | query: "
 MODALITIES: tuple[str, ...] = ("text", "image")
 DEFAULT_MODALITY = "text"
 # An image checkpoint trains on the processor's own image input, with no task
-# prompt in front of it (docs/specs/2026-11-04-eg2-image-tune.md, "tune (image)").
+# prompt in front of it.
 IMAGE_PREFIX = ""
-# `EmbeddingRecord.vision_tokens`: the processor's `max_soft_tokens` per image the
-# checkpoint was tuned at, which the app gives the runtime as its vision tokens per
-# image. The two values the image recipe admits (the spec's `--vision-tokens`).
+# `EmbeddingRecord.vision_tokens`: the processor's `max_soft_tokens`, the most soft
+# tokens an image becomes at the checkpoint's tuning, which the app gives the
+# runtime as its vision tokens per image. A budget, not a count: the processor
+# keeps the aspect ratio, so an image may take fewer. The two values
+# `--vision-tokens` admits.
 VISION_TOKENS: tuple[int, ...] = (70, 140)
 
 # The one device the recipe was measured on.
 MEASURED_DEVICE = "cpu"
-# The devices the scratch runs the image recipe comes from trained on (zn3 and
-# dg2 on mps, dg3 on cuda); there is no litetune measurement of it on any.
+# The devices the unpublished game-frame runs the image recipe comes from trained
+# on; there is no litetune measurement of it on any.
 IMAGE_RECIPE_DEVICES: tuple[str, ...] = ("mps", "cuda")
 
 MODEL_CHECK = "embedding model"
@@ -192,14 +204,15 @@ RECIPE = Recipe()
 
 @dataclass(frozen=True)
 class ImageRecipe:
-    """The image recipe, as the script is given it (docs/specs/2026-11-04-eg2-image-tune.md,
-    "tune (image)"): the scratch runs dg2's and dg3's (zn3's at 3 epochs), which
-    trained several heads at once; here one decision is one head.
+    """The image recipe, as the script is given it: that of unpublished runs on game
+    frames, which trained two heads at once, one per task, for 2 epochs (one run
+    3); here one decision is one head. litetune has not measured it.
 
-    A Linear(768, K) head on the L2-normalised mean pool of every token, its logits
-    times `logit_scale`, class-weighted cross-entropy (`class_weighting`), AdamW
-    with no schedule, the gradient of the language model clipped. The image
-    inputs are computed once with the vision tower frozen and kept in float16.
+    A Linear(768, K) head -- weights and bias on the L2-normalised mean pool of
+    every token, not a cosine head -- its logits times `logit_scale`,
+    class-weighted cross-entropy (`class_weighting`), AdamW with no schedule, the
+    gradient of the language model clipped. The image inputs are computed once
+    with the vision tower frozen and kept as `cache_dtype`.
     """
 
     learning_rate: float = 2e-5
@@ -245,29 +258,40 @@ class ImageRecipe:
 IMAGE_RECIPE = ImageRecipe()
 
 # The text the processor is given for one image; it expands it into the image's
-# soft tokens between its begin and end markers (the scratch runs' `common.inputs`).
+# soft tokens between its begin and end markers.
 IMAGE_TOKEN_TEXT = "<|image|>"
 # Under the output directory: the image inputs, computed once per picture.
 IMAGE_CACHE_DIR = "embed_image_inputs"
 # The image script's name in the output directory, beside the text one's.
 IMAGE_SCRIPT_NAME = "embed_image_train_script.py"
 # `save_pretrained` splits a checkpoint larger than `max_shard_size` into
-# shards, and convert reads one `model.safetensors` (`embedding_export`). The
-# float32 checkpoint is 438.8M parameters, about 1.76 GB, far below this.
+# shards, and convert reads one `model.safetensors` (`embedding_export`): a size
+# no checkpoint of this model reaches, so it is never split.
 IMAGE_MAX_SHARD_SIZE = "1000GB"
 # The one file of the checkpoint convert grafts from: `embedding_export.BASE_FILE`
 # (not imported: that module imports this one).
 BASE_CHECKPOINT_FILE = "model.safetensors"
+# What transformers 5.19.0's `processor.save_pretrained` writes for this model,
+# and so what `verify`'s reference reads its processor from.
+PROCESSOR_FILES: tuple[str, ...] = (
+    "chat_template.jinja",
+    "processor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
 # An image record's `prompt_name`: the image input has no sentence-transformers prompt.
 IMAGE_PROMPT_NAME = ""
-# Where an application sets the vision tokens per image (flutter_edge_ai).
+# Where an application sets the vision-token budget: flutter_edge_ai_litertlm
+# 1.17.0, lib/src/embedding/litert_embedding_backend.dart:46-83, whose default
+# is `APP_VISION_TOKENS`.
 VISION_TOKENS_SETTING = "LiteRtEmbeddingBackend(visionTokensPerImage: {n})"
+APP_VISION_TOKENS = 140
 
 IMAGE_RECIPE_UNMEASURED = (
-    "the image recipe has no litetune measurement yet: it comes from runs that trained on one "
-    "task family -- game frames -- on Apple's GPU (mps) and on CUDA, several heads at once "
-    "where this trains one. Whether it helps on other pictures is not known; `litetune verify` "
-    "measures this checkpoint's decider"
+    "the image recipe has no litetune measurement yet: it comes from unpublished runs on one "
+    "task family -- game frames -- on Apple's GPU (mps) and on CUDA, which trained two heads at "
+    "once, one per task, where this trains one. Whether it helps on other pictures is not known; "
+    "`litetune verify` measures this checkpoint's decider"
 )
 IMAGE_MIRROR_ASSUMES_SYMMETRY = (
     "--mirror trained on a horizontally flipped copy of every training image{swapped}. That "
@@ -521,6 +545,69 @@ if __name__ == "__main__":
 )
 
 
+# A picture into the vector the image recipe pools, shared as source by the tuning
+# script and `embedding_verify.IMAGE_REFERENCE_SCRIPT`, so the reference embeds
+# what tune trained on. Each function is given the modules it uses: the tests run
+# them here with numpy and Pillow, and none of them needs torch to be imported.
+IMAGE_INPUT_SOURCE = r'''
+
+def strict_pillow(Image):
+    """Past Pillow's pixel limit a picture is refused, not decoded with a warning."""
+    import warnings
+
+    warnings.simplefilter("error", Image.DecompressionBombWarning)
+
+
+def picture_of(Image, ImageOps, data, flipped):
+    """The RGB picture the bytes `data` hold, mirrored left to right when `flipped`."""
+    import io
+
+    with Image.open(io.BytesIO(data)) as image:
+        picture = image.convert("RGB")
+    return ImageOps.mirror(picture) if flipped else picture
+
+
+def image_input(torch, model, processor, picture, image_text, vision_tokens, device):
+    """The picture's language-model input, [1, tokens, hidden], and its soft tokens.
+
+    The processor's own input for `image_text` and the picture at a budget of
+    `vision_tokens` soft tokens; the vision tower's features take the place of
+    the image tokens in the token embeddings. Refused when the tower gives
+    another number of features than there are image tokens: scattering them
+    would place the first ones and drop the rest without a word.
+    """
+    enc = processor(
+        text=[image_text],
+        images=[[picture]],
+        return_tensors="pt",
+        images_kwargs={"max_soft_tokens": vision_tokens},
+    )
+    ids = enc["input_ids"].to(device)
+    mask = ids == model.config.image_token_id
+    embeds = model.get_input_embeddings()(
+        torch.where(mask, model.config.text_config.pad_token_id, ids)
+    )
+    features = model.get_image_features(
+        enc["pixel_values"].to(device),
+        enc["image_position_ids"].to(device),
+        return_dict=True,
+    ).pooler_output
+    features = torch.cat(features, 0).to(embeds.dtype)
+    soft = int(mask.sum())
+    if features.shape[0] != soft:
+        raise ValueError(
+            f"the vision tower gave {features.shape[0]} soft tokens for {soft} image positions"
+        )
+    return embeds.masked_scatter(mask.unsqueeze(-1).expand_as(embeds), features), soft
+
+
+def masked_mean(hidden, mask):
+    """Per row of `hidden` [rows, tokens, dim], the mean over the tokens `mask` marks."""
+    weights = (mask != 0)[..., None] * 1.0
+    return (hidden * weights).sum(1) / weights.sum(1)
+'''
+
+
 # The image recipe's script, kept beside the checkpoint as the text one is. Its
 # helpers above `main` import nothing outside the standard library, so the
 # tests run them in this process.
@@ -535,10 +622,10 @@ metrics JSON to spec["metrics_out"]. A model it refuses is written as
 
 Each picture's language-model input -- its token embeddings with the frozen
 vision tower's soft tokens scattered in -- is computed once and cached under
-spec["cache_dir"] as float16; training and the held-out pass read the cache.
+spec["cache_dir"] as the recipe's cache_dtype, with the soft tokens it took;
+training and the held-out pass read the cache.
 """
 import hashlib
-import io
 import json
 import math
 import os
@@ -549,15 +636,16 @@ from pathlib import Path
 REFUSED_EXIT = 3
 '''
     + devices.MPS_SCRIPT_SOURCE
+    + IMAGE_INPUT_SOURCE
     + r'''
 
 def model_type_refusal(config, expected):
-    """Why a config.json is not the model this recipe was measured on, or None."""
+    """Why a config.json is not the model this recipe is for, or None."""
     kind = config.get("model_type") if isinstance(config, dict) else None
     if kind != expected:
         return (
-            f"config.json declares model_type {kind!r}, not {expected!r}; the recipe was "
-            "measured on EmbeddingGemma 2 only"
+            f"config.json declares model_type {kind!r}, not {expected!r}; the image recipe is "
+            "for EmbeddingGemma 2 only"
         )
     return None
 
@@ -610,7 +698,7 @@ def class_counts(targets, k):
 
 
 def class_weights(targets, k):
-    """n / (k * count) per class, n the number of training items: the measured runs' weights."""
+    """n / (k * count) per class, n the number of training items, mirrored copies included."""
     counts = class_counts(targets, k)
     if 0 in counts:
         raise ValueError(f"class {counts.index(0)} has no training item")
@@ -630,6 +718,60 @@ def epoch_batches(n_items, batch_size, permutation):
     return [order[i : i + batch_size] for i in range(0, n_items, batch_size)]
 
 
+def run_items(rows, heldout, labels, mirror, swap_pairs):
+    """What training and the held-out pass go over, from the rows the parent wrote.
+
+    `items` are every training row, then each one's mirrored copy when
+    mirroring; the held-out rows are never mirrored. The class weights are over
+    `items`, copies included, and the training accuracy is read over the
+    originals. `inputs` is every (sha256, flipped) whose input is computed.
+    """
+    index = {label: i for i, label in enumerate(labels)}
+    items = training_items(rows, mirror, swap_map(swap_pairs))
+    heldout_items = training_items(heldout, False, {})
+    targets = [index[label] for _, _, label in items]
+    return {
+        "index": index,
+        "items": items,
+        "heldout_items": heldout_items,
+        "originals": items[: len(rows)],
+        "targets": targets,
+        "weights": class_weights(targets, len(labels)),
+        "paths": {r["sha256"]: r["image"] for r in rows + heldout},
+        "inputs": sorted({(sha, flipped) for sha, flipped, _ in items + heldout_items}),
+    }
+
+
+def padded(np, arrays):
+    """Inputs of different lengths as one batch: (embeds [n, longest, dim] float32, mask)."""
+    width = max(a.shape[0] for a in arrays)
+    embeds = np.zeros((len(arrays), width, arrays[0].shape[1]), np.float32)
+    mask = np.zeros((len(arrays), width), np.int64)
+    for j, a in enumerate(arrays):
+        embeds[j, : a.shape[0]] = a
+        mask[j, : a.shape[0]] = 1
+    return embeds, mask
+
+
+def cache_fields(spec, device, versions, script_sha256):
+    """Everything a picture's cached input depends on: the cache directory is keyed by it.
+
+    A run at another vision-token budget, revision, device, library version,
+    litetune version or script computes its inputs anew rather than reuse these.
+    """
+    return {
+        "model": spec["model"],
+        "revision": spec["revision"],
+        "vision_tokens": spec["vision_tokens"],
+        "image_text": spec["image_text"],
+        "cache_dtype": spec["recipe"]["cache_dtype"],
+        "device": device,
+        "versions": versions,
+        "litetune": spec["litetune_version"],
+        "script_sha256": script_sha256,
+    }
+
+
 def cache_key(fields):
     """The cache directory's name: what the inputs depend on, hashed."""
     text = json.dumps(fields, sort_keys=True)
@@ -638,6 +780,52 @@ def cache_key(fields):
 
 def cache_name(sha256, flipped):
     return f"{sha256}-{'mirrored' if flipped else 'original'}.npy"
+
+
+def _cache_meta(cache, sha256, flipped):
+    return Path(cache) / (cache_name(sha256, flipped)[: -len(".npy")] + ".json")
+
+
+def store_input(np, cache, sha256, flipped, array, soft):
+    """Write one picture's input and its soft-token count, each file whole or not at all."""
+    target = Path(cache) / cache_name(sha256, flipped)
+    partial = target.with_name(target.name + ".partial")
+    with open(partial, "wb") as handle:
+        np.save(handle, array)
+    os.replace(partial, target)
+    meta = _cache_meta(cache, sha256, flipped)
+    meta_partial = meta.with_name(meta.name + ".partial")
+    meta_partial.write_text(
+        json.dumps({"soft_tokens": soft, "tokens": int(array.shape[0])}), encoding="utf-8"
+    )
+    os.replace(meta_partial, meta)
+
+
+def cached_input(np, cache, sha256, flipped, hidden, dtype):
+    """One picture's cached (input, soft tokens); None when it is not cached; a str
+    saying why when it is cached and cannot be used, which the caller recomputes."""
+    target = Path(cache) / cache_name(sha256, flipped)
+    meta_path = _cache_meta(cache, sha256, flipped)
+    if not (target.is_file() and meta_path.is_file()):
+        return None
+    try:
+        array = np.load(target)
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"unreadable: {type(exc).__name__}: {exc}"
+    soft = meta.get("soft_tokens") if isinstance(meta, dict) else None
+    tokens = meta.get("tokens") if isinstance(meta, dict) else None
+    if not all(isinstance(n, int) and not isinstance(n, bool) for n in (soft, tokens)):
+        return f"its record {meta!r} gives no soft-token and token counts"
+    if array.ndim != 2 or array.shape != (tokens, hidden):
+        return f"shape {tuple(array.shape)}, not ({tokens}, {hidden})"
+    if str(array.dtype) != dtype:
+        return f"dtype {array.dtype}, not {dtype}"
+    if not 0 < soft < tokens:
+        return f"{soft} soft tokens of {tokens}"
+    if not np.isfinite(array).all():
+        return "a value that is not finite"
+    return array, soft
 
 
 def bytes_refusal(data, expected, path):
@@ -667,15 +855,13 @@ def main():
         return refuse(out, f"the recipe trains in float32, the spec says {recipe['dtype']!r}")
 
     import importlib.metadata
-    import warnings
 
     import numpy as np
     import torch
     from PIL import Image, ImageOps
     from transformers import AutoConfig, AutoModel, AutoProcessor
 
-    # Past Pillow's pixel limit a picture is refused, not decoded with a warning.
-    warnings.simplefilter("error", Image.DecompressionBombWarning)
+    strict_pillow(Image)
     device = training_device(torch, spec.get("device"))
     # The audio tower is not loaded: nothing here uses it, and it is not saved.
     model_config = AutoConfig.from_pretrained(spec["model"], revision=spec["revision"])
@@ -694,110 +880,68 @@ def main():
     lm = model.language_model
     for module in (model.vision_tower, model.embed_vision, lm.embed_tokens):
         module.requires_grad_(False)
-    image_token = model.config.image_token_id
-    pad_token = model.config.text_config.pad_token_id
+    hidden = model.config.text_config.hidden_size
 
     versions = {}
     for name in ("torch", "transformers", "sentence-transformers", "pillow", "numpy"):
         versions[name] = importlib.metadata.version(name)
 
-    def merged(picture):
-        """The picture's language-model input: [tokens, hidden], soft tokens scattered in."""
-        enc = processor(
-            text=[spec["image_text"]],
-            images=[[picture]],
-            return_tensors="pt",
-            images_kwargs={"max_soft_tokens": spec["vision_tokens"]},
-        )
-        ids = enc["input_ids"].to(device)
-        mask = ids == image_token
-        embeds = model.get_input_embeddings()(torch.where(mask, pad_token, ids))
-        features = model.get_image_features(
-            enc["pixel_values"].to(device),
-            enc["image_position_ids"].to(device),
-            return_dict=True,
-        ).pooler_output
-        features = torch.cat(features, 0).to(embeds.dtype)
-        if features.shape[0] != int(mask.sum()):
-            raise ValueError(
-                f"the vision tower gave {features.shape[0]} soft tokens for "
-                f"{int(mask.sum())} image positions"
-            )
-        embeds = embeds.masked_scatter(mask.unsqueeze(-1).expand_as(embeds), features)
-        return embeds[0].float().cpu().numpy(), int(mask.sum())
-
     # -- the inputs, computed once -------------------------------------------
     rows = read_jsonl(spec["train_rows"])
     heldout = read_jsonl(spec["heldout_rows"])
     labels = list(spec["labels"])
-    index = {label: i for i, label in enumerate(labels)}
     k = len(labels)
-    swaps = swap_map(spec["mirror_swap"])
-    items = training_items(rows, spec["mirror"], swaps)
-    heldout_items = training_items(heldout, False, {})
-    paths = {r["sha256"]: r["image"] for r in rows + heldout}
+    run = run_items(rows, heldout, labels, spec["mirror"], spec["mirror_swap"])
+    items, heldout_items, paths = run["items"], run["heldout_items"], run["paths"]
+    dtype = recipe["cache_dtype"]
 
-    key_fields = {
-        "model": spec["model"],
-        "revision": spec["revision"],
-        "vision_tokens": spec["vision_tokens"],
-        "image_text": spec["image_text"],
-        "device": device,
-        "versions": versions,
-    }
+    script_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    key_fields = cache_fields(spec, device, versions, script_sha256)
     cache = Path(spec["cache_dir"]) / cache_key(key_fields)
     cache.mkdir(parents=True, exist_ok=True)
     (cache / "key.json").write_text(json.dumps(key_fields, indent=1), encoding="utf-8")
-    tokens, soft, computed, reused = {}, [], 0, 0
+    tokens, soft, computed, reused, rejected = {}, {}, 0, 0, []
     model.eval()
     started = time.time()
     with torch.no_grad():
-        for sha, flipped in sorted({(s, f) for s, f, _ in items + heldout_items}):
-            target = cache / cache_name(sha, flipped)
-            if target.is_file():
-                array = np.load(target)
+        for sha, flipped in run["inputs"]:
+            found = cached_input(np, cache, sha, flipped, hidden, dtype)
+            if isinstance(found, tuple):
+                array, n_soft = found
                 reused += 1
             else:
+                if found is not None:
+                    rejected.append(f"{cache_name(sha, flipped)}: {found}")
+                    print(json.dumps({"cache_entry_recomputed": rejected[-1]}), flush=True)
                 data = Path(paths[sha]).read_bytes()
                 refusal = bytes_refusal(data, sha, paths[sha])
                 if refusal is not None:
                     return refuse(out, refusal)
-                with Image.open(io.BytesIO(data)) as image:
-                    picture = image.convert("RGB")
-                if flipped:
-                    picture = ImageOps.mirror(picture)
-                values, n_soft = merged(picture)
-                array = values.astype(np.float16)
+                picture = picture_of(Image, ImageOps, data, flipped)
+                text, budget = spec["image_text"], spec["vision_tokens"]
+                embeds, n_soft = image_input(
+                    torch, model, processor, picture, text, budget, device
+                )
+                array = embeds[0].float().cpu().numpy().astype(dtype)
                 if not np.isfinite(array).all():
-                    raise ValueError(f"{paths[sha]}: its input does not fit in float16")
-                soft.append(n_soft)
-                partial = target.with_name(target.name + ".partial")
-                with open(partial, "wb") as handle:
-                    np.save(handle, array)
-                os.replace(partial, target)
+                    raise ValueError(f"{paths[sha]}: its input does not fit in {dtype}")
+                store_input(np, cache, sha, flipped, array, n_soft)
                 computed += 1
             tokens[(sha, flipped)] = array
+            soft[(sha, flipped)] = n_soft
     precompute_seconds = round(time.time() - started, 1)
     lengths = [a.shape[0] for a in tokens.values()]
 
     def batch(keys):
-        arrays = [tokens[key] for key in keys]
-        width = max(a.shape[0] for a in arrays)
-        embeds = np.zeros((len(arrays), width, arrays[0].shape[1]), np.float32)
-        mask = np.zeros((len(arrays), width), np.int64)
-        for j, a in enumerate(arrays):
-            embeds[j, : a.shape[0]] = a
-            mask[j, : a.shape[0]] = 1
+        embeds, mask = padded(np, [tokens[key] for key in keys])
         return torch.from_numpy(embeds).to(device), torch.from_numpy(mask).to(device)
 
     def pooled(embeds, mask):
-        hidden = lm(inputs_embeds=embeds, attention_mask=mask, return_dict=True).last_hidden_state
-        m = mask.unsqueeze(-1).to(hidden.dtype)
-        return torch.nn.functional.normalize((hidden * m).sum(1) / m.sum(1), dim=-1)
+        state = lm(inputs_embeds=embeds, attention_mask=mask, return_dict=True).last_hidden_state
+        return torch.nn.functional.normalize(masked_mean(state, mask), dim=-1)
 
     # -- training ------------------------------------------------------------
-    targets = [index[label] for _, _, label in items]
-    weights = class_weights(targets, k)
+    targets, weights = run["targets"], run["weights"]
     weight_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
     torch.manual_seed(recipe["seed"])
     head = torch.nn.Linear(recipe["embedding_dim"], k).to(device)
@@ -861,7 +1005,7 @@ def main():
                 predicted += [labels[q] for q in scores.argmax(-1).tolist()]
         return predicted
 
-    originals = items[: len(rows)]
+    originals = run["originals"]
     train_accuracy = accuracy(predict(originals), [label for _, _, label in originals])
     heldout_accuracy = accuracy(
         predict(heldout_items), [label for _, _, label in heldout_items]
@@ -875,7 +1019,9 @@ def main():
             f"save_pretrained wrote no single model.safetensors into {model_dir}: "
             f"{sorted(p.name for p in model_dir.iterdir())}"
         )
+    index = run["index"]
     heldout_counts = class_counts([index[label] for _, _, label in heldout_items], k)
+    mirrored = sum(1 for _, flipped, _ in items if flipped)
     Path(out).write_text(
         json.dumps(
             {
@@ -885,7 +1031,9 @@ def main():
                 "labels": labels,
                 "rows": {"train": len(rows), "heldout": len(heldout)},
                 "training_items": len(items),
-                "mirror": spec["mirror"],
+                # Read off the items trained on, not off the spec.
+                "mirror": mirrored > 0,
+                "mirrored_items": mirrored,
                 "mirror_swap": [list(pair) for pair in spec["mirror_swap"]],
                 "vision_tokens": spec["vision_tokens"],
                 "class_counts": {
@@ -894,8 +1042,18 @@ def main():
                 },
                 "class_weights": {label: round(w, 6) for label, w in zip(labels, weights)},
                 "input_tokens": {"min": min(lengths), "max": max(lengths)},
-                "soft_tokens": {"min": min(soft), "max": max(soft)} if soft else None,
-                "cache": {"dir": str(cache), "computed": computed, "reused": reused},
+                # Per picture, from the processor at the budget: what `verify`'s
+                # reference must make of the same picture.
+                "soft_tokens_per_image": {
+                    sha: n for (sha, flipped), n in sorted(soft.items()) if not flipped
+                },
+                "soft_tokens": {"min": min(soft.values()), "max": max(soft.values())},
+                "cache": {
+                    "dir": str(cache),
+                    "computed": computed,
+                    "reused": reused,
+                    "recomputed": rejected,
+                },
                 "precompute_seconds": precompute_seconds,
                 "steps_done": step,
                 "steps_planned": steps,
@@ -1009,13 +1167,20 @@ def split_modality(path: Path, what: str) -> str:
         raise EmbeddingTuneError(str(exc)) from exc
 
 
-def images_of(path: Path, decision: Decision) -> list[LabelledImage]:
+def read_image_split(path: Path, decision: Decision, what: str) -> list[LabelledImage]:
     """Each image row of a split `prepare` wrote, its file checked against its digest.
 
-    Refused, naming the row: an `image` that is not a relative path inside the
-    split's directory, a file that is not there, bytes whose sha256 is not the
-    row's `image_sha256`, and a completion that is not one of the decision's ids.
+    The one reader of an image split, for `tune` and for `verify`. Refused,
+    naming the row: a row that is not an image row, an `image` that is not a
+    relative path inside the split's directory once every link is resolved (an
+    absolute path, a `..` out of it, a symlinked `images` pointing elsewhere), a
+    file that is not there, bytes whose sha256 is not the row's `image_sha256`,
+    and a completion that is not one of the decision's ids. A split that does
+    not exist or has no rows is refused naming `what` it is.
     """
+    path = Path(path)
+    if not path.is_file():
+        raise EmbeddingTuneError(f"the {what} split {path} does not exist")
     try:
         objects = read_objects(path, images=True)
     except PrepareError as exc:
@@ -1026,8 +1191,11 @@ def images_of(path: Path, decision: Decision) -> list[LabelledImage]:
     for lineno, obj in objects:
         where = f"{path}:{lineno}"
         value, expected = obj.get("image"), obj.get("image_sha256")
-        if "prompt" in obj:
-            raise EmbeddingTuneError(f"{where}: an image row has no 'prompt'")
+        if not is_image_row(obj):
+            raise EmbeddingTuneError(
+                f"{where}: a text row in the {what} split; an image row has an 'image' and no "
+                "'prompt'"
+            )
         if not isinstance(value, str) or not value:
             raise EmbeddingTuneError(f"{where}: 'image' must be the image's path in the split")
         if not isinstance(expected, str) or not _SHA256_HEX.fullmatch(expected):
@@ -1058,7 +1226,14 @@ def images_of(path: Path, decision: Decision) -> list[LabelledImage]:
                 f"{where}: the completion {completion!r} is not one of the decision's options"
             )
         out.append(LabelledImage(file, expected, completion))
+    if not out:
+        raise EmbeddingTuneError(f"the {what} split {path} has no rows")
     return out
+
+
+def pictures_in_both(train: Sequence[LabelledImage], heldout: Sequence[LabelledImage]) -> list[str]:
+    """The digests of the pictures both splits hold, sorted: none in a split `prepare` wrote."""
+    return sorted({row.sha256 for row in train} & {row.sha256 for row in heldout})
 
 
 def resolve_swaps(given: Sequence[str], ids: Sequence[str]) -> tuple[tuple[str, str], ...]:
@@ -1247,6 +1422,8 @@ class EmbeddingTuneRequest:
             "metrics_out": str(metrics_out),
             "cache_dir": str(self.image_cache_dir),
             "max_shard_size": IMAGE_MAX_SHARD_SIZE,
+            # Part of the cache key: inputs cached by another litetune are not reused.
+            "litetune_version": __version__,
         }
 
     def as_dict(self, modality: str = DEFAULT_MODALITY) -> dict[str, Any]:
@@ -1306,10 +1483,16 @@ class EmbeddingRecord:
     # trained on, and the option pairs whose labels the copies exchanged.
     mirror: bool = False
     mirror_swap: tuple[tuple[str, str], ...] = ()
+    # Image records only: per picture tuned on (its sha256), the soft tokens the
+    # processor made of it within the `vision_tokens` budget. `verify` holds its
+    # reference to the same counts.
+    soft_tokens: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
-        problem = _modality_problem(self.modality, self.vision_tokens) or _mirror_problem(
-            self.modality, self.mirror, self.mirror_swap, self.labels
+        problem = (
+            _modality_problem(self.modality, self.vision_tokens)
+            or _mirror_problem(self.modality, self.mirror, self.mirror_swap, self.labels)
+            or _soft_tokens_problem(self.modality, self.soft_tokens, self.vision_tokens)
         )
         if problem is not None:
             raise ValueError(problem)
@@ -1344,6 +1527,7 @@ class EmbeddingRecord:
         if self.is_image:
             out["mirror"] = self.mirror
             out["mirror_swap"] = [list(pair) for pair in self.mirror_swap]
+            out["soft_tokens"] = dict(sorted((self.soft_tokens or {}).items()))
         return out
 
     @classmethod
@@ -1405,6 +1589,10 @@ class EmbeddingRecord:
         problem = _mirror_problem(modality, mirror, mirror_swap, tuple(labels))
         if problem is not None:
             raise ValueError(f"{where}: {problem}")
+        soft_tokens = data.get("soft_tokens")
+        problem = _soft_tokens_problem(modality, soft_tokens, vision_tokens)
+        if problem is not None:
+            raise ValueError(f"{where}: {problem}")
         return cls(
             base_model=data["base_model"],
             base_model_revision=data["base_model_revision"],
@@ -1426,7 +1614,30 @@ class EmbeddingRecord:
             vision_tokens=vision_tokens,
             mirror=mirror,
             mirror_swap=mirror_swap,
+            soft_tokens=dict(soft_tokens) if isinstance(soft_tokens, dict) else None,
         )
+
+
+def _soft_tokens_problem(
+    modality: object, soft_tokens: object, vision_tokens: object
+) -> str | None:
+    """Why `soft_tokens` is not a record's, or `None`: per picture a count within the budget."""
+    if modality != "image":
+        if soft_tokens is not None:
+            return f"a {modality} record has no soft tokens, and this one gives {soft_tokens!r}"
+        return None
+    if not isinstance(soft_tokens, Mapping) or not soft_tokens:
+        return f"'soft_tokens' is {soft_tokens!r}; an image record gives them per picture"
+    budget = vision_tokens if isinstance(vision_tokens, int) else 0
+    for sha, count in soft_tokens.items():
+        if not (isinstance(sha, str) and _SHA256_HEX.fullmatch(sha)):
+            return f"'soft_tokens' names {sha!r}, which is not a picture's sha256"
+        if not isinstance(count, int) or isinstance(count, bool) or not 0 < count <= budget:
+            return (
+                f"'soft_tokens' gives {sha[:12]}… {count!r} soft tokens, not a count of 1 to the "
+                f"budget of {vision_tokens}"
+            )
+    return None
 
 
 def _mirror_problem(
@@ -1618,13 +1829,6 @@ class _Checked:
     swaps: tuple[tuple[str, str], ...] = ()
 
 
-def _read_image_split(path: Path, decision: Decision, what: str) -> list[LabelledImage]:
-    rows = images_of(path, decision)
-    if not rows:
-        raise EmbeddingTuneError(f"the {what} split {path} has no rows")
-    return rows
-
-
 def _refuse_image_flags_for_text(request: EmbeddingTuneRequest) -> None:
     given = [
         flag
@@ -1665,10 +1869,11 @@ def _check_request(request: EmbeddingTuneRequest) -> _Checked:
     if request.vision_tokens is None:
         raise EmbeddingTuneError(
             f"{request.data} is an image split, and needs --vision-tokens "
-            f"({' or '.join(map(str, VISION_TOKENS))}): the vision tokens per image the "
-            f"application gives the runtime, flutter_edge_ai's "
-            f"{VISION_TOKENS_SETTING.format(n='N')}. The "
-            "model is tuned at that count and embeds differently at another"
+            f"({' or '.join(map(str, VISION_TOKENS))}): at most how many vision tokens an image "
+            "becomes, the budget the application gives the runtime, flutter_edge_ai's "
+            f"{VISION_TOKENS_SETTING.format(n='N')}, which is {APP_VISION_TOKENS} when the "
+            "application does not set it. The model is tuned at that budget and embeds "
+            "differently at another"
         )
     heldout_modality = split_modality(request.heldout, "held-out")
     if heldout_modality != modality:
@@ -1678,8 +1883,8 @@ def _check_request(request: EmbeddingTuneRequest) -> _Checked:
             "wrote beside it"
         )
     swaps = resolve_swaps(request.mirror_swap, decision.ids)
-    images = _read_image_split(request.data, decision, "training")
-    held = _read_image_split(request.heldout, decision, "held-out")
+    images = read_image_split(request.data, decision, "training")
+    held = read_image_split(request.heldout, decision, "held-out")
     return _Checked(decision, modality, images, held, labels_for(decision, images), swaps)
 
 
@@ -1706,6 +1911,22 @@ def _note_unmeasured_device(result: EmbeddingTuneResult, device: str) -> None:
             '"EmbeddingGemma 2: many labels"); this run trained on '
             f"{device}, a device nothing measured the recipe on"
         )
+
+
+def _image_checkpoint_problem(model_dir: Path) -> str | None:
+    """Why an image run's checkpoint is not what convert and verify read, or `None`."""
+    if not (model_dir / BASE_CHECKPOINT_FILE).is_file():
+        return (
+            f"training exited zero but wrote no {BASE_CHECKPOINT_FILE} into {model_dir}, the one "
+            "file convert grafts from"
+        )
+    missing = [name for name in PROCESSOR_FILES if not (model_dir / name).is_file()]
+    if missing:
+        return (
+            f"training exited zero but saved no {', '.join(missing)} into {model_dir}: the "
+            "processor `verify` prepares the pictures with is not all there"
+        )
+    return None
 
 
 def _finish(
@@ -1893,7 +2114,7 @@ def run_embedding_tune(
 
     events.note(
         f"training {request.model} on {len(train)} "
-        f"{f'image rows at {request.vision_tokens} vision tokens' if image else 'rows'}, "
+        f"{f'image rows at most {request.vision_tokens} vision tokens each' if image else 'rows'}, "
         f"{len(labels)} options",
         device=probe.device,
         dtype=RECIPE.dtype,
@@ -2036,14 +2257,13 @@ def run_embedding_tune(
     if isinstance(device_reported, str):
         _note_unmeasured_device(result, device_reported)
 
-    if image and not (request.model_dir / BASE_CHECKPOINT_FILE).is_file():
+    if image and (problem := _image_checkpoint_problem(request.model_dir)) is not None:
         return _finish(
             result,
             events,
             Check.failed(
                 TRAINING_CHECK,
-                f"training exited zero but wrote no {BASE_CHECKPOINT_FILE} into "
-                f"{request.model_dir}, the one file convert grafts from",
+                problem,
                 observed={"saved_files": sorted(p.name for p in request.model_dir.iterdir())},
             ),
             attempted=True,
@@ -2055,6 +2275,7 @@ def run_embedding_tune(
             "vision_tokens": result.metrics.get("vision_tokens"),
             "mirror": result.metrics.get("mirror"),
             "mirror_swap": result.metrics.get("mirror_swap"),
+            "soft_tokens": result.metrics.get("soft_tokens_per_image"),
         }
     try:
         record = EmbeddingRecord.from_dict(
@@ -2101,6 +2322,10 @@ def run_embedding_tune(
             ),
             attempted=True,
         )
+    # What this compares: the budget and the swaps the script echoes from the
+    # spec it read, and whether it trained on mirrored items, which it reads
+    # off the items themselves -- so a script that read another spec, or built
+    # its items otherwise, does not have its checkpoint recorded as this run's.
     if image and (record.vision_tokens, record.mirror, record.mirror_swap) != (
         request.vision_tokens,
         request.mirror,
@@ -2111,13 +2336,27 @@ def run_embedding_tune(
             events,
             Check.failed(
                 TRAINING_CHECK,
-                f"the training script reports {record.vision_tokens} vision tokens, mirror "
-                f"{record.mirror}, swaps {[list(p) for p in record.mirror_swap]}, not the "
-                f"{request.vision_tokens}, {request.mirror}, "
-                f"{[list(p) for p in checked.swaps]} it was given",
+                f"the training script reports a budget of {record.vision_tokens} vision tokens, "
+                f"mirrored items {record.mirror}, swaps {[list(p) for p in record.mirror_swap]}, "
+                f"not the {request.vision_tokens}, {request.mirror}, "
+                f"{[list(p) for p in checked.swaps]} of the spec it was given",
             ),
             attempted=True,
         )
+    if image and record.soft_tokens is not None:
+        pictures = {row.sha256 for row in (*train, *heldout) if isinstance(row, LabelledImage)}
+        if set(record.soft_tokens) != pictures:
+            return _finish(
+                result,
+                events,
+                Check.failed(
+                    TRAINING_CHECK,
+                    f"the training script reports soft tokens for {len(record.soft_tokens)} "
+                    f"pictures, which are not the {len(pictures)} pictures of the two splits; "
+                    "`verify` could not hold its reference to them",
+                ),
+                attempted=True,
+            )
     write_embedding_record(request.model_dir, record)
     result.record = record
     result.model_dir = request.model_dir
@@ -2143,14 +2382,15 @@ def run_embedding_tune(
 def summarise(result: EmbeddingTuneResult) -> list[str]:
     if result.modality == "image":
         request = result.request
-        described = f"on images at {request.vision_tokens} vision tokens per image" + (
+        described = f"on images at most {request.vision_tokens} vision tokens per image" + (
             ", mirrored" if request.mirror else ""
         )
         lines = [
             f"outcome: {result.outcome.value}",
             f"  embedding fine-tune of {request.model} at {request.pinned_revision[:12]}, "
             f"{len(result.labels)} options, {described}; the app must give the runtime the "
-            f"same count ({VISION_TOKENS_SETTING.format(n=request.vision_tokens)})",
+            f"same budget ({VISION_TOKENS_SETTING.format(n=request.vision_tokens)}; "
+            f"{APP_VISION_TOKENS} when it sets none)",
         ]
     else:
         lines = [

@@ -41,6 +41,7 @@ from litetune.embedding_tune import (
     IMAGE_RECIPE_UNMEASURED,
     IMAGE_SCRIPT_NAME,
     IMAGE_TOKEN_TEXT,
+    PROCESSOR_FILES,
     PROMPT_NAME,
     RECIPE,
     EmbeddingRecord,
@@ -72,6 +73,10 @@ class FakeImageToolchain:
     returncode: int = 0
     stderr: str = ""
     write_safetensors: bool = True
+    # Processor files the fake run does not save.
+    skip_files: tuple[str, ...] = ()
+    # The soft tokens the fake processor makes of every picture.
+    soft_tokens: int = 63
     metrics_overrides: dict[str, Any] = field(default_factory=dict)
     specs: list[dict[str, Any]] = field(default_factory=list)
     calls: list[list[str]] = field(default_factory=list)
@@ -92,8 +97,12 @@ class FakeImageToolchain:
         )
         if self.write_safetensors:
             (model_dir / "model.safetensors").write_bytes(b"\0" * 16)
+        for name in PROCESSOR_FILES:
+            if name not in self.skip_files:
+                (model_dir / name).write_text("{}", encoding="utf-8")
         train = Path(spec["train_rows"]).read_text(encoding="utf-8").splitlines()
         heldout = Path(spec["heldout_rows"]).read_text(encoding="utf-8").splitlines()
+        pictures = sorted({json.loads(line)["sha256"] for line in train + heldout})
         items = len(train) * (2 if spec["mirror"] else 1)
         steps = spec["recipe"]["epochs"] * -(-items // spec["recipe"]["batch_size"])
         metrics = {
@@ -106,6 +115,7 @@ class FakeImageToolchain:
             "mirror": spec["mirror"],
             "mirror_swap": spec["mirror_swap"],
             "vision_tokens": spec["vision_tokens"],
+            "soft_tokens_per_image": {sha: self.soft_tokens for sha in pictures},
             "steps_done": steps,
             "steps_planned": steps,
             "train_seconds": 3.5,
@@ -245,6 +255,91 @@ def test_an_image_run_writes_an_image_record_beside_the_checkpoint(toolchain, sp
     on_disk = json.loads((tmp_path / "tuned" / "model" / "litetune.json").read_text())
     assert (on_disk["mirror"], on_disk["mirror_swap"]) == (False, [])
     assert on_disk["modality"] == "image" and on_disk["vision_tokens"] == 70
+    pictures = {r["image_sha256"] for r in _records(split.train) + _records(split.heldout)}
+    assert on_disk["soft_tokens"] == dict.fromkeys(sorted(pictures), 63)
+    assert record.soft_tokens == on_disk["soft_tokens"]
+
+
+@pytest.mark.parametrize("missing", [BASE_CHECKPOINT_FILE, *PROCESSOR_FILES])
+def test_a_checkpoint_without_its_weights_or_processor_is_a_failure(
+    toolchain, split, tmp_path, missing
+):
+    if missing == BASE_CHECKPOINT_FILE:
+        toolchain.write_safetensors = False
+    else:
+        toolchain.skip_files = (missing,)
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert result.outcome is Outcome.FAILED
+    detail = _check(result, TRAINING_CHECK).detail
+    assert f"no {missing}" in detail
+    assert result.record is None
+
+
+@pytest.mark.parametrize(
+    ("soft", "said"),
+    [
+        ({}, "'soft_tokens' is {}"),
+        ({"a" * 64: 63}, "soft tokens for 1 pictures, which are not the 18 pictures"),
+        (None, "'soft_tokens' is None"),
+    ],
+)
+def test_soft_tokens_that_do_not_cover_the_pictures_are_a_failure(
+    toolchain, split, tmp_path, soft, said
+):
+    toolchain.metrics_overrides = {"soft_tokens_per_image": soft}
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert result.outcome is Outcome.FAILED
+    assert said in _check(result, TRAINING_CHECK).detail
+    assert result.record is None
+
+
+@pytest.mark.parametrize("count", [0, 71, True])
+def test_a_soft_token_count_outside_the_budget_is_a_failure(toolchain, split, tmp_path, count):
+    toolchain.soft_tokens = count
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert result.outcome is Outcome.FAILED
+    assert "not a count of 1 to the budget of 70" in _check(result, TRAINING_CHECK).detail
+
+
+def test_tune_trains_on_the_split_prepare_wrote(toolchain, tmp_path):
+    from test_embedding_prepare_images import FakeImageInspector, _fake_image
+
+    from litetune.prepare import PrepareRequest, prepare
+
+    rows = []
+    for option in OPTIONS:
+        for i in range(12):
+            _fake_image(tmp_path / "raw" / f"{option}-{i}.png", width=8 + i, height=4)
+            rows.append({"image": f"raw/{option}-{i}.png", "label": option})
+    data = tmp_path / "rows.jsonl"
+    data.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    questions = tmp_path / "questions.json"
+    questions.write_text(_decision().canonical_text(), encoding="utf-8")
+    prepared = prepare(
+        PrepareRequest(
+            data=data,
+            output_dir=tmp_path / "split",
+            context_length=None,
+            base_model=EMBEDDING_MODEL,
+            questions=questions,
+            images=FakeImageInspector(),
+        )
+    )
+    assert prepared.train is not None and prepared.heldout is not None
+    split = Split(
+        tmp_path / "split",
+        prepared.train.path,
+        prepared.heldout.path,
+        tmp_path / "split" / "decision.json",
+    )
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert result.ok, result.checks.as_dict()
+    (spec,) = toolchain.specs
+    given = _records(Path(spec["train_rows"]))
+    assert len(given) == prepared.train.n
+    for row in given:
+        assert Path(row["image"]).parent == (tmp_path / "split" / "images").resolve()
+        assert hashlib.sha256(Path(row["image"]).read_bytes()).hexdigest() == row["sha256"]
 
 
 def test_the_image_script_is_run_with_the_image_spec(toolchain, split, tmp_path):
@@ -348,8 +443,8 @@ def test_the_report_and_the_summary_name_the_images_and_the_vision_tokens(
     assert report["request"]["recipe"] == IMAGE_RECIPE.as_dict()
     assert report["record"]["modality"] == "image"
     line = summarise(result)[1]
-    assert "on images at 70 vision tokens per image, mirrored" in line
-    assert "LiteRtEmbeddingBackend(visionTokensPerImage: 70)" in line
+    assert "on images at most 70 vision tokens per image, mirrored" in line
+    assert "same budget (LiteRtEmbeddingBackend(visionTokensPerImage: 70); 140 when" in line
     assert DECIDER_PREFIX not in line
 
 
@@ -390,6 +485,21 @@ def test_metrics_that_say_another_input_than_given_are_a_failure(
     result = run_embedding_tune(_request(split, tmp_path))
     assert result.outcome is Outcome.FAILED
     assert result.record is None
+    assert not (tmp_path / "tuned" / "model" / "litetune.json").exists()
+
+
+def test_metrics_that_drop_the_swap_of_a_mirrored_run_are_a_failure_naming_it(
+    toolchain, split, tmp_path
+):
+    toolchain.metrics_overrides = {"mirror_swap": []}
+    result = run_embedding_tune(_request(split, tmp_path, mirror=True, mirror_swap=("left:right",)))
+    assert result.outcome is Outcome.FAILED
+    check = _check(result, TRAINING_CHECK)
+    assert check.outcome is Outcome.FAILED
+    assert check.detail == (
+        "the training script reports a budget of 70 vision tokens, mirrored items True, swaps "
+        "[], not the 70, True, [['left', 'right']] of the spec it was given"
+    )
     assert not (tmp_path / "tuned" / "model" / "litetune.json").exists()
 
 
@@ -470,11 +580,59 @@ def test_a_completion_that_is_not_an_option_is_refused(toolchain, split, tmp_pat
     _refused(toolchain, _request(split, tmp_path), r"train\.jsonl:4: the completion 'reverse'")
 
 
-def test_an_image_row_with_a_prompt_is_refused(toolchain, split, tmp_path):
+def test_an_image_path_inside_the_split_given_absolute_is_refused(toolchain, split, tmp_path):
     rows = _records(split.train)
-    rows[0]["prompt"] = "a road"
+    rows[0]["image"] = str((split.dir / rows[0]["image"]).resolve())
     _write(split.train, rows)
-    _refused(toolchain, _request(split, tmp_path), r"train\.jsonl:1: an image row has no 'prompt'")
+    _refused(toolchain, _request(split, tmp_path), r"train\.jsonl:1: .*not inside the split")
+
+
+@pytest.mark.posix
+def test_an_images_directory_linked_out_of_the_split_is_refused(toolchain, split, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    (split.dir / "images").rename(elsewhere)
+    (split.dir / "images").symlink_to(elsewhere, target_is_directory=True)
+    _refused(toolchain, _request(split, tmp_path), r"train\.jsonl:1: .*not inside the split")
+
+
+def test_a_row_with_a_prompt_in_an_image_split_is_a_text_row_and_refused(
+    toolchain, split, tmp_path
+):
+    rows = _records(split.train)
+    rows[3]["prompt"] = "a road"
+    _write(split.train, rows)
+    _refused(
+        toolchain,
+        _request(split, tmp_path),
+        r"train\.jsonl:4: this is a text row, and line 1 is an image row",
+    )
+
+
+def test_the_reader_refuses_a_text_row_itself(split):
+    from litetune.embedding_tune import read_image_split
+
+    rows = _records(split.heldout)
+    rows[2]["prompt"] = "a road"
+    _write(split.heldout, rows)
+    with pytest.raises(EmbeddingTuneError, match=r"heldout\.jsonl:3: a text row in the held-out"):
+        read_image_split(split.heldout, _decision(), "held-out")
+
+
+def test_a_text_split_with_an_image_column_is_a_text_split(tmp_path):
+    """As before image rows: a row with a prompt is text whatever else it carries."""
+    from litetune.embedding_tune import split_modality
+
+    decision = _decision()
+    path = tmp_path / "train.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps({"prompt": decision.render(f"s{i}"), "completion": o, "image": "x.png"})
+            + "\n"
+            for i, o in enumerate(OPTIONS * 4)
+        ),
+        encoding="utf-8",
+    )
+    assert split_modality(path, "training") == "text"
 
 
 def test_a_split_mixing_image_and_text_rows_is_refused(toolchain, split, tmp_path):
@@ -606,7 +764,7 @@ def test_a_text_record_is_written_without_the_image_fields_it_never_had(tmp_path
         decision_sha256="sha256:" + "0" * 64,
     )
     data = record.as_dict()
-    assert "mirror" not in data and "mirror_swap" not in data
+    assert "mirror" not in data and "mirror_swap" not in data and "soft_tokens" not in data
     write_embedding_record(tmp_path, record)
     assert read_embedding_record(tmp_path) == record
 
@@ -638,9 +796,39 @@ def _image_record(**overrides: Any) -> dict[str, Any]:
         "vision_tokens": 70,
         "mirror": True,
         "mirror_swap": [["left", "right"]],
+        "soft_tokens": {"a" * 64: 63, "b" * 64: 54},
     }
     data.update(overrides)
     return data
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"soft_tokens": None}, "'soft_tokens' is None; an image record gives them per picture"),
+        ({"soft_tokens": {}}, "'soft_tokens' is {}"),
+        ({"soft_tokens": {"x": 3}}, "names 'x', which is not a picture's sha256"),
+        ({"soft_tokens": {"a" * 64: 71}}, "71 soft tokens, not a count of 1 to the budget of 70"),
+        ({"soft_tokens": {"a" * 64: 0}}, "0 soft tokens"),
+        ({"soft_tokens": {"a" * 64: "63"}}, "'63' soft tokens"),
+    ],
+)
+def test_a_record_whose_soft_tokens_are_not_counts_within_the_budget_is_refused(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        EmbeddingRecord.from_dict(_image_record(**overrides), "x")
+
+
+def test_a_text_record_with_soft_tokens_is_refused():
+    data = _image_record(modality="text", vision_tokens=None, mirror=False, mirror_swap=[])
+    with pytest.raises(ValueError, match="a text record has no soft tokens"):
+        EmbeddingRecord.from_dict(data, "x")
+
+
+def test_at_140_a_count_up_to_140_is_within_the_budget():
+    record = EmbeddingRecord.from_dict(
+        _image_record(vision_tokens=140, soft_tokens={"a" * 64: 130, "b" * 64: 121}), "x"
+    )
+    assert record.soft_tokens == {"a" * 64: 130, "b" * 64: 121}
 
 
 def test_an_image_record_round_trips(tmp_path):
@@ -648,9 +836,9 @@ def test_an_image_record_round_trips(tmp_path):
     assert record.mirror_swap == (("left", "right"),)
     write_embedding_record(tmp_path, record)
     assert read_embedding_record(tmp_path) == record
-    assert json.loads((tmp_path / "litetune.json").read_text())["mirror_swap"] == [
-        ["left", "right"]
-    ]
+    on_disk = json.loads((tmp_path / "litetune.json").read_text())
+    assert on_disk["mirror_swap"] == [["left", "right"]]
+    assert on_disk["soft_tokens"] == {"a" * 64: 63, "b" * 64: 54}
 
 
 def test_an_image_record_without_the_mirror_fields_reads_as_no_mirror():
@@ -733,7 +921,7 @@ def test_a_whole_image_run_through_the_command_line(toolchain, split, tmp_path, 
     )
     report = json.loads((tmp_path / "run" / "tune.json").read_text())
     assert (report["modality"], report["vision_tokens"]) == ("image", 70)
-    assert "on images at 70 vision tokens per image" in capsys.readouterr().out
+    assert "on images at most 70 vision tokens per image" in capsys.readouterr().out
 
 
 def test_the_swap_flag_repeats(toolchain, tmp_path):
@@ -834,7 +1022,7 @@ def test_class_weights_are_n_over_k_times_count(script):
     # 6 items, 3 classes, counts 3/2/1: 6/9, 6/6, 6/3.
     assert weights([0, 0, 0, 1, 1, 2], 3) == pytest.approx([2 / 3, 1.0, 2.0])
     assert weights([0, 1], 2) == [1.0, 1.0]
-    # zn3 recorded jump 3.745 / run 0.577, which is what the formula gives a 1:6.49 split.
+    # An unpublished game-frame run recorded 3.745 / 0.577 for a 1:6.49 split.
     w = weights([0] * 100 + [1] * 649, 2)
     assert w[0] == pytest.approx(3.745, abs=1e-3) and w[1] == pytest.approx(0.577, abs=1e-3)
     with pytest.raises(ValueError, match="class 1 has no training item"):
@@ -856,16 +1044,218 @@ def test_an_epochs_batches_follow_the_permutation(script):
         script["epoch_batches"](3, 2, lambda n: [0, 0, 1])
 
 
+def _spec_for_cache(**changed: Any) -> dict[str, Any]:
+    spec = {
+        "model": EMBEDDING_MODEL,
+        "revision": EMBEDDING_REVISION,
+        "vision_tokens": 70,
+        "image_text": IMAGE_TOKEN_TEXT,
+        "recipe": IMAGE_RECIPE.as_dict(),
+        "litetune_version": "0.7.3",
+        "train_rows": "ignored",
+    }
+    spec.update(changed)
+    return spec
+
+
 def test_the_cache_is_keyed_by_what_the_inputs_depend_on(script):
-    key = script["cache_key"]
-    fields = {"revision": "r", "vision_tokens": 70, "versions": {"torch": "2.9.1"}}
-    assert key(fields) == key(dict(reversed(list(fields.items()))))
-    assert len(key(fields)) == 16
-    assert key(fields) != key({**fields, "vision_tokens": 140})
-    assert key(fields) != key({**fields, "versions": {"torch": "2.9.2"}})
+    fields, key = script["cache_fields"], script["cache_key"]
+    versions = {"torch": "2.9.1", "transformers": "5.19.0"}
+    base = fields(_spec_for_cache(), "cpu", versions, "s" * 64)
+    assert base == {
+        "model": EMBEDDING_MODEL,
+        "revision": EMBEDDING_REVISION,
+        "vision_tokens": 70,
+        "image_text": IMAGE_TOKEN_TEXT,
+        "cache_dtype": "float16",
+        "device": "cpu",
+        "versions": versions,
+        "litetune": "0.7.3",
+        "script_sha256": "s" * 64,
+    }
+    assert key(base) == key(dict(reversed(list(base.items()))))
+    assert len(key(base)) == 16
+    # A rerun at 140 does not reuse the inputs computed at 70; nor does any other change.
+    others = [
+        fields(_spec_for_cache(vision_tokens=140), "cpu", versions, "s" * 64),
+        fields(_spec_for_cache(revision="other"), "cpu", versions, "s" * 64),
+        fields(_spec_for_cache(litetune_version="0.7.4"), "cpu", versions, "s" * 64),
+        fields(
+            _spec_for_cache(recipe=IMAGE_RECIPE.as_dict() | {"cache_dtype": "float32"}),
+            "cpu",
+            versions,
+            "s" * 64,
+        ),
+        fields(_spec_for_cache(), "mps", versions, "s" * 64),
+        fields(_spec_for_cache(), "cpu", {**versions, "torch": "2.9.2"}, "s" * 64),
+        fields(_spec_for_cache(), "cpu", versions, "t" * 64),
+    ]
+    assert len({key(base), *(key(f) for f in others)}) == 1 + len(others)
+    # The rows are not what the inputs depend on.
+    assert key(fields(_spec_for_cache(train_rows="x"), "cpu", versions, "s" * 64)) == key(base)
     name = script["cache_name"]
     assert name("ab", False) == "ab-original.npy"
     assert name("ab", True) == "ab-mirrored.npy"
+
+
+def test_main_keys_its_cache_with_cache_fields():
+    s = _EMBED_IMAGE_SCRIPT
+    assert "key_fields = cache_fields(spec, device, versions, script_sha256)" in s
+    assert 'cache = Path(spec["cache_dir"]) / cache_key(key_fields)' in s
+    assert "found = cached_input(np, cache, sha, flipped, hidden, dtype)" in s
+    assert "store_input(np, cache, sha, flipped, array, n_soft)" in s
+
+
+def test_a_cached_input_reads_back_with_its_soft_tokens(script, tmp_path):
+    np = pytest.importorskip("numpy")
+    array = np.arange(12, dtype=np.float16).reshape(4, 3)
+    assert script["cached_input"](np, tmp_path, "ab", False, 3, "float16") is None
+    script["store_input"](np, tmp_path, "ab", False, array, 2)
+    got, soft = script["cached_input"](np, tmp_path, "ab", False, 3, "float16")
+    assert soft == 2 and got.dtype == np.float16 and (got == array).all()
+    # The mirrored copy is another entry.
+    assert script["cached_input"](np, tmp_path, "ab", True, 3, "float16") is None
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ab-original.json", "ab-original.npy"]
+
+
+@pytest.mark.parametrize(
+    ("damage", "said"),
+    [
+        ("hidden", "shape (4, 3), not (4, 5)"),
+        ("dtype", "dtype float16, not float32"),
+        ("nan", "not finite"),
+        ("meta", "gives no soft-token and token counts"),
+        ("tokens", "shape (4, 3), not (9, 3)"),
+        ("soft", "4 soft tokens of 4"),
+        ("garbage", "unreadable"),
+    ],
+)
+def test_a_cached_input_that_cannot_be_used_says_why(script, tmp_path, damage, said):
+    np = pytest.importorskip("numpy")
+    array = np.ones((4, 3), np.float16)
+    if damage == "nan":
+        array[1, 1] = np.nan
+    script["store_input"](np, tmp_path, "ab", False, array, 4 if damage == "soft" else 2)
+    meta = tmp_path / "ab-original.json"
+    if damage == "meta":
+        meta.write_text(json.dumps({"soft_tokens": "2", "tokens": 4}), encoding="utf-8")
+    if damage == "tokens":
+        meta.write_text(json.dumps({"soft_tokens": 2, "tokens": 9}), encoding="utf-8")
+    if damage == "garbage":
+        (tmp_path / "ab-original.npy").write_bytes(b"not numpy")
+    hidden = 5 if damage == "hidden" else 3
+    dtype = "float32" if damage == "dtype" else "float16"
+    found = script["cached_input"](np, tmp_path, "ab", False, hidden, dtype)
+    assert isinstance(found, str) and said in found
+
+
+def test_an_input_without_its_record_is_not_cached(script, tmp_path):
+    np = pytest.importorskip("numpy")
+    script["store_input"](np, tmp_path, "ab", False, np.ones((4, 3), np.float16), 2)
+    (tmp_path / "ab-original.json").unlink()
+    assert script["cached_input"](np, tmp_path, "ab", False, 3, "float16") is None
+
+
+def test_the_run_items_mirror_training_only_and_weigh_the_copies(script):
+    rows = [
+        {"sha256": "s1", "label": "left", "image": "/p/1.png"},
+        {"sha256": "s2", "label": "left", "image": "/p/2.png"},
+        {"sha256": "s3", "label": "straight", "image": "/p/3.png"},
+    ]
+    heldout = [{"sha256": "h1", "label": "right", "image": "/p/h1.png"}]
+    labels = ["left", "right", "straight"]
+    run = script["run_items"](rows, heldout, labels, True, [["left", "right"]])
+    assert run["heldout_items"] == [("h1", False, "right")]
+    assert run["originals"] == [
+        ("s1", False, "left"),
+        ("s2", False, "left"),
+        ("s3", False, "straight"),
+    ]
+    assert run["items"][3:] == [
+        ("s1", True, "right"),
+        ("s2", True, "right"),
+        ("s3", True, "straight"),
+    ]
+    # Six items, counts left 2 / right 2 / straight 2: every weight 1.
+    assert run["targets"] == [0, 0, 2, 1, 1, 2]
+    assert run["weights"] == [1.0, 1.0, 1.0]
+    assert run["paths"] == {
+        "s1": "/p/1.png",
+        "s2": "/p/2.png",
+        "s3": "/p/3.png",
+        "h1": "/p/h1.png",
+    }
+    assert run["inputs"] == [
+        ("h1", False),
+        ("s1", False),
+        ("s1", True),
+        ("s2", False),
+        ("s2", True),
+        ("s3", False),
+        ("s3", True),
+    ]
+    plain = script["run_items"](rows, heldout, ["left", "straight"], False, [])
+    assert plain["items"] == plain["originals"] == run["originals"]
+    assert plain["weights"] == [0.75, 1.5]
+
+
+def test_without_mirroring_a_class_with_no_training_item_is_refused(script):
+    rows = [{"sha256": "s1", "label": "left", "image": "/p/1.png"}]
+    with pytest.raises(ValueError, match="class 1 has no training item"):
+        script["run_items"](rows, [], ["left", "right"], False, [])
+    # The swapped copy is a training item of the other class.
+    run = script["run_items"](rows, [], ["left", "right"], True, [["left", "right"]])
+    assert run["weights"] == [1.0, 1.0]
+
+
+def test_the_pool_is_the_mean_over_the_real_tokens_of_each_padded_row(script):
+    np = pytest.importorskip("numpy")
+    short = np.array([[1.0, 0.0], [3.0, 0.0]], np.float16)
+    long = np.array([[0.0, 1.0], [0.0, 2.0], [0.0, 6.0]], np.float16)
+    embeds, mask = script["padded"](np, [short, long])
+    assert embeds.dtype == np.float32 and embeds.shape == (2, 3, 2)
+    assert mask.tolist() == [[1, 1, 0], [1, 1, 1]]
+    # A padded position carries a large value: only the mask keeps it out of the mean.
+    embeds[0, 2] = 1000.0
+    pooled = script["masked_mean"](embeds, mask)
+    np.testing.assert_allclose(pooled, [[2.0, 0.0], [0.0, 3.0]])
+
+
+def test_a_flipped_picture_is_the_mirror_image_and_the_original_is_not(script):
+    image_module = pytest.importorskip("PIL.Image")
+    ops = pytest.importorskip("PIL.ImageOps")
+    import io
+
+    picture = image_module.new("RGB", (3, 1))
+    picture.putpixel((0, 0), (255, 0, 0))
+    buffer = io.BytesIO()
+    picture.save(buffer, format="PNG")
+    data = buffer.getvalue()
+    original = script["picture_of"](image_module, ops, data, False)
+    flipped = script["picture_of"](image_module, ops, data, True)
+    assert original.getpixel((0, 0)) == (255, 0, 0) and original.getpixel((2, 0)) == (0, 0, 0)
+    assert flipped.getpixel((2, 0)) == (255, 0, 0) and flipped.getpixel((0, 0)) == (0, 0, 0)
+    assert original.mode == flipped.mode == "RGB"
+
+
+def test_strict_pillow_makes_a_decompression_bomb_an_error(script):
+    import warnings
+
+    image_module = pytest.importorskip("PIL.Image")
+    with warnings.catch_warnings():
+        script["strict_pillow"](image_module)
+        with pytest.raises(image_module.DecompressionBombWarning):
+            warnings.warn("bomb", image_module.DecompressionBombWarning, stacklevel=1)
+
+
+def test_both_scripts_embed_a_picture_with_the_one_shared_source():
+    from litetune.embedding_tune import IMAGE_INPUT_SOURCE
+    from litetune.embedding_verify import IMAGE_REFERENCE_SCRIPT
+
+    assert IMAGE_INPUT_SOURCE in _EMBED_IMAGE_SCRIPT
+    assert IMAGE_INPUT_SOURCE in IMAGE_REFERENCE_SCRIPT
+    for source in (_EMBED_IMAGE_SCRIPT, IMAGE_REFERENCE_SCRIPT):
+        assert source.count("def image_input(") == 1 and source.count("def masked_mean(") == 1
 
 
 def test_the_script_refuses_bytes_that_are_not_the_rows_picture(script):
@@ -898,14 +1288,17 @@ def test_the_image_script_trains_what_the_recipe_says():
     assert "model_config.audio_config = None" in s
     assert "for module in (model.vision_tower, model.embed_vision, lm.embed_tokens):" in s
     assert "module.requires_grad_(False)" in s
-    assert 'images_kwargs={"max_soft_tokens": spec["vision_tokens"]}' in s
+    assert 'images_kwargs={"max_soft_tokens": vision_tokens}' in s
+    assert 'spec["image_text"], spec["vision_tokens"]' in s
+    assert 'run = run_items(rows, heldout, labels, spec["mirror"], spec["mirror_swap"])' in s
+    assert "masked_mean(state, mask)" in s
     assert 'logits = head(vectors) * recipe["logit_scale"]' in s
     assert 'weight=weight_tensor, reduction="sum"' in s and ") / len(chosen)" in s
     assert 'torch.nn.utils.clip_grad_norm_(lm_params, recipe["grad_clip"])' in s
     assert 'weight_decay=recipe["weight_decay"]' in s
     assert 'model.save_pretrained(model_dir, max_shard_size=spec["max_shard_size"])' in s
     assert "processor.save_pretrained(model_dir)" in s
-    assert "picture = ImageOps.mirror(picture)" in s
-    assert "array = values.astype(np.float16)" in s
+    assert "picture = picture_of(Image, ImageOps, data, flipped)" in s
+    assert "array = embeds[0].float().cpu().numpy().astype(dtype)" in s
     # The text script is not the image one.
     assert _EMBED_TRAIN_SCRIPT != s
