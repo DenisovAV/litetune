@@ -83,6 +83,18 @@ EMBEDDING_MODEL_TYPE = "embedding_gemma2"
 PROMPT_NAME = "SentenceSimilarity"
 DECIDER_PREFIX = "task: sentence similarity | query: "
 
+# What an embedding checkpoint was tuned on: `EmbeddingRecord.modality`. A record
+# without the field was written before image tuning existed and is a text one.
+MODALITIES: tuple[str, ...] = ("text", "image")
+DEFAULT_MODALITY = "text"
+# An image checkpoint trains on the processor's own image input, with no task
+# prompt in front of it (docs/specs/2026-11-04-eg2-image-tune.md, "tune (image)").
+IMAGE_PREFIX = ""
+# `EmbeddingRecord.vision_tokens`: the processor's `max_soft_tokens` per image the
+# checkpoint was tuned at, which the app gives the runtime as its vision tokens per
+# image. The two values the image recipe admits (the spec's `--vision-tokens`).
+VISION_TOKENS: tuple[int, ...] = (70, 140)
+
 # The one device the recipe was measured on.
 MEASURED_DEVICE = "cpu"
 
@@ -580,6 +592,19 @@ class EmbeddingRecord:
     # `storage.hash_file` of the training split tune read; `None` in a record
     # that does not carry it. `verify` compares it with the split it is given.
     train_sha256: str | None = None
+    # `MODALITIES`: "text" for a record that does not carry the field.
+    modality: str = DEFAULT_MODALITY
+    # One of `VISION_TOKENS` for an image record; `None` for a text one.
+    vision_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        problem = _modality_problem(self.modality, self.vision_tokens)
+        if problem is not None:
+            raise ValueError(problem)
+
+    @property
+    def is_image(self) -> bool:
+        return self.modality == "image"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -600,6 +625,8 @@ class EmbeddingRecord:
             "decision": dict(self.decision),
             "decision_sha256": self.decision_sha256,
             "train_sha256": self.train_sha256,
+            "modality": self.modality,
+            "vision_tokens": self.vision_tokens,
         }
 
     @classmethod
@@ -646,6 +673,11 @@ class EmbeddingRecord:
         train_sha256 = data.get("train_sha256")
         if train_sha256 is not None and not isinstance(train_sha256, str):
             raise ValueError(f"{where}: 'train_sha256' is {train_sha256!r}, which is not a str")
+        modality = data.get("modality", DEFAULT_MODALITY)
+        vision_tokens = data.get("vision_tokens")
+        problem = _modality_problem(modality, vision_tokens)
+        if problem is not None:
+            raise ValueError(f"{where}: {problem}")
         return cls(
             base_model=data["base_model"],
             base_model_revision=data["base_model_revision"],
@@ -663,7 +695,25 @@ class EmbeddingRecord:
             decision=dict(data["decision"]),
             decision_sha256=data["decision_sha256"],
             train_sha256=train_sha256,
+            modality=modality,
+            vision_tokens=vision_tokens,
         )
+
+
+def _modality_problem(modality: object, vision_tokens: object) -> str | None:
+    """Why `modality` and `vision_tokens` are not a record's, or `None`."""
+    if modality not in MODALITIES:
+        return f"'modality' is {modality!r}, not one of {', '.join(MODALITIES)}"
+    if modality == "image":
+        # `70.0 == 70`, and is no token count. (`True` is an `int`, but neither 70 nor 140.)
+        if not isinstance(vision_tokens, int) or vision_tokens not in VISION_TOKENS:
+            return (
+                f"'vision_tokens' is {vision_tokens!r}; an image record needs one of "
+                f"{', '.join(map(str, VISION_TOKENS))}"
+            )
+    elif vision_tokens is not None:
+        return f"'vision_tokens' is {vision_tokens!r} in a {modality} record, which has none"
+    return None
 
 
 def write_embedding_record(model_dir: Path, record: EmbeddingRecord) -> Path:

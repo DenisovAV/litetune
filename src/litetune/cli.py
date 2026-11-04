@@ -59,9 +59,12 @@ from litetune.embedding_export import (
 from litetune.embedding_export import (
     DEFAULT_WEIGHTS,
     EMBEDDING_CONVERT_SCHEMA,
+    IMAGE_DEFAULT_WEIGHTS,
+    NPU_IMAGE_REFUSED,
     WEIGHT_MODES,
     EmbeddingExportError,
     EmbeddingExportRequest,
+    default_weights,
     run_embedding_export,
 )
 from litetune.embedding_export import REPORT_NAME as EMBEDDING_REPORT_NAME
@@ -788,7 +791,8 @@ def _add_convert(sub) -> None:
         help=(
             "embedding checkpoints only (a `tune --model google/embeddinggemma-2` output): how "
             "the fine-tune's weights are quantized into Google's file. int8: both graphs int8; "
-            f"int4: both int4, Google's own size (default {DEFAULT_WEIGHTS})"
+            f"int4: both int4, Google's own size (default {DEFAULT_WEIGHTS}; for a checkpoint "
+            f"tuned on images {IMAGE_DEFAULT_WEIGHTS}, the only mode measured on images)"
         ),
     )
     convert.add_argument(
@@ -810,7 +814,8 @@ def _add_convert(sub) -> None:
             "more SoCs. Every SoC is compiled, a failed compile included, and publishing starts "
             "only when all have compiled; a failure while publishing one stops the ones after "
             "it, and the report says which were published. verify cannot run such a file; a "
-            "file compiled this way for SM8750 ran on one phone, no other SoC's on any. "
+            "file compiled this way for SM8750 ran on one phone, no other SoC's on any. An "
+            "embedding checkpoint tuned on images is refused. "
             f"One of {', '.join(NPU_SOCS)}"
         ),
     )
@@ -839,7 +844,18 @@ def _add_convert(sub) -> None:
         help=(
             "embedding checkpoints only: a local copy of Google's "
             "embeddinggemma-2-text-270m.litertlm, checked by its sha256; without it the file is "
-            "downloaded at the pinned revision"
+            "downloaded at the pinned revision. The graft writes into it for a checkpoint tuned "
+            "on images too, before the splice into the 440m file (--base-litertlm-440m)"
+        ),
+    )
+    convert.add_argument(
+        "--base-litertlm-440m",
+        type=Path,
+        help=(
+            "embedding checkpoints tuned on images only: a local copy of Google's "
+            "embeddinggemma-2-text-vision-440m.litertlm, checked by its sha256; without it the "
+            "file is downloaded at the pinned revision. The graft's text tower is spliced into "
+            "it, and its vision tower is kept as Google's"
         ),
     )
     # No default here: the LLM export and the embedding graft have their own
@@ -1772,9 +1788,14 @@ def _convert(args: argparse.Namespace) -> int:
             "--calibration-data and --cache-length are for --npu; without it convert writes "
             "the CPU/GPU bundles, which take neither"
         )
-    if args.weights is not None or args.base_litertlm is not None:
+    if (
+        args.weights is not None
+        or args.base_litertlm is not None
+        or args.base_litertlm_440m is not None
+    ):
         raise EmbeddingExportError(
-            "--weights and --base-litertlm are for an embedding checkpoint, one whose "
+            "--weights, --base-litertlm and --base-litertlm-440m are for an embedding "
+            "checkpoint, one whose "
             f"litetune.json `tune --model {EMBEDDING_MODEL}` wrote; {args.model} is not one"
             f"{model_dir_hint(args.model)}. Pick an LLM's quantization with --recipe"
         )
@@ -1811,6 +1832,7 @@ _NOT_FOR_LLM_NPU = (
     ("externalize_embedder", "--externalize-embedder"),
     ("weights", "--weights"),
     ("base_litertlm", "--base-litertlm"),
+    ("base_litertlm_440m", "--base-litertlm-440m"),
 )
 
 
@@ -1850,7 +1872,8 @@ def _convert_llm_npu(args: argparse.Namespace) -> int:
 
 
 def _convert_embedding(args: argparse.Namespace, record: EmbeddingRecord) -> int:
-    """`convert` of an embedding checkpoint: the graft into Google's file, nothing else.
+    """`convert` of an embedding checkpoint: the graft into Google's file, nothing else;
+    for one tuned on images, then the splice into Google's text-vision file.
 
     Every LLM flag given is refused by name rather than ignored.
     """
@@ -1865,12 +1888,16 @@ def _convert_embedding(args: argparse.Namespace, record: EmbeddingRecord) -> int
             f"{', '.join(given)}: {args.model} is an embedding checkpoint, which convert grafts "
             "into Google's EmbeddingGemma 2 file; pick its quantization with --weights"
         )
+    if record.is_image and args.npu:
+        # Before the request, whose own --npu checks would name the weights instead.
+        raise EmbeddingExportError(NPU_IMAGE_REFUSED.format(model=args.model))
     events = _stream()
     request = EmbeddingExportRequest(
         model=Path(args.model),
         output_dir=args.output_dir,
-        weights=args.weights or DEFAULT_WEIGHTS,
+        weights=args.weights or default_weights(record),
         base_litertlm=args.base_litertlm,
+        base_litertlm_440m=args.base_litertlm_440m,
         npu=tuple(args.npu or ()),
         npu_timeout_s=args.timeout_s if args.timeout_s is not None else NPU_TIMEOUT_S,
         timeout_s=args.timeout_s if args.timeout_s is not None else GRAFT_TIMEOUT_S,
