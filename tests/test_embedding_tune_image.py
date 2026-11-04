@@ -1102,8 +1102,46 @@ def test_main_keys_its_cache_with_cache_fields():
     s = _EMBED_IMAGE_SCRIPT
     assert "key_fields = cache_fields(spec, device, versions, script_sha256)" in s
     assert 'cache = Path(spec["cache_dir"]) / cache_key(key_fields)' in s
-    assert "found = cached_input(np, cache, sha, flipped, hidden, dtype)" in s
-    assert "store_input(np, cache, sha, flipped, array, n_soft)" in s
+    assert 'np, cache, run["inputs"], hidden, dtype, compute' in s
+
+
+def test_inputs_come_from_the_cache_when_usable_and_are_computed_and_stored_otherwise(
+    script, tmp_path
+):
+    np = pytest.importorskip("numpy")
+    asked: list[tuple[str, bool]] = []
+
+    def compute(sha, flipped):
+        asked.append((sha, flipped))
+        return np.full((4, 3), 2.0 if flipped else 1.0, np.float16), 3
+
+    wanted = [("aa", False), ("aa", True), ("bb", False)]
+    tokens, soft, counts = script["load_inputs"](np, tmp_path, wanted, 3, "float16", compute)
+    assert asked == wanted
+    assert counts == {"computed": 3, "reused": 0, "recomputed": []}
+    assert soft == {("aa", False): 3, ("aa", True): 3, ("bb", False): 3}
+    assert float(tokens[("aa", True)][0, 0]) == 2.0
+    # A second run reads every input back, with its soft tokens, and computes none.
+    asked.clear()
+    again, soft_again, counts = script["load_inputs"](np, tmp_path, wanted, 3, "float16", compute)
+    assert asked == [] and counts == {"computed": 0, "reused": 3, "recomputed": []}
+    assert soft_again == soft
+    assert all((again[k] == tokens[k]).all() for k in wanted)
+    # An entry that cannot be used is computed again, and named.
+    (tmp_path / "bb-original.npy").write_bytes(b"broken")
+    _, _, counts = script["load_inputs"](np, tmp_path, wanted, 3, "float16", compute)
+    assert asked == [("bb", False)]
+    assert counts["reused"] == 2 and counts["computed"] == 1
+    assert counts["recomputed"][0].startswith("bb-original.npy: unreadable")
+
+
+def test_a_refusal_while_computing_reaches_main_as_a_refusal(script, tmp_path):
+    def compute(sha, flipped):
+        raise script["Refusal"]("the split changed")
+
+    with pytest.raises(script["Refusal"], match="the split changed"):
+        script["load_inputs"](None, tmp_path, [("aa", False)], 3, "float16", compute)
+    assert "except Refusal as exc:\n        return refuse(out, str(exc))" in _EMBED_IMAGE_SCRIPT
 
 
 def test_a_cached_input_reads_back_with_its_soft_tokens(script, tmp_path):

@@ -828,6 +828,37 @@ def cached_input(np, cache, sha256, flipped, hidden, dtype):
     return array, soft
 
 
+class Refusal(Exception):
+    """Why the run will not go on with the inputs it was given; written as {"refused": ...}."""
+
+
+def load_inputs(np, cache, wanted, hidden, dtype, compute):
+    """Every (sha256, flipped) of `wanted` as (inputs, soft tokens, counts).
+
+    From the cache where it holds a usable entry (`cached_input`); else
+    `compute(sha256, flipped)` gives (input, soft tokens), which is stored. An
+    entry that is there and cannot be used is computed again, named in
+    `counts["recomputed"]` and printed.
+    """
+    tokens, soft, rejected = {}, {}, []
+    computed = reused = 0
+    for sha, flipped in wanted:
+        found = cached_input(np, cache, sha, flipped, hidden, dtype)
+        if isinstance(found, tuple):
+            array, n_soft = found
+            reused += 1
+        else:
+            if found is not None:
+                rejected.append(f"{cache_name(sha, flipped)}: {found}")
+                print(json.dumps({"cache_entry_recomputed": rejected[-1]}), flush=True)
+            array, n_soft = compute(sha, flipped)
+            store_input(np, cache, sha, flipped, array, n_soft)
+            computed += 1
+        tokens[(sha, flipped)] = array
+        soft[(sha, flipped)] = n_soft
+    return tokens, soft, {"computed": computed, "reused": reused, "recomputed": rejected}
+
+
 def bytes_refusal(data, expected, path):
     """Why the bytes read are not the picture the split names, or None."""
     found = hashlib.sha256(data).hexdigest()
@@ -900,35 +931,28 @@ def main():
     cache = Path(spec["cache_dir"]) / cache_key(key_fields)
     cache.mkdir(parents=True, exist_ok=True)
     (cache / "key.json").write_text(json.dumps(key_fields, indent=1), encoding="utf-8")
-    tokens, soft, computed, reused, rejected = {}, {}, 0, 0, []
+    def compute(sha, flipped):
+        data = Path(paths[sha]).read_bytes()
+        refusal = bytes_refusal(data, sha, paths[sha])
+        if refusal is not None:
+            raise Refusal(refusal)
+        picture = picture_of(Image, ImageOps, data, flipped)
+        text, budget = spec["image_text"], spec["vision_tokens"]
+        embeds, n_soft = image_input(torch, model, processor, picture, text, budget, device)
+        array = embeds[0].float().cpu().numpy().astype(dtype)
+        if not np.isfinite(array).all():
+            raise ValueError(f"{paths[sha]}: its input does not fit in {dtype}")
+        return array, n_soft
+
     model.eval()
     started = time.time()
-    with torch.no_grad():
-        for sha, flipped in run["inputs"]:
-            found = cached_input(np, cache, sha, flipped, hidden, dtype)
-            if isinstance(found, tuple):
-                array, n_soft = found
-                reused += 1
-            else:
-                if found is not None:
-                    rejected.append(f"{cache_name(sha, flipped)}: {found}")
-                    print(json.dumps({"cache_entry_recomputed": rejected[-1]}), flush=True)
-                data = Path(paths[sha]).read_bytes()
-                refusal = bytes_refusal(data, sha, paths[sha])
-                if refusal is not None:
-                    return refuse(out, refusal)
-                picture = picture_of(Image, ImageOps, data, flipped)
-                text, budget = spec["image_text"], spec["vision_tokens"]
-                embeds, n_soft = image_input(
-                    torch, model, processor, picture, text, budget, device
-                )
-                array = embeds[0].float().cpu().numpy().astype(dtype)
-                if not np.isfinite(array).all():
-                    raise ValueError(f"{paths[sha]}: its input does not fit in {dtype}")
-                store_input(np, cache, sha, flipped, array, n_soft)
-                computed += 1
-            tokens[(sha, flipped)] = array
-            soft[(sha, flipped)] = n_soft
+    try:
+        with torch.no_grad():
+            tokens, soft, cache_counts = load_inputs(
+                np, cache, run["inputs"], hidden, dtype, compute
+            )
+    except Refusal as exc:
+        return refuse(out, str(exc))
     precompute_seconds = round(time.time() - started, 1)
     lengths = [a.shape[0] for a in tokens.values()]
 
@@ -1048,12 +1072,7 @@ def main():
                     sha: n for (sha, flipped), n in sorted(soft.items()) if not flipped
                 },
                 "soft_tokens": {"min": min(soft.values()), "max": max(soft.values())},
-                "cache": {
-                    "dir": str(cache),
-                    "computed": computed,
-                    "reused": reused,
-                    "recomputed": rejected,
-                },
+                "cache": {"dir": str(cache), **cache_counts},
                 "precompute_seconds": precompute_seconds,
                 "steps_done": step,
                 "steps_planned": steps,
