@@ -1084,13 +1084,18 @@ class ConvertFacts:
     # `storage.hash_file` of the tuned checkpoint's model.safetensors.
     checkpoint_sha256: str | None
     decision_sha256: str | None
+    # "text" or "image"; "text" for a report written before image checkpoints.
+    modality: str = "text"
+    # An image report's vision tokens per image; `None` where it records none.
+    vision_tokens: int | None = None
 
 
 def convert_facts(model: Path) -> tuple[ConvertFacts | None, str]:
     """What `convert` recorded for `model`, and where that came from (or why nothing).
 
     Read from `convert.json` beside the file, and only when that report names
-    this file's sha256.
+    this file's sha256: `graft.sha256` for a text checkpoint's, `splice.sha256`
+    for an image checkpoint's, whose `graft` is the text file it spliced from.
     """
     report_path = Path(model).parent / REPORT_NAME
     if not report_path.is_file():
@@ -1105,18 +1110,33 @@ def convert_facts(model: Path) -> tuple[ConvertFacts | None, str]:
     graft = report.get("graft")
     if report.get("schema") != EMBEDDING_CONVERT_SCHEMA or not isinstance(graft, dict):
         return None, f"{report_path} is not an embedding convert report with a graft"
-    if graft.get("sha256") != hash_file(model):
+    modality = report.get("modality", "text")
+    if modality == "image":
+        written = report.get("splice")
+        if not isinstance(written, dict):
+            return None, f"{report_path} is an image convert report without a splice"
+    elif modality == "text":
+        written = graft
+    else:
+        return None, f"{report_path} records the modality {modality!r}"
+    if written.get("sha256") != hash_file(model):
         return None, f"{report_path} describes another file than {model}"
     checkpoint = _mapping(report.get("checkpoint"))
 
     def text(value: object) -> str | None:
         return value if isinstance(value, str) else None
 
+    tokens = report.get("vision_tokens")
+
     return (
         ConvertFacts(
             weights=text(graft.get("weights")),
             checkpoint_sha256=text(checkpoint.get("sha256")),
             decision_sha256=text(checkpoint.get("decision_sha256")),
+            modality=modality,
+            vision_tokens=(
+                tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else None
+            ),
         ),
         str(report_path),
     )

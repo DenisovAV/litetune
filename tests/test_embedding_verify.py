@@ -2133,3 +2133,60 @@ def test_on_the_gpu_the_engines_get_no_thread_count(fake, tmp_path, on_macos, sm
     engine = m["measurements"]["candidate"]["engine"]
     assert engine["threads"] is None and engine["threads_requested"] is None
     assert not _engine_thread_notes(m)
+
+
+def _convert_report(model: Path, **fields: Any) -> None:
+    (model.parent / REPORT_NAME).write_text(
+        json.dumps({"schema": EMBEDDING_CONVERT_SCHEMA} | fields), encoding="utf-8"
+    )
+
+
+def test_an_image_convert_report_is_tied_by_the_splices_sha256(tmp_path):
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"the spliced file")
+    _convert_report(
+        model,
+        modality="image",
+        vision_tokens=140,
+        graft={"sha256": "sha256:" + "0" * 64, "weights": "int8", "output": None},
+        splice={"sha256": hash_file(model)},
+        checkpoint={"sha256": "sha256:" + "1" * 64, "decision_sha256": "sha256:" + "2" * 64},
+    )
+    facts, source = convert_facts(model)
+    assert facts is not None and source == str(tmp_path / REPORT_NAME)
+    assert (facts.modality, facts.vision_tokens, facts.weights) == ("image", 140, "int8")
+    assert facts.checkpoint_sha256 == "sha256:" + "1" * 64
+
+
+def test_an_image_convert_report_is_not_tied_by_the_grafts_sha256(tmp_path):
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"the text file")
+    graft = {"sha256": hash_file(model), "weights": "int8"}
+    _convert_report(model, modality="image", graft=graft, splice={"sha256": "sha256:00"})
+    facts, why = convert_facts(model)
+    assert facts is None and "another file" in why
+    _convert_report(model, modality="image", graft=graft)
+    facts, why = convert_facts(model)
+    assert facts is None and "without a splice" in why
+
+
+def test_a_text_convert_report_is_tied_by_the_grafts_sha256_with_or_without_modality(tmp_path):
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"the grafted file")
+    graft = {"sha256": hash_file(model), "weights": "int4"}
+    for modality in ({}, {"modality": "text", "vision_tokens": None, "splice": None}):
+        _convert_report(model, graft=graft, **modality)
+        facts, _ = convert_facts(model)
+        assert facts is not None
+        assert (facts.modality, facts.vision_tokens, facts.weights) == ("text", None, "int4")
+    # A splice block in a text report ties nothing.
+    _convert_report(model, graft={"sha256": "sha256:00"}, splice={"sha256": hash_file(model)})
+    assert convert_facts(model)[0] is None
+
+
+def test_a_convert_report_of_an_unknown_modality_is_not_believed(tmp_path):
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"a file")
+    _convert_report(model, modality="audio", graft={"sha256": hash_file(model)})
+    facts, why = convert_facts(model)
+    assert facts is None and "'audio'" in why
