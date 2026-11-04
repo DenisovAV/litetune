@@ -73,6 +73,7 @@ from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.images import (
     IMAGES_DIR,
+    MULTI_FRAME_STILL,
     ImageCheckUnavailable,
     ImageCopyError,
     ImageInspector,
@@ -1020,7 +1021,8 @@ def image_rows(
     Refused, naming the row: a file Pillow cannot decode or convert to RGB, one
     of more than one frame, one with no width or height, and the same bytes
     given two different labels. The same bytes with the same label is a row
-    like any other, counted in `ImageStats.duplicate_rows`.
+    like any other, counted in `ImageStats.duplicate_rows`. An MPO file of
+    several frames is accepted as its first, and copied whole.
     """
     files = sorted({file for _, file, _ in located})
     try:
@@ -1048,7 +1050,10 @@ def image_rows(
                 f"{where}: {file} is not an image {decoder} can decode: {found.error}. `tune` "
                 "decodes it with the same Pillow"
             )
-        if found.frames != 1:
+        # An MPO file's later frames are not the picture: its first is, the one
+        # Pillow opens and `tune` trains on (`images.MULTI_FRAME_STILL`).
+        still = found.format == MULTI_FRAME_STILL and found.frames is not None and found.frames > 1
+        if found.frames != 1 and not still:
             raise PrepareError(
                 f"{where}: {file} holds {found.frames} frames. An image row is one still "
                 "picture; save the frame it means as a file of its own"

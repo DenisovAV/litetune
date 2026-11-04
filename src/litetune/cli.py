@@ -74,6 +74,8 @@ from litetune.embedding_tune import (
     DIRECTION,
     EMBEDDING_MODEL,
     EMBEDDING_REVISION,
+    VISION_TOKENS,
+    VISION_TOKENS_SETTING,
     EmbeddingRecord,
     EmbeddingTuneError,
     EmbeddingTuneRequest,
@@ -598,6 +600,33 @@ def _add_tune(sub) -> None:
         help=(
             f"only with --model {EMBEDDING_MODEL}: the held-out split the discarded head is "
             "scored on; default heldout.jsonl beside --data, where prepare writes it"
+        ),
+    )
+    tune.add_argument(
+        "--vision-tokens",
+        type=int,
+        choices=list(VISION_TOKENS),
+        help=(
+            f"image splits of --model {EMBEDDING_MODEL} only, and required for them: the vision "
+            "tokens per image the model is tuned at. Give the runtime the same count in the "
+            f"application, flutter_edge_ai's {VISION_TOKENS_SETTING.format(n='N')}"
+        ),
+    )
+    tune.add_argument(
+        "--mirror",
+        action="store_true",
+        help=(
+            "image splits only: also train on a horizontally flipped copy of every training "
+            "image. Only for pictures whose mirror image means the same (no text, no HUD)"
+        ),
+    )
+    tune.add_argument(
+        "--mirror-swap",
+        action="append",
+        metavar="A:B",
+        help=(
+            "with --mirror: the flipped copy of an image labelled A is labelled B and the other "
+            "way round (left:right). Repeatable; both must be option ids of the decision"
         ),
     )
     # The LLM-only flags below default to None, not to their values, so that the
@@ -1530,6 +1559,19 @@ def _tune(args: argparse.Namespace) -> int:
         return _tune_embedding(args)
     if args.heldout is not None:
         raise TuneError(f"--heldout is read only with --model {EMBEDDING_MODEL}")
+    image_flags = [
+        flag
+        for flag, value in (
+            ("--vision-tokens", args.vision_tokens is not None),
+            ("--mirror", args.mirror),
+            ("--mirror-swap", bool(args.mirror_swap)),
+        )
+        if value
+    ]
+    if image_flags:
+        raise TuneError(
+            f"{', '.join(image_flags)}: read only with --model {EMBEDDING_MODEL} on an image split"
+        )
     events = _stream()
     given = {
         name: getattr(args, name) for name in _TUNE_DEFAULTED if getattr(args, name) is not None
@@ -1641,6 +1683,9 @@ def _tune_embedding(args: argparse.Namespace) -> int:
         revision=args.revision,
         timeout_s=args.timeout_s,
         auto_provision=not args.no_provision,
+        vision_tokens=args.vision_tokens,
+        mirror=args.mirror,
+        mirror_swap=tuple(args.mirror_swap or ()),
     )
     result = run_embedding_tune(request, events=events)
     report = write_embedding_report(result)

@@ -348,6 +348,27 @@ def test_an_animated_image_is_refused(tmp_path):
     _refused(tmp_path, rows, r"given\.jsonl:25: .*bird-0\.png holds 2 frames")
 
 
+@pytest.mark.parametrize("fmt", ["GIF", "WEBP", "PNG"])
+def test_only_mpo_may_hold_more_than_one_frame(tmp_path, fmt):
+    rows = _image_rows(tmp_path)
+    _fake_image(tmp_path / "pics" / "bird-0.png", fmt=fmt, frames=3)
+    _refused(tmp_path, rows, r"given\.jsonl:25: .*bird-0\.png holds 3 frames")
+
+
+def test_an_mpo_of_two_frames_is_accepted_and_copied_whole_as_jpg(tmp_path):
+    rows = _image_rows(tmp_path)
+    mpo = _fake_image(tmp_path / "pics" / "bird-0.png", fmt="MPO", frames=2)
+    result = prepare(_request(tmp_path, data=_rows_file(tmp_path, rows)))
+    assert result.images is not None and result.images.formats.get("MPO") == 1
+    sha = hashlib.sha256(mpo.read_bytes()).hexdigest()
+    copied = tmp_path / "split" / "images" / f"{sha}.jpg"
+    assert copied.read_bytes() == mpo.read_bytes()
+
+
+def test_an_mpo_extension_is_jpg():
+    assert ImageFacts("a" * 64, "MPO", 4, 3, 2, None).extension == "jpg"
+
+
 @pytest.mark.parametrize(("width", "height"), [(0, 3), (4, 0)])
 def test_a_zero_sized_image_is_refused(tmp_path, width, height):
     rows = _image_rows(tmp_path)
@@ -713,3 +734,57 @@ def test_prepare_end_to_end_with_the_real_script(monkeypatch, tmp_path):
             )
         )
     assert not (tmp_path / "split-anim").exists()
+
+
+def test_a_real_mpo_is_accepted_as_its_first_frame_and_an_apng_refused(monkeypatch, tmp_path):
+    """Pillow writes both: an MPO of two frames, as a phone camera does, and an animated PNG."""
+    image_module = pytest.importorskip("PIL.Image")
+    rows = []
+    for o, colour in zip(OPTIONS, ("red", "green", "blue"), strict=True):
+        for i in range(12):
+            path = tmp_path / "pics" / f"{o}-{i}.png"
+            path.parent.mkdir(exist_ok=True)
+            image_module.new("RGB", (8 + i, 8), colour).save(path)
+            rows.append({"image": f"pics/{o}-{i}.png", "label": o})
+    mpo = tmp_path / "pics" / "camera.jpg"
+    first, second = (image_module.new("RGB", (8, 6), c) for c in ("red", "blue"))
+    first.save(mpo, format="MPO", save_all=True, append_images=[second])
+    with image_module.open(mpo) as opened:
+        assert (opened.format, opened.n_frames) == ("MPO", 2)
+    rows.append({"image": "pics/camera.jpg", "label": "cat"})
+
+    def run(self, args, timeout: int = 3600, **kwargs):
+        _exec_script(monkeypatch, Path(args[2]))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(envs.StageEnv, "run", run)
+    result = prepare(
+        _request(
+            tmp_path,
+            data=_rows_file(tmp_path, rows, "mpo.jsonl"),
+            images=PillowImageInspector(auto_provision=False),
+        )
+    )
+    assert result.images is not None and result.images.formats == {"PNG": 36, "MPO": 1}
+    sha = hashlib.sha256(mpo.read_bytes()).hexdigest()
+    assert (tmp_path / "split" / "images" / f"{sha}.jpg").read_bytes() == mpo.read_bytes()
+    split = tmp_path / "split"
+    written = [
+        *_records(split / "train.jsonl"),
+        *_records(split / "heldout.jsonl"),
+        *_records(split / "calibration.jsonl"),
+    ]
+    assert [r["image"] for r in written if r["image_sha256"] == sha] == [f"images/{sha}.jpg"]
+
+    apng = tmp_path / "pics" / "anim.png"
+    first.save(apng, save_all=True, append_images=[second])
+    rows[-1] = {"image": "pics/anim.png", "label": "cat"}
+    with pytest.raises(PrepareError, match=r"anim\.png holds 2 frames"):
+        prepare(
+            _request(
+                tmp_path,
+                data=_rows_file(tmp_path, rows, "apng.jsonl"),
+                output_dir=tmp_path / "split-apng",
+                images=PillowImageInspector(auto_provision=False),
+            )
+        )

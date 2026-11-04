@@ -52,8 +52,15 @@ _CHUNK_BYTES = 1 << 20
 _FORMAT = re.compile(r"[A-Z0-9]{2,16}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
-# The one spelling that differs from the format name lower-cased.
-_EXTENSIONS = {"jpeg": "jpg"}
+# The spellings that differ from the format name lower-cased. An MPO file
+# (Multi Picture Object, what phone cameras write) is JPEG streams one after
+# another, its first being the primary image, so it keeps the extension of one.
+_EXTENSIONS = {"jpeg": "jpg", "mpo": "jpg"}
+
+# The one format whose extra frames are not the picture's: Pillow opens an MPO
+# file at its primary image, the first frame, and so does `tune`. Every other
+# file of more than one frame (GIF, WebP, APNG) is refused by `prepare`.
+MULTI_FRAME_STILL = "MPO"
 
 
 class ImageCheckUnavailable(RuntimeError):
