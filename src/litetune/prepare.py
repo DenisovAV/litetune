@@ -302,14 +302,14 @@ EMBEDDING_NOT_A_DECISION = (
 )
 EMBEDDING_TYPE_REFUSED = (
     f"the decision is a {{kind}} question. {EMBEDDING_MODEL} is trained for a choice question "
-    "only, the type its recipe was measured on and the one flutter_edge_ai's embedding decider "
-    "answers"
+    "only: the text recipe was measured on that type, the image recipe follows the same rule, "
+    "and it is the one flutter_edge_ai's embedding decider answers"
 )
 EMBEDDING_NONE_OPTION_REFUSED = (
-    "the decision has a none_option ({none!r}). The embedding recipe was measured on decisions "
-    "without one, and flutter_edge_ai's embedding decider abstains by a threshold, not by an "
-    "option; `tune` refuses it. Leave the none_option out of the decision, and its rows out of "
-    "the split"
+    "the decision has a none_option ({none!r}). The text recipe was measured on decisions "
+    "without one, the image recipe follows the same rule, and flutter_edge_ai's embedding "
+    "decider abstains by a threshold, not by an option; `tune` refuses it. Leave the "
+    "none_option out of the decision, and its rows out of the split"
 )
 EMBEDDING_LENGTHS = (
     f"for {EMBEDDING_MODEL} each row is measured as `tune` embeds it: the decider's prefix and "

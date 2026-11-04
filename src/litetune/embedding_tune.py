@@ -141,10 +141,11 @@ NOT_VERIFIED = (
 # measured on decisions without one, and flutter_edge_ai's embedding decider
 # abstains by a threshold on the similarity, not by an option.
 NONE_OPTION_REFUSED = (
-    "the decision has a none_option ({none!r}). The embedding recipe was measured on decisions "
-    "without one, and flutter_edge_ai's embedding decider abstains by a threshold, not by an "
-    "option, so a none_option trained as one more label is a decider nobody has measured. Leave "
-    "the none_option out of the decision, and its rows out of the split"
+    "the decision has a none_option ({none!r}). The text recipe was measured on decisions "
+    "without one, the image recipe follows the same rule, and flutter_edge_ai's embedding "
+    "decider abstains by a threshold, not by an option, so a none_option trained as one more "
+    "label is a decider nobody has measured. Leave the none_option out of the decision, and its "
+    "rows out of the split"
 )
 
 _STDOUT_TAIL = 4000
@@ -1873,9 +1874,9 @@ def _check_request(request: EmbeddingTuneRequest) -> _Checked:
         raise EmbeddingTuneError(str(exc)) from exc
     if decision.type != "choice":
         raise EmbeddingTuneError(
-            f"the decision is a {decision.type} question; the embedding recipe trains a choice "
-            "question only, the type it was measured on and the one flutter_edge_ai's embedding "
-            "decider answers"
+            f"the decision is a {decision.type} question; the embedding recipes train a choice "
+            "question only: the text recipe was measured on that type, the image recipe follows "
+            "the same rule, and it is the one flutter_edge_ai's embedding decider answers"
         )
     if decision.none_option is not None:
         raise EmbeddingTuneError(NONE_OPTION_REFUSED.format(none=decision.none_option))
