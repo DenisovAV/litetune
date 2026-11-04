@@ -89,6 +89,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -627,9 +628,11 @@ IMAGE_REFERENCE_SCRIPT = (
     r'''
 """Embed images with an EmbeddingGemma 2 checkpoint tuned on images: transformers, float32, CPU.
 
-Reads JSON {model, images, image_sha256, image_text, vision_tokens, threads, out,
-report} from argv[1]. The model is loaded with its vision tower and without its
-audio tower (audio_config None), and its processor from the checkpoint. Each
+Reads JSON {model, processor, images, image_sha256, image_text, vision_tokens,
+threads, out, report} from argv[1]. The model is loaded from `model` with its
+vision tower and without its audio tower (audio_config None), and its processor
+from `processor`: verify's private copy of the checkpoint's processor files,
+hashed against what tune recorded, not the checkpoint directory. Each
 picture's file is read once and its bytes hashed against the row's sha256
 (`picture_bytes`); a mismatch is {"error": ...} and exit 3, and the picture is
 decoded from those bytes. Each picture becomes
@@ -676,7 +679,7 @@ def main():
     config = AutoConfig.from_pretrained(spec["model"])
     config.audio_config = None
     model = AutoModel.from_pretrained(spec["model"], config=config, dtype=torch.float32).eval()
-    processor = AutoProcessor.from_pretrained(spec["model"])
+    processor = AutoProcessor.from_pretrained(spec["processor"])
     images = json.loads(Path(spec["images"]).read_text(encoding="utf-8"))
     if (problem := digests_problem(images, spec["image_sha256"])) is not None:
         report.write_text(json.dumps({"error": problem}), encoding="utf-8")
@@ -716,7 +719,7 @@ def main():
         "dtype": "float32",
         "threads": torch.get_num_threads(),
         "vision_tokens": spec["vision_tokens"],
-        "processor": spec["model"],
+        "processor": spec["processor"],
         # The image tokens the processor wrote for each row, in the rows' order,
         # and every token with the specials: what the budget made of each picture.
         "soft_tokens_per_row": soft,
@@ -1695,6 +1698,18 @@ def processor_problem(reference: Path, recorded: Mapping[str, str]) -> str | Non
     return None
 
 
+def copy_processor(reference: Path, dest: Path) -> None:
+    """Copy the reference's `PROCESSOR_FILES` into `dest`, a directory it creates.
+
+    The reference script reads its processor from the copy, which only this run
+    can write, so the files `processor_problem` hashes there are the ones the
+    script reads, whatever happens to the reference directory meanwhile.
+    """
+    dest.mkdir()
+    for name in PROCESSOR_FILES:
+        shutil.copyfile(Path(reference) / name, dest / name)
+
+
 @dataclass(frozen=True)
 class SoftTokens:
     """The reference's soft tokens per picture held against the ones `tune` recorded."""
@@ -2109,9 +2124,26 @@ def verify_embedding(
 
         events.note(f"embedding {len(inputs)} {kind}: reference", env=job.train_env.name)
         if images:
+            # The check before the rows refuses early; this one ties the files
+            # the script reads, a copy the reference directory cannot change.
+            processor_dir = work / "processor"
+            try:
+                copy_processor(Path(job.reference), processor_dir)
+                problem = processor_problem(processor_dir, record.processor_sha256 or {})
+            except OSError as exc:
+                logger.exception("could not copy the reference's processor files")
+                return refuse(
+                    REFERENCE_CHECK, f"the reference's processor files could not be copied: {exc}"
+                )
+            if problem is not None:
+                return refuse(
+                    REFERENCE_CHECK,
+                    f"verify's copy of the processor files, taken after the first check: {problem}",
+                )
             reference_spec: dict[str, Any] = {
                 **common,
                 "model": job.reference,
+                "processor": str(processor_dir),
                 "image_text": IMAGE_TOKEN_TEXT,
                 "out": str(work / "reference.npy"),
             }

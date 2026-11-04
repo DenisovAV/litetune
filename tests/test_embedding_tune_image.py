@@ -780,6 +780,31 @@ def test_image_flags_on_a_text_split_are_refused_by_name(toolchain, tmp_path, kw
     _refused(toolchain, _request(s, tmp_path, **kwargs), rf"^{named}: .* is a text split")
 
 
+def test_a_heldout_row_with_a_prompt_and_an_image_beside_text_training_is_refused(
+    toolchain, tmp_path
+):
+    """Read as text, the held-out row would be scored with its picture dropped."""
+    s = _text_split(tmp_path)
+    rows = _records(s.heldout)
+    rows[2]["image"] = "images/x.png"
+    _write(s.heldout, rows)
+    _refused(
+        toolchain,
+        _request(s, tmp_path, vision_tokens=None),
+        r"heldout\.jsonl:3: this row gives both an 'image' and a 'prompt'\. A row for "
+        r"google/embeddinggemma-2 is an image row",
+    )
+
+
+def test_an_image_heldout_beside_a_text_training_split_is_refused(toolchain, split, tmp_path):
+    s = _text_split(tmp_path)
+    _refused(
+        toolchain,
+        _request(s, tmp_path, heldout=split.heldout, vision_tokens=None),
+        r"training split .* is text rows and the held-out split .* is image rows",
+    )
+
+
 def test_a_text_record_is_written_without_the_image_fields_it_never_had(tmp_path):
     record = EmbeddingRecord(
         base_model=EMBEDDING_MODEL,

@@ -1932,6 +1932,21 @@ def _refuse_image_flags_for_text(request: EmbeddingTuneRequest) -> None:
         )
 
 
+def _refuse_heldout_modality(request: EmbeddingTuneRequest, modality: str) -> None:
+    """Refuse a held-out split of another modality than training's, or with an image+prompt row.
+
+    `split_modality` runs `prepare`'s image+prompt refusal on the held-out rows
+    too: read as text, such a row would be scored with its picture dropped.
+    """
+    heldout_modality = split_modality(request.heldout, "held-out")
+    if heldout_modality != modality:
+        raise EmbeddingTuneError(
+            f"the training split {request.data} is {modality} rows and the held-out split "
+            f"{request.heldout} is {heldout_modality} rows; give the held-out split prepare "
+            "wrote beside it"
+        )
+
+
 def _check_request(request: EmbeddingTuneRequest) -> _Checked:
     """The decision, both splits' rows and the labels. Raises `EmbeddingTuneError`."""
     try:
@@ -1949,6 +1964,7 @@ def _check_request(request: EmbeddingTuneRequest) -> _Checked:
     modality = split_modality(request.data, "training")
     if modality == "text":
         _refuse_image_flags_for_text(request)
+        _refuse_heldout_modality(request, modality)
         train = _read_split(request.data, decision, "training")
         heldout = _read_split(request.heldout, decision, "held-out")
         return _Checked(decision, modality, train, heldout, labels_for(decision, train))
@@ -1961,13 +1977,7 @@ def _check_request(request: EmbeddingTuneRequest) -> _Checked:
             "application does not set it. The model is tuned at that budget and embeds "
             "differently at another"
         )
-    heldout_modality = split_modality(request.heldout, "held-out")
-    if heldout_modality != modality:
-        raise EmbeddingTuneError(
-            f"the training split {request.data} is image rows and the held-out split "
-            f"{request.heldout} is {heldout_modality} rows; give the held-out split prepare "
-            "wrote beside it"
-        )
+    _refuse_heldout_modality(request, modality)
     swaps = resolve_swaps(request.mirror_swap, decision.ids)
     images = read_image_split(request.data, decision, "training")
     held = read_image_split(request.heldout, decision, "held-out")

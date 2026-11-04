@@ -975,6 +975,9 @@ class FakeEmbedEnvs:
     repeat: str | None = None
     # Each script's source as written to run, by script stem or engine side.
     sources: dict[str, str] = field(default_factory=dict)
+    # The image reference's processor directory as it was when the script ran:
+    # each processor file's bare sha256, by name.
+    processor_seen: dict[str, str] | None = None
 
     def vectors(self, texts: list[str], kind: str) -> Any:
         if kind == "random":
@@ -1042,6 +1045,11 @@ class FakeEmbedEnvs:
             return subprocess.CompletedProcess(args, 0, "", "")
         report = Path(spec["report"])
         if name == "reference":
+            if "processor" in spec:
+                self.processor_seen = {
+                    file: hashlib.sha256((Path(spec["processor"]) / file).read_bytes()).hexdigest()
+                    for file in embedding_verify.PROCESSOR_FILES
+                }
             code = self.embed(name, spec)
             return subprocess.CompletedProcess(args, code, "", "")
         if name == "engines":
@@ -2377,7 +2385,7 @@ def test_an_image_checkpoint_embeds_its_images_on_both_sides_and_passes(fake, tm
     ref, cand = fake.specs["reference"], fake.specs["candidate"]
     assert ref["vision_tokens"] == IMAGE_TOKENS and cand["vision_tokens"] == IMAGE_TOKENS
     assert ref["model"] == str(s.reference) and ref["image_text"] == "<|image|>"
-    assert "processor" not in ref
+    assert Path(ref["processor"]).name == "processor" and ref["processor"] != ref["model"]
     assert "prefix" not in cand and "texts" not in cand and "prompt_name" not in ref
     # The budget allows for an image, not a text.
     assert fake.timeouts["reference"] == (
@@ -2794,6 +2802,53 @@ def test_a_processor_file_that_is_not_the_one_tune_recorded_is_refused(fake, tmp
     assert fake.runs == []
 
 
+def _recorded_processor() -> dict[str, str]:
+    return {
+        name: hashlib.sha256(_processor_text(name).encode()).hexdigest()
+        for name in IMAGE_PROCESSOR_FILES
+    }
+
+
+def test_a_processor_file_replaced_after_the_copy_does_not_reach_the_reference(
+    fake, tmp_path, monkeypatch
+):
+    s = _image_setup(tmp_path, fake)
+    copy = embedding_verify.copy_processor
+
+    def copy_then_replace(reference: Path, dest: Path) -> None:
+        copy(reference, dest)
+        (reference / "tokenizer.json").write_text('{"another": "processor"}', encoding="utf-8")
+
+    monkeypatch.setattr(embedding_verify, "copy_processor", copy_then_replace)
+    assert _verify(s).status is Status.PASSED
+    processor = Path(fake.specs["reference"]["processor"])
+    assert processor != s.reference and s.reference not in processor.parents
+    assert fake.processor_seen == _recorded_processor()
+
+
+def test_a_processor_file_replaced_after_the_first_check_is_refused_in_the_copy(
+    fake, tmp_path, monkeypatch
+):
+    s = _image_setup(tmp_path, fake)
+    copy = embedding_verify.copy_processor
+
+    def replace_then_copy(reference: Path, dest: Path) -> None:
+        (reference / "tokenizer.json").write_text('{"another": "processor"}', encoding="utf-8")
+        copy(reference, dest)
+
+    monkeypatch.setattr(embedding_verify, "copy_processor", replace_then_copy)
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == REFERENCE_CHECK
+    found = hashlib.sha256(b'{"another": "processor"}').hexdigest()
+    assert failed["detail"].startswith(
+        "verify's copy of the processor files, taken after the first check: the reference's "
+        f"tokenizer.json hash to {found}"
+    )
+    assert "reference" not in [name for name, _ in fake.runs]
+
+
 def test_an_image_record_without_processor_digests_is_not_read(fake, tmp_path):
     s = _image_setup(tmp_path, fake)
     path = s.reference / "litetune.json"
@@ -3050,8 +3105,19 @@ def test_the_picture_reader_returns_the_bytes_it_hashed(tmp_path):
     )
 
 
-def _image_reference_main(tmp_path, monkeypatch, images, digests):
-    """The image reference script's `main` against stand-ins for torch, PIL and transformers."""
+def _image_reference_main(tmp_path, monkeypatch, images, digests, loads=None):
+    """The image reference script's `main` against stand-ins for torch, PIL and transformers.
+
+    `loads`, when given, collects (class, path) for each `from_pretrained` call."""
+    loads = [] if loads is None else loads
+
+    def loader(cls: str, made: Callable[[], Any]) -> Any:
+        def from_pretrained(path, *a, **k):
+            loads.append((cls, path))
+            return made()
+
+        return types.SimpleNamespace(from_pretrained=from_pretrained)
+
     ns: dict[str, Any] = {"__name__": "image_reference"}
     exec(compile(embedding_verify.IMAGE_REFERENCE_SCRIPT, "reference.py", "exec"), ns)
     decoded: list[bytes] = []
@@ -3072,11 +3138,11 @@ def _image_reference_main(tmp_path, monkeypatch, images, digests):
     torch.float32 = "float32"
     torch.no_grad = NoGrad
     transformers: Any = types.ModuleType("transformers")
-    transformers.AutoConfig = types.SimpleNamespace(
-        from_pretrained=lambda *a, **k: types.SimpleNamespace(audio_config=object())
+    transformers.AutoConfig = loader(
+        "AutoConfig", lambda: types.SimpleNamespace(audio_config=object())
     )
-    transformers.AutoModel = types.SimpleNamespace(from_pretrained=lambda *a, **k: Model())
-    transformers.AutoProcessor = types.SimpleNamespace(from_pretrained=lambda *a, **k: object())
+    transformers.AutoModel = loader("AutoModel", Model)
+    transformers.AutoProcessor = loader("AutoProcessor", object)
     pil: Any = types.ModuleType("PIL")
     pil.Image, pil.ImageOps = object(), object()
     for name, module in (("torch", torch), ("transformers", transformers), ("PIL", pil)):
@@ -3091,6 +3157,7 @@ def _image_reference_main(tmp_path, monkeypatch, images, digests):
     (tmp_path / "images.json").write_text(json.dumps(images))
     spec = {
         "model": str(tmp_path / "ref"),
+        "processor": str(tmp_path / "processor"),
         "images": str(tmp_path / "images.json"),
         "image_sha256": digests,
         "image_text": "<|image|>",
@@ -3114,6 +3181,14 @@ def test_the_image_reference_script_decodes_the_bytes_it_hashed(tmp_path, monkey
     code, _, decoded = _image_reference_main(tmp_path, monkeypatch, paths, digests)
     # The stand-in decoder stops the run at the first picture, given its bytes.
     assert code is None and decoded == [PICTURES[0]]
+
+
+def test_the_image_reference_script_loads_its_processor_from_verifys_copy(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    loads: list[tuple[str, str]] = []
+    _image_reference_main(tmp_path, monkeypatch, paths, digests, loads)
+    model, processor = str(tmp_path / "ref"), str(tmp_path / "processor")
+    assert loads == [("AutoConfig", model), ("AutoModel", model), ("AutoProcessor", processor)]
 
 
 def test_the_image_reference_script_refuses_a_picture_changed_after_the_check(
