@@ -41,8 +41,9 @@ class ModelsPage extends StatelessComponent {
 
   static const intro =
       'Each model here was converted with litetune and compared with its '
-      'float reference on held-out data. A card says what the model is and '
-      'which checkpoint the run used, and links to the section that measured it.';
+      'float reference on held-out data. A card says what the model is, which '
+      'checkpoint the run used and where it has run, and links to the section '
+      'that measured it.';
 
   @override
   Component build(BuildContext context) {

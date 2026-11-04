@@ -40,15 +40,15 @@ const String _measurementsTitle = 'Measurements — litetune';
 
 const String _modelsDescription =
     'The language models litetune has converted and compared with their '
-    'float references end to end, each with the checkpoint its run used and '
-    'a link to its measurements.';
+    'float references end to end, each with the checkpoint its run used, '
+    'where it has run and a link to its measurements.';
 
 const String _modelsTitle = 'Models — litetune';
 
 const String _embeddingsDescription =
-    'EmbeddingGemma 2 with litetune: fine-tuned as an on-device decider, '
-    "written into Google's .litertlm in int8 or int4, verified on CPU and a "
-    "Mac's GPU, and compiled for a Qualcomm NPU.";
+    'The embedding models litetune has converted and compared with their '
+    'float references end to end, each with the checkpoint its run used, '
+    'where it has run and a link to its measurements.';
 
 const String _embeddingsTitle = 'Embedding models — litetune';
 

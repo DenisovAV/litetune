@@ -1,9 +1,10 @@
-// The embeddings half of `/models` carries numbers, which the language-model
-// cards do not. Each has to be one a reader can find in the files the page
-// says it comes from, so this checks every numeral on it against the
-// EmbeddingGemma 2 sections of MEASUREMENTS.md and README.md -- scoped to
-// those sections, because "somewhere in a 2,500-line file" is a bar any
-// plausible number clears.
+// The embeddings half of `/models`: the same card as the language-model half,
+// and a note under it. What numerals it still has -- a sample size, a SoC, a
+// precision -- have to be ones a reader can find in the files the page says
+// they come from, so this checks every one against the EmbeddingGemma 2
+// sections of MEASUREMENTS.md and README.md -- scoped to those sections,
+// because "somewhere in a 2,500-line file" is a bar any plausible number
+// clears.
 import 'dart:io';
 
 import 'package:litetune_website/measurements/measurements_page.dart';
@@ -38,30 +39,26 @@ String _between(String text, String from, String to) {
 
 /// Every string the embeddings half renders, card and panel included.
 List<String> _embeddingsCopy() => [
-  for (final run in EmbeddingModels.measured) ...[run.name, run.how, run.what],
-  EmbeddingModels.summary,
-  for (final step in EmbeddingModels.steps) ...[step.command, step.text],
-  for (final table in EmbeddingModels.tables) ...[
-    table.title,
-    table.conditions,
-    ...table.header,
-    for (final row in table.rows) ...row,
-    ...table.notes,
+  for (final run in EmbeddingModels.measured) ...[
+    run.name,
+    run.how,
+    run.what,
+    for (final ran in run.runtimes) ran.target.label,
   ],
-  ...EmbeddingModels.notMeasured,
+  EmbeddingModels.summary,
 ];
 
 String _normalise(String text) =>
-    text.replaceAll('−', '-').replaceAll(' ', ' ');
+    text.replaceAll('−', '-').replaceAll(' ', ' ');
 
 void main() {
   final root = _root();
   final measurements = File('${root.path}/MEASUREMENTS.md').readAsStringSync();
   final readme = File('${root.path}/README.md').readAsStringSync();
 
-  // The three sections the page names: the one that introduces the path and
-  // holds the end-to-end runs, the NPU run, and the Mac section, whose last
-  // rows are EmbeddingGemma 2's GPU run.
+  // The three sections the page draws on: the one that introduces the path
+  // and holds the end-to-end runs, the NPU run, and the Mac section, whose
+  // last rows are EmbeddingGemma 2's GPU run.
   final measurementsSource = _between(
     measurements,
     "## EmbeddingGemma 2: a decider fine-tuned and grafted into Google's file",
@@ -103,15 +100,6 @@ void main() {
     }
   });
 
-  test('a table carries its conditions and rows as wide as its header', () {
-    for (final table in EmbeddingModels.tables) {
-      expect(table.conditions.trim(), isNotEmpty, reason: table.title);
-      for (final row in table.rows) {
-        expect(row, hasLength(table.header.length), reason: table.title);
-      }
-    }
-  });
-
   test('the embedding card links to an id the measurements page emits', () {
     final ids = MeasurementsPage.idsIn(measurements);
     for (final run in EmbeddingModels.measured) {
@@ -123,6 +111,16 @@ void main() {
         expect(measurementsSource, contains(revision));
       }
     }
+  });
+
+  test('both tabs caption the link under the cards the same way', () {
+    // The two halves draw the same card; the link under it is the same link
+    // in kind -- to the numbers -- and was captioned two ways.
+    expect(LlmModels.numbersLink, isNotEmpty);
+    final embeddings = File(
+      '${root.path}/website/lib/models/embedding_models.dart',
+    ).readAsStringSync();
+    expect(embeddings, contains('LlmModels.numbersLink'));
   });
 
   test('no two cards on /models share a panel id', () {

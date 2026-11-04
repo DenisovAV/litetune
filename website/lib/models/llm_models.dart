@@ -13,7 +13,9 @@ import 'measured_cards.dart';
 /// because the measured figures live in MEASUREMENTS.md, where a reader can
 /// see the intervals and the sample sizes next to them. The only quantity on them is a
 /// sample size, which is the thing a claim needs rather than a claim itself,
-/// and no card carries a score or a verdict. That is not squeamishness:
+/// and no card carries a score or a verdict -- not on its face and not in its
+/// panel, where `what` says what the model is and what it is for and nothing
+/// about how its run came out. That is not squeamishness:
 /// `MEASUREMENTS.md` records the FunctionGemma conversion cost resolving in
 /// 2 of 6 recipe-runs across three runs of the same configuration, calls
 /// whether 640 examples resolve it "close to a coin flip", and says in terms
@@ -26,6 +28,15 @@ import 'measured_cards.dart';
 /// footnotes rather than as one fact each, with nothing shared to compare
 /// across. What is worth saying about a single run is worth a sentence in
 /// `MEASUREMENTS.md`, which the link below the cards goes to.
+///
+/// Where a checkpoint has run is in the panel, one link per runtime, and only
+/// where a section of `MEASUREMENTS.md` names that checkpoint and that
+/// runtime: the CPU for every card (its own section), a Mac's GPU for
+/// FunctionGemma (*The CPU and the GPU on a Mac* names
+/// `google/functiongemma-270m-it`), and SM8750 for the four checkpoints
+/// *Bundles `convert --npu` built, on SM8750* names and for FunctionGemma
+/// (*The same model on an NPU*, its base weights). The NPU runs were not
+/// banking77 or tool-call scores; the panel says "has run" and no more.
 ///
 /// The note under the cards keeps the two execution sides separate: every
 /// headline candidate ran on LiteRT-LM's CPU backend, while some float
@@ -51,6 +62,9 @@ class LlmModels extends StatelessComponent {
       'CPU backend, where the gap was larger. A separate Qwen3 phone run shows '
       'that the backend can change the answer. ';
 
+  /// The caption of the link under the cards, the same on both tabs.
+  static const numbersLink = 'The numbers, and what they do not establish';
+
   @override
   Component build(BuildContext context) {
     return MeasuredCards(
@@ -59,12 +73,23 @@ class LlmModels extends StatelessComponent {
       runs: measured,
       note: [
         Component.text(measurementSummary),
-        a(href: '/measurements', [
-          Component.text('The numbers, and what they do not establish'),
-        ]),
+        a(href: '/measurements', [Component.text(numbersLink)]),
       ],
     );
   }
+
+  /// *The CPU and the GPU on a Mac*: its tool runs used
+  /// `google/functiongemma-270m-it`.
+  static const _mac = 'the-cpu-and-the-gpu-on-a-mac';
+
+  /// *Bundles `convert --npu` built, on SM8750 (2026-11-02)*: gemma-3-270m-it,
+  /// the Qwen2.5-0.5B-Instruct banking77 fine-tune, Qwen3-0.6B and
+  /// MiniCPM5-1B, on a Galaxy S25 Ultra.
+  static const _npuBundles = 'bundles-convert---npu-built-on-sm8750-2026-11-02';
+
+  /// *The same model on an NPU*, under *The headline numbers*:
+  /// `functiongemma-270m-it` with its base weights, SM8750, a Galaxy S25.
+  static const _npuFunctionGemma = 'the-same-model-on-an-npu';
 
   /// The runs, in the order the cards show them.
   static const measured = <MeasuredRun>[
@@ -80,6 +105,11 @@ class LlmModels extends StatelessComponent {
       hubId: 'google/functiongemma-270m-it',
       revision: null,
       anchor: 'the-headline-numbers',
+      runtimes: [
+        (target: RunTarget.cpu, anchor: 'the-headline-numbers'),
+        (target: RunTarget.macGpu, anchor: _mac),
+        (target: RunTarget.qualcommNpu, anchor: _npuFunctionGemma),
+      ],
     ),
     (
       name: 'Gemma 3 270M',
@@ -92,6 +122,13 @@ class LlmModels extends StatelessComponent {
       hubId: 'google/gemma-3-270m-it',
       revision: 'ac82b4e8',
       anchor: 'a-second-family-and-the-second-scorer',
+      runtimes: [
+        (
+          target: RunTarget.cpu,
+          anchor: 'a-second-family-and-the-second-scorer',
+        ),
+        (target: RunTarget.qualcommNpu, anchor: _npuBundles),
+      ],
     ),
     (
       name: 'Gemma 3 1B',
@@ -104,6 +141,9 @@ class LlmModels extends StatelessComponent {
       hubId: 'google/gemma-3-1b-it',
       revision: 'dcc83ea8',
       anchor: 'the-same-family-four-times-the-size',
+      runtimes: [
+        (target: RunTarget.cpu, anchor: 'the-same-family-four-times-the-size'),
+      ],
     ),
     (
       name: 'Qwen3 0.6B',
@@ -117,6 +157,13 @@ class LlmModels extends StatelessComponent {
       hubId: 'Qwen/Qwen3-0.6B',
       revision: 'c1899de2',
       anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
+      runtimes: [
+        (
+          target: RunTarget.cpu,
+          anchor: 'a-fourth-family-and-the-first-that-is-not-gemma',
+        ),
+        (target: RunTarget.qualcommNpu, anchor: _npuBundles),
+      ],
     ),
     (
       name: 'Qwen3 1.7B',
@@ -124,24 +171,34 @@ class LlmModels extends StatelessComponent {
       what:
           '1.7B parameters, text only, and the same chat template as the '
           "0.6B byte for byte, so its rule hands it LiteRT-LM's own Qwen 3 "
-          'template on the same terms. Measured on litert-lm 0.18.0, with '
-          'neither eight-bit conversion cost resolved.',
+          'template on the same terms.',
       hubId: 'Qwen/Qwen3-1.7B',
       revision: '70d244cc',
       anchor: 'the-two-qwen-families-one-size-up',
+      runtimes: [
+        (target: RunTarget.cpu, anchor: 'the-two-qwen-families-one-size-up'),
+      ],
     ),
     (
       name: 'Qwen2.5 0.5B Instruct',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
-          '0.5B parameters, text only. It is the one checkpoint here on '
-          'which channelwise four bits produced a score at all, where the '
-          'others either refused or came apart, and those scores cost it '
-          '+0.2683 and +0.2500 against its float 0.7700 on litert-lm 0.17.1.',
+          '0.5B parameters, text only: the smallest Qwen checkpoint measured '
+          "here, and the Instruct variant, which is the one litetune's rule "
+          'for the family covers. It renders with its own chat template, '
+          "composed behind litetune's text-parts block.",
       hubId: 'Qwen/Qwen2.5-0.5B-Instruct',
       revision: '7ae55760',
       anchor:
           'a-fifth-family-and-the-first-where-channelwise-four-bits-answered',
+      runtimes: [
+        (
+          target: RunTarget.cpu,
+          anchor:
+              'a-fifth-family-and-the-first-where-channelwise-four-bits-answered',
+        ),
+        (target: RunTarget.qualcommNpu, anchor: _npuBundles),
+      ],
     ),
     (
       name: 'Qwen2.5 1.5B Instruct',
@@ -149,11 +206,14 @@ class LlmModels extends StatelessComponent {
       what:
           '1.5B parameters, text only, and the same chat template as the '
           '0.5B Instruct byte for byte, composed behind the same text-parts '
-          'block. Measured on litert-lm 0.18.0 with eight bits only, '
-          'neither conversion cost resolved.',
+          "block, and the larger of the two sizes litetune's rule for the "
+          'family covers.',
       hubId: 'Qwen/Qwen2.5-1.5B-Instruct',
       revision: '989aa798',
       anchor: 'the-two-qwen-families-one-size-up',
+      runtimes: [
+        (target: RunTarget.cpu, anchor: 'the-two-qwen-families-one-size-up'),
+      ],
     ),
     (
       name: 'Qwen3.5 0.8B',
@@ -167,18 +227,29 @@ class LlmModels extends StatelessComponent {
       hubId: 'Qwen/Qwen3.5-0.8B',
       revision: '2fc06364',
       anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+      runtimes: [
+        (
+          target: RunTarget.cpu,
+          anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+        ),
+      ],
     ),
     (
       name: 'Qwen3.5 2B',
       how: 'exact-text scoring, the same 600 held-out rows',
       what:
           '2B parameters, text only, under the same rule as the 0.8B: its '
-          'bundle carries the same edited template, byte for byte. Measured '
-          'on litert-lm 0.18.0, where its eight-bit dynamic conversion '
-          'cost resolved.',
+          'bundle carries the same edited template, byte for byte, and verify '
+          'gives every prompt an Engine of its own.',
       hubId: 'Qwen/Qwen3.5-2B',
       revision: '15852e8c',
       anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+      runtimes: [
+        (
+          target: RunTarget.cpu,
+          anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+        ),
+      ],
     ),
     (
       name: 'MiniCPM5 1B',
@@ -191,6 +262,13 @@ class LlmModels extends StatelessComponent {
       hubId: 'openbmb/MiniCPM5-1B',
       revision: '87179e5c',
       anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+      runtimes: [
+        (
+          target: RunTarget.cpu,
+          anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+        ),
+        (target: RunTarget.qualcommNpu, anchor: _npuBundles),
+      ],
     ),
     (
       name: 'Granite 4.1 3B',
@@ -198,11 +276,16 @@ class LlmModels extends StatelessComponent {
       what:
           '3.4B parameters, text only, and the largest text-only model '
           "measured here. Its own chat template, composed behind litetune's "
-          'text-parts block. Measured on litert-lm 0.18.0 with eight bits '
-          'only, neither conversion cost resolved.',
+          'text-parts block, as both Qwen2.5 sizes are.',
       hubId: 'ibm-granite/granite-4.1-3b',
       revision: 'c0650403',
       anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+      runtimes: [
+        (
+          target: RunTarget.cpu,
+          anchor: 'three-more-families-granite-41-minicpm5-and-qwen-35',
+        ),
+      ],
     ),
     (
       name: 'Gemma 4 E2B',
@@ -221,6 +304,12 @@ class LlmModels extends StatelessComponent {
       // parity the section it links to explicitly denies.
       revision: null,
       anchor: 'end-to-end-on-the-seven-projection-checkpoint',
+      runtimes: [
+        (
+          target: RunTarget.cpu,
+          anchor: 'end-to-end-on-the-seven-projection-checkpoint',
+        ),
+      ],
     ),
   ];
 }

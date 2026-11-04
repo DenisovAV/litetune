@@ -11,6 +11,13 @@ import '../theme/brand.dart';
 /// nobody wrote down. `anchor` is GitHub's own heading anchor for the section
 /// that measured this model; `measured_cards_test.dart` checks that the
 /// section still exists and still names this checkpoint.
+///
+/// `runtimes` is where the checkpoint has run, each with the anchor of a
+/// section that names both the checkpoint and that runtime. Having run is all
+/// an entry says: the NPU runs were not scored on the task the card's own run
+/// was, and the panel's heading, "Where it has run", claims no more than that.
+/// The panel lists them in [RunTarget] order whatever order they are written
+/// in.
 typedef MeasuredRun = ({
   String name,
   String what,
@@ -18,7 +25,23 @@ typedef MeasuredRun = ({
   String hubId,
   String? revision,
   String anchor,
+  List<RanOn> runtimes,
 });
+
+/// One runtime a checkpoint has run on, and the section that says so.
+typedef RanOn = ({RunTarget target, String anchor});
+
+/// The runtimes a panel can name, in the order it names them.
+enum RunTarget {
+  cpu('CPU'),
+  macGpu('Mac GPU'),
+  qualcommNpu('Qualcomm NPU (SM8750)');
+
+  const RunTarget(this.label);
+
+  /// The link's text in the panel.
+  final String label;
+}
 
 /// The cards of measured runs, each opening a panel about its model.
 ///
@@ -28,8 +51,9 @@ typedef MeasuredRun = ({
 ///
 /// Each card opens a panel. It says what the model is and what it is for,
 /// names the checkpoint the run actually used -- the Hub id and, where
-/// `MEASUREMENTS.md` pins one, the revision -- and links to the model on the
-/// Hub and to the section that measured it. It
+/// `MEASUREMENTS.md` pins one, the revision -- lists where that checkpoint has
+/// run, each runtime a link to the section that ran it, and links to the
+/// model on the Hub and to the section that measured it. It
 /// carries no score either, for the reason the face of the card carries none:
 /// a panel one click deep is still the shortest place there is to quote a
 /// verdict, and a reader who wants the number is one link from the table with
@@ -123,6 +147,11 @@ class MeasuredCards extends StatelessComponent {
         ]),
       ]);
 
+  /// [runs] in [RunTarget] order, so every panel lists CPU, then Mac GPU,
+  /// then the NPU, however a card wrote them.
+  static List<RanOn> _inOrder(List<RanOn> runs) =>
+      [...runs]..sort((x, y) => x.target.index.compareTo(y.target.index));
+
   Component _modal(MeasuredRun model) => div(
     classes: 'measured-modal',
     attributes: {
@@ -163,6 +192,20 @@ class MeasuredCards extends StatelessComponent {
           div(classes: 'measured-card-fact', [
             span(classes: 'measured-card-key', [Component.text('Revision')]),
             span(classes: 'measured-card-id', [Component.text(revision)]),
+          ]),
+        if (model.runtimes.isNotEmpty)
+          div(classes: 'measured-card-fact', [
+            span(classes: 'measured-card-key', [
+              Component.text('Where it has run'),
+            ]),
+            span(classes: 'measured-card-runs', [
+              for (final (i, run) in _inOrder(model.runtimes).indexed) ...[
+                if (i > 0) Component.text(' · '),
+                a(href: '/measurements#${run.anchor}', [
+                  Component.text(run.target.label),
+                ]),
+              ],
+            ]),
           ]),
         div(classes: 'measured-card-links', [
           a(
@@ -320,6 +363,8 @@ class MeasuredCards extends StatelessComponent {
       fontSize: 0.85.rem,
       raw: const {'overflow-wrap': 'anywhere'},
     ),
+    css('.measured-card-runs').styles(color: Brand.muted, fontSize: 0.85.rem),
+    css('.measured-card-runs a').styles(color: Brand.body),
     css('.measured-card-links').styles(
       display: Display.flex,
       flexWrap: FlexWrap.wrap,
