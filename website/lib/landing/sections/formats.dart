@@ -46,11 +46,19 @@ import '../../theme/brand.dart';
 /// unknown-family note. Qwen2.5 likewise: 0.5B and 1.5B Instruct.
 ///
 /// The acceleration row names NPU only as a platform-specific LiteRT-LM
-/// capability. The one NPU bundle litetune compiles is an EmbeddingGemma 2
-/// graft's encoder for four Qualcomm SoCs (`convert --npu`, on the embeddings
-/// page); it compiles none for a language model, and `verify` runs no NPU.
-/// Keeping that out of the runtime sentence stops a reader taking it as a
-/// promise about every bundle `convert` hands them.
+/// capability. `convert --npu` compiles for four Qualcomm SoCs (SM8550,
+/// SM8650, SM8750, SM8850) on Linux x86-64 only, and for two kinds of model:
+/// an EmbeddingGemma 2 graft's encoder, and a generation bundle for four
+/// language-model families at the sizes that have run on an SM8750 NPU
+/// (`gemma-3-text` 270M, `qwen-3` 0.6B, `qwen-2.5` 0.5B, `minicpm5` 1B; README,
+/// *A generation bundle for a Qualcomm NPU*). Any other family or size is
+/// refused, and `verify` refuses an NPU file, since LiteRT-LM's CPU and GPU
+/// cannot run it. Keeping that out of the runtime sentence stops a reader
+/// taking it as a promise about every bundle `convert` hands them.
+///
+/// "Conversion currently uses the CPU export path" holds with `--npu` too: its
+/// export, calibration and compile run on a Linux x86-64 host, not on CUDA or
+/// MPS.
 class Formats extends StatelessComponent {
   const Formats({super.key});
 
