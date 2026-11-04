@@ -52,6 +52,18 @@ thread only, and a grandchild stays in the child's session and job object, so
 Only the candidate decides the verdict. When Google's file cannot be embedded,
 that is a limitation and the gain is not reported; the candidate is still
 gated.
+
+**A checkpoint tuned on images** (`EmbeddingRecord.is_image`) is measured the
+same way on its image split (docs/specs/2026-11-04-eg2-image-tune.md, "verify
+(image)"). Each row's file is checked against its `image_sha256` before anything
+runs. The reference is the checkpoint through transformers with its vision
+tower, the processor's input at `max_soft_tokens` = the record's vision tokens,
+the mean over every token (`IMAGE_REFERENCE_SCRIPT`); the candidate is the file
+through `EmbeddingEngine` with a CPU vision backend at that many vision tokens
+per image, each image given as its file (`IMAGE_ENGINE_SCRIPT`); Google's file
+is the text-vision file (`embedding_vision.VISION_FILE`). The GPU is refused:
+it has not been measured on that file. A convert report that records other
+vision tokens, or another modality, than the reference is refused.
 """
 
 from __future__ import annotations
@@ -74,14 +86,17 @@ from litetune.embedding_export import (
     EMBEDDING_CONVERT_SCHEMA,
     GOOGLE_HUB_FILE,
     REPORT_NAME,
+    VISION_HUB_FILE,
     DownloadFailed,
     check_google_file,
+    check_vision_file,
     download,
 )
 from litetune.embedding_tune import (
     DECIDER_PREFIX,
     EMBEDDING_MODEL,
     EMBEDDING_REVISION,
+    IMAGE_PREFIX,
     PROMPT_NAME,
     EmbeddingRecord,
     EmbeddingTuneError,
@@ -91,7 +106,7 @@ from litetune.embedding_tune import (
 from litetune.evaluate import RUNTIME_ENGINE_SOURCE, gpu_observed, gpu_unused
 from litetune.events import EventStream
 from litetune.metrics import Difference, paired_difference
-from litetune.prepare import PrepareError, read_rows
+from litetune.prepare import PrepareError, read_objects, read_rows, rows_are_images
 from litetune.storage import hash_file
 
 logger = logging.getLogger(__name__)
@@ -200,11 +215,55 @@ GPU_NOT_MEASURED_HERE = (
 )
 SIDE_BY_SIDE = (
     "the candidate and Google's file were embedded at the same time, each on its own {threads}; "
-    "each file's time per text was measured with the other running"
+    "each file's time per input was measured with the other running"
 )
 REFERENCE_ON_CPU = (
     "the reference ran on the CPU in float32 through sentence-transformers, whatever "
     "LITETUNE_DEVICE says"
+)
+
+# -- a checkpoint tuned on images ------------------------------------------------
+SCORER_MEANS_IMAGES = (
+    "the centroid answer with no abstention, as flutter_edge_ai's EmbeddingModel.createDecider "
+    "computes it for text: the option whose centroid -- the mean of its examples' embeddings, "
+    "L2-normalised -- has the highest cosine to the input's embedding, every input answered; "
+    "every image embedded on its own, with no task prompt"
+)
+# An allowance per image, not a measurement: an image runs the vision tower as
+# well as the text tower.
+IMAGE_ROW_TIMEOUT_S = 15
+# The files `AutoProcessor` reads from a checkpoint saved with its processor, as
+# google/embeddinggemma-2 at `EMBEDDING_REVISION` ships them. A reference without
+# every one of them is embedded with that revision's processor instead.
+PROCESSOR_FILES = (
+    "processor_config.json",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
+IMAGE_GPU_NOT_MEASURED = (
+    "--backend gpu for a checkpoint tuned on images: LiteRT-LM's GPU path has not been "
+    "measured on the text-vision file, so it is refused; verify it on the CPU"
+)
+IMAGE_REFERENCE_ON_CPU = (
+    "the reference ran on the CPU in float32 through transformers, whatever LITETUNE_DEVICE says: "
+    "the checkpoint with its vision tower, each image the processor's input at max_soft_tokens "
+    "{vision_tokens}, the mean over every token, L2-normalised"
+)
+VISION_THREADS = (
+    "litert-lm 0.18.0's Python EmbeddingEngine sets a thread count for its main and audio "
+    "backends only (embedding_engine.py), so the vision encoder ran on the threads the runtime "
+    "chose, not on {threads}"
+)
+BASE_PROCESSOR = (
+    "the reference has no {missing}, so its images were prepared by the processor of "
+    "{repo} at {revision}, the base the checkpoint was tuned from"
+)
+IMAGE_CPU_ONLY = (
+    "measured on the CPU backend of LiteRT-LM's EmbeddingEngine, {threads}, each image given as "
+    "its file (litert_lm.Content.ImageFile) at {vision_tokens} vision tokens per image, from the "
+    "litert-lm package on PyPI on this host's CPU -- not the application's own build of the "
+    "runtime on a device's CPU; the GPU and the NPU are not measured"
 )
 
 
@@ -466,6 +525,243 @@ def main():
         "backend": "gpu" if on_gpu else "cpu",
         "threads": None if on_gpu else spec["threads"],
         "device": device,
+        "settings": settings,
+        "runtime": runtime,
+        "cpu": cpu_report(),
+        "python": platform.python_version(),
+    }), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+"""
+)
+
+IMAGE_REFERENCE_SCRIPT = r'''
+"""Embed images with an EmbeddingGemma 2 checkpoint tuned on images: transformers, float32, CPU.
+
+Reads JSON {model, processor, images, vision_tokens, threads, out, report} from
+argv[1]. `processor` is {"source": "checkpoint", "path"} or {"source": "base",
+"repo", "revision"}. The model is loaded with its vision tower and without its
+audio tower (audio_config None). Each image is the processor's own input --
+text "<|image|>", the image, images_kwargs max_soft_tokens = vision_tokens --
+its soft tokens scattered into the token embeddings, the language model run over
+every token, the mean over every token, L2-normalised: the input and the pool
+tune trains with (docs/specs/2026-11-04-eg2-image-tune.md, "tune (image)").
+Writes the vectors, float32, one row per image, to spec["out"] (numpy.save)
+and JSON to spec["report"]. A vector with a non-finite value or a zero norm is
+{"error": ...} and exit 3.
+"""
+import importlib.metadata
+import json
+import sys
+import time
+from pathlib import Path
+
+REFUSED_EXIT = 3
+
+
+def unusable_rows(np, v):
+    """Indices of the rows with a non-finite value or a zero (or overflowing) norm."""
+    with np.errstate(invalid="ignore", over="ignore"):
+        norms = np.linalg.norm(v, axis=1)
+    return np.flatnonzero(~np.isfinite(v).all(axis=1) | ~(np.isfinite(norms) & (norms > 0)))
+
+
+def pooled(torch, model, enc):
+    """(the mean of the last hidden state over every token, the image's soft tokens).
+
+    The vision tower's features take the place of the image tokens in the
+    token embeddings, as the tuning run computes them; the attention mask is
+    every token, so the mean is over every token."""
+    ids = enc["input_ids"]
+    image = ids == model.config.image_token_id
+    text_ids = torch.where(image, model.config.text_config.pad_token_id, ids)
+    embeds = model.get_input_embeddings()(text_ids)
+    features = model.get_image_features(
+        enc["pixel_values"], enc["image_position_ids"], return_dict=True
+    ).pooler_output
+    features = torch.cat(features, 0).to(embeds.dtype)
+    embeds = embeds.masked_scatter(image.unsqueeze(-1).expand_as(embeds), features)
+    mask = torch.ones(embeds.shape[:2], dtype=torch.long)
+    out = model.language_model(
+        inputs_embeds=embeds, attention_mask=mask, return_dict=True
+    ).last_hidden_state
+    return out.mean(1)[0], int(image.sum())
+
+
+def main():
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    report = Path(spec["report"])
+
+    import numpy as np
+    import torch
+    from PIL import Image
+    from transformers import AutoConfig, AutoModel, AutoProcessor
+
+    torch.set_num_threads(spec["threads"])
+    started = time.time()
+    config = AutoConfig.from_pretrained(spec["model"])
+    config.audio_config = None
+    model = AutoModel.from_pretrained(spec["model"], config=config, dtype=torch.float32).eval()
+    where = spec["processor"]
+    if where["source"] == "checkpoint":
+        processor = AutoProcessor.from_pretrained(where["path"])
+    else:
+        processor = AutoProcessor.from_pretrained(where["repo"], revision=where["revision"])
+    images = json.loads(Path(spec["images"]).read_text(encoding="utf-8"))
+    rows, soft, tokens = [], [], []
+    with torch.no_grad():
+        for path in images:
+            with Image.open(path) as opened:
+                picture = opened.convert("RGB")
+            enc = processor(
+                text=["<|image|>"],
+                images=[[picture]],
+                return_tensors="pt",
+                images_kwargs={"max_soft_tokens": spec["vision_tokens"]},
+            )
+            vector, n = pooled(torch, model, enc)
+            rows.append(vector.numpy().astype(np.float64))
+            soft.append(n)
+            tokens.append(int(enc["input_ids"].shape[1]))
+    raw = np.stack(rows) if rows else np.zeros((0, 0))
+    bad = unusable_rows(np, raw)
+    if len(bad):
+        report.write_text(json.dumps({"error": (
+            f"{len(bad)} of {raw.shape[0]} reference vectors have a non-finite value or a zero "
+            f"norm (rows {bad[:10].tolist()})")}), encoding="utf-8")
+        return REFUSED_EXIT
+    v = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+    np.save(spec["out"], v.astype(np.float32))
+    report.write_text(json.dumps({
+        "rows": int(v.shape[0]),
+        "dim": int(v.shape[1]),
+        "seconds": round(time.time() - started, 1),
+        "device": "cpu",
+        "dtype": "float32",
+        "threads": torch.get_num_threads(),
+        "vision_tokens": spec["vision_tokens"],
+        "processor": where,
+        # The image tokens the processor wrote per image, and every token with
+        # the specials: what max_soft_tokens did.
+        "soft_tokens": {"min": min(soft), "max": max(soft)} if soft else None,
+        "tokens": {"min": min(tokens), "max": max(tokens)} if tokens else None,
+        "versions": {name: importlib.metadata.version(name) for name in (
+            "torch", "transformers", "pillow", "numpy")},
+    }), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+IMAGE_ENGINE_SCRIPT = (
+    r'''
+"""Embed images with a .litertlm through LiteRT-LM's EmbeddingEngine on the CPU.
+
+Reads JSON {model, images, threads, vision_tokens, cache_dir, max_input_length,
+out, report} from argv[1]. The engine is built with a CPU backend and a CPU
+vision backend, `vision_tokens_per_image` = spec["vision_tokens"], its cache in
+spec["cache_dir"]; each image is given as the file
+(`litert_lm.Content.ImageFile`) with the options the text engine script sets.
+litert-lm 0.18.0's EmbeddingEngine sets a thread count for the main and the
+audio backends only (embedding_engine.py), so the vision backend's thread count
+is passed and not applied. Writes the L2-normalised vectors, float32, one row
+per image, to spec["out"] (numpy.save) and JSON to spec["report"]. An image the
+engine refuses, or a vector with a non-finite value or a zero norm, is
+{"error": ...} and exit 3.
+"""
+import importlib.metadata
+import json
+import platform
+import statistics
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+REFUSED_EXIT = 3
+
+
+def unusable_rows(v):
+    """Indices of the rows with a non-finite value or a zero (or overflowing) norm."""
+    with np.errstate(invalid="ignore", over="ignore"):
+        norms = np.linalg.norm(v, axis=1)
+    return np.flatnonzero(~np.isfinite(v).all(axis=1) | ~(np.isfinite(norms) & (norms > 0)))
+
+'''
+    + RUNTIME_ENGINE_SOURCE
+    + r"""
+
+def main():
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    report = Path(spec["report"])
+    import litert_lm
+
+    images = json.loads(Path(spec["images"]).read_text(encoding="utf-8"))
+    settings = {
+        "cache_dir": spec["cache_dir"],
+        "max_input_length": spec["max_input_length"],
+        "vision_tokens_per_image": spec["vision_tokens"],
+        "normalize": True,
+        "insert_special_tokens": True,
+        "input_overflow_strategy": "ERROR",
+    }
+    started = time.time()
+    out, times = [], []
+    with litert_lm.EmbeddingEngine(
+        spec["model"],
+        backend=litert_lm.Backend.CPU(thread_count=spec["threads"]),
+        vision_backend=litert_lm.Backend.CPU(thread_count=spec["threads"]),
+        vision_tokens_per_image=spec["vision_tokens"],
+        cache_dir=spec["cache_dir"],
+        max_input_length=spec["max_input_length"],
+    ) as engine:
+        options = litert_lm.EmbeddingOptions(
+            normalize=True,
+            insert_special_tokens=True,
+            input_overflow_strategy=litert_lm.InputOverflowStrategy.ERROR,
+        )
+        for i, path in enumerate(images):
+            t1 = time.perf_counter()
+            try:
+                answer = engine.compute_embedding(
+                    litert_lm.Content.ImageFile(path), options=options
+                )
+            except RuntimeError as exc:
+                report.write_text(json.dumps({"error": (
+                    f"the engine refused image {i} ({path}): {exc}")}), encoding="utf-8")
+                return REFUSED_EXIT
+            out.append(list(answer.embedding))
+            times.append(time.perf_counter() - t1)
+    raw = np.array(out, dtype=np.float64)
+    bad = unusable_rows(raw)
+    if len(bad):
+        report.write_text(json.dumps({"error": (
+            f"{len(bad)} of {raw.shape[0]} engine vectors have a non-finite value or a zero "
+            f"norm (rows {bad[:10].tolist()})")}), encoding="utf-8")
+        return REFUSED_EXIT
+    v = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+    np.save(spec["out"], v.astype(np.float32))
+    runtime = {}
+    for dist in ("litert-lm", "litert-lm-api"):
+        try:
+            runtime[dist] = importlib.metadata.version(dist)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    report.write_text(json.dumps({
+        "rows": int(v.shape[0]),
+        "dim": int(v.shape[1]),
+        "seconds": round(time.time() - started, 1),
+        "ms_median": round(1000 * statistics.median(times), 2) if times else None,
+        "backend": "cpu",
+        "vision_backend": "cpu",
+        "threads": spec["threads"],
+        "device": {},
         "settings": settings,
         "runtime": runtime,
         "cpu": cpu_report(),
@@ -917,8 +1213,10 @@ def run_engines(
     parallel: bool,
     timeout: int,
     backend: str = "cpu",
+    script_source: str = ENGINE_SCRIPT,
 ) -> tuple[dict[str, ScriptRun], str | None]:
-    """Embed each (name, file) with `ENGINE_SCRIPT` on `backend` through one `ENGINES_SCRIPT` child.
+    """Embed each (name, file) with `script_source` (`ENGINE_SCRIPT`, or
+    `IMAGE_ENGINE_SCRIPT` for images) on `backend` through one `ENGINES_SCRIPT` child.
 
     Each side's engine gets its own cache directory, `work/cache-<name>`,
     created here, so no cache is written beside the file and no two runs share
@@ -928,7 +1226,7 @@ def run_engines(
     A side the launcher stopped or never started has the failure `STOPPED`.
     """
     script = work / "engine.py"
-    script.write_text(ENGINE_SCRIPT, encoding="utf-8")
+    script.write_text(script_source, encoding="utf-8")
     runs, reports = [], {}
     for name, model in sides:
         spec_path, report = work / f"{name}.json", work / f"{name}.out"
@@ -1042,7 +1340,9 @@ def mean_value(costs: Sequence[Difference]) -> float:
     return sum(d.value for d in costs) / len(costs)
 
 
-def labels_short_of(train: Sequence[LabelledText], labels: Sequence[str], k: int) -> list[str]:
+def labels_short_of(
+    train: Sequence[LabelledText | LabelledImage], labels: Sequence[str], k: int
+) -> list[str]:
     """The labels with fewer than `k` training rows: a k-shot draw cannot be made for them."""
     counts = dict.fromkeys(labels, 0)
     for row in train:
@@ -1193,6 +1493,15 @@ def _record_problem(record: EmbeddingRecord) -> str | None:
             f"the checkpoint records {record.base_model} at {record.base_model_revision}, not "
             f"{EMBEDDING_MODEL} at {EMBEDDING_REVISION}"
         )
+    if record.is_image:
+        # An image is embedded alone, with no task prompt: the prompt name is
+        # not read on either side.
+        if record.prefix != IMAGE_PREFIX:
+            return (
+                f"the checkpoint was tuned on images with the prefix {record.prefix!r}; an image "
+                f"checkpoint is embedded with {IMAGE_PREFIX!r}, the image alone"
+            )
+        return None
     if record.prompt_name != PROMPT_NAME or record.prefix != DECIDER_PREFIX:
         return (
             f"the checkpoint was trained with prompt {record.prompt_name!r} = {record.prefix!r}, "
@@ -1214,6 +1523,98 @@ def _read_states(path: Path, decision: Decision, what: str) -> list[LabelledText
     return states
 
 
+@dataclass(frozen=True)
+class LabelledImage:
+    """One image row as the scripts embed it: the file, and the option id it is labelled with."""
+
+    path: Path
+    label: str
+
+
+_SHA256_HEX = frozenset("0123456789abcdef")
+
+
+def _split_objects(path: Path, what: str) -> tuple[list[tuple[int, dict[str, Any]]], bool]:
+    """The split's rows and whether they are image rows (`prepare.rows_are_images`)."""
+    if not Path(path).is_file():
+        raise EmbeddingTuneError(f"the {what} split {path} does not exist")
+    try:
+        objects = read_objects(Path(path), images=True)
+        return objects, rows_are_images(Path(path), objects)
+    except PrepareError as exc:
+        raise EmbeddingTuneError(str(exc)) from exc
+
+
+def split_modality_problem(path: Path, images: bool, what: str) -> str | None:
+    """Why the split at `path` is not of the checkpoint's modality, or `None`."""
+    _, are_images = _split_objects(path, what)
+    if are_images == images:
+        return None
+    if images:
+        return (
+            f"the {what} split {path} holds text rows and the reference was tuned on images; "
+            "verify it on the image split prepare wrote for it"
+        )
+    return (
+        f"the {what} split {path} holds image rows and the reference was tuned on text; "
+        "verify it on the text split prepare wrote for it"
+    )
+
+
+def read_image_states(path: Path, decision: Decision, what: str) -> list[LabelledImage]:
+    """Each image row of a split `prepare` wrote: its file, checked, and its answer.
+
+    A row's `image` is read relative to the split's directory. Refused, naming
+    the row: a row that is not an image row, whose file is missing, whose bytes
+    do not hash to its `image_sha256` (the file changed since prepare wrote
+    it), or whose completion is not one of the decision's ids.
+    """
+    objects, are_images = _split_objects(path, what)
+    if not are_images:
+        raise EmbeddingTuneError(f"the {what} split {path} holds text rows, not image rows")
+    out: list[LabelledImage] = []
+    for lineno, obj in objects:
+        where = f"{path}:{lineno}"
+        value, digest, completion = obj.get("image"), obj.get("image_sha256"), obj.get("completion")
+        if not isinstance(value, str) or not value:
+            raise EmbeddingTuneError(f"{where}: 'image' is {value!r}, not the path of a file")
+        if not isinstance(digest, str) or len(digest) != 64 or not set(digest) <= _SHA256_HEX:
+            raise EmbeddingTuneError(
+                f"{where}: 'image_sha256' is {digest!r}, not a sha256; use the split prepare wrote"
+            )
+        if completion not in decision.ids:
+            raise EmbeddingTuneError(
+                f"{where}: the completion {completion!r} is not one of the decision's options"
+            )
+        file = Path(path).parent / value
+        if not file.is_file():
+            raise EmbeddingTuneError(
+                f"{where}: the image {value!r} does not exist (read as {file})"
+            )
+        found = hash_file(file)
+        if found != f"sha256:{digest}":
+            raise EmbeddingTuneError(
+                f"{where}: the image {file} hashes to {found}, not the sha256:{digest} the row "
+                "records: it changed after prepare wrote the split"
+            )
+        out.append(LabelledImage(file.absolute(), completion))
+    if not out:
+        raise EmbeddingTuneError(f"the {what} split {path} has no rows")
+    return out
+
+
+def reference_processor(reference: Path) -> tuple[dict[str, str], list[str]]:
+    """Where the reference script takes its processor from, and the files it lacked.
+
+    The checkpoint's own processor when every file of `PROCESSOR_FILES` is in
+    it; otherwise the processor of the base at its pinned revision.
+    """
+    missing = [name for name in PROCESSOR_FILES if not (Path(reference) / name).is_file()]
+    if not missing:
+        return {"source": "checkpoint", "path": str(reference)}, []
+    return {"source": "base", "repo": EMBEDDING_MODEL, "revision": EMBEDDING_REVISION}, missing
+
+
 def verify_embedding(
     job: EmbeddingVerify, record: EmbeddingRecord, events: EventStream
 ) -> tuple[str, dict[str, Any]]:
@@ -1225,8 +1626,9 @@ def verify_embedding(
     """
     state = _State()
     threshold = job.threshold
+    images = record.is_image
     fields: dict[str, Any] = {
-        "scorer": {"name": SCORER, "means": SCORER_MEANS},
+        "scorer": {"name": SCORER, "means": SCORER_MEANS_IMAGES if images else SCORER_MEANS},
         "gates": [],
     }
 
@@ -1259,6 +1661,8 @@ def verify_embedding(
             CANDIDATE_CHECK,
             f"--backend {job.backend}: the embedding path runs on LiteRT-LM's CPU or GPU backend",
         )
+    if job.backend == "gpu" and images:
+        return refuse(CANDIDATE_CHECK, IMAGE_GPU_NOT_MEASURED)
     if job.backend == "gpu" and sys.platform != "darwin":
         return refuse(CANDIDATE_CHECK, GPU_NOT_MEASURED_HERE.format(platform=sys.platform))
     if job.not_applicable:
@@ -1309,6 +1713,20 @@ def verify_embedding(
     if facts is None:
         state.limitation(NOT_TIED.format(reason=weights_source))
     else:
+        if facts.modality != record.modality:
+            return refuse(
+                CANDIDATE_CHECK,
+                f"{weights_source} says the file was converted from a checkpoint tuned on "
+                f"{facts.modality}; the reference's litetune.json was tuned on {record.modality}",
+            )
+        if images and facts.vision_tokens != record.vision_tokens:
+            return refuse(
+                CANDIDATE_CHECK,
+                f"{weights_source} records {facts.vision_tokens} vision tokens per image; the "
+                f"reference was tuned at {record.vision_tokens}. The engine is given the "
+                "reference's, so the file's record would not describe this measurement; convert "
+                "the reference again",
+            )
         if facts.decision_sha256 is not None and facts.decision_sha256 != record.decision_sha256:
             return refuse(
                 RECORD_CHECK,
@@ -1360,14 +1778,37 @@ def verify_embedding(
         "threads": job.threads,
         "engine_threads": engine_threads,
         "engine_threads_reason": engine_cpu.reason if engine_cpu else None,
+        # "text" or "image"; an image checkpoint's vision tokens per image, which
+        # the engine is given and the reference's processor uses (None for text).
+        "modality": record.modality,
+        "vision_tokens": record.vision_tokens,
     }
+    processor: dict[str, str] | None = None
+    if images:
+        processor, missing = reference_processor(Path(job.reference))
+        fields["embedding"]["processor"] = processor
+        if missing:
+            state.limitation(
+                BASE_PROCESSOR.format(
+                    missing=", ".join(missing), repo=EMBEDDING_MODEL, revision=EMBEDDING_REVISION
+                )
+            )
     if weights is None:
         state.limitation(f"the weight mode of the file is not known: {weights_source}")
 
     # -- the rows ----------------------------------------------------------------
+    train: Sequence[LabelledText | LabelledImage]
+    heldout: Sequence[LabelledText | LabelledImage]
     try:
-        train = _read_states(job.train_path, decision, "training")
-        heldout = _read_states(job.heldout, decision, "held-out")
+        for path, what in ((job.train_path, "training"), (job.heldout, "held-out")):
+            if (problem := split_modality_problem(path, images, what)) is not None:
+                return refuse(ROWS_CHECK, problem)
+        if images:
+            train = read_image_states(job.train_path, decision, "training")
+            heldout = read_image_states(job.heldout, decision, "held-out")
+        else:
+            train = _read_states(job.train_path, decision, "training")
+            heldout = _read_states(job.heldout, decision, "held-out")
     except EmbeddingTuneError as exc:
         return refuse(ROWS_CHECK, str(exc))
     short = labels_short_of(train, labels, max(KS))
@@ -1401,8 +1842,9 @@ def verify_embedding(
             state.limitation(
                 f"the {what} split here has {len(rows)} rows; the one tune recorded had {trained}"
             )
+    noun = "images" if images else "states"
     state.add(
-        Check.passed(ROWS_CHECK, f"{len(train)} training and {len(heldout)} held-out states"),
+        Check.passed(ROWS_CHECK, f"{len(train)} training and {len(heldout)} held-out {noun}"),
         events,
     )
 
@@ -1417,24 +1859,38 @@ def verify_embedding(
             try:
                 if job.auto_provision:
                     job.export_env.provision(events=events)
-                google = download(job.export_env, [GOOGLE_HUB_FILE])[0]
+                hub_file = VISION_HUB_FILE if images else GOOGLE_HUB_FILE
+                google = download(job.export_env, [hub_file])[0]
             except (DownloadFailed, RuntimeError, OSError) as exc:
                 logger.exception("could not fetch Google's file")
                 return refuse(BASE_CHECK, f"Google's file could not be fetched: {exc}")
-        if (problem := check_google_file(google)) is not None:
+        # An image checkpoint's file is Google's text-vision file with the tuned
+        # text tower spliced in, so the file to compare is that one.
+        check_file = check_vision_file if images else check_google_file
+        if (problem := check_file(google)) is not None:
             return refuse(BASE_CHECK, problem)
         state.add(Check.passed(BASE_CHECK, f"{google}, Google's file by its sha256"), events)
     else:
         state.limitation(NO_BASE)
 
     # -- the embeddings, one process per file ---------------------------------------
-    texts = [row.text for row in (*train, *heldout)]
-    budget = STARTUP_TIMEOUT_S + ROW_TIMEOUT_S * len(texts)
+    # Each side embeds the train rows, then the held-out rows: the texts, or the
+    # images' absolute paths.
+    inputs = [
+        str(row.path) if isinstance(row, LabelledImage) else row.text for row in (*train, *heldout)
+    ]
+    kind = "images" if images else "texts"
+    per_row = IMAGE_ROW_TIMEOUT_S if images else ROW_TIMEOUT_S
+    budget = STARTUP_TIMEOUT_S + per_row * len(inputs)
     with tempfile.TemporaryDirectory(prefix="litetune-embedding-") as tmp:
         work = Path(tmp)
-        texts_path = work / "texts.json"
-        texts_path.write_text(json.dumps(texts, ensure_ascii=False), encoding="utf-8")
-        common = {"texts": str(texts_path), "threads": job.threads, "prefix": record.prefix}
+        inputs_path = work / f"{kind}.json"
+        inputs_path.write_text(json.dumps(inputs, ensure_ascii=False), encoding="utf-8")
+        common: dict[str, Any] = {kind: str(inputs_path), "threads": job.threads}
+        if images:
+            common["vision_tokens"] = record.vision_tokens
+        else:
+            common["prefix"] = record.prefix
         engine_sides: list[tuple[str, Path]] = [("candidate", Path(job.model))]
         if google is not None:
             engine_sides.append(("base", google))
@@ -1466,10 +1922,12 @@ def verify_embedding(
             out = work / f"{name}.npy"
             if run.failure is not None:
                 return run.failure
-            if run.report.get("rows") != len(texts):
-                return f"the script reports {run.report.get('rows')} vectors for {len(texts)} texts"
+            if run.report.get("rows") != len(inputs):
+                return (
+                    f"the script reports {run.report.get('rows')} vectors for {len(inputs)} {kind}"
+                )
             if not out.is_file():
-                return f"the script reports {len(texts)} vectors but wrote no {out.name}"
+                return f"the script reports {len(inputs)} vectors but wrote no {out.name}"
             if name != "reference" and gpu_unused(job.backend, run.report.get("device")):
                 return (
                     "the GPU backend was asked for and the kernel shows this process did no GPU "
@@ -1478,34 +1936,47 @@ def verify_embedding(
             harness[name] = run.report
             vectors[name] = str(out)
             state.add(
-                Check.passed(check_name, f"{len(texts)} vectors of {run.report.get('dim')} values"),
+                Check.passed(
+                    check_name, f"{len(inputs)} vectors of {run.report.get('dim')} values"
+                ),
                 events,
             )
             return None
 
-        events.note(f"embedding {len(texts)} texts: reference", env=job.train_env.name)
-        reference_run = run_script(
-            job.train_env,
-            REFERENCE_SCRIPT,
-            {
+        events.note(f"embedding {len(inputs)} {kind}: reference", env=job.train_env.name)
+        if images:
+            reference_spec: dict[str, Any] = {
+                **common,
+                "model": job.reference,
+                "processor": processor,
+                "out": str(work / "reference.npy"),
+            }
+        else:
+            reference_spec = {
                 **common,
                 "model": job.reference,
                 "prompt_name": record.prompt_name,
                 "batch_size": REFERENCE_BATCH,
                 "out": str(work / "reference.npy"),
-            },
+            }
+        reference_run = run_script(
+            job.train_env,
+            IMAGE_REFERENCE_SCRIPT if images else REFERENCE_SCRIPT,
+            reference_spec,
             work,
             "reference",
             budget,
         )
-        if (problem := truncated(reference_run, len(texts))) is not None:
+        # An image has no tokens to cut: the processor's input is the image at
+        # its vision tokens on both sides.
+        if not images and (problem := truncated(reference_run, len(inputs))) is not None:
             return refuse(REFERENCE_CHECK, problem)
         if (problem := accept("reference", REFERENCE_CHECK, reference_run)) is not None:
             return refuse(REFERENCE_CHECK, problem)
 
         names = " and ".join(name for name, _ in engine_sides)
         how = ", side by side" if parallel else ""
-        events.note(f"embedding {len(texts)} texts: {names}{how}", env=job.runtime_env.name)
+        events.note(f"embedding {len(inputs)} {kind}: {names}{how}", env=job.runtime_env.name)
         engine_runs, launch_failure = run_engines(
             job.runtime_env,
             engine_sides,
@@ -1514,6 +1985,7 @@ def verify_embedding(
             parallel,
             budget if parallel else budget * len(engine_sides),
             job.backend,
+            IMAGE_ENGINE_SCRIPT if images else ENGINE_SCRIPT,
         )
         if engine_cpu is not None and (said := engine_cpu.limitation("each EmbeddingEngine side")):
             state.limitation(said)
@@ -1585,7 +2057,9 @@ def verify_embedding(
         "threads_requested": job.threads if engine_cpu else None,
         "threads_reason": engine_cpu.reason if engine_cpu else None,
         "settings": _mapping(candidate_report.get("settings")),
-        "ms_per_text_median": candidate_report.get("ms_median"),
+        ("ms_per_image_median" if images else "ms_per_text_median"): candidate_report.get(
+            "ms_median"
+        ),
     }
     fields["quality"] = {
         "available": True,
@@ -1631,12 +2105,23 @@ def verify_embedding(
     if job.backend == "gpu":
         seen = gpu_observed("gpu", candidate_report.get("device"))
         state.limitation(GPU_MEASURED.format(how=GPU_SEEN if seen else GPU_ASKED_FOR))
+    elif images:
+        state.limitation(
+            IMAGE_CPU_ONLY.format(
+                threads=_threads_text(engine_threads), vision_tokens=record.vision_tokens
+            )
+        )
+        state.limitation(VISION_THREADS.format(threads=_threads_text(engine_threads)))
     else:
         state.limitation(CPU_ONLY.format(threads=_threads_text(engine_threads)))
     if parallel:
         state.limitation(SIDE_BY_SIDE.format(threads=_threads_text(engine_threads)))
     state.limitation(FITTED_ON_EXAMPLES.format(ks=" and ".join(f"k={k}" for k in KS), draws=DRAWS))
-    state.limitation(REFERENCE_ON_CPU)
+    state.limitation(
+        IMAGE_REFERENCE_ON_CPU.format(vision_tokens=record.vision_tokens)
+        if images
+        else REFERENCE_ON_CPU
+    )
     state.limitation(LINEAR_NOT_GATED)
     state.limitation(DESCRIPTIONS_UNUSED)
     state.limitation(CALIBRATION_MEASURED.format(keep=CROSSFIT_KEEP))
@@ -1658,10 +2143,17 @@ def summarise(manifest: dict[str, Any]) -> list[str]:
     lines = [f"status: {manifest.get('status')}"]
     embedding = _mapping(manifest.get("embedding"))
     if embedding:
-        lines.append(
-            f"  embedding decider, {len(embedding.get('labels') or [])} options, weights "
-            f"{embedding.get('weights') or 'unknown'}, prefix {embedding.get('prefix')!r}"
-        )
+        if embedding.get("modality") == "image":
+            lines.append(
+                f"  embedding decider on images, {len(embedding.get('labels') or [])} options, "
+                f"weights {embedding.get('weights') or 'unknown'}, "
+                f"{embedding.get('vision_tokens')} vision tokens per image"
+            )
+        else:
+            lines.append(
+                f"  embedding decider, {len(embedding.get('labels') or [])} options, weights "
+                f"{embedding.get('weights') or 'unknown'}, prefix {embedding.get('prefix')!r}"
+            )
     measured = _mapping(manifest.get("measurements"))
     key = f"centroid_k{GATED_K}"
     for name in ("reference", "candidate", "base"):

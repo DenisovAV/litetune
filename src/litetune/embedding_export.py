@@ -262,6 +262,11 @@ def check_google_file(path: Path) -> str | None:
     return _google_file_problem(path, hash_file(path))
 
 
+def check_vision_file(path: Path) -> str | None:
+    """Why `path` is not Google's text-vision file, or `None` when its sha256 is `VISION_SHA256`."""
+    return _vision_file_problem(path, hash_file(path))
+
+
 def _google_file_problem(path: Path, digest: str) -> str | None:
     if digest != f"sha256:{GOOGLE_SHA256}":
         return (

@@ -34,6 +34,7 @@ from litetune.embedding_tune import (
     DECIDER_PREFIX,
     EMBEDDING_MODEL,
     EMBEDDING_REVISION,
+    IMAGE_PREFIX,
     PROMPT_NAME,
     RECIPE,
     EmbeddingRecord,
@@ -68,6 +69,7 @@ from litetune.embedding_verify import (
     usable_cpus,
     weights_of,
 )
+from litetune.embedding_vision import VISION_FILE
 from litetune.metrics import Difference, paired_difference
 from litetune.storage import hash_file
 from litetune.verify import ReferenceRole, Status, VerifyRequest, run_verify
@@ -76,6 +78,7 @@ np: Any = pytest.importorskip("numpy")
 
 OPTIONS = ("balance", "card_lost", "refund")
 GOOGLE_BYTES = b"a stand-in for Google's file"
+VISION_STAND_IN = b"a stand-in for Google's text-vision file"
 
 
 @pytest.fixture(scope="module")
@@ -546,7 +549,7 @@ def test_the_reference_script_encodes_as_emb_s5_does():
 def _stub_litert_lm(answers: list[Any]) -> tuple[types.ModuleType, dict[str, list[Any]]]:
     """litert_lm 0.18.0's names, with its keyword arguments and no `**kwargs`, so
     a misspelt setting fails here (the real `EmbeddingEngine` swallows them)."""
-    calls: dict[str, list[Any]] = {"engine": [], "options": [], "texts": []}
+    calls: dict[str, list[Any]] = {"engine": [], "options": [], "texts": [], "vision": []}
     mod: Any = types.ModuleType("litert_lm")
     replies = iter(answers)
 
@@ -598,6 +601,12 @@ def _stub_litert_lm(answers: list[Any]) -> tuple[types.ModuleType, dict[str, lis
                     "min_input_length": min_input_length,
                 }
             )
+            calls["vision"].append(
+                {
+                    "vision_backend": vision_backend,
+                    "vision_tokens_per_image": vision_tokens_per_image,
+                }
+            )
 
         def __enter__(self):
             return self
@@ -612,6 +621,11 @@ def _stub_litert_lm(answers: list[Any]) -> tuple[types.ModuleType, dict[str, lis
                 raise reply
             return types.SimpleNamespace(embedding=list(reply))
 
+    @dataclass
+    class ImageFile:
+        absolute_path: str
+
+    mod.Content = types.SimpleNamespace(ImageFile=ImageFile)
     mod.Backend = Backend
     mod.InputOverflowStrategy = InputOverflowStrategy
     mod.EmbeddingOptions = EmbeddingOptions
@@ -948,6 +962,10 @@ class FakeEmbedEnvs:
     gpu_device: dict[str, Any] | None = None
     # The same for one side only, by its name.
     gpu_device_for: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # An image split's files by absolute path, and the label each was written with.
+    image_labels: dict[str, str] = field(default_factory=dict)
+    # Each script's source as written to run, by script stem or engine side.
+    sources: dict[str, str] = field(default_factory=dict)
 
     def vectors(self, texts: list[str], kind: str) -> Any:
         if kind == "random":
@@ -955,12 +973,13 @@ class FakeEmbedEnvs:
             v = rng.standard_normal((len(texts), 6))
         else:
             rng = np.random.default_rng(3)
-            labels = [OPTIONS.index(_label_of(t)) for t in texts]
+            labels = [OPTIONS.index(self.image_labels.get(t) or _label_of(t)) for t in texts]
             v = np.eye(6)[labels] + 0.05 * rng.standard_normal((len(texts), 6))
         return v / np.linalg.norm(v, axis=1, keepdims=True)
 
     def embed(self, name: str, spec: dict[str, Any]) -> int:
-        texts = json.loads(Path(spec["texts"]).read_text(encoding="utf-8"))
+        # An image script's spec names its inputs "images", a text script's "texts".
+        texts = json.loads(Path(spec.get("texts") or spec["images"]).read_text(encoding="utf-8"))
         self.texts[name] = texts
         if name in self.refuse:
             Path(spec["report"]).write_text(json.dumps({"error": self.refuse[name]}))
@@ -971,7 +990,9 @@ class FakeEmbedEnvs:
         report: dict[str, Any] = {"rows": len(texts) + (name in self.rows_off), "dim": 6}
         if name == "reference":
             report["max_seq_length"] = 128
-            if self.over_max_seq_length is not None:
+            if "images" in spec:
+                report["vision_tokens"] = spec["vision_tokens"]
+            elif self.over_max_seq_length is not None:
                 report["tokens"] = {"max": 9, "over_max_seq_length": self.over_max_seq_length}
         else:
             self.caches[name] = (spec["cache_dir"], Path(spec["cache_dir"]).is_dir())
@@ -994,13 +1015,15 @@ class FakeEmbedEnvs:
         if name != "engines":  # the sides it runs are recorded one by one below
             self.runs.append((name, env.name))
             self.specs[name] = spec
+            self.sources[name] = Path(args[1]).read_text(encoding="utf-8")
         if name in self.fail:
             return subprocess.CompletedProcess(args, 1, "", f"{name}: RuntimeError: boom")
         if name == "download":
             assert self.hub is not None
-            path = self.hub / spec["files"][0]["filename"]
+            filename = spec["files"][0]["filename"]
+            path = self.hub / filename
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(GOOGLE_BYTES)
+            path.write_bytes(VISION_STAND_IN if filename == VISION_FILE else GOOGLE_BYTES)
             Path(spec["out"]).write_text(json.dumps({"paths": [str(path)]}), encoding="utf-8")
             return subprocess.CompletedProcess(args, 0, "", "")
         report = Path(spec["report"])
@@ -1024,6 +1047,7 @@ class FakeEmbedEnvs:
                 sub = json.loads(Path(run["spec"]).read_text(encoding="utf-8"))
                 self.runs.append((side, env.name))
                 self.specs[side] = sub
+                self.sources[side] = Path(spec["script"]).read_text(encoding="utf-8")
                 if side in self.fail:
                     Path(run["stderr"]).write_text(f"{side}: RuntimeError: boom", encoding="utf-8")
                     results[side] = {"returncode": 1, "seconds": 1.0}
@@ -1076,6 +1100,9 @@ def fake(monkeypatch, tmp_path, ev) -> FakeEmbedEnvs:
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
     monkeypatch.setattr(envs.StageEnv, "run", run)
     monkeypatch.setattr(embedding_export, "GOOGLE_SHA256", hashlib.sha256(GOOGLE_BYTES).hexdigest())
+    monkeypatch.setattr(
+        embedding_export, "VISION_SHA256", hashlib.sha256(VISION_STAND_IN).hexdigest()
+    )
     return instance
 
 
@@ -2190,3 +2217,456 @@ def test_a_convert_report_of_an_unknown_modality_is_not_believed(tmp_path):
     _convert_report(model, modality="audio", graft={"sha256": hash_file(model)})
     facts, why = convert_facts(model)
     assert facts is None and "'audio'" in why
+
+
+# -- a checkpoint tuned on images ------------------------------------------------
+
+IMAGE_TOKENS = 70
+IMAGE_PROCESSOR_FILES = embedding_verify.PROCESSOR_FILES
+
+
+def _write_image_split(
+    path: Path, decision: Decision, per_label: int, fake: FakeEmbedEnvs, stem: str
+) -> Path:
+    """An image split as prepare writes one: `images/<sha256>.png` beside it, rows naming them."""
+    images = path.parent / "images"
+    images.mkdir(exist_ok=True)
+    lines: list[str] = []
+    for i in range(per_label):
+        for option in OPTIONS:
+            data = f"{stem} picture {i} of {option}".encode()
+            digest = hashlib.sha256(data).hexdigest()
+            file = images / f"{digest}.png"
+            file.write_bytes(data)
+            fake.image_labels[str(file.absolute())] = option
+            lines.append(
+                json.dumps(
+                    {
+                        "image": f"images/{digest}.png",
+                        "image_sha256": digest,
+                        "completion": option,
+                        "target": option,
+                        "source_line": len(lines) + 1,
+                    }
+                )
+                + "\n"
+            )
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
+
+
+def _image_setup(
+    tmp_path: Path,
+    fake: FakeEmbedEnvs,
+    *,
+    record: dict[str, Any] | None = None,
+    convert: dict[str, Any] | None = None,
+    processor: bool = True,
+) -> Setup:
+    """An image checkpoint, its split and its spliced file, with the convert.json that ties them.
+
+    `convert` updates that report; `{"skip": True}` writes none."""
+    decision = _decision()
+    split = tmp_path / "split"
+    split.mkdir()
+    train = _write_image_split(split / "train.jsonl", decision, 12, fake, "train")
+    heldout = _write_image_split(split / "heldout.jsonl", decision, 6, fake, "held")
+    reference = tmp_path / "tuned" / "model"
+    reference.mkdir(parents=True)
+    (reference / "model.safetensors").write_bytes(b"tuned image weights")
+    if processor:
+        for name in IMAGE_PROCESSOR_FILES:
+            (reference / name).write_text("{}", encoding="utf-8")
+    fields: dict[str, Any] = {
+        "base_model": EMBEDDING_MODEL,
+        "base_model_revision": EMBEDDING_REVISION,
+        "prompt_name": PROMPT_NAME,
+        "prefix": IMAGE_PREFIX,
+        "labels": tuple(sorted(OPTIONS)),
+        "rows": {"train": 36, "heldout": 18},
+        "steps_done": 10,
+        "steps_planned": 10,
+        "seconds": 1.0,
+        "device": "cpu",
+        "dtype": "float32",
+        "head_heldout_accuracy": 0.9,
+        "recipe": RECIPE.as_dict(),
+        "decision": decision.as_dict(),
+        "decision_sha256": decision.digest(),
+        "modality": "image",
+        "vision_tokens": IMAGE_TOKENS,
+    }
+    fields.update(record or {})
+    write_embedding_record(reference, EmbeddingRecord(**fields))
+    model = tmp_path / "out" / "int8" / "model.litertlm"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"spliced file")
+    report: dict[str, Any] = {
+        "schema": EMBEDDING_CONVERT_SCHEMA,
+        "modality": "image",
+        "vision_tokens": IMAGE_TOKENS,
+        "graft": {"sha256": "sha256:" + "0" * 64, "weights": "int8", "output": None},
+        "splice": {"sha256": hash_file(model)},
+        "checkpoint": {
+            "path": str(reference),
+            "sha256": hash_file(reference / "model.safetensors"),
+            "decision_sha256": decision.digest(),
+        },
+    }
+    report.update(convert or {})
+    if not report.pop("skip", False):
+        (model.parent / REPORT_NAME).write_text(json.dumps(report), encoding="utf-8")
+    return Setup(model, reference, heldout, train)
+
+
+def _image_paths(path: Path) -> list[str]:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    return [str((path.parent / row["image"]).absolute()) for row in rows]
+
+
+def _failed(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    return [c for c in manifest["checks"] if c["outcome"] == "failed"]
+
+
+def test_an_image_checkpoint_embeds_its_images_on_both_sides_and_passes(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    result = _verify(s)
+    m = result.manifest
+
+    assert result.status is Status.PASSED, m["checks"]
+    assert fake.runs == [
+        ("reference", envs.EMBED_TRAIN.name),
+        ("candidate", envs.RUNTIME.name),
+        ("evaluate", envs.EMBED_TRAIN.name),
+    ]
+    assert fake.sources["reference"] == embedding_verify.IMAGE_REFERENCE_SCRIPT
+    assert fake.sources["candidate"] == embedding_verify.IMAGE_ENGINE_SCRIPT
+    paths = _image_paths(s.train) + _image_paths(s.heldout)
+    assert fake.texts["reference"] == paths and fake.texts["candidate"] == paths
+    ref, cand = fake.specs["reference"], fake.specs["candidate"]
+    assert ref["vision_tokens"] == IMAGE_TOKENS and cand["vision_tokens"] == IMAGE_TOKENS
+    assert ref["processor"] == {"source": "checkpoint", "path": str(s.reference)}
+    assert "prefix" not in cand and "texts" not in cand and "prompt_name" not in ref
+    # The budget allows for an image, not a text.
+    assert fake.timeouts["reference"] == (
+        embedding_verify.STARTUP_TIMEOUT_S + embedding_verify.IMAGE_ROW_TIMEOUT_S * len(paths)
+    )
+
+    embedding = m["embedding"]
+    assert (embedding["modality"], embedding["vision_tokens"]) == ("image", IMAGE_TOKENS)
+    assert embedding["weights"] == "int8" and embedding["processor"]["source"] == "checkpoint"
+    engine = m["measurements"]["candidate"]["engine"]
+    assert engine["ms_per_image_median"] == 1.0 and "ms_per_text_median" not in engine
+    assert m["scorer"]["means"] == embedding_verify.SCORER_MEANS_IMAGES
+    assert m["gates"][0]["outcome"] == "passed"
+    assert _checks(m)[ROWS_CHECK]["detail"] == "36 training and 18 held-out images"
+    notes = " ".join(m["limitations"])
+    assert "each image given as its file" in notes and "at 70 vision tokens per image" in notes
+    assert "sets a thread count for its main and audio backends only" in notes
+    assert "through transformers" in notes and "max_soft_tokens 70" in notes
+    assert "sentence-transformers" not in notes
+    assert "not tied" not in notes
+    lines = embedding_verify.summarise(m)
+    assert any("embedding decider on images, 3 options" in ln for ln in lines)
+    assert any("70 vision tokens per image" in ln for ln in lines)
+
+
+def test_a_text_checkpoint_keeps_its_text_scripts_and_reports_text(fake, tmp_path):
+    m = _verify(_setup(tmp_path)).manifest
+    assert fake.sources["reference"] == REFERENCE_SCRIPT
+    assert fake.sources["candidate"] == ENGINE_SCRIPT
+    assert (m["embedding"]["modality"], m["embedding"]["vision_tokens"]) == ("text", None)
+    assert "processor" not in m["embedding"]
+    assert "ms_per_text_median" in m["measurements"]["candidate"]["engine"]
+    assert m["scorer"]["means"] == SCORER_MEANS
+    assert any(
+        ln.startswith("  embedding decider, 3 options") for ln in embedding_verify.summarise(m)
+    )
+
+
+def test_a_missing_image_is_refused_naming_its_row_before_any_run(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    victim = _image_paths(s.heldout)[4]
+    Path(victim).unlink()
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert f"{s.heldout}:5:" in failed["detail"] and "does not exist" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_an_image_changed_since_prepare_is_refused_naming_its_row(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    victim = Path(_image_paths(s.train)[2])
+    victim.write_bytes(b"other pixels")
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert f"{s.train}:3:" in failed["detail"]
+    assert "changed after prepare wrote the split" in failed["detail"]
+    assert hashlib.sha256(b"other pixels").hexdigest() in failed["detail"]
+    assert fake.runs == []
+
+
+@pytest.mark.parametrize(
+    ("edit", "said"),
+    [
+        ({"image_sha256": "not a digest"}, "'image_sha256' is 'not a digest'"),
+        ({"image_sha256": "A" * 64}, "not a sha256"),
+        ({"image": ""}, "'image' is ''"),
+        ({"completion": "elsewhere"}, "'elsewhere' is not one of the decision's options"),
+    ],
+)
+def test_an_image_row_that_is_not_preparess_is_refused(fake, tmp_path, edit, said):
+    s = _image_setup(tmp_path, fake)
+    rows = [json.loads(line) for line in s.heldout.read_text(encoding="utf-8").splitlines()]
+    rows[0].update(edit)
+    s.heldout.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    result = _verify(s)
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK and said in failed["detail"]
+    assert f"{s.heldout}:1:" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_a_text_checkpoint_given_an_image_split_is_refused(fake, tmp_path):
+    s = _setup(tmp_path)
+    images = _write_image_split(tmp_path / "images.jsonl", _decision(), 6, fake, "held")
+    result = run_verify(
+        VerifyRequest(model=s.model, reference=str(s.reference), data=images, train_data=s.train)
+    )
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert "holds image rows and the reference was tuned on text" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_an_image_checkpoint_given_a_text_split_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    text = _write_split(tmp_path / "text.jsonl", _decision(), 12)
+    result = run_verify(
+        VerifyRequest(model=s.model, reference=str(s.reference), data=s.heldout, train_data=text)
+    )
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert "holds text rows and the reference was tuned on images" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_a_file_converted_at_other_vision_tokens_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, convert={"vision_tokens": 140})
+    result = _verify(s)
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert "records 140 vision tokens per image" in failed["detail"]
+    assert "tuned at 70" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_an_image_report_without_vision_tokens_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, convert={"vision_tokens": None})
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == CANDIDATE_CHECK and "records None vision tokens" in failed["detail"]
+
+
+def test_a_text_file_for_an_image_checkpoint_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, convert={"skip": True})
+    (s.model.parent / REPORT_NAME).write_text(
+        json.dumps(
+            {
+                "schema": EMBEDDING_CONVERT_SCHEMA,
+                "graft": {"sha256": hash_file(s.model), "weights": "int8"},
+                "checkpoint": {"sha256": hash_file(s.reference / "model.safetensors")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert "tuned on text; the reference's litetune.json was tuned on image" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_an_image_file_for_a_text_checkpoint_is_refused(fake, tmp_path):
+    s = _setup(tmp_path)
+    (s.model.parent / REPORT_NAME).write_text(
+        json.dumps(
+            {
+                "schema": EMBEDDING_CONVERT_SCHEMA,
+                "modality": "image",
+                "vision_tokens": 70,
+                "graft": {"sha256": "sha256:00", "weights": "int8"},
+                "splice": {"sha256": hash_file(s.model)},
+                "checkpoint": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert "tuned on image; the reference's litetune.json was tuned on text" in failed["detail"]
+
+
+def test_an_untied_image_file_is_still_measured_at_the_records_vision_tokens(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, convert={"skip": True})
+    m = _verify(s).manifest
+    assert fake.specs["candidate"]["vision_tokens"] == IMAGE_TOKENS
+    assert any("not tied to the reference" in t for t in m["limitations"])
+
+
+def test_the_gpu_is_refused_for_an_image_checkpoint_even_on_macos(fake, tmp_path, on_macos):
+    result = _verify(_image_setup(tmp_path, fake), backend="gpu")
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert failed["detail"] == embedding_verify.IMAGE_GPU_NOT_MEASURED
+    assert fake.runs == []
+
+
+def test_an_image_checkpoint_with_a_text_prefix_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, record={"prefix": DECIDER_PREFIX})
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == RECORD_CHECK and "tuned on images with the prefix" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_an_image_checkpoint_does_not_read_the_prompt_name(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, record={"prompt_name": "Anything"})
+    assert _verify(s).status is Status.PASSED
+
+
+def test_a_reference_without_its_processor_uses_the_bases_and_says_so(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, processor=False)
+    (s.reference / "tokenizer.json").write_text("{}", encoding="utf-8")
+    m = _verify(s).manifest
+    assert fake.specs["reference"]["processor"] == {
+        "source": "base",
+        "repo": EMBEDDING_MODEL,
+        "revision": EMBEDDING_REVISION,
+    }
+    assert m["embedding"]["processor"]["source"] == "base"
+    (said,) = [t for t in m["limitations"] if "prepared by the processor of" in t]
+    assert "processor_config.json, preprocessor_config.json, tokenizer_config.json" in said
+    assert "tokenizer.json," not in said and EMBEDDING_REVISION in said
+
+
+def test_googles_text_vision_file_gives_the_gain_for_an_image_checkpoint(fake, tmp_path):
+    local = tmp_path / "vision.litertlm"
+    local.write_bytes(VISION_STAND_IN)
+    m = _verify(_image_setup(tmp_path, fake), base_litertlm=local).manifest
+    assert [r[0] for r in fake.runs] == ["reference", "candidate", "base", "evaluate"]
+    assert fake.sources["base"] == embedding_verify.IMAGE_ENGINE_SCRIPT
+    assert fake.specs["base"]["vision_tokens"] == IMAGE_TOKENS
+    assert "gain_over_base" in m["quality"]
+
+
+def test_googles_text_file_is_refused_as_the_base_of_an_image_checkpoint(fake, tmp_path):
+    result = _verify(_image_setup(tmp_path, fake), base_litertlm=_google(tmp_path))
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == BASE_EMBED_CHECK.replace(" embeddings", "")
+    assert VISION_FILE in failed["detail"]
+    assert fake.runs == []
+
+
+def test_with_base_downloads_the_text_vision_file_for_an_image_checkpoint(fake, tmp_path):
+    m = _verify(_image_setup(tmp_path, fake), with_base=True).manifest
+    assert fake.runs[0] == ("download", envs.EXPORT.name)
+    assert fake.specs["download"]["files"] == [embedding_export.VISION_HUB_FILE.as_dict()]
+    assert "gain_over_base" in m["quality"]
+
+
+def test_the_text_path_still_downloads_the_text_file(fake, tmp_path):
+    _verify(_setup(tmp_path), with_base=True)
+    assert fake.specs["download"]["files"] == [embedding_export.GOOGLE_HUB_FILE.as_dict()]
+
+
+def test_on_a_cpu_with_sme2_the_image_engine_runs_one_thread(fake, tmp_path, sme2_host):
+    m = _verify(_image_setup(tmp_path, fake), threads=4).manifest
+    assert fake.specs["reference"]["threads"] == 4
+    assert fake.specs["candidate"]["threads"] == 1
+    assert any("EmbeddingEngine, 1 thread, each image" in t for t in m["limitations"])
+    assert any("not on 1 thread" in t for t in m["limitations"])
+
+
+# -- the image engine script, run here against a stub of litert_lm ------------
+
+
+def _image_engine_main(tmp_path, monkeypatch, answers, images):
+    ns: dict[str, Any] = {"__name__": "image_engine_script"}
+    exec(compile(embedding_verify.IMAGE_ENGINE_SCRIPT, "engine.py", "exec"), ns)
+    stub, calls = _stub_litert_lm(answers)
+    monkeypatch.setitem(sys.modules, "litert_lm", stub)
+    monkeypatch.setitem(ns, "cpu_report", lambda: {"model": "stub cpu", "count": 2})
+    (tmp_path / "images.json").write_text(json.dumps(images))
+    spec = {
+        "model": "/models/m.litertlm",
+        "images": str(tmp_path / "images.json"),
+        "threads": 1,
+        "vision_tokens": 140,
+        "cache_dir": str(tmp_path / "cache-candidate"),
+        "max_input_length": 1024,
+        "out": str(tmp_path / "out.npy"),
+        "report": str(tmp_path / "report.json"),
+    }
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    monkeypatch.setattr(sys, "argv", ["engine.py", str(tmp_path / "spec.json")])
+    code = ns["main"]()
+    return code, json.loads((tmp_path / "report.json").read_text()), calls
+
+
+def test_the_image_engine_script_builds_a_vision_engine_and_gives_each_file(tmp_path, monkeypatch):
+    code, report, calls = _image_engine_main(
+        tmp_path, monkeypatch, [[3.0, 4.0], [0.0, 2.0]], ["/p/a.png", "/p/b.png"]
+    )
+    assert code == 0
+    assert calls["engine"] == [
+        {
+            "model": "/models/m.litertlm",
+            "backend": ("cpu", 1),
+            "cache_dir": str(tmp_path / "cache-candidate"),
+            "max_input_length": 1024,
+            "min_input_length": None,
+        }
+    ]
+    assert calls["vision"] == [{"vision_backend": ("cpu", 1), "vision_tokens_per_image": 140}]
+    assert [c.absolute_path for c in calls["texts"]] == ["/p/a.png", "/p/b.png"]
+    assert calls["options"] == [
+        {
+            "normalize": True,
+            "insert_special_tokens": True,
+            "input_overflow_strategy": "error",
+            "output_size": None,
+        }
+    ]
+    np.testing.assert_allclose(np.load(tmp_path / "out.npy"), [[0.6, 0.8], [0.0, 1.0]], rtol=1e-6)
+    assert report["rows"] == 2 and report["dim"] == 2
+    assert report["backend"] == "cpu" and report["vision_backend"] == "cpu"
+    assert report["threads"] == 1 and report["device"] == {}
+    assert report["settings"]["vision_tokens_per_image"] == 140
+    assert report["cpu"] == {"model": "stub cpu", "count": 2}
+    assert isinstance(report["ms_median"], float)
+
+
+def test_the_image_engine_script_refuses_an_image_the_engine_refuses(tmp_path, monkeypatch):
+    code, report, _ = _image_engine_main(
+        tmp_path, monkeypatch, [[1.0, 0.0], RuntimeError("bad image")], ["/p/a.png", "/p/b.png"]
+    )
+    assert code == 3
+    assert report["error"] == "the engine refused image 1 (/p/b.png): bad image"
+    assert not (tmp_path / "out.npy").exists()
+
+
+def test_the_image_engine_script_refuses_a_zero_vector(tmp_path, monkeypatch):
+    code, report, _ = _image_engine_main(
+        tmp_path, monkeypatch, [[1.0, 0.0], [0.0, 0.0]], ["/p/a.png", "/p/b.png"]
+    )
+    assert code == 3 and "zero" in report["error"] and "[1]" in report["error"]
+
+
+def test_the_image_reference_script_refuses_unusable_rows():
+    ns: dict[str, Any] = {"__name__": "image_reference"}
+    exec(compile(embedding_verify.IMAGE_REFERENCE_SCRIPT, "reference.py", "exec"), ns)
+    v = np.array([[1.0, 0.0], [0.0, 0.0], [np.nan, 1.0]])
+    assert ns["unusable_rows"](np, v).tolist() == [1, 2]
