@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,6 +34,7 @@ from litetune.embedding_tune import (
     DECIDER_PREFIX,
     EMBEDDING_MODEL,
     EMBEDDING_REVISION,
+    IMAGE_PREFIX,
     PROMPT_NAME,
     RECIPE,
     EmbeddingRecord,
@@ -68,6 +69,7 @@ from litetune.embedding_verify import (
     usable_cpus,
     weights_of,
 )
+from litetune.embedding_vision import VISION_FILE
 from litetune.metrics import Difference, paired_difference
 from litetune.storage import hash_file
 from litetune.verify import ReferenceRole, Status, VerifyRequest, run_verify
@@ -76,6 +78,7 @@ np: Any = pytest.importorskip("numpy")
 
 OPTIONS = ("balance", "card_lost", "refund")
 GOOGLE_BYTES = b"a stand-in for Google's file"
+VISION_STAND_IN = b"a stand-in for Google's text-vision file"
 
 
 @pytest.fixture(scope="module")
@@ -546,7 +549,7 @@ def test_the_reference_script_encodes_as_emb_s5_does():
 def _stub_litert_lm(answers: list[Any]) -> tuple[types.ModuleType, dict[str, list[Any]]]:
     """litert_lm 0.18.0's names, with its keyword arguments and no `**kwargs`, so
     a misspelt setting fails here (the real `EmbeddingEngine` swallows them)."""
-    calls: dict[str, list[Any]] = {"engine": [], "options": [], "texts": []}
+    calls: dict[str, list[Any]] = {"engine": [], "options": [], "texts": [], "vision": []}
     mod: Any = types.ModuleType("litert_lm")
     replies = iter(answers)
 
@@ -598,6 +601,12 @@ def _stub_litert_lm(answers: list[Any]) -> tuple[types.ModuleType, dict[str, lis
                     "min_input_length": min_input_length,
                 }
             )
+            calls["vision"].append(
+                {
+                    "vision_backend": vision_backend,
+                    "vision_tokens_per_image": vision_tokens_per_image,
+                }
+            )
 
         def __enter__(self):
             return self
@@ -612,6 +621,16 @@ def _stub_litert_lm(answers: list[Any]) -> tuple[types.ModuleType, dict[str, lis
                 raise reply
             return types.SimpleNamespace(embedding=list(reply))
 
+    @dataclass
+    class ImageFile:
+        absolute_path: str
+
+    # litert_lm 0.18.0's `ImageBytes` is a dataclass of one field, `bytes`.
+    @dataclass
+    class ImageBytes:
+        bytes: bytes
+
+    mod.Content = types.SimpleNamespace(ImageFile=ImageFile, ImageBytes=ImageBytes)
     mod.Backend = Backend
     mod.InputOverflowStrategy = InputOverflowStrategy
     mod.EmbeddingOptions = EmbeddingOptions
@@ -948,6 +967,17 @@ class FakeEmbedEnvs:
     gpu_device: dict[str, Any] | None = None
     # The same for one side only, by its name.
     gpu_device_for: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # An image split's files by absolute path, and the label each was written with.
+    image_labels: dict[str, str] = field(default_factory=dict)
+    # The soft tokens the fake reference makes of a picture, by path; else 63.
+    soft_tokens: dict[str, int] = field(default_factory=dict)
+    # What the candidate's second run embeds; None: what the candidate embeds.
+    repeat: str | None = None
+    # Each script's source as written to run, by script stem or engine side.
+    sources: dict[str, str] = field(default_factory=dict)
+    # The image reference's processor directory as it was when the script ran:
+    # each processor file's bare sha256, by name.
+    processor_seen: dict[str, str] | None = None
 
     def vectors(self, texts: list[str], kind: str) -> Any:
         if kind == "random":
@@ -955,23 +985,31 @@ class FakeEmbedEnvs:
             v = rng.standard_normal((len(texts), 6))
         else:
             rng = np.random.default_rng(3)
-            labels = [OPTIONS.index(_label_of(t)) for t in texts]
+            labels = [OPTIONS.index(self.image_labels.get(t) or _label_of(t)) for t in texts]
             v = np.eye(6)[labels] + 0.05 * rng.standard_normal((len(texts), 6))
         return v / np.linalg.norm(v, axis=1, keepdims=True)
 
     def embed(self, name: str, spec: dict[str, Any]) -> int:
-        texts = json.loads(Path(spec["texts"]).read_text(encoding="utf-8"))
+        # An image script's spec names its inputs "images", a text script's "texts".
+        texts = json.loads(Path(spec.get("texts") or spec["images"]).read_text(encoding="utf-8"))
         self.texts[name] = texts
         if name in self.refuse:
             Path(spec["report"]).write_text(json.dumps({"error": self.refuse[name]}))
             return 3
-        kind = {"candidate": self.candidate, "base": "random"}.get(name, "same")
+        kind = {
+            "candidate": self.candidate,
+            "candidate-repeat": self.repeat or self.candidate,
+            "base": "random",
+        }.get(name, "same")
         if name not in self.no_npy:
             np.save(spec["out"], self.vectors(texts, kind).astype(np.float32))
         report: dict[str, Any] = {"rows": len(texts) + (name in self.rows_off), "dim": 6}
         if name == "reference":
             report["max_seq_length"] = 128
-            if self.over_max_seq_length is not None:
+            if "images" in spec:
+                report["vision_tokens"] = spec["vision_tokens"]
+                report["soft_tokens_per_row"] = [self.soft_tokens.get(t, 63) for t in texts]
+            elif self.over_max_seq_length is not None:
                 report["tokens"] = {"max": 9, "over_max_seq_length": self.over_max_seq_length}
         else:
             self.caches[name] = (spec["cache_dir"], Path(spec["cache_dir"]).is_dir())
@@ -994,17 +1032,24 @@ class FakeEmbedEnvs:
         if name != "engines":  # the sides it runs are recorded one by one below
             self.runs.append((name, env.name))
             self.specs[name] = spec
+            self.sources[name] = Path(args[1]).read_text(encoding="utf-8")
         if name in self.fail:
             return subprocess.CompletedProcess(args, 1, "", f"{name}: RuntimeError: boom")
         if name == "download":
             assert self.hub is not None
-            path = self.hub / spec["files"][0]["filename"]
+            filename = spec["files"][0]["filename"]
+            path = self.hub / filename
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(GOOGLE_BYTES)
+            path.write_bytes(VISION_STAND_IN if filename == VISION_FILE else GOOGLE_BYTES)
             Path(spec["out"]).write_text(json.dumps({"paths": [str(path)]}), encoding="utf-8")
             return subprocess.CompletedProcess(args, 0, "", "")
         report = Path(spec["report"])
         if name == "reference":
+            if "processor" in spec:
+                self.processor_seen = {
+                    file: hashlib.sha256((Path(spec["processor"]) / file).read_bytes()).hexdigest()
+                    for file in embedding_verify.PROCESSOR_FILES
+                }
             code = self.embed(name, spec)
             return subprocess.CompletedProcess(args, code, "", "")
         if name == "engines":
@@ -1024,6 +1069,7 @@ class FakeEmbedEnvs:
                 sub = json.loads(Path(run["spec"]).read_text(encoding="utf-8"))
                 self.runs.append((side, env.name))
                 self.specs[side] = sub
+                self.sources[side] = Path(spec["script"]).read_text(encoding="utf-8")
                 if side in self.fail:
                     Path(run["stderr"]).write_text(f"{side}: RuntimeError: boom", encoding="utf-8")
                     results[side] = {"returncode": 1, "seconds": 1.0}
@@ -1076,6 +1122,9 @@ def fake(monkeypatch, tmp_path, ev) -> FakeEmbedEnvs:
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
     monkeypatch.setattr(envs.StageEnv, "run", run)
     monkeypatch.setattr(embedding_export, "GOOGLE_SHA256", hashlib.sha256(GOOGLE_BYTES).hexdigest())
+    monkeypatch.setattr(
+        embedding_export, "VISION_SHA256", hashlib.sha256(VISION_STAND_IN).hexdigest()
+    )
     return instance
 
 
@@ -2133,3 +2182,1048 @@ def test_on_the_gpu_the_engines_get_no_thread_count(fake, tmp_path, on_macos, sm
     engine = m["measurements"]["candidate"]["engine"]
     assert engine["threads"] is None and engine["threads_requested"] is None
     assert not _engine_thread_notes(m)
+
+
+def _convert_report(model: Path, **fields: Any) -> None:
+    (model.parent / REPORT_NAME).write_text(
+        json.dumps({"schema": EMBEDDING_CONVERT_SCHEMA} | fields), encoding="utf-8"
+    )
+
+
+def test_an_image_convert_report_is_tied_by_the_splices_sha256(tmp_path):
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"the spliced file")
+    _convert_report(
+        model,
+        modality="image",
+        vision_tokens=140,
+        graft={"sha256": "sha256:" + "0" * 64, "weights": "int8", "output": None},
+        splice={"sha256": hash_file(model)},
+        checkpoint={"sha256": "sha256:" + "1" * 64, "decision_sha256": "sha256:" + "2" * 64},
+    )
+    facts, source = convert_facts(model)
+    assert facts is not None and source == str(tmp_path / REPORT_NAME)
+    assert (facts.modality, facts.vision_tokens, facts.weights) == ("image", 140, "int8")
+    assert facts.checkpoint_sha256 == "sha256:" + "1" * 64
+
+
+def test_an_image_convert_report_is_not_tied_by_the_grafts_sha256(tmp_path):
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"the text file")
+    graft = {"sha256": hash_file(model), "weights": "int8"}
+    _convert_report(model, modality="image", graft=graft, splice={"sha256": "sha256:00"})
+    facts, why = convert_facts(model)
+    assert facts is None and "another file" in why
+    _convert_report(model, modality="image", graft=graft)
+    facts, why = convert_facts(model)
+    assert facts is None and "without a splice" in why
+
+
+def test_a_text_convert_report_is_tied_by_the_grafts_sha256_with_or_without_modality(tmp_path):
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"the grafted file")
+    graft = {"sha256": hash_file(model), "weights": "int4"}
+    for modality in ({}, {"modality": "text", "vision_tokens": None, "splice": None}):
+        _convert_report(model, graft=graft, **modality)
+        facts, _ = convert_facts(model)
+        assert facts is not None
+        assert (facts.modality, facts.vision_tokens, facts.weights) == ("text", None, "int4")
+    # A splice block in a text report ties nothing.
+    _convert_report(model, graft={"sha256": "sha256:00"}, splice={"sha256": hash_file(model)})
+    assert convert_facts(model)[0] is None
+
+
+def test_a_convert_report_of_an_unknown_modality_is_not_believed(tmp_path):
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"a file")
+    _convert_report(model, modality="audio", graft={"sha256": hash_file(model)})
+    facts, why = convert_facts(model)
+    assert facts is None and "'audio'" in why
+
+
+# -- a checkpoint tuned on images ------------------------------------------------
+
+IMAGE_TOKENS = 70
+IMAGE_PROCESSOR_FILES = embedding_verify.PROCESSOR_FILES
+
+
+def _write_image_split(
+    path: Path, decision: Decision, per_label: int, fake: FakeEmbedEnvs, stem: str
+) -> Path:
+    """An image split as prepare writes one: `images/<sha256>.png` beside it, rows naming them."""
+    images = path.parent / "images"
+    images.mkdir(exist_ok=True)
+    lines: list[str] = []
+    for i in range(per_label):
+        for option in OPTIONS:
+            data = f"{stem} picture {i} of {option}".encode()
+            digest = hashlib.sha256(data).hexdigest()
+            file = images / f"{digest}.png"
+            file.write_bytes(data)
+            fake.image_labels[str(file.resolve())] = option
+            lines.append(
+                json.dumps(
+                    {
+                        "image": f"images/{digest}.png",
+                        "image_sha256": digest,
+                        "completion": option,
+                        "target": option,
+                        "source_line": len(lines) + 1,
+                    }
+                )
+                + "\n"
+            )
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
+
+
+def _processor_text(name: str) -> str:
+    """A processor file's stand-in: different for each file."""
+    return json.dumps({"file": name})
+
+
+def _image_setup(
+    tmp_path: Path,
+    fake: FakeEmbedEnvs,
+    *,
+    record: dict[str, Any] | None = None,
+    convert: dict[str, Any] | None = None,
+    processor: bool = True,
+) -> Setup:
+    """An image checkpoint, its split and its spliced file, with the convert.json that ties them.
+
+    `convert` updates that report; `{"skip": True}` writes none."""
+    decision = _decision()
+    split = tmp_path / "split"
+    split.mkdir()
+    train = _write_image_split(split / "train.jsonl", decision, 12, fake, "train")
+    heldout = _write_image_split(split / "heldout.jsonl", decision, 6, fake, "held")
+    reference = tmp_path / "tuned" / "model"
+    reference.mkdir(parents=True)
+    (reference / "model.safetensors").write_bytes(b"tuned image weights")
+    if processor:
+        for name in IMAGE_PROCESSOR_FILES:
+            (reference / name).write_text(_processor_text(name), encoding="utf-8")
+    fields: dict[str, Any] = {
+        "base_model": EMBEDDING_MODEL,
+        "base_model_revision": EMBEDDING_REVISION,
+        "prompt_name": PROMPT_NAME,
+        "prefix": IMAGE_PREFIX,
+        "labels": tuple(sorted(OPTIONS)),
+        "rows": {"train": 36, "heldout": 18},
+        "steps_done": 10,
+        "steps_planned": 10,
+        "seconds": 1.0,
+        "device": "cpu",
+        "dtype": "float32",
+        "head_heldout_accuracy": 0.9,
+        "recipe": RECIPE.as_dict(),
+        "decision": decision.as_dict(),
+        "decision_sha256": decision.digest(),
+        "modality": "image",
+        "vision_tokens": IMAGE_TOKENS,
+        # What tune would have recorded: the fake reference's count for every picture.
+        "soft_tokens": dict.fromkeys(_image_digests(train) + _image_digests(heldout), 63),
+        # What tune would have recorded of the processor files written above.
+        "processor_sha256": {
+            name: hashlib.sha256(_processor_text(name).encode()).hexdigest()
+            for name in IMAGE_PROCESSOR_FILES
+        },
+    }
+    fields.update(record or {})
+    write_embedding_record(reference, EmbeddingRecord(**fields))
+    model = tmp_path / "out" / "int8" / "model.litertlm"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"spliced file")
+    report: dict[str, Any] = {
+        "schema": EMBEDDING_CONVERT_SCHEMA,
+        "modality": "image",
+        "vision_tokens": IMAGE_TOKENS,
+        "graft": {"sha256": "sha256:" + "0" * 64, "weights": "int8", "output": None},
+        "splice": {"sha256": hash_file(model)},
+        "checkpoint": {
+            "path": str(reference),
+            "sha256": hash_file(reference / "model.safetensors"),
+            "decision_sha256": decision.digest(),
+        },
+    }
+    report.update(convert or {})
+    if not report.pop("skip", False):
+        (model.parent / REPORT_NAME).write_text(json.dumps(report), encoding="utf-8")
+    return Setup(model, reference, heldout, train)
+
+
+def _image_paths(path: Path) -> list[str]:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    return [str((path.parent / row["image"]).resolve()) for row in rows]
+
+
+def _image_digests(path: Path) -> list[str]:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    return [row["image_sha256"] for row in rows]
+
+
+def _failed(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    return [c for c in manifest["checks"] if c["outcome"] == "failed"]
+
+
+def test_an_image_checkpoint_embeds_its_images_on_both_sides_and_passes(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    result = _verify(s)
+    m = result.manifest
+
+    assert result.status is Status.PASSED, m["checks"]
+    assert fake.runs == [
+        ("reference", envs.EMBED_TRAIN.name),
+        ("candidate", envs.RUNTIME.name),
+        ("evaluate", envs.EMBED_TRAIN.name),
+    ]
+    assert fake.sources["reference"] == embedding_verify.IMAGE_REFERENCE_SCRIPT
+    assert fake.sources["candidate"] == embedding_verify.IMAGE_ENGINE_SCRIPT
+    paths = _image_paths(s.train) + _image_paths(s.heldout)
+    assert fake.texts["reference"] == paths and fake.texts["candidate"] == paths
+    ref, cand = fake.specs["reference"], fake.specs["candidate"]
+    assert ref["vision_tokens"] == IMAGE_TOKENS and cand["vision_tokens"] == IMAGE_TOKENS
+    assert ref["model"] == str(s.reference) and ref["image_text"] == "<|image|>"
+    assert Path(ref["processor"]).name == "processor" and ref["processor"] != ref["model"]
+    assert "prefix" not in cand and "texts" not in cand and "prompt_name" not in ref
+    # The budget allows for an image, not a text.
+    assert fake.timeouts["reference"] == (
+        embedding_verify.STARTUP_TIMEOUT_S + embedding_verify.IMAGE_ROW_TIMEOUT_S * len(paths)
+    )
+
+    embedding = m["embedding"]
+    assert (embedding["modality"], embedding["vision_tokens"]) == ("image", IMAGE_TOKENS)
+    assert embedding["weights"] == "int8" and embedding["processor"] == str(s.reference)
+    assert embedding["vision_threads"] is None and embedding["candidate_repeated"] is False
+    assert embedding["soft_tokens"] == {"compared": 54, "unrecorded": 0, "min": 63, "max": 63}
+    assert embedding["engines_side_by_side"] is False
+    engine = m["measurements"]["candidate"]["engine"]
+    assert engine["ms_per_image_median"] == 1.0 and "ms_per_text_median" not in engine
+    assert m["scorer"]["means"] == embedding_verify.SCORER_MEANS_IMAGES
+    assert m["gates"][0]["outcome"] == "passed"
+    assert _checks(m)[ROWS_CHECK]["detail"] == "36 training and 18 held-out images"
+    notes = " ".join(m["limitations"])
+    assert "each image given as its file" in notes
+    assert "at a budget of at most 70 vision tokens per image" in notes
+    assert "the vision encoder ran on the runtime's default threads" in notes
+    assert "through transformers" in notes and "at most 70 soft tokens" in notes
+    assert "of each of 54 pictures the soft tokens `tune` recorded" in notes
+    assert "image path calibrates the same way was not checked" in notes
+    assert "as text, beside image examples" in notes
+    assert "sentence-transformers" not in notes
+    assert "not tied" not in notes
+    lines = embedding_verify.summarise(m)
+    assert any("embedding decider on images, 3 options" in ln for ln in lines)
+    assert any("at most 70 vision tokens per image" in ln for ln in lines)
+
+
+def test_verify_reads_the_split_prepare_wrote(fake, tmp_path):
+    from test_embedding_prepare_images import FakeImageInspector, _fake_image
+
+    from litetune.prepare import PrepareRequest, prepare
+
+    rows = []
+    for option in OPTIONS:
+        for i in range(20):
+            _fake_image(tmp_path / "raw" / f"{option}-{i}.png", width=8 + i, height=4)
+            rows.append({"image": f"raw/{option}-{i}.png", "label": option})
+    # A picture given twice stays in one half.
+    rows.append(dict(rows[0]))
+    data = tmp_path / "rows.jsonl"
+    data.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    questions = tmp_path / "questions.json"
+    questions.write_text(_decision().canonical_text(), encoding="utf-8")
+    out = tmp_path / "prepared"
+    prepared = prepare(
+        PrepareRequest(
+            data=data,
+            output_dir=out,
+            context_length=None,
+            base_model=EMBEDDING_MODEL,
+            questions=questions,
+            images=FakeImageInspector(),
+        )
+    )
+    assert prepared.train is not None and prepared.heldout is not None
+    s = _image_setup(tmp_path, fake)
+    for path in (prepared.train.path, prepared.heldout.path):
+        for row in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()):
+            fake.image_labels[str((out / row["image"]).resolve())] = row["completion"]
+    record = json.loads((s.reference / "litetune.json").read_text(encoding="utf-8"))
+    pictures = _image_digests(prepared.train.path) + _image_digests(prepared.heldout.path)
+    record["soft_tokens"] = dict.fromkeys(pictures, 63)
+    record["rows"] = {"train": prepared.train.n, "heldout": prepared.heldout.n}
+    (s.reference / "litetune.json").write_text(json.dumps(record), encoding="utf-8")
+    result = run_verify(
+        VerifyRequest(model=s.model, reference=str(s.reference), data=prepared.heldout.path)
+    )
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    paths = _image_paths(prepared.train.path) + _image_paths(prepared.heldout.path)
+    assert fake.texts["reference"] == paths
+    assert result.manifest["embedding"]["soft_tokens"]["unrecorded"] == 0
+
+
+def test_an_image_checkpoint_at_140_gives_every_side_its_budget(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, record={"vision_tokens": 140}, convert={"vision_tokens": 140})
+    local = tmp_path / "vision.litertlm"
+    local.write_bytes(VISION_STAND_IN)
+    result = _verify(s, base_litertlm=local)
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    for side in ("reference", "candidate", "base"):
+        assert fake.specs[side]["vision_tokens"] == 140, side
+    assert result.manifest["embedding"]["vision_tokens"] == 140
+
+
+def test_a_picture_the_reference_makes_other_soft_tokens_of_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    victim = _image_paths(s.heldout)[2]
+    fake.soft_tokens[victim] = 54
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == REFERENCE_CHECK
+    assert f"made 54 soft tokens of {victim}" in failed["detail"]
+    assert "tune recorded 63 for it" in failed["detail"]
+    assert [r[0] for r in fake.runs] == ["reference"]
+
+
+def test_pictures_tune_did_not_record_are_counted_and_said(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    record = json.loads((s.reference / "litetune.json").read_text(encoding="utf-8"))
+    for sha in _image_digests(s.heldout)[:4]:
+        del record["soft_tokens"][sha]
+    (s.reference / "litetune.json").write_text(json.dumps(record), encoding="utf-8")
+    m = _verify(s).manifest
+    assert m["embedding"]["soft_tokens"]["unrecorded"] == 4
+    assert m["embedding"]["soft_tokens"]["compared"] == 50
+    assert any(
+        t.startswith("4 of the pictures here were not in the splits") for t in m["limitations"]
+    )
+
+
+@pytest.mark.parametrize("reported", [None, [63] * 3, ["63"] * 54])
+def test_a_reference_that_reports_no_count_per_picture_is_refused(fake, tmp_path, reported):
+    s = _image_setup(tmp_path, fake)
+    real = fake.embed
+
+    def embed(name: str, spec: dict[str, Any]) -> int:
+        code = real(name, spec)
+        if name == "reference":
+            report = json.loads(Path(spec["report"]).read_text(encoding="utf-8"))
+            report["soft_tokens_per_row"] = reported
+            Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
+        return code
+
+    fake.embed = embed
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == REFERENCE_CHECK and "not one count per picture" in failed["detail"]
+
+
+def test_a_picture_in_both_splits_is_refused_before_any_run(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    train_rows = s.train.read_text(encoding="utf-8").splitlines()
+    held_rows = s.heldout.read_text(encoding="utf-8").splitlines()
+    s.heldout.write_text("\n".join([*held_rows, train_rows[0]]) + "\n", encoding="utf-8")
+    result = _verify(s)
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert "1 picture(s) are in both the training split" in failed["detail"]
+    assert _image_digests(s.train)[0] in failed["detail"]
+    assert fake.runs == []
+
+
+def test_a_text_checkpoint_keeps_its_text_scripts_and_reports_text(fake, tmp_path):
+    m = _verify(_setup(tmp_path)).manifest
+    assert fake.sources["reference"] == REFERENCE_SCRIPT
+    assert fake.sources["candidate"] == ENGINE_SCRIPT
+    assert (m["embedding"]["modality"], m["embedding"]["vision_tokens"]) == ("text", None)
+    assert "processor" not in m["embedding"]
+    assert "ms_per_text_median" in m["measurements"]["candidate"]["engine"]
+    assert m["scorer"]["means"] == SCORER_MEANS
+    assert any(
+        ln.startswith("  embedding decider, 3 options") for ln in embedding_verify.summarise(m)
+    )
+
+
+def test_a_missing_image_is_refused_naming_its_row_before_any_run(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    victim = _image_paths(s.heldout)[4]
+    Path(victim).unlink()
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert f"{s.heldout}:5:" in failed["detail"] and "does not exist" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_an_image_changed_since_prepare_is_refused_naming_its_row(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    victim = Path(_image_paths(s.train)[2])
+    victim.write_bytes(b"other pixels")
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert f"{s.train}:3:" in failed["detail"]
+    assert "changed after `prepare` wrote the split" in failed["detail"]
+    assert hashlib.sha256(b"other pixels").hexdigest() in failed["detail"]
+    assert fake.runs == []
+
+
+@pytest.mark.parametrize(
+    ("edit", "said"),
+    [
+        ({"image_sha256": "not a digest"}, "'image_sha256' is 'not a digest'"),
+        ({"image_sha256": "A" * 64}, "not a sha256"),
+        ({"image": ""}, "'image' must be the image's path in the split"),
+        ({"completion": "elsewhere"}, "'elsewhere' is not one of the decision's options"),
+    ],
+)
+def test_an_image_row_that_is_not_preparess_is_refused(fake, tmp_path, edit, said):
+    s = _image_setup(tmp_path, fake)
+    rows = [json.loads(line) for line in s.heldout.read_text(encoding="utf-8").splitlines()]
+    rows[0].update(edit)
+    s.heldout.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    result = _verify(s)
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK and said in failed["detail"]
+    assert f"{s.heldout}:1:" in failed["detail"]
+    assert fake.runs == []
+
+
+def _point_first_row_at(s: Setup, value: str) -> None:
+    rows = [json.loads(line) for line in s.heldout.read_text(encoding="utf-8").splitlines()]
+    rows[0]["image"] = value
+    s.heldout.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+@pytest.mark.parametrize("how", ["absolute inside", "absolute outside", "dot-dot"])
+def test_an_image_path_that_leaves_the_split_or_is_absolute_is_refused(fake, tmp_path, how):
+    s = _image_setup(tmp_path, fake)
+    first = _image_paths(s.heldout)[0]
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(Path(first).read_bytes())
+    value = {
+        "absolute inside": first,
+        "absolute outside": str(outside),
+        "dot-dot": "../outside.png",
+    }[how]
+    _point_first_row_at(s, value)
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert f"{s.heldout}:1:" in failed["detail"] and "not inside the split" in failed["detail"]
+    assert fake.runs == []
+
+
+@pytest.mark.posix
+def test_an_images_directory_linked_out_of_the_split_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    images = s.heldout.parent / "images"
+    elsewhere = tmp_path / "elsewhere"
+    images.rename(elsewhere)
+    images.symlink_to(elsewhere, target_is_directory=True)
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == ROWS_CHECK and "not inside the split" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_a_text_checkpoint_given_an_image_split_is_refused(fake, tmp_path):
+    s = _setup(tmp_path)
+    images = _write_image_split(tmp_path / "images.jsonl", _decision(), 6, fake, "held")
+    result = run_verify(
+        VerifyRequest(model=s.model, reference=str(s.reference), data=images, train_data=s.train)
+    )
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert "holds image rows and the reference was tuned on text" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_an_image_checkpoint_given_a_text_split_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    text = _write_split(tmp_path / "text.jsonl", _decision(), 12)
+    result = run_verify(
+        VerifyRequest(model=s.model, reference=str(s.reference), data=s.heldout, train_data=text)
+    )
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert "holds text rows and the reference was tuned on images" in failed["detail"]
+    assert fake.runs == []
+
+
+@pytest.mark.parametrize("image_checkpoint", [True, False])
+def test_a_row_with_both_an_image_and_a_prompt_is_refused_with_prepares_reason(
+    fake, tmp_path, image_checkpoint
+):
+    s = _image_setup(tmp_path, fake) if image_checkpoint else _setup(tmp_path)
+    rows = [json.loads(line) for line in s.heldout.read_text(encoding="utf-8").splitlines()]
+    if image_checkpoint:
+        rows[2]["prompt"] = "a road"
+    else:
+        # A text split whose every row also names a picture: read as text, the
+        # picture would be dropped, so it is refused before the modality is decided.
+        rows = [row | {"image": "images/x.png"} for row in rows]
+    s.heldout.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == ROWS_CHECK
+    line = 3 if image_checkpoint else 1
+    said = failed["detail"]
+    assert f"heldout.jsonl:{line}: this row gives both an 'image' and a 'prompt'" in said
+    assert fake.runs == []
+
+
+def test_a_file_converted_at_other_vision_tokens_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, convert={"vision_tokens": 140})
+    result = _verify(s)
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert "records a budget of 140 vision tokens per image" in failed["detail"]
+    assert "tuned at 70" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_an_image_report_without_vision_tokens_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, convert={"vision_tokens": None})
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert "records a budget of None vision tokens" in failed["detail"]
+
+
+def test_a_text_file_for_an_image_checkpoint_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, convert={"skip": True})
+    (s.model.parent / REPORT_NAME).write_text(
+        json.dumps(
+            {
+                "schema": EMBEDDING_CONVERT_SCHEMA,
+                "graft": {"sha256": hash_file(s.model), "weights": "int8"},
+                "checkpoint": {"sha256": hash_file(s.reference / "model.safetensors")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert "tuned on text; the reference's litetune.json was tuned on image" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_an_image_file_for_a_text_checkpoint_is_refused(fake, tmp_path):
+    s = _setup(tmp_path)
+    (s.model.parent / REPORT_NAME).write_text(
+        json.dumps(
+            {
+                "schema": EMBEDDING_CONVERT_SCHEMA,
+                "modality": "image",
+                "vision_tokens": 70,
+                "graft": {"sha256": "sha256:00", "weights": "int8"},
+                "splice": {"sha256": hash_file(s.model)},
+                "checkpoint": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert "tuned on image; the reference's litetune.json was tuned on text" in failed["detail"]
+
+
+def test_an_untied_image_file_is_still_measured_at_the_records_vision_tokens(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, convert={"skip": True})
+    m = _verify(s).manifest
+    assert fake.specs["candidate"]["vision_tokens"] == IMAGE_TOKENS
+    assert any("not tied to the reference" in t for t in m["limitations"])
+
+
+def test_the_gpu_is_refused_for_an_image_checkpoint_even_on_macos(fake, tmp_path, on_macos):
+    result = _verify(_image_setup(tmp_path, fake), backend="gpu")
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert failed["detail"] == embedding_verify.IMAGE_GPU_NOT_MEASURED
+    assert fake.runs == []
+
+
+def test_an_image_checkpoint_with_a_text_prefix_is_refused(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, record={"prefix": DECIDER_PREFIX})
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == RECORD_CHECK and "tuned on images with the prefix" in failed["detail"]
+    assert fake.runs == []
+
+
+def test_an_image_checkpoint_does_not_read_the_prompt_name(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, record={"prompt_name": "Anything"})
+    assert _verify(s).status is Status.PASSED
+
+
+def test_the_processor_files_are_what_transformers_saves():
+    assert IMAGE_PROCESSOR_FILES == (
+        "chat_template.jinja",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    )
+    assert "preprocessor_config.json" not in IMAGE_PROCESSOR_FILES
+
+
+def test_a_reference_without_its_processor_is_refused_with_no_stand_in(fake, tmp_path):
+    s = _image_setup(tmp_path, fake, processor=False)
+    (s.reference / "tokenizer.json").write_text("{}", encoding="utf-8")
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == REFERENCE_CHECK
+    said = failed["detail"]
+    assert "has no chat_template.jinja, processor_config.json, tokenizer_config.json" in said
+    assert "tokenizer.json," not in failed["detail"].split("has no")[1].split(":")[0]
+    assert fake.runs == []
+
+
+def test_a_reference_with_every_processor_file_is_embedded_with_its_own(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    assert _verify(s).status is Status.PASSED
+    assert fake.specs["reference"]["model"] == str(s.reference)
+
+
+@pytest.mark.parametrize("changed", IMAGE_PROCESSOR_FILES)
+def test_a_processor_file_that_is_not_the_one_tune_recorded_is_refused(fake, tmp_path, changed):
+    s = _image_setup(tmp_path, fake)
+    (s.reference / changed).write_text('{"another": "processor"}', encoding="utf-8")
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == REFERENCE_CHECK
+    said = failed["detail"]
+    found = hashlib.sha256(b'{"another": "processor"}').hexdigest()
+    recorded = hashlib.sha256(_processor_text(changed).encode()).hexdigest()
+    assert f"the reference's {changed} hash to {found}, not the sha256" in said
+    assert f"({recorded})" in said
+    assert fake.runs == []
+
+
+def _recorded_processor() -> dict[str, str]:
+    return {
+        name: hashlib.sha256(_processor_text(name).encode()).hexdigest()
+        for name in IMAGE_PROCESSOR_FILES
+    }
+
+
+def test_a_processor_file_replaced_after_the_copy_does_not_reach_the_reference(
+    fake, tmp_path, monkeypatch
+):
+    s = _image_setup(tmp_path, fake)
+    copy = embedding_verify.copy_processor
+
+    def copy_then_replace(reference: Path, dest: Path) -> None:
+        copy(reference, dest)
+        (reference / "tokenizer.json").write_text('{"another": "processor"}', encoding="utf-8")
+
+    monkeypatch.setattr(embedding_verify, "copy_processor", copy_then_replace)
+    assert _verify(s).status is Status.PASSED
+    processor = Path(fake.specs["reference"]["processor"])
+    assert processor != s.reference and s.reference not in processor.parents
+    assert fake.processor_seen == _recorded_processor()
+
+
+def test_a_processor_file_replaced_after_the_first_check_is_refused_in_the_copy(
+    fake, tmp_path, monkeypatch
+):
+    s = _image_setup(tmp_path, fake)
+    copy = embedding_verify.copy_processor
+
+    def replace_then_copy(reference: Path, dest: Path) -> None:
+        (reference / "tokenizer.json").write_text('{"another": "processor"}', encoding="utf-8")
+        copy(reference, dest)
+
+    monkeypatch.setattr(embedding_verify, "copy_processor", replace_then_copy)
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == REFERENCE_CHECK
+    found = hashlib.sha256(b'{"another": "processor"}').hexdigest()
+    assert failed["detail"].startswith(
+        "verify's copy of the processor files, taken after the first check: the reference's "
+        f"tokenizer.json hash to {found}"
+    )
+    assert "reference" not in [name for name, _ in fake.runs]
+
+
+def test_an_image_record_without_processor_digests_is_not_read(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    path = s.reference / "litetune.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    del data["processor_sha256"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    result = _verify(s)
+    assert result.status is not Status.PASSED
+    said = json.dumps(result.manifest)
+    assert "'processor_sha256' is None; an image record gives the sha256 of each of" in said
+    assert fake.runs == []
+
+
+def test_googles_text_vision_file_gives_the_gain_for_an_image_checkpoint(fake, tmp_path):
+    local = tmp_path / "vision.litertlm"
+    local.write_bytes(VISION_STAND_IN)
+    m = _verify(_image_setup(tmp_path, fake), base_litertlm=local).manifest
+    assert [r[0] for r in fake.runs] == ["reference", "candidate", "base", "evaluate"]
+    assert fake.sources["base"] == embedding_verify.IMAGE_ENGINE_SCRIPT
+    assert fake.specs["base"]["vision_tokens"] == IMAGE_TOKENS
+    assert "gain_over_base" in m["quality"]
+
+
+def test_googles_text_file_is_refused_as_the_base_of_an_image_checkpoint(fake, tmp_path):
+    result = _verify(_image_setup(tmp_path, fake), base_litertlm=_google(tmp_path))
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == BASE_EMBED_CHECK.replace(" embeddings", "")
+    assert VISION_FILE in failed["detail"]
+    assert fake.runs == []
+
+
+def test_with_base_downloads_the_text_vision_file_for_an_image_checkpoint(fake, tmp_path):
+    m = _verify(_image_setup(tmp_path, fake), with_base=True).manifest
+    assert fake.runs[0] == ("download", envs.EXPORT.name)
+    assert fake.specs["download"]["files"] == [embedding_export.VISION_HUB_FILE.as_dict()]
+    assert "gain_over_base" in m["quality"]
+
+
+def test_the_text_path_still_downloads_the_text_file(fake, tmp_path):
+    _verify(_setup(tmp_path), with_base=True)
+    assert fake.specs["download"]["files"] == [embedding_export.GOOGLE_HUB_FILE.as_dict()]
+
+
+def test_on_a_cpu_with_sme2_the_image_candidate_runs_one_thread_twice(fake, tmp_path, sme2_host):
+    local = tmp_path / "vision.litertlm"
+    local.write_bytes(VISION_STAND_IN)
+    result = _verify(_image_setup(tmp_path, fake), threads=4, base_litertlm=local)
+    m = result.manifest
+    assert result.status is Status.PASSED, m["checks"]
+    assert fake.specs["reference"]["threads"] == 4
+    assert fake.specs["candidate"]["threads"] == 1
+    assert [r[0] for r in fake.runs] == [
+        "reference",
+        "candidate",
+        "candidate-repeat",
+        "base",
+        "evaluate",
+    ]
+    assert fake.specs["candidate-repeat"]["model"] == fake.specs["candidate"]["model"]
+    assert fake.specs["candidate-repeat"]["cache_dir"] != fake.specs["candidate"]["cache_dir"]
+    (launch,) = fake.launches
+    assert launch["parallel"] is False and launch["stop_on"] == ["candidate", "candidate-repeat"]
+    assert m["embedding"]["candidate_repeated"] is True
+    assert any("EmbeddingEngine, 1 thread, each image" in t for t in m["limitations"])
+    assert any("1 thread applied to the text tower alone" in t for t in m["limitations"])
+    assert embedding_verify.REPEATED in m["limitations"]
+    # The evaluation gets the first run's vectors, and no vectors of the second.
+    assert "candidate-repeat" not in fake.specs["evaluate"]["vectors"]
+
+
+def test_a_second_run_that_differs_is_a_harness_failure(fake, tmp_path, sme2_host):
+    fake.repeat = "random"
+    result = _verify(_image_setup(tmp_path, fake), threads=4)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    said = failed["detail"]
+    assert "did not give the same vectors (candidate.npy and candidate-repeat.npy differ)" in said
+    assert "evaluate" not in [r[0] for r in fake.runs]
+
+
+def test_a_second_run_that_fails_is_a_harness_failure(fake, tmp_path, sme2_host):
+    fake.fail = {"candidate-repeat"}
+    (failed,) = _failed(_verify(_image_setup(tmp_path, fake), threads=4).manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    said = failed["detail"]
+    assert "the candidate's second run, which shows the first one repeatable, failed" in said
+
+
+def test_off_such_a_cpu_an_image_run_embeds_the_candidate_once_and_never_side_by_side(
+    fake, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(embedding_verify, "usable_cpus", lambda: 64)
+    local = tmp_path / "vision.litertlm"
+    local.write_bytes(VISION_STAND_IN)
+    m = _verify(_image_setup(tmp_path, fake), threads=4, base_litertlm=local).manifest
+    assert [r[0] for r in fake.runs] == ["reference", "candidate", "base", "evaluate"]
+    assert [launch["parallel"] for launch in fake.launches] == [False]
+    assert not any(
+        t.startswith("the candidate and Google's file were embedded at the same")
+        for t in m["limitations"]
+    )
+    assert embedding_verify.REPEATED not in m["limitations"]
+
+
+# -- the image engine script, run here against a stub of litert_lm ------------
+
+
+PICTURES = (b"picture a", b"picture b")
+
+
+def _pictures(tmp_path: Path, pictures: Sequence[bytes] = PICTURES) -> tuple[list[str], list[str]]:
+    """Each picture written to its own file: (the paths, the bytes' sha256)."""
+    folder = tmp_path / "pics"
+    folder.mkdir(exist_ok=True)
+    paths = []
+    for i, data in enumerate(pictures):
+        path = folder / f"{'ab'[i]}.png"
+        path.write_bytes(data)
+        paths.append(str(path))
+    return paths, [hashlib.sha256(data).hexdigest() for data in pictures]
+
+
+def _image_engine_main(tmp_path, monkeypatch, answers, images, digests=None):
+    ns: dict[str, Any] = {"__name__": "image_engine_script"}
+    exec(compile(embedding_verify.IMAGE_ENGINE_SCRIPT, "engine.py", "exec"), ns)
+    stub, calls = _stub_litert_lm(answers)
+    monkeypatch.setitem(sys.modules, "litert_lm", stub)
+    monkeypatch.setitem(ns, "cpu_report", lambda: {"model": "stub cpu", "count": 2})
+    (tmp_path / "images.json").write_text(json.dumps(images))
+    spec = {
+        "model": "/models/m.litertlm",
+        "images": str(tmp_path / "images.json"),
+        "image_sha256": digests,
+        "threads": 1,
+        "vision_tokens": 140,
+        "cache_dir": str(tmp_path / "cache-candidate"),
+        "max_input_length": 1024,
+        "out": str(tmp_path / "out.npy"),
+        "report": str(tmp_path / "report.json"),
+    }
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    monkeypatch.setattr(sys, "argv", ["engine.py", str(tmp_path / "spec.json")])
+    code = ns["main"]()
+    return code, json.loads((tmp_path / "report.json").read_text()), calls
+
+
+def test_the_image_engine_script_builds_a_vision_engine_and_gives_each_pictures_bytes(
+    tmp_path, monkeypatch
+):
+    paths, digests = _pictures(tmp_path)
+    code, report, calls = _image_engine_main(
+        tmp_path, monkeypatch, [[3.0, 4.0], [0.0, 2.0]], paths, digests
+    )
+    assert code == 0
+    assert calls["engine"] == [
+        {
+            "model": "/models/m.litertlm",
+            "backend": ("cpu", 1),
+            "cache_dir": str(tmp_path / "cache-candidate"),
+            "max_input_length": 1024,
+            "min_input_length": None,
+        }
+    ]
+    # No thread count for the vision backend: 0.18.0 would not apply one.
+    assert calls["vision"] == [{"vision_backend": ("cpu", None), "vision_tokens_per_image": 140}]
+    assert report["vision_threads"] is None
+    # The bytes read and hashed are the bytes embedded: no path reaches the engine.
+    assert [c.bytes for c in calls["texts"]] == list(PICTURES)
+    assert calls["options"] == [
+        {
+            "normalize": True,
+            "insert_special_tokens": True,
+            "input_overflow_strategy": "error",
+            "output_size": None,
+        }
+    ]
+    np.testing.assert_allclose(np.load(tmp_path / "out.npy"), [[0.6, 0.8], [0.0, 1.0]], rtol=1e-6)
+    assert report["rows"] == 2 and report["dim"] == 2
+    assert report["backend"] == "cpu" and report["vision_backend"] == "cpu"
+    assert report["threads"] == 1 and report["device"] == {}
+    assert report["settings"]["vision_tokens_per_image"] == 140
+    assert report["cpu"] == {"model": "stub cpu", "count": 2}
+    assert isinstance(report["ms_median"], float)
+
+
+def test_the_image_engine_script_refuses_an_image_the_engine_refuses(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    code, report, _ = _image_engine_main(
+        tmp_path, monkeypatch, [[1.0, 0.0], RuntimeError("bad image")], paths, digests
+    )
+    assert code == 3
+    assert report["error"] == f"the engine refused image 1 ({paths[1]}): bad image"
+    assert not (tmp_path / "out.npy").exists()
+
+
+def test_the_image_engine_script_refuses_a_zero_vector(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    code, report, _ = _image_engine_main(
+        tmp_path, monkeypatch, [[1.0, 0.0], [0.0, 0.0]], paths, digests
+    )
+    assert code == 3 and "zero" in report["error"] and "[1]" in report["error"]
+
+
+def test_the_image_engine_script_refuses_a_picture_changed_after_the_check(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    Path(paths[1]).write_bytes(b"another picture")
+    code, report, calls = _image_engine_main(
+        tmp_path, monkeypatch, [[1.0, 0.0], [0.0, 1.0]], paths, digests
+    )
+    assert code == 3
+    found = hashlib.sha256(b"another picture").hexdigest()
+    assert report["error"] == (
+        f"{paths[1]} hashes to {found}, not the {digests[1]} its row names; the picture "
+        "changed after verify checked it"
+    )
+    # The first picture was embedded; the changed one never reached the engine.
+    assert [c.bytes for c in calls["texts"]] == [PICTURES[0]]
+    assert not (tmp_path / "out.npy").exists()
+
+
+@pytest.mark.parametrize("digests", [None, ["a" * 64], ["a" * 64] * 3])
+def test_the_image_engine_script_refuses_digests_that_are_not_one_per_image(
+    tmp_path, monkeypatch, digests
+):
+    paths, _ = _pictures(tmp_path)
+    code, report, calls = _image_engine_main(
+        tmp_path, monkeypatch, [[1.0, 0.0], [0.0, 1.0]], paths, digests
+    )
+    assert code == 3 and "sha256 for 2 images" in report["error"]
+    assert calls["engine"] == []
+
+
+def test_the_image_scripts_share_one_picture_reader():
+    for script in (embedding_verify.IMAGE_ENGINE_SCRIPT, embedding_verify.IMAGE_REFERENCE_SCRIPT):
+        assert embedding_verify.PICTURE_BYTES_SOURCE in script
+        assert script.count("def picture_bytes(") == 1
+        assert "read_bytes()" not in script.replace(embedding_verify.PICTURE_BYTES_SOURCE, "")
+    assert "ImageFile" not in embedding_verify.IMAGE_ENGINE_SCRIPT.split('"""', 2)[2]
+
+
+def test_the_picture_reader_returns_the_bytes_it_hashed(tmp_path):
+    ns: dict[str, Any] = {"__name__": "image_reference"}
+    exec(compile(embedding_verify.IMAGE_REFERENCE_SCRIPT, "reference.py", "exec"), ns)
+    picture = tmp_path / "p.png"
+    picture.write_bytes(b"the picture")
+    digest = hashlib.sha256(b"the picture").hexdigest()
+    assert ns["picture_bytes"](str(picture), digest) == (b"the picture", None)
+    data, problem = ns["picture_bytes"](str(picture), "0" * 64)
+    assert data == b"the picture"
+    assert problem == (
+        f"{picture} hashes to {digest}, not the {'0' * 64} its row names; the picture changed "
+        "after verify checked it"
+    )
+
+
+def _image_reference_main(tmp_path, monkeypatch, images, digests, loads=None):
+    """The image reference script's `main` against stand-ins for torch, PIL and transformers.
+
+    `loads`, when given, collects (class, path) for each `from_pretrained` call."""
+    loads = [] if loads is None else loads
+
+    def loader(cls: str, made: Callable[[], Any]) -> Any:
+        def from_pretrained(path, *a, **k):
+            loads.append((cls, path))
+            return made()
+
+        return types.SimpleNamespace(from_pretrained=from_pretrained)
+
+    ns: dict[str, Any] = {"__name__": "image_reference"}
+    exec(compile(embedding_verify.IMAGE_REFERENCE_SCRIPT, "reference.py", "exec"), ns)
+    decoded: list[bytes] = []
+
+    class NoGrad:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    class Model:
+        def eval(self):
+            return self
+
+    torch: Any = types.ModuleType("torch")
+    torch.set_num_threads = lambda n: None
+    torch.float32 = "float32"
+    torch.no_grad = NoGrad
+    transformers: Any = types.ModuleType("transformers")
+    transformers.AutoConfig = loader(
+        "AutoConfig", lambda: types.SimpleNamespace(audio_config=object())
+    )
+    transformers.AutoModel = loader("AutoModel", Model)
+    transformers.AutoProcessor = loader("AutoProcessor", object)
+    pil: Any = types.ModuleType("PIL")
+    pil.Image, pil.ImageOps = object(), object()
+    for name, module in (("torch", torch), ("transformers", transformers), ("PIL", pil)):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(ns, "strict_pillow", lambda image: None)
+
+    def picture_of(image, ops, data, flipped):
+        decoded.append(data)
+        raise StopIteration("decoded")
+
+    monkeypatch.setitem(ns, "picture_of", picture_of)
+    (tmp_path / "images.json").write_text(json.dumps(images))
+    spec = {
+        "model": str(tmp_path / "ref"),
+        "processor": str(tmp_path / "processor"),
+        "images": str(tmp_path / "images.json"),
+        "image_sha256": digests,
+        "image_text": "<|image|>",
+        "vision_tokens": 70,
+        "threads": 1,
+        "out": str(tmp_path / "ref.npy"),
+        "report": str(tmp_path / "ref.json"),
+    }
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    monkeypatch.setattr(sys, "argv", ["reference.py", str(tmp_path / "spec.json")])
+    try:
+        code = ns["main"]()
+    except StopIteration:
+        code = None
+    report = tmp_path / "ref.json"
+    return code, json.loads(report.read_text()) if report.exists() else None, decoded
+
+
+def test_the_image_reference_script_decodes_the_bytes_it_hashed(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    code, _, decoded = _image_reference_main(tmp_path, monkeypatch, paths, digests)
+    # The stand-in decoder stops the run at the first picture, given its bytes.
+    assert code is None and decoded == [PICTURES[0]]
+
+
+def test_the_image_reference_script_loads_its_processor_from_verifys_copy(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    loads: list[tuple[str, str]] = []
+    _image_reference_main(tmp_path, monkeypatch, paths, digests, loads)
+    model, processor = str(tmp_path / "ref"), str(tmp_path / "processor")
+    assert loads == [("AutoConfig", model), ("AutoModel", model), ("AutoProcessor", processor)]
+
+
+def test_the_image_reference_script_refuses_a_picture_changed_after_the_check(
+    tmp_path, monkeypatch
+):
+    paths, digests = _pictures(tmp_path)
+    Path(paths[0]).write_bytes(b"another picture")
+    code, report, decoded = _image_reference_main(tmp_path, monkeypatch, paths, digests)
+    assert code == 3 and decoded == []
+    assert report is not None
+    found = hashlib.sha256(b"another picture").hexdigest()
+    assert report["error"].startswith(f"{paths[0]} hashes to {found}, not the {digests[0]}")
+
+
+@pytest.mark.parametrize("digests", [None, ["a" * 64]])
+def test_the_image_reference_script_refuses_digests_that_are_not_one_per_image(
+    tmp_path, monkeypatch, digests
+):
+    paths, _ = _pictures(tmp_path)
+    code, report, decoded = _image_reference_main(tmp_path, monkeypatch, paths, digests)
+    assert code == 3 and decoded == []
+    assert report is not None and "sha256 for 2 images" in report["error"]
+
+
+def test_verify_gives_each_script_the_rows_digests_in_the_inputs_order(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    assert _verify(s).status is Status.PASSED
+    digests = _image_digests(s.train) + _image_digests(s.heldout)
+    for side in ("reference", "candidate"):
+        assert fake.specs[side]["image_sha256"] == digests
+        assert fake.texts[side] == _image_paths(s.train) + _image_paths(s.heldout)
+
+
+def test_the_image_reference_script_refuses_unusable_rows():
+    ns: dict[str, Any] = {"__name__": "image_reference"}
+    exec(compile(embedding_verify.IMAGE_REFERENCE_SCRIPT, "reference.py", "exec"), ns)
+    v = np.array([[1.0, 0.0], [0.0, 0.0], [np.nan, 1.0]])
+    assert ns["unusable_rows"](np, v).tolist() == [1, 2]

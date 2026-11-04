@@ -59,18 +59,24 @@ from litetune.embedding_export import (
 from litetune.embedding_export import (
     DEFAULT_WEIGHTS,
     EMBEDDING_CONVERT_SCHEMA,
+    IMAGE_DEFAULT_WEIGHTS,
+    NPU_IMAGE_REFUSED,
     WEIGHT_MODES,
     EmbeddingExportError,
     EmbeddingExportRequest,
+    default_weights,
     run_embedding_export,
 )
 from litetune.embedding_export import REPORT_NAME as EMBEDDING_REPORT_NAME
 from litetune.embedding_export import summarise as summarise_embedding_convert
 from litetune.embedding_npu import NPU_SOCS, NPU_TIMEOUT_S
 from litetune.embedding_tune import (
+    APP_VISION_TOKENS,
     DIRECTION,
     EMBEDDING_MODEL,
     EMBEDDING_REVISION,
+    VISION_TOKENS,
+    VISION_TOKENS_SETTING,
     EmbeddingRecord,
     EmbeddingTuneError,
     EmbeddingTuneRequest,
@@ -475,7 +481,8 @@ def _add_verify(sub) -> None:
         "--base-litertlm",
         type=Path,
         help=(
-            "embedding checkpoints: a local copy of Google's embeddinggemma-2-text-270m.litertlm, "
+            "embedding checkpoints: a local copy of Google's embeddinggemma-2-text-270m.litertlm "
+            "(embeddinggemma-2-text-vision-440m.litertlm for a checkpoint tuned on images), "
             "checked by its sha256, measured on the same rows for the gain over it"
         ),
     )
@@ -483,8 +490,8 @@ def _add_verify(sub) -> None:
         "--with-base",
         action="store_true",
         help=(
-            "embedding checkpoints: download Google's file at the pinned revision and measure "
-            "the gain over it"
+            "embedding checkpoints: download Google's file at the pinned revision (the 440m "
+            "text-vision file for a checkpoint tuned on images) and measure the gain over it"
         ),
     )
     verify.add_argument("--json", action="store_true", help="write the manifest to stdout")
@@ -503,11 +510,12 @@ def _add_prepare(sub) -> None:
     prep.add_argument("--output-dir", required=True, type=Path, help="where the splits are written")
     prep.add_argument(
         "--context-length",
-        required=True,
         type=int,
         help=(
-            "the binding context window: pass the smaller of export.context_length and "
-            "train.max_seq_length. Rows that do not fit are named, never truncated"
+            "text rows: required, the binding context window: pass the smaller of "
+            "export.context_length and train.max_seq_length. Rows that do not fit are named, "
+            f"never truncated. Image rows (--base-model {EMBEDDING_MODEL}) have no text to "
+            "measure and refuse it"
         ),
     )
     prep.add_argument("--seed", type=int, default=0, help="split seed (with the file's content)")
@@ -534,7 +542,8 @@ def _add_prepare(sub) -> None:
         "--tokenizer",
         help=(
             "HF id whose tokenizer measures example lengths. Without it no example is measured "
-            "against the context window and that check reports could_not_check"
+            "against the context window and that check reports could_not_check. Refused for "
+            "image rows, which have no text"
         ),
     )
     prep.add_argument("--tokenizer-revision", help="revision of --tokenizer")
@@ -557,7 +566,11 @@ def _add_prepare(sub) -> None:
             'none_option for rows labelled null. Each row is {"prompt": <the state>, '
             '"label": <option id>}, rendered into the prompt createDecider is to '
             "score (the 2026-10-16 design). Rows with labels and no completions are decisions "
-            "without it too, asked a generic question about their sorted labels"
+            "without it too, asked a generic question about their sorted labels. For --base-model "
+            f"{EMBEDDING_MODEL} a row may instead be an image row, "
+            '{"image": <a PNG or JPEG file, relative to --data or absolute>, "label": <option '
+            "id>}; the file is checked and copied into the split, and a rows file is all image "
+            "rows or all text rows"
         ),
     )
     prep.add_argument(
@@ -582,7 +595,8 @@ def _add_tune(sub) -> None:
             "Fine-tune inside the pinned training environment. Training completing is not "
             f"evidence: a run that scored nine times worse than its base finished cleanly with a "
             f"lower loss. --model {EMBEDDING_MODEL} trains an embedding model for a choice "
-            "--decision instead, with its measured recipe and none of the LLM flags. "
+            "--decision instead, with none of the LLM flags: on text rows with its measured "
+            "recipe, on image rows with a recipe litetune has measured on one dataset. "
             f"{STAGE_EXIT_CODE_HELP}"
         ),
     )
@@ -595,6 +609,35 @@ def _add_tune(sub) -> None:
         help=(
             f"only with --model {EMBEDDING_MODEL}: the held-out split the discarded head is "
             "scored on; default heldout.jsonl beside --data, where prepare writes it"
+        ),
+    )
+    tune.add_argument(
+        "--vision-tokens",
+        type=int,
+        choices=list(VISION_TOKENS),
+        help=(
+            f"image splits of --model {EMBEDDING_MODEL} only, and required for them: at most "
+            "how many vision tokens each image becomes, the budget the model is tuned at (the "
+            "processor keeps the aspect ratio, so an image may take fewer). Give the runtime the "
+            f"same budget in the application, flutter_edge_ai's "
+            f"{VISION_TOKENS_SETTING.format(n='N')}, whose default is {APP_VISION_TOKENS}"
+        ),
+    )
+    tune.add_argument(
+        "--mirror",
+        action="store_true",
+        help=(
+            "image splits only: also train on a horizontally flipped copy of every training "
+            "image. Only for pictures whose mirror image means the same (no text, no HUD)"
+        ),
+    )
+    tune.add_argument(
+        "--mirror-swap",
+        action="append",
+        metavar="A:B",
+        help=(
+            "with --mirror: the flipped copy of an image labelled A is labelled B and the other "
+            "way round (left:right). Repeatable; both must be option ids of the decision"
         ),
     )
     # The LLM-only flags below default to None, not to their values, so that the
@@ -640,9 +683,10 @@ def _add_tune(sub) -> None:
         "--decision",
         type=Path,
         help=(
-            "the decision.json prepare wrote beside a decision split. Every row is checked to be "
-            "that decision rendered around a state, and the decision is recorded beside the "
-            "checkpoint, where convert, verify and bundle read it"
+            "the decision.json prepare wrote beside a decision split. Every text row is checked "
+            "to be that decision rendered around a state, every image row to name one of its "
+            "options and a picture in the split that matches its digest, and the decision is "
+            "recorded beside the checkpoint, where convert, verify and bundle read it"
         ),
     )
     tune.add_argument(
@@ -788,7 +832,9 @@ def _add_convert(sub) -> None:
         help=(
             "embedding checkpoints only (a `tune --model google/embeddinggemma-2` output): how "
             "the fine-tune's weights are quantized into Google's file. int8: both graphs int8; "
-            f"int4: both int4, Google's own size (default {DEFAULT_WEIGHTS})"
+            f"int4: both int4, Google's own size (default {DEFAULT_WEIGHTS}; for a checkpoint "
+            f"tuned on images {IMAGE_DEFAULT_WEIGHTS}, whose vectors stayed closer to the "
+            "float32 fine-tune's in the one image measurement)"
         ),
     )
     convert.add_argument(
@@ -810,7 +856,8 @@ def _add_convert(sub) -> None:
             "more SoCs. Every SoC is compiled, a failed compile included, and publishing starts "
             "only when all have compiled; a failure while publishing one stops the ones after "
             "it, and the report says which were published. verify cannot run such a file; a "
-            "file compiled this way for SM8750 ran on one phone, no other SoC's on any. "
+            "file compiled this way for SM8750 ran on one phone, no other SoC's on any. An "
+            "embedding checkpoint tuned on images is refused. "
             f"One of {', '.join(NPU_SOCS)}"
         ),
     )
@@ -839,7 +886,18 @@ def _add_convert(sub) -> None:
         help=(
             "embedding checkpoints only: a local copy of Google's "
             "embeddinggemma-2-text-270m.litertlm, checked by its sha256; without it the file is "
-            "downloaded at the pinned revision"
+            "downloaded at the pinned revision. The graft writes into it for a checkpoint tuned "
+            "on images too, before the splice into the 440m file (--base-litertlm-440m)"
+        ),
+    )
+    convert.add_argument(
+        "--base-litertlm-440m",
+        type=Path,
+        help=(
+            "embedding checkpoints tuned on images only: a local copy of Google's "
+            "embeddinggemma-2-text-vision-440m.litertlm, checked by its sha256; without it the "
+            "file is downloaded at the pinned revision. The graft's text tower is spliced into "
+            "it, and its vision tower is kept as Google's"
         ),
     )
     # No default here: the LLM export and the embedding graft have their own
@@ -1415,6 +1473,7 @@ def _prepare(args: argparse.Namespace) -> int:
         heldout_size=args.heldout_size,
         min_heldout_examples=args.min_heldout_examples,
         tokens=counter,
+        tokenizer_revision=args.tokenizer_revision,
         declarations=args.declarations,
         base_model=args.base_model,
         questions=args.questions,
@@ -1514,6 +1573,19 @@ def _tune(args: argparse.Namespace) -> int:
         return _tune_embedding(args)
     if args.heldout is not None:
         raise TuneError(f"--heldout is read only with --model {EMBEDDING_MODEL}")
+    image_flags = [
+        flag
+        for flag, value in (
+            ("--vision-tokens", args.vision_tokens is not None),
+            ("--mirror", args.mirror),
+            ("--mirror-swap", bool(args.mirror_swap)),
+        )
+        if value
+    ]
+    if image_flags:
+        raise TuneError(
+            f"{', '.join(image_flags)}: read only with --model {EMBEDDING_MODEL} on an image split"
+        )
     events = _stream()
     given = {
         name: getattr(args, name) for name in _TUNE_DEFAULTED if getattr(args, name) is not None
@@ -1625,6 +1697,9 @@ def _tune_embedding(args: argparse.Namespace) -> int:
         revision=args.revision,
         timeout_s=args.timeout_s,
         auto_provision=not args.no_provision,
+        vision_tokens=args.vision_tokens,
+        mirror=args.mirror,
+        mirror_swap=tuple(args.mirror_swap or ()),
     )
     result = run_embedding_tune(request, events=events)
     report = write_embedding_report(result)
@@ -1772,9 +1847,14 @@ def _convert(args: argparse.Namespace) -> int:
             "--calibration-data and --cache-length are for --npu; without it convert writes "
             "the CPU/GPU bundles, which take neither"
         )
-    if args.weights is not None or args.base_litertlm is not None:
+    if (
+        args.weights is not None
+        or args.base_litertlm is not None
+        or args.base_litertlm_440m is not None
+    ):
         raise EmbeddingExportError(
-            "--weights and --base-litertlm are for an embedding checkpoint, one whose "
+            "--weights, --base-litertlm and --base-litertlm-440m are for an embedding "
+            "checkpoint, one whose "
             f"litetune.json `tune --model {EMBEDDING_MODEL}` wrote; {args.model} is not one"
             f"{model_dir_hint(args.model)}. Pick an LLM's quantization with --recipe"
         )
@@ -1811,6 +1891,7 @@ _NOT_FOR_LLM_NPU = (
     ("externalize_embedder", "--externalize-embedder"),
     ("weights", "--weights"),
     ("base_litertlm", "--base-litertlm"),
+    ("base_litertlm_440m", "--base-litertlm-440m"),
 )
 
 
@@ -1850,7 +1931,8 @@ def _convert_llm_npu(args: argparse.Namespace) -> int:
 
 
 def _convert_embedding(args: argparse.Namespace, record: EmbeddingRecord) -> int:
-    """`convert` of an embedding checkpoint: the graft into Google's file, nothing else.
+    """`convert` of an embedding checkpoint: the graft into Google's file, nothing else;
+    for one tuned on images, then the splice into Google's text-vision file.
 
     Every LLM flag given is refused by name rather than ignored.
     """
@@ -1865,12 +1947,16 @@ def _convert_embedding(args: argparse.Namespace, record: EmbeddingRecord) -> int
             f"{', '.join(given)}: {args.model} is an embedding checkpoint, which convert grafts "
             "into Google's EmbeddingGemma 2 file; pick its quantization with --weights"
         )
+    if record.is_image and args.npu:
+        # Before the request, whose own --npu checks would name the weights instead.
+        raise EmbeddingExportError(NPU_IMAGE_REFUSED.format(model=args.model))
     events = _stream()
     request = EmbeddingExportRequest(
         model=Path(args.model),
         output_dir=args.output_dir,
-        weights=args.weights or DEFAULT_WEIGHTS,
+        weights=args.weights or default_weights(record),
         base_litertlm=args.base_litertlm,
+        base_litertlm_440m=args.base_litertlm_440m,
         npu=tuple(args.npu or ()),
         npu_timeout_s=args.timeout_s if args.timeout_s is not None else NPU_TIMEOUT_S,
         timeout_s=args.timeout_s if args.timeout_s is not None else GRAFT_TIMEOUT_S,

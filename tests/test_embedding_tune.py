@@ -950,6 +950,46 @@ def test_a_stale_complete_metrics_file_is_not_read_as_this_run(toolchain, split,
     assert "no metrics file" in _check(result, TRAINING_CHECK).detail
 
 
+def test_a_text_split_runs_the_text_recipe_exactly_as_before_images(toolchain, split, tmp_path):
+    """Image tuning added a script, flags and fields; a text split sees none of them."""
+    from litetune.embedding_tune import write_report
+
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert result.ok and result.modality == "text"
+    out = tmp_path / "tuned"
+    assert (out / "embed_train_script.py").read_text(encoding="utf-8") == _EMBED_TRAIN_SCRIPT
+    assert not (out / "embed_image_train_script.py").exists()
+    assert not (out / "embed_image_inputs").exists()
+    (spec,) = toolchain.specs
+    assert set(spec) == {
+        "model",
+        "revision",
+        "model_type",
+        "prompt_name",
+        "prefix",
+        "labels",
+        "train_rows",
+        "heldout_rows",
+        "recipe",
+        "device",
+        "model_dir",
+        "metrics_out",
+    }
+    record = json.loads((out / "model" / "litetune.json").read_text())
+    assert "mirror" not in record and "mirror_swap" not in record
+    assert (record["modality"], record["vision_tokens"]) == ("text", None)
+    report = json.loads(write_report(result).read_text())
+    assert "modality" not in report and "vision_tokens" not in report
+    assert "modality" not in report["request"]
+    assert report["request"]["recipe"] == RECIPE.as_dict()
+    from litetune.embedding_tune import summarise
+
+    assert summarise(result)[1] == (
+        f"  embedding fine-tune of {EMBEDDING_MODEL} at {EMBEDDING_REVISION[:12]}, 3 options, "
+        f"prefix {DECIDER_PREFIX!r}"
+    )
+
+
 def test_a_row_whose_prompt_is_the_bare_question_has_no_state_and_is_refused(
     toolchain, split, tmp_path
 ):

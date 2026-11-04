@@ -71,6 +71,16 @@ from litetune.declarations import (
 from litetune.embedding_convert import BASE_MODEL as EMBEDDING_MODEL
 from litetune.events import EventStream
 from litetune.exits import read_returncode
+from litetune.images import (
+    IMAGES_DIR,
+    MULTI_FRAME_STILL,
+    ImageCheckUnavailable,
+    ImageCopyError,
+    ImageInspector,
+    PillowImageInspector,
+    SplitImage,
+    write_images,
+)
 from litetune.liveness import SkippedCheck
 from litetune.metrics import (
     END_CALL,
@@ -292,14 +302,14 @@ EMBEDDING_NOT_A_DECISION = (
 )
 EMBEDDING_TYPE_REFUSED = (
     f"the decision is a {{kind}} question. {EMBEDDING_MODEL} is trained for a choice question "
-    "only, the type its recipe was measured on and the one flutter_edge_ai's embedding decider "
-    "answers"
+    "only: the text recipe was measured on that type, the image recipe follows the same rule, "
+    "and it is the one flutter_edge_ai's embedding decider answers"
 )
 EMBEDDING_NONE_OPTION_REFUSED = (
-    "the decision has a none_option ({none!r}). The embedding recipe was measured on decisions "
-    "without one, and flutter_edge_ai's embedding decider abstains by a threshold, not by an "
-    "option; `tune` refuses it. Leave the none_option out of the decision, and its rows out of "
-    "the split"
+    "the decision has a none_option ({none!r}). The text recipe was measured on decisions "
+    "without one, the image recipe follows the same rule, and flutter_edge_ai's embedding "
+    "decider abstains by a threshold, not by an option; `tune` refuses it. Leave the "
+    "none_option out of the decision, and its rows out of the split"
 )
 EMBEDDING_LENGTHS = (
     f"for {EMBEDDING_MODEL} each row is measured as `tune` embeds it: the decider's prefix and "
@@ -546,6 +556,9 @@ class Row:
     # the file. `tune` trains the completion a file gives, and refuses a row
     # that gives none; every row of a split `prepare` writes gives one.
     rendered: bool = False
+    # An image decision row's picture (`images.SplitImage`). Its state is the
+    # image alone, so `prompt` is empty and the record names the file instead.
+    image: SplitImage | None = None
 
     @property
     def tool(self) -> str:
@@ -560,6 +573,16 @@ class Row:
         return "<unlabelled>"
 
     def as_record(self) -> dict[str, Any]:
+        if self.image is not None:
+            # The digest travels in the row so that `content_sha256` of the
+            # JSONL covers the pixels, not only the file names.
+            return {
+                "image": self.image.relative,
+                "image_sha256": self.image.sha256,
+                "completion": self.completion,
+                "target": self.target,
+                "source_line": self.lineno,
+            }
         return {
             "prompt": self.prompt,
             "completion": self.completion,
@@ -683,8 +706,14 @@ def read_rows(path: Path, wire_format: WireFormat | None = None) -> list[Row]:
     return _rows_from(path, read_objects(path), wire_format)
 
 
-def read_objects(path: Path) -> list[tuple[int, dict[str, Any]]]:
-    """Each row of a JSONL dataset as an object with a `prompt`, with its line number."""
+def read_objects(path: Path, images: bool = False) -> list[tuple[int, dict[str, Any]]]:
+    """Each row of a JSONL dataset as an object with a `prompt`, with its line number.
+
+    `images` also accepts a row with an `image` in place of the `prompt`
+    (`is_image_row`): the EmbeddingGemma 2 path reads image decision rows, and
+    nothing else does. Without it a row with an `image` and no `prompt` is
+    refused as any row without a `prompt` is, and the refusal says why.
+    """
     try:
         raw = path.read_bytes()
     except OSError:
@@ -710,8 +739,13 @@ def read_objects(path: Path) -> list[tuple[int, dict[str, Any]]]:
             obj = json.loads(line)
         except json.JSONDecodeError as exc:
             raise PrepareError(f"{path}:{lineno}: not valid JSON: {exc}") from exc
-        if not isinstance(obj, dict) or "prompt" not in obj:
-            raise PrepareError(f"{path}:{lineno}: expected an object with a 'prompt' field")
+        if not isinstance(obj, dict) or not ("prompt" in obj or (images and "image" in obj)):
+            said = f"{path}:{lineno}: expected an object with a 'prompt' field"
+            if images:
+                said += " or an 'image' field"
+            elif isinstance(obj, dict) and "image" in obj:
+                said += f"; a row with an 'image' and no 'prompt' is an image row, {IMAGE_ROWS_FOR}"
+            raise PrepareError(said)
         objects.append((lineno, obj))
     if not objects:
         raise PrepareError(f"{path}: no examples")
@@ -803,11 +837,7 @@ def read_decision_rows(
     """
     for lineno, obj in objects:
         where = f"{path}:{lineno}"
-        if "label" not in obj:
-            raise PrepareError(
-                f"{where}: no 'label'. Every row of a decision split names its option, or null "
-                "for a row outside every option"
-            )
+        _refuse_unlabelled(where, obj)
         given = [key for key in ("completion", "target") if key in obj]
         if given:
             raise PrepareError(
@@ -817,20 +847,9 @@ def read_decision_rows(
         problem = state_problem(obj["prompt"])
         if problem is not None:
             raise PrepareError(f"{where}: {problem}")
-        label = obj["label"]
-        if label is not None and not isinstance(label, str):
-            raise PrepareError(
-                f"{where}: the label must be an option id, as a string, or null for a row outside "
-                f"every option; got {json.dumps(label)}"
-            )
+        _refuse_label_type(where, obj["label"])
     try:
-        if questions is not None:
-            decision, digest = read_questions(questions)
-        else:
-            decision = inferred_decision(
-                obj["label"] for _, obj in objects if obj["label"] is not None
-            )
-            digest = None
+        decision, digest = _decision_for(objects, questions)
         rows = []
         for lineno, obj in objects:
             answer = decision.answer_for(obj["label"], f"{path}:{lineno}")
@@ -846,6 +865,301 @@ def read_decision_rows(
     except DecisionError as exc:
         raise PrepareError(str(exc)) from exc
     return decision, digest, rows
+
+
+def _refuse_unlabelled(where: str, obj: Mapping[str, Any]) -> None:
+    if "label" not in obj:
+        raise PrepareError(
+            f"{where}: no 'label'. Every row of a decision split names its option, or null "
+            "for a row outside every option"
+        )
+
+
+def _refuse_label_type(where: str, label: Any) -> None:
+    if label is not None and not isinstance(label, str):
+        raise PrepareError(
+            f"{where}: the label must be an option id, as a string, or null for a row outside "
+            f"every option; got {json.dumps(label)}"
+        )
+
+
+def _decision_for(
+    objects: Sequence[tuple[int, dict[str, Any]]], questions: Path | None
+) -> tuple[Decision, str | None]:
+    """`--questions` and its digest, or the Choice question the labels imply and `None`.
+
+    Raises `DecisionError`."""
+    if questions is not None:
+        return read_questions(questions)
+    return inferred_decision(obj["label"] for _, obj in objects if obj["label"] is not None), None
+
+
+# ---------------------------------------------------------------------------
+# Image decision rows
+# ---------------------------------------------------------------------------
+
+
+IMAGE_ROWS_FOR = (
+    f"which prepare reads for --base-model {EMBEDDING_MODEL} only, the one model litetune trains "
+    "on images"
+)
+
+IMAGE_ROWS_NOT_COUNTED = (
+    "image rows have no text to count: the state of an image row is its picture, so no token "
+    "length was measured and no tokenizer was run"
+)
+
+# The formats an image row may be. LiteRT-LM decodes the picture an application
+# gives it with stb_image; PNG and JPEG are what litetune accepts for it, an MPO
+# being JPEG streams one after another (`images.MULTI_FRAME_STILL`). Pillow's
+# names for them.
+IMAGE_FORMATS: tuple[str, ...] = ("PNG", "JPEG", MULTI_FRAME_STILL)
+
+IMAGE_FLAGS_FOR_TEXT = (
+    "{flags}: these are image rows, which have no text to measure, so no context window and no "
+    "tokenizer is applied to them; drop the flags rather than have a report name settings that "
+    "were never used"
+)
+CONTEXT_LENGTH_REQUIRED = (
+    "--context-length is required for text rows: the binding context window, the smaller of "
+    "export.context_length and train.max_seq_length"
+)
+
+IMAGE_DUPLICATES = (
+    "{count} image row(s) give the same bytes as an earlier row with the same label. Each is "
+    "trained as a row of its own, so those pictures weigh more than the others. The rows of one "
+    "picture are kept in one split, so no held-out row scores a picture the model was trained on"
+)
+
+
+def is_image_row(obj: Mapping[str, Any]) -> bool:
+    """Whether a row is an image row: it has an `image` and no `prompt`.
+
+    A row with a `prompt` is a text row whatever else it carries, as it was
+    before image rows existed; `prepare` refuses one that gives both for
+    EmbeddingGemma 2 (`refuse_image_and_prompt`).
+    """
+    return "image" in obj and "prompt" not in obj
+
+
+def refuse_image_and_prompt(path: Path, objects: Sequence[tuple[int, dict[str, Any]]]) -> None:
+    """Refuse, naming the first, a row that gives both an `image` and a `prompt`.
+
+    For EmbeddingGemma 2 a row is a picture or a text, and one that names both
+    would be trained as the text with the picture dropped.
+    """
+    for lineno, obj in objects:
+        if "image" in obj and "prompt" in obj:
+            raise PrepareError(
+                f"{path}:{lineno}: this row gives both an 'image' and a 'prompt'. A row for "
+                f"{EMBEDDING_MODEL} is an image row (an 'image' and a 'label') or a text row (a "
+                "'prompt'); keep the one it is"
+            )
+
+
+def rows_are_images(path: Path, objects: Sequence[tuple[int, dict[str, Any]]]) -> bool:
+    """Whether the rows are image rows (`is_image_row`). A file is all image rows or all text rows.
+
+    Mixing is refused naming the first row of the other kind: one decision
+    trained on states of two kinds is not a recipe anything here was measured on.
+    """
+    first_line, first = objects[0]
+    images = is_image_row(first)
+    for lineno, obj in objects:
+        if is_image_row(obj) is not images:
+            this, that = ("a text row", "an image row")
+            if not images:
+                this, that = that, this
+            raise PrepareError(
+                f"{path}:{lineno}: this is {this}, and line {first_line} is {that}. A rows file "
+                "is all image rows ('image') or all text rows ('prompt'); put them in two files"
+            )
+    return images
+
+
+def _image_path(data: Path, value: str) -> Path:
+    """An image row's `image`: absolute as given, or relative to the rows file's directory."""
+    given = Path(value)
+    return given if given.is_absolute() else data.parent / given
+
+
+def read_image_rows(
+    path: Path, objects: Sequence[tuple[int, dict[str, Any]]], questions: Path | None
+) -> tuple[Decision, str | None, list[tuple[int, Path, str]]]:
+    """Image decision rows: the decision, its digest, and per row its line, file and answer.
+
+    A row is `{"image": <path>, "label": <option id>}`, the path relative to the
+    rows file's directory or absolute. Labels are read as a text decision row's
+    are. The files are only located here; `image_rows` opens them.
+    """
+    located: list[tuple[int, Path]] = []
+    for lineno, obj in objects:
+        where = f"{path}:{lineno}"
+        given = [key for key in ("completion", "target") if key in obj]
+        if given:
+            raise PrepareError(
+                f"{where}: an image row is an 'image' and a 'label', and this one also gives "
+                f"{given}. Its state is the picture alone, and its answer is the label"
+            )
+        _refuse_unlabelled(where, obj)
+        _refuse_label_type(where, obj["label"])
+        value = obj["image"]
+        if not isinstance(value, str) or not value.strip():
+            raise PrepareError(
+                f"{where}: 'image' must be the path of an image file, relative to "
+                f"{path.parent} or absolute; got {json.dumps(value)}"
+            )
+        file = _image_path(path, value)
+        if not file.exists():
+            raise PrepareError(f"{where}: the image {value!r} does not exist (read as {file})")
+        if not file.is_file():
+            raise PrepareError(
+                f"{where}: the image {value!r} is not a regular file (read as {file})"
+            )
+        located.append((lineno, file))
+    try:
+        decision, digest = _decision_for(objects, questions)
+        answers = [decision.answer_for(obj["label"], f"{path}:{lineno}") for lineno, obj in objects]
+    except DecisionError as exc:
+        raise PrepareError(str(exc)) from exc
+    return (
+        decision,
+        digest,
+        [(lineno, file, answer) for (lineno, file), answer in zip(located, answers, strict=True)],
+    )
+
+
+@dataclass
+class ImageStats:
+    """What the images of an image decision split are."""
+
+    rows: int
+    files: int
+    duplicate_rows: int
+    formats: dict[str, int]
+    width: dict[str, int]
+    height: dict[str, int]
+    checker: dict[str, Any]
+    # The split's images directory, once written.
+    path: Path | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "rows": self.rows,
+            "files": self.files,
+            "duplicate_rows": self.duplicate_rows,
+            "formats": dict(sorted(self.formats.items())),
+            "width": self.width,
+            "height": self.height,
+            "checker": self.checker,
+            "path": str(self.path) if self.path is not None else None,
+        }
+
+
+def image_rows(
+    path: Path, located: Sequence[tuple[int, Path, str]], inspector: ImageInspector
+) -> tuple[list[Row], ImageStats]:
+    """Open every image of `located`, refuse what cannot be trained, and make the rows.
+
+    Refused, naming the row: a file Pillow cannot decode or convert to RGB, one
+    of more than one frame, one with no width or height, and the same bytes
+    given two different labels. The same bytes with the same label is a row
+    like any other, counted in `ImageStats.duplicate_rows`. An MPO file of
+    several frames is accepted as its first, and copied whole.
+    """
+    files = sorted({file for _, file, _ in located})
+    try:
+        facts = inspector.inspect(files)
+    except ImageCheckUnavailable as exc:
+        raise PrepareError(
+            f"the images could not be checked, so no split was written: {exc}"
+        ) from exc
+    if len(facts) != len(files):
+        raise PrepareError(
+            f"the image check answered for {len(facts)} of {len(files)} images; a split cannot "
+            "be written from a partial answer"
+        )
+    by_file = dict(zip(files, facts, strict=True))
+    checker = inspector.describe()
+    decoder = f"Pillow {checker['pillow']}" if checker.get("pillow") else "Pillow"
+    first: dict[str, tuple[int, str]] = {}
+    duplicates = 0
+    rows: list[Row] = []
+    for lineno, file, answer in located:
+        where = f"{path}:{lineno}"
+        found = by_file[file]
+        if found.error is not None:
+            raise PrepareError(
+                f"{where}: {file} is not an image {decoder} can decode: {found.error}. `tune` "
+                "decodes it with the same Pillow"
+            )
+        if found.format not in IMAGE_FORMATS:
+            raise PrepareError(
+                f"{where}: {file} is {found.format!r} to {decoder}, not PNG or JPEG. LiteRT-LM "
+                "decodes the picture an application gives it with stb_image, and an image row is "
+                "a PNG or a JPEG file (an MPO as its first frame); save it as one of those, in "
+                "the format the application will give"
+            )
+        # An MPO file's later frames are not the picture: its first is, the one
+        # Pillow opens and `tune` trains on (`images.MULTI_FRAME_STILL`).
+        still = found.format == MULTI_FRAME_STILL and found.frames is not None and found.frames > 1
+        if found.frames != 1 and not still:
+            raise PrepareError(
+                f"{where}: {file} holds {found.frames} frames. An image row is one still "
+                "picture; save the frame it means as a file of its own"
+            )
+        if not found.width or not found.height:
+            raise PrepareError(
+                f"{where}: {file} is {found.width}x{found.height} pixels, an image with nothing "
+                "in it"
+            )
+        if found.sha256 is None or found.format is None:
+            raise PrepareError(f"{where}: the image check gave {file} no digest or no format")
+        seen = first.get(found.sha256)
+        if seen is None:
+            first[found.sha256] = (lineno, answer)
+        elif seen[1] != answer:
+            raise PrepareError(
+                f"{where}: {file} has the same bytes (sha256 {found.sha256}) as line {seen[0]}, "
+                f"which is labelled {seen[1]!r}, and this row is labelled {answer!r}. One "
+                "picture with two answers teaches neither; keep the row that is right"
+            )
+        else:
+            duplicates += 1
+        image = SplitImage(
+            source=file,
+            sha256=found.sha256,
+            format=found.format,
+            width=found.width,
+            height=found.height,
+            extension=found.extension,
+        )
+        rows.append(
+            Row(
+                lineno=lineno,
+                prompt="",
+                completion=answer,
+                target=answer,
+                rendered=True,
+                image=image,
+            )
+        )
+    unique = {row.image.sha256: row.image for row in rows if row.image is not None}
+    formats: dict[str, int] = {}
+    for image in unique.values():
+        formats[image.format] = formats.get(image.format, 0) + 1
+    widths = [image.width for image in unique.values()]
+    heights = [image.height for image in unique.values()]
+    stats = ImageStats(
+        rows=len(rows),
+        files=len(unique),
+        duplicate_rows=duplicates,
+        formats=formats,
+        width={"min": min(widths), "max": max(widths)},
+        height={"min": min(heights), "max": max(heights)},
+        checker=checker,
+    )
+    return rows, stats
 
 
 SPECIALS_UNCHECKED = (
@@ -1029,6 +1343,48 @@ def split_calibration(
     return (
         [row for i, row in enumerate(rows) if i not in held and i not in aside],
         [row for i, row in enumerate(rows) if i in aside],
+    )
+
+
+def split_grouped(
+    rows: Sequence[Row],
+    groups: Sequence[str],
+    content_sha256: str,
+    seed: int,
+    heldout: int,
+    calibration: int,
+) -> tuple[list[Row], list[Row], list[Row]] | None:
+    """(training, calibration, held-out) rows, the rows of one group never in two of them.
+
+    `groups[i]` is row i's group. The groups, in the order of their first row,
+    are permuted as `split_rows` permutes rows; the held-out split takes whole
+    groups from the front until it holds at least `heldout` rows, calibration
+    the next ones until it holds `calibration`, and at least one group is left
+    for training. When every group is one row this is the split `split_rows`
+    and `split_calibration` give. `None` when there are fewer than two groups.
+    """
+    order_of: dict[str, int] = {}
+    for group in groups:
+        order_of.setdefault(group, len(order_of))
+    if len(order_of) < 2:
+        return None
+    members: list[list[int]] = [[] for _ in order_of]
+    for i, group in enumerate(groups):
+        members[order_of[group]].append(i)
+    order = _permutation(len(members), split_seed(content_sha256, seed))
+    taken: list[set[int]] = []
+    place = 0
+    for wanted in (heldout, calibration):
+        part: set[int] = set()
+        while len(part) < wanted and place < len(order) - 1:
+            part.update(members[order[place]])
+            place += 1
+        taken.append(part)
+    held, aside = taken
+    return (
+        [row for i, row in enumerate(rows) if i not in held and i not in aside],
+        [row for i, row in enumerate(rows) if i in aside],
+        [row for i, row in enumerate(rows) if i in held],
     )
 
 
@@ -1569,7 +1925,8 @@ def profile_slices(rows: Sequence[Row], probe: HeadroomProbe | None) -> tuple[Sl
 
 @dataclass(frozen=True)
 class PrepareRequest:
-    """One ingestion. `context_length` is required and is the *binding* limit.
+    """One ingestion. `context_length` is required for text rows and is the *binding*
+    limit; image rows have no text to measure, and refuse one (`None` there).
 
     A sequence has to fit two windows, and they are declared in different
     sections of the spec: `export.context_length`, baked into the artifact and
@@ -1582,7 +1939,7 @@ class PrepareRequest:
 
     data: Path
     output_dir: Path
-    context_length: int
+    context_length: int | None
     seed: int = 0
     heldout_fraction: float = DEFAULT_HELDOUT_FRACTION
     heldout_size: int | None = None
@@ -1608,11 +1965,18 @@ class PrepareRequest:
     # takes `DEFAULT_CALIBRATION_FRACTION`.
     calibration_fraction: float | None = None
     calibration_size: int | None = None
+    # Image rows only: what opens the images. `None` takes `PillowImageInspector`,
+    # the check inside `envs.EMBED_TRAIN`.
+    images: ImageInspector | None = None
+    # `--tokenizer-revision` as given. Text rows read it through `tokens` only,
+    # and without `--tokenizer` it is ignored, as it always was; image rows
+    # refuse it with the other text flags.
+    tokenizer_revision: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", Path(self.data))
         object.__setattr__(self, "output_dir", Path(self.output_dir))
-        if self.context_length < 1:
+        if self.context_length is not None and self.context_length < 1:
             raise ValueError(f"context_length must be at least 1, got {self.context_length}")
         if not 0.0 < self.heldout_fraction < 1.0:
             raise ValueError(
@@ -1629,10 +1993,12 @@ class PrepareRequest:
             raise ValueError(f"calibration_size must be at least 1, got {self.calibration_size}")
 
     def as_dict(self) -> dict[str, Any]:
+        # An image split has no window: it is not reported as one.
+        window = {} if self.context_length is None else {"context_length": self.context_length}
         return {
             "data": str(self.data),
             "output_dir": str(self.output_dir),
-            "context_length": self.context_length,
+            **window,
             "seed": self.seed,
             "heldout_fraction": self.heldout_fraction,
             "heldout_size": self.heldout_size,
@@ -1694,6 +2060,8 @@ class PrepareResult:
     # same one `tune` records, so the split can be traced to its tool list.
     declarations_sha256: str | None = None
     decision: DecisionProfile | None = None
+    # Image decision splits only: what the images are.
+    images: ImageStats | None = None
     skipped: list[SkippedCheck] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
     report_path: Path | None = None
@@ -1760,6 +2128,8 @@ class PrepareResult:
             "model": self.identity,
             "declarations_sha256": self.declarations_sha256,
             "decision": self.decision.as_dict() if self.decision is not None else None,
+            "modality": "image" if self.images is not None else "text",
+            "images": self.images.as_dict() if self.images is not None else None,
             "checks": self.checks.as_dict() | {"skipped": [s.as_dict() for s in self.skipped]},
             "limitations": list(self.limitations),
             "spec_fragment": self.spec_fragment(),
@@ -1880,108 +2250,20 @@ def _check_scoreability(result: PrepareResult, rows: Sequence[Row], events: Even
     events.check(scoreability)
 
 
-def prepare(request: PrepareRequest, events: EventStream | None = None) -> PrepareResult:
-    """Read, measure and split a dataset. Raises only if the file is not a dataset.
-
-    Every other problem -- a row too long, a held-out set too small, an argument
-    nothing can score -- is a recorded result, because those are facts about the
-    data that a report has to carry rather than exceptions that lose them.
-    """
-    # This run's own record of which host variables it dropped, so a second
-    # run in one process -- a notebook, a service -- says what the first
-    # one did instead of inheriting its silence.
-    envs.forget_reported_drops()
-    events = events or EventStream(echo_json=False)
-    events.stage_started("prepare", data=str(request.data), seed=request.seed)
-
-    # The family decides how a structured target is spelled, and it is read
-    # from the model rather than asked of the caller. A run that named no
-    # model gets `None`: FunctionGemma's format, and a limitation saying so.
-    wire = wire_format_for(request.base_model) if request.base_model else None
-    # google/embeddinggemma-2 is no LLM family: it has no rule, and its rows
-    # are embedded, not scored (`embedding_tune`).
+def _check_lengths(
+    request: PrepareRequest,
+    context_length: int,
+    result: PrepareResult,
+    rows: Sequence[Row],
+    decision: DecisionProfile | None,
+    declarations_sha256: str | None,
+    evidence: PromptMode | None,
+    events: EventStream,
+) -> Check:
+    """Measure every row against `context_length`, and record the check on `result`."""
     embedding = request.base_model == EMBEDDING_MODEL
-    objects = read_objects(request.data)
-    decision: DecisionProfile | None = None
-    if is_decision_split(objects, request.questions):
-        if request.declarations is not None:
-            raise PrepareError(
-                "these are decision rows, and --declarations was given. A decision model "
-                "answers with the id of an option, never with a tool call, so there is nothing "
-                "for a tool list to check"
-            )
-        refusal = (
-            decision_model_refusal(request.base_model)
-            if request.base_model and not embedding
-            else None
-        )
-        if refusal is not None:
-            raise PrepareError(refusal)
-        asked, questions_sha256, rows = read_decision_rows(request.data, objects, request.questions)
-        if embedding and (refusal := embedding_decision_refusal(asked)) is not None:
-            raise PrepareError(refusal)
-        decision = DecisionProfile(
-            decision=asked,
-            questions=request.questions,
-            questions_sha256=questions_sha256,
-            rows=_count_by_option(asked, rows),
-        )
-    else:
-        if embedding:
-            raise PrepareError(EMBEDDING_NOT_A_DECISION)
-        if request.calibration_fraction is not None or request.calibration_size is not None:
-            raise PrepareError(
-                "a calibration split is set aside for decision rows only, and these rows are not "
-                "decisions: they give completions or targets, and no --questions was given"
-            )
-        rows = _rows_from(request.data, objects, wire)
-    # Before anything is profiled or split: a row calling a tool the prompt will
-    # never offer is a row that cannot be trained, and saying so after a split
-    # has been written means the caller re-runs the stage to learn it.
-    declarations_sha256 = None
-    evidence = prompt_evidence([row.prompt for row in rows]).mode
-    if request.declarations is not None:
-        declarations_sha256 = recorded_digest(
-            refuse_undeclared_tools(rows, request.data, request.declarations),
-            request.declarations,
-            evidence is PromptMode.PRERENDERED,
-        )
-    elif request.base_model is not None:
-        refuse_calls_without_declarations(rows, request.base_model)
-    content_sha256 = hash_file(request.data)
-    result = PrepareResult(
-        request=request,
-        checks=CheckSet(name=f"prepare:{request.data.name}"),
-        content_sha256=content_sha256,
-        n_rows=len(rows),
-        identity=_identity(request.base_model, wire),
-        declarations_sha256=declarations_sha256,
-        decision=decision,
-    )
-    if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
-        result.limitation(ASSUMED_WIRE_FORMAT)
-    if decision is not None:
-        if embedding:
-            result.limitation(EMBEDDING_CALIBRATION_UNUSED)
-        elif request.base_model is None:
-            result.limitation(DECISION_MODEL_UNNAMED)
-        elif (unmeasured := decision_model_limitation(request.base_model)) is not None:
-            result.limitation(unmeasured)
-        if request.questions is None:
-            result.limitation(DECISION_INFERRED.format(question=decision.decision.question))
-        if decision.decision.type != "choice":
-            kind = decision.decision.type
-            result.limitation(
-                DECISION_TYPE_LESS_MEASURED.format(kind=kind, measured=TYPE_MEASURED[kind])
-            )
-    events.metric("rows", len(rows), source=str(request.data))
-
-    if decision is not None and request.tokens is not None:
-        refuse_tokenizer_specials(rows, request.data, request.tokens, result)
-
-    # -- lengths -----------------------------------------------------------
     measured: list[LengthStats] = []
-    window = request.context_length
+    window = context_length
     if embedding:
         from litetune.embedding_tune import RECIPE
 
@@ -2001,7 +2283,7 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             if embedding and decision is not None:
                 stats = measure_embedded_lengths(rows, decision.decision, request.tokens, window)
             else:
-                stats = measure_lengths(rows, request.tokens, request.context_length)
+                stats = measure_lengths(rows, request.tokens, context_length)
             measured.append(stats)
             if stats.over_length:
                 named = ", ".join(
@@ -2063,6 +2345,193 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 "is provisioned"
             )
         )
+    return length_check
+
+
+def _split_pictures(
+    result: PrepareResult,
+    rows: Sequence[Row],
+    content_sha256: str,
+    seed: int,
+    heldout: int,
+    calibration: int,
+) -> tuple[tuple[list[Row], list[Row]] | None, list[Row]]:
+    """An image split's (training, held-out) rows and its calibration rows, by picture.
+
+    Rows that give the same bytes are one group (`split_grouped`), so no picture
+    is both trained on and scored. `None` for the halves when the rows hold
+    fewer than two pictures. A held-out or calibration split that the groups
+    made larger than asked is a limitation.
+    """
+    pictures = [row.image.sha256 if row.image is not None else "" for row in rows]
+    grouped = split_grouped(rows, pictures, content_sha256, seed, heldout, calibration)
+    if grouped is None:
+        return None, []
+    train, aside, held = grouped
+    if (len(held), len(aside)) != (heldout, calibration):
+        result.limitation(
+            f"rows that give the same picture are kept in one split, so {len(held)} rows were held "
+            f"out and {len(aside)} set aside for calibration where {heldout} and {calibration} "
+            "were asked"
+        )
+    return (train, held), aside
+
+
+def _context_length_for(request: PrepareRequest, image_mode: bool) -> int | None:
+    """The window text rows are measured against; `None` for image rows, which
+    refuse a window and a tokenizer rather than report ones never applied."""
+    if image_mode:
+        flags = [
+            name
+            for name, given in (
+                ("--context-length", request.context_length is not None),
+                ("--tokenizer (and --tokenizer-revision)", request.tokens is not None),
+                (
+                    "--tokenizer-revision",
+                    request.tokens is None and request.tokenizer_revision is not None,
+                ),
+            )
+            if given
+        ]
+        if flags:
+            raise PrepareError(IMAGE_FLAGS_FOR_TEXT.format(flags=", ".join(flags)))
+        return None
+    if request.context_length is None:
+        raise PrepareError(CONTEXT_LENGTH_REQUIRED)
+    return request.context_length
+
+
+def prepare(request: PrepareRequest, events: EventStream | None = None) -> PrepareResult:
+    """Read, measure and split a dataset. Raises only if the file is not a dataset.
+
+    Every other problem -- a row too long, a held-out set too small, an argument
+    nothing can score -- is a recorded result, because those are facts about the
+    data that a report has to carry rather than exceptions that lose them.
+    """
+    # This run's own record of which host variables it dropped, so a second
+    # run in one process -- a notebook, a service -- says what the first
+    # one did instead of inheriting its silence.
+    envs.forget_reported_drops()
+    events = events or EventStream(echo_json=False)
+    events.stage_started("prepare", data=str(request.data), seed=request.seed)
+
+    # The family decides how a structured target is spelled, and it is read
+    # from the model rather than asked of the caller. A run that named no
+    # model gets `None`: FunctionGemma's format, and a limitation saying so.
+    wire = wire_format_for(request.base_model) if request.base_model else None
+    # google/embeddinggemma-2 is no LLM family: it has no rule, and its rows
+    # are embedded, not scored (`embedding_tune`).
+    embedding = request.base_model == EMBEDDING_MODEL
+    # Image rows exist on the EmbeddingGemma 2 path only. For every other model
+    # an `image` key is a field like any other, ignored as it always was.
+    objects = read_objects(request.data, images=embedding)
+    if embedding:
+        refuse_image_and_prompt(request.data, objects)
+    image_mode = embedding and rows_are_images(request.data, objects)
+    context_length = _context_length_for(request, image_mode)
+    decision: DecisionProfile | None = None
+    image_stats: ImageStats | None = None
+    if image_mode or is_decision_split(objects, request.questions):
+        if request.declarations is not None:
+            raise PrepareError(
+                "these are decision rows, and --declarations was given. A decision model "
+                "answers with the id of an option, never with a tool call, so there is nothing "
+                "for a tool list to check"
+            )
+        refusal = (
+            decision_model_refusal(request.base_model)
+            if request.base_model and not embedding
+            else None
+        )
+        if refusal is not None:
+            raise PrepareError(refusal)
+        if image_mode:
+            asked, questions_sha256, located = read_image_rows(
+                request.data, objects, request.questions
+            )
+        else:
+            asked, questions_sha256, rows = read_decision_rows(
+                request.data, objects, request.questions
+            )
+        if embedding and (refusal := embedding_decision_refusal(asked)) is not None:
+            raise PrepareError(refusal)
+        if image_mode:
+            # After every refusal the rows file alone can give: opening the
+            # images provisions an environment.
+            rows, image_stats = image_rows(
+                request.data, located, request.images or PillowImageInspector()
+            )
+        decision = DecisionProfile(
+            decision=asked,
+            questions=request.questions,
+            questions_sha256=questions_sha256,
+            rows=_count_by_option(asked, rows),
+        )
+    else:
+        if embedding:
+            raise PrepareError(EMBEDDING_NOT_A_DECISION)
+        if request.calibration_fraction is not None or request.calibration_size is not None:
+            raise PrepareError(
+                "a calibration split is set aside for decision rows only, and these rows are not "
+                "decisions: they give completions or targets, and no --questions was given"
+            )
+        rows = _rows_from(request.data, objects, wire)
+    # Before anything is profiled or split: a row calling a tool the prompt will
+    # never offer is a row that cannot be trained, and saying so after a split
+    # has been written means the caller re-runs the stage to learn it.
+    declarations_sha256 = None
+    evidence = prompt_evidence([row.prompt for row in rows]).mode
+    if request.declarations is not None:
+        declarations_sha256 = recorded_digest(
+            refuse_undeclared_tools(rows, request.data, request.declarations),
+            request.declarations,
+            evidence is PromptMode.PRERENDERED,
+        )
+    elif request.base_model is not None:
+        refuse_calls_without_declarations(rows, request.base_model)
+    content_sha256 = hash_file(request.data)
+    result = PrepareResult(
+        request=request,
+        checks=CheckSet(name=f"prepare:{request.data.name}"),
+        content_sha256=content_sha256,
+        n_rows=len(rows),
+        identity=_identity(request.base_model, wire),
+        declarations_sha256=declarations_sha256,
+        decision=decision,
+        images=image_stats,
+    )
+    if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
+        result.limitation(ASSUMED_WIRE_FORMAT)
+    if decision is not None:
+        if embedding:
+            result.limitation(EMBEDDING_CALIBRATION_UNUSED)
+        elif request.base_model is None:
+            result.limitation(DECISION_MODEL_UNNAMED)
+        elif (unmeasured := decision_model_limitation(request.base_model)) is not None:
+            result.limitation(unmeasured)
+        if request.questions is None:
+            result.limitation(DECISION_INFERRED.format(question=decision.decision.question))
+        if decision.decision.type != "choice":
+            kind = decision.decision.type
+            result.limitation(
+                DECISION_TYPE_LESS_MEASURED.format(kind=kind, measured=TYPE_MEASURED[kind])
+            )
+    events.metric("rows", len(rows), source=str(request.data))
+
+    if decision is not None and request.tokens is not None and image_stats is None:
+        refuse_tokenizer_specials(rows, request.data, request.tokens, result)
+    if image_stats is not None and image_stats.duplicate_rows:
+        result.limitation(IMAGE_DUPLICATES.format(count=image_stats.duplicate_rows))
+
+    # -- lengths -----------------------------------------------------------
+    length_check: Check | None = None
+    if context_length is None:  # image rows (`_context_length_for`)
+        result.lengths = Unavailable(IMAGE_ROWS_NOT_COUNTED)
+        result.skipped.append(SkippedCheck(LENGTH_CHECK, IMAGE_ROWS_NOT_COUNTED))
+    else:
+        length_check = _check_lengths(
+            request, context_length, result, rows, decision, declarations_sha256, evidence, events
+        )
 
     # -- scoreability, before anyone pays for a GPU -------------------------
     if decision is not None:
@@ -2118,11 +2587,17 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 f"{len(rows) - heldout_n} rows are left after the held-out split, so "
                 f"{calibration_n} were set aside"
             )
-        train_part, calibration_rows = split_calibration(
-            rows, content_sha256, request.seed, heldout_n, calibration_n
-        )
-        halves = (train_part, halves[1])
-        decision.train = _count_by_option(decision.decision, train_part)
+        if image_stats is None:
+            train_part, calibration_rows = split_calibration(
+                rows, content_sha256, request.seed, heldout_n, calibration_n
+            )
+            halves = (train_part, halves[1])
+        else:
+            halves, calibration_rows = _split_pictures(
+                result, rows, content_sha256, request.seed, heldout_n, calibration_n
+            )
+    if decision is not None and halves is not None:
+        decision.train = _count_by_option(decision.decision, halves[0])
         decision.calibration = _count_by_option(decision.decision, calibration_rows)
         decision.heldout = _count_by_option(decision.decision, halves[1])
         options_check = result.checks.add(_options_check(decision))
@@ -2151,15 +2626,16 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 "calibration split"
             )
     if halves is None:
+        pictures = f" of {image_stats.files} picture(s)" if image_stats is not None else ""
         split_check = Check.failed(
             SPLIT_CHECK,
-            f"{len(rows)} row(s) cannot be split into a training set and a held-out set; with no "
-            "held-out data nothing downstream can be measured at all",
+            f"{len(rows)} row(s){pictures} cannot be split into a training set and a held-out "
+            "set; with no held-out data nothing downstream can be measured at all",
             observed={"rows": len(rows)},
         )
         result.checks.add(split_check)
         events.check(split_check)
-    elif length_check.outcome is Outcome.FAILED:
+    elif length_check is not None and length_check.outcome is Outcome.FAILED:
         # Deliberate: no split is written when rows do not fit. Writing one
         # anyway would put the over-length rows into a file that the next stage
         # reads without ever seeing this check, and `tune` would refuse them
@@ -2191,6 +2667,16 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         )
     else:
         train_rows, heldout_rows = halves
+        if image_stats is not None:
+            # Before the rows that name them, so no split row names a missing file.
+            try:
+                image_stats.path = write_images(
+                    request.output_dir,
+                    {row.image.name: row.image.source for row in rows if row.image is not None},
+                )
+            except ImageCopyError as exc:
+                raise PrepareError(str(exc)) from exc
+            events.artifact(str(image_stats.path), name=IMAGES_DIR, n=image_stats.files)
         result.train = _write_split(request.output_dir / "train.jsonl", train_rows)
         result.heldout = _write_split(request.output_dir / "heldout.jsonl", heldout_rows)
         if decision is not None:

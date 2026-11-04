@@ -91,6 +91,10 @@ dev = [
     # there); the tests run it with the host interpreter. 2.0.2 has no wheel for
     # Python 3.13, which CI also tests; 2.2.6 has wheels for 3.10 to 3.13.
     "numpy==2.2.6",
+    # `prepare`'s image check script runs inside the embed-train env (pillow
+    # 12.3.0 there, `envs.EMBED_TRAIN`); the tests run it with the host
+    # interpreter, on images they write with it.
+    "pillow==12.3.0",
 ]
 
 [project.scripts]

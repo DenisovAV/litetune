@@ -2426,6 +2426,72 @@ CPU file on the same texts: cosine 0.787 (mean). Loading took 0.67 s on the NPU 
 1.0 s on the phone's CPU; the peak resident memory was 421–423 MiB on the NPU and 511 MiB on
 the CPU. No text was longer than 105 tokens, so only the 128-token signature ran.
 
+## EmbeddingGemma 2 on images: beans
+
+Measured 2026-11-04, once: litetune's own stages, `prepare` → `tune` → `convert`
+(int8 and int4) → `verify --with-base`, at litetune commit `c9904df` (unreleased), on
+image rows. The decider's inputs are pictures, and the file is Google's
+`embeddinggemma-2-text-vision-440m.litertlm`
+(litert-community/embeddinggemma-2-text-vision-440m-litert-lm, revision `e301f74d`) with
+its text tower replaced by the fine-tune's. It is the first int4 image file litetune has
+measured.
+
+**The rows.** AI-Lab-Makerere/beans at revision `27aa014c` (MIT): its train, validation
+and test archives pooled, 1,295 JPEG leaf photos, every one 500×500, in three options —
+`bean_rust` 436, `angular_leaf_spot` 432, `healthy` 427 — no two the same bytes.
+`prepare --heldout-size 300` split them into 865 training, 130 calibration (which the
+embedding path does not read) and 300 held-out rows (99, 99 and 102 per option).
+
+**tune** `--vision-tokens 70`, without `--mirror`, on one CUDA device: 110 steps (two
+epochs) in 19.8 s, after 49.5 s computing the 1,165 pictures' inputs; 106 s for the stage.
+Every picture took 64 soft tokens. The discarded head scored 0.92 on the held-out rows;
+that is the head's, not the decider's. **convert** passed both times: int8 523,173,888 bytes,
+int4 387,710,976 (the size of Google's file), the four text-tower sections from the graft
+and the other seven Google's, every frozen tensor the base's.
+
+**verify** ran on the CPU of the same machine, an Intel Xeon @ 2.20GHz with 12 CPUs, at 8
+threads: the reference in float32 through transformers 5.19.0 (torch 2.9.1), the files
+through LiteRT-LM 0.18.0's `EmbeddingEngine` from PyPI at 70 vision tokens per image. The
+vision encoder takes no thread count in 0.18.0 and ran on the runtime's default, and the
+file and Google's were embedded one after the other. The reference made 64 soft tokens of
+every picture, the count `tune` recorded.
+
+| embeddings | all rows | k=5 mean | k=10 mean | linear | cosine to float32, mean / min |
+|---|---|---|---|---|---|
+| Google's 440m file | 0.8467 | 0.8013 | 0.8233 | 0.9300 | |
+| fine-tuned, float32 | 0.9300 | 0.9287 | 0.9287 | 0.9400 | |
+| int8 file | 0.9300 | 0.9307 | 0.9347 | 0.9367 | 0.9601 / 0.6824 |
+| int4 file | 0.9400 | 0.9333 | 0.9413 | 0.9400 | 0.9164 / 0.6438 |
+
+The 10-shot draws, the same five for every side, and the paired differences on them
+(conversion cost: reference minus file; gain: file minus Google's):
+
+| side | k=10, per draw | cost per draw | gain over Google's per draw |
+|---|---|---|---|
+| fine-tuned, float32 | 0.9300, 0.9300, 0.9300, 0.9233, 0.9300 | | |
+| int8 file | 0.9400, 0.9333, 0.9367, 0.9300, 0.9333 | -0.0100 ±0.0196, -0.0033 ±0.0173, -0.0067 ±0.0226, -0.0067 ±0.0160, -0.0033 ±0.0173 | +0.1533 ±0.0480, +0.0867 ±0.0453, +0.0967 ±0.0418, +0.0900 ±0.0448, +0.1300 ±0.0485 |
+| int4 file | 0.9433, 0.9400, 0.9367, 0.9400, 0.9467 | -0.0133 ±0.0160, -0.0100 ±0.0196, -0.0067 ±0.0207, -0.0167 ±0.0196, -0.0167 ±0.0173 | +0.1567 ±0.0485, +0.0933 ±0.0453, +0.0967 ±0.0428, +0.1000 ±0.0453, +0.1433 ±0.0476 |
+| Google's 440m file | 0.7867, 0.8467, 0.8400, 0.8400, 0.8033 | | |
+
+- Both gates were inconclusive. No draw's cost is resolved, and at 300 held-out rows the
+  intervals (±0.016 to ±0.023) are wider than the 0.01 threshold: an upper bound above it
+  in three of five draws for int8 and one of five for int4. The mean cost was -0.0060
+  (int8) and -0.0127 (int4), the files scoring above the float32 fine-tune; the sample
+  does not tell that apart from zero.
+- The gain over Google's file is resolved in every draw of both: +0.1113 (int8) and
+  +0.1180 (int4) on average at k=10. With a linear layer on every training row the files
+  scored 0.9367 (int8) and 0.9400 (int4) against Google's 0.9300; no interval was computed
+  for the linear decider.
+- Four bits moved the vectors further than eight: mean cosine 0.9164 against 0.9601 to the
+  float32 fine-tune, minimum 0.6438 against 0.6824.
+- Per picture the int8 file took a median 481.9 ms and Google's 495.8 ms; the int4 file
+  481.7 ms and Google's 486.7 ms. The reference took 922.5 s (int8 run) and 941.8 s (int4
+  run) for the 1,165 pictures. The reference's and Google's accuracies were the same in both
+  verify runs, draw for draw.
+- Not measured: 140 vision tokens, `--mirror`, the GPU (`verify` refuses it for an image
+  file), an NPU (`convert` does not compile an image file), and the spliced file through
+  flutter_edge_ai on any device.
+
 ## LLMs on a Qualcomm NPU
 
 Measured 2026-11-01 on one Galaxy S25 Ultra (SM-S938U1, SM8750, Hexagon V79), through the

@@ -914,6 +914,111 @@ litetune convert --model ./tuned/model --output-dir ./out --weights int8 --npu S
   against 0.9312 for the float32 reference ([MEASUREMENTS.md](MEASUREMENTS.md#embeddinggemma-2-on-a-qualcomm-npu)).
   No other SoC's file has run on a device.
 
+#### EmbeddingGemma 2 on images
+
+The same four stages fine-tune a decider whose inputs are pictures. Each row
+names an image file instead of a state, relative to the rows file or absolute;
+a rows file is all image rows or all text rows:
+
+```
+{"image": "leaves/0001.jpg", "label": "bean_rust"}
+{"image": "leaves/0002.png", "label": "healthy"}
+```
+
+```bash
+litetune prepare --data rows.jsonl --questions questions.json --output-dir data \
+                 --base-model google/embeddinggemma-2
+
+litetune tune --model google/embeddinggemma-2 --data data/train.jsonl \
+              --decision data/decision.json --vision-tokens 70 --output-dir tuned
+
+litetune convert --model tuned/model --output-dir artifacts            # int8 for images
+
+litetune verify --model artifacts/int8/model.litertlm --reference tuned/model \
+                --data data/heldout.jsonl --with-base --json > manifest.json
+```
+
+`questions.json` is a `choice` question without a `none_option`, as for text.
+`--context-length` and `--tokenizer` are refused for image rows: there is no
+text to measure.
+
+- **prepare** opens every picture with the Pillow `tune` trains with and
+  accepts PNG and JPEG only (an MPO file, which some cameras write, is taken at
+  its first frame; any other file of more than one frame is refused). It copies
+  each picture byte for byte into the split, as `images/<sha256>.<ext>`, and
+  never re-encodes it. Rows that give the same bytes stay in one split, so no
+  held-out row scores a picture the model was trained on; the same picture
+  under two labels is refused.
+- **tune** needs `--vision-tokens`, 70 or 140: the most soft tokens a picture
+  becomes, the budget the model is tuned at. The processor keeps the aspect
+  ratio, so a picture may take fewer: at 70, each 500×500 picture of the run
+  below took 64. The vision tower, its adapter (`embed_vision`) and the token
+  embeddings are frozen, and each picture's input is computed once and cached
+  under the output directory (`embed_image_inputs`); the rest of the text tower
+  is trained, in float32, with a throwaway classification head on the mean
+  pool. `--mirror` also
+  trains on a horizontally flipped copy of every training picture, for pictures
+  whose mirror image means the same (no text, no HUD); `--mirror-swap A:B`,
+  repeatable, labels the flipped copy of an A picture B and the other way
+  round. The recipe comes from unpublished runs on one task family -- game
+  frames -- on Apple's GPU and on CUDA; litetune has measured it once, below.
+- **convert** writes `artifacts/int8/model.litertlm`: Google's
+  `embeddinggemma-2-text-vision-440m.litertlm` (checked by its sha256, revision
+  `e301f74d`, or given with `--base-litertlm-440m`) with its four text-tower
+  sections replaced by the fine-tune's graft and the other seven kept as Google
+  wrote them, read back against both inputs. The weights default to int8
+  (523,173,888 bytes); `--weights int4` writes 387,710,976, Google's size. It
+  first refuses a checkpoint whose frozen tensors differ from the base's, since
+  the vision sections it keeps are computed from them, and refuses `--npu`.
+- **verify** embeds every picture with the float32 fine-tune (transformers, on
+  the CPU, with the checkpoint's own processor at the tuned budget) and with
+  the file (LiteRT-LM's `EmbeddingEngine`, CPU, each picture given as its
+  file), and with `--with-base` with Google's 440m file. It refuses a picture
+  in both splits, a reference whose soft tokens for a picture differ from the
+  count `tune` recorded (the engine reports none, so the file's count is not
+  compared), a `convert.json` that records another budget, and `--backend
+  gpu`. LiteRT-LM 0.18.0 sets no thread count for the vision encoder, so the
+  file and Google's are embedded one after the other, and on a Mac whose CPU
+  has SME2, where litetune holds LiteRT-LM to one thread, the file is embedded
+  twice and a difference between the two runs fails the harness. The gate is
+  the one for text.
+
+In the app, the budget has to be the one tuned at. flutter_edge_ai's
+`LiteRtEmbeddingBackend(visionTokensPerImage: N)` sets it, and its default is
+140 (flutter_edge_ai_litertlm 1.17.0,
+`lib/src/embedding/litert_embedding_backend.dart`); the `.litertlm` does not
+record it, so a file tuned at 70 and loaded at the default embeds at 140:
+
+```dart
+await FlutterEdgeAi.initialize(
+  embeddingBackends: const [LiteRtEmbeddingBackend(visionTokensPerImage: 70)],
+);
+final embedder = await FlutterEdgeAi.getActiveEmbedder(supportImage: true);
+```
+
+Options' examples are then `EmbeddingInput.image(bytes)`; the task prefix
+reaches text only, and litetune trains and verifies each picture with no task
+prompt. Train on the pictures in the format the app will give (the
+flutter_edge_ai_litertlm README's `uprightAndSmall` hands the engine a PNG):
+prepare keeps the bytes it is given, and on 1005 crops from an unpublished
+fine-tune, each embedded as PNG and as JPEG, the two vectors' mean cosine was
+0.918 (0.982 on the base model).
+
+What has and has not been measured
+([MEASUREMENTS.md](MEASUREMENTS.md#embeddinggemma-2-on-images-beans)):
+
+- One run, on beans (three options, 1,295 leaf photos, 300 held out), at 70
+  vision tokens. On the 10-shot centroid decider the float32 fine-tune scored
+  0.9287, the int8 file 0.9347, the int4 file 0.9413 and Google's 440m file
+  0.8233. Both files' gate was inconclusive: the conversion cost per draw was
+  -0.0100 to -0.0033 (int8) and -0.0167 to -0.0067 (int4), with intervals of
+  ±0.016 to ±0.023 at 300 held-out rows, wider than the 0.01 threshold. Their
+  gain over Google's file, +0.1113 (int8) and +0.1180 (int4), was resolved in
+  every draw. This was litetune's first int4 image file.
+- Not measured: 140 vision tokens, `--mirror`, an NPU (convert does not compile
+  one), the GPU, and the app's CPU path through flutter_edge_ai on the spliced
+  file.
+
 ### A generation bundle for a Qualcomm NPU: `convert --npu`
 
 ```

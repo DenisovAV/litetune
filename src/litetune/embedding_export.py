@@ -20,6 +20,22 @@ The file is written to `<output-dir>/<weights>/model.litertlm`, one directory
 per weight mode as `convert` writes one per recipe (`export.ExportRequest.dir_for`),
 with `convert.json` beside it. `verify` reads the weight mode from that report.
 
+**An image checkpoint** (`EmbeddingRecord.modality` "image") needs a fourth input,
+Google's text-vision file (`embedding_vision.VISION_FILE` at `VISION_REVISION`,
+downloaded the same way, or `--base-litertlm-440m PATH`; its sha256 must be
+`embedding_vision.VISION_SHA256`). Before the graft, its frozen tensors are held
+to the base's (`embedding_vision.frozen_changes`): the splice keeps Google's
+vision sections, which come from them. The graft writes the text file as for a
+text checkpoint, into the run's own scratch directory, and
+`embedding_vision.splice` puts its text tower into the text-vision file at the
+same output path; the text file is removed with the scratch directory. Its
+weights default to int8, the mode whose vectors stayed closer to the float32
+fine-tune's in the one image measurement (`IMAGE_DEFAULT_WEIGHTS`). `--npu` is
+refused for it. Its
+report adds `google_vision_file` and `splice`; `splice.sha256` is the file's,
+which `verify` ties the report to, and `graft` describes the text file, whose
+`output` is `null` because it is not kept.
+
 What the file embeds is not checked here: `litetune verify` measures it.
 """
 
@@ -61,7 +77,17 @@ from litetune.embedding_npu import (
     host_problem,
     request_problem,
 )
-from litetune.embedding_tune import DECIDER_PREFIX, EmbeddingRecord
+from litetune.embedding_tune import DECIDER_PREFIX, IMAGE_PREFIX, EmbeddingRecord
+from litetune.embedding_vision import (
+    FROZEN_PREFIXES,
+    VISION_FILE,
+    VISION_REPO,
+    VISION_REVISION,
+    VISION_SHA256,
+    SpliceResult,
+    frozen_changes,
+    splice,
+)
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.storage import hash_file
@@ -92,6 +118,29 @@ ENV_CHECK = "export environment"
 BASE_FILE_CHECK = "Google's file"
 BASE_CHECKPOINT_CHECK = "base checkpoint"
 GRAFT_CHECK = "graft"
+VISION_FILE_CHECK = "Google's text-vision file"
+FROZEN_CHECK = "frozen tensors are the base's"
+SPLICE_CHECK = "splice"
+
+# An image checkpoint's weights when --weights is not given. Both modes were
+# measured once, on beans (MEASUREMENTS.md, "EmbeddingGemma 2 on images: beans"):
+# the int4 file's 10-shot centroid decider scored 0.9413 and the int8 file's
+# 0.9347, but int8's vectors stayed closer to the float32 fine-tune's (mean
+# cosine 0.9601 against 0.9164), and neither conversion cost was resolved at 300
+# held-out rows. One dataset does not show int4's accuracy to hold, so the
+# default is the mode whose vectors moved less.
+IMAGE_DEFAULT_WEIGHTS = "int8"
+IMAGE_INT4_NOT_MEASURED = (
+    'int4 has been measured on one image checkpoint (beans; MEASUREMENTS.md, "EmbeddingGemma 2 '
+    "on images: beans\"): its 10-shot centroid decider scored 0.9413 against int8's 0.9347, "
+    "its vectors were further from the float32 fine-tune's (mean cosine 0.9164 against 0.9601), "
+    "and neither file's conversion cost was resolved at 300 held-out rows. `litetune verify` "
+    "measures this file"
+)
+NPU_IMAGE_REFUSED = (
+    "--npu: {model} was tuned on images, and convert does not compile an image model for an "
+    "NPU; drop --npu to write the CPU file"
+)
 
 
 NPU_ENV_CHECK = "npu environment"
@@ -180,6 +229,12 @@ class HubFile:
 
 GOOGLE_HUB_FILE = HubFile(GOOGLE_REPO, GOOGLE_FILE, GOOGLE_REVISION)
 BASE_HUB_FILE = HubFile(BASE_MODEL, BASE_FILE, BASE_REVISION)
+VISION_HUB_FILE = HubFile(VISION_REPO, VISION_FILE, VISION_REVISION)
+
+
+def default_weights(record: EmbeddingRecord) -> str:
+    """The weight mode `convert` writes `record`'s checkpoint in when none is asked for."""
+    return IMAGE_DEFAULT_WEIGHTS if record.is_image else DEFAULT_WEIGHTS
 
 
 def download(
@@ -222,11 +277,26 @@ def check_google_file(path: Path) -> str | None:
     return _google_file_problem(path, hash_file(path))
 
 
+def check_vision_file(path: Path) -> str | None:
+    """Why `path` is not Google's text-vision file, or `None` when its sha256 is `VISION_SHA256`."""
+    return _vision_file_problem(path, hash_file(path))
+
+
 def _google_file_problem(path: Path, digest: str) -> str | None:
     if digest != f"sha256:{GOOGLE_SHA256}":
         return (
             f"{path} has {digest}, not sha256:{GOOGLE_SHA256}, the {GOOGLE_FILE} of {GOOGLE_REPO} "
             f"at {GOOGLE_REVISION} that the graft's mapping was established on"
+        )
+    return None
+
+
+def _vision_file_problem(path: Path, digest: str) -> str | None:
+    if digest != f"sha256:{VISION_SHA256}":
+        return (
+            f"{path} has {digest}, not sha256:{VISION_SHA256}, the {VISION_FILE} of "
+            f"{VISION_REPO} at {VISION_REVISION} whose text sections are the ones the graft "
+            "writes"
         )
     return None
 
@@ -249,6 +319,8 @@ class EmbeddingExportRequest:
     weights: str = DEFAULT_WEIGHTS
     # A local copy of Google's file; `None` downloads it.
     base_litertlm: Path | None = None
+    # An image checkpoint's: a local copy of Google's text-vision file; `None` downloads it.
+    base_litertlm_440m: Path | None = None
     timeout_s: int = GRAFT_TIMEOUT_S
     env: envs.StageEnv = envs.EXPORT
     auto_provision: bool = True
@@ -278,6 +350,8 @@ class EmbeddingExportRequest:
         object.__setattr__(self, "output_dir", Path(self.output_dir))
         if self.base_litertlm is not None:
             object.__setattr__(self, "base_litertlm", Path(self.base_litertlm))
+        if self.base_litertlm_440m is not None:
+            object.__setattr__(self, "base_litertlm_440m", Path(self.base_litertlm_440m))
 
     @property
     def tuned_safetensors(self) -> Path:
@@ -297,6 +371,9 @@ class EmbeddingExportRequest:
             "output_dir": str(self.output_dir),
             "weights": self.weights,
             "base_litertlm": str(self.base_litertlm) if self.base_litertlm else None,
+            "base_litertlm_440m": (
+                str(self.base_litertlm_440m) if self.base_litertlm_440m else None
+            ),
             "timeout_s": self.timeout_s,
             "environment": {"name": self.env.name, "identity": self.env.identity},
             "npu": list(self.npu),
@@ -317,6 +394,9 @@ class EmbeddingExportResult:
     google: dict[str, Any] = field(default_factory=dict)
     base: dict[str, Any] = field(default_factory=dict)
     graft: GraftResult | None = None
+    # An image checkpoint's: Google's text-vision file, and the splice into it.
+    vision: dict[str, Any] = field(default_factory=dict)
+    splice: SpliceResult | None = None
     limitations: list[str] = field(default_factory=list)
     # `hash_file` of the fine-tune's safetensors, taken before the graft reads it.
     checkpoint_sha256: str | None = None
@@ -339,9 +419,15 @@ class EmbeddingExportResult:
 
     @property
     def artifact(self) -> Path | None:
+        if self.record.is_image:
+            # The graft's text file is scratch; the splice writes the file.
+            return self.splice.output if self.splice is not None else None
         return self.graft.output if self.graft is not None else None
 
     def as_dict(self) -> dict[str, Any]:
+        graft = self.graft.as_dict() if self.graft else None
+        if graft is not None and self.record.is_image:
+            graft["output"] = None  # removed with the run's scratch directory
         return {
             "schema": EMBEDDING_CONVERT_SCHEMA,
             "direction": "embedding",
@@ -349,11 +435,15 @@ class EmbeddingExportResult:
             "outcome": self.outcome.value,
             "weights": self.request.weights,
             "prefix": self.record.prefix,
+            "modality": self.record.modality,
+            "vision_tokens": self.record.vision_tokens,
             "artifact": str(self.artifact) if self.artifact else None,
-            "graft": self.graft.as_dict() if self.graft else None,
+            "graft": graft,
+            "splice": self.splice.as_dict() if self.splice else None,
             "npu": [r.as_dict() for r in self.npu],
             "npu_published": self.npu_published if self.request.npu else None,
             "google_file": self.google,
+            "google_vision_file": self.vision if self.record.is_image else None,
             "base_checkpoint": self.base,
             "checkpoint": {
                 "path": str(self.request.model),
@@ -370,15 +460,27 @@ class EmbeddingExportResult:
 
 
 def _refuse_request(request: EmbeddingExportRequest, record: EmbeddingRecord) -> None:
+    if record.is_image and request.npu:
+        raise EmbeddingExportError(NPU_IMAGE_REFUSED.format(model=request.model))
+    if not record.is_image and request.base_litertlm_440m is not None:
+        raise EmbeddingExportError(
+            f"--base-litertlm-440m is Google's text-vision file, for a checkpoint tuned on "
+            f"images; {request.model} was tuned on text, which convert grafts into "
+            f"{GOOGLE_FILE} alone"
+        )
     if (record.base_model, record.base_model_revision) != (BASE_MODEL, BASE_REVISION):
         raise EmbeddingExportError(
             f"{request.model} records {record.base_model} at {record.base_model_revision}; the "
             f"graft's mapping was established for {BASE_MODEL} at {BASE_REVISION}"
         )
-    if record.prefix != DECIDER_PREFIX:
+    if record.is_image:
+        prefix, whose = IMAGE_PREFIX, "image input's"
+    else:
+        prefix, whose = DECIDER_PREFIX, "decider's"
+    if record.prefix != prefix:
         raise EmbeddingExportError(
-            f"{request.model} was trained with the prefix {record.prefix!r}, not the decider's "
-            f"{DECIDER_PREFIX!r}"
+            f"{request.model} was trained with the prefix {record.prefix!r}, not the {whose} "
+            f"{prefix!r}"
         )
     if not request.tuned_safetensors.is_file():
         found = sorted(p.name for p in request.model.iterdir()) if request.model.is_dir() else []
@@ -388,6 +490,10 @@ def _refuse_request(request: EmbeddingExportRequest, record: EmbeddingRecord) ->
         )
     if request.base_litertlm is not None and not request.base_litertlm.is_file():
         raise EmbeddingExportError(f"--base-litertlm {request.base_litertlm}: no such file")
+    if request.base_litertlm_440m is not None and not request.base_litertlm_440m.is_file():
+        raise EmbeddingExportError(
+            f"--base-litertlm-440m {request.base_litertlm_440m}: no such file"
+        )
     if request.npu:
         problem = host_problem() or request.npu_env.refusal()
         if problem is not None:
@@ -470,16 +576,20 @@ def _run(
         return
 
     # -- the inputs -------------------------------------------------------------
-    wanted = [BASE_HUB_FILE] if request.base_litertlm else [GOOGLE_HUB_FILE, BASE_HUB_FILE]
+    image = result.record.is_image
+    wanted = [] if request.base_litertlm else [GOOGLE_HUB_FILE]
+    if image and request.base_litertlm_440m is None:
+        wanted.append(VISION_HUB_FILE)
+    wanted.append(BASE_HUB_FILE)
     try:
-        fetched = download(env, wanted, timeout=request.timeout_s)
+        fetched = dict(zip(wanted, download(env, wanted, timeout=request.timeout_s), strict=True))
     except DownloadFailed as exc:
         logger.error("could not download %s: %s", [f.filename for f in wanted], exc)
         _add(result, events, Check.unchecked(BASE_CHECKPOINT_CHECK, f"not fetched: {exc}"))
         result.limitations.append(f"the graft was not attempted: {exc}")
         return
-    google = request.base_litertlm or fetched[0]
-    base = fetched[-1]
+    google = request.base_litertlm or fetched[GOOGLE_HUB_FILE]
+    base = fetched[BASE_HUB_FILE]
     google_digest = hash_file(google)
     result.google = {
         "path": str(google),
@@ -497,6 +607,11 @@ def _run(
         events,
         Check.passed(BASE_FILE_CHECK, f"{google.name}, sha256 {GOOGLE_SHA256[:16]}…"),
     )
+    vision: Path | None = None
+    if image:
+        vision = request.base_litertlm_440m or fetched[VISION_HUB_FILE]
+        if not _vision_file_checked(request, result, events, vision):
+            return
     result.base["sha256"] = hash_file(base)
     problem = _base_checkpoint_problem(base, result.base["sha256"])
     if problem is not None:
@@ -509,15 +624,20 @@ def _run(
             BASE_CHECKPOINT_CHECK, f"{BASE_MODEL} at {BASE_REVISION}, sha256 {BASE_SHA256[:16]}…"
         ),
     )
+    if image and not _frozen_checked(result, events, base, tuned):
+        return
 
     # -- the graft ---------------------------------------------------------------
+    if image and request.weights == "int4":
+        result.limitations.append(IMAGE_INT4_NOT_MEASURED)
     try:
         grafted = graft(
             env,
             google,
             base,
             tuned,
-            request.output,
+            # An image checkpoint's text file is scratch, removed with the snapshot.
+            snapshot / f"text-{request.weights}.litertlm" if image else request.output,
             request.weights,  # type: ignore[arg-type]
             events=events,
             auto_provision=False,
@@ -541,14 +661,134 @@ def _run(
         Check.passed(
             GRAFT_CHECK,
             f"{grafted.weights}: {grafted.bytes:,} bytes, read back; "
-            f"{grafted.norms_written} norms written, folds {grafted.folds}",
+            f"{grafted.norms_written} norms written, folds {grafted.folds}"
+            + (f"; spliced into {VISION_FILE} next" if image else ""),
             observed={"sha256": grafted.sha256, "bytes": grafted.bytes},
         ),
     )
+    if vision is not None:
+        if not _spliced(request, result, events, grafted, vision):
+            return
+        result.limitations.append(NOT_VERIFIED)
+        events.artifact(str(request.output), name=ARTIFACT_NAME, verified=False)
+        return
     result.limitations.append(NOT_VERIFIED)
     events.artifact(str(grafted.output), name=ARTIFACT_NAME, verified=False)
     if request.npu:
         _compile_npus(request, result, events, grafted)
+
+
+def _vision_file_checked(
+    request: EmbeddingExportRequest,
+    result: EmbeddingExportResult,
+    events: EventStream,
+    vision: Path,
+) -> bool:
+    """Whether `vision` is Google's text-vision file, recorded as a check either way."""
+    digest = hash_file(vision)
+    result.vision = {
+        "path": str(vision),
+        "source": "--base-litertlm-440m" if request.base_litertlm_440m else "downloaded",
+        **VISION_HUB_FILE.as_dict(),
+        "sha256": digest,
+    }
+    problem = _vision_file_problem(vision, digest)
+    if problem is not None:
+        _add(result, events, Check.failed(VISION_FILE_CHECK, problem, observed=result.vision))
+        return False
+    _add(
+        result,
+        events,
+        Check.passed(VISION_FILE_CHECK, f"{vision.name}, sha256 {VISION_SHA256[:16]}…"),
+    )
+    return True
+
+
+def _frozen_checked(
+    result: EmbeddingExportResult, events: EventStream, base: Path, tuned: Path
+) -> bool:
+    """Whether the fine-tune holds the base's frozen tensors, recorded as a check either way.
+
+    The splice keeps Google's vision sections and `end_of_vision`, which are the
+    base's (`embedding_vision.frozen_changes`); a checkpoint that changed what
+    they come from would be spliced into a file that is not it.
+    """
+    try:
+        changes = frozen_changes(base, tuned)
+    except EmbeddingConvertError as exc:
+        logger.error("the frozen tensors could not be compared: %s", exc)
+        _add(result, events, Check.failed(FROZEN_CHECK, f"{exc.cause}: {exc}"))
+        return False
+    if changes:
+        more = f" and {len(changes) - 5} more" if len(changes) > 5 else ""
+        shown = ", ".join(changes[:5]) + more
+        _add(
+            result,
+            events,
+            Check.failed(
+                FROZEN_CHECK,
+                f"the fine-tune holds {len(changes)} of the tensors the image recipe freezes "
+                f"otherwise than the base: {shown}. The splice keeps Google's vision encoder, "
+                "vision adapter and end_of_vision, which hold the base's, so the file would not "
+                "be this checkpoint",
+                observed={"changed": changes},
+            ),
+        )
+        return False
+    _add(
+        result,
+        events,
+        Check.passed(
+            FROZEN_CHECK,
+            f"every tensor under {', '.join(FROZEN_PREFIXES)} holds the base's values",
+        ),
+    )
+    return True
+
+
+def _spliced(
+    request: EmbeddingExportRequest,
+    result: EmbeddingExportResult,
+    events: EventStream,
+    grafted: GraftResult,
+    vision: Path,
+) -> bool:
+    """The graft's text tower spliced into `vision` at the output, as one check."""
+    try:
+        spliced = splice(
+            request.env,
+            grafted.output,
+            vision,
+            request.output,
+            events=events,
+            auto_provision=False,
+            timeout=request.timeout_s,
+        )
+    except EmbeddingConvertError as exc:
+        logger.error("the splice refused (%s): %s", exc.cause, exc)
+        make = Check.unchecked if exc.cause == "run" else Check.failed
+        _add(
+            result,
+            events,
+            make(SPLICE_CHECK, f"{exc.cause}: {exc}", observed={"cause": exc.cause}),
+        )
+        return False
+    except FileNotFoundError as exc:
+        logger.exception("a splice input went missing")
+        _add(result, events, Check.unchecked(SPLICE_CHECK, f"an input went missing: {exc}"))
+        return False
+    result.splice = spliced
+    _add(
+        result,
+        events,
+        Check.passed(
+            SPLICE_CHECK,
+            f"{spliced.bytes:,} bytes, read back; {', '.join(spliced.replaced)} from the graft, "
+            f"the other {len(spliced.sections) - len(spliced.replaced)} sections {VISION_FILE}'s",
+            observed={"sha256": spliced.sha256, "bytes": spliced.bytes},
+        ),
+    )
+    return True
 
 
 def _compile_npus(
@@ -763,13 +1003,20 @@ def _compile_npu(
 
 
 def summarise(result: EmbeddingExportResult) -> list[str]:
+    into = f"{GOOGLE_FILE}, spliced into {VISION_FILE}" if result.record.is_image else GOOGLE_FILE
     lines = [
         f"outcome: {result.outcome.value}",
         f"  embedding checkpoint {result.request.model}: {result.request.weights} graft into "
-        f"{GOOGLE_FILE}",
+        f"{into}",
     ]
-    if result.graft is not None:
-        lines.append(f"  {result.graft.bytes:,} bytes — {result.graft.output}")
+    if result.record.is_image:
+        lines.append(
+            f"  tuned on images at most {result.record.vision_tokens} vision tokens per image; "
+            "the app must give the runtime the same budget"
+        )
+    written = result.splice if result.record.is_image else result.graft
+    if written is not None:
+        lines.append(f"  {written.bytes:,} bytes — {written.output}")
     for npu in result.npu:
         lines.append(f"  {npu.soc} NPU: {npu.bytes:,} bytes — {npu.output}")
         if npu.as_dict()["device_run"]:
@@ -779,6 +1026,6 @@ def summarise(result: EmbeddingExportResult) -> list[str]:
             lines.append(f"  {check.outcome.value}: {check.name} — {check.detail}")
     for text in result.limitations:
         lines.append(f"  note: {text}")
-    if result.graft is not None:
+    if result.artifact is not None:
         lines.append("  produced, not verified: run `litetune verify` on the artifact")
     return lines

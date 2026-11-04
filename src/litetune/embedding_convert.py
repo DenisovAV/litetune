@@ -1163,7 +1163,7 @@ def graft(
                 str(report.get("cause") or "run"),
                 f"{report.get('reason') or 'the graft wrote nothing'}; nothing was written",
             )
-        digest = _publish(Path(report["rebuilt"]), output, report["sha256"])
+        digest = publish_packed(Path(report["rebuilt"]), output, report["sha256"])
     finally:
         leaked: list[str] = []
         shutil.rmtree(work, onerror=lambda _fn, path, _exc: leaked.append(str(path)))
@@ -1186,11 +1186,12 @@ def graft(
     )
 
 
-def _publish(rebuilt: Path, output: Path, packed_sha256: str) -> str:
+def publish_packed(rebuilt: Path, output: Path, packed_sha256: str, what: str = "the graft") -> str:
     """Put the packed file at `output` and return its digest, once it hashes to
     the `packed_sha256` the script read back -- checked before the name exists,
     so a mismatch leaves nothing at `output`. Never over a file already there: a
-    hard link fails if the name exists, and the file appears whole (as `towers`)."""
+    hard link fails if the name exists, and the file appears whole (as `towers`).
+    `what` names the step that packed it (`embedding_vision.splice` uses this too)."""
     digest = hash_file(rebuilt)
     if digest != f"sha256:{packed_sha256}":
         raise EmbeddingConvertError(
@@ -1200,7 +1201,7 @@ def _publish(rebuilt: Path, output: Path, packed_sha256: str) -> str:
         os.link(rebuilt, output)
     except FileExistsError:
         raise EmbeddingConvertError(
-            "input", f"{output} appeared while the graft ran; nothing was written over it"
+            "input", f"{output} appeared while {what} ran; nothing was written over it"
         ) from None
     except OSError as exc:
         raise EmbeddingConvertError(
