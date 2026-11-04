@@ -478,7 +478,8 @@ def _add_verify(sub) -> None:
         "--base-litertlm",
         type=Path,
         help=(
-            "embedding checkpoints: a local copy of Google's embeddinggemma-2-text-270m.litertlm, "
+            "embedding checkpoints: a local copy of Google's embeddinggemma-2-text-270m.litertlm "
+            "(embeddinggemma-2-text-vision-440m.litertlm for a checkpoint tuned on images), "
             "checked by its sha256, measured on the same rows for the gain over it"
         ),
     )
@@ -486,8 +487,8 @@ def _add_verify(sub) -> None:
         "--with-base",
         action="store_true",
         help=(
-            "embedding checkpoints: download Google's file at the pinned revision and measure "
-            "the gain over it"
+            "embedding checkpoints: download Google's file at the pinned revision (the 440m "
+            "text-vision file for a checkpoint tuned on images) and measure the gain over it"
         ),
     )
     verify.add_argument("--json", action="store_true", help="write the manifest to stdout")

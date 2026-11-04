@@ -163,3 +163,17 @@ def test_a_generative_flag_on_an_embedding_checkpoint_is_refused_by_name(tmp_pat
     assert result.status is Status.FAILED_HARNESS
     assert flag in _checks_text(result)
     assert "not apply to an embedding checkpoint" in _checks_text(result)
+
+
+def test_the_base_flags_name_the_text_vision_file_for_image_checkpoints():
+    import argparse
+
+    from litetune.cli import build_parser
+
+    parser = build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    verify = sub.choices["verify"]
+    helps = {a.dest: a.help or "" for a in verify._actions}
+    assert "embeddinggemma-2-text-vision-440m.litertlm" in helps["base_litertlm"]
+    assert "tuned on images" in helps["base_litertlm"]
+    assert "440m text-vision file" in helps["with_base"]
