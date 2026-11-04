@@ -11,6 +11,7 @@ helpers import nothing beyond the standard library and are `exec`'d here.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import subprocess
@@ -64,6 +65,11 @@ OPTIONS = ("left", "right", "straight")
 # ---------------------------------------------------------------------------
 
 
+def _processor_text(name: str) -> str:
+    """What the fake run saves as processor file `name`: different for each file."""
+    return json.dumps({"file": name})
+
+
 @dataclass
 class FakeImageToolchain:
     """Stands in for `envs.StageEnv.run`: the device probe, then the image script."""
@@ -99,7 +105,7 @@ class FakeImageToolchain:
             (model_dir / "model.safetensors").write_bytes(b"\0" * 16)
         for name in PROCESSOR_FILES:
             if name not in self.skip_files:
-                (model_dir / name).write_text("{}", encoding="utf-8")
+                (model_dir / name).write_text(_processor_text(name), encoding="utf-8")
         train = Path(spec["train_rows"]).read_text(encoding="utf-8").splitlines()
         heldout = Path(spec["heldout_rows"]).read_text(encoding="utf-8").splitlines()
         pictures = sorted({json.loads(line)["sha256"] for line in train + heldout})
@@ -260,6 +266,17 @@ def test_an_image_run_writes_an_image_record_beside_the_checkpoint(toolchain, sp
     assert record.soft_tokens == on_disk["soft_tokens"]
 
 
+def test_the_record_holds_the_sha256_of_each_processor_file_saved(toolchain, split, tmp_path):
+    result = run_embedding_tune(_request(split, tmp_path))
+    assert result.outcome is Outcome.PASSED, result.checks
+    on_disk = json.loads((tmp_path / "tuned" / "model" / "litetune.json").read_text())
+    expected = {
+        name: hashlib.sha256(_processor_text(name).encode()).hexdigest() for name in PROCESSOR_FILES
+    }
+    assert on_disk["processor_sha256"] == expected
+    assert result.record is not None and result.record.processor_sha256 == expected
+
+
 @pytest.mark.parametrize("missing", [BASE_CHECKPOINT_FILE, *PROCESSOR_FILES])
 def test_a_checkpoint_without_its_weights_or_processor_is_a_failure(
     toolchain, split, tmp_path, missing
@@ -410,10 +427,14 @@ def test_no_mirror_no_mirror_limitation(toolchain, split, tmp_path):
     assert not [t for t in result.limitations if "--mirror" in t]
 
 
-def test_an_image_run_says_its_recipe_has_no_litetune_measurement(toolchain, split, tmp_path):
+def test_an_image_run_says_its_recipe_has_one_litetune_measurement(toolchain, split, tmp_path):
     result = run_embedding_tune(_request(split, tmp_path))
     assert IMAGE_RECIPE_UNMEASURED in result.limitations
     assert "game frames" in IMAGE_RECIPE_UNMEASURED
+    # MEASUREMENTS.md, "EmbeddingGemma 2 on images: beans": centroid_k10 of the
+    # reference and of Google's file in verify_int8.json.
+    for said in ("one litetune measurement", "beans", "0.9287", "0.8233", "is not known"):
+        assert said in IMAGE_RECIPE_UNMEASURED
     # The text recipe's CPU measurement is not this recipe's.
     assert not [t for t in result.limitations if "measured in float32 on the CPU only" in t]
     assert any("this run trained on cpu" in t for t in result.limitations)
@@ -595,11 +616,23 @@ def test_an_images_directory_linked_out_of_the_split_is_refused(toolchain, split
     _refused(toolchain, _request(split, tmp_path), r"train\.jsonl:1: .*not inside the split")
 
 
-def test_a_row_with_a_prompt_in_an_image_split_is_a_text_row_and_refused(
+def test_a_row_with_a_prompt_and_an_image_is_refused_with_prepares_reason(
     toolchain, split, tmp_path
 ):
     rows = _records(split.train)
     rows[3]["prompt"] = "a road"
+    _write(split.train, rows)
+    _refused(
+        toolchain,
+        _request(split, tmp_path),
+        r"train\.jsonl:4: this row gives both an 'image' and a 'prompt'\. A row for "
+        r"google/embeddinggemma-2 is an image row",
+    )
+
+
+def test_a_text_row_in_an_image_split_is_refused(toolchain, split, tmp_path):
+    rows = _records(split.train)
+    rows[3] = {"prompt": "a road", "completion": rows[3]["completion"], "source_line": 4}
     _write(split.train, rows)
     _refused(
         toolchain,
@@ -618,8 +651,9 @@ def test_the_reader_refuses_a_text_row_itself(split):
         read_image_split(split.heldout, _decision(), "held-out")
 
 
-def test_a_text_split_with_an_image_column_is_a_text_split(tmp_path):
-    """As before image rows: a row with a prompt is text whatever else it carries."""
+def test_a_text_split_whose_rows_also_name_an_image_is_refused(tmp_path):
+    """`prepare` refuses such a row for EmbeddingGemma 2, and so does the split reader:
+    read as text, its picture would be dropped without a word."""
     from litetune.embedding_tune import split_modality
 
     decision = _decision()
@@ -632,7 +666,8 @@ def test_a_text_split_with_an_image_column_is_a_text_split(tmp_path):
         ),
         encoding="utf-8",
     )
-    assert split_modality(path, "training") == "text"
+    with pytest.raises(EmbeddingTuneError, match=r"train\.jsonl:1: this row gives both"):
+        split_modality(path, "training")
 
 
 def test_a_split_mixing_image_and_text_rows_is_refused(toolchain, split, tmp_path):
@@ -797,9 +832,57 @@ def _image_record(**overrides: Any) -> dict[str, Any]:
         "mirror": True,
         "mirror_swap": [["left", "right"]],
         "soft_tokens": {"a" * 64: 63, "b" * 64: 54},
+        "processor_sha256": dict.fromkeys(PROCESSOR_FILES, "d" * 64),
     }
     data.update(overrides)
     return data
+
+
+@pytest.mark.parametrize(
+    ("processor", "message"),
+    [
+        (None, "'processor_sha256' is None; an image record gives the sha256 of each of"),
+        ({}, "'processor_sha256' is {}"),
+        (
+            dict.fromkeys(PROCESSOR_FILES[1:], "d" * 64),
+            "an image record gives the sha256 of each of chat_template.jinja",
+        ),
+        (
+            dict.fromkeys((*PROCESSOR_FILES, "extra.json"), "d" * 64),
+            "an image record gives the sha256 of each of",
+        ),
+        (
+            dict.fromkeys(PROCESSOR_FILES, "d" * 64) | {"tokenizer.json": "D" * 64},
+            "gives tokenizer.json 'DDDD",
+        ),
+        (
+            dict.fromkeys(PROCESSOR_FILES, "d" * 64) | {"tokenizer.json": 7},
+            "gives tokenizer.json 7, which is not a sha256",
+        ),
+        ([["tokenizer.json", "d" * 64]], "'processor_sha256' is \\[\\["),
+    ],
+)
+def test_an_image_record_without_the_processor_digests_is_refused(processor, message):
+    data = _image_record(processor_sha256=processor)
+    if processor is None:
+        del data["processor_sha256"]
+    with pytest.raises(ValueError, match=message):
+        EmbeddingRecord.from_dict(data, "x")
+    valid = EmbeddingRecord.from_dict(_image_record(), "x")
+    with pytest.raises(ValueError, match=message):
+        dataclasses.replace(valid, processor_sha256=processor)
+
+
+def test_a_text_record_with_processor_digests_is_refused():
+    data = _image_record(
+        modality="text", vision_tokens=None, mirror=False, mirror_swap=[], soft_tokens=None
+    )
+    with pytest.raises(ValueError, match="a text record has no processor files"):
+        EmbeddingRecord.from_dict(data, "x")
+    del data["processor_sha256"]
+    record = EmbeddingRecord.from_dict(data, "x")
+    assert record.processor_sha256 is None
+    assert "processor_sha256" not in record.as_dict()
 
 
 @pytest.mark.parametrize(
@@ -839,6 +922,7 @@ def test_an_image_record_round_trips(tmp_path):
     on_disk = json.loads((tmp_path / "litetune.json").read_text())
     assert on_disk["mirror_swap"] == [["left", "right"]]
     assert on_disk["soft_tokens"] == {"a" * 64: 63, "b" * 64: 54}
+    assert on_disk["processor_sha256"] == dict.fromkeys(PROCESSOR_FILES, "d" * 64)
 
 
 def test_an_image_record_without_the_mirror_fields_reads_as_no_mirror():
@@ -1102,7 +1186,8 @@ def test_main_keys_its_cache_with_cache_fields():
     s = _EMBED_IMAGE_SCRIPT
     assert "key_fields = cache_fields(spec, device, versions, script_sha256)" in s
     assert 'cache = Path(spec["cache_dir"]) / cache_key(key_fields)' in s
-    assert 'np, cache, run["inputs"], hidden, dtype, compute' in s
+    assert 'np, cache, run["inputs"], hidden, dtype, compute, confirm\n' in s
+    assert "def confirm(sha):\n        confirm_picture(paths[sha], sha)\n" in s
 
 
 def test_inputs_come_from_the_cache_when_usable_and_are_computed_and_stored_otherwise(
@@ -1110,27 +1195,35 @@ def test_inputs_come_from_the_cache_when_usable_and_are_computed_and_stored_othe
 ):
     np = pytest.importorskip("numpy")
     asked: list[tuple[str, bool]] = []
+    confirmed: list[str] = []
 
     def compute(sha, flipped):
         asked.append((sha, flipped))
         return np.full((4, 3), 2.0 if flipped else 1.0, np.float16), 3
 
     wanted = [("aa", False), ("aa", True), ("bb", False)]
-    tokens, soft, counts = script["load_inputs"](np, tmp_path, wanted, 3, "float16", compute)
+    load = script["load_inputs"]
+    tokens, soft, counts = load(np, tmp_path, wanted, 3, "float16", compute, confirmed.append)
     assert asked == wanted
+    # A computed input hashes its own bytes (`compute`); nothing else is confirmed.
+    assert confirmed == []
     assert counts == {"computed": 3, "reused": 0, "recomputed": []}
     assert soft == {("aa", False): 3, ("aa", True): 3, ("bb", False): 3}
     assert float(tokens[("aa", True)][0, 0]) == 2.0
-    # A second run reads every input back, with its soft tokens, and computes none.
+    # A second run reads every input back, with its soft tokens, and computes none,
+    # each picture's file confirmed once whatever number of inputs it has.
     asked.clear()
-    again, soft_again, counts = script["load_inputs"](np, tmp_path, wanted, 3, "float16", compute)
+    again, soft_again, counts = load(np, tmp_path, wanted, 3, "float16", compute, confirmed.append)
     assert asked == [] and counts == {"computed": 0, "reused": 3, "recomputed": []}
+    assert confirmed == ["aa", "bb"]
     assert soft_again == soft
     assert all((again[k] == tokens[k]).all() for k in wanted)
     # An entry that cannot be used is computed again, and named.
     (tmp_path / "bb-original.npy").write_bytes(b"broken")
-    _, _, counts = script["load_inputs"](np, tmp_path, wanted, 3, "float16", compute)
+    confirmed.clear()
+    _, _, counts = load(np, tmp_path, wanted, 3, "float16", compute, confirmed.append)
     assert asked == [("bb", False)]
+    assert confirmed == ["aa"]
     assert counts["reused"] == 2 and counts["computed"] == 1
     assert counts["recomputed"][0].startswith("bb-original.npy: unreadable")
 
@@ -1140,8 +1233,35 @@ def test_a_refusal_while_computing_reaches_main_as_a_refusal(script, tmp_path):
         raise script["Refusal"]("the split changed")
 
     with pytest.raises(script["Refusal"], match="the split changed"):
-        script["load_inputs"](None, tmp_path, [("aa", False)], 3, "float16", compute)
+        script["load_inputs"](None, tmp_path, [("aa", False)], 3, "float16", compute, None)
     assert "except Refusal as exc:\n        return refuse(out, str(exc))" in _EMBED_IMAGE_SCRIPT
+
+
+def test_a_cached_input_whose_picture_changed_is_refused_not_used(script, tmp_path):
+    np = pytest.importorskip("numpy")
+    picture = tmp_path / "picture.png"
+    picture.write_bytes(b"the picture")
+    sha = hashlib.sha256(b"the picture").hexdigest()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    script["store_input"](np, cache, sha, False, np.ones((4, 3), np.float16), 3)
+
+    def compute(sha, flipped):
+        raise AssertionError("a cached input is not computed")
+
+    def confirm(digest):
+        script["confirm_picture"](picture, digest)
+
+    tokens, _, counts = script["load_inputs"](
+        np, cache, [(sha, False)], 3, "float16", compute, confirm
+    )
+    assert counts["reused"] == 1 and (sha, False) in tokens
+    picture.write_bytes(b"another picture")
+    with pytest.raises(script["Refusal"]) as refused:
+        script["load_inputs"](np, cache, [(sha, False)], 3, "float16", compute, confirm)
+    said = str(refused.value)
+    assert str(picture) in said and hashlib.sha256(b"another picture").hexdigest() in said
+    assert f"not the {sha} its row names" in said
 
 
 def test_a_cached_input_reads_back_with_its_soft_tokens(script, tmp_path):

@@ -50,6 +50,7 @@ from litetune.embedding_tune import (
     EMBEDDING_MODEL,
     EMBEDDING_REVISION,
     IMAGE_PREFIX,
+    PROCESSOR_FILES,
     PROMPT_NAME,
     RECIPE,
     EmbeddingRecord,
@@ -582,6 +583,7 @@ def _image_record(**overrides: Any) -> EmbeddingRecord:
         "vision_tokens": 70,
         "prefix": IMAGE_PREFIX,
         "soft_tokens": {"a" * 64: 63},
+        "processor_sha256": dict.fromkeys(PROCESSOR_FILES, "d" * 64),
     }
     return _record(**(image | overrides))
 
@@ -721,11 +723,18 @@ def test_a_text_report_carries_no_vision_and_ties_to_the_graft(hub, grafter, spl
     assert len(hub.asked[0]) == 2
 
 
-def test_int4_for_an_image_checkpoint_says_it_was_not_measured(hub, grafter, splicer, tmp_path):
+def test_int4_for_an_image_checkpoint_carries_its_one_measurement(hub, grafter, splicer, tmp_path):
     out = tmp_path / "out"
     assert _convert(_image_checkpoint(tmp_path), out, "--weights", "int4") == 0
     assert grafter.calls[0]["weights"] == "int4"
-    assert embedding_export.IMAGE_INT4_NOT_MEASURED in _report(out, "int4")["limitations"]
+    note = embedding_export.IMAGE_INT4_NOT_MEASURED
+    assert note in _report(out, "int4")["limitations"]
+    # MEASUREMENTS.md, "EmbeddingGemma 2 on images: beans": centroid_k10 and the
+    # mean cosine to the reference of verify_int4.json and verify_int8.json.
+    for number in ("0.9413", "0.9347", "0.9164", "0.9601", "beans"):
+        assert number in note
+    assert "neither file's conversion cost was resolved" in note
+    assert embedding_export.IMAGE_DEFAULT_WEIGHTS == "int8"
 
 
 def test_int4_for_a_text_checkpoint_carries_no_image_limitation(hub, grafter, tmp_path):

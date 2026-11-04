@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -625,7 +625,12 @@ def _stub_litert_lm(answers: list[Any]) -> tuple[types.ModuleType, dict[str, lis
     class ImageFile:
         absolute_path: str
 
-    mod.Content = types.SimpleNamespace(ImageFile=ImageFile)
+    # litert_lm 0.18.0's `ImageBytes` is a dataclass of one field, `bytes`.
+    @dataclass
+    class ImageBytes:
+        bytes: bytes
+
+    mod.Content = types.SimpleNamespace(ImageFile=ImageFile, ImageBytes=ImageBytes)
     mod.Backend = Backend
     mod.InputOverflowStrategy = InputOverflowStrategy
     mod.EmbeddingOptions = EmbeddingOptions
@@ -2264,6 +2269,11 @@ def _write_image_split(
     return path
 
 
+def _processor_text(name: str) -> str:
+    """A processor file's stand-in: different for each file."""
+    return json.dumps({"file": name})
+
+
 def _image_setup(
     tmp_path: Path,
     fake: FakeEmbedEnvs,
@@ -2285,7 +2295,7 @@ def _image_setup(
     (reference / "model.safetensors").write_bytes(b"tuned image weights")
     if processor:
         for name in IMAGE_PROCESSOR_FILES:
-            (reference / name).write_text("{}", encoding="utf-8")
+            (reference / name).write_text(_processor_text(name), encoding="utf-8")
     fields: dict[str, Any] = {
         "base_model": EMBEDDING_MODEL,
         "base_model_revision": EMBEDDING_REVISION,
@@ -2306,6 +2316,11 @@ def _image_setup(
         "vision_tokens": IMAGE_TOKENS,
         # What tune would have recorded: the fake reference's count for every picture.
         "soft_tokens": dict.fromkeys(_image_digests(train) + _image_digests(heldout), 63),
+        # What tune would have recorded of the processor files written above.
+        "processor_sha256": {
+            name: hashlib.sha256(_processor_text(name).encode()).hexdigest()
+            for name in IMAGE_PROCESSOR_FILES
+        },
     }
     fields.update(record or {})
     write_embedding_record(reference, EmbeddingRecord(**fields))
@@ -2630,6 +2645,27 @@ def test_an_image_checkpoint_given_a_text_split_is_refused(fake, tmp_path):
     assert fake.runs == []
 
 
+@pytest.mark.parametrize("image_checkpoint", [True, False])
+def test_a_row_with_both_an_image_and_a_prompt_is_refused_with_prepares_reason(
+    fake, tmp_path, image_checkpoint
+):
+    s = _image_setup(tmp_path, fake) if image_checkpoint else _setup(tmp_path)
+    rows = [json.loads(line) for line in s.heldout.read_text(encoding="utf-8").splitlines()]
+    if image_checkpoint:
+        rows[2]["prompt"] = "a road"
+    else:
+        # A text split whose every row also names a picture: read as text, the
+        # picture would be dropped, so it is refused before the modality is decided.
+        rows = [row | {"image": "images/x.png"} for row in rows]
+    s.heldout.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    (failed,) = _failed(_verify(s).manifest)
+    assert failed["name"] == ROWS_CHECK
+    line = 3 if image_checkpoint else 1
+    said = failed["detail"]
+    assert f"heldout.jsonl:{line}: this row gives both an 'image' and a 'prompt'" in said
+    assert fake.runs == []
+
+
 def test_a_file_converted_at_other_vision_tokens_is_refused(fake, tmp_path):
     s = _image_setup(tmp_path, fake, convert={"vision_tokens": 140})
     result = _verify(s)
@@ -2742,6 +2778,35 @@ def test_a_reference_with_every_processor_file_is_embedded_with_its_own(fake, tm
     assert fake.specs["reference"]["model"] == str(s.reference)
 
 
+@pytest.mark.parametrize("changed", IMAGE_PROCESSOR_FILES)
+def test_a_processor_file_that_is_not_the_one_tune_recorded_is_refused(fake, tmp_path, changed):
+    s = _image_setup(tmp_path, fake)
+    (s.reference / changed).write_text('{"another": "processor"}', encoding="utf-8")
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == REFERENCE_CHECK
+    said = failed["detail"]
+    found = hashlib.sha256(b'{"another": "processor"}').hexdigest()
+    recorded = hashlib.sha256(_processor_text(changed).encode()).hexdigest()
+    assert f"the reference's {changed} hash to {found}, not the sha256" in said
+    assert f"({recorded})" in said
+    assert fake.runs == []
+
+
+def test_an_image_record_without_processor_digests_is_not_read(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    path = s.reference / "litetune.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    del data["processor_sha256"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    result = _verify(s)
+    assert result.status is not Status.PASSED
+    said = json.dumps(result.manifest)
+    assert "'processor_sha256' is None; an image record gives the sha256 of each of" in said
+    assert fake.runs == []
+
+
 def test_googles_text_vision_file_gives_the_gain_for_an_image_checkpoint(fake, tmp_path):
     local = tmp_path / "vision.litertlm"
     local.write_bytes(VISION_STAND_IN)
@@ -2837,7 +2902,22 @@ def test_off_such_a_cpu_an_image_run_embeds_the_candidate_once_and_never_side_by
 # -- the image engine script, run here against a stub of litert_lm ------------
 
 
-def _image_engine_main(tmp_path, monkeypatch, answers, images):
+PICTURES = (b"picture a", b"picture b")
+
+
+def _pictures(tmp_path: Path, pictures: Sequence[bytes] = PICTURES) -> tuple[list[str], list[str]]:
+    """Each picture written to its own file: (the paths, the bytes' sha256)."""
+    folder = tmp_path / "pics"
+    folder.mkdir(exist_ok=True)
+    paths = []
+    for i, data in enumerate(pictures):
+        path = folder / f"{'ab'[i]}.png"
+        path.write_bytes(data)
+        paths.append(str(path))
+    return paths, [hashlib.sha256(data).hexdigest() for data in pictures]
+
+
+def _image_engine_main(tmp_path, monkeypatch, answers, images, digests=None):
     ns: dict[str, Any] = {"__name__": "image_engine_script"}
     exec(compile(embedding_verify.IMAGE_ENGINE_SCRIPT, "engine.py", "exec"), ns)
     stub, calls = _stub_litert_lm(answers)
@@ -2847,6 +2927,7 @@ def _image_engine_main(tmp_path, monkeypatch, answers, images):
     spec = {
         "model": "/models/m.litertlm",
         "images": str(tmp_path / "images.json"),
+        "image_sha256": digests,
         "threads": 1,
         "vision_tokens": 140,
         "cache_dir": str(tmp_path / "cache-candidate"),
@@ -2860,9 +2941,12 @@ def _image_engine_main(tmp_path, monkeypatch, answers, images):
     return code, json.loads((tmp_path / "report.json").read_text()), calls
 
 
-def test_the_image_engine_script_builds_a_vision_engine_and_gives_each_file(tmp_path, monkeypatch):
+def test_the_image_engine_script_builds_a_vision_engine_and_gives_each_pictures_bytes(
+    tmp_path, monkeypatch
+):
+    paths, digests = _pictures(tmp_path)
     code, report, calls = _image_engine_main(
-        tmp_path, monkeypatch, [[3.0, 4.0], [0.0, 2.0]], ["/p/a.png", "/p/b.png"]
+        tmp_path, monkeypatch, [[3.0, 4.0], [0.0, 2.0]], paths, digests
     )
     assert code == 0
     assert calls["engine"] == [
@@ -2877,7 +2961,8 @@ def test_the_image_engine_script_builds_a_vision_engine_and_gives_each_file(tmp_
     # No thread count for the vision backend: 0.18.0 would not apply one.
     assert calls["vision"] == [{"vision_backend": ("cpu", None), "vision_tokens_per_image": 140}]
     assert report["vision_threads"] is None
-    assert [c.absolute_path for c in calls["texts"]] == ["/p/a.png", "/p/b.png"]
+    # The bytes read and hashed are the bytes embedded: no path reaches the engine.
+    assert [c.bytes for c in calls["texts"]] == list(PICTURES)
     assert calls["options"] == [
         {
             "normalize": True,
@@ -2896,19 +2981,170 @@ def test_the_image_engine_script_builds_a_vision_engine_and_gives_each_file(tmp_
 
 
 def test_the_image_engine_script_refuses_an_image_the_engine_refuses(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
     code, report, _ = _image_engine_main(
-        tmp_path, monkeypatch, [[1.0, 0.0], RuntimeError("bad image")], ["/p/a.png", "/p/b.png"]
+        tmp_path, monkeypatch, [[1.0, 0.0], RuntimeError("bad image")], paths, digests
     )
     assert code == 3
-    assert report["error"] == "the engine refused image 1 (/p/b.png): bad image"
+    assert report["error"] == f"the engine refused image 1 ({paths[1]}): bad image"
     assert not (tmp_path / "out.npy").exists()
 
 
 def test_the_image_engine_script_refuses_a_zero_vector(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
     code, report, _ = _image_engine_main(
-        tmp_path, monkeypatch, [[1.0, 0.0], [0.0, 0.0]], ["/p/a.png", "/p/b.png"]
+        tmp_path, monkeypatch, [[1.0, 0.0], [0.0, 0.0]], paths, digests
     )
     assert code == 3 and "zero" in report["error"] and "[1]" in report["error"]
+
+
+def test_the_image_engine_script_refuses_a_picture_changed_after_the_check(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    Path(paths[1]).write_bytes(b"another picture")
+    code, report, calls = _image_engine_main(
+        tmp_path, monkeypatch, [[1.0, 0.0], [0.0, 1.0]], paths, digests
+    )
+    assert code == 3
+    found = hashlib.sha256(b"another picture").hexdigest()
+    assert report["error"] == (
+        f"{paths[1]} hashes to {found}, not the {digests[1]} its row names; the picture "
+        "changed after verify checked it"
+    )
+    # The first picture was embedded; the changed one never reached the engine.
+    assert [c.bytes for c in calls["texts"]] == [PICTURES[0]]
+    assert not (tmp_path / "out.npy").exists()
+
+
+@pytest.mark.parametrize("digests", [None, ["a" * 64], ["a" * 64] * 3])
+def test_the_image_engine_script_refuses_digests_that_are_not_one_per_image(
+    tmp_path, monkeypatch, digests
+):
+    paths, _ = _pictures(tmp_path)
+    code, report, calls = _image_engine_main(
+        tmp_path, monkeypatch, [[1.0, 0.0], [0.0, 1.0]], paths, digests
+    )
+    assert code == 3 and "sha256 for 2 images" in report["error"]
+    assert calls["engine"] == []
+
+
+def test_the_image_scripts_share_one_picture_reader():
+    for script in (embedding_verify.IMAGE_ENGINE_SCRIPT, embedding_verify.IMAGE_REFERENCE_SCRIPT):
+        assert embedding_verify.PICTURE_BYTES_SOURCE in script
+        assert script.count("def picture_bytes(") == 1
+        assert "read_bytes()" not in script.replace(embedding_verify.PICTURE_BYTES_SOURCE, "")
+    assert "ImageFile" not in embedding_verify.IMAGE_ENGINE_SCRIPT.split('"""', 2)[2]
+
+
+def test_the_picture_reader_returns_the_bytes_it_hashed(tmp_path):
+    ns: dict[str, Any] = {"__name__": "image_reference"}
+    exec(compile(embedding_verify.IMAGE_REFERENCE_SCRIPT, "reference.py", "exec"), ns)
+    picture = tmp_path / "p.png"
+    picture.write_bytes(b"the picture")
+    digest = hashlib.sha256(b"the picture").hexdigest()
+    assert ns["picture_bytes"](str(picture), digest) == (b"the picture", None)
+    data, problem = ns["picture_bytes"](str(picture), "0" * 64)
+    assert data == b"the picture"
+    assert problem == (
+        f"{picture} hashes to {digest}, not the {'0' * 64} its row names; the picture changed "
+        "after verify checked it"
+    )
+
+
+def _image_reference_main(tmp_path, monkeypatch, images, digests):
+    """The image reference script's `main` against stand-ins for torch, PIL and transformers."""
+    ns: dict[str, Any] = {"__name__": "image_reference"}
+    exec(compile(embedding_verify.IMAGE_REFERENCE_SCRIPT, "reference.py", "exec"), ns)
+    decoded: list[bytes] = []
+
+    class NoGrad:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    class Model:
+        def eval(self):
+            return self
+
+    torch: Any = types.ModuleType("torch")
+    torch.set_num_threads = lambda n: None
+    torch.float32 = "float32"
+    torch.no_grad = NoGrad
+    transformers: Any = types.ModuleType("transformers")
+    transformers.AutoConfig = types.SimpleNamespace(
+        from_pretrained=lambda *a, **k: types.SimpleNamespace(audio_config=object())
+    )
+    transformers.AutoModel = types.SimpleNamespace(from_pretrained=lambda *a, **k: Model())
+    transformers.AutoProcessor = types.SimpleNamespace(from_pretrained=lambda *a, **k: object())
+    pil: Any = types.ModuleType("PIL")
+    pil.Image, pil.ImageOps = object(), object()
+    for name, module in (("torch", torch), ("transformers", transformers), ("PIL", pil)):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(ns, "strict_pillow", lambda image: None)
+
+    def picture_of(image, ops, data, flipped):
+        decoded.append(data)
+        raise StopIteration("decoded")
+
+    monkeypatch.setitem(ns, "picture_of", picture_of)
+    (tmp_path / "images.json").write_text(json.dumps(images))
+    spec = {
+        "model": str(tmp_path / "ref"),
+        "images": str(tmp_path / "images.json"),
+        "image_sha256": digests,
+        "image_text": "<|image|>",
+        "vision_tokens": 70,
+        "threads": 1,
+        "out": str(tmp_path / "ref.npy"),
+        "report": str(tmp_path / "ref.json"),
+    }
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    monkeypatch.setattr(sys, "argv", ["reference.py", str(tmp_path / "spec.json")])
+    try:
+        code = ns["main"]()
+    except StopIteration:
+        code = None
+    report = tmp_path / "ref.json"
+    return code, json.loads(report.read_text()) if report.exists() else None, decoded
+
+
+def test_the_image_reference_script_decodes_the_bytes_it_hashed(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    code, _, decoded = _image_reference_main(tmp_path, monkeypatch, paths, digests)
+    # The stand-in decoder stops the run at the first picture, given its bytes.
+    assert code is None and decoded == [PICTURES[0]]
+
+
+def test_the_image_reference_script_refuses_a_picture_changed_after_the_check(
+    tmp_path, monkeypatch
+):
+    paths, digests = _pictures(tmp_path)
+    Path(paths[0]).write_bytes(b"another picture")
+    code, report, decoded = _image_reference_main(tmp_path, monkeypatch, paths, digests)
+    assert code == 3 and decoded == []
+    assert report is not None
+    found = hashlib.sha256(b"another picture").hexdigest()
+    assert report["error"].startswith(f"{paths[0]} hashes to {found}, not the {digests[0]}")
+
+
+@pytest.mark.parametrize("digests", [None, ["a" * 64]])
+def test_the_image_reference_script_refuses_digests_that_are_not_one_per_image(
+    tmp_path, monkeypatch, digests
+):
+    paths, _ = _pictures(tmp_path)
+    code, report, decoded = _image_reference_main(tmp_path, monkeypatch, paths, digests)
+    assert code == 3 and decoded == []
+    assert report is not None and "sha256 for 2 images" in report["error"]
+
+
+def test_verify_gives_each_script_the_rows_digests_in_the_inputs_order(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    assert _verify(s).status is Status.PASSED
+    digests = _image_digests(s.train) + _image_digests(s.heldout)
+    for side in ("reference", "candidate"):
+        assert fake.specs[side]["image_sha256"] == digests
+        assert fake.texts[side] == _image_paths(s.train) + _image_paths(s.heldout)
 
 
 def test_the_image_reference_script_refuses_unusable_rows():

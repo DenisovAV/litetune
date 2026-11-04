@@ -35,6 +35,7 @@ from litetune.embedding_tune import (
     EMBEDDING_MODEL,
     EMBEDDING_REVISION,
     IMAGE_PREFIX,
+    PROCESSOR_FILES,
     PROMPT_NAME,
     RECIPE,
     EmbeddingRecord,
@@ -618,6 +619,7 @@ def _record(**overrides: Any) -> EmbeddingRecord:
     fields.update(overrides)
     if fields["modality"] == "image":
         fields.setdefault("soft_tokens", {"c" * 64: 54})
+        fields.setdefault("processor_sha256", dict.fromkeys(PROCESSOR_FILES, "d" * 64))
     return EmbeddingRecord(**fields)
 
 

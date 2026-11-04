@@ -34,7 +34,8 @@ embeddings, without the head.
 
 **Images.** A split whose rows name images (`prepare` writes them with each
 picture copied into the split and its sha256 in the row) takes the image
-recipe instead (`IMAGE_RECIPE`), which litetune has not measured: the model
+recipe instead (`IMAGE_RECIPE`), which litetune has measured on one dataset
+(`IMAGE_RECIPE_UNMEASURED` says what is and is not known): the model
 with its vision tower and no audio tower, the vision tower, `embed_vision`
 and the token embeddings frozen, each picture's input computed once at a
 budget of at most `--vision-tokens` soft tokens and cached in the output
@@ -43,7 +44,8 @@ on the L2-normalised mean pool, its logits times 20. `--mirror` adds a flipped
 copy of every training picture, `--mirror-swap` exchanges two labels on the
 copies. The full HF checkpoint is saved, as one `model.safetensors` convert
 grafts from, with the processor; the record says `modality: "image"` with the
-vision-token budget, the soft tokens each picture took, and the mirror.
+vision-token budget, the soft tokens each picture took, the mirror, and the
+sha256 of each processor file saved, which `verify` holds the reference to.
 
 The training runs in `envs.EMBED_TRAIN` as a generated script; this process
 imports neither torch nor sentence-transformers.
@@ -76,6 +78,7 @@ from litetune.prepare import (
     is_image_row,
     read_objects,
     read_rows,
+    refuse_image_and_prompt,
     rows_are_images,
 )
 from litetune.storage import hash_file
@@ -123,7 +126,8 @@ VISION_TOKENS: tuple[int, ...] = (70, 140)
 # The one device the recipe was measured on.
 MEASURED_DEVICE = "cpu"
 # The devices the unpublished game-frame runs the image recipe comes from trained
-# on; there is no litetune measurement of it on any.
+# on. litetune's one measurement of it (MEASUREMENTS.md, "EmbeddingGemma 2 on
+# images: beans") trained on CUDA.
 IMAGE_RECIPE_DEVICES: tuple[str, ...] = ("mps", "cuda")
 
 MODEL_CHECK = "embedding model"
@@ -207,7 +211,8 @@ RECIPE = Recipe()
 class ImageRecipe:
     """The image recipe, as the script is given it: that of unpublished runs on game
     frames, which trained two heads at once, one per task, for 2 epochs (one run
-    3); here one decision is one head. litetune has not measured it.
+    3); here one decision is one head. litetune has measured it on one dataset
+    (MEASUREMENTS.md, "EmbeddingGemma 2 on images: beans").
 
     A Linear(768, K) head -- weights and bias on the L2-normalised mean pool of
     every token, not a cosine head -- its logits times `logit_scale`,
@@ -289,10 +294,11 @@ VISION_TOKENS_SETTING = "LiteRtEmbeddingBackend(visionTokensPerImage: {n})"
 APP_VISION_TOKENS = 140
 
 IMAGE_RECIPE_UNMEASURED = (
-    "the image recipe has no litetune measurement yet: it comes from unpublished runs on one "
-    "task family -- game frames -- on Apple's GPU (mps) and on CUDA, which trained two heads at "
-    "once, one per task, where this trains one. Whether it helps on other pictures is not known; "
-    "`litetune verify` measures this checkpoint's decider"
+    "the image recipe has one litetune measurement, on one dataset (beans; MEASUREMENTS.md, "
+    '"EmbeddingGemma 2 on images: beans"): the 10-shot centroid decider scored 0.9287 on the '
+    "float32 fine-tune against 0.8233 on Google's file. It comes from unpublished runs on game "
+    "frames. Whether it helps on other pictures is not known; `litetune verify` measures this "
+    "checkpoint's decider"
 )
 IMAGE_MIRROR_ASSUMES_SYMMETRY = (
     "--mirror trained on a horizontally flipped copy of every training image{swapped}. That "
@@ -833,19 +839,27 @@ class Refusal(Exception):
     """Why the run will not go on with the inputs it was given; written as {"refused": ...}."""
 
 
-def load_inputs(np, cache, wanted, hidden, dtype, compute):
+def load_inputs(np, cache, wanted, hidden, dtype, compute, confirm):
     """Every (sha256, flipped) of `wanted` as (inputs, soft tokens, counts).
 
-    From the cache where it holds a usable entry (`cached_input`); else
-    `compute(sha256, flipped)` gives (input, soft tokens), which is stored. An
-    entry that is there and cannot be used is computed again, named in
-    `counts["recomputed"]` and printed.
+    From the cache where it holds a usable entry (`cached_input`), once
+    `confirm(sha256)` has held the picture's file to its digest (it raises
+    `Refusal` otherwise; once per picture); else `compute(sha256, flipped)`
+    gives (input, soft tokens), which is stored. An entry that is there and
+    cannot be used is computed again, named in `counts["recomputed"]` and
+    printed.
     """
     tokens, soft, rejected = {}, {}, []
     computed = reused = 0
+    confirmed = set()
     for sha, flipped in wanted:
         found = cached_input(np, cache, sha, flipped, hidden, dtype)
         if isinstance(found, tuple):
+            # The cache is keyed by the digest, so a file changed since the
+            # split was checked would otherwise train as the picture it was.
+            if sha not in confirmed:
+                confirm(sha)
+                confirmed.add(sha)
             array, n_soft = found
             reused += 1
         else:
@@ -869,6 +883,13 @@ def bytes_refusal(data, expected, path):
             "after tune checked it"
         )
     return None
+
+
+def confirm_picture(path, expected):
+    """Refuse (`Refusal`) when the file at `path` no longer holds the picture `expected` names."""
+    refusal = bytes_refusal(Path(path).read_bytes(), expected, path)
+    if refusal is not None:
+        raise Refusal(refusal)
 
 
 def main():
@@ -945,12 +966,15 @@ def main():
             raise ValueError(f"{paths[sha]}: its input does not fit in {dtype}")
         return array, n_soft
 
+    def confirm(sha):
+        confirm_picture(paths[sha], sha)
+
     model.eval()
     started = time.time()
     try:
         with torch.no_grad():
             tokens, soft, cache_counts = load_inputs(
-                np, cache, run["inputs"], hidden, dtype, compute
+                np, cache, run["inputs"], hidden, dtype, compute, confirm
             )
     except Refusal as exc:
         return refuse(out, str(exc))
@@ -1176,12 +1200,16 @@ def _sha256_hex(path: Path) -> str:
 def split_modality(path: Path, what: str) -> str:
     """The split's modality: `image` when its rows name images, `text` when they carry prompts.
 
-    A split that mixes the two is refused, as `prepare` refuses such a file.
+    A split that mixes the two is refused, as `prepare` refuses such a file, and
+    so is a row that gives both an image and a prompt, with `prepare`'s reason
+    (`prepare.refuse_image_and_prompt`): it would otherwise be a text row with
+    its picture dropped.
     """
     if not path.is_file():
         raise EmbeddingTuneError(f"the {what} split {path} does not exist")
     try:
         objects = read_objects(path, images=True)
+        refuse_image_and_prompt(path, objects)
         return "image" if rows_are_images(path, objects) else "text"
     except PrepareError as exc:
         raise EmbeddingTuneError(str(exc)) from exc
@@ -1507,12 +1535,17 @@ class EmbeddingRecord:
     # processor made of it within the `vision_tokens` budget. `verify` holds its
     # reference to the same counts.
     soft_tokens: Mapping[str, int] | None = None
+    # Image records only: the bare sha256 of each `PROCESSOR_FILES` file `tune`
+    # saved beside the checkpoint. `verify` prepares the pictures with the
+    # reference's processor and refuses one whose files are not these.
+    processor_sha256: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         problem = (
             _modality_problem(self.modality, self.vision_tokens)
             or _mirror_problem(self.modality, self.mirror, self.mirror_swap, self.labels)
             or _soft_tokens_problem(self.modality, self.soft_tokens, self.vision_tokens)
+            or _processor_problem(self.modality, self.processor_sha256)
         )
         if problem is not None:
             raise ValueError(problem)
@@ -1548,6 +1581,7 @@ class EmbeddingRecord:
             out["mirror"] = self.mirror
             out["mirror_swap"] = [list(pair) for pair in self.mirror_swap]
             out["soft_tokens"] = dict(sorted((self.soft_tokens or {}).items()))
+            out["processor_sha256"] = dict(sorted((self.processor_sha256 or {}).items()))
         return out
 
     @classmethod
@@ -1613,6 +1647,10 @@ class EmbeddingRecord:
         problem = _soft_tokens_problem(modality, soft_tokens, vision_tokens)
         if problem is not None:
             raise ValueError(f"{where}: {problem}")
+        processor_sha256 = data.get("processor_sha256")
+        problem = _processor_problem(modality, processor_sha256)
+        if problem is not None:
+            raise ValueError(f"{where}: {problem}")
         return cls(
             base_model=data["base_model"],
             base_model_revision=data["base_model_revision"],
@@ -1635,7 +1673,35 @@ class EmbeddingRecord:
             mirror=mirror,
             mirror_swap=mirror_swap,
             soft_tokens=dict(soft_tokens) if isinstance(soft_tokens, dict) else None,
+            processor_sha256=(
+                dict(processor_sha256) if isinstance(processor_sha256, dict) else None
+            ),
         )
+
+
+def _processor_problem(modality: object, processor_sha256: object) -> str | None:
+    """Why `processor_sha256` is not a record's, or `None`: one digest per `PROCESSOR_FILES`."""
+    if modality != "image":
+        if processor_sha256 is not None:
+            return (
+                f"a {modality} record has no processor files, and this one gives "
+                f"{processor_sha256!r}"
+            )
+        return None
+    if not isinstance(processor_sha256, Mapping) or set(processor_sha256) != set(PROCESSOR_FILES):
+        return (
+            f"'processor_sha256' is {processor_sha256!r}; an image record gives the sha256 of "
+            f"each of {', '.join(PROCESSOR_FILES)}"
+        )
+    for name, digest in processor_sha256.items():
+        if not (isinstance(digest, str) and _SHA256_HEX.fullmatch(digest)):
+            return f"'processor_sha256' gives {name} {digest!r}, which is not a sha256"
+    return None
+
+
+def processor_digests(model_dir: Path) -> dict[str, str]:
+    """The bare sha256 of each `PROCESSOR_FILES` file in `model_dir`, by name."""
+    return {name: _sha256_hex(Path(model_dir) / name) for name in PROCESSOR_FILES}
 
 
 def _soft_tokens_problem(
@@ -2290,7 +2356,21 @@ def run_embedding_tune(
         )
     image_fields: dict[str, Any] = {}
     if image:
+        try:
+            processor_sha256 = processor_digests(request.model_dir)
+        except OSError as exc:
+            logger.exception("could not hash the saved processor files")
+            return _finish(
+                result,
+                events,
+                Check.failed(
+                    TRAINING_CHECK,
+                    f"the processor files saved in {request.model_dir} could not be read: {exc}",
+                ),
+                attempted=True,
+            )
         image_fields = {
+            "processor_sha256": processor_sha256,
             "modality": "image",
             "vision_tokens": result.metrics.get("vision_tokens"),
             "mirror": result.metrics.get("mirror"),

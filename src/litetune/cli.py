@@ -596,7 +596,7 @@ def _add_tune(sub) -> None:
             f"evidence: a run that scored nine times worse than its base finished cleanly with a "
             f"lower loss. --model {EMBEDDING_MODEL} trains an embedding model for a choice "
             "--decision instead, with none of the LLM flags: on text rows with its measured "
-            "recipe, on image rows with a recipe litetune has not measured yet. "
+            "recipe, on image rows with a recipe litetune has measured on one dataset. "
             f"{STAGE_EXIT_CODE_HELP}"
         ),
     )
@@ -833,8 +833,8 @@ def _add_convert(sub) -> None:
             "embedding checkpoints only (a `tune --model google/embeddinggemma-2` output): how "
             "the fine-tune's weights are quantized into Google's file. int8: both graphs int8; "
             f"int4: both int4, Google's own size (default {DEFAULT_WEIGHTS}; for a checkpoint "
-            f"tuned on images {IMAGE_DEFAULT_WEIGHTS}, the mode of every converted image file "
-            "measured so far)"
+            f"tuned on images {IMAGE_DEFAULT_WEIGHTS}, whose vectors stayed closer to the "
+            "float32 fine-tune's in the one image measurement)"
         ),
     )
     convert.add_argument(
@@ -1473,6 +1473,7 @@ def _prepare(args: argparse.Namespace) -> int:
         heldout_size=args.heldout_size,
         min_heldout_examples=args.min_heldout_examples,
         tokens=counter,
+        tokenizer_revision=args.tokenizer_revision,
         declarations=args.declarations,
         base_model=args.base_model,
         questions=args.questions,

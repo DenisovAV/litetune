@@ -29,8 +29,9 @@ vision sections, which come from them. The graft writes the text file as for a
 text checkpoint, into the run's own scratch directory, and
 `embedding_vision.splice` puts its text tower into the text-vision file at the
 same output path; the text file is removed with the scratch directory. Its
-weights default to int8, the mode of every converted image file measured so far
-(`IMAGE_DEFAULT_WEIGHTS`). `--npu` is refused for it. Its
+weights default to int8, the mode whose vectors stayed closer to the float32
+fine-tune's in the one image measurement (`IMAGE_DEFAULT_WEIGHTS`). `--npu` is
+refused for it. Its
 report adds `google_vision_file` and `splice`; `splice.sha256` is the file's,
 which `verify` ties the report to, and `graft` describes the text file, whose
 `output` is `null` because it is not kept.
@@ -121,12 +122,20 @@ VISION_FILE_CHECK = "Google's text-vision file"
 FROZEN_CHECK = "frozen tensors are the base's"
 SPLICE_CHECK = "splice"
 
-# An image checkpoint's weights when --weights is not given: every converted image
-# file measured so far, in unpublished runs on game frames, was an int8 graft.
+# An image checkpoint's weights when --weights is not given. Both modes were
+# measured once, on beans (MEASUREMENTS.md, "EmbeddingGemma 2 on images: beans"):
+# the int4 file's 10-shot centroid decider scored 0.9413 and the int8 file's
+# 0.9347, but int8's vectors stayed closer to the float32 fine-tune's (mean
+# cosine 0.9601 against 0.9164), and neither conversion cost was resolved at 300
+# held-out rows. One dataset does not show int4's accuracy to hold, so the
+# default is the mode whose vectors moved less.
 IMAGE_DEFAULT_WEIGHTS = "int8"
 IMAGE_INT4_NOT_MEASURED = (
-    "int4 has not been measured on an image checkpoint; every converted image file measured so "
-    "far was int8. `litetune verify` measures this file"
+    'int4 has been measured on one image checkpoint (beans; MEASUREMENTS.md, "EmbeddingGemma 2 '
+    "on images: beans\"): its 10-shot centroid decider scored 0.9413 against int8's 0.9347, "
+    "its vectors were further from the float32 fine-tune's (mean cosine 0.9164 against 0.9601), "
+    "and neither file's conversion cost was resolved at 300 held-out rows. `litetune verify` "
+    "measures this file"
 )
 NPU_IMAGE_REFUSED = (
     "--npu: {model} was tuned on images, and convert does not compile an image model for an "

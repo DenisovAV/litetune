@@ -1968,6 +1968,10 @@ class PrepareRequest:
     # Image rows only: what opens the images. `None` takes `PillowImageInspector`,
     # the check inside `envs.EMBED_TRAIN`.
     images: ImageInspector | None = None
+    # `--tokenizer-revision` as given. Text rows read it through `tokens` only,
+    # and without `--tokenizer` it is ignored, as it always was; image rows
+    # refuse it with the other text flags.
+    tokenizer_revision: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", Path(self.data))
@@ -2382,6 +2386,10 @@ def _context_length_for(request: PrepareRequest, image_mode: bool) -> int | None
             for name, given in (
                 ("--context-length", request.context_length is not None),
                 ("--tokenizer (and --tokenizer-revision)", request.tokens is not None),
+                (
+                    "--tokenizer-revision",
+                    request.tokens is None and request.tokenizer_revision is not None,
+                ),
             )
             if given
         ]

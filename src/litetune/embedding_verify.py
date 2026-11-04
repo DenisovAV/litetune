@@ -57,14 +57,18 @@ gated.
 same way on its image split, read by `embedding_tune.read_image_split`, the
 reader `tune` uses: each row's file is confined to the split and checked against
 its `image_sha256` before anything runs, and a picture in both halves is
-refused. The reference is the checkpoint through transformers with its vision
-tower and its own processor, each picture turned into a vector by the source
+refused. Each script reads a picture's file once, hashes those bytes against
+the row's `image_sha256` and embeds them, so a file changed after the check is
+refused rather than embedded. The reference is the checkpoint through
+transformers with its vision tower and its own processor, whose files must be
+the ones `tune` recorded (`EmbeddingRecord.processor_sha256`), each picture
+turned into a vector by the source
 `tune` trains with (`embedding_tune.IMAGE_INPUT_SOURCE`) at the record's budget
 of vision tokens, the mean over every token (`IMAGE_REFERENCE_SCRIPT`). It
 reports the soft tokens it made of each picture, and a count other than the
 one `tune` recorded for it is refused. The candidate is the file through
 `EmbeddingEngine` with a CPU vision backend at that budget, each image given as
-its file (`IMAGE_ENGINE_SCRIPT`); the engine reports no per-image count, so
+its bytes (`IMAGE_ENGINE_SCRIPT`); the engine reports no per-image count, so
 only the reference's is compared. Google's file is the text-vision file
 (`embedding_vision.VISION_FILE`). The GPU is refused: it has not been measured
 on that file. A convert report that records another budget, or another
@@ -120,13 +124,20 @@ from litetune.embedding_tune import (
     LabelledImage,
     LabelledText,
     pictures_in_both,
+    processor_digests,
     read_image_split,
     states_of,
 )
 from litetune.evaluate import RUNTIME_ENGINE_SOURCE, gpu_observed, gpu_unused
 from litetune.events import EventStream
 from litetune.metrics import Difference, paired_difference
-from litetune.prepare import PrepareError, read_objects, read_rows, rows_are_images
+from litetune.prepare import (
+    PrepareError,
+    read_objects,
+    read_rows,
+    refuse_image_and_prompt,
+    rows_are_images,
+)
 from litetune.storage import hash_file
 
 logger = logging.getLogger(__name__)
@@ -283,6 +294,11 @@ REPEATED = (
 NO_PROCESSOR = (
     "the reference {reference} has no {missing}: a checkpoint `tune` saved has its processor "
     "beside it ({files}), and the pictures are prepared by that one or not at all"
+)
+PROCESSOR_CHANGED = (
+    "the reference's {names} hash to {found}, not the sha256 `tune` recorded in litetune.json "
+    "({recorded}): the processor beside the checkpoint is not the one it was tuned with, and "
+    "the pictures would be prepared otherwise. Restore the files `tune` saved"
 )
 SOFT_TOKENS_COMPARED = (
     "the reference made of each of {compared} pictures the soft tokens `tune` recorded for it, "
@@ -580,13 +596,43 @@ if __name__ == "__main__":
 """
 )
 
+# Shared by both image scripts: the parent checks each picture's sha256 before
+# they run, and each script reads the file once more, so it hashes the bytes it
+# read and embeds those, never a second read of the path.
+PICTURE_BYTES_SOURCE = r'''
+
+def digests_problem(images, digests):
+    """Why `digests` is not one sha256 per image, in order, or None."""
+    if not isinstance(digests, list) or len(digests) != len(images):
+        return (
+            f"the spec gives {len(digests) if isinstance(digests, list) else digests!r} "
+            f"sha256 for {len(images)} images"
+        )
+    return None
+
+
+def picture_bytes(path, expected):
+    """(the file's bytes, read once; why they are not the row's picture, or None)."""
+    data = Path(path).read_bytes()
+    found = hashlib.sha256(data).hexdigest()
+    if found != expected:
+        return data, (
+            f"{path} hashes to {found}, not the {expected} its row names; the picture changed "
+            "after verify checked it"
+        )
+    return data, None
+'''
+
 IMAGE_REFERENCE_SCRIPT = (
     r'''
 """Embed images with an EmbeddingGemma 2 checkpoint tuned on images: transformers, float32, CPU.
 
-Reads JSON {model, images, image_text, vision_tokens, threads, out, report} from
-argv[1]. The model is loaded with its vision tower and without its audio tower
-(audio_config None), and its processor from the checkpoint. Each picture becomes
+Reads JSON {model, images, image_sha256, image_text, vision_tokens, threads, out,
+report} from argv[1]. The model is loaded with its vision tower and without its
+audio tower (audio_config None), and its processor from the checkpoint. Each
+picture's file is read once and its bytes hashed against the row's sha256
+(`picture_bytes`); a mismatch is {"error": ...} and exit 3, and the picture is
+decoded from those bytes. Each picture becomes
 its vector by the source tune trains with (`image_input`, `masked_mean`): the
 processor's own input for `image_text` and the picture at a budget of
 `vision_tokens` soft tokens, its soft tokens scattered into the token
@@ -595,6 +641,7 @@ then L2-normalised. Writes the vectors, float32, one row per image, to
 spec["out"] (numpy.save) and JSON to spec["report"], with the soft tokens of each
 row. A vector with a non-finite value or a zero norm is {"error": ...} and exit 3.
 """
+import hashlib
 import importlib.metadata
 import json
 import sys
@@ -610,6 +657,7 @@ def unusable_rows(np, v):
         norms = np.linalg.norm(v, axis=1)
     return np.flatnonzero(~np.isfinite(v).all(axis=1) | ~(np.isfinite(norms) & (norms > 0)))
 '''
+    + PICTURE_BYTES_SOURCE
     + IMAGE_INPUT_SOURCE
     + r"""
 
@@ -630,10 +678,17 @@ def main():
     model = AutoModel.from_pretrained(spec["model"], config=config, dtype=torch.float32).eval()
     processor = AutoProcessor.from_pretrained(spec["model"])
     images = json.loads(Path(spec["images"]).read_text(encoding="utf-8"))
+    if (problem := digests_problem(images, spec["image_sha256"])) is not None:
+        report.write_text(json.dumps({"error": problem}), encoding="utf-8")
+        return REFUSED_EXIT
     rows, soft, tokens = [], [], []
     with torch.no_grad():
-        for path in images:
-            picture = picture_of(Image, ImageOps, Path(path).read_bytes(), False)
+        for path, expected in zip(images, spec["image_sha256"]):
+            data, problem = picture_bytes(path, expected)
+            if problem is not None:
+                report.write_text(json.dumps({"error": problem}), encoding="utf-8")
+                return REFUSED_EXIT
+            picture = picture_of(Image, ImageOps, data, False)
             embeds, n = image_input(
                 torch, model, processor, picture, spec["image_text"], spec["vision_tokens"], "cpu"
             )
@@ -682,18 +737,21 @@ IMAGE_ENGINE_SCRIPT = (
     r'''
 """Embed images with a .litertlm through LiteRT-LM's EmbeddingEngine on the CPU.
 
-Reads JSON {model, images, threads, vision_tokens, cache_dir, max_input_length,
-out, report} from argv[1]. The engine is built with a CPU backend of
-spec["threads"] and a CPU vision backend given no thread count -- litert-lm
-0.18.0 sets one for the main and the audio backends only, so none is passed
-that would not be applied -- `vision_tokens_per_image` = spec["vision_tokens"],
-its cache in spec["cache_dir"]; each image is given as the file
-(`litert_lm.Content.ImageFile`) with the options the text engine script sets.
-Writes the L2-normalised vectors, float32, one row
-per image, to spec["out"] (numpy.save) and JSON to spec["report"]. An image the
-engine refuses, or a vector with a non-finite value or a zero norm, is
-{"error": ...} and exit 3.
+Reads JSON {model, images, image_sha256, threads, vision_tokens, cache_dir,
+max_input_length, out, report} from argv[1]. The engine is built with a CPU
+backend of spec["threads"] and a CPU vision backend given no thread count --
+litert-lm 0.18.0 sets one for the main and the audio backends only, so none is
+passed that would not be applied -- `vision_tokens_per_image` =
+spec["vision_tokens"], its cache in spec["cache_dir"]. Each image's file is read
+once and its bytes hashed against the row's sha256 (`picture_bytes`), and those
+bytes are given (`litert_lm.Content.ImageBytes`; litert-lm 0.18.0's `ImageFile`
+reads the file into the same bytes in Python) with the options the text engine
+script sets. Writes the L2-normalised vectors, float32, one row per image, to
+spec["out"] (numpy.save) and JSON to spec["report"]. A picture whose bytes are
+not the row's, an image the engine refuses, or a vector with a non-finite value
+or a zero norm, is {"error": ...} and exit 3.
 """
+import hashlib
 import importlib.metadata
 import json
 import platform
@@ -712,8 +770,9 @@ def unusable_rows(v):
     with np.errstate(invalid="ignore", over="ignore"):
         norms = np.linalg.norm(v, axis=1)
     return np.flatnonzero(~np.isfinite(v).all(axis=1) | ~(np.isfinite(norms) & (norms > 0)))
-
 '''
+    + PICTURE_BYTES_SOURCE
+    + "\n"
     + RUNTIME_ENGINE_SOURCE
     + r"""
 
@@ -723,6 +782,9 @@ def main():
     import litert_lm
 
     images = json.loads(Path(spec["images"]).read_text(encoding="utf-8"))
+    if (problem := digests_problem(images, spec["image_sha256"])) is not None:
+        report.write_text(json.dumps({"error": problem}), encoding="utf-8")
+        return REFUSED_EXIT
     settings = {
         "cache_dir": spec["cache_dir"],
         "max_input_length": spec["max_input_length"],
@@ -746,11 +808,15 @@ def main():
             insert_special_tokens=True,
             input_overflow_strategy=litert_lm.InputOverflowStrategy.ERROR,
         )
-        for i, path in enumerate(images):
+        for i, (path, expected) in enumerate(zip(images, spec["image_sha256"])):
+            data, problem = picture_bytes(path, expected)
+            if problem is not None:
+                report.write_text(json.dumps({"error": problem}), encoding="utf-8")
+                return REFUSED_EXIT
             t1 = time.perf_counter()
             try:
                 answer = engine.compute_embedding(
-                    litert_lm.Content.ImageFile(path), options=options
+                    litert_lm.Content.ImageBytes(data), options=options
                 )
             except RuntimeError as exc:
                 report.write_text(json.dumps({"error": (
@@ -1574,11 +1640,16 @@ def _read_states(path: Path, decision: Decision, what: str) -> list[LabelledText
 
 
 def _split_objects(path: Path, what: str) -> tuple[list[tuple[int, dict[str, Any]]], bool]:
-    """The split's rows and whether they are image rows (`prepare.rows_are_images`)."""
+    """The split's rows and whether they are image rows (`prepare.rows_are_images`).
+
+    A row that gives both an image and a prompt is refused with `prepare`'s
+    reason (`prepare.refuse_image_and_prompt`) rather than read as a text row.
+    """
     if not Path(path).is_file():
         raise EmbeddingTuneError(f"the {what} split {path} does not exist")
     try:
         objects = read_objects(Path(path), images=True)
+        refuse_image_and_prompt(Path(path), objects)
         return objects, rows_are_images(Path(path), objects)
     except PrepareError as exc:
         raise EmbeddingTuneError(str(exc)) from exc
@@ -1600,18 +1671,28 @@ def split_modality_problem(path: Path, images: bool, what: str) -> str | None:
     )
 
 
-def processor_problem(reference: Path) -> str | None:
+def processor_problem(reference: Path, recorded: Mapping[str, str]) -> str | None:
     """Why the reference has no processor of its own to prepare the pictures with, or `None`.
 
-    No other processor stands in for a missing one: the pictures would be
-    prepared otherwise than the checkpoint was tuned on, and nothing would say so.
+    No other processor stands in for a missing one, and none whose files are
+    not the ones `tune` recorded (`recorded`, `EmbeddingRecord.processor_sha256`):
+    the pictures would be prepared otherwise than the checkpoint was tuned on,
+    and nothing would say so.
     """
     missing = [name for name in PROCESSOR_FILES if not (Path(reference) / name).is_file()]
-    if not missing:
-        return None
-    return NO_PROCESSOR.format(
-        reference=reference, missing=", ".join(missing), files=", ".join(PROCESSOR_FILES)
-    )
+    if missing:
+        return NO_PROCESSOR.format(
+            reference=reference, missing=", ".join(missing), files=", ".join(PROCESSOR_FILES)
+        )
+    found = processor_digests(Path(reference))
+    changed = [name for name in PROCESSOR_FILES if found[name] != recorded.get(name)]
+    if changed:
+        return PROCESSOR_CHANGED.format(
+            names=", ".join(changed),
+            found=", ".join(found[name] for name in changed),
+            recorded=", ".join(str(recorded.get(name)) for name in changed),
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -1845,7 +1926,14 @@ def verify_embedding(
     # embeds the candidate twice to see that it is.
     repeat = images and engine_cpu is not None and engine_cpu.reason is not None
     if images:
-        if (problem := processor_problem(Path(job.reference))) is not None:
+        try:
+            problem = processor_problem(Path(job.reference), record.processor_sha256 or {})
+        except OSError as exc:
+            logger.exception("could not hash the reference's processor files")
+            return refuse(
+                REFERENCE_CHECK, f"the reference's processor files could not be read: {exc}"
+            )
+        if problem is not None:
             return refuse(REFERENCE_CHECK, problem)
         fields["embedding"] |= {
             "processor": str(job.reference),
@@ -1956,6 +2044,10 @@ def verify_embedding(
         common: dict[str, Any] = {kind: str(inputs_path), "threads": job.threads}
         if images:
             common["vision_tokens"] = record.vision_tokens
+            # Each script hashes the bytes it reads against these, in the inputs' order.
+            common["image_sha256"] = [
+                row.sha256 for row in (*train, *heldout) if isinstance(row, LabelledImage)
+            ]
         else:
             common["prefix"] = record.prefix
         engine_sides: list[tuple[str, Path]] = [("candidate", Path(job.model))]

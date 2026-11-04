@@ -317,6 +317,12 @@ def test_image_rows_measure_no_length_and_report_no_window(tmp_path):
         ({"context_length": 1024}, "--context-length: "),
         ({"tokens": "counter"}, "--tokenizer (and --tokenizer-revision): "),
         ({"context_length": 1024, "tokens": "counter"}, "--context-length, --tokenizer"),
+        # Without --tokenizer, nothing reads the revision; for image rows it is refused.
+        ({"tokenizer_revision": "main"}, "--tokenizer-revision: "),
+        (
+            {"tokens": "counter", "tokenizer_revision": "main"},
+            "--tokenizer (and --tokenizer-revision): ",
+        ),
     ],
 )
 def test_a_window_or_a_tokenizer_for_image_rows_is_refused_by_name(tmp_path, kwargs, named):
@@ -330,6 +336,13 @@ def test_a_window_or_a_tokenizer_for_image_rows_is_refused_by_name(tmp_path, kwa
     assert str(raised.value).startswith(named) and "these are image rows" in str(raised.value)
     assert counter.calls == []
     assert not (tmp_path / "split").exists()
+
+
+def test_a_revision_without_a_tokenizer_is_ignored_for_text_rows_as_before(tmp_path):
+    rows = _text_rows()
+    data = _rows_file(tmp_path, rows, "text.jsonl")
+    result = prepare(_request(tmp_path, data=data, context_length=1024, tokenizer_revision="x"))
+    assert result.train is not None
 
 
 def test_text_rows_without_a_window_are_refused(tmp_path):
@@ -844,6 +857,35 @@ def test_the_command_line_checks_images_in_embed_train_and_counts_no_tokens(monk
     assert report["images"]["checker"]["pillow"] == "12.3.0"
     assert report["images"]["checker"]["environment"] == envs.EMBED_TRAIN.name
     assert len(list((tmp_path / "split" / "images").iterdir())) == 36
+
+
+def test_the_command_line_refuses_a_tokenizer_revision_alone_for_image_rows(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    fake = FakeImageEnv()
+    monkeypatch.setattr(
+        envs.StageEnv, "run", lambda self, args, timeout=3600, **kw: fake(self, args, timeout, **kw)
+    )
+    code = main(
+        [
+            "prepare",
+            "--data",
+            str(_rows_file(tmp_path, _image_rows(tmp_path))),
+            "--output-dir",
+            str(tmp_path / "split"),
+            "--questions",
+            str(_questions(tmp_path)),
+            "--base-model",
+            EMBEDDING_MODEL,
+            "--tokenizer-revision",
+            "main",
+        ]
+    )
+    assert code != 0
+    assert "--tokenizer-revision: these are image rows" in capsys.readouterr().err
+    assert fake.envs_run == []
+    assert not (tmp_path / "split").exists()
 
 
 @pytest.mark.parametrize(
