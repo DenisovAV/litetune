@@ -2407,7 +2407,7 @@ def test_an_image_checkpoint_embeds_its_images_on_both_sides_and_passes(fake, tm
     assert m["gates"][0]["outcome"] == "passed"
     assert _checks(m)[ROWS_CHECK]["detail"] == "36 training and 18 held-out images"
     notes = " ".join(m["limitations"])
-    assert "each image given as its file" in notes
+    assert "each image given as its bytes (litert_lm.Content.ImageBytes)" in notes
     assert "at a budget of at most 70 vision tokens per image" in notes
     assert "the vision encoder ran on the runtime's default threads" in notes
     assert "through transformers" in notes and "at most 70 soft tokens" in notes

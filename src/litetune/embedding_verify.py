@@ -337,9 +337,9 @@ SOFT_TOKENS_UNRECORDED = (
 )
 IMAGE_CPU_ONLY = (
     "measured on the CPU backend of LiteRT-LM's EmbeddingEngine, {threads}, each image given as "
-    "its file (litert_lm.Content.ImageFile) at a budget of at most {vision_tokens} vision tokens "
-    "per image, from the litert-lm package on PyPI on this host's CPU -- not the application's "
-    "own build of the runtime on a device's CPU; the GPU and the NPU are not measured"
+    "its bytes (litert_lm.Content.ImageBytes) at a budget of at most {vision_tokens} vision "
+    "tokens per image, from the litert-lm package on PyPI on this host's CPU -- not the "
+    "application's own build of the runtime on a device's CPU; the NPU is not measured"
 )
 IMAGE_CALIBRATION = (
     "; the application's calibration is fitted here on image embeddings as it is on text ones, "
