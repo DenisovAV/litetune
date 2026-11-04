@@ -70,8 +70,9 @@ one `tune` recorded for it is refused. The candidate is the file through
 `EmbeddingEngine` with a CPU vision backend at that budget, each image given as
 its bytes (`IMAGE_ENGINE_SCRIPT`); the engine reports no per-image count, so
 only the reference's is compared. Google's file is the text-vision file
-(`embedding_vision.VISION_FILE`). The GPU is refused: it has not been measured
-on that file. A convert report that records another budget, or another
+(`embedding_vision.VISION_FILE`). On the GPU, on macOS as for text, the text
+tower runs on the GPU and the vision encoder on the CPU, as flutter_edge_ai_litertlm
+1.19.0 places them (`IMAGE_GPU_MEASURED`). A convert report that records another budget, or another
 modality, than the reference is refused.
 
 litert-lm 0.18.0 sets no thread count for the vision encoder (its Python
@@ -81,7 +82,7 @@ therefore never embeds the candidate and Google's file side by side, and on a
 CPU with SME2, or one whose answer could not be read, where litetune's CPU runs
 are held to one thread for repeatability (`devices.runtime_cpu_threads`), the
 candidate is embedded twice and any difference between the two is a harness
-failure.
+failure -- on the GPU too, whose vision encoder is on that CPU.
 """
 
 from __future__ import annotations
@@ -227,14 +228,18 @@ NO_BASE = (
     "the gain over Google's file was not measured; pass --base-litertlm or --with-base to measure "
     "it on these rows"
 )
+# The precision of every GPU run here, text or image.
+GPU_PRECISION = (
+    "The Python EmbeddingEngine takes no activation data type: litert-lm "
+    "0.18.0's embedding_engine.py deletes the keyword arguments it is given, so the GPU computes "
+    "in the precision the runtime picks -- the file's own prefer_activation_type when it declares "
+    "one, F16 otherwise -- which can differ from the application's"
+)
 GPU_MEASURED = (
     "{how} the GPU backend of LiteRT-LM's EmbeddingEngine, from the litert-lm package on "
     "PyPI on this Mac's GPU, one file at a time -- not the "
     "application's own build of the runtime on a device's GPU; the CPU and the NPU are not "
-    "measured in this run. The Python EmbeddingEngine takes no activation data type: litert-lm "
-    "0.18.0's embedding_engine.py deletes the keyword arguments it is given, so the GPU computes "
-    "in the precision the runtime picks -- the file's own prefer_activation_type when it declares "
-    "one, F16 otherwise -- which can differ from the application's"
+    "measured in this run. " + GPU_PRECISION
 )
 GPU_SEEN = "measured on"
 # Not observed: the kernel's GPU time for the engine process was not read or did not
@@ -266,9 +271,17 @@ SCORER_MEANS_IMAGES = (
 # An allowance per image, not a measurement: an image runs the vision tower as
 # well as the text tower.
 IMAGE_ROW_TIMEOUT_S = 15
-IMAGE_GPU_NOT_MEASURED = (
-    "--backend gpu for a checkpoint tuned on images: LiteRT-LM's GPU path has not been "
-    "measured on the text-vision file, so it is refused; verify it on the CPU"
+# On the GPU the vision encoder is given the CPU, as flutter_edge_ai_litertlm
+# 1.19.0 names it beside a text tower on the GPU (litert_lm_embedding_pass.dart
+# 1369-1375, litert_embedding_backend.dart 264-268).
+IMAGE_GPU_MEASURED = (
+    "{how} the GPU backend of LiteRT-LM's EmbeddingEngine for the text tower, with the vision "
+    "encoder on its CPU backend at the runtime's default threads -- where flutter_edge_ai_litertlm "
+    "1.19.0 puts the vision encoder beside a text tower on the GPU -- each image given as its "
+    "bytes at a budget of at most {vision_tokens} vision tokens per image, from the litert-lm "
+    "package on PyPI on this Mac, one file at a time -- not the application's own build of the "
+    "runtime on a device; the NPU is not measured. litetune has published no measurement of an "
+    "image checkpoint on the GPU (MEASUREMENTS.md). " + GPU_PRECISION
 )
 IMAGE_REFERENCE_ON_CPU = (
     "the reference ran on the CPU in float32 through transformers, whatever LITETUNE_DEVICE says: "
@@ -291,6 +304,18 @@ NOT_REPEATABLE = (
 REPEATED = (
     "the candidate was embedded twice, the vision encoder on the runtime's default threads, and "
     "gave the same vectors both times"
+)
+# A GPU run's vision encoder is on the CPU, so on such a CPU it is repeated too.
+NOT_REPEATABLE_GPU = (
+    "the candidate embedded twice, its text tower on the GPU and its vision encoder on this CPU, "
+    "did not give the same vectors ({differ}): on a CPU with SME2, or one whose answer could not "
+    "be read, litetune's CPU runs are held to one thread for repeatable results, and the vision "
+    "encoder takes no thread count, so a difference between two runs of one file is the "
+    "harness's, not the file's"
+)
+REPEATED_GPU = (
+    "the candidate was embedded twice, its text tower on the GPU and its vision encoder on the "
+    "CPU at the runtime's default threads, and gave the same vectors both times"
 )
 NO_PROCESSOR = (
     "the reference {reference} has no {missing}: a checkpoint `tune` saved has its processor "
@@ -738,11 +763,14 @@ if __name__ == "__main__":
 
 IMAGE_ENGINE_SCRIPT = (
     r'''
-"""Embed images with a .litertlm through LiteRT-LM's EmbeddingEngine on the CPU.
+"""Embed images with a .litertlm through LiteRT-LM's EmbeddingEngine.
 
 Reads JSON {model, images, image_sha256, threads, vision_tokens, cache_dir,
-max_input_length, out, report} from argv[1]. The engine is built with a CPU
-backend of spec["threads"] and a CPU vision backend given no thread count --
+max_input_length, out, report, backend} from argv[1]. The engine is built with a
+CPU backend of spec["threads"] -- or, when spec["backend"] is "gpu", the GPU
+backend the text engine script builds (`backend_for`), the kernel's GPU time
+read around the work as that script reads it -- and a CPU vision backend given
+no thread count, on either --
 litert-lm 0.18.0 sets one for the main and the audio backends only, so none is
 passed that would not be applied -- `vision_tokens_per_image` =
 spec["vision_tokens"], its cache in spec["cache_dir"]. Each image's file is read
@@ -798,14 +826,23 @@ def main():
     }
     started = time.time()
     out, times = [], []
+    on_gpu = spec.get("backend", "cpu") == "gpu"
+    backend = backend_for("gpu") if on_gpu else litert_lm.Backend.CPU(thread_count=spec["threads"])
+    device = {}
     with litert_lm.EmbeddingEngine(
         spec["model"],
-        backend=litert_lm.Backend.CPU(thread_count=spec["threads"]),
+        backend=backend,
+        # The CPU on either backend: flutter_edge_ai_litertlm 1.19.0 names it
+        # beside a text tower on the GPU.
         vision_backend=litert_lm.Backend.CPU(),
         vision_tokens_per_image=spec["vision_tokens"],
         cache_dir=spec["cache_dir"],
         max_input_length=spec["max_input_length"],
     ) as engine:
+        # As the text engine script reads it: the kernel's GPU time once the
+        # engine exists and after the last image, with the engine still open.
+        if on_gpu:
+            device["at_engine"] = device_report()
         options = litert_lm.EmbeddingOptions(
             normalize=True,
             insert_special_tokens=True,
@@ -827,6 +864,8 @@ def main():
                 return REFUSED_EXIT
             out.append(list(answer.embedding))
             times.append(time.perf_counter() - t1)
+        if on_gpu:
+            device["after_generation"] = device_report()
     raw = np.array(out, dtype=np.float64)
     bad = unusable_rows(raw)
     if len(bad):
@@ -847,12 +886,12 @@ def main():
         "dim": int(v.shape[1]),
         "seconds": round(time.time() - started, 1),
         "ms_median": round(1000 * statistics.median(times), 2) if times else None,
-        "backend": "cpu",
+        "backend": "gpu" if on_gpu else "cpu",
         "vision_backend": "cpu",
-        "threads": spec["threads"],
+        "threads": None if on_gpu else spec["threads"],
         # None: the runtime's default; the engine takes no count for it.
         "vision_threads": None,
-        "device": {},
+        "device": device,
         "settings": settings,
         "runtime": runtime,
         "cpu": cpu_report(),
@@ -1267,12 +1306,15 @@ STOPPED = "the launcher reports no exit for this file: it was stopped or never s
 REPEAT_SIDE = "candidate-repeat"
 
 
-def repeat_problem(runs: Mapping[str, ScriptRun], work: Path, rows: int) -> str | None:
+def repeat_problem(
+    runs: Mapping[str, ScriptRun], work: Path, rows: int, not_repeatable: str = NOT_REPEATABLE
+) -> str | None:
     """Why the candidate's second run does not show the first repeatable, or `None`.
 
     Repeatable is bit for bit: the two vector files `numpy.save` wrote are the
     same bytes, which they are when the arrays are equal in shape, type and
-    every value.
+    every value. `not_repeatable` says so when they differ: `NOT_REPEATABLE`, or
+    `NOT_REPEATABLE_GPU` for a run whose text tower was on the GPU.
     """
     run = runs.get(REPEAT_SIDE, ScriptRun(failure=STOPPED))
     if run.failure is not None:
@@ -1287,7 +1329,7 @@ def repeat_problem(runs: Mapping[str, ScriptRun], work: Path, rows: int) -> str 
             f"images{'' if second.is_file() else ' and wrote none'}"
         )
     if first.read_bytes() != second.read_bytes():
-        return NOT_REPEATABLE.format(differ=f"{first.name} and {second.name} differ")
+        return not_repeatable.format(differ=f"{first.name} and {second.name} differ")
     return None
 
 
@@ -1814,8 +1856,6 @@ def verify_embedding(
             CANDIDATE_CHECK,
             f"--backend {job.backend}: the embedding path runs on LiteRT-LM's CPU or GPU backend",
         )
-    if job.backend == "gpu" and images:
-        return refuse(CANDIDATE_CHECK, IMAGE_GPU_NOT_MEASURED)
     if job.backend == "gpu" and sys.platform != "darwin":
         return refuse(CANDIDATE_CHECK, GPU_NOT_MEASURED_HERE.format(platform=sys.platform))
     if job.not_applicable:
@@ -1938,8 +1978,11 @@ def verify_embedding(
     }
     # The engine takes no thread count for the vision encoder, so an image run
     # embeds one file at a time, and where one thread is what is repeatable it
-    # embeds the candidate twice to see that it is.
-    repeat = images and engine_cpu is not None and engine_cpu.reason is not None
+    # embeds the candidate twice to see that it is. The vision encoder is on
+    # the CPU on the GPU backend too, so the host's CPU decides there as well.
+    on_gpu = job.backend == "gpu"
+    vision_cpu = devices.runtime_cpu_threads(None) if images and on_gpu else engine_cpu
+    repeat = images and vision_cpu is not None and vision_cpu.reason is not None
     if images:
         try:
             problem = processor_problem(Path(job.reference), record.processor_sha256 or {})
@@ -1952,6 +1995,8 @@ def verify_embedding(
             return refuse(REFERENCE_CHECK, problem)
         fields["embedding"] |= {
             "processor": str(job.reference),
+            # The CPU on either backend (`IMAGE_ENGINE_SCRIPT`).
+            "vision_backend": "cpu",
             "vision_threads": None,
             "candidate_repeated": repeat,
         }
@@ -2203,7 +2248,8 @@ def verify_embedding(
         # because of it, and the failure to report is the candidate's.
         if (problem := accept("candidate", CANDIDATE_CHECK, engine_runs["candidate"])) is not None:
             return refuse(CANDIDATE_CHECK, problem)
-        if repeat and (problem := repeat_problem(engine_runs, work, len(inputs))) is not None:
+        differs = NOT_REPEATABLE_GPU if on_gpu else NOT_REPEATABLE
+        if repeat and (problem := repeat_problem(engine_runs, work, len(inputs), differs)):
             return refuse(CANDIDATE_CHECK, problem)
         with_base = google is not None
         if with_base and (problem := accept("base", BASE_EMBED_CHECK, engine_runs["base"])):
@@ -2267,6 +2313,8 @@ def verify_embedding(
         "threads_requested": job.threads if engine_cpu else None,
         "threads_reason": engine_cpu.reason if engine_cpu else None,
         "settings": _mapping(candidate_report.get("settings")),
+        # An image file's vision encoder: what the engine script built it on.
+        **({"vision_backend": candidate_report.get("vision_backend")} if images else {}),
         ("ms_per_image_median" if images else "ms_per_text_median"): candidate_report.get(
             "ms_median"
         ),
@@ -2312,9 +2360,14 @@ def verify_embedding(
         {"name": "conversion_cost", "outcome": check.outcome.value, "detail": check.detail}
         | {"threshold": threshold, "mean": round(mean_value(k_costs), 6)}
     )
-    if job.backend == "gpu":
-        seen = gpu_observed("gpu", candidate_report.get("device"))
-        state.limitation(GPU_MEASURED.format(how=GPU_SEEN if seen else GPU_ASKED_FOR))
+    if on_gpu:
+        how = GPU_SEEN if gpu_observed("gpu", candidate_report.get("device")) else GPU_ASKED_FOR
+        if images:
+            state.limitation(IMAGE_GPU_MEASURED.format(how=how, vision_tokens=record.vision_tokens))
+            if repeat:
+                state.limitation(REPEATED_GPU)
+        else:
+            state.limitation(GPU_MEASURED.format(how=how))
     elif images:
         state.limitation(
             IMAGE_CPU_ONLY.format(

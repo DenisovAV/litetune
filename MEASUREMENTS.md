@@ -2488,8 +2488,8 @@ The 10-shot draws, the same five for every side, and the paired differences on t
   481.7 ms and Google's 486.7 ms. The reference took 922.5 s (int8 run) and 941.8 s (int4
   run) for the 1,165 pictures. The reference's and Google's accuracies were the same in both
   verify runs, draw for draw.
-- Not measured: 140 vision tokens, `--mirror`, the GPU (`verify` refuses it for an image
-  file), an NPU (`convert` does not compile an image file), and the spliced file through
+- Not measured: 140 vision tokens, `--mirror`, the GPU (`verify` refused it for an image
+  file when these runs were made), an NPU (`convert` does not compile an image file), and the spliced file through
   flutter_edge_ai on any device.
 
 ## LLMs on a Qualcomm NPU
