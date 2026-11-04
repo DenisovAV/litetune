@@ -2491,7 +2491,7 @@ The 10-shot draws, the same five for every side, and the paired differences on t
 - Not measured: 140 vision tokens, `--mirror`, an NPU (`convert` does not compile an image
   file), and the spliced file through flutter_edge_ai on any device.
 
-### The same int8 file on a Mac's CPU and GPU
+### The same int8 file on a Mac's CPU and GPU, and on Windows
 
 Measured 2026-11-04 on one Mac (Apple M5 Pro, 18 cores), the same checkpoint, int8 file
 and split as above, with `verify --with-base` at litetune commit `79e2fba` (unreleased),
@@ -2510,11 +2510,17 @@ which has SME2, both runs embedded the file twice and got the same vectors both 
 | CPU, Intel Xeon (above) | 0.9347 | 0.8233 | 0.9601 / 0.6824 | 481.9 |
 | CPU, Apple M5 Pro | 0.9333 | 0.8287 | 0.9602 / 0.6787 | 172.5 |
 | GPU, Apple M5 Pro | 0.9353 | 0.8313 | 0.9586 / 0.6856 | 154.5 |
+| CPU, Windows 11 x64, Intel Core Ultra (16 logical CPUs, 8 threads) | 0.9327 | 0.8313 | 0.9608 / 0.7583 | 363.5 |
 
-The float32 reference scored 0.9287 in both runs. Both gates were inconclusive for the same
+The float32 reference scored 0.9287 in every run. Every gate was inconclusive for the same
 reason as above: at 300 held-out rows no draw's interval (±0.015 to ±0.020) fits under the
 0.01 threshold. The GPU computes in the precision LiteRT-LM picks for the file, F16 unless
 the file declares otherwise.
+
+The Windows run used litetune at `c493291` installed from a wheel, with Google's file given
+as `--base-litertlm`: `--with-base` could not fetch it there, because `verify` provisions the
+`export` environment to download it and that environment needs `litert-converter`, which
+publishes no Windows wheel.
 
 ## LLMs on a Qualcomm NPU
 
