@@ -47,7 +47,7 @@ import platform
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -164,8 +164,24 @@ class NpuResult:
     encoder_bytes: int
     encoder_sha256: str
     report: dict[str, Any] = field(default_factory=dict)
+    # An image checkpoint's: the compiled encoder spliced into Google's text-vision file
+    # for this SoC (`embedding_export`), which `output`, `bytes` and `sha256` then
+    # describe. Holds `google_vision_npu_file`, `splice` and `compiled_file`, the
+    # compile's own file, which is not kept.
+    image: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
+        if self.image is not None:
+            # DEVICE_RUNS is about the text file; no text-vision file has run.
+            return {
+                **self._as_dict(),
+                "device_run": None,
+                "text_file_device_run": DEVICE_RUNS.get(self.soc),
+                **self.image,
+            }
+        return self._as_dict()
+
+    def _as_dict(self) -> dict[str, Any]:
         return {
             "soc": self.soc,
             "output": str(self.output),
@@ -185,16 +201,7 @@ class NpuResult:
         }
 
     def moved_to(self, output: Path) -> NpuResult:
-        return NpuResult(
-            self.soc,
-            output,
-            self.bytes,
-            self.sha256,
-            self.compile_s,
-            self.encoder_bytes,
-            self.encoder_sha256,
-            self.report,
-        )
+        return replace(self, output=output)
 
 
 def _result(soc: str, output: Path, got: dict[str, Any]) -> NpuResult:

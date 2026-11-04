@@ -60,7 +60,6 @@ from litetune.embedding_export import (
     DEFAULT_WEIGHTS,
     EMBEDDING_CONVERT_SCHEMA,
     IMAGE_DEFAULT_WEIGHTS,
-    NPU_IMAGE_REFUSED,
     WEIGHT_MODES,
     EmbeddingExportError,
     EmbeddingExportRequest,
@@ -857,7 +856,9 @@ def _add_convert(sub) -> None:
             "only when all have compiled; a failure while publishing one stops the ones after "
             "it, and the report says which were published. verify cannot run such a file; a "
             "file compiled this way for SM8750 ran on one phone, no other SoC's on any. An "
-            "embedding checkpoint tuned on images is refused. "
+            "embedding checkpoint tuned on images: the same compile, spliced into Google's "
+            "text-vision file for the SoC in place of its text encoder, everything else of "
+            "that file kept; no such file has run on a device. "
             f"One of {', '.join(NPU_SOCS)}"
         ),
     )
@@ -1947,9 +1948,6 @@ def _convert_embedding(args: argparse.Namespace, record: EmbeddingRecord) -> int
             f"{', '.join(given)}: {args.model} is an embedding checkpoint, which convert grafts "
             "into Google's EmbeddingGemma 2 file; pick its quantization with --weights"
         )
-    if record.is_image and args.npu:
-        # Before the request, whose own --npu checks would name the weights instead.
-        raise EmbeddingExportError(NPU_IMAGE_REFUSED.format(model=args.model))
     events = _stream()
     request = EmbeddingExportRequest(
         model=Path(args.model),

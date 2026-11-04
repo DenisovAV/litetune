@@ -40,7 +40,15 @@ graft whose text sections the TOML describes otherwise than the text-vision
 file's; `readback` for a pack that does not read back; `run` for a script that did
 not finish.
 
-What the file embeds is not checked here: `litetune verify` measures it.
+**For a Qualcomm NPU** (`splice_npu`), the same script puts one section of a file
+`embedding_npu.compile_for_npu` wrote -- its compiled `text_encoder` graph -- in
+place of the one in Google's text-vision file for that SoC (`VISION_NPU_FILES`),
+and keeps every other section of that file, its NPU-compiled vision encoder
+included; the parent then holds the replaced section to the compiled encoder's
+sha256 before anything is published.
+
+What the file embeds is not checked here: `litetune verify` measures it (not an
+NPU file, which it cannot run).
 """
 
 from __future__ import annotations
@@ -52,13 +60,14 @@ import shutil
 import struct
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
 from litetune import envs
 from litetune.embedding_convert import EmbeddingConvertError, publish_packed
+from litetune.embedding_npu import NPU_SOCS
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.towers import _TOWERS_SCRIPT
@@ -75,6 +84,73 @@ VISION_BYTES = 387_710_976
 # The sections the splice takes from the graft: each part's graph and weights.
 TEXT_PARTS: tuple[str, ...] = ("embedder", "text_encoder")
 TEXT_KINDS: tuple[str, ...] = ("TFLiteModel", "TFLiteWeights")
+
+
+@dataclass(frozen=True)
+class GoogleNpuFile:
+    """One of Google's Qualcomm builds of the text-vision file, at `VISION_REVISION`."""
+
+    soc: str
+    filename: str
+    sha256: str
+    bytes: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "repo": VISION_REPO,
+            "filename": self.filename,
+            "revision": VISION_REVISION,
+            "sha256": self.sha256,
+            "bytes": self.bytes,
+        }
+
+
+def _npu_file(soc: str, sha256: str, size: int) -> GoogleNpuFile:
+    filename = f"embeddinggemma-2-text-vision-440m_Qualcomm_{soc}.litertlm"
+    return GoogleNpuFile(soc, filename, sha256, size)
+
+
+# Google's Qualcomm builds of the text-vision file at VISION_REVISION, for the SoCs
+# `embedding_npu.NPU_SOCS` compiles for. Each sha256 and size is the Hub's: the LFS
+# sha256 and size the revision API lists (`/api/models/<repo>/revision/<rev>?blobs=true`,
+# read 2026-11-04), which for this repository's CPU file is `VISION_SHA256`; SM8750's
+# file was also hashed from the Hub cache, to the same sha256. Their headers, read
+# from the first 64 KiB of each with litert-lm-builder 0.18.0's header schema on
+# 2026-11-04, list the same nine sections in the same order: the metadata, the
+# tokenizer, the embedder graph, the text encoder graph, the vision encoder,
+# vision_adapter and end_of_vision graphs, the embedder's and the vision adapter's
+# weights. No text encoder or vision encoder weights: both are compiled, and in
+# SM8750's file (unpacked whole) each signature of either is one DISPATCH_OP stamped
+# Qualcomm SM8750, the text encoder's signatures `embedding_npu.NPU_SIGNATURES`. Each
+# text encoder section carries only its model_type, as the one `compile_for_npu`
+# packs. The Hub also lists a QCS8275 build, which NPU_SOCS does not take.
+VISION_NPU_FILES: dict[str, GoogleNpuFile] = {
+    soc: _npu_file(soc, sha256, size)
+    for soc, sha256, size in (
+        ("SM8550", "4427eecca4289555e72b297308f4c9cf97110a657de25dd2fe7946ac824f6214", 465_993_728),
+        ("SM8650", "ec7d2ee513830337343567409f32fea4a3e4f8f7b94facd0a20f3d3523cd7480", 465_747_968),
+        ("SM8750", "c5c05cb59833541a2d0d9374c7b50d2c3a406a4a84c85762775e5f9c6d96cd0c", 446_611_456),
+        ("SM8850", "661369235aa9fc23cf04a213d4e445c4634073832279f5a261ed22650a8ebc5b", 462_536_704),
+    )
+}
+# What the NPU splice takes from the compile: the compiled text encoder, which has no
+# weights section; the embedder and every other section stay Google's.
+NPU_PARTS: tuple[str, ...] = ("text_encoder",)
+NPU_KINDS: tuple[str, ...] = ("TFLiteModel",)
+# The `source` the splice report gives the section taken from the compile.
+NPU_SOURCE = "npu_compile"
+CPU_NAMES: dict[str, str] = {
+    "vision": "Google's text-vision file",
+    "graft": "the graft",
+    "spliced": "the spliced file",
+    "source": "graft",
+}
+
+
+def npu_socs() -> str:
+    """The SoCs a text-vision file is pinned for, in `NPU_SOCS`'s order, for a message."""
+    return ", ".join(soc for soc in NPU_SOCS if soc in VISION_NPU_FILES)
+
 
 # An allowance for an unpack, a pack and a read-back of a few hundred MB, not a
 # measurement.
@@ -207,8 +283,9 @@ _SPLICE_SCRIPT = r'''
 leave the result, packed and read back, in the work directory for the parent to
 publish.
 
-Reads JSON {grafted, vision, vision_sha256, work, parts: [...], kinds: [...]} from
-argv[1]. Writes JSON to argv[2]:
+Reads JSON {grafted, vision, vision_sha256, work, parts: [...], kinds: [...], names}
+from argv[1]; `names` has NAMES's keys: what the messages call each file, and the
+`source` the report gives the sections taken from `grafted`. Writes JSON to argv[2]:
   {"ok": true, "rebuilt": <path>, "bytes": ..., "sha256": ..., "sections": [...],
    "replaced": [...]}
   or {"ok": false, "cause": <str>, "reason": <str>}
@@ -221,9 +298,13 @@ import os
 import sys
 from pathlib import Path
 
-VISION_WHERE = "Google's text-vision file"
-GRAFT_WHERE = "the graft"
-SPLICED_WHERE = "the spliced file"
+NAMES = {
+    "vision": "Google's text-vision file",
+    "graft": "the graft",
+    "spliced": "the spliced file",
+    # A taken section's `source` in the report; every other section's is "google_vision".
+    "source": "graft",
+}
 
 
 class Refused(Exception):
@@ -263,19 +344,20 @@ def described(section):
 
 
 def read_back(rebuilt, after, vision, vision_doc, vision_places, grafted, graft_places,
-              graft_text, parts, kinds, T):
+              graft_text, parts, kinds, T, names=NAMES):
     """Refused unless the packed file is the text-vision file with the graft's text
     sections in it: its TOML the text-vision file's apart from what `pack`
     regenerates, each text section's bytes the graft's, every other section's the
     text-vision file's. Each section's description, digest and source otherwise."""
+    vision_where, graft_where, spliced_where = names["vision"], names["graft"], names["spliced"]
     if T.comparable(after) != T.comparable(vision_doc):
-        raise Refused("readback", f"{SPLICED_WHERE}'s TOML is not {VISION_WHERE}'s apart from "
+        raise Refused("readback", f"{spliced_where}'s TOML is not {vision_where}'s apart from "
                       "uuid and creation_timestamp")
-    places = T.spans(rebuilt, SPLICED_WHERE)
+    places = T.spans(rebuilt, spliced_where)
     if len(places) != len(vision_places):
-        raise Refused("readback", f"{SPLICED_WHERE} has {len(places)} sections where "
-                      f"{VISION_WHERE} has {len(vision_places)}")
-    role = {i: key for key, i in text_sections(after, SPLICED_WHERE, parts, kinds, T).items()}
+        raise Refused("readback", f"{spliced_where} has {len(places)} sections where "
+                      f"{vision_where} has {len(vision_places)}")
+    role = {i: key for key, i in text_sections(after, spliced_where, parts, kinds, T).items()}
     sections = []
     for i, place in enumerate(places):
         got = T.digest(rebuilt, place)
@@ -284,11 +366,11 @@ def read_back(rebuilt, after, vision, vision_doc, vision_places, grafted, graft_
         if key is None:
             want, source = google, "google_vision"
         else:
-            want, source = T.digest(grafted, graft_places[graft_text[key]]), "graft"
+            want, source = T.digest(grafted, graft_places[graft_text[key]]), names["source"]
         if got != want:
-            whose = GRAFT_WHERE if key else VISION_WHERE
+            whose = graft_where if key else vision_where
             raise Refused("readback", f"section {i} ({T.label(after['section'][i])}) of "
-                          f"{SPLICED_WHERE} does not hold the bytes of {whose}")
+                          f"{spliced_where} does not hold the bytes of {whose}")
         sections.append(dict(T.describe(after["section"][i], place), index=i, source=source,
                              sha256=got, changed=got != google))
     return sections
@@ -297,29 +379,30 @@ def read_back(rebuilt, after, vision, vision_doc, vision_places, grafted, graft_
 def splice(spec, T):
     work = Path(spec["work"])
     vision, grafted = spec["vision"], spec["grafted"]
-    parts, kinds = spec["parts"], spec["kinds"]
+    parts, kinds, names = spec["parts"], spec["kinds"], spec["names"]
+    vision_where, graft_where = names["vision"], names["graft"]
     found = sha256(vision)
     if found != spec["vision_sha256"]:
         raise Refused("base_sha256", f"{Path(vision).name} has sha256 {found}, not Google's "
                       f"{spec['vision_sha256']}")
     vision_dir, graft_dir = work / "vision", work / "graft"
     try:
-        vision_places = T.spans(vision, VISION_WHERE)
-        graft_places = T.spans(grafted, GRAFT_WHERE)
-        vision_doc, vision_sources = T.unpacked(vision, vision_dir, VISION_WHERE, vision_places)
-        graft_doc, graft_sources = T.unpacked(grafted, graft_dir, GRAFT_WHERE, graft_places)
+        vision_places = T.spans(vision, vision_where)
+        graft_places = T.spans(grafted, graft_where)
+        vision_doc, vision_sources = T.unpacked(vision, vision_dir, vision_where, vision_places)
+        graft_doc, graft_sources = T.unpacked(grafted, graft_dir, graft_where, graft_places)
     except T.Refused as exc:
         raise Refused("input", str(exc)) from None
-    vision_text = text_sections(vision_doc, VISION_WHERE, parts, kinds, T)
-    graft_text = text_sections(graft_doc, GRAFT_WHERE, parts, kinds, T)
+    vision_text = text_sections(vision_doc, vision_where, parts, kinds, T)
+    graft_text = text_sections(graft_doc, graft_where, parts, kinds, T)
     # What the text-vision file's TOML says about a text section is kept; it must
     # say of the graft's what the graft's own TOML says.
     for (part, kind), i in vision_text.items():
         ours = described(vision_doc["section"][i])
         theirs = described(graft_doc["section"][graft_text[(part, kind)]])
         if ours != theirs:
-            raise Refused("input", f"{GRAFT_WHERE}'s {kind} {part} section is described as "
-                          f"{theirs}, {VISION_WHERE}'s as {ours}")
+            raise Refused("input", f"{graft_where}'s {kind} {part} section is described as "
+                          f"{theirs}, {vision_where}'s as {ours}")
     composed = copy.deepcopy(vision_doc)
     sources = list(vision_sources)
     for key, i in vision_text.items():
@@ -331,14 +414,14 @@ def splice(spec, T):
         rebuilt = report["rebuilt"]
         after = T.load(work / "after" / "model.toml")
         sections = read_back(rebuilt, after, vision, vision_doc, vision_places, grafted,
-                             graft_places, graft_text, parts, kinds, T)
+                             graft_places, graft_text, parts, kinds, T, names)
     except T.Refused as exc:
         raise Refused("readback", str(exc)) from None
     return {
         "ok": True, "rebuilt": rebuilt, "bytes": os.path.getsize(rebuilt),
         "sha256": sha256(rebuilt), "vision_sha256": found, "sections": sections,
         "replaced": [T.label(after["section"][s["index"]]) for s in sections
-                     if s["source"] == "graft"],
+                     if s["source"] == names["source"]],
     }
 
 
@@ -371,10 +454,11 @@ class SpliceResult:
     # The litert-lm-builder version that packed it.
     builder: str
     # Per section of `output`, in order: section_type, model_type, bytes, sha256,
-    # `source` ("graft" or "google_vision") and whether it differs from the
-    # text-vision file's section at that place.
+    # `source` ("graft", or `NPU_SOURCE` for the NPU splice, or "google_vision") and
+    # whether it differs from the text-vision file's section at that place.
     sections: tuple[dict[str, Any], ...]
-    # The labels ("TFLiteModel embedder", ...) of the sections taken from the graft.
+    # The labels ("TFLiteModel embedder", ...) of the sections taken from the graft
+    # (the compile, for the NPU splice).
     replaced: tuple[str, ...]
 
     def as_dict(self) -> dict[str, Any]:
@@ -404,6 +488,101 @@ def splice(
     `EmbeddingConvertError` for a splice it refuses, `FileNotFoundError` for a
     missing input.
     """
+    return _splice(
+        env,
+        grafted,
+        vision_file,
+        out_path,
+        sha256=VISION_SHA256,
+        parts=TEXT_PARTS,
+        kinds=TEXT_KINDS,
+        names=CPU_NAMES,
+        events=events,
+        auto_provision=auto_provision,
+        timeout=timeout,
+    )
+
+
+def npu_names(soc: str) -> dict[str, str]:
+    """The splice script's `names` for `soc`'s file."""
+    return {
+        "vision": f"Google's {soc} text-vision file",
+        "graft": f"the {soc} compile",
+        "spliced": "the spliced file",
+        "source": NPU_SOURCE,
+    }
+
+
+def splice_npu(
+    env: envs.StageEnv,
+    compiled: Path,
+    vision_npu_file: Path,
+    out_path: Path,
+    soc: str,
+    encoder_sha256: str,
+    *,
+    events: EventStream | None = None,
+    auto_provision: bool = True,
+    timeout: int = SPLICE_TIMEOUT_S,
+) -> SpliceResult:
+    """Write `out_path`: Google's text-vision file for `soc` (`VISION_NPU_FILES`) with
+    its compiled text encoder replaced by `compiled`'s.
+
+    `compiled` is a file `embedding_npu.compile_for_npu` wrote for `soc`, whose text
+    encoder section holds the compiled encoder of sha256 `encoder_sha256`; the
+    spliced file's text encoder must hold those bytes, or nothing is written. Raises
+    as `splice` does.
+    """
+    pinned = VISION_NPU_FILES.get(soc)
+    if pinned is None:
+        raise EmbeddingConvertError(
+            "input", f"{soc}: no text-vision file of Google's is pinned for it ({npu_socs()})"
+        )
+
+    def holds_the_compile(report: dict[str, Any]) -> None:
+        taken = [s for s in report["sections"] if s.get("source") == NPU_SOURCE]
+        if [s.get("sha256") for s in taken] != [encoder_sha256]:
+            raise EmbeddingConvertError(
+                "readback",
+                f"the spliced file's sections from the {soc} compile have sha256 "
+                f"{[s.get('sha256') for s in taken]}, not the compiled encoder's "
+                f"[{encoder_sha256!r}]",
+            )
+
+    return _splice(
+        env,
+        compiled,
+        vision_npu_file,
+        out_path,
+        sha256=pinned.sha256,
+        parts=NPU_PARTS,
+        kinds=NPU_KINDS,
+        names=npu_names(soc),
+        events=events,
+        auto_provision=auto_provision,
+        timeout=timeout,
+        check=holds_the_compile,
+    )
+
+
+def _splice(
+    env: envs.StageEnv,
+    grafted: Path,
+    vision_file: Path,
+    out_path: Path,
+    *,
+    sha256: str,
+    parts: tuple[str, ...],
+    kinds: tuple[str, ...],
+    names: dict[str, str],
+    events: EventStream | None,
+    auto_provision: bool,
+    timeout: int,
+    check: Callable[[dict[str, Any]], None] | None = None,
+) -> SpliceResult:
+    """`vision_file`, of sha256 `sha256`, with `grafted`'s `parts` x `kinds` sections in
+    it, at `out_path`. `check` sees the script's report before anything is published,
+    and raises to stop it."""
     inputs = [Path(p).absolute() for p in (grafted, vision_file)]
     for path in inputs:
         if not path.is_file():
@@ -432,17 +611,22 @@ def splice(
                 {
                     "grafted": str(graft_path),
                     "vision": str(vision),
-                    "vision_sha256": VISION_SHA256,
+                    "vision_sha256": sha256,
                     "work": str(work),
-                    "parts": list(TEXT_PARTS),
-                    "kinds": list(TEXT_KINDS),
+                    "parts": list(parts),
+                    "kinds": list(kinds),
+                    "names": names,
                 }
             ),
             encoding="utf-8",
         )
         if events:
-            events.note(f"embedding splice: {graft_path.name}'s text tower into {vision.name}")
+            events.note(
+                f"embedding splice: {graft_path.name}'s {', '.join(parts)} into {vision.name}"
+            )
         report = _run_script(env, script, spec_path, result_path, output, timeout)
+        if check is not None:
+            check(report)
         digest = publish_packed(Path(report["rebuilt"]), output, report["sha256"], "the splice")
     finally:
         leaked: list[str] = []

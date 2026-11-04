@@ -30,11 +30,22 @@ text checkpoint, into the run's own scratch directory, and
 `embedding_vision.splice` puts its text tower into the text-vision file at the
 same output path; the text file is removed with the scratch directory. Its
 weights default to int8, the mode whose vectors stayed closer to the float32
-fine-tune's in the one image measurement (`IMAGE_DEFAULT_WEIGHTS`). `--npu` is
-refused for it. Its
+fine-tune's in the one image measurement (`IMAGE_DEFAULT_WEIGHTS`). Its
 report adds `google_vision_file` and `splice`; `splice.sha256` is the file's,
 which `verify` ties the report to, and `graft` describes the text file, whose
 `output` is `null` because it is not kept.
+
+`--npu <SoC>` on an image checkpoint writes the CPU file as above, then, per SoC,
+compiles the graft's text encoder as for a text checkpoint (`compile_for_npu`,
+unchanged) and splices the compiled encoder into Google's text-vision file for
+that SoC (`embedding_vision.splice_npu`, the file pinned in `VISION_NPU_FILES`,
+downloaded and checked against its sha256 before the graft). Only that file's
+`text_encoder` graph is replaced; its vision encoder, Google's NPU build, and
+every other section stay Google's, the embedder too: an image checkpoint's
+token table is frozen and held to the base's, and Google's embedder holds it in
+Google's own int4, where the CPU file holds the graft's int8. Each SoC's file is
+published into `int8-npu-<SoC>/` with a report of kind `npu`, as a text
+checkpoint's is; the compile's own file is not kept.
 
 What the file embeds is not checked here: `litetune verify` measures it.
 """
@@ -47,7 +58,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, get_args
 
@@ -81,12 +92,15 @@ from litetune.embedding_tune import DECIDER_PREFIX, IMAGE_PREFIX, EmbeddingRecor
 from litetune.embedding_vision import (
     FROZEN_PREFIXES,
     VISION_FILE,
+    VISION_NPU_FILES,
     VISION_REPO,
     VISION_REVISION,
     VISION_SHA256,
     SpliceResult,
     frozen_changes,
+    npu_socs,
     splice,
+    splice_npu,
 )
 from litetune.events import EventStream
 from litetune.exits import read_returncode
@@ -109,6 +123,8 @@ WEIGHT_MODES: tuple[str, ...] = get_args(WeightMode)
 # defaults to it too; this module's name for it stays.
 
 ARTIFACT_NAME = "model.litertlm"
+# An image checkpoint's compile, staged until its encoder is spliced; not published.
+COMPILED_NAME = "compiled.litertlm"
 REPORT_NAME = "convert.json"
 
 # An allowance for two files of hundreds of MB each, not a measurement.
@@ -137,13 +153,38 @@ IMAGE_INT4_NOT_MEASURED = (
     "and neither file's conversion cost was resolved at 300 held-out rows. `litetune verify` "
     "measures this file"
 )
-NPU_IMAGE_REFUSED = (
-    "--npu: {model} was tuned on images, and convert does not compile an image model for an "
-    "NPU; drop --npu to write the CPU file"
+NPU_IMAGE_SOC_REFUSED = (
+    "--npu {socs}: {model} was tuned on images, and its NPU file is Google's text-vision file "
+    "for the SoC with the compiled text encoder in it; Google's file is pinned for {pinned} only"
 )
 
 
 NPU_ENV_CHECK = "npu environment"
+
+
+def vision_npu_check(soc: str) -> str:
+    return f"Google's {soc} text-vision file"
+
+
+def npu_splice_check(soc: str) -> str:
+    return f"npu {soc} splice"
+
+
+def npu_image_not_verified(soc: str, filename: str) -> str:
+    """The limitation of an image checkpoint's file for `soc`."""
+    return (
+        f"compiled, never run on a device by this code: the {soc} text encoder was compiled "
+        "from the int8 graft and checked as a text checkpoint's --npu file is, then spliced "
+        f"into Google's {filename} in place of its text encoder and read back. The vision "
+        "encoder is Google's NPU build from that file, not compiled by litetune; the vision "
+        "adapter, end_of_vision, embedder, tokenizer and metadata are that file's too, byte for "
+        "byte, so the token table is Google's int4 one where the CPU file has the graft's int8. "
+        "What the file embeds has not been measured on any SoC "
+        f"({npu_socs()}), and `litetune verify` cannot measure it: "
+        "LiteRT-LM's CPU and GPU do not run a DISPATCH_OP"
+    )
+
+
 # Causes that say nothing about the model or the compiler: the run itself, and an error
 # in litetune's own script.
 NPU_RUN_CAUSES = ("run", "script")
@@ -230,6 +271,11 @@ class HubFile:
 GOOGLE_HUB_FILE = HubFile(GOOGLE_REPO, GOOGLE_FILE, GOOGLE_REVISION)
 BASE_HUB_FILE = HubFile(BASE_MODEL, BASE_FILE, BASE_REVISION)
 VISION_HUB_FILE = HubFile(VISION_REPO, VISION_FILE, VISION_REVISION)
+
+
+def vision_npu_hub_file(soc: str) -> HubFile:
+    """Google's text-vision file for `soc`, at `VISION_REVISION`."""
+    return HubFile(VISION_REPO, VISION_NPU_FILES[soc].filename, VISION_REVISION)
 
 
 def default_weights(record: EmbeddingRecord) -> str:
@@ -397,6 +443,8 @@ class EmbeddingExportResult:
     # An image checkpoint's: Google's text-vision file, and the splice into it.
     vision: dict[str, Any] = field(default_factory=dict)
     splice: SpliceResult | None = None
+    # An image checkpoint's `--npu`: per SoC, Google's text-vision file for it, as checked.
+    vision_npu: dict[str, dict[str, Any]] = field(default_factory=dict)
     limitations: list[str] = field(default_factory=list)
     # `hash_file` of the fine-tune's safetensors, taken before the graft reads it.
     checkpoint_sha256: str | None = None
@@ -444,6 +492,9 @@ class EmbeddingExportResult:
             "npu_published": self.npu_published if self.request.npu else None,
             "google_file": self.google,
             "google_vision_file": self.vision if self.record.is_image else None,
+            "google_vision_npu_files": (
+                self.vision_npu if self.record.is_image and self.request.npu else None
+            ),
             "base_checkpoint": self.base,
             "checkpoint": {
                 "path": str(self.request.model),
@@ -460,8 +511,13 @@ class EmbeddingExportResult:
 
 
 def _refuse_request(request: EmbeddingExportRequest, record: EmbeddingRecord) -> None:
-    if record.is_image and request.npu:
-        raise EmbeddingExportError(NPU_IMAGE_REFUSED.format(model=request.model))
+    unpinned = [soc for soc in request.npu if soc not in VISION_NPU_FILES]
+    if record.is_image and unpinned:
+        raise EmbeddingExportError(
+            NPU_IMAGE_SOC_REFUSED.format(
+                socs=", ".join(unpinned), model=request.model, pinned=npu_socs()
+            )
+        )
     if not record.is_image and request.base_litertlm_440m is not None:
         raise EmbeddingExportError(
             f"--base-litertlm-440m is Google's text-vision file, for a checkpoint tuned on "
@@ -580,6 +636,8 @@ def _run(
     wanted = [] if request.base_litertlm else [GOOGLE_HUB_FILE]
     if image and request.base_litertlm_440m is None:
         wanted.append(VISION_HUB_FILE)
+    npu_files = {soc: vision_npu_hub_file(soc) for soc in request.npu} if image else {}
+    wanted.extend(npu_files.values())
     wanted.append(BASE_HUB_FILE)
     try:
         fetched = dict(zip(wanted, download(env, wanted, timeout=request.timeout_s), strict=True))
@@ -612,6 +670,9 @@ def _run(
         vision = request.base_litertlm_440m or fetched[VISION_HUB_FILE]
         if not _vision_file_checked(request, result, events, vision):
             return
+        for soc, hub_file in npu_files.items():
+            if not _vision_npu_file_checked(result, events, soc, fetched[hub_file]):
+                return
     result.base["sha256"] = hash_file(base)
     problem = _base_checkpoint_problem(base, result.base["sha256"])
     if problem is not None:
@@ -671,6 +732,9 @@ def _run(
             return
         result.limitations.append(NOT_VERIFIED)
         events.artifact(str(request.output), name=ARTIFACT_NAME, verified=False)
+        if request.npu:
+            # The graft's text file is still in the snapshot, which outlives this call.
+            _compile_npus(request, result, events, grafted)
         return
     result.limitations.append(NOT_VERIFIED)
     events.artifact(str(grafted.output), name=ARTIFACT_NAME, verified=False)
@@ -700,6 +764,40 @@ def _vision_file_checked(
         result,
         events,
         Check.passed(VISION_FILE_CHECK, f"{vision.name}, sha256 {VISION_SHA256[:16]}…"),
+    )
+    return True
+
+
+def _vision_npu_file_checked(
+    result: EmbeddingExportResult, events: EventStream, soc: str, path: Path
+) -> bool:
+    """Whether `path` is Google's text-vision file for `soc` (`VISION_NPU_FILES`),
+    recorded as a check either way."""
+    pinned = VISION_NPU_FILES[soc]
+    digest = hash_file(path)
+    result.vision_npu[soc] = {
+        "path": str(path),
+        "source": "downloaded",
+        **vision_npu_hub_file(soc).as_dict(),
+        "sha256": digest,
+        "bytes": path.stat().st_size,
+    }
+    if digest != f"sha256:{pinned.sha256}":
+        _add(
+            result,
+            events,
+            Check.failed(
+                vision_npu_check(soc),
+                f"{path} has {digest}, not sha256:{pinned.sha256}, the {pinned.filename} of "
+                f"{VISION_REPO} at {VISION_REVISION} whose text encoder the compile replaces",
+                observed=result.vision_npu[soc],
+            ),
+        )
+        return False
+    _add(
+        result,
+        events,
+        Check.passed(vision_npu_check(soc), f"{path.name}, sha256 {pinned.sha256[:16]}…"),
     )
     return True
 
@@ -904,7 +1002,11 @@ def _npus_on_disk(
     for npu in published:
         events.artifact(str(npu.output), name=npu_artifact_name(npu.soc), verified=False)
         events.artifact(str(npu.output.parent / REPORT_NAME), name=f"{REPORT_NAME} (npu {npu.soc})")
-    if published:
+    for npu in published:
+        if npu.image is not None:
+            pinned = npu.image["google_vision_npu_file"]["filename"]
+            result.limitations.append(npu_image_not_verified(npu.soc, pinned))
+    if any(npu.image is None for npu in published):
         result.limitations.append(NPU_NOT_VERIFIED)
     if result.npu_publish_error is None and not partial:
         if published:
@@ -932,7 +1034,7 @@ def npu_report(result: EmbeddingExportResult, npu: NpuResult) -> dict[str, Any]:
     """The report beside an NPU file: what it was compiled from, what it is, and that it
     is not verified. `kind` "npu" and `npu.sha256` are what `verify` reads to refuse it."""
     whole = result.as_dict()
-    return {
+    report = {
         "schema": EMBEDDING_CONVERT_SCHEMA,
         "direction": "embedding",
         "kind": "npu",
@@ -949,6 +1051,16 @@ def npu_report(result: EmbeddingExportResult, npu: NpuResult) -> dict[str, Any]:
         "request": result.request.as_dict(),
         "limitations": [NPU_NOT_VERIFIED],
     }
+    if npu.image is not None:
+        report |= {
+            "modality": result.record.modality,
+            "vision_tokens": result.record.vision_tokens,
+            "google_vision_npu_file": npu.image["google_vision_npu_file"],
+            "limitations": [
+                npu_image_not_verified(npu.soc, npu.image["google_vision_npu_file"]["filename"])
+            ],
+        }
+    return report
 
 
 def _compile_npu(
@@ -960,14 +1072,17 @@ def _compile_npu(
     stage: Path,
 ) -> NpuResult | None:
     """The int8 graft's text encoder compiled for `soc` into `stage`, as one check; its
-    result, or None. Anything that escapes the compile is this SoC's, as `run`."""
+    result, or None. Anything that escapes the compile is this SoC's, as `run`. An image
+    checkpoint's is then spliced into Google's text-vision file for `soc`, as one more
+    check (`_spliced_npu`)."""
     name = npu_check(soc)
+    image = result.record.is_image
     try:
         compiled = compile_for_npu(
             request.npu_env,
             grafted,
             soc,
-            stage / soc / ARTIFACT_NAME,
+            stage / soc / (COMPILED_NAME if image else ARTIFACT_NAME),
             events=events,
             auto_provision=False,
             timeout=request.npu_timeout_s,
@@ -999,7 +1114,76 @@ def _compile_npu(
             observed={"sha256": compiled.sha256, "bytes": compiled.bytes},
         ),
     )
+    if image:
+        return _spliced_npu(request, result, events, compiled)
     return compiled
+
+
+def _spliced_npu(
+    request: EmbeddingExportRequest,
+    result: EmbeddingExportResult,
+    events: EventStream,
+    compiled: NpuResult,
+) -> NpuResult | None:
+    """`compiled`'s text encoder spliced into Google's text-vision file for its SoC, beside
+    it as `ARTIFACT_NAME`, as one check; the result describing the spliced file, or None.
+    The compile's own file is removed either way."""
+    soc, name = compiled.soc, npu_splice_check(compiled.soc)
+    try:
+        spliced = splice_npu(
+            request.env,
+            compiled.output,
+            Path(result.vision_npu[soc]["path"]),
+            compiled.output.parent / ARTIFACT_NAME,
+            soc,
+            compiled.encoder_sha256,
+            events=events,
+            auto_provision=False,
+            timeout=request.timeout_s,
+        )
+    except EmbeddingConvertError as exc:
+        logger.error("the %s splice refused (%s): %s", soc, exc.cause, exc)
+        make = Check.unchecked if exc.cause == "run" else Check.failed
+        _add(result, events, make(name, f"{exc.cause}: {exc}", observed={"cause": exc.cause}))
+        return None
+    except Exception as exc:  # noqa: BLE001 -- the SoC's own check, the others go on
+        logger.exception("the %s splice raised", soc)
+        _add(
+            result,
+            events,
+            Check.unchecked(name, f"run: {type(exc).__name__}: {exc}", observed={"cause": "run"}),
+        )
+        return None
+    finally:
+        compiled.output.unlink(missing_ok=True)
+    pinned = VISION_NPU_FILES[soc]
+    _add(
+        result,
+        events,
+        Check.passed(
+            name,
+            f"{spliced.bytes:,} bytes, read back; {', '.join(spliced.replaced)} from the compile, "
+            f"the other {len(spliced.sections) - len(spliced.replaced)} sections "
+            f"{pinned.filename}'s",
+            observed={"sha256": spliced.sha256, "bytes": spliced.bytes},
+        ),
+    )
+    return replace(
+        compiled,
+        output=spliced.output,
+        bytes=spliced.bytes,
+        sha256=spliced.sha256.removeprefix("sha256:"),
+        image={
+            "google_vision_npu_file": result.vision_npu[soc],
+            # Its `output` is the staged path; the report's `artifact` is the published one.
+            "splice": {k: v for k, v in spliced.as_dict().items() if k != "output"},
+            "compiled_file": {
+                "bytes": compiled.bytes,
+                "sha256": compiled.sha256,
+                "kept": False,
+            },
+        },
+    )
 
 
 def summarise(result: EmbeddingExportResult) -> list[str]:

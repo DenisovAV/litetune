@@ -22,7 +22,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_embedding_export import _checkpoint, _convert, grafter, hub  # noqa: F401
+from test_embedding_export import (  # noqa: F401
+    _checkpoint,
+    _convert,
+    _image_checkpoint,
+    _weights,
+    grafter,
+    hub,
+)
+from test_embedding_vision import (
+    COMPILED,
+    COMPILED_ENCODER,
+    COMPILED_TOML,
+    ENCODER_SHA,
+    NPU_VISION_TOML,
+    FakeToolchain,
+    read,
+    write,
+)
 
 from litetune import embedding_export, embedding_npu, envs, wheels
 from litetune.checks import Outcome
@@ -31,6 +48,7 @@ from litetune.embedding_export import (
     REPORT_NAME,
     EmbeddingExportError,
     EmbeddingExportRequest,
+    run_embedding_export,
 )
 from litetune.embedding_npu import (
     ANSWER_KEYS,
@@ -46,7 +64,10 @@ from litetune.embedding_npu import (
     output_for,
     request_problem,
 )
+from litetune.embedding_tune import read_embedding_record
 from litetune.embedding_verify import npu_target_of
+from litetune.embedding_vision import VISION_NPU_FILES, SpliceResult
+from litetune.storage import hash_file
 
 # ---------------------------------------------------------------------------
 # What is refused before anything runs
@@ -782,6 +803,10 @@ class FakeCompile:
     causes: dict[str, str] = field(default_factory=dict)
     raises: dict[str, BaseException] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
+    # What the compile writes, and its encoder's sha256: a file the real splice can read
+    # (`image_npu`), else a stand-in.
+    packed: bytes | None = None
+    encoder_sha256: str = "ef" * 32
 
     def __call__(self, env, grafted, soc, output, *, timeout, **kwargs) -> NpuResult:
         self.calls.append(
@@ -792,15 +817,16 @@ class FakeCompile:
         if soc in self.causes:
             raise EmbeddingNpuError(self.causes[soc], f"refused for {self.causes[soc]}")
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(b"npu " + soc.encode())
+        data = self.packed if self.packed is not None else b"npu " + soc.encode()
+        output.write_bytes(data)
         return NpuResult(
             soc,
             output,
-            7,
-            hashlib.sha256(b"npu " + soc.encode()).hexdigest(),
+            len(data),
+            hashlib.sha256(data).hexdigest(),
             230.0,
             169_000_000,
-            "ef" * 32,
+            self.encoder_sha256,
             _ok(stamp=["Qualcomm", soc]),
         )
 
@@ -1224,3 +1250,331 @@ def test_the_staged_copy_is_gone_once_a_file_is_placed(tmp_path):
     with pytest.raises(FileExistsError):
         embedding_export._place(source, target)
     assert target.read_bytes() == b"x" and source.exists()
+
+
+# ---------------------------------------------------------------------------
+# An image checkpoint: the compiled encoder spliced into Google's text-vision file
+# ---------------------------------------------------------------------------
+
+
+def _vision_npu_toml_bytes(tmp_path: Path, soc: str) -> bytes:
+    """Google's text-vision file for `soc` in the fake builder's format, each section
+    holding "Google's <soc> <name>"."""
+    path = tmp_path / "made" / f"{soc}.litertlm"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    contents = {name: f"Google's {soc} {name}".encode() for _, name in NPU_VISION_TOML}
+    return write(path, NPU_VISION_TOML, contents).read_bytes()
+
+
+def _compiled_bytes(tmp_path: Path) -> bytes:
+    path = tmp_path / "made" / "compiled.litertlm"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return write(path, COMPILED_TOML, COMPILED).read_bytes()
+
+
+@dataclass
+class ImageNpu:
+    """What `image_npu` set up: Google's files by SoC, and the splice toolchain."""
+
+    google: dict[str, bytes]
+    toolchain: FakeToolchain
+
+
+@pytest.fixture
+def image_npu(hub, compiler, monkeypatch, tmp_path) -> ImageNpu:  # noqa: F811
+    """The download writes Google's text-vision file for each SoC, pinned by its sha256;
+    the compile writes a file the splice can read; the splice is the real script, run
+    against the fake builder (test_embedding_vision.FakeToolchain)."""
+    google = {soc: _vision_npu_toml_bytes(tmp_path, soc) for soc in NPU_SOCS}
+    for soc, data in google.items():
+        pinned = VISION_NPU_FILES[soc]
+        hub.files[pinned.filename] = data
+        digest = hashlib.sha256(data).hexdigest()
+        monkeypatch.setitem(VISION_NPU_FILES, soc, replace(pinned, sha256=digest))
+    compiler.packed = _compiled_bytes(tmp_path)
+    compiler.encoder_sha256 = ENCODER_SHA
+    toolchain = FakeToolchain()
+
+    def run(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
+        if str(args[1]).endswith("embedding_splice.py"):
+            return toolchain(args, timeout=timeout, **kwargs)
+        return hub(args, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(envs.StageEnv, "run", run)
+    # The CPU splice is not this section's: test_embedding_export covers it.
+    monkeypatch.setattr(embedding_export, "splice", _cpu_splice)
+    return ImageNpu(google, toolchain)
+
+
+def _cpu_splice(env, grafted, vision, out_path, **kwargs) -> SpliceResult:
+    out = Path(out_path)
+    out.write_bytes(b"spliced " + Path(grafted).read_bytes())
+    return SpliceResult(out, out.stat().st_size, hash_file(out), "0.18.0", (), ())
+
+
+def _image_npu_args(*socs: str) -> list[str]:
+    return [a for soc in socs for a in ("--npu", soc)]
+
+
+def test_an_image_checkpoint_compiles_and_splices_each_soc(
+    hub,  # noqa: F811
+    grafter,  # noqa: F811
+    compiler,
+    image_npu,
+    tmp_path,
+    monkeypatch,
+):
+    staged: list[list[str]] = []
+    real_place = embedding_export._place
+
+    def place(source: Path, target: Path) -> None:
+        staged.append(sorted(p.name for p in source.parent.iterdir()))
+        real_place(source, target)
+
+    monkeypatch.setattr(embedding_export, "_place", place)
+    out = tmp_path / "out"
+    # No --weights: an image checkpoint's default, int8, is the one --npu takes.
+    assert _convert(_image_checkpoint(tmp_path), out, *_image_npu_args("SM8750", "SM8650")) == 0
+    graft_out = grafter.calls[0]["out"]
+    # The compile reads the graft's text file in the run's scratch, as the CPU splice does.
+    assert [c["grafted"] for c in compiler.calls] == [graft_out, graft_out]
+    assert all(c["output"].name == embedding_export.COMPILED_NAME for c in compiler.calls)
+    # The CPU file is written as without --npu.
+    assert (out / "int8" / "model.litertlm").read_bytes() == b"spliced grafted int8"
+    # Google's files were asked for at the pinned revision, with the others.
+    asked = [f["filename"] for f in hub.asked[0]]
+    assert asked[:2] == [embedding_export.GOOGLE_FILE, embedding_export.VISION_FILE]
+    assert asked[2:4] == [VISION_NPU_FILES[s].filename for s in ("SM8750", "SM8650")]
+    assert all(f["revision"] == embedding_export.VISION_REVISION for f in hub.asked[0][1:4])
+    report = _report(out)
+    assert report["npu_published"] is True and report["outcome"] == "passed"
+    assert set(report["google_vision_npu_files"]) == {"SM8750", "SM8650"}
+    for soc in ("SM8750", "SM8650"):
+        npu_file = out / f"int8-npu-{soc}" / "model.litertlm"
+        assert sorted(p.name for p in npu_file.parent.iterdir()) == [REPORT_NAME, "model.litertlm"]
+        _, contents = read(npu_file)
+        names = [name for _, name in NPU_VISION_TOML]
+        # Only the text encoder is the compile's; every other section Google's for the SoC.
+        assert contents == [
+            COMPILED_ENCODER if n == "encoder graph" else f"Google's {soc} {n}".encode()
+            for n in names
+        ]
+        sibling = _report(out, f"int8-npu-{soc}")
+        assert (sibling["kind"], sibling["modality"], sibling["vision_tokens"]) == (
+            "npu",
+            "image",
+            70,
+        )
+        assert sibling["artifact"] == str(npu_file)
+        npu = sibling["npu"]
+        assert npu["sha256"] == hashlib.sha256(npu_file.read_bytes()).hexdigest()
+        assert npu["bytes"] == npu_file.stat().st_size
+        assert npu["encoder_sha256"] == ENCODER_SHA and npu["stamp"] == ["Qualcomm", soc]
+        assert npu["splice"]["replaced"] == ["TFLiteModel text_encoder"]
+        assert "output" not in npu["splice"]
+        assert npu["splice"]["sha256"] == hash_file(npu_file)
+        assert npu["compiled_file"] == {
+            "bytes": len(compiler.packed or b""),
+            "sha256": hashlib.sha256(compiler.packed or b"").hexdigest(),
+            "kept": False,
+        }
+        # No text-vision file has run anywhere; what ran is the text file, said as such.
+        assert npu["device_run"] is None
+        assert npu["text_file_device_run"] == DEVICE_RUNS.get(soc)
+        pinned = VISION_NPU_FILES[soc]
+        google = sibling["google_vision_npu_file"]
+        assert google == npu["google_vision_npu_file"] == report["google_vision_npu_files"][soc]
+        assert (google["repo"], google["filename"], google["revision"]) == (
+            embedding_export.VISION_REPO,
+            pinned.filename,
+            embedding_export.VISION_REVISION,
+        )
+        assert google["sha256"] == f"sha256:{pinned.sha256}"
+        (limitation,) = sibling["limitations"]
+        assert limitation == embedding_export.npu_image_not_verified(soc, pinned.filename)
+        assert limitation in report["limitations"]
+        assert npu_target_of(npu_file) == soc
+    # The compile's own file was gone before publishing, and the staging directory after.
+    assert staged and all(embedding_export.COMPILED_NAME not in names for names in staged)
+    assert not list(out.glob(".litetune-npu-stage-*"))
+    assert NPU_NOT_VERIFIED not in report["limitations"]
+    names = [c["name"] for c in report["checks"]["checks"]]
+    for soc in ("SM8750", "SM8650"):
+        assert {
+            embedding_export.vision_npu_check(soc),
+            f"npu {soc}",
+            embedding_export.npu_splice_check(soc),
+        } <= set(names)
+
+
+def test_the_image_limitation_says_what_was_and_was_not_done():
+    text = embedding_export.npu_image_not_verified("SM8750", "f.litertlm")
+    for said in (
+        "compiled, never run on a device by this code",
+        "Google's NPU build",
+        "not compiled by litetune",
+        "Google's f.litertlm",
+        "has not been measured on any SoC (SM8550, SM8650, SM8750, SM8850)",
+        "`litetune verify` cannot measure it",
+    ):
+        assert said in text
+
+
+@pytest.mark.parametrize("soc", NPU_SOCS)
+def test_each_soc_takes_its_own_google_file(hub, grafter, compiler, image_npu, tmp_path, soc):  # noqa: F811
+    out = tmp_path / "out"
+    assert _convert(_image_checkpoint(tmp_path), out, *_image_npu_args(soc)) == 0
+    npu_file = out / f"int8-npu-{soc}" / "model.litertlm"
+    _, contents = read(npu_file)
+    assert contents[4] == f"Google's {soc} vision graph".encode()
+    assert contents[3] == COMPILED_ENCODER
+    assert npu_target_of(npu_file) == soc
+
+
+def test_another_file_for_the_soc_is_refused_before_the_graft(
+    hub,  # noqa: F811
+    grafter,  # noqa: F811
+    compiler,
+    image_npu,
+    tmp_path,
+):
+    hub.files[VISION_NPU_FILES["SM8650"].filename] = image_npu.google["SM8750"]
+    result = _run_image(tmp_path, npu=("SM8750", "SM8650"))
+    assert result.outcome is Outcome.FAILED
+    last = result.checks.checks[-1]
+    assert last.name == embedding_export.vision_npu_check("SM8650")
+    assert f"not sha256:{VISION_NPU_FILES['SM8650'].sha256}" in last.detail
+    assert grafter.calls == [] and compiler.calls == []
+    assert not (tmp_path / "out" / "int8-npu-SM8750").exists()
+
+
+def test_a_pack_that_changes_the_vision_encoder_publishes_nothing(
+    hub,  # noqa: F811
+    grafter,  # noqa: F811
+    compiler,
+    image_npu,
+    tmp_path,
+):
+    image_npu.toolchain.alters_bytes_of = "vision_encoder"
+    out = tmp_path / "out"
+    assert _convert(_image_checkpoint(tmp_path), out, *_image_npu_args("SM8750", "SM8650")) != 0
+    report = _report(out)
+    checks = {c["name"]: c for c in report["checks"]["checks"]}
+    for soc in ("SM8750", "SM8650"):
+        check = checks[embedding_export.npu_splice_check(soc)]
+        assert check["outcome"] == Outcome.FAILED.value and check["detail"].startswith("readback:")
+        assert not (out / f"int8-npu-{soc}").exists()
+    assert report["npu"] == [] and report["npu_published"] is False
+    assert not list(out.glob(".litetune-npu-stage-*"))
+
+
+def test_a_spliced_encoder_that_is_not_the_compiled_one_publishes_nothing(
+    hub,  # noqa: F811
+    grafter,  # noqa: F811
+    compiler,
+    image_npu,
+    tmp_path,
+):
+    compiler.encoder_sha256 = "cd" * 32
+    result = _run_image(tmp_path, npu=("SM8750",))
+    (check,) = [
+        c for c in result.checks.checks if c.name == embedding_export.npu_splice_check("SM8750")
+    ]
+    assert check.outcome is Outcome.FAILED and "not the compiled encoder's" in check.detail
+    assert result.npu == [] and not (tmp_path / "out" / "int8-npu-SM8750").exists()
+
+
+def test_a_soc_without_a_google_file_is_refused_by_name(
+    hub,  # noqa: F811
+    grafter,  # noqa: F811
+    compiler,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delitem(VISION_NPU_FILES, "SM8550")
+    with pytest.raises(EmbeddingExportError, match="--npu SM8550: .* tuned on images") as info:
+        _run_image(tmp_path, npu=("SM8750", "SM8550"))
+    assert "pinned for SM8650, SM8750, SM8850 only" in str(info.value)
+    assert hub.asked == [] and grafter.calls == []
+    # A text checkpoint does not need Google's text-vision file for the SoC.
+    text = tmp_path / "text"
+    text.mkdir()
+    assert _convert(_checkpoint(text), text / "out", *_npu_args("SM8550")) == 0
+
+
+def test_a_soc_without_a_google_npu_build_is_refused_by_the_parser(
+    hub,  # noqa: F811
+    grafter,  # noqa: F811
+    compiler,
+    tmp_path,
+    capsys,
+):
+    assert _convert(_image_checkpoint(tmp_path), tmp_path / "out", "--npu", "QCS8275") == 4
+    assert "invalid choice: 'QCS8275'" in capsys.readouterr().err
+    assert grafter.calls == []
+
+
+def test_int4_with_npu_on_an_image_checkpoint_is_refused(
+    hub,  # noqa: F811
+    grafter,  # noqa: F811
+    compiler,
+    tmp_path,
+    capsys,
+):
+    model = _image_checkpoint(tmp_path)
+    assert _convert(model, tmp_path / "out", "--npu", "SM8750", "--weights", "int4") == 4
+    assert "--weights int8" in capsys.readouterr().err
+    assert hub.asked == [] and grafter.calls == [] and compiler.calls == []
+
+
+def test_npu_on_an_image_checkpoint_off_linux_x86_64_is_refused(
+    hub,  # noqa: F811
+    grafter,  # noqa: F811
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    monkeypatch.setattr(embedding_export, "host_problem", lambda: "Linux x86-64 only")
+    assert _convert(_image_checkpoint(tmp_path), tmp_path / "out", "--npu", "SM8750") == 4
+    assert "Linux x86-64 only" in capsys.readouterr().err
+    assert hub.asked == [] and grafter.calls == []
+
+
+def test_an_image_checkpoint_whose_frozen_tensors_changed_compiles_nothing(
+    hub,  # noqa: F811
+    grafter,  # noqa: F811
+    compiler,
+    image_npu,
+    tmp_path,
+):
+    model = _image_checkpoint(tmp_path)
+    (model / embedding_export.BASE_FILE).write_bytes(
+        _weights("F32", 1.25, vision_tower=[1.0, -2.5])
+    )
+    result = _run_image(tmp_path, model=model, npu=("SM8750",))
+    assert result.outcome is Outcome.FAILED
+    assert result.checks.checks[-1].name == embedding_export.FROZEN_CHECK
+    assert grafter.calls == [] and compiler.calls == [] and image_npu.toolchain.calls == []
+
+
+def test_a_text_checkpoints_npu_report_is_unchanged(hub, grafter, compiler, tmp_path):  # noqa: F811
+    out = tmp_path / "out"
+    assert _convert(_checkpoint(tmp_path), out, *_npu_args("SM8750")) == 0
+    assert len(hub.asked[0]) == 2
+    sibling = _report(out, "int8-npu-SM8750")
+    assert "modality" not in sibling and "google_vision_npu_file" not in sibling
+    assert sibling["npu"]["device_run"] == DEVICE_RUNS["SM8750"]
+    assert "splice" not in sibling["npu"] and "text_file_device_run" not in sibling["npu"]
+    assert sibling["limitations"] == [NPU_NOT_VERIFIED]
+    assert _report(out)["google_vision_npu_files"] is None
+    assert compiler.calls[0]["output"].name == "model.litertlm"
+
+
+def _run_image(tmp_path: Path, **kwargs: Any):
+    model = kwargs.pop("model", None) or _image_checkpoint(tmp_path)
+    request = EmbeddingExportRequest(
+        model=model, output_dir=tmp_path / "out", weights="int8", **kwargs
+    )
+    record = read_embedding_record(model)
+    assert record is not None
+    return run_embedding_export(request, record)
