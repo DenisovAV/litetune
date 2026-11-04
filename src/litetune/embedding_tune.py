@@ -62,7 +62,7 @@ import subprocess
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Protocol
 
 from litetune import devices, envs, models
@@ -1252,8 +1252,12 @@ def read_image_split(path: Path, decision: Decision, what: str) -> list[Labelled
                 "`prepare` wrote, whose rows carry the digest of their picture"
             )
         relative = PurePosixPath(value)
+        # `prepare` writes forward-slash paths relative to the split. A drive, an
+        # anchor or a backslash is refused on every host: on Windows `root / "C:\\x"`
+        # is "C:\\x", which a POSIX-only absolute check lets through.
+        absolute = relative.is_absolute() or bool(PureWindowsPath(value).anchor) or "\\" in value
         file = (root / relative).resolve()
-        if relative.is_absolute() or not file.is_relative_to(root):
+        if absolute or not file.is_relative_to(root):
             raise EmbeddingTuneError(
                 f"{where}: the image {value!r} is not inside the split's directory {root}; "
                 "`prepare` copies every picture into it"

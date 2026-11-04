@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -706,7 +707,8 @@ def test_a_source_that_cannot_be_read_is_an_image_copy_error_naming_it(tmp_path)
     sources = _sources(tmp_path)
     name, victim = next(iter(sorted(sources.items())))
     victim.unlink()
-    with pytest.raises(ImageCopyError, match=rf"{victim} could not be copied into the split"):
+    # A Windows path's backslashes are regex escapes: escape it.
+    with pytest.raises(ImageCopyError, match=rf"{re.escape(str(victim))} could not be copied"):
         write_images(tmp_path / "split", sources)
     assert not (tmp_path / "split" / "images").exists()
 

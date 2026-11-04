@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -1066,7 +1067,17 @@ def test_a_swap_without_mirror_exits_could_not_check(toolchain, split, tmp_path,
 
 def test_vision_tokens_outside_the_choices_are_refused_by_argparse(split, tmp_path, capsys):
     assert main(_argv(split, tmp_path, "--vision-tokens", "100")) == 4
-    assert "--vision-tokens: invalid choice: '100'" in capsys.readouterr().err
+    # Python 3.10's argparse prints the value unquoted (`invalid choice: 100`), later
+    # versions quote it.
+    assert re.search(r"--vision-tokens: invalid choice: '?100'?", capsys.readouterr().err)
+
+
+@pytest.mark.parametrize("value", ["C:\\split\\images\\a.png", "images\\a.png", "C:a.png"])
+def test_a_windows_path_in_an_image_row_is_refused_on_every_host(toolchain, split, tmp_path, value):
+    rows = _records(split.train)
+    rows[0]["image"] = value
+    _write(split.train, rows)
+    _refused(toolchain, _request(split, tmp_path), r"train\.jsonl:1: .*not inside the split")
 
 
 @pytest.mark.parametrize(
