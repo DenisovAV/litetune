@@ -42,6 +42,7 @@ from litetune.embedding_tune import (
     write_embedding_record,
 )
 from litetune.embedding_verify import (
+    BASE_CHECK,
     BASE_EMBED_CHECK,
     CANDIDATE_CHECK,
     DEFAULT_MAX_CONVERSION_COST,
@@ -945,6 +946,7 @@ class FakeEmbedEnvs:
     candidate: str = "same"  # "same": the reference's vectors; "random": unrelated ones
     fail: set[str] = field(default_factory=set)
     runs: list[tuple[str, str]] = field(default_factory=list)
+    provisioned: list[str] = field(default_factory=list)
     specs: dict[str, dict[str, Any]] = field(default_factory=dict)
     texts: dict[str, list[str]] = field(default_factory=dict)
     launches: list[dict[str, Any]] = field(default_factory=list)
@@ -1032,6 +1034,8 @@ class FakeEmbedEnvs:
         name = Path(args[1]).stem
         spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
         self.timeouts[name] = timeout
+        # A script runs in an environment a provision finished, as `StageEnv.run` needs.
+        assert env.ready, f"{name} ran in {env.name}, which was never provisioned"
         if name != "engines":  # the sides it runs are recorded one by one below
             self.runs.append((name, env.name))
             self.specs[name] = spec
@@ -1116,6 +1120,7 @@ def fake(monkeypatch, tmp_path, ev) -> FakeEmbedEnvs:
     instance = FakeEmbedEnvs(ev=ev, hub=tmp_path / "hub")
 
     def fake_provision(self, events=None, force: bool = False) -> Path:
+        instance.provisioned.append(self.name)
         mark_provisioned(self)
         return self.path
 
@@ -1449,10 +1454,37 @@ def test_googles_file_with_another_sha256_is_refused(fake, tmp_path):
     assert fake.runs == []
 
 
-def test_with_base_downloads_googles_file_in_the_export_env(fake, tmp_path):
+def test_with_base_downloads_googles_file_in_the_reference_env(fake, tmp_path):
     m = _verify(_setup(tmp_path), with_base=True).manifest
-    assert fake.runs[0] == ("download", envs.EXPORT.name)
+    assert fake.runs[0] == ("download", envs.EMBED_TRAIN.name)
+    # The export environment needs litert-converter, which has no Windows wheel.
+    assert envs.EXPORT.name not in fake.provisioned
+    assert all(env != envs.EXPORT.name for _, env in fake.runs)
     assert "gain_over_base" in m["quality"]
+
+
+def test_a_failed_download_of_googles_file_is_the_base_check_failing(fake, tmp_path):
+    fake.fail = {"download"}
+    result = _verify(_setup(tmp_path), with_base=True)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
+    assert failed["name"] == BASE_CHECK
+    assert "could not be fetched" in failed["detail"] and "boom" in failed["detail"]
+
+
+def test_with_base_on_a_host_without_the_reference_env_names_the_reference(
+    fake, tmp_path, monkeypatch
+):
+    def cannot(self, events=None, force: bool = False) -> Path:
+        raise RuntimeError(f"{self.name} cannot be installed here")
+
+    monkeypatch.setattr(envs.StageEnv, "provision", cannot)
+    result = _verify(_setup(tmp_path), with_base=True)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
+    assert failed["name"] == REFERENCE_CHECK
+    assert f"{envs.EMBED_TRAIN.name} cannot be installed here" in failed["detail"]
+    assert fake.runs == []
 
 
 @pytest.mark.parametrize("script", ["reference", "candidate", "evaluate"])
@@ -3017,7 +3049,8 @@ def test_googles_text_file_is_refused_as_the_base_of_an_image_checkpoint(fake, t
 
 def test_with_base_downloads_the_text_vision_file_for_an_image_checkpoint(fake, tmp_path):
     m = _verify(_image_setup(tmp_path, fake), with_base=True).manifest
-    assert fake.runs[0] == ("download", envs.EXPORT.name)
+    assert fake.runs[0] == ("download", envs.EMBED_TRAIN.name)
+    assert envs.EXPORT.name not in fake.provisioned
     assert fake.specs["download"]["files"] == [embedding_export.VISION_HUB_FILE.as_dict()]
     assert "gain_over_base" in m["quality"]
 

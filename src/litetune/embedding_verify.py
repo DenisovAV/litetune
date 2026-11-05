@@ -372,7 +372,6 @@ class EmbeddingVerify:
     not_applicable: tuple[str, ...] = ()
     train_env: envs.StageEnv = envs.EMBED_TRAIN
     runtime_env: envs.StageEnv = envs.RUNTIME
-    export_env: envs.StageEnv = envs.EXPORT
     auto_provision: bool = True
 
     @property
@@ -2072,11 +2071,22 @@ def verify_embedding(
             if not google.is_file():
                 return refuse(BASE_CHECK, f"--base-litertlm {google}: no such file")
         else:
+            # In the reference's environment, which verify needs anyway and which
+            # installs wherever verify runs: the download needs huggingface_hub only,
+            # and the export environment's litert-converter has no Windows wheel. An
+            # environment that cannot be installed is the reference's failure, named so.
+            if job.auto_provision:
+                try:
+                    job.train_env.provision(events=events)
+                except Exception as exc:  # noqa: BLE001 - a failed environment is a harness failure
+                    logger.exception("could not provision environment %r", job.train_env.name)
+                    return refuse(
+                        REFERENCE_CHECK,
+                        f"the {job.train_env.name} environment could not be provisioned: {exc}",
+                    )
             try:
-                if job.auto_provision:
-                    job.export_env.provision(events=events)
                 hub_file = VISION_HUB_FILE if images else GOOGLE_HUB_FILE
-                google = download(job.export_env, [hub_file])[0]
+                google = download(job.train_env, [hub_file])[0]
             except (DownloadFailed, RuntimeError, OSError) as exc:
                 logger.exception("could not fetch Google's file")
                 return refuse(BASE_CHECK, f"Google's file could not be fetched: {exc}")
