@@ -46,7 +46,7 @@ import statistics
 import subprocess
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
@@ -76,12 +76,14 @@ from litetune.images import (
     MULTI_FRAME_STILL,
     ImageCheckUnavailable,
     ImageCopyError,
+    ImageFacts,
     ImageInspector,
     PillowImageInspector,
     SplitImage,
     write_images,
 )
 from litetune.liveness import SkippedCheck
+from litetune.llm_images import IMAGE_MODEL, VISION_TOKENS, has_image, is_image_model
 from litetune.metrics import (
     END_CALL,
     ESCAPE_SPELLINGS,
@@ -559,6 +561,9 @@ class Row:
     # An image decision row's picture (`images.SplitImage`). Its state is the
     # image alone, so `prompt` is empty and the record names the file instead.
     image: SplitImage | None = None
+    # Whether `image` is shown with the `prompt` rather than in place of it: a
+    # Gemma 4 row (`llm_images`), whose record keeps both.
+    image_with_prompt: bool = False
 
     @property
     def tool(self) -> str:
@@ -573,6 +578,15 @@ class Row:
         return "<unlabelled>"
 
     def as_record(self) -> dict[str, Any]:
+        if self.image is not None and self.image_with_prompt:
+            return {
+                "prompt": self.prompt,
+                "image": self.image.relative,
+                "image_sha256": self.image.sha256,
+                "completion": self.completion,
+                "target": self.target if isinstance(self.target, str) else None,
+                "source_line": self.lineno,
+            }
         if self.image is not None:
             # The digest travels in the row so that `content_sha256` of the
             # JSONL covers the pixels, not only the file names.
@@ -1056,18 +1070,10 @@ class ImageStats:
         }
 
 
-def image_rows(
-    path: Path, located: Sequence[tuple[int, Path, str]], inspector: ImageInspector
-) -> tuple[list[Row], ImageStats]:
-    """Open every image of `located`, refuse what cannot be trained, and make the rows.
-
-    Refused, naming the row: a file Pillow cannot decode or convert to RGB, one
-    of more than one frame, one with no width or height, and the same bytes
-    given two different labels. The same bytes with the same label is a row
-    like any other, counted in `ImageStats.duplicate_rows`. An MPO file of
-    several frames is accepted as its first, and copied whole.
-    """
-    files = sorted({file for _, file, _ in located})
+def _inspected(
+    files: Sequence[Path], inspector: ImageInspector
+) -> tuple[dict[Path, ImageFacts], dict[str, Any], str]:
+    """What `inspector` made of each file, what checked them, and the decoder's name."""
     try:
         facts = inspector.inspect(files)
     except ImageCheckUnavailable as exc:
@@ -1079,61 +1085,100 @@ def image_rows(
             f"the image check answered for {len(facts)} of {len(files)} images; a split cannot "
             "be written from a partial answer"
         )
-    by_file = dict(zip(files, facts, strict=True))
     checker = inspector.describe()
     decoder = f"Pillow {checker['pillow']}" if checker.get("pillow") else "Pillow"
+    return dict(zip(files, facts, strict=True)), checker, decoder
+
+
+def _checked_image(where: str, file: Path, found: ImageFacts, decoder: str) -> SplitImage:
+    """The split's picture for one row, or a refusal naming the row.
+
+    Refused: a file Pillow cannot decode or convert to RGB, one that is neither
+    PNG nor JPEG, one of more than one frame, and one with no width or height.
+    An MPO file of several frames is accepted as its first, and copied whole.
+    """
+    if found.error is not None:
+        raise PrepareError(
+            f"{where}: {file} is not an image {decoder} can decode: {found.error}. `tune` "
+            "decodes it with the same Pillow"
+        )
+    if found.format not in IMAGE_FORMATS:
+        raise PrepareError(
+            f"{where}: {file} is {found.format!r} to {decoder}, not PNG or JPEG. LiteRT-LM "
+            "decodes the picture an application gives it with stb_image, and an image row is "
+            "a PNG or a JPEG file (an MPO as its first frame); save it as one of those, in "
+            "the format the application will give"
+        )
+    # An MPO file's later frames are not the picture: its first is, the one
+    # Pillow opens and `tune` trains on (`images.MULTI_FRAME_STILL`).
+    still = found.format == MULTI_FRAME_STILL and found.frames is not None and found.frames > 1
+    if found.frames != 1 and not still:
+        raise PrepareError(
+            f"{where}: {file} holds {found.frames} frames. An image row is one still "
+            "picture; save the frame it means as a file of its own"
+        )
+    if not found.width or not found.height:
+        raise PrepareError(
+            f"{where}: {file} is {found.width}x{found.height} pixels, an image with nothing in it"
+        )
+    if found.sha256 is None or found.format is None:
+        raise PrepareError(f"{where}: the image check gave {file} no digest or no format")
+    return SplitImage(
+        source=file,
+        sha256=found.sha256,
+        format=found.format,
+        width=found.width,
+        height=found.height,
+        extension=found.extension,
+    )
+
+
+def _image_stats(rows: Sequence[Row], duplicates: int, checker: dict[str, Any]) -> ImageStats:
+    unique = {row.image.sha256: row.image for row in rows if row.image is not None}
+    formats: dict[str, int] = {}
+    for image in unique.values():
+        formats[image.format] = formats.get(image.format, 0) + 1
+    widths = [image.width for image in unique.values()]
+    heights = [image.height for image in unique.values()]
+    return ImageStats(
+        rows=len(rows),
+        files=len(unique),
+        duplicate_rows=duplicates,
+        formats=formats,
+        width={"min": min(widths), "max": max(widths)},
+        height={"min": min(heights), "max": max(heights)},
+        checker=checker,
+    )
+
+
+def image_rows(
+    path: Path, located: Sequence[tuple[int, Path, str]], inspector: ImageInspector
+) -> tuple[list[Row], ImageStats]:
+    """Open every image of `located`, refuse what cannot be trained, and make the rows.
+
+    Refused, naming the row: what `_checked_image` refuses, and the same bytes
+    given two different labels. The same bytes with the same label is a row
+    like any other, counted in `ImageStats.duplicate_rows`.
+    """
+    files = sorted({file for _, file, _ in located})
+    by_file, checker, decoder = _inspected(files, inspector)
     first: dict[str, tuple[int, str]] = {}
     duplicates = 0
     rows: list[Row] = []
     for lineno, file, answer in located:
         where = f"{path}:{lineno}"
-        found = by_file[file]
-        if found.error is not None:
-            raise PrepareError(
-                f"{where}: {file} is not an image {decoder} can decode: {found.error}. `tune` "
-                "decodes it with the same Pillow"
-            )
-        if found.format not in IMAGE_FORMATS:
-            raise PrepareError(
-                f"{where}: {file} is {found.format!r} to {decoder}, not PNG or JPEG. LiteRT-LM "
-                "decodes the picture an application gives it with stb_image, and an image row is "
-                "a PNG or a JPEG file (an MPO as its first frame); save it as one of those, in "
-                "the format the application will give"
-            )
-        # An MPO file's later frames are not the picture: its first is, the one
-        # Pillow opens and `tune` trains on (`images.MULTI_FRAME_STILL`).
-        still = found.format == MULTI_FRAME_STILL and found.frames is not None and found.frames > 1
-        if found.frames != 1 and not still:
-            raise PrepareError(
-                f"{where}: {file} holds {found.frames} frames. An image row is one still "
-                "picture; save the frame it means as a file of its own"
-            )
-        if not found.width or not found.height:
-            raise PrepareError(
-                f"{where}: {file} is {found.width}x{found.height} pixels, an image with nothing "
-                "in it"
-            )
-        if found.sha256 is None or found.format is None:
-            raise PrepareError(f"{where}: the image check gave {file} no digest or no format")
-        seen = first.get(found.sha256)
+        image = _checked_image(where, file, by_file[file], decoder)
+        seen = first.get(image.sha256)
         if seen is None:
-            first[found.sha256] = (lineno, answer)
+            first[image.sha256] = (lineno, answer)
         elif seen[1] != answer:
             raise PrepareError(
-                f"{where}: {file} has the same bytes (sha256 {found.sha256}) as line {seen[0]}, "
+                f"{where}: {file} has the same bytes (sha256 {image.sha256}) as line {seen[0]}, "
                 f"which is labelled {seen[1]!r}, and this row is labelled {answer!r}. One "
                 "picture with two answers teaches neither; keep the row that is right"
             )
         else:
             duplicates += 1
-        image = SplitImage(
-            source=file,
-            sha256=found.sha256,
-            format=found.format,
-            width=found.width,
-            height=found.height,
-            extension=found.extension,
-        )
         rows.append(
             Row(
                 lineno=lineno,
@@ -1144,22 +1189,94 @@ def image_rows(
                 image=image,
             )
         )
-    unique = {row.image.sha256: row.image for row in rows if row.image is not None}
-    formats: dict[str, int] = {}
-    for image in unique.values():
-        formats[image.format] = formats.get(image.format, 0) + 1
-    widths = [image.width for image in unique.values()]
-    heights = [image.height for image in unique.values()]
-    stats = ImageStats(
-        rows=len(rows),
-        files=len(unique),
-        duplicate_rows=duplicates,
-        formats=formats,
-        width={"min": min(widths), "max": max(widths)},
-        height={"min": min(heights), "max": max(heights)},
-        checker=checker,
-    )
-    return rows, stats
+    return rows, _image_stats(rows, duplicates, checker)
+
+
+# -- Gemma 4 rows that carry a picture (`llm_images`) ---------------------------
+
+LLM_IMAGE_ROWS_FOR = (
+    f"rows with an 'image' are read as pictures for --base-model {IMAGE_MODEL} (with the "
+    f"prompt and completion) and {EMBEDDING_MODEL} (in place of the prompt)"
+)
+
+IMAGES_IGNORED = (
+    "{count} row(s) carry an 'image', which this split ignores: " + LLM_IMAGE_ROWS_FOR + ", and "
+    "this run named {model}. Each is trained as its text alone"
+)
+
+LLM_IMAGE_LENGTHS = (
+    "the token lengths measured here are each row's text alone: a picture adds up to "
+    f"{VISION_TOKENS} soft tokens and the two markers around them, which `tune` counts with the "
+    "processor and refuses a row over --max-seq-length for"
+)
+
+LLM_IMAGE_PICTURES_IN_BOTH = (
+    "{count} picture(s) are in both the training split and the held-out split, under different "
+    "rows. A held-out row about a picture the model was trained on measures recall of that "
+    "picture as much as the task"
+)
+
+
+def llm_image_rows(
+    path: Path,
+    objects: Sequence[tuple[int, dict[str, Any]]],
+    rows: Sequence[Row],
+    inspector: ImageInspector,
+) -> tuple[list[Row], ImageStats]:
+    """Gemma 4 rows with their pictures: each opened, refused if it cannot be trained.
+
+    `rows` are `_rows_from(objects)`, in the same order. Refused, naming the row:
+    a file mixing rows with a picture and rows without, an `image` that is not
+    the path of one file (a list asks for several pictures, which this path does
+    not train), a file that is not there, a row whose target is a tool call, and
+    whatever `_checked_image` refuses. One picture under several rows is a row
+    each, as the rows say.
+    """
+    with_image = [lineno for lineno, obj in objects if has_image(obj)]
+    if len(with_image) != len(objects):
+        without = next(lineno for lineno, obj in objects if not has_image(obj))
+        raise PrepareError(
+            f"{path}:{without}: this row gives no picture, and line {with_image[0]} does. A rows "
+            "file for pictures gives one in every row; put the text rows in a file of their own"
+        )
+    located: list[Path] = []
+    for (lineno, obj), row in zip(objects, rows, strict=True):
+        where = f"{path}:{lineno}"
+        value = obj["image"]
+        if isinstance(value, list):
+            raise PrepareError(
+                f"{where}: 'image' gives {len(value)} pictures. A row here is one picture and "
+                "one text; litetune has not trained Gemma 4 on several pictures in one turn"
+            )
+        if not isinstance(value, str) or not value.strip():
+            raise PrepareError(
+                f"{where}: 'image' must be the path of an image file, relative to "
+                f"{path.parent} or absolute; got {json.dumps(value)}"
+            )
+        if isinstance(row.target, ToolCall):
+            raise PrepareError(
+                f"{where}: this row's target is a tool call, and it gives a picture. litetune "
+                "trains Gemma 4 on pictures with text answers only"
+            )
+        file = _image_path(path, value)
+        if not file.exists():
+            raise PrepareError(f"{where}: the image {value!r} does not exist (read as {file})")
+        if not file.is_file():
+            raise PrepareError(
+                f"{where}: the image {value!r} is not a regular file (read as {file})"
+            )
+        located.append(file)
+    files = sorted(set(located))
+    by_file, checker, decoder = _inspected(files, inspector)
+    out = [
+        replace(
+            row,
+            image=_checked_image(f"{path}:{row.lineno}", file, by_file[file], decoder),
+            image_with_prompt=True,
+        )
+        for row, file in zip(rows, located, strict=True)
+    ]
+    return out, _image_stats(out, 0, checker)
 
 
 SPECIALS_UNCHECKED = (
@@ -2422,15 +2539,37 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     # google/embeddinggemma-2 is no LLM family: it has no rule, and its rows
     # are embedded, not scored (`embedding_tune`).
     embedding = request.base_model == EMBEDDING_MODEL
-    # Image rows exist on the EmbeddingGemma 2 path only. For every other model
-    # an `image` key is a field like any other, ignored as it always was.
+    # Image rows exist on two paths: EmbeddingGemma 2's, where the picture is
+    # the row's state, and Gemma 4 E2B's, where it comes with the prompt
+    # (`llm_images`). For every other model an `image` key is a field like any
+    # other, ignored as it always was, and the report says so.
     objects = read_objects(request.data, images=embedding)
     if embedding:
         refuse_image_and_prompt(request.data, objects)
     image_mode = embedding and rows_are_images(request.data, objects)
+    llm_images = (
+        not embedding
+        and is_image_model(request.base_model)
+        and any(has_image(obj) for _, obj in objects)
+    )
+    ignored_images = (
+        0 if embedding or llm_images else sum(1 for _, obj in objects if has_image(obj))
+    )
     context_length = _context_length_for(request, image_mode)
     decision: DecisionProfile | None = None
     image_stats: ImageStats | None = None
+    if llm_images and is_decision_split(objects, request.questions):
+        raise PrepareError(
+            f"these rows give pictures and are read as decisions (labels, or --questions). "
+            f"litetune trains {IMAGE_MODEL} on pictures with a text answer per row: give each row "
+            "a 'completion', or train decisions on pictures with --base-model "
+            f"{EMBEDDING_MODEL}"
+        )
+    if llm_images and request.declarations is not None:
+        raise PrepareError(
+            "these rows give pictures, and --declarations was given. litetune trains Gemma 4 on "
+            "pictures with text answers only, never with a tool list"
+        )
     if image_mode or is_decision_split(objects, request.questions):
         if request.declarations is not None:
             raise PrepareError(
@@ -2476,6 +2615,21 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 "decisions: they give completions or targets, and no --questions was given"
             )
         rows = _rows_from(request.data, objects, wire)
+        if llm_images:
+            if prompt_evidence([row.prompt for row in rows]).mode is PromptMode.PRERENDERED:
+                raise PrepareError(
+                    "these rows give pictures, and their prompts already carry turn markers. A "
+                    "picture goes into the prompt through the template the runtime renders, so "
+                    "rows with pictures give the user's text alone"
+                )
+            # After every refusal the rows file alone can give: opening the
+            # images provisions an environment.
+            rows, image_stats = llm_image_rows(
+                request.data,
+                objects,
+                rows,
+                request.images or PillowImageInspector(env=envs.TRAIN_VISION),
+            )
     # Before anything is profiled or split: a row calling a tool the prompt will
     # never offer is a row that cannot be trained, and saying so after a split
     # has been written means the caller re-runs the stage to learn it.
@@ -2522,6 +2676,12 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         refuse_tokenizer_specials(rows, request.data, request.tokens, result)
     if image_stats is not None and image_stats.duplicate_rows:
         result.limitation(IMAGE_DUPLICATES.format(count=image_stats.duplicate_rows))
+    if ignored_images:
+        result.limitation(
+            IMAGES_IGNORED.format(count=ignored_images, model=request.base_model or "no model")
+        )
+    if llm_images:
+        result.limitation(LLM_IMAGE_LENGTHS)
 
     # -- lengths -----------------------------------------------------------
     length_check: Check | None = None
@@ -2572,6 +2732,11 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             "not at the size that was asked for"
         )
     halves = split_rows(rows, content_sha256, request.seed, heldout_n) if heldout_n >= 1 else None
+    if llm_images and halves is not None:
+        trained = {row.image.sha256 for row in halves[0] if row.image is not None}
+        shared = {row.image.sha256 for row in halves[1] if row.image is not None} & trained
+        if shared:
+            result.limitation(LLM_IMAGE_PICTURES_IN_BOTH.format(count=len(shared)))
     calibration_rows: list[Row] = []
     options_check = None
     if decision is not None and halves is not None:
