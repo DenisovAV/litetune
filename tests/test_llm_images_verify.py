@@ -940,3 +940,33 @@ def test_a_limited_split_reads_only_the_rows_it_keeps(tmp_path):
     assert load_split(path, limit=3).n == 3
     with pytest.raises(DataError):
         load_split(path)
+
+
+def test_a_reference_tokenizer_config_that_is_not_json_is_refused(tmp_path):
+    reference = _checkpoint(tmp_path)
+    (reference / "tokenizer_config.json").write_text("{not json", encoding="utf-8")
+    result = run_verify(_request(tmp_path, reference=reference), backends=_pair())
+    assert result.status is Status.FAILED_HARNESS
+    assert "processor files could not be compared" in _check(result, PICTURES_CHECK).detail
+
+
+@pytest.mark.parametrize(
+    ("declared", "sent"),
+    [
+        ({"type": "TOP_P", "k": 64, "p": 0.95, "temperature": 1.0}, True),
+        ({"type": "TOP_P", "k": 1, "p": 1.0, "temperature": 1.0}, False),
+        (None, False),
+    ],
+)
+def test_what_verify_says_about_the_sampler_is_what_it_sent(declared, sent):
+    from litetune.llm_images import CANDIDATE_SAMPLER, sampler_samples
+    from litetune.verify import PICTURES_COMPARED, _candidate_sampling
+
+    # The driver's rule decides what was sent; the prose must say exactly that.
+    sampler_sent = dict(CANDIDATE_SAMPLER) if sampler_samples(declared) else None
+    assert (sampler_sent is not None) is sent
+    said = _candidate_sampling({"bundle_sampler": declared, "sampler_sent": sampler_sent})
+    assert ("in its place on every row" in said) is sent
+    assert ("greedy" in said) is not sent
+    # The picture limitation, written before anything ran, claims no sampler.
+    assert "top_k 1" not in PICTURES_COMPARED

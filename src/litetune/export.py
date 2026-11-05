@@ -778,7 +778,13 @@ def _recorded_images(model: str) -> tuple[dict[str, Any] | None, str | None]:
         llm_images.checked_template(model, record)
     except llm_images.ImageRowError as exc:
         return record, str(exc)
-    mismatch = llm_images.processor_mismatch(model, record)
+    try:
+        mismatch = llm_images.processor_mismatch(model, record)
+    except (OSError, ValueError) as exc:
+        return record, (
+            f"{model}: its processor files could not be compared with the ones `tune` recorded "
+            f"({type(exc).__name__}: {exc})"
+        )
     if mismatch is not None:
         return record, mismatch
     return record, None
@@ -2970,10 +2976,7 @@ def export_recipe(
                 "and adapter constrained to the CPU, the one vision backend litetune has "
                 "measured"
                 + (
-                    "; "
-                    + llm_images.SAMPLER_NOTE.format(
-                        sampler=", ".join(f"{k} {v}" for k, v in vision["sampler"].items())
-                    )
+                    "; " + llm_images.sampler_note(vision["sampler"])
                     if vision["sampler"] is not None
                     else ""
                 )

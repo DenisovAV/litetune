@@ -20,6 +20,7 @@ from litetune.images import PillowImageInspector
 from litetune.llm_images import IMAGE_MODEL, split_images
 from litetune.prepare import (
     IMAGES_IGNORED,
+    LENGTH_CHECK,
     LLM_IMAGE_LENGTHS,
     LLM_IMAGES_READ,
     PrepareError,
@@ -73,7 +74,6 @@ def test_rows_with_pictures_keep_prompt_completion_and_the_copied_picture(tmp_pa
     report = json.loads((split / "prepare.json").read_text())
     assert report["modality"] == "image"
     assert report["images"]["files"] == 36
-    assert LLM_IMAGE_LENGTHS in result.limitations
 
 
 def test_the_pictures_are_opened_in_train_vision_by_default(tmp_path, monkeypatch):
@@ -238,3 +238,57 @@ def test_an_image_that_is_a_directory_is_refused(tmp_path):
         PrepareError, match=r":2: the image 'pics/folder.jpg' is not a regular file"
     ):
         prepare(_request(tmp_path, rows))
+
+
+class _Counter:
+    """One token per text."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def describe(self):
+        return {"counter": "fake"}
+
+    def count(self, texts):
+        self.calls += 1
+        return [1 for _ in texts]
+
+
+def test_an_over_length_split_never_opens_its_pictures(tmp_path):
+    inspector = FakeImageInspector()
+    result = prepare(_request(tmp_path, tokens=_Counter(), context_length=200, images=inspector))
+    # Every row is one token and a 282-token picture: over 200, refused unopened.
+    assert inspector.calls == []
+    assert result.train is None
+    lengths = next(c for c in result.checks.checks if c.name == LENGTH_CHECK)
+    assert lengths.outcome is Outcome.FAILED
+
+
+def test_a_split_that_fits_opens_its_pictures_once(tmp_path):
+    inspector = FakeImageInspector()
+    result = prepare(_request(tmp_path, tokens=_Counter(), context_length=4096, images=inspector))
+    assert len(inspector.calls) == 1 and result.train is not None
+    assert LLM_IMAGE_LENGTHS in result.limitations
+
+
+def test_without_a_tokenizer_no_length_is_claimed_for_the_pictures(tmp_path):
+    result = prepare(_request(tmp_path))
+    assert LLM_IMAGE_LENGTHS not in result.limitations
+
+
+def test_a_clamped_grouped_split_reports_its_sizes_once(tmp_path):
+    rows = []
+    for p in range(12):
+        _fake_image(tmp_path / "pics" / f"p{p}.jpg", fmt="JPEG", tag=f"picture {p}")
+        rows += [
+            {"prompt": f"question {q}", "completion": "a", "image": f"pics/p{p}.jpg"}
+            for q in range(4)
+        ]
+    result = prepare(_request(tmp_path, rows, heldout_size=100))
+    sizes = [t for t in result.limitations if "held out" in t]
+    assert len(sizes) == 1
+    assert result.heldout is not None and result.train is not None
+    held, train = result.heldout.n, result.train.n
+    assert (held, train) == (44, 4)
+    assert f"{held} rows were held out" in sizes[0] and f"{train} kept for training" in sizes[0]
+    assert "where 100 and 0 were asked" in sizes[0]

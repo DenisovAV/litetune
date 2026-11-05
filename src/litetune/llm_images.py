@@ -146,10 +146,19 @@ VISION_CONSTRAINTS = {"vision_encoder": "cpu", "vision_adapter": "cpu"}
 # comparison with the greedy float reference holds.
 CANDIDATE_SAMPLER = {"top_k": 1, "top_p": 1.0, "temperature": 1.0, "seed": 0}
 
-SAMPLER_NOTE = (
-    "the bundle declares a sampler ({sampler}): an application that passes no sampler of its "
-    "own samples with it, and litetune's verify measures it with top_k 1 in its place"
-)
+
+def sampler_note(sampler: Mapping[str, Any]) -> str:
+    """What `convert` says about the sampler a bundle declares, as `verify` will treat it."""
+    shown = ", ".join(f"{key} {value}" for key, value in sampler.items())
+    if sampler_samples(sampler):
+        return (
+            f"the bundle declares a sampler ({shown}): an application that passes no sampler of "
+            "its own samples with it, and litetune's verify measures it with top_k 1 in its place"
+        )
+    return (
+        f"the bundle declares a sampler ({shown}): an application that passes no sampler of its "
+        "own decodes with it, and litetune's verify measures it so"
+    )
 
 
 def sampler_samples(sampler: Mapping[str, Any] | None) -> bool:

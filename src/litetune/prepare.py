@@ -1803,8 +1803,14 @@ class LengthStats:
         }
 
 
-def measure_lengths(rows: Sequence[Row], counter: TokenCounter, context_length: int) -> LengthStats:
-    """Token statistics for the split, and every row that will not fit."""
+def measure_lengths(
+    rows: Sequence[Row], counter: TokenCounter, context_length: int, picture_tokens: int = 0
+) -> LengthStats:
+    """Token statistics for the split, and every row that will not fit.
+
+    `picture_tokens` is added to each row's prompt: the most its picture becomes,
+    for rows that carry one, counted before the pictures are opened.
+    """
     prompts = [row.prompt for row in rows]
     completions = [row.completion for row in rows]
     # One call, not two: the real counter pays a process launch and a tokenizer
@@ -1821,10 +1827,7 @@ def measure_lengths(rows: Sequence[Row], counter: TokenCounter, context_length: 
             "the over-length check cannot be performed on a partial answer"
         )
     # A row with a picture: its text, and the most the picture becomes.
-    prompt_counts = [
-        count + (PICTURE_TOKENS if row.image is not None and row.image_with_prompt else 0)
-        for row, count in zip(rows, counts[: len(rows)], strict=True)
-    ]
+    prompt_counts = [count + picture_tokens for count in counts[: len(rows)]]
     completion_counts = counts[len(rows) :]
     totals = [
         p + c + SEQUENCE_OVERHEAD_TOKENS
@@ -2400,8 +2403,12 @@ def _check_lengths(
     declarations_sha256: str | None,
     evidence: PromptMode | None,
     events: EventStream,
+    picture_tokens: int = 0,
 ) -> Check:
-    """Measure every row against `context_length`, and record the check on `result`."""
+    """Measure every row against `context_length`, and record the check on `result`.
+
+    `picture_tokens` is added to every row: the most a row's picture becomes.
+    """
     embedding = request.base_model == EMBEDDING_MODEL
     measured: list[LengthStats] = []
     window = context_length
@@ -2424,7 +2431,7 @@ def _check_lengths(
             if embedding and decision is not None:
                 stats = measure_embedded_lengths(rows, decision.decision, request.tokens, window)
             else:
-                stats = measure_lengths(rows, request.tokens, context_length)
+                stats = measure_lengths(rows, request.tokens, context_length, picture_tokens)
             measured.append(stats)
             if stats.over_length:
                 named = ", ".join(
@@ -2496,24 +2503,28 @@ def _split_pictures(
     seed: int,
     heldout: int,
     calibration: int,
+    asked: int | None = None,
 ) -> tuple[tuple[list[Row], list[Row]] | None, list[Row]]:
     """An image split's (training, held-out) rows and its calibration rows, by picture.
 
     Rows that give the same bytes are one group (`split_grouped`), so no picture
     is both trained on and scored. `None` for the halves when the rows hold
-    fewer than two pictures. A held-out or calibration split that the groups
-    made larger than asked is a limitation.
+    fewer than two pictures. A held-out or calibration split of another size
+    than asked -- `asked`, the caller's --heldout-size, else `heldout` -- is one
+    limitation, with the sizes the groups gave.
     """
     pictures = [row.image.sha256 if row.image is not None else "" for row in rows]
     grouped = split_grouped(rows, pictures, content_sha256, seed, heldout, calibration)
     if grouped is None:
         return None, []
     train, aside, held = grouped
-    if (len(held), len(aside)) != (heldout, calibration):
+    wanted = heldout if asked is None else asked
+    if (len(held), len(aside)) != (wanted, calibration):
         result.limitation(
-            f"rows that give the same picture are kept in one split, so {len(held)} rows were held "
-            f"out and {len(aside)} set aside for calibration where {heldout} and {calibration} "
-            "were asked"
+            f"rows that give the same picture are kept in one split, and {len(rows)} rows are "
+            f"available, so {len(held)} rows were held out, {len(aside)} set aside for "
+            f"calibration and {len(train)} kept for training, where {wanted} and {calibration} "
+            f"were asked. Every interval on this split is computed at n={len(held)}"
         )
     return (train, held), aside
 
@@ -2651,13 +2662,25 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                     "rows with pictures give the user's text alone"
                 )
             # After every refusal the rows file alone can give: opening the
-            # images provisions an environment.
-            rows, image_stats = llm_image_rows(
-                request.data,
-                objects,
-                rows,
-                request.images or PillowImageInspector(env=envs.TRAIN_VISION),
+            # images provisions an environment. Not for rows the length check
+            # below will refuse anyway: their text and the most a picture
+            # becomes are counted first, when a tokenizer was given.
+            over = (
+                request.tokens is not None
+                and context_length is not None
+                and bool(
+                    measure_lengths(
+                        rows, request.tokens, context_length, PICTURE_TOKENS
+                    ).over_length
+                )
             )
+            if not over:
+                rows, image_stats = llm_image_rows(
+                    request.data,
+                    objects,
+                    rows,
+                    request.images or PillowImageInspector(env=envs.TRAIN_VISION),
+                )
     # Before anything is profiled or split: a row calling a tool the prompt will
     # never offer is a row that cannot be trained, and saying so after a split
     # has been written means the caller re-runs the stage to learn it.
@@ -2710,7 +2733,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         )
     if llm_images:
         result.limitation(LLM_IMAGES_READ)
-        result.limitation(LLM_IMAGE_LENGTHS)
+        if request.tokens is not None:
+            result.limitation(LLM_IMAGE_LENGTHS)
 
     # -- lengths -----------------------------------------------------------
     length_check: Check | None = None
@@ -2719,7 +2743,15 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         result.skipped.append(SkippedCheck(LENGTH_CHECK, IMAGE_ROWS_NOT_COUNTED))
     else:
         length_check = _check_lengths(
-            request, context_length, result, rows, decision, declarations_sha256, evidence, events
+            request,
+            context_length,
+            result,
+            rows,
+            decision,
+            declarations_sha256,
+            evidence,
+            events,
+            PICTURE_TOKENS if llm_images else 0,
         )
 
     # -- scoreability, before anyone pays for a GPU -------------------------
@@ -2750,7 +2782,10 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
 
     # -- the split ---------------------------------------------------------
     heldout_n = heldout_size_for(len(rows), request.heldout_fraction, request.heldout_size)
-    if request.heldout_size is not None and heldout_n != request.heldout_size:
+    # Rows split by picture report their sizes once, after the grouping
+    # (`_split_pictures`), which may move them again.
+    grouped = llm_images or image_stats is not None
+    if request.heldout_size is not None and heldout_n != request.heldout_size and not grouped:
         # Silently handing back 99 when 500 was asked for is the shape of every
         # failure in this codebase's history: the caller reads their own number
         # back out of the spec and never learns it was not honoured.
@@ -2764,7 +2799,9 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         # By picture, as EmbeddingGemma 2's image rows are: rows that give the
         # same bytes go to one side, so no held-out row asks about a picture the
         # model was trained on.
-        halves, _ = _split_pictures(result, rows, content_sha256, request.seed, heldout_n, 0)
+        halves, _ = _split_pictures(
+            result, rows, content_sha256, request.seed, heldout_n, 0, request.heldout_size
+        )
     else:
         halves = (
             split_rows(rows, content_sha256, request.seed, heldout_n) if heldout_n >= 1 else None
@@ -2791,7 +2828,13 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             halves = (train_part, halves[1])
         else:
             halves, calibration_rows = _split_pictures(
-                result, rows, content_sha256, request.seed, heldout_n, calibration_n
+                result,
+                rows,
+                content_sha256,
+                request.seed,
+                heldout_n,
+                calibration_n,
+                request.heldout_size,
             )
     if decision is not None and halves is not None:
         decision.train = _count_by_option(decision.decision, halves[0])

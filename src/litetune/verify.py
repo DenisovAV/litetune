@@ -673,7 +673,7 @@ PICTURES_COMPARED = (
     "the held-out rows carry pictures. The reference reads each through the checkpoint's own "
     "processor at {tokens} soft tokens and the bundle's template; the candidate is sent the "
     "picture's bytes and decodes and resizes it with the runtime's own image preprocessor, on a "
-    "CPU vision backend, with a top_k 1 sampler in place of the one the bundle declares. The "
+    "CPU vision backend; the sampler it decodes with is said where decoding is. The "
     "two sides do not decode and resize a picture with the same code, so "
     "a difference here holds that as well as the conversion. The rendering check compares the "
     "text around each picture's placeholder as token ids; how many soft tokens the runtime "
@@ -763,7 +763,13 @@ def _picture_inputs(
             "the held-out rows carry pictures, and --scorer tool-call was asked. Their answers are "
             "text; pass --scorer exact-text"
         )
-    mismatch = llm_images.processor_mismatch(request.reference, record)
+    try:
+        mismatch = llm_images.processor_mismatch(request.reference, record)
+    except (OSError, ValueError) as exc:
+        return refused(
+            "the reference's processor files could not be compared with the ones `tune` "
+            f"recorded ({type(exc).__name__}: {exc})"
+        )
     if mismatch is not None:
         return refused(mismatch)
     try:
