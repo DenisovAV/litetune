@@ -1956,12 +1956,12 @@ def run_verify(
     # limitation silently vanished for exactly the third-party backend that
     # most needs it.
     if candidate.decode_enforced != reference.decode_enforced:
-        # Both sides declare the same decoding, but only one of them was handed
-        # it: litetune passes none to the runtime, so it runs on its own
-        # defaults. They are greedy on both sides, which is what makes the
-        # comparison admissible at all -- but a differing token limit would show
-        # as truncation on one side only, so it is named rather than assumed
-        # away.
+        # Both sides declare the same decoding, but only the reference is handed
+        # all of it: the runtime gets no token limit, and a sampler only when the
+        # bundle declares one that samples (`_candidate_sampling` says which).
+        # Greedy on both sides is what makes the comparison admissible at all --
+        # but a differing token limit would show as truncation on one side only,
+        # so it is named rather than assumed away.
         # How far the unverified limit could reach is measurable even though the
         # limit is not: a generation that ends with a terminator stopped on its
         # own and no bound touched it. The count is not proof -- a runtime may
@@ -1971,9 +1971,10 @@ def run_verify(
         loose = unterminated_count(candidate)
         run.limitation(
             f"decoding was passed explicitly to {reference.backend} "
-            f"({reference.decode.as_dict()}) and not to {candidate.backend}: "
-            f"{_candidate_sampling(candidate.engine)}. The output-token limit is unverified on "
-            f"the runtime side. {loose} of {candidate.n} {candidate.backend} generations end "
+            f"({reference.decode.as_dict()}); {candidate.backend} was given no output-token "
+            f"limit, and {_candidate_sampling(candidate.engine)}. The output-token limit is "
+            f"unverified on the runtime side. {loose} of {candidate.n} {candidate.backend} "
+            "generations end "
             "without a terminator"
         )
 

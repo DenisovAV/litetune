@@ -882,6 +882,15 @@ def test_run_verify_builds_its_backends_with_the_pictures(tmp_path, monkeypatch)
 # -- what verify says about decoding (review 1, 18) ------------------------------
 
 
+def test_the_decoding_limitation_does_not_say_nothing_reached_the_runtime(tmp_path):
+    # The runtime gets no token limit but may get a sampler; the sentence once read "passed
+    # to transformers and not to litert-lm" beside "verify sent top_k 1".
+    result = run_verify(_request(tmp_path), backends=_pair())
+    (said,) = [t for t in result.manifest["limitations"] if t.startswith("decoding was passed")]
+    assert "was given no output-token limit, and " in said
+    assert "and not to" not in said
+
+
 @pytest.mark.parametrize(
     ("engine", "said"),
     [
