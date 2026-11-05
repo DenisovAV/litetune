@@ -32,7 +32,7 @@ import hashlib
 import json
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -678,6 +678,39 @@ PICTURES_COMPARED = (
     "a difference here holds that as well as the conversion. The rendering check compares the "
     "text around each picture's placeholder as token ids; how many soft tokens the runtime "
     "gives a picture it does not report, so that was not compared"
+)
+
+
+def _candidate_sampling(engine: Mapping[str, Any]) -> str:
+    """What the candidate decoded with, said for the sampler it ran on."""
+    declared, sent = engine.get("bundle_sampler"), engine.get("sampler_sent")
+    if sent:
+        return (
+            f"the bundle declares a sampler that samples ({declared}), so verify sent "
+            f"{sent} in its place on every row. This number is for an application that passes "
+            "top_k 1 itself; one that passes no sampler samples with the bundle's"
+        )
+    if declared:
+        return (
+            f"the bundle declares a sampler that picks the likeliest token ({declared}), and the "
+            "runtime ran on it; both sides are greedy"
+        )
+    return (
+        "the bundle declares no sampler, and the runtime ran on its own defaults; both are greedy"
+    )
+
+
+PICTURE_THREADS = (
+    "the vision encoder ran on the runtime's default CPU threads: litert-lm 0.18.0's Engine "
+    "sets a thread count for its text and audio backends only (`engine.py`), so the {threads} "
+    "the text side was given did not reach it"
+)
+
+PICTURE_PREFILL_UNCHECKED = (
+    "the rendering check's second half, the runtime's own prefill count against the "
+    "reference's, was not run for rows with a picture: the runtime counts a picture's soft "
+    "tokens itself and does not report how many, so tokens it adds outside the rendered text "
+    "-- a second BOS around an image turn -- would not show here"
 )
 
 
@@ -1476,6 +1509,7 @@ def run_verify(
         run.record(accepted)
         run.manifest["harness"]["pictures"] = pictures.as_dict()
         run.limitation(PICTURES_COMPARED.format(tokens=pictures.vision_tokens))
+        run.limitation(PICTURE_PREFILL_UNCHECKED)
 
     # A text split calls it as it always has, so a stand-in that takes two
     # arguments still stands in for it.
@@ -1659,6 +1693,14 @@ def run_verify(
         _limit_gpu_reading(run, candidate.engine)
     _limit_runtime_named(run, candidate.engine)
     _limit_cpu_threads(run, pair.candidate)
+    if pictures is not None:
+        threads = candidate.engine.get("cpu_threads") or {}
+        used = threads.get("threads") if isinstance(threads, Mapping) else None
+        run.limitation(
+            PICTURE_THREADS.format(
+                threads=f"{used} thread(s)" if used else "runtime's default thread count"
+            )
+        )
 
     # Check 5 (divergence) is deferred: the caller decides whether it applies,
     # and generating the reference before the candidate is known alive would pay
@@ -1930,9 +1972,9 @@ def run_verify(
         loose = unterminated_count(candidate)
         run.limitation(
             f"decoding was passed explicitly to {reference.backend} "
-            f"({reference.decode.as_dict()}) but not to {candidate.backend}, which uses the "
-            "pinned runtime's own defaults; both are greedy, and the token limit is unverified "
-            f"on the runtime side. {loose} of {candidate.n} {candidate.backend} generations end "
+            f"({reference.decode.as_dict()}) and not to {candidate.backend}: "
+            f"{_candidate_sampling(candidate.engine)}. The output-token limit is unverified on "
+            f"the runtime side. {loose} of {candidate.n} {candidate.backend} generations end "
             "without a terminator"
         )
 

@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 from conftest import FakeBackend
+from llm_image_fixtures import TEMPLATE, pin_template, write_checkpoint
 
 from litetune import envs
 from litetune.checks import Outcome
@@ -30,7 +31,7 @@ from litetune.evaluate import (
     _litertlm_script,
     load_split,
 )
-from litetune.llm_images import PROCESSOR_FILES, RECORD_KEY, TEMPLATE_FILE, VISION_TOKENS
+from litetune.llm_images import TEMPLATE_FILE, VISION_TOKENS
 from litetune.prompt_mode import PromptMode
 from litetune.rendering import (
     _REFERENCE_SCRIPT,
@@ -49,12 +50,16 @@ from litetune.verify import (
     run_verify,
 )
 
-TEMPLATE = "{{ bos_token }}{# the bundle's #}"
 LABELS = ("healthy", "bean_rust")
 
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+@pytest.fixture(autouse=True)
+def _pinned(monkeypatch):
+    pin_template(monkeypatch)
 
 
 def _split(tmp_path: Path, n: int = 12, pictures: bool = True) -> Path:
@@ -74,22 +79,7 @@ def _split(tmp_path: Path, n: int = 12, pictures: bool = True) -> Path:
 
 
 def _checkpoint(tmp_path: Path, mode: str | None = "runtime_rendered", **record: Any) -> Path:
-    model = tmp_path / "tuned" / "model"
-    model.mkdir(parents=True, exist_ok=True)
-    for name in PROCESSOR_FILES:
-        (model / name).write_text(name, encoding="utf-8")
-    (model / TEMPLATE_FILE).write_bytes(TEMPLATE.encode())
-    body = {
-        "vision_tokens": VISION_TOKENS,
-        "template_sha256": _sha(TEMPLATE.encode()),
-        "processor_sha256": {n: _sha(n.encode()) for n in PROCESSOR_FILES},
-        **record,
-    }
-    sidecar: dict[str, Any] = {"base_model": "google/gemma-4-E2B-it", RECORD_KEY: body}
-    if mode is not None:
-        sidecar["prompt_mode"] = mode
-    (model / "litetune.json").write_text(json.dumps(sidecar), encoding="utf-8")
-    return model
+    return write_checkpoint(tmp_path / "tuned" / "model", mode=mode, **record)
 
 
 def _request(tmp_path: Path, reference: Path | str | None = None, **kwargs: Any) -> VerifyRequest:
@@ -307,8 +297,9 @@ def test_the_candidate_is_sent_each_picture_on_a_cpu_vision_backend():
     (spec,) = env.specs
     assert spec["images"] == list(PICTURES)
     assert spec["vision_backend"] == "cpu"
-    assert spec["sampler"] == {"top_k": 1, "top_p": 1.0, "temperature": 1.0, "seed": 0}
-    assert backend.describe()["sampler"] == spec["sampler"]
+    # Offered for every run; the driver sends it only to a bundle that samples.
+    assert spec["greedy_sampler"] == {"top_k": 1, "top_p": 1.0, "temperature": 1.0, "seed": 0}
+    assert "sampler" not in spec
     assert backend.describe()["pictures"] == 2
     assert backend.describe()["vision_backend"] == "cpu"
 
@@ -317,7 +308,7 @@ def test_a_text_candidate_has_no_vision_backend():
     env = SpecEnv()
     LiteRtLmBackend(model=Path("m"), env=env, auto_provision=False).generate(["one"])  # type: ignore[arg-type]
     assert "images" not in env.specs[0] and "vision_backend" not in env.specs[0]
-    assert "sampler" not in env.specs[0]
+    assert "sampler" not in env.specs[0] and "greedy_sampler" in env.specs[0]
 
 
 def test_a_candidate_given_the_wrong_number_of_pictures_runs_nothing():
@@ -621,3 +612,322 @@ def test_the_reference_script_renders_pictures_with_the_template(tmp_path, monke
     assert seen[0]["messages"][0]["content"][0] == {"type": "image"}
     assert seen[1] == {"add_special_tokens": False}
     assert json.loads(out.read_text()) == [{"index": 0, "rendered": "<bos>x", "ids": [2, 7]}]
+
+
+# -- the reference driver's main, with pictures (review 25) ---------------------
+
+
+def _run_reference_main(tmp_path, monkeypatch, *, vision=True, sticky=False):
+    from test_evaluate import FakeGenerationConfig
+
+    seen: dict[str, Any] = {"processor": [], "generate": []}
+
+    class Pixels:
+        def __init__(self, dtype="float32-ish"):
+            self.dtype = dtype
+
+        def to(self, dtype):
+            return Pixels(dtype)
+
+    class Ids(list):
+        @property
+        def shape(self):
+            return (1, len(self[0]))
+
+    class Encoding(dict):
+        def to(self, device):
+            seen["encoding_device"] = device
+            return self
+
+    class Budget:
+        def __init__(self):
+            self._value = 140
+
+        @property
+        def max_soft_tokens(self):
+            return self._value
+
+        @max_soft_tokens.setter
+        def max_soft_tokens(self, value):
+            if not sticky:
+                self._value = value
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def apply_chat_template(self, messages, **kwargs):
+            seen["template"] = kwargs.get("chat_template")
+            return "<bos>rendered"
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "healthy<turn|>"
+
+    class Processor:
+        def __init__(self):
+            self.image_processor = Budget()
+            self.tokenizer = Tokenizer()
+
+        def __call__(self, **kwargs):
+            seen["processor"].append(
+                {"budget": self.image_processor.max_soft_tokens, "text": kwargs["text"]}
+            )
+            return Encoding(input_ids=Ids([[2, 3]]), pixel_values=Pixels())
+
+    class Model:
+        def __init__(self):
+            self.generation_config = FakeGenerationConfig()
+            self.model = types.SimpleNamespace(vision_tower=object() if vision else None)
+
+        def eval(self):
+            return self
+
+        def to(self, device):
+            return self
+
+        def generate(self, generation_config=None, **kwargs):
+            seen["generate"].append(
+                {k: getattr(v, "dtype", None) for k, v in kwargs.items() if k == "pixel_values"}
+            )
+            return [[2, 3, 9]]
+
+    torch = types.ModuleType("torch")
+    torch.float32 = "float32"  # type: ignore[attr-defined]
+    torch.no_grad = __import__("contextlib").nullcontext  # type: ignore[attr-defined]
+    torch.cuda = types.SimpleNamespace(is_available=lambda: False)  # type: ignore[attr-defined]
+    transformers = types.ModuleType("transformers")
+    transformers.AutoModelForCausalLM = types.SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=lambda model, **kw: Model()
+    )
+    transformers.AutoTokenizer = types.SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=lambda model: (_ for _ in ()).throw(AssertionError("not for pictures"))
+    )
+    transformers.AutoProcessor = types.SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=lambda model: Processor()
+    )
+
+    class Picture:
+        def load(self):
+            return None
+
+        def convert(self, mode):
+            return self
+
+    pil = types.ModuleType("PIL")
+    pil.Image = types.SimpleNamespace(open=lambda handle: Picture())  # type: ignore[attr-defined]
+    for name, module in (("torch", torch), ("transformers", transformers), ("PIL", pil)):
+        monkeypatch.setitem(sys.modules, name, module)
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"jpeg")
+    spec = tmp_path / "spec.json"
+    out = tmp_path / "out.jsonl"
+    spec.write_text(
+        json.dumps(
+            {
+                "model": "m",
+                "prompts": ["q"],
+                "max_tokens": 8,
+                "runtime_rendered": True,
+                "attn_implementation": "eager",
+                "device": "cpu",
+                "images": [{"path": str(picture), "sha256": _sha(b"jpeg")}],
+                "template": TEMPLATE,
+                "vision_tokens": VISION_TOKENS,
+                "out": str(out),
+                "run_report": str(tmp_path / "run.json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["generate.py", str(spec)])
+    namespace: dict[str, Any] = {"__name__": "hf_script"}
+    exec(compile(_HF_GENERATE_SCRIPT, "hf", "exec"), namespace)  # noqa: S102
+    return namespace, seen, out
+
+
+def test_the_reference_main_sends_each_picture_at_the_budget_in_float32(tmp_path, monkeypatch):
+    namespace, seen, out = _run_reference_main(tmp_path, monkeypatch)
+    assert namespace["main"]() == 0
+    assert seen["processor"] == [{"budget": VISION_TOKENS, "text": "<bos>rendered"}]
+    assert seen["template"] == TEMPLATE
+    assert seen["generate"] == [{"pixel_values": "float32"}]
+    assert json.loads(out.read_text()) == {"index": 0, "text": "healthy<turn|>"}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "said"),
+    [({"vision": False}, "has no vision tower"), ({"sticky": True}, "kept max_soft_tokens 140")],
+)
+def test_the_reference_main_refuses_a_model_or_processor_that_ignores_pictures(
+    tmp_path, monkeypatch, kwargs, said
+):
+    namespace, _, _ = _run_reference_main(tmp_path, monkeypatch, **kwargs)
+    with pytest.raises(ValueError, match=said):
+        namespace["main"]()
+
+
+# -- the rendering runtime script's vision branch (review 26) -------------------
+
+
+def test_the_rendering_main_renders_the_picture_message_on_a_vision_engine(tmp_path, monkeypatch):
+    built: list[dict] = []
+    rendered: list[Any] = []
+
+    class Conversation:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def render_message_to_string(self, message):
+            rendered.append(message)
+            return "<|turn>user\n\n\n<|image|>\n\nq<turn|>\n<|turn>model\n"
+
+    class Engine:
+        bos_token_id = 2
+
+        def __init__(self, model, **kwargs):
+            built.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def create_conversation(self, **kwargs):
+            return Conversation()
+
+        def detokenize(self, ids):
+            return "<bos>"
+
+        def tokenize(self, text):
+            return [len(text)]
+
+    lm = types.ModuleType("litert_lm")
+    lm.Engine = Engine  # type: ignore[attr-defined]
+    lm.Backend = types.SimpleNamespace(CPU=lambda **k: ("cpu", k))  # type: ignore[attr-defined]
+    lm.SamplerConfig = lambda **k: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "litert_lm", lm)
+    namespace: dict[str, Any] = {"__name__": "render_script"}
+    exec(compile(_RUNTIME_SCRIPT, "render", "exec"), namespace)  # noqa: S102
+    namespace["section_types"] = lambda path: ["end_of_vision", "vision_adapter", "vision_encoder"]
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"jpeg")
+    spec = tmp_path / "spec.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "model": "m",
+                "prompts": ["q"],
+                "prefill_sample": 0,
+                "images": [{"path": str(picture), "sha256": _sha(b"jpeg")}],
+                "sections_out": str(tmp_path / "sections.json"),
+                "out": str(tmp_path / "rows.json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["render", str(spec)])
+    assert namespace["main"]() == 0
+    assert built[0]["vision_backend"] == ("cpu", {})
+    assert rendered[0]["content"][0]["type"] == "image"
+    assert rendered[0]["content"][1] == {"type": "text", "text": "q"}
+    with pytest.raises(ValueError, match="is not the one the split names"):
+        namespace["picture_message"]("q", {"path": str(picture), "sha256": "0" * 64})
+
+
+# -- the probe's sections file (review 31) --------------------------------------
+
+
+@pytest.mark.parametrize(("sections", "said"), [(None, "did not say"), ("x", "no section list")])
+def test_a_rendering_script_that_does_not_say_which_sections_is_a_harness_fault(sections, said):
+    from litetune.rendering import RenderingProbeError
+
+    class Env(ScriptEnv):
+        def run(self, argv, timeout=None):
+            proc = super().run(argv, timeout)
+            spec = self.specs[-1]
+            if sections is not None:
+                Path(spec["sections_out"]).write_text(json.dumps(sections), encoding="utf-8")
+            return proc
+
+    runtime = Env("runtime", [], None)
+    with pytest.raises(RenderingProbeError, match=said):
+        _probe(runtime, ScriptEnv("reference", []), images=PICTURES[:1], template=TEMPLATE).observe(
+            ["q"]
+        )
+
+
+# -- run_verify builds picture backends (review 23) -----------------------------
+
+
+def test_run_verify_builds_its_backends_with_the_pictures(tmp_path, monkeypatch):
+    from litetune import verify as verify_module
+
+    built: list[Any] = []
+
+    def recorder(request, declarations=None, pictures=None):
+        built.append(pictures)
+        return _pair()
+
+    monkeypatch.setattr(verify_module, "build_backends", recorder)
+    run_verify(_request(tmp_path))
+    (pictures,) = built
+    assert isinstance(pictures, PictureInputs) and len(pictures.images) == 12
+    assert pictures.template == TEMPLATE and pictures.vision_tokens == VISION_TOKENS
+
+
+# -- what verify says about decoding (review 1, 18) ------------------------------
+
+
+@pytest.mark.parametrize(
+    ("engine", "said"),
+    [
+        (
+            {"bundle_sampler": {"type": "TOP_P", "k": 64}, "sampler_sent": {"top_k": 1}},
+            "so verify sent {'top_k': 1} in its place on every row",
+        ),
+        (
+            {"bundle_sampler": {"type": "TOP_P", "k": 1}, "sampler_sent": None},
+            "picks the likeliest token",
+        ),
+        ({"bundle_sampler": None, "sampler_sent": None}, "declares no sampler"),
+    ],
+)
+def test_the_decoding_sentence_says_what_the_candidate_ran_on(engine, said):
+    from litetune.verify import _candidate_sampling
+
+    assert said in _candidate_sampling(engine)
+
+
+def test_a_picture_measurement_says_what_it_did_not_compare(tmp_path):
+    from litetune.verify import PICTURE_PREFILL_UNCHECKED
+
+    result = run_verify(_request(tmp_path), backends=_pair())
+    limitations = result.manifest["limitations"]
+    assert PICTURE_PREFILL_UNCHECKED in limitations
+    assert any(
+        "the vision encoder ran on the runtime's default CPU threads" in t for t in limitations
+    )
+
+
+def test_a_split_with_a_non_object_line_is_refused(tmp_path):
+    path = _split(tmp_path)
+    path.write_text(path.read_text() + "[1, 2]\n", encoding="utf-8")
+    from litetune.llm_images import ImageRowError, split_images
+
+    with pytest.raises(ImageRowError, match=":13: not a JSON object"):
+        split_images(path)
+
+
+def test_a_limited_split_reads_only_the_rows_it_keeps(tmp_path):
+    path = _split(tmp_path)
+    # A picture past the limit that changed is not this sample's concern.
+    rows = path.read_text().splitlines()
+    last = json.loads(rows[-1])
+    (path.parent / last["image"]).write_bytes(b"swapped")
+    assert load_split(path, limit=3).n == 3
+    with pytest.raises(DataError):
+        load_split(path)

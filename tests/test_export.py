@@ -528,16 +528,63 @@ def read_litertlm_header(path, output_stream):
 # builder's `unpack` writes.
 FAKE_LLM_METADATA_PB2 = """
 # Scalars a real message reads as their zero value when unset.
-_ZERO = {"jinja_prompt_template": "", "token_str": "", "ids": [], "max_num_patches": 0}
+_ZERO = {
+    "jinja_prompt_template": "",
+    "token_str": "",
+    "ids": [],
+    "max_num_patches": 0,
+    "k": 0,
+    "p": 0.0,
+    "temperature": 0.0,
+    "type": 0,
+}
+
+
+# Scalars without presence in litert-lm-builder 0.18.0's proto: `HasField` raises
+# ValueError for them there, and so here.
+_NO_PRESENCE = {"max_num_patches", "k", "p", "temperature", "type"}
+
+
+class _Enum:
+    def __init__(self, name):
+        self.name = name
+
+
+class _Descriptor:
+    # SamplerParameters.Type as 0.18.0 numbers it.
+    fields_by_name = {
+        "type": type(
+            "Field",
+            (),
+            {
+                "enum_type": type(
+                    "EnumType",
+                    (),
+                    {
+                        "values_by_number": {
+                            0: _Enum("TYPE_UNSPECIFIED"),
+                            1: _Enum("TOP_K"),
+                            2: _Enum("TOP_P"),
+                            3: _Enum("GREEDY"),
+                        }
+                    },
+                )
+            },
+        )
+    }
 
 
 class _Message:
     # A message over a dict: a field is set when its name is a key, a nested
     # dict is a message, and an unset scalar reads as its zero.
+    DESCRIPTOR = _Descriptor()
+
     def __init__(self, fields=None):
         self.__dict__["fields"] = {} if fields is None else fields
 
     def HasField(self, name):
+        if name in _NO_PRESENCE:
+            raise ValueError(f"Field {name} does not have presence")
         return name in self.fields
 
     def __getattr__(self, name):

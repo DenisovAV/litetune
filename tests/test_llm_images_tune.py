@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 from conftest import mark_provisioned
+from llm_image_fixtures import pin_template
 from test_tune import (
     _STUB_PEFT,
     _STUB_TORCH,
@@ -26,13 +27,16 @@ from test_tune import (
 )
 
 from litetune import envs
+from litetune import tune as tune_module
 from litetune.checks import Outcome
 from litetune.llm_images import (
     FROZEN_PREFIXES,
     PROCESSOR_FILES,
     TEMPLATE_FILE,
+    TEMPLATE_REVISION,
     VISION_TOKENS,
     image_record,
+    processor_file_digest,
 )
 from litetune.prompt_mode import PromptMode, PromptModeDecision
 from litetune.tune import (
@@ -92,6 +96,11 @@ def _request(tmp_path: Path, **kwargs: Any) -> TuneRequest:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _pinned(monkeypatch):
+    pin_template(monkeypatch, BUNDLE_TEMPLATE)
+
+
 @pytest.fixture
 def trainer(monkeypatch, tmp_path) -> FakeTrainer:
     """`test_tune`'s fake training environment, every stage environment answering."""
@@ -116,6 +125,8 @@ def test_a_split_with_pictures_trains_in_train_vision_with_the_picture_spec(trai
     assert config["images"] == {
         "vision_tokens": VISION_TOKENS,
         "template_repo": TEMPLATE_REPO,
+        "template_revision": TEMPLATE_REVISION,
+        "template_sha256": tune_module.TEMPLATE_SHA256,
         "template_file": TEMPLATE_FILE,
         "processor_files": list(PROCESSOR_FILES),
         "frozen_prefixes": list(FROZEN_PREFIXES),
@@ -205,10 +216,17 @@ def test_a_picture_changed_since_prepare_is_refused_before_the_environment(train
     assert trainer.calls == []
 
 
-def _frozen(checked: int, changed=(), missing=()) -> dict:
+def _frozen(checked: int, changed=(), missing=(), per_prefix=None) -> dict:
     return {
         "images": {
-            "frozen": {"checked": checked, "changed": list(changed), "missing": list(missing)}
+            "frozen": {
+                "checked": checked,
+                "per_prefix": (
+                    per_prefix if per_prefix is not None else {p: 1 for p in FROZEN_PREFIXES}
+                ),
+                "changed": list(changed),
+                "missing": list(missing),
+            }
         }
     }
 
@@ -224,9 +242,14 @@ def test_an_unchanged_merge_passes_the_frozen_check(trainer, tmp_path):
 @pytest.mark.parametrize(
     ("metrics", "outcome", "said"),
     [
-        (_frozen(1413, changed=["model.vision_tower.x"]), Outcome.FAILED, "1 changed"),
-        (_frozen(1413, missing=["model.embed_vision.y"]), Outcome.FAILED, "1 are missing"),
-        (_frozen(0), Outcome.FAILED, "none of the names"),
+        (_frozen(1413, changed=["model.vision_tower.x"]), Outcome.FAILED, "1 tensor(s) changed"),
+        (_frozen(1413, missing=["model.embed_vision.y"]), Outcome.FAILED, "1 went missing"),
+        (_frozen(0), Outcome.FAILED, "0 tensors were compared"),
+        (
+            _frozen(1413, per_prefix={p: (0 if "audio" in p else 3) for p in FROZEN_PREFIXES}),
+            Outcome.FAILED,
+            "no tensor under model.audio_tower., model.embed_audio. was compared",
+        ),
         ({}, Outcome.UNCHECKED, "reported no comparison"),
     ],
 )
@@ -266,6 +289,19 @@ def _shape(self):
 
 _Tensor.shape = property(_shape)
 _Tensor.is_floating_point = lambda self: getattr(self, "floating", False)
+
+
+_plain_to = _Tensor.to
+
+
+def _to(self, device):
+    moved = _plain_to(self, device)
+    if moved is not self:
+        moved.moves = list(getattr(self, "moves", [])) + [device]
+    return moved
+
+
+_Tensor.to = _to
 
 
 def cat(tensors, dim=0):
@@ -349,7 +385,10 @@ class _Tokenizer:
                 out += "\\n\\n<|image|>\\n\\n" if part["type"] == "image" else part["text"]
         out += "<turn|>\\nmodel "
         if len(messages) > 1:
-            out += messages[1]["content"] + "<turn|>\\n"
+            answer = messages[1]["content"]
+            if os.environ.get("LITETUNE_STUB_PROBE_TWICE"):
+                answer = answer + answer
+            out += answer + "<turn|>\\n"
         return out
 
     def decode(self, ids):
@@ -357,12 +396,27 @@ class _Tokenizer:
 
     def save_pretrained(self, path):
         Path(path).mkdir(parents=True, exist_ok=True)
-        for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        for name in ("tokenizer.json", "chat_template.jinja"):
             (Path(path) / name).write_text(name, encoding="utf-8")
+        (Path(path) / "tokenizer_config.json").write_text(
+            json.dumps({"name": "tokenizer_config.json", "vocab_file": str(path)}),
+            encoding="utf-8",
+        )
 
 
 class Gemma4ImageProcessor:
-    max_soft_tokens = 140
+    _budget = 140
+
+    @property
+    def max_soft_tokens(self):
+        return self._budget
+
+    @max_soft_tokens.setter
+    def max_soft_tokens(self, value):
+        # A processor that does not take the setting, as one that validated it
+        # away would.
+        if not os.environ.get("LITETUNE_STUB_STICKY_BUDGET"):
+            self._budget = value
 
 
 class _Processor:
@@ -444,7 +498,12 @@ def _state(tag):
         "model.embed_vision.embedding_projection.weight",
         "model.language_model.embed_tokens.weight",
         "model.language_model.layers.0.self_attn.q_proj.weight",
+        "model.audio_tower.layers.0.ffw_layer_1.weight",
+        "model.embed_audio.embedding_projection.weight",
+        "model.language_model.embed_tokens_per_layer.weight",
     ]
+    if os.environ.get("LITETUNE_STUB_NO_AUDIO"):
+        names = [n for n in names if "audio" not in n]
     out = {name: torch._Weight(name) for name in names}
     if tag == "merged" and os.environ.get("LITETUNE_STUB_CHANGE_FROZEN"):
         out[names[1]] = torch._Weight("changed")
@@ -453,10 +512,16 @@ def _state(tag):
     return out
 
 
+class _Inner:
+    def __init__(self):
+        self.vision_tower = None if os.environ.get("LITETUNE_STUB_NO_VISION") else object()
+
+
 class _Model:
     def __init__(self, tag):
         self.tag = tag
         self.config = _Config()
+        self.model = _Inner()
 
     def parameters(self):
         return [_Parameter()]
@@ -476,7 +541,8 @@ class _Model:
     def __call__(self, input_ids=None, attention_mask=None, logits_to_keep=None, **pictures):
         _log({"event": "forward", "rows": len(input_ids), "width": len(input_ids[0]),
               "kept": list(logits_to_keep),
-              "pictures": {k: {"device": getattr(v, "device", None), "value": list(v)}
+              "pictures": {k: {"device": getattr(v, "device", None), "value": list(v),
+                               "dtypes": list(getattr(v, "moves", []))[:-1]}
                            for k, v in pictures.items()}})
         return _Output(_Logits(len(input_ids), len(logits_to_keep)))
 
@@ -561,7 +627,7 @@ def test_the_script_trains_each_picture_through_the_bundle_template(tmp_path, im
 
     # The template is the one the export fetches, by repository and no revision.
     (hub,) = [e for e in log if e["event"] == "hub"]
-    assert hub == {"event": "hub", "repo_id": TEMPLATE_REPO, "revision": None}
+    assert hub == {"event": "hub", "repo_id": TEMPLATE_REPO, "revision": TEMPLATE_REVISION}
     rendered = [e for e in log if e["event"] == "chat_template"]
     assert rendered and all(e["template"] == BUNDLE_TEMPLATE for e in rendered)
     # Every row is one user turn: the picture, then the text.
@@ -586,8 +652,9 @@ def test_the_script_trains_each_picture_through_the_bundle_template(tmp_path, im
     types = pictures["mm_token_type_ids"]["value"][0]
     assert len(types) == forwards[0]["width"]
     assert sum(types) == 4 and types[-1] == 0
-    # The pixels reach the model in the training dtype.
-    assert pictures["pixel_values"]["device"] in ("cpu", "bfloat16")
+    # The pixels reach the model in the training dtype: the stub's `.to` records
+    # the last argument it was moved to, and the dtype comes before the device.
+    assert pictures["pixel_values"]["dtypes"] == ["bfloat16"]
 
     # The loss is the answer and the terminator, never the picture or the prompt.
     # The stub tokenizes a word as 1000 + its length, and `<turn|>` as 106: the
@@ -608,18 +675,22 @@ def test_the_checkpoint_keeps_the_template_and_records_what_verify_checks(tmp_pa
     record = image_record(model)
     assert record is not None
     assert record["template_sha256"] == hashlib.sha256(BUNDLE_TEMPLATE.encode()).hexdigest()
+    # The pinned revision, asked for by name, not `main`.
     assert record["template_revision"] == REVISION
     assert record["template_repo"] == TEMPLATE_REPO
     assert record["image_processor"] == "Gemma4ImageProcessor"
     assert record["soft_tokens"] == {"min": 4, "max": 4, "rows": 8}
     for name in PROCESSOR_FILES:
-        assert (
-            record["processor_sha256"][name]
-            == hashlib.sha256((model / name).read_bytes()).hexdigest()
-        )
+        # The script's own digest, which leaves `vocab_file` out, is the parent's.
+        assert record["processor_sha256"][name] == processor_file_digest(model / name)
     # The processor saved at the budget it trained at.
     assert json.loads((model / "processor_config.json").read_text())["max_soft_tokens"] == 280
-    assert record["frozen"] == {"checked": 3, "changed": [], "missing": []}
+    assert record["frozen"] == {
+        "checked": 6,
+        "per_prefix": {p: 1 for p in FROZEN_PREFIXES},
+        "changed": [],
+        "missing": [],
+    }
     metrics = json.loads((request.output_dir / "metrics.json").read_text())
     assert metrics["images"] == record
 
@@ -675,3 +746,62 @@ def test_a_row_too_long_with_its_picture_stops_training(tmp_path, image_stubs):
     _, proc = _run(tmp_path, image_stubs, max_seq_length=12)
     assert proc.returncode != 0
     assert "tokens with its picture, over max_seq_length 12" in proc.stderr
+
+
+def test_a_moved_checkpoints_vocab_file_does_not_change_its_processor_digest(tmp_path):
+    config = tmp_path / "tokenizer_config.json"
+    config.write_text(json.dumps({"a": 1, "vocab_file": "/old/tokenizer.model"}), encoding="utf-8")
+    before = processor_file_digest(config)
+    config.write_text(json.dumps({"vocab_file": "/new/tokenizer.model", "a": 1}), encoding="utf-8")
+    assert processor_file_digest(config) == before
+    config.write_text(json.dumps({"a": 2, "vocab_file": "/new/tokenizer.model"}), encoding="utf-8")
+    assert processor_file_digest(config) != before
+
+
+@pytest.mark.parametrize(
+    ("switch", "said"),
+    [
+        ("LITETUNE_STUB_PROBE_TWICE", "renders an answer 2 times"),
+        ("LITETUNE_STUB_NO_VISION", "which has no vision tower"),
+        ("LITETUNE_STUB_STICKY_BUDGET", "the processor kept max_soft_tokens 140"),
+    ],
+)
+def test_the_script_refuses_what_would_train_the_wrong_thing(tmp_path, image_stubs, switch, said):
+    _, proc = _run(tmp_path, image_stubs, extra_env={switch: "1"})
+    assert proc.returncode != 0
+    assert said in proc.stderr
+
+
+def test_the_script_refuses_a_template_that_is_not_the_pinned_one(
+    tmp_path, image_stubs, monkeypatch
+):
+    monkeypatch.setattr(tune_module, "TEMPLATE_SHA256", "0" * 64)
+    _, proc = _run(tmp_path, image_stubs)
+    assert proc.returncode != 0
+    assert "not the " + "0" * 64 + " this litetune trains pictures with" in proc.stderr
+
+
+def test_the_script_counts_the_frozen_tensors_under_each_prefix(tmp_path, image_stubs):
+    request, proc = _run(tmp_path, image_stubs, extra_env={"LITETUNE_STUB_NO_AUDIO": "1"})
+    assert proc.returncode == 0, proc.stderr
+    frozen = json.loads((request.output_dir / "metrics.json").read_text())["images"]["frozen"]
+    assert frozen["per_prefix"]["model.audio_tower."] == 0
+    assert frozen["per_prefix"]["model.vision_tower."] == 1
+
+
+def test_two_pictures_in_one_forward_are_padded_together(tmp_path, image_stubs):
+    _, proc = _run(tmp_path, image_stubs, micro_batch_size=2)
+    assert proc.returncode == 0, proc.stderr
+    forwards = [e for e in stub_log(image_stubs) if e["event"] == "forward"]
+    assert forwards and all(e["rows"] == 2 for e in forwards)
+    pictures = forwards[0]["pictures"]
+    # One pixel row per picture, concatenated; token types padded to the width.
+    assert len(pictures["pixel_values"]["value"]) == 2
+    assert all(len(row) == forwards[0]["width"] for row in pictures["mm_token_type_ids"]["value"])
+
+
+def test_another_id_of_the_family_is_refused_naming_the_one(trainer, tmp_path):
+    result = run_tune(_request(tmp_path, model="google/gemma-4-E2B"))
+    refused = check_named(result, IMAGES_CHECK)
+    assert refused.outcome is Outcome.FAILED
+    assert "name it as --model google/gemma-4-E2B-it" in refused.detail

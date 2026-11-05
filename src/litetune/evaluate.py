@@ -221,13 +221,18 @@ def load_split(path: Path, limit: int | None = None) -> Split:
     # A row's picture is part of what it asks, so it is part of the split's id;
     # a text split's payload, and so its id, is what it always was.
     try:
-        pictures = split_images(path)
+        pictures = split_images(path, limit=limit)
     except ImageRowError as exc:
         raise DataError(str(exc)) from exc
     if pictures is not None:
+        if len(pictures) != len(examples):
+            raise DataError(
+                f"{path}: {len(pictures)} pictures for {len(examples)} examples; each row of a "
+                "split with pictures gives one"
+            )
         examples = [
             replace(example, image=picture)
-            for example, picture in zip(examples, pictures, strict=False)
+            for example, picture in zip(examples, pictures, strict=True)
         ]
 
     payload = json.dumps(
@@ -856,8 +861,13 @@ class LiteRtLmBackend:
             # encoder ran on. `None` for text.
             "pictures": len(self.images) if self.images is not None else None,
             "vision_backend": VISION_BACKEND if self.images is not None else None,
-            # The sampler sent in place of the bundle's, for rows with a picture.
-            "sampler": dict(CANDIDATE_SAMPLER) if self.images is not None else None,
+            # The sampler the bundle declares, as the driver script read it, and
+            # the one sent in its place when it would sample; `None` before a run
+            # and when none was sent. Separate from `decode_passed_to_runtime`,
+            # which is about the output-token limit and the rest of `decode`.
+            "bundle_sampler": (self.device_report or {}).get("bundle_sampler"),
+            "sampler_sent": (self.device_report or {}).get("sampler_sent"),
+            "sampler_enforced": (self.device_report or {}).get("sampler_sent") is not None,
             "runner_call": self.runner_call,
             "prompt_mode": self.prompt_mode.value,
             "prompt_mode_declared": self.declared_prompt_mode is not None,
@@ -913,6 +923,9 @@ class LiteRtLmBackend:
                         "engine_per_prompt": bool(self.engine_per_prompt_reason),
                         **runtime_engine_spec(self.backend_flag, thread_count),
                         **picture_spec(self.images),
+                        # Sent in place of a bundle's own sampler when that one
+                        # would sample (`llm_images.sampler_samples`).
+                        "greedy_sampler": dict(CANDIDATE_SAMPLER),
                         "out": str(results),
                         "report": str(report),
                     }
@@ -1002,6 +1015,7 @@ class LiteRtLmBackend:
                         "runtime_rendered": self.uses_template,
                         **runtime_engine_spec(self.backend_flag),
                         **picture_spec(self.images[:1] if self.images else None),
+                        "greedy_sampler": dict(CANDIDATE_SAMPLER),
                         "out": str(work / "generations.jsonl"),
                     }
                 ),
@@ -1070,9 +1084,6 @@ def picture_spec(images: Sequence[Mapping[str, str]] | None) -> dict[str, Any]:
     return {
         "images": [{"path": str(i["path"]), "sha256": str(i["sha256"])} for i in images],
         "vision_backend": VISION_BACKEND,
-        # In place of the bundle's own, which litetune does not choose
-        # (`llm_images.CANDIDATE_SAMPLER`).
-        "sampler": dict(CANDIDATE_SAMPLER),
     }
 
 
@@ -1751,6 +1762,44 @@ def picture_message(prompt, picture):
     }
 
 
+def bundle_sampler(path):
+    """The sampler a bundle's LlmMetadata declares, as `export.vision_in` reads it; or None."""
+    import io
+
+    from litert_lm_builder import litertlm_peek
+    from litert_lm_builder.runtime.proto import llm_metadata_pb2
+
+    header = litertlm_peek.read_litertlm_header(path, io.StringIO())
+    listed = header.SectionMetadata()
+    for index in range(listed.ObjectsLength() if listed else 0):
+        section = listed.Objects(index)
+        if section.DataType() != litertlm_peek.schema.AnySectionDataType.LlmMetadataProto:
+            continue
+        with open(path, "rb") as handle:
+            handle.seek(section.BeginOffset())
+            data = handle.read(section.EndOffset() - section.BeginOffset())
+        meta = llm_metadata_pb2.LlmMetadata()
+        meta.ParseFromString(data)
+        if not meta.HasField("sampler_params"):
+            return None
+        params = meta.sampler_params
+        kind = params.type
+        try:
+            kind = params.DESCRIPTOR.fields_by_name["type"].enum_type.values_by_number[kind].name
+        except (AttributeError, KeyError, TypeError):
+            pass
+        return {"type": kind, "k": int(params.k), "p": float(params.p),
+                "temperature": float(params.temperature)}
+    return None
+
+
+def sampler_samples(sampler):
+    """`llm_images.sampler_samples`, which this script cannot import."""
+    if sampler is None:
+        return False
+    return not (sampler.get("type") in ("TOP_P", "TOP_K") and sampler.get("k") == 1)
+
+
 def sampler_for(settings):
     """The spec's sampler as the runtime takes one; `None`, the bundle's own, without one."""
     if not settings:
@@ -1774,7 +1823,7 @@ def score_one(engine, runtime_rendered, index, prompt, out, picture=None, sample
                 text = text_from_conversation(runner, message)
         else:
             with engine.create_session(
-                apply_prompt_template=False, sampler_config=None
+                apply_prompt_template=False, sampler_config=sampler_for(sampler)
             ) as runner:
                 text = text_from_session(runner, prompt)
     except MemoryError:
@@ -1827,11 +1876,17 @@ def main(spec_path):
     engine_args = engine_kwargs(spec)
     prompts = spec["prompts"]
     pictures = spec.get("images") or [None] * len(prompts)
+    # The bundle's own sampler, unless it would sample: then the greedy one the
+    # parent sent, for every row, text or picture.
+    declared = bundle_sampler(spec["model"])
+    sampler = spec.get("greedy_sampler") if sampler_samples(declared) else None
 
     def write_report(at_engine, after=None, init=None):
         if spec.get("report"):
             report = run_report(spec, at_engine, after)
             report["engine_init_seconds"] = init
+            report["bundle_sampler"] = declared
+            report["sampler_sent"] = sampler
             Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
 
     with Path(spec["out"]).open("w", encoding="utf-8") as out:
@@ -1860,8 +1915,7 @@ def main(spec_path):
                     last = index == len(prompts) - 1
                     write_report(at_engine, None, init)
                     score_one(
-                        engine, runtime_rendered, index, prompt, out, pictures[index],
-                        spec.get("sampler"),
+                        engine, runtime_rendered, index, prompt, out, pictures[index], sampler
                     )
                     if last:
                         write_report(at_engine, device_report(), init)
@@ -1874,8 +1928,7 @@ def main(spec_path):
             write_report(at_engine)
             for index, prompt in enumerate(prompts):
                 score_one(
-                    engine, runtime_rendered, index, prompt, out, pictures[index],
-                    spec.get("sampler"),
+                    engine, runtime_rendered, index, prompt, out, pictures[index], sampler
                 )
             # Again after generating, with the engine still alive: a client
             # shows the runtime opened the GPU, and only its GPU time growing
@@ -2091,6 +2144,11 @@ def main() -> int:
 
         processor = AutoProcessor.from_pretrained(spec["model"])
         processor.image_processor.max_soft_tokens = spec["vision_tokens"]
+        if processor.image_processor.max_soft_tokens != spec["vision_tokens"]:
+            raise ValueError(
+                "the processor kept max_soft_tokens %r where %r was set"
+                % (processor.image_processor.max_soft_tokens, spec["vision_tokens"])
+            )
         tok = processor.tokenizer
     else:
         tok = AutoTokenizer.from_pretrained(spec["model"])
@@ -2104,6 +2162,11 @@ def main() -> int:
         attn_implementation=spec["attn_implementation"],
     )
     model.eval()
+    if pictures and getattr(getattr(model, "model", None), "vision_tower", None) is None:
+        raise ValueError(
+            "%s loaded as %s, which has no vision tower: the rows' pictures would reach nothing"
+            % (spec["model"], type(model).__name__)
+        )
     model.generation_config, not_applied = greedy_generation_config(model.generation_config)
     device = generation_device(torch, spec.get("device"))
     model.to(device)

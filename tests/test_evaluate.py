@@ -9,6 +9,7 @@ failed against a process that never ran. Collapsing the two is what produced
 eight confident negatives during the measurement work, so each has its own test.
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -2338,6 +2339,8 @@ class _FakeRunner:
         # (google-ai-edge/LiteRT-LM#3165): the answer says how many runners this
         # engine had served before it.
         self.inherited = len(registry) if leaks else None
+        self.kwargs: dict = {}
+        self.messages: list[dict] = []
         registry.append(self)
 
     def __enter__(self):
@@ -2348,6 +2351,10 @@ class _FakeRunner:
         return False
 
     def _answer(self, prompt):
+        if isinstance(prompt, dict):
+            # A row with a picture: answered by its text part, the message kept.
+            self.messages.append(prompt)
+            prompt = prompt["content"][-1]["text"]
         if prompt in self.raise_on:
             raise self.raise_on[prompt]
         if self.inherited:
@@ -2391,10 +2398,14 @@ class _FakeEngine:
         return False
 
     def create_session(self, **kwargs):
-        return _FakeRunner(self.runners, self.raise_on, self.leaks)
+        runner = _FakeRunner(self.runners, self.raise_on, self.leaks)
+        runner.kwargs = kwargs
+        return runner
 
     def create_conversation(self, **kwargs):
-        return _FakeRunner(self.runners, self.raise_on, self.leaks)
+        runner = _FakeRunner(self.runners, self.raise_on, self.leaks)
+        runner.kwargs = kwargs
+        return runner
 
 
 def _fake_litert_lm(monkeypatch, raise_on=None, leaks=False):
@@ -2433,6 +2444,7 @@ def _fake_litert_lm(monkeypatch, raise_on=None, leaks=False):
     module = types.ModuleType("litert_lm")
     module.engine_open = False
     module.Engine = make_engine
+    module.SamplerConfig = lambda **settings: ("SamplerConfig", settings)
     module.ActivationDataType = _ActivationDataType
     interfaces = types.ModuleType("litert_lm.interfaces")
     interfaces.CPU = _Cpu
@@ -2452,8 +2464,12 @@ def _run_script(
     report=None,
     engine_per_prompt=None,
     leaks=False,
+    bundle_sampler=None,
+    extra=None,
 ):
     engines = _fake_litert_lm(monkeypatch, raise_on, leaks)
+    # What the bundle's LlmMetadata declares, in place of reading a real header.
+    monkeypatch.setitem(_litertlm_script(), "bundle_sampler", lambda path: bundle_sampler)
     spec = tmp_path / "spec.json"
     out = tmp_path / "out.jsonl"
     spec.write_text(
@@ -2470,6 +2486,7 @@ def _run_script(
                     if engine_per_prompt is not None
                     else {}
                 ),
+                **(extra or {}),
             }
         ),
         encoding="utf-8",
@@ -3212,6 +3229,7 @@ def test_the_driver_takes_a_reading_before_and_after_generating(tmp_path, monkey
     monkeypatch.setitem(ns_main, "device_report", fake_report)
     monkeypatch.setitem(ns_main, "bundle_activation", lambda path: "fp32")
     monkeypatch.setitem(ns_main, "runtime_version", lambda: "0.17.1")
+    monkeypatch.setitem(ns_main, "bundle_sampler", lambda path: None)
     engines = _fake_litert_lm(monkeypatch)
     spec = tmp_path / "spec.json"
     spec.write_text(
@@ -4006,3 +4024,86 @@ def test_the_gpu_text_path_records_no_cpu_threads(tmp_path, monkeypatch, sme2_ho
 
     assert "thread_count" not in seen[-1]
     assert backend.describe()["cpu_threads"] is None
+
+
+# -- the sampler and the pictures in the driver's main ------------------------
+
+TOP_P = {"type": "TOP_P", "k": 64, "p": 0.95, "temperature": 1.0}
+GREEDY_SENT = {"top_k": 1, "top_p": 1.0, "temperature": 1.0, "seed": 0}
+
+
+@pytest.mark.parametrize("runtime_rendered", [True, False])
+@pytest.mark.parametrize("engine_per_prompt", [False, True])
+def test_a_bundle_that_samples_is_sent_top_k_1_on_text_rows_too(
+    tmp_path, monkeypatch, runtime_rendered, engine_per_prompt
+):
+    report = tmp_path / "report.json"
+    _, engines = _run_script(
+        tmp_path,
+        ["one", "two"],
+        runtime_rendered,
+        monkeypatch=monkeypatch,
+        report=report,
+        engine_per_prompt=engine_per_prompt,
+        bundle_sampler=TOP_P,
+        extra={"greedy_sampler": GREEDY_SENT},
+    )
+    runners = [r for e in engines for r in e.runners]
+    assert len(runners) == 2
+    assert all(r.kwargs["sampler_config"] == ("SamplerConfig", GREEDY_SENT) for r in runners)
+    recorded = json.loads(report.read_text())
+    assert recorded["bundle_sampler"] == TOP_P and recorded["sampler_sent"] == GREEDY_SENT
+
+
+@pytest.mark.parametrize(
+    "declared", [None, {"type": "TOP_P", "k": 1, "p": 1.0, "temperature": 1.0}]
+)
+def test_a_bundle_that_does_not_sample_keeps_its_own(tmp_path, monkeypatch, declared):
+    report = tmp_path / "report.json"
+    _, engines = _run_script(
+        tmp_path,
+        ["one"],
+        monkeypatch=monkeypatch,
+        report=report,
+        bundle_sampler=declared,
+        extra={"greedy_sampler": GREEDY_SENT},
+    )
+    assert engines[0].runners[0].kwargs["sampler_config"] is None
+    assert json.loads(report.read_text())["sampler_sent"] is None
+
+
+def test_the_sampler_rule_in_the_script_is_llm_images_rule():
+    from litetune.llm_images import sampler_samples
+
+    for declared in (
+        None,
+        TOP_P,
+        {"type": "TOP_K", "k": 1},
+        {"type": "TOP_P", "k": 1},
+        {"type": "GREEDY", "k": 1},
+        {"type": 3, "k": 1},
+    ):
+        assert _litertlm_script()["sampler_samples"](declared) is sampler_samples(declared)
+    assert sampler_samples({"type": "GREEDY", "k": 1}) is True
+    assert sampler_samples({"type": "TOP_P", "k": 1}) is False
+
+
+@pytest.mark.parametrize("engine_per_prompt", [False, True])
+def test_pictures_reach_the_engine_and_each_conversation(tmp_path, monkeypatch, engine_per_prompt):
+    pictures = []
+    for name in ("a", "b"):
+        path = tmp_path / f"{name}.jpg"
+        path.write_bytes(name.encode())
+        pictures.append({"path": str(path), "sha256": hashlib.sha256(name.encode()).hexdigest()})
+    rows, engines = _run_script(
+        tmp_path,
+        ["one", "two"],
+        monkeypatch=monkeypatch,
+        engine_per_prompt=engine_per_prompt,
+        extra={"images": pictures, "vision_backend": "cpu"},
+    )
+    assert [r["text"] for r in rows] == ["answer to one", "answer to two"]
+    assert all(e.kwargs["vision_backend"].name == "cpu" for e in engines)
+    messages = [m for e in engines for r in e.runners for m in r.messages]
+    assert [m["content"][0]["type"] for m in messages] == ["image", "image"]
+    assert [m["content"][1]["text"] for m in messages] == ["one", "two"]

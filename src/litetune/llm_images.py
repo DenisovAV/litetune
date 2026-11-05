@@ -61,8 +61,15 @@ VISION_TOKENS = 280
 PATCHES_PER_SOFT_TOKEN = 9
 MAX_NUM_PATCHES = VISION_TOKENS * PATCHES_PER_SOFT_TOKEN
 
-# The placeholder both templates render for an image part.
+# The placeholder both templates render for an image part, and the markers the
+# processor puts around a picture's soft tokens (`tokenizer_config.json` at
+# google/gemma-4-E2B-it 3e22461f: `boi_token "<|image>"`, `eoi_token "<image|>"`),
+# which a bundle's Gemma 4 metadata must name as its start and end of image.
 IMAGE_TOKEN = "<|image|>"
+START_OF_IMAGE = "<|image>"
+END_OF_IMAGE = "<image|>"
+# The most tokens a picture adds to a row: its soft tokens and the two markers.
+PICTURE_TOKENS = VISION_TOKENS + 2
 
 # The sections a bundle that takes pictures carries, as `litert-lm-builder
 # unpack` names their `model_type` (`tf_lite_` dropped): what litert-torch's
@@ -93,6 +100,15 @@ FROZEN_PREFIXES = (
     "model.language_model.embed_tokens_per_layer.",
 )
 
+# The bundle template `tune` trains with, pinned: `chat_template.jinja` of
+# litert-community/gemma-4-E2B-it-litert-lm at b3ca0d2f, the revision whose
+# `gemma-4-E2B-it.litertlm` the spike and MEASUREMENTS.md read. Its bytes hash to
+# `TEMPLATE_SHA256`, as did the file at ec14a837 (`main` on 2026-11-05, which
+# litetune's own beans run fetched) and the template inside that bundle. A file
+# with another digest is refused rather than trained on.
+TEMPLATE_REVISION = "b3ca0d2f076785a8f4b2219ddbd2bdb99954eae1"
+TEMPLATE_SHA256 = "02b3091acf53c0b722e3db0c7a1b4980363edcc2d85549dafa339ff5dbfff629"
+
 # The bundle template `tune` trained with, kept beside the checkpoint.
 TEMPLATE_FILE = "litetune_bundle_template.jinja"
 
@@ -106,26 +122,47 @@ EXPORT_FLAGS = (
     f"--gemma4_vision_max_soft_tokens={VISION_TOKENS}",
 )
 
-# The sampler such a bundle declares is not litetune's choice. With the
-# `image_text_to_text` task litert-torch keeps the checkpoint's `do_sample` (it
-# sets it to False for `text_generation` only, `core/export_lib.py:357-359`), and
-# from a sampling generation config writes a sampler into the bundle
-# (`core/litert_lm_builder.py:274-301`): TOP_P, k 64, p 0.95, temperature 1.0 on
-# the spike's export, where a litetune text export carries none. The one way the
-# exporter offers to make it greedy, a top_k of 1, writes the GREEDY type
-# (`:300-301`), and litert-lm 0.18.0 then refused every message sent with no
-# sampler of the caller's: `RuntimeError: UNIMPLEMENTED: Sampler type: 3 not
-# implemented yet.` on 300 of 300 held-out rows (litetune's own beans run,
-# 2026-11-05). So the bundle keeps the sampler the exporter writes, `convert`
-# records it, and `verify` sends the candidate this sampler of its own -- the one
-# the spike measured with, top_k 1 -- in place of the bundle's.
+# `backend_constraint` on the sections a picture runs through: the CPU, the one
+# vision backend litetune has measured them on. Google's E2B bundle at b3ca0d2f
+# constrains its vision adapter so (its unpacked TOML); litert-torch writes none,
+# and the bundle then offers its vision sections to the GPU as well.
+VISION_CONSTRAINTS = {"vision_encoder": "cpu", "vision_adapter": "cpu"}
+
+# The sampler a bundle declares is the exporter's, for text and pictures alike.
+# litert-torch writes none for `text_generation`, whose `do_sample` it turns off
+# (`core/export_lib.py:357-359`); a litetune Gemma 4 text bundle describes as
+# `Sampler Temp 0.00, Top K 0, Top P 0.00`. With `image_text_to_text` it keeps
+# the checkpoint's `do_sample` and writes TOP_P, k 64, p 0.95, temperature 1.0
+# (`core/litert_lm_builder.py:274-301`). An application that passes no sampler
+# samples with either: flutter_edge_ai falls back to the bundle's, and for a
+# bundle that has none to the Gemma 4 family default of the same values
+# (flutter_edge_ai `sampling.dart`). The exporter's one way to make it greedy, a
+# top_k of 1, writes GREEDY, which litert-lm 0.18.0 does not run: "UNIMPLEMENTED:
+# Sampler type: 3 not implemented yet." on 300 of 300 rows (litetune's beans run,
+# 2026-11-05). So litetune leaves the sampler as the exporter writes it.
+#
+# `verify` then sends this sampler in its place to any bundle whose own would
+# sample (`sampler_samples`): top_k 1, the one the spike measured with, so the
+# comparison with the greedy float reference holds.
 CANDIDATE_SAMPLER = {"top_k": 1, "top_p": 1.0, "temperature": 1.0, "seed": 0}
 
 SAMPLER_NOTE = (
-    "the bundle declares the sampler litert-torch writes from the checkpoint's generation "
-    "config ({sampler}); an application that passes no sampler of its own samples with it. "
-    "litetune's measurements of it send top_k 1 instead"
+    "the bundle declares a sampler ({sampler}): an application that passes no sampler of its "
+    "own samples with it, and litetune's verify measures it with top_k 1 in its place"
 )
+
+
+def sampler_samples(sampler: Mapping[str, Any] | None) -> bool:
+    """Whether a bundle's declared sampler (`export.vision_in`'s reading) would sample.
+
+    No sampler is the runtime's own default, which litetune's text measurements
+    run on; a TOP_P or TOP_K one with k 1 picks the likeliest token. Anything
+    else samples, or (GREEDY on 0.18.0) does not run at all.
+    """
+    if sampler is None:
+        return False
+    return not (sampler.get("type") in ("TOP_P", "TOP_K") and sampler.get("k") == 1)
+
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _CHUNK = 1 << 20
@@ -136,7 +173,25 @@ class ImageRowError(ValueError):
 
 
 def is_image_model(model: str | None) -> bool:
-    """Whether `model` (an id, or a checkpoint that records one) is the image family."""
+    """Whether `model` is `IMAGE_MODEL`, by id or as a checkpoint whose record names it.
+
+    The id itself and nothing else of its family: the template, processor and
+    budget this path assumes are the instruction-tuned checkpoint's, and another
+    name the family's patterns match (a base checkpoint, a third party's copy)
+    may have others.
+    """
+    if not model:
+        return False
+    try:
+        read = models.read_training_record(str(model))
+    except (OSError, ValueError):
+        read = None
+    named = read[0].get("base_model") if read is not None else model
+    return isinstance(named, str) and named.casefold() == IMAGE_MODEL.casefold()
+
+
+def in_image_family(model: str | None) -> bool:
+    """Whether `model` is of `IMAGE_FAMILY`, the family `is_image_model` takes one id of."""
     if not model:
         return False
     rules = models.identify(model)
@@ -168,14 +223,16 @@ class ImageRef:
         return {"image": self.relative, "image_sha256": self.sha256}
 
 
-def split_images(path: Path) -> tuple[ImageRef, ...] | None:
+def split_images(path: Path, limit: int | None = None) -> tuple[ImageRef, ...] | None:
     """Each row's picture, in row order, checked against its digest; `None` for text rows.
 
     The one reader of an image split's pictures, for `tune` and for `verify`.
     Refused, naming the row: a split mixing rows with and without a picture, an
     `image` that is not a relative path inside the split's directory once every
     link is resolved, a file that is not there, and bytes whose sha256 is not
-    the row's `image_sha256` -- the picture changed after `prepare` wrote it.
+    the row's `image_sha256` -- the picture changed after `prepare` wrote it --
+    and a line that is not a JSON object. With `limit`, only the first `limit`
+    rows are read, as `evaluate.load_split` reads them.
     """
     path = Path(path)
     root = path.parent.resolve()
@@ -187,8 +244,11 @@ def split_images(path: Path) -> tuple[ImageRef, ...] | None:
             obj = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ImageRowError(f"{path}:{lineno}: not valid JSON: {exc}") from exc
-        if isinstance(obj, dict):
-            objects.append((lineno, obj))
+        if not isinstance(obj, dict):
+            raise ImageRowError(f"{path}:{lineno}: not a JSON object")
+        objects.append((lineno, obj))
+        if limit is not None and len(objects) >= limit:
+            break
     with_image = [lineno for lineno, obj in objects if has_image(obj)]
     if not with_image:
         return None
@@ -233,12 +293,32 @@ def split_images(path: Path) -> tuple[ImageRef, ...] | None:
     return tuple(out)
 
 
+# The one key of `tokenizer_config.json` left out of its digest: `vocab_file`, a
+# path `tune` writes for the exporter and `export.repair_vocab_file` rewrites
+# when the checkpoint has moved. It names where the SentencePiece model is, not
+# how the processor reads a picture or a text.
+UNHASHED_TOKENIZER_KEY = "vocab_file"
+
+
+def processor_file_digest(file: Path) -> str:
+    """A processor file's sha256; `tokenizer_config.json`'s without `UNHASHED_TOKENIZER_KEY`.
+
+    `tune`'s script computes the same, by the same rule, for the record.
+    """
+    if file.name != "tokenizer_config.json":
+        return sha256_hex(file)
+    data = json.loads(file.read_text(encoding="utf-8"))
+    data.pop(UNHASHED_TOKENIZER_KEY, None)
+    canonical = json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def processor_digests(model_dir: Path) -> dict[str, str | None]:
-    """The sha256 of each `PROCESSOR_FILES` file in `model_dir`; `None` for one not there."""
+    """The digest of each `PROCESSOR_FILES` file in `model_dir`; `None` for one not there."""
     out: dict[str, str | None] = {}
     for name in PROCESSOR_FILES:
         file = Path(model_dir) / name
-        out[name] = sha256_hex(file) if file.is_file() else None
+        out[name] = processor_file_digest(file) if file.is_file() else None
     return out
 
 
@@ -271,8 +351,15 @@ def record_problem(record: Any) -> str | None:
             f"trains and exports pictures at {VISION_TOKENS}"
         )
     template = record.get("template_sha256")
-    if not isinstance(template, str) or not _SHA256.fullmatch(template):
-        return f"'{RECORD_KEY}.template_sha256' is {template!r}, not a sha256"
+    if template != TEMPLATE_SHA256:
+        return (
+            f"'{RECORD_KEY}.template_sha256' is {template!r}; this litetune trains and exports "
+            f"pictures with the template whose sha256 is {TEMPLATE_SHA256} only"
+        )
+    frozen = record.get("frozen")
+    problem = frozen_problem(frozen)
+    if problem is not None:
+        return f"'{RECORD_KEY}.frozen': {problem}"
     digests = record.get("processor_sha256")
     if not isinstance(digests, Mapping) or set(digests) != set(PROCESSOR_FILES):
         return (
@@ -282,6 +369,33 @@ def record_problem(record: Any) -> str | None:
     for name, digest in digests.items():
         if not (digest is None or (isinstance(digest, str) and _SHA256.fullmatch(digest))):
             return f"'{RECORD_KEY}.processor_sha256' gives {name} {digest!r}, not a sha256"
+    return None
+
+
+def frozen_problem(frozen: Any) -> str | None:
+    """Why `frozen` does not show the merge left every `FROZEN_PREFIXES` tensor alone, or `None`.
+
+    It must have compared at least one tensor under each prefix, and found none
+    changed and none missing: a prefix that matched nothing checked nothing.
+    """
+    if not isinstance(frozen, Mapping):
+        return f"{frozen!r} is no comparison of the frozen tensors"
+    checked = frozen.get("checked")
+    if not isinstance(checked, int) or checked < 1:
+        return f"{checked!r} tensors were compared"
+    per_prefix = frozen.get("per_prefix")
+    if not isinstance(per_prefix, Mapping) or set(per_prefix) != set(FROZEN_PREFIXES):
+        return f"the comparison gives no count for each of {', '.join(FROZEN_PREFIXES)}"
+    empty = [p for p in FROZEN_PREFIXES if not isinstance(per_prefix[p], int) or per_prefix[p] < 1]
+    if empty:
+        return f"no tensor under {', '.join(empty)} was compared"
+    changed = list(frozen.get("changed") or [])
+    missing = list(frozen.get("missing") or [])
+    if changed or missing:
+        return (
+            f"{len(changed)} tensor(s) changed and {len(missing)} went missing in the merge "
+            f"(first: {(changed + missing)[0]})"
+        )
     return None
 
 

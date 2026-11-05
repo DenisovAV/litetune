@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from llm_image_fixtures import TEMPLATE, frozen_ok, pin_template, write_checkpoint
 
 from litetune import llm_images
 from litetune.llm_images import (
     PROCESSOR_FILES,
-    RECORD_KEY,
     TEMPLATE_FILE,
     VISION_TOKENS,
     ImageRowError,
@@ -47,6 +47,11 @@ def _split(tmp_path: Path, n: int = 3, override: dict[int, dict[str, Any]] | Non
     path = tmp_path / "train.jsonl"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+@pytest.fixture(autouse=True)
+def _pinned(monkeypatch):
+    pin_template(monkeypatch)
 
 
 def test_a_split_gives_each_rows_picture_in_order(tmp_path):
@@ -113,28 +118,14 @@ def test_only_gemma_4_e2b_is_the_image_model():
 
 
 def _checkpoint(tmp_path: Path, **record: Any) -> Path:
-    model = tmp_path / "model"
-    model.mkdir(exist_ok=True)
-    for name in PROCESSOR_FILES:
-        (model / name).write_text(name, encoding="utf-8")
-    (model / TEMPLATE_FILE).write_text("{{ bos_token }}", encoding="utf-8")
-    body = {
-        "vision_tokens": VISION_TOKENS,
-        "template_sha256": _sha(b"{{ bos_token }}"),
-        "processor_sha256": {n: _sha(n.encode()) for n in PROCESSOR_FILES},
-    }
-    body.update(record)
-    (model / "litetune.json").write_text(
-        json.dumps({"base_model": "google/gemma-4-E2B-it", RECORD_KEY: body}), encoding="utf-8"
-    )
-    return model
+    return write_checkpoint(tmp_path / "model", **record)
 
 
 def test_a_record_reads_back_and_its_files_match(tmp_path):
     model = _checkpoint(tmp_path)
     record = image_record(model)
     assert record is not None
-    assert checked_template(model, record) == "{{ bos_token }}"
+    assert checked_template(model, record) == TEMPLATE
     assert processor_mismatch(model, record) is None
 
 
@@ -191,3 +182,38 @@ def test_a_changed_or_missing_template_is_refused(tmp_path):
 def test_export_flags_name_the_budget_the_metadata_checks():
     assert f"--gemma4_vision_max_soft_tokens={VISION_TOKENS}" in llm_images.EXPORT_FLAGS
     assert llm_images.MAX_NUM_PATCHES == 2520
+
+
+def test_the_vision_environments_are_claimed_in_the_cache_listing(tmp_path, monkeypatch):
+    from litetune import envs
+
+    monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path / "envs"))
+    for env in (envs.TRAIN_VISION, envs.EXPORT_VISION):
+        env.path.mkdir(parents=True)
+    claimed = {entry.path.name: entry.stage for entry in envs.cached_environments()}
+    assert claimed[envs.TRAIN_VISION.path.name] == "train-vision"
+    assert claimed[envs.EXPORT_VISION.path.name] == "export-vision"
+
+
+def test_a_record_whose_frozen_comparison_is_short_is_refused(tmp_path):
+    frozen = frozen_ok()
+    frozen["per_prefix"]["model.audio_tower."] = 0
+    with pytest.raises(ImageRowError, match=r"no tensor under model.audio_tower. was compared"):
+        image_record(_checkpoint(tmp_path, frozen=frozen))
+    with pytest.raises(ImageRowError, match=r"is no comparison"):
+        image_record(_checkpoint(tmp_path, frozen=None))
+    changed = frozen_ok() | {"changed": ["model.vision_tower.w"]}
+    with pytest.raises(ImageRowError, match=r"1 tensor\(s\) changed"):
+        image_record(_checkpoint(tmp_path, frozen=changed))
+
+
+def test_a_record_of_another_template_is_refused(tmp_path):
+    with pytest.raises(ImageRowError, match=r"with the template whose sha256 is"):
+        image_record(_checkpoint(tmp_path, template_sha256="a" * 64))
+
+
+def test_the_family_and_the_one_id():
+    from litetune.llm_images import in_image_family
+
+    assert in_image_family("google/gemma-4-E2B") and not is_image_model("google/gemma-4-E2B")
+    assert is_image_model("GOOGLE/gemma-4-e2b-IT")

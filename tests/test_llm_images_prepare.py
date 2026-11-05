@@ -21,6 +21,7 @@ from litetune.llm_images import IMAGE_MODEL, split_images
 from litetune.prepare import (
     IMAGES_IGNORED,
     LLM_IMAGE_LENGTHS,
+    LLM_IMAGES_READ,
     PrepareError,
     PrepareRequest,
     prepare,
@@ -180,10 +181,17 @@ def test_another_family_ignores_an_image_and_says_so(tmp_path):
     assert all("image_sha256" not in r for r in _records(tmp_path / "split" / "train.jsonl"))
 
 
-def test_no_model_ignores_an_image_and_says_so(tmp_path):
+def test_no_model_with_pictures_is_refused(tmp_path):
     rows = [{"prompt": f"q{i}", "completion": "a", "image": "pics/x.png"} for i in range(40)]
-    result = prepare(_request(tmp_path, rows, base_model=None, images=None))
-    assert IMAGES_IGNORED.format(count=40, model="no model") in result.limitations
+    with pytest.raises(PrepareError, match=r"40 row\(s\) carry an 'image', and no --base-model"):
+        prepare(_request(tmp_path, rows, base_model=None, images=None))
+
+
+@pytest.mark.parametrize("model", ["google/gemma-4-E2B", "someone/gemma-4-e2b-it-mirror"])
+def test_another_id_of_the_image_family_is_refused_naming_the_one(tmp_path, model):
+    rows = _rows(tmp_path)
+    with pytest.raises(PrepareError, match=r"pass --base-model google/gemma-4-E2B-it"):
+        prepare(_request(tmp_path, rows, base_model=model, images=None))
 
 
 def test_a_text_split_for_gemma_4_is_unchanged(tmp_path):
@@ -193,10 +201,40 @@ def test_a_text_split_for_gemma_4_is_unchanged(tmp_path):
     assert LLM_IMAGE_LENGTHS not in result.limitations
 
 
-def test_a_picture_in_both_halves_is_named(tmp_path):
-    _fake_image(tmp_path / "pics" / "one.jpg", fmt="JPEG")
-    rows = [
-        {"prompt": f"question {i}", "completion": "a", "image": "pics/one.jpg"} for i in range(40)
-    ]
-    result = prepare(_request(tmp_path, rows))
-    assert any("in both the training split and the held-out split" in t for t in result.limitations)
+def test_rows_of_one_picture_are_kept_on_one_side_of_the_split(tmp_path):
+    rows = []
+    for p in range(12):
+        _fake_image(tmp_path / "pics" / f"p{p}.jpg", fmt="JPEG", tag=f"picture {p}")
+        rows += [
+            {"prompt": f"question {q}", "completion": "a", "image": f"pics/p{p}.jpg"}
+            for q in range(4)
+        ]
+    result = prepare(_request(tmp_path, rows, heldout_size=8))
+    train = {r["image_sha256"] for r in _records(tmp_path / "split" / "train.jsonl")}
+    held = {r["image_sha256"] for r in _records(tmp_path / "split" / "heldout.jsonl")}
+    assert train and held and not (train & held)
+    assert result.heldout is not None and result.heldout.n % 4 == 0
+
+
+def test_the_lengths_count_each_picture(tmp_path):
+    class Counter:
+        def describe(self):
+            return {"counter": "fake"}
+
+        def count(self, texts):
+            return [1 for _ in texts]
+
+    result = prepare(_request(tmp_path, tokens=Counter(), context_length=200))
+    # One token of text and the picture's 282: every row is over a 200-token window.
+    assert result.lengths.total["max"] > 200
+    assert LLM_IMAGES_READ in result.limitations
+
+
+def test_an_image_that_is_a_directory_is_refused(tmp_path):
+    rows = _rows(tmp_path)
+    (tmp_path / "pics" / "folder.jpg").mkdir()
+    rows[1]["image"] = "pics/folder.jpg"
+    with pytest.raises(
+        PrepareError, match=r":2: the image 'pics/folder.jpg' is not a regular file"
+    ):
+        prepare(_request(tmp_path, rows))

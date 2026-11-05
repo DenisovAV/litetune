@@ -62,8 +62,12 @@ from litetune.llm_images import (
     IMAGE_MODEL,
     PROCESSOR_FILES,
     TEMPLATE_FILE,
+    TEMPLATE_REVISION,
+    TEMPLATE_SHA256,
     VISION_TOKENS,
     ImageRowError,
+    frozen_problem,
+    in_image_family,
     is_image_model,
     split_images,
 )
@@ -405,9 +409,16 @@ def _refuse_pictures_here(request: TuneRequest, mode: PromptMode) -> Check | Non
     observed = {"model": request.model, "method": request.method, "prompt_mode": mode.value}
     reason = None
     if not is_image_model(request.model):
+        family = (
+            f" It is of {IMAGE_MODEL}'s family, and only that checkpoint's template, processor "
+            "and budget are the ones this path was built and measured on; name it as "
+            f"--model {IMAGE_MODEL}"
+            if in_image_family(request.model)
+            else ""
+        )
         reason = (
             f"the split's rows carry a picture, and {request.model} is not {IMAGE_MODEL}, the "
-            "one model litetune trains on pictures with text answers"
+            f"one model litetune trains on pictures with text answers.{family}"
         )
     elif request.method != "lora":
         reason = (
@@ -453,22 +464,18 @@ def _frozen_check(metrics: TrainingMetrics | None) -> Check:
             "vision tower and the embeddings as the base's is unknown",
         )
     checked = frozen.get("checked")
-    changed = list(frozen.get("changed") or [])
-    missing = list(frozen.get("missing") or [])
-    observed = {"checked": checked, "changed": changed[:20], "missing": missing[:20]}
-    if not isinstance(checked, int) or checked < 1:
+    observed = {
+        "checked": checked,
+        "per_prefix": frozen.get("per_prefix"),
+        "changed": list(frozen.get("changed") or [])[:20],
+        "missing": list(frozen.get("missing") or [])[:20],
+    }
+    problem = frozen_problem(frozen)
+    if problem is not None:
         return Check.failed(
             FROZEN_CHECK,
-            f"the run compared {checked!r} tensors under {', '.join(FROZEN_PREFIXES)}: none of "
-            "the names it was given matched the checkpoint, so nothing shows they were left alone",
-            observed=observed,
-        )
-    if changed or missing:
-        return Check.failed(
-            FROZEN_CHECK,
-            f"of {checked} tensors that must be the base's, {len(changed)} changed and "
-            f"{len(missing)} are missing after the merge (first: {(changed + missing)[0]}). The "
-            "bundle's vision encoder is exported from them",
+            f"the tensors that must be the base's after the merge are not shown to be: "
+            f"{problem}. The bundle's vision encoder is exported from them",
             observed=observed,
         )
     return Check.passed(
@@ -1010,18 +1017,50 @@ def sha256_of(data):
 
 
 def bundle_template(images):
-    """The template the converted bundle carries: its text, its bytes' sha256, its revision.
+    """The template the converted bundle carries: its bytes, their sha256, their revision.
 
-    Fetched the way the exporter fetches `--jinja_chat_template_override` when
-    it names a repository -- `chat_template.jinja`, no revision -- and kept
+    `chat_template.jinja` of the repository the family's export rule names, at
+    the pinned revision, refused unless its bytes hash to the pinned sha256. Kept
     beside the checkpoint, where `convert` hands the exporter the file itself.
     """
     from huggingface_hub import hf_hub_download
 
-    path = Path(hf_hub_download(repo_id=images["template_repo"], filename="chat_template.jinja"))
+    path = Path(hf_hub_download(
+        repo_id=images["template_repo"], filename="chat_template.jinja",
+        revision=images["template_revision"],
+    ))
     raw = path.read_bytes()
-    revision = path.parent.name if re.fullmatch(r"[0-9a-f]{40}", path.parent.name) else None
-    return raw, sha256_of(raw), revision
+    if sha256_of(raw) != images["template_sha256"]:
+        raise ValueError(
+            "%s at %s hashes to %s, not the %s this litetune trains pictures with"
+            % (images["template_repo"], images["template_revision"], sha256_of(raw),
+               images["template_sha256"])
+        )
+    return raw, sha256_of(raw), images["template_revision"]
+
+
+def picture_terminator(tok, template):
+    """What the bundle template puts after an answer, refused unless the probe shows it.
+
+    `turn_terminator` falls back to the tokenizer's EOS when the probe cannot be
+    rendered, and takes everything after the probe's last occurrence -- the
+    whole rendering, when the probe is not in it. For rows with a picture both
+    are refusals: the runtime renders this template and nothing else.
+    """
+    probe = "\u0000LITETUNE_ANSWER\u0000"
+    rendered = tok.apply_chat_template(
+        [{"role": "user", "content": "x"}, {"role": "assistant", "content": probe}],
+        chat_template=template, tokenize=False, add_generation_prompt=False,
+    )
+    if rendered.count(probe) != 1:
+        raise ValueError(
+            "the bundle template renders an answer %d times where once was asked, so what it "
+            "puts after one cannot be read off it" % rendered.count(probe)
+        )
+    ids = list(tok(rendered.split(probe)[-1], add_special_tokens=False)["input_ids"])
+    if not ids:
+        raise ValueError("the bundle template puts nothing after an answer, so none would stop")
+    return ids, "chat_template"
 
 
 def build_image_examples(tok, processor, rows, data_dir, max_seq_length, template, vision_tokens):
@@ -1038,7 +1077,7 @@ def build_image_examples(tok, processor, rows, data_dir, max_seq_length, templat
 
     from PIL import Image
 
-    terminator, terminator_source = turn_terminator(tok, True, template)
+    terminator, terminator_source = picture_terminator(tok, template)
     image_id = tok.convert_tokens_to_ids("<|image|>")
     examples = []
     soft = []
@@ -1114,6 +1153,25 @@ def image_inputs(chunk, width, torch, dtype):
             value = torch.cat([ex[2][key] for ex in chunk], dim=0)
             out[key] = value.to(dtype) if value.is_floating_point() else value
     return out
+
+
+def per_prefix(names, prefixes):
+    """How many of `names` sit under each of `prefixes`."""
+    return {prefix: sum(1 for n in names if n.startswith(prefix)) for prefix in prefixes}
+
+
+def processor_file_digest(path):
+    """`llm_images.processor_file_digest`, which this script cannot import.
+
+    A file's sha256; `tokenizer_config.json`'s without `vocab_file`, the path the
+    exporter's repair rewrites when a checkpoint moves.
+    """
+    raw = Path(path).read_bytes()
+    if Path(path).name != "tokenizer_config.json":
+        return sha256_of(raw)
+    data = json.loads(raw.decode("utf-8"))
+    data.pop("vocab_file", None)
+    return sha256_of(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8"))
 
 
 def frozen_digests(model, prefixes, torch):
@@ -1295,6 +1353,11 @@ def main() -> int:
 
         processor = AutoProcessor.from_pretrained(spec["model"], **from_kwargs)
         processor.image_processor.max_soft_tokens = images["vision_tokens"]
+        if processor.image_processor.max_soft_tokens != images["vision_tokens"]:
+            raise ValueError(
+                "the processor kept max_soft_tokens %r where %r was set"
+                % (processor.image_processor.max_soft_tokens, images["vision_tokens"])
+            )
         tok = processor.tokenizer
     else:
         tok = AutoTokenizer.from_pretrained(spec["model"], **from_kwargs)
@@ -1330,6 +1393,11 @@ def main() -> int:
         **from_kwargs
     )
     model.config.use_cache = False
+    if images and getattr(getattr(model, "model", None), "vision_tower", None) is None:
+        raise ValueError(
+            "%s loaded as %s, which has no vision tower: the rows' pictures would reach nothing"
+            % (spec["model"], type(model).__name__)
+        )
     # Read before anything can move them: the merge must leave every one as it is.
     frozen_before = frozen_digests(model, images["frozen_prefixes"], torch) if images else None
     # From CHECKPOINT_FROM_PARAMETERS up, each layer's activations are
@@ -1514,6 +1582,7 @@ def main() -> int:
             frozen_after = frozen_digests(merged, images["frozen_prefixes"], torch)
             frozen = {
                 "checked": len(frozen_before),
+                "per_prefix": per_prefix(frozen_before, images["frozen_prefixes"]),
                 "changed": sorted(
                     n for n in frozen_before
                     if n in frozen_after and frozen_after[n] != frozen_before[n]
@@ -1542,7 +1611,7 @@ def main() -> int:
             "template_sha256": template_sha256,
             "processor_sha256": {
                 name: (
-                    sha256_of((Path(model_dir) / name).read_bytes())
+                    processor_file_digest(Path(model_dir) / name)
                     if (Path(model_dir) / name).is_file()
                     else None
                 )
@@ -2052,6 +2121,8 @@ class TuneRequest:
         return {
             "vision_tokens": VISION_TOKENS,
             "template_repo": bundle_template_repo(self.model),
+            "template_revision": TEMPLATE_REVISION,
+            "template_sha256": TEMPLATE_SHA256,
             "template_file": TEMPLATE_FILE,
             "processor_files": list(PROCESSOR_FILES),
             "frozen_prefixes": list(FROZEN_PREFIXES),

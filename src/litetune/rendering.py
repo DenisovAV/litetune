@@ -139,10 +139,20 @@ def section_types(path):
 
 
 def picture_message(prompt, picture):
-    """The user turn the candidate is sent: the picture's bytes, base64, then the text."""
+    """The user turn the candidate is sent: the picture's bytes, base64, then the text.
+
+    The bytes are checked against the digest the split's row names, as the
+    candidate's driver checks them.
+    """
     import base64
+    import hashlib
 
     data = Path(picture["path"]).read_bytes()
+    if hashlib.sha256(data).hexdigest() != picture["sha256"]:
+        raise ValueError(
+            "the picture %s is not the one the split names (sha256 %s)"
+            % (picture["path"], picture["sha256"])
+        )
     return {
         "role": "user",
         "content": [

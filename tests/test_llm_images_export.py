@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from conftest import buildable_here, mark_provisioned
+from llm_image_fixtures import TEMPLATE, pin_template, write_checkpoint
 from test_export import FAKE_TOML, FakeToolchain
 
 from litetune import envs, models
@@ -20,13 +21,10 @@ from litetune.checks import Outcome
 from litetune.export import REFUSED_SUFFIX, ExportRequest, run_export
 from litetune.llm_images import (
     EXPORT_FLAGS,
-    PROCESSOR_FILES,
     RECORD_KEY,
     TEMPLATE_FILE,
     VISION_TOKENS,
 )
-
-TEMPLATE = "{{ bos_token }}{# the bundle's template #}"
 
 VISION_TOML = FAKE_TOML + "".join(
     f'\n[[section]]\nmodel_type = "{kind}"\nsection_type = "TFLiteModel"\n'
@@ -44,43 +42,29 @@ def _gemma4(patches: int = 2520, start: str | None = "<|image>", end: str | None
     return "llm_model_type: " + json.dumps({"gemma4": fields}) + "\n"
 
 
+# SamplerParameters.Type numbers in litert-lm-builder 0.18.0: the proto gives the
+# number, and the readback names it.
+SAMPLER_TYPES = {"TOP_K": 1, "TOP_P": 2, "GREEDY": 3}
+
+
 def _sampler(kind: str) -> str:
-    return (
-        "sampler_params: "
-        + json.dumps({"type": kind, "k": 1, "p": 0.95, "temperature": 1.0})
-        + "\n"
-    )
+    fields = {"type": SAMPLER_TYPES[kind], "k": 1, "p": 0.95, "temperature": 1.0}
+    return "sampler_params: " + json.dumps(fields) + "\n"
 
 
 def _checkpoint(tmp_path: Path, template: str = TEMPLATE) -> Path:
-    model = tmp_path / "tuned" / "model"
-    model.mkdir(parents=True)
-    for name in PROCESSOR_FILES:
-        (model / name).write_text(name, encoding="utf-8")
-    (model / TEMPLATE_FILE).write_bytes(template.encode())
-    (model / "config.json").write_text("{}", encoding="utf-8")
-    record = {
-        "vision_tokens": VISION_TOKENS,
-        "template_sha256": hashlib.sha256(TEMPLATE.encode()).hexdigest(),
-        "processor_sha256": {n: hashlib.sha256(n.encode()).hexdigest() for n in PROCESSOR_FILES},
-    }
-    (model / "litetune.json").write_text(
-        json.dumps(
-            {
-                "base_model": "google/gemma-4-E2B-it",
-                "prompt_mode": "runtime_rendered",
-                RECORD_KEY: record,
-            }
-        ),
-        encoding="utf-8",
-    )
-    return model
+    return write_checkpoint(tmp_path / "tuned" / "model", template=template)
 
 
 def _request(tmp_path: Path, model: Path, **kwargs) -> ExportRequest:
     return ExportRequest(
         model=str(model), output_dir=tmp_path / "out", recipes=("dynamic_wi8_afp32",), **kwargs
     )
+
+
+@pytest.fixture(autouse=True)
+def _pinned(monkeypatch):
+    pin_template(monkeypatch)
 
 
 @pytest.fixture
@@ -130,6 +114,7 @@ def test_a_picture_checkpoint_exports_its_vision_encoder_from_its_template(tmp_p
         "start_of_image_token": "<|image>",
         "end_of_image_token": "<image|>",
         "sampler": {"type": "GREEDY", "k": 1, "p": 0.95, "temperature": 1.0},
+        "backend_constraints": {"vision_encoder": "cpu", "vision_adapter": "cpu"},
         "template_sha256": hashlib.sha256(TEMPLATE.encode()).hexdigest(),
     }
     assert "takes pictures at 280 soft tokens" in export.check.detail
@@ -220,7 +205,42 @@ def test_a_bundle_at_another_budget_is_refused(tmp_path, vision_bundle):
 def test_a_bundle_without_the_image_markers_is_refused(tmp_path, vision_bundle, missing):
     vision_bundle.metadata_extra = _gemma4(**{missing: None})
     detail, _ = _refused(tmp_path)
-    assert "names no start or end of image token" in detail
+    assert "as its start and end of image, where the processor puts '<|image>'" in detail
+
+
+def test_a_bundle_naming_other_image_markers_is_refused(tmp_path, vision_bundle):
+    vision_bundle.metadata_extra = _gemma4(start="<start_of_image>")
+    detail, _ = _refused(tmp_path)
+    assert "names '<start_of_image>' and '<image|>'" in detail
+
+
+def test_the_vision_sections_are_constrained_to_the_cpu(tmp_path, vision_bundle):
+    (export,) = run_export(_request(tmp_path, _checkpoint(tmp_path))).exports
+    assert export.ok, export.check.detail
+    # Read back from the rebuilt bundle, which the fake builder packs from the TOML.
+    assert export.vision["backend_constraints"] == {
+        "vision_encoder": "cpu",
+        "vision_adapter": "cpu",
+    }
+    assert "constrained to the CPU" in export.check.detail
+
+
+def test_a_bundle_whose_vision_sections_were_left_unconstrained_is_refused(tmp_path, vision_bundle):
+    vision_bundle.repack_pack_fails = True
+    detail, _ = _refused(tmp_path)
+    assert "constrains its vision sections to" in detail
+
+
+def test_a_text_bundle_is_not_constrained(tmp_path, toolchain):
+    model = tmp_path / "text"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    (model / "litetune.json").write_text(
+        json.dumps({"base_model": "google/gemma-4-E2B-it"}), encoding="utf-8"
+    )
+    toolchain.repack_toml = VISION_TOML
+    (export,) = run_export(_request(tmp_path, model)).exports
+    assert export.ok and export.vision is None
 
 
 def test_the_sampler_a_bundle_declares_is_recorded_not_refused(tmp_path, vision_bundle):
@@ -244,3 +264,28 @@ def test_a_bundle_whose_pictures_could_not_be_read_back_is_not_handed_on(tmp_pat
     (export,) = run_export(_request(tmp_path, _checkpoint(tmp_path))).exports
     assert export.check.outcome is Outcome.UNCHECKED
     assert "could not be read back" in export.check.detail
+
+
+def test_an_unreadable_record_beside_a_kept_template_exports_nothing(tmp_path, vision_bundle):
+    model = _checkpoint(tmp_path)
+    (model / "litetune.json").write_text("{not json", encoding="utf-8")
+    result = run_export(_request(tmp_path, model, base_model="google/gemma-4-E2B-it"))
+    assert vision_bundle.exports == []
+    refused = next(c for c in result.checks.checks if c.name == "pictures")
+    assert "keeps litetune_bundle_template.jinja" in refused.detail
+
+
+def test_a_processor_file_that_changed_exports_nothing(tmp_path, vision_bundle):
+    model = _checkpoint(tmp_path)
+    (model / "processor_config.json").write_text('{"max_soft_tokens": 140}', encoding="utf-8")
+    result = run_export(_request(tmp_path, model))
+    assert vision_bundle.exports == []
+    refused = next(c for c in result.checks.checks if c.name == "pictures")
+    assert "processor_config.json hashes to" in refused.detail
+
+
+def test_the_template_override_is_reported_as_litetunes(tmp_path, vision_bundle):
+    request = _request(tmp_path, _checkpoint(tmp_path))
+    said = [c.detail for c in request.plan.checks if models.TEMPLATE_FLAG in c.detail]
+    assert said and all("was set by litetune" in d for d in said)
+    assert not any("supplied by the caller" in d for d in said)

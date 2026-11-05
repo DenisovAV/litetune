@@ -83,7 +83,14 @@ from litetune.images import (
     write_images,
 )
 from litetune.liveness import SkippedCheck
-from litetune.llm_images import IMAGE_MODEL, VISION_TOKENS, has_image, is_image_model
+from litetune.llm_images import (
+    IMAGE_MODEL,
+    PICTURE_TOKENS,
+    VISION_TOKENS,
+    has_image,
+    in_image_family,
+    is_image_model,
+)
 from litetune.metrics import (
     END_CALL,
     ESCAPE_SPELLINGS,
@@ -1200,20 +1207,33 @@ LLM_IMAGE_ROWS_FOR = (
 )
 
 IMAGES_IGNORED = (
-    "{count} row(s) carry an 'image', which this split ignores: " + LLM_IMAGE_ROWS_FOR + ", and "
-    "this run named {model}. Each is trained as its text alone"
+    "{count} row(s) carry an 'image', which this split leaves out: " + LLM_IMAGE_ROWS_FOR + ", "
+    "and this run named {model}. The split prepare wrote carries no picture and each row is "
+    "trained as its text alone; a split that does carry one is refused by `tune` and `verify` "
+    "for this model"
+)
+
+IMAGES_WITHOUT_A_MODEL = (
+    "{count} row(s) carry an 'image', and no --base-model was named. " + LLM_IMAGE_ROWS_FOR + ": "
+    "pass --base-model, so that the pictures are read, or are left out by a choice that names "
+    "the model"
+)
+
+IMAGES_FOR_ANOTHER_ID = (
+    "{model} is of " + IMAGE_MODEL + "'s family, and the rows carry an 'image'. litetune reads "
+    "pictures for " + IMAGE_MODEL + " itself only, the one checkpoint whose template, processor "
+    "and budget this path was built and measured on; pass --base-model " + IMAGE_MODEL
+)
+
+LLM_IMAGES_READ = (
+    "the rows' 'image' fields are read as pictures: for " + IMAGE_MODEL + " litetune 0.7.3 and "
+    "earlier ignored them and trained each row as its text"
 )
 
 LLM_IMAGE_LENGTHS = (
-    "the token lengths measured here are each row's text alone: a picture adds up to "
-    f"{VISION_TOKENS} soft tokens and the two markers around them, which `tune` counts with the "
-    "processor and refuses a row over --max-seq-length for"
-)
-
-LLM_IMAGE_PICTURES_IN_BOTH = (
-    "{count} picture(s) are in both the training split and the held-out split, under different "
-    "rows. A held-out row about a picture the model was trained on measures recall of that "
-    "picture as much as the task"
+    f"each row with a picture is measured as its text plus {PICTURE_TOKENS} tokens, the most a "
+    f"picture becomes ({VISION_TOKENS} soft tokens and the two markers around them); `tune` "
+    "counts the real number with the processor and refuses a row over --max-seq-length"
 )
 
 
@@ -1800,7 +1820,11 @@ def measure_lengths(rows: Sequence[Row], counter: TokenCounter, context_length: 
             f"the token counter returned {len(counts)} counts for {2 * len(rows)} texts; "
             "the over-length check cannot be performed on a partial answer"
         )
-    prompt_counts = counts[: len(rows)]
+    # A row with a picture: its text, and the most the picture becomes.
+    prompt_counts = [
+        count + (PICTURE_TOKENS if row.image is not None and row.image_with_prompt else 0)
+        for row, count in zip(rows, counts[: len(rows)], strict=True)
+    ]
     completion_counts = counts[len(rows) :]
     totals = [
         p + c + SEQUENCE_OVERHEAD_TOKENS
@@ -2555,6 +2579,10 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     ignored_images = (
         0 if embedding or llm_images else sum(1 for _, obj in objects if has_image(obj))
     )
+    if ignored_images and request.base_model is None:
+        raise PrepareError(IMAGES_WITHOUT_A_MODEL.format(count=ignored_images))
+    if ignored_images and in_image_family(request.base_model):
+        raise PrepareError(IMAGES_FOR_ANOTHER_ID.format(model=request.base_model))
     context_length = _context_length_for(request, image_mode)
     decision: DecisionProfile | None = None
     image_stats: ImageStats | None = None
@@ -2681,6 +2709,7 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             IMAGES_IGNORED.format(count=ignored_images, model=request.base_model or "no model")
         )
     if llm_images:
+        result.limitation(LLM_IMAGES_READ)
         result.limitation(LLM_IMAGE_LENGTHS)
 
     # -- lengths -----------------------------------------------------------
@@ -2731,12 +2760,15 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             f"{len(rows) - heldout_n}. Every interval on this split is computed at n={heldout_n}, "
             "not at the size that was asked for"
         )
-    halves = split_rows(rows, content_sha256, request.seed, heldout_n) if heldout_n >= 1 else None
-    if llm_images and halves is not None:
-        trained = {row.image.sha256 for row in halves[0] if row.image is not None}
-        shared = {row.image.sha256 for row in halves[1] if row.image is not None} & trained
-        if shared:
-            result.limitation(LLM_IMAGE_PICTURES_IN_BOTH.format(count=len(shared)))
+    if llm_images and heldout_n >= 1:
+        # By picture, as EmbeddingGemma 2's image rows are: rows that give the
+        # same bytes go to one side, so no held-out row asks about a picture the
+        # model was trained on.
+        halves, _ = _split_pictures(result, rows, content_sha256, request.seed, heldout_n, 0)
+    else:
+        halves = (
+            split_rows(rows, content_sha256, request.seed, heldout_n) if heldout_n >= 1 else None
+        )
     calibration_rows: list[Row] = []
     options_check = None
     if decision is not None and halves is not None:

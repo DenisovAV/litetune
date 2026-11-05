@@ -31,7 +31,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -529,6 +529,7 @@ class ExportRequest:
         # are litetune's for it: a caller's own setting of one is refused, since
         # the bundle would then not be the model that was trained.
         images, images_problem = _recorded_images(self.model)
+        picture_flags: dict[str, str] = {}
         if images is not None:
             try:
                 caller_set = models.parse_exporter_flags(self.model, requested)
@@ -548,7 +549,12 @@ class ExportRequest:
                     "encoder, the budget and the template the pictures were trained with"
                 )
             template = llm_images.template_file(self.model).absolute()
-            requested += [*llm_images.EXPORT_FLAGS, f"{models.TEMPLATE_FLAG}={template}"]
+            ours = f"{models.TEMPLATE_FLAG}={template}"
+            requested += [*llm_images.EXPORT_FLAGS, ours]
+            picture_flags[ours] = (
+                "the bundle template this checkpoint was trained on pictures with, kept beside it "
+                "by `tune`"
+            )
             object.__setattr__(self, "env", self.vision_env)
         object.__setattr__(self, "_images", images)
         object.__setattr__(self, "_images_problem", images_problem)
@@ -583,7 +589,7 @@ class ExportRequest:
             )
         )
         object.__setattr__(self, "_identity_conflict", conflict)
-        plan = models.plan_export(identity, requested, self.recipes)
+        plan = models.plan_export(identity, requested, self.recipes, litetune_flags=picture_flags)
         flags = list(plan.flags)
         # Read off the plan's table, as the exporter will read it: a caller's
         # `--noexternalize_embedder` or `--externalize-embedder=False` is theirs,
@@ -753,9 +759,18 @@ def _recorded_images(model: str) -> tuple[dict[str, Any] | None, str | None]:
         record = llm_images.image_record(model)
     except llm_images.ImageRowError as exc:
         return None, str(exc)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
         # An unreadable `litetune.json` is reported through the identity, as for
-        # every record (`models.provenance_error`).
+        # every record (`models.provenance_error`) -- and refused when the
+        # checkpoint keeps a bundle template beside it: `tune` writes that file
+        # only for a run on pictures, and exporting such a checkpoint as text
+        # would make a bundle that cannot take the pictures it was trained on.
+        if llm_images.template_file(model).is_file():
+            return None, (
+                f"{model} keeps {llm_images.TEMPLATE_FILE}, which `tune` writes for a run on "
+                f"pictures, and its litetune.json cannot be read ({exc}), so how it was trained "
+                "on them is unknown"
+            )
         return None, None
     if record is None:
         return None, None
@@ -763,6 +778,9 @@ def _recorded_images(model: str) -> tuple[dict[str, Any] | None, str | None]:
         llm_images.checked_template(model, record)
     except llm_images.ImageRowError as exc:
         return record, str(exc)
+    mismatch = llm_images.processor_mismatch(model, record)
+    if mismatch is not None:
+        return record, mismatch
     return record, None
 
 
@@ -2010,15 +2028,19 @@ def token_of(message, name):
     return token.token_str if token.HasField("token_str") else list(token.token_ids.ids)
 
 
+def section_type_of(section):
+    """A section's model type as `unpack` names it, `tf_lite_` dropped."""
+    return str(section.get("model_type", "")).lower().removeprefix("tf_lite_")
+
+
 def vision_in(doc, meta):
-    """What the bundle carries for pictures: section types, Gemma 4's media fields, sampler."""
-    types = sorted(
-        {
-            str(s.get("model_type", "")).lower().removeprefix("tf_lite_")
-            for s in doc.get("section", [])
-            if s.get("model_type")
-        }
-    )
+    """What the bundle carries for pictures: section types, constraints, media fields, sampler."""
+    types = sorted({section_type_of(s) for s in doc.get("section", []) if s.get("model_type")})
+    constraints = {
+        section_type_of(s): s.get("backend_constraint")
+        for s in doc.get("section", [])
+        if section_type_of(s) in ("vision_encoder", "vision_adapter")
+    }
     gemma4 = None
     if has(meta, "llm_model_type") and has(meta.llm_model_type, "gemma4"):
         g = meta.llm_model_type.gemma4
@@ -2043,7 +2065,12 @@ def vision_in(doc, meta):
             "p": float(p.p),
             "temperature": float(p.temperature),
         }
-    return {"section_types": types, "gemma4": gemma4, "sampler": sampler}
+    return {
+        "section_types": types,
+        "constraints": constraints,
+        "gemma4": gemma4,
+        "sampler": sampler,
+    }
 
 
 def report(declared=None, written=False, reason=None, broken=None):
@@ -2111,7 +2138,16 @@ def main(spec):
             reason=f"found {len(targets)} prefill_decode sections where exactly one was expected"
         )
     existing = declared_in(targets[0], key)
-    if existing is not None:
+    # `backend_constraint` by section type, for a bundle that takes pictures:
+    # each section of that type that does not already say it.
+    wanted = spec.get("constraints") or {}
+    constrain = [
+        s
+        for s in before.get("section", [])
+        if section_type_of(s) in wanted
+        and s.get("backend_constraint") != wanted[section_type_of(s)]
+    ]
+    if existing is not None and not constrain:
         shown = existing or "(empty)"
         reason = f"the bundle already declares {key} = {shown}; left as written"
         return report(declared=existing, reason=reason)
@@ -2119,7 +2155,11 @@ def main(spec):
     # Patch the structure, not the text.
     patched = copy.deepcopy(before)
     sec = prefill_sections(patched)[0]
-    sec["additional_metadata"] = list(sec.get("additional_metadata") or []) + [entry]
+    if existing is None:
+        sec["additional_metadata"] = list(sec.get("additional_metadata") or []) + [entry]
+    for s in patched["section"]:
+        if section_type_of(s) in wanted:
+            s["backend_constraint"] = wanted[section_type_of(s)]
     for s in patched["section"]:
         s["data_path"] = str(before_dir / os.path.basename(s["data_path"]))
     patched_toml = work / "patched.toml"
@@ -2136,11 +2176,16 @@ def main(spec):
     if comparable(after) != comparable(patched):
         return report(reason="the rebuild changed the bundle beyond the one key")
     read_back = declared_in(prefill_sections(after)[0], key)
-    if read_back != value:
-        return report(reason=f"the rebuild wrote {key} = {read_back!r}; {value!r} was asked")
-    if template_out and chat_template_in(after_dir, after) != template:
+    expected = existing if existing is not None else value
+    if read_back != expected:
+        return report(reason=f"the rebuild wrote {key} = {read_back!r}; {expected!r} was asked")
+    rebuilt_reading = chat_template_in(after_dir, after) if template_out else None
+    if template_out and {**rebuilt_reading, "vision": None} != {**template, "vision": None}:
         return report(reason="the rebuild changed the bundle's chat template")
     os.replace(rebuilt, artifact)
+    if template_out:
+        # What the file left at `artifact` carries now, its constraints included.
+        Path(template_out).write_text(json.dumps(rebuilt_reading), encoding="utf-8")
     return report(declared=read_back, written=True)
 
 
@@ -2221,6 +2266,7 @@ def repack_bundle(
     *,
     timeout: int = REPACK_TIMEOUT_S,
     read_template: bool = False,
+    constraints: Mapping[str, str] | None = None,
 ) -> Repack:
     """`set_gpu_activation`, and with `read_template` the bundle's chat template too.
 
@@ -2255,7 +2301,9 @@ def repack_bundle(
             # the script's final `os.replace` is one rename.
             work = Path(tempfile.mkdtemp(prefix=f".{artifact.stem}-repack-", dir=artifact.parent))
             template_out = work / "template.json" if read_template else None
-            declared, note, broken = _run_repack(artifact, env, work, timeout, template_out)
+            declared, note, broken = _run_repack(
+                artifact, env, work, timeout, template_out, constraints
+            )
         except subprocess.TimeoutExpired:
             declared, note, broken = (
                 None,
@@ -2291,7 +2339,12 @@ def repack_bundle(
 
 
 def _run_repack(
-    artifact: Path, env: envs.StageEnv, work: Path, timeout: int, template_out: Path | None
+    artifact: Path,
+    env: envs.StageEnv,
+    work: Path,
+    timeout: int,
+    template_out: Path | None,
+    constraints: Mapping[str, str] | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Run `_REPACK_SCRIPT` on `artifact` in `work`. Returns (declared, note, broken)."""
     script = work / "repack.py"
@@ -2306,6 +2359,7 @@ def _run_repack(
                 "key": GPU_ACTIVATION_KEY,
                 "value": GPU_ACTIVATION,
                 "template_out": str(template_out) if template_out is not None else None,
+                "constraints": dict(constraints or {}),
             }
         ),
         encoding="utf-8",
@@ -2451,6 +2505,7 @@ def _vision_carried(
     types = list(vision.get("section_types") or [])
     gemma4 = vision.get("gemma4") or {}
     sampler = vision.get("sampler")
+    constraints = dict(vision.get("constraints") or {})
     template_sha256 = (
         hashlib.sha256(carried.text.encode("utf-8")).hexdigest() if carried.text else None
     )
@@ -2462,6 +2517,7 @@ def _vision_carried(
         "start_of_image_token": gemma4.get("start_of_image_token"),
         "end_of_image_token": gemma4.get("end_of_image_token"),
         "sampler": sampler,
+        "backend_constraints": constraints,
         "template_sha256": template_sha256,
     }
     observed |= facts
@@ -2472,8 +2528,21 @@ def _vision_carried(
             f"carries no {', '.join(missing)} section, so it cannot take a picture; it has "
             f"{', '.join(types) or 'no sections'}"
         )
-    elif not facts["start_of_image_token"] or not facts["end_of_image_token"]:
-        problem = "names no start or end of image token in its Gemma 4 metadata"
+    elif (facts["start_of_image_token"], facts["end_of_image_token"]) != (
+        llm_images.START_OF_IMAGE,
+        llm_images.END_OF_IMAGE,
+    ):
+        problem = (
+            f"names {facts['start_of_image_token']!r} and {facts['end_of_image_token']!r} as its "
+            f"start and end of image, where the processor puts {llm_images.START_OF_IMAGE!r} and "
+            f"{llm_images.END_OF_IMAGE!r} around a picture"
+        )
+    elif constraints != dict(llm_images.VISION_CONSTRAINTS):
+        problem = (
+            f"constrains its vision sections to {constraints}, where convert writes "
+            f"{dict(llm_images.VISION_CONSTRAINTS)}: the CPU is the one vision backend litetune "
+            "has measured them on"
+        )
     elif facts["max_num_patches"] != llm_images.MAX_NUM_PATCHES:
         problem = (
             f"sets max_num_patches {facts['max_num_patches']!r}, where the pictures were trained "
@@ -2848,6 +2917,9 @@ def export_recipe(
         request.env,
         timeout=min(REPACK_TIMEOUT_S, remaining),
         read_template=True,
+        # A bundle that takes pictures: its vision encoder and adapter on the
+        # CPU, the one vision backend litetune has verified them on.
+        constraints=llm_images.VISION_CONSTRAINTS if request.images is not None else None,
     )
     gpu_activation, gpu_note = repack.declared, repack.note
     if gpu_activation is None:
@@ -2894,7 +2966,9 @@ def export_recipe(
             f"{artifact.name}: {artifact_bytes:,} bytes in {seconds:.1f}s exported on cpu; "
             f"{gpu_text}"
             + (
-                f"; takes pictures at {vision['vision_tokens']} soft tokens"
+                f"; takes pictures at {vision['vision_tokens']} soft tokens, its vision encoder "
+                "and adapter constrained to the CPU, the one vision backend litetune has "
+                "measured"
                 + (
                     "; "
                     + llm_images.SAMPLER_NOTE.format(
