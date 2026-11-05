@@ -267,10 +267,12 @@ def test_an_over_length_split_never_opens_its_pictures(tmp_path):
 
 
 def test_a_split_that_fits_opens_its_pictures_once(tmp_path):
-    inspector = FakeImageInspector()
-    result = prepare(_request(tmp_path, tokens=_Counter(), context_length=4096, images=inspector))
+    inspector, counter = FakeImageInspector(), _Counter()
+    result = prepare(_request(tmp_path, tokens=counter, context_length=4096, images=inspector))
     assert len(inspector.calls) == 1 and result.train is not None
     assert LLM_IMAGE_LENGTHS in result.limitations
+    # The lengths measured before the pictures are opened are the ones checked after.
+    assert counter.calls == 1
 
 
 def test_without_a_tokenizer_no_length_is_claimed_for_the_pictures(tmp_path):
