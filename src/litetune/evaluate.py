@@ -225,11 +225,8 @@ def load_split(path: Path, limit: int | None = None) -> Split:
     except ImageRowError as exc:
         raise DataError(str(exc)) from exc
     if pictures is not None:
-        if len(pictures) != len(examples):
-            raise DataError(
-                f"{path}: {len(pictures)} pictures for {len(examples)} examples; each row of a "
-                "split with pictures gives one"
-            )
+        # The same rows, the same limit: `split_images` refuses a split where
+        # any row lacks a picture, so the two are one for one.
         examples = [
             replace(example, image=picture)
             for example, picture in zip(examples, pictures, strict=True)
