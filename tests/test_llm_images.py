@@ -75,7 +75,7 @@ def test_a_mixed_split_is_refused(tmp_path):
 
 def test_a_changed_picture_is_refused(tmp_path):
     path = _split(tmp_path)
-    ref = split_images(path)[0]  # type: ignore[index]
+    ref = split_images(path)[0]
     ref.file.write_bytes(b"another picture")
     with pytest.raises(ImageRowError, match=r":1: the image .* hashes to .*changed after"):
         split_images(path)

@@ -288,7 +288,7 @@ def test_the_candidate_is_sent_each_picture_on_a_cpu_vision_backend():
     env = SpecEnv()
     backend = LiteRtLmBackend(
         model=Path("m.litertlm"),
-        env=env,  # type: ignore[arg-type]
+        env=env,
         auto_provision=False,
         declared_prompt_mode=PromptMode.RUNTIME_RENDERED,
         images=PICTURES,
@@ -306,14 +306,14 @@ def test_the_candidate_is_sent_each_picture_on_a_cpu_vision_backend():
 
 def test_a_text_candidate_has_no_vision_backend():
     env = SpecEnv()
-    LiteRtLmBackend(model=Path("m"), env=env, auto_provision=False).generate(["one"])  # type: ignore[arg-type]
+    LiteRtLmBackend(model=Path("m"), env=env, auto_provision=False).generate(["one"])
     assert "images" not in env.specs[0] and "vision_backend" not in env.specs[0]
     assert "sampler" not in env.specs[0] and "greedy_sampler" in env.specs[0]
 
 
 def test_a_candidate_given_the_wrong_number_of_pictures_runs_nothing():
     env = SpecEnv()
-    backend = LiteRtLmBackend(model=Path("m"), env=env, auto_provision=False, images=PICTURES[:1])  # type: ignore[arg-type]
+    backend = LiteRtLmBackend(model=Path("m"), env=env, auto_provision=False, images=PICTURES[:1])
     generations = backend.generate(["one", "two"])
     assert env.specs == []
     assert all("1 pictures were given for 2 prompts" in g.harness_error for g in generations)
@@ -324,7 +324,7 @@ def test_the_reference_is_given_the_pictures_the_template_and_the_budget(monkeyp
     monkeypatch.setattr(HuggingFaceBackend, "_ensure_env", lambda self, events: None)
     backend = HuggingFaceBackend(
         model="m",
-        env=env,  # type: ignore[arg-type]
+        env=env,
         declared_prompt_mode=PromptMode.RUNTIME_RENDERED,
         images=PICTURES,
         template=TEMPLATE,
@@ -347,7 +347,7 @@ def test_a_reference_missing_what_pictures_need_runs_nothing(monkeypatch, kwargs
     env = SpecEnv()
     monkeypatch.setattr(HuggingFaceBackend, "_ensure_env", lambda self, events: None)
     params = {"images": PICTURES, "template": TEMPLATE, "vision_tokens": VISION_TOKENS} | kwargs
-    generations = HuggingFaceBackend(model="m", env=env, **params).generate(["one", "two"])  # type: ignore[arg-type]
+    generations = HuggingFaceBackend(model="m", env=env, **params).generate(["one", "two"])
     assert env.specs == []
     assert all(g.harness_error and "needs its own" in g.harness_error for g in generations)
 
@@ -376,7 +376,7 @@ def test_the_runtime_is_sent_the_apps_message(tmp_path):
 
 def test_a_row_with_a_picture_goes_to_the_conversation_as_that_message(tmp_path, monkeypatch):
     lm = types.ModuleType("litert_lm")
-    lm.SamplerConfig = lambda **settings: ("sampler", settings)  # type: ignore[attr-defined]
+    lm.SamplerConfig = lambda **settings: ("sampler", settings)
     monkeypatch.setitem(sys.modules, "litert_lm", lm)
     samplers: list[Any] = []
     picture = tmp_path / "a.jpg"
@@ -420,10 +420,10 @@ def test_a_row_with_a_picture_goes_to_the_conversation_as_that_message(tmp_path,
 
 def test_the_engine_gets_a_vision_backend_only_for_pictures(monkeypatch):
     interfaces = types.ModuleType("litert_lm.interfaces")
-    interfaces.CPU = lambda thread_count=None: ("CPU", thread_count)  # type: ignore[attr-defined]
-    interfaces.GPU = lambda: ("GPU",)  # type: ignore[attr-defined]
+    interfaces.CPU = lambda thread_count=None: ("CPU", thread_count)
+    interfaces.GPU = lambda: ("GPU",)
     package = types.ModuleType("litert_lm")
-    package.interfaces = interfaces  # type: ignore[attr-defined]
+    package.interfaces = interfaces
     monkeypatch.setitem(sys.modules, "litert_lm", package)
     monkeypatch.setitem(sys.modules, "litert_lm.interfaces", interfaces)
     kwargs = _litertlm_script()["engine_kwargs"]
@@ -453,7 +453,7 @@ def test_the_reference_renders_a_picture_row_with_the_bundle_template(tmp_path, 
             return self
 
     pil = types.ModuleType("PIL")
-    pil.Image = types.SimpleNamespace(open=lambda handle: Picture())  # type: ignore[attr-defined]
+    pil.Image = types.SimpleNamespace(open=lambda handle: Picture())
     monkeypatch.setitem(sys.modules, "PIL", pil)
     namespace: dict[str, Any] = {"__name__": "hf_script"}
     exec(compile(_HF_GENERATE_SCRIPT, "hf", "exec"), namespace)  # noqa: S102
@@ -555,9 +555,9 @@ def test_a_text_probe_asks_for_neither():
 def test_the_runtime_script_reads_the_sections_before_any_engine(tmp_path, monkeypatch):
     built: list[Any] = []
     lm = types.ModuleType("litert_lm")
-    lm.Engine = lambda *a, **k: built.append(k)  # type: ignore[attr-defined]
-    lm.Backend = types.SimpleNamespace(CPU=lambda **k: "cpu")  # type: ignore[attr-defined]
-    lm.SamplerConfig = lambda **k: None  # type: ignore[attr-defined]
+    lm.Engine = lambda *a, **k: built.append(k)
+    lm.Backend = types.SimpleNamespace(CPU=lambda **k: "cpu")
+    lm.SamplerConfig = lambda **k: None
     monkeypatch.setitem(sys.modules, "litert_lm", lm)
     namespace: dict[str, Any] = {"__name__": "render_script"}
     exec(compile(_RUNTIME_SCRIPT, "render", "exec"), namespace)  # noqa: S102
@@ -596,7 +596,7 @@ def test_the_reference_script_renders_pictures_with_the_template(tmp_path, monke
             return {"input_ids": [2, 7]}
 
     transformers = types.ModuleType("transformers")
-    transformers.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda m: Tokenizer())  # type: ignore[attr-defined]
+    transformers.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda m: Tokenizer())
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     namespace: dict[str, Any] = {"__name__": "reference_script"}
     exec(compile(_REFERENCE_SCRIPT, "reference", "exec"), namespace)  # noqa: S102
@@ -692,19 +692,17 @@ def _run_reference_main(tmp_path, monkeypatch, *, vision=True, sticky=False):
             return [[2, 3, 9]]
 
     torch = types.ModuleType("torch")
-    torch.float32 = "float32"  # type: ignore[attr-defined]
-    torch.no_grad = __import__("contextlib").nullcontext  # type: ignore[attr-defined]
-    torch.cuda = types.SimpleNamespace(is_available=lambda: False)  # type: ignore[attr-defined]
+    torch.float32 = "float32"
+    torch.no_grad = __import__("contextlib").nullcontext
+    torch.cuda = types.SimpleNamespace(is_available=lambda: False)
     transformers = types.ModuleType("transformers")
-    transformers.AutoModelForCausalLM = types.SimpleNamespace(  # type: ignore[attr-defined]
+    transformers.AutoModelForCausalLM = types.SimpleNamespace(
         from_pretrained=lambda model, **kw: Model()
     )
-    transformers.AutoTokenizer = types.SimpleNamespace(  # type: ignore[attr-defined]
+    transformers.AutoTokenizer = types.SimpleNamespace(
         from_pretrained=lambda model: (_ for _ in ()).throw(AssertionError("not for pictures"))
     )
-    transformers.AutoProcessor = types.SimpleNamespace(  # type: ignore[attr-defined]
-        from_pretrained=lambda model: Processor()
-    )
+    transformers.AutoProcessor = types.SimpleNamespace(from_pretrained=lambda model: Processor())
 
     class Picture:
         def load(self):
@@ -714,7 +712,7 @@ def _run_reference_main(tmp_path, monkeypatch, *, vision=True, sticky=False):
             return self
 
     pil = types.ModuleType("PIL")
-    pil.Image = types.SimpleNamespace(open=lambda handle: Picture())  # type: ignore[attr-defined]
+    pil.Image = types.SimpleNamespace(open=lambda handle: Picture())
     for name, module in (("torch", torch), ("transformers", transformers), ("PIL", pil)):
         monkeypatch.setitem(sys.modules, name, module)
     picture = tmp_path / "a.jpg"
@@ -806,9 +804,9 @@ def test_the_rendering_main_renders_the_picture_message_on_a_vision_engine(tmp_p
             return [len(text)]
 
     lm = types.ModuleType("litert_lm")
-    lm.Engine = Engine  # type: ignore[attr-defined]
-    lm.Backend = types.SimpleNamespace(CPU=lambda **k: ("cpu", k))  # type: ignore[attr-defined]
-    lm.SamplerConfig = lambda **k: None  # type: ignore[attr-defined]
+    lm.Engine = Engine
+    lm.Backend = types.SimpleNamespace(CPU=lambda **k: ("cpu", k))
+    lm.SamplerConfig = lambda **k: None
     monkeypatch.setitem(sys.modules, "litert_lm", lm)
     namespace: dict[str, Any] = {"__name__": "render_script"}
     exec(compile(_RUNTIME_SCRIPT, "render", "exec"), namespace)  # noqa: S102

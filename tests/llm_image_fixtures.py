@@ -55,8 +55,8 @@ def write_checkpoint(
     """A checkpoint directory with processor files, the kept template and its record."""
     model.mkdir(parents=True, exist_ok=True)
     for name in PROCESSOR_FILES:
-        body = {"name": name} if name == "tokenizer_config.json" else name
-        text = json.dumps(body) if isinstance(body, dict) else body
+        content = {"name": name} if name == "tokenizer_config.json" else name
+        text = json.dumps(content) if isinstance(content, dict) else content
         (model / name).write_text(text, encoding="utf-8")
     (model / TEMPLATE_FILE).write_bytes(template.encode())
     (model / "config.json").write_text("{}", encoding="utf-8")
