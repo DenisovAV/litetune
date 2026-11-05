@@ -2435,7 +2435,8 @@ def _vision_carried(
     nothing before this reads what it wrote.
     """
     observed: dict[str, Any] = {"artifact": str(artifact)}
-    if carried is None or carried.unread is not None or carried.vision is None:
+    # An unread bundle carries no reading of its pictures either.
+    if carried is None or carried.vision is None:
         why = carried.unread if carried is not None and carried.unread else "it was not read"
         return (
             Check.unchecked(

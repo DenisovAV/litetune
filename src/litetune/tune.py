@@ -998,8 +998,8 @@ def build_examples(tok, rows, max_seq_length, runtime_rendered, tools=None, call
     }
 
 
-# The processor's outputs that run along the token sequence, and are extended
-# over the completion with zeros (a text token) to the row's length.
+# The processor's outputs that run along the token sequence, padded with zeros
+# (a text token) over the completion and the batch's padding.
 TOKEN_TYPE_KEYS = ("mm_token_type_ids", "token_type_ids")
 
 
@@ -1084,7 +1084,9 @@ def build_image_examples(tok, processor, rows, data_dir, max_seq_length, templat
             if key in ("input_ids", "attention_mask"):
                 continue
             if key in TOKEN_TYPE_KEYS:
-                inputs[key] = [int(v) for v in value[0].tolist()] + [0] * len(completion_ids)
+                # The prompt's; `image_inputs` pads it with zeros (a text token)
+                # to the batch's width, the completion included.
+                inputs[key] = [int(v) for v in value[0].tolist()]
             else:
                 inputs[key] = value
         supervised += len(completion_ids)
