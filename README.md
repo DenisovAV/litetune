@@ -972,12 +972,14 @@ text to measure.
   the vision sections it keeps are computed from them, and refuses `--npu`.
 - **verify** embeds every picture with the float32 fine-tune (transformers, on
   the CPU, with the checkpoint's own processor at the tuned budget) and with
-  the file (LiteRT-LM's `EmbeddingEngine`, CPU, each picture given as its
-  file), and with `--with-base` with Google's 440m file. It refuses a picture
+  the file (LiteRT-LM's `EmbeddingEngine`, each picture given as its bytes),
+  and with `--with-base` with Google's 440m file. With `--backend gpu`, on
+  macOS only as for text, the text tower runs on the GPU and the vision encoder
+  on the CPU, where flutter_edge_ai_litertlm 1.19.0 puts it. It refuses a picture
   in both splits, a reference whose soft tokens for a picture differ from the
   count `tune` recorded (the engine reports none, so the file's count is not
-  compared), a `convert.json` that records another budget, and `--backend
-  gpu`. LiteRT-LM 0.18.0 sets no thread count for the vision encoder, so the
+  compared), and a `convert.json` that records another budget. LiteRT-LM
+  0.18.0 sets no thread count for the vision encoder, so the
   file and Google's are embedded one after the other, and on a Mac whose CPU
   has SME2, where litetune holds LiteRT-LM to one thread, the file is embedded
   twice and a difference between the two runs fails the harness. The gate is

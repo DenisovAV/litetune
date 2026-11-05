@@ -280,8 +280,9 @@ IMAGE_GPU_MEASURED = (
     "1.19.0 puts the vision encoder beside a text tower on the GPU -- each image given as its "
     "bytes at a budget of at most {vision_tokens} vision tokens per image, from the litert-lm "
     "package on PyPI on this Mac, one file at a time -- not the application's own build of the "
-    "runtime on a device; the NPU is not measured. litetune has published no measurement of an "
-    "image checkpoint on the GPU (MEASUREMENTS.md). " + GPU_PRECISION
+    "runtime on a device; the NPU is not measured. litetune has published one measurement of "
+    'an image checkpoint on the GPU, on one Mac (MEASUREMENTS.md, "The same int8 file on a '
+    "Mac's CPU and GPU, and on Windows\"). " + GPU_PRECISION
 )
 IMAGE_REFERENCE_ON_CPU = (
     "the reference ran on the CPU in float32 through transformers, whatever LITETUNE_DEVICE says: "
