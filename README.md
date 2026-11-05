@@ -1164,6 +1164,56 @@ runtime ([MEASUREMENTS.md](MEASUREMENTS.md#towers-grafted-into-an-sm8850-npu-bun
 
 ---
 
+### Gemma 4 E2B tuned on pictures
+
+`google/gemma-4-E2B-it` can be tuned on rows that carry a picture and still take
+pictures after `convert`. Each row is a prompt, the answer, and a picture beside
+it, PNG or JPEG:
+
+```json
+{"prompt": "Which of these does this bean leaf show: angular_leaf_spot, bean_rust or healthy? Answer with the label only.", "completion": "bean_rust", "image": "leaves/0412.jpg"}
+```
+
+```bash
+litetune prepare --data rows.jsonl --output-dir split --base-model google/gemma-4-E2B-it
+litetune tune --model google/gemma-4-E2B-it --data split/train.jsonl --output-dir run
+litetune convert --model run/model --recipe dynamic_wi8_afp32 --output-dir conv
+litetune verify --model conv/dynamic_wi8_afp32/model.litertlm --reference run/model \
+                --data split/heldout.jsonl --scorer exact-text
+```
+
+- **prepare** copies each picture byte for byte as `images/<sha256>` and keeps rows
+  that share a picture in the same half of the split. It refuses a picture it cannot
+  decode, a format other than PNG or JPEG, more than one picture in a row, rows with
+  and without pictures in one file, and rows with pictures when `--base-model` is not
+  given: pictures are used for `google/gemma-4-E2B-it` and for EmbeddingGemma 2 only.
+  For any other model an `image` field is left out and the report says so.
+- **tune** trains LoRA on the text tower (the seven projections), with the vision and
+  audio towers and the token embeddings frozen and checked unchanged after the merge.
+  The prompt is rendered with the template the converted bundle will carry --
+  `litert-community/gemma-4-E2B-it-litert-lm` at `b3ca0d2f`, sha256 `02b3091a...`,
+  refused if it differs -- with the picture before the text, as flutter_edge_ai sends
+  it, at up to 280 soft tokens per picture. That template puts blank lines around the
+  picture where the checkpoint's own template does not, so a model tuned on the
+  checkpoint's template would be trained on a prompt the app never sends. It runs in
+  the `train-vision` environment (`train` plus `torchvision==0.20.1` and
+  `pillow==12.3.0`; the Gemma 4 image processor does not load without torchvision).
+- **convert** exports the tuned checkpoint with its vision encoder (litert-torch's
+  `image_text_to_text` task, 280 soft tokens, `max_num_patches` 2520) in the
+  `export-vision` environment (`export` plus `torchvision==0.29.2`), reads the bundle
+  back for its vision sections, image markers, budget and template, and constrains
+  the vision encoder and adapter to the CPU, the only vision backend measured.
+- **verify** gives the reference each picture through the checkpoint's processor and
+  the same template, and the candidate the picture's bytes in the message shape the
+  app sends, on a CPU vision backend. `--backend gpu` is refused for picture rows.
+
+The bundle keeps the sampler the exporter writes, TOP_P with top_k 64 and
+temperature 1.0, as litetune's text bundles get the Gemma 4 family default from
+flutter_edge_ai: an app that passes no sampler samples. `verify` sends top_k 1 in
+its place, so its number is for an app that passes top_k 1 itself; for a label like
+the one above, pass it. What has been measured is in
+[MEASUREMENTS.md](MEASUREMENTS.md#gemma-4-e2b-tuned-on-pictures-beans).
+
 ## What it knows that a shell script does not
 
 Each of these was paid for once, by an artifact that looked fine and was not.
