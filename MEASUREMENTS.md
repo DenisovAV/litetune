@@ -1003,13 +1003,16 @@ projections, lr 2e-4, 2 epochs, batch 8; each picture took 256 soft tokens.
 - On the second split, before tuning, the checkpoint answered 0.4833 of the held-out
   pictures exactly through transformers and Google's own
   `gemma-4-E2B-it.litertlm` (at `b3ca0d2f`) 0.4967 through litert-lm 0.18.0, measured
-  by scripts outside litetune.
+  by scripts outside litetune, as are the three runs in the next point.
 - The same rows tuned by a script outside litetune scored 0.9367 in float32; that
   script with another seed and shuffle order, 0.9167; with litetune's token-weighted
   loss, 0.9067. Its inputs were byte for byte litetune's (the rendered prompt,
   `input_ids`, pixel values, image positions and completion ids of 20 rows compared).
-  Every one of these runs confused angular_leaf_spot and bean_rust most. One run per
-  setting does not separate the loss weighting from the seed.
+  Each run's weakest label was one of the two diseases: bean_rust in the three runs
+  outside litetune (88, 77 and 81 of 99 right), angular_leaf_spot in an earlier tune by
+  litetune on the same split, before the review fixes, which scored the same 0.8800 (71
+  of 99, 26 of its 36 errors answered as bean_rust). One run per setting does not separate
+  the loss weighting from the seed.
 - On the second split tune took 1,393 s and peaked at 11.44 GB of CUDA memory, and
   convert took 853 s.
   Every tensor of the vision and audio towers and the token embeddings hashed the

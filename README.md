@@ -1182,7 +1182,7 @@ litetune verify --model conv/dynamic_wi8_afp32/model.litertlm --reference run/mo
                 --data split/heldout.jsonl --scorer exact-text
 ```
 
-- **prepare** copies each picture byte for byte as `images/<sha256>` and keeps rows
+- **prepare** copies each picture byte for byte as `images/<sha256>.<ext>` and keeps rows
   that share a picture in the same half of the split. It refuses a picture it cannot
   decode, a format other than PNG or JPEG, more than one picture in a row, rows with
   and without pictures in one file, and rows with pictures when `--base-model` is not
