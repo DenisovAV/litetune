@@ -39,7 +39,7 @@ from typing import Any
 
 from packaging.requirements import InvalidRequirement, Requirement
 
-from litetune import envs, models, template_checks, wheels
+from litetune import envs, llm_images, models, template_checks, wheels
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.events import EventStream
 from litetune.exits import read_returncode
@@ -475,6 +475,10 @@ class ExportRequest:
     env: envs.StageEnv = envs.EXPORT
     auto_provision: bool = True
     hash_artifacts: bool = True
+    # Where a checkpoint `tune` trained on pictures exports, with its vision
+    # encoder: EXPORT plus torchvision (`envs.EXPORT_VISION`). `__post_init__`
+    # puts it in `env` for such a checkpoint; for any other it is unused.
+    vision_env: envs.StageEnv = field(default=envs.EXPORT_VISION, kw_only=True)
 
     def __post_init__(self) -> None:
         cleaned: list[str] = []
@@ -519,6 +523,35 @@ class ExportRequest:
                 prefill_source = "decision checkpoint"
         object.__setattr__(self, "_decision", decision)
         object.__setattr__(self, "_prefill_source", prefill_source)
+        # A checkpoint trained on pictures exports with its vision encoder, at
+        # the budget it trained at, from the template it trained on, in the
+        # environment that has the image processor (`llm_images`). Those flags
+        # are litetune's for it: a caller's own setting of one is refused, since
+        # the bundle would then not be the model that was trained.
+        images, images_problem = _recorded_images(self.model)
+        if images is not None:
+            try:
+                caller_set = models.parse_exporter_flags(self.model, requested)
+            except models.FlagRefused:
+                caller_set = {}
+            owned = [*llm_images.EXPORT_FLAGS, models.TEMPLATE_FLAG]
+            taken = [
+                caller_set[models.flag_key(flag.split("=", 1)[0])].token
+                for flag in owned
+                if models.flag_key(flag.split("=", 1)[0]) in caller_set
+            ]
+            if taken:
+                raise models.FlagRefused(
+                    f"{self.model}: litetune refuses {', '.join(taken)}: this checkpoint was "
+                    "trained on pictures, and convert sets "
+                    f"{', '.join(owned)} for it itself, so that the bundle carries the vision "
+                    "encoder, the budget and the template the pictures were trained with"
+                )
+            template = llm_images.template_file(self.model).absolute()
+            requested += [*llm_images.EXPORT_FLAGS, f"{models.TEMPLATE_FLAG}={template}"]
+            object.__setattr__(self, "env", self.vision_env)
+        object.__setattr__(self, "_images", images)
+        object.__setattr__(self, "_images_problem", images_problem)
         # `convert`'s own option is the caller's setting, so it enters the table
         # the plan reads like any `--flag=`: an opt-out a family cannot export
         # without is then refused by the plan, not overridden by its rule.
@@ -568,6 +601,16 @@ class ExportRequest:
         object.__setattr__(self, "_externalize_source", source)
         object.__setattr__(self, "_externalized", externalized)
         object.__setattr__(self, "_plan", plan)
+
+    @property
+    def images(self) -> dict[str, Any] | None:
+        """The checkpoint's `llm_images` record, when `tune` trained it on pictures."""
+        return self._images  # type: ignore[attr-defined]
+
+    @property
+    def images_problem(self) -> str | None:
+        """Why the checkpoint's picture record or template cannot be exported from."""
+        return self._images_problem  # type: ignore[attr-defined]
 
     def decision_record(self) -> dict[str, Any] | None:
         """The decision the checkpoint records, and the prefill lengths it was exported with."""
@@ -681,6 +724,7 @@ class ExportRequest:
             "flags": list(self.extra_flags),
             "model_rules": self.plan.as_dict(),
             "decision": self.decision_record(),
+            "images": self.images,
             "timeout_s": self.timeout_s,
             "environment": {
                 "name": self.env.name,
@@ -696,6 +740,30 @@ class ExportRequest:
 # ---------------------------------------------------------------------------
 # One recipe
 # ---------------------------------------------------------------------------
+
+
+def _recorded_images(model: str) -> tuple[dict[str, Any] | None, str | None]:
+    """The checkpoint's picture record, and why it cannot be exported from (`None`: it can).
+
+    The record names the template `tune` trained on; a file that is missing or
+    whose bytes are not the recorded ones is a problem `run_export` refuses on,
+    since the bundle would carry a template the pictures were not trained with.
+    """
+    try:
+        record = llm_images.image_record(model)
+    except llm_images.ImageRowError as exc:
+        return None, str(exc)
+    except (OSError, ValueError):
+        # An unreadable `litetune.json` is reported through the identity, as for
+        # every record (`models.provenance_error`).
+        return None, None
+    if record is None:
+        return None, None
+    try:
+        llm_images.checked_template(model, record)
+    except llm_images.ImageRowError as exc:
+        return record, str(exc)
+    return record, None
 
 
 def _recorded_decision(model: str) -> dict[str, Any] | None:
@@ -752,6 +820,10 @@ class RecipeExport:
     # (`template_checks`), which `run_export` fills in once per template.
     bundle_template: BundleTemplate | None = field(default=None, repr=False)
     conversation: ConversationCheck | None = None
+    # A checkpoint trained on pictures: what the bundle was read back to carry
+    # for them -- its vision sections, budget, sampler and template digest.
+    # `None` for every other bundle.
+    vision: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -803,6 +875,7 @@ class RecipeExport:
             "stderr": self.stderr,
             "stdout_tail": self.stdout_tail,
             "conversation": self.conversation.as_dict() if self.conversation else None,
+            "vision": self.vision,
         }
 
 
@@ -1918,7 +1991,59 @@ def chat_template_in(directory, doc):
         "present": present,
         "template": meta.jinja_prompt_template if present else None,
         "start_token": start,
+        "vision": vision_in(doc, meta),
     }
+
+
+def has(message, name):
+    """Whether `message` sets `name`; a scalar without presence counts when it is not zero."""
+    try:
+        return message.HasField(name)
+    except ValueError:
+        return bool(getattr(message, name))
+
+
+def token_of(message, name):
+    if not has(message, name):
+        return None
+    token = getattr(message, name)
+    return token.token_str if token.HasField("token_str") else list(token.token_ids.ids)
+
+
+def vision_in(doc, meta):
+    """What the bundle carries for pictures: section types, Gemma 4's media fields, sampler."""
+    types = sorted(
+        {
+            str(s.get("model_type", "")).lower().removeprefix("tf_lite_")
+            for s in doc.get("section", [])
+            if s.get("model_type")
+        }
+    )
+    gemma4 = None
+    if has(meta, "llm_model_type") and has(meta.llm_model_type, "gemma4"):
+        g = meta.llm_model_type.gemma4
+        gemma4 = {
+            "start_of_image_token": token_of(g, "start_of_image_token"),
+            "end_of_image_token": token_of(g, "end_of_image_token"),
+            "max_num_patches": int(g.max_num_patches) if has(g, "max_num_patches") else None,
+        }
+    sampler = None
+    if has(meta, "sampler_params"):
+        p = meta.sampler_params
+        # The enum's name; a number this proto does not name stays the number,
+        # which no check reads as GREEDY.
+        kind = p.type
+        try:
+            kind = p.DESCRIPTOR.fields_by_name["type"].enum_type.values_by_number[p.type].name
+        except (AttributeError, KeyError, TypeError):
+            pass
+        sampler = {
+            "type": kind,
+            "k": int(p.k),
+            "p": float(p.p),
+            "temperature": float(p.temperature),
+        }
+    return {"section_types": types, "gemma4": gemma4, "sampler": sampler}
 
 
 def report(declared=None, written=False, reason=None, broken=None):
@@ -2071,6 +2196,10 @@ class BundleTemplate:
     empty: bool = False
     # The section's `start_token`: its `token_str`, its ids, or None for none.
     start_token: str | list[int] | None = None
+    # What the bundle carries for pictures, as `_REPACK_SCRIPT`'s `vision_in`
+    # read it: section types, Gemma 4's media fields, the sampler. `None` when
+    # the reading did not say.
+    vision: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -2218,8 +2347,12 @@ def _bundle_template(path: Path | None, note: str | None) -> BundleTemplate:
     start = data.get("start_token")
     if not (start is None or isinstance(start, str) or isinstance(start, list)):
         return BundleTemplate(unread=f"the repack script's reading is not one this reads: {data!r}")
+    vision = data.get("vision")
     return BundleTemplate(
-        text=text if data.get("present") else None, sections=sections, start_token=start
+        text=text if data.get("present") else None,
+        sections=sections,
+        start_token=start,
+        vision=vision if isinstance(vision, dict) else None,
     )
 
 
@@ -2288,6 +2421,77 @@ def _template_carried(
             | {"start_token": carried.start_token, "start_token_checked": composed.start_token},
         )
     return None
+
+
+def _vision_carried(
+    name: str, artifact: Path, record: dict[str, Any], carried: BundleTemplate | None
+) -> tuple[Check | None, dict[str, Any] | None]:
+    """Refuse a bundle that does not take pictures the way its checkpoint was trained on them.
+
+    `(None, facts)` when it does. Read back from the bundle itself: it must
+    carry every `llm_images.VISION_SECTIONS`, Gemma 4's image markers and
+    `llm_images.MAX_NUM_PATCHES`, a greedy sampler or none, and as its template
+    the bytes `tune` trained with. The exporter is handed all of these, and
+    nothing before this reads what it wrote.
+    """
+    observed: dict[str, Any] = {"artifact": str(artifact)}
+    if carried is None or carried.unread is not None or carried.vision is None:
+        why = carried.unread if carried is not None and carried.unread else "it was not read"
+        return (
+            Check.unchecked(
+                name,
+                f"{artifact.name}: what it carries for pictures could not be read back ({why}), "
+                "so nothing shows it takes them",
+                observed=observed,
+            ),
+            None,
+        )
+    vision = carried.vision
+    types = list(vision.get("section_types") or [])
+    gemma4 = vision.get("gemma4") or {}
+    sampler = vision.get("sampler")
+    template_sha256 = (
+        hashlib.sha256(carried.text.encode("utf-8")).hexdigest() if carried.text else None
+    )
+    facts = {
+        "vision_encoder": "vision_encoder" in types,
+        "section_types": types,
+        "vision_tokens": record["vision_tokens"],
+        "max_num_patches": gemma4.get("max_num_patches"),
+        "start_of_image_token": gemma4.get("start_of_image_token"),
+        "end_of_image_token": gemma4.get("end_of_image_token"),
+        "sampler": sampler,
+        "template_sha256": template_sha256,
+    }
+    observed |= facts
+    missing = [section for section in llm_images.VISION_SECTIONS if section not in types]
+    problem = None
+    if missing:
+        problem = (
+            f"carries no {', '.join(missing)} section, so it cannot take a picture; it has "
+            f"{', '.join(types) or 'no sections'}"
+        )
+    elif not facts["start_of_image_token"] or not facts["end_of_image_token"]:
+        problem = "names no start or end of image token in its Gemma 4 metadata"
+    elif facts["max_num_patches"] != llm_images.MAX_NUM_PATCHES:
+        problem = (
+            f"sets max_num_patches {facts['max_num_patches']!r}, where the pictures were trained "
+            f"at {record['vision_tokens']} soft tokens, {llm_images.MAX_NUM_PATCHES} patches"
+        )
+    elif sampler is not None and sampler.get("type") != "GREEDY":
+        problem = (
+            f"declares a {sampler.get('type')} sampler (top_k {sampler.get('k')}, top_p "
+            f"{sampler.get('p')}, temperature {sampler.get('temperature')}), where convert asked "
+            "for a greedy one"
+        )
+    elif template_sha256 != record["template_sha256"]:
+        problem = (
+            f"carries a template with sha256 {template_sha256}, not the "
+            f"{record['template_sha256']} the pictures were trained with"
+        )
+    if problem is not None:
+        return Check.failed(name, f"{artifact.name} {problem}", observed=observed), None
+    return None, facts
 
 
 _CONVERSATION_BODY = r'''
@@ -2664,6 +2868,9 @@ def export_recipe(
         )
     elif composed is not None:
         refused = _template_carried(name, artifact, composed, repack.template)
+    vision = None
+    if refused is None and request.images is not None:
+        refused, vision = _vision_carried(name, artifact, request.images, repack.template)
     if refused is not None:
         # Not handed on as an artifact, and not left where one would be.
         return RecipeExport(**base, check=_set_aside(refused, artifact))
@@ -2686,10 +2893,17 @@ def export_recipe(
         gpu_activation=gpu_activation,
         gpu_activation_note=gpu_note,
         bundle_template=repack.template,
+        vision=vision,
         check=Check.passed(
             name,
             f"{artifact.name}: {artifact_bytes:,} bytes in {seconds:.1f}s exported on cpu; "
-            f"{gpu_text} — produced, not verified",
+            f"{gpu_text}"
+            + (
+                f"; takes pictures at {vision['vision_tokens']} soft tokens"
+                if vision is not None
+                else ""
+            )
+            + " — produced, not verified",
             observed=observed
             | {
                 "artifact": str(artifact),
@@ -2698,6 +2912,7 @@ def export_recipe(
                 "sha256": digest,
                 "gpu_activation": gpu_activation,
                 "gpu_activation_note": gpu_note,
+                "vision": vision,
                 "verified": False,
             },
         ),
@@ -2945,6 +3160,20 @@ def run_export(request: ExportRequest, events: EventStream | None = None) -> Exp
                     "base_model_flag": request.base_model,
                     "recorded": models.recorded_identity(request.model),
                 },
+            )
+        )
+        result.not_attempted = tuple(request.recipes)
+        events.stage_finished(result.outcome.value, attempted=0)
+        return result
+
+    # A checkpoint trained on pictures whose record or template cannot be read
+    # back would export a bundle that does not take pictures as it learned to.
+    if request.images_problem:
+        result.checks.add(
+            Check.failed(
+                "pictures",
+                f"{request.images_problem}; nothing was exported",
+                observed={"model": request.model},
             )
         )
         result.not_attempted = tuple(request.recipes)
