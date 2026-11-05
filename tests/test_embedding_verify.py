@@ -42,6 +42,7 @@ from litetune.embedding_tune import (
     write_embedding_record,
 )
 from litetune.embedding_verify import (
+    BASE_CHECK,
     BASE_EMBED_CHECK,
     CANDIDATE_CHECK,
     DEFAULT_MAX_CONVERSION_COST,
@@ -1033,6 +1034,8 @@ class FakeEmbedEnvs:
         name = Path(args[1]).stem
         spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
         self.timeouts[name] = timeout
+        # A script runs in an environment a provision finished, as `StageEnv.run` needs.
+        assert env.ready, f"{name} ran in {env.name}, which was never provisioned"
         if name != "engines":  # the sides it runs are recorded one by one below
             self.runs.append((name, env.name))
             self.specs[name] = spec
@@ -1458,6 +1461,30 @@ def test_with_base_downloads_googles_file_in_the_reference_env(fake, tmp_path):
     assert envs.EXPORT.name not in fake.provisioned
     assert all(env != envs.EXPORT.name for _, env in fake.runs)
     assert "gain_over_base" in m["quality"]
+
+
+def test_a_failed_download_of_googles_file_is_the_base_check_failing(fake, tmp_path):
+    fake.fail = {"download"}
+    result = _verify(_setup(tmp_path), with_base=True)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
+    assert failed["name"] == BASE_CHECK
+    assert "could not be fetched" in failed["detail"] and "boom" in failed["detail"]
+
+
+def test_with_base_on_a_host_without_the_reference_env_names_the_reference(
+    fake, tmp_path, monkeypatch
+):
+    def cannot(self, events=None, force: bool = False) -> Path:
+        raise RuntimeError(f"{self.name} cannot be installed here")
+
+    monkeypatch.setattr(envs.StageEnv, "provision", cannot)
+    result = _verify(_setup(tmp_path), with_base=True)
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
+    assert failed["name"] == REFERENCE_CHECK
+    assert f"{envs.EMBED_TRAIN.name} cannot be installed here" in failed["detail"]
+    assert fake.runs == []
 
 
 @pytest.mark.parametrize("script", ["reference", "candidate", "evaluate"])
