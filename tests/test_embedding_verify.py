@@ -2118,6 +2118,25 @@ def test_a_file_compiled_for_an_npu_is_refused_before_any_run(fake, tmp_path):
     assert fake.runs == []
 
 
+def test_an_image_file_compiled_for_an_npu_is_refused_before_any_run(fake, tmp_path):
+    """An image checkpoint's `convert --npu` file: Google's text-vision file for the SoC
+    with the compiled encoder in it, and a report of kind npu as a text one's."""
+    s = _image_setup(tmp_path, fake)
+    digest = hash_file(s.model).removeprefix("sha256:")
+    report = json.loads((s.model.parent / REPORT_NAME).read_text(encoding="utf-8"))
+    report |= {
+        "kind": "npu",
+        "npu": {"soc": "SM8650", "sha256": digest, "splice": {"sha256": hash_file(s.model)}},
+        "google_vision_npu_file": {"filename": "x_Qualcomm_SM8650.litertlm"},
+    }
+    (s.model.parent / REPORT_NAME).write_text(json.dumps(report), encoding="utf-8")
+    result = _verify(s)
+    assert result.status is Status.FAILED_HARNESS
+    failed = _failed(result.manifest)
+    assert failed[0]["name"] == CANDIDATE_CHECK and "Qualcomm SM8650 NPU" in failed[0]["detail"]
+    assert fake.runs == []
+
+
 # -- the engines' CPU threads on a CPU with SME2 -------------------------------
 
 

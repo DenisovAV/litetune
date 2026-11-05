@@ -969,7 +969,14 @@ text to measure.
   wrote them, read back against both inputs. The weights default to int8
   (523,173,888 bytes); `--weights int4` writes 387,710,976, Google's size. It
   first refuses a checkpoint whose frozen tensors differ from the base's, since
-  the vision sections it keeps are computed from them, and refuses `--npu`.
+  the vision sections it keeps are computed from them. With `--npu <SoC>` (int8,
+  Linux x86-64, as for text) it also compiles the graft's text encoder as above
+  and writes `artifacts/int8-npu-<SoC>/model.litertlm`: Google's
+  `embeddinggemma-2-text-vision-440m_Qualcomm_<SoC>.litertlm` (same revision,
+  checked by its sha256) with only its compiled text encoder replaced. The vision
+  encoder there is Google's own NPU build, and the embedder Google's int4 one.
+  `verify` refuses it; one such file has run, on a Galaxy S25 Ultra's NPU
+  (SM8750), measured in [MEASUREMENTS.md](MEASUREMENTS.md).
 - **verify** embeds every picture with the float32 fine-tune (transformers, on
   the CPU, with the checkpoint's own processor at the tuned budget) and with
   the file (LiteRT-LM's `EmbeddingEngine`, each picture given as its bytes),

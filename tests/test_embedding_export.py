@@ -15,7 +15,7 @@ import hashlib
 import json
 import struct
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +57,13 @@ from litetune.embedding_tune import (
     read_embedding_record,
     write_embedding_record,
 )
-from litetune.embedding_vision import VISION_FILE, VISION_REPO, VISION_REVISION, SpliceResult
+from litetune.embedding_vision import (
+    VISION_FILE,
+    VISION_NPU_FILES,
+    VISION_REPO,
+    VISION_REVISION,
+    SpliceResult,
+)
 from litetune.events import EventStream
 from litetune.storage import hash_file
 
@@ -112,6 +118,11 @@ def _digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
+def vision_npu_bytes(soc: str) -> bytes:
+    """The stand-in for Google's text-vision file for `soc`."""
+    return f"not google's {soc} text-vision file, a stand-in".encode()
+
+
 @dataclass
 class FakeHub:
     """`StageEnv.run` on the download script: writes each file asked for under `root`."""
@@ -119,6 +130,8 @@ class FakeHub:
     root: Path
     fail: bool = False
     asked: list[list[dict[str, str]]] = field(default_factory=list)
+    # By file name: bytes to write in place of the stand-in.
+    files: dict[str, bytes] = field(default_factory=dict)
 
     def __call__(self, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
         spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
@@ -130,6 +143,8 @@ class FakeHub:
             path = self.root / f["repo"].replace("/", "--") / f["revision"] / f["filename"]
             path.parent.mkdir(parents=True, exist_ok=True)
             stand_in = {GOOGLE_FILE: GOOGLE_BYTES, VISION_FILE: VISION_BYTES}
+            stand_in |= {p.filename: vision_npu_bytes(soc) for soc, p in VISION_NPU_FILES.items()}
+            stand_in |= self.files
             path.write_bytes(stand_in.get(f["filename"], BASE_BYTES))
             paths.append(str(path))
         Path(spec["out"]).write_text(
@@ -198,6 +213,9 @@ def hub(monkeypatch, tmp_path) -> FakeHub:
     monkeypatch.setattr(embedding_export, "GOOGLE_SHA256", hashlib.sha256(GOOGLE_BYTES).hexdigest())
     monkeypatch.setattr(embedding_export, "BASE_SHA256", hashlib.sha256(BASE_BYTES).hexdigest())
     monkeypatch.setattr(embedding_export, "VISION_SHA256", hashlib.sha256(VISION_BYTES).hexdigest())
+    for soc, pinned in list(VISION_NPU_FILES.items()):
+        digest = hashlib.sha256(vision_npu_bytes(soc)).hexdigest()
+        monkeypatch.setitem(VISION_NPU_FILES, soc, replace(pinned, sha256=digest))
     return fake
 
 
@@ -741,23 +759,6 @@ def test_int4_for_a_text_checkpoint_carries_no_image_limitation(hub, grafter, tm
     out = tmp_path / "out"
     _convert(_checkpoint(tmp_path), out, "--weights", "int4")
     assert embedding_export.IMAGE_INT4_NOT_MEASURED not in _report(out, "int4")["limitations"]
-
-
-@pytest.mark.parametrize("weights", [(), ("--weights", "int8"), ("--weights", "int4")])
-def test_npu_for_an_image_checkpoint_is_refused_before_anything_runs(
-    hub, grafter, splicer, tmp_path, capsys, weights
-):
-    out = tmp_path / "out"
-    assert _convert(_image_checkpoint(tmp_path), out, "--npu", "SM8750", *weights) == 4
-    assert hub.asked == [] and grafter.calls == [] and splicer.calls == []
-    assert "tuned on images" in capsys.readouterr().err
-    assert not out.exists()
-
-
-def test_npu_for_an_image_checkpoint_is_refused_by_the_run_too(hub, grafter, splicer, tmp_path):
-    with pytest.raises(EmbeddingExportError, match="tuned on images"):
-        _run(tmp_path, model=_image_checkpoint(tmp_path), weights="int8", npu=("SM8750",))
-    assert hub.asked == [] and grafter.calls == []
 
 
 def test_a_local_text_vision_file_is_used_and_not_downloaded(hub, grafter, splicer, tmp_path):

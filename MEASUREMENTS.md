@@ -2488,8 +2488,8 @@ The 10-shot draws, the same five for every side, and the paired differences on t
   481.7 ms and Google's 486.7 ms. The reference took 922.5 s (int8 run) and 941.8 s (int4
   run) for the 1,165 pictures. The reference's and Google's accuracies were the same in both
   verify runs, draw for draw.
-- Not measured: 140 vision tokens, `--mirror`, an NPU (`convert` does not compile an image
-  file), and the spliced file through flutter_edge_ai on any device.
+- Not measured: 140 vision tokens, `--mirror`, and the spliced file through flutter_edge_ai
+  on any device.
 
 ### The same int8 file on a Mac's CPU and GPU, and on Windows
 
@@ -2521,6 +2521,48 @@ The Windows run used litetune at `c493291` installed from a wheel, with Google's
 as `--base-litertlm`: `--with-base` could not fetch it there, because `verify` provisions the
 `export` environment to download it and that environment needs `litert-converter`, which
 publishes no Windows wheel.
+
+### The same fine-tune on a phone's NPU
+
+Measured 2026-11-05 on one Galaxy S25 Ultra (SM-S938U1, SM8750, Android 15): the beans
+fine-tune above, its file from `convert --npu SM8750` with the image support that came with
+this measurement (unreleased), 503,611,392 bytes. That file is Google's `embeddinggemma-2-text-vision-440m_Qualcomm_SM8750.litertlm` (revision `e301f74d`) with its
+text encoder replaced by the int8 graft's, compiled in 278 s (QAIRT 2.50.0, ai-edge-litert
+2.3.0, weight sharing; one `DISPATCH_OP` per signature, a 169,582,592-byte QNN context). Its
+vision encoder, vision adapter and embedder are Google's, the embedder in four bits where the
+CPU file's is the graft's eight.
+
+The phone ran LiteRT-LM 0.18.0's EmbeddingEngine through the C API, with the same libraries
+as *EmbeddingGemma 2 on a Qualcomm NPU* above (`native-v0.18.0-h`, QNN runtime 2.50.0), each
+picture given as its JPEG bytes at 70 vision tokens, on the 1,165 pictures of the split above.
+On the NPU the engine's log shows both encoders dispatched to it: the vision encoder
+(`vision_70`, Google's 257 MB QNN context) and the text encoder (`encoder_1x128`, the compiled
+one); the vision adapter ran on the CPU (XNNPACK). The CPU file ran on four CPU threads, its
+vision encoder on the runtime's default. Accuracy is verify's k=10 centroid decider on the
+same five draws, computed from the vectors the phone wrote, and paired differences are
+`metrics.paired_difference`; there is no float32 reference on this side, so no conversion
+cost.
+
+| on the phone | k=10 mean | k=10, per draw | ms per picture, median | peak RSS |
+|---|---|---|---|---|
+| NPU, the fine-tune's SM8750 file | 0.9367 | 0.9333, 0.9333, 0.9367, 0.9433, 0.9367 | 70.7 | 661 MiB |
+| CPU, the fine-tune's int8 file | 0.9300 | 0.9233, 0.9300, 0.9267, 0.9300, 0.9400 | 844.8 | 862 MiB |
+| NPU, Google's SM8750 file | 0.8120 | 0.7867, 0.8067, 0.8233, 0.8367, 0.8067 | 68.7 | 609 MiB |
+
+- On the 300 held-out pictures the NPU file's vectors had mean cosine 0.9746 (minimum
+  0.8596) to the CPU file's, on the same phone.
+- NPU file minus CPU file on the phone, paired per draw: +0.0100 ±0.0173, +0.0033 ±0.0146,
+  +0.0100 ±0.0173, +0.0133 ±0.0131, -0.0033 ±0.0173. The fourth is resolved, by 0.0002;
+  the other four are not. On the CPU files elsewhere the fine-tune scored 0.9327 to 0.9353
+  (above), no paired difference computed against the phone.
+- The fine-tune's NPU file minus Google's, paired per draw: +0.1467 ±0.0506, +0.1267
+  ±0.0471, +0.1133 ±0.0443, +0.1067 ±0.0423, +0.1300 ±0.0467, resolved in every draw.
+  Google's NPU file scored 0.8120, its CPU file 0.8233 on the Xeon and 0.8287 on the Mac.
+- Every picture was embedded on all three sides, none refused; each side embedded its first
+  picture twice and got the same vector. Loading took 1.14 s (fine-tune, NPU), 1.19 s
+  (Google's, NPU) and 1.59 s (CPU).
+- Not measured: the other three SoCs `convert --npu` writes a file for (SM8550, SM8650,
+  SM8850), 140 vision tokens on the NPU, and this file through flutter_edge_ai.
 
 ## LLMs on a Qualcomm NPU
 

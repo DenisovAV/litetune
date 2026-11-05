@@ -8,7 +8,8 @@ one is and what the TOML says of it, so each section holds its own name. The
 text-vision file's TOML is laid out as Google's 440m file's is (litert-lm-builder
 0.18.0's `unpack` of it, 2026-11-04): the text sections, then the vision tower's,
 with the vision encoder's activation-type metadata and the adapter's CPU
-constraint.
+constraint. The NPU splice's inputs are laid out as Google's Qualcomm text-vision
+files' headers and as `compile_for_npu`'s pack (`NPU_VISION_TOML`, `COMPILED_TOML`).
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import os
 import subprocess
 import sys
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from test_towers import FAKE_BUILDER, FAKE_FORMAT, FAKE_PEEK
 
 from litetune import embedding_vision, envs
 from litetune.embedding_convert import EmbeddingConvertError
+from litetune.embedding_npu import NPU_SOCS
 from litetune.embedding_tune import (
     DECIDER_PREFIX,
     EMBEDDING_MODEL,
@@ -42,7 +44,7 @@ from litetune.embedding_tune import (
     read_embedding_record,
     write_embedding_record,
 )
-from litetune.embedding_vision import _SPLICE_SCRIPT, SpliceResult, splice
+from litetune.embedding_vision import _SPLICE_SCRIPT, SpliceResult, splice, splice_npu
 from litetune.towers import _TOWERS_SCRIPT, BUILDER_TYPES
 
 # tomli below Python 3.11, as the builder itself; by name, so that mypy, checking
@@ -591,6 +593,240 @@ def test_the_read_back_names_a_text_section_moved_elsewhere(towers_script, tmp_p
     swapped["vision weights"] = GRAFTED["encoder weights"]
     rebuilt = write(tmp_path / "r.litertlm", VISION_TOML, swapped)
     read_back_refused(towers_script, tmp_path, rebuilt, r"section 8 \(TFLiteWeights text_enc")
+
+
+# -- the NPU splice: the compiled encoder into Google's text-vision file for a SoC ---
+
+# Google's Qualcomm text-vision files as litert-lm-builder 0.18.0's header schema
+# lists them (all four SoCs alike, 2026-11-04; `VISION_NPU_FILES`): the text encoder
+# and the vision encoder compiled, neither with a weights section, and the vision
+# encoder without the CPU file's activation-type metadata.
+NPU_VISION_TOML = [
+    TEXT_TOML[0],
+    TEXT_TOML[1],
+    TEXT_TOML[2],
+    TEXT_TOML[3],
+    (
+        'model_type = "vision_encoder"\nsection_type = "TFLiteModel"\n'
+        'data_path = "Section4_TFLiteModel_tf_lite_vision_encoder.tflite"',
+        "vision graph",
+    ),
+    VISION_TOML[5],
+    VISION_TOML[6],
+    (TEXT_TOML[4][0].replace("Section4", "Section7"), "embedder weights"),
+    (VISION_TOML[10][0].replace("Section10", "Section8"), "adapter weights"),
+]
+# What `compile_for_npu` packs (embedding_npu's script, `main`): the graft's metadata,
+# tokenizer and embedder, and the compiled encoder, which has no weights section.
+COMPILED_TOML = [TEXT_TOML[0], TEXT_TOML[1], TEXT_TOML[2], TEXT_TOML[3], TEXT_TOML[4]]
+COMPILED_ENCODER = b"the compiled encoder"
+# The compile's other sections are the graft's, which are not Google's.
+COMPILED = {
+    "meta": b"graft's meta",
+    "tokenizer": b"graft's tokenizer",
+    "embedder graph": b"graft's embedder graph",
+    "encoder graph": COMPILED_ENCODER,
+    "embedder weights": b"graft's embedder weights",
+}
+ENCODER_SHA = hashlib.sha256(COMPILED_ENCODER).hexdigest()
+
+
+@dataclass
+class NpuFiles:
+    vision: Path
+    compiled: Path
+    soc: str
+
+
+def npu_files(
+    tmp_path: Path,
+    monkeypatch,
+    soc: str = "SM8750",
+    *,
+    vision_sections: list[tuple[str, str]] | None = None,
+    compiled_sections: list[tuple[str, str]] | None = None,
+) -> NpuFiles:
+    vision = write(tmp_path / f"vision-{soc}.litertlm", vision_sections or NPU_VISION_TOML)
+    compiled = write(tmp_path / "compiled.litertlm", compiled_sections or COMPILED_TOML, COMPILED)
+    pinned = embedding_vision.VISION_NPU_FILES[soc]
+    monkeypatch.setitem(
+        embedding_vision.VISION_NPU_FILES,
+        soc,
+        replace(pinned, sha256=hashlib.sha256(vision.read_bytes()).hexdigest()),
+    )
+    return NpuFiles(vision, compiled, soc)
+
+
+def run_npu_splice(f: NpuFiles, out: Path, encoder_sha256: str = ENCODER_SHA) -> SpliceResult:
+    return splice_npu(envs.EXPORT, f.compiled, f.vision, out, f.soc, encoder_sha256)
+
+
+def npu_refused(f: NpuFiles, out: Path, cause: str, match: str, **kwargs: Any) -> None:
+    with pytest.raises(EmbeddingConvertError, match=match) as info:
+        run_npu_splice(f, out, **kwargs)
+    assert info.value.cause == cause
+    assert not out.exists()
+    assert not [p for p in out.parent.iterdir() if p.name.startswith(".")]
+
+
+def test_google_npu_files_are_pinned_for_every_soc_the_compile_takes():
+    assert sorted(embedding_vision.VISION_NPU_FILES) == sorted(NPU_SOCS)
+    for soc, pinned in embedding_vision.VISION_NPU_FILES.items():
+        assert pinned.soc == soc
+        assert pinned.filename == f"embeddinggemma-2-text-vision-440m_Qualcomm_{soc}.litertlm"
+        assert len(pinned.sha256) == 64 and int(pinned.sha256, 16) >= 0
+        assert pinned.as_dict()["revision"] == embedding_vision.VISION_REVISION
+    # The one hashed from the Hub cache as well as read from the Hub's listing.
+    sm8750 = embedding_vision.VISION_NPU_FILES["SM8750"]
+    assert sm8750.sha256.startswith("c5c05cb59833541a") and sm8750.bytes == 446_611_456
+
+
+@pytest.mark.parametrize("soc", NPU_SOCS)
+def test_the_npu_splice_replaces_the_text_encoder_and_keeps_every_other_section(
+    toolchain, tmp_path, monkeypatch, soc
+):
+    f = npu_files(tmp_path, monkeypatch, soc)
+    out = tmp_path / "out" / "model.litertlm"
+    result = run_npu_splice(f, out)
+    doc, contents = read(out)
+    names = [name for _, name in NPU_VISION_TOML]
+    assert contents == [
+        COMPILED_ENCODER if name == "encoder graph" else f"Google's {name}".encode()
+        for name in names
+    ]
+    google, _ = read(f.vision)
+    assert without_volatile(doc) == without_volatile(google)
+    assert result.replaced == ("TFLiteModel text_encoder",)
+    assert [s["source"] for s in result.sections] == [
+        embedding_vision.NPU_SOURCE if n == "encoder graph" else "google_vision" for n in names
+    ]
+    assert [s["changed"] for s in result.sections] == [n == "encoder graph" for n in names]
+    assert result.sections[3]["sha256"] == ENCODER_SHA
+    assert result.sha256 == "sha256:" + hashlib.sha256(out.read_bytes()).hexdigest()
+    assert [p.name for p in out.parent.iterdir()] == [out.name]
+    # The script was told what it splices, by name.
+    spec_names = embedding_vision.npu_names(soc)
+    assert spec_names["vision"] == f"Google's {soc} text-vision file"
+
+
+def test_the_npu_splice_refuses_a_file_that_is_not_googles_for_the_soc(
+    toolchain, tmp_path, monkeypatch
+):
+    f = npu_files(tmp_path, monkeypatch)
+    # SM8650's pin, for SM8750's file.
+    monkeypatch.setitem(
+        embedding_vision.VISION_NPU_FILES,
+        "SM8750",
+        replace(embedding_vision.VISION_NPU_FILES["SM8750"], sha256="ab" * 32),
+    )
+    npu_refused(f, tmp_path / "out" / "m.litertlm", "base_sha256", f"not Google's {'ab' * 32}")
+
+
+def test_the_npu_splice_refuses_a_soc_with_no_pinned_file(toolchain, tmp_path, monkeypatch):
+    f = npu_files(tmp_path, monkeypatch)
+    monkeypatch.delitem(embedding_vision.VISION_NPU_FILES, "SM8750")
+    with pytest.raises(EmbeddingConvertError, match="SM8750: no text-vision file") as info:
+        run_npu_splice(f, tmp_path / "m.litertlm")
+    assert info.value.cause == "input" and toolchain.calls == []
+
+
+def test_the_npu_splice_refuses_an_encoder_that_is_not_the_compiled_one(
+    toolchain, tmp_path, monkeypatch
+):
+    f = npu_files(tmp_path, monkeypatch)
+    npu_refused(
+        f,
+        tmp_path / "out" / "m.litertlm",
+        "readback",
+        "not the compiled encoder's",
+        encoder_sha256="cd" * 32,
+    )
+
+
+@pytest.mark.parametrize("model_type", ["vision_encoder", "embedder", "text_encoder"])
+def test_an_npu_pack_that_changes_a_sections_bytes_is_refused(
+    toolchain, tmp_path, monkeypatch, model_type
+):
+    toolchain.alters_bytes_of = model_type
+    f = npu_files(tmp_path, monkeypatch)
+    npu_refused(f, tmp_path / "out" / "m.litertlm", "readback", "changed in the rebuild")
+
+
+def test_a_compile_whose_toml_says_otherwise_of_the_encoder_is_refused(
+    toolchain, tmp_path, monkeypatch
+):
+    constrained = list(COMPILED_TOML)
+    constrained[3] = ('backend_constraint = "npu"\n' + TEXT_TOML[3][0], TEXT_TOML[3][1])
+    f = npu_files(tmp_path, monkeypatch, compiled_sections=constrained)
+    npu_refused(
+        f, tmp_path / "out" / "m.litertlm", "input", "the SM8750 compile's TFLiteModel text_enc"
+    )
+
+
+def test_a_compile_without_an_encoder_is_refused(toolchain, tmp_path, monkeypatch):
+    f = npu_files(tmp_path, monkeypatch, compiled_sections=[*COMPILED_TOML[:3], COMPILED_TOML[4]])
+    npu_refused(f, tmp_path / "out" / "m.litertlm", "input", "0 TFLiteModel sections for text_enc")
+
+
+def npu_read_back(T, f: NpuFiles, rebuilt: Path) -> list[dict[str, Any]]:
+    vision_doc, _ = read(f.vision)
+    compiled_doc, _ = read(f.compiled)
+    after, _ = read(rebuilt)
+    names = embedding_vision.npu_names(f.soc)
+    parts, kinds = list(embedding_vision.NPU_PARTS), list(embedding_vision.NPU_KINDS)
+    graft_text = SCRIPT["text_sections"](compiled_doc, names["graft"], parts, kinds, T)
+    return SCRIPT["read_back"](
+        str(rebuilt),
+        after,
+        str(f.vision),
+        vision_doc,
+        T.spans(str(f.vision), "v"),
+        str(f.compiled),
+        T.spans(str(f.compiled), "g"),
+        graft_text,
+        parts,
+        kinds,
+        T,
+        names,
+    )
+
+
+def npu_spliced(**changed: bytes) -> dict[str, bytes]:
+    return {"encoder graph": COMPILED_ENCODER, **changed}
+
+
+def test_the_npu_read_back_takes_a_right_splice(towers_script, tmp_path, monkeypatch):
+    f = npu_files(tmp_path, monkeypatch)
+    rebuilt = write(tmp_path / "r.litertlm", NPU_VISION_TOML, npu_spliced())
+    sources = [s["source"] for s in npu_read_back(towers_script, f, rebuilt)]
+    assert sources.count(embedding_vision.NPU_SOURCE) == 1 and sources[3] == "npu_compile"
+
+
+@pytest.mark.parametrize(
+    "name", ["vision graph", "embedder graph", "embedder weights", "adapter graph", "meta"]
+)
+def test_the_npu_read_back_refuses_a_section_that_is_not_googles(
+    towers_script, tmp_path, monkeypatch, name
+):
+    f = npu_files(tmp_path, monkeypatch)
+    # The compile's own section, or another's bytes, where Google's belongs.
+    tampered = COMPILED.get(name, b"tampered")
+    rebuilt = write(tmp_path / "r.litertlm", NPU_VISION_TOML, npu_spliced(**{name: tampered}))
+    with pytest.raises(SCRIPT["Refused"], match="bytes of Google's SM8750 text-vision file"):
+        npu_read_back(towers_script, f, rebuilt)
+
+
+def test_the_npu_read_back_refuses_googles_encoder_left_in_place(
+    towers_script, tmp_path, monkeypatch
+):
+    f = npu_files(tmp_path, monkeypatch)
+    rebuilt = write(
+        tmp_path / "r.litertlm",
+        NPU_VISION_TOML,
+        npu_spliced(**{"encoder graph": b"Google's encoder graph"}),
+    )
+    with pytest.raises(SCRIPT["Refused"], match="bytes of the SM8750 compile"):
+        npu_read_back(towers_script, f, rebuilt)
 
 
 # -- the record ---------------------------------------------------------------------
