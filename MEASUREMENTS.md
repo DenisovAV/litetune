@@ -2565,6 +2565,66 @@ cost.
 - Not measured: the other three SoCs `convert --npu` writes a file for (SM8550, SM8650,
   SM8850), 140 vision tokens on the NPU, and this file through flutter_edge_ai.
 
+### The same fine-tune on Intel Panther Lake and Lunar Lake
+
+Measured 2026-11-05 on two Windows 11 laptops, a Panther Lake (Core Ultra X7 358H, Arc B390)
+and a Lunar Lake (Core Ultra 7 258V, Arc 140V), with the beans int8 file above and its 1,165
+pictures. Nothing here is a litetune stage: `convert --npu` compiles for Qualcomm only, and
+these files were built by hand with scripts outside this repository: the text or vision
+encoder cut out of the int8 file with its weights inline, every RMSNorm composite inlined
+with x scaled by 1/16 before it is squared so the square stays inside float16's range (the
+OpenVINO NPU plugin takes `f16` or `i8` precision only), 776 composites in the text encoder
+and 224 in the vision encoder, and compiled by ai-edge-litert 2.3.0's Intel plugin (OpenVINO
+2026.3.1) on the machine itself, with weight sharing and `NPUW_ONLINE_PIPELINE=NONE`.
+
+- **Panther Lake:** Google's `embeddinggemma-2-text-vision-440m_Intel_PTL.litertlm` (revision
+  `e301f74d`) with its text encoder replaced by the compiled one, the splice litetune does for
+  Qualcomm (its splice script, the other six sections Google's byte for byte). Its vision
+  encoder is Google's NPU build.
+- **Lunar Lake:** Google publishes no file for it, so both encoders were compiled for it and
+  packed with the int8 file's other sections. LiteRT-LM 0.18.0 refused every picture
+  ("No signature found with prefix vision_ and length greater than or equal to 144") until the
+  cut vision encoder kept its signatures in the order the int8 file has them, `vision_140`
+  first.
+
+The runs went through LiteRT-LM 0.18.0's EmbeddingEngine C API from Python (ctypes), with
+flutter_edge_ai's `native-v0.18.0-h` Windows libraries for the CPU and NPU and
+`native-v0.18.0-g` for the GPU (the two sets differ only in `LiteRtWebGpuAccelerator.dll`),
+each picture given as its bytes at 70 vision tokens, the CPU at four threads. Accuracy is
+verify's k=10 centroid decider on the same five draws, from the vectors each run wrote;
+paired differences are against the CPU on the same machine (`metrics.paired_difference`).
+
+| | k=10 mean | cosine to the CPU, mean / min | resolved against the CPU | ms per picture, median |
+|---|---|---|---|---|
+| PTL NPU, Google's vision + our text encoder | 0.9347 | 0.9801 / 0.8801 | 0 of 5 draws | 52.7 |
+| PTL NPU, both encoders ours | 0.9407 | 0.9779 / 0.7993 | 0 of 5 | 259.8 |
+| PTL NPU, Google's file (base model) | 0.8273 | | | 51.1 |
+| PTL GPU, vision on the CPU | 0.9467 | 0.9947 / 0.9755 | 1 of 5 (+0.0133 ±0.0131) | 380.9 |
+| PTL GPU, vision on the GPU | 0.9473 | 0.9738 / 0.7330 | 0 of 5 | 65.2 |
+| PTL CPU | 0.9380 | | | 402.8 |
+| LNL NPU, both encoders ours | 0.9347 | 0.9773 / 0.8414 | 0 of 5 | 298.6 |
+| LNL NPU, the same without the vision rewrite | 0.9287 | 0.9629 / 0.8184 | 0 of 5 | 297.5 |
+| LNL GPU, vision on the CPU | 0.9467 | 0.9947 / 0.9755 | 1 of 5 (+0.0133 ±0.0131) | 332.1 |
+| LNL GPU, vision on the GPU | 0.9493 | 0.9730 / 0.7901 | 1 of 5 (+0.0233 ±0.0173) | 94.4 |
+| LNL CPU | 0.9380 | | | 369.2 |
+
+- Every picture was embedded on every side, none refused, each side's first picture twice to
+  the same vector. The two CPUs gave the same accuracy draw for draw.
+- The fine-tune's PTL NPU file scored above Google's in every draw (+0.0767 to +0.1533,
+  each resolved).
+- Our vision encoder on an NPU took five times Google's: 259.8 ms against 52.7 on the same
+  PTL, with the same text encoder. It was neither weight sharing nor the pipeline setting: 50
+  pictures took 259.8 ms per picture compiled without weight sharing and 268.4 ms without
+  `NPUW_ONLINE_PIPELINE=NONE`. What differs is the graph. Google's compiled vision encoder is
+  two partitions whose bytecode names no float type, only `I8`/`U8`/`I4`/`U4`; ours, cut
+  from the int8 file, is 226 partitions
+  (the 224 RMSNorm decompositions compiled beside the two signatures), and its bytecode names
+  `f32` 911 times and `NPU_USE_NPUW` 226 times.
+- On Lunar Lake the GPU with the vision encoder on it was the fastest, 94.4 ms per picture
+  against 298.6 on the NPU.
+- Not measured: Google's PTL file on Lunar Lake, peak memory, and any of these files through
+  flutter_edge_ai.
+
 ## LLMs on a Qualcomm NPU
 
 Measured 2026-11-01 on one Galaxy S25 Ultra (SM-S938U1, SM8750, Hexagon V79), through the
