@@ -2488,9 +2488,39 @@ The 10-shot draws, the same five for every side, and the paired differences on t
   481.7 ms and Google's 486.7 ms. The reference took 922.5 s (int8 run) and 941.8 s (int4
   run) for the 1,165 pictures. The reference's and Google's accuracies were the same in both
   verify runs, draw for draw.
-- Not measured: 140 vision tokens, `--mirror`, the GPU (`verify` refuses it for an image
-  file), an NPU (`convert` does not compile an image file), and the spliced file through
-  flutter_edge_ai on any device.
+- Not measured: 140 vision tokens, `--mirror`, an NPU (`convert` does not compile an image
+  file), and the spliced file through flutter_edge_ai on any device.
+
+### The same int8 file on a Mac's CPU and GPU, and on Windows
+
+Measured 2026-11-04 on one Mac (Apple M5 Pro, 18 cores), the same checkpoint, int8 file
+and split as above, with `verify --with-base` at litetune commit `79e2fba` (unreleased),
+once on the CPU and once with `--backend gpu`. The checkpoint was tuned before `tune`
+recorded the processor files' digests; their digests were added to its `litetune.json`
+from the files `tune` saved (the original record is kept beside the run's reports).
+
+On the CPU the text tower ran on one thread, as on every Mac with SME2, and the vision
+encoder on the runtime's default threads. With `--backend gpu` the text tower ran on the
+GPU (the kernel reported GPU work) and the vision encoder on the CPU, where
+flutter_edge_ai_litertlm 1.19.0 puts it when the text tower is on the GPU. On this CPU,
+which has SME2, both runs embedded the file twice and got the same vectors both times.
+
+| | k=10 mean | Google's file, k=10 mean | cosine to float32, mean / min | ms per picture, median |
+|---|---|---|---|---|
+| CPU, Intel Xeon (above) | 0.9347 | 0.8233 | 0.9601 / 0.6824 | 481.9 |
+| CPU, Apple M5 Pro | 0.9333 | 0.8287 | 0.9602 / 0.6787 | 172.5 |
+| GPU, Apple M5 Pro | 0.9353 | 0.8313 | 0.9586 / 0.6856 | 154.5 |
+| CPU, Windows 11 x64, Intel Core Ultra (16 logical CPUs, 8 threads) | 0.9327 | 0.8313 | 0.9608 / 0.7583 | 363.5 |
+
+The float32 reference scored 0.9287 in every run. Every gate was inconclusive for the same
+reason as above: at 300 held-out rows no draw's interval (±0.015 to ±0.020) fits under the
+0.01 threshold. The GPU computes in the precision LiteRT-LM picks for the file, F16 unless
+the file declares otherwise.
+
+The Windows run used litetune at `c493291` installed from a wheel, with Google's file given
+as `--base-litertlm`: `--with-base` could not fetch it there, because `verify` provisions the
+`export` environment to download it and that environment needs `litert-converter`, which
+publishes no Windows wheel.
 
 ## LLMs on a Qualcomm NPU
 
