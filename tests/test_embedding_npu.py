@@ -53,6 +53,7 @@ from litetune.embedding_export import (
 from litetune.embedding_npu import (
     ANSWER_KEYS,
     DEVICE_RUNS,
+    IMAGE_DEVICE_RUNS,
     NPU_SIGNATURES,
     NPU_SOCS,
     NPU_TIMEOUT_S,
@@ -96,6 +97,7 @@ def test_a_repeated_soc_is_refused():
 def test_the_socs_are_the_four_google_publishes_files_for():
     assert NPU_SOCS == ("SM8550", "SM8650", "SM8750", "SM8850")
     assert set(DEVICE_RUNS) == {"SM8750"}
+    assert set(IMAGE_DEVICE_RUNS) == {"SM8750"}
 
 
 @pytest.mark.parametrize(
@@ -1378,8 +1380,9 @@ def test_an_image_checkpoint_compiles_and_splices_each_soc(
             "sha256": hashlib.sha256(compiler.packed or b"").hexdigest(),
             "kept": False,
         }
-        # No text-vision file has run anywhere; what ran is the text file, said as such.
-        assert npu["device_run"] is None
+        # What the text-vision file did is its own entry; what the text file did, said as such.
+        assert npu["device_run"] == IMAGE_DEVICE_RUNS.get(soc)
+        assert (npu["device_run"] is None) == (soc != "SM8750")
         assert npu["text_file_device_run"] == DEVICE_RUNS.get(soc)
         pinned = VISION_NPU_FILES[soc]
         google = sibling["google_vision_npu_file"]
@@ -1408,16 +1411,26 @@ def test_an_image_checkpoint_compiles_and_splices_each_soc(
 
 
 def test_the_image_limitation_says_what_was_and_was_not_done():
+    for soc in ("SM8750", "SM8650"):
+        text = embedding_export.npu_image_not_verified(soc, "f.litertlm")
+        for said in (
+            "compiled, never run on a device by this code",
+            f"the {soc} text encoder",
+            "Google's NPU build",
+            "not compiled by litetune",
+            "Google's f.litertlm",
+            "has been measured on SM8750 only, once (see device_run), "
+            "not on SM8550, SM8650, SM8850",
+            "`litetune verify` cannot measure it",
+        ):
+            assert said in text
+
+
+def test_the_image_limitation_without_a_device_run_says_none_was_measured(monkeypatch):
+    monkeypatch.setattr(embedding_export, "IMAGE_DEVICE_RUNS", {})
     text = embedding_export.npu_image_not_verified("SM8750", "f.litertlm")
-    for said in (
-        "compiled, never run on a device by this code",
-        "Google's NPU build",
-        "not compiled by litetune",
-        "Google's f.litertlm",
-        "has not been measured on any SoC (SM8550, SM8650, SM8750, SM8850)",
-        "`litetune verify` cannot measure it",
-    ):
-        assert said in text
+    assert "has not been measured on any SoC (SM8550, SM8650, SM8750, SM8850)" in text
+    assert "device_run" not in text
 
 
 @pytest.mark.parametrize("soc", NPU_SOCS)

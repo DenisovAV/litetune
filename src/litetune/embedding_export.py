@@ -79,7 +79,9 @@ from litetune.embedding_convert import (
     graft,
 )
 from litetune.embedding_npu import (
+    IMAGE_DEVICE_RUNS,
     NPU_SIGNATURES,
+    NPU_SOCS,
     NPU_TIMEOUT_S,
     EmbeddingNpuError,
     NpuResult,
@@ -172,6 +174,15 @@ def npu_splice_check(soc: str) -> str:
 
 def npu_image_not_verified(soc: str, filename: str) -> str:
     """The limitation of an image checkpoint's file for `soc`."""
+    measured = [s for s in NPU_SOCS if s in IMAGE_DEVICE_RUNS]
+    if measured:
+        unmeasured = ", ".join(s for s in NPU_SOCS if s in VISION_NPU_FILES and s not in measured)
+        embeds = (
+            f"What such a file embeds has been measured on {', '.join(measured)} only, once "
+            f"(see device_run), not on {unmeasured}"
+        )
+    else:
+        embeds = f"What the file embeds has not been measured on any SoC ({npu_socs()})"
     return (
         f"compiled, never run on a device by this code: the {soc} text encoder was compiled "
         "from the int8 graft and checked as a text checkpoint's --npu file is, then spliced "
@@ -179,8 +190,7 @@ def npu_image_not_verified(soc: str, filename: str) -> str:
         "encoder is Google's NPU build from that file, not compiled by litetune; the vision "
         "adapter, end_of_vision, embedder, tokenizer and metadata are that file's too, byte for "
         "byte, so the token table is Google's int4 one where the CPU file has the graft's int8. "
-        "What the file embeds has not been measured on any SoC "
-        f"({npu_socs()}), and `litetune verify` cannot measure it: "
+        f"{embeds}, and `litetune verify` cannot measure it: "
         "LiteRT-LM's CPU and GPU do not run a DISPATCH_OP"
     )
 

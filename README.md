@@ -975,7 +975,8 @@ text to measure.
   `embeddinggemma-2-text-vision-440m_Qualcomm_<SoC>.litertlm` (same revision,
   checked by its sha256) with only its compiled text encoder replaced. The vision
   encoder there is Google's own NPU build, and the embedder Google's int4 one.
-  No such file has run on a device, and `verify` refuses it.
+  `verify` refuses it; one such file has run, on a Galaxy S25 Ultra's NPU
+  (SM8750), measured in [MEASUREMENTS.md](MEASUREMENTS.md).
 - **verify** embeds every picture with the float32 fine-tune (transformers, on
   the CPU, with the checkpoint's own processor at the tuned budget) and with
   the file (LiteRT-LM's `EmbeddingEngine`, each picture given as its bytes),

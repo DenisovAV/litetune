@@ -35,8 +35,8 @@ Linux x86-64 wheels only, and the QAIRT SDK they load is downloaded when
 ai-edge-litert-sdk-qualcomm is built (`envs.NPU_QUALCOMM`).
 
 **What a device does with the file is not checked here**, and `litetune verify` cannot
-check it: LiteRT-LM's CPU and GPU cannot run a `DISPATCH_OP`. `DEVICE_RUNS` says what ran
-where.
+check it: LiteRT-LM's CPU and GPU cannot run a `DISPATCH_OP`. `DEVICE_RUNS` and
+`IMAGE_DEVICE_RUNS` say what ran where.
 """
 
 from __future__ import annotations
@@ -71,6 +71,16 @@ DEVICE_RUNS: dict[str, str] = {
         "a file compiled this way for SM8750 ran on one Galaxy S25 Ultra's NPU on "
         "2026-10-31; its vectors were byte-identical to those of another compile of the "
         "same graft"
+    ),
+}
+# The same for an image checkpoint's text-vision file (`embedding_export`), which is
+# another file: the compiled encoder inside Google's text-vision file for the SoC.
+IMAGE_DEVICE_RUNS: dict[str, str] = {
+    "SM8750": (
+        "a text-vision file made this way for SM8750 ran on one Galaxy S25 Ultra on "
+        "2026-11-05, its text and vision encoders on the NPU; on 300 held-out pictures its "
+        "vectors had mean cosine 0.975 to those of the same fine-tune's CPU file on the "
+        "phone's CPU"
     ),
 }
 # The signatures of Google's Qualcomm files (embeddinggemma-2-text-270m_Qualcomm_SM8750 at
@@ -172,10 +182,10 @@ class NpuResult:
 
     def as_dict(self) -> dict[str, Any]:
         if self.image is not None:
-            # DEVICE_RUNS is about the text file; no text-vision file has run.
+            # DEVICE_RUNS is about the text file, kept apart from what the text-vision file did.
             return {
                 **self._as_dict(),
-                "device_run": None,
+                "device_run": IMAGE_DEVICE_RUNS.get(self.soc),
                 "text_file_device_run": DEVICE_RUNS.get(self.soc),
                 **self.image,
             }
