@@ -684,6 +684,12 @@ PICTURES_COMPARED = (
 def _candidate_sampling(engine: Mapping[str, Any]) -> str:
     """What the candidate decoded with, said for the sampler it ran on."""
     declared, sent = engine.get("bundle_sampler"), engine.get("sampler_sent")
+    if sent and isinstance(declared, Mapping) and declared.get("type") == llm_images.UNRUN_GREEDY:
+        return (
+            f"the bundle declares a greedy sampler ({declared}), which litert-lm 0.18.0's CPU "
+            f"sampler does not implement, so verify sent {sent} in its place on every row. An "
+            "application that passes no sampler of its own gets an error from this bundle"
+        )
     if sent:
         return (
             f"the bundle declares a sampler that samples ({declared}), so verify sent "

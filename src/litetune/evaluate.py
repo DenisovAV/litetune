@@ -921,7 +921,7 @@ class LiteRtLmBackend:
                         **runtime_engine_spec(self.backend_flag, thread_count),
                         **picture_spec(self.images),
                         # Sent in place of a bundle's own sampler when that one
-                        # would sample (`llm_images.sampler_samples`).
+                        # samples or does not run (`llm_images.sampler_replaced`).
                         "greedy_sampler": dict(CANDIDATE_SAMPLER),
                         "out": str(results),
                         "report": str(report),
@@ -1790,8 +1790,8 @@ def bundle_sampler(path):
     return None
 
 
-def sampler_samples(sampler):
-    """`llm_images.sampler_samples`, which this script cannot import."""
+def sampler_replaced(sampler):
+    """`llm_images.sampler_replaced`, which this script cannot import."""
     if sampler is None:
         return False
     return not (sampler.get("type") in ("TOP_P", "TOP_K") and sampler.get("k") == 1)
@@ -1876,7 +1876,7 @@ def main(spec_path):
     # The bundle's own sampler, unless it would sample: then the greedy one the
     # parent sent, for every row, text or picture.
     declared = bundle_sampler(spec["model"])
-    sampler = spec.get("greedy_sampler") if sampler_samples(declared) else None
+    sampler = spec.get("greedy_sampler") if sampler_replaced(declared) else None
 
     def write_report(at_engine, after=None, init=None):
         if spec.get("report"):

@@ -255,10 +255,12 @@ class _Counter:
 
 
 def test_an_over_length_split_never_opens_its_pictures(tmp_path):
-    inspector = FakeImageInspector()
-    result = prepare(_request(tmp_path, tokens=_Counter(), context_length=200, images=inspector))
+    inspector, counter = FakeImageInspector(), _Counter()
+    result = prepare(_request(tmp_path, tokens=counter, context_length=200, images=inspector))
     # Every row is one token and a 282-token picture: over 200, refused unopened.
     assert inspector.calls == []
+    # Measured once: the length check reports the measurement taken before.
+    assert counter.calls == 1
     assert result.train is None
     lengths = next(c for c in result.checks.checks if c.name == LENGTH_CHECK)
     assert lengths.outcome is Outcome.FAILED
@@ -292,3 +294,25 @@ def test_a_clamped_grouped_split_reports_its_sizes_once(tmp_path):
     assert (held, train) == (44, 4)
     assert f"{held} rows were held out" in sizes[0] and f"{train} kept for training" in sizes[0]
     assert "where 100 and 0 were asked" in sizes[0]
+
+
+@pytest.mark.parametrize(
+    ("change", "said"),
+    [
+        (lambda rows: rows[3].pop("image"), r":4: this row gives no picture"),
+        (lambda rows: rows[3].update(image=["a.jpg", "b.jpg"]), r":4: 'image' gives 2 pictures"),
+        (lambda rows: rows[3].update(image=7), r":4: 'image' must be the path"),
+        (lambda rows: rows[3].update(image="pics/gone.jpg"), r":4: the image 'pics/gone.jpg'"),
+        (
+            lambda rows: rows[3].update(target={"name": "set", "args": {}}),
+            r":4: this row's target is a tool call",
+        ),
+    ],
+)
+def test_a_malformed_split_is_refused_even_when_a_row_is_over_length(tmp_path, change, said):
+    rows = _rows(tmp_path)
+    change(rows)
+    inspector = FakeImageInspector()
+    with pytest.raises(PrepareError, match=said):
+        prepare(_request(tmp_path, rows, tokens=_Counter(), context_length=200, images=inspector))
+    assert inspector.calls == []

@@ -142,7 +142,7 @@ VISION_CONSTRAINTS = {"vision_encoder": "cpu", "vision_adapter": "cpu"}
 # 2026-11-05). So litetune leaves the sampler as the exporter writes it.
 #
 # `verify` then sends this sampler in its place to any bundle whose own would
-# sample (`sampler_samples`): top_k 1, the one the spike measured with, so the
+# sample or would not run (`sampler_replaced`): top_k 1, the one the spike measured with, so the
 # comparison with the greedy float reference holds.
 CANDIDATE_SAMPLER = {"top_k": 1, "top_p": 1.0, "temperature": 1.0, "seed": 0}
 
@@ -150,6 +150,12 @@ CANDIDATE_SAMPLER = {"top_k": 1, "top_p": 1.0, "temperature": 1.0, "seed": 0}
 def sampler_note(sampler: Mapping[str, Any]) -> str:
     """What `convert` says about the sampler a bundle declares, as `verify` will treat it."""
     shown = ", ".join(f"{key} {value}" for key, value in sampler.items())
+    if sampler.get("type") == UNRUN_GREEDY:
+        return (
+            f"the bundle declares a greedy sampler ({shown}), which litert-lm 0.18.0's CPU "
+            "sampler does not implement: an application that passes no sampler of its own gets "
+            "an error, and litetune's verify measures the bundle with top_k 1 in its place"
+        )
     if sampler_samples(sampler):
         return (
             f"the bundle declares a sampler ({shown}): an application that passes no sampler of "
@@ -161,16 +167,27 @@ def sampler_note(sampler: Mapping[str, Any]) -> str:
     )
 
 
-def sampler_samples(sampler: Mapping[str, Any] | None) -> bool:
-    """Whether a bundle's declared sampler (`export.vision_in`'s reading) would sample.
+# The sampler type a bundle may declare that is greedy and that litert-lm 0.18.0's
+# CPU sampler does not run ("UNIMPLEMENTED: Sampler type: 3 not implemented yet.").
+UNRUN_GREEDY = "GREEDY"
 
-    No sampler is the runtime's own default, which litetune's text measurements
-    run on; a TOP_P or TOP_K one with k 1 picks the likeliest token. Anything
-    else samples, or (GREEDY on 0.18.0) does not run at all.
+
+def sampler_replaced(sampler: Mapping[str, Any] | None) -> bool:
+    """Whether `verify` sends top_k 1 in place of a bundle's declared sampler.
+
+    It does unless the bundle declares none -- the runtime's own default, which
+    litetune's text measurements run on -- or a TOP_P or TOP_K one with k 1,
+    which picks the likeliest token: so for one that samples (`sampler_samples`)
+    and for GREEDY, which 0.18.0 does not run.
     """
     if sampler is None:
         return False
     return not (sampler.get("type") in ("TOP_P", "TOP_K") and sampler.get("k") == 1)
+
+
+def sampler_samples(sampler: Mapping[str, Any] | None) -> bool:
+    """Whether a bundle's declared sampler samples: one `verify` replaces that is not GREEDY."""
+    return sampler_replaced(sampler) and sampler is not None and sampler.get("type") != UNRUN_GREEDY
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -317,6 +334,8 @@ def processor_file_digest(file: Path) -> str:
     if file.name != "tokenizer_config.json":
         return sha256_hex(file)
     data = json.loads(file.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{file} holds {type(data).__name__} JSON, not an object")
     data.pop(UNHASHED_TOKENIZER_KEY, None)
     canonical = json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()

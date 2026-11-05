@@ -956,17 +956,30 @@ def test_a_reference_tokenizer_config_that_is_not_json_is_refused(tmp_path):
         ({"type": "TOP_P", "k": 64, "p": 0.95, "temperature": 1.0}, True),
         ({"type": "TOP_P", "k": 1, "p": 1.0, "temperature": 1.0}, False),
         (None, False),
+        ({"type": "GREEDY", "k": 1, "p": 0.95, "temperature": 1.0}, True),
     ],
 )
 def test_what_verify_says_about_the_sampler_is_what_it_sent(declared, sent):
-    from litetune.llm_images import CANDIDATE_SAMPLER, sampler_samples
+    from litetune.llm_images import CANDIDATE_SAMPLER, sampler_replaced
     from litetune.verify import PICTURES_COMPARED, _candidate_sampling
 
     # The driver's rule decides what was sent; the prose must say exactly that.
-    sampler_sent = dict(CANDIDATE_SAMPLER) if sampler_samples(declared) else None
+    sampler_sent = dict(CANDIDATE_SAMPLER) if sampler_replaced(declared) else None
     assert (sampler_sent is not None) is sent
     said = _candidate_sampling({"bundle_sampler": declared, "sampler_sent": sampler_sent})
     assert ("in its place on every row" in said) is sent
-    assert ("greedy" in said) is not sent
+    greedy_declared = declared is not None and declared["type"] == "GREEDY"
+    assert ("greedy" in said) is (not sent or greedy_declared)
+    assert ("does not implement" in said) is greedy_declared
+    assert ("samples with the bundle's" in said) is (sent and not greedy_declared)
     # The picture limitation, written before anything ran, claims no sampler.
     assert "top_k 1" not in PICTURES_COMPARED
+
+
+@pytest.mark.parametrize("body", ["[]", "null"])
+def test_a_reference_tokenizer_config_that_is_not_an_object_is_refused(tmp_path, body):
+    reference = _checkpoint(tmp_path)
+    (reference / "tokenizer_config.json").write_text(body, encoding="utf-8")
+    result = run_verify(_request(tmp_path, reference=reference), backends=_pair())
+    assert result.status is Status.FAILED_HARNESS
+    assert "JSON, not an object" in _check(result, PICTURES_CHECK).detail

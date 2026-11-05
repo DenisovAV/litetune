@@ -1243,6 +1243,15 @@ def llm_image_rows(
     rows: Sequence[Row],
     inspector: ImageInspector,
 ) -> tuple[list[Row], ImageStats]:
+    """`locate_llm_images`, then `open_llm_images`: the rows with their pictures."""
+    return open_llm_images(path, rows, locate_llm_images(path, objects, rows), inspector)
+
+
+def locate_llm_images(
+    path: Path,
+    objects: Sequence[tuple[int, dict[str, Any]]],
+    rows: Sequence[Row],
+) -> list[Path]:
     """Gemma 4 rows with their pictures: each opened, refused if it cannot be trained.
 
     `rows` are `_rows_from(objects)`, in the same order. Refused, naming the row:
@@ -1286,6 +1295,18 @@ def llm_image_rows(
                 f"{where}: the image {value!r} is not a regular file (read as {file})"
             )
         located.append(file)
+    return located
+
+
+def open_llm_images(
+    path: Path, rows: Sequence[Row], located: Sequence[Path], inspector: ImageInspector
+) -> tuple[list[Row], ImageStats]:
+    """Open each located picture, refuse what `_checked_image` refuses, and give rows theirs.
+
+    This is the step that provisions an environment, so it comes after every
+    refusal the rows file alone can give (`locate_llm_images`) and the length
+    check.
+    """
     files = sorted(set(located))
     by_file, checker, decoder = _inspected(files, inspector)
     out = [
@@ -2404,10 +2425,13 @@ def _check_lengths(
     evidence: PromptMode | None,
     events: EventStream,
     picture_tokens: int = 0,
+    measured_already: LengthStats | None = None,
 ) -> Check:
     """Measure every row against `context_length`, and record the check on `result`.
 
     `picture_tokens` is added to every row: the most a row's picture becomes.
+    `measured_already` is that measurement when it was taken before, and is
+    reported instead of a second one.
     """
     embedding = request.base_model == EMBEDDING_MODEL
     measured: list[LengthStats] = []
@@ -2428,7 +2452,9 @@ def _check_lengths(
                 )
             )
         else:
-            if embedding and decision is not None:
+            if measured_already is not None:
+                stats = measured_already
+            elif embedding and decision is not None:
                 stats = measure_embedded_lengths(rows, decision.decision, request.tokens, window)
             else:
                 stats = measure_lengths(rows, request.tokens, context_length, picture_tokens)
@@ -2597,6 +2623,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     context_length = _context_length_for(request, image_mode)
     decision: DecisionProfile | None = None
     image_stats: ImageStats | None = None
+    # The rows' lengths when they were measured before the pictures were opened.
+    lengths: LengthStats | None = None
     if llm_images and is_decision_split(objects, request.questions):
         raise PrepareError(
             f"these rows give pictures and are read as decisions (labels, or --questions). "
@@ -2661,24 +2689,19 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                     "picture goes into the prompt through the template the runtime renders, so "
                     "rows with pictures give the user's text alone"
                 )
-            # After every refusal the rows file alone can give: opening the
-            # images provisions an environment. Not for rows the length check
-            # below will refuse anyway: their text and the most a picture
-            # becomes are counted first, when a tokenizer was given.
-            over = (
-                request.tokens is not None
-                and context_length is not None
-                and bool(
-                    measure_lengths(
-                        rows, request.tokens, context_length, PICTURE_TOKENS
-                    ).over_length
-                )
-            )
-            if not over:
-                rows, image_stats = llm_image_rows(
+            # Every refusal the rows file alone can give, first; then the
+            # lengths, the text and the most a picture becomes, when a tokenizer
+            # was given; and only for rows that fit, opening the pictures, which
+            # provisions an environment. The lengths are measured once and the
+            # length check below reports this measurement.
+            picture_files = locate_llm_images(request.data, objects, rows)
+            if request.tokens is not None and context_length is not None:
+                lengths = measure_lengths(rows, request.tokens, context_length, PICTURE_TOKENS)
+            if lengths is None or not lengths.over_length:
+                rows, image_stats = open_llm_images(
                     request.data,
-                    objects,
                     rows,
+                    picture_files,
                     request.images or PillowImageInspector(env=envs.TRAIN_VISION),
                 )
     # Before anything is profiled or split: a row calling a tool the prompt will
@@ -2752,6 +2775,7 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             evidence,
             events,
             PICTURE_TOKENS if llm_images else 0,
+            lengths,
         )
 
     # -- scoreability, before anyone pays for a GPU -------------------------

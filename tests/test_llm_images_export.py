@@ -306,11 +306,23 @@ def test_a_tokenizer_config_that_is_not_json_exports_nothing(tmp_path, vision_bu
         ({"type": "TOP_P", "k": 64, "p": 0.95, "temperature": 1.0}, "samples with it"),
         ({"type": "TOP_P", "k": 1, "p": 1.0, "temperature": 1.0}, "decodes with it"),
         ({"type": "TOP_K", "k": 1, "p": 0.0, "temperature": 1.0}, "decodes with it"),
+        ({"type": "GREEDY", "k": 1, "p": 0.95, "temperature": 1.0}, "does not implement"),
     ],
 )
 def test_the_sampler_note_follows_what_verify_will_do(sampler, said):
-    from litetune.llm_images import sampler_note, sampler_samples
+    from litetune.llm_images import sampler_note, sampler_replaced, sampler_samples
 
     note = sampler_note(sampler)
     assert said in note
-    assert ("top_k 1 in its place" in note) is sampler_samples(sampler)
+    assert ("top_k 1 in its place" in note) is sampler_replaced(sampler)
+    assert ("samples with it" in note) is sampler_samples(sampler)
+
+
+@pytest.mark.parametrize("body", ["[]", "null"])
+def test_a_tokenizer_config_that_is_not_an_object_exports_nothing(tmp_path, vision_bundle, body):
+    model = _checkpoint(tmp_path)
+    (model / "tokenizer_config.json").write_text(body, encoding="utf-8")
+    result = run_export(_request(tmp_path, model))
+    assert vision_bundle.exports == []
+    refused = next(c for c in result.checks.checks if c.name == "pictures")
+    assert "JSON, not an object" in refused.detail

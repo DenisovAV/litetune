@@ -4073,7 +4073,7 @@ def test_a_bundle_that_does_not_sample_keeps_its_own(tmp_path, monkeypatch, decl
 
 
 def test_the_sampler_rule_in_the_script_is_llm_images_rule():
-    from litetune.llm_images import sampler_samples
+    from litetune.llm_images import sampler_replaced, sampler_samples
 
     for declared in (
         None,
@@ -4083,9 +4083,12 @@ def test_the_sampler_rule_in_the_script_is_llm_images_rule():
         {"type": "GREEDY", "k": 1},
         {"type": 3, "k": 1},
     ):
-        assert _litertlm_script()["sampler_samples"](declared) is sampler_samples(declared)
-    assert sampler_samples({"type": "GREEDY", "k": 1}) is True
-    assert sampler_samples({"type": "TOP_P", "k": 1}) is False
+        assert _litertlm_script()["sampler_replaced"](declared) is sampler_replaced(declared)
+    # GREEDY is replaced, because 0.18.0 does not run it, and does not sample.
+    assert sampler_replaced({"type": "GREEDY", "k": 1}) is True
+    assert sampler_samples({"type": "GREEDY", "k": 1}) is False
+    assert sampler_replaced({"type": "TOP_P", "k": 1}) is False
+    assert sampler_samples(TOP_P) is True and sampler_samples(None) is False
 
 
 @pytest.mark.parametrize("engine_per_prompt", [False, True])
@@ -4107,3 +4110,18 @@ def test_pictures_reach_the_engine_and_each_conversation(tmp_path, monkeypatch, 
     messages = [m for e in engines for r in e.runners for m in r.messages]
     assert [m["content"][0]["type"] for m in messages] == ["image", "image"]
     assert [m["content"][1]["text"] for m in messages] == ["one", "two"]
+
+
+def test_a_bundle_that_declares_greedy_is_sent_top_k_1(tmp_path, monkeypatch):
+    """litert-lm 0.18.0 does not run GREEDY, so the driver replaces it like a sampling one."""
+    report = tmp_path / "report.json"
+    _, engines = _run_script(
+        tmp_path,
+        ["one"],
+        monkeypatch=monkeypatch,
+        report=report,
+        bundle_sampler={"type": "GREEDY", "k": 1, "p": 0.95, "temperature": 1.0},
+        extra={"greedy_sampler": GREEDY_SENT},
+    )
+    assert engines[0].runners[0].kwargs["sampler_config"] == ("SamplerConfig", GREEDY_SENT)
+    assert json.loads(report.read_text())["sampler_sent"] == GREEDY_SENT
