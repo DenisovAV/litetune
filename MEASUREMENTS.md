@@ -2520,7 +2520,8 @@ the file declares otherwise.
 The Windows run used litetune at `c493291` installed from a wheel, with Google's file given
 as `--base-litertlm`: `--with-base` could not fetch it there, because `verify` provisions the
 `export` environment to download it and that environment needs `litert-converter`, which
-publishes no Windows wheel.
+publishes no Windows wheel. Since #114 `verify` downloads it in the `embed-train` environment; on the same machine
+`--with-base` then fetched Google's file itself and gave the same accuracies, draw for draw.
 
 ### The same fine-tune on a phone's NPU
 
