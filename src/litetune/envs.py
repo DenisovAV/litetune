@@ -2907,7 +2907,16 @@ def cached_environments() -> list[CachedEnv]:
         return []
     claimed = {
         env.path.name: env.name
-        for env in (RUNTIME, TRAIN, EXPORT, EMBED_TRAIN, NPU_QUALCOMM, NPU_LLM)
+        for env in (
+            RUNTIME,
+            TRAIN,
+            TRAIN_VISION,
+            EXPORT,
+            EXPORT_VISION,
+            EMBED_TRAIN,
+            NPU_QUALCOMM,
+            NPU_LLM,
+        )
     }
     out = [
         CachedEnv(
@@ -3812,6 +3821,49 @@ TRAIN = StageEnv(
         'sentencepiece==0.2.0; python_version < "3.13"',
         'sentencepiece==0.2.1; python_version >= "3.13"',
     ),
+)
+
+# TRAIN, plus what Gemma 4's image processor needs: the environment `tune` trains
+# Gemma 4 E2B on image rows in, `verify`'s float reference for those rows runs in,
+# and `prepare` opens their pictures in. Its own, so that a text run's environment
+# -- the one every measured LLM baseline was trained in -- stays the one it was.
+#
+# torchvision because transformers 5.16.1's `Gemma4ImageProcessor` imports it at
+# the top of `image_processing_gemma4.py` (line 17, `from torchvision.transforms.v2
+# import functional as tvF`), and `processor_config.json` at google/gemma-4-E2B-it
+# 3e22461f names that class. A spike outside litetune (2026-11-05) found
+# `AutoProcessor.from_pretrained` raising `ModuleNotFoundError: Could not import
+# module 'Gemma4Processor'` with Pillow installed and torchvision not. 0.20.1 is
+# the torchvision whose metadata requires torch==2.5.1, TRAIN's pin
+# (https://pypi.org/pypi/torchvision/0.20.1/json). Pillow at the 12.3.0 that spike
+# trained and measured with: torchvision asks for any Pillow >= 5.3.0, and Pillow
+# decodes every picture the model is trained on.
+#
+# A floor comes with the pins, readable in `wheels.PUBLISHED`: torchvision 0.20.1
+# publishes no CPython 3.13 wheel, so this environment does not install there.
+TRAIN_VISION = StageEnv(
+    name="train-vision",
+    requirements=(
+        *TRAIN.requirements,
+        "torchvision==0.20.1",
+        "pillow==12.3.0",
+    ),
+)
+
+# EXPORT, plus torchvision: the environment `convert` exports a Gemma 4 checkpoint
+# tuned on images in, with its vision encoder. litert-torch's `image_text_to_text`
+# task loads `transformers.AutoImageProcessor` for the vision export
+# (`generative/export_hf/core/export_lib.py:369-376` in litert-torch-nightly
+# 0.10.0.dev20260926). In the spike above that raised `ImportError:
+# AutoImageProcessor requires the Torchvision library but it was not found in your
+# environment` in EXPORT as pinned here; with torchvision 0.29.2 added and nothing
+# else changed, the same command exported. 0.29.2 requires torch>=2.14.0
+# (https://pypi.org/pypi/torchvision/0.29.2/json), which EXPORT leaves to
+# litert-torch; that spike's EXPORT resolved torch 2.14.1.
+EXPORT_VISION = StageEnv(
+    name="export-vision",
+    requirements=(*EXPORT.requirements, "torchvision==0.29.2"),
+    system_requirements=EXPORT.system_requirements,
 )
 
 # The environment `tune` fine-tunes google/embeddinggemma-2 in

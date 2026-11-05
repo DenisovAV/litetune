@@ -19,7 +19,15 @@ from packaging.utils import parse_wheel_filename
 from litetune import envs, wheels
 from litetune.wheels import PUBLISHED, Host, Release, canonical, gaps
 
-STAGES = (envs.RUNTIME, envs.EXPORT, envs.TRAIN, envs.EMBED_TRAIN, envs.NPU_QUALCOMM)
+STAGES = (
+    envs.RUNTIME,
+    envs.EXPORT,
+    envs.EXPORT_VISION,
+    envs.TRAIN,
+    envs.TRAIN_VISION,
+    envs.EMBED_TRAIN,
+    envs.NPU_QUALCOMM,
+)
 
 
 def _blocking(env: envs.StageEnv, name: str, minor: int) -> list[str]:
@@ -270,6 +278,26 @@ def test_embed_train_installs_on_the_machines_its_comments_say_and_not_on_the_ot
     torch_pair = ["torch==2.9.1", "torchvision==0.24.1"]
     assert _blocking(envs.EMBED_TRAIN, "macosx_x86_64", 12) == torch_pair
     assert _blocking(envs.EMBED_TRAIN, "linux_x86_64_glibc_2_27", 12) == torch_pair
+
+
+def test_the_vision_environments_are_their_text_ones_plus_the_image_processors_needs():
+    """TRAIN and EXPORT keep the identity every text run was measured in."""
+    assert envs.TRAIN_VISION.requirements == (
+        *envs.TRAIN.requirements,
+        "torchvision==0.20.1",
+        "pillow==12.3.0",
+    )
+    assert envs.EXPORT_VISION.requirements == (*envs.EXPORT.requirements, "torchvision==0.29.2")
+    assert envs.TRAIN_VISION.identity != envs.TRAIN.identity
+    assert envs.EXPORT_VISION.identity != envs.EXPORT.identity
+    # torchvision 0.20.1 is the release built against TRAIN's torch.
+    assert PUBLISHED["torchvision==0.20.1"].requires == ("torch==2.5.1",)
+
+
+def test_train_vision_has_no_python_3_13_wheel_for_torchvision():
+    """The floor `envs.TRAIN_VISION`'s comment states, from the files on record."""
+    assert _blocking(envs.TRAIN_VISION, "linux_x86_64", 12) == []
+    assert "torchvision==0.20.1" in _blocking(envs.TRAIN_VISION, "linux_x86_64", 13)
 
 
 # Every tag a wheel on record carries: what a host's tags are asked about.
