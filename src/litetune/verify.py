@@ -702,7 +702,9 @@ def _candidate_sampling(engine: Mapping[str, Any]) -> str:
             "runtime ran on it; both sides are greedy"
         )
     return (
-        "the bundle declares no sampler, and the runtime ran on its own defaults; both are greedy"
+        "the bundle declares no sampler, and the runtime ran on its own defaults; both are "
+        "greedy. An application through flutter_edge_ai that passes no sampler gets its model "
+        "family's default instead, which for Gemma 4 samples"
     )
 
 

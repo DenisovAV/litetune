@@ -902,7 +902,10 @@ def test_the_decoding_limitation_does_not_say_nothing_reached_the_runtime(tmp_pa
             {"bundle_sampler": {"type": "TOP_P", "k": 1}, "sampler_sent": None},
             "picks the likeliest token",
         ),
-        ({"bundle_sampler": None, "sampler_sent": None}, "declares no sampler"),
+        (
+            {"bundle_sampler": None, "sampler_sent": None},
+            "default instead, which for Gemma 4 samples",
+        ),
     ],
 )
 def test_the_decoding_sentence_says_what_the_candidate_ran_on(engine, said):
