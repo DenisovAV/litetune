@@ -702,8 +702,7 @@ def _candidate_sampling(engine: Mapping[str, Any]) -> str:
 
 PICTURE_THREADS = (
     "the vision encoder ran on the runtime's default CPU threads: litert-lm 0.18.0's Engine "
-    "sets a thread count for its text and audio backends only (`engine.py`), so the {threads} "
-    "the text side was given did not reach it"
+    "sets a thread count for its text and audio backends only (`engine.py`). The text side {text}"
 )
 
 PICTURE_PREFILL_UNCHECKED = (
@@ -1698,7 +1697,7 @@ def run_verify(
         used = threads.get("threads") if isinstance(threads, Mapping) else None
         run.limitation(
             PICTURE_THREADS.format(
-                threads=f"{used} thread(s)" if used else "runtime's default thread count"
+                text=f"was given {used} thread(s)" if used else "ran on the default count too"
             )
         )
 
