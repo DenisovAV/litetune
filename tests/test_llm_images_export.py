@@ -167,7 +167,6 @@ def test_a_text_checkpoint_exports_as_it_did(tmp_path, toolchain):
         "--task=text_generation",
         "--export_vision_encoder=False",
         "--gemma4_vision_max_soft_tokens=140",
-        "--sampler_top_k=64",
         "--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm",
     ],
 )
@@ -224,10 +223,14 @@ def test_a_bundle_without_the_image_markers_is_refused(tmp_path, vision_bundle, 
     assert "names no start or end of image token" in detail
 
 
-def test_a_bundle_that_samples_is_refused(tmp_path, vision_bundle):
+def test_the_sampler_a_bundle_declares_is_recorded_not_refused(tmp_path, vision_bundle):
     vision_bundle.metadata_extra = _gemma4() + _sampler("TOP_P")
-    detail, _ = _refused(tmp_path)
-    assert "declares a TOP_P sampler" in detail
+    (export,) = run_export(_request(tmp_path, _checkpoint(tmp_path))).exports
+    assert export.ok, export.check.detail
+    assert export.vision is not None and export.vision["sampler"]["type"] == "TOP_P"
+    assert "an application that passes no sampler of its own samples with it" in (
+        export.check.detail
+    )
 
 
 def test_a_bundle_carrying_another_template_is_refused(tmp_path, vision_bundle):

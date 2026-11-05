@@ -47,7 +47,7 @@ from litetune import devices, envs
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.export import GPU_ACTIVATION
-from litetune.llm_images import ImageRef, ImageRowError, split_images
+from litetune.llm_images import CANDIDATE_SAMPLER, ImageRef, ImageRowError, split_images
 from litetune.metrics import ToolCall, read_target
 from litetune.prompt_mode import RENDERING_SOURCE, PromptMode
 
@@ -856,6 +856,8 @@ class LiteRtLmBackend:
             # encoder ran on. `None` for text.
             "pictures": len(self.images) if self.images is not None else None,
             "vision_backend": VISION_BACKEND if self.images is not None else None,
+            # The sampler sent in place of the bundle's, for rows with a picture.
+            "sampler": dict(CANDIDATE_SAMPLER) if self.images is not None else None,
             "runner_call": self.runner_call,
             "prompt_mode": self.prompt_mode.value,
             "prompt_mode_declared": self.declared_prompt_mode is not None,
@@ -1068,6 +1070,9 @@ def picture_spec(images: Sequence[Mapping[str, str]] | None) -> dict[str, Any]:
     return {
         "images": [{"path": str(i["path"]), "sha256": str(i["sha256"])} for i in images],
         "vision_backend": VISION_BACKEND,
+        # In place of the bundle's own, which litetune does not choose
+        # (`llm_images.CANDIDATE_SAMPLER`).
+        "sampler": dict(CANDIDATE_SAMPLER),
     }
 
 
@@ -1746,7 +1751,16 @@ def picture_message(prompt, picture):
     }
 
 
-def score_one(engine, runtime_rendered, index, prompt, out, picture=None):
+def sampler_for(settings):
+    """The spec's sampler as the runtime takes one; `None`, the bundle's own, without one."""
+    if not settings:
+        return None
+    import litert_lm
+
+    return litert_lm.SamplerConfig(**settings)
+
+
+def score_one(engine, runtime_rendered, index, prompt, out, picture=None, sampler=None):
     """One prompt on `engine`, its row written and flushed; with its picture, when it has one."""
     # A runner per prompt, not one per split. A conversation keeps
     # its history, so the second prompt would be answered with the
@@ -1756,7 +1770,7 @@ def score_one(engine, runtime_rendered, index, prompt, out, picture=None):
     try:
         if runtime_rendered:
             message = prompt if picture is None else picture_message(prompt, picture)
-            with engine.create_conversation(sampler_config=None) as runner:
+            with engine.create_conversation(sampler_config=sampler_for(sampler)) as runner:
                 text = text_from_conversation(runner, message)
         else:
             with engine.create_session(
@@ -1845,7 +1859,10 @@ def main(spec_path):
                     # reports every load it paid for.
                     last = index == len(prompts) - 1
                     write_report(at_engine, None, init)
-                    score_one(engine, runtime_rendered, index, prompt, out, pictures[index])
+                    score_one(
+                        engine, runtime_rendered, index, prompt, out, pictures[index],
+                        spec.get("sampler"),
+                    )
                     if last:
                         write_report(at_engine, device_report(), init)
             return
@@ -1856,7 +1873,10 @@ def main(spec_path):
             at_engine = device_report()
             write_report(at_engine)
             for index, prompt in enumerate(prompts):
-                score_one(engine, runtime_rendered, index, prompt, out, pictures[index])
+                score_one(
+                    engine, runtime_rendered, index, prompt, out, pictures[index],
+                    spec.get("sampler"),
+                )
             # Again after generating, with the engine still alive: a client
             # shows the runtime opened the GPU, and only its GPU time growing
             # across the split shows work was done there.

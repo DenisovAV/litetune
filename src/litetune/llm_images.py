@@ -100,17 +100,31 @@ TEMPLATE_FILE = "litetune_bundle_template.jinja"
 RECORD_KEY = "images"
 
 # What `convert` adds for an image checkpoint, beside the template override.
-# `--sampler_top_k=1`: with the `image_text_to_text` task litert-torch keeps the
-# checkpoint's `do_sample` (it sets it to False for `text_generation` only,
-# `core/export_lib.py:357-359`), and from a sampling generation config it writes
-# a sampler into the bundle (`core/litert_lm_builder.py:274-301`). The spike's
-# export carried TOP_P, k 64, p 0.95, temperature 1.0, where a litetune text
-# export carries none. A caller's top_k of 1 makes it GREEDY (`:300-301`).
 EXPORT_FLAGS = (
     "--task=image_text_to_text",
     "--export_vision_encoder=True",
     f"--gemma4_vision_max_soft_tokens={VISION_TOKENS}",
-    "--sampler_top_k=1",
+)
+
+# The sampler such a bundle declares is not litetune's choice. With the
+# `image_text_to_text` task litert-torch keeps the checkpoint's `do_sample` (it
+# sets it to False for `text_generation` only, `core/export_lib.py:357-359`), and
+# from a sampling generation config writes a sampler into the bundle
+# (`core/litert_lm_builder.py:274-301`): TOP_P, k 64, p 0.95, temperature 1.0 on
+# the spike's export, where a litetune text export carries none. The one way the
+# exporter offers to make it greedy, a top_k of 1, writes the GREEDY type
+# (`:300-301`), and litert-lm 0.18.0 then refused every message sent with no
+# sampler of the caller's: `RuntimeError: UNIMPLEMENTED: Sampler type: 3 not
+# implemented yet.` on 300 of 300 held-out rows (litetune's own beans run,
+# 2026-11-05). So the bundle keeps the sampler the exporter writes, `convert`
+# records it, and `verify` sends the candidate this sampler of its own -- the one
+# the spike measured with, top_k 1 -- in place of the bundle's.
+CANDIDATE_SAMPLER = {"top_k": 1, "top_p": 1.0, "temperature": 1.0, "seed": 0}
+
+SAMPLER_NOTE = (
+    "the bundle declares the sampler litert-torch writes from the checkpoint's generation "
+    "config ({sampler}); an application that passes no sampler of its own samples with it. "
+    "litetune's measurements of it send top_k 1 instead"
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")

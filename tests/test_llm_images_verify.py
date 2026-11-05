@@ -307,6 +307,8 @@ def test_the_candidate_is_sent_each_picture_on_a_cpu_vision_backend():
     (spec,) = env.specs
     assert spec["images"] == list(PICTURES)
     assert spec["vision_backend"] == "cpu"
+    assert spec["sampler"] == {"top_k": 1, "top_p": 1.0, "temperature": 1.0, "seed": 0}
+    assert backend.describe()["sampler"] == spec["sampler"]
     assert backend.describe()["pictures"] == 2
     assert backend.describe()["vision_backend"] == "cpu"
 
@@ -315,6 +317,7 @@ def test_a_text_candidate_has_no_vision_backend():
     env = SpecEnv()
     LiteRtLmBackend(model=Path("m"), env=env, auto_provision=False).generate(["one"])  # type: ignore[arg-type]
     assert "images" not in env.specs[0] and "vision_backend" not in env.specs[0]
+    assert "sampler" not in env.specs[0]
 
 
 def test_a_candidate_given_the_wrong_number_of_pictures_runs_nothing():
@@ -380,7 +383,11 @@ def test_the_runtime_is_sent_the_apps_message(tmp_path):
         _litertlm_script()["picture_message"]("q", {"path": str(picture), "sha256": "0" * 64})
 
 
-def test_a_row_with_a_picture_goes_to_the_conversation_as_that_message(tmp_path):
+def test_a_row_with_a_picture_goes_to_the_conversation_as_that_message(tmp_path, monkeypatch):
+    lm = types.ModuleType("litert_lm")
+    lm.SamplerConfig = lambda **settings: ("sampler", settings)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "litert_lm", lm)
+    samplers: list[Any] = []
     picture = tmp_path / "a.jpg"
     picture.write_bytes(b"jpeg bytes")
     sent: list[Any] = []
@@ -398,15 +405,26 @@ def test_a_row_with_a_picture_goes_to_the_conversation_as_that_message(tmp_path)
 
     class Engine:
         def create_conversation(self, sampler_config=None):
+            samplers.append(sampler_config)
             return Conversation()
 
     out = tmp_path / "rows.jsonl"
     with out.open("w", encoding="utf-8") as sink:
         _litertlm_script()["score_one"](
-            Engine(), True, 0, "q", sink, {"path": str(picture), "sha256": _sha(b"jpeg bytes")}
+            Engine(),
+            True,
+            0,
+            "q",
+            sink,
+            {"path": str(picture), "sha256": _sha(b"jpeg bytes")},
+            {"top_k": 1},
         )
+        # A text row keeps the bundle's sampler.
+        _litertlm_script()["score_one"](Engine(), True, 1, "q", sink)
+    assert samplers == [("sampler", {"top_k": 1}), None]
     assert sent[0]["content"][0]["type"] == "image"
-    assert json.loads(out.read_text()) == {"index": 0, "text": "healthy"}
+    first = json.loads(out.read_text().splitlines()[0])
+    assert first == {"index": 0, "text": "healthy"}
 
 
 def test_the_engine_gets_a_vision_backend_only_for_pictures(monkeypatch):

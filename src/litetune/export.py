@@ -2430,7 +2430,7 @@ def _vision_carried(
 
     `(None, facts)` when it does. Read back from the bundle itself: it must
     carry every `llm_images.VISION_SECTIONS`, Gemma 4's image markers and
-    `llm_images.MAX_NUM_PATCHES`, a greedy sampler or none, and as its template
+    `llm_images.MAX_NUM_PATCHES`, and as its template
     the bytes `tune` trained with. The exporter is handed all of these, and
     nothing before this reads what it wrote.
     """
@@ -2478,12 +2478,6 @@ def _vision_carried(
         problem = (
             f"sets max_num_patches {facts['max_num_patches']!r}, where the pictures were trained "
             f"at {record['vision_tokens']} soft tokens, {llm_images.MAX_NUM_PATCHES} patches"
-        )
-    elif sampler is not None and sampler.get("type") != "GREEDY":
-        problem = (
-            f"declares a {sampler.get('type')} sampler (top_k {sampler.get('k')}, top_p "
-            f"{sampler.get('p')}, temperature {sampler.get('temperature')}), where convert asked "
-            "for a greedy one"
         )
     elif template_sha256 != record["template_sha256"]:
         problem = (
@@ -2901,6 +2895,14 @@ def export_recipe(
             f"{gpu_text}"
             + (
                 f"; takes pictures at {vision['vision_tokens']} soft tokens"
+                + (
+                    "; "
+                    + llm_images.SAMPLER_NOTE.format(
+                        sampler=", ".join(f"{k} {v}" for k, v in vision["sampler"].items())
+                    )
+                    if vision["sampler"] is not None
+                    else ""
+                )
                 if vision is not None
                 else ""
             )
