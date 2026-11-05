@@ -78,6 +78,21 @@ PROCESSOR_FILES = (
     "chat_template.jinja",
 )
 
+# The tensors a LoRA run on the text tower must leave as the base's, by their
+# `state_dict` names in transformers 5.16.1's `Gemma4ForConditionalGeneration`:
+# the vision and audio towers and their embedders, which sit beside
+# `language_model` (`modeling_gemma4.py:2176-2190`), and the token embeddings,
+# which hold the `<|image>` and `<image|>` rows and which litetune adapts no
+# projection of. `tune` hashes each before training and after the merge.
+FROZEN_PREFIXES = (
+    "model.vision_tower.",
+    "model.embed_vision.",
+    "model.audio_tower.",
+    "model.embed_audio.",
+    "model.language_model.embed_tokens.",
+    "model.language_model.embed_tokens_per_layer.",
+)
+
 # The bundle template `tune` trained with, kept beside the checkpoint.
 TEMPLATE_FILE = "litetune_bundle_template.jinja"
 
