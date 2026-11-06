@@ -288,6 +288,8 @@ not measured. Off such a CPU nothing changes.
 | 0.4.0 – 0.4.1 | `litert-lm==0.18.0` | `litert-lm==0.18.0` and `litert-lm-builder==0.18.0`; `litert-torch-nightly` and the LiteRT, quantizer and converter pins unchanged | unchanged |
 | 0.4.2 – 0.6.0 | `litert-lm==0.18.0` | unchanged | unchanged on Python 3.10 – 3.12; `sentencepiece==0.2.1` in place of 0.2.0 on Python 3.13 |
 | 0.7.0 – 0.7.2 | `litert-lm==0.18.0` | unchanged | unchanged; EmbeddingGemma 2 trains in an environment of its own: `torch==2.9.1`, `torchvision==0.24.1`, `transformers==5.19.0`, `sentence-transformers==6.1.0`, `pillow==12.3.0`, `tokenizers==0.23.3`, `huggingface-hub==1.33.0`, `safetensors==0.8.0` |
+| 0.7.3 | `litert-lm==0.18.0` | unchanged; `convert --npu` compiles in environments of its own: an EmbeddingGemma 2 encoder with `ai-edge-litert==2.3.0`, `ai-edge-litert-sdk-qualcomm==2.3.0` (its sdist, sha256-pinned), `litert-lm-builder==0.18.0` and `flatbuffers==25.12.19`; an LLM bundle with the conversion pins plus the same SDK and `flatbuffers` | unchanged |
+| 0.8.0 | `litert-lm==0.18.0` | unchanged; a Gemma 4 checkpoint tuned on pictures exports with the conversion pins plus `torchvision==0.29.2` | unchanged; a Gemma 4 checkpoint tuned on pictures trains with the training pins plus `torchvision==0.20.1` and `pillow==12.3.0` |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with

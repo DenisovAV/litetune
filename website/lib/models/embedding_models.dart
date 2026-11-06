@@ -17,7 +17,7 @@ import 'measured_cards.dart';
 ///
 /// The card's facts come from MEASUREMENTS.md: the checkpoint and revision
 /// from *The graft*, the held-out count from *litetune end to end*, and the
-/// three runtimes from the sections that name EmbeddingGemma 2 and that
+/// runtimes from the sections that name EmbeddingGemma 2 and that
 /// runtime. `models_page_test.dart` checks every numeral on this half against
 /// the EmbeddingGemma 2 sections of MEASUREMENTS.md and README.md.
 class EmbeddingModels extends StatelessComponent {
@@ -42,16 +42,24 @@ class EmbeddingModels extends StatelessComponent {
         'embeds the input and answers with the option whose examples have the '
         'nearest centroid. litetune fine-tunes the tower on one decision and '
         "writes the result into Google's own .litertlm file, so the app loads "
-        'one file and nothing ships beside it.',
+        'one file and nothing ships beside it. It can also be fine-tuned on '
+        "pictures and written into Google's text-vision file.",
     hubId: 'google/embeddinggemma-2',
     revision: '914f7f89',
     anchor: _section,
     runtimes: [
       (target: RunTarget.cpu, anchor: _section),
+      (target: RunTarget.windowsCpu, anchor: _picturesSection),
       (target: RunTarget.macGpu, anchor: 'the-cpu-and-the-gpu-on-a-mac'),
+      (target: RunTarget.windowsGpu, anchor: _windowsAndLinuxGpu),
+      (target: RunTarget.linuxGpu, anchor: _windowsAndLinuxGpu),
       (
         target: RunTarget.qualcommNpu,
         anchor: 'embeddinggemma-2-on-a-qualcomm-npu',
+      ),
+      (
+        target: RunTarget.intelNpu,
+        anchor: 'the-same-fine-tune-on-intel-panther-lake-and-lunar-lake',
       ),
     ],
   );
@@ -59,16 +67,23 @@ class EmbeddingModels extends StatelessComponent {
   static const _section =
       'embeddinggemma-2-a-decider-fine-tuned-and-grafted-into-googles-file';
 
+  static const _picturesSection = 'embeddinggemma-2-on-images-beans';
+
+  static const _windowsAndLinuxGpu = 'the-gpu-on-windows-and-linux';
+
   /// The cards, in order. One today.
   static const measured = <MeasuredRun>[embeddingGemma2];
 
   /// What the runs behind the card covered, as the language-model note does
   /// for its twelve: the sides and the runtimes, no score.
   static const summary =
-      "EmbeddingGemma 2's int8 and int4 files were compared with the float32 "
-      "fine-tune on held-out rows through LiteRT-LM's EmbeddingEngine on an "
-      "x86 host's CPU; the int8 file also on a Mac's CPU and GPU and, "
-      "compiled for SM8750, on a phone's NPU. ";
+      "EmbeddingGemma 2's int8 and int4 files, of a text fine-tune and of a "
+      'picture fine-tune, were compared with the float32 fine-tune on held-out '
+      "rows through LiteRT-LM's EmbeddingEngine on an x86 host's CPU; the int8 "
+      "files also on a Mac's CPU and GPU and, compiled for SM8750, on a "
+      "phone's NPU, and the picture file on a Windows CPU and GPU and a Linux "
+      'NVIDIA GPU. The picture file, compiled by hand outside litetune, also '
+      'ran on Intel NPUs. ';
 
   @override
   Component build(BuildContext context) {

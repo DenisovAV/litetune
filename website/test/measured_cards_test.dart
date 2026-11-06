@@ -87,8 +87,12 @@ bool _namesCheckpoint(String section, MeasuredRun model) {
 /// What a section has to say for a runtime link to it to be honest.
 const _runtimeWords = {
   RunTarget.cpu: ['CPU'],
+  RunTarget.windowsCpu: ['Windows', 'CPU'],
   RunTarget.macGpu: ['Mac', 'GPU'],
+  RunTarget.windowsGpu: ['Windows', 'GPU'],
+  RunTarget.linuxGpu: ['Linux', 'GPU'],
   RunTarget.qualcommNpu: ['NPU', 'SM8750'],
+  RunTarget.intelNpu: ['Intel', 'NPU'],
 };
 
 void main() {
@@ -239,6 +243,20 @@ void main() {
       );
     }
   });
+
+  test(
+    'Windows and Linux GPU runs stay scoped to the embedding picture run',
+    () {
+      for (final model in LlmModels.measured) {
+        expect(
+          model.runtimes.map((run) => run.target),
+          isNot(contains(anyOf(RunTarget.windowsGpu, RunTarget.linuxGpu))),
+          reason:
+              '${model.name} has no checkpoint-named Windows or Linux GPU run',
+        );
+      }
+    },
+  );
 
   test('each runtime links to a section that names the checkpoint and the '
       'runtime', () {

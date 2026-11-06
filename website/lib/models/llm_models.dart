@@ -293,10 +293,11 @@ class LlmModels extends StatelessComponent {
       what:
           'About 5B parameters, and multimodal — a text tower with '
           'vision and audio towers beside it. For an assistant that has '
-          'to see or hear as well as read. A LoRA run on it is scoped '
-          'to the text tower, because all three use the same projection '
-          'names and a run scoped by name alone reaches every one of '
-          'them.',
+          'to see or hear as well as read. It can also be fine-tuned on rows '
+          'with a picture, with the vision tower kept and LoRA on the text '
+          'tower. The LoRA run is scoped to the text tower because all three '
+          'use the same projection names and a run scoped by name alone '
+          'reaches every one of them.',
       hubId: 'google/gemma-4-E2B-it',
       // Null although MEASUREMENTS.md names a commit: that run passed no
       // `--revision` and the hash was read back from the cache afterwards.
