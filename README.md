@@ -866,9 +866,9 @@ What has and has not been measured
   `verify --backend gpu` on a Mac's GPU, which passed the same gate (0.9311
   against the reference's 0.9312) with vectors further from the reference
   (cosine 0.9969 against 0.99928 on the CPU); see *The CPU and the GPU on a
-  Mac* in MEASUREMENTS.md. On Linux the 0.18.0 package's GPU engine did not
-  start in the one container tried, Windows is not measured, and `verify
-  --backend gpu` refuses on both. The app's own runtime build, a phone's CPU
+  Mac* in MEASUREMENTS.md. The beans image file has also run `verify --backend
+  gpu` on Windows (an Intel Arc B390) and on Linux (an NVIDIA L4), see *The GPU
+  on Windows and Linux*; a text file has not been measured on a GPU there. The app's own runtime build, a phone's CPU
   through the app, Google's NPU files and the web are not measured here (an NPU
   file `convert --npu` wrote is, below). Training was measured on the CPU only.
 - On a 32-vCPU Intel Xeon, at four threads, verify took 47 minutes (int8) and

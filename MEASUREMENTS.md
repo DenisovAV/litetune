@@ -2948,3 +2948,75 @@ runs used the banking77 int8 file from *litetune end to end*.
   The 300-row figures, the tool replies and the EmbeddingGemma 2 CPU figures
   were not measured again. `verify` now runs LiteRT-LM on one thread on such a
   CPU.
+
+## The GPU on Windows and Linux
+
+Measured 2026-11-06 with litert-lm 0.18.0 from PyPI on two machines: Windows 11 on
+an Intel Core Ultra (Panther Lake, 16 logical CPUs) with its integrated Intel Arc
+B390, and Ubuntu 22.04 on an 8-vCPU Intel Xeon @ 2.20GHz with an NVIDIA L4, driver
+580.178.04. On both the package's GPU path is LiteRT's WebGPU accelerator, linked
+into the package, and the runtime names on stderr the adapter it selected:
+
+| | adapter line |
+|---|---|
+| Windows | `Intel(R) Arc(TM) B390 GPU, arch=xe-3lpg, vendor=intel, backend=Direct3D 12, adapterType=Integrated GPU` |
+| Ubuntu, with `libnvidia-gl-580-server` and `libegl1` | `NVIDIA L4, arch=lovelace, vendor=nvidia, backend=Vulkan, adapterType=Discrete GPU` |
+| Ubuntu, with `libnvidia-gl-580-server`, without `libegl1` | `llvmpipe (LLVM 15.0.7, 256 bits), arch=software, vendor=mesa, backend=Vulkan, adapterType=CPU / Software` |
+
+- Without `libegl1` NVIDIA's Vulkan driver could not load `libEGL.so.1`, Vulkan
+  offered only Mesa's llvmpipe, and the runtime used it without an error. An
+  EmbeddingGemma 2 picture with the text tower "on the GPU" took 11,443 ms there,
+  against 585 ms with both towers on the CPU backend; Gemma 4 E2B failed to build
+  its engine (a 384 MiB buffer binding against llvmpipe's 128 MiB limit). With
+  `libegl1` installed the same picture took 527 ms and one text 15 ms, and Gemma 4
+  E2B answered one prompt in 1.6 s against 2.7 s on the CPU backend, with "colours"
+  where the CPU wrote "colors" and otherwise the same reply; `nvidia-smi` listed the
+  process with 3,151 MiB.
+- On Windows the per-process GPU engine counters
+  (`Win32_PerfRawData_GPUPerformanceCounters_GPUEngine`) had no instance for the
+  process before its engine was built, had instances once a GPU engine existed, and
+  their running time grew with work: from 60,343 to 30,493,406 (100 ns units) over
+  40 embeddings. A CPU engine's process had none at either reading.
+
+`verify --backend gpu` reads those signals: on Windows the counters at the two
+points macOS reads its kernel, on Linux the adapter line (and records `nvidia-smi`'s
+listing of the process), and on every platform it fails the harness on a software
+adapter. Run with litetune at `3ee2b47` on Windows and at `770b825` and `679fac9`
+on Linux (unreleased; wheels of the branch), on the beans int8 file and checkpoint
+of *EmbeddingGemma 2 on images: beans* and the emotion decision bundle of *The CPU
+and the GPU on a Mac*:
+
+| | Windows, Arc B390 | Linux, NVIDIA L4 |
+|---|---|---|
+| beans, status | inconclusive | inconclusive |
+| beans, candidate / reference, k=10 mean | 0.9347 / 0.9287 | 0.9400 / 0.9287 |
+| beans, cosine to float32, mean / min | 0.9589 / 0.7431 | 0.9578 / 0.7038 |
+| beans, ms per picture, median (text tower on the GPU, vision on the CPU) | 289.0 | 526.9 |
+| beans, what established the GPU | counters grew from 371,465 to 2,268,822,883 | the L4's adapter line; `nvidia-smi` listed the process at 450 MiB |
+| decision, status | not run | passed |
+| decision, top option / answer equal to the reference's (300 rows) | | 1.0000 / 0.9933 |
+| decision, mean KL, reference to runtime | | 2.23e-04 |
+| decision, rows the two GPU runs differed on | | 0 |
+| decision, ms per decision, median | | 111.7 |
+
+- The beans gates were inconclusive for the reason in *EmbeddingGemma 2 on images:
+  beans*: at 300 held-out rows no draw's interval fits under the 0.01 threshold.
+  The same file on the same Windows machine's CPU scored 0.9327 at 363.5 ms per
+  picture (*The same int8 file on a Mac's CPU and GPU, and on Windows*). On
+  Windows Google's file ran on the GPU too and scored 0.8333.
+- Both machines ran the same checkpoint (`65bca52c`) and int8 file (`36e54790`).
+  The beans record as shipped predates `tune` recording the processor files'
+  digests, and `verify` refused it; both runs used the record with the digests
+  added, as on the Mac and on Windows before, whose four files' digests matched.
+- The first decision run on Linux, at `770b825`, passed with the same numbers and
+  was recorded as asked for, not as observed: the scoring script set the runtime's
+  log to ERROR before building its engine, so the adapter line, logged at INFO,
+  was never written, although `nvidia-smi` listed the process with 876 MiB. At
+  `679fac9` the script quiets the log once the engine exists and the run was
+  observed.
+- With `VK_ICD_FILENAMES` pointing at Mesa's llvmpipe ICD on the same Linux host,
+  `verify --backend gpu` on beans failed the harness: the candidate's script read
+  the llvmpipe line from its stderr once its engine existed, stopped, and the
+  candidate check named the adapter and the two packages.
+- Not run on these machines: the text and tool paths on the GPU, and on Windows the
+  decision path. Their reading is the same code and is held by tests, not by a run.
