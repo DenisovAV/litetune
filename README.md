@@ -1707,11 +1707,13 @@ withdrawn after re-measurement.
   decision bundle and an EmbeddingGemma 2 file. On Linux the kernel is not
   asked: the run is measured on the GPU when LiteRT-LM names a hardware
   adapter on its stderr as it builds its GPU environment ("Selected adapter:
-  …") and `nvidia-smi`, on a host where it lists one GPU, lists the process
-  after the work: a context held on that GPU, which places the run there and
-  is not a reading of each operation. With the adapter alone, or with several
-  GPUs, which nvidia-smi does not identify by anything the runtime prints,
-  the manifest says it was selected, not measured on; a finished run that
+  …"), that adapter is NVIDIA's, and `nvidia-smi`, on a host where it lists
+  one GPU, lists the process after the work: a context held on the host's
+  only NVIDIA GPU, which places the run there and is not a reading of each
+  operation. With the adapter alone, an adapter of another vendor (which
+  nvidia-smi does not see), or several NVIDIA GPUs (which it does not
+  identify by anything the runtime prints), the manifest says it was
+  selected, not measured on; a finished run that
   names no adapter fails the harness. On every platform a GPU run
   whose adapter is a software one (`adapterType` with `cpu` or `software` in
   it, or llvmpipe, lavapipe, SwiftShader or WARP by name) is a harness

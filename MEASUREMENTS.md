@@ -2983,8 +2983,9 @@ into the package, and the runtime names on stderr the adapter it selected:
 points macOS reads its kernel, counted only on the adapter the runtime named, whose
 LUID the driver script gets from DXGI's adapter list, and only on counters present
 at both readings. On Linux: the adapter line, and the run counts as measured on the
-GPU only when `nvidia-smi` also lists the process after the work; with the line
-alone it is said as "selected", and a finished run with no line fails the harness.
+GPU only when that adapter is NVIDIA's and `nvidia-smi` also lists the process after
+the work on a host with one NVIDIA GPU; otherwise it is said as "selected", and a
+finished run with no line fails the harness.
 On every platform a software adapter fails the harness. Run with litetune at
 `cc4bdbe` (unreleased), from one wheel whose sha256, `14cd2c7b…`, and file-for-file
 match to that commit are in each run's `wheel.txt`, on the beans int8 file and checkpoint
@@ -2997,7 +2998,7 @@ and the GPU on a Mac*:
 | beans, candidate / reference, k=10 mean | 0.9347 / 0.9287 | 0.9400 / 0.9287 |
 | beans, cosine to float32, mean / min | 0.9589 / 0.7431 | 0.9578 / 0.7038 |
 | beans, ms per picture, median (text tower on the GPU, vision on the CPU) | 291.0 | 441.7 |
-| beans, what established the GPU | the Arc's counters (LUID `0x0000A62B`) grew from 382,400 to 2,247,383,261 | the L4's adapter line, and `nvidia-smi` listed the process at 450 MiB on the host's only GPU: a context held there, not a reading of each operation |
+| beans, what established the GPU | the Arc's counters (LUID `0x0000A62B`) grew from 382,400 to 2,247,383,261 | the L4's adapter line, and `nvidia-smi` listed the process at 450 MiB on the host's only NVIDIA GPU: a context held there, not a reading of each operation |
 | decision, status | failed the harness | passed |
 | decision, top option / answer equal to the reference's (300 rows) | | 1.0000 / 0.9933 |
 | decision, mean KL, reference to runtime | | 2.23e-04 |
@@ -3039,5 +3040,11 @@ and the GPU on a Mac*:
   `verify --backend gpu` on beans failed the harness: the candidate's script read
   the llvmpipe line from its stderr once its engine existed and stopped, and the
   candidate check named the adapter and the variable that chose it.
+- The L4 records name the adapter's vendor as `nvidia` and were taken at
+  `cc4bdbe`, whose nvidia-smi reading did not yet record the host's GPU count;
+  that the host had one GPU rests on `nvidia-smi --query-gpu` in
+  `linux-l4-verify/setup.txt`, one line, `NVIDIA L4, 580.178.04`. Read by the
+  current code, which wants the count in the record, the two runs would be said
+  as selected.
 - Not run on these machines: the text and tool paths on the GPU. Their reading is
   the same code and is held by tests, not by a run.
