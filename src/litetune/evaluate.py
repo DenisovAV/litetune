@@ -1972,6 +1972,42 @@ def run_report(spec, at_engine, after_generation=None):
     return report
 '''
 
+# Pasted after `RUNTIME_ENGINE_SOURCE`'s functions with the patterns above, so a
+# script whose stderr goes to a file it is told of can stop once its engine
+# exists rather than compute a whole split on the CPU through a software
+# adapter (an image there took 11,443 ms against 585 ms on the CPU backend).
+# The parent judges the same lines again afterwards (`software_adapter`).
+RUNTIME_ENGINE_SOURCE += (
+    f"\n\nADAPTER_LINE = {_ADAPTER_LINE.pattern!r}\n"
+    f"SOFTWARE_ADAPTER_TYPE = {SOFTWARE_ADAPTER_TYPE!r}\n"
+    f"SOFTWARE_ADAPTER_NAME = {_SOFTWARE_ADAPTER_NAME.pattern!r}\n"
+    + r"""
+
+def software_adapter_in(path):
+    '''The first adapter the runtime named in the file at `path` that is a software one, or None.
+
+    `evaluate._is_software`'s rule, which this script cannot import. None when
+    there is no such file, or no path.
+    '''
+    import re
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except (OSError, TypeError, ValueError):
+        return None
+    for match in re.finditer(ADAPTER_LINE, text):
+        adapter = {key: value.strip() for key, value in match.groupdict().items()}
+        if (
+            adapter["adapter_type"] == SOFTWARE_ADAPTER_TYPE
+            or adapter["arch"].lower() == "software"
+            or re.search(SOFTWARE_ADAPTER_NAME, adapter["name"], re.IGNORECASE)
+        ):
+            return adapter
+    return None
+"""
+)
+
 
 _LITERTLM_GENERATE_SCRIPT = (
     r'''

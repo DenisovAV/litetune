@@ -577,6 +577,15 @@ def main():
         # the CPU, where it would only cost the probe's time.
         if on_gpu:
             device["at_engine"] = device_report()
+            # The runtime has named its adapter by now, in this script's stderr
+            # file; on a software one every vector would be the CPU's.
+            software = software_adapter_in(spec.get("stderr"))
+            if software is not None:
+                report.write_text(json.dumps({"error": (
+                    "stopped once the engine was built: LiteRT-LM selected a software "
+                    "adapter, %s, which computes on the CPU" % software["name"])}),
+                    encoding="utf-8")
+                return REFUSED_EXIT
         options = litert_lm.EmbeddingOptions(
             normalize=True,
             insert_special_tokens=True,
@@ -853,6 +862,15 @@ def main():
         # engine exists and after the last image, with the engine still open.
         if on_gpu:
             device["at_engine"] = device_report()
+            # The runtime has named its adapter by now, in this script's stderr
+            # file; on a software one every vector would be the CPU's.
+            software = software_adapter_in(spec.get("stderr"))
+            if software is not None:
+                report.write_text(json.dumps({"error": (
+                    "stopped once the engine was built: LiteRT-LM selected a software "
+                    "adapter, %s, which computes on the CPU" % software["name"])}),
+                    encoding="utf-8")
+                return REFUSED_EXIT
         options = litert_lm.EmbeddingOptions(
             normalize=True,
             insert_special_tokens=True,
@@ -1413,6 +1431,9 @@ def run_engines(
                     "max_input_length": MAX_INPUT_TOKENS,
                     "out": str(work / f"{name}.npy"),
                     "report": str(report),
+                    # Where the launcher sends this side's stderr, which the
+                    # script reads for the adapter the runtime selected.
+                    "stderr": str(work / f"{name}.err"),
                 }
             ),
             encoding="utf-8",

@@ -639,7 +639,7 @@ def _stub_litert_lm(answers: list[Any]) -> tuple[types.ModuleType, dict[str, lis
     return mod, calls
 
 
-def _engine_main(tmp_path, monkeypatch, answers, texts, backend=None):
+def _engine_main(tmp_path, monkeypatch, answers, texts, backend=None, stderr=None):
     ns: dict[str, Any] = {"__name__": "engine_script"}
     exec(compile(ENGINE_SCRIPT, "engine.py", "exec"), ns)
     stub, calls = _stub_litert_lm(answers)
@@ -665,6 +665,9 @@ def _engine_main(tmp_path, monkeypatch, answers, texts, backend=None):
     }
     if backend is not None:
         spec["backend"] = backend
+    if stderr is not None:
+        (tmp_path / "side.err").write_text(stderr, encoding="utf-8")
+        spec["stderr"] = str(tmp_path / "side.err")
     (tmp_path / "spec.json").write_text(json.dumps(spec))
     monkeypatch.setattr(sys, "argv", ["engine.py", str(tmp_path / "spec.json")])
     code = ns["main"]()
@@ -3271,7 +3274,9 @@ def _pictures(tmp_path: Path, pictures: Sequence[bytes] = PICTURES) -> tuple[lis
     return paths, [hashlib.sha256(data).hexdigest() for data in pictures]
 
 
-def _image_engine_main(tmp_path, monkeypatch, answers, images, digests=None, backend=None):
+def _image_engine_main(
+    tmp_path, monkeypatch, answers, images, digests=None, backend=None, stderr=None
+):
     ns: dict[str, Any] = {"__name__": "image_engine_script"}
     exec(compile(embedding_verify.IMAGE_ENGINE_SCRIPT, "engine.py", "exec"), ns)
     stub, calls = _stub_litert_lm(answers)
@@ -3298,6 +3303,9 @@ def _image_engine_main(tmp_path, monkeypatch, answers, images, digests=None, bac
     }
     if backend is not None:
         spec["backend"] = backend
+    if stderr is not None:
+        (tmp_path / "side.err").write_text(stderr, encoding="utf-8")
+        spec["stderr"] = str(tmp_path / "side.err")
     (tmp_path / "spec.json").write_text(json.dumps(spec))
     monkeypatch.setattr(sys, "argv", ["engine.py", str(tmp_path / "spec.json")])
     code = ns["main"]()
@@ -3595,3 +3603,78 @@ def test_a_failed_cpu_side_is_not_blamed_on_an_adapter_line(fake, tmp_path):
     assert result.status is Status.FAILED_HARNESS
     detail = json.dumps(result.manifest["checks"])
     assert "the script exited 1" in detail and "software adapter" not in detail
+
+
+@pytest.mark.parametrize("line", [LLVMPIPE_LINE, L4_LINE])
+def test_the_engine_script_stops_once_its_engine_is_on_a_software_adapter(
+    tmp_path, monkeypatch, line
+):
+    """The launcher sends the side's stderr to a file the script is told of; the
+    runtime has named its adapter there by the time the engine exists."""
+    code, report, calls = _engine_main(
+        tmp_path, monkeypatch, [[3.0, 4.0], [0.0, 2.0]], ["a", "b"], backend="gpu", stderr=line
+    )
+    if line is LLVMPIPE_LINE:
+        assert code == 3 and calls["texts"] == []
+        assert "selected a software adapter, llvmpipe (LLVM 15.0.7, 256 bits)" in report["error"]
+    else:
+        assert code == 0 and len(calls["texts"]) == 2
+
+
+def test_the_engine_script_on_the_cpu_does_not_read_its_stderr(tmp_path, monkeypatch):
+    code, _, calls = _engine_main(
+        tmp_path, monkeypatch, [[3.0, 4.0], [0.0, 2.0]], ["a", "b"], stderr=LLVMPIPE_LINE
+    )
+    assert code == 0 and len(calls["texts"]) == 2
+
+
+def test_the_image_engine_script_stops_once_its_engine_is_on_a_software_adapter(
+    tmp_path, monkeypatch
+):
+    paths, digests = _pictures(tmp_path)
+    code, report, calls = _image_engine_main(
+        tmp_path,
+        monkeypatch,
+        [[3.0, 4.0], [0.0, 2.0]],
+        paths,
+        digests,
+        backend="gpu",
+        stderr=LLVMPIPE_LINE,
+    )
+    assert code == 3 and calls["texts"] == []
+    assert "software adapter, llvmpipe" in report["error"]
+
+
+def test_each_engine_side_is_told_where_its_stderr_goes(fake, tmp_path, on_macos):
+    _verify(_setup(tmp_path), backend="gpu", with_base=True)
+    for side in ("candidate", "base"):
+        assert fake.specs[side]["stderr"].endswith(f"{side}.err")
+    (launch,) = fake.launches
+    assert [r["stderr"] for r in launch["runs"]] == [
+        fake.specs[r["name"]]["stderr"] for r in launch["runs"]
+    ]
+
+
+def test_the_script_and_the_parent_tell_a_software_adapter_alike(tmp_path):
+    """The rule is written twice, once for the script, which cannot import it."""
+    from litetune.evaluate import RUNTIME_ENGINE_SOURCE, adapters_of, software_adapter
+
+    ns: dict[str, Any] = {}
+    exec(RUNTIME_ENGINE_SOURCE, ns)
+    lines = [
+        LLVMPIPE_LINE,
+        L4_LINE,
+        "Selected adapter: Some GPU, arch=software, vendor=x, backend=Vulkan, adapterType=Unknown",
+        "Selected adapter: SwiftShader Device, arch=x, vendor=google, backend=Vulkan, "
+        "adapterType=Unknown",
+        "Selected adapter: Microsoft Basic Render Driver, arch=x, vendor=microsoft, "
+        "backend=Direct3D 12, adapterType=Unknown",
+    ]
+    for i, line in enumerate(lines):
+        path = tmp_path / f"{i}.err"
+        path.write_text(line, encoding="utf-8")
+        script = ns["software_adapter_in"](str(path))
+        parent = software_adapter(adapters_of(line))
+        assert (script is None) is (parent is None), line
+        assert script is None or script == parent
+    assert ns["software_adapter_in"](str(tmp_path / "missing.err")) is None
