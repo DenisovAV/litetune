@@ -969,6 +969,9 @@ class FakeEmbedEnvs:
     gpu_device: dict[str, Any] | None = None
     # The same for one side only, by its name.
     gpu_device_for: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # What an engine side writes to its stderr, by its name: where the runtime
+    # names the adapter it selected.
+    stderr_for: dict[str, str] = field(default_factory=dict)
     # An image split's files by absolute path, and the label each was written with.
     image_labels: dict[str, str] = field(default_factory=dict)
     # The soft tokens the fake reference makes of a picture, by path; else 63.
@@ -1077,11 +1080,16 @@ class FakeEmbedEnvs:
                 self.runs.append((side, env.name))
                 self.specs[side] = sub
                 self.sources[side] = Path(spec["script"]).read_text(encoding="utf-8")
+                said = self.stderr_for.get(side, "")
                 if side in self.fail:
-                    Path(run["stderr"]).write_text(f"{side}: RuntimeError: boom", encoding="utf-8")
+                    Path(run["stderr"]).write_text(
+                        f"{said}\n{side}: RuntimeError: boom", encoding="utf-8"
+                    )
                     results[side] = {"returncode": 1, "seconds": 1.0}
                     stopped = side in spec["stop_on"]
                     continue
+                if said:
+                    Path(run["stderr"]).write_text(said, encoding="utf-8")
                 code = self.embed(side, sub)
                 results[side] = {"returncode": code, "seconds": 1.0}
                 stopped = code != 0 and side in spec["stop_on"]
@@ -1871,7 +1879,7 @@ def test_a_flag_of_another_path_is_refused_not_ignored(fake, tmp_path, kwargs, f
 
 @pytest.fixture
 def on_macos(monkeypatch) -> None:
-    """The GPU path for an embedding file is measured on macOS only, and runs there only."""
+    """The GPU path's kernel reading is macOS's; the fakes' readings are written for it."""
     monkeypatch.setattr(sys, "platform", "darwin")
 
 
@@ -1911,8 +1919,8 @@ def test_the_cpu_backend_is_passed_and_stated_as_before(fake, tmp_path):
     assert "GPU backend of LiteRT-LM's EmbeddingEngine" not in limitations
 
 
-@pytest.mark.parametrize("platform", ["linux", "win32"])
-def test_the_gpu_backend_is_refused_off_macos_where_it_was_not_measured(
+@pytest.mark.parametrize("platform", ["freebsd14", "cygwin"])
+def test_the_gpu_backend_is_refused_where_its_work_is_not_read(
     fake, tmp_path, monkeypatch, platform
 ):
     monkeypatch.setattr(sys, "platform", platform)
@@ -1922,9 +1930,127 @@ def test_the_gpu_backend_is_refused_off_macos_where_it_was_not_measured(
     failed = [c for c in result.manifest["checks"] if c["outcome"] == "failed"]
     assert [c["name"] for c in failed] == [CANDIDATE_CHECK]
     assert f"--backend gpu on {platform}" in failed[0]["detail"]
-    assert "measured on macOS only" in failed[0]["detail"]
-    assert "The CPU and the GPU on a Mac" in failed[0]["detail"]
+    assert "on macOS, Windows and Linux only" in failed[0]["detail"]
+    assert "The GPU on Windows and Linux" in failed[0]["detail"]
     assert fake.runs == []
+
+
+# The adapter lines litert-lm 0.18.0 printed on an NVIDIA L4 and, without its
+# Vulkan driver, on llvmpipe (measurements/2026-11-06-gpu-linux-windows).
+L4_LINE = (
+    "I0000 environment.cc:532] Selected adapter: NVIDIA L4, arch=lovelace, vendor=nvidia, "
+    "backend=Vulkan, adapterType=Discrete GPU"
+)
+LLVMPIPE_LINE = (
+    "I0000 environment.cc:532] Selected adapter: llvmpipe (LLVM 15.0.7, 256 bits), "
+    "arch=software, vendor=mesa, backend=Vulkan, adapterType=CPU / Software"
+)
+LINUX_UNREAD = {
+    "at_engine": {"platform": "linux", "looked": False},
+    "after_generation": {"platform": "linux", "looked": False},
+}
+
+
+def _windows_reading(time_: int) -> dict[str, Any]:
+    return {
+        "platform": "win32",
+        "looked": True,
+        "gpu_client": "pid_1_luid_0x0_0xA62B_phys_0_eng_0_engtype_3D",
+        "gpu_time": time_,
+        "gpu_clients": {"luid_0x0_0xA62B_phys_0_eng_0_engtype_3D": time_},
+    }
+
+
+def test_on_linux_the_gpu_runs_and_the_hardware_adapter_is_the_reading(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    fake.gpu_device = LINUX_UNREAD
+    fake.stderr_for = {"candidate": L4_LINE, "base": L4_LINE}
+    result = _verify(_setup(tmp_path), backend="gpu", with_base=True)
+
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert engine["backend_observed"] is True
+    assert "NVIDIA L4" in engine["gpu_evidence"]
+    assert engine["device"]["adapters"][0]["adapter_type"] == "Discrete GPU"
+    assert result.manifest["quality"]["gain_over_base"]["base_backend_observed"] is True
+    said = embedding_verify.GPU_MEASURED.format(how=embedding_verify.GPU_SEEN)
+    assert said in result.manifest["limitations"]
+
+
+def test_on_linux_a_gpu_run_with_no_adapter_line_is_asked_for_not_observed(
+    fake, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(sys, "platform", "linux")
+    fake.gpu_device = LINUX_UNREAD
+    result = _verify(_setup(tmp_path), backend="gpu")
+
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert engine["backend_observed"] is False and engine["gpu_evidence"] is None
+    said = embedding_verify.GPU_MEASURED.format(how=embedding_verify.GPU_ASKED_FOR)
+    assert said in result.manifest["limitations"]
+
+
+def test_on_windows_the_gpu_runs_and_the_counters_are_the_reading(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    fake.gpu_device = {
+        "at_engine": _windows_reading(60343),
+        "after_generation": _windows_reading(30493406),
+    }
+    result = _verify(_setup(tmp_path), backend="gpu")
+
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert engine["backend_observed"] is True
+    assert "GPU engine counters" in engine["gpu_evidence"]
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+def test_a_candidate_on_a_software_adapter_fails_the_harness(fake, tmp_path, monkeypatch, platform):
+    """The runtime embeds on llvmpipe and says nothing; the kernel's reading, here
+    one that shows GPU work, does not outweigh the adapter it named."""
+    monkeypatch.setattr(sys, "platform", platform)
+    fake.stderr_for = {"candidate": LLVMPIPE_LINE}
+    result = _verify(_setup(tmp_path), backend="gpu", with_base=True)
+
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert "selected a software adapter, llvmpipe (LLVM 15.0.7, 256 bits)" in failed["detail"]
+    assert ("libegl1" in failed["detail"]) is (platform == "linux")
+
+
+def test_google_s_file_on_a_software_adapter_is_not_compared(fake, tmp_path, monkeypatch):
+    """As an idle one is not: its vectors feed the gain over it."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    fake.gpu_device = LINUX_UNREAD
+    fake.stderr_for = {"candidate": L4_LINE, "base": LLVMPIPE_LINE}
+    result = _verify(_setup(tmp_path), backend="gpu", with_base=True)
+
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    assert "selected a software adapter, llvmpipe" in json.dumps(result.manifest["checks"])
+    assert "gain_over_base" not in result.manifest.get("quality", {})
+
+
+def test_a_side_that_failed_on_a_software_adapter_names_the_adapter_first(
+    fake, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(sys, "platform", "linux")
+    fake.stderr_for = {"candidate": LLVMPIPE_LINE}
+    fake.fail = {"candidate"}
+    result = _verify(_setup(tmp_path), backend="gpu")
+
+    assert result.status is Status.FAILED_HARNESS
+    detail = json.dumps(result.manifest["checks"])
+    assert "selected a software adapter, llvmpipe" in detail
+    assert "the run then failed: the script exited 1" in detail
+
+
+def test_a_cpu_side_is_not_judged_by_an_adapter_line(fake, tmp_path):
+    fake.stderr_for = {"candidate": LLVMPIPE_LINE}
+    result = _verify(_setup(tmp_path))
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    assert "adapters" not in result.manifest["measurements"]["candidate"]["engine"]["device"]
 
 
 @pytest.mark.parametrize("platform", ["linux", "win32"])
@@ -2838,8 +2964,10 @@ def test_a_text_checkpoint_on_the_gpu_keeps_its_own_words(fake, tmp_path, on_mac
     assert "vision_backend" not in m["measurements"]["candidate"]["engine"]
 
 
-@pytest.mark.parametrize("platform", ["linux", "win32"])
-def test_an_image_checkpoint_on_the_gpu_is_refused_off_macos(fake, tmp_path, monkeypatch, platform):
+@pytest.mark.parametrize("platform", ["freebsd14", "cygwin"])
+def test_an_image_checkpoint_on_the_gpu_is_refused_where_its_work_is_not_read(
+    fake, tmp_path, monkeypatch, platform
+):
     s = _image_setup(tmp_path, fake)
     monkeypatch.setattr(sys, "platform", platform)
     result = _verify(s, backend="gpu", with_base=True)
@@ -3428,3 +3556,42 @@ def test_the_image_reference_script_refuses_unusable_rows():
     exec(compile(embedding_verify.IMAGE_REFERENCE_SCRIPT, "reference.py", "exec"), ns)
     v = np.array([[1.0, 0.0], [0.0, 0.0], [np.nan, 1.0]])
     assert ns["unusable_rows"](np, v).tolist() == [1, 2]
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_an_image_checkpoint_runs_on_the_gpu_off_macos(fake, tmp_path, monkeypatch, platform):
+    s = _image_setup(tmp_path, fake)
+    monkeypatch.setattr(sys, "platform", platform)
+    if platform == "linux":
+        fake.gpu_device = LINUX_UNREAD
+        fake.stderr_for = {"candidate": L4_LINE}
+    else:
+        fake.gpu_device = {
+            "at_engine": _windows_reading(10),
+            "after_generation": _windows_reading(99),
+        }
+    m = _verify(s, backend="gpu").manifest
+    assert m["status"] == "passed", m["checks"]
+    assert m["measurements"]["candidate"]["engine"]["backend_observed"] is True
+    said = embedding_verify.IMAGE_GPU_MEASURED.format(
+        how=embedding_verify.GPU_SEEN, vision_tokens=m["embedding"]["vision_tokens"]
+    )
+    assert said in m["limitations"]
+
+
+def test_an_image_checkpoint_on_a_software_adapter_fails_the_harness(fake, tmp_path, monkeypatch):
+    s = _image_setup(tmp_path, fake)
+    monkeypatch.setattr(sys, "platform", "linux")
+    fake.stderr_for = {"candidate": LLVMPIPE_LINE}
+    result = _verify(s, backend="gpu")
+    assert result.status is Status.FAILED_HARNESS
+    assert "selected a software adapter, llvmpipe" in json.dumps(result.manifest["checks"])
+
+
+def test_a_failed_cpu_side_is_not_blamed_on_an_adapter_line(fake, tmp_path):
+    fake.stderr_for = {"candidate": LLVMPIPE_LINE}
+    fake.fail = {"candidate"}
+    result = _verify(_setup(tmp_path))
+    assert result.status is Status.FAILED_HARNESS
+    detail = json.dumps(result.manifest["checks"])
+    assert "the script exited 1" in detail and "software adapter" not in detail

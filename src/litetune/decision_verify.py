@@ -58,10 +58,16 @@ from litetune.decisions import (
     decision_from,
 )
 from litetune.evaluate import (
+    adapters_of,
     bundle_activation_error_of,
     bundle_activation_of,
+    gpu_evidence,
     gpu_observed,
+    gpu_read_here,
     gpu_unused,
+    software_adapter,
+    software_adapter_refusal,
+    with_adapters,
 )
 from litetune.events import EventStream
 from litetune.metrics import paired_difference
@@ -210,6 +216,8 @@ class ScoreRun:
     prompt_ids: dict[int, list[int]] = field(default_factory=dict)
     report: dict[str, Any] = field(default_factory=dict)
     failure: str | None = None
+    # The adapters the runtime said on stderr it selected (`evaluate.adapters_of`).
+    adapters: list[dict[str, str]] = field(default_factory=list)
 
 
 def _tail(text: str | bytes | None, limit: int = 2000) -> str:
@@ -220,8 +228,8 @@ def _tail(text: str | bytes | None, limit: int = 2000) -> str:
 
 
 GPU_IDLE = (
-    "the GPU backend was asked for and the kernel shows the {run} run did no GPU work: its "
-    "scores came from somewhere else"
+    "the GPU backend was asked for and the kernel (on Windows its GPU engine counters) shows "
+    "the {run} run did no GPU work: its scores came from somewhere else"
 )
 # Copies of each row still in question, in the third and last GPU run. More copies
 # spread the run's few wrong scores over more calls: a process gets a few wrong
@@ -240,9 +248,24 @@ GPU_REPEAT = (
     "{rows} of {n} rows needed the third run"
 )
 GPU_NOT_SEEN = (
-    "the GPU backend was asked for and the kernel did not establish that this process did GPU "
-    "work in the {runs} run: the numbers are the GPU backend's as asked for, not as observed"
+    "the GPU backend was asked for and nothing established that this process did GPU work in "
+    "the {runs} run -- not the kernel on macOS, the GPU engine counters on Windows, or a "
+    "hardware adapter named by the runtime on Linux: the numbers are the GPU backend's as asked "
+    "for, not as observed"
 )
+
+
+def _gpu_refusal(run: ScoreRun, which: str) -> str | None:
+    """Why the `which` GPU run's scores are not the GPU's, or None.
+
+    A software adapter first, by name, then a reading that shows no GPU work.
+    """
+    software = software_adapter(run.adapters)
+    if software is not None:
+        return f"the {which} GPU run: {software_adapter_refusal(software)}"
+    if gpu_unused("gpu", run.report.get("device")):
+        return GPU_IDLE.format(run=which)
+    return None
 
 
 def _bundle_activation_limit(report: dict[str, Any]) -> str | None:
@@ -410,8 +433,8 @@ def _repeat_on_gpu(
         return "the second GPU run left rows unscored: " + (
             second.failure or f"{n_rows - len(second.scores)} rows"
         )
-    if gpu_unused("gpu", second.report.get("device")):
-        return GPU_IDLE.format(run="second")
+    if (refused := _gpu_refusal(second, "second")) is not None:
+        return refused
     observed = [gpu_observed("gpu", first.report.get("device"))]
     observed.append(gpu_observed("gpu", second.report.get("device")))
     differ = [i for i in range(n_rows) if second.scores.get(i) != first.scores.get(i)]
@@ -437,8 +460,8 @@ def _repeat_on_gpu(
         )
         if third.failure or any(c["index"] not in third.scores for c in copies):
             return "the third GPU run left rows unscored: " + (third.failure or "some rows")
-        if gpu_unused("gpu", third.report.get("device")):
-            return GPU_IDLE.format(run="third")
+        if (refused := _gpu_refusal(third, "third")) is not None:
+            return refused
         observed.append(gpu_observed("gpu", third.report.get("device")))
         for c in range(GPU_COPIES_IN_LAST_RUN):
             runs.append({i: third.scores[n_rows * (c + 1) + i] for i in differ})
@@ -495,6 +518,7 @@ def run_script(
             proc = env.run(["python", str(script), str(spec_path)], timeout=timeout, env=child_env)
         except subprocess.TimeoutExpired as expired:
             said = _tail(expired.stderr)
+            run.adapters = adapters_of(expired.stderr)
             run.failure = f"no result after {timeout} s (timeout)" + (f": {said}" if said else "")
         except OSError as exc:
             run.failure = f"the script could not be started: {type(exc).__name__}: {exc}"
@@ -525,6 +549,14 @@ def run_script(
         elif proc is not None and not report.exists() and run.failure is None:
             said = _tail(proc.stderr)
             run.failure = "the script wrote no report" + (f": {said}" if said else "")
+    if proc is not None:
+        run.adapters = adapters_of(proc.stderr)
+    # The script cannot read its own stderr, where the runtime names its adapter.
+    with_adapters(run.report.get("device"), proc.stderr if proc is not None else None)
+    software = software_adapter(run.adapters)
+    if spec.get("backend") == "gpu" and software is not None and run.failure is not None:
+        # What failed, failed on an adapter that computes on the CPU.
+        run.failure = f"{software_adapter_refusal(software)}; the run then failed: {run.failure}"
     return run
 
 
@@ -838,13 +870,11 @@ def verify_decision(
             RUNTIME_CHECK,
             f"--backend {job.backend}: option scoring runs on LiteRT-LM's CPU or GPU backend",
         )
-    if job.backend == "gpu" and sys.platform != "darwin":
+    if job.backend == "gpu" and not gpu_read_here():
         return refuse(
             RUNTIME_CHECK,
-            f"--backend gpu: option scoring on the GPU is measured on macOS only, and this is "
-            f"{sys.platform}; on Linux the 0.18.0 package's GPU engine did not start in the one "
-            "container tried (no Vulkan driver), and Windows is not measured "
-            '(MEASUREMENTS.md, "The CPU and the GPU on a Mac")',
+            f"--backend gpu: option scoring on the GPU is read for GPU work on macOS, Windows "
+            f"and Linux only, and this is {sys.platform}",
         )
     method = METHOD_FRESH_ENGINE if job.engine_per_prompt_reason else METHOD_REWIND
     if job.backend == "gpu" and method == METHOD_FRESH_ENGINE:
@@ -1155,8 +1185,8 @@ def verify_decision(
     # After the first run's method and targets are checked: a run refused on
     # those does not cost two more on the GPU.
     if job.backend == "gpu":
-        if gpu_unused("gpu", eng.report.get("device")):
-            return refuse(RUNTIME_CHECK, GPU_IDLE.format(run="first"))
+        if (refused := _gpu_refusal(eng, "first")) is not None:
+            return refuse(RUNTIME_CHECK, refused)
         repeated = _repeat_on_gpu(
             job, engine_spec, eng, n_engine, len(decision.ids), method, events
         )
@@ -1323,8 +1353,9 @@ def verify_decision(
     fields["measurements"]["candidate"]["engine"] = {
         "engine": "litert-lm",
         "backend": job.backend,
-        # Whether the kernel showed the GPU work (macOS); False on the CPU.
+        # Whether the GPU work was read (`evaluate.gpu_observed`); False on the CPU.
         "backend_observed": gpu_observed(job.backend, eng.report.get("device")),
+        "gpu_evidence": gpu_evidence(job.backend, eng.report.get("device")),
         "runtime_version": (eng.report.get("runtime") or {}).get("litert-lm"),
         "cpu": {"model": eng.report.get("cpu")},
         "threads": cpu.used if on_cpu else None,

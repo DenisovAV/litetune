@@ -130,7 +130,17 @@ from litetune.embedding_tune import (
     read_image_split,
     states_of,
 )
-from litetune.evaluate import RUNTIME_ENGINE_SOURCE, gpu_observed, gpu_unused
+from litetune.evaluate import (
+    RUNTIME_ENGINE_SOURCE,
+    adapters_of,
+    gpu_evidence,
+    gpu_observed,
+    gpu_read_here,
+    gpu_unused,
+    software_adapter,
+    software_adapter_refusal,
+    with_adapters,
+)
 from litetune.events import EventStream
 from litetune.metrics import Difference, paired_difference
 from litetune.prepare import (
@@ -237,19 +247,19 @@ GPU_PRECISION = (
 )
 GPU_MEASURED = (
     "{how} the GPU backend of LiteRT-LM's EmbeddingEngine, from the litert-lm package on "
-    "PyPI on this Mac's GPU, one file at a time -- not the "
+    "PyPI on this host's GPU, one file at a time -- not the "
     "application's own build of the runtime on a device's GPU; the CPU and the NPU are not "
     "measured in this run. " + GPU_PRECISION
 )
 GPU_SEEN = "measured on"
-# Not observed: the kernel's GPU time for the engine process was not read or did not
-# settle the question.
+# Not observed: the engine process's GPU work was not read or did not settle the
+# question (`evaluate.gpu_observed`: the kernel on macOS, the GPU engine counters
+# on Windows, the adapter the runtime names on Linux).
 GPU_ASKED_FOR = "asked of, and not observed on,"
 GPU_NOT_MEASURED_HERE = (
-    "--backend gpu on {platform}: LiteRT-LM's GPU path for an EmbeddingGemma 2 file is measured "
-    'on macOS only (MEASUREMENTS.md, "The CPU and the GPU on a Mac"): on Linux the 0.18.0 '
-    "package's GPU engine did not start in the one container tried, and Windows is not "
-    "measured, so it is refused here"
+    "--backend gpu on {platform}: LiteRT-LM's GPU path for an EmbeddingGemma 2 file is read "
+    'for GPU work on macOS, Windows and Linux only (MEASUREMENTS.md, "The CPU and the GPU on a '
+    'Mac" and "The GPU on Windows and Linux"), so it is refused here'
 )
 SIDE_BY_SIDE = (
     "the candidate and Google's file were embedded at the same time, each on its own {threads}; "
@@ -279,7 +289,7 @@ IMAGE_GPU_MEASURED = (
     "encoder on its CPU backend at the runtime's default threads -- where flutter_edge_ai_litertlm "
     "1.19.0 puts the vision encoder beside a text tower on the GPU -- each image given as its "
     "bytes at a budget of at most {vision_tokens} vision tokens per image, from the litert-lm "
-    "package on PyPI on this Mac, one file at a time -- not the application's own build of the "
+    "package on PyPI on this host, one file at a time -- not the application's own build of the "
     "runtime on a device; the NPU is not measured. litetune has published one measurement of "
     'an image checkpoint on the GPU, on one Mac (MEASUREMENTS.md, "The same int8 file on a '
     "Mac's CPU and GPU, and on Windows\"). " + GPU_PRECISION
@@ -563,7 +573,7 @@ def main():
     ) as engine:
         # On the GPU, the kernel's GPU time for this process once the engine
         # exists and again after the last text, with the engine still open: the
-        # reading evaluate.gpu_observed takes as GPU work, on macOS. Not asked on
+        # reading evaluate.gpu_observed takes as GPU work. Not asked on
         # the CPU, where it would only cost the probe's time.
         if on_gpu:
             device["at_engine"] = device_report()
@@ -1435,6 +1445,18 @@ def run_engines(
         err = work / f"{name}.err"
         stderr = err.read_text(encoding="utf-8", errors="replace") if err.is_file() else None
         out[name] = read_run(reports[name], code, stderr)
+        if backend == "gpu":
+            # The adapter the runtime named on this side's stderr, which its
+            # script cannot read (`evaluate.with_adapters`). A side that failed
+            # on a software adapter says so first: the failure is that
+            # adapter's (Gemma 4 E2B ran out of llvmpipe's buffer size).
+            with_adapters(out[name].report.get("device"), stderr)
+            software = software_adapter(adapters_of(stderr))
+            if software is not None and out[name].failure is not None:
+                out[name].failure = (
+                    f"{software_adapter_refusal(software)}; the run then failed: "
+                    f"{out[name].failure}"
+                )
     return out, None
 
 
@@ -1856,7 +1878,7 @@ def verify_embedding(
             CANDIDATE_CHECK,
             f"--backend {job.backend}: the embedding path runs on LiteRT-LM's CPU or GPU backend",
         )
-    if job.backend == "gpu" and sys.platform != "darwin":
+    if job.backend == "gpu" and not gpu_read_here():
         return refuse(CANDIDATE_CHECK, GPU_NOT_MEASURED_HERE.format(platform=sys.platform))
     if job.not_applicable:
         return refuse(
@@ -2163,10 +2185,15 @@ def verify_embedding(
                 )
             if not out.is_file():
                 return f"the script reports {len(inputs)} vectors but wrote no {out.name}"
-            if name != "reference" and gpu_unused(job.backend, run.report.get("device")):
+            device = run.report.get("device")
+            software = software_adapter(_mapping(device).get("adapters"))
+            if name != "reference" and job.backend == "gpu" and software is not None:
+                return software_adapter_refusal(software)
+            if name != "reference" and gpu_unused(job.backend, device):
                 return (
-                    "the GPU backend was asked for and the kernel shows this process did no GPU "
-                    "work: the vectors came from somewhere else"
+                    "the GPU backend was asked for and the kernel (on Windows its GPU engine "
+                    "counters) shows this process did no GPU work: the vectors came from "
+                    "somewhere else"
                 )
             harness[name] = run.report
             vectors[name] = str(out)
@@ -2314,8 +2341,9 @@ def verify_embedding(
         "engine": "litert-lm",
         "api": "EmbeddingEngine",
         "backend": job.backend,
-        # Whether the kernel showed the GPU work (macOS only); False on the CPU.
+        # Whether the GPU work was read (`evaluate.gpu_observed`); False on the CPU.
         "backend_observed": gpu_observed(job.backend, candidate_report.get("device")),
+        "gpu_evidence": gpu_evidence(job.backend, candidate_report.get("device")),
         "device": _mapping(candidate_report.get("device")),
         "runtime_version": (candidate_report.get("runtime") or {}).get("litert-lm"),
         # `evaluate.cpu_report`, run by the engine script on the CPU it computed on.

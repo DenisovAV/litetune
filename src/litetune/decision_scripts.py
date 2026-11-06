@@ -726,7 +726,7 @@ def main():
     with open_engine() as engine:
         report["init_seconds"] = round(time.perf_counter() - t0, 3)
         # On the GPU, the kernel's GPU time for this process now and after the
-        # rows, with the engine open: what evaluate.gpu_observed reads (macOS).
+        # rows, with the engine open: what evaluate.gpu_observed reads.
         device = {}
         if on_gpu:
             device["at_engine"] = device_report()

@@ -162,6 +162,9 @@ class FakeScoringEnv:
     path: Path = Path("/nonexistent")
     # A reference run on this device exits with this code and stderr.
     stops_on: dict[str, tuple[int, str]] = field(default_factory=dict)
+    # What an engine run, by its number, writes to stderr: where the runtime
+    # names the adapter it selected. The rest write "fake stderr".
+    stderr_for_run: dict[int, str] = field(default_factory=dict)
 
     def provision(self, events=None, force: bool = False) -> Path:
         self.provisioned += 1
@@ -244,7 +247,8 @@ class FakeScoringEnv:
                     rec["prompt_ids"] = [*self.ref_prefix, *prompt_ids(row["prompt"])]
                 out.write(json.dumps(rec) + "\n")
         Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
-        return subprocess.CompletedProcess(argv, self.returncode, "", "fake stderr")
+        said = self.stderr_for_run.get(self.engine_runs, "fake stderr") if engine else "fake stderr"
+        return subprocess.CompletedProcess(argv, self.returncode, "", said)
 
 
 @pytest.fixture(autouse=True)
@@ -702,7 +706,7 @@ def test_a_gpu_run_the_kernel_did_not_settle_is_recorded_as_asked_for(
     status, fields = run(job, s["record"])
 
     assert status == "passed"
-    flagged = [t for t in fields["limitations"] if "did not establish" in t]
+    flagged = [t for t in fields["limitations"] if "nothing established" in t]
     assert len(flagged) == 1 and f"GPU work in {said}" in flagged[0]
     assert "not as observed" in flagged[0]
 
@@ -766,8 +770,8 @@ def test_the_gpu_with_an_engine_per_option_is_refused_before_scoring(split, tmp_
     assert _engine_specs(job) == []
 
 
-@pytest.mark.parametrize("platform", ["linux", "win32"])
-def test_the_gpu_backend_off_macos_is_refused_before_scoring(
+@pytest.mark.parametrize("platform", ["freebsd14", "cygwin"])
+def test_the_gpu_backend_where_its_work_is_not_read_is_refused_before_scoring(
     split, tmp_path, monkeypatch, platform
 ):
     monkeypatch.setattr(sys, "platform", platform)
@@ -778,8 +782,109 @@ def test_the_gpu_backend_off_macos_is_refused_before_scoring(
 
     assert status == "failed_harness"
     detail = check(fields, RUNTIME_CHECK)["detail"]
-    assert "measured on macOS only" in detail and platform in detail
+    assert "on macOS, Windows and Linux only" in detail and platform in detail
     assert _engine_specs(job) == []
+
+
+L4_LINE = (
+    "I0000 environment.cc:532] Selected adapter: NVIDIA L4, arch=lovelace, vendor=nvidia, "
+    "backend=Vulkan, adapterType=Discrete GPU"
+)
+LLVMPIPE_LINE = (
+    "I0000 environment.cc:532] Selected adapter: llvmpipe (LLVM 15.0.7, 256 bits), "
+    "arch=software, vendor=mesa, backend=Vulkan, adapterType=CPU / Software"
+)
+LINUX_UNREAD = {
+    "at_engine": {"platform": "linux", "looked": False},
+    "after_generation": {"platform": "linux", "looked": False},
+}
+
+
+def _windows_reading(time_: int) -> dict[str, Any]:
+    return {
+        "platform": "win32",
+        "looked": True,
+        "gpu_client": "pid_1_luid_0x0_0xA62B_phys_0_eng_0_engtype_3D",
+        "gpu_time": time_,
+        "gpu_clients": {"luid_0x0_0xA62B_phys_0_eng_0_engtype_3D": time_},
+    }
+
+
+def test_on_linux_the_gpu_scores_and_the_hardware_adapter_is_the_reading(
+    split, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(sys, "platform", "linux")
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.device = LINUX_UNREAD
+    job.runtime_env.stderr_for_run = {1: L4_LINE, 2: L4_LINE}
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    engine = fields["measurements"]["candidate"]["engine"]
+    assert engine["backend_observed"] is True and "NVIDIA L4" in engine["gpu_evidence"]
+    assert fields["harness"]["gpu_repeat"]["observed"] == [True, True]
+    assert not [t for t in fields["limitations"] if "nothing established" in t]
+
+
+def test_on_windows_the_gpu_scores_and_the_counters_are_the_reading(split, tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.device = {
+        "at_engine": _windows_reading(10),
+        "after_generation": _windows_reading(900),
+    }
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    engine = fields["measurements"]["candidate"]["engine"]
+    assert engine["backend_observed"] is True and "GPU engine counters" in engine["gpu_evidence"]
+
+
+@pytest.mark.parametrize(
+    ("run_no", "glitch", "word"),
+    [(1, set(), "first"), (2, set(), "second"), (3, {(1, 3)}, "third")],
+)
+def test_a_gpu_run_on_a_software_adapter_is_refused(
+    split, tmp_path, monkeypatch, run_no, glitch, word
+):
+    """Each run, the first and both repeats: the kernel's reading here shows GPU
+    work, and the adapter the runtime named still decides."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.glitch = glitch
+    job.runtime_env.stderr_for_run = {run_no: LLVMPIPE_LINE}
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    detail = check(fields, RUNTIME_CHECK)["detail"]
+    assert (
+        f"the {word} GPU run: the GPU backend was asked for and LiteRT-LM selected a "
+        "software adapter, llvmpipe" in detail
+    )
+    assert "libegl1" in detail
+
+
+def test_a_gpu_run_that_failed_on_a_software_adapter_names_the_adapter(
+    split, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(sys, "platform", "linux")
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.returncode = 1
+    job.runtime_env.stderr_for_run = {1: LLVMPIPE_LINE}
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    detail = json.dumps(fields["checks"])
+    assert "selected a software adapter, llvmpipe" in detail
+    assert "the run then failed: the script exited 1" in detail
 
 
 def test_a_backend_other_than_cpu_or_gpu_is_refused(split, tmp_path):
@@ -3713,3 +3818,15 @@ def test_the_engine_script_builds_its_cpu_backend_on_the_threads_it_is_given(tmp
     )
     assert proc.returncode == 0, proc.stderr
     assert report["threads"] == 1
+
+
+def test_a_failed_cpu_run_is_not_blamed_on_an_adapter_line(split, tmp_path):
+    s = split()
+    job = job_for(s, tmp_path, backend="cpu")
+    job.runtime_env.returncode = 1
+    job.runtime_env.stderr_for_run = {1: LLVMPIPE_LINE}
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    assert "software adapter" not in json.dumps(fields["checks"])
