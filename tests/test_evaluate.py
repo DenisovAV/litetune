@@ -3180,6 +3180,7 @@ def test_a_run_killed_after_its_engine_opened_the_gpu_is_not_called_a_gpu_run(
         Path(spec["out"]).write_text(json.dumps({"index": 0, "text": "a"}) + "\n")
         raise subprocess.TimeoutExpired(cmd=args, timeout=timeout, stderr="killed")
 
+    monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(envs.StageEnv, "run", times_out)
     backend = _litertlm(tmp_path, backend_flag="gpu")
     backend.generate(["one", "two"])
@@ -4903,6 +4904,7 @@ def test_a_split_killed_on_a_software_adapter_scores_no_row(monkeypatch, tmp_pat
         Path(spec["report"]).write_text(json.dumps(_linux()), encoding="utf-8")
         raise subprocess.TimeoutExpired(cmd=args, timeout=timeout, stderr=_stderr(_LLVMPIPE))
 
+    monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(envs.StageEnv, "run", killed)
     backend = _litertlm(tmp_path, backend_flag="gpu")
     out = backend.generate(["one", "two"])

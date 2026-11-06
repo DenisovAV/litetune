@@ -600,6 +600,7 @@ def test_a_native_crash_leaves_its_reason_in_the_error(tmp_path):
         # Died after the parser refused this one: its kind, never its text.
         (PARSE_FAILURE_LOG, "its call parser rejected the generation"),
     ],
+    ids=["native-crash", "parser-refusal"],
 )
 def test_a_crash_quotes_only_the_prompt_it_died_on_and_never_the_models_text(
     tmp_path, last, reason
@@ -1864,7 +1865,7 @@ def test_verify_hands_the_backend_to_whichever_candidate_it_picks(tmp_path):
     assert text_path.describe()["backend"] == "gpu"
 
 
-def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path):
+def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path, monkeypatch):
     """Found by mutation: the backend could stop at `ToolPathBackend` and no
     test failed.
 
@@ -1873,6 +1874,7 @@ def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path):
     said "gpu" over a run the script built on the CPU -- a silently ignored
     flag, on the path the `<pad>` flood was measured on.
     """
+    monkeypatch.setattr(sys, "platform", "darwin")
     rows_ = labelled_rows(8)
     env = CannedEnv(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
     backend = ToolPathBackend(
@@ -1912,7 +1914,8 @@ _NO_CLIENT = {
 }
 
 
-def _gpu_run(tmp_path, device_by_mode):
+def _gpu_run(tmp_path, device_by_mode, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
     rows_ = labelled_rows(8)
     env = CannedEnv(
         by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
@@ -1925,8 +1928,8 @@ def _gpu_run(tmp_path, device_by_mode):
     return backend
 
 
-def test_the_tool_path_is_observed_on_the_gpu_when_both_modes_worked_there(tmp_path):
-    backend = _gpu_run(tmp_path, {"constrained": _WORKED, "unconstrained": _WORKED})
+def test_the_tool_path_is_observed_on_the_gpu_when_both_modes_worked_there(tmp_path, monkeypatch):
+    backend = _gpu_run(tmp_path, {"constrained": _WORKED, "unconstrained": _WORKED}, monkeypatch)
 
     described = backend.describe()
     assert described[BACKEND_OBSERVED] is True
@@ -1935,18 +1938,18 @@ def test_the_tool_path_is_observed_on_the_gpu_when_both_modes_worked_there(tmp_p
     assert described["device_reports"] == [_WORKED, _WORKED]
 
 
-def test_one_mode_without_gpu_work_is_enough_to_say_the_gpu_was_not_used(tmp_path):
+def test_one_mode_without_gpu_work_is_enough_to_say_the_gpu_was_not_used(tmp_path, monkeypatch):
     """Each mode builds its own engine in its own process, so one mode's
     reading says nothing about the other's -- and the one that did no GPU work
     produced rows too."""
-    backend = _gpu_run(tmp_path, {"constrained": _WORKED, "unconstrained": _NO_CLIENT})
+    backend = _gpu_run(tmp_path, {"constrained": _WORKED, "unconstrained": _NO_CLIENT}, monkeypatch)
 
     assert backend.describe()[BACKEND_OBSERVED] is False
     assert backend.describe()["gpu_unused"] is True
 
 
-def test_a_tool_path_run_that_wrote_no_report_claims_nothing(tmp_path):
-    backend = _gpu_run(tmp_path, {})
+def test_a_tool_path_run_that_wrote_no_report_claims_nothing(tmp_path, monkeypatch):
+    backend = _gpu_run(tmp_path, {}, monkeypatch)
 
     assert backend.describe()[BACKEND_OBSERVED] is False
     assert backend.describe()["gpu_unused"] is False
@@ -1956,17 +1959,17 @@ def test_a_tool_path_run_that_wrote_no_report_claims_nothing(tmp_path):
     assert backend.describe()["bundle_activation_error"] == "the run wrote no device report"
 
 
-def test_one_mode_that_read_the_bundle_speaks_for_it(tmp_path):
+def test_one_mode_that_read_the_bundle_speaks_for_it(tmp_path, monkeypatch):
     """A mode with no report says nothing; the other mode's reading stands."""
-    backend = _gpu_run(tmp_path, {"unconstrained": _WORKED})
+    backend = _gpu_run(tmp_path, {"unconstrained": _WORKED}, monkeypatch)
 
     assert backend.describe()["bundle_activation"] == "fp32"
     assert backend.describe()["bundle_activation_error"] is None
 
 
-def test_a_mode_that_read_no_key_is_not_overruled_by_a_mode_with_no_report(tmp_path):
+def test_a_mode_that_read_no_key_is_not_overruled_by_a_mode_with_no_report(tmp_path, monkeypatch):
     unkeyed = {**_WORKED, "bundle_activation": None}
-    backend = _gpu_run(tmp_path, {"unconstrained": unkeyed})
+    backend = _gpu_run(tmp_path, {"unconstrained": unkeyed}, monkeypatch)
 
     assert backend.describe()["bundle_activation"] is None
     assert backend.describe()["bundle_activation_error"] is None, "declares none: a finding"
@@ -1985,10 +1988,11 @@ def test_the_tool_path_script_returns_both_readings_and_the_bundles_key(tmp_path
         assert set(device[reading]) >= {"platform", "looked", "gpu_client", "gpu_time"}
 
 
-def test_a_second_tool_path_run_is_judged_on_its_own_readings(tmp_path):
+def test_a_second_tool_path_run_is_judged_on_its_own_readings(tmp_path, monkeypatch):
     """Found by mutation: without the reset the readings accumulated, so a run
     that worked on the GPU in both modes stayed unobserved because an earlier
     run had not."""
+    monkeypatch.setattr(sys, "platform", "darwin")
     rows_ = labelled_rows(8)
     env = CannedEnv(
         by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
@@ -2024,20 +2028,21 @@ def test_the_tool_path_names_its_pin_beside_the_runtime_that_ran(tmp_path):
     )
 
 
-def test_the_tool_path_names_the_cpu_its_modes_ran_on(tmp_path):
+def test_the_tool_path_names_the_cpu_its_modes_ran_on(tmp_path, monkeypatch):
     cpu = {"machine": "x86_64", "model": "Intel(R) Xeon(R) CPU @ 2.20GHz", "flags": ["avx2"]}
     report = {**_WORKED, "cpu": cpu}
-    backend = _gpu_run(tmp_path, {"constrained": report, "unconstrained": _WORKED})
+    backend = _gpu_run(tmp_path, {"constrained": report, "unconstrained": _WORKED}, monkeypatch)
 
     assert backend.describe()["cpu"] == cpu
 
 
-def test_a_mode_that_could_not_read_its_cpu_does_not_hide_the_one_that_could(tmp_path):
+def test_a_mode_that_could_not_read_its_cpu_does_not_hide_the_one_that_could(tmp_path, monkeypatch):
     cpu = {"machine": "x86_64", "model": "AMD EPYC 7B12", "flags": ["avx2"]}
     unread = {"machine": None, "model": None, "flags": None, "error": "PermissionError: no"}
     backend = _gpu_run(
         tmp_path,
         {"constrained": {**_WORKED, "cpu": unread}, "unconstrained": {**_WORKED, "cpu": cpu}},
+        monkeypatch,
     )
 
     assert backend.describe()["cpu"] == cpu
@@ -2182,7 +2187,8 @@ _L4 = (
 
 
 @pytest.mark.parametrize("mode", ["constrained", "unconstrained"])
-def test_a_tool_path_mode_on_a_software_adapter_scores_nothing(tmp_path, mode):
+def test_a_tool_path_mode_on_a_software_adapter_scores_nothing(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(sys, "platform", "darwin")
     rows_ = labelled_rows(8)
     env = CannedEnv(
         by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
@@ -2332,6 +2338,7 @@ def test_a_tool_path_on_linux_that_named_no_adapter_scores_nothing(tmp_path, mon
 
 
 def test_the_tool_path_script_stops_once_its_engine_is_on_a_software_adapter(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
     runtime = FakeRuntime(replies=[_reply("set_colour", {"colour": "red"})])
     real = _fake_litert_lm
 

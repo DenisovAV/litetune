@@ -198,6 +198,7 @@ def test_a_signature_key_longer_than_the_graph_is_refused(tmp_path):
         (graph([1, 8, WIDTH], sub_index=1), "a signature names subgraph 1 of 1"),
         (graph([1, 8, WIDTH], tensor_index=1), "an output names tensor 1 of 1"),
     ],
+    ids=["subgraph", "output-tensor"],
 )
 def test_an_index_past_its_list_is_refused_not_crashed(tmp_path, data, reason):
     with pytest.raises(

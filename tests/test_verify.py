@@ -2450,6 +2450,7 @@ def test_verifys_threads_do_not_reach_the_text_path(tmp_path):
         # A backend that records no evidence is not given one.
         (None, "the backend reported GPU work from the candidate's process, not how"),
     ],
+    ids=["adapter-evidence", "no-evidence"],
 )
 def test_an_observed_gpu_run_says_what_established_it(write_split, evidence, said):
     class Observed(FakeBackend):

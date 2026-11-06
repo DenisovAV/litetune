@@ -516,7 +516,11 @@ def test_the_evaluation_script_refuses_unusable_vectors(ev, tmp_path, monkeypatc
     assert "candidate: 1 vectors have a non-finite value or a zero norm" in out["error"]
 
 
-@pytest.mark.parametrize("source", [REFERENCE_SCRIPT, ENGINE_SCRIPT, ENGINES_SCRIPT, EVAL_SCRIPT])
+@pytest.mark.parametrize(
+    "source",
+    [REFERENCE_SCRIPT, ENGINE_SCRIPT, ENGINES_SCRIPT, EVAL_SCRIPT],
+    ids=["reference", "engine", "engines", "evaluation"],
+)
 def test_every_script_compiles(source):
     compile(source, "script.py", "exec")
 

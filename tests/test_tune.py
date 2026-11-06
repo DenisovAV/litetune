@@ -4794,6 +4794,7 @@ def test_an_mps_out_of_memory_behind_the_error_class_still_gets_its_advice(train
         "RuntimeError: invalid high watermark ratio 2.5",
         "RuntimeError: invalid low watermark ratio 1.4",
     ],
+    ids=["unsupported-operator", "unsupported-bfloat16", "high-watermark", "low-watermark"],
 )
 def test_an_mps_device_fact_is_the_machines_and_points_at_the_cpu(trainer, request_for, line):
     _mps_trainer(trainer)
