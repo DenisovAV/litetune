@@ -1024,9 +1024,10 @@ What has and has not been measured
   ±0.016 to ±0.023 at 300 held-out rows, wider than the 0.01 threshold. Their
   gain over Google's file, +0.1113 (int8) and +0.1180 (int4), was resolved in
   every draw. This was litetune's first int4 image file.
-- Not measured: 140 vision tokens, `--mirror`, an NPU (convert does not compile
-  one), the GPU, and the app's CPU path through flutter_edge_ai on the spliced
-  file.
+- The same int8 file on a Mac's CPU and GPU and on Windows' CPU, and its
+  SM8750 file on a Galaxy S25 Ultra's NPU, are measured there too.
+- Not measured: 140 vision tokens, `--mirror`, and the app's CPU path through
+  flutter_edge_ai on the spliced file.
 
 ### A generation bundle for a Qualcomm NPU: `convert --npu`
 
@@ -1726,8 +1727,10 @@ withdrawn after re-measurement.
   device, so the reference is held to an explicit token limit while the device
   runs to the runtime's own. The manifest says so and counts unterminated
   generations.
-- **`convert` compiles for an NPU only for EmbeddingGemma 2** (`--npu`, above). The
-  LLM NPU bundle described under
+- **`convert --npu` does not compile a tool-calling model.** It compiles an
+  EmbeddingGemma 2 encoder and a generation bundle for `gemma-3-text`, `qwen-3`,
+  `qwen-2.5` and `minicpm5` (above), and
+  refuses FunctionGemma. The tool-calling NPU bundle described under
   *Known to be broken* was built by hand: the four functions in litert-torch's
   `generative/export_hf/experimental/npu_export/stages.py` — `npu_export`,
   `npu_calibrate` on 64 tool prompts disjoint from the scored set,
@@ -1738,9 +1741,8 @@ withdrawn after re-measurement.
   short comparison script); `verify` has no device mode. litert-torch's
   documented one-step `export-hf --aot_backend=qualcomm` is not this path: its
   float bundle of `gemma-3-270m-it` loads on the HTP and is garbage on every
-  row, single-chunk included. Until the
-  stages are in `convert` and the fine-tuned figure exists, "NPU" here means
-  the four NPU bullets under *Known to be broken*, not a flag.
+  row, single-chunk included. For a tool-calling model, "NPU" here means the
+  four NPU bullets under *Known to be broken*, not a flag.
 - **`.litertlm` only**, no library API, and no single `run` command.
 
 ---
