@@ -2567,13 +2567,13 @@ cost.
 
 ### The same fine-tune on Intel Panther Lake and Lunar Lake
 
-Measured 2026-11-05 on two Windows 11 laptops, a Panther Lake (Core Ultra X7 358H, Arc B390)
+Measured 2026-11-05 on two Windows 11 machines, a Panther Lake (Core Ultra X7 358H, Arc B390)
 and a Lunar Lake (Core Ultra 7 258V, Arc 140V), with the beans int8 file above and its 1,165
 pictures. Nothing here is a litetune stage: `convert --npu` compiles for Qualcomm only, and
 these files were built by hand with scripts outside this repository: the text or vision
 encoder cut out of the int8 file with its weights inline, every RMSNorm composite inlined
-with x scaled by 1/16 before it is squared so the square stays inside float16's range (the
-OpenVINO NPU plugin takes `f16` or `i8` precision only), 776 composites in the text encoder
+with x scaled by 1/16 before it is squared so the square stays inside float16's range, 776
+composites in the text encoder
 and 224 in the vision encoder, and compiled by ai-edge-litert 2.3.0's Intel plugin (OpenVINO
 2026.3.1) on the machine itself, with weight sharing and `NPUW_ONLINE_PIPELINE=NONE`.
 
@@ -2581,7 +2581,7 @@ and 224 in the vision encoder, and compiled by ai-edge-litert 2.3.0's Intel plug
   `e301f74d`) with its text encoder replaced by the compiled one, the splice litetune does for
   Qualcomm (its splice script, the other six sections Google's byte for byte). Its vision
   encoder is Google's NPU build.
-- **Lunar Lake:** Google publishes no file for it, so both encoders were compiled for it and
+- **Lunar Lake:** Google's repository at `e301f74d` has no Lunar Lake file, so both encoders were compiled for it and
   packed with the int8 file's other sections. LiteRT-LM 0.18.0 refused every picture
   ("No signature found with prefix vision_ and length greater than or equal to 144") until the
   cut vision encoder kept its signatures in the order the int8 file has them, `vision_140`
@@ -2594,7 +2594,7 @@ each picture given as its bytes at 70 vision tokens, the CPU at four threads. Ac
 verify's k=10 centroid decider on the same five draws, from the vectors each run wrote;
 paired differences are against the CPU on the same machine (`metrics.paired_difference`).
 
-| | k=10 mean | cosine to the CPU, mean / min | resolved against the CPU | ms per picture, median |
+| | k=10 mean | cosine to the CPU on the 300 held-out pictures, mean / min | resolved against the CPU | ms per picture, median |
 |---|---|---|---|---|
 | PTL NPU, Google's vision + our text encoder | 0.9347 | 0.9801 / 0.8801 | 0 of 5 draws | 52.7 |
 | PTL NPU, both encoders ours | 0.9407 | 0.9779 / 0.7993 | 0 of 5 | 259.8 |
@@ -2612,7 +2612,7 @@ paired differences are against the CPU on the same machine (`metrics.paired_diff
   the same vector. The two CPUs gave the same accuracy draw for draw.
 - The fine-tune's PTL NPU file scored above Google's in every draw (+0.0767 to +0.1533,
   each resolved).
-- Our vision encoder on an NPU took five times Google's: 259.8 ms against 52.7 on the same
+- Our vision encoder on an NPU took 4.9 times Google's: 259.8 ms against 52.7 on the same
   PTL, with the same text encoder. It was neither weight sharing nor the pipeline setting: 50
   pictures took 259.8 ms per picture compiled without weight sharing and 268.4 ms without
   `NPUW_ONLINE_PIPELINE=NONE`. What differs is the graph. Google's compiled vision encoder is
