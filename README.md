@@ -709,11 +709,13 @@ What has and has not been measured:
   ([MEASUREMENTS.md](MEASUREMENTS.md#decisions-a-model-that-chooses-among-options)).
 - It needs training on the task: the untuned model, and a model trained on
   other tasks, chose far worse.
-- `verify` measures scoring on the CPU backend, and on macOS with `--backend
-  gpu` on the GPU: there LiteRT-LM's package gives a few rows wrong scores, at
-  different rows in each run, so every row is scored twice, the rows that differ five more times,
-  and the scores most of the readings gave are kept (a family that scores each
-  option on an Engine of its own is refused on the GPU). It is measured against
+- `verify` measures scoring on the CPU backend, and with `--backend gpu` on
+  the GPU on macOS, Windows and Linux (how each is read, and what Linux needs:
+  [Limitations](#limitations)). On macOS LiteRT-LM's package gives a few rows
+  wrong scores, at different rows in each run, so on every platform every row
+  is scored twice, the rows that differ five more times, and the scores most
+  of the readings gave are kept (a family that scores each option on an
+  Engine of its own is refused on the GPU). It is measured against
   the float reference on LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561
   fix only. On a Mac CPU with SME2 it scores on one thread
   ([Which runtime each version measures on](#which-runtime-each-version-measures-on)). On another runtime, `verify` needs `--float-twin` to say more than
@@ -981,7 +983,7 @@ text to measure.
   the CPU, with the checkpoint's own processor at the tuned budget) and with
   the file (LiteRT-LM's `EmbeddingEngine`, each picture given as its bytes),
   and with `--with-base` with Google's 440m file. With `--backend gpu`, on
-  macOS only as for text, the text tower runs on the GPU and the vision encoder
+  macOS, Windows and Linux as for text, the text tower runs on the GPU and the vision encoder
   on the CPU, where flutter_edge_ai_litertlm 1.19.0 puts it. It refuses a picture
   in both splits, a reference whose soft tokens for a picture differ from the
   count `tune` recorded (the engine reports none, so the file's count is not
@@ -1680,17 +1682,37 @@ withdrawn after re-measurement.
   when it is not `fp32`. GPU and CPU still do not agree row for row: the
   function name matched on all 40, the whole first call on 29, and every
   difference was a free-form date. litert-lm reports no device back, so
-  litetune asks the kernel: on macOS a GPU engine's process owns a GPU user
-  client, and the run is recorded as measured on the GPU only when that
-  client's GPU time grew while it generated — measured on the same M4 Pro,
-  where a CPU engine owned none. A run the kernel shows doing no GPU work is
-  said, in the limitations, not to have used the GPU. Off macOS nothing is
-  looked at yet, and on the text and tool paths the manifest records the GPU as
-  asked for; a decision bundle and an EmbeddingGemma 2 file are refused on the
-  GPU off macOS. On a host
+  litetune reads it from elsewhere. On macOS it asks the kernel: a GPU
+  engine's process owns a GPU user client, and the run is recorded as measured
+  on the GPU only when that client's GPU time grew while it generated —
+  measured on the same M4 Pro, where a CPU engine owned none. On Windows it
+  reads the process's own GPU engine counters
+  (`Win32_PerfRawData_GPUPerformanceCounters_GPUEngine`) at the same two
+  points: on an Intel Arc B390 a GPU engine's process had them from
+  construction and their running time grew with work, and a CPU engine's
+  process had none. A run either reading shows doing no GPU work is said not
+  to have used the GPU — in the limitations on the text and tool paths, and as
+  a harness failure for a decision bundle and an EmbeddingGemma 2 file. On
+  Linux the kernel is not asked: the GPU is the adapter LiteRT-LM names on its
+  stderr when it builds its GPU environment ("Selected adapter: …"), and
+  `nvidia-smi`'s listing of the process is recorded beside it, not required.
+  On every platform a GPU run whose adapter is a software one (`adapterType`
+  `CPU / Software`, or llvmpipe, lavapipe, SwiftShader or WARP by name) is a
+  harness failure: on an Ubuntu host without NVIDIA's Vulkan driver the
+  runtime used Mesa's llvmpipe and reported success, at 14.7 s per text
+  against 0.6 s on its CPU backend. **On Ubuntu with an NVIDIA GPU, install
+  `libnvidia-gl-<driver version>` (the one matching the installed driver,
+  e.g. `libnvidia-gl-580-server`) and `libegl1`**: the runtime's GPU path
+  there is WebGPU over Vulkan, that package holds NVIDIA's Vulkan driver, and
+  the driver loads `libEGL.so.1` from `libegl1` — on the one host measured,
+  without `libegl1` Vulkan offered only llvmpipe and `verify --backend gpu`
+  refuses. A run nothing
+  established is recorded as asked for, not measured; on other platforms a
+  decision bundle and an EmbeddingGemma 2 file are refused on the GPU. On a host
   without a usable GPU, a GPU engine has been measured to produce nothing, so
   a GPU split on the text path first runs one prompt within one prompt's
-  budget and stops there if it gets no answer. The tool path has no such
+  budget and stops there if it gets no answer or names a software adapter.
+  The tool path has no such
   check yet: there each decoding mode waits out its own budget, an hour.
 - **The NPU number is 20 rows on one SoC.** The same
   `functiongemma-270m-it` (base weights, not the fine-tune) through
