@@ -4021,6 +4021,10 @@ def test_a_cpu_run_that_named_no_adapter_on_linux_is_not_refused(split, tmp_path
     assert status == "passed", fields["checks"]
 
 
+# POSIX only: on Windows `software_adapter_in` does not redirect fd 2 (whether the runtime's library
+# writes through this process's fd 2 there is not measured), so the script runs on and the parent
+# alone refuses the run.
+@pytest.mark.posix
 def test_on_the_gpu_the_scoring_script_stops_once_its_engine_is_on_a_software_adapter(tmp_path):
     loud = FAKE_GPU_LITERT_LM + (
         "\n\n_Quiet = Engine\n\n\nclass Engine(_Quiet):\n"
