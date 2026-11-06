@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import types
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from litetune import toolpath
 from litetune.evaluate import BACKEND_OBSERVED, runtime_engine_spec
 from litetune.metrics import ToolCall
 from litetune.toolpath import (
@@ -598,6 +600,7 @@ def test_a_native_crash_leaves_its_reason_in_the_error(tmp_path):
         # Died after the parser refused this one: its kind, never its text.
         (PARSE_FAILURE_LOG, "its call parser rejected the generation"),
     ],
+    ids=["native-crash", "parser-refusal"],
 )
 def test_a_crash_quotes_only_the_prompt_it_died_on_and_never_the_models_text(
     tmp_path, last, reason
@@ -762,6 +765,8 @@ class CannedEnv:
     fail_code: int = 3
     # Every spec the script was handed, so a test can see what reached it.
     specs: list[dict] = field(default_factory=list)
+    # What each mode's script writes to stderr, by mode; empty otherwise.
+    stderr_by_mode: dict[str, str] = field(default_factory=dict)
 
     def provision(self, events=None):
         return None
@@ -779,7 +784,7 @@ class CannedEnv:
         if mode in self.device_by_mode:
             written["device"] = self.device_by_mode[mode]
         Path(spec["out"]).write_text(json.dumps(written), encoding="utf-8")
-        return types.SimpleNamespace(returncode=0, stderr="")
+        return types.SimpleNamespace(returncode=0, stderr=self.stderr_by_mode.get(mode, ""))
 
 
 PARSE_REFUSED = "its call parser rejected the generation"
@@ -1860,7 +1865,7 @@ def test_verify_hands_the_backend_to_whichever_candidate_it_picks(tmp_path):
     assert text_path.describe()["backend"] == "gpu"
 
 
-def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path):
+def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path, monkeypatch):
     """Found by mutation: the backend could stop at `ToolPathBackend` and no
     test failed.
 
@@ -1869,6 +1874,7 @@ def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path):
     said "gpu" over a run the script built on the CPU -- a silently ignored
     flag, on the path the `<pad>` flood was measured on.
     """
+    monkeypatch.setattr(sys, "platform", "darwin")
     rows_ = labelled_rows(8)
     env = CannedEnv(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
     backend = ToolPathBackend(
@@ -1908,7 +1914,8 @@ _NO_CLIENT = {
 }
 
 
-def _gpu_run(tmp_path, device_by_mode):
+def _gpu_run(tmp_path, device_by_mode, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
     rows_ = labelled_rows(8)
     env = CannedEnv(
         by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
@@ -1921,8 +1928,8 @@ def _gpu_run(tmp_path, device_by_mode):
     return backend
 
 
-def test_the_tool_path_is_observed_on_the_gpu_when_both_modes_worked_there(tmp_path):
-    backend = _gpu_run(tmp_path, {"constrained": _WORKED, "unconstrained": _WORKED})
+def test_the_tool_path_is_observed_on_the_gpu_when_both_modes_worked_there(tmp_path, monkeypatch):
+    backend = _gpu_run(tmp_path, {"constrained": _WORKED, "unconstrained": _WORKED}, monkeypatch)
 
     described = backend.describe()
     assert described[BACKEND_OBSERVED] is True
@@ -1931,18 +1938,18 @@ def test_the_tool_path_is_observed_on_the_gpu_when_both_modes_worked_there(tmp_p
     assert described["device_reports"] == [_WORKED, _WORKED]
 
 
-def test_one_mode_without_gpu_work_is_enough_to_say_the_gpu_was_not_used(tmp_path):
+def test_one_mode_without_gpu_work_is_enough_to_say_the_gpu_was_not_used(tmp_path, monkeypatch):
     """Each mode builds its own engine in its own process, so one mode's
     reading says nothing about the other's -- and the one that did no GPU work
     produced rows too."""
-    backend = _gpu_run(tmp_path, {"constrained": _WORKED, "unconstrained": _NO_CLIENT})
+    backend = _gpu_run(tmp_path, {"constrained": _WORKED, "unconstrained": _NO_CLIENT}, monkeypatch)
 
     assert backend.describe()[BACKEND_OBSERVED] is False
     assert backend.describe()["gpu_unused"] is True
 
 
-def test_a_tool_path_run_that_wrote_no_report_claims_nothing(tmp_path):
-    backend = _gpu_run(tmp_path, {})
+def test_a_tool_path_run_that_wrote_no_report_claims_nothing(tmp_path, monkeypatch):
+    backend = _gpu_run(tmp_path, {}, monkeypatch)
 
     assert backend.describe()[BACKEND_OBSERVED] is False
     assert backend.describe()["gpu_unused"] is False
@@ -1952,17 +1959,17 @@ def test_a_tool_path_run_that_wrote_no_report_claims_nothing(tmp_path):
     assert backend.describe()["bundle_activation_error"] == "the run wrote no device report"
 
 
-def test_one_mode_that_read_the_bundle_speaks_for_it(tmp_path):
+def test_one_mode_that_read_the_bundle_speaks_for_it(tmp_path, monkeypatch):
     """A mode with no report says nothing; the other mode's reading stands."""
-    backend = _gpu_run(tmp_path, {"unconstrained": _WORKED})
+    backend = _gpu_run(tmp_path, {"unconstrained": _WORKED}, monkeypatch)
 
     assert backend.describe()["bundle_activation"] == "fp32"
     assert backend.describe()["bundle_activation_error"] is None
 
 
-def test_a_mode_that_read_no_key_is_not_overruled_by_a_mode_with_no_report(tmp_path):
+def test_a_mode_that_read_no_key_is_not_overruled_by_a_mode_with_no_report(tmp_path, monkeypatch):
     unkeyed = {**_WORKED, "bundle_activation": None}
-    backend = _gpu_run(tmp_path, {"unconstrained": unkeyed})
+    backend = _gpu_run(tmp_path, {"unconstrained": unkeyed}, monkeypatch)
 
     assert backend.describe()["bundle_activation"] is None
     assert backend.describe()["bundle_activation_error"] is None, "declares none: a finding"
@@ -1981,10 +1988,11 @@ def test_the_tool_path_script_returns_both_readings_and_the_bundles_key(tmp_path
         assert set(device[reading]) >= {"platform", "looked", "gpu_client", "gpu_time"}
 
 
-def test_a_second_tool_path_run_is_judged_on_its_own_readings(tmp_path):
+def test_a_second_tool_path_run_is_judged_on_its_own_readings(tmp_path, monkeypatch):
     """Found by mutation: without the reset the readings accumulated, so a run
     that worked on the GPU in both modes stayed unobserved because an earlier
     run had not."""
+    monkeypatch.setattr(sys, "platform", "darwin")
     rows_ = labelled_rows(8)
     env = CannedEnv(
         by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
@@ -2020,20 +2028,21 @@ def test_the_tool_path_names_its_pin_beside_the_runtime_that_ran(tmp_path):
     )
 
 
-def test_the_tool_path_names_the_cpu_its_modes_ran_on(tmp_path):
+def test_the_tool_path_names_the_cpu_its_modes_ran_on(tmp_path, monkeypatch):
     cpu = {"machine": "x86_64", "model": "Intel(R) Xeon(R) CPU @ 2.20GHz", "flags": ["avx2"]}
     report = {**_WORKED, "cpu": cpu}
-    backend = _gpu_run(tmp_path, {"constrained": report, "unconstrained": _WORKED})
+    backend = _gpu_run(tmp_path, {"constrained": report, "unconstrained": _WORKED}, monkeypatch)
 
     assert backend.describe()["cpu"] == cpu
 
 
-def test_a_mode_that_could_not_read_its_cpu_does_not_hide_the_one_that_could(tmp_path):
+def test_a_mode_that_could_not_read_its_cpu_does_not_hide_the_one_that_could(tmp_path, monkeypatch):
     cpu = {"machine": "x86_64", "model": "AMD EPYC 7B12", "flags": ["avx2"]}
     unread = {"machine": None, "model": None, "flags": None, "error": "PermissionError: no"}
     backend = _gpu_run(
         tmp_path,
         {"constrained": {**_WORKED, "cpu": unread}, "unconstrained": {**_WORKED, "cpu": cpu}},
+        monkeypatch,
     )
 
     assert backend.describe()["cpu"] == cpu
@@ -2165,3 +2174,215 @@ def test_the_gpu_tool_path_gets_no_thread_count(tmp_path, sme2_host):
     backend.generate(["make it red"])
     assert all("thread_count" not in s for s in env.specs)
     assert backend.describe()["cpu_threads"] is None
+
+
+_LLVMPIPE = (
+    "I0000 environment.cc:532] Selected adapter: llvmpipe (LLVM 15.0.7, 256 bits), "
+    "arch=software, vendor=mesa, backend=Vulkan, adapterType=CPU / Software"
+)
+_L4 = (
+    "I0000 environment.cc:532] Selected adapter: NVIDIA L4, arch=lovelace, vendor=nvidia, "
+    "backend=Vulkan, adapterType=Discrete GPU"
+)
+
+
+@pytest.mark.parametrize("mode", ["constrained", "unconstrained"])
+def test_a_tool_path_mode_on_a_software_adapter_scores_nothing(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        device_by_mode={"constrained": _WORKED, "unconstrained": _WORKED},
+        stderr_by_mode={mode: _LLVMPIPE},
+    )
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    out = backend.generate([r["prompt"] for r in rows_])
+    assert all("selected a software adapter, llvmpipe" in g.harness_error for g in out)
+
+
+def test_a_tool_path_on_linux_names_the_adapter_that_established_the_gpu(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    linux = {
+        "at_engine": {"platform": "linux", "looked": False},
+        "after_generation": {
+            "platform": "linux",
+            "looked": False,
+            "nvidia_smi": {"listed": True, "used_memory_mib": 9, "pids_hidden": False, "gpus": 1},
+        },
+        "bundle_activation": "fp32",
+    }
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        device_by_mode={"constrained": dict(linux), "unconstrained": dict(linux)},
+        stderr_by_mode={"constrained": _L4, "unconstrained": _L4},
+    )
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    backend.generate([r["prompt"] for r in rows_])
+    described = backend.describe()
+    assert described[BACKEND_OBSERVED] is True
+    assert "NVIDIA L4" in described["gpu_evidence"]
+
+
+def test_a_cpu_tool_path_is_not_judged_by_an_adapter_line(tmp_path):
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        stderr_by_mode={"constrained": _LLVMPIPE, "unconstrained": _LLVMPIPE},
+    )
+    backend = ToolPathBackend(model=tmp_path / "m.litertlm", declarations=DECLS, env=env)
+    out = backend.generate([r["prompt"] for r in rows_])
+    assert not any(g.harness_error for g in out)
+
+
+@pytest.mark.parametrize(
+    ("backend", "order"), [("gpu", ["load", "quiet"]), ("cpu", ["quiet", "load"])]
+)
+def test_on_the_gpu_the_runtime_is_quieted_only_once_its_engine_exists(
+    tmp_path, monkeypatch, backend, order
+):
+    """Building a GPU engine is when the runtime logs, at INFO, the adapter it
+    selected; quieted to ERROR first, that line is never written for the parent
+    to read."""
+    events: list[str] = []
+    real = _fake_litert_lm
+
+    def recording(runtime):
+        module = real(runtime)
+        base = module.Engine
+
+        class Engine(base):
+            def __init__(self, *args, **kwargs):
+                events.append("load")
+                super().__init__(*args, **kwargs)
+
+        module.Engine = Engine
+        module.set_min_log_severity = lambda level: events.append("quiet")
+        return module
+
+    monkeypatch.setitem(globals(), "_fake_litert_lm", recording)
+    runtime = FakeRuntime(replies=[_reply("set_colour", {"colour": "red"})])
+    code, _ = _run(runtime, tmp_path, monkeypatch, backend=backend)
+
+    assert code == 0
+    assert events == order
+
+
+def _probe(env, backend_flag="gpu"):
+    return toolpath.ToolPathProbe(
+        model=Path("m.litertlm"),
+        declarations=DECLS,
+        max_tokens=64,
+        env=env,
+        auto_provision=False,
+        timeout_s=5,
+        backend_flag=backend_flag,
+    )
+
+
+class _ExitEnv:
+    """The tool-path script exits `returncode` with `stderr`, or times out with it."""
+
+    name = "runtime"
+    requirements: tuple[str, ...] = ()
+
+    def __init__(self, returncode=1, stderr="", timeout=False):
+        self.returncode, self.stderr, self.timeout = returncode, stderr, timeout
+
+    def provision(self, events=None):
+        return None
+
+    def run(self, argv, timeout=None):
+        if self.timeout:
+            raise subprocess.TimeoutExpired(argv, timeout, stderr=self.stderr.encode())
+        return types.SimpleNamespace(returncode=self.returncode, stderr=self.stderr)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        _ExitEnv(returncode=1, stderr=_LLVMPIPE),
+        _ExitEnv(returncode=toolpath._script()["CREATE_REFUSED"], stderr=_LLVMPIPE),
+        _ExitEnv(stderr=_LLVMPIPE, timeout=True),
+    ],
+)
+def test_a_tool_path_run_that_failed_on_a_software_adapter_says_so_first(env):
+    with pytest.raises(toolpath.ToolPathError) as raised:
+        _probe(env).observe(["make it red"], constrained=False)
+    said = str(raised.value)
+    assert said.startswith("the GPU backend was asked for and LiteRT-LM selected a software")
+    assert "the run then failed: the tool-path script" in said
+    # Not the grammar's refusal, which would leave the other mode standing.
+    assert not isinstance(raised.value, toolpath.ConversationRefused)
+
+
+def test_a_failed_cpu_tool_path_run_is_not_blamed_on_an_adapter_line():
+    with pytest.raises(toolpath.ToolPathError) as raised:
+        _probe(_ExitEnv(returncode=1, stderr=_LLVMPIPE), "cpu").observe(["x"], constrained=False)
+    assert "software adapter" not in str(raised.value)
+
+
+def test_a_tool_path_on_linux_that_named_no_adapter_scores_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    rows_ = labelled_rows(8)
+    env = CannedEnv(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    out = backend.generate([r["prompt"] for r in rows_])
+    assert all("named no adapter on stderr" in g.harness_error for g in out)
+
+
+def test_the_tool_path_script_stops_once_its_engine_is_on_a_software_adapter(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    runtime = FakeRuntime(replies=[_reply("set_colour", {"colour": "red"})])
+    real = _fake_litert_lm
+
+    def loud(runtime):
+        module = real(runtime)
+        base = module.Engine
+
+        class Engine(base):
+            def __init__(self, *args, **kwargs):
+                os.write(2, (_LLVMPIPE + "\n").encode())
+                super().__init__(*args, **kwargs)
+
+        module.Engine = Engine
+        return module
+
+    monkeypatch.setitem(globals(), "_fake_litert_lm", loud)
+    code, _ = _run(runtime, tmp_path, monkeypatch, backend="gpu")
+    assert code == toolpath._script()["SOFTWARE_ADAPTER"]
+    assert runtime.sent == []
+
+
+def test_the_tool_path_evidence_names_each_modes_reading_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    listed = {"listed": True, "used_memory_mib": 9, "pids_hidden": False, "gpus": 1}
+    linux = {
+        "at_engine": {"platform": "linux", "looked": False},
+        "after_generation": {"platform": "linux", "looked": False, "nvidia_smi": listed},
+    }
+    other = {
+        **linux,
+        "after_generation": {
+            **linux["after_generation"],
+            "nvidia_smi": {**listed, "used_memory_mib": 11},
+        },
+    }
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        device_by_mode={"constrained": other, "unconstrained": dict(linux)},
+        stderr_by_mode={"constrained": _L4, "unconstrained": _L4},
+    )
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    backend.generate([r["prompt"] for r in rows_])
+    said = backend.describe()["gpu_evidence"]
+    assert "holding 9 MiB" in said and "holding 11 MiB" in said

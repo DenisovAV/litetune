@@ -36,7 +36,7 @@ recorded as scored alone with no cache, whatever the batch gave. MEASUREMENTS.md
 has what batching changed in time and in the scores.
 
 **The runtime** (`ENGINE_SCRIPT`, `envs.RUNTIME`) scores through LiteRT-LM's
-session API on the CPU, or on macOS the GPU, as the flutter_edge_ai design of
+session API on the CPU or the GPU, as the flutter_edge_ai design of
 2026-10-16 has its decider do. It renders with
 `Conversation.render_message_to_string`, prefills the prompt, saves a
 checkpoint, and per option scores and rewinds. LiteRT-LM 0.18.0 scores right
@@ -571,12 +571,21 @@ def c_call(session, name, *args):
         raise RuntimeError(f"{name} returned {rc}: {last_error(session._lib)}")
 
 
-def main():
-    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+def quiet():
+    """The runtime's log at ERROR and above only."""
     try:
         L.set_min_log_severity(L.LogSeverity.ERROR)
     except AttributeError:
         pass
+
+
+def main():
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    # On the GPU not before the engine exists: building it is when the runtime
+    # logs, at INFO, the adapter it selected, which the parent reads off stderr
+    # (`evaluate.adapters_of`); at ERROR that line is not written.
+    if spec.get("backend", "cpu") != "gpu":
+        quiet()
     greedy = L.SamplerConfig(top_k=1, top_p=1.0, temperature=1.0, seed=0)
     term = spec["terminator"]
     options = spec["options"]
@@ -723,12 +732,24 @@ def main():
         return per[0]
 
     t0 = time.perf_counter()
-    with open_engine() as engine:
+    # On the GPU the adapter the runtime names while the engine is built is read
+    # here too (`build_watching_adapter`), so a software one ends the run before
+    # its first row instead of after the last.
+    built, software = build_watching_adapter(open_engine) if on_gpu else (open_engine(), None)
+    with built as engine:
         report["init_seconds"] = round(time.perf_counter() - t0, 3)
-        # On the GPU, the kernel's GPU time for this process now and after the
-        # rows, with the engine open: what evaluate.gpu_observed reads (macOS).
+        if software is not None:
+            report["error"] = (
+                "stopped once the engine was built: LiteRT-LM selected a software adapter, "
+                f"{software.get('name') or software.get('raw')}, which computes on the CPU"
+            )
+            write_report()
+            return 3
+        # On the GPU, the GPU reading for this process now and after the rows,
+        # with the engine open: what evaluate.gpu_observed reads.
         device = {}
         if on_gpu:
+            quiet()
             device["at_engine"] = device_report()
         report["device"] = device
         # What every session here reads before its prompt's ids, as a first turn.

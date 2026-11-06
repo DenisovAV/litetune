@@ -3846,6 +3846,7 @@ def test_a_family_with_a_packaged_template_composes_nothing(toolchain, request_f
         (QWEN3, CANONICAL_OR_COMPOSED_FLAG, models.QWEN3_CANONICAL_TEMPLATE),
         ("Qwen/Qwen2.5-0.5B-Instruct", COMPOSED_TEMPLATE_FLAG, None),
     ],
+    ids=["qwen3-canonical", "qwen2-composed"],
 )
 def test_the_marker_never_reaches_an_exporter_argv(qwen_request, model, marker, canonical):
     """It describes a file, and the exporter would look it up as a repository."""

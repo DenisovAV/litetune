@@ -1383,6 +1383,7 @@ def test_a_repeated_field_that_differs_anywhere_is_reported(toolchain, tmp_path)
         (GEMMA4_META.replace("unknown_field: 1", "unknown_field: 2"), "but the raw bytes do"),
         (GEMMA4_META, "It is byte for byte the bundle's own"),
     ],
+    ids=["raw-bytes-differ", "raw-bytes-match"],
 )
 def test_metadata_that_differs_only_in_its_raw_bytes_is_said_to(
     toolchain, tmp_path, donor_meta, said
@@ -1447,6 +1448,14 @@ def test_a_bundle_and_a_donor_laid_out_on_blocks_keep_their_bytes(toolchain, tmp
                              "        ids: 6\n      }\n    }\n    patch_width"),
          ["vision"], "gives end_of_audio_token without a token_str"),
     ],
+    ids=[
+        "model-type-unset",
+        "wrong-model-type",
+        "missing-audio-token",
+        "empty-image-token",
+        "image-token-ids",
+        "audio-end-token-ids",
+    ],
 )  # fmt: skip
 def test_metadata_the_tower_cannot_be_added_under_is_refused(
     toolchain, tmp_path, meta, towers, reason
@@ -1465,6 +1474,7 @@ def test_metadata_the_tower_cannot_be_added_under_is_refused(
         (GEMMA4_META.replace("gemma4 {", "gemma3n {"),
          "the donor's LlmMetadata has llm_model_type gemma3n, not gemma4"),
     ],
+    ids=["missing-image-token", "wrong-model-type"],
 )  # fmt: skip
 def test_the_donors_metadata_is_held_to_the_same(toolchain, tmp_path, meta, reason):
     giver = donor(tmp_path, meta=meta)
@@ -1510,6 +1520,7 @@ def test_tokenizers_that_disagree_on_a_named_token_are_refused(
         # `suppress_tokens` is a TokenIds of its own (llm_metadata.proto:130).
         (GEMMA4_META + "suppress_tokens {\n  ids: 99\n}\n", "id 99 is no piece"),
     ],
+    ids=["unknown-media-token", "unknown-stop-token", "unknown-suppressed-token"],
 )  # fmt: skip
 def test_a_token_neither_tokenizer_has_is_refused(toolchain, tmp_path, meta, reason):
     with pytest.raises(TowersError, match=reason):
@@ -1596,6 +1607,7 @@ def test_a_tokenizer_without_pieces_is_refused(toolchain, tmp_path):
         (GEMMA4_META.replace('"<|image>"', '"<\\q>"'), r"could not be read: unknown escape \\q"),
         (GEMMA4_META.replace("ids: 2", "ids: two"), "the LlmMetadata names a token id 'two'"),
     ],
+    ids=["truncated-field", "unbalanced-braces", "unknown-escape", "non-numeric-token-id"],
 )  # fmt: skip
 def test_metadata_text_that_cannot_be_read_is_refused(toolchain, tmp_path, meta, reason):
     with pytest.raises(TowersError, match=reason):
@@ -1877,6 +1889,7 @@ def test_an_adapter_that_does_not_write_the_embedders_width_is_refused(
         (tflite(("prefill", [[1, WIDTH]])), r"an output has 2 dims, not 3 to 8"),
         (b"bytes of an NPU graph", "an offset points outside its 21 bytes"),
     ],
+    ids=["different-widths", "two-dimensional-output", "invalid-npu-graph"],
 )
 def test_an_embedder_whose_width_cannot_be_read_is_refused(toolchain, tmp_path, graph, reason):
     with pytest.raises(

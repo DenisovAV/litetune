@@ -2056,7 +2056,8 @@ def test_an_observed_gpu_run_replaces_the_caveat_rather_than_dropping_it(write_s
     )
     measured = [n for n in notes if n.startswith("measured on the gpu backend of litert-lm")]
     assert measured, notes
-    assert "the kernel showed" in measured[0]
+    # Said as the backend recorded it, and only "not how" when it recorded nothing.
+    assert "the backend reported GPU work from the candidate's process, not how" in measured[0]
     assert "a phone's GPU is a different backend" in measured[0]
 
 
@@ -2435,3 +2436,76 @@ def test_verifys_threads_do_not_reach_the_text_path(tmp_path):
     candidate = build_backends(request).candidate
     assert isinstance(candidate, LiteRtLmBackend)
     assert candidate.threads is None
+
+
+@pytest.mark.parametrize(
+    ("evidence", "said"),
+    [
+        (
+            "the runtime reported selecting a hardware adapter, NVIDIA L4 (vendor nvidia, "
+            "Vulkan, Discrete GPU)",
+            "measured on the gpu backend of litert-lm: the runtime reported selecting a hardware "
+            "adapter, NVIDIA L4 (vendor nvidia, Vulkan, Discrete GPU). That is",
+        ),
+        # A backend that records no evidence is not given one.
+        (None, "the backend reported GPU work from the candidate's process, not how"),
+    ],
+    ids=["adapter-evidence", "no-evidence"],
+)
+def test_an_observed_gpu_run_says_what_established_it(write_split, evidence, said):
+    class Observed(FakeBackend):
+        def describe(self) -> dict:
+            return {
+                "engine": "litert-lm",
+                "backend": "gpu",
+                BACKEND_OBSERVED: True,
+                "gpu_evidence": evidence,
+            }
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=Observed(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+    assert any(said in note for note in result.manifest["limitations"])
+
+
+def test_an_unobserved_gpu_run_says_how_each_platform_is_read(write_split):
+    class Asked(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "litert-lm", "backend": "gpu", BACKEND_OBSERVED: False}
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=Asked(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+    (note,) = [n for n in result.manifest["limitations"] if "may not be a GPU number" in n]
+    assert "kernel on macOS" in note and "GPU engine counters on Windows" in note
+    assert "on Linux takes the hardware adapter the runtime names" in note
+
+
+def test_a_gpu_run_whose_runtime_only_selected_an_adapter_says_so(write_split):
+    note = "the runtime selected NVIDIA L4 (...) for the GPU backend, but nothing showed it"
+
+    class Selected(FakeBackend):
+        def describe(self) -> dict:
+            return {
+                "engine": "litert-lm",
+                "backend": "gpu",
+                BACKEND_OBSERVED: False,
+                "adapter_selected_note": note,
+            }
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=Selected(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+    assert note in result.manifest["limitations"]

@@ -59,12 +59,19 @@ from litetune.evaluate import (
     RUNTIME_ENGINE_SOURCE,
     DecodeConfig,
     Generation,
+    adapter_refusal,
+    adapter_selected_note,
+    adapters_of,
     bundle_activation_error_of,
     bundle_activation_of,
     cpu_of,
+    gpu_evidence,
     gpu_observed,
     gpu_unused,
     runtime_engine_spec,
+    software_adapter,
+    software_adapter_refusal,
+    with_adapters,
 )
 from litetune.events import EventStream
 from litetune.exits import read_returncode
@@ -124,6 +131,8 @@ FINISHED = "finished prompt"
 
 # The script's exit when the runtime would not create a conversation at all.
 CREATE_REFUSED = 4
+# The script's exit when the engine was built on a software adapter.
+SOFTWARE_ADAPTER = 5
 
 
 def tokenizer_sections(path):
@@ -288,10 +297,17 @@ def main():
 
     import litert_lm
 
-    try:
-        litert_lm.set_min_log_severity(litert_lm.LogSeverity.ERROR)
-    except AttributeError:
-        pass
+    def quiet():
+        try:
+            litert_lm.set_min_log_severity(litert_lm.LogSeverity.ERROR)
+        except AttributeError:
+            pass
+
+    # On the GPU not before the engine exists: building it is when the runtime
+    # logs, at INFO, the adapter it selected, which the parent reads off stderr
+    # (`evaluate.adapters_of`); at ERROR that line is not written.
+    if spec.get("backend", "cpu") != "gpu":
+        quiet()
 
     executed = []
     version = runtime_version()
@@ -335,7 +351,23 @@ def main():
         return CREATE_REFUSED
 
     rows = []
-    with litert_lm.Engine(spec["model"], **engine_kwargs(spec)) as engine:
+
+    def make():
+        return litert_lm.Engine(spec["model"], **engine_kwargs(spec))
+
+    on_gpu = spec.get("backend", "cpu") == "gpu"
+    # On the GPU the adapter the runtime names while the engine is built is
+    # read here too, so a software one ends the run before its first reply.
+    built, software = build_watching_adapter(make) if on_gpu else (make(), None)
+    with built as engine:
+        if software is not None:
+            sys.stderr.write(
+                "stopped once the engine was built: LiteRT-LM selected a software adapter, "
+                "%s, which computes on the CPU\n" % (software.get("name") or software.get("raw"))
+            )
+            return SOFTWARE_ADAPTER
+        if on_gpu:
+            quiet()
         # Once the engine exists, which is when a GPU engine opens the GPU.
         at_engine = device_report()
         for index, prompt in enumerate(spec["prompts"]):
@@ -584,11 +616,12 @@ class ToolPathProbe:
                 )
             try:
                 proc = self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
-            except subprocess.TimeoutExpired:
-                raise ToolPathError(
+            except subprocess.TimeoutExpired as expired:
+                said = (
                     f"the tool-path script gave no result after {self.timeout_s}s on the "
                     f"{self.backend_flag} backend"
-                ) from None
+                )
+                raise ToolPathError(self._adapter_first(expired.stderr, said)) from None
             except OSError as exc:
                 raise ToolPathError(f"could not start the tool-path script: {exc}") from exc
             if proc.returncode != 0 or not out.is_file():
@@ -605,6 +638,11 @@ class ToolPathProbe:
                     f"the tool-path script {reading.describe('the model')}"
                     f"{_said_before_dying(log, mark, pinned)}; stderr: {stderr or 'empty'}"
                 )
+                # A software adapter is said before anything else the run
+                # failed on, and is not the grammar's refusal.
+                first = self._adapter_first(proc.stderr, said)
+                if first != said:
+                    raise ToolPathError(first)
                 if proc.returncode == _script()["CREATE_REFUSED"]:
                     raise ConversationRefused(said)
                 raise ToolPathError(said)
@@ -620,8 +658,26 @@ class ToolPathProbe:
             )
         self.runtime_version = written.get("runtime_version")
         device = written.get("device")
-        self.device_report = device if isinstance(device, dict) else None
+        self.device_report = with_adapters(
+            device if isinstance(device, dict) else None, proc.stderr
+        )
+        # Rows from a software adapter are the CPU's, which the runtime reports
+        # as a success; none of them is a GPU row. On Linux a finished run must
+        # also have named a hardware adapter (`evaluate.adapter_refusal`).
+        if self.backend_flag == "gpu":
+            refused = adapter_refusal(adapters_of(proc.stderr), finished=True)
+            if refused is not None:
+                raise ToolPathError(refused)
         return [ToolPathRow.read(position, row) for position, row in enumerate(rows)]
+
+    def _adapter_first(self, stderr: str | bytes | None, said: str) -> str:
+        """`said`, or the software adapter `stderr` names followed by it, on the GPU."""
+        if self.backend_flag != "gpu":
+            return said
+        software = software_adapter(adapters_of(stderr))
+        if software is None:
+            return said
+        return f"{software_adapter_refusal(software)}; the run then failed: {said}"
 
 
 def _refuse_a_mode_with_unread_reasons(rows: list[ToolPathRow]) -> None:
@@ -795,6 +851,28 @@ class ToolPathBackend:
             # Either mode showing no GPU work is enough: each built its own
             # engine, and the one that did not use the GPU produced rows too.
             "gpu_unused": any(gpu_unused(self.backend_flag, r) for r in self.device_reports),
+            # The first mode's note when its runtime selected an adapter nothing
+            # showed working (`evaluate.adapter_selected_note`).
+            "adapter_selected_note": next(
+                (
+                    note
+                    for note in (
+                        adapter_selected_note(self.backend_flag, r) for r in self.device_reports
+                    )
+                    if note
+                ),
+                None,
+            ),
+            # What established the GPU in each mode, once each, when every mode's did.
+            "gpu_evidence": (
+                "; ".join(
+                    dict.fromkeys(
+                        str(gpu_evidence(self.backend_flag, r)) for r in self.device_reports
+                    )
+                )
+                if self.backend_observed
+                else None
+            ),
             # From the modes whose report carries a reading of the bundle; with
             # none, why none did -- not "declares none", which is a claim.
             "bundle_activation": next(
