@@ -3665,6 +3665,7 @@ def test_the_script_and_the_parent_tell_a_software_adapter_alike(tmp_path):
         LLVMPIPE_LINE,
         L4_LINE,
         "Selected adapter: Some GPU, arch=software, vendor=x, backend=Vulkan, adapterType=Unknown",
+        "Selected adapter: Some GPU, arch=x, vendor=x, backend=Vulkan, adapterType=CPU / Software",
         "Selected adapter: SwiftShader Device, arch=x, vendor=google, backend=Vulkan, "
         "adapterType=Unknown",
         "Selected adapter: Microsoft Basic Render Driver, arch=x, vendor=microsoft, "
