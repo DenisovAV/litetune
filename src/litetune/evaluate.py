@@ -1180,13 +1180,13 @@ def _read_device_report(path: Path) -> dict[str, Any] | None:
 # The adapter LiteRT's WebGPU accelerator picked, as it says on the process's
 # stderr when it builds a GPU environment: "Selected adapter: <name>,
 # arch=<arch>, vendor=<vendor>, backend=<backend>, adapterType=<type>"
-# (environment.cc in litert-lm 0.18.0's log). Seen on all three platforms
-# litetune runs a GPU on: an Intel Arc B390 over Direct3D 12 on Windows, an
-# NVIDIA L4 over Vulkan on Linux, and on the same Linux host without NVIDIA's
-# Vulkan driver Mesa's llvmpipe -- a rasteriser on the CPU -- with
-# "adapterType=CPU / Software", which the runtime used without a word: a text
-# took 14,686 ms there against 585 ms on its CPU backend, and every call
-# succeeded (MEASUREMENTS.md, "The GPU on Windows and Linux").
+# (environment.cc in litert-lm 0.18.0's log). Seen on Windows, an Intel Arc
+# B390 over Direct3D 12, and on Linux, an NVIDIA L4 over Vulkan -- and on the
+# same Linux host without libegl1, which NVIDIA's Vulkan driver loads, Mesa's
+# llvmpipe, a rasteriser on the CPU, with "adapterType=CPU / Software". The
+# runtime used it without a word: an EmbeddingGemma 2 picture took 11,443 ms
+# there against 585 ms on the CPU backend, and every call succeeded
+# (MEASUREMENTS.md, "The GPU on Windows and Linux").
 #
 # The name in the line can hold commas ("llvmpipe (LLVM 15.0.7, 256 bits)"),
 # so it runs up to the first ", arch=".

@@ -1698,9 +1698,9 @@ withdrawn after re-measurement.
   `nvidia-smi`'s listing of the process is recorded beside it, not required.
   On every platform a GPU run whose adapter is a software one (`adapterType`
   `CPU / Software`, or llvmpipe, lavapipe, SwiftShader or WARP by name) is a
-  harness failure: on an Ubuntu host without NVIDIA's Vulkan driver the
-  runtime used Mesa's llvmpipe and reported success, at 14.7 s per text
-  against 0.6 s on its CPU backend. **On Ubuntu with an NVIDIA GPU, install
+  harness failure: on an Ubuntu host with an NVIDIA L4 and without `libegl1`
+  the runtime used Mesa's llvmpipe and reported success, at 11.4 s for an
+  EmbeddingGemma 2 picture against 0.6 s on the CPU backend. **On Ubuntu with an NVIDIA GPU, install
   `libnvidia-gl-<driver version>` (the one matching the installed driver,
   e.g. `libnvidia-gl-580-server`) and `libegl1`**: the runtime's GPU path
   there is WebGPU over Vulkan, that package holds NVIDIA's Vulkan driver, and
