@@ -293,10 +293,17 @@ def main():
 
     import litert_lm
 
-    try:
-        litert_lm.set_min_log_severity(litert_lm.LogSeverity.ERROR)
-    except AttributeError:
-        pass
+    def quiet():
+        try:
+            litert_lm.set_min_log_severity(litert_lm.LogSeverity.ERROR)
+        except AttributeError:
+            pass
+
+    # On the GPU not before the engine exists: building it is when the runtime
+    # logs, at INFO, the adapter it selected, which the parent reads off stderr
+    # (`evaluate.adapters_of`); at ERROR that line is not written.
+    if spec.get("backend", "cpu") != "gpu":
+        quiet()
 
     executed = []
     version = runtime_version()
@@ -341,6 +348,8 @@ def main():
 
     rows = []
     with litert_lm.Engine(spec["model"], **engine_kwargs(spec)) as engine:
+        if spec.get("backend", "cpu") == "gpu":
+            quiet()
         # Once the engine exists, which is when a GPU engine opens the GPU.
         at_engine = device_report()
         for index, prompt in enumerate(spec["prompts"]):

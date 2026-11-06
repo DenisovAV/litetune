@@ -3830,3 +3830,63 @@ def test_a_failed_cpu_run_is_not_blamed_on_an_adapter_line(split, tmp_path):
 
     assert status == "failed_harness"
     assert "software adapter" not in json.dumps(fields["checks"])
+
+
+FAKE_GPU_LITERT_LM = (
+    FAKE_LITERT_LM
+    + """
+
+import sys as _sys
+import types as _types
+
+_interfaces = _types.ModuleType("litert_lm.interfaces")
+_interfaces.CPU = lambda thread_count=None: ("cpu", thread_count)
+_interfaces.GPU = lambda: ("gpu", None)
+_sys.modules["litert_lm.interfaces"] = _interfaces
+
+
+class ActivationDataType:
+    @staticmethod
+    def from_str(name):
+        return 0
+
+
+def set_min_log_severity(level):
+    if os.environ.get("FAKE_LOADS"):
+        with open(os.environ["FAKE_LOADS"], "a") as fh:
+            fh.write("quiet\\n")
+
+
+_Engine = Engine
+
+
+class Engine(_Engine):
+    def __init__(self, path, backend=None, cache_dir=None, activation_data_type=None):
+        super().__init__(path, backend=backend, cache_dir=cache_dir)
+"""
+)
+
+
+@pytest.mark.parametrize(
+    ("backend", "order"), [("gpu", ["load", "quiet"]), ("cpu", ["quiet", "load"])]
+)
+def test_on_the_gpu_the_scoring_script_quiets_the_runtime_once_its_engine_exists(
+    tmp_path, backend, order
+):
+    """Building a GPU engine is when the runtime logs, at INFO, the adapter it
+    selected; quieted to ERROR first, that line is never written for the parent
+    to read."""
+    loads = tmp_path / "loads.txt"
+    proc, rows, _ = _run_engine_script(
+        tmp_path,
+        False,
+        ["text 1 about joy"],
+        ("joy", "anger"),
+        fake_source=FAKE_GPU_LITERT_LM,
+        fake_env={"FAKE_LOADS": str(loads)},
+        script_tail="def device_report():\n    return {}\n",
+        backend=backend,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert len(rows) == 1
+    assert loads.read_text().split() == order

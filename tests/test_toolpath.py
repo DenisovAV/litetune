@@ -2225,3 +2225,36 @@ def test_a_cpu_tool_path_is_not_judged_by_an_adapter_line(tmp_path):
     backend = ToolPathBackend(model=tmp_path / "m.litertlm", declarations=DECLS, env=env)
     out = backend.generate([r["prompt"] for r in rows_])
     assert not any(g.harness_error for g in out)
+
+
+@pytest.mark.parametrize(
+    ("backend", "order"), [("gpu", ["load", "quiet"]), ("cpu", ["quiet", "load"])]
+)
+def test_on_the_gpu_the_runtime_is_quieted_only_once_its_engine_exists(
+    tmp_path, monkeypatch, backend, order
+):
+    """Building a GPU engine is when the runtime logs, at INFO, the adapter it
+    selected; quieted to ERROR first, that line is never written for the parent
+    to read."""
+    events: list[str] = []
+    real = _fake_litert_lm
+
+    def recording(runtime):
+        module = real(runtime)
+        base = module.Engine
+
+        class Engine(base):
+            def __init__(self, *args, **kwargs):
+                events.append("load")
+                super().__init__(*args, **kwargs)
+
+        module.Engine = Engine
+        module.set_min_log_severity = lambda level: events.append("quiet")
+        return module
+
+    monkeypatch.setitem(globals(), "_fake_litert_lm", recording)
+    runtime = FakeRuntime(replies=[_reply("set_colour", {"colour": "red"})])
+    code, _ = _run(runtime, tmp_path, monkeypatch, backend=backend)
+
+    assert code == 0
+    assert events == order

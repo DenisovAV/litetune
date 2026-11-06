@@ -571,12 +571,21 @@ def c_call(session, name, *args):
         raise RuntimeError(f"{name} returned {rc}: {last_error(session._lib)}")
 
 
-def main():
-    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+def quiet():
+    """The runtime's log at ERROR and above only."""
     try:
         L.set_min_log_severity(L.LogSeverity.ERROR)
     except AttributeError:
         pass
+
+
+def main():
+    spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    # On the GPU not before the engine exists: building it is when the runtime
+    # logs, at INFO, the adapter it selected, which the parent reads off stderr
+    # (`evaluate.adapters_of`); at ERROR that line is not written.
+    if spec.get("backend", "cpu") != "gpu":
+        quiet()
     greedy = L.SamplerConfig(top_k=1, top_p=1.0, temperature=1.0, seed=0)
     term = spec["terminator"]
     options = spec["options"]
@@ -729,6 +738,7 @@ def main():
         # rows, with the engine open: what evaluate.gpu_observed reads.
         device = {}
         if on_gpu:
+            quiet()
             device["at_engine"] = device_report()
         report["device"] = device
         # What every session here reads before its prompt's ids, as a first turn.
