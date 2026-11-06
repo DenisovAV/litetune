@@ -2203,7 +2203,7 @@ def test_a_tool_path_on_linux_names_the_adapter_that_established_the_gpu(tmp_pat
         "after_generation": {
             "platform": "linux",
             "looked": False,
-            "nvidia_smi": {"listed": True, "used_memory_mib": 9, "pids_hidden": False},
+            "nvidia_smi": {"listed": True, "used_memory_mib": 9, "pids_hidden": False, "gpus": 1},
         },
         "bundle_activation": "fp32",
     }
@@ -2355,7 +2355,7 @@ def test_the_tool_path_script_stops_once_its_engine_is_on_a_software_adapter(tmp
 
 def test_the_tool_path_evidence_names_each_modes_reading_once(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
-    listed = {"listed": True, "used_memory_mib": 9, "pids_hidden": False}
+    listed = {"listed": True, "used_memory_mib": 9, "pids_hidden": False, "gpus": 1}
     linux = {
         "at_engine": {"platform": "linux", "looked": False},
         "after_generation": {"platform": "linux", "looked": False, "nvidia_smi": listed},
@@ -2378,4 +2378,4 @@ def test_the_tool_path_evidence_names_each_modes_reading_once(tmp_path, monkeypa
     )
     backend.generate([r["prompt"] for r in rows_])
     said = backend.describe()["gpu_evidence"]
-    assert "(9 MiB)" in said and "(11 MiB)" in said
+    assert "holding 9 MiB" in said and "holding 11 MiB" in said

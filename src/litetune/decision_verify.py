@@ -67,6 +67,7 @@ from litetune.evaluate import (
     gpu_evidence,
     gpu_observed,
     gpu_read_here,
+    gpu_unbound,
     gpu_unused,
     software_adapter,
     software_adapter_refusal,
@@ -416,6 +417,7 @@ def _repeat_on_gpu(
     n_options: int,
     method: str,
     events: EventStream,
+    readings: dict[str, Any] | None = None,
 ) -> dict[str, Any] | str:
     """Score every row a second time, in reverse order, and the rows the two runs differ
     on in a third run, `GPU_COPIES_IN_LAST_RUN` copies of each in a shuffled order.
@@ -428,6 +430,15 @@ def _repeat_on_gpu(
     put rows after other rows where there are enough to differ; whether a wrong
     score depends on the row before it is not measured.
     """
+    # Each run's reading as it returns, refused or not (`readings` is the caller's).
+    readings = {} if readings is None else readings
+    readings["devices"] = [first.report.get("device")]
+    readings["observed"] = [gpu_observed("gpu", first.report.get("device"))]
+
+    def took(run: ScoreRun) -> None:
+        readings["devices"].append(run.report.get("device"))
+        readings["observed"] = [gpu_observed("gpu", d) for d in readings["devices"]]
+
     again_spec = {**spec, "mode": first.report.get("mode") or spec["mode"]}
     events.note(f"runtime: scoring the {n_rows} rows again, on the GPU")
     second = run_script(
@@ -438,6 +449,7 @@ def _repeat_on_gpu(
         auto_provision=False,
         events=events,
     )
+    took(second)
     if second.adapter_failure:
         return str(_gpu_refusal(second, "second"))
     if second.failure or len(second.scores) < n_rows:
@@ -470,6 +482,7 @@ def _repeat_on_gpu(
             auto_provision=False,
             events=events,
         )
+        took(third)
         if third.adapter_failure:
             return str(_gpu_refusal(third, "third"))
         if third.failure or any(c["index"] not in third.scores for c in copies):
@@ -1217,10 +1230,14 @@ def verify_decision(
     if job.backend == "gpu":
         if (refused := _gpu_refusal(eng, "first")) is not None:
             return refuse(RUNTIME_CHECK, refused)
+        # Filled as each repeat returns, so a refused repeat still records every
+        # run's reading and whether it was observed.
+        readings: dict[str, Any] = {}
         repeated = _repeat_on_gpu(
-            job, engine_spec, eng, n_engine, len(decision.ids), method, events
+            job, engine_spec, eng, n_engine, len(decision.ids), method, events, readings
         )
         if isinstance(repeated, str):
+            fields["harness"]["gpu_repeat"] = {"refused": repeated, **readings}
             return refuse(RUNTIME_CHECK, repeated)
         fields["harness"]["gpu_repeat"] = repeated
         state.limitations.append(GPU_REPEAT.format(rows=repeated["rows_rescored"], n=n_engine))
@@ -1383,21 +1400,25 @@ def verify_decision(
     )
     # In the shape the generative path records, so `bundle` reads the runtime
     # and the CPU these numbers were taken on the same way.
+    # Every GPU run's scores take part in the settled ones (`_repeat_on_gpu`).
+    run_devices = (fields["harness"].get("gpu_repeat") or {}).get(
+        "devices", [eng.report.get("device")]
+    )
+    every_run_observed = all(gpu_observed(job.backend, d) for d in run_devices)
     fields["measurements"]["candidate"]["engine"] = {
         "engine": "litert-lm",
         "backend": job.backend,
-        # Whether the GPU work was read (`evaluate.gpu_observed`); False on the CPU.
-        # Every GPU run's scores take part in the settled ones, so every run's
-        # reading has to show the GPU (`_repeat_on_gpu`'s "devices").
-        "backend_observed": all(
-            gpu_observed(job.backend, d)
-            for d in (fields["harness"].get("gpu_repeat") or {}).get(
-                "devices", [eng.report.get("device")]
-            )
-        ),
-        "adapter_selected": adapter_selected(job.backend, eng.report.get("device")),
-        "gpu_luids": windows_luid_times(eng.report.get("device")) or None,
-        "gpu_evidence": gpu_evidence(job.backend, eng.report.get("device")),
+        # Whether the GPU work was read (`evaluate.gpu_observed`) in every run;
+        # False on the CPU.
+        "backend_observed": every_run_observed,
+        # The run's evidence only when every run's reading showed the GPU; each
+        # run's own beside it, in run order.
+        "gpu_evidence": gpu_evidence(job.backend, run_devices[0]) if every_run_observed else None,
+        "gpu_luids": (windows_luid_times(run_devices[0]) or None if every_run_observed else None),
+        "adapter_selected": all(adapter_selected(job.backend, d) for d in run_devices),
+        "gpu_unbound": gpu_unbound(job.backend, run_devices[0]),
+        "gpu_evidence_by_run": [gpu_evidence(job.backend, d) for d in run_devices],
+        "adapter_selected_by_run": [adapter_selected(job.backend, d) for d in run_devices],
         "runtime_version": (eng.report.get("runtime") or {}).get("litert-lm"),
         "cpu": {"model": eng.report.get("cpu")},
         "threads": cpu.used if on_cpu else None,

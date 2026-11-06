@@ -839,6 +839,9 @@ class LiteRtLmBackend:
             # On Windows: the process's engine time per adapter LUID, at the
             # engine and after the work, on counters present at both.
             "gpu_luids": windows_luid_times(self.device_report) or None,
+            # Why the reading could not be tied to the adapter the runtime
+            # selected (two cards of one name, several GPUs on Linux); or None.
+            "gpu_unbound": gpu_unbound(self.backend_flag, self.device_report),
             "adapters": (self.device_report or {}).get("adapters"),
             "bundle_activation": bundle_activation_of(self.device_report),
             "bundle_activation_error": bundle_activation_error_of(self.device_report),
@@ -1433,12 +1436,20 @@ def _luid_of(key: str) -> str | None:
 
 
 def windows_selected_luids(report: Any) -> list[str]:
-    """The LUIDs of the DXGI adapters whose description is the selected adapter's name.
+    """The LUID of the DXGI adapter whose description is the selected adapter's name.
 
     The driver script lists DXGI's adapters (`dxgi_adapters`); the runtime names
     its adapter on stderr. Empty when either is missing, the name matches none,
-    or the matching adapter is DXGI's software one -- then nothing is observed.
+    the matching adapter is DXGI's software one, or more than one hardware
+    adapter carries the name -- two identical cards, which a name cannot tell
+    apart (`gpu_unbound` says so) -- and then nothing is observed.
     """
+    matches = _dxgi_matches(report)
+    return matches if len(matches) == 1 else []
+
+
+def _dxgi_matches(report: Any) -> list[str]:
+    """Every hardware DXGI adapter's LUID whose description is the selected adapter's name."""
     if not isinstance(report, dict):
         return []
     adapter = hardware_adapter(report.get("adapters"))
@@ -1521,8 +1532,41 @@ def _windows_work(report: dict) -> tuple[bool | None, str | None]:
 
 
 def _nvidia_listed(end: Any) -> bool:
+    """nvidia-smi listed this process, on a host where it lists exactly one GPU.
+
+    The adapter the runtime selected is named by Vulkan, and nvidia-smi's rows
+    carry no Vulkan identity, so a listing ties the process to that adapter only
+    when there is one GPU it could be on (`gpu_unbound` otherwise).
+    """
     smi = end.get("nvidia_smi") if isinstance(end, dict) else None
-    return isinstance(smi, dict) and smi.get("listed") is True
+    return isinstance(smi, dict) and smi.get("listed") is True and smi.get("gpus") == 1
+
+
+def gpu_unbound(backend: str, report: Any) -> str | None:
+    """Why the GPU reading cannot be tied to the adapter the runtime selected, or None."""
+    if backend != "gpu" or not isinstance(report, dict):
+        return None
+    adapter = hardware_adapter(report.get("adapters"))
+    if adapter is None:
+        return None
+    platform = _platform_of(report)
+    if platform == "win32":
+        matches = _dxgi_matches(report)
+        if len(matches) > 1:
+            return (
+                f"DXGI lists {len(matches)} hardware adapters named {adapter.get('name')} "
+                f"(LUIDs {', '.join(matches)}), so the GPU engine counters cannot be tied to the "
+                "one the runtime selected"
+            )
+    if platform.startswith("linux"):
+        smi = (report.get("after_generation") or {}).get("nvidia_smi")
+        gpus = smi.get("gpus") if isinstance(smi, dict) else None
+        if isinstance(gpus, int) and gpus > 1:
+            return (
+                f"nvidia-smi lists {gpus} GPUs and identifies them by nothing the runtime prints, "
+                "so its listing of the process cannot be tied to the adapter the runtime selected"
+            )
+    return None
 
 
 def gpu_evidence(backend: str, report: Any) -> str | None:
@@ -1548,7 +1592,9 @@ def gpu_evidence(backend: str, report: Any) -> str | None:
     smi = report["after_generation"].get("nvidia_smi") or {}
     return (
         f"the runtime selected a hardware adapter, {describe_adapter(adapter)}, and nvidia-smi "
-        f"listed the process on the GPU after the work ({smi.get('used_memory_mib')} MiB)"
+        f"listed the process holding {smi.get('used_memory_mib')} MiB on the host's only GPU "
+        "after the work: the process held a context there, which places the run on that GPU "
+        "and is not a reading of each operation"
     )
 
 
@@ -1574,7 +1620,10 @@ def adapter_selected_note(backend: str, report: Any) -> str | None:
     adapter = hardware_adapter(report.get("adapters"))
     assert adapter is not None  # `adapter_selected` holds it
     smi = (report.get("after_generation") or {}).get("nvidia_smi")
-    if smi is None:
+    unbound = gpu_unbound(backend, report)
+    if unbound is not None:
+        why = unbound
+    elif smi is None:
         why = "no nvidia-smi was there to list the process"
     elif not isinstance(smi, dict) or "error" in smi:
         error = smi.get("error") if isinstance(smi, dict) else smi
@@ -2066,42 +2115,53 @@ def own_pids():
 
 
 def nvidia_smi_report():
-    """Whether `nvidia-smi` lists this process among the GPU's compute processes.
+    """Whether `nvidia-smi` lists this process among the GPU's compute processes, and on which.
 
     During a GPU generation on an NVIDIA L4 through Vulkan it listed the
-    process with its memory. `pids_hidden` when it listed a process with no pid
-    it shows (as in a container), which can be this one but is not read as it.
-    None when there is no `nvidia-smi`; never raises.
+    process with its memory. `gpus` is how many GPUs it lists on the host: the
+    parent ties the listing to the adapter the runtime selected only when there
+    is one. `pids_hidden` when it listed a process with no pid it shows (as in
+    a container), which can be this one but is not read as it. None when there
+    is no `nvidia-smi`; never raises.
     """
     import shutil
     import subprocess
+
+    def ask(query):
+        done = subprocess.run(
+            [smi, query, "--format=csv,noheader,nounits"], capture_output=True, timeout=30
+        )
+        if done.returncode != 0:
+            said = done.stderr.decode("utf-8", "replace").strip() or done.stdout.decode(
+                "utf-8", "replace").strip()
+            raise RuntimeError("nvidia-smi exited %d: %s" % (done.returncode, said[-200:]))
+        lines = done.stdout.decode("utf-8", "replace").splitlines()
+        return [[p.strip() for p in line.split(",")] for line in lines if line.strip()]
 
     try:
         smi = shutil.which("nvidia-smi")
         if smi is None:
             return None
-        done = subprocess.run(
-            [smi, "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            timeout=30,
-        )
-        if done.returncode != 0:
-            said = done.stderr.decode("utf-8", "replace").strip() or done.stdout.decode(
-                "utf-8", "replace").strip()
-            return {"error": "nvidia-smi exited %d: %s" % (done.returncode, said[-200:])}
+        gpus = ask("--query-gpu=uuid")
+        rows = ask("--query-compute-apps=pid,used_memory,gpu_uuid")
         mine, hidden = own_pids(), False
-        for line in done.stdout.decode("utf-8", "replace").splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if not parts[0]:
-                continue
+        for parts in rows:
             if not parts[0].isdigit():
                 hidden = True
                 continue
             if parts[0] in mine:
                 memory = parts[1] if len(parts) > 1 else ""
-                used = int(memory) if memory.isdigit() else None
-                return {"listed": True, "used_memory_mib": used, "pids_hidden": hidden}
-        return {"listed": False, "used_memory_mib": None, "pids_hidden": hidden}
+                return {
+                    "listed": True,
+                    "used_memory_mib": int(memory) if memory.isdigit() else None,
+                    "gpu_uuid": parts[2] if len(parts) > 2 else None,
+                    "gpus": len(gpus),
+                    "pids_hidden": hidden,
+                }
+        return {"listed": False, "used_memory_mib": None, "gpu_uuid": None,
+                "gpus": len(gpus), "pids_hidden": hidden}
+    except RuntimeError as exc:
+        return {"error": str(exc)}
     except Exception as exc:  # noqa: BLE001 -- a diagnostic must not end a run
         return {"error": "%s: %s" % (type(exc).__name__, exc)}
 

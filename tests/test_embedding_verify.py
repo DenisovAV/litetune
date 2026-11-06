@@ -1963,7 +1963,7 @@ LINUX_LISTED = {
     "after_generation": {
         "platform": "linux",
         "looked": False,
-        "nvidia_smi": {"listed": True, "used_memory_mib": 450, "pids_hidden": False},
+        "nvidia_smi": {"listed": True, "used_memory_mib": 450, "pids_hidden": False, "gpus": 1},
     },
 }
 ARC_LINE = (

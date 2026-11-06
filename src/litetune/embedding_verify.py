@@ -140,6 +140,7 @@ from litetune.evaluate import (
     gpu_evidence,
     gpu_observed,
     gpu_read_here,
+    gpu_unbound,
     gpu_unused,
     software_adapter,
     software_adapter_refusal,
@@ -2373,6 +2374,7 @@ def verify_embedding(
         "gpu_evidence": gpu_evidence(job.backend, candidate_report.get("device")),
         "adapter_selected": adapter_selected(job.backend, candidate_report.get("device")),
         "gpu_luids": windows_luid_times(candidate_report.get("device")) or None,
+        "gpu_unbound": gpu_unbound(job.backend, candidate_report.get("device")),
         "device": _mapping(candidate_report.get("device")),
         "runtime_version": (candidate_report.get("runtime") or {}).get("litert-lm"),
         # `evaluate.cpu_report`, run by the engine script on the CPU it computed on.

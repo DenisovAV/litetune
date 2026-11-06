@@ -813,7 +813,7 @@ LINUX_LISTED = {
     "after_generation": {
         "platform": "linux",
         "looked": False,
-        "nvidia_smi": {"listed": True, "used_memory_mib": 876, "pids_hidden": False},
+        "nvidia_smi": {"listed": True, "used_memory_mib": 876, "pids_hidden": False, "gpus": 1},
     },
 }
 ARC_LINE = (
@@ -911,7 +911,14 @@ def test_a_repeat_whose_reading_failed_leaves_the_run_unobserved(split, tmp_path
     assert status == "passed", fields["checks"]
     assert fields["harness"]["gpu_repeat"]["observed"] == [True, False]
     assert len(fields["harness"]["gpu_repeat"]["devices"]) == 2
-    assert fields["measurements"]["candidate"]["engine"]["backend_observed"] is False
+    engine = fields["measurements"]["candidate"]["engine"]
+    assert engine["backend_observed"] is False
+    # No aggregate claim from the first run alone; each run's own beside it.
+    assert engine["gpu_evidence"] is None and engine["gpu_luids"] is None
+    assert engine["adapter_selected"] is False
+    first, second = engine["gpu_evidence_by_run"]
+    assert "NVIDIA L4" in first and second is None
+    assert engine["adapter_selected_by_run"] == [False, True]
 
 
 def test_on_windows_the_gpu_scores_and_the_counters_are_the_reading(split, tmp_path, monkeypatch):
@@ -4034,3 +4041,52 @@ def test_on_the_gpu_the_scoring_script_stops_once_its_engine_is_on_a_software_ad
     assert report["error"].startswith("stopped once the engine was built: LiteRT-LM selected")
     # Written back to stderr for the parent, which reads it again.
     assert "llvmpipe" in proc.stderr
+
+
+def test_a_refused_repeat_keeps_every_runs_reading(split, tmp_path, monkeypatch):
+    """The third run leaves a row unscored: the record still shows each run's reading."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    s = split()
+    n = _engine_row_count(s, tmp_path)
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.device = LINUX_LISTED
+    job.runtime_env.stderr_for_run = {1: L4_LINE, 2: L4_LINE, 3: L4_LINE}
+    job.runtime_env.glitch = {(1, 3)}
+    job.runtime_env.skip_for_run = {3: {n + 3}}
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    record = fields["harness"]["gpu_repeat"]
+    assert record["refused"].startswith("the third GPU run left rows unscored")
+    assert len(record["devices"]) == 3 and record["observed"] == [True, True, True]
+
+
+def test_a_repeat_refused_on_its_reading_keeps_the_readings_taken(split, tmp_path, on_macos):
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.device_for_run = {2: GPU_IDLE}
+
+    status, fields = run(job, s["record"])
+
+    assert status == "failed_harness"
+    record = fields["harness"]["gpu_repeat"]
+    assert record["observed"] == [True, False] and len(record["devices"]) == 2
+
+
+def test_a_run_is_called_selected_only_when_every_run_was(split, tmp_path, monkeypatch):
+    """The first run's adapter alone, the second observed: neither claim is the whole run's."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.device = LINUX_LISTED
+    job.runtime_env.device_for_run = {1: LINUX_UNREAD}
+    job.runtime_env.stderr_for_run = {1: L4_LINE, 2: L4_LINE}
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    engine = fields["measurements"]["candidate"]["engine"]
+    assert engine["backend_observed"] is False and engine["adapter_selected"] is False
+    assert engine["adapter_selected_by_run"] == [True, False]
+    assert engine["gpu_evidence"] is None

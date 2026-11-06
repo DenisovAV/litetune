@@ -4331,8 +4331,13 @@ def test_the_gpu_is_read_on_three_platforms(platform, read):
     assert gpu_read_here(platform) is read
 
 
-def _smi(listed=True, memory=3105, hidden=False):
-    return {"listed": listed, "used_memory_mib": memory if listed else None, "pids_hidden": hidden}
+def _smi(listed=True, memory=3105, hidden=False, gpus=1):
+    return {
+        "listed": listed,
+        "used_memory_mib": memory if listed else None,
+        "pids_hidden": hidden,
+        "gpus": gpus,
+    }
 
 
 def _linux(adapters=None, ended=True, smi=None):
@@ -4351,7 +4356,9 @@ def test_on_linux_a_hardware_adapter_and_nvidia_smi_listing_the_process_is_the_r
     assert adapter_selected("gpu", l4) is False
     assert gpu_evidence("gpu", l4) == (
         "the runtime selected a hardware adapter, NVIDIA L4 (vendor nvidia, Vulkan, Discrete "
-        "GPU), and nvidia-smi listed the process on the GPU after the work (3105 MiB)"
+        "GPU), and nvidia-smi listed the process holding 3105 MiB on the host's only GPU after "
+        "the work: the process held a context there, which places the run on that GPU and is "
+        "not a reading of each operation"
     )
     # A run killed before its second reading has not shown its work.
     assert gpu_observed("gpu", _linux(adapters_of(_L4), ended=False, smi=_smi())) is False
@@ -4674,14 +4681,19 @@ def test_a_counter_time_that_is_not_an_integer_is_unread():
     assert engines_of(rows, 7) == {"a": None, "b": None, "c": None, "d": 5}
 
 
-def _linux_smi(monkeypatch, answer, which="/usr/bin/nvidia-smi", pids=None):
+_ONE_GPU = subprocess.CompletedProcess(["smi"], 0, b"GPU-1111\n", b"")
+
+
+def _linux_smi(monkeypatch, answer, which="/usr/bin/nvidia-smi", pids=None, gpus=_ONE_GPU):
+    """nvidia-smi answering the GPU query with `gpus` and the process query with `answer`."""
     seen = []
 
     def fake_run(argv, **kwargs):
         seen.append(argv)
-        if isinstance(answer, BaseException):
-            raise answer
-        return answer
+        reply = gpus if argv[1] == "--query-gpu=uuid" else answer
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
 
     import shutil
 
@@ -4695,18 +4707,25 @@ def _linux_smi(monkeypatch, answer, which="/usr/bin/nvidia-smi", pids=None):
 
 def test_on_linux_nvidia_smi_is_recorded_and_the_kernel_is_not_asked(monkeypatch):
     pid = os.getpid()
-    listing = f"12, 100\n{pid}, 3105\n".encode()
+    listing = f"12, 100, GPU-1111\n{pid}, 3105, GPU-1111\n".encode()
     seen = _linux_smi(monkeypatch, subprocess.CompletedProcess(["smi"], 0, listing, b""))
     report = _litertlm_script()["device_report"]()
     assert seen == [
+        ["/usr/bin/nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader,nounits"],
         [
             "/usr/bin/nvidia-smi",
-            "--query-compute-apps=pid,used_memory",
+            "--query-compute-apps=pid,used_memory,gpu_uuid",
             "--format=csv,noheader,nounits",
-        ]
+        ],
     ]
     assert report["looked"] is False
-    assert report["nvidia_smi"] == {"listed": True, "used_memory_mib": 3105, "pids_hidden": False}
+    assert report["nvidia_smi"] == {
+        "listed": True,
+        "used_memory_mib": 3105,
+        "gpu_uuid": "GPU-1111",
+        "gpus": 1,
+        "pids_hidden": False,
+    }
     # Listed, and no adapter line: still not observed.
     assert gpu_observed("gpu", _run_report(report, report)) is False
 
@@ -4719,6 +4738,8 @@ def test_nvidia_smi_finds_the_process_by_its_pid_in_another_namespace(monkeypatc
     assert _litertlm_script()["device_report"]()["nvidia_smi"] == {
         "listed": True,
         "used_memory_mib": 876,
+        "gpu_uuid": None,
+        "gpus": 1,
         "pids_hidden": True,
     }
 
@@ -4743,12 +4764,24 @@ def test_own_pids_reads_every_namespace_from_proc(monkeypatch, tmp_path):
         (
             subprocess.CompletedProcess(["smi"], 0, b"12, 100\n", b""),
             "/usr/bin/nvidia-smi",
-            {"listed": False, "used_memory_mib": None, "pids_hidden": False},
+            {
+                "listed": False,
+                "used_memory_mib": None,
+                "gpu_uuid": None,
+                "gpus": 1,
+                "pids_hidden": False,
+            },
         ),
         (
             subprocess.CompletedProcess(["smi"], 0, b"[N/A], 100\n", b""),
             "/usr/bin/nvidia-smi",
-            {"listed": False, "used_memory_mib": None, "pids_hidden": True},
+            {
+                "listed": False,
+                "used_memory_mib": None,
+                "gpu_uuid": None,
+                "gpus": 1,
+                "pids_hidden": True,
+            },
         ),
         (
             subprocess.CompletedProcess(["smi"], 9, b"", b"Failed to initialize NVML"),
@@ -4969,3 +5002,48 @@ def test_the_preflight_takes_no_device_reading(monkeypatch, tmp_path):
     monkeypatch.setitem(ns, "score_one", lambda *a, **k: None)
     ns["main"](str(spec_path))
     assert calls == []
+
+
+def test_on_a_two_gpu_host_nvidia_smis_listing_is_not_tied_to_the_selected_adapter(monkeypatch):
+    """The process is listed on the other card; the Vulkan adapter cannot be bound to a row."""
+    from litetune.evaluate import adapter_selected, adapter_selected_note, adapters_of, gpu_unbound
+
+    pid = os.getpid()
+    listing = f"{pid}, 876, GPU-2222\n".encode()
+    two = subprocess.CompletedProcess(["smi"], 0, b"GPU-1111\nGPU-2222\n", b"")
+    _linux_smi(monkeypatch, subprocess.CompletedProcess(["smi"], 0, listing, b""), gpus=two)
+    reading = _litertlm_script()["device_report"]()
+    assert reading["nvidia_smi"]["gpus"] == 2 and reading["nvidia_smi"]["gpu_uuid"] == "GPU-2222"
+    report = {**_run_report(reading, reading), "adapters": adapters_of(_L4)}
+    assert gpu_observed("gpu", report) is False and adapter_selected("gpu", report) is True
+    assert "nvidia-smi lists 2 GPUs" in gpu_unbound("gpu", report)
+    assert "nvidia-smi lists 2 GPUs" in adapter_selected_note("gpu", report)
+    # One GPU: the listing is tied, and nothing is unbound.
+    one = _linux(adapters_of(_L4), smi=_smi())
+    assert gpu_observed("gpu", one) is True and gpu_unbound("gpu", one) is None
+    # A listing without the count (an older record) is not tied either.
+    assert gpu_observed("gpu", _linux(adapters_of(_L4), smi=_smi(gpus=None))) is False
+
+
+def test_on_windows_two_hardware_adapters_of_one_name_are_ambiguous(monkeypatch):
+    """Growth only on the second card of the name: neither is observed."""
+    from litetune.evaluate import gpu_unbound, windows_selected_luids
+
+    pid = os.getpid()
+    dxgi = [
+        {"description": "Intel(R) Arc(TM) B390 GPU", "luid": _ARC_LUID, "software": False},
+        {"description": "Intel(R) Arc(TM) B390 GPU", "luid": _OTHER_LUID, "software": False},
+    ]
+    _windows(
+        monkeypatch,
+        _engines(pid, [3], luid=_ARC_LUID) + _engines(pid, [10], others=False, luid=_OTHER_LUID),
+        _engines(pid, [3], luid=_ARC_LUID) + _engines(pid, [900], others=False, luid=_OTHER_LUID),
+        dxgi=dxgi,
+    )
+    device = _litertlm_script()["device_report"]
+    report = _arc(_run_report(device(), device()))
+    assert windows_selected_luids(report) == []
+    assert gpu_observed("gpu", report) is False and gpu_unused("gpu", report) is False
+    said = gpu_unbound("gpu", report)
+    assert "DXGI lists 2 hardware adapters named Intel(R) Arc(TM) B390 GPU" in said
+    assert _ARC_LUID.lower() in said and _OTHER_LUID.lower() in said
