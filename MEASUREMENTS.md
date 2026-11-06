@@ -2986,7 +2986,8 @@ at both readings. On Linux: the adapter line, and the run counts as measured on 
 GPU only when `nvidia-smi` also lists the process after the work; with the line
 alone it is said as "selected", and a finished run with no line fails the harness.
 On every platform a software adapter fails the harness. Run with litetune at
-`cc4bdbe` (unreleased; wheels of the branch), on the beans int8 file and checkpoint
+`cc4bdbe` (unreleased), from one wheel whose sha256, `14cd2c7b…`, and file-for-file
+match to that commit are in each run's `wheel.txt`, on the beans int8 file and checkpoint
 of *EmbeddingGemma 2 on images: beans* and the emotion decision bundle of *The CPU
 and the GPU on a Mac*:
 
@@ -2996,19 +2997,21 @@ and the GPU on a Mac*:
 | beans, candidate / reference, k=10 mean | 0.9347 / 0.9287 | 0.9400 / 0.9287 |
 | beans, cosine to float32, mean / min | 0.9589 / 0.7431 | 0.9578 / 0.7038 |
 | beans, ms per picture, median (text tower on the GPU, vision on the CPU) | 291.0 | 441.7 |
-| beans, what established the GPU | the Arc's counters (LUID `0x0000A62B`) grew from 382,400 to 2,247,383,261 | the L4's adapter line, and `nvidia-smi` listed the process at 450 MiB |
+| beans, what established the GPU | the Arc's counters (LUID `0x0000A62B`) grew from 382,400 to 2,247,383,261 | the L4's adapter line, and `nvidia-smi` listed the process at 450 MiB on the host's only GPU: a context held there, not a reading of each operation |
 | decision, status | failed the harness | passed |
 | decision, top option / answer equal to the reference's (300 rows) | | 1.0000 / 0.9933 |
 | decision, mean KL, reference to runtime | | 2.23e-04 |
-| decision, rows the two GPU runs differed on | 111 | 0 |
+| decision, rows the first two GPU-backend runs differed on | 111 | 0 |
 | decision, ms per decision, median | | 105.0 |
 
-- On Windows the decision bundle's first GPU run was observed on the Arc (its
-  counters grew from 1,727,474 to 233,204,940), and its second run, in reverse
+- On Windows the decision bundle's first GPU-backend run was observed on the Arc
+  (its counters grew from 1,727,474 to 233,204,940), and its second, in reverse
   order, scored 111 of the 300 rows differently. Five more readings of each in a
-  third run settled none of the 111: no score came up twice and more often than any
-  other. `verify` failed the harness, as the repeat rule is written to; there are
-  no Windows GPU decision numbers. On macOS the same rule settled a few rows of 300
+  third run settled none of the 111. The record keeps only the first run's
+  reading: at `cc4bdbe` a refused repeat dropped the others' (kept since), so
+  whether the second and third ran on the Arc is not recorded. No score came up
+  twice and more often than any other. `verify` failed the harness, as the repeat
+  rule is written to; there are no Windows GPU decision numbers. On macOS the same rule settled a few rows of 300
   (*The CPU and the GPU on a Mac*); on the L4 the two runs agreed on all 300.
 - DXGI listed two adapters on the Windows machine: the Arc B390 at LUID
   `0x0000A62B` and the Microsoft Basic Render Driver, DXGI's software adapter, at
@@ -3026,7 +3029,8 @@ and the GPU on a Mac*:
   The beans record as shipped predates `tune` recording the processor files'
   digests, and `verify` refused it; both runs used the record with the digests
   added, as on the Mac and on Windows before, whose four files' digests matched.
-- An earlier decision run on Linux, at `770b825`, passed with the same numbers and
+- An earlier decision run on Linux, at `770b825` (from a wheel whose digest was
+  not kept; the manifest records version 0.7.3), passed with the same numbers and
   was recorded as asked for, not as observed: the scoring script set the runtime's
   log to ERROR before building its engine, so the adapter line, logged at INFO,
   was never written, although `nvidia-smi` listed the process with 876 MiB. Since

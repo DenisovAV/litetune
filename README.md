@@ -709,9 +709,10 @@ What has and has not been measured:
   ([MEASUREMENTS.md](MEASUREMENTS.md#decisions-a-model-that-chooses-among-options)).
 - It needs training on the task: the untuned model, and a model trained on
   other tasks, chose far worse.
-- `verify` measures scoring on the CPU backend, and with `--backend gpu` on
-  the GPU (how each platform is read, and what Linux needs:
-  [Limitations](#limitations)). On macOS LiteRT-LM's package gives a few rows
+- `verify` measures scoring on the CPU backend. With `--backend gpu` it asks
+  for the GPU, and calls the scores measured there only when the platform's
+  reading shows every run on it (how each platform is read, and what Linux
+  needs: [Limitations](#limitations)). On macOS LiteRT-LM's package gives a few rows
   wrong scores, at different rows in each run, so on every platform every row
   is scored twice, the rows that differ five more times, and the scores most
   of the readings gave are kept (a family that scores each option on an
@@ -1672,8 +1673,9 @@ withdrawn after re-measurement.
   be repacked is named in the limitations: an app that loads it without an
   activation override gets the F16 default. litetune cannot drive a phone GPU
   from a laptop, so a device run is a separate job.
-- **`verify --backend gpu` measures on this machine's GPU, with fp32 passed
-  by litetune.** The activation type is passed on every GPU run of a text,
+- **`verify --backend gpu` asks for this machine's GPU, with fp32 passed by
+  litetune, and calls a run measured there only when the platform's reading
+  shows it.** The activation type is passed on every GPU run of a text,
   tool or decision bundle (an EmbeddingGemma 2 file's engine takes none), so a
   bundle
   without the key is measured rather than flooding — upstream calls the
@@ -1698,15 +1700,19 @@ withdrawn after re-measurement.
   on the Intel Arc B390 and on the Microsoft Basic Render Driver; a GPU
   engine's process had them from construction and the Arc's running time grew
   with work, and a CPU engine's process had none. Without an adapter line, or
-  when DXGI lists no hardware adapter of that name, nothing is observed. A run
+  when DXGI lists no hardware adapter of that name, or two (identical cards a
+  name cannot tell apart), nothing is observed. A run
   either reading shows doing no GPU work is said not to have used the GPU — in
   the limitations on the text and tool paths, and as a harness failure for a
   decision bundle and an EmbeddingGemma 2 file. On Linux the kernel is not
   asked: the run is measured on the GPU when LiteRT-LM names a hardware
   adapter on its stderr as it builds its GPU environment ("Selected adapter:
-  …") and `nvidia-smi` lists the process after the work; with the adapter
-  alone the manifest says it was selected, not measured on, and a finished
-  run that names no adapter fails the harness. On every platform a GPU run
+  …") and `nvidia-smi`, on a host where it lists one GPU, lists the process
+  after the work: a context held on that GPU, which places the run there and
+  is not a reading of each operation. With the adapter alone, or with several
+  GPUs, which nvidia-smi does not identify by anything the runtime prints,
+  the manifest says it was selected, not measured on; a finished run that
+  names no adapter fails the harness. On every platform a GPU run
   whose adapter is a software one (`adapterType` with `cpu` or `software` in
   it, or llvmpipe, lavapipe, SwiftShader or WARP by name) is a harness
   failure: on an Ubuntu host with an NVIDIA L4 and without `libegl1`
