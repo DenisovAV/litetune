@@ -2976,13 +2976,17 @@ into the package, and the runtime names on stderr the adapter it selected:
   (`Win32_PerfRawData_GPUPerformanceCounters_GPUEngine`) had no instance for the
   process before its engine was built, had instances once a GPU engine existed, and
   their running time grew with work: from 60,343 to 30,493,406 (100 ns units) over
-  40 embeddings. A CPU engine's process had none at either reading.
+  40 embeddings, all of it on one adapter's engines (`windows-ptl/gpu_split.json`).
+  A CPU engine's process had none at either reading.
 
-`verify --backend gpu` reads those signals: on Windows the counters at the two
-points macOS reads its kernel, on Linux the adapter line (and records `nvidia-smi`'s
-listing of the process), and on every platform it fails the harness on a software
-adapter. Run with litetune at `3ee2b47` on Windows and at `770b825` and `679fac9`
-on Linux (unreleased; wheels of the branch), on the beans int8 file and checkpoint
+`verify --backend gpu` reads those signals. On Windows: the counters at the two
+points macOS reads its kernel, counted only on the adapter the runtime named, whose
+LUID the driver script gets from DXGI's adapter list, and only on counters present
+at both readings. On Linux: the adapter line, and the run counts as measured on the
+GPU only when `nvidia-smi` also lists the process after the work; with the line
+alone it is said as "selected", and a finished run with no line fails the harness.
+On every platform a software adapter fails the harness. Run with litetune at
+`cc4bdbe` (unreleased; wheels of the branch), on the beans int8 file and checkpoint
 of *EmbeddingGemma 2 on images: beans* and the emotion decision bundle of *The CPU
 and the GPU on a Mac*:
 
@@ -2991,14 +2995,28 @@ and the GPU on a Mac*:
 | beans, status | inconclusive | inconclusive |
 | beans, candidate / reference, k=10 mean | 0.9347 / 0.9287 | 0.9400 / 0.9287 |
 | beans, cosine to float32, mean / min | 0.9589 / 0.7431 | 0.9578 / 0.7038 |
-| beans, ms per picture, median (text tower on the GPU, vision on the CPU) | 289.0 | 526.9 |
-| beans, what established the GPU | counters grew from 371,465 to 2,268,822,883 | the L4's adapter line; `nvidia-smi` listed the process at 450 MiB |
-| decision, status | not run | passed |
+| beans, ms per picture, median (text tower on the GPU, vision on the CPU) | 291.0 | 441.7 |
+| beans, what established the GPU | the Arc's counters (LUID `0x0000A62B`) grew from 382,400 to 2,247,383,261 | the L4's adapter line, and `nvidia-smi` listed the process at 450 MiB |
+| decision, status | failed the harness | passed |
 | decision, top option / answer equal to the reference's (300 rows) | | 1.0000 / 0.9933 |
 | decision, mean KL, reference to runtime | | 2.23e-04 |
-| decision, rows the two GPU runs differed on | | 0 |
-| decision, ms per decision, median | | 111.7 |
+| decision, rows the two GPU runs differed on | 111 | 0 |
+| decision, ms per decision, median | | 105.0 |
 
+- On Windows the decision bundle's first GPU run was observed on the Arc (its
+  counters grew from 1,727,474 to 233,204,940), and its second run, in reverse
+  order, scored 111 of the 300 rows differently. Five more readings of each in a
+  third run settled none of the 111: no score came up twice and more often than any
+  other. `verify` failed the harness, as the repeat rule is written to; there are
+  no Windows GPU decision numbers. On macOS the same rule settled a few rows of 300
+  (*The CPU and the GPU on a Mac*); on the L4 the two runs agreed on all 300.
+- DXGI listed two adapters on the Windows machine: the Arc B390 at LUID
+  `0x0000A62B` and the Microsoft Basic Render Driver, DXGI's software adapter, at
+  `0x0000AA0B`. The process held counters on both; all its engine time was on the
+  Arc's, and the Basic Render Driver's stayed at 0. The first Windows records
+  (`windows-ptl-verify/`), taken before the reading was restricted to the selected
+  adapter, summed both and named an instance on `0x0000AA0B`; the totals agree
+  only because the other adapter's time was 0.
 - The beans gates were inconclusive for the reason in *EmbeddingGemma 2 on images:
   beans*: at 300 held-out rows no draw's interval fits under the 0.01 threshold.
   The same file on the same Windows machine's CPU scored 0.9327 at 363.5 ms per
@@ -3008,15 +3026,14 @@ and the GPU on a Mac*:
   The beans record as shipped predates `tune` recording the processor files'
   digests, and `verify` refused it; both runs used the record with the digests
   added, as on the Mac and on Windows before, whose four files' digests matched.
-- The first decision run on Linux, at `770b825`, passed with the same numbers and
+- An earlier decision run on Linux, at `770b825`, passed with the same numbers and
   was recorded as asked for, not as observed: the scoring script set the runtime's
   log to ERROR before building its engine, so the adapter line, logged at INFO,
-  was never written, although `nvidia-smi` listed the process with 876 MiB. At
-  `679fac9` the script quiets the log once the engine exists and the run was
-  observed.
+  was never written, although `nvidia-smi` listed the process with 876 MiB. Since
+  `679fac9` the script quiets the log once the engine exists.
 - With `VK_ICD_FILENAMES` pointing at Mesa's llvmpipe ICD on the same Linux host,
   `verify --backend gpu` on beans failed the harness: the candidate's script read
-  the llvmpipe line from its stderr once its engine existed, stopped, and the
-  candidate check named the adapter and the two packages.
-- Not run on these machines: the text and tool paths on the GPU, and on Windows the
-  decision path. Their reading is the same code and is held by tests, not by a run.
+  the llvmpipe line from its stderr once its engine existed and stopped, and the
+  candidate check named the adapter and the variable that chose it.
+- Not run on these machines: the text and tool paths on the GPU. Their reading is
+  the same code and is held by tests, not by a run.

@@ -710,12 +710,16 @@ What has and has not been measured:
 - It needs training on the task: the untuned model, and a model trained on
   other tasks, chose far worse.
 - `verify` measures scoring on the CPU backend, and with `--backend gpu` on
-  the GPU on macOS, Windows and Linux (how each is read, and what Linux needs:
+  the GPU (how each platform is read, and what Linux needs:
   [Limitations](#limitations)). On macOS LiteRT-LM's package gives a few rows
   wrong scores, at different rows in each run, so on every platform every row
   is scored twice, the rows that differ five more times, and the scores most
   of the readings gave are kept (a family that scores each option on an
-  Engine of its own is refused on the GPU). It is measured against
+  Engine of its own is refused on the GPU). One emotion bundle has been run so
+  on each platform: it passed on a Mac and on an NVIDIA L4 under Linux, where
+  the two runs agreed on all 300 rows, and failed the harness on an Intel Arc
+  B390 under Windows, where they differed on 111 rows and the third run
+  settled none ([MEASUREMENTS.md](MEASUREMENTS.md#the-gpu-on-windows-and-linux)). It is measured against
   the float reference on LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561
   fix only. On a Mac CPU with SME2 it scores on one thread
   ([Which runtime each version measures on](#which-runtime-each-version-measures-on)). On another runtime, `verify` needs `--float-twin` to say more than
@@ -1688,17 +1692,24 @@ withdrawn after re-measurement.
   measured on the same M4 Pro, where a CPU engine owned none. On Windows it
   reads the process's own GPU engine counters
   (`Win32_PerfRawData_GPUPerformanceCounters_GPUEngine`) at the same two
-  points: on an Intel Arc B390 a GPU engine's process had them from
-  construction and their running time grew with work, and a CPU engine's
-  process had none. A run either reading shows doing no GPU work is said not
-  to have used the GPU — in the limitations on the text and tool paths, and as
-  a harness failure for a decision bundle and an EmbeddingGemma 2 file. On
-  Linux the kernel is not asked: the GPU is the adapter LiteRT-LM names on its
-  stderr when it builds its GPU environment ("Selected adapter: …"), and
-  `nvidia-smi`'s listing of the process is recorded beside it, not required.
-  On every platform a GPU run whose adapter is a software one (`adapterType`
-  `CPU / Software`, or llvmpipe, lavapipe, SwiftShader or WARP by name) is a
-  harness failure: on an Ubuntu host with an NVIDIA L4 and without `libegl1`
+  points, on the adapter the runtime named only: the driver script maps that
+  name to its LUID through DXGI's adapter list, and only counters present at
+  both readings count. On the Panther Lake machine the process held counters
+  on the Intel Arc B390 and on the Microsoft Basic Render Driver; a GPU
+  engine's process had them from construction and the Arc's running time grew
+  with work, and a CPU engine's process had none. Without an adapter line, or
+  when DXGI lists no hardware adapter of that name, nothing is observed. A run
+  either reading shows doing no GPU work is said not to have used the GPU — in
+  the limitations on the text and tool paths, and as a harness failure for a
+  decision bundle and an EmbeddingGemma 2 file. On Linux the kernel is not
+  asked: the run is measured on the GPU when LiteRT-LM names a hardware
+  adapter on its stderr as it builds its GPU environment ("Selected adapter:
+  …") and `nvidia-smi` lists the process after the work; with the adapter
+  alone the manifest says it was selected, not measured on, and a finished
+  run that names no adapter fails the harness. On every platform a GPU run
+  whose adapter is a software one (`adapterType` with `cpu` or `software` in
+  it, or llvmpipe, lavapipe, SwiftShader or WARP by name) is a harness
+  failure: on an Ubuntu host with an NVIDIA L4 and without `libegl1`
   the runtime used Mesa's llvmpipe and reported success, at 11.4 s for an
   EmbeddingGemma 2 picture against 0.6 s on the CPU backend. **On Ubuntu with an NVIDIA GPU, install
   `libnvidia-gl-<driver version>` (the one matching the installed driver,
