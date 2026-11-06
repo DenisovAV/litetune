@@ -3,7 +3,7 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
-## 0.8.0 — 2026-11-06
+## 0.8.0 — 2026-11-07
 - `prepare`, `tune`, `convert` and `verify` fine-tune EmbeddingGemma 2 on images and write the encoder into Google's text-vision file (#110).
 - `prepare`, `tune`, `convert` and `verify` fine-tune Gemma 4 E2B on rows that carry a picture; the bundle keeps its vision encoder (#115).
 - `convert --npu` compiles an EmbeddingGemma 2 image checkpoint for Qualcomm NPUs (#113).
