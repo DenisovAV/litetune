@@ -165,6 +165,9 @@ class FakeToolchain:
     start_token_embedded: str | None = None
     special_tokens: dict[str, str] | None = None
     repack_pack_rewrites_template: bool = False
+    # LlmMetadata text the exporter writes beside the template, a field per line
+    # as the fake text format reads it: a Gemma 4 vision export's media fields.
+    metadata_extra: str = ""
     # The conversation script's knobs: its exit code, or its result, in place
     # of running it.
     conversation_returncode: int | None = None
@@ -292,6 +295,7 @@ class FakeToolchain:
                 pack_misplaces=self.repack_pack_misplaces,
                 pack_rewrites_template=self.repack_pack_rewrites_template,
                 start_token=self.start_token_embedded,
+                metadata_extra=self.metadata_extra,
                 embedded_path=str(embedded),
             ),
             encoding="utf-8",
@@ -350,6 +354,7 @@ PACK_DRIFTS = {pack_drifts}
 PACK_MISPLACES = {pack_misplaces}
 PACK_REWRITES_TEMPLATE = {pack_rewrites_template}
 START_TOKEN = {start_token!r}
+METADATA_EXTRA = {metadata_extra!r}
 EMBEDDED = json.loads(Path({embedded_path!r}).read_text(encoding="utf-8"))
 # The LlmMetadata text of each bundle `pack` wrote, by path: kept beside the
 # fake rather than inside the bundle, so that a bundle's size stays the
@@ -369,6 +374,7 @@ def _metadata_text(template):
     start = "" if START_TOKEN is None else (
         "start_token: " + json.dumps({{"token_str": START_TOKEN}}) + "\\n"
     )
+    start += METADATA_EXTRA
     if template is None:
         return start
     return start + "jinja_prompt_template: " + json.dumps(template) + "\\n"
@@ -521,37 +527,75 @@ def read_litertlm_header(path, output_stream):
 # repack script uses them, reading the one-field-per-line text the fake
 # builder's `unpack` writes.
 FAKE_LLM_METADATA_PB2 = """
-class LlmMetadata:
-    def __init__(self):
-        self.fields = {}
+# Scalars a real message reads as their zero value when unset.
+_ZERO = {
+    "jinja_prompt_template": "",
+    "token_str": "",
+    "ids": [],
+    "max_num_patches": 0,
+    "k": 0,
+    "p": 0.0,
+    "temperature": 0.0,
+    "type": 0,
+}
+
+
+# Scalars without presence in litert-lm-builder 0.18.0's proto: `HasField` raises
+# ValueError for them there, and so here.
+_NO_PRESENCE = {"max_num_patches", "k", "p", "temperature", "type"}
+
+
+class _Enum:
+    def __init__(self, name):
+        self.name = name
+
+
+class _Descriptor:
+    # SamplerParameters.Type as 0.18.0 numbers it.
+    fields_by_name = {
+        "type": type(
+            "Field",
+            (),
+            {
+                "enum_type": type(
+                    "EnumType",
+                    (),
+                    {
+                        "values_by_number": {
+                            0: _Enum("TYPE_UNSPECIFIED"),
+                            1: _Enum("TOP_K"),
+                            2: _Enum("TOP_P"),
+                            3: _Enum("GREEDY"),
+                        }
+                    },
+                )
+            },
+        )
+    }
+
+
+class _Message:
+    # A message over a dict: a field is set when its name is a key, a nested
+    # dict is a message, and an unset scalar reads as its zero.
+    DESCRIPTOR = _Descriptor()
+
+    def __init__(self, fields=None):
+        self.__dict__["fields"] = {} if fields is None else fields
 
     def HasField(self, name):
+        if name in _NO_PRESENCE:
+            raise ValueError(f"Field {name} does not have presence")
         return name in self.fields
 
-    @property
-    def jinja_prompt_template(self):
-        return self.fields.get("jinja_prompt_template", "")
-
-    @property
-    def start_token(self):
-        token = _Token()
-        token.fields = self.fields.get("start_token", {})
-        return token
+    def __getattr__(self, name):
+        value = self.fields.get(name)
+        if isinstance(value, dict) or (value is None and name not in _ZERO):
+            return _Message(value or {})
+        return _ZERO.get(name) if value is None else value
 
 
-class _Token:
-    fields = {}
-
-    def HasField(self, name):
-        return name in self.fields
-
-    @property
-    def token_str(self):
-        return self.fields.get("token_str", "")
-
-    @property
-    def token_ids(self):
-        return type("Ids", (), {"ids": self.fields.get("ids", [])})()
+class LlmMetadata(_Message):
+    pass
 """
 
 FAKE_TEXT_FORMAT = """

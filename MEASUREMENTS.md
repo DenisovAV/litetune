@@ -984,6 +984,45 @@ backend library version 5.51.0 is used. The version LiteRT using is 5.50.0.`; wi
 the QAIRT 2.47.0 libraries the engine was not created on the same phone, though the
 bundle's context binary is 2.47.0.
 
+### Gemma 4 E2B tuned on pictures: beans
+
+Measured 2026-11-05 with litetune's own stages at the commit that added them
+(unreleased): `tune` → `convert --recipe dynamic_wi8_afp32` → `verify --scorer
+exact-text`, on one A100 40GB (tune and the reference) and the same machine's 12-vCPU
+Intel Xeon @ 2.20GHz (the candidate, litert-lm 0.18.0, CPU text and vision backends).
+`google/gemma-4-E2B-it` at `3e22461f`; rows from AI-Lab-Makerere/beans at `27aa014c`,
+the 1,165 pictures of *EmbeddingGemma 2 on images: beans* (500×500 JPEG), one question
+per picture asking for its label, the label as the answer. LoRA r16/α32 on the seven
+projections, lr 2e-4, 2 epochs, batch 8; each picture took 256 soft tokens.
+
+| split | float reference | `dynamic_wi8_afp32` bundle | cost of conversion (paired) |
+|---|---|---|---|
+| prepare's own split (865 / 300) | 0.8633 | 0.8667 | −0.0033 ±0.0065, 1 of 300 discordant, unresolved |
+| the EmbeddingGemma 2 beans split (865 / 300) | 0.8800 | 0.8867 | −0.0067 ±0.0131, 4 of 300 discordant, unresolved |
+
+- On the second split, before tuning, the checkpoint answered 0.4833 of the held-out
+  pictures exactly through transformers and Google's own
+  `gemma-4-E2B-it.litertlm` (at `b3ca0d2f`) 0.4967 through litert-lm 0.18.0, measured
+  by scripts outside litetune, as are the three runs in the next point.
+- The same rows tuned by a script outside litetune scored 0.9367 in float32; that
+  script with another seed and shuffle order, 0.9167; with litetune's token-weighted
+  loss, 0.9067. Its inputs were byte for byte litetune's (the rendered prompt,
+  `input_ids`, pixel values, image positions and completion ids of 20 rows compared).
+  Each run's weakest label was one of the two diseases: bean_rust in the three runs
+  outside litetune (88, 77 and 81 of 99 right), angular_leaf_spot in an earlier tune by
+  litetune on the same split, before the review fixes, which scored the same 0.8800 (71
+  of 99, 26 of its 36 errors answered as bean_rust). One run per setting does not separate
+  the loss weighting from the seed.
+- On the second split tune took 1,393 s and peaked at 11.44 GB of CUDA memory, and
+  convert took 853 s.
+  Every tensor of the vision and audio towers and the token embeddings hashed the
+  same after the merge.
+- The bundle declares TOP_P, top_k 64, temperature 1.0; verify sent top_k 1 in its
+  place, so these numbers are for an app that passes top_k 1. Its vision encoder and
+  adapter are constrained to the CPU.
+- Not measured: the GPU, a phone, flutter_edge_ai, int4, and more than one seed of
+  litetune's own tune.
+
 ## A fourth family, and the first that is not Gemma
 
 Every section above measures a Gemma: FunctionGemma and Gemma 3 fine-tuned

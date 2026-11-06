@@ -43,7 +43,7 @@ import logging
 import os
 import re
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -2081,7 +2081,10 @@ class ExportPlan:
 
 
 def plan_export(
-    model: str, requested_flags: Sequence[str] = (), recipes: Sequence[str] = ()
+    model: str,
+    requested_flags: Sequence[str] = (),
+    recipes: Sequence[str] = (),
+    litetune_flags: Mapping[str, str] | None = None,
 ) -> ExportPlan:
     """Work out the flags this model's export must carry.
 
@@ -2091,6 +2094,10 @@ def plan_export(
     and a required flag whose value it cannot determine makes the plan unusable
     rather than guessed at. Every decision reads the parsed table, and `flags`
     is that table, one token per keyword: what the exporter is given.
+
+    `litetune_flags` are tokens among `requested_flags` that litetune itself
+    set, each with its reason: a required flag they satisfy is reported as set
+    by litetune, not by the caller.
     """
     hint = hint_for(model)
     rules = rules_for_hint(hint)
@@ -2130,6 +2137,21 @@ def plan_export(
             )
         if supplied is not None and required.value in WRITTEN_AT_EXPORT:
             limitations.append(_CALLER_TEMPLATE.format(flag=supplied.shown))
+        if supplied is not None and supplied.token in (litetune_flags or {}):
+            reason = (litetune_flags or {})[supplied.token]
+            checks.append(
+                Check.passed(
+                    EXPORT_FLAGS_CHECK,
+                    f"{rules.family}: {supplied.shown} was set by litetune: {reason}",
+                    observed={
+                        "flag": supplied.shown,
+                        "token": supplied.token,
+                        "family": rules.family,
+                        "added": True,
+                    },
+                )
+            )
+            continue
         if supplied is not None:
             wanted = required.rendered
             detail = f"{supplied.shown} was supplied by the caller"

@@ -32,13 +32,13 @@ import hashlib
 import json
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from litetune import devices, envs, llm_npu, metrics, models
+from litetune import devices, envs, llm_images, llm_npu, metrics, models
 from litetune.checks import Check, CheckSet, Outcome, guard
 from litetune.decision_verify import DEFAULT_ENGINE_ROWS, DEFAULT_THREADS
 from litetune.declarations import digest_matches, read_declarations, recorded_digest
@@ -647,7 +647,154 @@ def _unavailable_modes(backend: ToolPathBackend) -> dict[str, dict[str, Any]]:
     }
 
 
-def _candidate_backend(request: VerifyRequest, declarations: list | None) -> GenerationBackend:
+@dataclass(frozen=True)
+class PictureInputs:
+    """What both sides need for rows with a picture: the pictures, the template, the budget."""
+
+    images: tuple[dict[str, str], ...]
+    template: str
+    vision_tokens: int
+    template_sha256: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "pictures": len(self.images),
+            "distinct": len({i["sha256"] for i in self.images}),
+            "vision_tokens": self.vision_tokens,
+            "template_sha256": self.template_sha256,
+            "candidate_vision_backend": "cpu",
+            "reference_environment": envs.TRAIN_VISION.name,
+        }
+
+
+PICTURES_CHECK = "rows with a picture can be compared"
+
+PICTURES_COMPARED = (
+    "the held-out rows carry pictures. The reference reads each through the checkpoint's own "
+    "processor at {tokens} soft tokens and the bundle's template; the candidate is sent the "
+    "picture's bytes and decodes and resizes it with the runtime's own image preprocessor, on a "
+    "CPU vision backend; the sampler it decodes with is said where decoding is. The "
+    "two sides do not decode and resize a picture with the same code, so "
+    "a difference here holds that as well as the conversion. The rendering check compares the "
+    "text around each picture's placeholder as token ids; how many soft tokens the runtime "
+    "gives a picture it does not report, so that was not compared"
+)
+
+
+def _candidate_sampling(engine: Mapping[str, Any]) -> str:
+    """What the candidate decoded with, said for the sampler it ran on."""
+    declared, sent = engine.get("bundle_sampler"), engine.get("sampler_sent")
+    if sent and isinstance(declared, Mapping) and declared.get("type") == llm_images.UNRUN_GREEDY:
+        return (
+            f"the bundle declares a greedy sampler ({declared}), which litert-lm 0.18.0's CPU "
+            f"sampler does not implement, so verify sent {sent} in its place on every row. An "
+            "application that passes no sampler of its own gets an error from this bundle"
+        )
+    if sent:
+        return (
+            f"the bundle declares a sampler that samples ({declared}), so verify sent "
+            f"{sent} in its place on every row. This number is for an application that passes "
+            "top_k 1 itself; one that passes no sampler samples with the bundle's"
+        )
+    if declared:
+        return (
+            f"the bundle declares a sampler that picks the likeliest token ({declared}), and the "
+            "runtime ran on it; both sides are greedy"
+        )
+    return (
+        "the bundle declares no sampler, and the runtime ran on its own defaults; both are "
+        "greedy. An application through flutter_edge_ai that passes no sampler gets its model "
+        "family's default instead, which for Gemma 4 samples"
+    )
+
+
+PICTURE_THREADS = (
+    "the vision encoder ran on the runtime's default CPU threads: litert-lm 0.18.0's Engine "
+    "sets a thread count for its text and audio backends only (`engine.py`). The text side {text}"
+)
+
+PICTURE_PREFILL_UNCHECKED = (
+    "the rendering check's second half, the runtime's own prefill count against the "
+    "reference's, was not run for rows with a picture: the runtime counts a picture's soft "
+    "tokens itself and does not report how many, so tokens it adds outside the rendered text "
+    "-- a second BOS around an image turn -- would not show here"
+)
+
+
+def _picture_inputs(
+    request: VerifyRequest, split: Split
+) -> tuple[Check | None, PictureInputs | None]:
+    """Why the split's pictures cannot be compared, or what both sides are given for them."""
+    images = split.images or ()
+
+    def refused(reason: str) -> tuple[Check, None]:
+        return (
+            Check.failed(
+                PICTURES_CHECK,
+                reason,
+                observed={"reference": request.reference, "pictures": len(images)},
+            ),
+            None,
+        )
+
+    try:
+        record = llm_images.image_record(request.reference)
+    except (llm_images.ImageRowError, OSError, ValueError) as exc:
+        return refused(f"the reference's record of its pictures could not be read: {exc}")
+    if record is None:
+        return refused(
+            f"the held-out rows carry pictures, and {request.reference} records no training on "
+            "pictures: the reference is the checkpoint `tune` trained on rows like these, whose "
+            "litetune.json names the processor and the template they were trained through"
+            f"{model_dir_hint(request.reference)}"
+        )
+    if request.backend != "cpu":
+        return refused(
+            f"the held-out rows carry pictures, and --backend {request.backend} was asked. "
+            "litetune measures a bundle on pictures on the CPU, text and vision both; drop "
+            "--backend"
+        )
+    if request.declarations is not None:
+        return refused(
+            "the held-out rows carry pictures, and declarations were given. litetune trains Gemma "
+            "4 on pictures with text answers only"
+        )
+    if request.prompt_mode is not PromptMode.RUNTIME_RENDERED:
+        mode = request.prompt_mode.value if request.prompt_mode is not None else "not known"
+        return refused(
+            f"the held-out rows carry pictures, and the prompt mode is {mode}. A picture reaches "
+            "the model through the template the runtime renders: "
+            f"{PromptMode.RUNTIME_RENDERED.value} only"
+        )
+    if request.scorer == "tool-call":
+        return refused(
+            "the held-out rows carry pictures, and --scorer tool-call was asked. Their answers are "
+            "text; pass --scorer exact-text"
+        )
+    try:
+        mismatch = llm_images.processor_mismatch(request.reference, record)
+    except (OSError, ValueError) as exc:
+        return refused(
+            "the reference's processor files could not be compared with the ones `tune` "
+            f"recorded ({type(exc).__name__}: {exc})"
+        )
+    if mismatch is not None:
+        return refused(mismatch)
+    try:
+        template = llm_images.checked_template(request.reference, record)
+    except llm_images.ImageRowError as exc:
+        return refused(str(exc))
+    return None, PictureInputs(
+        images=tuple({"path": str(i.file), "sha256": i.sha256} for i in images),
+        template=template,
+        vision_tokens=int(record["vision_tokens"]),
+        template_sha256=str(record["template_sha256"]),
+    )
+
+
+def _candidate_backend(
+    request: VerifyRequest, declarations: list | None, pictures: PictureInputs | None = None
+) -> GenerationBackend:
     chosen, _ = _tool_path_reason(request, declarations)
     if chosen:
         return ToolPathBackend(
@@ -663,6 +810,7 @@ def _candidate_backend(request: VerifyRequest, declarations: list | None) -> Gen
         declared_prompt_mode=request.prompt_mode,
         backend_flag=request.backend,
         engine_per_prompt_reason=rules.engine_per_prompt_reason if rules else "",
+        images=pictures.images if pictures is not None else None,
     )
 
 
@@ -719,7 +867,11 @@ def _limit_gpu_reading(run: Any, engine: dict[str, Any]) -> None:
     )
 
 
-def build_backends(request: VerifyRequest, declarations: list | None = None) -> BackendPair:
+def build_backends(
+    request: VerifyRequest,
+    declarations: list | None = None,
+    pictures: PictureInputs | None = None,
+) -> BackendPair:
     """The real backends. Tests pass their own pair to `run_verify` instead.
 
     `request.prompt_mode` has been resolved by the time this is called, so both
@@ -739,16 +891,29 @@ def build_backends(request: VerifyRequest, declarations: list | None = None) -> 
     """
     chosen, _ = _tool_path_reason(request, declarations)
     rendered = declarations if chosen else None
+    # Rows with a picture: the reference and the rendering check's tokenizer in
+    # the environment that has the image processor, each given the pictures and
+    # the bundle template; the candidate the pictures' bytes.
+    reference_env = envs.TRAIN_VISION if pictures is not None else envs.TRAIN
     return BackendPair(
-        candidate=_candidate_backend(request, declarations),
+        candidate=_candidate_backend(request, declarations, pictures),
         reference=HuggingFaceBackend(
             model=request.reference,
             decode=request.decode,
+            env=reference_env,
             declared_prompt_mode=request.prompt_mode,
             declarations=rendered,
+            images=pictures.images if pictures is not None else None,
+            template=pictures.template if pictures is not None else None,
+            vision_tokens=pictures.vision_tokens if pictures is not None else None,
         ),
         rendering=RenderingProbe(
-            model=request.model, reference=request.reference, declarations=rendered
+            model=request.model,
+            reference=request.reference,
+            declarations=rendered,
+            reference_env=reference_env,
+            images=pictures.images if pictures is not None else None,
+            template=pictures.template if pictures is not None else None,
         ),
     )
 
@@ -1336,7 +1501,36 @@ def run_verify(
     for text in rules.limitations if rules is not None else ():
         run.limitation(text)
 
-    pair = backends or build_backends(request, declarations)
+    # -- rows with a picture -------------------------------------------------
+    # Before the backends: what the reference is given for each picture comes
+    # from the checkpoint's record, and a record or a processor that is not the
+    # one the pictures were trained through leaves nothing to compare.
+    pictures: PictureInputs | None = None
+    if split.images is not None:
+        refusal, pictures = _picture_inputs(request, split)
+        if refusal is not None:
+            run.record(refusal)
+            return run.finish(Status.FAILED_HARNESS)
+        assert pictures is not None
+        accepted = Check.passed(
+            PICTURES_CHECK,
+            f"{len(pictures.images)} rows with a picture; the reference's processor files and "
+            f"the bundle template (sha256 {pictures.template_sha256[:12]}) are the ones `tune` "
+            "recorded",
+            observed=pictures.as_dict(),
+        )
+        run.record(accepted)
+        run.manifest["harness"]["pictures"] = pictures.as_dict()
+        run.limitation(PICTURES_COMPARED.format(tokens=pictures.vision_tokens))
+        run.limitation(PICTURE_PREFILL_UNCHECKED)
+
+    # A text split calls it as it always has, so a stand-in that takes two
+    # arguments still stands in for it.
+    pair = backends or (
+        build_backends(request, declarations)
+        if pictures is None
+        else build_backends(request, declarations, pictures)
+    )
     # Which path the candidate is measured through, and why. From what actually
     # runs rather than from the rule alone: a caller that supplies its own
     # backends has chosen the path itself, and a manifest that named the rule's
@@ -1512,6 +1706,14 @@ def run_verify(
         _limit_gpu_reading(run, candidate.engine)
     _limit_runtime_named(run, candidate.engine)
     _limit_cpu_threads(run, pair.candidate)
+    if pictures is not None:
+        threads = candidate.engine.get("cpu_threads") or {}
+        used = threads.get("threads") if isinstance(threads, Mapping) else None
+        run.limitation(
+            PICTURE_THREADS.format(
+                text=f"was given {used} thread(s)" if used else "ran on the default count too"
+            )
+        )
 
     # Check 5 (divergence) is deferred: the caller decides whether it applies,
     # and generating the reference before the candidate is known alive would pay
@@ -1768,12 +1970,12 @@ def run_verify(
     # limitation silently vanished for exactly the third-party backend that
     # most needs it.
     if candidate.decode_enforced != reference.decode_enforced:
-        # Both sides declare the same decoding, but only one of them was handed
-        # it: litetune passes none to the runtime, so it runs on its own
-        # defaults. They are greedy on both sides, which is what makes the
-        # comparison admissible at all -- but a differing token limit would show
-        # as truncation on one side only, so it is named rather than assumed
-        # away.
+        # Both sides declare the same decoding, but only the reference is handed
+        # all of it: the runtime gets no token limit, and a sampler only when the
+        # bundle declares one that samples (`_candidate_sampling` says which).
+        # Greedy on both sides is what makes the comparison admissible at all --
+        # but a differing token limit would show as truncation on one side only,
+        # so it is named rather than assumed away.
         # How far the unverified limit could reach is measurable even though the
         # limit is not: a generation that ends with a terminator stopped on its
         # own and no bound touched it. The count is not proof -- a runtime may
@@ -1783,9 +1985,10 @@ def run_verify(
         loose = unterminated_count(candidate)
         run.limitation(
             f"decoding was passed explicitly to {reference.backend} "
-            f"({reference.decode.as_dict()}) but not to {candidate.backend}, which uses the "
-            "pinned runtime's own defaults; both are greedy, and the token limit is unverified "
-            f"on the runtime side. {loose} of {candidate.n} {candidate.backend} generations end "
+            f"({reference.decode.as_dict()}); {candidate.backend} was given no output-token "
+            f"limit, and {_candidate_sampling(candidate.engine)}. The output-token limit is "
+            f"unverified on the runtime side. {loose} of {candidate.n} {candidate.backend} "
+            "generations end "
             "without a terminator"
         )
 

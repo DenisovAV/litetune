@@ -39,7 +39,7 @@ import statistics
 import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -47,6 +47,7 @@ from litetune import devices, envs
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.export import GPU_ACTIVATION
+from litetune.llm_images import CANDIDATE_SAMPLER, ImageRef, ImageRowError, split_images
 from litetune.metrics import ToolCall, read_target
 from litetune.prompt_mode import RENDERING_SOURCE, PromptMode
 
@@ -146,6 +147,9 @@ class Example:
     # A call for `tool-call` scoring, a string for `exact-text`, `None` for an
     # unlabelled row -- which contributes to liveness only.
     target: ToolCall | str | None
+    # The row's picture, checked against its digest (`llm_images`); `None` for
+    # a text row.
+    image: ImageRef | None = None
 
 
 @dataclass(frozen=True)
@@ -175,6 +179,12 @@ class Split:
     @property
     def labelled(self) -> tuple[Example, ...]:
         return tuple(e for e in self.examples if e.target is not None)
+
+    @property
+    def images(self) -> tuple[ImageRef, ...] | None:
+        """Each example's picture, in order; `None` for a split of text rows."""
+        found = tuple(e.image for e in self.examples if e.image is not None)
+        return found if found else None
 
     def as_dict(self) -> dict:
         return {
@@ -208,6 +218,19 @@ def load_split(path: Path, limit: int | None = None) -> Split:
             break
     if not examples:
         raise DataError(f"{path}: no examples")
+    # A row's picture is part of what it asks, so it is part of the split's id;
+    # a text split's payload, and so its id, is what it always was.
+    try:
+        pictures = split_images(path, limit=limit)
+    except ImageRowError as exc:
+        raise DataError(str(exc)) from exc
+    if pictures is not None:
+        # The same rows, the same limit: `split_images` refuses a split where
+        # any row lacks a picture, so the two are one for one.
+        examples = [
+            replace(example, image=picture)
+            for example, picture in zip(examples, pictures, strict=True)
+        ]
 
     payload = json.dumps(
         [
@@ -220,6 +243,7 @@ def load_split(path: Path, limit: int | None = None) -> Split:
                     if isinstance(e.target, ToolCall)
                     else e.target
                 ),
+                **({"image_sha256": e.image.sha256} if e.image is not None else {}),
             }
             for e in examples
         ],
@@ -730,6 +754,10 @@ class LiteRtLmBackend:
     # default. On a CPU with SME2 the run gets one whatever this says
     # (`devices.runtime_cpu_threads`), and `cpu_threads` records it.
     threads: int | None = None
+    # Rows with a picture: each prompt's picture as `{"path", "sha256"}`, in
+    # prompt order. Each is sent as the app sends it -- its bytes, base64, as an
+    # `image` part before the text -- to an engine with a CPU vision backend.
+    images: tuple[Mapping[str, str], ...] | None = None
 
     name = "litert-lm"
     # litetune passes no decoding parameters to the runtime, so `decode` is a
@@ -826,6 +854,17 @@ class LiteRtLmBackend:
             "engine_per_prompt": bool(self.engine_per_prompt_reason),
             "engine_per_prompt_reason": self.engine_per_prompt_reason or None,
             "engine_init_seconds": engine_init_of(self.device_report),
+            # Rows with a picture: how many, and the backend their vision
+            # encoder ran on. `None` for text.
+            "pictures": len(self.images) if self.images is not None else None,
+            "vision_backend": VISION_BACKEND if self.images is not None else None,
+            # The sampler the bundle declares, as the driver script read it, and
+            # the one sent in its place when it would sample; `None` before a run
+            # and when none was sent. Separate from `decode_passed_to_runtime`,
+            # which is about the output-token limit and the rest of `decode`.
+            "bundle_sampler": (self.device_report or {}).get("bundle_sampler"),
+            "sampler_sent": (self.device_report or {}).get("sampler_sent"),
+            "sampler_enforced": (self.device_report or {}).get("sampler_sent") is not None,
             "runner_call": self.runner_call,
             "prompt_mode": self.prompt_mode.value,
             "prompt_mode_declared": self.declared_prompt_mode is not None,
@@ -851,6 +890,11 @@ class LiteRtLmBackend:
         )
         thread_count = self.cpu_threads.used if self.cpu_threads else None
         blocked = self._ensure_env(events)
+        if blocked is None and self.images is not None and len(self.images) != len(prompts):
+            blocked = (
+                f"{len(self.images)} pictures were given for {len(prompts)} prompts; each prompt "
+                "of a split with pictures is sent with its own"
+            )
         if blocked is not None:
             return [Generation(i, p, harness_error=blocked) for i, p in enumerate(prompts)]
         if not prompts:
@@ -875,6 +919,10 @@ class LiteRtLmBackend:
                         "runtime_rendered": self.uses_template,
                         "engine_per_prompt": bool(self.engine_per_prompt_reason),
                         **runtime_engine_spec(self.backend_flag, thread_count),
+                        **picture_spec(self.images),
+                        # Sent in place of a bundle's own sampler when that one
+                        # samples or does not run (`llm_images.sampler_replaced`).
+                        "greedy_sampler": dict(CANDIDATE_SAMPLER),
                         "out": str(results),
                         "report": str(report),
                     }
@@ -963,6 +1011,8 @@ class LiteRtLmBackend:
                         "prompts": [prompt],
                         "runtime_rendered": self.uses_template,
                         **runtime_engine_spec(self.backend_flag),
+                        **picture_spec(self.images[:1] if self.images else None),
+                        "greedy_sampler": dict(CANDIDATE_SAMPLER),
                         "out": str(work / "generations.jsonl"),
                     }
                 ),
@@ -1017,6 +1067,21 @@ class LiteRtLmBackend:
 # The backends a litert-lm candidate can be asked for, in the word both the
 # CLI's `--backend` and `verify --backend` use.
 CANDIDATE_BACKENDS = ("cpu", "gpu")
+
+# The backend a picture's vision encoder runs on in the candidate: the one the
+# spike this path follows measured (litert-lm 0.18.0, `Backend.CPU()` as the
+# `vision_backend`).
+VISION_BACKEND = "cpu"
+
+
+def picture_spec(images: Sequence[Mapping[str, str]] | None) -> dict[str, Any]:
+    """The driver script's spec keys for rows with a picture; nothing for text."""
+    if images is None:
+        return {}
+    return {
+        "images": [{"path": str(i["path"]), "sha256": str(i["sha256"])} for i in images],
+        "vision_backend": VISION_BACKEND,
+    }
 
 
 def runtime_engine_spec(backend: str, thread_count: int | None = None) -> dict[str, Any]:
@@ -1261,6 +1326,9 @@ def engine_kwargs(spec):
     prevent -- so an unknown name ends the run instead.
     """
     kwargs = {"backend": backend_for(spec.get("backend", "cpu"), spec.get("thread_count"))}
+    if spec.get("vision_backend"):
+        # Rows with a picture: without a vision backend the engine refuses one.
+        kwargs["vision_backend"] = backend_for(spec["vision_backend"])
     requested = spec.get("activation_data_type")
     if requested is not None:
         from litert_lm import ActivationDataType
@@ -1667,8 +1735,79 @@ def text_from_conversation(conversation, prompt):
     return "".join(parts)
 
 
-def score_one(engine, runtime_rendered, index, prompt, out):
-    """One prompt on `engine`, its row written and flushed."""
+def picture_message(prompt, picture):
+    """One user turn as flutter_edge_ai sends it to Gemma 4: the picture's bytes, then the text.
+
+    The bytes are the file's, base64, checked against the digest the split's row
+    names; a picture that changed since is refused for that row.
+    """
+    import base64
+    import hashlib
+
+    data = Path(picture["path"]).read_bytes()
+    if hashlib.sha256(data).hexdigest() != picture["sha256"]:
+        raise ValueError(
+            "the picture %s is not the one the split names (sha256 %s)"
+            % (picture["path"], picture["sha256"])
+        )
+    return {
+        "role": "user",
+        "content": [
+            {"type": "image", "blob": base64.b64encode(data).decode("ascii")},
+            {"type": "text", "text": prompt},
+        ],
+    }
+
+
+def bundle_sampler(path):
+    """The sampler a bundle's LlmMetadata declares, as `export.vision_in` reads it; or None."""
+    import io
+
+    from litert_lm_builder import litertlm_peek
+    from litert_lm_builder.runtime.proto import llm_metadata_pb2
+
+    header = litertlm_peek.read_litertlm_header(path, io.StringIO())
+    listed = header.SectionMetadata()
+    for index in range(listed.ObjectsLength() if listed else 0):
+        section = listed.Objects(index)
+        if section.DataType() != litertlm_peek.schema.AnySectionDataType.LlmMetadataProto:
+            continue
+        with open(path, "rb") as handle:
+            handle.seek(section.BeginOffset())
+            data = handle.read(section.EndOffset() - section.BeginOffset())
+        meta = llm_metadata_pb2.LlmMetadata()
+        meta.ParseFromString(data)
+        if not meta.HasField("sampler_params"):
+            return None
+        params = meta.sampler_params
+        kind = params.type
+        try:
+            kind = params.DESCRIPTOR.fields_by_name["type"].enum_type.values_by_number[kind].name
+        except (AttributeError, KeyError, TypeError):
+            pass
+        return {"type": kind, "k": int(params.k), "p": float(params.p),
+                "temperature": float(params.temperature)}
+    return None
+
+
+def sampler_replaced(sampler):
+    """`llm_images.sampler_replaced`, which this script cannot import."""
+    if sampler is None:
+        return False
+    return not (sampler.get("type") in ("TOP_P", "TOP_K") and sampler.get("k") == 1)
+
+
+def sampler_for(settings):
+    """The spec's sampler as the runtime takes one; `None`, the bundle's own, without one."""
+    if not settings:
+        return None
+    import litert_lm
+
+    return litert_lm.SamplerConfig(**settings)
+
+
+def score_one(engine, runtime_rendered, index, prompt, out, picture=None, sampler=None):
+    """One prompt on `engine`, its row written and flushed; with its picture, when it has one."""
     # A runner per prompt, not one per split. A conversation keeps
     # its history, so the second prompt would be answered with the
     # first still in context -- the CLI started a process per
@@ -1676,11 +1815,12 @@ def score_one(engine, runtime_rendered, index, prompt, out):
     # split scored with drifting context looks like nothing.
     try:
         if runtime_rendered:
-            with engine.create_conversation(sampler_config=None) as runner:
-                text = text_from_conversation(runner, prompt)
+            message = prompt if picture is None else picture_message(prompt, picture)
+            with engine.create_conversation(sampler_config=sampler_for(sampler)) as runner:
+                text = text_from_conversation(runner, message)
         else:
             with engine.create_session(
-                apply_prompt_template=False, sampler_config=None
+                apply_prompt_template=False, sampler_config=sampler_for(sampler)
             ) as runner:
                 text = text_from_session(runner, prompt)
     except MemoryError:
@@ -1732,11 +1872,18 @@ def main(spec_path):
     runtime_rendered = bool(spec["runtime_rendered"])
     engine_args = engine_kwargs(spec)
     prompts = spec["prompts"]
+    pictures = spec.get("images") or [None] * len(prompts)
+    # The bundle's own sampler, unless it would sample: then the greedy one the
+    # parent sent, for every row, text or picture.
+    declared = bundle_sampler(spec["model"])
+    sampler = spec.get("greedy_sampler") if sampler_replaced(declared) else None
 
     def write_report(at_engine, after=None, init=None):
         if spec.get("report"):
             report = run_report(spec, at_engine, after)
             report["engine_init_seconds"] = init
+            report["bundle_sampler"] = declared
+            report["sampler_sent"] = sampler
             Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
 
     with Path(spec["out"]).open("w", encoding="utf-8") as out:
@@ -1764,7 +1911,9 @@ def main(spec_path):
                     # reports every load it paid for.
                     last = index == len(prompts) - 1
                     write_report(at_engine, None, init)
-                    score_one(engine, runtime_rendered, index, prompt, out)
+                    score_one(
+                        engine, runtime_rendered, index, prompt, out, pictures[index], sampler
+                    )
                     if last:
                         write_report(at_engine, device_report(), init)
             return
@@ -1775,7 +1924,9 @@ def main(spec_path):
             at_engine = device_report()
             write_report(at_engine)
             for index, prompt in enumerate(prompts):
-                score_one(engine, runtime_rendered, index, prompt, out)
+                score_one(
+                    engine, runtime_rendered, index, prompt, out, pictures[index], sampler
+                )
             # Again after generating, with the engine still alive: a client
             # shows the runtime opened the GPU, and only its GPU time growing
             # across the split shows work was done there.
@@ -1947,13 +2098,57 @@ def greedy_generation_config(checkpoint):
     return type(checkpoint)(**kept), left_out
 
 
+def picture_inputs(tok, processor, prompt, picture, template):
+    """The processor's inputs for one user turn: the picture, then the text, in `template`.
+
+    The same rendering `tune` trains rows with a picture on: the bundle's
+    template, and the processor's expansion of its image placeholder. The
+    picture is decoded from its file's bytes, checked against its digest.
+    """
+    import hashlib
+    import io
+
+    from PIL import Image
+
+    data = Path(picture["path"]).read_bytes()
+    if hashlib.sha256(data).hexdigest() != picture["sha256"]:
+        raise ValueError(
+            "the picture %s is not the one the split names (sha256 %s)"
+            % (picture["path"], picture["sha256"])
+        )
+    image = Image.open(io.BytesIO(data))
+    image.load()
+    image = image.convert("RGB")
+    messages = [{"role": "user", "content": [
+        {"type": "image"}, {"type": "text", "text": prompt}]}]
+    text = tok.apply_chat_template(
+        messages, chat_template=template, tokenize=False, add_generation_prompt=True
+    )
+    return processor(text=text, images=[image], return_tensors="pt", add_special_tokens=False)
+
+
 def main() -> int:
     spec = json.loads(Path(sys.argv[1]).read_text())
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(spec["model"])
+    pictures = spec.get("images")
+    processor = None
+    if pictures:
+        # The checkpoint's processor at the budget it trained at, and its tokenizer.
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(spec["model"])
+        processor.image_processor.max_soft_tokens = spec["vision_tokens"]
+        if processor.image_processor.max_soft_tokens != spec["vision_tokens"]:
+            raise ValueError(
+                "the processor kept max_soft_tokens %r where %r was set"
+                % (processor.image_processor.max_soft_tokens, spec["vision_tokens"])
+            )
+        tok = processor.tokenizer
+    else:
+        tok = AutoTokenizer.from_pretrained(spec["model"])
     # Named, not left to transformers' per-model default, so the float
     # reference is one stated computation. `HuggingFaceBackend` sends eager;
     # the training attention is not threaded here, and does not need to be:
@@ -1964,6 +2159,11 @@ def main() -> int:
         attn_implementation=spec["attn_implementation"],
     )
     model.eval()
+    if pictures and getattr(getattr(model, "model", None), "vision_tower", None) is None:
+        raise ValueError(
+            "%s loaded as %s, which has no vision tower: the rows' pictures would reach nothing"
+            % (spec["model"], type(model).__name__)
+        )
     model.generation_config, not_applied = greedy_generation_config(model.generation_config)
     device = generation_device(torch, spec.get("device"))
     model.to(device)
@@ -1988,10 +2188,15 @@ def main() -> int:
 
     with Path(spec["out"]).open("w", encoding="utf-8") as sink:
         for i, prompt in enumerate(spec["prompts"]):
-            text, add_special = render_prompt(
-                tok, prompt, spec["runtime_rendered"], spec.get("tools")
-            )
-            enc = tok(text, return_tensors="pt", add_special_tokens=add_special).to(device)
+            if pictures:
+                enc = picture_inputs(tok, processor, prompt, pictures[i], spec["template"])
+                enc = enc.to(device)
+                enc["pixel_values"] = enc["pixel_values"].to(torch.float32)
+            else:
+                text, add_special = render_prompt(
+                    tok, prompt, spec["runtime_rendered"], spec.get("tools")
+                )
+                enc = tok(text, return_tensors="pt", add_special_tokens=add_special).to(device)
             with torch.no_grad():
                 ids = model.generate(
                     **enc,
@@ -2049,6 +2254,12 @@ class HuggingFaceBackend:
     # always had; both are reported so a measurement never hides which one
     # decided it.
     declared_prompt_mode: PromptMode | None = None
+    # Rows with a picture: each prompt's picture as `{"path", "sha256"}`, in
+    # prompt order; the bundle template they are rendered with, which `tune`
+    # trained them on; and the processor's soft-token budget. `None` for text.
+    images: tuple[Mapping[str, str], ...] | None = None
+    template: str | None = None
+    vision_tokens: int | None = None
     # Where the reference actually generated. Set twice: to what
     # `envs.resolve_device` found, before the run, and then to what the script
     # itself reported after it -- see `generate()`. `None` until `generate()`
@@ -2186,6 +2397,15 @@ class HuggingFaceBackend:
             "prompt_mode": self.prompt_mode.value,
             "prompt_mode_declared": self.declared_prompt_mode is not None,
             "applies_chat_template": self.uses_template,
+            # Rows with a picture: how many, the budget, and the template's
+            # digest -- the bundle's, which the reference renders them with.
+            "pictures": len(self.images) if self.images is not None else None,
+            "vision_tokens": self.vision_tokens if self.images is not None else None,
+            "template_sha256": (
+                hashlib.sha256(self.template.encode("utf-8")).hexdigest()
+                if self.images is not None and self.template is not None
+                else None
+            ),
         }
 
     def generate(
@@ -2198,6 +2418,16 @@ class HuggingFaceBackend:
         # `device` in `_ensure_env`, and a `True` left from the previous run
         # would then sit beside `UNKNOWN_BACKEND` claiming it was read back.
         self.device_observed = False
+        if self.images is not None and (
+            len(self.images) != len(prompts) or self.template is None or not self.vision_tokens
+        ):
+            unfit = (
+                f"{len(self.images)} pictures, template "
+                f"{'given' if self.template is not None else 'missing'} and budget "
+                f"{self.vision_tokens!r} for {len(prompts)} prompts; each prompt of a split with "
+                "pictures needs its own, the bundle template and the budget"
+            )
+            return [Generation(i, p, harness_error=unfit) for i, p in enumerate(prompts)]
         blocked = self._ensure_env(events)
         if blocked is not None:
             return [Generation(i, p, harness_error=blocked) for i, p in enumerate(prompts)]
@@ -2246,6 +2476,18 @@ class HuggingFaceBackend:
                         "tools": self.declarations,
                         "attn_implementation": self.attn_implementation,
                         "device": device_for_run,
+                        **(
+                            {
+                                "images": [
+                                    {"path": str(i["path"]), "sha256": str(i["sha256"])}
+                                    for i in self.images
+                                ],
+                                "template": self.template,
+                                "vision_tokens": self.vision_tokens,
+                            }
+                            if self.images is not None
+                            else {}
+                        ),
                         "out": str(results),
                         "run_report": str(report),
                     }

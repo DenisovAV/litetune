@@ -122,6 +122,46 @@ _RUNTIME_SCRIPT = (
     + SESSION_IDS_SOURCE
     + r'''
 
+def section_types(path):
+    """The bundle's section model types, `tf_lite_` dropped, from its header."""
+    import io
+
+    from litert_lm_builder import litertlm_peek
+
+    header = litertlm_peek.read_litertlm_header(path, io.StringIO())
+    listed = header.SectionMetadata()
+    found = set()
+    for index in range(listed.ObjectsLength() if listed else 0):
+        kind = litertlm_peek.get_model_type(listed.Objects(index))
+        if kind:
+            found.add(str(kind).lower().removeprefix("tf_lite_"))
+    return sorted(found)
+
+
+def picture_message(prompt, picture):
+    """The user turn the candidate is sent: the picture's bytes, base64, then the text.
+
+    The bytes are checked against the digest the split's row names, as the
+    candidate's driver checks them.
+    """
+    import base64
+    import hashlib
+
+    data = Path(picture["path"]).read_bytes()
+    if hashlib.sha256(data).hexdigest() != picture["sha256"]:
+        raise ValueError(
+            "the picture %s is not the one the split names (sha256 %s)"
+            % (picture["path"], picture["sha256"])
+        )
+    return {
+        "role": "user",
+        "content": [
+            {"type": "image", "blob": base64.b64encode(data).decode("ascii")},
+            {"type": "text", "text": prompt},
+        ],
+    }
+
+
 def main():
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 
@@ -176,12 +216,25 @@ def main():
         cpu = litert_lm.Backend.CPU()
     else:
         cpu = litert_lm.Backend.CPU(thread_count=threads)
-    with litert_lm.Engine(spec["model"], backend=cpu, enable_benchmark=True) as engine:
+    pictures = spec.get("images")
+    engine_args = {"backend": cpu, "enable_benchmark": True}
+    if pictures:
+        # Rows with a picture: which sections the bundle carries, read from its
+        # header before an engine is asked for -- one with a vision backend is
+        # not created on a bundle without a vision encoder.
+        sections = section_types(spec["model"])
+        Path(spec["sections_out"]).write_text(json.dumps(sections), encoding="utf-8")
+        if "vision_encoder" not in sections:
+            Path(spec["out"]).write_text("[]", encoding="utf-8")
+            return 0
+        engine_args["vision_backend"] = litert_lm.Backend.CPU()
+    with litert_lm.Engine(spec["model"], **engine_args) as engine:
         # Rendering reads the conversation's history and never adds to it, so
         # one conversation renders every prompt as the first turn it would be.
         with engine.create_conversation(**conversation_args) as renderer:
             for index, prompt in enumerate(spec["prompts"]):
-                rendered = renderer.render_message_to_string(prompt)
+                message = prompt if not pictures else picture_message(prompt, pictures[index])
+                rendered = renderer.render_message_to_string(message)
                 rows.append(
                     {
                         "index": index,
@@ -226,8 +279,20 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(spec["model"])
     rows = []
+    template = spec.get("template")
     for index, prompt in enumerate(spec["prompts"]):
-        text, add_special = render_prompt(tok, prompt, True, spec.get("tools"))
+        if template is not None:
+            # A row with a picture, as `tune` renders it: one user turn, the
+            # picture and then the text, in the bundle's template. Its image
+            # placeholder stays one token here; the processor expands it.
+            messages = [{"role": "user", "content": [
+                {"type": "image"}, {"type": "text", "text": prompt}]}]
+            text = tok.apply_chat_template(
+                messages, chat_template=template, tokenize=False, add_generation_prompt=True
+            )
+            add_special = False
+        else:
+            text, add_special = render_prompt(tok, prompt, True, spec.get("tools"))
         ids = tok(text, add_special_tokens=add_special)["input_ids"]
         rows.append({"index": index, "rendered": text, "ids": [int(i) for i in ids]})
     Path(spec["out"]).write_text(json.dumps(rows), encoding="utf-8")
@@ -326,12 +391,24 @@ class RenderingComparison:
     prefill_skipped: int = 0
     # The threads the runtime script's CPU engine used; `None` when not recorded.
     cpu_threads: devices.CpuThreads | None = None
+    # Rows with a picture: the bundle's section types, read from its header
+    # before anything was rendered. `None` for text.
+    vision_sections: tuple[str, ...] | None = None
 
     @property
     def agrees(self) -> bool:
         return not self.mismatches
 
     def check(self) -> Check:
+        if self.vision_sections is not None and "vision_encoder" not in self.vision_sections:
+            return Check.failed(
+                RENDERING_CHECK,
+                "the held-out rows carry pictures, and the bundle has no vision encoder (its "
+                f"sections: {', '.join(self.vision_sections) or 'none read'}), so it cannot be "
+                "sent one. Convert the checkpoint `tune` trained on these pictures with this "
+                "litetune, which exports its vision encoder",
+                observed=self.as_dict(),
+            )
         sampled = len(self.prefill)
         if self.agrees and self.prefill_sent and not sampled:
             # Equal ids are half of this check. The other half -- the runtime's
@@ -423,6 +500,9 @@ class RenderingComparison:
             "prefill_skipped": self.prefill_skipped,
             "prefill_sampled": [dict(row) for row in self.prefill],
             "runtime_cpu_threads": self.cpu_threads.as_dict() if self.cpu_threads else None,
+            "vision_sections": (
+                list(self.vision_sections) if self.vision_sections is not None else None
+            ),
             "mismatches": len(self.mismatches),
             # The first few, which is what a reader needs to find the cause; the
             # count above says how many there were.
@@ -536,31 +616,48 @@ class RenderingProbe:
     reference_env: envs.StageEnv = envs.TRAIN
     auto_provision: bool = True
     timeout_s: int = 1800
+    # Rows with a picture: each prompt's picture as `{"path", "sha256"}`, and
+    # the bundle template the reference renders them with. Then the runtime is
+    # sent each prompt with its picture's bytes and asked only to render it --
+    # no prefill count is taken, the picture's soft tokens being the runtime's
+    # own -- and the reference's tokenizer renders the same turn, the image
+    # placeholder one token on both sides. `None` for text.
+    images: tuple[Mapping[str, str], ...] | None = None
+    template: str | None = None
 
     def observe(
         self, prompts: Sequence[str], events: EventStream | None = None
     ) -> RenderingComparison:
         # Always the CPU, which `verify --backend gpu` does not change.
         threads = devices.runtime_cpu_threads(None)
-        runtime_rows = self._run(
-            self.runtime_env,
-            _RUNTIME_SCRIPT,
-            {
-                "model": str(self.model),
-                "prompts": list(prompts),
-                "prefill_sample": self.prefill_sample,
-                "tools": self.declarations,
-                "thread_count": threads.used,
-            },
-            events,
+        pictures = self.images is not None
+        runtime_spec: dict[str, Any] = {
+            "model": str(self.model),
+            "prompts": list(prompts),
+            "prefill_sample": 0 if pictures else self.prefill_sample,
+            "tools": self.declarations,
+            "thread_count": threads.used,
+        }
+        if pictures:
+            runtime_spec["images"] = [
+                {"path": str(i["path"]), "sha256": str(i["sha256"])} for i in self.images or ()
+            ]
+        runtime_rows, sections = self._run(
+            self.runtime_env, _RUNTIME_SCRIPT, runtime_spec, events, sections=pictures
         )
-        reference_rows = self._run(
+        vision = tuple(sections) if sections is not None else None
+        if vision is not None and "vision_encoder" not in vision:
+            return RenderingComparison(
+                compared=0, prefill_sent=0, cpu_threads=threads, vision_sections=vision
+            )
+        reference_rows, _ = self._run(
             self.reference_env,
             _REFERENCE_SCRIPT,
             {
                 "model": self.reference,
                 "prompts": list(prompts),
                 "tools": self.declarations,
+                **({"template": self.template} if pictures else {}),
             },
             events,
         )
@@ -571,9 +668,10 @@ class RenderingProbe:
         # instead of restating the configured number as a fact about what the
         # runtime was given. Less the rows it skipped because they did not render.
         skipped = {int(row["index"]) for row in runtime_rows if row.get("prefill_skipped")}
-        sent = [i for i in range(len(prompts))[: self.prefill_sample] if i not in skipped]
+        sample = int(runtime_spec["prefill_sample"])
+        sent = [i for i in range(len(prompts))[:sample] if i not in skipped]
         compared = compare_renderings(prompts, runtime_rows, reference_rows, prefill_sent=len(sent))
-        return replace(compared, cpu_threads=threads)
+        return replace(compared, cpu_threads=threads, vision_sections=vision)
 
     def _run(
         self,
@@ -581,7 +679,9 @@ class RenderingProbe:
         source: str,
         spec: dict[str, Any],
         events: EventStream | None,
-    ) -> list[dict[str, Any]]:
+        sections: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[str] | None]:
+        """The script's rows, and with `sections` the section types it read from the bundle."""
         if self.auto_provision:
             env.provision(events=events)
         with tempfile.TemporaryDirectory(prefix="litetune-render-") as tmp:
@@ -589,8 +689,10 @@ class RenderingProbe:
             script = work / "render.py"
             script.write_text(source, encoding="utf-8")
             out = work / "rows.json"
+            found = work / "sections.json"
             spec_path = work / "spec.json"
-            spec_path.write_text(json.dumps({**spec, "out": str(out)}), encoding="utf-8")
+            extra = {"sections_out": str(found)} if sections else {}
+            spec_path.write_text(json.dumps({**spec, **extra, "out": str(out)}), encoding="utf-8")
             try:
                 proc = env.run(["python", str(script), str(spec_path)], timeout=self.timeout_s)
             except subprocess.TimeoutExpired:
@@ -604,6 +706,18 @@ class RenderingProbe:
                     f"{(proc.stderr or '').strip()[-300:] or 'no stderr'}"
                 )
             rows = json.loads(out.read_text(encoding="utf-8"))
+            types = None
+            if sections:
+                if not found.is_file():
+                    raise RenderingProbeError(
+                        f"the rendering script in {env.name!r} did not say which sections the "
+                        "bundle carries"
+                    )
+                types = json.loads(found.read_text(encoding="utf-8"))
+                if not isinstance(types, list):
+                    raise RenderingProbeError(
+                        f"the rendering script in {env.name!r} wrote no section list"
+                    )
         if not isinstance(rows, list):
             raise RenderingProbeError(f"the rendering script in {env.name!r} wrote no row list")
-        return rows
+        return rows, types

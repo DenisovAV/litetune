@@ -42,7 +42,7 @@ import re
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,20 @@ from litetune.declarations import (
 )
 from litetune.events import EventStream
 from litetune.exits import read_returncode
+from litetune.llm_images import (
+    FROZEN_PREFIXES,
+    IMAGE_MODEL,
+    PROCESSOR_FILES,
+    TEMPLATE_FILE,
+    TEMPLATE_REVISION,
+    TEMPLATE_SHA256,
+    VISION_TOKENS,
+    ImageRowError,
+    frozen_problem,
+    in_image_family,
+    is_image_model,
+    split_images,
+)
 from litetune.metrics import START_CALL, ToolCall, runtime_calls, text_after_the_calls
 from litetune.models import (
     PROVENANCE_NAME,
@@ -89,6 +103,8 @@ DECLARATIONS_CHECK = "tool declarations"
 DECISION_CHECK = "decision"
 CALLS_CHECK = "calls are written as the runtime reads them"
 COMPLETIONS_CHECK = "every row carries its completion"
+IMAGES_CHECK = "rows with a picture"
+FROZEN_CHECK = "the towers and embeddings are the base's after the merge"
 
 # A name no declaration could plausibly use, rendered only to ask the template how a call ends.
 CALL_PROBE_NAME = "litetune_probe"
@@ -379,6 +395,97 @@ def _refuse_calls_the_runtime_would_not_read(
     return None
 
 
+def bundle_template_repo(model: str) -> str | None:
+    """The repository the family's export takes its chat template from, or `None`."""
+    rules = models.identify(model)
+    for flag in rules.required_flags if rules is not None else ():
+        if flag.name == models.TEMPLATE_FLAG and not flag.value_unknown:
+            return flag.value
+    return None
+
+
+def _refuse_pictures_here(request: TuneRequest, mode: PromptMode) -> Check | None:
+    """Why rows with a picture cannot be trained by this request, or `None`."""
+    observed = {"model": request.model, "method": request.method, "prompt_mode": mode.value}
+    reason = None
+    if not is_image_model(request.model):
+        family = (
+            f" It is of {IMAGE_MODEL}'s family, and only that checkpoint's template, processor "
+            "and budget are the ones this path was built and measured on; name it as "
+            f"--model {IMAGE_MODEL}"
+            if in_image_family(request.model)
+            else ""
+        )
+        reason = (
+            f"the split's rows carry a picture, and {request.model} is not {IMAGE_MODEL}, the "
+            f"one model litetune trains on pictures with text answers.{family}"
+        )
+    elif request.method != "lora":
+        reason = (
+            f"the split's rows carry a picture, and --method {request.method} was asked. litetune "
+            "trains pictures with LoRA on the text tower, the vision tower and embeddings left as "
+            "the base's (the converted bundle's vision encoder is exported from them); pass "
+            "--method lora"
+        )
+    elif mode is not PromptMode.RUNTIME_RENDERED:
+        reason = (
+            f"the split's rows carry a picture, and the prompt mode is {mode.value}. A picture "
+            "reaches the model through the template the runtime renders, so these rows train "
+            f"{PromptMode.RUNTIME_RENDERED.value} only"
+        )
+    elif request.declarations is not None:
+        reason = (
+            "the split's rows carry a picture, and declarations were given. litetune trains Gemma "
+            "4 on pictures with text answers only, never with a tool list"
+        )
+    elif request.decision is not None:
+        reason = (
+            "the split's rows carry a picture, and a decision was given. Decisions on pictures are "
+            "EmbeddingGemma 2's (`tune --model google/embeddinggemma-2`)"
+        )
+    elif bundle_template_repo(request.model) is None:
+        reason = (
+            f"{request.model}: litetune's export rule names no chat template repository for it, "
+            "so there is no bundle template to train the pictures on"
+        )
+    if reason is None:
+        return None
+    return Check.failed(IMAGES_CHECK, reason, observed=observed)
+
+
+def _frozen_check(metrics: TrainingMetrics | None) -> Check:
+    """Whether the run left every frozen tensor as the base's, from what the script compared."""
+    images = metrics.images if metrics is not None else None
+    frozen = images.get("frozen") if isinstance(images, Mapping) else None
+    if not isinstance(frozen, Mapping):
+        return Check.unchecked(
+            FROZEN_CHECK,
+            "the run reported no comparison of the frozen tensors, so whether the merge left the "
+            "vision tower and the embeddings as the base's is unknown",
+        )
+    checked = frozen.get("checked")
+    observed = {
+        "checked": checked,
+        "per_prefix": frozen.get("per_prefix"),
+        "changed": list(frozen.get("changed") or [])[:20],
+        "missing": list(frozen.get("missing") or [])[:20],
+    }
+    problem = frozen_problem(frozen)
+    if problem is not None:
+        return Check.failed(
+            FROZEN_CHECK,
+            f"the tensors that must be the base's after the merge are not shown to be: "
+            f"{problem}. The bundle's vision encoder is exported from them",
+            observed=observed,
+        )
+    return Check.passed(
+        FROZEN_CHECK,
+        f"all {checked} tensors of the vision and audio towers, their embedders and the token "
+        "embeddings hash the same before training and after the merge",
+        observed=observed,
+    )
+
+
 def _refused(result: TuneResult, events: EventStream, check: Check) -> TuneResult:
     """End the stage on a refusal made before anything was attempted."""
     result.checks.add(check)
@@ -538,12 +645,20 @@ class MicroBatchDecision:
     source: str
 
 
+IMAGE_MICRO_BATCH_SOURCE = (
+    "default for rows with a picture: one example per forward, the shape Gemma 4 E2B was "
+    "trained on pictures in by the spike this path follows"
+)
+
+
 def decide_micro_batch_size(
-    declared: int | None, batch_size: int, device: str | None
+    declared: int | None, batch_size: int, device: str | None, pictures: bool = False
 ) -> MicroBatchDecision:
-    """Keep the old full-batch path everywhere except an undeclared MPS run."""
+    """Keep the old full-batch path everywhere except an undeclared MPS run or picture run."""
     if declared is not None:
         return MicroBatchDecision(declared, "declared")
+    if pictures:
+        return MicroBatchDecision(1, IMAGE_MICRO_BATCH_SOURCE)
     if device == "mps":
         return MicroBatchDecision(MPS_DEFAULT_MICRO_BATCH_SIZE, MPS_MICRO_BATCH_SOURCE)
     return MicroBatchDecision(batch_size, "default: one forward per optimiser batch")
@@ -718,7 +833,7 @@ MPS_SAMPLE_POINTS = ("after forward", "after backward", "after optimiser step")
     + r'''
 
 
-def turn_terminator(tok, runtime_rendered):
+def turn_terminator(tok, runtime_rendered, template=None):
     """The token ids the serving convention puts after the model's answer.
 
     Training used to append `tok.eos_token_id` unconditionally. That is the
@@ -737,14 +852,18 @@ def turn_terminator(tok, runtime_rendered):
     Falls back to the tokenizer's EOS when there is no template to ask, and the
     choice is recorded either way -- a terminator picked silently is one nobody
     can check.
+
+    `template` is a chat template to ask in place of the tokenizer's own: the
+    bundle's, for rows with a picture (`build_image_examples`).
     """
     probe = "\u0000LITETUNE_ANSWER\u0000"
     if runtime_rendered:
+        own = {} if template is None else {"chat_template": template}
         try:
             rendered = tok.apply_chat_template(
                 [{"role": "user", "content": "x"},
                  {"role": "assistant", "content": probe}],
-                tokenize=False, add_generation_prompt=False,
+                tokenize=False, add_generation_prompt=False, **own,
             )
             tail = rendered.split(probe)[-1]
             ids = tok(tail, add_special_tokens=False)["input_ids"]
@@ -886,6 +1005,187 @@ def build_examples(tok, rows, max_seq_length, runtime_rendered, tools=None, call
     }
 
 
+# The processor's outputs that run along the token sequence, padded with zeros
+# (a text token) over the completion and the batch's padding.
+TOKEN_TYPE_KEYS = ("mm_token_type_ids", "token_type_ids")
+
+
+def sha256_of(data):
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def bundle_template(images):
+    """The template the converted bundle carries: its bytes, their sha256, their revision.
+
+    `chat_template.jinja` of the repository the family's export rule names, at
+    the pinned revision, refused unless its bytes hash to the pinned sha256. Kept
+    beside the checkpoint, where `convert` hands the exporter the file itself.
+    """
+    from huggingface_hub import hf_hub_download
+
+    path = Path(hf_hub_download(
+        repo_id=images["template_repo"], filename="chat_template.jinja",
+        revision=images["template_revision"],
+    ))
+    raw = path.read_bytes()
+    if sha256_of(raw) != images["template_sha256"]:
+        raise ValueError(
+            "%s at %s hashes to %s, not the %s this litetune trains pictures with"
+            % (images["template_repo"], images["template_revision"], sha256_of(raw),
+               images["template_sha256"])
+        )
+    return raw, sha256_of(raw), images["template_revision"]
+
+
+def picture_terminator(tok, template):
+    """What the bundle template puts after an answer, refused unless the probe shows it.
+
+    `turn_terminator` falls back to the tokenizer's EOS when the probe cannot be
+    rendered, and takes everything after the probe's last occurrence -- the
+    whole rendering, when the probe is not in it. For rows with a picture both
+    are refusals: the runtime renders this template and nothing else.
+    """
+    probe = "\u0000LITETUNE_ANSWER\u0000"
+    rendered = tok.apply_chat_template(
+        [{"role": "user", "content": "x"}, {"role": "assistant", "content": probe}],
+        chat_template=template, tokenize=False, add_generation_prompt=False,
+    )
+    if rendered.count(probe) != 1:
+        raise ValueError(
+            "the bundle template renders an answer %d times where once was asked, so what it "
+            "puts after one cannot be read off it" % rendered.count(probe)
+        )
+    ids = list(tok(rendered.split(probe)[-1], add_special_tokens=False)["input_ids"])
+    if not ids:
+        raise ValueError("the bundle template puts nothing after an answer, so none would stop")
+    return ids, "chat_template"
+
+
+def build_image_examples(tok, processor, rows, data_dir, max_seq_length, template, vision_tokens):
+    """One (input_ids, labels, inputs) per row: the picture and the prompt masked, the answer not.
+
+    The prompt is one user turn whose content is the picture and then the text,
+    rendered with `template` -- the bundle's -- and expanded by the processor,
+    which replaces the template's image placeholder with the picture's soft
+    tokens. `inputs` holds what else the processor returned for the model
+    (`pixel_values`, `image_position_ids`, `mm_token_type_ids`). The picture is
+    decoded from the bytes `prepare` copied, checked against the row's digest.
+    """
+    import io
+
+    from PIL import Image
+
+    terminator, terminator_source = picture_terminator(tok, template)
+    image_id = tok.convert_tokens_to_ids("<|image|>")
+    examples = []
+    soft = []
+    supervised = 0
+    total = 0
+    for row in rows:
+        line = row.get("source_line", "?")
+        data = (Path(data_dir) / row["image"]).read_bytes()
+        if sha256_of(data) != row["image_sha256"]:
+            raise ValueError(
+                "the picture of the row on source line %s hashes to %s, not the %s the row "
+                "names; it changed after prepare wrote the split" % (
+                    line, sha256_of(data), row["image_sha256"])
+            )
+        picture = Image.open(io.BytesIO(data))
+        picture.load()
+        picture = picture.convert("RGB")
+        messages = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": row["prompt"]}]}]
+        text = tok.apply_chat_template(
+            messages, chat_template=template, tokenize=False, add_generation_prompt=True
+        )
+        enc = processor(text=text, images=[picture], return_tensors="pt", add_special_tokens=False)
+        prompt_ids = [int(i) for i in enc["input_ids"][0].tolist()]
+        count = prompt_ids.count(image_id)
+        if not 0 < count <= vision_tokens:
+            raise ValueError(
+                "the row on source line %s became %d image tokens, where a picture is between "
+                "one and %d" % (line, count, vision_tokens)
+            )
+        soft.append(count)
+        completion_ids = list(tok(row["completion"], add_special_tokens=False)["input_ids"])
+        completion_ids += list(terminator)
+        input_ids = prompt_ids + completion_ids
+        if len(input_ids) > max_seq_length:
+            raise ValueError(
+                "row on source line %s is %d tokens with its picture, over max_seq_length %d. "
+                "Truncating it would drop the supervised span; fix the row or raise the limit"
+                % (line, len(input_ids), max_seq_length)
+            )
+        inputs = {}
+        for key, value in enc.items():
+            if key in ("input_ids", "attention_mask"):
+                continue
+            if key in TOKEN_TYPE_KEYS:
+                # The prompt's; `image_inputs` pads it with zeros (a text token)
+                # to the batch's width, the completion included.
+                inputs[key] = [int(v) for v in value[0].tolist()]
+            else:
+                inputs[key] = value
+        supervised += len(completion_ids)
+        total += len(input_ids)
+        examples.append((input_ids, [IGNORE_INDEX] * len(prompt_ids) + completion_ids, inputs))
+    return examples, supervised, total, {
+        "ids": list(terminator),
+        "source": terminator_source,
+        "text": tok.decode(terminator) if terminator else "",
+        "call": None,
+    }, soft
+
+
+def image_inputs(chunk, width, torch, dtype):
+    """The processor's inputs for a batch of image examples, padded to `width`; `{}` for text."""
+    if len(chunk[0]) < 3:
+        return {}
+    out = {}
+    for key in chunk[0][2]:
+        if key in TOKEN_TYPE_KEYS:
+            out[key] = torch.tensor(
+                [ex[2][key] + [0] * (width - len(ex[2][key])) for ex in chunk], dtype=torch.long
+            )
+        else:
+            value = torch.cat([ex[2][key] for ex in chunk], dim=0)
+            out[key] = value.to(dtype) if value.is_floating_point() else value
+    return out
+
+
+def per_prefix(names, prefixes):
+    """How many of `names` sit under each of `prefixes`."""
+    return {prefix: sum(1 for n in names if n.startswith(prefix)) for prefix in prefixes}
+
+
+def processor_file_digest(path):
+    """`llm_images.processor_file_digest`, which this script cannot import.
+
+    A file's sha256; `tokenizer_config.json`'s without `vocab_file`, the path the
+    exporter's repair rewrites when a checkpoint moves.
+    """
+    raw = Path(path).read_bytes()
+    if Path(path).name != "tokenizer_config.json":
+        return sha256_of(raw)
+    data = json.loads(raw.decode("utf-8"))
+    data.pop("vocab_file", None)
+    return sha256_of(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+
+
+def frozen_digests(model, prefixes, torch):
+    """The sha256 of every tensor under `prefixes`, by name: what the merge must leave alone."""
+    import hashlib
+
+    out = {}
+    for name, tensor in model.state_dict().items():
+        if name.startswith(tuple(prefixes)):
+            flat = tensor.detach().to("cpu").contiguous().reshape(-1).view(torch.uint8)
+            out[name] = hashlib.sha256(flat.numpy()).hexdigest()
+    return out
+
+
 def epoch_schedule(epochs, n_examples, batch_size):
     """[(number, portion, steps)] for a possibly fractional number of epochs.
 
@@ -917,14 +1217,14 @@ def batches(examples, size, pad_id, torch, pad_to_multiple_of=None, max_length=N
     """
     for start in range(0, len(examples), size):
         chunk = examples[start : start + size]
-        width = max(len(ids) for ids, _ in chunk)
+        width = max(len(example[0]) for example in chunk)
         if pad_to_multiple_of:
             width = -(-width // pad_to_multiple_of) * pad_to_multiple_of
             if max_length is not None:
                 width = min(width, max_length)
-        input_ids = [ids + [pad_id] * (width - len(ids)) for ids, _ in chunk]
-        labels = [lab + [IGNORE_INDEX] * (width - len(lab)) for _, lab in chunk]
-        attention = [[1] * len(ids) + [0] * (width - len(ids)) for ids, _ in chunk]
+        input_ids = [ex[0] + [pad_id] * (width - len(ex[0])) for ex in chunk]
+        labels = [ex[1] + [IGNORE_INDEX] * (width - len(ex[1])) for ex in chunk]
+        attention = [[1] * len(ex[0]) + [0] * (width - len(ex[0])) for ex in chunk]
         yield (
             torch.tensor(input_ids, dtype=torch.long),
             torch.tensor(attention, dtype=torch.long),
@@ -940,7 +1240,7 @@ def supervised_shifted_tokens(examples):
     always IGNORE_INDEX, therefore counting the unpadded labels here gives the
     same denominator without allocating a full device batch.
     """
-    return sum(label != IGNORE_INDEX for _, labels in examples for label in labels[1:])
+    return sum(label != IGNORE_INDEX for example in examples for label in example[1][1:])
 
 
 def scored_targets(rows):
@@ -1044,7 +1344,23 @@ def main() -> int:
         raise ValueError("the training split is empty")
 
     from_kwargs = {"revision": spec["revision"]} if spec.get("revision") else {}
-    tok = AutoTokenizer.from_pretrained(spec["model"], **from_kwargs)
+    images = spec.get("images")
+    processor = None
+    if images:
+        # The checkpoint's own processor, at the budget the bundle and the app
+        # use, and its tokenizer: the one that expands the image placeholder.
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(spec["model"], **from_kwargs)
+        processor.image_processor.max_soft_tokens = images["vision_tokens"]
+        if processor.image_processor.max_soft_tokens != images["vision_tokens"]:
+            raise ValueError(
+                "the processor kept max_soft_tokens %r where %r was set"
+                % (processor.image_processor.max_soft_tokens, images["vision_tokens"])
+            )
+        tok = processor.tokenizer
+    else:
+        tok = AutoTokenizer.from_pretrained(spec["model"], **from_kwargs)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     if pad_id is None:
         raise ValueError("the tokenizer has neither a pad token nor an eos token to pad with")
@@ -1057,10 +1373,18 @@ def main() -> int:
             "runtime_rendered train different prompts."
         )
     runtime_rendered = mode == "runtime_rendered"
-    examples, supervised, total, terminator = build_examples(
-        tok, rows, spec["max_seq_length"], runtime_rendered, spec.get("tools"),
-        spec.get("call_probe"),
-    )
+    soft = None
+    if images:
+        template_raw, template_sha256, template_revision = bundle_template(images)
+        examples, supervised, total, terminator, soft = build_image_examples(
+            tok, processor, rows, Path(spec["data"]).parent, spec["max_seq_length"],
+            template_raw.decode("utf-8"), images["vision_tokens"],
+        )
+    else:
+        examples, supervised, total, terminator = build_examples(
+            tok, rows, spec["max_seq_length"], runtime_rendered, spec.get("tools"),
+            spec.get("call_probe"),
+        )
 
     model = AutoModelForCausalLM.from_pretrained(
         spec["model"],
@@ -1069,6 +1393,13 @@ def main() -> int:
         **from_kwargs
     )
     model.config.use_cache = False
+    if images and getattr(getattr(model, "model", None), "vision_tower", None) is None:
+        raise ValueError(
+            "%s loaded as %s, which has no vision tower: the rows' pictures would reach nothing"
+            % (spec["model"], type(model).__name__)
+        )
+    # Read before anything can move them: the merge must leave every one as it is.
+    frozen_before = frozen_digests(model, images["frozen_prefixes"], torch) if images else None
     # From CHECKPOINT_FROM_PARAMETERS up, each layer's activations are
     # recomputed in the backward pass instead of kept from the forward one, so
     # a long row fits where it otherwise would not, whatever the attention or
@@ -1183,10 +1514,19 @@ def main() -> int:
                 # averaging microbatch means would give a short completion the same
                 # vote as a long one.
                 keep, targets = scored_targets(labels.tolist())
+                # The picture's inputs, for rows that carry one; nothing for text.
+                pictures = (
+                    image_inputs(
+                        micro_batch, input_ids.shape[1], torch, getattr(torch, spec["dtype"])
+                    )
+                    if len(micro_batch[0]) > 2
+                    else {}
+                )
                 out = model(
                     input_ids=input_ids.to(device),
                     attention_mask=attention.to(device),
                     logits_to_keep=torch.tensor(keep, dtype=torch.long).to(device),
+                    **{key: value.to(device) for key, value in pictures.items()},
                 )
                 logits = out.logits.float()
                 loss = torch.nn.functional.cross_entropy(
@@ -1237,11 +1577,50 @@ def main() -> int:
         # a different base, or ship on its own.
         model.save_pretrained(str(adapter_dir))
         merged = model.merge_and_unload()
+        frozen = None
+        if frozen_before is not None:
+            frozen_after = frozen_digests(merged, images["frozen_prefixes"], torch)
+            frozen = {
+                "checked": len(frozen_before),
+                "per_prefix": per_prefix(frozen_before, images["frozen_prefixes"]),
+                "changed": sorted(
+                    n for n in frozen_before
+                    if n in frozen_after and frozen_after[n] != frozen_before[n]
+                ),
+                "missing": sorted(n for n in frozen_before if n not in frozen_after),
+            }
         merged.save_pretrained(str(model_dir))
     else:
+        frozen = None
         model.save_pretrained(str(model_dir))
     tok.save_pretrained(str(model_dir))
+    if processor is not None:
+        processor.save_pretrained(str(model_dir))
     sentencepiece = carry_back_sentencepiece(tok, model_dir, spec["model"], spec.get("revision"))
+    image_record = None
+    if images:
+        # The template the pictures were trained on, byte for byte, where
+        # `convert` hands it to the exporter; and the processor files `verify`'s
+        # reference reads, by digest, after everything above has written them.
+        (Path(model_dir) / images["template_file"]).write_bytes(template_raw)
+        image_record = {
+            "vision_tokens": images["vision_tokens"],
+            "template_repo": images["template_repo"],
+            "template_revision": template_revision,
+            "template_file": images["template_file"],
+            "template_sha256": template_sha256,
+            "processor_sha256": {
+                name: (
+                    processor_file_digest(Path(model_dir) / name)
+                    if (Path(model_dir) / name).is_file()
+                    else None
+                )
+                for name in images["processor_files"]
+            },
+            "image_processor": type(processor.image_processor).__name__,
+            "soft_tokens": {"min": min(soft), "max": max(soft), "rows": len(soft)},
+            "frozen": frozen,
+        }
 
     # Beside the checkpoint, because a directory names nothing. `convert` keys
     # the per-family export flags on the model's name, and `config.json` no
@@ -1266,6 +1645,9 @@ def main() -> int:
                 # Recorded, not used downstream: the checkpoint's config does
                 # not carry it, and nothing after training reads it.
                 "attn_implementation": spec["attn_implementation"],
+                # Rows with a picture only: the budget, the bundle template and
+                # the processor `convert` and `verify` must use (`llm_images`).
+                **({"images": image_record} if image_record is not None else {}),
             },
             indent=2,
         ),
@@ -1383,6 +1765,9 @@ def main() -> int:
                 "epochs": epochs,
                 "model_dir": str(model_dir),
                 "adapter_dir": str(adapter_dir) if adapter_dir else None,
+                # Rows with a picture: what `litetune.json` records, the frozen
+                # tensors' comparison included. `None` for text.
+                "images": image_record,
             },
             indent=2,
         ),
@@ -1559,6 +1944,11 @@ class TuneRequest:
     timeout_s: int = DEFAULT_TIMEOUT_S
     env: envs.StageEnv = envs.TRAIN
     auto_provision: bool = True
+    # Where a split whose rows carry a picture trains: TRAIN plus Gemma 4's image
+    # processor (`envs.TRAIN_VISION`). `run_tune` swaps it in for `env` and sets
+    # `trains_pictures` when it finds one; the caller does not choose either.
+    vision_env: envs.StageEnv = field(default=envs.TRAIN_VISION, kw_only=True)
+    trains_pictures: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.method not in METHODS:
@@ -1650,7 +2040,9 @@ class TuneRequest:
         """
         mode = decision.mode if decision is not None else self.prompt_mode
         dtype = decide_dtype(self.dtype, device)
-        micro_batch = decide_micro_batch_size(self.micro_batch_size, self.batch_size, device)
+        micro_batch = decide_micro_batch_size(
+            self.micro_batch_size, self.batch_size, device, self.trains_pictures
+        )
         return {
             "model": self.model,
             "revision": self.revision,
@@ -1711,11 +2103,29 @@ class TuneRequest:
             ),
             "model_dir": str(self.model_dir),
             "adapter_dir": str(self.adapter_dir) if self.adapter_dir else None,
+            # Rows with a picture: the budget, where the bundle template comes
+            # from and where it is kept, the processor files to record and the
+            # tensors the merge must leave alone (`llm_images`). `None` for text.
+            "images": self.picture_spec(),
             "metrics_out": str(metrics_out),
             "device": device,
             "device_probe": dict(device_probe) if device_probe is not None else None,
             "host": dict(host) if host is not None else None,
             "mps_memory": dict(mps_memory) if mps_memory is not None else None,
+        }
+
+    def picture_spec(self) -> dict[str, Any] | None:
+        """What the script needs to train rows with a picture; `None` for a text run."""
+        if not self.trains_pictures:
+            return None
+        return {
+            "vision_tokens": VISION_TOKENS,
+            "template_repo": bundle_template_repo(self.model),
+            "template_revision": TEMPLATE_REVISION,
+            "template_sha256": TEMPLATE_SHA256,
+            "template_file": TEMPLATE_FILE,
+            "processor_files": list(PROCESSOR_FILES),
+            "frozen_prefixes": list(FROZEN_PREFIXES),
         }
 
     def as_dict(
@@ -1861,6 +2271,10 @@ class TrainingMetrics:
     # for the parent to compare with what it sent. `None` from a script that
     # predates the field.
     mps_environment: Mapping[str, str | None] | None = None
+    # Rows with a picture: the budget, template, processor digests, soft-token
+    # counts and the frozen tensors' comparison. `None` for text and from a
+    # script that predates the field.
+    images: Mapping[str, Any] | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -1909,6 +2323,7 @@ class TrainingMetrics:
             cuda_max_memory_allocated=data.get("cuda_max_memory_allocated"),
             cuda_max_memory_reserved=data.get("cuda_max_memory_reserved"),
             mps_environment=data.get("mps_environment"),
+            images=data.get("images"),
             raw=dict(data),
         )
 
@@ -1946,6 +2361,7 @@ class TrainingMetrics:
             "mps_environment": (
                 dict(self.mps_environment) if self.mps_environment is not None else None
             ),
+            "images": dict(self.images) if self.images is not None else None,
             "epochs": [e.as_dict() for e in self.epochs],
             "final_loss": self.final_loss,
         }
@@ -2339,6 +2755,39 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     result.checks.add(decided)
     events.check(decided)
 
+    # -- do the rows carry a picture? ----------------------------------------
+    # Before the environment, like the mode: which environment to provision is
+    # the answer, and a picture that changed since `prepare` is a refusal that
+    # costs nothing to find.
+    try:
+        pictures = split_images(request.data)
+    except (ImageRowError, OSError, UnicodeDecodeError) as exc:
+        return _refused(
+            result,
+            events,
+            Check.failed(IMAGES_CHECK, str(exc), observed={"data": str(request.data)}),
+        )
+    if pictures is not None:
+        refusal = _refuse_pictures_here(request, decision.mode)
+        if refusal is not None:
+            return _refused(result, events, refusal)
+        request = replace(request, env=request.vision_env, trains_pictures=True)
+        result.request = request
+        seen = Check.passed(
+            IMAGES_CHECK,
+            f"{len(pictures)} rows, {len({p.sha256 for p in pictures})} pictures, each the bytes "
+            f"`prepare` copied; trained in {request.env.name} at {VISION_TOKENS} soft tokens per "
+            "picture, on the bundle's template",
+            observed={
+                "rows": len(pictures),
+                "pictures": len({p.sha256 for p in pictures}),
+                "vision_tokens": VISION_TOKENS,
+                "environment": request.env.name,
+            },
+        )
+        result.checks.add(seen)
+        events.check(seen)
+
     # A decision split is checked first: its refusals name the decision, where
     # the generic ones below would name a tool channel it never had.
     if request.decision is not None:
@@ -2605,7 +3054,9 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
     if dtype.source == MPS_DTYPE_SOURCE:
         events.note(f"training in {dtype.dtype} on mps: {dtype.source}", dtype=dtype.dtype)
 
-    micro_batch = decide_micro_batch_size(request.micro_batch_size, request.batch_size, device)
+    micro_batch = decide_micro_batch_size(
+        request.micro_batch_size, request.batch_size, device, request.trains_pictures
+    )
     if micro_batch.size < request.batch_size:
         events.note(
             f"optimiser batch {request.batch_size} as microbatches of {micro_batch.size}: "
@@ -2936,6 +3387,9 @@ def run_tune(request: TuneRequest, events: EventStream | None = None) -> TuneRes
 
     # -- the adapter, and the merge ----------------------------------------
     result.checks.add(_merge_check(request, result, events))
+    if request.trains_pictures and result.model_dir is not None:
+        frozen = result.checks.add(_frozen_check(result.metrics))
+        events.check(frozen)
 
     if metrics_error and result.metrics is None:
         result.limitation(

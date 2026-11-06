@@ -747,7 +747,9 @@ def test_text_rows_with_an_image_column_split_as_on_main_for_an_llm(tmp_path, ca
             {"prompt": f"say {i}", "completion": f"ok {i}", "image": "pics/x.png"}
             for i in range(30)
         ]
-        model, questions = None, None
+        # A named model that takes no pictures: with none named, rows that carry
+        # an `image` are refused (`prepare.IMAGES_WITHOUT_A_MODEL`).
+        model, questions = "google/gemma-3-270m-it", None
     inspector = FakeImageInspector()
     result = prepare(
         PrepareRequest(
