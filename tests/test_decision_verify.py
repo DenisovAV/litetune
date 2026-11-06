@@ -4090,3 +4090,35 @@ def test_a_run_is_called_selected_only_when_every_run_was(split, tmp_path, monke
     assert engine["backend_observed"] is False and engine["adapter_selected"] is False
     assert engine["adapter_selected_by_run"] == [True, False]
     assert engine["gpu_evidence"] is None
+
+
+def test_each_runs_unbound_reason_is_kept_and_the_runs_reason_names_it(
+    split, tmp_path, monkeypatch
+):
+    """The first run is observed; the second's listing sits on a two-GPU host."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    two = {
+        "at_engine": {"platform": "linux", "looked": False},
+        "after_generation": {
+            "platform": "linux",
+            "looked": False,
+            "nvidia_smi": {"listed": True, "used_memory_mib": 9, "pids_hidden": False, "gpus": 2},
+        },
+    }
+    s = split()
+    job = job_for(s, tmp_path, backend="gpu")
+    job.runtime_env.device = LINUX_LISTED
+    job.runtime_env.device_for_run = {2: two}
+    job.runtime_env.stderr_for_run = {1: L4_LINE, 2: L4_LINE}
+
+    status, fields = run(job, s["record"])
+
+    assert status == "passed", fields["checks"]
+    engine = fields["measurements"]["candidate"]["engine"]
+    first, second = engine["gpu_unbound_by_run"]
+    assert first is None and "nvidia-smi lists 2 GPUs" in second
+    assert engine["gpu_unbound"].startswith("run 2: nvidia-smi lists 2 GPUs")
+    notes = engine["adapter_selected_note_by_run"]
+    assert notes[0] is None and "nvidia-smi lists 2 GPUs" in notes[1]
+    assert any(t.startswith("run 2: the runtime selected NVIDIA L4") for t in fields["limitations"])
+    assert engine["backend_observed"] is False and engine["gpu_evidence"] is None

@@ -4356,9 +4356,9 @@ def test_on_linux_a_hardware_adapter_and_nvidia_smi_listing_the_process_is_the_r
     assert adapter_selected("gpu", l4) is False
     assert gpu_evidence("gpu", l4) == (
         "the runtime selected a hardware adapter, NVIDIA L4 (vendor nvidia, Vulkan, Discrete "
-        "GPU), and nvidia-smi listed the process holding 3105 MiB on the host's only GPU after "
-        "the work: the process held a context there, which places the run on that GPU and is "
-        "not a reading of each operation"
+        "GPU), and nvidia-smi listed the process holding 3105 MiB on the host's only NVIDIA GPU "
+        "after the work: the process held a context there, which places the run on that GPU "
+        "and is not a reading of each operation"
     )
     # A run killed before its second reading has not shown its work.
     assert gpu_observed("gpu", _linux(adapters_of(_L4), ended=False, smi=_smi())) is False
@@ -5021,8 +5021,12 @@ def test_on_a_two_gpu_host_nvidia_smis_listing_is_not_tied_to_the_selected_adapt
     # One GPU: the listing is tied, and nothing is unbound.
     one = _linux(adapters_of(_L4), smi=_smi())
     assert gpu_observed("gpu", one) is True and gpu_unbound("gpu", one) is None
-    # A listing without the count (an older record) is not tied either.
-    assert gpu_observed("gpu", _linux(adapters_of(_L4), smi=_smi(gpus=None))) is False
+    # A listing without the count (an older record) is not tied either, and says why.
+    legacy = _linux(adapters_of(_L4), smi=_smi(gpus=None))
+    assert gpu_observed("gpu", legacy) is False and adapter_selected("gpu", legacy) is True
+    note = adapter_selected_note("gpu", legacy)
+    assert "did not record how many GPUs the host has or which one" in note
+    assert "did not list this process" not in note
 
 
 def test_on_windows_two_hardware_adapters_of_one_name_are_ambiguous(monkeypatch):
@@ -5047,3 +5051,26 @@ def test_on_windows_two_hardware_adapters_of_one_name_are_ambiguous(monkeypatch)
     said = gpu_unbound("gpu", report)
     assert "DXGI lists 2 hardware adapters named Intel(R) Arc(TM) B390 GPU" in said
     assert _ARC_LUID.lower() in said and _OTHER_LUID.lower() in said
+
+
+_INTEL_UHD = (
+    "I0000 environment.cc:532] Selected adapter: Intel(R) UHD Graphics 770, arch=gen-12lp, "
+    "vendor=intel, backend=Vulkan, adapterType=Integrated GPU"
+)
+
+
+def test_on_a_hybrid_host_an_intel_adapter_is_not_read_through_nvidia_smi():
+    """The process is listed on the one NVIDIA card, and the runtime selected the Intel one."""
+    from litetune.evaluate import adapter_selected, adapter_selected_note, adapters_of, gpu_unbound
+
+    hybrid = _linux(adapters_of(_INTEL_UHD), smi=_smi())
+    assert gpu_observed("gpu", hybrid) is False and adapter_selected("gpu", hybrid) is True
+    said = gpu_unbound("gpu", hybrid)
+    assert "vendor intel" in said and "sees NVIDIA's GPUs alone" in said
+    assert said in adapter_selected_note("gpu", hybrid)
+    # The NVIDIA adapter on a one-GPU host is still observed.
+    nvidia = _linux(adapters_of(_L4), smi=_smi())
+    assert gpu_observed("gpu", nvidia) is True and gpu_unbound("gpu", nvidia) is None
+    # The vendor is read without regard to case.
+    upper = _linux(adapters_of(_L4.replace("vendor=nvidia", "vendor=NVIDIA")), smi=_smi())
+    assert gpu_observed("gpu", upper) is True

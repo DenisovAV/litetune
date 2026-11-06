@@ -1531,15 +1531,25 @@ def _windows_work(report: dict) -> tuple[bool | None, str | None]:
     return False, None
 
 
-def _nvidia_listed(end: Any) -> bool:
-    """nvidia-smi listed this process, on a host where it lists exactly one GPU.
+def _is_nvidia(adapter: Mapping[str, Any] | None) -> bool:
+    return adapter is not None and str(adapter.get("vendor") or "").strip().lower() == "nvidia"
+
+
+def _nvidia_listed(end: Any, adapter: Mapping[str, Any] | None) -> bool:
+    """nvidia-smi listed this process, the selected adapter is NVIDIA's, and it lists one GPU.
 
     The adapter the runtime selected is named by Vulkan, and nvidia-smi's rows
     carry no Vulkan identity, so a listing ties the process to that adapter only
-    when there is one GPU it could be on (`gpu_unbound` otherwise).
+    when the adapter is an NVIDIA one -- nvidia-smi sees no other vendor's -- and
+    there is one NVIDIA GPU it could be on (`gpu_unbound` otherwise).
     """
     smi = end.get("nvidia_smi") if isinstance(end, dict) else None
-    return isinstance(smi, dict) and smi.get("listed") is True and smi.get("gpus") == 1
+    return (
+        _is_nvidia(adapter)
+        and isinstance(smi, dict)
+        and smi.get("listed") is True
+        and smi.get("gpus") == 1
+    )
 
 
 def gpu_unbound(backend: str, report: Any) -> str | None:
@@ -1561,6 +1571,18 @@ def gpu_unbound(backend: str, report: Any) -> str | None:
     if platform.startswith("linux"):
         smi = (report.get("after_generation") or {}).get("nvidia_smi")
         gpus = smi.get("gpus") if isinstance(smi, dict) else None
+        if not _is_nvidia(adapter):
+            return (
+                f"the runtime selected an adapter of vendor {adapter.get('vendor') or '?'}, and "
+                "on Linux litetune reads a process on the GPU only through nvidia-smi, which "
+                "sees NVIDIA's GPUs alone"
+            )
+        if isinstance(smi, dict) and smi.get("listed") is True and gpus is None:
+            return (
+                "nvidia-smi listed this process, but the reading did not record how many GPUs "
+                "the host has or which one it was on, so the listing cannot be tied to the "
+                "adapter the runtime selected"
+            )
         if isinstance(gpus, int) and gpus > 1:
             return (
                 f"nvidia-smi lists {gpus} GPUs and identifies them by nothing the runtime prints, "
@@ -1592,8 +1614,8 @@ def gpu_evidence(backend: str, report: Any) -> str | None:
     smi = report["after_generation"].get("nvidia_smi") or {}
     return (
         f"the runtime selected a hardware adapter, {describe_adapter(adapter)}, and nvidia-smi "
-        f"listed the process holding {smi.get('used_memory_mib')} MiB on the host's only GPU "
-        "after the work: the process held a context there, which places the run on that GPU "
+        f"listed the process holding {smi.get('used_memory_mib')} MiB on the host's only NVIDIA "
+        "GPU after the work: the process held a context there, which places the run on that GPU "
         "and is not a reading of each operation"
     )
 
@@ -1677,7 +1699,7 @@ def _gpu_work(report: Any) -> tuple[bool | None, Any]:
         return None, None
     platform = str(end.get("platform") or "")
     if platform.startswith("linux"):
-        observed = hardware_adapter(report.get("adapters")) is not None and _nvidia_listed(end)
+        observed = _nvidia_listed(end, hardware_adapter(report.get("adapters")))
         return (True if observed else None), end
     if end.get("looked") is not True:
         return None, None

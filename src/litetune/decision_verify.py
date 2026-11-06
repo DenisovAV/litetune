@@ -1248,9 +1248,10 @@ def verify_decision(
         ]
         if unseen:
             state.limitations.append(GPU_NOT_SEEN.format(runs=" and ".join(unseen)))
-        selected = adapter_selected_note("gpu", eng.report.get("device"))
-        if selected is not None:
-            state.limitations.append(selected)
+        for n, device in enumerate(repeated.get("devices", [eng.report.get("device")]), 1):
+            selected = adapter_selected_note("gpu", device)
+            if selected is not None:
+                state.limitations.append(f"run {n}: {selected}")
         activation = _bundle_activation_limit(eng.report)
         if activation:
             state.limitations.append(activation)
@@ -1416,7 +1417,18 @@ def verify_decision(
         "gpu_evidence": gpu_evidence(job.backend, run_devices[0]) if every_run_observed else None,
         "gpu_luids": (windows_luid_times(run_devices[0]) or None if every_run_observed else None),
         "adapter_selected": all(adapter_selected(job.backend, d) for d in run_devices),
-        "gpu_unbound": gpu_unbound(job.backend, run_devices[0]),
+        # Why a run's reading could not be tied to its adapter, from every run
+        # whose scores took part, each one's beside it.
+        "gpu_unbound": "; ".join(
+            f"run {n}: {why}"
+            for n, why in enumerate((gpu_unbound(job.backend, d) for d in run_devices), 1)
+            if why
+        )
+        or None,
+        "gpu_unbound_by_run": [gpu_unbound(job.backend, d) for d in run_devices],
+        "adapter_selected_note_by_run": [
+            adapter_selected_note(job.backend, d) for d in run_devices
+        ],
         "gpu_evidence_by_run": [gpu_evidence(job.backend, d) for d in run_devices],
         "adapter_selected_by_run": [adapter_selected(job.backend, d) for d in run_devices],
         "runtime_version": (eng.report.get("runtime") or {}).get("litert-lm"),
