@@ -47,6 +47,7 @@ from litetune.embedding_tune import DIRECTION as EMBEDDING_DIRECTION
 from litetune.embedding_tune import EMBEDDING_MODEL, model_dir_hint
 from litetune.evaluate import (
     GENERATION_SETTINGS_NOT_APPLIED,
+    GPU_IDLE_READING,
     GREEDY,
     UNKNOWN_BACKEND,
     DataError,
@@ -825,7 +826,7 @@ def _limit_gpu_reading(run: Any, engine: dict[str, Any]) -> None:
         # "A process", not "the": on the tool path each decoding mode runs in
         # its own, and one mode doing no GPU work is enough to say this.
         run.limitation(
-            "the GPU backend was asked for, and the kernel (on Windows its GPU engine counters) "
+            f"the GPU backend was asked for, and the GPU reading ({GPU_IDLE_READING}) "
             "showed no GPU work from a process "
             "that generated this run's answers: by that reading the GPU was not used there, "
             "and not every number here is a GPU number"
@@ -1681,9 +1682,10 @@ def run_verify(
         # doubt is not which executor it predicts but whether it ran there.
         run.limitation(
             f"{measured_on}, so this may not be a GPU number. litetune reads GPU work from the "
-            "kernel on macOS and from the GPU engine counters on Windows, and on Linux takes "
-            "the hardware adapter the runtime names; only a reading that shows it establishes "
-            "the GPU, and README.md's limitations section says what each reading is"
+            "kernel on macOS and from the selected adapter's GPU engine counters on Windows, "
+            "and on Linux takes the hardware adapter the runtime names together with nvidia-smi "
+            "listing the process; only a reading that shows it establishes the GPU, and "
+            "README.md's limitations section says what each reading is"
         )
     elif not established or (engine.lower(), backend.lower()) != GPU_MEASURED:
         run.limitation(
@@ -1701,16 +1703,18 @@ def run_verify(
         # reading is said as the backend recorded it (`evaluate.gpu_evidence`).
         evidence = candidate.engine.get("gpu_evidence")
         if not isinstance(evidence, str) or not evidence:
-            evidence = (
-                "the kernel showed the candidate's process doing work on this host's GPU while "
-                "it generated"
-            )
+            # A backend that says it observed the GPU and not how: litetune's
+            # own always say (`evaluate.gpu_evidence`).
+            evidence = "the backend reported GPU work from the candidate's process, not how"
         run.limitation(
             f"{measured_on}: {evidence}. That is litert-lm's GPU backend here, with fp32 "
             "activations passed by litetune; a phone's GPU is a different backend of the same "
             "runtime, and an app there gets the activations the bundle declares"
         )
     if backend.lower() == "gpu":
+        selected = candidate.engine.get("adapter_selected_note")
+        if isinstance(selected, str) and selected:
+            run.limitation(selected)
         _limit_gpu_reading(run, candidate.engine)
     _limit_runtime_named(run, candidate.engine)
     _limit_cpu_threads(run, pair.candidate)

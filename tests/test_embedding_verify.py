@@ -1900,6 +1900,11 @@ def test_the_gpu_backend_runs_each_engine_file_on_the_gpu_one_at_a_time(fake, tm
     assert engine["backend_observed"] is True
     assert engine["threads"] is None
     assert engine["device"] == GPU_WORKED
+    # macOS says what established it as it always has, end to end.
+    assert engine["gpu_evidence"] == (
+        "the kernel showed the candidate's process doing work on this host's GPU while it "
+        "generated"
+    )
     gain = result.manifest["quality"]["gain_over_base"]
     assert gain["base_backend"] == "gpu" and gain["base_backend_observed"] is True
     limitations = " ".join(result.manifest["limitations"])
@@ -1952,64 +1957,122 @@ LINUX_UNREAD = {
     "at_engine": {"platform": "linux", "looked": False},
     "after_generation": {"platform": "linux", "looked": False},
 }
+# The same, with nvidia-smi listing the process after the work.
+LINUX_LISTED = {
+    "at_engine": {"platform": "linux", "looked": False},
+    "after_generation": {
+        "platform": "linux",
+        "looked": False,
+        "nvidia_smi": {"listed": True, "used_memory_mib": 450, "pids_hidden": False},
+    },
+}
+ARC_LINE = (
+    "I0000 environment.cc:532] Selected adapter: Intel(R) Arc(TM) B390 GPU, arch=xe-3lpg, "
+    "vendor=intel, backend=Direct3D 12, adapterType=Integrated GPU"
+)
+ARC_LUID = "0x00000000_0x0000A62B"
 
 
 def _windows_reading(time_: int) -> dict[str, Any]:
     return {
         "platform": "win32",
         "looked": True,
-        "gpu_client": "pid_1_luid_0x0_0xA62B_phys_0_eng_0_engtype_3D",
+        "gpu_client": None,
         "gpu_time": time_,
-        "gpu_clients": {"luid_0x0_0xA62B_phys_0_eng_0_engtype_3D": time_},
+        "gpu_clients": {f"luid_{ARC_LUID}_phys_0_eng_0_engtype_3D": time_},
+        "dxgi_adapters": [
+            {"description": "Intel(R) Arc(TM) B390 GPU", "luid": ARC_LUID, "software": False}
+        ],
     }
 
 
-def test_on_linux_the_gpu_runs_and_the_hardware_adapter_is_the_reading(fake, tmp_path, monkeypatch):
+@pytest.fixture
+def nvidia_host(monkeypatch):
+    from litetune import evaluate
+
+    monkeypatch.setattr(evaluate, "_nvidia_driver_present", lambda: True)
+    for name in evaluate.VULKAN_DRIVER_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_on_linux_the_gpu_runs_and_the_adapter_with_its_process_listed_is_the_reading(
+    fake, tmp_path, monkeypatch
+):
     monkeypatch.setattr(sys, "platform", "linux")
-    fake.gpu_device = LINUX_UNREAD
+    fake.gpu_device = LINUX_LISTED
     fake.stderr_for = {"candidate": L4_LINE, "base": L4_LINE}
     result = _verify(_setup(tmp_path), backend="gpu", with_base=True)
 
     assert result.status is Status.PASSED, result.manifest["checks"]
     engine = result.manifest["measurements"]["candidate"]["engine"]
-    assert engine["backend_observed"] is True
-    assert "NVIDIA L4" in engine["gpu_evidence"]
+    assert engine["backend_observed"] is True and engine["adapter_selected"] is False
+    assert "NVIDIA L4" in engine["gpu_evidence"] and "nvidia-smi listed" in engine["gpu_evidence"]
     assert engine["device"]["adapters"][0]["adapter_type"] == "Discrete GPU"
     assert result.manifest["quality"]["gain_over_base"]["base_backend_observed"] is True
     said = embedding_verify.GPU_MEASURED.format(how=embedding_verify.GPU_SEEN)
     assert said in result.manifest["limitations"]
 
 
-def test_on_linux_a_gpu_run_with_no_adapter_line_is_asked_for_not_observed(
+def test_on_linux_an_adapter_nvidia_smi_did_not_show_working_is_selected(
     fake, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(sys, "platform", "linux")
     fake.gpu_device = LINUX_UNREAD
+    fake.stderr_for = {"candidate": L4_LINE}
     result = _verify(_setup(tmp_path), backend="gpu")
 
     assert result.status is Status.PASSED, result.manifest["checks"]
     engine = result.manifest["measurements"]["candidate"]["engine"]
-    assert engine["backend_observed"] is False and engine["gpu_evidence"] is None
+    assert engine["backend_observed"] is False and engine["adapter_selected"] is True
     said = embedding_verify.GPU_MEASURED.format(how=embedding_verify.GPU_ASKED_FOR)
     assert said in result.manifest["limitations"]
+    assert any("said as selected there" in t for t in result.manifest["limitations"])
 
 
-def test_on_windows_the_gpu_runs_and_the_counters_are_the_reading(fake, tmp_path, monkeypatch):
+def test_on_linux_a_gpu_run_with_no_adapter_line_fails_the_harness(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    fake.gpu_device = LINUX_LISTED
+    result = _verify(_setup(tmp_path), backend="gpu")
+
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert "named no adapter on stderr" in failed["detail"]
+
+
+def test_on_windows_the_gpu_runs_and_the_selected_adapters_counters_are_the_reading(
+    fake, tmp_path, monkeypatch
+):
     monkeypatch.setattr(sys, "platform", "win32")
     fake.gpu_device = {
         "at_engine": _windows_reading(60343),
         "after_generation": _windows_reading(30493406),
     }
+    fake.stderr_for = {"candidate": ARC_LINE}
     result = _verify(_setup(tmp_path), backend="gpu")
 
     assert result.status is Status.PASSED, result.manifest["checks"]
     engine = result.manifest["measurements"]["candidate"]["engine"]
     assert engine["backend_observed"] is True
     assert "GPU engine counters" in engine["gpu_evidence"]
+    assert engine["gpu_luids"] == {ARC_LUID.lower(): {"start": 60343, "end": 30493406}}
+
+
+def test_on_windows_growth_without_an_adapter_line_is_not_observed(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    fake.gpu_device = {
+        "at_engine": _windows_reading(60343),
+        "after_generation": _windows_reading(30493406),
+    }
+    result = _verify(_setup(tmp_path), backend="gpu")
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    assert result.manifest["measurements"]["candidate"]["engine"]["backend_observed"] is False
 
 
 @pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
-def test_a_candidate_on_a_software_adapter_fails_the_harness(fake, tmp_path, monkeypatch, platform):
+def test_a_candidate_on_a_software_adapter_fails_the_harness(
+    fake, tmp_path, monkeypatch, platform, nvidia_host
+):
     """The runtime embeds on llvmpipe and says nothing; the kernel's reading, here
     one that shows GPU work, does not outweigh the adapter it named."""
     monkeypatch.setattr(sys, "platform", platform)
@@ -3571,9 +3634,10 @@ def test_an_image_checkpoint_runs_on_the_gpu_off_macos(fake, tmp_path, monkeypat
     s = _image_setup(tmp_path, fake)
     monkeypatch.setattr(sys, "platform", platform)
     if platform == "linux":
-        fake.gpu_device = LINUX_UNREAD
+        fake.gpu_device = LINUX_LISTED
         fake.stderr_for = {"candidate": L4_LINE}
     else:
+        fake.stderr_for = {"candidate": ARC_LINE}
         fake.gpu_device = {
             "at_engine": _windows_reading(10),
             "after_generation": _windows_reading(99),

@@ -70,7 +70,7 @@ one `tune` recorded for it is refused. The candidate is the file through
 `EmbeddingEngine` with a CPU vision backend at that budget, each image given as
 its bytes (`IMAGE_ENGINE_SCRIPT`); the engine reports no per-image count, so
 only the reference's is compared. Google's file is the text-vision file
-(`embedding_vision.VISION_FILE`). On the GPU, on macOS as for text, the text
+(`embedding_vision.VISION_FILE`). On the GPU, where text runs on it, the text
 tower runs on the GPU and the vision encoder on the CPU, as flutter_edge_ai_litertlm
 1.19.0 places them (`IMAGE_GPU_MEASURED`). A convert report that records another budget, or another
 modality, than the reference is refused.
@@ -131,7 +131,11 @@ from litetune.embedding_tune import (
     states_of,
 )
 from litetune.evaluate import (
+    GPU_IDLE_READING,
     RUNTIME_ENGINE_SOURCE,
+    adapter_refusal,
+    adapter_selected,
+    adapter_selected_note,
     adapters_of,
     gpu_evidence,
     gpu_observed,
@@ -139,6 +143,7 @@ from litetune.evaluate import (
     gpu_unused,
     software_adapter,
     software_adapter_refusal,
+    windows_luid_times,
     with_adapters,
 )
 from litetune.events import EventStream
@@ -2208,14 +2213,14 @@ def verify_embedding(
             if not out.is_file():
                 return f"the script reports {len(inputs)} vectors but wrote no {out.name}"
             device = run.report.get("device")
-            software = software_adapter(_mapping(device).get("adapters"))
-            if name != "reference" and job.backend == "gpu" and software is not None:
-                return software_adapter_refusal(software)
+            refused = adapter_refusal(_mapping(device).get("adapters"), finished=True)
+            if name != "reference" and job.backend == "gpu" and refused is not None:
+                return refused
             if name != "reference" and gpu_unused(job.backend, device):
                 return (
-                    "the GPU backend was asked for and the kernel (on Windows its GPU engine "
-                    "counters) shows this process did no GPU work: the vectors came from "
-                    "somewhere else"
+                    "the GPU backend was asked for and the GPU reading "
+                    f"({GPU_IDLE_READING}) shows this process did no GPU work: the vectors came "
+                    "from somewhere else"
                 )
             harness[name] = run.report
             vectors[name] = str(out)
@@ -2366,6 +2371,8 @@ def verify_embedding(
         # Whether the GPU work was read (`evaluate.gpu_observed`); False on the CPU.
         "backend_observed": gpu_observed(job.backend, candidate_report.get("device")),
         "gpu_evidence": gpu_evidence(job.backend, candidate_report.get("device")),
+        "adapter_selected": adapter_selected(job.backend, candidate_report.get("device")),
+        "gpu_luids": windows_luid_times(candidate_report.get("device")) or None,
         "device": _mapping(candidate_report.get("device")),
         "runtime_version": (candidate_report.get("runtime") or {}).get("litert-lm"),
         # `evaluate.cpu_report`, run by the engine script on the CPU it computed on.
@@ -2423,6 +2430,9 @@ def verify_embedding(
     )
     if on_gpu:
         how = GPU_SEEN if gpu_observed("gpu", candidate_report.get("device")) else GPU_ASKED_FOR
+        selected = adapter_selected_note("gpu", candidate_report.get("device"))
+        if selected is not None:
+            state.limitation(selected)
         if images:
             state.limitation(IMAGE_GPU_MEASURED.format(how=how, vision_tokens=record.vision_tokens))
             if repeat:

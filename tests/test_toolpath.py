@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import types
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from litetune import toolpath
 from litetune.evaluate import BACKEND_OBSERVED, runtime_engine_spec
 from litetune.metrics import ToolCall
 from litetune.toolpath import (
@@ -2198,7 +2200,11 @@ def test_a_tool_path_on_linux_names_the_adapter_that_established_the_gpu(tmp_pat
     monkeypatch.setattr(sys, "platform", "linux")
     linux = {
         "at_engine": {"platform": "linux", "looked": False},
-        "after_generation": {"platform": "linux", "looked": False},
+        "after_generation": {
+            "platform": "linux",
+            "looked": False,
+            "nvidia_smi": {"listed": True, "used_memory_mib": 9, "pids_hidden": False},
+        },
         "bundle_activation": "fp32",
     }
     rows_ = labelled_rows(8)
@@ -2258,3 +2264,118 @@ def test_on_the_gpu_the_runtime_is_quieted_only_once_its_engine_exists(
 
     assert code == 0
     assert events == order
+
+
+def _probe(env, backend_flag="gpu"):
+    return toolpath.ToolPathProbe(
+        model=Path("m.litertlm"),
+        declarations=DECLS,
+        max_tokens=64,
+        env=env,
+        auto_provision=False,
+        timeout_s=5,
+        backend_flag=backend_flag,
+    )
+
+
+class _ExitEnv:
+    """The tool-path script exits `returncode` with `stderr`, or times out with it."""
+
+    name = "runtime"
+    requirements: tuple[str, ...] = ()
+
+    def __init__(self, returncode=1, stderr="", timeout=False):
+        self.returncode, self.stderr, self.timeout = returncode, stderr, timeout
+
+    def provision(self, events=None):
+        return None
+
+    def run(self, argv, timeout=None):
+        if self.timeout:
+            raise subprocess.TimeoutExpired(argv, timeout, stderr=self.stderr.encode())
+        return types.SimpleNamespace(returncode=self.returncode, stderr=self.stderr)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        _ExitEnv(returncode=1, stderr=_LLVMPIPE),
+        _ExitEnv(returncode=toolpath._script()["CREATE_REFUSED"], stderr=_LLVMPIPE),
+        _ExitEnv(stderr=_LLVMPIPE, timeout=True),
+    ],
+)
+def test_a_tool_path_run_that_failed_on_a_software_adapter_says_so_first(env):
+    with pytest.raises(toolpath.ToolPathError) as raised:
+        _probe(env).observe(["make it red"], constrained=False)
+    said = str(raised.value)
+    assert said.startswith("the GPU backend was asked for and LiteRT-LM selected a software")
+    assert "the run then failed: the tool-path script" in said
+    # Not the grammar's refusal, which would leave the other mode standing.
+    assert not isinstance(raised.value, toolpath.ConversationRefused)
+
+
+def test_a_failed_cpu_tool_path_run_is_not_blamed_on_an_adapter_line():
+    with pytest.raises(toolpath.ToolPathError) as raised:
+        _probe(_ExitEnv(returncode=1, stderr=_LLVMPIPE), "cpu").observe(["x"], constrained=False)
+    assert "software adapter" not in str(raised.value)
+
+
+def test_a_tool_path_on_linux_that_named_no_adapter_scores_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    rows_ = labelled_rows(8)
+    env = CannedEnv(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    out = backend.generate([r["prompt"] for r in rows_])
+    assert all("named no adapter on stderr" in g.harness_error for g in out)
+
+
+def test_the_tool_path_script_stops_once_its_engine_is_on_a_software_adapter(tmp_path, monkeypatch):
+    runtime = FakeRuntime(replies=[_reply("set_colour", {"colour": "red"})])
+    real = _fake_litert_lm
+
+    def loud(runtime):
+        module = real(runtime)
+        base = module.Engine
+
+        class Engine(base):
+            def __init__(self, *args, **kwargs):
+                os.write(2, (_LLVMPIPE + "\n").encode())
+                super().__init__(*args, **kwargs)
+
+        module.Engine = Engine
+        return module
+
+    monkeypatch.setitem(globals(), "_fake_litert_lm", loud)
+    code, _ = _run(runtime, tmp_path, monkeypatch, backend="gpu")
+    assert code == toolpath._script()["SOFTWARE_ADAPTER"]
+    assert runtime.sent == []
+
+
+def test_the_tool_path_evidence_names_each_modes_reading_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    listed = {"listed": True, "used_memory_mib": 9, "pids_hidden": False}
+    linux = {
+        "at_engine": {"platform": "linux", "looked": False},
+        "after_generation": {"platform": "linux", "looked": False, "nvidia_smi": listed},
+    }
+    other = {
+        **linux,
+        "after_generation": {
+            **linux["after_generation"],
+            "nvidia_smi": {**listed, "used_memory_mib": 11},
+        },
+    }
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        device_by_mode={"constrained": other, "unconstrained": dict(linux)},
+        stderr_by_mode={"constrained": _L4, "unconstrained": _L4},
+    )
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    backend.generate([r["prompt"] for r in rows_])
+    said = backend.describe()["gpu_evidence"]
+    assert "(9 MiB)" in said and "(11 MiB)" in said
