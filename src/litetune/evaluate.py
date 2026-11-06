@@ -37,6 +37,7 @@ import os
 import re
 import statistics
 import subprocess
+import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -827,6 +828,10 @@ class LiteRtLmBackend:
             # from this process although the GPU was asked for, and what the
             # bundle itself declares for GPU activations.
             "gpu_unused": gpu_unused(self.backend_flag, self.device_report),
+            # What established GPU work, in a sentence, and the adapters the
+            # runtime said it selected; `None` where nothing established it.
+            "gpu_evidence": gpu_evidence(self.backend_flag, self.device_report),
+            "adapters": (self.device_report or {}).get("adapters"),
             "bundle_activation": bundle_activation_of(self.device_report),
             "bundle_activation_error": bundle_activation_error_of(self.device_report),
             # The flag as passed, not a device torch chose: see
@@ -963,7 +968,6 @@ class LiteRtLmBackend:
                 # flushes after each one, and a half-written last line fails to
                 # parse and is dropped by the reader.
                 texts, faults = read_jsonl_results(results)
-                self.device_report = _read_device_report(report)
                 # `_run_guarded` kills the group and drains it precisely to put
                 # the child's last words on this exception; the first version
                 # of this discarded them, leaving the budget as the whole
@@ -971,7 +975,14 @@ class LiteRtLmBackend:
                 killed = expired.stderr or ""
                 if isinstance(killed, bytes):
                     killed = killed.decode("utf-8", "surrogateescape")
+                self.device_report = with_adapters(_read_device_report(report), killed)
+                software = self._software_adapter(killed)
                 killed = killed[-2000:]
+                if software is not None:
+                    return [
+                        Generation(i, p, stderr=killed, harness_error=software)
+                        for i, p in enumerate(prompts)
+                    ]
                 reason = f"no result after {budget}s on the {self.backend_flag} backend (timeout)"
                 return salvage_after_kill(prompts, texts, faults, killed, reason)
             except OSError as exc:
@@ -980,8 +991,24 @@ class LiteRtLmBackend:
                 return [Generation(i, p, harness_error=reason) for i, p in enumerate(prompts)]
 
             texts, faults = read_jsonl_results(results)
-            self.device_report = _read_device_report(report)
+            self.device_report = with_adapters(_read_device_report(report), proc.stderr)
+        # Every row, answered or not: an answer computed on a software adapter
+        # is the CPU's, and scoring it as the GPU's is the report this refuses.
+        software = self._software_adapter(proc.stderr)
+        if software is not None:
+            stderr = (proc.stderr or "")[-2000:]
+            return [
+                Generation(i, p, returncode=proc.returncode, stderr=stderr, harness_error=software)
+                for i, p in enumerate(prompts)
+            ]
         return assemble_generations(prompts, texts, proc, faults)
+
+    def _software_adapter(self, stderr: str | bytes | None) -> str | None:
+        """Why a GPU run whose stderr names a software adapter is refused; None otherwise."""
+        if self.backend_flag != "gpu":
+            return None
+        adapter = software_adapter(adapters_of(stderr))
+        return software_adapter_refusal(adapter) if adapter is not None else None
 
     def _gpu_preflight(self, prompt: str, events: EventStream | None) -> str | None:
         """One prompt on the GPU backend, with one prompt's budget, before the split.
@@ -991,7 +1018,8 @@ class LiteRtLmBackend:
         error, then no token for a single prompt in fifty-five minutes. The
         split's budget is `timeout_s` per prompt, so a 600-row run would wait
         fifty hours to report what one prompt can show in `timeout_s`. Only
-        the silence is judged here -- anything else the run itself reports,
+        the silence is judged here, and a software adapter the runtime named
+        (`software_adapter_refusal`) -- anything else the run itself reports,
         with the split's own evidence. Costs one extra engine load.
         """
         if events:
@@ -1019,12 +1047,15 @@ class LiteRtLmBackend:
                 encoding="utf-8",
             )
             try:
-                self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
+                done = self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
             except subprocess.TimeoutExpired as expired:
                 # The child's last words, as the split's own timeout keeps them.
                 killed = expired.stderr or ""
                 if isinstance(killed, bytes):
                     killed = killed.decode("utf-8", "surrogateescape")
+                software = self._software_adapter(killed)
+                if software is not None:
+                    return software
                 killed = killed.strip()[-2000:]
                 return (
                     f"the gpu backend gave no answer to one prompt in {self.timeout_s}s, a "
@@ -1038,7 +1069,9 @@ class LiteRtLmBackend:
                 # The split starts the same script and reports this with its rows.
                 logger.exception("could not start the litert-lm gpu preflight")
                 return None
-        return None
+        # A software adapter answers, slowly, and reports success: the one
+        # prompt is enough to see it, before the split pays for it.
+        return self._software_adapter(done.stderr)
 
     def _ensure_env(self, events: EventStream | None) -> str | None:
         """Provision the runtime environment. Returns why it could not be, or None."""
@@ -1144,6 +1177,165 @@ def _read_device_report(path: Path) -> dict[str, Any] | None:
     return payload
 
 
+# The adapter LiteRT's WebGPU accelerator picked, as it says on the process's
+# stderr when it builds a GPU environment: "Selected adapter: <name>,
+# arch=<arch>, vendor=<vendor>, backend=<backend>, adapterType=<type>"
+# (environment.cc in litert-lm 0.18.0's log). Seen on all three platforms
+# litetune runs a GPU on: an Intel Arc B390 over Direct3D 12 on Windows, an
+# NVIDIA L4 over Vulkan on Linux, and on the same Linux host without NVIDIA's
+# Vulkan driver Mesa's llvmpipe -- a rasteriser on the CPU -- with
+# "adapterType=CPU / Software", which the runtime used without a word: a text
+# took 14,686 ms there against 585 ms on its CPU backend, and every call
+# succeeded (MEASUREMENTS.md, "The GPU on Windows and Linux").
+#
+# The name in the line can hold commas ("llvmpipe (LLVM 15.0.7, 256 bits)"),
+# so it runs up to the first ", arch=".
+_ADAPTER_LINE = re.compile(
+    r"Selected adapter: (?P<name>.*?), arch=(?P<arch>[^,\r\n]*), vendor=(?P<vendor>[^,\r\n]*), "
+    r"backend=(?P<backend>[^,\r\n]*), adapterType=(?P<adapter_type>[^\r\n]*)"
+)
+# The adapter type Dawn gives an adapter that computes on the CPU, as the line
+# above printed it for llvmpipe.
+SOFTWARE_ADAPTER_TYPE = "CPU / Software"
+# Software rasterisers a GPU request can land on: Mesa's llvmpipe (the one
+# observed, above) and lavapipe, Google's SwiftShader, and Microsoft's WARP,
+# which Windows lists as the Microsoft Basic Render Driver. Only llvmpipe has
+# been seen in a litetune run; the others are named so that a line which
+# carries one of them is not read as a GPU even if its type were not printed.
+_SOFTWARE_ADAPTER_NAME = re.compile(
+    r"\b(llvmpipe|lavapipe|swiftshader|warp|microsoft basic render)\b", re.IGNORECASE
+)
+# What a Linux host needs for NVIDIA's Vulkan driver to be offered, measured
+# on Ubuntu 22.04 with driver 580.178.04: with libnvidia-gl-580-server and Mesa's
+# Vulkan drivers installed and libegl1 not, the NVIDIA driver could not load
+# libEGL.so.1 and Vulkan offered only llvmpipe; with libegl1 as well, the L4.
+LINUX_VULKAN_PACKAGES = (
+    "on Ubuntu, NVIDIA's Vulkan driver is in the package libnvidia-gl-<driver version> matching "
+    "the installed driver (libnvidia-gl-580-server for a 580 server driver), and it loads "
+    "libEGL.so.1 from the package libegl1; on the one host measured, without libegl1 Vulkan "
+    "offered only Mesa's llvmpipe"
+)
+
+
+def adapters_of(stderr: str | bytes | None) -> list[dict[str, str]]:
+    """Each adapter the runtime said it selected, in order, once each.
+
+    A run may build more than one GPU environment -- an EmbeddingGemma 2 file
+    with pictures logged the line twice -- and every one is kept, because one
+    software adapter among them is enough to make the run not a GPU run.
+    """
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    found: list[dict[str, str]] = []
+    for match in _ADAPTER_LINE.finditer(stderr or ""):
+        adapter = {key: value.strip() for key, value in match.groupdict().items()}
+        if adapter not in found:
+            found.append(adapter)
+    return found
+
+
+def _is_software(adapter: Mapping[str, Any]) -> bool:
+    if str(adapter.get("adapter_type", "")).strip() == SOFTWARE_ADAPTER_TYPE:
+        return True
+    if str(adapter.get("arch", "")).strip().lower() == "software":
+        return True
+    return bool(_SOFTWARE_ADAPTER_NAME.search(str(adapter.get("name", ""))))
+
+
+def _adapters(value: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [a for a in value if isinstance(a, Mapping)]
+
+
+def software_adapter(adapters: Any) -> Mapping[str, Any] | None:
+    """The first adapter in `adapters` that computes on the CPU, or None."""
+    return next((a for a in _adapters(adapters) if _is_software(a)), None)
+
+
+def hardware_adapter(adapters: Any) -> Mapping[str, Any] | None:
+    """The first adapter in `adapters`, when none of them is a software one."""
+    listed = _adapters(adapters)
+    if not listed or software_adapter(listed) is not None:
+        return None
+    return listed[0]
+
+
+def describe_adapter(adapter: Mapping[str, Any]) -> str:
+    """ "NVIDIA L4 (vendor nvidia, Vulkan, Discrete GPU)"."""
+    return (
+        f"{adapter.get('name') or 'an unnamed adapter'} (vendor {adapter.get('vendor') or '?'}, "
+        f"{adapter.get('backend') or '?'}, {adapter.get('adapter_type') or '?'})"
+    )
+
+
+def software_adapter_refusal(adapter: Mapping[str, Any], platform: str | None = None) -> str:
+    """Why a GPU run on `adapter`, a software one, is not a GPU number.
+
+    A harness failure wherever it is met: the runtime reports success on such
+    an adapter, so nothing after it would say the GPU was never used.
+    """
+    platform = sys.platform if platform is None else platform
+    said = (
+        "the GPU backend was asked for and LiteRT-LM selected a software adapter, "
+        f"{describe_adapter(adapter)}, which computes on the CPU: this is not a GPU run, and "
+        "the runtime reports success on it"
+    )
+    if platform.startswith("linux"):
+        said += f". {LINUX_VULKAN_PACKAGES[0].upper()}{LINUX_VULKAN_PACKAGES[1:]}"
+    return said
+
+
+def with_adapters(report: Any, stderr: str | bytes | None) -> Any:
+    """`report` with the adapters `stderr` names under "adapters", when it is a dict.
+
+    The driver script cannot read its own process's stderr, which is where the
+    runtime writes; the parent captures it, so the parent adds it here, to the
+    report every reading of GPU work goes through. No key when the runtime
+    named none -- a CPU run, or a GPU run whose line was not found.
+    """
+    found = adapters_of(stderr)
+    if isinstance(report, dict) and found:
+        report["adapters"] = found
+    return report
+
+
+# The platforms on which a GPU run's work can be read, each in its own way
+# (`device_report` and `_gpu_work`); the paths that refuse a GPU run they
+# cannot read refuse it everywhere else.
+GPU_READ_PLATFORMS = ("darwin", "win32", "linux")
+
+
+def gpu_read_here(platform: str | None = None) -> bool:
+    """Whether this platform is one of `GPU_READ_PLATFORMS`."""
+    platform = sys.platform if platform is None else platform
+    return platform in ("darwin", "win32") or platform.startswith("linux")
+
+
+# How each platform's reading is said in a manifest, once it showed GPU work.
+GPU_EVIDENCE = {
+    "darwin": "the kernel showed the process's GPU client doing work while it ran",
+    "win32": (
+        "Windows' GPU engine counters for the process showed its GPU running time growing "
+        "while it ran"
+    ),
+}
+
+
+def gpu_evidence(backend: str, report: Any) -> str | None:
+    """What established a GPU run's work, said for a manifest, or None when nothing did."""
+    if not gpu_observed(backend, report):
+        return None
+    end = report.get("after_generation") if isinstance(report, dict) else None
+    platform = str(end.get("platform") or "") if isinstance(end, dict) else ""
+    if isinstance(end, dict) and end.get("looked") is True and platform in GPU_EVIDENCE:
+        return GPU_EVIDENCE[platform]
+    adapter = hardware_adapter(report.get("adapters"))
+    if adapter is not None:
+        return f"the runtime reported selecting a hardware adapter, {describe_adapter(adapter)}"
+    return None
+
+
 def _gpu_work(report: Any) -> tuple[bool | None, Any]:
     """What a run report says about GPU work: (did it happen, the reading).
 
@@ -1157,11 +1349,28 @@ def _gpu_work(report: Any) -> tuple[bool | None, Any]:
     None when nothing was established either way -- the kernel was not asked,
     the run died before the second reading, a client seen at the engine was
     gone by the end, or the report is missing.
+
+    The same reading on Windows, from its GPU engine counters (`device_report`):
+    a GPU engine's process has counter instances from construction and their
+    running time grows with work; a CPU run has none. On Linux nothing is read
+    off the kernel: there the run is True when it reached its second reading
+    and the runtime named only hardware adapters (`with_adapters`). On every
+    platform a software adapter makes it False -- the GPU that was asked for
+    was not used, whatever else the reading says.
     """
     if not isinstance(report, dict):
         return None, None
     end = report.get("after_generation")
     start = report.get("at_engine")
+    if software_adapter(report.get("adapters")) is not None:
+        return False, end
+    if (
+        isinstance(end, dict)
+        and end.get("looked") is not True
+        and str(end.get("platform") or "").startswith("linux")
+        and hardware_adapter(report.get("adapters")) is not None
+    ):
+        return True, end
     if not isinstance(end, dict) or end.get("looked") is not True:
         return None, None
     if isinstance(end.get("gpu_client"), str):
@@ -1358,10 +1567,15 @@ def device_report():
     after generating -- because a client proves the runtime opened the GPU,
     and only the growth proves work was done there.
 
+    On Windows the same two readings come from its GPU engine counters
+    (`windows_gpu_report`). On Linux the kernel is not asked: what marks a
+    GPU there is the adapter the runtime names on stderr, which the parent
+    reads (`evaluate.with_adapters`); `nvidia-smi`'s listing of this pid is
+    recorded beside it where the tool is installed, and nothing is decided on
+    it. Other platforms are not looked at.
+
     A diagnostic, so it must never end a run: any failure is recorded in
-    `error` and the report says it did not look. Other platforms are not
-    looked at, because which signal marks litert-lm's GPU path there has not
-    been observed.
+    `error` and the report says it did not look.
     """
     import os
     import sys
@@ -1373,6 +1587,11 @@ def device_report():
         "gpu_time": None,
         "gpu_clients": None,
     }
+    if sys.platform == "win32":
+        return windows_gpu_report(report)
+    if sys.platform.startswith("linux"):
+        report["nvidia_smi"] = nvidia_smi_report()
+        return report
     if sys.platform != "darwin":
         return report
     try:
@@ -1406,6 +1625,126 @@ def device_report():
     report["gpu_time"] = sum(times) if times else None
     report["gpu_clients"] = clients
     return report
+
+
+# Every GPU engine counter instance Windows keeps, with its running time:
+# instances are named pid_<pid>_luid_<adapter>_phys_<n>_eng_<n>_engtype_<kind>,
+# and RunningTime is in 100 ns units. Passed through a string so the 64-bit
+# count is not rounded on its way through JSON; `@()` so one instance is still a
+# list.
+WINDOWS_GPU_QUERY = (
+    "$r = @(Get-CimInstance -ClassName Win32_PerfRawData_GPUPerformanceCounters_GPUEngine | "
+    "ForEach-Object { @{n = $_.Name; t = [string]$_.RunningTime} }); "
+    "ConvertTo-Json -InputObject $r -Compress"
+)
+
+
+def windows_gpu_report(report):
+    """`device_report` on Windows: this pid's GPU engine counters, as of now.
+
+    Measured on Windows 11 on an Intel Arc B390 with litert-lm 0.18.0: the
+    process had no instance before its engine, a GPU engine's process had
+    them from construction, and their summed running time grew from 60,343 to
+    30,493,406 over 40 embeddings; a CPU engine's process had none at either
+    reading. Each instance is one engine of one adapter, so the instances are
+    the clients `_clients_worked` compares one by one, keyed by name.
+    """
+    import json
+    import os
+    import subprocess
+
+    try:
+        shell = os.path.join(
+            os.environ.get("SystemRoot") or "C:/Windows",
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+        )
+        done = subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-Command", WINDOWS_GPU_QUERY],
+            capture_output=True,
+            timeout=60,
+        )
+        if done.returncode != 0:
+            report["error"] = "powershell exited %d: %s" % (
+                done.returncode,
+                done.stderr.decode("utf-8", "replace").strip()[-200:],
+            )
+            return report
+        rows = json.loads(done.stdout.decode("utf-8", "replace").strip() or "[]")
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list) or not rows:
+            # Not "no instance of ours": no instance of anyone's, so there was
+            # nothing to find this process among.
+            report["error"] = "Windows listed no GPU engine counter of any process"
+            return report
+    except Exception as exc:  # noqa: BLE001 -- a diagnostic must not end a run
+        report["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return report
+    report["looked"] = True
+    client, clients = gpu_engines_of(rows, os.getpid())
+    times = [t for t in clients.values() if t is not None]
+    report["gpu_client"] = client
+    report["gpu_time"] = sum(times) if times else None
+    report["gpu_clients"] = clients
+    return report
+
+
+def gpu_engines_of(rows, pid):
+    """The GPU engine counter instances of `pid`: the first one's name, and each one's time.
+
+    Only an instance named for this pid counts -- `pid_42_` is not a prefix of
+    `pid_4242_`. A time that is not an integer is None, unread.
+    """
+    prefix = "pid_%d_" % pid
+    client, clients = None, {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("n")
+        if not isinstance(name, str) or not name.startswith(prefix):
+            continue
+        if client is None:
+            client = name
+        raw = row.get("t")
+        try:
+            time = None if isinstance(raw, bool) else int(raw)
+        except (TypeError, ValueError):
+            time = None
+        clients[name[len(prefix):]] = time
+    return client, clients
+
+
+def nvidia_smi_report():
+    """Whether `nvidia-smi` lists this pid among the GPU's compute processes; recorded only.
+
+    During a GPU generation on an NVIDIA L4 through Vulkan it listed the
+    process with its memory. None when there is no `nvidia-smi`; never raises.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    try:
+        smi = shutil.which("nvidia-smi")
+        if smi is None:
+            return None
+        done = subprocess.run(
+            [smi, "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            timeout=30,
+        )
+        if done.returncode != 0:
+            return {"error": "nvidia-smi exited %d: %s" % (
+                done.returncode, done.stdout.decode("utf-8", "replace").strip()[-200:])}
+        for line in done.stdout.decode("utf-8", "replace").splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if parts[0] == str(os.getpid()):
+                memory = parts[1] if len(parts) > 1 else ""
+                used = int(memory) if memory.isdigit() else None
+                return {"listed": True, "used_memory_mib": used}
+        return {"listed": False, "used_memory_mib": None}
+    except Exception as exc:  # noqa: BLE001 -- a diagnostic must not end a run
+        return {"error": "%s: %s" % (type(exc).__name__, exc)}
 
 
 def gpu_client_of(listing, pid):

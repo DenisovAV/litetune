@@ -2435,3 +2435,53 @@ def test_verifys_threads_do_not_reach_the_text_path(tmp_path):
     candidate = build_backends(request).candidate
     assert isinstance(candidate, LiteRtLmBackend)
     assert candidate.threads is None
+
+
+@pytest.mark.parametrize(
+    ("evidence", "said"),
+    [
+        (
+            "the runtime reported selecting a hardware adapter, NVIDIA L4 (vendor nvidia, "
+            "Vulkan, Discrete GPU)",
+            "measured on the gpu backend of litert-lm: the runtime reported selecting a hardware "
+            "adapter, NVIDIA L4 (vendor nvidia, Vulkan, Discrete GPU). That is",
+        ),
+        # A backend that records no evidence keeps the kernel's sentence.
+        (None, "the kernel showed the candidate's process doing work on this host's GPU"),
+    ],
+)
+def test_an_observed_gpu_run_says_what_established_it(write_split, evidence, said):
+    class Observed(FakeBackend):
+        def describe(self) -> dict:
+            return {
+                "engine": "litert-lm",
+                "backend": "gpu",
+                BACKEND_OBSERVED: True,
+                "gpu_evidence": evidence,
+            }
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=Observed(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+    assert any(said in note for note in result.manifest["limitations"])
+
+
+def test_an_unobserved_gpu_run_says_how_each_platform_is_read(write_split):
+    class Asked(FakeBackend):
+        def describe(self) -> dict:
+            return {"engine": "litert-lm", "backend": "gpu", BACKEND_OBSERVED: False}
+
+    rows = labelled_rows(4)
+    result = verify(
+        write_split,
+        rows,
+        candidate=Asked(texts=correct_texts(rows)),
+        reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+    )
+    (note,) = [n for n in result.manifest["limitations"] if "may not be a GPU number" in n]
+    assert "kernel on macOS" in note and "GPU engine counters on Windows" in note
+    assert "on Linux takes the hardware adapter the runtime names" in note

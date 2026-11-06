@@ -59,12 +59,17 @@ from litetune.evaluate import (
     RUNTIME_ENGINE_SOURCE,
     DecodeConfig,
     Generation,
+    adapters_of,
     bundle_activation_error_of,
     bundle_activation_of,
     cpu_of,
+    gpu_evidence,
     gpu_observed,
     gpu_unused,
     runtime_engine_spec,
+    software_adapter,
+    software_adapter_refusal,
+    with_adapters,
 )
 from litetune.events import EventStream
 from litetune.exits import read_returncode
@@ -620,7 +625,14 @@ class ToolPathProbe:
             )
         self.runtime_version = written.get("runtime_version")
         device = written.get("device")
-        self.device_report = device if isinstance(device, dict) else None
+        self.device_report = with_adapters(
+            device if isinstance(device, dict) else None, proc.stderr
+        )
+        # Rows from a software adapter are the CPU's, which the runtime reports
+        # as a success; none of them is a GPU row.
+        software = software_adapter(adapters_of(proc.stderr))
+        if self.backend_flag == "gpu" and software is not None:
+            raise ToolPathError(software_adapter_refusal(software))
         return [ToolPathRow.read(position, row) for position, row in enumerate(rows)]
 
 
@@ -795,6 +807,12 @@ class ToolPathBackend:
             # Either mode showing no GPU work is enough: each built its own
             # engine, and the one that did not use the GPU produced rows too.
             "gpu_unused": any(gpu_unused(self.backend_flag, r) for r in self.device_reports),
+            # What established the GPU, from the first mode, when every mode's did.
+            "gpu_evidence": (
+                gpu_evidence(self.backend_flag, self.device_reports[0])
+                if self.backend_observed
+                else None
+            ),
             # From the modes whose report carries a reading of the bundle; with
             # none, why none did -- not "declares none", which is a claim.
             "bundle_activation": next(

@@ -762,6 +762,8 @@ class CannedEnv:
     fail_code: int = 3
     # Every spec the script was handed, so a test can see what reached it.
     specs: list[dict] = field(default_factory=list)
+    # What each mode's script writes to stderr, by mode; empty otherwise.
+    stderr_by_mode: dict[str, str] = field(default_factory=dict)
 
     def provision(self, events=None):
         return None
@@ -779,7 +781,7 @@ class CannedEnv:
         if mode in self.device_by_mode:
             written["device"] = self.device_by_mode[mode]
         Path(spec["out"]).write_text(json.dumps(written), encoding="utf-8")
-        return types.SimpleNamespace(returncode=0, stderr="")
+        return types.SimpleNamespace(returncode=0, stderr=self.stderr_by_mode.get(mode, ""))
 
 
 PARSE_REFUSED = "its call parser rejected the generation"
@@ -2165,3 +2167,61 @@ def test_the_gpu_tool_path_gets_no_thread_count(tmp_path, sme2_host):
     backend.generate(["make it red"])
     assert all("thread_count" not in s for s in env.specs)
     assert backend.describe()["cpu_threads"] is None
+
+
+_LLVMPIPE = (
+    "I0000 environment.cc:532] Selected adapter: llvmpipe (LLVM 15.0.7, 256 bits), "
+    "arch=software, vendor=mesa, backend=Vulkan, adapterType=CPU / Software"
+)
+_L4 = (
+    "I0000 environment.cc:532] Selected adapter: NVIDIA L4, arch=lovelace, vendor=nvidia, "
+    "backend=Vulkan, adapterType=Discrete GPU"
+)
+
+
+@pytest.mark.parametrize("mode", ["constrained", "unconstrained"])
+def test_a_tool_path_mode_on_a_software_adapter_scores_nothing(tmp_path, mode):
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        device_by_mode={"constrained": _WORKED, "unconstrained": _WORKED},
+        stderr_by_mode={mode: _LLVMPIPE},
+    )
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    out = backend.generate([r["prompt"] for r in rows_])
+    assert all("selected a software adapter, llvmpipe" in g.harness_error for g in out)
+
+
+def test_a_tool_path_on_linux_names_the_adapter_that_established_the_gpu(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    linux = {
+        "at_engine": {"platform": "linux", "looked": False},
+        "after_generation": {"platform": "linux", "looked": False},
+        "bundle_activation": "fp32",
+    }
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        device_by_mode={"constrained": dict(linux), "unconstrained": dict(linux)},
+        stderr_by_mode={"constrained": _L4, "unconstrained": _L4},
+    )
+    backend = ToolPathBackend(
+        model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
+    )
+    backend.generate([r["prompt"] for r in rows_])
+    described = backend.describe()
+    assert described[BACKEND_OBSERVED] is True
+    assert "NVIDIA L4" in described["gpu_evidence"]
+
+
+def test_a_cpu_tool_path_is_not_judged_by_an_adapter_line(tmp_path):
+    rows_ = labelled_rows(8)
+    env = CannedEnv(
+        by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)},
+        stderr_by_mode={"constrained": _LLVMPIPE, "unconstrained": _LLVMPIPE},
+    )
+    backend = ToolPathBackend(model=tmp_path / "m.litertlm", declarations=DECLS, env=env)
+    out = backend.generate([r["prompt"] for r in rows_])
+    assert not any(g.harness_error for g in out)

@@ -825,7 +825,8 @@ def _limit_gpu_reading(run: Any, engine: dict[str, Any]) -> None:
         # "A process", not "the": on the tool path each decoding mode runs in
         # its own, and one mode doing no GPU work is enough to say this.
         run.limitation(
-            "the GPU backend was asked for, and the kernel showed no GPU work from a process "
+            "the GPU backend was asked for, and the kernel (on Windows its GPU engine counters) "
+            "showed no GPU work from a process "
             "that generated this run's answers: by that reading the GPU was not used there, "
             "and not every number here is a GPU number"
         )
@@ -1679,9 +1680,10 @@ def run_verify(
         # Asked for the very executor the other caveat compares against: the
         # doubt is not which executor it predicts but whether it ran there.
         run.limitation(
-            f"{measured_on}, so this may not be a GPU number. litetune asks the kernel on "
-            "macOS only, and there only a reading that shows GPU work establishes it; "
-            "README.md's limitations section says what the reading is"
+            f"{measured_on}, so this may not be a GPU number. litetune reads GPU work from the "
+            "kernel on macOS and from the GPU engine counters on Windows, and on Linux takes "
+            "the hardware adapter the runtime names; only a reading that shows it establishes "
+            "the GPU, and README.md's limitations section says what each reading is"
         )
     elif not established or (engine.lower(), backend.lower()) != GPU_MEASURED:
         run.limitation(
@@ -1692,13 +1694,19 @@ def run_verify(
         )
     else:
         # Not dropped but replaced: what the caveat warned about is still true
-        # of every GPU but this one. The kernel's reading shows work on this
-        # host's GPU, through this runtime, with the activations litetune
-        # chose -- which predicts neither a phone's GPU, a different backend of
-        # the same runtime, nor an app that leaves the bundle's key to decide.
+        # of every GPU but this one. The reading shows work on this host's
+        # GPU, through this runtime, with the activations litetune chose --
+        # which predicts neither a phone's GPU, a different backend of the
+        # same runtime, nor an app that leaves the bundle's key to decide. The
+        # reading is said as the backend recorded it (`evaluate.gpu_evidence`).
+        evidence = candidate.engine.get("gpu_evidence")
+        if not isinstance(evidence, str) or not evidence:
+            evidence = (
+                "the kernel showed the candidate's process doing work on this host's GPU while "
+                "it generated"
+            )
         run.limitation(
-            f"{measured_on}: the kernel showed the candidate's process doing work on this "
-            "host's GPU while it generated. That is litert-lm's GPU backend here, with fp32 "
+            f"{measured_on}: {evidence}. That is litert-lm's GPU backend here, with fp32 "
             "activations passed by litetune; a phone's GPU is a different backend of the same "
             "runtime, and an app there gets the activations the bundle declares"
         )

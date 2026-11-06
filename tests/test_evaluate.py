@@ -2870,9 +2870,9 @@ def test_a_bool_in_a_report_is_not_gpu_time():
 
 
 def test_a_platform_nobody_observed_is_not_looked_at(monkeypatch):
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "platform", "freebsd14")
     report = _litertlm_script()["device_report"]()
-    assert report == _reading(looked=False, client=None, platform="linux")
+    assert report == _reading(looked=False, client=None, platform="freebsd14")
 
 
 def test_on_macos_the_kernel_is_asked_about_this_pid(monkeypatch):
@@ -4125,3 +4125,445 @@ def test_a_bundle_that_declares_greedy_is_sent_top_k_1(tmp_path, monkeypatch):
     )
     assert engines[0].runners[0].kwargs["sampler_config"] == ("SamplerConfig", GREEDY_SENT)
     assert json.loads(report.read_text())["sampler_sent"] == GREEDY_SENT
+
+
+# -- the adapter the runtime selected, and the GPU on Windows and Linux --------
+#
+# The three lines litert-lm 0.18.0 printed on 2026-11-06: an Intel Arc B390 on
+# Windows 11, an NVIDIA L4 on Ubuntu 22.04, and the same Ubuntu host without
+# NVIDIA's Vulkan driver, where the runtime used Mesa's llvmpipe and reported
+# success (measurements/2026-11-06-gpu-linux-windows).
+
+_ARC = (
+    "I0000 00:00:1793930400.978420   13428 environment.cc:532] Selected adapter: Intel(R) "
+    "Arc(TM) B390 GPU, arch=xe-3lpg, vendor=intel, backend=Direct3D 12, "
+    "adapterType=Integrated GPU"
+)
+_L4 = (
+    "I0000 00:00:1793934514.713555    3383 environment.cc:532] Selected adapter: NVIDIA L4, "
+    "arch=lovelace, vendor=nvidia, backend=Vulkan, adapterType=Discrete GPU"
+)
+_LLVMPIPE = (
+    "I0000 00:00:1793934412.006476    2858 environment.cc:532] Selected adapter: llvmpipe "
+    "(LLVM 15.0.7, 256 bits), arch=software, vendor=mesa, backend=Vulkan, "
+    "adapterType=CPU / Software"
+)
+
+
+def _stderr(*lines: str) -> str:
+    return "\n".join(["INFO: [environment.cc:36] Creating LiteRT environment", *lines, ""])
+
+
+def test_the_adapter_line_is_read_field_by_field_with_commas_in_the_name():
+    from litetune.evaluate import adapters_of
+
+    assert adapters_of(_stderr(_ARC, _LLVMPIPE)) == [
+        {
+            "name": "Intel(R) Arc(TM) B390 GPU",
+            "arch": "xe-3lpg",
+            "vendor": "intel",
+            "backend": "Direct3D 12",
+            "adapter_type": "Integrated GPU",
+        },
+        {
+            "name": "llvmpipe (LLVM 15.0.7, 256 bits)",
+            "arch": "software",
+            "vendor": "mesa",
+            "backend": "Vulkan",
+            "adapter_type": "CPU / Software",
+        },
+    ]
+    # Bytes as a pipe may hand them back, a Windows line ending, and the same
+    # adapter named twice (an image engine builds two environments): once.
+    assert adapters_of((_L4 + "\r\n" + _L4 + "\n").encode()) == [
+        {
+            "name": "NVIDIA L4",
+            "arch": "lovelace",
+            "vendor": "nvidia",
+            "backend": "Vulkan",
+            "adapter_type": "Discrete GPU",
+        }
+    ]
+    assert adapters_of(None) == [] and adapters_of("no adapter here") == []
+
+
+@pytest.mark.parametrize(
+    ("adapter", "software"),
+    [
+        (
+            {
+                "name": "llvmpipe (LLVM 15.0.7, 256 bits)",
+                "arch": "software",
+                "adapter_type": "CPU / Software",
+            },
+            True,
+        ),
+        # The type alone, the arch alone, and each named rasteriser alone.
+        ({"name": "Some Adapter", "arch": "x", "adapter_type": "CPU / Software"}, True),
+        ({"name": "Some Adapter", "arch": "software", "adapter_type": "Unknown"}, True),
+        ({"name": "llvmpipe", "adapter_type": "Unknown"}, True),
+        ({"name": "lavapipe", "adapter_type": "Unknown"}, True),
+        ({"name": "SwiftShader Device (Subzero)", "adapter_type": "Unknown"}, True),
+        ({"name": "Microsoft Basic Render Driver", "adapter_type": "Unknown"}, True),
+        ({"name": "WARP", "adapter_type": "Unknown"}, True),
+        ({"name": "NVIDIA L4", "arch": "lovelace", "adapter_type": "Discrete GPU"}, False),
+        (
+            {
+                "name": "Intel(R) Arc(TM) B390 GPU",
+                "arch": "xe-3lpg",
+                "adapter_type": "Integrated GPU",
+            },
+            False,
+        ),
+    ],
+)
+def test_a_software_adapter_is_told_from_a_gpu(adapter, software):
+    from litetune.evaluate import hardware_adapter, software_adapter
+
+    assert (software_adapter([adapter]) is not None) is software
+    assert (hardware_adapter([adapter]) is not None) is not software
+
+
+def test_one_software_adapter_among_gpus_leaves_no_hardware_adapter():
+    from litetune.evaluate import adapters_of, hardware_adapter, software_adapter
+
+    both = adapters_of(_stderr(_L4, _LLVMPIPE))
+    assert software_adapter(both)["name"].startswith("llvmpipe")
+    assert hardware_adapter(both) is None
+    assert hardware_adapter([]) is None and software_adapter("not a list") is None
+
+
+def test_the_software_refusal_names_the_adapter_and_on_linux_the_packages():
+    from litetune.evaluate import adapters_of, software_adapter_refusal
+
+    (adapter,) = adapters_of(_LLVMPIPE)
+    linux = software_adapter_refusal(adapter, platform="linux")
+    assert "llvmpipe (LLVM 15.0.7, 256 bits) (vendor mesa, Vulkan, CPU / Software)" in linux
+    assert "libnvidia-gl-<driver version>" in linux and "libegl1" in linux
+    windows = software_adapter_refusal(adapter, platform="win32")
+    assert "llvmpipe" in windows and "libegl1" not in windows
+
+
+@pytest.mark.parametrize(
+    ("platform", "read"),
+    [("darwin", True), ("win32", True), ("linux", True), ("freebsd14", False), ("cygwin", False)],
+)
+def test_the_gpu_is_read_on_three_platforms(platform, read):
+    from litetune.evaluate import gpu_read_here
+
+    assert gpu_read_here(platform) is read
+
+
+def _linux(adapters=None, ended=True):
+    reading = _reading(looked=False, client=None, platform="linux")
+    report = _run_report(reading, reading if ended else None)
+    if adapters is not None:
+        report["adapters"] = adapters
+    return report
+
+
+def test_on_linux_a_hardware_adapter_is_the_reading():
+    from litetune.evaluate import adapters_of, gpu_evidence
+
+    l4 = _linux(adapters_of(_L4))
+    assert gpu_observed("gpu", l4) is True and gpu_unused("gpu", l4) is False
+    assert gpu_evidence("gpu", l4) == (
+        "the runtime reported selecting a hardware adapter, NVIDIA L4 (vendor nvidia, Vulkan, "
+        "Discrete GPU)"
+    )
+    # No line: not observed and not unused -- nothing was established.
+    assert gpu_observed("gpu", _linux()) is False and gpu_unused("gpu", _linux()) is False
+    assert gpu_evidence("gpu", _linux()) is None
+    # A run killed before its second reading has not shown its work.
+    assert gpu_observed("gpu", _linux(adapters_of(_L4), ended=False)) is False
+    # Only on Linux: the same line beside a macOS reading that did not look.
+    darwin = {**_NOT_LOOKED, "adapters": adapters_of(_L4)}
+    darwin["after_generation"] = {**darwin["after_generation"], "platform": "darwin"}
+    assert gpu_observed("gpu", darwin) is False
+    assert gpu_observed("cpu", l4) is False
+
+
+def test_a_software_adapter_is_unused_gpu_even_beside_kernel_work():
+    from litetune.evaluate import adapters_of, gpu_evidence
+
+    linux = _linux(adapters_of(_LLVMPIPE))
+    assert gpu_observed("gpu", linux) is False and gpu_unused("gpu", linux) is True
+    darwin = {**_WORKED, "adapters": adapters_of(_stderr(_ARC, _LLVMPIPE))}
+    assert gpu_observed("gpu", darwin) is False and gpu_unused("gpu", darwin) is True
+    assert gpu_evidence("gpu", darwin) is None
+    assert gpu_evidence("gpu", _WORKED) == (
+        "the kernel showed the process's GPU client doing work while it ran"
+    )
+
+
+# Win32_PerfRawData_GPUPerformanceCounters_GPUEngine as the query hands it
+# back: every process's instances, RunningTime as a string.
+def _engines(pid, times, others=True):
+    rows = [
+        {"n": f"pid_{pid}_luid_0x00000000_0x0000A62B_phys_0_eng_{i}_engtype_3D", "t": str(t)}
+        for i, t in enumerate(times)
+    ]
+    if others:
+        rows.insert(
+            0, {"n": "pid_4_luid_0x00000000_0x0000A62B_phys_0_eng_0_engtype_3D", "t": "999999"}
+        )
+        rows.append({"n": f"pid_{pid}0_luid_0x0_0x1_phys_0_eng_0_engtype_3D", "t": "77"})
+    return rows
+
+
+def _windows(monkeypatch, *answers):
+    """`subprocess.run` answering the counter query with each of `answers` in turn."""
+    seen, queue = [], list(answers)
+
+    def fake_run(argv, **kwargs):
+        seen.append(argv)
+        answer = queue.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        if isinstance(answer, subprocess.CompletedProcess):
+            return answer
+        return subprocess.CompletedProcess(argv, 0, json.dumps(answer).encode(), b"")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("SystemRoot", "C:/Windows")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return seen
+
+
+def test_on_windows_this_pids_gpu_engine_counters_are_read(monkeypatch):
+    pid = os.getpid()
+    seen = _windows(monkeypatch, _engines(pid, [60343, 0]))
+    script = _litertlm_script()
+    report = script["device_report"]()
+
+    (argv,) = seen
+    assert argv[0] == os.path.join(
+        "C:/Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+    )
+    assert argv[1:4] == ["-NoProfile", "-NonInteractive", "-Command"]
+    assert argv[4] == script["WINDOWS_GPU_QUERY"]
+    assert "Win32_PerfRawData_GPUPerformanceCounters_GPUEngine" in argv[4]
+    assert report["looked"] is True
+    assert report["gpu_client"] == f"pid_{pid}_luid_0x00000000_0x0000A62B_phys_0_eng_0_engtype_3D"
+    # Another pid, and a pid this one is a prefix of, are not this process's.
+    assert report["gpu_clients"] == {
+        "luid_0x00000000_0x0000A62B_phys_0_eng_0_engtype_3D": 60343,
+        "luid_0x00000000_0x0000A62B_phys_0_eng_1_engtype_3D": 0,
+    }
+    assert report["gpu_time"] == 60343
+
+
+def test_on_windows_growth_is_work_and_no_instance_is_no_gpu(monkeypatch):
+    pid = os.getpid()
+    _windows(monkeypatch, _engines(pid, [60343]), _engines(pid, [30493406]))
+    device = _litertlm_script()["device_report"]
+    worked = _run_report(device(), device())
+    assert gpu_observed("gpu", worked) is True
+    from litetune.evaluate import gpu_evidence
+
+    assert "GPU engine counters" in gpu_evidence("gpu", worked)
+    # A CPU engine's process: other processes' instances, none of its own.
+    _windows(monkeypatch, _engines(pid, []), _engines(pid, []))
+    idle = _run_report(device(), device())
+    assert gpu_unused("gpu", idle) is True and gpu_observed("gpu", idle) is False
+    # Instances, time that did not grow.
+    _windows(monkeypatch, _engines(pid, [500]), _engines(pid, [500]))
+    assert gpu_unused("gpu", _run_report(device(), device())) is True
+
+
+def test_one_counter_instance_comes_back_as_an_object_and_is_still_read(monkeypatch):
+    pid = os.getpid()
+    (row,) = _engines(pid, [12], others=False)
+    _windows(monkeypatch, row)
+    report = _litertlm_script()["device_report"]()
+    assert report["looked"] is True and report["gpu_time"] == 12
+
+
+@pytest.mark.parametrize(
+    ("answer", "said"),
+    [
+        ([], "no GPU engine counter of any process"),
+        (subprocess.CompletedProcess(["ps"], 1, b"", b"Get-CimInstance: denied"), "denied"),
+        (subprocess.CompletedProcess(["ps"], 0, b"not json", b""), "JSONDecodeError"),
+        (FileNotFoundError("no powershell"), "FileNotFoundError"),
+        (subprocess.TimeoutExpired(cmd="powershell", timeout=60), "TimeoutExpired"),
+    ],
+)
+def test_a_counter_query_that_fails_did_not_look_and_never_ends_the_run(monkeypatch, answer, said):
+    """Read as looked-and-found-none, any of these would say the GPU was not used."""
+    _windows(monkeypatch, answer)
+    report = _litertlm_script()["device_report"]()
+    assert report["looked"] is False
+    assert said in report["error"]
+
+
+def test_a_counter_time_that_is_not_an_integer_is_unread():
+    engines_of = _litertlm_script()["gpu_engines_of"]
+    rows = [
+        {"n": "pid_7_a", "t": True},
+        {"n": "pid_7_b", "t": "n/a"},
+        {"n": "pid_7_c", "t": None},
+        {"n": "pid_7_d", "t": 5},
+        "not a row",
+        {"n": 7, "t": "1"},
+    ]
+    assert engines_of(rows, 7) == ("pid_7_a", {"a": None, "b": None, "c": None, "d": 5})
+
+
+def _linux_smi(monkeypatch, answer, which="/usr/bin/nvidia-smi"):
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(argv)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    import shutil
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(shutil, "which", lambda name: which if name == "nvidia-smi" else None)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return seen
+
+
+def test_on_linux_nvidia_smi_is_recorded_and_the_kernel_is_not_asked(monkeypatch):
+    pid = os.getpid()
+    listing = f"12, 100\n{pid}, 3105\n".encode()
+    seen = _linux_smi(monkeypatch, subprocess.CompletedProcess(["smi"], 0, listing, b""))
+    report = _litertlm_script()["device_report"]()
+    assert seen == [
+        [
+            "/usr/bin/nvidia-smi",
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ]
+    ]
+    assert report["looked"] is False
+    assert report["nvidia_smi"] == {"listed": True, "used_memory_mib": 3105}
+    # Recorded only: listed or not, the reading decides nothing.
+    assert gpu_observed("gpu", _run_report(report, report)) is False
+
+
+@pytest.mark.parametrize(
+    ("answer", "which", "recorded"),
+    [
+        (
+            subprocess.CompletedProcess(["smi"], 0, b"12, 100\n", b""),
+            "/usr/bin/nvidia-smi",
+            {"listed": False, "used_memory_mib": None},
+        ),
+        (
+            subprocess.CompletedProcess(["smi"], 9, b"No devices were found", b""),
+            "/usr/bin/nvidia-smi",
+            {"error": "nvidia-smi exited 9: No devices were found"},
+        ),
+        (OSError("gone"), "/usr/bin/nvidia-smi", {"error": "OSError: gone"}),
+        (None, None, None),
+    ],
+)
+def test_nvidia_smi_that_lists_nothing_or_fails_is_recorded_as_such(
+    monkeypatch, answer, which, recorded
+):
+    _linux_smi(monkeypatch, answer, which=which)
+    assert _litertlm_script()["device_report"]()["nvidia_smi"] == recorded
+
+
+def _gpu_split(stderr, device=None, preflight_stderr=None, calls=None):
+    """`StageEnv.run` for a GPU split: the one-prompt preflight, then the split."""
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        if calls is not None:
+            calls.append(len(spec["prompts"]))
+        rows = [{"index": i, "text": "a"} for i in range(len(spec["prompts"]))]
+        Path(spec["out"]).write_text("".join(json.dumps(r) + "\n" for r in rows))
+        if "report" not in spec:
+            return subprocess.CompletedProcess(args, 0, "", preflight_stderr or "")
+        if device is not None:
+            Path(spec["report"]).write_text(json.dumps(device), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, "", stderr)
+
+    return fake_run
+
+
+def test_a_gpu_split_on_a_software_adapter_is_a_harness_failure_on_every_row(monkeypatch, tmp_path):
+    """The runtime answers on llvmpipe and reports success; the answers are the CPU's."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(envs.StageEnv, "run", _gpu_split(_stderr(_LLVMPIPE), _linux()))
+    backend = _litertlm(tmp_path, backend_flag="gpu")
+    out = backend.generate(["one"])
+
+    assert [g.text for g in out] == [""]
+    assert "selected a software adapter, llvmpipe" in out[0].harness_error
+    assert "libegl1" in out[0].harness_error
+    described = backend.describe()
+    assert described["adapters"][0]["adapter_type"] == "CPU / Software"
+    assert described[BACKEND_OBSERVED] is False and described["gpu_unused"] is True
+
+
+def test_the_preflight_stops_a_split_on_a_software_adapter(monkeypatch, tmp_path):
+    calls: list[int] = []
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _gpu_split(_stderr(_L4), _linux(), preflight_stderr=_stderr(_LLVMPIPE), calls=calls),
+    )
+    out = _litertlm(tmp_path, backend_flag="gpu").generate(["one", "two"])
+
+    assert calls == [1]
+    assert all("software adapter, llvmpipe" in g.harness_error for g in out)
+
+
+def test_a_preflight_that_times_out_on_a_software_adapter_says_which(monkeypatch, tmp_path):
+    def slow(self, args, timeout=3600, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout, stderr=_stderr(_LLVMPIPE))
+
+    monkeypatch.setattr(envs.StageEnv, "run", slow)
+    out = _litertlm(tmp_path, backend_flag="gpu").generate(["one", "two"])
+    assert all("software adapter, llvmpipe" in g.harness_error for g in out)
+
+
+def test_a_split_killed_on_a_software_adapter_scores_no_row(monkeypatch, tmp_path):
+    def killed(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        Path(spec["out"]).write_text(json.dumps({"index": 0, "text": "a"}) + "\n")
+        if "report" not in spec:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout, stderr=_stderr(_LLVMPIPE))
+
+    monkeypatch.setattr(envs.StageEnv, "run", killed)
+    out = _litertlm(tmp_path, backend_flag="gpu").generate(["one", "two"])
+    assert [g.text for g in out] == ["", ""]
+    assert all("software adapter, llvmpipe" in g.harness_error for g in out)
+
+
+def test_a_cpu_run_is_not_judged_by_an_adapter_line(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        envs.StageEnv,
+        "run",
+        _writes_results([{"index": 0, "text": "a"}], stderr=_stderr(_LLVMPIPE)),
+    )
+    (out,) = _litertlm(tmp_path, backend_flag="cpu").generate(["one"])
+    assert out.text == "a" and out.harness_error is None
+
+
+def test_a_gpu_split_on_linux_with_a_hardware_adapter_is_observed(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(envs.StageEnv, "run", _gpu_split(_stderr(_L4), _linux()))
+    backend = _litertlm(tmp_path, backend_flag="gpu")
+    (out,) = backend.generate(["one"])
+
+    assert out.text == "a" and out.harness_error is None
+    described = backend.describe()
+    assert described[BACKEND_OBSERVED] is True
+    assert "NVIDIA L4" in described["gpu_evidence"]
+    assert described["adapters"] == [
+        {
+            "name": "NVIDIA L4",
+            "arch": "lovelace",
+            "vendor": "nvidia",
+            "backend": "Vulkan",
+            "adapter_type": "Discrete GPU",
+        }
+    ]
