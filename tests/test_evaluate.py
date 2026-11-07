@@ -4099,6 +4099,7 @@ def test_pictures_reach_the_engine_and_each_conversation(tmp_path, monkeypatch, 
         path = tmp_path / f"{name}.jpg"
         path.write_bytes(name.encode())
         pictures.append({"path": str(path), "sha256": hashlib.sha256(name.encode()).hexdigest()})
+    monkeypatch.setitem(_litertlm_script(), "bundle_vision_constraints", lambda path: {})
     rows, engines = _run_script(
         tmp_path,
         ["one", "two"],
@@ -4111,6 +4112,54 @@ def test_pictures_reach_the_engine_and_each_conversation(tmp_path, monkeypatch, 
     messages = [m for e in engines for r in e.runners for m in r.messages]
     assert [m["content"][0]["type"] for m in messages] == ["image", "image"]
     assert [m["content"][1]["text"] for m in messages] == ["one", "two"]
+
+
+def test_a_cpu_constrained_picture_bundle_requests_cpu_vision_and_records_the_sections(
+    tmp_path, monkeypatch
+):
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"a")
+    report = tmp_path / "report.json"
+    monkeypatch.setitem(
+        _litertlm_script(),
+        "bundle_vision_constraints",
+        lambda path: {"vision_encoder": "cpu", "vision_adapter": "cpu"},
+    )
+    _, engines = _run_script(
+        tmp_path,
+        ["one"],
+        monkeypatch=monkeypatch,
+        report=report,
+        extra={
+            "backend": "gpu",
+            "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+            "vision_backend": "gpu",
+        },
+    )
+    assert engines[0].kwargs["vision_backend"].name == "cpu"
+    recorded = json.loads(report.read_text())
+    assert recorded["vision_backend"] == "cpu"
+    assert recorded["vision_backend_constraints"] == {
+        "vision_encoder": "cpu",
+        "vision_adapter": "cpu",
+    }
+
+
+def test_an_unconstrained_gpu_picture_bundle_requests_gpu_vision(tmp_path, monkeypatch):
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"a")
+    monkeypatch.setitem(_litertlm_script(), "bundle_vision_constraints", lambda path: {})
+    _, engines = _run_script(
+        tmp_path,
+        ["one"],
+        monkeypatch=monkeypatch,
+        extra={
+            "backend": "gpu",
+            "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+            "vision_backend": "gpu",
+        },
+    )
+    assert engines[0].kwargs["vision_backend"].name == "gpu"
 
 
 def test_a_bundle_that_declares_greedy_is_sent_top_k_1(tmp_path, monkeypatch):

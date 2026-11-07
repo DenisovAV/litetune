@@ -990,12 +990,14 @@ text to measure.
   the CPU, with the checkpoint's own processor at the tuned budget) and with
   the file (LiteRT-LM's `EmbeddingEngine`, each picture given as its bytes),
   and with `--with-base` with Google's 440m file. With `--backend gpu`, on
-  macOS, Windows and Linux as for text, the text tower runs on the GPU and the vision encoder
-  on the CPU, where flutter_edge_ai_litertlm 1.19.0 puts it. It refuses a picture
+  macOS, Windows and Linux as for text, litetune requests the GPU for both the
+  text tower and vision encoder. litetune has not yet run this verify path with
+  vision on the GPU; an outside harness ran this file's vision on Intel GPUs
+  ([MEASUREMENTS.md](MEASUREMENTS.md#the-same-fine-tune-on-intel-panther-lake-and-lunar-lake)). It refuses a picture
   in both splits, a reference whose soft tokens for a picture differ from the
   count `tune` recorded (the engine reports none, so the file's count is not
   compared), and a `convert.json` that records another budget. LiteRT-LM
-  0.18.0 sets no thread count for the vision encoder, so the
+  On the CPU, LiteRT-LM 0.18.0 sets no thread count for the vision encoder, so the
   file and Google's are embedded one after the other, and on a Mac whose CPU
   has SME2, where litetune holds LiteRT-LM to one thread, the file is embedded
   twice and a difference between the two runs fails the harness. The gate is
@@ -1033,8 +1035,10 @@ What has and has not been measured
   ±0.016 to ±0.023 at 300 held-out rows, wider than the 0.01 threshold. Their
   gain over Google's file, +0.1113 (int8) and +0.1180 (int4), was resolved in
   every draw. This was litetune's first int4 image file.
-- The same int8 file on a Mac's CPU and GPU and on Windows' CPU, and its
-  SM8750 file on a Galaxy S25 Ultra's NPU, are measured there too.
+- The same int8 file with its text tower on a Mac's GPU and vision encoder on
+  the CPU, and on the Mac's and Windows' CPUs, plus its SM8750 file on a Galaxy
+  S25 Ultra's NPU, are measured there too. Those GPU results do not measure the
+  new both-towers-on-GPU verify path.
 - Not measured: 140 vision tokens, `--mirror`, and the app's CPU path through
   flutter_edge_ai on the spliced file.
 
@@ -1211,11 +1215,20 @@ litetune verify --model conv/dynamic_wi8_afp32/model.litertlm --reference run/mo
 - **convert** exports the tuned checkpoint with its vision encoder (litert-torch's
   `image_text_to_text` task, 280 soft tokens, `max_num_patches` 2520) in the
   `export-vision` environment (`export` plus `torchvision==0.29.2`), reads the bundle
-  back for its vision sections, image markers, budget and template, and constrains
-  the vision encoder and adapter to the CPU, the only vision backend measured.
+  back for its vision sections, image markers, budget, template and any backend
+  constraints. It adds no constraint to the vision encoder or adapter. Google's
+  own E2B bundle at `b3ca0d2f` constrains its vision adapter to the CPU; litetune
+  does not copy that constraint.
 - **verify** gives the reference each picture through the checkpoint's processor and
   the same template, and the candidate the picture's bytes in the message shape the
-  app sends, on a CPU vision backend. `--backend gpu` is refused for picture rows.
+  app sends. Its candidate vision backend follows `--backend`; if the bundle itself
+  constrains a vision section to the CPU (including picture bundles converted by
+  litetune 0.8.0), verify requests CPU vision and records the constraining sections.
+  GPU picture verification uses the same platform observation and software-adapter
+  refusal rules as GPU text verification. On the beans bundle, CPU text and vision
+  scored 0.8867; GPU text with CPU vision and GPU text with GPU vision both scored
+  0.8800 on 300 held-out pictures on an NVIDIA A100 under Linux with LiteRT-LM 0.18.0
+  (MEASUREMENTS.md, Gemma 4 E2B tuned on pictures: beans).
 
 The bundle keeps the sampler the exporter writes, TOP_P with top_k 64 and
 temperature 1.0, as litetune's text bundles get the Gemma 4 family default from

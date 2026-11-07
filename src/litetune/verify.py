@@ -656,6 +656,7 @@ class PictureInputs:
     template: str
     vision_tokens: int
     template_sha256: str
+    candidate_vision_backend: str = "cpu"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -663,7 +664,7 @@ class PictureInputs:
             "distinct": len({i["sha256"] for i in self.images}),
             "vision_tokens": self.vision_tokens,
             "template_sha256": self.template_sha256,
-            "candidate_vision_backend": "cpu",
+            "candidate_vision_backend": self.candidate_vision_backend,
             "reference_environment": envs.TRAIN_VISION.name,
         }
 
@@ -673,8 +674,9 @@ PICTURES_CHECK = "rows with a picture can be compared"
 PICTURES_COMPARED = (
     "the held-out rows carry pictures. The reference reads each through the checkpoint's own "
     "processor at {tokens} soft tokens and the bundle's template; the candidate is sent the "
-    "picture's bytes and decodes and resizes it with the runtime's own image preprocessor, on a "
-    "CPU vision backend; the sampler it decodes with is said where decoding is. The "
+    "picture's bytes and decodes and resizes it with the runtime's own image preprocessor; the "
+    "vision backend actually requested is recorded with the candidate, and the sampler it "
+    "decodes with is said where decoding is. The "
     "two sides do not decode and resize a picture with the same code, so "
     "a difference here holds that as well as the conversion. The rendering check compares the "
     "text around each picture's placeholder as token ids; how many soft tokens the runtime "
@@ -749,12 +751,6 @@ def _picture_inputs(
             "litetune.json names the processor and the template they were trained through"
             f"{model_dir_hint(request.reference)}"
         )
-    if request.backend != "cpu":
-        return refused(
-            f"the held-out rows carry pictures, and --backend {request.backend} was asked. "
-            "litetune measures a bundle on pictures on the CPU, text and vision both; drop "
-            "--backend"
-        )
     if request.declarations is not None:
         return refused(
             "the held-out rows carry pictures, and declarations were given. litetune trains Gemma "
@@ -790,6 +786,7 @@ def _picture_inputs(
         template=template,
         vision_tokens=int(record["vision_tokens"]),
         template_sha256=str(record["template_sha256"]),
+        candidate_vision_backend=request.backend,
     )
 
 
@@ -1609,6 +1606,24 @@ def run_verify(
         run.record(sink[0])
         return run.finish(Status.FAILED_HARNESS)
     run.manifest["measurements"]["candidate"] = candidate.as_dict()
+    if pictures is not None:
+        actual_vision = candidate.engine.get("vision_backend")
+        constraints = candidate.engine.get("vision_backend_constraints")
+        if isinstance(actual_vision, str):
+            run.manifest["harness"]["pictures"]["candidate_vision_backend"] = actual_vision
+        run.manifest["harness"]["pictures"]["vision_backend_constraints"] = constraints
+        if (
+            candidate.engine.get("backend") == "gpu"
+            and actual_vision == "cpu"
+            and isinstance(constraints, Mapping)
+            and constraints
+        ):
+            sections = ", ".join(sorted(str(section) for section in constraints))
+            run.limitation(
+                f"the GPU backend was asked for, but the bundle constrains {sections} to the "
+                "CPU, so the candidate Engine was given a CPU vision backend; the constraints "
+                "are recorded from the bundle"
+            )
     # The terminator vocabulary is `metrics.TERMINATORS`, recorded at
     # harness.terminators. A count here moves only for a marker the vocabulary
     # lists but the runtime did not consume. On a litert-lm candidate it has
@@ -1718,14 +1733,17 @@ def run_verify(
         _limit_gpu_reading(run, candidate.engine)
     _limit_runtime_named(run, candidate.engine)
     _limit_cpu_threads(run, pair.candidate)
-    if pictures is not None:
+    if pictures is not None and candidate.engine.get("vision_backend") == "cpu":
         threads = candidate.engine.get("cpu_threads") or {}
         used = threads.get("threads") if isinstance(threads, Mapping) else None
-        run.limitation(
-            PICTURE_THREADS.format(
-                text=f"was given {used} thread(s)" if used else "ran on the default count too"
-            )
+        text = (
+            "ran on the GPU"
+            if candidate.engine.get("backend") == "gpu"
+            else f"was given {used} thread(s)"
+            if used
+            else "ran on the default count too"
         )
+        run.limitation(PICTURE_THREADS.format(text=text))
 
     # Check 5 (divergence) is deferred: the caller decides whether it applies,
     # and generating the reference before the candidate is known alive would pay

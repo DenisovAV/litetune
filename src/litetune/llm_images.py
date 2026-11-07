@@ -26,8 +26,9 @@ vision encoder (`EXPORT_FLAGS`), in `envs.EXPORT_VISION`, and reads the bundle
 back: it must carry `VISION_SECTIONS`, `MAX_NUM_PATCHES`, and the template.
 
 **`verify`** gives the reference the picture through the processor and the
-same template, and the runtime the picture's bytes in the app's message shape
-with a CPU vision backend.
+same template, and the runtime the picture's bytes in the app's message shape.
+The candidate's vision backend is its requested text backend unless the bundle
+constrains a vision section to the CPU.
 """
 
 from __future__ import annotations
@@ -122,11 +123,11 @@ EXPORT_FLAGS = (
     f"--gemma4_vision_max_soft_tokens={VISION_TOKENS}",
 )
 
-# `backend_constraint` on the sections a picture runs through: the CPU, the one
-# vision backend litetune has measured them on. Google's E2B bundle at b3ca0d2f
-# constrains its vision adapter so (its unpacked TOML); litert-torch writes none,
-# and the bundle then offers its vision sections to the GPU as well.
-VISION_CONSTRAINTS = {"vision_encoder": "cpu", "vision_adapter": "cpu"}
+# `convert` adds no `backend_constraint` to the sections a picture runs
+# through. Google's E2B bundle at b3ca0d2f constrains its vision adapter to the
+# CPU (its unpacked TOML); litetune does not copy that constraint. litert-torch
+# writes none, and the bundle then offers its vision sections to the GPU too.
+VISION_CONSTRAINTS: dict[str, str] = {}
 
 # The sampler a bundle declares is the exporter's, for text and pictures alike.
 # litert-torch writes none for `text_generation`, whose `do_sample` it turns off

@@ -2046,6 +2046,7 @@ def vision_in(doc, meta):
         section_type_of(s): s.get("backend_constraint")
         for s in doc.get("section", [])
         if section_type_of(s) in ("vision_encoder", "vision_adapter")
+        and s.get("backend_constraint") is not None
     }
     gemma4 = None
     if has(meta, "llm_model_type") and has(meta.llm_model_type, "gemma4"):
@@ -2543,12 +2544,6 @@ def _vision_carried(
             f"start and end of image, where the processor puts {llm_images.START_OF_IMAGE!r} and "
             f"{llm_images.END_OF_IMAGE!r} around a picture"
         )
-    elif constraints != dict(llm_images.VISION_CONSTRAINTS):
-        problem = (
-            f"constrains its vision sections to {constraints}, where convert writes "
-            f"{dict(llm_images.VISION_CONSTRAINTS)}: the CPU is the one vision backend litetune "
-            "has measured them on"
-        )
     elif facts["max_num_patches"] != llm_images.MAX_NUM_PATCHES:
         problem = (
             f"sets max_num_patches {facts['max_num_patches']!r}, where the pictures were trained "
@@ -2923,8 +2918,9 @@ def export_recipe(
         request.env,
         timeout=min(REPACK_TIMEOUT_S, remaining),
         read_template=True,
-        # A bundle that takes pictures: its vision encoder and adapter on the
-        # CPU, the one vision backend litetune has verified them on.
+        # A picture bundle keeps the vision constraints the exporter wrote.
+        # In particular, litetune does not copy the CPU adapter constraint from
+        # Google's E2B bundle at llm_images.TEMPLATE_REVISION.
         constraints=llm_images.VISION_CONSTRAINTS if request.images is not None else None,
     )
     gpu_activation, gpu_note = repack.declared, repack.note
@@ -2972,9 +2968,8 @@ def export_recipe(
             f"{artifact.name}: {artifact_bytes:,} bytes in {seconds:.1f}s exported on cpu; "
             f"{gpu_text}"
             + (
-                f"; takes pictures at {vision['vision_tokens']} soft tokens, its vision encoder "
-                "and adapter constrained to the CPU, the one vision backend litetune has "
-                "measured"
+                f"; takes pictures at {vision['vision_tokens']} soft tokens; vision section "
+                f"constraints: {vision['backend_constraints'] or 'none'}"
                 + (
                     "; " + llm_images.sampler_note(vision["sampler"])
                     if vision["sampler"] is not None

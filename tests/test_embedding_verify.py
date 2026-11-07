@@ -1030,7 +1030,7 @@ class FakeEmbedEnvs:
                 report["device"] = self.gpu_device_for.get(name, default)
             if "images" in spec:
                 # IMAGE_ENGINE_SCRIPT's vision encoder, on either backend.
-                report["vision_backend"] = "cpu"
+                report["vision_backend"] = spec.get("backend", "cpu")
             report |= {
                 "runtime": {"litert-lm": "0.18.0"},
                 "cpu": {"model": "fake", "count": 4},
@@ -2986,9 +2986,7 @@ def test_an_untied_image_file_is_still_measured_at_the_records_vision_tokens(fak
     assert any("not tied to the reference" in t for t in m["limitations"])
 
 
-def test_an_image_checkpoint_on_the_gpu_puts_the_text_tower_there_and_vision_on_the_cpu(
-    fake, tmp_path, on_macos
-):
+def test_an_image_checkpoint_on_the_gpu_puts_text_and_vision_there(fake, tmp_path, on_macos):
     local = tmp_path / "vision.litertlm"
     local.write_bytes(VISION_STAND_IN)
     result = _verify(_image_setup(tmp_path, fake), backend="gpu", threads=4, base_litertlm=local)
@@ -3006,11 +3004,11 @@ def test_an_image_checkpoint_on_the_gpu_puts_the_text_tower_there_and_vision_on_
     (launch,) = fake.launches
     assert launch["parallel"] is False and launch["stop_on"] == ["candidate"]
     embedding = m["embedding"]
-    assert embedding["vision_backend"] == "cpu" and embedding["candidate_repeated"] is False
+    assert embedding["vision_backend"] == "gpu" and embedding["candidate_repeated"] is False
     assert embedding["engine_threads"] is None
     engine = m["measurements"]["candidate"]["engine"]
     assert engine["backend"] == "gpu" and engine["backend_observed"] is True
-    assert engine["vision_backend"] == "cpu"
+    assert engine["vision_backend"] == "gpu"
     assert engine["threads"] is None and engine["device"] == GPU_WORKED
     gain = m["quality"]["gain_over_base"]
     assert gain["base_backend"] == "gpu" and gain["base_backend_observed"] is True
@@ -3024,7 +3022,6 @@ def test_an_image_checkpoint_on_the_gpu_puts_the_text_tower_there_and_vision_on_
     assert "the CPU and the NPU are not measured" not in limitations
     assert "CPU backend of LiteRT-LM's EmbeddingEngine, " not in limitations
     assert "applied to the text tower alone" not in limitations
-    assert embedding_verify.REPEATED_GPU not in m["limitations"]
 
 
 def test_a_text_checkpoint_on_the_gpu_keeps_its_own_words(fake, tmp_path, on_macos):
@@ -3066,48 +3063,33 @@ def test_an_image_gpu_run_the_kernel_shows_idle_is_refused(fake, tmp_path, on_ma
     assert failed["name"] == CANDIDATE_CHECK and "did no GPU work" in failed["detail"]
 
 
-def test_on_a_cpu_with_sme2_an_image_gpu_run_embeds_the_candidate_twice(
+def test_on_a_cpu_with_sme2_an_image_gpu_run_does_not_apply_the_cpu_repeat_rule(
     fake, tmp_path, on_macos, sme2_host
 ):
-    """The vision encoder is on the CPU beside a GPU text tower, at threads
-    nobody sets, so such a CPU is held to the CPU run's rule."""
+    """Both towers are on the GPU, so the host CPU does not trigger a repeat."""
     local = tmp_path / "vision.litertlm"
     local.write_bytes(VISION_STAND_IN)
     result = _verify(_image_setup(tmp_path, fake), backend="gpu", threads=4, base_litertlm=local)
     m = result.manifest
     assert result.status is Status.PASSED, m["checks"]
-    assert [r[0] for r in fake.runs] == [
-        "reference",
-        "candidate",
-        "candidate-repeat",
-        "base",
-        "evaluate",
-    ]
-    assert fake.specs["candidate-repeat"]["backend"] == "gpu"
-    assert fake.specs["candidate-repeat"]["threads"] is None
+    assert [r[0] for r in fake.runs] == ["reference", "candidate", "base", "evaluate"]
     (launch,) = fake.launches
-    assert launch["parallel"] is False and launch["stop_on"] == ["candidate", "candidate-repeat"]
-    assert m["embedding"]["candidate_repeated"] is True
+    assert launch["parallel"] is False and launch["stop_on"] == ["candidate"]
+    assert m["embedding"]["candidate_repeated"] is False
     # The GPU takes no thread count, SME2 or not.
     assert m["embedding"]["engine_threads"] is None
     assert m["embedding"]["engine_threads_reason"] is None
-    assert embedding_verify.REPEATED_GPU in m["limitations"]
     assert embedding_verify.REPEATED not in m["limitations"]
     assert "candidate-repeat" not in fake.specs["evaluate"]["vectors"]
 
 
-def test_an_image_gpu_second_run_that_differs_is_a_harness_failure(
+def test_an_image_gpu_run_does_not_start_a_cpu_repeatability_run(
     fake, tmp_path, on_macos, sme2_host
 ):
     fake.repeat = "random"
     result = _verify(_image_setup(tmp_path, fake), backend="gpu")
-    assert result.status is Status.FAILED_HARNESS
-    (failed,) = _failed(result.manifest)
-    assert failed["name"] == CANDIDATE_CHECK
-    assert failed["detail"] == embedding_verify.NOT_REPEATABLE_GPU.format(
-        differ="candidate.npy and candidate-repeat.npy differ"
-    )
-    assert "evaluate" not in [r[0] for r in fake.runs]
+    assert result.status is Status.PASSED
+    assert "candidate-repeat" not in [r[0] for r in fake.runs]
 
 
 def test_an_image_checkpoint_with_a_text_prefix_is_refused(fake, tmp_path):
@@ -3379,7 +3361,7 @@ def _image_engine_main(
     return code, json.loads((tmp_path / "report.json").read_text()), calls
 
 
-def test_the_image_engine_script_on_the_gpu_keeps_the_vision_encoder_on_the_cpu(
+def test_the_image_engine_script_on_the_gpu_puts_the_vision_encoder_on_the_gpu(
     tmp_path, monkeypatch
 ):
     paths, digests = _pictures(tmp_path)
@@ -3387,11 +3369,11 @@ def test_the_image_engine_script_on_the_gpu_keeps_the_vision_encoder_on_the_cpu(
         tmp_path, monkeypatch, [[3.0, 4.0], [0.0, 2.0]], paths, digests, backend="gpu"
     )
     assert code == 0
-    # The text engine script's GPU backend, and the CPU for the vision encoder.
+    # The text and vision towers get the requested GPU backend.
     assert calls["engine"][0]["backend"] == ("gpu", None)
-    assert calls["vision"] == [{"vision_backend": ("cpu", None), "vision_tokens_per_image": 140}]
+    assert calls["vision"] == [{"vision_backend": ("gpu", None), "vision_tokens_per_image": 140}]
     assert [c.bytes for c in calls["texts"]] == list(PICTURES)
-    assert report["backend"] == "gpu" and report["vision_backend"] == "cpu"
+    assert report["backend"] == "gpu" and report["vision_backend"] == "gpu"
     assert report["threads"] is None and report["vision_threads"] is None
     assert report["device"] == {
         "at_engine": {"reading": "at engine"},

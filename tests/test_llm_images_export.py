@@ -114,7 +114,7 @@ def test_a_picture_checkpoint_exports_its_vision_encoder_from_its_template(tmp_p
         "start_of_image_token": "<|image>",
         "end_of_image_token": "<image|>",
         "sampler": {"type": "GREEDY", "k": 1, "p": 0.95, "temperature": 1.0},
-        "backend_constraints": {"vision_encoder": "cpu", "vision_adapter": "cpu"},
+        "backend_constraints": {},
         "template_sha256": hashlib.sha256(TEMPLATE.encode()).hexdigest(),
     }
     assert "takes pictures at 280 soft tokens" in export.check.detail
@@ -214,21 +214,19 @@ def test_a_bundle_naming_other_image_markers_is_refused(tmp_path, vision_bundle)
     assert "names '<start_of_image>' and '<image|>'" in detail
 
 
-def test_the_vision_sections_are_constrained_to_the_cpu(tmp_path, vision_bundle):
+def test_convert_writes_no_vision_section_constraint(tmp_path, vision_bundle):
     (export,) = run_export(_request(tmp_path, _checkpoint(tmp_path))).exports
     assert export.ok, export.check.detail
     # Read back from the rebuilt bundle, which the fake builder packs from the TOML.
-    assert export.vision["backend_constraints"] == {
-        "vision_encoder": "cpu",
-        "vision_adapter": "cpu",
-    }
-    assert "constrained to the CPU" in export.check.detail
+    assert export.vision["backend_constraints"] == {}
+    assert "vision section constraints: none" in export.check.detail
 
 
-def test_a_bundle_whose_vision_sections_were_left_unconstrained_is_refused(tmp_path, vision_bundle):
+def test_an_unconstrained_bundle_is_kept_if_the_optional_repack_fails(tmp_path, vision_bundle):
     vision_bundle.repack_pack_fails = True
-    detail, _ = _refused(tmp_path)
-    assert "constrains its vision sections to" in detail
+    (export,) = run_export(_request(tmp_path, _checkpoint(tmp_path))).exports
+    assert export.ok, export.check.detail
+    assert export.vision is not None and export.vision["backend_constraints"] == {}
 
 
 def test_a_text_bundle_is_not_constrained(tmp_path, toolchain):

@@ -168,7 +168,6 @@ def test_pictures_are_measured_with_what_the_checkpoint_recorded(tmp_path):
 @pytest.mark.parametrize(
     ("kwargs", "said"),
     [
-        ({"backend": "gpu"}, "--backend gpu was asked"),
         ({"scorer": "tool-call"}, "--scorer tool-call"),
     ],
 )
@@ -177,6 +176,42 @@ def test_what_pictures_cannot_be_measured_with_is_refused(tmp_path, kwargs, said
     assert result.status is Status.FAILED_HARNESS
     refused = _check(result, PICTURES_CHECK)
     assert refused.outcome is Outcome.FAILED and said in refused.detail
+
+
+def test_gpu_picture_verify_is_allowed_and_records_gpu_vision(tmp_path):
+    result = run_verify(_request(tmp_path, backend="gpu"), backends=_pair())
+    assert result.status is not Status.FAILED_HARNESS, result.manifest["checks"]
+    assert result.manifest["harness"]["pictures"]["candidate_vision_backend"] == "gpu"
+
+
+def test_a_constrained_gpu_picture_bundle_records_cpu_vision_and_its_sections(tmp_path):
+    class Constrained(FakeBackend):
+        def describe(self) -> dict[str, Any]:
+            return super().describe() | {
+                "backend": "gpu",
+                "vision_backend": "cpu",
+                "vision_backend_constraints": {
+                    "vision_encoder": "cpu",
+                    "vision_adapter": "cpu",
+                },
+            }
+
+    pair = _pair()
+    pair = BackendPair(
+        candidate=Constrained(
+            texts=pair.candidate.texts,
+            prompt_mode=PromptMode.RUNTIME_RENDERED,
+            decode_enforced=False,
+        ),
+        reference=pair.reference,
+    )
+    result = run_verify(_request(tmp_path, backend="gpu"), backends=pair)
+    pictures = result.manifest["harness"]["pictures"]
+    assert pictures["candidate_vision_backend"] == "cpu"
+    assert pictures["vision_backend_constraints"] == {
+        "vision_encoder": "cpu",
+        "vision_adapter": "cpu",
+    }
 
 
 def test_a_reference_that_records_no_pictures_is_refused(tmp_path):
@@ -302,6 +337,21 @@ def test_the_candidate_is_sent_each_picture_on_a_cpu_vision_backend():
     assert "sampler" not in spec
     assert backend.describe()["pictures"] == 2
     assert backend.describe()["vision_backend"] == "cpu"
+
+
+def test_a_gpu_candidate_is_sent_each_picture_on_a_gpu_vision_backend():
+    env = SpecEnv()
+    backend = LiteRtLmBackend(
+        model=Path("m.litertlm"),
+        env=env,
+        auto_provision=False,
+        backend_flag="gpu",
+        declared_prompt_mode=PromptMode.RUNTIME_RENDERED,
+        images=PICTURES,
+    )
+    backend.generate(["one", "two"])
+    assert env.specs[0]["vision_backend"] == "gpu"
+    assert backend.describe()["vision_backend"] == "gpu"
 
 
 def test_a_text_candidate_has_no_vision_backend():
@@ -918,7 +968,7 @@ def test_a_picture_measurement_says_what_it_did_not_compare(tmp_path):
     result = run_verify(_request(tmp_path), backends=_pair())
     limitations = result.manifest["limitations"]
     assert PICTURE_PREFILL_UNCHECKED in limitations
-    assert any(
+    assert not any(
         "the vision encoder ran on the runtime's default CPU threads" in t for t in limitations
     )
 

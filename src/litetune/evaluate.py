@@ -758,7 +758,8 @@ class LiteRtLmBackend:
     threads: int | None = None
     # Rows with a picture: each prompt's picture as `{"path", "sha256"}`, in
     # prompt order. Each is sent as the app sends it -- its bytes, base64, as an
-    # `image` part before the text -- to an engine with a CPU vision backend.
+    # `image` part before the text -- to an engine whose vision backend follows
+    # `backend_flag`, unless a vision section in the bundle constrains it to CPU.
     images: tuple[Mapping[str, str], ...] | None = None
 
     name = "litert-lm"
@@ -873,7 +874,16 @@ class LiteRtLmBackend:
             # Rows with a picture: how many, and the backend their vision
             # encoder ran on. `None` for text.
             "pictures": len(self.images) if self.images is not None else None,
-            "vision_backend": VISION_BACKEND if self.images is not None else None,
+            "vision_backend": (
+                (self.device_report or {}).get("vision_backend", self.backend_flag)
+                if self.images is not None
+                else None
+            ),
+            "vision_backend_constraints": (
+                (self.device_report or {}).get("vision_backend_constraints")
+                if self.images is not None
+                else None
+            ),
             # The sampler the bundle declares, as the driver script read it, and
             # the one sent in its place when it would sample; `None` before a run
             # and when none was sent. Separate from `decode_passed_to_runtime`,
@@ -935,7 +945,7 @@ class LiteRtLmBackend:
                         "runtime_rendered": self.uses_template,
                         "engine_per_prompt": bool(self.engine_per_prompt_reason),
                         **runtime_engine_spec(self.backend_flag, thread_count),
-                        **picture_spec(self.images),
+                        **picture_spec(self.images, self.backend_flag),
                         # Sent in place of a bundle's own sampler when that one
                         # samples or does not run (`llm_images.sampler_replaced`).
                         "greedy_sampler": dict(CANDIDATE_SAMPLER),
@@ -1053,7 +1063,7 @@ class LiteRtLmBackend:
                         "prompts": [prompt],
                         "runtime_rendered": self.uses_template,
                         **runtime_engine_spec(self.backend_flag),
-                        **picture_spec(self.images[:1] if self.images else None),
+                        **picture_spec(self.images[:1] if self.images else None, self.backend_flag),
                         "greedy_sampler": dict(CANDIDATE_SAMPLER),
                         "out": str(work / "generations.jsonl"),
                     }
@@ -1115,19 +1125,16 @@ class LiteRtLmBackend:
 # CLI's `--backend` and `verify --backend` use.
 CANDIDATE_BACKENDS = ("cpu", "gpu")
 
-# The backend a picture's vision encoder runs on in the candidate: the one the
-# spike this path follows measured (litert-lm 0.18.0, `Backend.CPU()` as the
-# `vision_backend`).
-VISION_BACKEND = "cpu"
 
-
-def picture_spec(images: Sequence[Mapping[str, str]] | None) -> dict[str, Any]:
+def picture_spec(
+    images: Sequence[Mapping[str, str]] | None, backend: str = "cpu"
+) -> dict[str, Any]:
     """The driver script's spec keys for rows with a picture; nothing for text."""
     if images is None:
         return {}
     return {
         "images": [{"path": str(i["path"]), "sha256": str(i["sha256"])} for i in images],
-        "vision_backend": VISION_BACKEND,
+        "vision_backend": backend,
     }
 
 
@@ -2654,6 +2661,33 @@ def bundle_sampler(path):
     return None
 
 
+def bundle_vision_constraints(path):
+    """Constraints carried by vision sections, by section type."""
+    import io
+
+    from litert_lm_builder import litertlm_peek
+
+    header = litertlm_peek.read_litertlm_header(path, io.StringIO())
+    listed = header.SectionMetadata()
+    found = {}
+    for index in range(listed.ObjectsLength() if listed else 0):
+        section = listed.Objects(index)
+        kind = litertlm_peek.get_model_type(section)
+        if not kind:
+            continue
+        kind = str(kind).lower().removeprefix("tf_lite_")
+        if kind not in ("vision_encoder", "vision_adapter"):
+            continue
+        for item_index in range(section.ItemsLength()):
+            item = section.Items(item_index)
+            if item is None:
+                continue
+            pair = litertlm_peek.kvp_to_dict(item)
+            if pair.get("key") == "backend_constraint" and pair.get("value"):
+                found[kind] = str(pair["value"]).lower()
+    return found
+
+
 def sampler_replaced(sampler):
     """`llm_images.sampler_replaced`, which this script cannot import."""
     if sampler is None:
@@ -2734,6 +2768,16 @@ def main(spec_path):
 
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     runtime_rendered = bool(spec["runtime_rendered"])
+    constraints = bundle_vision_constraints(spec["model"]) if spec.get("images") else {}
+    cpu_constraints = {
+        section: value for section, value in constraints.items()
+        if [part.strip() for part in value.split(",")] == ["cpu"]
+    }
+    # A caller asking for GPU vision must not override a bundle section that
+    # explicitly permits only the CPU. Record both the effective request and
+    # the sections that caused it before constructing the Engine.
+    if cpu_constraints:
+        spec["vision_backend"] = "cpu"
     engine_args = engine_kwargs(spec)
     prompts = spec["prompts"]
     pictures = spec.get("images") or [None] * len(prompts)
@@ -2748,6 +2792,9 @@ def main(spec_path):
             report["engine_init_seconds"] = init
             report["bundle_sampler"] = declared
             report["sampler_sent"] = sampler
+            if spec.get("images"):
+                report["vision_backend"] = spec["vision_backend"]
+                report["vision_backend_constraints"] = cpu_constraints
             Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
 
     with Path(spec["out"]).open("w", encoding="utf-8") as out:
