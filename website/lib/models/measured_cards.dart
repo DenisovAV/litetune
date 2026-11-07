@@ -34,8 +34,12 @@ typedef RanOn = ({RunTarget target, String anchor});
 /// The runtimes a panel can name, in the order it names them.
 enum RunTarget {
   cpu('CPU'),
+  windowsCpu('Windows CPU'),
   macGpu('Mac GPU'),
-  qualcommNpu('Qualcomm NPU (SM8750)');
+  windowsGpu('Windows GPU'),
+  linuxGpu('Linux GPU'),
+  qualcommNpu('Qualcomm NPU (SM8750)'),
+  intelNpu('Intel NPU');
 
   const RunTarget(this.label);
 
@@ -147,8 +151,8 @@ class MeasuredCards extends StatelessComponent {
         ]),
       ]);
 
-  /// [runs] in [RunTarget] order, so every panel lists CPU, then Mac GPU,
-  /// then the NPU, however a card wrote them.
+  /// [runs] in [RunTarget] order, so every panel lists CPUs, then GPUs, then
+  /// NPUs, however a card wrote them.
   static List<RanOn> _inOrder(List<RanOn> runs) =>
       [...runs]..sort((x, y) => x.target.index.compareTo(y.target.index));
 

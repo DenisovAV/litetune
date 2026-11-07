@@ -56,9 +56,10 @@ void main() {
   final measurements = File('${root.path}/MEASUREMENTS.md').readAsStringSync();
   final readme = File('${root.path}/README.md').readAsStringSync();
 
-  // The three sections the page draws on: the one that introduces the path
-  // and holds the end-to-end runs, the NPU run, and the Mac section, whose
-  // last rows are EmbeddingGemma 2's GPU run.
+  // The sections the page draws on: the one that introduces the text path and
+  // holds the end-to-end runs, the text NPU run, the Mac section (whose last
+  // rows are the text file's GPU run), the picture run and its host
+  // subsections, and the Windows and Linux GPU run.
   final measurementsSource = _between(
     measurements,
     "## EmbeddingGemma 2: a decider fine-tuned and grafted into Google's file",
@@ -74,14 +75,41 @@ void main() {
     '## The CPU and the GPU on a Mac',
     '\n## ',
   );
+  final pictures = _between(
+    measurements,
+    '## EmbeddingGemma 2 on images: beans',
+    '\n## ',
+  );
+  final gpu = _between(
+    measurements,
+    '## The GPU on Windows and Linux',
+    '\n## ',
+  );
   final readmeSource = _between(
     readme,
     '### Decisions on EmbeddingGemma 2',
     '### Gemma 4 towers',
   );
   final source = _normalise(
-    [measurementsSource, npu, mac, readmeSource].join('\n'),
+    [measurementsSource, npu, mac, pictures, gpu, readmeSource].join('\n'),
   );
+
+  test('the picture card names every measured host and backend', () {
+    final targets = EmbeddingModels.embeddingGemma2.runtimes.map(
+      (run) => run.target,
+    );
+    expect(
+      targets,
+      containsAll([
+        RunTarget.windowsCpu,
+        RunTarget.macGpu,
+        RunTarget.windowsGpu,
+        RunTarget.linuxGpu,
+        RunTarget.qualcommNpu,
+        RunTarget.intelNpu,
+      ]),
+    );
+  });
 
   test('every numeral on the embeddings page is in its source sections', () {
     final numeral = RegExp(r'[+\-]?\d[\d,]*(?:\.\d+)?');

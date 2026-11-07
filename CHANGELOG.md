@@ -3,6 +3,16 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.8.0 — 2026-11-07
+- `prepare`, `tune`, `convert` and `verify` fine-tune EmbeddingGemma 2 on images and write the encoder into Google's text-vision file (#110).
+- `prepare`, `tune`, `convert` and `verify` fine-tune Gemma 4 E2B on rows that carry a picture; the bundle keeps its vision encoder (#115).
+- `convert --npu` compiles an EmbeddingGemma 2 image checkpoint for Qualcomm NPUs (#113).
+- `verify --backend gpu` runs an EmbeddingGemma 2 image file on a Mac's GPU (#112).
+- `verify --backend gpu` runs on Windows and Linux, and a run on a software adapter fails the harness (#117).
+- `verify --with-base` fetches Google's file in the reference's environment, so it runs on Windows (#114).
+- MEASUREMENTS has the beans image file on Intel Panther Lake and Lunar Lake (#116).
+- Both Models tabs on the site use the same card, with no scores on it (#111).
+
 ## 0.7.3 — 2026-11-02
 - Ran `verify` on an M4/M5 Mac's CPU at more than one thread? Run it again (#105).
 - `verify` uses one CPU thread on Apple M4/M5, where results depended on the thread count (#105).
