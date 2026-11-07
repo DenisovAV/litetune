@@ -7,6 +7,7 @@ two sides were not measured the same way is refused rather than annotated.
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -91,13 +92,21 @@ def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifyi
     data = write_split(rows)
     model = tmp_path / "model.litertlm"
     model.write_bytes(b"model")
+    os.utime(model, (1700000000, 1700000000))
     caches = [
         tmp_path / "model.litertlm_1700000000_5_mldrift_weight_cache.bin",
         tmp_path / "model.litertlm_1700000000_5_mldrift_program_cache.bin",
         tmp_path / "model.litertlm.vision_encoder_1700000000_5_mldrift_weight_cache.bin",
     ]
-    # Another model's cache beside it is not this file's.
-    (tmp_path / "other.litertlm_1700000000_5_mldrift_weight_cache.bin").write_bytes(b"x")
+    # Not this file's: another model's, one whose name only starts with this one's, and
+    # one keyed to an earlier version of this file (another mtime).
+    strangers = [
+        "other.litertlm_1700000000_5_mldrift_weight_cache.bin",
+        "model.litertlm_backup_1700000000_5_mldrift_weight_cache.bin",
+        "model.litertlm_1600000000_5_mldrift_weight_cache.bin",
+    ]
+    for name in strangers:
+        (tmp_path / name).write_bytes(b"x")
     for index, cache in enumerate(caches):
         cache.write_bytes(f"cache-{index}".encode())
     request = VerifyRequest(
@@ -119,7 +128,7 @@ def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifyi
     assert all(cache.name in notice for cache in caches)
     assert "an app or the CLI" in notice
     assert "litetune did not read them" in notice
-    assert "other.litertlm" not in notice
+    assert not [name for name in strangers if name in notice]
     assert [cache.read_bytes() for cache in caches] == [b"cache-0", b"cache-1", b"cache-2"]
 
     clean = tmp_path / "clean"
@@ -155,6 +164,17 @@ def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifyi
     )
 
     assert not [text for text in cpu_result.manifest["limitations"] if "mldrift" in text]
+
+    # The cache was shown read by a later run on Linux only; elsewhere nothing is claimed.
+    monkeypatch.setattr(sys, "platform", "darwin")
+    mac_result = run_verify(
+        request,
+        backends=BackendPair(
+            candidate=FakeBackend(texts=correct_texts(rows)),
+            reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+        ),
+    )
+    assert not [text for text in mac_result.manifest["limitations"] if "mldrift" in text]
 
 
 # -- the ordinary case ------------------------------------------------------

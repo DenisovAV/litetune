@@ -32,6 +32,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -1154,18 +1156,29 @@ class _Run:
         return VerifyResult(status=status, manifest=self.manifest)
 
 
-def _default_gpu_cache_limitation(model: Path) -> str | None:
-    """Name default LiteRT-LM GPU caches already beside ``model``, if any.
+def _default_gpu_cache_limitation(model: Path, platform: str) -> str | None:
+    """Name default LiteRT-LM GPU caches already beside ``model`` for this very file, if any.
 
     litert-lm 0.18.0 names the text model's `<model>_<mtime>_<size>_mldrift_*cache.bin`
     and a vision encoder's `<model>.vision_encoder_<mtime>_<size>_mldrift_*cache.bin`
-    (MEASUREMENTS.md#a-gpu-cache-built-on-a-software-adapter), so both separators match.
+    (MEASUREMENTS.md#a-gpu-cache-built-on-a-software-adapter), with the file's mtime in
+    seconds and its size: only names carrying this file's are its caches. Linux only, the
+    one platform where a cache was shown to be read by a later run.
     """
+    if platform != "linux":
+        return None
+    try:
+        stat = model.stat()
+    except OSError:
+        return None
+    key = f"_{int(stat.st_mtime)}_{stat.st_size}_mldrift_"
+    pattern = re.compile(r"(?:\.[A-Za-z0-9_]+)?" + re.escape(key) + r".*cache.*")
     caches = sorted(
         path.name
-        for pattern in (f"{model.name}_*mldrift*cache*", f"{model.name}.*mldrift*cache*")
-        for path in model.parent.glob(pattern)
-        if path.is_file()
+        for path in model.parent.iterdir()
+        if path.name.startswith(model.name)
+        and pattern.fullmatch(path.name[len(model.name) :])
+        and path.is_file()
     )
     if not caches:
         return None
@@ -1552,7 +1565,7 @@ def run_verify(
     # Immediately before the generative candidate can open its GPU engine. The
     # decision path above disables caching instead, and never reaches here.
     if request.backend == "gpu":
-        default_cache = _default_gpu_cache_limitation(request.model)
+        default_cache = _default_gpu_cache_limitation(request.model, sys.platform)
         if default_cache is not None:
             run.limitation(default_cache)
 

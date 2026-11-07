@@ -2574,6 +2574,25 @@ def test_the_gpu_script_uses_the_cache_directory_the_parent_created(tmp_path, mo
     assert engines[0].kwargs["cache_dir"] == str(cache)
 
 
+def test_an_engine_per_prompt_on_the_gpu_uses_the_parents_cache_directory_every_time(
+    tmp_path, monkeypatch
+):
+    cache = tmp_path / "cache-candidate"
+    cache.mkdir()
+
+    _, engines = _run_script(
+        tmp_path,
+        ["one", "two"],
+        monkeypatch=monkeypatch,
+        engine=runtime_engine_spec("gpu"),
+        engine_per_prompt=True,
+        extra={"cache_dir": str(cache)},
+    )
+
+    assert len(engines) == 2
+    assert [e.kwargs["cache_dir"] for e in engines] == [str(cache), str(cache)]
+
+
 def test_the_script_refuses_a_backend_it_does_not_know(tmp_path, monkeypatch):
     _fake_litert_lm(monkeypatch)
     backend_for = _litertlm_script()["backend_for"]
