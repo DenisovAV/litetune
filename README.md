@@ -722,7 +722,10 @@ What has and has not been measured:
   on each platform: it passed on a Mac and on an NVIDIA L4 under Linux, where
   the two runs agreed on all 300 rows, and failed the harness on an Intel Arc
   B390 under Windows, where they differed on 111 rows and the third run
-  settled none ([MEASUREMENTS.md](MEASUREMENTS.md#the-gpu-on-windows-and-linux)). It is measured against
+  settled none ([MEASUREMENTS.md](MEASUREMENTS.md#the-gpu-on-windows-and-linux)): on that GPU
+  and on an Arc 140V, both under Direct3D 12, LiteRT-LM's GPU path gave other
+  answers than its CPU path, in plain generation too, on litert-lm 0.18.0 and
+  0.19.0 ([MEASUREMENTS.md](MEASUREMENTS.md#why-the-decision-failed-on-intel-arc)). It is measured against
   the float reference on LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561
   fix only. On a Mac CPU with SME2 it scores on one thread
   ([Which runtime each version measures on](#which-runtime-each-version-measures-on)). On another runtime, `verify` needs `--float-twin` to say more than
