@@ -1059,9 +1059,16 @@ unconstrained copy.
 | NVIDIA A100 | GPU / CPU | 0.8800 | 6 |
 | NVIDIA A100 | GPU / GPU (unconstrained copy) | 0.8800 | 6 |
 | NVIDIA A100, `verify --backend gpu` at `e0bbf41` | GPU / GPU (unconstrained copy) | 0.8800, reference 0.8800, 0.0000 ±0.0131, 4 discordant | |
+| NVIDIA A100, `verify --backend gpu` at `e633e3c`, the bundle as convert wrote it | GPU / CPU (the bundle's constraint, recorded) | 0.8800, reference 0.8800, 0.0000 ±0.0131, 4 discordant | |
 | Apple M5 Pro (Metal) | CPU / CPU, 8 threads | 0.8833 | |
 | Apple M5 Pro | GPU / GPU (unconstrained copy) | 0.8733 | 4 |
 
+- On the bundle as convert wrote it, `verify --backend gpu` gave the vision encoder and
+  adapter the CPU, recorded both sections' `cpu` constraint and the reason, and passed.
+  An earlier attempt of that run read a GPU weight cache an llvmpipe run had left beside
+  the file and answered every picture with one repeated word; the numbers here are from
+  after those cache files were deleted (*A GPU cache built on a software adapter*, which
+  litetune's GPU runs now avoid).
 - No reply on any GPU fell outside the three labels. Of the A100's six GPU/GPU replies
   unlike its CPU's, the CPU was right on three and the GPU on one; on the Mac the CPU
   was right on three of four, the GPU on none.
