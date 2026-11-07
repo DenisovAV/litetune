@@ -222,6 +222,18 @@ def test_convert_writes_no_vision_section_constraint(tmp_path, vision_bundle):
     assert "vision section constraints: none" in export.check.detail
 
 
+@pytest.mark.parametrize("value", ["", "bananas", "CPU", "cpu,,gpu", "cpu,gpu,"])
+def test_convert_refuses_an_invalid_vision_backend_constraint(tmp_path, vision_bundle, value):
+    vision_bundle.repack_toml = VISION_TOML.replace(
+        'model_type = "vision_encoder"',
+        f'model_type = "vision_encoder"\nbackend_constraint = {json.dumps(value)}',
+    )
+    (export,) = run_export(_request(tmp_path, _checkpoint(tmp_path))).exports
+    assert export.check.outcome is Outcome.FAILED
+    assert "vision_encoder" in export.check.detail
+    assert repr(value) in export.check.detail
+
+
 def test_an_unconstrained_bundle_is_kept_if_the_optional_repack_fails(tmp_path, vision_bundle):
     vision_bundle.repack_pack_fails = True
     (export,) = run_export(_request(tmp_path, _checkpoint(tmp_path))).exports

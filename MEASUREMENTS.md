@@ -1039,7 +1039,9 @@ seed 0 row is the run above (at the commit that added the stages).
 
 - Three seeds of litetune's tune gave references of 0.8800, 0.9600 and 0.9500 on
   the same 300 pictures: seed 0's 0.8800 was the low end of the spread, not a
-  property of litetune's recipe. The scripts outside litetune scored 0.9067 to 0.9367.
+  property of litetune's recipe. The scripts outside litetune scored 0.9067 to 0.9367,
+  as listed in the earlier bullet of this section beginning “The same rows tuned by a
+  script outside litetune”.
 - Four bits (int4 weights in blocks of 32, int8 embeddings) cost 0.0900 on seed 0's
   checkpoint, resolved.
 - Seed 1 tuned in 1,575 s and seed 2 in 1,324 s (wall clock of the stage).

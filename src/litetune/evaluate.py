@@ -759,7 +759,8 @@ class LiteRtLmBackend:
     # Rows with a picture: each prompt's picture as `{"path", "sha256"}`, in
     # prompt order. Each is sent as the app sends it -- its bytes, base64, as an
     # `image` part before the text -- to an engine whose vision backend follows
-    # `backend_flag`, unless a vision section in the bundle constrains it to CPU.
+    # `backend_flag`, unless the bundle's vision constraints require the other
+    # backend supported by litert-lm's Python API.
     images: tuple[Mapping[str, str], ...] | None = None
 
     name = "litert-lm"
@@ -875,12 +876,17 @@ class LiteRtLmBackend:
             # encoder ran on. `None` for text.
             "pictures": len(self.images) if self.images is not None else None,
             "vision_backend": (
-                (self.device_report or {}).get("vision_backend", self.backend_flag)
+                (self.device_report or {}).get("vision_backend")
                 if self.images is not None
                 else None
             ),
             "vision_backend_constraints": (
                 (self.device_report or {}).get("vision_backend_constraints")
+                if self.images is not None
+                else None
+            ),
+            "vision_backend_reason": (
+                (self.device_report or {}).get("vision_backend_reason")
                 if self.images is not None
                 else None
             ),
@@ -2683,8 +2689,8 @@ def bundle_vision_constraints(path):
             if item is None:
                 continue
             pair = litertlm_peek.kvp_to_dict(item)
-            if pair.get("key") == "backend_constraint" and pair.get("value"):
-                found[kind] = str(pair["value"]).lower()
+            if pair.get("key") == "backend_constraint" and pair.get("value") is not None:
+                found[kind] = str(pair["value"]).strip().lower()
     return found
 
 
@@ -2769,15 +2775,30 @@ def main(spec_path):
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     runtime_rendered = bool(spec["runtime_rendered"])
     constraints = bundle_vision_constraints(spec["model"]) if spec.get("images") else {}
-    cpu_constraints = {
-        section: value for section, value in constraints.items()
-        if [part.strip() for part in value.split(",")] == ["cpu"]
-    }
-    # A caller asking for GPU vision must not override a bundle section that
-    # explicitly permits only the CPU. Record both the effective request and
-    # the sections that caused it before constructing the Engine.
-    if cpu_constraints:
-        spec["vision_backend"] = "cpu"
+    vision_reason = None
+    if spec.get("images"):
+        requested = spec.get("backend", "cpu")
+        supported = {"cpu", "gpu"}
+        common = set(supported)
+        for value in constraints.values():
+            common &= {part.strip().lower() for part in value.split(",")} & supported
+        shown = ", ".join(
+            "%s=%r" % (section, value) for section, value in sorted(constraints.items())
+        )
+        if requested in common:
+            spec["vision_backend"] = requested
+        elif len(common) == 1:
+            spec["vision_backend"] = common.pop()
+            vision_reason = (
+                "--backend %s is not allowed by the vision constraints %s; %s is the only "
+                "cpu/gpu backend every constrained vision section allows"
+                % (requested, shown, spec["vision_backend"])
+            )
+        else:
+            raise ValueError(
+                "the vision sections leave no cpu or gpu backend they all allow: %s"
+                % (shown or "no parsed constraints")
+            )
     engine_args = engine_kwargs(spec)
     prompts = spec["prompts"]
     pictures = spec.get("images") or [None] * len(prompts)
@@ -2794,8 +2815,15 @@ def main(spec_path):
             report["sampler_sent"] = sampler
             if spec.get("images"):
                 report["vision_backend"] = spec["vision_backend"]
-                report["vision_backend_constraints"] = cpu_constraints
+                report["vision_backend_constraints"] = constraints
+                if vision_reason is not None:
+                    report["vision_backend_reason"] = vision_reason
             Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
+
+    # Before Engine construction: a runtime failure while opening the model
+    # must not erase which vision backend and bundle constraints were used.
+    if spec.get("images"):
+        write_report(None)
 
     with Path(spec["out"]).open("w", encoding="utf-8") as out:
         # `cache_dir=""` is what the CLI passes on its default `--cache`:

@@ -1613,16 +1613,20 @@ def run_verify(
             run.manifest["harness"]["pictures"]["candidate_vision_backend"] = actual_vision
         run.manifest["harness"]["pictures"]["vision_backend_constraints"] = constraints
         if (
-            candidate.engine.get("backend") == "gpu"
-            and actual_vision == "cpu"
+            actual_vision in ("cpu", "gpu")
+            and actual_vision != request.backend
             and isinstance(constraints, Mapping)
             and constraints
         ):
-            sections = ", ".join(sorted(str(section) for section in constraints))
+            shown = ", ".join(
+                f"{section}={value!r}"
+                for section, value in sorted(constraints.items(), key=lambda item: str(item[0]))
+            )
             run.limitation(
-                f"the GPU backend was asked for, but the bundle constrains {sections} to the "
-                "CPU, so the candidate Engine was given a CPU vision backend; the constraints "
-                "are recorded from the bundle"
+                f"--backend {request.backend} was asked for, but the bundle's vision sections "
+                f"state {shown}, so the candidate Engine was given a "
+                f"{actual_vision.upper()} vision backend; the constraints are recorded from "
+                "the bundle"
             )
     # The terminator vocabulary is `metrics.TERMINATORS`, recorded at
     # harness.terminators. A count here moves only for a marker the vocabulary

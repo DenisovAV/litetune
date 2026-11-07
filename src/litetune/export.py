@@ -2530,7 +2530,23 @@ def _vision_carried(
     observed |= facts
     missing = [section for section in llm_images.VISION_SECTIONS if section not in types]
     problem = None
-    if missing:
+    invalid_constraint = next(
+        (
+            (section, value)
+            for section, value in sorted(constraints.items())
+            if not isinstance(value, str)
+            or not (tokens := [part.strip() for part in value.split(",")])
+            or any(not token or token not in {"cpu", "gpu", "npu"} for token in tokens)
+        ),
+        None,
+    )
+    if invalid_constraint is not None:
+        section, value = invalid_constraint
+        problem = (
+            f"sets {section} backend_constraint to {value!r}; expected a non-empty, "
+            "comma-separated list of lower-case cpu, gpu or npu"
+        )
+    elif missing:
         problem = (
             f"carries no {', '.join(missing)} section, so it cannot take a picture; it has "
             f"{', '.join(types) or 'no sections'}"

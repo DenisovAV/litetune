@@ -1330,8 +1330,8 @@ def repeat_problem(
 
     Repeatable is bit for bit: the two vector files `numpy.save` wrote are the
     same bytes, which they are when the arrays are equal in shape, type and
-    every value. `not_repeatable` says so when they differ: `NOT_REPEATABLE`, or
-    `NOT_REPEATABLE_GPU` for a run whose text tower was on the GPU.
+    every value. `not_repeatable` supplies the failure text when they differ;
+    callers use the default `NOT_REPEATABLE`.
     """
     run = runs.get(REPEAT_SIDE, ScriptRun(failure=STOPPED))
     if run.failure is not None:

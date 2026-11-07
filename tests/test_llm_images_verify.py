@@ -212,6 +212,46 @@ def test_a_constrained_gpu_picture_bundle_records_cpu_vision_and_its_sections(tm
         "vision_encoder": "cpu",
         "vision_adapter": "cpu",
     }
+    limitation = next(
+        text for text in result.manifest["limitations"] if text.startswith("--backend")
+    )
+    assert "--backend gpu" in limitation
+    assert "vision_encoder='cpu'" in limitation
+    assert "vision_adapter='cpu'" in limitation
+    assert "CPU vision backend" in limitation
+
+
+def test_a_cpu_request_with_gpu_only_vision_names_the_constraints_and_backend_used(tmp_path):
+    class Constrained(FakeBackend):
+        def describe(self) -> dict[str, Any]:
+            return super().describe() | {
+                "backend": "cpu",
+                "vision_backend": "gpu",
+                "vision_backend_constraints": {
+                    "vision_encoder": "gpu",
+                    "vision_adapter": "cpu,gpu",
+                },
+            }
+
+    pair = _pair()
+    result = run_verify(
+        _request(tmp_path, backend="cpu"),
+        backends=BackendPair(
+            candidate=Constrained(
+                texts=pair.candidate.texts,
+                prompt_mode=PromptMode.RUNTIME_RENDERED,
+                decode_enforced=False,
+            ),
+            reference=pair.reference,
+        ),
+    )
+    limitation = next(
+        text for text in result.manifest["limitations"] if text.startswith("--backend")
+    )
+    assert "--backend cpu" in limitation
+    assert "vision_encoder='gpu'" in limitation
+    assert "vision_adapter='cpu,gpu'" in limitation
+    assert "GPU vision backend" in limitation
 
 
 def test_a_reference_that_records_no_pictures_is_refused(tmp_path):
@@ -336,7 +376,8 @@ def test_the_candidate_is_sent_each_picture_on_a_cpu_vision_backend():
     assert spec["greedy_sampler"] == {"top_k": 1, "top_p": 1.0, "temperature": 1.0, "seed": 0}
     assert "sampler" not in spec
     assert backend.describe()["pictures"] == 2
-    assert backend.describe()["vision_backend"] == "cpu"
+    assert backend.describe()["vision_backend"] is None
+    assert backend.describe()["vision_backend_constraints"] is None
 
 
 def test_a_gpu_candidate_is_sent_each_picture_on_a_gpu_vision_backend():
@@ -351,7 +392,8 @@ def test_a_gpu_candidate_is_sent_each_picture_on_a_gpu_vision_backend():
     )
     backend.generate(["one", "two"])
     assert env.specs[0]["vision_backend"] == "gpu"
-    assert backend.describe()["vision_backend"] == "gpu"
+    assert backend.describe()["vision_backend"] is None
+    assert backend.describe()["vision_backend_constraints"] is None
 
 
 def test_a_text_candidate_has_no_vision_backend():
