@@ -292,10 +292,9 @@ IMAGE_GPU_MEASURED = (
     "and vision encoder, each image given as its "
     "bytes at a budget of at most {vision_tokens} vision tokens per image, from the litert-lm "
     "package on PyPI on this host, one file at a time -- not the application's own build of the "
-    "runtime on a device; the NPU is not measured. litetune had not run verify with the vision "
-    "encoder on the GPU before this path was added; an outside harness ran this file's vision on "
-    'Intel GPUs (MEASUREMENTS.md, "The same fine-tune on Intel Panther Lake and Lunar Lake"). '
-    + GPU_PRECISION
+    "runtime on a device; the NPU is not measured. litetune has run one image checkpoint so, "
+    "on one Mac (MEASUREMENTS.md, \"The same int8 file on a Mac's CPU and GPU, and on "
+    'Windows"); not with the vision encoder on a Windows or Linux GPU. ' + GPU_PRECISION
 )
 IMAGE_REFERENCE_ON_CPU = (
     "the reference ran on the CPU in float32 through transformers, whatever LITETUNE_DEVICE says: "

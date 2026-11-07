@@ -991,9 +991,10 @@ text to measure.
   the file (LiteRT-LM's `EmbeddingEngine`, each picture given as its bytes),
   and with `--with-base` with Google's 440m file. With `--backend gpu`, on
   macOS, Windows and Linux as for text, litetune requests the GPU for both the
-  text tower and vision encoder. litetune has not yet run this verify path with
-  vision on the GPU; an outside harness ran this file's vision on Intel GPUs
-  ([MEASUREMENTS.md](MEASUREMENTS.md#the-same-fine-tune-on-intel-panther-lake-and-lunar-lake)). It refuses a picture
+  text tower and vision encoder. On one Mac that verify passed on the beans
+  file at 55.8 ms per picture, against 154.5 ms with the vision encoder on the
+  CPU ([MEASUREMENTS.md](MEASUREMENTS.md#the-same-int8-file-on-a-macs-cpu-and-gpu-and-on-windows)); it has not
+  been run with the vision encoder on a Windows or Linux GPU. It refuses a picture
   in both splits, a reference whose soft tokens for a picture differ from the
   count `tune` recorded (the engine reports none, so the file's count is not
   compared), and a `convert.json` that records another budget. LiteRT-LM
@@ -1227,8 +1228,10 @@ litetune verify --model conv/dynamic_wi8_afp32/model.litertlm --reference run/mo
   GPU picture verification uses the same platform observation and software-adapter
   refusal rules as GPU text verification. On the beans bundle, CPU text and vision
   scored 0.8867; GPU text with CPU vision and GPU text with GPU vision both scored
-  0.8800 on 300 held-out pictures on an NVIDIA A100 under Linux with LiteRT-LM 0.18.0
-  (MEASUREMENTS.md, Gemma 4 E2B tuned on pictures: beans).
+  0.8800 on 300 held-out pictures on an NVIDIA A100 under Linux with LiteRT-LM 0.18.0,
+  and both on the GPU 0.8733 on an Apple M5 Pro against its CPU's 0.8833
+  ([MEASUREMENTS.md](MEASUREMENTS.md#two-more-seeds-int4-and-the-gpu)). Not run on a
+  Windows GPU.
 
 The bundle keeps the sampler the exporter writes, TOP_P with top_k 64 and
 temperature 1.0, as litetune's text bundles get the Gemma 4 family default from
