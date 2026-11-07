@@ -2479,6 +2479,7 @@ def _run_script(
                 "prompts": prompts,
                 "runtime_rendered": runtime_rendered,
                 **(engine if engine is not None else runtime_engine_spec("cpu")),
+                "cache_dir": "",
                 "out": str(out),
                 **({"report": str(report)} if report is not None else {}),
                 **(
@@ -2552,10 +2553,25 @@ def test_memory_error_is_not_contained(tmp_path, monkeypatch):
         )
 
 
-def test_the_script_asks_for_the_cache_the_cli_asks_for(tmp_path, monkeypatch):
+def test_the_cpu_script_asks_for_the_cache_the_cli_asks_for(tmp_path, monkeypatch):
     """`cache_dir=""` is the CLI's own default, and omitting it is a fourth state."""
     _, engines = _run_script(tmp_path, ["one"], monkeypatch=monkeypatch)
     assert engines[0].kwargs["cache_dir"] == ""
+
+
+def test_the_gpu_script_uses_the_cache_directory_the_parent_created(tmp_path, monkeypatch):
+    cache = tmp_path / "cache-candidate"
+    cache.mkdir()
+
+    _, engines = _run_script(
+        tmp_path,
+        ["one"],
+        monkeypatch=monkeypatch,
+        engine=runtime_engine_spec("gpu"),
+        extra={"cache_dir": str(cache)},
+    )
+
+    assert engines[0].kwargs["cache_dir"] == str(cache)
 
 
 def test_the_script_refuses_a_backend_it_does_not_know(tmp_path, monkeypatch):
@@ -3240,6 +3256,7 @@ def test_the_driver_takes_a_reading_before_and_after_generating(tmp_path, monkey
                 "prompts": ["one"],
                 "runtime_rendered": True,
                 **runtime_engine_spec("gpu"),
+                "cache_dir": str(tmp_path / "cache-candidate"),
                 "out": str(tmp_path / "out.jsonl"),
                 "report": str(report),
             }
@@ -4830,6 +4847,49 @@ def _gpu_split(stderr, device=None, preflight_stderr=None, calls=None, returncod
     return fake_run
 
 
+def test_the_gpu_parent_creates_a_private_cache_and_threads_it_through_the_spec(
+    monkeypatch, tmp_path
+):
+    seen = []
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        spec_path = Path(args[2])
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        cache = Path(spec["cache_dir"])
+        seen.append((spec_path.parent, cache, cache.is_dir()))
+        rows = [json.dumps({"index": i, "text": "a"}) for i in range(len(spec["prompts"]))]
+        Path(spec["out"]).write_text("\n".join(rows) + "\n", encoding="utf-8")
+        if "report" in spec:
+            Path(spec["report"]).write_text(json.dumps(_WORKED), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+
+    _litertlm(tmp_path, backend_flag="gpu").generate(["one", "two"])
+
+    assert len(seen) == 2  # one preflight driver, then the split driver
+    assert all(existed and cache == work / "cache-candidate" for work, cache, existed in seen)
+    assert seen[0][1] != seen[1][1]
+
+
+def test_the_cpu_parent_keeps_the_cli_default_cache_in_the_spec(monkeypatch, tmp_path):
+    seen = []
+
+    def fake_run(self, args, timeout=3600, **kwargs):
+        spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        seen.append(spec["cache_dir"])
+        Path(spec["out"]).write_text('{"index": 0, "text": "a"}\n', encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(envs.StageEnv, "run", fake_run)
+
+    _litertlm(tmp_path, backend_flag="cpu").generate(["one"])
+
+    assert seen == [""]
+
+
 def test_a_gpu_split_on_a_software_adapter_is_a_harness_failure_on_every_row(
     monkeypatch, tmp_path, nvidia_host
 ):
@@ -4977,6 +5037,7 @@ def test_the_preflight_takes_no_device_reading(monkeypatch, tmp_path):
                 "runtime_rendered": True,
                 "backend": "cpu",
                 "activation_data_type": None,
+                "cache_dir": "",
                 "out": str(tmp_path / "out.jsonl"),
             }
         ),

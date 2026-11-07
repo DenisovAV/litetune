@@ -156,6 +156,7 @@ def _run(
         "tools": TOOLS,
         "max_tokens": 64,
         "constrained": True,
+        "cache_dir": "",
         "out": str(out),
         "log": str(tmp_path / "runtime.log"),
         "mark": "litetune-test",
@@ -1818,12 +1819,21 @@ def test_the_tool_path_script_builds_a_gpu_engine_with_fp32(tmp_path, monkeypatc
     measured on a Galaxy S24, gets past it.
     """
     runtime = FakeRuntime(replies=[_reply("set_colour", {"colour": "red"})])
-    code, _ = _run(runtime, tmp_path, monkeypatch, **runtime_engine_spec("gpu"))
+    cache = tmp_path / "cache-toolpath"
+    cache.mkdir()
+    code, _ = _run(
+        runtime,
+        tmp_path,
+        monkeypatch,
+        cache_dir=str(cache),
+        **runtime_engine_spec("gpu"),
+    )
 
     assert code == 0
     args = sys.modules["litert_lm"].engine_args
     assert args["backend"] == "gpu"
     assert "activation_data_type" in args and args["activation_data_type"] == 0
+    assert args["cache_dir"] == str(cache)
 
 
 def test_the_tool_path_script_still_builds_a_cpu_engine_by_default(tmp_path, monkeypatch):
@@ -1834,6 +1844,7 @@ def test_the_tool_path_script_still_builds_a_cpu_engine_by_default(tmp_path, mon
     args = sys.modules["litert_lm"].engine_args
     assert args["backend"] == "cpu"
     assert "activation_data_type" not in args
+    assert args["cache_dir"] == ""
 
 
 def test_the_tool_path_backend_describes_what_it_asked_for(tmp_path):
@@ -1887,6 +1898,10 @@ def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path, monkeypatch):
         ("gpu", "fp32"),
         ("gpu", "fp32"),
     ]
+    for spec in env.specs:
+        cache = Path(spec["cache_dir"])
+        assert cache.name == "cache-toolpath"
+        assert cache.parent == Path(spec["out"]).parent
     assert backend.describe()["backend"] == "gpu"
 
 

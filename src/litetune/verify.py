@@ -1154,6 +1154,29 @@ class _Run:
         return VerifyResult(status=status, manifest=self.manifest)
 
 
+def _default_gpu_cache_limitation(model: Path) -> str | None:
+    """Name default LiteRT-LM GPU caches already beside ``model``, if any.
+
+    litert-lm 0.18.0 names the text model's `<model>_<mtime>_<size>_mldrift_*cache.bin`
+    and a vision encoder's `<model>.vision_encoder_<mtime>_<size>_mldrift_*cache.bin`
+    (MEASUREMENTS.md#a-gpu-cache-built-on-a-software-adapter), so both separators match.
+    """
+    caches = sorted(
+        path.name
+        for pattern in (f"{model.name}_*mldrift*cache*", f"{model.name}.*mldrift*cache*")
+        for path in model.parent.glob(pattern)
+        if path.is_file()
+    )
+    if not caches:
+        return None
+    named = ", ".join(caches)
+    return (
+        f"default LiteRT-LM GPU cache files already exist beside the model: {named}; "
+        "an app or the CLI opening this file with its default cache would read them; "
+        "litetune did not read them because this run used its own cache"
+    )
+
+
 def _decision_record(reference: str) -> tuple[dict[str, Any] | None, str | None]:
     """The reference's training record when it records a decision, and why it could not be read.
 
@@ -1525,6 +1548,13 @@ def run_verify(
         run.manifest["harness"]["pictures"] = pictures.as_dict()
         run.limitation(PICTURES_COMPARED.format(tokens=pictures.vision_tokens))
         run.limitation(PICTURE_PREFILL_UNCHECKED)
+
+    # Immediately before the generative candidate can open its GPU engine. The
+    # decision path above disables caching instead, and never reaches here.
+    if request.backend == "gpu":
+        default_cache = _default_gpu_cache_limitation(request.model)
+        if default_cache is not None:
+            run.limitation(default_cache)
 
     # A text split calls it as it always has, so a stand-in that takes two
     # arguments still stands in for it.

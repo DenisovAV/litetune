@@ -1727,7 +1727,14 @@ withdrawn after re-measurement.
   there is WebGPU over Vulkan, that package holds NVIDIA's Vulkan driver, and
   the driver loads `libEGL.so.1` from `libegl1` — on the one host measured,
   without `libegl1` Vulkan offered only llvmpipe and `verify --backend gpu`
-  refuses. A run nothing
+  refuses. GPU verify runs now use a cache of their own. If you ran
+  `verify --backend gpu` on Linux before installing `libegl1`, that refused run
+  may have written `…_mldrift_weight_cache.bin` and
+  `…_mldrift_program_cache.bin` beside the model; a later app or CLI run that
+  opens the same file with its default cache can read them and give wrong text.
+  Delete those `…mldrift…cache.bin` files. The measured llvmpipe-to-NVIDIA case
+  is recorded in [MEASUREMENTS.md](MEASUREMENTS.md#a-gpu-cache-built-on-a-software-adapter).
+  A run nothing
   established is recorded as asked for, not measured; on other platforms a
   decision bundle and an EmbeddingGemma 2 file are refused on the GPU. On a host
   without a usable GPU, a GPU engine has been measured to produce nothing, so

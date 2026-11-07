@@ -353,7 +353,9 @@ def main():
     rows = []
 
     def make():
-        return litert_lm.Engine(spec["model"], **engine_kwargs(spec))
+        return litert_lm.Engine(
+            spec["model"], cache_dir=spec["cache_dir"], **engine_kwargs(spec)
+        )
 
     on_gpu = spec.get("backend", "cpu") == "gpu"
     # On the GPU the adapter the runtime names while the engine is built is
@@ -584,6 +586,11 @@ class ToolPathProbe:
             self.env.provision(events=events)
         with tempfile.TemporaryDirectory(prefix="litetune-toolpath-") as tmp:
             work = Path(tmp)
+            cache_dir = ""
+            if self.backend_flag == "gpu":
+                cache = work / "cache-toolpath"
+                cache.mkdir()
+                cache_dir = str(cache)
             script = work / "toolpath.py"
             script.write_text(_TOOL_PATH_SCRIPT, encoding="utf-8")
             out = work / "rows.json"
@@ -598,6 +605,7 @@ class ToolPathProbe:
                         "tools": self.declarations,
                         "max_tokens": self.max_tokens,
                         "constrained": constrained,
+                        "cache_dir": cache_dir,
                         **runtime_engine_spec(self.backend_flag, self.thread_count),
                         "out": str(out),
                         "log": str(log),

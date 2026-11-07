@@ -9,6 +9,7 @@ two sides were not measured the same way is refused rather than annotated.
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -80,6 +81,80 @@ def verify(
         **request_kwargs,
     )
     return run_verify(request, backends=BackendPair(candidate=candidate, reference=reference))
+
+
+def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifying_them(
+    write_split, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(sys, "platform", "linux")
+    rows = labelled_rows(8)
+    data = write_split(rows)
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"model")
+    caches = [
+        tmp_path / "model.litertlm_1700000000_5_mldrift_weight_cache.bin",
+        tmp_path / "model.litertlm_1700000000_5_mldrift_program_cache.bin",
+        tmp_path / "model.litertlm.vision_encoder_1700000000_5_mldrift_weight_cache.bin",
+    ]
+    # Another model's cache beside it is not this file's.
+    (tmp_path / "other.litertlm_1700000000_5_mldrift_weight_cache.bin").write_bytes(b"x")
+    for index, cache in enumerate(caches):
+        cache.write_bytes(f"cache-{index}".encode())
+    request = VerifyRequest(
+        model=model,
+        reference="org/reference",
+        data=data,
+        backend="gpu",
+    )
+
+    result = run_verify(
+        request,
+        backends=BackendPair(
+            candidate=FakeBackend(texts=correct_texts(rows)),
+            reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+        ),
+    )
+
+    (notice,) = [text for text in result.manifest["limitations"] if "mldrift" in text]
+    assert all(cache.name in notice for cache in caches)
+    assert "an app or the CLI" in notice
+    assert "litetune did not read them" in notice
+    assert "other.litertlm" not in notice
+    assert [cache.read_bytes() for cache in caches] == [b"cache-0", b"cache-1", b"cache-2"]
+
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    clean_request = VerifyRequest(
+        model=clean / "model.litertlm",
+        reference="org/reference",
+        data=data,
+        backend="gpu",
+    )
+    clean_result = run_verify(
+        clean_request,
+        backends=BackendPair(
+            candidate=FakeBackend(texts=correct_texts(rows)),
+            reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+        ),
+    )
+
+    assert not [text for text in clean_result.manifest["limitations"] if "mldrift" in text]
+
+    cpu_request = VerifyRequest(
+        model=model,
+        reference="org/reference",
+        data=data,
+        backend="cpu",
+    )
+    cpu_result = run_verify(
+        cpu_request,
+        backends=BackendPair(
+            candidate=FakeBackend(texts=correct_texts(rows)),
+            reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+        ),
+    )
+
+    assert not [text for text in cpu_result.manifest["limitations"] if "mldrift" in text]
 
 
 # -- the ordinary case ------------------------------------------------------
