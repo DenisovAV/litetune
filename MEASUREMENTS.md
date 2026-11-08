@@ -3056,34 +3056,39 @@ and the GPU on a Mac*:
 ### Why the decision failed on Intel Arc
 
 Measured 2026-11-07 with scripts outside this repository, on the emotion decision
-bundle above and its first 40 held-out prompts, on the Panther Lake (Arc B390,
-driver 32.0.101.8864) and a Lunar Lake (Core Ultra 7 258V, Arc 140V, driver
-32.0.101.8826), both Windows 11, both GPUs under Direct3D 12. The repeat rule read
-the failure as unsettled scores; it is not noise. LiteRT-LM's GPU path on these
-GPUs computes other answers than its CPU path, in option scoring and in plain
-generation:
+bundle above and its first 40 held-out prompts, on two Windows 11 machines with
+integrated Intel GPUs under Direct3D 12: the Panther Lake (Core Ultra X7 358H, Arc
+B390, driver 32.0.101.8864) and a Lunar Lake (Core Ultra 7 258V, Arc 140V, driver
+32.0.101.8826), each GPU named by the runtime's adapter line. The repeat rule read the
+failure as unsettled scores; it is not noise. On these GPUs LiteRT-LM's GPU path gave
+other answers than its CPU path, in option scoring and in plain generation:
 
 | | answers that differ from the same machine's CPU, 40 prompts |
 |---|---|
-| Panther Lake, greedy replies through a Conversation, litert-lm 0.18.0 | 10, the same 10 in two passes |
-| Panther Lake, the same, litert-lm 0.19.0 | 9, the same 9 in two passes |
+| Panther Lake, greedy replies through a Conversation, litert-lm 0.18.0 | 10 in each of two passes, the same 10 |
+| Panther Lake, the same, litert-lm 0.19.0 | 9 in each of two passes, the same 9 |
 | Lunar Lake, the same, litert-lm 0.18.0 | 12 and 11 in two passes |
-| Panther Lake, top option of verify's scoring sequence | 11 |
-| Lunar Lake, top option of verify's scoring sequence | 10 |
-| Apple M5 Pro (Metal), top option of verify's scoring sequence | 0 |
+| Panther Lake, top option of verify's scoring sequence, 0.18.0 | 10, 11 and 11 in three passes |
+| Lunar Lake, the same | 9 and 10 in two passes |
+| Apple M5 Pro (Metal), the same, against the Panther Lake's CPU | 0 in each of two passes |
 
-- The two CPUs gave the same scores, 0.0 apart.
-- Within one engine the wrong scores depend on what ran before: the same 40
-  prompts in reverse order scored 15 differently. A new engine for every prompt
-  removed most of that, not all: two of 20 prompts still got near-flat scores,
-  10.8 and 12.9 nats from the CPU's.
+- The two Intel CPUs gave the same scores, 0.0 apart.
+- Within one engine the scores depend on what ran before: the same 40 prompts in
+  reverse order scored 15 differently. A new engine for every prompt removed most of
+  that, not all: two of 20 prompts were still 10.8 and 12.9 nats from the CPU's
+  scores (their top option the CPU's).
 - Not the scoring sequence: scoring each option in a session of its own (no
-  checkpoint), no second prefill of the last prompt token, and float16
-  activations all left 9 to 10 top options of 40 unlike the CPU's. Not the host:
-  a 0.3 s pause after every call, and `LITERT_LM_SYNC_EXECUTION=1`, changed
-  nothing.
+  checkpoint), no second prefill of the last prompt token, and float16 activations
+  each left 9 or 10 top options of 40 unlike the CPU's. Neither host-side change tried
+  removed the divergence: a 0.3 s pause after every prefill and every scoring call
+  (not after the checkpoint and the rewind) left 11 top options of 40 unlike the CPU's
+  in both passes, and `LITERT_LM_SYNC_EXECUTION=1`, tried on generation only, left 10
+  (0.18.0) and 9 (0.19.0) replies of 40 unlike the CPU's. Whether host-side
+  synchronisation around the checkpoint and rewind plays a part was not tested.
 - Shorter prompts were hit more often: on the Panther Lake the 37 of 60 prompts more than
   0.5 nats from the CPU had 52 to 82 tokens, the 23 within it 63 to 97.
-- The beans EmbeddingGemma 2 file on the same GPU agreed with its CPU (above).
-- Not run: Dawn's Vulkan backend on these GPUs (the package offers no switch),
-  other models, and flutter_edge_ai's Windows GPU library.
+- The beans EmbeddingGemma 2 file scored 0.9347 on the same GPU and 0.9327 on that
+  machine's CPU (above); its vectors were not compared row by row.
+- Not run: litert-lm 0.19.0 on the Lunar Lake, Dawn's Vulkan backend on these GPUs (the
+  package offers no switch), discrete Arc GPUs, other drivers, other models, and
+  flutter_edge_ai's Windows GPU library.
