@@ -12,6 +12,7 @@ eight confident negatives during the measurement work, so each has its own test.
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import types
@@ -28,7 +29,9 @@ from conftest import (
     probe_answer,
 )
 
+import litetune
 from litetune import envs, toolpath
+from litetune.embedding_verify import SHADOWABLE_MODULES
 from litetune.evaluate import (
     BACKEND_OBSERVED,
     GENERATION_SETTINGS_NOT_APPLIED,
@@ -5423,3 +5426,60 @@ def test_on_a_hybrid_host_an_intel_adapter_is_not_read_through_nvidia_smi():
     # The vendor is read without regard to case.
     upper = _linux(adapters_of(_L4.replace("vendor=nvidia", "vendor=NVIDIA")), smi=_smi())
     assert gpu_observed("gpu", upper) is True
+
+
+def test_the_picture_header_probe_is_not_named_after_a_standard_module(tmp_path):
+    # Python puts a script's own directory first on sys.path, so a script named
+    # `inspect.py` is what `import inspect` finds. In 0.8.1 the probe was, and
+    # every CPU picture verify ended failed_harness on it.
+    seen = []
+
+    class ProbeEnv:
+        name = "runtime"
+
+        def provision(self, events=None):
+            return None
+
+        def run(self, argv, timeout=None):
+            seen.append(Path(argv[1]).stem)
+            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            Path(spec["report"]).write_text(json.dumps({"error": None}), encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+    backend = _litertlm(
+        tmp_path,
+        backend_flag="cpu",
+        images=({"path": "a.jpg", "sha256": "0" * 64},),
+        env=ProbeEnv(),
+    )
+    assert backend.picture_backend_problem() is None
+    assert seen and seen[0] not in sys.stdlib_module_names
+
+
+def test_no_script_named_in_the_source_shadows_a_standard_module():
+    # A helper script is written into a work directory and run by path, so that
+    # directory is first on its sys.path (see the test above). This reads the
+    # names spelled out in the source -- `work / "name.py"` and `NAME = "name.py"`;
+    # `embedding_verify.run_script`, which builds its path from a name, refuses
+    # one itself (tests/test_embedding_verify.py).
+    source = Path(litetune.__file__).parent
+    names = set()
+    for path in source.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        names.update(re.findall(r'/ "([A-Za-z_][A-Za-z0-9_]*)\.py"', text))
+        names.update(re.findall(r'^[A-Z_]+ = "([A-Za-z_][A-Za-z0-9_]*)\.py"', text, re.M))
+    assert names, "no helper script names found; the pattern no longer matches the code"
+    assert not names & SHADOWABLE_MODULES, names & SHADOWABLE_MODULES
+
+
+def test_the_shadowable_list_names_every_package_the_source_imports():
+    source = Path(litetune.__file__).parent
+    imported = set()
+    for path in source.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        imported.update(re.findall(r"^\s*import ([A-Za-z_][A-Za-z0-9_]*)", text, re.M))
+        imported.update(re.findall(r"^\s*from ([A-Za-z_][A-Za-z0-9_]*)[\w.]* import ", text, re.M))
+    # The two helpers a script imports from its own directory on purpose.
+    siblings = {"repack", "towers_script"}
+    missing = imported - SHADOWABLE_MODULES - siblings - {"__future__"}
+    assert not missing, f"add these to embedding_verify.SHADOWABLE_MODULES: {sorted(missing)}"

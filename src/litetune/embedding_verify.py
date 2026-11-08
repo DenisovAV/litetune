@@ -1306,6 +1306,24 @@ def _tail(text: str | None, limit: int = 2000) -> str:
     return (text or "").strip()[-limit:]
 
 
+# What a helper script litetune writes and runs by path must not be named: the
+# script's directory is first on its sys.path, so `<name>.py` there is what
+# `import <name>` finds. The standard modules, and the third-party packages the
+# stage scripts import (tests/test_evaluate.py checks this list against the
+# source's imports).
+SHADOWABLE_MODULES = frozenset(sys.stdlib_module_names) | frozenset(
+    {
+        "PIL", "ai_edge_litert", "ai_edge_litert_sdk_qualcomm", "flatbuffers", "google",
+        "huggingface_hub", "jinja2", "litert_lm", "litert_lm_builder", "litert_torch",
+        "litetune", "numpy", "packaging", "peft", "sentence_transformers", "tomli", "torch",
+        "transformers", "yaml",
+        # Standard from 3.11, so not in 3.10's stdlib_module_names; the scripts
+        # fall back to tomli there.
+        "tomllib",
+    }
+)  # fmt: skip
+
+
 def run_script(
     env: envs.StageEnv,
     source: str,
@@ -1315,6 +1333,10 @@ def run_script(
     timeout: int,
 ) -> ScriptRun:
     """Write `source` and `spec` under `work`, run it in `env`, read back its report."""
+    if name in SHADOWABLE_MODULES:
+        # The script's directory is first on its own sys.path, so it would be
+        # what `import <name>` finds.
+        raise ValueError(f"a script named {name}.py would shadow the module {name}")
     run = ScriptRun()
     script, spec_path, report = work / f"{name}.py", work / f"{name}.json", work / f"{name}.out"
     script.write_text(source, encoding="utf-8")

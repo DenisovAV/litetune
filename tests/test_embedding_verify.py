@@ -3831,3 +3831,15 @@ def test_the_script_and_the_parent_tell_a_software_adapter_alike(tmp_path):
         assert (script is None) is (parent is None), line
         assert script is None or script == parent
     assert ns["software_adapter_in"](str(tmp_path / "missing.err")) is None
+
+
+def test_run_script_refuses_a_name_that_shadows_a_standard_module(tmp_path):
+    class NeverRun:
+        def run(self, argv, timeout=None):
+            raise AssertionError("ran a script that shadows a standard module")
+
+    with pytest.raises(ValueError, match="shadow the module json"):
+        embedding_verify.run_script(NeverRun(), "", {}, tmp_path, "json", 1)
+    assert not (tmp_path / "json.py").exists()
+    with pytest.raises(ValueError, match="shadow the module torch"):
+        embedding_verify.run_script(NeverRun(), "", {}, tmp_path, "torch", 1)
