@@ -1317,6 +1317,9 @@ SHADOWABLE_MODULES = frozenset(sys.stdlib_module_names) | frozenset(
         "huggingface_hub", "jinja2", "litert_lm", "litert_lm_builder", "litert_torch",
         "litetune", "numpy", "packaging", "peft", "sentence_transformers", "tomli", "torch",
         "transformers", "yaml",
+        # Standard from 3.11, so not in 3.10's stdlib_module_names; the scripts
+        # fall back to tomli there.
+        "tomllib",
     }
 )  # fmt: skip
 
