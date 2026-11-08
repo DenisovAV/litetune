@@ -106,9 +106,15 @@ def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifyi
         "model.litertlm_1600000000_5_mldrift_weight_cache.bin",
         # This file's key, but not a cache LiteRT-LM writes.
         "model.litertlm_1700000000_5_mldrift_cache_notes.txt",
+        "model.litertlm_1700000000_5_mldrift_foo_cache.bin",
+        # A copy's cache: same mtime and size, another file's name.
+        "model.litertlm.bak_1700000000_5_mldrift_weight_cache.bin",
     ]
     for name in strangers:
         (tmp_path / name).write_bytes(b"x")
+    # A directory with a cache's name is not a cache.
+    cache_named_dir = "model.litertlm.vision_encoder_1700000000_5_mldrift_program_cache.bin"
+    (tmp_path / cache_named_dir).mkdir()
     for index, cache in enumerate(caches):
         cache.write_bytes(f"cache-{index}".encode())
     request = VerifyRequest(
@@ -129,7 +135,8 @@ def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifyi
     (notice,) = [text for text in result.manifest["limitations"] if "mldrift" in text]
     assert all(cache.name in notice for cache in caches)
     assert "an app or the CLI" in notice
-    assert "a cache directory of its own" in notice
+    assert cache_named_dir not in notice
+    assert "litetune gives its text, picture and tool-path GPU engines a cache directory" in notice
     assert not [name for name in strangers if name in notice]
     assert [cache.read_bytes() for cache in caches] == [b"cache-0", b"cache-1", b"cache-2"]
 
@@ -183,6 +190,8 @@ def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifyi
     monkeypatch.setattr(sys, "platform", "linux")
     assert hidden.status is result.status
     assert not [text for text in hidden.manifest["limitations"] if "mldrift" in text]
+    (could_not,) = [t for t in hidden.manifest["limitations"] if t.startswith("could not look")]
+    assert "not listable" in could_not
 
     # The cache was shown read by a later run on Linux only; elsewhere nothing is claimed.
     monkeypatch.setattr(sys, "platform", "darwin")

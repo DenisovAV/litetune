@@ -1727,7 +1727,7 @@ withdrawn after re-measurement.
   there is WebGPU over Vulkan, that package holds NVIDIA's Vulkan driver, and
   the driver loads `libEGL.so.1` from `libegl1` — on the one host measured,
   without `libegl1` Vulkan offered only llvmpipe and `verify --backend gpu`
-  refuses. GPU verify runs now use a cache of their own. If you ran
+  refuses. litetune's text, picture and tool-path GPU runs now use a cache directory of their own. If you ran
   `verify --backend gpu` on Linux before installing `libegl1`, that refused run
   may have written `…_mldrift_weight_cache.bin` and
   `…_mldrift_program_cache.bin` beside the model; a later app or CLI run that

@@ -353,9 +353,10 @@ def main():
     rows = []
 
     def make():
-        return litert_lm.Engine(
-            spec["model"], cache_dir=spec["cache_dir"], **engine_kwargs(spec)
-        )
+        # A GPU run's own cache directory (MEASUREMENTS.md#a-gpu-cache-built-on-a-software-
+        # adapter); on the CPU no cache_dir at all, as this path has always asked.
+        cache = {"cache_dir": spec["cache_dir"]} if spec.get("cache_dir") is not None else {}
+        return litert_lm.Engine(spec["model"], **cache, **engine_kwargs(spec))
 
     on_gpu = spec.get("backend", "cpu") == "gpu"
     # On the GPU the adapter the runtime names while the engine is built is
@@ -586,7 +587,7 @@ class ToolPathProbe:
             self.env.provision(events=events)
         with tempfile.TemporaryDirectory(prefix="litetune-toolpath-") as tmp:
             work = Path(tmp)
-            cache_dir = ""
+            cache_dir: str | None = None
             if self.backend_flag == "gpu":
                 cache = work / "cache-toolpath"
                 cache.mkdir()
