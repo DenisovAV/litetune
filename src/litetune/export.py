@@ -90,9 +90,9 @@ COMPOSED_TEMPLATE_PREFIX = "_litetune-chat-template-"
 # and a `prefill_8` signature makes Intel Arc GPUs under Direct3D 12 answer
 # wrong (MEASUREMENTS.md, "Why the decision failed on Intel Arc";
 # google-ai-edge/LiteRT-LM#4460). So only 128 is named: the exporter's own
-# default (`exportable_module_config.py`, litert-torch-nightly
-# 0.11.0.dev20261107), kept explicit so a decision bundle keeps the signature
-# it was measured with if that default moves.
+# default (`exportable_module_config.py:44`, litert-torch-nightly
+# 0.10.0.dev20260926: `[128]`), kept explicit so a decision bundle keeps the
+# signature it was measured with if that default moves.
 PREFILL_FLAG = "--prefill_lengths"
 DECISION_PREFILL_LENGTHS = "128"
 CHAT_TEMPLATE_CHECK = "chat template"
@@ -2547,8 +2547,8 @@ def _vision_carried(
             for section, value in sorted(constraints.items())
             if not isinstance(value, str)
             or not (tokens := [part.strip() for part in value.split(",")])
-            # litert-lm-builder 0.19.1's complete Backend enum
-            # (`litertlm_builder.py:253-260`). Keep this
+            # litert-lm-builder 0.18.0's complete Backend enum
+            # (`litertlm_builder.py:263-269`). Keep this
             # explicit so reading a bundle never silently accepts a future
             # value the pinned builder has not defined for this release.
             or any(

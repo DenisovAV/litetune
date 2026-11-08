@@ -866,7 +866,7 @@ def test_convert_on_windows_is_refused_by_the_converter_and_says_so(tmp_path, ca
 
     report = capsys.readouterr().out
     assert code == 4
-    assert "litert-converter==0.5.0 publishes no wheel for win_amd64" in report
+    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in report
     assert json.loads(report)["outcome"] == "could_not_check"
     assert sorted(p.name for p in model.iterdir()) == ["config.json"]
     assert not (tmp_path / "out").exists()

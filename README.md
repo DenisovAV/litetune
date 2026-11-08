@@ -290,7 +290,7 @@ not measured. Off such a CPU nothing changes.
 | 0.7.0 – 0.7.2 | `litert-lm==0.18.0` | unchanged | unchanged; EmbeddingGemma 2 trains in an environment of its own: `torch==2.9.1`, `torchvision==0.24.1`, `transformers==5.19.0`, `sentence-transformers==6.1.0`, `pillow==12.3.0`, `tokenizers==0.23.3`, `huggingface-hub==1.33.0`, `safetensors==0.8.0` |
 | 0.7.3 | `litert-lm==0.18.0` | unchanged; `convert --npu` compiles in environments of its own: an EmbeddingGemma 2 encoder with `ai-edge-litert==2.3.0`, `ai-edge-litert-sdk-qualcomm==2.3.0` (its sdist, sha256-pinned), `litert-lm-builder==0.18.0` and `flatbuffers==25.12.19`; an LLM bundle with the conversion pins plus the same SDK and `flatbuffers` | unchanged |
 | 0.8.0 – 0.8.2 | `litert-lm==0.18.0` | unchanged; a Gemma 4 checkpoint tuned on pictures exports with the conversion pins plus `torchvision==0.29.2` | unchanged; a Gemma 4 checkpoint tuned on pictures trains with the training pins plus `torchvision==0.20.1` and `pillow==12.3.0` |
-| main after 0.8.2 | `litert-lm==0.19.1` | `litert-torch-nightly==0.11.0.dev20261107`, `litert-lm-builder==0.19.1`, `ai-edge-litert-nightly==2.4.0.dev20261107`, `litert-quantizer-nightly==0.12.0.dev20261108`, `litert-converter==0.5.0`; the two Qualcomm NPU environments keep their 0.18-era conversion pins and SDK | unchanged |
+| main after 0.8.2 | `litert-lm==0.19.1` | unchanged | unchanged |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
@@ -1490,8 +1490,8 @@ incompatible dependencies and cannot share an interpreter.
 ## Results
 
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
-runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, 0.4.0 – 0.8.1 pin 0.18.0,
-and main after 0.8.1 pins 0.19.1.
+runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, 0.4.0 – 0.8.2 pin 0.18.0,
+and main after 0.8.2 pins 0.19.1.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
 0.17.1 re-measurements beside the originals where there are any, and the same
 again on 0.18.0.

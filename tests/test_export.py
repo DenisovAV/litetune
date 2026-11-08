@@ -62,13 +62,13 @@ from litetune.export import (
 # closure -- `absl-py` and `flatbuffers` below stand for it, and are exactly the
 # packages a post-hoc diagnosis would need.
 PIP_FREEZE = """absl-py==2.1.0
-ai-edge-litert-nightly==2.4.0.dev20261107
+ai-edge-litert-nightly==2.3.0.dev20260925
+ai-edge-quantizer-nightly==0.10.0.dev20260926
 flatbuffers==24.3.25
-litert-converter==0.5.0
-litert-lm==0.19.1
-litert-lm-builder==0.19.1
-litert-quantizer-nightly==0.12.0.dev20261108
-litert-torch-nightly==0.11.0.dev20261107
+litert-converter==0.4.0
+litert-lm==0.18.0
+litert-lm-builder==0.18.0
+litert-torch-nightly==0.10.0.dev20260926
 numpy==2.0.2
 transformers==5.16.1
 """
@@ -935,14 +935,14 @@ def test_resolved_toolchain_versions_are_recorded(toolchain, request_for):
     result = run_export(request_for(("weight_only_wi8_afp32",)))
 
     assert result.toolchain.available
-    assert result.toolchain.resolved["litert-torch-nightly"] == "0.11.0.dev20261107"
+    assert result.toolchain.resolved["litert-torch-nightly"] == "0.10.0.dev20260926"
     assert result.toolchain.resolved["numpy"] == "2.0.2"
     # The point of freezing: packages nobody declared are recorded too, because
     # that is where the toolchain actually moved under us.
     assert result.toolchain.resolved["flatbuffers"] == "24.3.25"
     assert result.toolchain.missing == ()
     # The declared pins travel with what they resolved to; neither implies the other.
-    assert "litert-lm==0.19.1" in result.toolchain.declared
+    assert "litert-lm==0.18.0" in result.toolchain.declared
     assert result.as_dict()["toolchain"]["available"] is True
 
 
@@ -1073,13 +1073,13 @@ def test_parse_pip_freeze_records_the_whole_resolved_set():
     # Including packages nobody declared -- that is the point of freezing.
     assert parse_pip_freeze(PIP_FREEZE) == {
         "absl-py": "2.1.0",
-        "ai-edge-litert-nightly": "2.4.0.dev20261107",
+        "ai-edge-litert-nightly": "2.3.0.dev20260925",
+        "ai-edge-quantizer-nightly": "0.10.0.dev20260926",
         "flatbuffers": "24.3.25",
-        "litert-converter": "0.5.0",
-        "litert-lm": "0.19.1",
-        "litert-lm-builder": "0.19.1",
-        "litert-quantizer-nightly": "0.12.0.dev20261108",
-        "litert-torch-nightly": "0.11.0.dev20261107",
+        "litert-converter": "0.4.0",
+        "litert-lm": "0.18.0",
+        "litert-lm-builder": "0.18.0",
+        "litert-torch-nightly": "0.10.0.dev20260926",
         "numpy": "2.0.2",
         "transformers": "5.16.1",
     }
@@ -1285,7 +1285,7 @@ def test_convert_refused_on_this_machine_writes_nothing_into_the_checkpoint(
     assert result.not_attempted == ("dynamic_wi8_afp32",)
     detail = result.checks.first_unchecked.detail
     assert detail.startswith("environment 'export' cannot be provisioned on win_amd64")
-    assert "litert-converter==0.5.0 publishes no wheel for win_amd64" in detail
+    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in detail
 
     monkeypatch.setattr(envs.wheels, "current_host", lambda: machine("linux_x86_64", (3, 12)))
     _convert_checkpoint(model, tmp_path)
@@ -1305,7 +1305,7 @@ def _pip_fails(monkeypatch) -> None:
         envs,
         "_run_guarded",
         lambda *a, **k: subprocess.CompletedProcess(
-            a[0], 1, "", "ERROR: No matching distribution found for litert-converter==0.5.0\n"
+            a[0], 1, "", "ERROR: No matching distribution found for litert-converter==0.4.0\n"
         ),
     )
 

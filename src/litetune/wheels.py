@@ -7,8 +7,8 @@ later without naming the version -- so the environments are checked before pip
 is asked, against the files each pin actually publishes.
 
 **The facts are data, with their source.** Each `Release` below is what PyPI's
-JSON API returned for one pinned release, read on 2026-10-12 or, for pins added
-in this port, from the package-index records cached on 2026-11-08: its file names
+JSON API returned for one pinned release, read on 2026-10-12 or, for the
+litert-lm 0.19.1 line, from the package-index records cached on 2026-11-08: its file names
 (`urls[].filename`) copied verbatim, the URL they were read from, and the `==`
 requirements its metadata names without a marker (`info.requires_dist`), which
 pip can only satisfy with exactly that version. Nothing here is inferred from a
@@ -494,11 +494,6 @@ _RELEASES = (
         files=("litert_torch_nightly-0.10.0.dev20260926-py3-none-any.whl",),
     ),
     Release(
-        "litert-torch-nightly==0.11.0.dev20261107",
-        "https://pypi.org/pypi/litert-torch-nightly/0.11.0.dev20261107/json",
-        files=("litert_torch_nightly-0.11.0.dev20261107-py3-none-any.whl",),
-    ),
-    Release(
         "ai-edge-litert-nightly==2.3.0.dev20260925",
         "https://pypi.org/pypi/ai-edge-litert-nightly/2.3.0.dev20260925/json",
         files=(
@@ -525,43 +520,11 @@ _RELEASES = (
         ),
     ),
     Release(
-        "ai-edge-litert-nightly==2.4.0.dev20261107",
-        "https://pypi.org/pypi/ai-edge-litert-nightly/2.4.0.dev20261107/json",
-        files=tuple(
-            f"ai_edge_litert_nightly-2.4.0.dev20261107-cp{minor}-cp{minor}-{platform}.whl"
-            for minor in (310, 311, 312, 313, 314)
-            for platform in (
-                (
-                    "macosx_12_0_arm64",
-                    "manylinux_2_27_aarch64",
-                    "manylinux_2_27_x86_64",
-                    "win_amd64",
-                )
-                if minor == 310
-                else (
-                    "macosx_12_0_arm64",
-                    "manylinux_2_27_aarch64",
-                    "manylinux_2_27_x86_64",
-                    "win_amd64",
-                    "win_arm64",
-                )
-            )
-        ),
-    ),
-    Release(
         "ai-edge-quantizer-nightly==0.10.0.dev20260926",
         "https://pypi.org/pypi/ai-edge-quantizer-nightly/0.10.0.dev20260926/json",
         files=(
             "ai_edge_quantizer_nightly-0.10.0.dev20260926-py3-none-any.whl",
             "ai_edge_quantizer_nightly-0.10.0.dev20260926.tar.gz",
-        ),
-    ),
-    Release(
-        "litert-quantizer-nightly==0.12.0.dev20261108",
-        "https://pypi.org/pypi/litert-quantizer-nightly/0.12.0.dev20261108/json",
-        files=(
-            "litert_quantizer_nightly-0.12.0.dev20261108-py3-none-any.whl",
-            "litert_quantizer_nightly-0.12.0.dev20261108.tar.gz",
         ),
     ),
     Release(
@@ -579,16 +542,6 @@ _RELEASES = (
             "litert_converter-0.4.0-cp313-cp313-manylinux_2_27_x86_64.whl",
             "litert_converter-0.4.0-cp314-cp314-macosx_12_0_arm64.whl",
             "litert_converter-0.4.0-cp314-cp314-manylinux_2_27_x86_64.whl",
-        ),
-    ),
-    Release(
-        "litert-converter==0.5.0",
-        "https://pypi.org/pypi/litert-converter/0.5.0/json",
-        requires=("xdsl==0.28.0",),
-        files=tuple(
-            f"litert_converter-0.5.0-cp{minor}-cp{minor}-{platform}.whl"
-            for minor in (310, 311, 312, 313, 314)
-            for platform in ("macosx_12_0_arm64", "manylinux_2_27_x86_64")
         ),
     ),
     Release(

@@ -110,9 +110,9 @@ def test_every_release_on_record_is_the_one_it_names(release: Release):
             "linux_x86_64_glibc_2_26",
             12,
             [
-                "ai-edge-litert-nightly==2.4.0.dev20261107",
-                "litert-converter==0.5.0",
-                "litert-lm-api==0.19.1",
+                "ai-edge-litert-nightly==2.3.0.dev20260925",
+                "litert-converter==0.4.0",
+                "litert-lm-api==0.18.0",
             ],
         ),
         (envs.TRAIN, "linux_x86_64_glibc_2_26", 12, []),
@@ -136,7 +136,7 @@ def test_every_release_on_record_is_the_one_it_names(release: Release):
         # Windows x64: verify and tune install; convert does not, for one pin.
         (envs.RUNTIME, "win_amd64", 12, []),
         (envs.TRAIN, "win_amd64", 12, []),
-        (envs.EXPORT, "win_amd64", 12, ["litert-converter==0.5.0"]),
+        (envs.EXPORT, "win_amd64", 12, ["litert-converter==0.4.0"]),
         (envs.TRAIN, "win_amd64", 13, ["torch==2.5.1"]),
         # Windows on ARM64 and 32-bit Windows: no stage at all.
         (envs.RUNTIME, "win_arm64", 12, ["litert-lm-api==0.19.1", "numpy==2.0.2"]),
@@ -149,14 +149,14 @@ def test_every_release_on_record_is_the_one_it_names(release: Release):
             "win32",
             12,
             [
-                "ai-edge-litert-nightly==2.4.0.dev20261107",
-                "litert-converter==0.5.0",
-                "litert-lm-api==0.19.1",
+                "ai-edge-litert-nightly==2.3.0.dev20260925",
+                "litert-converter==0.4.0",
+                "litert-lm-api==0.18.0",
             ],
         ),
         # ARM Linux: the runtime installs, the converter does not.
         (envs.RUNTIME, "linux_aarch64", 12, []),
-        (envs.EXPORT, "linux_aarch64", 12, ["litert-converter==0.5.0"]),
+        (envs.EXPORT, "linux_aarch64", 12, ["litert-converter==0.4.0"]),
         # Intel macOS: neither the runtime's native library nor torch.
         (envs.RUNTIME, "macosx_x86_64", 12, ["litert-lm-api==0.19.1"]),
         (envs.TRAIN, "macosx_x86_64", 12, ["torch==2.5.1"]),

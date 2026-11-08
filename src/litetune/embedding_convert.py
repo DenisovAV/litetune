@@ -49,7 +49,7 @@ carry; and a pack that does not read back -- section by section, byte for byte
 bytes the graft wrote, then every written tensor, scale vector and norm re-read
 from the packed file.
 
-The work runs in `envs.EXPORT`, which has litert-lm-builder 0.19.1 and numpy
+The work runs in `envs.EXPORT`, which has litert-lm-builder 0.18.0 and numpy
 2.0.2 pinned and no torch requirement of this script: the safetensors files are
 read by hand (an 8-byte header length, a JSON header, raw little-endian data).
 

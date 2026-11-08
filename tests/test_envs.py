@@ -528,7 +528,7 @@ def test_an_unready_environment_says_what_pypi_lacks(monkeypatch, tmp_path, allo
 
     detail = EXPORT.unready_detail
 
-    assert "litert-converter==0.5.0 publishes no wheel for win_amd64" in detail
+    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in detail
     if allowed:
         assert detail.startswith(f"is not provisioned at {EXPORT.path}; by PyPI's file lists it ")
         assert detail.endswith(f"though {envs.ALLOW_MISSING_WHEELS}=1 lets pip try")
@@ -927,7 +927,7 @@ def test_pips_words_are_redacted_before_they_are_cut():
 
 
 def test_convert_is_refused_on_windows_before_anything_is_installed(monkeypatch, tmp_path):
-    """`litert-converter==0.5.0` publishes no Windows wheel and no source distribution.
+    """`litert-converter==0.4.0` publishes no Windows wheel and no source distribution.
 
     pip used to be asked anyway, and failed while resolving. The refusal now
     comes first, names the package and says where `convert` does run -- and
@@ -943,9 +943,9 @@ def test_convert_is_refused_on_windows_before_anything_is_installed(monkeypatch,
 
     assert reached == [], "nothing is built or installed for an environment that cannot be"
     assert message.startswith("environment 'export' cannot be provisioned on win_amd64")
-    assert "litert-converter==0.5.0 publishes no wheel for win_amd64" in message
+    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in message
     assert "no source distribution" in message
-    assert "https://pypi.org/pypi/litert-converter/0.5.0/json" in message
+    assert "https://pypi.org/pypi/litert-converter/0.4.0/json" in message
     assert "WSL2" in message and "`verify` takes it" in message
 
 
@@ -1056,7 +1056,7 @@ def test_an_environment_that_cannot_be_built_here_says_so_when_unready(monkeypat
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
 
     _host(monkeypatch, "win_amd64", (3, 12))
-    assert "litert-converter==0.5.0 publishes no wheel" in EXPORT.unready_detail
+    assert "litert-converter==0.4.0 publishes no wheel" in EXPORT.unready_detail
     assert EXPORT.unready_detail.startswith(f"is not provisioned at {EXPORT.path}, and cannot")
 
     _host(monkeypatch, "linux_x86_64", (3, 12))
@@ -5098,12 +5098,15 @@ def test_the_export_environment_pins_what_litert_torch_leaves_open():
     pins = dict(r.split("==", 1) for r in envs.EXPORT.requirements if "==" in r)
     train = dict(r.split("==", 1) for r in envs.TRAIN.requirements if "==" in r)
 
-    for name in ("ai-edge-litert-nightly", "litert-quantizer-nightly", "litert-converter"):
+    for name in ("ai-edge-litert-nightly", "ai-edge-quantizer-nightly", "litert-converter"):
         assert name in pins
     assert pins["transformers"] == train["transformers"]
     assert pins["litert-lm"] == pins["litert-lm-builder"]
     runtime = dict(r.split("==", 1) for r in envs.RUNTIME.requirements if "==" in r)
-    assert pins["litert-lm"] == runtime["litert-lm"]
+    assert pins["litert-torch-nightly"] == "0.10.0.dev20260926"
+    assert pins["litert-lm-builder"] == "0.18.0"
+    assert runtime["litert-lm"] == "0.19.1"
+    assert pins["litert-lm"] != runtime["litert-lm"]
 
 
 @pytest.mark.parametrize(
