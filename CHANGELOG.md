@@ -3,6 +3,12 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.8.1 — 2026-11-08
+- Ran `verify --backend gpu` on Linux where it refused a software adapter (llvmpipe, e.g. before installing `libegl1`)? Delete the `…_mldrift_*cache.bin` files beside that model and run its text, picture or tool-path GPU verify again (#119).
+- GPU verify runs of text, pictures and the tool path use a cache directory of their own, so one built on a software adapter is not read (#119).
+- A picture model's vision encoder can be given the GPU in `convert` and `verify --backend gpu` (#120).
+- MEASUREMENTS has why the decision failed on two integrated Intel Arc GPUs (#121).
+
 ## 0.8.0 — 2026-11-07
 - `prepare`, `tune`, `convert` and `verify` fine-tune EmbeddingGemma 2 on images and write the encoder into Google's text-vision file (#110).
 - `prepare`, `tune`, `convert` and `verify` fine-tune Gemma 4 E2B on rows that carry a picture; the bundle keeps its vision encoder (#115).
