@@ -67,22 +67,24 @@ turned into a vector by the source
 of vision tokens, the mean over every token (`IMAGE_REFERENCE_SCRIPT`). It
 reports the soft tokens it made of each picture, and a count other than the
 one `tune` recorded for it is refused. The candidate is the file through
-`EmbeddingEngine` with its requested backend for text and vision at that
+`EmbeddingEngine` with the backends litetune gives text and vision at that
 budget, each image given as its bytes (`IMAGE_ENGINE_SCRIPT`); the engine
 reports no per-image count, so only the reference's is compared. Google's file
 is the text-vision file (`embedding_vision.VISION_FILE`). On the GPU, both
-towers are requested there
+towers are given that backend when the vision encoder constraints allow it;
+adapter constraints are recorded and left to LiteRT-LM
 (`IMAGE_GPU_MEASURED`). A convert report that records another budget, or another
 modality, than the reference is refused.
 
+Nothing litetune reads shows which device the vision encoder itself ran on.
 On a CPU image run, litert-lm 0.18.0 sets no thread count for the vision encoder (its Python
 `EmbeddingEngine` and its C API set the main and the audio backends' only), so
-the vision encoder runs on the runtime's default threads. An image run
+the vision encoder is given the runtime's default CPU thread setting. An image run
 therefore never embeds the candidate and Google's file side by side on the CPU, and on a
 CPU with SME2, or one whose answer could not be read, where litetune's CPU runs
 are held to one thread for repeatability (`devices.runtime_cpu_threads`), the
 candidate is embedded twice and any difference between the two is a harness
-failure. A GPU image run does not use that CPU-repeatability rule.
+failure. A GPU image run always repeats the candidate too.
 """
 
 from __future__ import annotations
@@ -148,6 +150,7 @@ from litetune.evaluate import (
     with_adapters,
 )
 from litetune.events import EventStream
+from litetune.llm_images import VISION_BACKEND_SOURCE
 from litetune.metrics import Difference, paired_difference
 from litetune.prepare import (
     PrepareError,
@@ -288,8 +291,8 @@ SCORER_MEANS_IMAGES = (
 # well as the text tower.
 IMAGE_ROW_TIMEOUT_S = 15
 IMAGE_GPU_MEASURED = (
-    "{how} LiteRT-LM's EmbeddingEngine, with the GPU backend requested for both the text tower "
-    "and vision encoder, each image given as its "
+    "{how} LiteRT-LM's EmbeddingEngine, with both the text tower and vision encoder given the "
+    "GPU backend, each image given as its "
     "bytes at a budget of at most {vision_tokens} vision tokens per image, from the litert-lm "
     "package on PyPI on this host, one file at a time -- not the application's own build of the "
     "runtime on a device; the NPU is not measured. litetune has run one image checkpoint so, "
@@ -303,10 +306,12 @@ IMAGE_REFERENCE_ON_CPU = (
     "L2-normalised"
 )
 VISION_THREADS = (
-    "the vision encoder ran on the runtime's default threads: litert-lm 0.18.0 sets a thread "
+    "the vision encoder was given the CPU backend with its default thread setting: litert-lm "
+    "0.18.0 sets a thread "
     "count for an EmbeddingEngine's main and audio backends only (its Python embedding_engine.py "
     "and its C API), so {threads} applied to the text tower alone, and the candidate and Google's "
-    "file were embedded one after the other"
+    "file were embedded one after the other. Nothing litetune reads shows which device the "
+    "vision encoder itself ran on"
 )
 NOT_REPEATABLE = (
     "the candidate embedded twice on this CPU did not give the same vectors ({differ}): on a CPU "
@@ -315,8 +320,17 @@ NOT_REPEATABLE = (
     "two runs of one file is the harness's, not the file's"
 )
 REPEATED = (
-    "the candidate was embedded twice, the vision encoder on the runtime's default threads, and "
+    "the candidate was embedded twice, the vision encoder given the CPU backend with its "
+    "default thread setting, and "
     "gave the same vectors both times"
+)
+NOT_REPEATABLE_GPU = (
+    "the candidate embedded twice with both towers given the GPU did not give the same vectors "
+    "({differ}): a difference between two runs of one file is the harness's, not the file's"
+)
+REPEATED_GPU = (
+    "the candidate was embedded twice with both its text tower and vision encoder given the GPU, "
+    "and gave the same vectors both times"
 )
 NO_PROCESSOR = (
     "the reference {reference} has no {missing}: a checkpoint `tune` saved has its processor "
@@ -814,6 +828,8 @@ def unusable_rows(v):
     + PICTURE_BYTES_SOURCE
     + "\n"
     + RUNTIME_ENGINE_SOURCE
+    + "\n"
+    + VISION_BACKEND_SOURCE
     + r"""
 
 def main():
@@ -837,7 +853,18 @@ def main():
     out, times = [], []
     on_gpu = spec.get("backend", "cpu") == "gpu"
     backend = backend_for("gpu") if on_gpu else litert_lm.Backend.CPU(thread_count=spec["threads"])
-    vision_backend = backend if on_gpu else litert_lm.Backend.CPU()
+    constraints = bundle_vision_constraints(spec["model"])
+    try:
+        vision_backend_name, vision_reason = choose_vision_backend(
+            spec.get("backend", "cpu"), constraints
+        )
+    except ValueError as exc:
+        report.write_text(
+            json.dumps({"error": str(exc), "vision_backend_constraints": constraints}),
+            encoding="utf-8",
+        )
+        return REFUSED_EXIT
+    vision_backend = backend_for(vision_backend_name)
     device = {}
     with litert_lm.EmbeddingEngine(
         spec["model"],
@@ -904,7 +931,11 @@ def main():
         "seconds": round(time.time() - started, 1),
         "ms_median": round(1000 * statistics.median(times), 2) if times else None,
         "backend": "gpu" if on_gpu else "cpu",
-        "vision_backend": "gpu" if on_gpu else "cpu",
+        # What litetune gave EmbeddingEngine, not a reading of where the vision
+        # encoder ran: the runtime exposes no such reading.
+        "vision_backend": vision_backend_name,
+        "vision_backend_constraints": constraints,
+        "vision_backend_reason": vision_reason,
         "threads": None if on_gpu else spec["threads"],
         # None: the runtime's default; the engine takes no count for it.
         "vision_threads": None,
@@ -2010,10 +2041,12 @@ def verify_embedding(
     }
     # The engine takes no thread count for the CPU vision encoder, so a CPU
     # image run embeds one file at a time, and where one thread is what is
-    # repeatable it embeds the candidate twice to see that it is.
+    # repeatable it embeds the candidate twice to see that it is. A GPU image
+    # run always repeats the candidate: GPU evidence is process-wide and says
+    # nothing about repeatability.
     on_gpu = job.backend == "gpu"
     vision_cpu = engine_cpu
-    repeat = images and vision_cpu is not None and vision_cpu.reason is not None
+    repeat = images and (on_gpu or (vision_cpu is not None and vision_cpu.reason is not None))
     if images:
         try:
             problem = processor_problem(Path(job.reference), record.processor_sha256 or {})
@@ -2026,7 +2059,9 @@ def verify_embedding(
             return refuse(REFERENCE_CHECK, problem)
         fields["embedding"] |= {
             "processor": str(job.reference),
-            "vision_backend": job.backend,
+            # Filled from the candidate report: what litetune gave its vision
+            # tower, not a reading of where that tower ran.
+            "vision_backend": None,
             "vision_threads": None,
             "candidate_repeated": repeat,
         }
@@ -2294,7 +2329,8 @@ def verify_embedding(
         # because of it, and the failure to report is the candidate's.
         if (problem := accept("candidate", CANDIDATE_CHECK, engine_runs["candidate"])) is not None:
             return refuse(CANDIDATE_CHECK, problem)
-        if repeat and (problem := repeat_problem(engine_runs, work, len(inputs), NOT_REPEATABLE)):
+        repeat_text = NOT_REPEATABLE_GPU if on_gpu else NOT_REPEATABLE
+        if repeat and (problem := repeat_problem(engine_runs, work, len(inputs), repeat_text)):
             return refuse(CANDIDATE_CHECK, problem)
         with_base = google is not None
         if with_base and (problem := accept("base", BASE_EMBED_CHECK, engine_runs["base"])):
@@ -2344,6 +2380,15 @@ def verify_embedding(
     )
     fields["measurements"] = {name: {"available": True, **accuracy[name]} for name in accuracy}
     candidate_report = harness.get("candidate") or {}
+    if images:
+        fields["embedding"]["vision_backend"] = candidate_report.get("vision_backend")
+        fields["embedding"]["vision_backend_constraints"] = candidate_report.get(
+            "vision_backend_constraints"
+        )
+        fields["embedding"]["vision_backend_reason"] = candidate_report.get("vision_backend_reason")
+        vision_reason = candidate_report.get("vision_backend_reason")
+        if isinstance(vision_reason, str) and vision_reason:
+            state.limitation(vision_reason)
     fields["measurements"]["candidate"]["engine"] = {
         "engine": "litert-lm",
         "api": "EmbeddingEngine",
@@ -2362,8 +2407,17 @@ def verify_embedding(
         "threads_requested": job.threads if engine_cpu else None,
         "threads_reason": engine_cpu.reason if engine_cpu else None,
         "settings": _mapping(candidate_report.get("settings")),
-        # An image file's vision encoder: what the engine script built it on.
-        **({"vision_backend": candidate_report.get("vision_backend")} if images else {}),
+        # An image file's vision encoder: the backend litetune gave the engine,
+        # not a reading of the device where the encoder ran.
+        **(
+            {
+                "vision_backend": candidate_report.get("vision_backend"),
+                "vision_backend_constraints": candidate_report.get("vision_backend_constraints"),
+                "vision_backend_reason": candidate_report.get("vision_backend_reason"),
+            }
+            if images
+            else {}
+        ),
         ("ms_per_image_median" if images else "ms_per_text_median"): candidate_report.get(
             "ms_median"
         ),
@@ -2416,6 +2470,8 @@ def verify_embedding(
             state.limitation(selected)
         if images:
             state.limitation(IMAGE_GPU_MEASURED.format(how=how, vision_tokens=record.vision_tokens))
+            if repeat:
+                state.limitation(REPEATED_GPU)
         else:
             state.limitation(GPU_MEASURED.format(how=how))
     elif images:

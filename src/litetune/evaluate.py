@@ -49,7 +49,13 @@ from litetune import devices, envs
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.export import GPU_ACTIVATION
-from litetune.llm_images import CANDIDATE_SAMPLER, ImageRef, ImageRowError, split_images
+from litetune.llm_images import (
+    CANDIDATE_SAMPLER,
+    VISION_BACKEND_SOURCE,
+    ImageRef,
+    ImageRowError,
+    split_images,
+)
 from litetune.metrics import ToolCall, read_target
 from litetune.prompt_mode import RENDERING_SOURCE, PromptMode
 
@@ -758,9 +764,10 @@ class LiteRtLmBackend:
     threads: int | None = None
     # Rows with a picture: each prompt's picture as `{"path", "sha256"}`, in
     # prompt order. Each is sent as the app sends it -- its bytes, base64, as an
-    # `image` part before the text -- to an engine whose vision backend follows
-    # `backend_flag`, unless the bundle's vision constraints require the other
-    # backend supported by litert-lm's Python API.
+    # `image` part before the text -- to an engine whose vision backend is given
+    # `backend_flag`, unless the bundle's vision encoder constraints require
+    # the other backend supported by litert-lm's Python API. Adapter constraints are
+    # recorded and left to LiteRT-LM; they do not select this argument.
     images: tuple[Mapping[str, str], ...] | None = None
 
     name = "litert-lm"
@@ -812,6 +819,45 @@ class LiteRtLmBackend:
         if self.uses_template:
             return "Engine.create_conversation()"
         return "Engine.create_session(apply_prompt_template=False)"
+
+    def picture_backend_problem(self, events: EventStream | None = None) -> str | None:
+        """Why a CPU request cannot safely use this picture bundle, or `None`.
+
+        This header-only probe runs before verify's rendering check and before
+        the candidate engine. A CPU run whose bundle would force vision onto
+        the GPU must be restarted as an explicit GPU run so the GPU preflight,
+        software-adapter refusal and evidence checks all apply. The generation
+        driver repeats the decision as a backstop.
+        """
+        if self.images is None or self.backend_flag != "cpu":
+            return None
+        if (blocked := self._ensure_env(events)) is not None:
+            return blocked
+        with tempfile.TemporaryDirectory(prefix="litetune-vision-backend-") as tmp:
+            work = Path(tmp)
+            script = work / "inspect.py"
+            spec = work / "spec.json"
+            report = work / "report.json"
+            script.write_text(_VISION_BACKEND_PROBE_SCRIPT, encoding="utf-8")
+            spec.write_text(
+                json.dumps(
+                    {"model": str(self.model), "backend": self.backend_flag, "report": str(report)}
+                ),
+                encoding="utf-8",
+            )
+            try:
+                proc = self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
+            except subprocess.TimeoutExpired:
+                return f"the vision-backend header probe gave no result after {self.timeout_s}s"
+            if proc.returncode != 0 or not report.is_file():
+                said = (proc.stderr or "").strip()[-300:] or "no report"
+                return f"the vision-backend header probe exited {proc.returncode}: {said}"
+            try:
+                reading = json.loads(report.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return f"the vision-backend header probe wrote no readable report: {exc}"
+            error = reading.get("error") if isinstance(reading, dict) else None
+            return str(error) if error else None
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -872,8 +918,8 @@ class LiteRtLmBackend:
             "engine_per_prompt": bool(self.engine_per_prompt_reason),
             "engine_per_prompt_reason": self.engine_per_prompt_reason or None,
             "engine_init_seconds": engine_init_of(self.device_report),
-            # Rows with a picture: how many, and the backend their vision
-            # encoder ran on. `None` for text.
+            # Rows with a picture: how many, and the backend litetune gave the
+            # vision encoder. `None` for text.
             "pictures": len(self.images) if self.images is not None else None,
             "vision_backend": (
                 (self.device_report or {}).get("vision_backend")
@@ -1016,6 +1062,12 @@ class LiteRtLmBackend:
                 logger.exception("could not start the litert-lm generation script")
                 reason = f"{type(exc).__name__}: {exc}"
                 return [Generation(i, p, harness_error=reason) for i, p in enumerate(prompts)]
+            except BaseException:
+                # The picture driver writes its backend decision before it
+                # constructs the engine. Keep that report if the transport
+                # raises so verify can describe the failed attempt accurately.
+                self.device_report = _read_device_report(report)
+                raise
 
             texts, faults = read_jsonl_results(results)
             self.device_report = with_adapters(_read_device_report(report), proc.stderr)
@@ -2511,6 +2563,34 @@ def build_watching_adapter(make):
 )
 
 
+_VISION_BACKEND_PROBE_SCRIPT = (
+    r"""
+import json
+import sys
+from pathlib import Path
+"""
+    + VISION_BACKEND_SOURCE
+    + r"""
+
+def main(spec_path):
+    spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    constraints = bundle_vision_constraints(spec["model"])
+    result = {"constraints": constraints}
+    try:
+        backend, reason = choose_vision_backend(spec.get("backend", "cpu"), constraints)
+    except ValueError as exc:
+        result["error"] = str(exc)
+    else:
+        result["vision_backend"] = backend
+        result["reason"] = reason
+    Path(spec["report"]).write_text(json.dumps(result), encoding="utf-8")
+
+if __name__ == "__main__":
+    main(sys.argv[1])
+"""
+)
+
+
 _LITERTLM_GENERATE_SCRIPT = (
     r'''
 """Generation for one split through litert-lm's Python API.
@@ -2527,6 +2607,8 @@ import sys
 from pathlib import Path
 '''
     + RUNTIME_ENGINE_SOURCE
+    + "\n"
+    + VISION_BACKEND_SOURCE
     + r'''
 
 def text_from_session(session, prompt):
@@ -2667,33 +2749,6 @@ def bundle_sampler(path):
     return None
 
 
-def bundle_vision_constraints(path):
-    """Constraints carried by vision sections, by section type."""
-    import io
-
-    from litert_lm_builder import litertlm_peek
-
-    header = litertlm_peek.read_litertlm_header(path, io.StringIO())
-    listed = header.SectionMetadata()
-    found = {}
-    for index in range(listed.ObjectsLength() if listed else 0):
-        section = listed.Objects(index)
-        kind = litertlm_peek.get_model_type(section)
-        if not kind:
-            continue
-        kind = str(kind).lower().removeprefix("tf_lite_")
-        if kind not in ("vision_encoder", "vision_adapter"):
-            continue
-        for item_index in range(section.ItemsLength()):
-            item = section.Items(item_index)
-            if item is None:
-                continue
-            pair = litertlm_peek.kvp_to_dict(item)
-            if pair.get("key") == "backend_constraint" and pair.get("value") is not None:
-                found[kind] = str(pair["value"]).strip().lower()
-    return found
-
-
 def sampler_replaced(sampler):
     """`llm_images.sampler_replaced`, which this script cannot import."""
     if sampler is None:
@@ -2778,27 +2833,7 @@ def main(spec_path):
     vision_reason = None
     if spec.get("images"):
         requested = spec.get("backend", "cpu")
-        supported = {"cpu", "gpu"}
-        common = set(supported)
-        for value in constraints.values():
-            common &= {part.strip().lower() for part in value.split(",")} & supported
-        shown = ", ".join(
-            "%s=%r" % (section, value) for section, value in sorted(constraints.items())
-        )
-        if requested in common:
-            spec["vision_backend"] = requested
-        elif len(common) == 1:
-            spec["vision_backend"] = common.pop()
-            vision_reason = (
-                "--backend %s is not allowed by the vision constraints %s; %s is the only "
-                "cpu/gpu backend every constrained vision section allows"
-                % (requested, shown, spec["vision_backend"])
-            )
-        else:
-            raise ValueError(
-                "the vision sections leave no cpu or gpu backend they all allow: %s"
-                % (shown or "no parsed constraints")
-            )
+        spec["vision_backend"], vision_reason = choose_vision_backend(requested, constraints)
     engine_args = engine_kwargs(spec)
     prompts = spec["prompts"]
     pictures = spec.get("images") or [None] * len(prompts)

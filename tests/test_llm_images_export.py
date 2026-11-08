@@ -222,6 +222,31 @@ def test_convert_writes_no_vision_section_constraint(tmp_path, vision_bundle):
     assert "vision section constraints: none" in export.check.detail
 
 
+def test_duplicate_vision_section_constraints_are_intersected(tmp_path, vision_bundle):
+    first = VISION_TOML.replace(
+        'model_type = "vision_encoder"',
+        'model_type = "vision_encoder"\nbackend_constraint = "gpu"',
+    )
+    vision_bundle.repack_toml = first + (
+        '\n[[section]]\nmodel_type = "vision_encoder"\nsection_type = "TFLiteModel"\n'
+        'data_path = "vision_encoder_2.tflite"\nbackend_constraint = "cpu,gpu"\n'
+    )
+    (export,) = run_export(_request(tmp_path, _checkpoint(tmp_path))).exports
+    assert export.ok, export.check.detail
+    assert export.vision["backend_constraints"]["vision_encoder"] == "gpu"
+
+
+@pytest.mark.parametrize("value", ["npu", "gpu_artisan"])
+def test_convert_accepts_the_builders_other_backends(tmp_path, vision_bundle, value):
+    vision_bundle.repack_toml = VISION_TOML.replace(
+        'model_type = "vision_encoder"',
+        f'model_type = "vision_encoder"\nbackend_constraint = "{value}"',
+    )
+    (export,) = run_export(_request(tmp_path, _checkpoint(tmp_path))).exports
+    assert export.ok, export.check.detail
+    assert export.vision["backend_constraints"]["vision_encoder"] == value
+
+
 @pytest.mark.parametrize("value", ["", "bananas", "CPU", "cpu,,gpu", "cpu,gpu,"])
 def test_convert_refuses_an_invalid_vision_backend_constraint(tmp_path, vision_bundle, value):
     vision_bundle.repack_toml = VISION_TOML.replace(
@@ -232,6 +257,17 @@ def test_convert_refuses_an_invalid_vision_backend_constraint(tmp_path, vision_b
     assert export.check.outcome is Outcome.FAILED
     assert "vision_encoder" in export.check.detail
     assert repr(value) in export.check.detail
+
+
+def test_convert_cleanly_refuses_a_non_string_vision_backend_constraint(tmp_path, vision_bundle):
+    vision_bundle.repack_toml = VISION_TOML.replace(
+        'model_type = "vision_encoder"',
+        'model_type = "vision_encoder"\nbackend_constraint = 7',
+    )
+    (export,) = run_export(_request(tmp_path, _checkpoint(tmp_path))).exports
+    assert export.check.outcome is Outcome.FAILED
+    assert "vision_encoder" in export.check.detail
+    assert "backend_constraint to 7" in export.check.detail
 
 
 def test_an_unconstrained_bundle_is_kept_if_the_optional_repack_fails(tmp_path, vision_bundle):

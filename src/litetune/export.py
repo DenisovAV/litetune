@@ -2042,12 +2042,19 @@ def section_type_of(section):
 def vision_in(doc, meta):
     """What the bundle carries for pictures: section types, constraints, media fields, sampler."""
     types = sorted({section_type_of(s) for s in doc.get("section", []) if s.get("model_type")})
-    constraints = {
-        section_type_of(s): s.get("backend_constraint")
-        for s in doc.get("section", [])
-        if section_type_of(s) in ("vision_encoder", "vision_adapter")
-        and s.get("backend_constraint") is not None
-    }
+    constraints = {}
+    for section in doc.get("section", []):
+        kind = section_type_of(section)
+        value = section.get("backend_constraint")
+        if kind not in ("vision_encoder", "vision_adapter") or value is None:
+            continue
+        if kind not in constraints:
+            # Preserve one section's exact value so validation can name bad
+            # case, spacing and empty entries exactly as the bundle carries it.
+            constraints[kind] = value
+        elif isinstance(constraints[kind], str) and isinstance(value, str):
+            left = set(constraints[kind].split(","))
+            constraints[kind] = ",".join(sorted(left & set(value.split(","))))
     gemma4 = None
     if has(meta, "llm_model_type") and has(meta.llm_model_type, "gemma4"):
         g = meta.llm_model_type.gemma4
@@ -2536,7 +2543,12 @@ def _vision_carried(
             for section, value in sorted(constraints.items())
             if not isinstance(value, str)
             or not (tokens := [part.strip() for part in value.split(",")])
-            or any(not token or token not in {"cpu", "gpu", "npu"} for token in tokens)
+            # litert-lm-builder 0.18.0's complete Backend enum. Keep this
+            # explicit so reading a bundle never silently accepts a future
+            # value the pinned builder has not defined for this release.
+            or any(
+                not token or token not in {"cpu", "gpu", "npu", "gpu_artisan"} for token in tokens
+            )
         ),
         None,
     )
@@ -2544,7 +2556,7 @@ def _vision_carried(
         section, value = invalid_constraint
         problem = (
             f"sets {section} backend_constraint to {value!r}; expected a non-empty, "
-            "comma-separated list of lower-case cpu, gpu or npu"
+            "comma-separated list of lower-case cpu, gpu, npu or gpu_artisan"
         )
     elif missing:
         problem = (

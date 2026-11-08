@@ -3090,8 +3090,19 @@ def test_bundle_vision_constraints_reads_the_production_header_reader(monkeypatc
             {"vision_adapter": "gpu"},
         ),
         (
+            [
+                [("model_type", "vision_encoder"), ("backend_constraint", "gpu")],
+                [("model_type", "vision_encoder"), ("backend_constraint", "cpu,gpu")],
+            ],
+            {"vision_encoder": "gpu"},
+        ),
+        (
             [[("model_type", "vision_encoder"), ("backend_constraint", " gpu ")]],
             {"vision_encoder": "gpu"},
+        ),
+        (
+            [[("model_type", "vision_encoder"), ("backend_constraint", "cpu, gpu")]],
+            {"vision_encoder": "cpu,gpu"},
         ),
         ([_pd(("backend_constraint", "cpu"))], {}),
         ([], {}),
@@ -4176,7 +4187,6 @@ def test_a_cpu_constrained_picture_bundle_requests_cpu_vision_and_records_the_se
         "vision_adapter": "cpu",
     }
     assert "vision_encoder='cpu'" in recorded["vision_backend_reason"]
-    assert "vision_adapter='cpu'" in recorded["vision_backend_reason"]
 
 
 def test_every_vision_constraint_is_recorded_separately_from_the_gpu_decision(
@@ -4211,7 +4221,35 @@ def test_every_vision_constraint_is_recorded_separately_from_the_gpu_decision(
     assert "vision_backend_reason" not in recorded
 
 
-def test_a_gpu_only_bundle_overrides_a_cpu_vision_request_and_records_why(tmp_path, monkeypatch):
+def test_google_embeddinggemma_layout_keeps_gpu_vision_and_records_adapter_limitation(
+    tmp_path, monkeypatch
+):
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"a")
+    report = tmp_path / "report.json"
+    monkeypatch.setitem(
+        _litertlm_script(), "bundle_vision_constraints", lambda path: {"vision_adapter": "cpu"}
+    )
+    _, engines = _run_script(
+        tmp_path,
+        ["one"],
+        monkeypatch=monkeypatch,
+        report=report,
+        extra={
+            "backend": "gpu",
+            "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+            "vision_backend": "gpu",
+        },
+    )
+    assert engines[0].kwargs["vision_backend"].name == "gpu"
+    recorded = json.loads(report.read_text())
+    assert recorded["vision_backend"] == "gpu"
+    assert recorded["vision_backend_constraints"] == {"vision_adapter": "cpu"}
+    assert "measured on one Mac with litert-lm 0.18.0" in recorded["vision_backend_reason"]
+    assert "which device the adapter used was not observed" in recorded["vision_backend_reason"]
+
+
+def test_the_driver_refuses_cpu_text_with_gpu_only_vision_as_a_backstop(tmp_path, monkeypatch):
     picture = tmp_path / "a.jpg"
     picture.write_bytes(b"a")
     report = tmp_path / "report.json"
@@ -4220,25 +4258,53 @@ def test_a_gpu_only_bundle_overrides_a_cpu_vision_request_and_records_why(tmp_pa
         "bundle_vision_constraints",
         lambda path: {"vision_encoder": "gpu", "vision_adapter": "cpu,gpu"},
     )
-    _, engines = _run_script(
+    with pytest.raises(ValueError) as raised:
+        _run_script(
+            tmp_path,
+            ["one"],
+            monkeypatch=monkeypatch,
+            report=report,
+            extra={
+                "backend": "cpu",
+                "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+                "vision_backend": "cpu",
+            },
+        )
+    said = str(raised.value)
+    assert "--backend cpu" in said and "vision_encoder='gpu'" in said
+    assert "Pass --backend gpu" in said
+
+
+def test_the_cpu_picture_preflight_returns_the_header_probes_refusal(tmp_path):
+    class ProbeEnv:
+        name = "runtime"
+
+        def provision(self, events=None):
+            return None
+
+        def run(self, argv, timeout=None):
+            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            Path(spec["report"]).write_text(
+                json.dumps(
+                    {
+                        "constraints": {
+                            "vision_encoder": "gpu",
+                            "vision_adapter": "cpu,gpu",
+                        },
+                        "error": "vision_encoder='gpu'; Pass --backend gpu",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+    backend = _litertlm(
         tmp_path,
-        ["one"],
-        monkeypatch=monkeypatch,
-        report=report,
-        extra={
-            "backend": "cpu",
-            "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
-            "vision_backend": "cpu",
-        },
+        backend_flag="cpu",
+        images=({"path": "a.jpg", "sha256": "0" * 64},),
+        env=ProbeEnv(),
     )
-    assert engines[0].kwargs["vision_backend"].name == "gpu"
-    recorded = json.loads(report.read_text())
-    assert recorded["vision_backend"] == "gpu"
-    assert recorded["vision_backend_constraints"] == {
-        "vision_encoder": "gpu",
-        "vision_adapter": "cpu,gpu",
-    }
-    assert "--backend cpu" in recorded["vision_backend_reason"]
+    assert backend.picture_backend_problem() == "vision_encoder='gpu'; Pass --backend gpu"
 
 
 def test_vision_constraints_are_written_before_engine_construction(tmp_path, monkeypatch):
@@ -4272,13 +4338,15 @@ def test_vision_constraints_are_written_before_engine_construction(tmp_path, mon
     assert "--backend gpu" in recorded["vision_backend_reason"]
 
 
-def test_incompatible_vision_constraints_end_the_candidate_without_guessing(tmp_path, monkeypatch):
+def test_an_encoder_allowing_neither_cpu_nor_gpu_ends_the_candidate_without_guessing(
+    tmp_path, monkeypatch
+):
     picture = tmp_path / "a.jpg"
     picture.write_bytes(b"a")
     monkeypatch.setitem(
         _litertlm_script(),
         "bundle_vision_constraints",
-        lambda path: {"vision_encoder": "cpu", "vision_adapter": "gpu"},
+        lambda path: {"vision_encoder": "npu", "vision_adapter": "gpu"},
     )
     with pytest.raises(ValueError) as exc:
         _run_script(
@@ -4291,8 +4359,8 @@ def test_incompatible_vision_constraints_end_the_candidate_without_guessing(tmp_
                 "vision_backend": "gpu",
             },
         )
-    assert "vision_encoder='cpu'" in str(exc.value)
-    assert "vision_adapter='gpu'" in str(exc.value)
+    assert "vision_encoder='npu'" in str(exc.value)
+    assert "leave no cpu or gpu backend" in str(exc.value)
 
 
 def test_an_unconstrained_gpu_picture_bundle_requests_gpu_vision(tmp_path, monkeypatch):

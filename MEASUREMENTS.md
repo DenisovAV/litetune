@@ -1037,9 +1037,11 @@ seed 0 row is the run above (at the commit that added the stages).
 | seed 2, `dynamic_wi8_afp32` | 0.9500 | 0.9433 | +0.0067 ±0.0092, 2 of 300 discordant, unresolved |
 | seed 0, `dynamic_wi4b32_emb8_afp32` | 0.8800 | 0.7900 | +0.0900 ±0.0364, 31 of 300 discordant, resolved |
 
-- Three seeds of litetune's tune gave references of 0.8800, 0.9600 and 0.9500 on
-  the same 300 pictures: seed 0's 0.8800 was the low end of the spread, not a
-  property of litetune's recipe. The scripts outside litetune scored 0.9067 to 0.9367,
+- Three runs gave references of 0.8800, 0.9600 and 0.9500 on the same 300
+  pictures: seed 0 at the earlier implementation commit, and seeds 1 and 2 with
+  litetune 0.8.0 from PyPI. With n=3 they show that these runs differed; they do
+  not establish a distribution or attribute the difference to the recipe. The
+  scripts outside litetune scored 0.9067 to 0.9367,
   as listed in the earlier bullet of this section beginning “The same rows tuned by a
   script outside litetune”.
 - Four bits (int4 weights in blocks of 32, int8 embeddings) cost 0.0900 on seed 0's
@@ -1050,21 +1052,23 @@ On the GPU, seed 0's bundle on its 300 pictures, greedy as verify sends it, thro
 litert-lm 0.18.0 from PyPI; the copy with the vision sections unconstrained is the
 bundle with its two `backend_constraint = "cpu"` lines removed and nothing else
 changed. A script outside litetune sent each picture as verify does
-(`evaluate.picture_message`); `verify --backend gpu` at `e0bbf41` (unreleased) ran the
-unconstrained copy.
+(`evaluate.picture_message`); `verify --backend gpu` at `e0bbf41` (a wheel built from
+that commit; its sha256 is with the run) ran the unconstrained copy.
 
 | host | text / vision | bundle | replies unlike the same host's CPU |
 |---|---|---|---|
 | NVIDIA A100, Linux (Vulkan) | CPU / CPU | 0.8867 | |
 | NVIDIA A100 | GPU / CPU | 0.8800 | 6 |
 | NVIDIA A100 | GPU / GPU (unconstrained copy) | 0.8800 | 6 |
-| NVIDIA A100, `verify --backend gpu` at `e0bbf41` | GPU / GPU (unconstrained copy) | 0.8800, reference 0.8800, 0.0000 ±0.0131, 4 discordant | |
-| NVIDIA A100, `verify --backend gpu` at `e633e3c`, the bundle as convert wrote it | GPU / CPU (the bundle's constraint, recorded) | 0.8800, reference 0.8800, 0.0000 ±0.0131, 4 discordant | |
-| Apple M5 Pro (Metal) | CPU / CPU, 8 threads | 0.8833 | |
+| NVIDIA A100, `verify --backend gpu` at `e0bbf41` (a wheel built from that commit; its sha256 is with the run) | GPU / GPU (unconstrained copy) | 0.8800, reference 0.8800, 0.0000 ±0.0131, 4 discordant | |
+| NVIDIA A100, `verify --backend gpu` at `e633e3c` (a wheel built from that commit; its sha256 is with the run), the bundle as convert wrote it | GPU / CPU (the bundle's constraint, recorded) | 0.8800, reference 0.8800, 0.0000 ±0.0131, 4 discordant | |
+| Apple M5 Pro (Metal) | CPU / CPU, 8 threads (unconstrained copy) | 0.8833 | |
 | Apple M5 Pro | GPU / GPU (unconstrained copy) | 0.8733 | 4 |
 
 - On the bundle as convert wrote it, `verify --backend gpu` gave the vision encoder and
   adapter the CPU, recorded both sections' `cpu` constraint and the reason, and passed.
+  These are the backends litetune gave the engine; nothing it reads shows which
+  device the vision encoder itself ran on.
   An earlier attempt of that run read a GPU weight cache an llvmpipe run had left beside
   the file and answered every picture with one repeated word; the numbers here are from
   after those cache files were deleted (*A GPU cache built on a software adapter*, which
@@ -2547,9 +2551,11 @@ and the other seven Google's, every frozen tensor the base's.
 **verify** ran on the CPU of the same machine, an Intel Xeon @ 2.20GHz with 12 CPUs, at 8
 threads: the reference in float32 through transformers 5.19.0 (torch 2.9.1), the files
 through LiteRT-LM 0.18.0's `EmbeddingEngine` from PyPI at 70 vision tokens per image. The
-vision encoder takes no thread count in 0.18.0 and ran on the runtime's default, and the
+vision encoder takes no thread count in 0.18.0 and was given the CPU backend with its default
+thread setting, and the
 file and Google's were embedded one after the other. The reference made 64 soft tokens of
-every picture, the count `tune` recorded.
+every picture, the count `tune` recorded. Nothing litetune reads shows which device the
+vision encoder itself ran on.
 
 | embeddings | all rows | k=5 mean | k=10 mean | linear | cosine to float32, mean / min |
 |---|---|---|---|---|---|
@@ -2594,11 +2600,14 @@ once on the CPU and once with `--backend gpu`. The checkpoint was tuned before `
 recorded the processor files' digests; their digests were added to its `litetune.json`
 from the files `tune` saved (the original record is kept beside the run's reports).
 
-On the CPU the text tower ran on one thread, as on every Mac with SME2, and the vision
-encoder on the runtime's default threads. With `--backend gpu` the text tower ran on the
-GPU (the kernel reported GPU work) and the vision encoder on the CPU, where
+On the CPU the text tower was given one thread, as on every Mac with SME2, and the vision
+encoder was given the CPU backend with its default thread setting. With `--backend gpu` the
+text tower was given the GPU backend (the kernel reported process-wide GPU work) and the
+vision encoder was given the CPU backend, where
 flutter_edge_ai_litertlm 1.19.0 puts it when the text tower is on the GPU. On this CPU,
 which has SME2, both runs embedded the file twice and got the same vectors both times.
+Those are the backends given; nothing litetune reads shows which device the vision encoder
+itself ran on.
 
 | | k=10 mean | Google's file, k=10 mean | cosine to float32, mean / min | ms per picture, median |
 |---|---|---|---|---|
@@ -2619,7 +2628,8 @@ publishes no Windows wheel. Since #114 `verify` downloads it in the `embed-train
 `--with-base` then fetched Google's file itself and gave the same accuracies, draw for draw.
 
 On 2026-11-07 the same Mac ran `verify --with-base --backend gpu` on the same checkpoint
-and file at `e0bbf41` (unreleased), which puts the vision encoder on the GPU as well:
+and file at `e0bbf41` (a wheel built from that commit; its sha256 is with the run), which
+gave the GPU backend to the vision encoder as well:
 
 | | k=10 mean | Google's file, k=10 mean | cosine to float32, mean / min | ms per picture, median |
 |---|---|---|---|---|
@@ -2630,8 +2640,10 @@ and file at `e0bbf41` (unreleased), which puts the vision encoder on the GPU as 
   under the 0.01 threshold. The file scored above the float32 fine-tune (0.9287) in
   every draw (0.9433 to 0.9500); the cost is negative, not resolved as a gain.
 - The kernel reported the process's GPU work, as for the run above.
+- The backend recorded for the vision encoder is the one litetune gave the engine; the
+  process-wide reading does not show which device ran that encoder itself.
 - On the Intel GPUs, through an outside harness, the same file scored 0.9473 and 0.9493
-  with the vision encoder on the GPU and 0.9467 with it on the CPU (*The same fine-tune
+  with the vision encoder given the GPU and 0.9467 with it given the CPU (*The same fine-tune
   on Intel Panther Lake and Lunar Lake*). Why the Mac's score moved from 0.9353 to
   0.9467 was not measured.
 
@@ -2651,7 +2663,8 @@ picture given as its JPEG bytes at 70 vision tokens, on the 1,165 pictures of th
 On the NPU the engine's log shows both encoders dispatched to it: the vision encoder
 (`vision_70`, Google's 257 MB QNN context) and the text encoder (`encoder_1x128`, the compiled
 one); the vision adapter ran on the CPU (XNNPACK). The CPU file ran on four CPU threads, its
-vision encoder on the runtime's default. Accuracy is verify's k=10 centroid decider on the
+vision encoder given the CPU backend with its default thread setting. Accuracy is verify's
+k=10 centroid decider on the
 same five draws, computed from the vectors the phone wrote, and paired differences are
 `metrics.paired_difference`; there is no float32 reference on this side, so no conversion
 cost.

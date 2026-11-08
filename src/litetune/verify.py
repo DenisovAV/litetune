@@ -674,12 +674,13 @@ class PictureInputs:
 
 
 PICTURES_CHECK = "rows with a picture can be compared"
+VISION_BACKEND_CHECK = "picture backends keep the requested safeguards"
 
 PICTURES_COMPARED = (
     "the held-out rows carry pictures. The reference reads each through the checkpoint's own "
     "processor at {tokens} soft tokens and the bundle's template; the candidate is sent the "
     "picture's bytes and decodes and resizes it with the runtime's own image preprocessor; the "
-    "vision backend actually requested is recorded with the candidate, and the sampler it "
+    "vision backend litetune gave the candidate Engine is recorded, and the sampler it "
     "decodes with is said where decoding is. The "
     "two sides do not decode and resize a picture with the same code, so "
     "a difference here holds that as well as the conversion. The rendering check compares the "
@@ -716,8 +717,15 @@ def _candidate_sampling(engine: Mapping[str, Any]) -> str:
 
 
 PICTURE_THREADS = (
-    "the vision encoder ran on the runtime's default CPU threads: litert-lm 0.18.0's Engine "
-    "sets a thread count for its text and audio backends only (`engine.py`). The text side {text}"
+    "the vision encoder was given the CPU backend with its default thread setting: litert-lm "
+    "0.18.0's Engine sets a thread count for its text and audio backends only (`engine.py`). "
+    "The text side {text}. Nothing litetune reads establishes which device ran the vision "
+    "encoder itself"
+)
+
+PICTURE_BACKEND_UNKNOWN = (
+    "the vision backend given is unknown because the candidate driver wrote no report. Nothing "
+    "litetune reads establishes which device ran the vision encoder itself"
 )
 
 PICTURE_PREFILL_UNCHECKED = (
@@ -1534,6 +1542,16 @@ def run_verify(
         if pictures is None
         else build_backends(request, declarations, pictures)
     )
+    if pictures is not None:
+        inspect_backend = getattr(pair.candidate, "picture_backend_problem", None)
+        if callable(inspect_backend):
+            with guard(VISION_BACKEND_CHECK) as sink:
+                problem = inspect_backend(events)
+                if problem is not None:
+                    sink.append(Check.failed(VISION_BACKEND_CHECK, problem))
+            if sink:
+                run.record(sink[0])
+                return run.finish(Status.FAILED_HARNESS)
     # Which path the candidate is measured through, and why. From what actually
     # runs rather than from the rule alone: a caller that supplies its own
     # backends has chosen the path itself, and a manifest that named the rule's
@@ -1607,18 +1625,35 @@ def run_verify(
     with guard("run candidate model") as sink:
         candidate = evaluate(pair.candidate, split, label="candidate", events=events)
     if sink:
+        if pictures is not None:
+            # The driver writes its vision choice before constructing the
+            # engine. Preserve that early report even when generation raises
+            # and `evaluate` cannot return an Evaluation.
+            early_engine = pair.candidate.describe()
+            run.manifest["measurements"]["candidate"] = {"engine": early_engine}
+            given_vision = early_engine.get("vision_backend")
+            constraints = early_engine.get("vision_backend_constraints")
+            early_vision_reason = early_engine.get("vision_backend_reason")
+            if isinstance(given_vision, str):
+                run.manifest["harness"]["pictures"]["candidate_vision_backend"] = given_vision
+            run.manifest["harness"]["pictures"]["vision_backend_constraints"] = constraints
+            if isinstance(early_vision_reason, str) and early_vision_reason:
+                run.limitation(early_vision_reason)
         run.record(sink[0])
         return run.finish(Status.FAILED_HARNESS)
     run.manifest["measurements"]["candidate"] = candidate.as_dict()
     if pictures is not None:
-        actual_vision = candidate.engine.get("vision_backend")
+        given_vision = candidate.engine.get("vision_backend")
         constraints = candidate.engine.get("vision_backend_constraints")
-        if isinstance(actual_vision, str):
-            run.manifest["harness"]["pictures"]["candidate_vision_backend"] = actual_vision
+        vision_reason = candidate.engine.get("vision_backend_reason")
+        if isinstance(given_vision, str):
+            run.manifest["harness"]["pictures"]["candidate_vision_backend"] = given_vision
         run.manifest["harness"]["pictures"]["vision_backend_constraints"] = constraints
-        if (
-            actual_vision in ("cpu", "gpu")
-            and actual_vision != request.backend
+        if isinstance(vision_reason, str) and vision_reason:
+            run.limitation(vision_reason)
+        elif (
+            given_vision in ("cpu", "gpu")
+            and given_vision != request.backend
             and isinstance(constraints, Mapping)
             and constraints
         ):
@@ -1627,9 +1662,9 @@ def run_verify(
                 for section, value in sorted(constraints.items(), key=lambda item: str(item[0]))
             )
             run.limitation(
-                f"--backend {request.backend} was asked for, but the bundle's vision sections "
+                f"--backend {request.backend} was asked for, but the bundle's vision encoder "
                 f"state {shown}, so the candidate Engine was given a "
-                f"{actual_vision.upper()} vision backend; the constraints are recorded from "
+                f"{given_vision.upper()} vision backend; the constraints are recorded from "
                 "the bundle"
             )
     # The terminator vocabulary is `metrics.TERMINATORS`, recorded at
@@ -1741,17 +1776,20 @@ def run_verify(
         _limit_gpu_reading(run, candidate.engine)
     _limit_runtime_named(run, candidate.engine)
     _limit_cpu_threads(run, pair.candidate)
-    if pictures is not None and candidate.engine.get("vision_backend") == "cpu":
-        threads = candidate.engine.get("cpu_threads") or {}
-        used = threads.get("threads") if isinstance(threads, Mapping) else None
-        text = (
-            "ran on the GPU"
-            if candidate.engine.get("backend") == "gpu"
-            else f"was given {used} thread(s)"
-            if used
-            else "ran on the default count too"
-        )
-        run.limitation(PICTURE_THREADS.format(text=text))
+    if pictures is not None:
+        if candidate.engine.get("vision_backend") == "cpu":
+            threads = candidate.engine.get("cpu_threads") or {}
+            used = threads.get("threads") if isinstance(threads, Mapping) else None
+            text = (
+                "was given the GPU backend"
+                if candidate.engine.get("backend") == "gpu"
+                else f"was given {used} thread(s)"
+                if used
+                else "was left at the default count too"
+            )
+            run.limitation(PICTURE_THREADS.format(text=text))
+        elif candidate.engine.get("vision_backend") is None:
+            run.limitation(PICTURE_BACKEND_UNKNOWN)
 
     # Check 5 (divergence) is deferred: the caller decides whether it applies,
     # and generating the reference before the candidate is known alive would pay

@@ -41,7 +41,9 @@ from litetune.rendering import (
     RenderingProbe,
 )
 from litetune.verify import (
+    PICTURE_THREADS,
     PICTURES_CHECK,
+    VISION_BACKEND_CHECK,
     BackendPair,
     PictureInputs,
     Status,
@@ -206,6 +208,185 @@ def test_a_picture_run_whose_driver_reported_nothing_records_the_vision_backend_
     pictures = result.manifest["harness"]["pictures"]
     assert pictures["requested_vision_backend"] == "gpu"
     assert pictures["candidate_vision_backend"] is None
+    assert any(
+        "vision backend given is unknown because the candidate driver wrote no report" in text
+        for text in result.manifest["limitations"]
+    )
+
+
+def test_matching_gpu_vision_has_no_backend_mismatch_limitation(tmp_path):
+    class Matching(FakeBackend):
+        def describe(self) -> dict[str, Any]:
+            return super().describe() | {
+                "backend": "gpu",
+                "vision_backend": "gpu",
+                "vision_backend_constraints": {"vision_encoder": "cpu,gpu"},
+            }
+
+    pair = _pair()
+    result = run_verify(
+        _request(tmp_path, backend="gpu"),
+        backends=BackendPair(
+            candidate=Matching(
+                texts=pair.candidate.texts,
+                prompt_mode=PromptMode.RUNTIME_RENDERED,
+                decode_enforced=False,
+            ),
+            reference=pair.reference,
+        ),
+    )
+    assert not any(text.startswith("--backend gpu") for text in result.manifest["limitations"])
+
+
+@pytest.mark.parametrize(
+    ("text_backend", "asked", "text_words"),
+    [
+        ("cpu", "cpu", "was left at the default count too"),
+        ("gpu", "gpu", "was given the GPU backend"),
+    ],
+)
+def test_cpu_vision_picture_runs_state_the_runtime_default_threads(
+    tmp_path, text_backend, asked, text_words
+):
+    class CpuVision(FakeBackend):
+        def describe(self) -> dict[str, Any]:
+            return super().describe() | {
+                "backend": text_backend,
+                "vision_backend": "cpu",
+                "vision_backend_constraints": {"vision_encoder": "cpu"},
+                "cpu_threads": None,
+            }
+
+    pair = _pair()
+    result = run_verify(
+        _request(tmp_path, backend=asked),
+        backends=BackendPair(
+            candidate=CpuVision(
+                texts=pair.candidate.texts,
+                prompt_mode=PromptMode.RUNTIME_RENDERED,
+                decode_enforced=False,
+            ),
+            reference=pair.reference,
+        ),
+    )
+    thread_note = next(
+        text
+        for text in result.manifest["limitations"]
+        if text.startswith("the vision encoder was given the CPU backend")
+    )
+    assert text_words in thread_note
+    assert thread_note == PICTURE_THREADS.format(text=text_words)
+
+
+def test_a_real_driver_report_reaches_describe_and_the_verify_manifest(tmp_path):
+    adapter_reason = (
+        "the vision adapter constraint vision_adapter='cpu' excludes the gpu vision backend "
+        "given to the engine, but adapter constraints are recorded and left to LiteRT-LM: "
+        "measured on one Mac with litert-lm 0.18.0: an EmbeddingGemma 2 file whose vision "
+        "adapter is constrained to cpu ran with a GPU vision backend; which device the adapter "
+        "used was not observed"
+    )
+
+    class ReportingEnv:
+        name = "reporting"
+        requirements: tuple[str, ...] = ()
+
+        def system_requirements_on(self) -> tuple[str, ...]:
+            return ()
+
+        def run(self, argv, timeout=None, env=None):
+            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            Path(spec["out"]).write_text(
+                "".join(
+                    json.dumps({"index": i, "text": LABELS[i % 2]}) + "\n"
+                    for i in range(len(spec["prompts"]))
+                ),
+                encoding="utf-8",
+            )
+            if "report" in spec:
+                Path(spec["report"]).write_text(
+                    json.dumps(
+                        {
+                            "vision_backend": "gpu",
+                            "vision_backend_constraints": {"vision_adapter": "cpu"},
+                            "vision_backend_reason": adapter_reason,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+    pictures = tuple({"path": f"/p/{i}.jpg", "sha256": f"{i:064x}"} for i in range(12))
+    candidate = LiteRtLmBackend(
+        model=tmp_path / "out" / "model.litertlm",
+        backend_flag="gpu",
+        env=ReportingEnv(),
+        auto_provision=False,
+        declared_prompt_mode=PromptMode.RUNTIME_RENDERED,
+        images=pictures,
+    )
+    pair = _pair()
+    result = run_verify(
+        _request(tmp_path, backend="gpu"),
+        backends=BackendPair(candidate=candidate, reference=pair.reference),
+    )
+    described = candidate.describe()
+    assert described["vision_backend"] == "gpu"
+    assert described["vision_backend_constraints"] == {"vision_adapter": "cpu"}
+    assert described["vision_backend_reason"] == adapter_reason
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert engine["vision_backend"] == "gpu"
+    assert engine["vision_backend_constraints"] == {"vision_adapter": "cpu"}
+    assert engine["vision_backend_reason"] == adapter_reason
+    assert adapter_reason in result.manifest["limitations"]
+
+
+def test_a_candidate_exception_keeps_the_early_vision_report_in_the_manifest(tmp_path):
+    class RaisingBackend(LiteRtLmBackend):
+        def picture_backend_problem(self, events=None):
+            return None
+
+    class RaisingEnv:
+        name = "raising"
+        requirements: tuple[str, ...] = ()
+
+        def system_requirements_on(self) -> tuple[str, ...]:
+            return ()
+
+        def run(self, argv, timeout=None, env=None):
+            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            Path(spec["report"]).write_text(
+                json.dumps(
+                    {
+                        "vision_backend": "cpu",
+                        "vision_backend_constraints": {"vision_encoder": "cpu"},
+                        "vision_backend_reason": "the encoder required cpu",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            raise MemoryError("engine did not open")
+
+    pictures = tuple({"path": f"/p/{i}.jpg", "sha256": f"{i:064x}"} for i in range(12))
+    candidate = RaisingBackend(
+        model=tmp_path / "out" / "model.litertlm",
+        backend_flag="cpu",
+        env=RaisingEnv(),
+        auto_provision=False,
+        declared_prompt_mode=PromptMode.RUNTIME_RENDERED,
+        images=pictures,
+    )
+    pair = _pair()
+    result = run_verify(
+        _request(tmp_path, backend="cpu"),
+        backends=BackendPair(candidate=candidate, reference=pair.reference),
+    )
+    assert result.status is Status.FAILED_HARNESS
+    pictures_manifest = result.manifest["harness"]["pictures"]
+    assert pictures_manifest["candidate_vision_backend"] == "cpu"
+    assert pictures_manifest["vision_backend_constraints"] == {"vision_encoder": "cpu"}
+    engine = result.manifest["measurements"]["candidate"]["engine"]
+    assert engine["vision_backend_reason"] == "the encoder required cpu"
 
 
 def test_a_constrained_gpu_picture_bundle_records_cpu_vision_and_its_sections(tmp_path):
@@ -276,6 +457,40 @@ def test_a_cpu_request_with_gpu_only_vision_names_the_constraints_and_backend_us
     assert "vision_encoder='gpu'" in limitation
     assert "vision_adapter='cpu,gpu'" in limitation
     assert "GPU vision backend" in limitation
+
+
+def test_cpu_text_with_gpu_only_vision_is_refused_before_the_candidate_runs(tmp_path):
+    ran = False
+
+    class GpuOnly(FakeBackend):
+        def picture_backend_problem(self, events=None):
+            return (
+                "--backend cpu is not allowed by the vision encoder constraint "
+                "vision_encoder='gpu'; the encoder allows only gpu. Pass --backend gpu so "
+                "its GPU safeguards apply"
+            )
+
+        def generate(self, prompts, events=None):
+            nonlocal ran
+            ran = True
+            return super().generate(prompts, events)
+
+    pair = _pair()
+    result = run_verify(
+        _request(tmp_path, backend="cpu"),
+        backends=BackendPair(
+            candidate=GpuOnly(
+                texts=pair.candidate.texts,
+                prompt_mode=PromptMode.RUNTIME_RENDERED,
+                decode_enforced=False,
+            ),
+            reference=pair.reference,
+        ),
+    )
+    assert result.status is Status.FAILED_HARNESS and ran is False
+    refused = _check(result, VISION_BACKEND_CHECK)
+    assert "vision_encoder='gpu'" in refused.detail
+    assert "Pass --backend gpu" in refused.detail
 
 
 def test_a_reference_that_records_no_pictures_is_refused(tmp_path):

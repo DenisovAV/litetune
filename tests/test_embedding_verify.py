@@ -983,6 +983,8 @@ class FakeEmbedEnvs:
     image_labels: dict[str, str] = field(default_factory=dict)
     # The soft tokens the fake reference makes of a picture, by path; else 63.
     soft_tokens: dict[str, int] = field(default_factory=dict)
+    vision_backend_constraints: dict[str, str] = field(default_factory=dict)
+    vision_backend_reason: str | None = None
     # What the candidate's second run embeds; None: what the candidate embeds.
     repeat: str | None = None
     # Each script's source as written to run, by script stem or engine side.
@@ -1031,6 +1033,8 @@ class FakeEmbedEnvs:
             if "images" in spec:
                 # IMAGE_ENGINE_SCRIPT's vision encoder, on either backend.
                 report["vision_backend"] = spec.get("backend", "cpu")
+                report["vision_backend_constraints"] = self.vision_backend_constraints
+                report["vision_backend_reason"] = self.vision_backend_reason
             report |= {
                 "runtime": {"litert-lm": "0.18.0"},
                 "cpu": {"model": "fake", "count": 4},
@@ -2656,7 +2660,8 @@ def test_an_image_checkpoint_embeds_its_images_on_both_sides_and_passes(fake, tm
     notes = " ".join(m["limitations"])
     assert "each image given as its bytes (litert_lm.Content.ImageBytes)" in notes
     assert "at a budget of at most 70 vision tokens per image" in notes
-    assert "the vision encoder ran on the runtime's default threads" in notes
+    assert "the vision encoder was given the CPU backend" in notes
+    assert "Nothing litetune reads shows which device" in notes
     assert "through transformers" in notes and "at most 70 soft tokens" in notes
     assert "of each of 54 pictures the soft tokens `tune` recorded" in notes
     assert "image path calibrates the same way was not checked" in notes
@@ -2666,6 +2671,22 @@ def test_an_image_checkpoint_embeds_its_images_on_both_sides_and_passes(fake, tm
     lines = embedding_verify.summarise(m)
     assert any("embedding decider on images, 3 options" in ln for ln in lines)
     assert any("at most 70 vision tokens per image" in ln for ln in lines)
+
+
+def test_an_embeddinggemma_adapter_mismatch_is_a_manifest_limitation(fake, tmp_path, on_macos):
+    fake.vision_backend_constraints = {"vision_adapter": "cpu"}
+    fake.vision_backend_reason = (
+        "the vision adapter constraint vision_adapter='cpu' excludes the gpu vision backend "
+        "given to the engine, but adapter constraints are recorded and left to LiteRT-LM: "
+        "measured on one Mac with litert-lm 0.18.0: an EmbeddingGemma 2 file whose vision "
+        "adapter is constrained to cpu ran with a GPU vision backend; which device the adapter "
+        "used was not observed"
+    )
+    result = _verify(_image_setup(tmp_path, fake), backend="gpu")
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    assert fake.vision_backend_reason in result.manifest["limitations"]
+    assert result.manifest["embedding"]["vision_backend"] == "gpu"
+    assert result.manifest["embedding"]["vision_backend_constraints"] == {"vision_adapter": "cpu"}
 
 
 def test_verify_reads_the_split_prepare_wrote(fake, tmp_path):
@@ -2992,9 +3013,14 @@ def test_an_image_checkpoint_on_the_gpu_puts_text_and_vision_there(fake, tmp_pat
     result = _verify(_image_setup(tmp_path, fake), backend="gpu", threads=4, base_litertlm=local)
     m = result.manifest
     assert result.status is Status.PASSED, m["checks"]
-    # Off a CPU with SME2 the candidate is embedded once, Google's file after it.
-    assert [r[0] for r in fake.runs] == ["reference", "candidate", "base", "evaluate"]
-    for side in ("candidate", "base"):
+    assert [r[0] for r in fake.runs] == [
+        "reference",
+        "candidate",
+        "candidate-repeat",
+        "base",
+        "evaluate",
+    ]
+    for side in ("candidate", "candidate-repeat", "base"):
         assert fake.specs[side]["backend"] == "gpu"
         assert fake.specs[side]["threads"] is None
         assert fake.specs[side]["vision_tokens"] == m["embedding"]["vision_tokens"]
@@ -3002,9 +3028,9 @@ def test_an_image_checkpoint_on_the_gpu_puts_text_and_vision_there(fake, tmp_pat
     assert fake.specs["reference"].get("backend") is None
     assert fake.specs["reference"]["threads"] == 4
     (launch,) = fake.launches
-    assert launch["parallel"] is False and launch["stop_on"] == ["candidate"]
+    assert launch["parallel"] is False and launch["stop_on"] == ["candidate", "candidate-repeat"]
     embedding = m["embedding"]
-    assert embedding["vision_backend"] == "gpu" and embedding["candidate_repeated"] is False
+    assert embedding["vision_backend"] == "gpu" and embedding["candidate_repeated"] is True
     assert embedding["engine_threads"] is None
     engine = m["measurements"]["candidate"]["engine"]
     assert engine["backend"] == "gpu" and engine["backend_observed"] is True
@@ -3017,6 +3043,7 @@ def test_an_image_checkpoint_on_the_gpu_puts_text_and_vision_there(fake, tmp_pat
     )
     assert said in m["limitations"]
     assert embedding_verify.GPU_PRECISION in said
+    assert embedding_verify.REPEATED_GPU in m["limitations"]
     limitations = " ".join(m["limitations"])
     # Not the text GPU run's words (no CPU in it), nor the CPU image run's.
     assert "the CPU and the NPU are not measured" not in limitations
@@ -3063,33 +3090,44 @@ def test_an_image_gpu_run_the_kernel_shows_idle_is_refused(fake, tmp_path, on_ma
     assert failed["name"] == CANDIDATE_CHECK and "did no GPU work" in failed["detail"]
 
 
-def test_on_a_cpu_with_sme2_an_image_gpu_run_does_not_apply_the_cpu_repeat_rule(
+def test_on_a_cpu_with_sme2_an_image_gpu_run_repeats_for_the_gpu_rule(
     fake, tmp_path, on_macos, sme2_host
 ):
-    """Both towers are on the GPU, so the host CPU does not trigger a repeat."""
+    """The repeat belongs to every GPU image run, independently of the host CPU."""
     local = tmp_path / "vision.litertlm"
     local.write_bytes(VISION_STAND_IN)
     result = _verify(_image_setup(tmp_path, fake), backend="gpu", threads=4, base_litertlm=local)
     m = result.manifest
     assert result.status is Status.PASSED, m["checks"]
-    assert [r[0] for r in fake.runs] == ["reference", "candidate", "base", "evaluate"]
+    assert [r[0] for r in fake.runs] == [
+        "reference",
+        "candidate",
+        "candidate-repeat",
+        "base",
+        "evaluate",
+    ]
     (launch,) = fake.launches
-    assert launch["parallel"] is False and launch["stop_on"] == ["candidate"]
-    assert m["embedding"]["candidate_repeated"] is False
+    assert launch["parallel"] is False and launch["stop_on"] == ["candidate", "candidate-repeat"]
+    assert m["embedding"]["candidate_repeated"] is True
     # The GPU takes no thread count, SME2 or not.
     assert m["embedding"]["engine_threads"] is None
     assert m["embedding"]["engine_threads_reason"] is None
-    assert embedding_verify.REPEATED not in m["limitations"]
+    assert embedding_verify.REPEATED_GPU in m["limitations"]
     assert "candidate-repeat" not in fake.specs["evaluate"]["vectors"]
 
 
-def test_an_image_gpu_run_does_not_start_a_cpu_repeatability_run(
-    fake, tmp_path, on_macos, sme2_host
-):
+def test_an_image_gpu_run_refuses_when_the_repeat_differs(fake, tmp_path, on_macos, sme2_host):
     fake.repeat = "random"
     result = _verify(_image_setup(tmp_path, fake), backend="gpu")
-    assert result.status is Status.PASSED
-    assert "candidate-repeat" not in [r[0] for r in fake.runs]
+    assert result.status is Status.FAILED_HARNESS
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == CANDIDATE_CHECK
+    assert (
+        embedding_verify.NOT_REPEATABLE_GPU.format(
+            differ="candidate.npy and candidate-repeat.npy differ"
+        )
+        in failed["detail"]
+    )
 
 
 def test_an_image_checkpoint_with_a_text_prefix_is_refused(fake, tmp_path):
@@ -3324,7 +3362,14 @@ def _pictures(tmp_path: Path, pictures: Sequence[bytes] = PICTURES) -> tuple[lis
 
 
 def _image_engine_main(
-    tmp_path, monkeypatch, answers, images, digests=None, backend=None, stderr=None
+    tmp_path,
+    monkeypatch,
+    answers,
+    images,
+    digests=None,
+    backend=None,
+    stderr=None,
+    constraints=None,
 ):
     ns: dict[str, Any] = {"__name__": "image_engine_script"}
     exec(compile(embedding_verify.IMAGE_ENGINE_SCRIPT, "engine.py", "exec"), ns)
@@ -3338,6 +3383,7 @@ def _image_engine_main(
     monkeypatch.setitem(ns, "cpu_report", lambda: {"model": "stub cpu", "count": 2})
     readings = iter([{"reading": "at engine"}, {"reading": "after"}])
     monkeypatch.setitem(ns, "device_report", lambda: next(readings))
+    monkeypatch.setitem(ns, "bundle_vision_constraints", lambda path: constraints or {})
     (tmp_path / "images.json").write_text(json.dumps(images))
     spec = {
         "model": "/models/m.litertlm",
@@ -3380,6 +3426,62 @@ def test_the_image_engine_script_on_the_gpu_puts_the_vision_encoder_on_the_gpu(
         "after_generation": {"reading": "after"},
     }
     np.testing.assert_allclose(np.load(tmp_path / "out.npy"), [[0.6, 0.8], [0.0, 1.0]], rtol=1e-6)
+
+
+def test_the_image_engine_script_leaves_an_adapter_constraint_to_litert_lm(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    code, report, calls = _image_engine_main(
+        tmp_path,
+        monkeypatch,
+        [[3.0, 4.0], [0.0, 2.0]],
+        paths,
+        digests,
+        backend="gpu",
+        constraints={"vision_adapter": "cpu"},
+    )
+    assert code == 0
+    assert calls["engine"][0]["backend"] == ("gpu", None)
+    assert calls["vision"] == [{"vision_backend": ("gpu", None), "vision_tokens_per_image": 140}]
+    assert report["vision_backend"] == "gpu"
+    assert report["vision_backend_constraints"] == {"vision_adapter": "cpu"}
+    assert "measured on one Mac with litert-lm 0.18.0" in report["vision_backend_reason"]
+    assert "which device the adapter used was not observed" in report["vision_backend_reason"]
+
+
+def test_the_image_engine_script_honours_a_cpu_encoder_constraint(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    code, report, calls = _image_engine_main(
+        tmp_path,
+        monkeypatch,
+        [[3.0, 4.0], [0.0, 2.0]],
+        paths,
+        digests,
+        backend="gpu",
+        constraints={"vision_encoder": "cpu", "vision_adapter": "cpu"},
+    )
+    assert code == 0
+    assert calls["vision"] == [{"vision_backend": ("cpu", None), "vision_tokens_per_image": 140}]
+    assert report["vision_backend"] == "cpu"
+    assert "vision_encoder='cpu'" in report["vision_backend_reason"]
+
+
+def test_the_image_engine_script_refuses_cpu_text_with_gpu_only_vision(tmp_path, monkeypatch):
+    paths, digests = _pictures(tmp_path)
+    code, report, calls = _image_engine_main(
+        tmp_path,
+        monkeypatch,
+        [[3.0, 4.0], [0.0, 2.0]],
+        paths,
+        digests,
+        constraints={"vision_encoder": "gpu", "vision_adapter": "cpu,gpu"},
+    )
+    assert code == 3 and calls["engine"] == []
+    assert "vision_encoder='gpu'" in report["error"]
+    assert "Pass --backend gpu" in report["error"]
+    assert report["vision_backend_constraints"] == {
+        "vision_encoder": "gpu",
+        "vision_adapter": "cpu,gpu",
+    }
 
 
 def test_the_image_engine_script_builds_a_vision_engine_and_gives_each_pictures_bytes(
