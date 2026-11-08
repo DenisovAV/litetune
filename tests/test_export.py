@@ -1009,6 +1009,9 @@ def test_argv_is_the_documented_command(request_for):
         # suffix because the value is an absolute path into the installed
         # package, which differs per machine.
         _ANY_TEMPLATE,
+        # The exporter must build metadata around the template above instead
+        # of taking a family default that can carry another template.
+        "--litert_lm_llm_metadata_override=none",
         # Appended by `ExportRequest` itself, because the caller said nothing
         # about it and the default is on. Every measured artifact carries it,
         # and an export without it is a different shape -- 286 MB against

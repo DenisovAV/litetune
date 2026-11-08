@@ -1290,6 +1290,10 @@ Each of these was paid for once, by an artifact that looked fine and was not.
 | `minicpm5` (MiniCPM5 1B) | `--jinja_chat_template_override=<LiteRT-LM's MiniCPM5 template with one edit if it renders single turns as the checkpoint's own does, else the checkpoint's own behind litetune's text-parts block>` |
 | `granite-4.1` (granite-4.1 3B) | `--jinja_chat_template_override=<the checkpoint's own chat template behind litetune's text-parts block>` |
 
+Beside a template, litetune also passes `--litert_lm_llm_metadata_override=none`,
+because from litert-torch-nightly 0.11 the exporter otherwise takes its own metadata
+override for Qwen and MiniCPM5 and writes that override's template instead.
+
 **A LoRA scope keyed on model identity.** On a multimodal checkpoint the
 vision and audio towers use the same projection names as the text layers, so
 `--method lora` scoped by name alone reaches all three, and peft refuses the

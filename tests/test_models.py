@@ -52,6 +52,7 @@ GEMMA4_E2B = "google/gemma-4-E2B-it"
 FUNCTIONGEMMA = "google/functiongemma-270m-it"
 
 E2B_TEMPLATE = "--jinja_chat_template_override=litert-community/gemma-4-E2B-it-litert-lm"
+NO_METADATA_OVERRIDE = "--litert_lm_llm_metadata_override=none"
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +291,7 @@ def test_gemma4_gets_both_required_flags_with_the_reason_stated():
     assert plan.usable
     assert "--externalize_embedder" in plan.flags
     assert E2B_TEMPLATE in plan.flags
-    assert set(plan.added) == {"--externalize_embedder", E2B_TEMPLATE}
+    assert set(plan.added) == {"--externalize_embedder", E2B_TEMPLATE, NO_METADATA_OVERRIDE}
 
     reasons = " ".join(plan.notes)
     # Not just "required": the observation behind each rule travels with it.
@@ -317,7 +318,7 @@ def test_a_caller_supplied_override_satisfies_the_requirement():
     assert plan.usable
     assert "--jinja_chat_template_override=me/my-template" in plan.flags
     # The one flag litetune can resolve on its own is still added.
-    assert plan.added == ("--externalize_embedder",)
+    assert plan.added == ("--externalize_embedder", NO_METADATA_OVERRIDE)
 
 
 def test_a_caller_who_disagrees_with_litetune_keeps_their_value_and_it_is_recorded():
@@ -393,9 +394,10 @@ def test_a_qwen_export_asks_for_its_own_template_composed_and_no_type_override(m
     assert plan.rules is not None
     assert plan.rules.family == family
     assert plan.flags[0] == "--some_flag=1"
-    assert len(plan.flags) == 2
+    assert len(plan.flags) == 3
     assert plan.flags[1] == f"--jinja_chat_template_override={QWEN_MARKERS[family]}"
-    assert plan.added == (plan.flags[1],)
+    assert plan.flags[2] == NO_METADATA_OVERRIDE
+    assert plan.added == (plan.flags[1], NO_METADATA_OVERRIDE)
     assert not any("--litert_lm_model_type_override" in f for f in plan.flags)
     assert plan.usable
     assert models.UNKNOWN_FAMILY not in plan.notes
@@ -1102,7 +1104,7 @@ def test_convert_auto_corrects_a_gemma4_export_and_says_why(toolchain, tmp_path)
     assert E2B_TEMPLATE in argv
     # The correction is in the report, not only in the command line.
     added = [c for c in result.checks.checks if c.name == EXPORT_FLAGS_CHECK]
-    assert len(added) == 2
+    assert len(added) == 3
     assert any("External embedder is required for Gemma4" in c.detail for c in added)
     assert any(_GOOGLES_ARTIFACT in text for text in result.limitations)
 
@@ -1145,8 +1147,8 @@ def test_a_callers_template_is_recognised_in_every_spelling_the_exporter_reads(s
     `:875`): every spelling sets the one keyword, so each is the caller's own
     template and nothing is composed beside it."""
     plan = plan_export("Qwen/Qwen3-0.6B", (spelling,), ("dynamic_wi8_afp32",))
-    assert plan.flags == (spelling,)
-    assert plan.added == ()
+    assert plan.flags == (spelling, NO_METADATA_OVERRIDE)
+    assert plan.added == (NO_METADATA_OVERRIDE,)
 
 
 @pytest.mark.parametrize(
@@ -1228,9 +1230,13 @@ def test_a_repeated_flag_is_read_as_its_last_occurrence(flags, composes):
             plan_export("Qwen/Qwen3-0.6B", flags, ())
         return
     plan = plan_export("Qwen/Qwen3-0.6B", flags, ())
-    assert plan.added == ()
-    (check,) = plan.checks
-    assert check.observed["flag"] == "--jinja_chat_template_override=/good.jinja"
+    assert plan.added == (NO_METADATA_OVERRIDE,)
+    template_check = next(
+        check
+        for check in plan.checks
+        if check.observed["flag"] == "--jinja_chat_template_override=/good.jinja"
+    )
+    assert template_check.outcome is Outcome.PASSED
     assert any(
         "--jinja_chat_template_override=/good.jinja was passed by the caller" in text
         for text in plan.limitations
@@ -1334,7 +1340,7 @@ def test_the_exporter_is_given_one_argument_per_keyword_the_last(flags, effectiv
     """What litetune reasons about is what the exporter is handed: the token in
     effect, once."""
     plan = plan_export(QWEN3, flags, ())
-    assert plan.flags == (effective,)
+    assert plan.flags == (effective, NO_METADATA_OVERRIDE)
 
 
 @pytest.mark.parametrize(
@@ -1356,8 +1362,8 @@ def test_a_valueless_no_prefix_sets_the_keyword_to_false(flags, outcome):
             plan_export(QWEN3, flags, ())
         return
     plan = plan_export(QWEN3, flags, ())
-    assert plan.flags == ("--jinja_chat_template_override=/good.jinja",)
-    assert plan.added == ()
+    assert plan.flags == ("--jinja_chat_template_override=/good.jinja", NO_METADATA_OVERRIDE)
+    assert plan.added == (NO_METADATA_OVERRIDE,)
 
 
 def test_a_no_prefix_with_a_value_is_a_keyword_of_its_own():
@@ -1380,7 +1386,11 @@ def test_a_value_is_reported_as_the_exporter_will_get_it():
     assert any(
         "--jinja_chat_template_override=mine was passed" in text for text in plan.limitations
     )
-    (check,) = plan.checks
+    check = next(
+        check
+        for check in plan.checks
+        if check.observed["flag"] == "--jinja_chat_template_override=mine"
+    )
     assert check.observed["flag"] == "--jinja_chat_template_override=mine"
     assert check.observed["token"] == "--jinja_chat_template_override=mine#v2.jinja"
 
@@ -1408,6 +1418,60 @@ def test_a_callers_template_on_a_composing_rule_is_said_to_have_no_block():
 def test_a_callers_template_on_another_rule_carries_no_such_note():
     plan = plan_export(GEMMA4_E2B, ("--jinja_chat_template_override=me/mine",), ())
     assert not any("no text-parts block" in text for text in plan.limitations)
+
+
+def test_a_family_template_adds_no_metadata_override_with_its_reason_and_check():
+    plan = plan_export("Qwen/Qwen3-0.6B", (), ())
+
+    assert NO_METADATA_OVERRIDE in plan.added
+    assert any(
+        note == f"added {NO_METADATA_OVERRIDE}: {models._NO_METADATA_OVERRIDE_REASON}"
+        for note in plan.notes
+    )
+    check = next(
+        check for check in plan.checks if check.observed.get("flag") == NO_METADATA_OVERRIDE
+    )
+    assert check.name == EXPORT_FLAGS_CHECK
+    assert check.outcome is Outcome.PASSED
+    assert check.observed == {
+        "flag": NO_METADATA_OVERRIDE,
+        "family": "qwen-3",
+        "added": True,
+    }
+
+
+def test_callers_none_metadata_override_on_a_composing_family_is_kept_once():
+    plan = plan_export("Qwen/Qwen3-0.6B", (NO_METADATA_OVERRIDE,), ())
+
+    assert plan.flags.count(NO_METADATA_OVERRIDE) == 1
+    assert NO_METADATA_OVERRIDE not in plan.added
+    assert f"--jinja_chat_template_override={models.CANONICAL_OR_COMPOSED_TEMPLATE}" in plan.added
+
+
+def test_callers_non_none_metadata_override_on_a_composing_family_is_still_refused():
+    with pytest.raises(FlagRefused, match="in place of the LlmMetadata it builds"):
+        plan_export(
+            "Qwen/Qwen3-0.6B",
+            ("--litert_lm_llm_metadata_override=meta.pbtext",),
+            (),
+        )
+
+
+def test_callers_own_template_also_adds_no_metadata_override():
+    template = "--jinja_chat_template_override=/my/own.jinja"
+    plan = plan_export("Qwen/Qwen3-0.6B", (template,), ())
+
+    assert plan.flags == (template, NO_METADATA_OVERRIDE)
+    assert plan.added == (NO_METADATA_OVERRIDE,)
+
+
+def test_an_unknown_family_with_a_template_gets_no_metadata_override():
+    template = "--jinja_chat_template_override=/my/own.jinja"
+    plan = plan_export("acme/unknown-model", (template,), ())
+
+    assert plan.rules is None
+    assert plan.flags == (template,)
+    assert plan.added == ()
 
 
 @pytest.mark.parametrize(
@@ -2075,7 +2139,10 @@ def test_the_granite_rule_claims_the_3b_and_not_its_base_or_repacks(tmp_path):
     ):
         assert identify(claimed).family == "granite-4.1", claimed
         plan = plan_export(claimed, (), ("dynamic_wi8_afp32",))
-        assert plan.added == (f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}",)
+        assert plan.added == (
+            f"--jinja_chat_template_override={models.COMPOSED_TEMPLATE}",
+            NO_METADATA_OVERRIDE,
+        )
         assert "joins its text parts with a newline" in plan.rules.required_flags[0].reason
     for unclaimed in (
         "ibm-granite/granite-4.1-3b-base",
@@ -2109,7 +2176,7 @@ def test_the_minicpm5_rule_claims_the_1b_and_not_its_siblings(tmp_path):
         assert identify(claimed).family == "minicpm5", claimed
         plan = plan_export(claimed, (), ("dynamic_wi8_afp32",))
         marker = models.CANONICAL_OR_COMPOSED_TEMPLATE
-        assert plan.added == (f"--jinja_chat_template_override={marker}",)
+        assert plan.added == (f"--jinja_chat_template_override={marker}", NO_METADATA_OVERRIDE)
         assert plan.rules.canonical_template == models.MINICPM5_CANONICAL_TEMPLATE
         reason = plan.rules.required_flags[0].reason
         assert "google-ai-edge/LiteRT-LM#3576" in reason
@@ -2143,7 +2210,7 @@ def test_the_qwen35_rule_offers_its_edited_template():
         plan = plan_export(model, (), ("dynamic_wi8_afp32",))
         assert plan.rules.family == "qwen-3.5"
         marker = models.CANONICAL_OR_COMPOSED_TEMPLATE
-        assert plan.added == (f"--jinja_chat_template_override={marker}",)
+        assert plan.added == (f"--jinja_chat_template_override={marker}", NO_METADATA_OVERRIDE)
         assert plan.rules.canonical_template == models.QWEN35_CANONICAL_TEMPLATE
         reason = plan.rules.required_flags[0].reason
         assert "google-ai-edge/LiteRT-LM#3166" in reason
