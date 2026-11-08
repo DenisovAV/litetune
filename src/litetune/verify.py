@@ -1172,21 +1172,28 @@ def _default_gpu_cache_limitation(model: Path, platform: str) -> str | None:
     except OSError:
         return None
     key = f"_{int(stat.st_mtime)}_{stat.st_size}_mldrift_"
-    pattern = re.compile(r"(?:\.[A-Za-z0-9_]+)?" + re.escape(key) + r".*cache.*")
-    caches = sorted(
-        path.name
-        for path in model.parent.iterdir()
-        if path.name.startswith(model.name)
-        and pattern.fullmatch(path.name[len(model.name) :])
-        and path.is_file()
+    pattern = re.compile(
+        r"(?:\.[A-Za-z0-9_]+)?" + re.escape(key) + r"(?:weight|program)_cache\.bin"
     )
+    try:
+        caches = sorted(
+            path.name
+            for path in model.parent.iterdir()
+            if path.name.startswith(model.name)
+            and pattern.fullmatch(path.name[len(model.name) :])
+            and path.is_file()
+        )
+    except OSError:
+        # An advisory scan: a directory that cannot be listed ends it, not the run.
+        return None
     if not caches:
         return None
     named = ", ".join(caches)
     return (
         f"default LiteRT-LM GPU cache files already exist beside the model: {named}; "
         "an app or the CLI opening this file with its default cache would read them; "
-        "litetune did not read them because this run used its own cache"
+        "litetune's litert-lm candidate opens its GPU engine with a cache directory of its "
+        "own and does not"
     )
 
 

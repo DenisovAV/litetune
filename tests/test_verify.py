@@ -104,6 +104,8 @@ def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifyi
         "other.litertlm_1700000000_5_mldrift_weight_cache.bin",
         "model.litertlm_backup_1700000000_5_mldrift_weight_cache.bin",
         "model.litertlm_1600000000_5_mldrift_weight_cache.bin",
+        # This file's key, but not a cache LiteRT-LM writes.
+        "model.litertlm_1700000000_5_mldrift_cache_notes.txt",
     ]
     for name in strangers:
         (tmp_path / name).write_bytes(b"x")
@@ -127,7 +129,7 @@ def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifyi
     (notice,) = [text for text in result.manifest["limitations"] if "mldrift" in text]
     assert all(cache.name in notice for cache in caches)
     assert "an app or the CLI" in notice
-    assert "litetune did not read them" in notice
+    assert "a cache directory of its own" in notice
     assert not [name for name in strangers if name in notice]
     assert [cache.read_bytes() for cache in caches] == [b"cache-0", b"cache-1", b"cache-2"]
 
@@ -164,6 +166,23 @@ def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifyi
     )
 
     assert not [text for text in cpu_result.manifest["limitations"] if "mldrift" in text]
+
+    # A directory that cannot be listed ends the scan, not the run.
+    def unlistable(self):
+        raise PermissionError("not listable")
+
+    monkeypatch.setattr(Path, "iterdir", unlistable)
+    hidden = run_verify(
+        request,
+        backends=BackendPair(
+            candidate=FakeBackend(texts=correct_texts(rows)),
+            reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+        ),
+    )
+    monkeypatch.undo()
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert hidden.status is result.status
+    assert not [text for text in hidden.manifest["limitations"] if "mldrift" in text]
 
     # The cache was shown read by a later run on Linux only; elsewhere nothing is claimed.
     monkeypatch.setattr(sys, "platform", "darwin")

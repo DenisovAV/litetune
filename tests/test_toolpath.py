@@ -1887,13 +1887,23 @@ def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(sys, "platform", "darwin")
     rows_ = labelled_rows(8)
-    env = CannedEnv(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
+    existed: list[bool] = []
+
+    class Recording(CannedEnv):
+        def run(self, argv, timeout=None):
+            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            # While the script runs: the directory it is handed must already exist.
+            existed.append(Path(spec["cache_dir"]).is_dir())
+            return super().run(argv, timeout=timeout)
+
+    env = Recording(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
     backend = ToolPathBackend(
         model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
     )
 
     backend.generate([r["prompt"] for r in rows_])
 
+    assert existed == [True, True]
     assert [(spec["backend"], spec["activation_data_type"]) for spec in env.specs] == [
         ("gpu", "fp32"),
         ("gpu", "fp32"),

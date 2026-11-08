@@ -3077,8 +3077,9 @@ text driver passed) writes its GPU caches beside the model, named after the file
   GPU run on that host whose runtime named llvmpipe, before `libegl1` was installed. The same
   verify driver given no cache answered with the labels.
 - So a `verify --backend gpu` that refuses llvmpipe (*The GPU on Windows and Linux*) leaves
-  such a cache behind, and up to 0.8.0 the next text, picture or tool-path GPU run of that
-  file read it. The change that adds this section gives litetune's GPU runs a cache of
+  such a cache behind, and up to 0.8.0 the next text or picture GPU run of that file,
+  whose driver passed the default cache, read it. The tool path passed no cache
+  directory at all; what LiteRT-LM does then was not measured. The change that adds this section gives litetune's GPU runs a cache of
   their own; that code has not been run on a GPU here.
 - Not run: a cache built on one hardware GPU read on another, Windows and macOS caches,
   litert-lm 0.19.0.
