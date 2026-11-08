@@ -3015,6 +3015,7 @@ and the GPU on a Mac*:
   twice and more often than any other. `verify` failed the harness, as the repeat
   rule is written to; there are no Windows GPU decision numbers. On macOS the same rule settled a few rows of 300
   (*The CPU and the GPU on a Mac*); on the L4 the two runs agreed on all 300.
+  Why: *Why the decision failed on Intel Arc*, below.
 - DXGI listed two adapters on the Windows machine: the Arc B390 at LUID
   `0x0000A62B` and the Microsoft Basic Render Driver, DXGI's software adapter, at
   `0x0000AA0B`. The process held counters on both; all its engine time was on the
@@ -3051,6 +3052,47 @@ and the GPU on a Mac*:
 - The forced llvmpipe run above was taken at `cc4bdbe` (`linux-l4-verify-r3/`).
 - Not run on these machines: the text and tool paths on the GPU. Their reading is
   the same code and is held by tests, not by a run.
+
+### Why the decision failed on Intel Arc
+
+Measured 2026-11-07 with scripts outside this repository, on the emotion decision
+bundle above and its first 40 held-out prompts, on two Windows 11 machines with
+integrated Intel GPUs under Direct3D 12: the Panther Lake (Core Ultra X7 358H, Arc
+B390, driver 32.0.101.8864) and a Lunar Lake (Core Ultra 7 258V, Arc 140V, driver
+32.0.101.8826), each GPU named by the runtime's adapter line. The repeat rule read the
+failure as unsettled scores. There is run-to-run variation (below), but not only that:
+on these GPUs LiteRT-LM's GPU path gave other answers than its CPU path, pass after pass,
+in option scoring and in plain generation:
+
+| | answers that differ from the same machine's CPU, 40 prompts |
+|---|---|
+| Panther Lake, greedy replies through a Conversation, litert-lm 0.18.0 | 10 in each of two passes, the same 10 |
+| Panther Lake, the same, litert-lm 0.19.0 | 9 in each of two passes, the same 9 |
+| Lunar Lake, the same, litert-lm 0.18.0 | 12 and 11 in two passes |
+| Panther Lake, top option of verify's scoring sequence, 0.18.0 | 10, 11 and 11 in three passes |
+| Lunar Lake, the same | 9 and 10 in two passes |
+| Apple M5 Pro (Metal), the same, against the Panther Lake's CPU | 0 in each of two passes |
+
+- The two Intel CPUs gave the same scores, 0.0 apart.
+- Within one engine the scores depend on what ran before: the same 40 prompts in
+  reverse order scored 15 differently. A new engine for every prompt removed most of
+  that, not all: two of 20 prompts were still 10.8 and 12.9 nats from the CPU's
+  scores (their top option the CPU's).
+- Not the scoring sequence: scoring each option in a session of its own (no
+  checkpoint), no second prefill of the last prompt token, and float16 activations
+  each left 9 or 10 top options of 40 unlike the CPU's. Neither host-side change tried
+  removed the divergence: a 0.3 s pause after every prefill and every scoring call
+  (not after the checkpoint and the rewind) left 11 top options of 40 unlike the CPU's
+  in both passes, and `LITERT_LM_SYNC_EXECUTION=1`, tried on generation only, left 10
+  (0.18.0) and 9 (0.19.0) replies of 40 unlike the CPU's. Whether host-side
+  synchronisation around the checkpoint and rewind plays a part was not tested.
+- Shorter prompts were hit more often: on the Panther Lake the 37 of 60 prompts more than
+  0.5 nats from the CPU had 52 to 82 tokens, the 23 within it 63 to 97.
+- The beans EmbeddingGemma 2 file scored 0.9347 on the same GPU and 0.9327 on that
+  machine's CPU (above); its vectors were not compared row by row.
+- Not run: litert-lm 0.19.0 on the Lunar Lake, Dawn's Vulkan backend on these GPUs (the
+  package offers no switch), discrete Arc GPUs, other drivers, other models, and
+  flutter_edge_ai's Windows GPU library.
 
 ### A GPU cache built on a software adapter
 
