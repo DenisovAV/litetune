@@ -3,6 +3,9 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.8.2 — 2026-11-08
+- `verify` of a Gemma 4 picture bundle on the CPU, the default backend, ended `failed_harness` in 0.8.1; it runs again (#123).
+
 ## 0.8.1 — 2026-11-08
 - Ran `verify --backend gpu` on Linux where it refused a software adapter (llvmpipe, e.g. before installing `libegl1`)? Delete the `…_mldrift_*cache.bin` files beside that model and run its text, picture or tool-path GPU verify again (#119).
 - GPU verify runs of text, pictures and the tool path use a cache directory of their own, so one built on a software adapter is not read (#119).
