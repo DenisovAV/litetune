@@ -36,8 +36,8 @@ MINIJINJA_EDITS = (
     (r"\.strip\(\)", " | trim"),
     (r"\.strip\((.*?)\)", r" | trim(\1)"),
     (r"\.items\(\)", " | items"),
-    (r"{% generation %}", ""),
-    (r"{% endgeneration %}", ""),
+    (r"{%-?\s*generation\s*-?%}", ""),
+    (r"{%-?\s*endgeneration\s*-?%}", ""),
 )
 
 

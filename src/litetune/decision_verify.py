@@ -103,8 +103,10 @@ PROBE_ROWS = 4
 AGREEMENT_FLOOR = 0.95
 TWIN_TOLERANCE = 1e-3
 # The runtime the method was measured correct on, against PyTorch, on a float32
-# bundle (2026-10-16). On another, only a float twin shows it still is.
-MEASURED_RUNTIME = "0.18.0"
+# bundle: mode `once` on 0.18.0 (2026-10-16), mode `plain` on 0.19.1
+# (MEASUREMENTS.md, "On LiteRT-LM 0.19.1"). On another, only a float twin shows
+# it still is.
+MEASURED_RUNTIME = "0.19.1"
 
 # Seconds: a start-up allowance, then a budget per row. At 151 options the
 # runtime took 7.2 s a decision on a server CPU; a phone-class CPU is slower.
@@ -937,10 +939,10 @@ def verify_decision(
             "Creating an Engine took 1.17 s for a gemma-3-270m bundle on LiteRT-LM 0.18.0 "
             "(2026-10-16); this family's load time is not measured"
         )
-    # The method -- a rewind that resets only the step while the re-prefilled
-    # cell stays (decision_scripts.ENGINE_SCRIPT, mode `once`) -- was measured
-    # against PyTorch on Gemma 3's caches only, on 2026-10-16. On another family
-    # nothing has shown it holds, and a float twin is what shows it.
+    # The rewind method was measured against PyTorch on Gemma 3's caches:
+    # mode `once` on 0.18.0 (2026-10-16), mode `plain` on 0.19.1
+    # (MEASUREMENTS.md, "On LiteRT-LM 0.19.1"). On another family only its own
+    # float twin shows it holds.
     if job.family != DECISION_FAMILY:
         if job.float_twin is None:
             return refuse(
@@ -1503,14 +1505,14 @@ def verify_decision(
     # -- the float twin -----------------------------------------------------------------
     runtime_version = (eng.report.get("runtime") or {}).get("litert-lm")
     if job.float_twin is None:
-        if runtime_version == MEASURED_RUNTIME and mode == "once":
+        if runtime_version == MEASURED_RUNTIME and mode == "plain":
             state.limitations.append(NO_TWIN.format(runtime=MEASURED_RUNTIME))
         elif runtime_version == MEASURED_RUNTIME:
             state.add(
                 Check.unchecked(
                     TWIN_CHECK,
                     f"the self-check picked mode {mode!r} on litert-lm {MEASURED_RUNTIME}, where "
-                    "the measured method is 'once', and no --float-twin was given to show which "
+                    "the measured method is 'plain', and no --float-twin was given to show which "
                     "is right on this build",
                 ),
                 events,

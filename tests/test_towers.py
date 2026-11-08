@@ -1,7 +1,7 @@
 """`towers`: a bundle's vision and audio sections dropped, or taken from another.
 
 The script under test is the real one, run by this interpreter. Only
-`litert_lm_builder` is replaced, by a fake that behaves like 0.18.0's in each
+`litert_lm_builder` is replaced, by a fake that behaves like 0.19.1's in each
 place the script could go wrong unnoticed:
 
   - a bundle is laid out as `_build_sections` lays it out: the header's end at
@@ -14,10 +14,10 @@ place the script could go wrong unnoticed:
     text and drops from it every field the proto does not declare (a line
     holding `unknown_field` here, `gemma4` field 13 on Google's bundle), and
     leaves out of `model.toml` the sections it has no type for;
-  - `pack` maps every `model_type` through `TfLiteModelType`, raising for one it
+  - `pack` checks every `model_type` against `get_all_tflite_model_types`, raising for one it
     does not have, opens every `data_path` as the real `_resolve_path` resolves
     it, and drops and appends again the system `uuid` and `creation_timestamp`;
-  - the package is installed as `litert-lm-builder` 0.18.0, as far as
+  - the package is installed as `litert-lm-builder` 0.19.1, as far as
     `importlib.metadata` can tell.
 
 The TOMLs are the ones `unpack` wrote for Google's Gemma 4 E2B CPU/GPU bundle
@@ -229,7 +229,6 @@ def write(path, toml, contents, listed=None):
 FAKE_BUILDER = (
     FAKE_FORMAT
     + r"""
-import enum
 import os
 import re
 import uuid as _uuid
@@ -240,17 +239,8 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-TfLiteModelType = enum.Enum(
-    "TfLiteModelType", {t.upper(): "tf_lite_" + t for t in KNOWN_TYPES}
-)
-
-
-def _from_free_value(cls, value):
-    name = value.lower()
-    return cls(name if name.startswith("tf_lite_") else "tf_lite_" + name)
-
-
-TfLiteModelType.get_enum_from_tf_free_value = classmethod(_from_free_value)
+def get_all_tflite_model_types():
+    return sorted(KNOWN_TYPES)
 
 
 def unpack(litertlm_path, output_dir, jinja_prompt_template_path=None):
@@ -316,7 +306,8 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
     contents = []
     for s in doc.get("section", []):
         if s.get("section_type") in ("TFLiteModel", "TFLiteWeights"):
-            TfLiteModelType.get_enum_from_tf_free_value(s["model_type"])
+            if s["model_type"].lower().removeprefix("tf_lite_") not in get_all_tflite_model_types():
+                raise ValueError("Unknown TfLiteModelType: " + s["model_type"])
         path = Path(s["data_path"])
         data = (path if path.is_absolute() else toml_path.parent / path).read_bytes()
         if PACK_ALTERS_BYTES and s.get("model_type") == "prefill_decode":
@@ -487,7 +478,7 @@ class FakeToolchain:
     pack_alters_value: bool = False
     pack_alters_bytes: bool = False
     known_types: list[str] = field(default_factory=lambda: list(BUILDER_TYPES))
-    builder_version: str = "0.18.0"
+    builder_version: str = "0.19.1"
     # `unpack` cuts its input to this many bytes once it has read it.
     shrink_input: int | None = None
     # Something writes this path while the rebuild runs.
@@ -804,7 +795,7 @@ def test_both_towers_go_and_every_other_section_is_the_inputs_bytes(toolchain, t
     assert result.bytes_before == model.stat().st_size
     assert result.bytes_after == out.stat().st_size
     assert result.sha256 == "sha256:" + hashlib.sha256(out.read_bytes()).hexdigest()
-    assert result.builder == "0.18.0"
+    assert result.builder == "0.19.1"
     assert no_scratch(tmp_path)
 
 
@@ -1128,28 +1119,34 @@ def test_no_tower_or_an_unknown_one_is_refused(toolchain, tmp_path):
 
 
 def test_a_builder_without_a_tower_type_is_refused(toolchain, tmp_path):
-    """The tower lists were read from 0.18.0's `TfLiteModelType`; a builder that
+    """The tower lists were read from 0.19.1's type list; a builder that
     renamed one would leave half a tower behind."""
     toolchain.known_types = [t for t in BUILDER_TYPES if t != "end_of_vision"]
-    with pytest.raises(TowersError, match=r"\(0.18.0\) has no model type end_of_vision"):
+    with pytest.raises(TowersError, match=r"\(0.19.1\) has no model type end_of_vision"):
         drop_towers(gemma4(tmp_path), tmp_path / "out.litertlm", ["vision"])
 
 
-def test_a_builder_with_a_type_0_18_0_lacks_is_refused(toolchain, tmp_path):
+def test_a_builder_with_a_type_0_19_1_lacks_is_refused(toolchain, tmp_path):
     """One the lists do not name could be part of a tower."""
     toolchain.known_types = [*BUILDER_TYPES, "vision_projector"]
-    toolchain.builder_version = "0.19.0"
-    with pytest.raises(TowersError, match=r"\(0.19.0\) has model types 0.18.0 does not: vision_p"):
+    toolchain.builder_version = "0.20.0"
+    with pytest.raises(TowersError, match=r"\(0.20.0\) has model types 0.19.1 does not: vision_p"):
         drop_towers(gemma4(tmp_path), tmp_path / "out.litertlm", ["vision"])
 
 
-def test_the_tower_lists_are_builder_0_18_0s_types():
-    """`BUILDER_TYPES` pins the 0.18.0 list (`TfLiteModelType`,
-    `litertlm_builder.py:211-232`); re-read it when the builder pin moves. The
+def test_the_tower_lists_are_builder_0_19_1s_types():
+    """`BUILDER_TYPES` pins 0.19.1's `get_all_tflite_model_types()` result;
+    re-read it when the builder pin moves. The
     script refuses a builder whose list differs."""
     named = {t for types_ in TOWER_SECTIONS.values() for t in types_}
     assert named <= set(BUILDER_TYPES)
-    assert {t for t in BUILDER_TYPES if t.startswith(("vision", "audio", "end_of"))} == named
+    assert set(TOWER_SECTIONS["vision"]) == {"vision_encoder", "vision_adapter", "end_of_vision"}
+    assert set(TOWER_SECTIONS["audio"]) == {
+        "audio_frontend",
+        "audio_encoder_hw",
+        "audio_adapter",
+        "end_of_audio",
+    }
 
 
 ODD_SYSTEM = """[system_metadata]
@@ -1354,7 +1351,7 @@ def test_towers_are_added_with_the_donors_metadata_and_nothing_else_moves(toolch
     )
     assert result.tokens_checked == 4
     assert result.embedding_width == WIDTH
-    assert result.builder == "0.18.0"
+    assert result.builder == "0.19.1"
     assert result.donor == giver
     assert {d["tower"] for d in result.added} == {"vision", "audio"}
     assert model.read_bytes() == before
@@ -1980,7 +1977,7 @@ def test_drop_writes_the_report_and_exits_0(toolchain, tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["schema"] == "litetune.towers/1" and report["operation"] == "drop"
     assert report["towers"] == ["vision", "audio"] and len(report["dropped"]) == 6
-    assert report["builder"] == "0.18.0"
+    assert report["builder"] == "0.19.1"
 
 
 def test_a_refusal_exits_4_and_says_why(toolchain, tmp_path, capsys):
@@ -2002,7 +1999,7 @@ def test_add_wiring_and_its_refusals(toolchain, tmp_path, capsys):
     assert "added audio: 3 sections" in text
     assert "each added adapter writes 16 values per token, as the bundle's embedder does" in text
     assert "tokenizers agree on the 4 token strings and ids the metadata names as tokens" in text
-    assert "written by litert-lm-builder 0.18.0" in text
+    assert "written by litert-lm-builder 0.19.1" in text
     drop = ["towers", "--model", str(giver), "--drop", "vision", "--output", str(tmp_path / "x")]
     assert main([*drop, "--from", str(giver)]) == 4
     assert "go with --add, not --drop" in capsys.readouterr().err

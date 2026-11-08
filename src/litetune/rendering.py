@@ -9,8 +9,8 @@ two engines can render the same template differently, and a tokenizer can add
 tokens neither template shows.
 
 So the check compares token ids. For every prompt, a script in `envs.RUNTIME`
-renders it with `Conversation.render_message_to_string` -- in LiteRT-LM v0.18.0
-(as in v0.17.1) that returns `GetSingleTurnText`, the function `SendMessage` renders with --
+renders it with `Conversation.render_message_to_string` -- in LiteRT-LM v0.19.1
+that returns `GetSingleTurnText`, the function `SendMessage` renders with --
 and turns the result into ids the way a first-turn prefill does. A template renders
 single-turn only when its text contains `is_appending_to_prefill`
 (`minijinja_template.rs`), and none that litetune packages or fetches does (checked
@@ -237,7 +237,14 @@ def main():
         with engine.create_conversation(**conversation_args) as renderer:
             for index, prompt in enumerate(spec["prompts"]):
                 message = prompt if not pictures else picture_message(prompt, pictures[index])
-                rendered = renderer.render_message_to_string(message)
+                try:
+                    rendered = renderer.render_message_to_string(message)
+                except RuntimeError:
+                    # 0.19 raises where 0.18 returned "". Keep a template
+                    # failure as this row's `unrendered` mismatch instead of
+                    # ending the script (`python/litert_lm/conversation.py`,
+                    # render_message_to_string).
+                    rendered = ""
                 rows.append(
                     {
                         "index": index,
@@ -248,8 +255,9 @@ def main():
                 )
         for row in rows[: spec["prefill_sample"]]:
             if not row["rendered"]:
-                # The binding returns "" when the template fails, and sending
-                # the prompt fails the same way: the comparison reports it as
+                # The binding returned "" through 0.18 and raises from 0.19;
+                # both become an empty rendering above. Sending the prompt
+                # fails the same way: the comparison reports it as
                 # unrendered, and the parent does not count it as sent.
                 row["prefill_skipped"] = True
                 continue
@@ -321,7 +329,7 @@ class RenderingMismatch:
     # `ids`: the rendered id lists differ. `prefill`: they agree, and the count
     # the runtime prefilled when the prompt was sent does not. `unrendered`: the
     # runtime's rendering is empty where the reference's is not -- what the
-    # binding returns for the C API's null when the template fails, and also for
+    # binding returned through 0.18 when the template failed (0.19 raises), and also for
     # a template that renders nothing (`conversation.py`,
     # `render_message_to_string`, v0.18.0) -- not a rendering of only the
     # tokens the session adds.

@@ -3738,12 +3738,12 @@ def _macos_cpu_detail(probe: DeviceProbe) -> str:
 RUNTIME = StageEnv(
     name="runtime",
     requirements=(
-        # 0.18.0, the runtime flutter_edge_ai_litertlm 1.10.0 ships (its
-        # CHANGELOG: "LiteRT-LM v0.18.0 (`native-v0.18.0-a`)"). Runtimes are not
+        # 0.19.1, the patch release on the line flutter_edge_ai_litertlm 1.20.0
+        # runs (`native-v0.19.0-a`). Runtimes are not
         # assumed to reproduce each other's answers -- 0.17.1 did not reproduce
         # 0.16.1's (MEASUREMENTS.md, "Which runtime a number was taken on") --
         # so every number records the one it ran on.
-        "litert-lm==0.18.0",
+        "litert-lm==0.19.1",
         "numpy==2.0.2",  # last of the 2.0 line; `<2.1` is a bound, not a pin
     ),
     # litert-lm dlopen()s a native library that links vulkan unconditionally,
@@ -3755,23 +3755,25 @@ RUNTIME = StageEnv(
 EXPORT = StageEnv(
     name="export",
     requirements=(
-        "litert-torch-nightly==0.10.0.dev20260926",
-        "litert-lm==0.18.0",
+        "litert-torch-nightly==0.11.0.dev20261107",
+        "litert-lm==0.19.1",
         # Provides `litert-lm-builder` and `litert-lm-peek`, which `export`
         # runs to write the GPU activation type into each bundle and to read
         # the result back. Pinned by name: `litert-lm` happens to require
         # this exact version today and `litert-torch` accepts any, so without
         # this line the builder floats the moment the other two pins move.
-        "litert-lm-builder==0.18.0",
+        "litert-lm-builder==0.19.1",
         # `litert-torch-nightly` requires the first two by name only and the
         # third as `>=0.0.0.dev0`, so up to 0.1.9 each install took whatever
         # was newest that day: the same pin could convert with a different
-        # quantizer a day later. These are what `uv pip compile` resolved
-        # 0.10.0.dev20260926 to on 2026-09-26, for Linux x86-64 and macOS
-        # arm64 alike. `convert` records the full `pip freeze`.
-        "ai-edge-litert-nightly==2.3.0.dev20260925",
-        "ai-edge-quantizer-nightly==0.10.0.dev20260926",
-        "litert-converter==0.4.0",
+        # quantizer a day later. These are what installing 0.11.0.dev20261107
+        # resolved them to on 2026-11-08; from that release on the quantizer
+        # is published as `litert-quantizer-nightly` (its `requires_dist`), no
+        # longer `ai-edge-quantizer-nightly`. `convert` records the full
+        # `pip freeze`.
+        "ai-edge-litert-nightly==2.4.0.dev20261107",
+        "litert-quantizer-nightly==0.12.0.dev20261108",
+        "litert-converter==0.5.0",
         # The version `TRAIN` pins, so a checkpoint is exported by the
         # transformers that trained it; unpinned, it resolved to 5.17.0.
         "transformers==5.16.1",
@@ -3960,10 +3962,20 @@ NPU_QUALCOMM = StageEnv(
 # with ai-edge-litert-nightly's Linux x86-64 wheel.
 NPU_LLM = StageEnv(
     name="npu-llm",
-    # flatbuffers pinned as NPU_QUALCOMM pins it: the script repacks the stage-3 graph with it.
-    # numpy is EXPORT's own pin.
+    # Kept as the exact conversion list this NPU path was measured with. It used
+    # to expand EXPORT.requirements here; spelling the list out prevents the
+    # 0.19 text-runtime/export move from changing the Qualcomm path without a
+    # new NPU measurement (MEASUREMENTS.md, "LLMs on a Qualcomm NPU").
+    # flatbuffers is NPU_QUALCOMM's pin: the script repacks the stage-3 graph with it.
     requirements=(
-        *EXPORT.requirements,
+        "litert-torch-nightly==0.10.0.dev20260926",
+        "litert-lm==0.18.0",
+        "litert-lm-builder==0.18.0",
+        "ai-edge-litert-nightly==2.3.0.dev20260925",
+        "ai-edge-quantizer-nightly==0.10.0.dev20260926",
+        "litert-converter==0.4.0",
+        "transformers==5.16.1",
+        "numpy==2.0.2",
         "ai-edge-litert-sdk-qualcomm==2.3.0",
         "flatbuffers==25.12.19",
     ),

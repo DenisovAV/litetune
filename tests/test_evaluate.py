@@ -711,7 +711,7 @@ def test_backend_reports_which_engine_produced_the_numbers(tmp_path):
     described = _litertlm(tmp_path).describe()
     assert described["engine"] == "litert-lm"
     assert described["backend"] == "cpu"
-    assert "litert-lm==0.18.0" in described["requirements"]
+    assert "litert-lm==0.19.1" in described["requirements"]
 
 
 @pytest.mark.parametrize(("platform", "debian"), [("linux", ["libvulkan1"]), ("win32", [])])
@@ -2528,13 +2528,21 @@ def test_one_refused_prompt_is_one_row(tmp_path, monkeypatch):
     rows, _ = _run_script(
         tmp_path,
         ["one", "two", "three"],
-        raise_on={"two": RuntimeError("litert_lm_session_run_prefill failed")},
+        raise_on={
+            "two": RuntimeError(
+                "litert_lm_session_run_prefill failed with status "
+                "RESOURCE_EXHAUSTED (8): prefill reaches the token limit"
+            )
+        },
         monkeypatch=monkeypatch,
     )
     assert [r["index"] for r in rows] == [0, 1, 2]
     assert rows[0]["text"] == "answer to one"
     assert "text" not in rows[1]
-    assert rows[1]["error"] == "RuntimeError: litert_lm_session_run_prefill failed"
+    assert rows[1]["error"] == (
+        "RuntimeError: litert_lm_session_run_prefill failed with status "
+        "RESOURCE_EXHAUSTED (8): prefill reaches the token limit"
+    )
     assert rows[2]["text"] == "answer to three"
     # And the reader turns that row into a fault rather than an answer.
     texts, faults = read_jsonl_results(tmp_path / "out.jsonl")

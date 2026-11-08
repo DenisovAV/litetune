@@ -196,12 +196,16 @@ class FakeScoringEnv:
             ]
             report.update(
                 {
-                    "runtime": {"litert-lm": "0.18.0"},
+                    "runtime": {"litert-lm": "0.19.1"},
                     "cpu": "fake CPU",
                     "threads": spec["threads"],
-                    "mode": "once" if spec["mode"] == "auto" else spec["mode"],
+                    "mode": "plain" if spec["mode"] == "auto" else spec["mode"],
                     "method": spec["method"],
-                    "selfcheck": {"verdict": "dropped", "comparisons": 18, "max_abs_diff": 0.0},
+                    "selfcheck": {
+                        "verdict": "not dropped",
+                        "comparisons": 18,
+                        "max_abs_diff": 0.135,
+                    },
                     "k": ks,
                     "scored_lengths": lengths,
                     "mismatches": [{"option": o} for o in spec["options"] if o in self.full_for],
@@ -389,7 +393,7 @@ def test_a_decision_that_scores_alike_on_both_sides_passes(split, tmp_path):
     assert fields["quality"]["argmax_agreement"] == 1.0
     held = [json.loads(line) for line in s["heldout"].read_text().splitlines()]
     assert fields["measurements"]["reference"]["accuracy"] == expected_accuracy(held)
-    assert fields["cost"]["mode"] == "once"
+    assert fields["cost"]["mode"] == "plain"
     assert fields["cost"]["scored_tokens_per_decision"] == sum(
         unique_lengths([tokens(o) for o in s["decision"].ids])
     )
@@ -538,7 +542,7 @@ def test_on_macos_the_gpu_scores_every_row_twice_and_passes_when_they_agree(
     assert first["backend"] == second["backend"] == "gpu"
     # The repeat takes the mode the first run's self-check chose, and the rows
     # in reverse order.
-    assert (first["mode"], second["mode"]) == ("auto", "once")
+    assert (first["mode"], second["mode"]) == ("auto", "plain")
     assert [r["index"] for r in second["rows"]] == [r["index"] for r in first["rows"]][::-1]
     assert (
         len(fields["harness"]["gpu_repeat"].pop("devices"))
@@ -577,7 +581,7 @@ def test_a_row_the_two_gpu_runs_disagree_on_is_settled_by_a_third(split, tmp_pat
     # Row 3, five times, under indices of their own.
     copies = [r["index"] for r in candidate[2]["rows"]]
     assert sorted(copies) == [n * c + 3 for c in range(1, 6)]
-    assert candidate[2]["mode"] == "once"
+    assert candidate[2]["mode"] == "plain"
     assert len({r["prompt"] for r in candidate[2]["rows"]}) == 1
     assert (
         len(fields["harness"]["gpu_repeat"].pop("devices"))
@@ -1119,7 +1123,7 @@ def test_a_float_twin_within_the_tolerance_passes(split, tmp_path):
     assert check(fields, TWIN_CHECK)["outcome"] == "passed"
     twin_spec = job.runtime_env.specs[-1]
     assert twin_spec["model"] == str(twin)
-    assert twin_spec["targets"] == "full" and twin_spec["mode"] == "once"
+    assert twin_spec["targets"] == "full" and twin_spec["mode"] == "plain"
     assert not any("--float-twin" in text for text in fields["limitations"])
 
 
@@ -1468,6 +1472,11 @@ class _Conversation:
         return False
 
     def render_message_to_string(self, prompt):
+        if os.environ.get("FAKE_RENDER_RAISES") == "1":
+            raise RuntimeError(
+                "litert_lm_conversation_render_message failed with status "
+                "INTERNAL (13): failed to apply template"
+            )
         before, after = _TEMPLATES[os.environ.get("FAKE_TEMPLATE", "gemma")]
         return before + prompt + after
 
@@ -1670,7 +1679,7 @@ def test_run_verify_measures_a_decision_checkpoint_by_option_scoring(split, tmp_
     lines = summarise(manifest)
     assert lines[0] == "status: passed"
     assert any(line.startswith("  decision: choice, 4 options, temperature ") for line in lines)
-    assert any(line.startswith("  cost: ") and "mode once" in line for line in lines)
+    assert any(line.startswith("  cost: ") and "mode plain" in line for line in lines)
 
 
 def test_a_checkpoint_with_no_decision_and_no_calibration_is_verified_as_before(tmp_path):
@@ -1952,14 +1961,14 @@ def test_no_runtime_rows_is_refused_rather_than_divided_by(split, tmp_path):
     assert "engine_rows is 0" in check(fields, RUNTIME_CHECK)["detail"]
 
 
-def test_plain_on_the_measured_runtime_without_a_twin_is_not_called_correct(split, tmp_path):
+def test_once_on_the_measured_runtime_without_a_twin_is_not_called_correct(split, tmp_path):
     s = split()
-    eng = FakeScoringEnv("runtime", report_extra={"mode": "plain"})
+    eng = FakeScoringEnv("runtime", report_extra={"mode": "once"})
 
     status, fields = run(job_for(s, tmp_path, runtime_env=eng), s["record"])
 
     assert status == "inconclusive"
-    assert "the measured method is 'once'" in check(fields, TWIN_CHECK)["detail"]
+    assert "the measured method is 'plain'" in check(fields, TWIN_CHECK)["detail"]
 
 
 def test_the_reference_checks_its_longest_row_against_the_uncached_scores(split, tmp_path):
@@ -2709,6 +2718,21 @@ def test_a_rendering_with_no_pair_is_no_comparisons_and_a_harness_failure(tmp_pa
     assert proc.returncode == 3
     assert report["selfcheck"]["verdict"] == "no comparisons"
     assert report["selfcheck"]["pair"] is None and rows == []
+
+
+def test_a_render_exception_is_no_comparisons_and_a_harness_failure(tmp_path):
+    proc, rows, report = _run_engine_script(
+        tmp_path,
+        False,
+        ["text 1 about joy"],
+        OPTIONS,
+        fake_env={"FAKE_RENDER_RAISES": "1"},
+    )
+
+    assert proc.returncode == 3
+    assert report["selfcheck"]["verdict"] == "no comparisons"
+    assert report["selfcheck"]["pair"] is None and rows == []
+    assert "Traceback" not in proc.stderr
 
 
 # -- a family the method was not measured on -----------------------------------------

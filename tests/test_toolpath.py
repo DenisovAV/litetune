@@ -382,8 +382,10 @@ def test_every_prompt_gets_a_row_in_order(tmp_path, monkeypatch):
 
 # -- how it fails ------------------------------------------------------------
 
-# What the binding raises for every failed reply, in LiteRT-LM v0.17.1.
-SEND_FAILED = RuntimeError("litert_lm_conversation_send_message failed")
+# The exception shape in LiteRT-LM 0.19.1 (`litertlm_api.cc`, `ReturnIfError`).
+SEND_FAILED = RuntimeError(
+    "litert_lm_conversation_send_message failed with status INTERNAL (13): send refused"
+)
 # What the runtime logs when its parser refuses a reply (`parser_utils.cc`,
 # `c/conversation.cc`): the model's code block and full response in it.
 PARSE_FAILURE_LOG = (

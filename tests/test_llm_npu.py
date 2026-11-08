@@ -153,9 +153,23 @@ def test_an_unmeasured_family_is_refused(family):
 # ---------------------------------------------------------------------------
 
 
-def test_the_environment_is_export_plus_the_qualcomm_sdk_on_linux_x86_64():
+def test_the_environment_keeps_the_measured_0_18_conversion_set_on_linux_x86_64():
     env = envs.NPU_LLM
-    assert set(envs.EXPORT.requirements) < set(env.requirements)
+    assert set(env.requirements) == {
+        "litert-torch-nightly==0.10.0.dev20260926",
+        "litert-lm==0.18.0",
+        "litert-lm-builder==0.18.0",
+        "ai-edge-litert-nightly==2.3.0.dev20260925",
+        "ai-edge-quantizer-nightly==0.10.0.dev20260926",
+        "litert-converter==0.4.0",
+        "transformers==5.16.1",
+        "numpy==2.0.2",
+        "ai-edge-litert-sdk-qualcomm==2.3.0",
+        "flatbuffers==25.12.19",
+    }
+    assert set(env.requirements).isdisjoint(
+        set(envs.EXPORT.requirements) - {"transformers==5.16.1", "numpy==2.0.2"}
+    )
     assert {"ai-edge-litert-sdk-qualcomm==2.3.0", "flatbuffers==25.12.19"} <= set(env.requirements)
     assert any(r.startswith("numpy==") for r in env.requirements)
     assert env.install_as == envs.NPU_QUALCOMM.install_as

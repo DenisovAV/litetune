@@ -39,15 +39,14 @@ has what batching changed in time and in the scores.
 session API on the CPU or the GPU, as the flutter_edge_ai design of
 2026-10-16 has its decider do. It renders with
 `Conversation.render_message_to_string`, prefills the prompt, saves a
-checkpoint, and per option scores and rewinds. LiteRT-LM 0.18.0 scores right
-after a prefill without the prompt's second-to-last token (#3561): mode `once`
-prefills the last token again, once per decision, which gives the reference's
-scores on 0.18.0; mode `plain` does not, which is right on an engine with the
-fix and wrong on 0.18.0. The self-check picks between them: two prompts that
-differ only in their second-to-last token score identically on 0.18.0 and
-differently with the fix. Measured 2026-10-16: 0.0 in all 42 comparisons on
-0.18.0, at least 0.135 on a nightly with the fix; each mode within 8.2e-4 nats
-of PyTorch on a float32 bundle, and wrong on the other engine. Those
+checkpoint, and per option scores and rewinds. LiteRT-LM 0.19.1 includes the
+#3561 fix, so its self-check says `not dropped` and selects mode `plain`.
+Mode `once` remains for an older runtime whose self-check says `dropped`:
+0.18.0 scored right after a prefill without the prompt's second-to-last token,
+and prefilling the last token again once per decision restored its scores.
+Measured 2026-10-16: 0.0 in all 42 comparisons on 0.18.0, at least 0.135 on a
+nightly with the fix; each mode within 8.2e-4 nats of PyTorch on a float32
+bundle, and wrong on the other engine. Those
 measurements were Gemma 3's; the self-check's pair is rendered by the bundle's
 own template, which on Gemma 3 is the pair measured.
 
@@ -625,9 +624,13 @@ def main():
 
     def render(engine, prompt):
         with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
-            rendered = conv.render_message_to_string(prompt)
-        # 0.18.0 returns "" when the render fails in C, and "" tokenises to no
-        # ids, which every check below would pass.
+            try:
+                rendered = conv.render_message_to_string(prompt)
+            except RuntimeError:
+                # 0.19 raises where 0.18 returned ""
+                # (`python/litert_lm/conversation.py`, render_message_to_string).
+                rendered = ""
+        # An empty failed rendering tokenises to no ids, which every check below would pass.
         if not rendered:
             raise RuntimeError("the runtime rendered the prompt as empty text")
         # As prefill reads the text; the session puts `session_prefix` first.
@@ -704,7 +707,12 @@ def main():
         dropped.
         """
         with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
-            a = conv.render_message_to_string(SELFCHECK_MESSAGE)
+            try:
+                a = conv.render_message_to_string(SELFCHECK_MESSAGE)
+            except RuntimeError:
+                # The 0.18 empty-render path below returned None; keep that
+                # self-check refusal on 0.19's exception form.
+                a = ""
         ia = list(engine.tokenize(a)) if a else []
         if len(ia) < 2:
             return None

@@ -528,7 +528,7 @@ def test_an_unready_environment_says_what_pypi_lacks(monkeypatch, tmp_path, allo
 
     detail = EXPORT.unready_detail
 
-    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in detail
+    assert "litert-converter==0.5.0 publishes no wheel for win_amd64" in detail
     if allowed:
         assert detail.startswith(f"is not provisioned at {EXPORT.path}; by PyPI's file lists it ")
         assert detail.endswith(f"though {envs.ALLOW_MISSING_WHEELS}=1 lets pip try")
@@ -927,7 +927,7 @@ def test_pips_words_are_redacted_before_they_are_cut():
 
 
 def test_convert_is_refused_on_windows_before_anything_is_installed(monkeypatch, tmp_path):
-    """`litert-converter==0.4.0` publishes no Windows wheel and no source distribution.
+    """`litert-converter==0.5.0` publishes no Windows wheel and no source distribution.
 
     pip used to be asked anyway, and failed while resolving. The refusal now
     comes first, names the package and says where `convert` does run -- and
@@ -943,9 +943,9 @@ def test_convert_is_refused_on_windows_before_anything_is_installed(monkeypatch,
 
     assert reached == [], "nothing is built or installed for an environment that cannot be"
     assert message.startswith("environment 'export' cannot be provisioned on win_amd64")
-    assert "litert-converter==0.4.0 publishes no wheel for win_amd64" in message
+    assert "litert-converter==0.5.0 publishes no wheel for win_amd64" in message
     assert "no source distribution" in message
-    assert "https://pypi.org/pypi/litert-converter/0.4.0/json" in message
+    assert "https://pypi.org/pypi/litert-converter/0.5.0/json" in message
     assert "WSL2" in message and "`verify` takes it" in message
 
 
@@ -966,9 +966,9 @@ def test_what_runs_on_windows_x64_is_not_refused(monkeypatch, tmp_path, env):
 @pytest.mark.parametrize(
     ("platform", "named"),
     [
-        ("win_arm64", ["litert-lm-api==0.18.0 (required by litert-lm==0.18.0)", "numpy==2.0.2"]),
-        ("win32", ["litert-lm-api==0.18.0 (required by litert-lm==0.18.0)"]),
-        ("macosx_x86_64", ["litert-lm-api==0.18.0 (required by litert-lm==0.18.0)"]),
+        ("win_arm64", ["litert-lm-api==0.19.1 (required by litert-lm==0.19.1)", "numpy==2.0.2"]),
+        ("win32", ["litert-lm-api==0.19.1 (required by litert-lm==0.19.1)"]),
+        ("macosx_x86_64", ["litert-lm-api==0.19.1 (required by litert-lm==0.19.1)"]),
     ],
 )
 def test_an_architecture_with_no_wheel_is_refused_by_the_package(
@@ -976,7 +976,7 @@ def test_an_architecture_with_no_wheel_is_refused_by_the_package(
 ):
     """Windows on ARM64, 32-bit Windows and Intel macOS have no `litert-lm-api` wheel.
 
-    It is the runtime's native library, pinned exactly by `litert-lm==0.18.0`,
+    It is the runtime's native library, pinned exactly by `litert-lm==0.19.1`,
     so the environment's own list does not name it -- and a refusal that named
     only what the environment pins would point at the wrong package.
     """
@@ -1008,7 +1008,7 @@ def test_an_architecture_with_no_wheel_is_refused_by_the_package(
 def test_a_wheel_is_matched_by_its_whole_tag_not_its_architecture(
     monkeypatch, tmp_path, name, refused
 ):
-    """`litert-lm-api==0.18.0` is `macosx_12_0_arm64` and `manylinux_2_27_x86_64`.
+    """`litert-lm-api==0.19.1` is `macosx_12_0_arm64` and `manylinux_2_27_x86_64`.
 
     Read down to the architecture, macOS 11 and glibc 2.26 passed the check
     while pip, which reads the whole tag, has no wheel for either; and musl
@@ -1022,7 +1022,7 @@ def test_a_wheel_is_matched_by_its_whole_tag_not_its_architecture(
 
     assert (refusal is not None) is refused
     if refused:
-        assert refusal is not None and "litert-lm-api==0.18.0" in refusal
+        assert refusal is not None and "litert-lm-api==0.19.1" in refusal
 
 
 def test_a_machine_nobody_has_can_be_asked_about(monkeypatch):
@@ -1056,7 +1056,7 @@ def test_an_environment_that_cannot_be_built_here_says_so_when_unready(monkeypat
     monkeypatch.setenv("LITETUNE_ENV_DIR", str(tmp_path))
 
     _host(monkeypatch, "win_amd64", (3, 12))
-    assert "litert-converter==0.4.0 publishes no wheel" in EXPORT.unready_detail
+    assert "litert-converter==0.5.0 publishes no wheel" in EXPORT.unready_detail
     assert EXPORT.unready_detail.startswith(f"is not provisioned at {EXPORT.path}, and cannot")
 
     _host(monkeypatch, "linux_x86_64", (3, 12))
@@ -5098,7 +5098,7 @@ def test_the_export_environment_pins_what_litert_torch_leaves_open():
     pins = dict(r.split("==", 1) for r in envs.EXPORT.requirements if "==" in r)
     train = dict(r.split("==", 1) for r in envs.TRAIN.requirements if "==" in r)
 
-    for name in ("ai-edge-litert-nightly", "ai-edge-quantizer-nightly", "litert-converter"):
+    for name in ("ai-edge-litert-nightly", "litert-quantizer-nightly", "litert-converter"):
         assert name in pins
     assert pins["transformers"] == train["transformers"]
     assert pins["litert-lm"] == pins["litert-lm-builder"]
