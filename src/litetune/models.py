@@ -80,10 +80,6 @@ class FlagRefused(ValueError):
 
 TEMPLATE_FLAG = "--jinja_chat_template_override"
 METADATA_OVERRIDE_FLAG = "--litert_lm_llm_metadata_override"
-# The value that tells the exporter to build the metadata from the checkpoint
-# rather than take an override (`export.py`, `str(value).lower() == 'none'`,
-# litert-torch-nightly 0.11.0.dev20261107).
-NO_METADATA_OVERRIDE = "none"
 
 
 def flag_key(name: str) -> str:
@@ -2204,33 +2200,12 @@ def plan_export(
             )
         )
 
-    # A template reaches the bundle only through the metadata the exporter
-    # builds, and from litert-torch-nightly 0.11 the exporter takes an override
-    # of its own for several families unless told not to. So beside a template,
-    # and unless the caller chose an override, litetune names "none".
-    if flag_key(TEMPLATE_FLAG) in table and flag_key(METADATA_OVERRIDE_FLAG) not in table:
-        token = f"{METADATA_OVERRIDE_FLAG}={NO_METADATA_OVERRIDE}"
-        table.update(parse_exporter_flags(model, [token]))
-        added.append(token)
-        notes.append(f"added {token}: {_NO_METADATA_OVERRIDE_REASON}")
-        checks.append(
-            Check.passed(
-                EXPORT_FLAGS_CHECK,
-                f"{rules.family}: {token} was added by litetune — {_NO_METADATA_OVERRIDE_REASON}",
-                observed={"flag": token, "family": rules.family, "added": True},
-            )
-        )
-
     # On a rule that composes, whether it did or the caller brought a template:
     # either way the template reaches the bundle only through the metadata the
     # exporter builds, and an override of its own takes that metadata's place.
     if any(required.value in WRITTEN_AT_EXPORT for required in rules.required_flags):
         override = table.get(flag_key(METADATA_OVERRIDE_FLAG))
-        if (
-            override is not None
-            and override.value
-            and str(override.value).lower() != NO_METADATA_OVERRIDE
-        ):
+        if override is not None and override.value:
             reason = _METADATA_OVERRIDE_REASON if composes else _METADATA_OVERRIDE_OWN_REASON
             raise FlagRefused(f"{model}: litetune refuses {override.token!r}. {reason}")
 
@@ -2296,17 +2271,6 @@ _CALLER_TEMPLATE = (
 # would build (`litert_lm_builder.py:438-456`, then `add_llm_metadata` at
 # `:487`), and `build_llm_metadata` is the only place a chat template is
 # written into it (`:314-318`).
-_NO_METADATA_OVERRIDE_REASON = (
-    "litert-torch-nightly 0.11.0.dev20261107 gives the qwen2, qwen3, qwen3_5 and minicpm5 "
-    "families, and Gemma 4 26B and 31B, a metadata override of its own by default, fetched "
-    "from LiteRT-LM's "
-    "`models/` directory at its `main` branch at export time, and with one it writes that "
-    "metadata's template, not the template it was handed (`export.py`, the note on built-in "
-    "LlmMetadata defaults; `litert_lm_builder.py` `package_model`). Measured 2026-11-08: a "
-    "Qwen2.5 0.5B bundle exported without this flag carried another template than the one "
-    "handed over. With it the exporter builds the metadata from the checkpoint, as 0.10 did"
-)
-
 _METADATA_OVERRIDE_REASON = (
     "The exporter puts a metadata override in the bundle in place of the LlmMetadata it builds, "
     "and the chat template litetune writes at export reaches the bundle only through the "
