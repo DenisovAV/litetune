@@ -3083,7 +3083,12 @@ text driver passed) writes its GPU caches beside the model, named after the file
   whose driver passed the default cache, read it. The tool path passed no cache
   directory at all; what LiteRT-LM does then was not measured. The change that adds this
   section gives litetune's text, picture and tool-path GPU engines a cache directory of
-  their own (EmbeddingGemma 2 already had one per run, decisions use none); that code has
-  not been run on a GPU here.
+  their own (EmbeddingGemma 2 already had one per run, decisions use none).
+- Given a directory of its own, LiteRT-LM 0.18.0 wrote every cache there and nothing beside
+  the model: on an Apple M5 Pro's GPU, the unconstrained copy of this bundle with text and
+  vision given the GPU (the label for both pictures) left `…_mldrift_{weight,program}_cache.bin`,
+  `….vision_encoder_…_mldrift_{weight,program}_cache.bin` and `…vision_adapter.xnnpack_cache`
+  in that directory, and the beans EmbeddingGemma 2 file likewise, its `.text_encoder_` and
+  `.vision_encoder_` caches included. That was this measurement's script, not a litetune run.
 - Not run: a cache built on one hardware GPU read on another, Windows and macOS caches,
   litert-lm 0.19.0.
