@@ -278,7 +278,10 @@ def test_cpu_vision_picture_runs_state_the_runtime_default_threads(
     assert thread_note == PICTURE_THREADS.format(text=text_words)
 
 
-def test_a_real_driver_report_reaches_describe_and_the_verify_manifest(tmp_path):
+def test_a_real_driver_report_reaches_describe_and_the_verify_manifest(tmp_path, monkeypatch):
+    # The GPU reading differs by platform (on Linux a run naming no adapter fails the
+    # harness); this test is about the report's vision fields, read as on macOS.
+    monkeypatch.setattr(sys, "platform", "darwin")
     adapter_reason = (
         "the vision adapter constraint vision_adapter='cpu' excludes the gpu vision backend "
         "given to the engine, but adapter constraints are recorded and left to LiteRT-LM: "
