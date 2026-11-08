@@ -2042,11 +2042,19 @@ def section_type_of(section):
 def vision_in(doc, meta):
     """What the bundle carries for pictures: section types, constraints, media fields, sampler."""
     types = sorted({section_type_of(s) for s in doc.get("section", []) if s.get("model_type")})
-    constraints = {
-        section_type_of(s): s.get("backend_constraint")
-        for s in doc.get("section", [])
-        if section_type_of(s) in ("vision_encoder", "vision_adapter")
-    }
+    constraints = {}
+    for section in doc.get("section", []):
+        kind = section_type_of(section)
+        value = section.get("backend_constraint")
+        if kind not in ("vision_encoder", "vision_adapter") or value is None:
+            continue
+        if kind not in constraints:
+            # Preserve one section's exact value so validation can name bad
+            # case, spacing and empty entries exactly as the bundle carries it.
+            constraints[kind] = value
+        elif isinstance(constraints[kind], str) and isinstance(value, str):
+            left = set(constraints[kind].split(","))
+            constraints[kind] = ",".join(sorted(left & set(value.split(","))))
     gemma4 = None
     if has(meta, "llm_model_type") and has(meta.llm_model_type, "gemma4"):
         g = meta.llm_model_type.gemma4
@@ -2529,7 +2537,28 @@ def _vision_carried(
     observed |= facts
     missing = [section for section in llm_images.VISION_SECTIONS if section not in types]
     problem = None
-    if missing:
+    invalid_constraint = next(
+        (
+            (section, value)
+            for section, value in sorted(constraints.items())
+            if not isinstance(value, str)
+            or not (tokens := [part.strip() for part in value.split(",")])
+            # litert-lm-builder 0.18.0's complete Backend enum. Keep this
+            # explicit so reading a bundle never silently accepts a future
+            # value the pinned builder has not defined for this release.
+            or any(
+                not token or token not in {"cpu", "gpu", "npu", "gpu_artisan"} for token in tokens
+            )
+        ),
+        None,
+    )
+    if invalid_constraint is not None:
+        section, value = invalid_constraint
+        problem = (
+            f"sets {section} backend_constraint to {value!r}; expected a non-empty, "
+            "comma-separated list of lower-case cpu, gpu, npu or gpu_artisan"
+        )
+    elif missing:
         problem = (
             f"carries no {', '.join(missing)} section, so it cannot take a picture; it has "
             f"{', '.join(types) or 'no sections'}"
@@ -2542,12 +2571,6 @@ def _vision_carried(
             f"names {facts['start_of_image_token']!r} and {facts['end_of_image_token']!r} as its "
             f"start and end of image, where the processor puts {llm_images.START_OF_IMAGE!r} and "
             f"{llm_images.END_OF_IMAGE!r} around a picture"
-        )
-    elif constraints != dict(llm_images.VISION_CONSTRAINTS):
-        problem = (
-            f"constrains its vision sections to {constraints}, where convert writes "
-            f"{dict(llm_images.VISION_CONSTRAINTS)}: the CPU is the one vision backend litetune "
-            "has measured them on"
         )
     elif facts["max_num_patches"] != llm_images.MAX_NUM_PATCHES:
         problem = (
@@ -2923,8 +2946,9 @@ def export_recipe(
         request.env,
         timeout=min(REPACK_TIMEOUT_S, remaining),
         read_template=True,
-        # A bundle that takes pictures: its vision encoder and adapter on the
-        # CPU, the one vision backend litetune has verified them on.
+        # A picture bundle keeps the vision constraints the exporter wrote.
+        # In particular, litetune does not copy the CPU adapter constraint from
+        # Google's E2B bundle at llm_images.TEMPLATE_REVISION.
         constraints=llm_images.VISION_CONSTRAINTS if request.images is not None else None,
     )
     gpu_activation, gpu_note = repack.declared, repack.note
@@ -2972,9 +2996,8 @@ def export_recipe(
             f"{artifact.name}: {artifact_bytes:,} bytes in {seconds:.1f}s exported on cpu; "
             f"{gpu_text}"
             + (
-                f"; takes pictures at {vision['vision_tokens']} soft tokens, its vision encoder "
-                "and adapter constrained to the CPU, the one vision backend litetune has "
-                "measured"
+                f"; takes pictures at {vision['vision_tokens']} soft tokens; vision section "
+                f"constraints: {vision['backend_constraints'] or 'none'}"
                 + (
                     "; " + llm_images.sampler_note(vision["sampler"])
                     if vision["sampler"] is not None

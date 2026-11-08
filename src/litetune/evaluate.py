@@ -49,7 +49,13 @@ from litetune import devices, envs
 from litetune.events import EventStream
 from litetune.exits import read_returncode
 from litetune.export import GPU_ACTIVATION
-from litetune.llm_images import CANDIDATE_SAMPLER, ImageRef, ImageRowError, split_images
+from litetune.llm_images import (
+    CANDIDATE_SAMPLER,
+    VISION_BACKEND_SOURCE,
+    ImageRef,
+    ImageRowError,
+    split_images,
+)
 from litetune.metrics import ToolCall, read_target
 from litetune.prompt_mode import RENDERING_SOURCE, PromptMode
 
@@ -758,7 +764,10 @@ class LiteRtLmBackend:
     threads: int | None = None
     # Rows with a picture: each prompt's picture as `{"path", "sha256"}`, in
     # prompt order. Each is sent as the app sends it -- its bytes, base64, as an
-    # `image` part before the text -- to an engine with a CPU vision backend.
+    # `image` part before the text -- to an engine whose vision backend is given
+    # `backend_flag`, unless the bundle's vision encoder constraints require
+    # the other backend supported by litert-lm's Python API. Adapter constraints are
+    # recorded and left to LiteRT-LM; they do not select this argument.
     images: tuple[Mapping[str, str], ...] | None = None
 
     name = "litert-lm"
@@ -810,6 +819,45 @@ class LiteRtLmBackend:
         if self.uses_template:
             return "Engine.create_conversation()"
         return "Engine.create_session(apply_prompt_template=False)"
+
+    def picture_backend_problem(self, events: EventStream | None = None) -> str | None:
+        """Why a CPU request cannot safely use this picture bundle, or `None`.
+
+        This header-only probe runs before verify's rendering check and before
+        the candidate engine. A CPU run whose bundle would force vision onto
+        the GPU must be restarted as an explicit GPU run so the GPU preflight,
+        software-adapter refusal and evidence checks all apply. The generation
+        driver repeats the decision as a backstop.
+        """
+        if self.images is None or self.backend_flag != "cpu":
+            return None
+        if (blocked := self._ensure_env(events)) is not None:
+            return blocked
+        with tempfile.TemporaryDirectory(prefix="litetune-vision-backend-") as tmp:
+            work = Path(tmp)
+            script = work / "inspect.py"
+            spec = work / "spec.json"
+            report = work / "report.json"
+            script.write_text(_VISION_BACKEND_PROBE_SCRIPT, encoding="utf-8")
+            spec.write_text(
+                json.dumps(
+                    {"model": str(self.model), "backend": self.backend_flag, "report": str(report)}
+                ),
+                encoding="utf-8",
+            )
+            try:
+                proc = self.env.run(["python", str(script), str(spec)], timeout=self.timeout_s)
+            except subprocess.TimeoutExpired:
+                return f"the vision-backend header probe gave no result after {self.timeout_s}s"
+            if proc.returncode != 0 or not report.is_file():
+                said = (proc.stderr or "").strip()[-300:] or "no report"
+                return f"the vision-backend header probe exited {proc.returncode}: {said}"
+            try:
+                reading = json.loads(report.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return f"the vision-backend header probe wrote no readable report: {exc}"
+            error = reading.get("error") if isinstance(reading, dict) else None
+            return str(error) if error else None
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -870,10 +918,24 @@ class LiteRtLmBackend:
             "engine_per_prompt": bool(self.engine_per_prompt_reason),
             "engine_per_prompt_reason": self.engine_per_prompt_reason or None,
             "engine_init_seconds": engine_init_of(self.device_report),
-            # Rows with a picture: how many, and the backend their vision
-            # encoder ran on. `None` for text.
+            # Rows with a picture: how many, and the backend litetune gave the
+            # vision encoder. `None` for text.
             "pictures": len(self.images) if self.images is not None else None,
-            "vision_backend": VISION_BACKEND if self.images is not None else None,
+            "vision_backend": (
+                (self.device_report or {}).get("vision_backend")
+                if self.images is not None
+                else None
+            ),
+            "vision_backend_constraints": (
+                (self.device_report or {}).get("vision_backend_constraints")
+                if self.images is not None
+                else None
+            ),
+            "vision_backend_reason": (
+                (self.device_report or {}).get("vision_backend_reason")
+                if self.images is not None
+                else None
+            ),
             # The sampler the bundle declares, as the driver script read it, and
             # the one sent in its place when it would sample; `None` before a run
             # and when none was sent. Separate from `decode_passed_to_runtime`,
@@ -941,7 +1003,7 @@ class LiteRtLmBackend:
                         "engine_per_prompt": bool(self.engine_per_prompt_reason),
                         "cache_dir": cache_dir,
                         **runtime_engine_spec(self.backend_flag, thread_count),
-                        **picture_spec(self.images),
+                        **picture_spec(self.images, self.backend_flag),
                         # Sent in place of a bundle's own sampler when that one
                         # samples or does not run (`llm_images.sampler_replaced`).
                         "greedy_sampler": dict(CANDIDATE_SAMPLER),
@@ -1006,6 +1068,12 @@ class LiteRtLmBackend:
                 logger.exception("could not start the litert-lm generation script")
                 reason = f"{type(exc).__name__}: {exc}"
                 return [Generation(i, p, harness_error=reason) for i, p in enumerate(prompts)]
+            except BaseException:
+                # The picture driver writes its backend decision before it
+                # constructs the engine. Keep that report if the transport
+                # raises so verify can describe the failed attempt accurately.
+                self.device_report = _read_device_report(report)
+                raise
 
             texts, faults = read_jsonl_results(results)
             self.device_report = with_adapters(_read_device_report(report), proc.stderr)
@@ -1062,7 +1130,7 @@ class LiteRtLmBackend:
                         "runtime_rendered": self.uses_template,
                         "cache_dir": str(cache),
                         **runtime_engine_spec(self.backend_flag),
-                        **picture_spec(self.images[:1] if self.images else None),
+                        **picture_spec(self.images[:1] if self.images else None, self.backend_flag),
                         "greedy_sampler": dict(CANDIDATE_SAMPLER),
                         "out": str(work / "generations.jsonl"),
                     }
@@ -1124,19 +1192,16 @@ class LiteRtLmBackend:
 # CLI's `--backend` and `verify --backend` use.
 CANDIDATE_BACKENDS = ("cpu", "gpu")
 
-# The backend a picture's vision encoder runs on in the candidate: the one the
-# spike this path follows measured (litert-lm 0.18.0, `Backend.CPU()` as the
-# `vision_backend`).
-VISION_BACKEND = "cpu"
 
-
-def picture_spec(images: Sequence[Mapping[str, str]] | None) -> dict[str, Any]:
+def picture_spec(
+    images: Sequence[Mapping[str, str]] | None, backend: str = "cpu"
+) -> dict[str, Any]:
     """The driver script's spec keys for rows with a picture; nothing for text."""
     if images is None:
         return {}
     return {
         "images": [{"path": str(i["path"]), "sha256": str(i["sha256"])} for i in images],
-        "vision_backend": VISION_BACKEND,
+        "vision_backend": backend,
     }
 
 
@@ -2507,6 +2572,34 @@ def build_watching_adapter(make):
 )
 
 
+_VISION_BACKEND_PROBE_SCRIPT = (
+    r"""
+import json
+import sys
+from pathlib import Path
+"""
+    + VISION_BACKEND_SOURCE
+    + r"""
+
+def main(spec_path):
+    spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    constraints = bundle_vision_constraints(spec["model"])
+    result = {"constraints": constraints}
+    try:
+        backend, reason = choose_vision_backend(spec.get("backend", "cpu"), constraints)
+    except ValueError as exc:
+        result["error"] = str(exc)
+    else:
+        result["vision_backend"] = backend
+        result["reason"] = reason
+    Path(spec["report"]).write_text(json.dumps(result), encoding="utf-8")
+
+if __name__ == "__main__":
+    main(sys.argv[1])
+"""
+)
+
+
 _LITERTLM_GENERATE_SCRIPT = (
     r'''
 """Generation for one split through litert-lm's Python API.
@@ -2523,6 +2616,8 @@ import sys
 from pathlib import Path
 '''
     + RUNTIME_ENGINE_SOURCE
+    + "\n"
+    + VISION_BACKEND_SOURCE
     + r'''
 
 def text_from_session(session, prompt):
@@ -2743,6 +2838,11 @@ def main(spec_path):
 
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     runtime_rendered = bool(spec["runtime_rendered"])
+    constraints = bundle_vision_constraints(spec["model"]) if spec.get("images") else {}
+    vision_reason = None
+    if spec.get("images"):
+        requested = spec.get("backend", "cpu")
+        spec["vision_backend"], vision_reason = choose_vision_backend(requested, constraints)
     engine_args = engine_kwargs(spec)
     prompts = spec["prompts"]
     pictures = spec.get("images") or [None] * len(prompts)
@@ -2757,7 +2857,17 @@ def main(spec_path):
             report["engine_init_seconds"] = init
             report["bundle_sampler"] = declared
             report["sampler_sent"] = sampler
+            if spec.get("images"):
+                report["vision_backend"] = spec["vision_backend"]
+                report["vision_backend_constraints"] = constraints
+                if vision_reason is not None:
+                    report["vision_backend_reason"] = vision_reason
             Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
+
+    # Before Engine construction: a runtime failure while opening the model
+    # must not erase which vision backend and bundle constraints were used.
+    if spec.get("images"):
+        write_report(None)
 
     with Path(spec["out"]).open("w", encoding="utf-8") as out:
         # `cache_dir=""` is what the CLI passes on its default `--cache`, and

@@ -26,8 +26,12 @@ vision encoder (`EXPORT_FLAGS`), in `envs.EXPORT_VISION`, and reads the bundle
 back: it must carry `VISION_SECTIONS`, `MAX_NUM_PATCHES`, and the template.
 
 **`verify`** gives the reference the picture through the processor and the
-same template, and the runtime the picture's bytes in the app's message shape
-with a CPU vision backend.
+same template, and the runtime the picture's bytes in the app's message shape.
+The candidate's vision backend is decided by the vision encoder sections only:
+it is given its requested text backend unless their constraints exclude it. A
+CPU request is refused when the encoder allows only the GPU, because the GPU
+safeguards belong to a GPU verify run. Adapter constraints are recorded and
+left to LiteRT-LM.
 """
 
 from __future__ import annotations
@@ -60,6 +64,84 @@ VISION_TOKENS = 280
 # the bundle's metadata gives the budget as patches (`max_num_patches`).
 PATCHES_PER_SOFT_TOKEN = 9
 MAX_NUM_PATCHES = VISION_TOKENS * PATCHES_PER_SOFT_TOKEN
+
+# Kept as source because the three consumers run in envs.RUNTIME, where the
+# builder that reads a .litertlm header is installed: generation, the verify
+# preflight, and EmbeddingGemma 2 image verification. One reader and one
+# decision rule keep those paths from disagreeing about duplicate sections or
+# about a CPU text run that would otherwise smuggle in GPU vision.
+VISION_BACKEND_SOURCE = r'''
+def bundle_vision_constraints(path):
+    """Record constraints carried by vision sections, intersecting duplicates by type."""
+    import io
+
+    from litert_lm_builder import litertlm_peek
+
+    header = litertlm_peek.read_litertlm_header(path, io.StringIO())
+    listed = header.SectionMetadata()
+    found = {}
+    for index in range(listed.ObjectsLength() if listed else 0):
+        section = listed.Objects(index)
+        kind = litertlm_peek.get_model_type(section)
+        if not kind:
+            continue
+        kind = str(kind).lower().removeprefix("tf_lite_")
+        if kind not in ("vision_encoder", "vision_adapter"):
+            continue
+        for item_index in range(section.ItemsLength()):
+            item = section.Items(item_index)
+            if item is None:
+                continue
+            pair = litertlm_peek.kvp_to_dict(item)
+            if pair.get("key") != "backend_constraint" or pair.get("value") is None:
+                continue
+            allowed = {part.strip().lower() for part in str(pair["value"]).split(",")}
+            found[kind] = allowed if kind not in found else found[kind] & allowed
+    return {kind: ",".join(sorted(allowed)) for kind, allowed in found.items()}
+
+
+def choose_vision_backend(requested, constraints):
+    """Choose from encoder constraints; report an adapter mismatch without enforcing it."""
+    supported = {"cpu", "gpu"}
+    common = set(supported)
+    encoder = constraints.get("vision_encoder")
+    if encoder is not None:
+        common &= {part.strip().lower() for part in encoder.split(",")} & supported
+    shown = "vision_encoder=%r" % encoder if encoder is not None else "no encoder constraint"
+    if requested in common:
+        chosen = requested
+    elif requested == "cpu" and common == {"gpu"}:
+        raise ValueError(
+            "--backend cpu is not allowed by the vision encoder constraint %s; the encoder "
+            "allows only gpu. Pass --backend gpu so its GPU safeguards apply" % shown
+        )
+    elif len(common) == 1:
+        chosen = next(iter(common))
+    else:
+        raise ValueError(
+            "the vision encoder sections leave no cpu or gpu backend they all allow: %s" % shown
+        )
+
+    reasons = []
+    if chosen != requested:
+        reasons.append(
+            "--backend %s is not allowed by the vision encoder constraint %s; %s is the only "
+            "cpu/gpu backend every constrained vision encoder section allows"
+            % (requested, shown, chosen)
+        )
+    adapter = constraints.get("vision_adapter")
+    if adapter is not None:
+        adapter_allowed = {part.strip().lower() for part in adapter.split(",")}
+        if chosen not in adapter_allowed:
+            reasons.append(
+                "the vision adapter constraint vision_adapter=%r excludes the %s vision backend "
+                "given to the engine, but adapter constraints are recorded and left to "
+                "LiteRT-LM: measured on one Mac with litert-lm 0.18.0: an EmbeddingGemma 2 "
+                "file whose vision adapter is constrained to cpu ran with a GPU vision backend; "
+                "which device the adapter used was not observed" % (adapter, chosen)
+            )
+    return chosen, "; ".join(reasons) or None
+'''
 
 # The placeholder both templates render for an image part, and the markers the
 # processor puts around a picture's soft tokens (`tokenizer_config.json` at
@@ -122,11 +204,11 @@ EXPORT_FLAGS = (
     f"--gemma4_vision_max_soft_tokens={VISION_TOKENS}",
 )
 
-# `backend_constraint` on the sections a picture runs through: the CPU, the one
-# vision backend litetune has measured them on. Google's E2B bundle at b3ca0d2f
-# constrains its vision adapter so (its unpacked TOML); litert-torch writes none,
-# and the bundle then offers its vision sections to the GPU as well.
-VISION_CONSTRAINTS = {"vision_encoder": "cpu", "vision_adapter": "cpu"}
+# `convert` adds no `backend_constraint` to the sections a picture runs
+# through. Google's E2B bundle at b3ca0d2f constrains its vision adapter to the
+# CPU (its unpacked TOML); litetune does not copy that constraint. litert-torch
+# writes none, and the bundle then offers its vision sections to the GPU too.
+VISION_CONSTRAINTS: dict[str, str] = {}
 
 # The sampler a bundle declares is the exporter's, for text and pictures alike.
 # litert-torch writes none for `text_generation`, whose `do_sample` it turns off

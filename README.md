@@ -994,15 +994,23 @@ text to measure.
   the CPU, with the checkpoint's own processor at the tuned budget) and with
   the file (LiteRT-LM's `EmbeddingEngine`, each picture given as its bytes),
   and with `--with-base` with Google's 440m file. With `--backend gpu`, on
-  macOS, Windows and Linux as for text, the text tower runs on the GPU and the vision encoder
-  on the CPU, where flutter_edge_ai_litertlm 1.19.0 puts it. It refuses a picture
+  macOS, Windows and Linux as for text, litetune gives the GPU backend to both
+  the text tower and vision encoder unless the file's vision encoder constraints
+  exclude it. Adapter constraints are recorded and left to LiteRT-LM. `convert`
+  writes no vision constraint; Google's E2B bundle constrains only its adapter.
+  On one Mac that verify passed on the beans
+  file at 55.8 ms per picture, against 154.5 ms with the vision encoder on the
+  CPU ([MEASUREMENTS.md](MEASUREMENTS.md#the-same-int8-file-on-a-macs-cpu-and-gpu-and-on-windows)); it has not
+  been run with the vision encoder on a Windows or Linux GPU. It refuses a picture
   in both splits, a reference whose soft tokens for a picture differ from the
   count `tune` recorded (the engine reports none, so the file's count is not
-  compared), and a `convert.json` that records another budget. LiteRT-LM
-  0.18.0 sets no thread count for the vision encoder, so the
+  compared), and a `convert.json` that records another budget. Nothing litetune
+  reads shows which device the vision encoder itself ran on; the manifest records
+  the backend it gave the engine. On the CPU, LiteRT-LM 0.18.0 sets no thread count for the vision encoder, so the
   file and Google's are embedded one after the other, and on a Mac whose CPU
   has SME2, where litetune holds LiteRT-LM to one thread, the file is embedded
-  twice and a difference between the two runs fails the harness. The gate is
+  twice and a difference between the two runs fails the harness. GPU image runs
+  also repeat the candidate and fail on a difference. The gate is
   the one for text.
 
 In the app, the budget has to be the one tuned at. flutter_edge_ai's
@@ -1037,8 +1045,10 @@ What has and has not been measured
   ±0.016 to ±0.023 at 300 held-out rows, wider than the 0.01 threshold. Their
   gain over Google's file, +0.1113 (int8) and +0.1180 (int4), was resolved in
   every draw. This was litetune's first int4 image file.
-- The same int8 file on a Mac's CPU and GPU and on Windows' CPU, and its
-  SM8750 file on a Galaxy S25 Ultra's NPU, are measured there too.
+- The same int8 file was measured first with its text tower given a Mac's GPU
+  and vision encoder given the CPU, and later through verify with both given the
+  Mac's GPU. It was also measured on the Mac's and Windows' CPUs, and its SM8750
+  file on a Galaxy S25 Ultra's NPU.
 - Not measured: 140 vision tokens, `--mirror`, and the app's CPU path through
   flutter_edge_ai on the spliced file.
 
@@ -1215,11 +1225,33 @@ litetune verify --model conv/dynamic_wi8_afp32/model.litertlm --reference run/mo
 - **convert** exports the tuned checkpoint with its vision encoder (litert-torch's
   `image_text_to_text` task, 280 soft tokens, `max_num_patches` 2520) in the
   `export-vision` environment (`export` plus `torchvision==0.29.2`), reads the bundle
-  back for its vision sections, image markers, budget and template, and constrains
-  the vision encoder and adapter to the CPU, the only vision backend measured.
+  back for its vision sections, image markers, budget, template and any backend
+  constraints. It adds no constraint to the vision encoder or adapter. Google's
+  own E2B bundle at `b3ca0d2f` constrains its vision adapter to the CPU; litetune
+  does not copy that constraint.
 - **verify** gives the reference each picture through the checkpoint's processor and
   the same template, and the candidate the picture's bytes in the message shape the
-  app sends, on a CPU vision backend. `--backend gpu` is refused for picture rows.
+  app sends. Verify gives its candidate vision backend the value from `--backend`
+  unless the bundle's vision encoder constraints exclude it; duplicate encoder
+  sections are intersected, while an unconstrained one allows both. If a CPU request
+  meets a GPU-only encoder, verify refuses before the candidate and says to pass
+  `--backend gpu` so the GPU safeguards apply. It records encoder and adapter
+  constraints, but leaves an adapter constraint to LiteRT-LM. When the adapter
+  excludes the backend given, the manifest states the measured limitation:
+  measured on one Mac with litert-lm 0.18.0: an EmbeddingGemma 2 file whose vision
+  adapter is constrained to cpu ran with a GPU vision backend; which device the
+  adapter used was not observed. Nothing litetune reads shows which device the vision encoder
+  itself ran on.
+  GPU picture verification uses the same platform observation and software-adapter
+  refusal rules as GPU text verification. On the beans bundle, CPU text and vision
+  scored 0.8867; GPU text with CPU vision and GPU text with GPU vision both scored
+  0.8800 on 300 held-out pictures on an NVIDIA A100 under Linux with LiteRT-LM 0.18.0,
+  and both on the GPU 0.8733 on an Apple M5 Pro against its CPU's 0.8833
+  ([MEASUREMENTS.md](MEASUREMENTS.md#two-more-seeds-int4-and-the-gpu)). GPU vision
+  has been measured for Gemma 4 on an A100 and M5 Pro, and for EmbeddingGemma 2
+  on an M5 Pro; an outside harness also measured EmbeddingGemma 2 on Intel GPUs.
+  It has not been measured on phones, on Windows GPUs for Gemma 4, or on Linux
+  GPUs for EmbeddingGemma 2.
 
 The bundle keeps the sampler the exporter writes, TOP_P with top_k 64 and
 temperature 1.0, as litetune's text bundles get the Gemma 4 family default from

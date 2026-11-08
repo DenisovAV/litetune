@@ -227,6 +227,9 @@ def main():
         if "vision_encoder" not in sections:
             Path(spec["out"]).write_text("[]", encoding="utf-8")
             return 0
+        # This engine only renders the message and never measures the candidate
+        # or runs its vision graphs, so the rendering check keeps its CPU
+        # backend independently of the backend `verify` measures.
         engine_args["vision_backend"] = litert_lm.Backend.CPU()
     with litert_lm.Engine(spec["model"], **engine_args) as engine:
         # Rendering reads the conversation's history and never adds to it, so

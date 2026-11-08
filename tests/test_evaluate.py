@@ -2408,7 +2408,7 @@ class _FakeEngine:
         return runner
 
 
-def _fake_litert_lm(monkeypatch, raise_on=None, leaks=False):
+def _fake_litert_lm(monkeypatch, raise_on=None, leaks=False, engine_error=None):
     """A `litert_lm` the script can import, and the engine it hands back."""
     engines: list[_FakeEngine] = []
 
@@ -2434,6 +2434,8 @@ def _fake_litert_lm(monkeypatch, raise_on=None, leaks=False):
             return {"fp32": cls.FLOAT32}.get(value.lower())
 
     def make_engine(path, backend=None, **kwargs):
+        if engine_error is not None:
+            raise engine_error
         engine = _FakeEngine(path, backend, **kwargs)
         engine.raise_on = raise_on or {}
         engine.leaks = leaks
@@ -2464,10 +2466,11 @@ def _run_script(
     report=None,
     engine_per_prompt=None,
     leaks=False,
+    engine_error=None,
     bundle_sampler=None,
     extra=None,
 ):
-    engines = _fake_litert_lm(monkeypatch, raise_on, leaks)
+    engines = _fake_litert_lm(monkeypatch, raise_on, leaks, engine_error)
     # What the bundle's LlmMetadata declares, in place of reading a real header.
     monkeypatch.setitem(_litertlm_script(), "bundle_sampler", lambda path: bundle_sampler)
     spec = tmp_path / "spec.json"
@@ -3006,6 +3009,9 @@ def _fake_builder(monkeypatch, sections):
         def Value(self):
             return _Value(self._value.encode() if isinstance(self._value, str) else b"")
 
+        def as_dict(self):
+            return {"key": self._key.decode(), "value": self._value}
+
     class _Section:
         def __init__(self, items):
             self._items = [_Item(k, v) for k, v in items]
@@ -3043,9 +3049,10 @@ def _fake_builder(monkeypatch, sections):
         return None
 
     header = types.SimpleNamespace(SectionMetadata=lambda: _Sections(sections))
-    peek = types.SimpleNamespace(
-        read_litertlm_header=lambda path, out: header, get_model_type=get_model_type
-    )
+    peek = types.ModuleType("litert_lm_builder.litertlm_peek")
+    peek.read_litertlm_header = lambda path, out: header
+    peek.get_model_type = get_model_type
+    peek.kvp_to_dict = lambda item: item.as_dict()
     schema = types.SimpleNamespace(
         VData=types.SimpleNamespace(StringValue=string_type), StringValue=_StringValue
     )
@@ -3102,6 +3109,42 @@ def test_a_bundle_key_that_is_not_one_answer_is_unreadable(monkeypatch, sections
     report = _litertlm_script()["run_report"]({"model": "m.litertlm"}, None)
     assert report["bundle_activation"] is None
     assert report["bundle_activation_error"].startswith("ValueError")
+
+
+def test_bundle_vision_constraints_reads_the_production_header_reader(monkeypatch):
+    cases = [
+        (
+            [
+                [("model_type", "tf_lite_vision_encoder"), ("backend_constraint", "cpu")],
+                [("model_type", "vision_adapter"), ("backend_constraint", "cpu,gpu")],
+            ],
+            {"vision_encoder": "cpu", "vision_adapter": "cpu,gpu"},
+        ),
+        (
+            [[("model_type", "tf_lite_vision_adapter"), ("backend_constraint", "gpu")]],
+            {"vision_adapter": "gpu"},
+        ),
+        (
+            [
+                [("model_type", "vision_encoder"), ("backend_constraint", "gpu")],
+                [("model_type", "vision_encoder"), ("backend_constraint", "cpu,gpu")],
+            ],
+            {"vision_encoder": "gpu"},
+        ),
+        (
+            [[("model_type", "vision_encoder"), ("backend_constraint", " gpu ")]],
+            {"vision_encoder": "gpu"},
+        ),
+        (
+            [[("model_type", "vision_encoder"), ("backend_constraint", "cpu, gpu")]],
+            {"vision_encoder": "cpu,gpu"},
+        ),
+        ([_pd(("backend_constraint", "cpu"))], {}),
+        ([], {}),
+    ]
+    for sections, expected in cases:
+        _fake_builder(monkeypatch, sections)
+        assert _litertlm_script()["bundle_vision_constraints"]("m.litertlm") == expected
 
 
 @pytest.mark.parametrize(
@@ -4135,6 +4178,7 @@ def test_pictures_reach_the_engine_and_each_conversation(tmp_path, monkeypatch, 
         path = tmp_path / f"{name}.jpg"
         path.write_bytes(name.encode())
         pictures.append({"path": str(path), "sha256": hashlib.sha256(name.encode()).hexdigest()})
+    monkeypatch.setitem(_litertlm_script(), "bundle_vision_constraints", lambda path: {})
     rows, engines = _run_script(
         tmp_path,
         ["one", "two"],
@@ -4147,6 +4191,229 @@ def test_pictures_reach_the_engine_and_each_conversation(tmp_path, monkeypatch, 
     messages = [m for e in engines for r in e.runners for m in r.messages]
     assert [m["content"][0]["type"] for m in messages] == ["image", "image"]
     assert [m["content"][1]["text"] for m in messages] == ["one", "two"]
+
+
+def test_a_cpu_constrained_picture_bundle_requests_cpu_vision_and_records_the_sections(
+    tmp_path, monkeypatch
+):
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"a")
+    report = tmp_path / "report.json"
+    monkeypatch.setitem(
+        _litertlm_script(),
+        "bundle_vision_constraints",
+        lambda path: {"vision_encoder": "cpu", "vision_adapter": "cpu"},
+    )
+    _, engines = _run_script(
+        tmp_path,
+        ["one"],
+        monkeypatch=monkeypatch,
+        report=report,
+        extra={
+            "backend": "gpu",
+            "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+            "vision_backend": "gpu",
+        },
+    )
+    assert engines[0].kwargs["vision_backend"].name == "cpu"
+    recorded = json.loads(report.read_text())
+    assert recorded["vision_backend"] == "cpu"
+    assert recorded["vision_backend_constraints"] == {
+        "vision_encoder": "cpu",
+        "vision_adapter": "cpu",
+    }
+    assert "vision_encoder='cpu'" in recorded["vision_backend_reason"]
+
+
+def test_every_vision_constraint_is_recorded_separately_from_the_gpu_decision(
+    tmp_path, monkeypatch
+):
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"a")
+    report = tmp_path / "report.json"
+    monkeypatch.setitem(
+        _litertlm_script(),
+        "bundle_vision_constraints",
+        lambda path: {"vision_encoder": "cpu,gpu", "vision_adapter": "gpu"},
+    )
+    _, engines = _run_script(
+        tmp_path,
+        ["one"],
+        monkeypatch=monkeypatch,
+        report=report,
+        extra={
+            "backend": "gpu",
+            "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+            "vision_backend": "cpu",
+        },
+    )
+    assert engines[0].kwargs["vision_backend"].name == "gpu"
+    recorded = json.loads(report.read_text())
+    assert recorded["vision_backend"] == "gpu"
+    assert recorded["vision_backend_constraints"] == {
+        "vision_encoder": "cpu,gpu",
+        "vision_adapter": "gpu",
+    }
+    assert "vision_backend_reason" not in recorded
+
+
+def test_google_embeddinggemma_layout_keeps_gpu_vision_and_records_adapter_limitation(
+    tmp_path, monkeypatch
+):
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"a")
+    report = tmp_path / "report.json"
+    monkeypatch.setitem(
+        _litertlm_script(), "bundle_vision_constraints", lambda path: {"vision_adapter": "cpu"}
+    )
+    _, engines = _run_script(
+        tmp_path,
+        ["one"],
+        monkeypatch=monkeypatch,
+        report=report,
+        extra={
+            "backend": "gpu",
+            "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+            "vision_backend": "gpu",
+        },
+    )
+    assert engines[0].kwargs["vision_backend"].name == "gpu"
+    recorded = json.loads(report.read_text())
+    assert recorded["vision_backend"] == "gpu"
+    assert recorded["vision_backend_constraints"] == {"vision_adapter": "cpu"}
+    assert "measured on one Mac with litert-lm 0.18.0" in recorded["vision_backend_reason"]
+    assert "which device the adapter used was not observed" in recorded["vision_backend_reason"]
+
+
+def test_the_driver_refuses_cpu_text_with_gpu_only_vision_as_a_backstop(tmp_path, monkeypatch):
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"a")
+    report = tmp_path / "report.json"
+    monkeypatch.setitem(
+        _litertlm_script(),
+        "bundle_vision_constraints",
+        lambda path: {"vision_encoder": "gpu", "vision_adapter": "cpu,gpu"},
+    )
+    with pytest.raises(ValueError) as raised:
+        _run_script(
+            tmp_path,
+            ["one"],
+            monkeypatch=monkeypatch,
+            report=report,
+            extra={
+                "backend": "cpu",
+                "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+                "vision_backend": "cpu",
+            },
+        )
+    said = str(raised.value)
+    assert "--backend cpu" in said and "vision_encoder='gpu'" in said
+    assert "Pass --backend gpu" in said
+
+
+def test_the_cpu_picture_preflight_returns_the_header_probes_refusal(tmp_path):
+    class ProbeEnv:
+        name = "runtime"
+
+        def provision(self, events=None):
+            return None
+
+        def run(self, argv, timeout=None):
+            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            Path(spec["report"]).write_text(
+                json.dumps(
+                    {
+                        "constraints": {
+                            "vision_encoder": "gpu",
+                            "vision_adapter": "cpu,gpu",
+                        },
+                        "error": "vision_encoder='gpu'; Pass --backend gpu",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+    backend = _litertlm(
+        tmp_path,
+        backend_flag="cpu",
+        images=({"path": "a.jpg", "sha256": "0" * 64},),
+        env=ProbeEnv(),
+    )
+    assert backend.picture_backend_problem() == "vision_encoder='gpu'; Pass --backend gpu"
+
+
+def test_vision_constraints_are_written_before_engine_construction(tmp_path, monkeypatch):
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"a")
+    report = tmp_path / "report.json"
+    monkeypatch.setitem(
+        _litertlm_script(),
+        "bundle_vision_constraints",
+        lambda path: {"vision_encoder": "cpu", "vision_adapter": "cpu,gpu"},
+    )
+    with pytest.raises(RuntimeError, match="engine did not open"):
+        _run_script(
+            tmp_path,
+            ["one"],
+            monkeypatch=monkeypatch,
+            report=report,
+            engine_error=RuntimeError("engine did not open"),
+            extra={
+                "backend": "gpu",
+                "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+                "vision_backend": "gpu",
+            },
+        )
+    recorded = json.loads(report.read_text())
+    assert recorded["vision_backend"] == "cpu"
+    assert recorded["vision_backend_constraints"] == {
+        "vision_encoder": "cpu",
+        "vision_adapter": "cpu,gpu",
+    }
+    assert "--backend gpu" in recorded["vision_backend_reason"]
+
+
+def test_an_encoder_allowing_neither_cpu_nor_gpu_ends_the_candidate_without_guessing(
+    tmp_path, monkeypatch
+):
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"a")
+    monkeypatch.setitem(
+        _litertlm_script(),
+        "bundle_vision_constraints",
+        lambda path: {"vision_encoder": "npu", "vision_adapter": "gpu"},
+    )
+    with pytest.raises(ValueError) as exc:
+        _run_script(
+            tmp_path,
+            ["one"],
+            monkeypatch=monkeypatch,
+            extra={
+                "backend": "gpu",
+                "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+                "vision_backend": "gpu",
+            },
+        )
+    assert "vision_encoder='npu'" in str(exc.value)
+    assert "leave no cpu or gpu backend" in str(exc.value)
+
+
+def test_an_unconstrained_gpu_picture_bundle_requests_gpu_vision(tmp_path, monkeypatch):
+    picture = tmp_path / "a.jpg"
+    picture.write_bytes(b"a")
+    monkeypatch.setitem(_litertlm_script(), "bundle_vision_constraints", lambda path: {})
+    _, engines = _run_script(
+        tmp_path,
+        ["one"],
+        monkeypatch=monkeypatch,
+        extra={
+            "backend": "gpu",
+            "images": [{"path": str(picture), "sha256": hashlib.sha256(b"a").hexdigest()}],
+            "vision_backend": "gpu",
+        },
+    )
+    assert engines[0].kwargs["vision_backend"].name == "gpu"
 
 
 def test_a_bundle_that_declares_greedy_is_sent_top_k_1(tmp_path, monkeypatch):
