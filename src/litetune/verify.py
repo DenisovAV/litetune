@@ -656,7 +656,10 @@ class PictureInputs:
     template: str
     vision_tokens: int
     template_sha256: str
-    candidate_vision_backend: str = "cpu"
+    # What the candidate's driver reported giving the vision encoder; `None` (unknown)
+    # until it reports, and when it never does. The backend asked for is beside it.
+    requested_vision_backend: str = "cpu"
+    candidate_vision_backend: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -664,6 +667,7 @@ class PictureInputs:
             "distinct": len({i["sha256"] for i in self.images}),
             "vision_tokens": self.vision_tokens,
             "template_sha256": self.template_sha256,
+            "requested_vision_backend": self.requested_vision_backend,
             "candidate_vision_backend": self.candidate_vision_backend,
             "reference_environment": envs.TRAIN_VISION.name,
         }
@@ -786,7 +790,7 @@ def _picture_inputs(
         template=template,
         vision_tokens=int(record["vision_tokens"]),
         template_sha256=str(record["template_sha256"]),
-        candidate_vision_backend=request.backend,
+        requested_vision_backend=request.backend,
     )
 
 

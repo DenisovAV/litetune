@@ -178,10 +178,34 @@ def test_what_pictures_cannot_be_measured_with_is_refused(tmp_path, kwargs, said
     assert refused.outcome is Outcome.FAILED and said in refused.detail
 
 
-def test_gpu_picture_verify_is_allowed_and_records_gpu_vision(tmp_path):
-    result = run_verify(_request(tmp_path, backend="gpu"), backends=_pair())
+def test_gpu_picture_verify_is_allowed_and_records_the_vision_backend_the_driver_reported(
+    tmp_path,
+):
+    class Reported(FakeBackend):
+        def describe(self) -> dict[str, Any]:
+            return super().describe() | {"backend": "gpu", "vision_backend": "gpu"}
+
+    texts = [LABELS[i % 2] for i in range(12)]
+    pair = BackendPair(
+        candidate=Reported(
+            texts=texts, prompt_mode=PromptMode.RUNTIME_RENDERED, decode_enforced=False
+        ),
+        reference=_pair().reference,
+    )
+    result = run_verify(_request(tmp_path, backend="gpu"), backends=pair)
     assert result.status is not Status.FAILED_HARNESS, result.manifest["checks"]
-    assert result.manifest["harness"]["pictures"]["candidate_vision_backend"] == "gpu"
+    pictures = result.manifest["harness"]["pictures"]
+    assert pictures["requested_vision_backend"] == "gpu"
+    assert pictures["candidate_vision_backend"] == "gpu"
+
+
+def test_a_picture_run_whose_driver_reported_nothing_records_the_vision_backend_as_unknown(
+    tmp_path,
+):
+    result = run_verify(_request(tmp_path, backend="gpu"), backends=_pair())
+    pictures = result.manifest["harness"]["pictures"]
+    assert pictures["requested_vision_backend"] == "gpu"
+    assert pictures["candidate_vision_backend"] is None
 
 
 def test_a_constrained_gpu_picture_bundle_records_cpu_vision_and_its_sections(tmp_path):
