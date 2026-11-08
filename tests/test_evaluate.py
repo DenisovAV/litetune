@@ -2528,21 +2528,13 @@ def test_one_refused_prompt_is_one_row(tmp_path, monkeypatch):
     rows, _ = _run_script(
         tmp_path,
         ["one", "two", "three"],
-        raise_on={
-            "two": RuntimeError(
-                "litert_lm_session_run_prefill failed with status "
-                "RESOURCE_EXHAUSTED (8): prefill reaches the token limit"
-            )
-        },
+        raise_on={"two": RuntimeError("litert_lm_session_run_prefill failed")},
         monkeypatch=monkeypatch,
     )
     assert [r["index"] for r in rows] == [0, 1, 2]
     assert rows[0]["text"] == "answer to one"
     assert "text" not in rows[1]
-    assert rows[1]["error"] == (
-        "RuntimeError: litert_lm_session_run_prefill failed with status "
-        "RESOURCE_EXHAUSTED (8): prefill reaches the token limit"
-    )
+    assert rows[1]["error"] == "RuntimeError: litert_lm_session_run_prefill failed"
     assert rows[2]["text"] == "answer to three"
     # And the reader turns that row into a fault rather than an answer.
     texts, faults = read_jsonl_results(tmp_path / "out.jsonl")

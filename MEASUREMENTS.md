@@ -3180,6 +3180,31 @@ in option scoring and in plain generation:
   package offers no switch), discrete Arc GPUs, other drivers, other models, and
   flutter_edge_ai's Windows GPU library.
 
+The trigger, found 2026-11-08 on the Panther Lake with litert-lm 0.19.1: the 8-token prefill
+signature `convert` added to every decision bundle. google/gemma-3-270m-it, untuned, exported
+by litert-torch-nightly 0.10.0.dev20260926 (`dynamic_wi8_afp32`) in ways that differ only in
+`--prefill_lengths`; 40 short prompts ("What is the capital of Japan? Answer in one word." …),
+each in a new Conversation, greedy, 32 tokens at most, the GPU at fp32 activations, then the
+same 40 in reverse order on the same GPU engine:
+
+| export | GPU | replies unlike the CPU's, of 40 | empty GPU replies | forward vs reverse order |
+|---|---|---|---|---|
+| `--prefill_lengths=8` | Arc B390 | 30 | 34 | 1 differs |
+| `--prefill_lengths=8,128` (what decisions used) | Arc B390 | 30 | 33 | 3 differ |
+| `--prefill_lengths=128` | Arc B390 | 17 | 4 | 0 |
+| no flag (the exporter's default, 128) | Arc B390 | 17 | 4 | 0 |
+| `--prefill_lengths=8`, `8,128`, or no flag | Apple M5 Pro (Metal) | 14 each | 4 each | 0 |
+
+- 17 and 14 are this model's ordinary GPU-against-CPU wording differences; with a `prefill_8`
+  signature the Arc answered the first prompt ("Paris") and left most later ones empty. The
+  emotion decision bundle above (`8,128`), run the same way but at the GPU's default
+  activation type, gave 27 replies of 40 unlike the CPU's on 0.19.1 and 35 on
+  `litert-lm-nightly` 0.20.0.dev20261106. Reported as google-ai-edge/LiteRT-LM#4460.
+- So decision bundles are exported with the 128-token signature only from the change that
+  adds this paragraph on; a decision bundle converted by litetune 0.8.1 or earlier carries
+  `prefill_8` and needs converting again to run on an Intel Arc GPU. Whether a fine-tuned
+  decision without it agrees with the CPU on the Arc was not measured.
+
 ### A GPU cache built on a software adapter
 
 Measured 2026-11-07 on Ubuntu 22.04 with an NVIDIA A100 40GB (driver 580.178.04), litert-lm

@@ -1472,9 +1472,10 @@ class _Conversation:
         return False
 
     def render_message_to_string(self, prompt):
-        if os.environ.get("FAKE_RENDER_RAISES") == "1":
+        raises = os.environ.get("FAKE_RENDER_RAISES")
+        if raises == "1" or raises == prompt:
             raise RuntimeError(
-                "litert_lm_conversation_render_message failed with status "
+                "litert_lm_conversation_render_message_to_string failed with status "
                 "INTERNAL (13): failed to apply template"
             )
         before, after = _TEMPLATES[os.environ.get("FAKE_TEMPLATE", "gemma")]
@@ -2732,7 +2733,34 @@ def test_a_render_exception_is_no_comparisons_and_a_harness_failure(tmp_path):
     assert proc.returncode == 3
     assert report["selfcheck"]["verdict"] == "no comparisons"
     assert report["selfcheck"]["pair"] is None and rows == []
+    assert report["selfcheck"]["render_error"] == (
+        "litert_lm_conversation_render_message_to_string failed with status "
+        "INTERNAL (13): failed to apply template"
+    )
+    assert report["selfcheck"]["render_error"] in report["error"]
     assert "Traceback" not in proc.stderr
+
+
+def test_a_row_render_exception_keeps_its_reason_and_later_rows_score(tmp_path):
+    prompts = ["text 1 about joy", "text 22 about fear", "text 333 about anger"]
+    failed = prompts[1]
+    proc, rows, report = _run_engine_script(
+        tmp_path,
+        False,
+        prompts,
+        OPTIONS,
+        fake_env={"FAKE_RENDER_RAISES": failed},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert report["selfcheck"]["pair"] is not None
+    assert rows[1]["error"] == (
+        "the runtime could not render the prompt: "
+        "litert_lm_conversation_render_message_to_string failed with status "
+        "INTERNAL (13): failed to apply template"
+    )
+    assert "token_scores" in rows[0]
+    assert "token_scores" in rows[2]
 
 
 # -- a family the method was not measured on -----------------------------------------

@@ -626,11 +626,11 @@ def main():
         with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
             try:
                 rendered = conv.render_message_to_string(prompt)
-            except RuntimeError:
-                # 0.19 raises where 0.18 returned ""
-                # (`python/litert_lm/conversation.py`, render_message_to_string).
-                rendered = ""
-        # An empty failed rendering tokenises to no ids, which every check below would pass.
+            except RuntimeError as exc:
+                # The 0.19.1 binding raises through `get_checked`
+                # (`conversation.py`, L593-L607; `_ffi.py`, L1315-L1344).
+                raise RuntimeError(f"the runtime could not render the prompt: {exc}") from exc
+        # An empty successful rendering tokenises to no ids, which every check below would pass.
         if not rendered:
             raise RuntimeError("the runtime rendered the prompt as empty text")
         # As prefill reads the text; the session puts `session_prefix` first.
@@ -694,6 +694,8 @@ def main():
                 c_call(s, "litert_lm_session_rewind_to_checkpoint", b"p")
         return out, (time.perf_counter() - t0) * 1000
 
+    selfcheck_render_error = [None]
+
     def selfcheck_pair(engine):
         """Two prompts of one length that differ only in their second-to-last token, or None.
 
@@ -709,10 +711,11 @@ def main():
         with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
             try:
                 a = conv.render_message_to_string(SELFCHECK_MESSAGE)
-            except RuntimeError:
-                # The 0.18 empty-render path below returned None; keep that
-                # self-check refusal on 0.19's exception form.
+            except RuntimeError as exc:
+                # The 0.18 binding returned "" for this render failure; it is
+                # the `len(ia) < 2` branch below that returns None.
                 a = ""
+                selfcheck_render_error[0] = str(exc)
         ia = list(engine.tokenize(a)) if a else []
         if len(ia) < 2:
             return None
@@ -806,6 +809,7 @@ def main():
                 "not_finite": len(diffs) - len(finite),
                 "prompt_lengths": checked,
                 "pair": list(pair) if pair else None,
+                "render_error": selfcheck_render_error[0],
             }
             if verdict == "not finite":
                 report["error"] = (
@@ -818,6 +822,8 @@ def main():
                 return 3
             if verdict not in ("dropped", "not dropped"):
                 report["error"] = f"the self-check could not tell the engine apart: {verdict}"
+                if selfcheck_render_error[0] is not None:
+                    report["error"] += f": {selfcheck_render_error[0]}"
                 write_report()
                 return 3
             mode = "once" if verdict == "dropped" else "plain"

@@ -388,7 +388,7 @@ def _fake_litert_lm(engine: FakeEngine) -> Any:
             engine.rendered.append(prompt)
             if prompt in engine.render_raises:
                 raise RuntimeError(
-                    "litert_lm_conversation_render_message failed with status "
+                    "litert_lm_conversation_render_message_to_string failed with status "
                     "INTERNAL (13): failed to apply template"
                 )
             return "" if prompt in engine.unrenderable else f"[{prompt}]"
@@ -498,7 +498,23 @@ def test_a_render_exception_is_one_unrendered_row_and_later_rows_continue(tmp_pa
     assert engine.rendered == ["a", "bb", "ccc"]
     assert engine.sent == ["a", "ccc"]
     assert written[1]["rendered"] == "" and written[1]["prefill_skipped"] is True
+    error = (
+        "litert_lm_conversation_render_message_to_string failed with status "
+        "INTERNAL (13): failed to apply template"
+    )
+    assert written[1]["render_error"] == error
     assert written[2]["rendered"] == "[ccc]"
+
+    runtime = [dict(row) for row in written]
+    for row in runtime:
+        if row["prefill_tokens"] is not None:
+            row["prefill_tokens"] = len(row["ids"])
+    reference = [dict(row) for row in runtime]
+    reference[1] = {"index": 1, "ids": [2, 92], "rendered": "reference"}
+    comparison = compare_renderings(["a", "bb", "ccc"], runtime, reference, prefill_sent=2)
+    assert comparison.mismatches[0].render_error == error
+    assert error in comparison.check().detail
+    assert comparison.as_dict()["first_mismatches"][0]["render_error"] == error
 
 
 TOOLS = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]

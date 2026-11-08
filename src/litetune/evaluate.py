@@ -2655,8 +2655,8 @@ def text_from_conversation(conversation, prompt):
     So this mirrors `litert_lm_cli/commands/run.py` as a state machine rather
     than approximating it, from v0.18.0 through v0.19.1, the version
     `envs.RUNTIME` pins:
-    `close_channel` (run.py:50-53) writes `" [/name]"` and a newline, and
-    run.py:108-123 calls it before a chunk whose text is not empty (`text =
+    `close_channel` (run.py:54-57 at 0.19.1) writes `" [/name]"` and a newline, and
+    run.py:112-127 at 0.19.1 calls it before a chunk whose text is not empty (`text =
     str(chunk)`, the chunk's text parts joined), on a switch between channels,
     and at the end of the stream. Up to v0.17.1 it was called before every text
     item, empty ones included, so an empty text item between two pieces of one
@@ -2805,8 +2805,9 @@ def score_one(engine, runtime_rendered, index, prompt, out, picture=None, sample
     except Exception as exc:  # noqa: BLE001
         # One prompt, not the rest of the split. The runtime
         # raises `RuntimeError` when rendering, prefill or a decode call
-        # fails (`litert_lm/session.py:72` and `:101` at v0.17.1 and
-        # v0.19.1) and when a streamed send fails (`conversation.py`), and
+        # fails (at 0.19.1, prefill raises at `session.py:96-100` and decode
+        # calls `_ffi.create_checked` at `session.py:105-109`) and when a
+        # streamed send fails (`conversation.py`), and
         # without this the first of those ends the process: every
         # later prompt comes back as "the script exited 1".
         #

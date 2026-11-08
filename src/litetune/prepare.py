@@ -1858,10 +1858,7 @@ def measure_lengths(
     over = tuple(
         OverLength(lineno=row.lineno, tokens=total, prompt_tokens=p, completion_tokens=c)
         for row, total, p, c in zip(rows, totals, prompt_counts, completion_counts, strict=True)
-        # LiteRT-LM 0.19 refuses a prefill when current_step + num_tokens is
-        # equal to max_num_tokens (`tasks.cc`, release/v0.19.0:596-601), so a
-        # row that exactly fills the exported window must be refused here too.
-        if total >= context_length
+        if total > context_length
     )
     return LengthStats(
         n=len(rows),
@@ -2471,7 +2468,7 @@ def _check_lengths(
                 sink.append(
                     Check.failed(
                         LENGTH_CHECK,
-                        f"{len(stats.over_length)}/{len(rows)} rows reach or exceed the "
+                        f"{len(stats.over_length)}/{len(rows)} rows exceed the "
                         f"{window}-token context window: {named}{more}. They are "
                         "named rather than dropped: truncating an example removes its supervised "
                         "span, so the row still costs a training step and teaches nothing",

@@ -506,9 +506,9 @@ class ExportRequest:
         object.__setattr__(self, "output_dir", Path(self.output_dir))
 
         requested = list(self.extra_flags)
-        # A checkpoint that records a decision is scored option by option, and
-        # gets the small prefill signature that scoring needs unless the caller
-        # set the flag. An unreadable record is not read as "no decision": the
+        # A checkpoint that records a decision gets the exporter's 128-token
+        # default named explicitly unless the caller set the flag. An unreadable
+        # record is not read as "no decision": the
         # plan reports it through the base-model identity, as for any record.
         decision = _recorded_decision(self.model)
         prefill_source: str | None = None
@@ -2547,7 +2547,8 @@ def _vision_carried(
             for section, value in sorted(constraints.items())
             if not isinstance(value, str)
             or not (tokens := [part.strip() for part in value.split(",")])
-            # litert-lm-builder 0.18.0's complete Backend enum. Keep this
+            # litert-lm-builder 0.19.1's complete Backend enum
+            # (`litertlm_builder.py:253-260`). Keep this
             # explicit so reading a bundle never silently accepts a future
             # value the pinned builder has not defined for this release.
             or any(

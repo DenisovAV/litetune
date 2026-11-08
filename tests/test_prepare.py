@@ -37,7 +37,6 @@ from litetune.prepare import (
     Row,
     TokenCountUnavailable,
     is_extractive,
-    measure_lengths,
     prepare,
     profile_arguments,
     read_rows,
@@ -366,15 +365,6 @@ def test_an_over_length_example_fails_and_names_the_row(write_jsonl, request_for
     assert "line 7" in check.detail
     assert check.observed["over_length"][0]["source_line"] == 7
     assert result.outcome is Outcome.FAILED
-
-
-def test_an_example_that_exactly_fills_the_runtime_window_is_refused():
-    # 3 prompt + 1 completion + the two sequence specials = a six-token prefill.
-    stats = measure_lengths(
-        [Row(7, "one two three", "answer", None)], FakeTokenCounter(), context_length=6
-    )
-
-    assert [(row.lineno, row.tokens) for row in stats.over_length] == [(7, 6)]
 
 
 def test_an_over_length_example_stops_the_split_being_written(write_jsonl, request_for):

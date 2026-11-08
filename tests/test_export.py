@@ -4000,7 +4000,11 @@ def test_the_callers_prefill_lengths_are_kept_and_said_to_be_theirs(tmp_path, to
         extra_flags=[token],
     )
 
-    assert not any(f.startswith("--prefill_lengths=128") for f in request.extra_flags)
+    assert list(request.extra_flags) == [
+        token,
+        "--litert_lm_model_type_override=gemma3",
+        "--externalize_embedder",
+    ]
     assert token in request.argv("dynamic_wi8_afp32")
     record = request.as_dict()["decision"]
     assert record["prefill_lengths_source"] == "caller"
