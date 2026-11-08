@@ -3060,8 +3060,9 @@ bundle above and its first 40 held-out prompts, on two Windows 11 machines with
 integrated Intel GPUs under Direct3D 12: the Panther Lake (Core Ultra X7 358H, Arc
 B390, driver 32.0.101.8864) and a Lunar Lake (Core Ultra 7 258V, Arc 140V, driver
 32.0.101.8826), each GPU named by the runtime's adapter line. The repeat rule read the
-failure as unsettled scores; it is not noise. On these GPUs LiteRT-LM's GPU path gave
-other answers than its CPU path, in option scoring and in plain generation:
+failure as unsettled scores. There is run-to-run variation (below), but not only that:
+on these GPUs LiteRT-LM's GPU path gave other answers than its CPU path, pass after pass,
+in option scoring and in plain generation:
 
 | | answers that differ from the same machine's CPU, 40 prompts |
 |---|---|
