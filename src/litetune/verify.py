@@ -32,6 +32,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -1154,6 +1156,55 @@ class _Run:
         return VerifyResult(status=status, manifest=self.manifest)
 
 
+def _default_gpu_cache_limitation(model: Path, platform: str) -> str | None:
+    """Name default LiteRT-LM GPU caches already beside ``model`` for this very file, if any.
+
+    litert-lm 0.18.0 names the text model's `<model>_<mtime>_<size>_mldrift_*cache.bin`
+    and a vision encoder's `<model>.vision_encoder_<mtime>_<size>_mldrift_*cache.bin`
+    (MEASUREMENTS.md#a-gpu-cache-built-on-a-software-adapter), with the file's mtime in
+    seconds and its size: only names carrying this file's are its caches. Linux only, the
+    one platform where a cache was shown to be read by a later run. A scan that cannot
+    look says so rather than reading as a clean directory; it never ends the run.
+    """
+    if platform != "linux":
+        return None
+    try:
+        stat = model.stat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"could not look for default LiteRT-LM GPU caches beside the model: {exc}"
+    key = f"_{int(stat.st_mtime)}_{stat.st_size}_mldrift_"
+    pattern = re.compile(
+        r"(?:\.vision_encoder)?" + re.escape(key) + r"(?:weight|program)_cache\.bin"
+    )
+    try:
+        entries = list(model.parent.iterdir())
+    except OSError as exc:
+        return f"could not look for default LiteRT-LM GPU caches beside the model: {exc}"
+    caches = []
+    for path in entries:
+        if not path.name.startswith(model.name):
+            continue
+        if not pattern.fullmatch(path.name[len(model.name) :]):
+            continue
+        try:
+            if path.is_file():
+                caches.append(path.name)
+        except OSError:
+            # One entry that cannot be read does not hide the others.
+            continue
+    if not caches:
+        return None
+    named = ", ".join(sorted(caches))
+    return (
+        f"default LiteRT-LM GPU cache files already exist beside the model: {named}; "
+        "an app or the CLI opening this file with its default cache would read them. "
+        "litetune gives its text, picture and tool-path GPU engines a cache directory of "
+        "their own instead of the default"
+    )
+
+
 def _decision_record(reference: str) -> tuple[dict[str, Any] | None, str | None]:
     """The reference's training record when it records a decision, and why it could not be read.
 
@@ -1525,6 +1576,13 @@ def run_verify(
         run.manifest["harness"]["pictures"] = pictures.as_dict()
         run.limitation(PICTURES_COMPARED.format(tokens=pictures.vision_tokens))
         run.limitation(PICTURE_PREFILL_UNCHECKED)
+
+    # Immediately before the generative candidate can open its GPU engine. The
+    # decision path above disables caching instead, and never reaches here.
+    if request.backend == "gpu":
+        default_cache = _default_gpu_cache_limitation(request.model, sys.platform)
+        if default_cache is not None:
+            run.limitation(default_cache)
 
     # A text split calls it as it always has, so a stand-in that takes two
     # arguments still stands in for it.

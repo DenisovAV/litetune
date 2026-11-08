@@ -3093,3 +3093,44 @@ in option scoring and in plain generation:
 - Not run: litert-lm 0.19.0 on the Lunar Lake, Dawn's Vulkan backend on these GPUs (the
   package offers no switch), discrete Arc GPUs, other drivers, other models, and
   flutter_edge_ai's Windows GPU library.
+
+### A GPU cache built on a software adapter
+
+Measured 2026-11-07 on Ubuntu 22.04 with an NVIDIA A100 40GB (driver 580.178.04), litert-lm
+0.18.0 from PyPI, with the beans picture bundle of *Gemma 4 E2B tuned on pictures: beans*
+(`dynamic_wi8_afp32`, seed 0), a fresh copy of the file for each experiment, two held-out
+pictures, greedy, text and vision on the GPU, through a script outside this repository.
+LiteRT-LM given its default cache (`cache_dir=""`, what the CLI passes and what litetune's
+text driver passed) writes its GPU caches beside the model, named after the file:
+`<model>_<mtime>_<size>_mldrift_weight_cache.bin` and `…_mldrift_program_cache.bin`, and
+`<model>.vision_encoder_<mtime>_<size>_mldrift_…` for the vision encoder.
+
+| run, in order, on one fresh copy | replies to the two pictures |
+|---|---|
+| `VK_ICD_FILENAMES` set to Mesa's llvmpipe ICD, default cache | none (the engine did not finish), but the two `…_mldrift_…cache.bin` files were written |
+| the NVIDIA GPU, the same default cache | ` இரண்டாம் இரண்டாம் இரண்டாம் …` for both (the first 60 characters printed) |
+| the NVIDIA GPU, no cache (`:nocache`) | `angular_leaf_spot` for both, the label |
+
+- On another fresh copy, a cache written by an F16 run (the GPU default) and read by an
+  fp32 run gave the label for both pictures, as did both runs without a cache: a cache
+  written under another activation type did no harm here. One run cannot tell whether
+  what spoiled the llvmpipe cache was the software adapter or that its engine never
+  finished building.
+- Found because `verify --backend gpu` of that bundle generated the same repeated word for
+  every picture: beside it lay a weight cache written in the same second as an earlier
+  GPU run on that host whose runtime named llvmpipe, before `libegl1` was installed. The same
+  verify driver given no cache answered with the labels.
+- So a `verify --backend gpu` that refuses llvmpipe (*The GPU on Windows and Linux*) leaves
+  such a cache behind, and up to 0.8.0 the next text or picture GPU run of that file,
+  whose driver passed the default cache, read it. The tool path passed no cache
+  directory at all; what LiteRT-LM does then was not measured. The change that adds this
+  section gives litetune's text, picture and tool-path GPU engines a cache directory of
+  their own (EmbeddingGemma 2 already had one per run, decisions use none).
+- Given a directory of its own, LiteRT-LM 0.18.0 wrote every cache there and nothing beside
+  the model: on an Apple M5 Pro's GPU, the unconstrained copy of this bundle with text and
+  vision given the GPU (the label for both pictures) left `…_mldrift_{weight,program}_cache.bin`,
+  `….vision_encoder_…_mldrift_{weight,program}_cache.bin` and `…vision_adapter.xnnpack_cache`
+  in that directory, and the beans EmbeddingGemma 2 file likewise, its `.text_encoder_` and
+  `.vision_encoder_` caches included. That was this measurement's script, not a litetune run.
+- Not run: a cache built on one hardware GPU read on another, Windows and macOS caches,
+  litert-lm 0.19.0.

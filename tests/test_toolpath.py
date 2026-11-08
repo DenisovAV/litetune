@@ -156,6 +156,7 @@ def _run(
         "tools": TOOLS,
         "max_tokens": 64,
         "constrained": True,
+        "cache_dir": None,
         "out": str(out),
         "log": str(tmp_path / "runtime.log"),
         "mark": "litetune-test",
@@ -1818,12 +1819,21 @@ def test_the_tool_path_script_builds_a_gpu_engine_with_fp32(tmp_path, monkeypatc
     measured on a Galaxy S24, gets past it.
     """
     runtime = FakeRuntime(replies=[_reply("set_colour", {"colour": "red"})])
-    code, _ = _run(runtime, tmp_path, monkeypatch, **runtime_engine_spec("gpu"))
+    cache = tmp_path / "cache-toolpath"
+    cache.mkdir()
+    code, _ = _run(
+        runtime,
+        tmp_path,
+        monkeypatch,
+        cache_dir=str(cache),
+        **runtime_engine_spec("gpu"),
+    )
 
     assert code == 0
     args = sys.modules["litert_lm"].engine_args
     assert args["backend"] == "gpu"
     assert "activation_data_type" in args and args["activation_data_type"] == 0
+    assert args["cache_dir"] == str(cache)
 
 
 def test_the_tool_path_script_still_builds_a_cpu_engine_by_default(tmp_path, monkeypatch):
@@ -1834,6 +1844,8 @@ def test_the_tool_path_script_still_builds_a_cpu_engine_by_default(tmp_path, mon
     args = sys.modules["litert_lm"].engine_args
     assert args["backend"] == "cpu"
     assert "activation_data_type" not in args
+    # As 0.8.0 asked on the CPU: no cache_dir at all, not even the CLI's "".
+    assert "cache_dir" not in args
 
 
 def test_the_tool_path_backend_describes_what_it_asked_for(tmp_path):
@@ -1876,18 +1888,43 @@ def test_the_backend_reaches_the_runtime_in_both_modes(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(sys, "platform", "darwin")
     rows_ = labelled_rows(8)
-    env = CannedEnv(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
+    existed: list[bool] = []
+
+    class Recording(CannedEnv):
+        def run(self, argv, timeout=None):
+            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            # While the script runs: the directory it is handed must already exist.
+            existed.append(Path(spec["cache_dir"]).is_dir())
+            return super().run(argv, timeout=timeout)
+
+    env = Recording(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
     backend = ToolPathBackend(
         model=tmp_path / "m.litertlm", declarations=DECLS, env=env, backend_flag="gpu"
     )
 
     backend.generate([r["prompt"] for r in rows_])
 
+    assert existed == [True, True]
     assert [(spec["backend"], spec["activation_data_type"]) for spec in env.specs] == [
         ("gpu", "fp32"),
         ("gpu", "fp32"),
     ]
+    for spec in env.specs:
+        cache = Path(spec["cache_dir"])
+        assert cache.name == "cache-toolpath"
+        assert cache.parent == Path(spec["out"]).parent
     assert backend.describe()["backend"] == "gpu"
+
+
+def test_a_cpu_tool_path_run_hands_the_script_no_cache_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    rows_ = labelled_rows(8)
+    env = CannedEnv(by_mode={"constrained": _rows(rows_, 8), "unconstrained": _rows(rows_, 8)})
+    backend = ToolPathBackend(model=tmp_path / "m.litertlm", declarations=DECLS, env=env)
+
+    backend.generate([r["prompt"] for r in rows_])
+
+    assert [spec["cache_dir"] for spec in env.specs] == [None, None]
 
 
 def _reading(client="pid 4242, python3.12", gpu_time=None):

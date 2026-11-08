@@ -922,6 +922,11 @@ class LiteRtLmBackend:
 
         with tempfile.TemporaryDirectory(prefix="litetune-litertlm-") as tmp:
             work = Path(tmp)
+            cache_dir = ""
+            if self.backend_flag == "gpu":
+                cache = work / "cache-candidate"
+                cache.mkdir()
+                cache_dir = str(cache)
             script = work / "generate.py"
             script.write_text(_LITERTLM_GENERATE_SCRIPT, encoding="utf-8")
             results = work / "generations.jsonl"
@@ -934,6 +939,7 @@ class LiteRtLmBackend:
                         "prompts": list(prompts),
                         "runtime_rendered": self.uses_template,
                         "engine_per_prompt": bool(self.engine_per_prompt_reason),
+                        "cache_dir": cache_dir,
                         **runtime_engine_spec(self.backend_flag, thread_count),
                         **picture_spec(self.images),
                         # Sent in place of a bundle's own sampler when that one
@@ -1043,6 +1049,8 @@ class LiteRtLmBackend:
             )
         with tempfile.TemporaryDirectory(prefix="litetune-litertlm-preflight-") as tmp:
             work = Path(tmp)
+            cache = work / "cache-candidate"
+            cache.mkdir()
             script = work / "generate.py"
             script.write_text(_LITERTLM_GENERATE_SCRIPT, encoding="utf-8")
             spec = work / "spec.json"
@@ -1052,6 +1060,7 @@ class LiteRtLmBackend:
                         "model": str(self.model),
                         "prompts": [prompt],
                         "runtime_rendered": self.uses_template,
+                        "cache_dir": str(cache),
                         **runtime_engine_spec(self.backend_flag),
                         **picture_spec(self.images[:1] if self.images else None),
                         "greedy_sampler": dict(CANDIDATE_SAMPLER),
@@ -2751,7 +2760,8 @@ def main(spec_path):
             Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
 
     with Path(spec["out"]).open("w", encoding="utf-8") as out:
-        # `cache_dir=""` is what the CLI passes on its default `--cache`:
+        # `cache_dir=""` is what the CLI passes on its default `--cache`, and
+        # remains what the parent sends for a CPU run:
         # `cache_dir_value_from_cache_mode` (common.py) maps both `None` and
         # "disk" to the empty string, and `Engine.__init__` reaches
         # `litert_lm_engine_settings_set_cache_dir` only when `cache_dir is not
@@ -2759,6 +2769,9 @@ def main(spec_path):
         # CLI's behaviour but a fourth state beside disk, memory and none.
         # Which of the three that fourth state resolves to is decided in the
         # C++ the binding calls, not in anything readable from here.
+        # A GPU run differs: MEASUREMENTS.md#a-gpu-cache-built-on-a-software-adapter
+        # records a default cache written on llvmpipe being read on NVIDIA and
+        # changing the answer, so its parent creates a cache private to this run.
         if spec.get("engine_per_prompt"):
             # An Engine per prompt, each closed before the next opens: for a
             # model whose state a session on a shared Engine does not reset
@@ -2767,7 +2780,9 @@ def main(spec_path):
             at_engine, init = None, []
             for index, prompt in enumerate(prompts):
                 started = time.monotonic()
-                with litert_lm.Engine(spec["model"], cache_dir="", **engine_args) as engine:
+                with litert_lm.Engine(
+                    spec["model"], cache_dir=spec["cache_dir"], **engine_args
+                ) as engine:
                     init.append(time.monotonic() - started)
                     if at_engine is None and spec.get("report"):
                         at_engine = device_report()
@@ -2781,7 +2796,9 @@ def main(spec_path):
                     if last and spec.get("report"):
                         write_report(at_engine, device_report(), init)
             return
-        with litert_lm.Engine(spec["model"], cache_dir="", **engine_args) as engine:
+        with litert_lm.Engine(
+            spec["model"], cache_dir=spec["cache_dir"], **engine_args
+        ) as engine:
             # Before the first prompt, so a run killed part-way still says
             # where it was running -- the same reason the transformers script
             # writes its report before generating.

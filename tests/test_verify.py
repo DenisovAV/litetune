@@ -7,8 +7,10 @@ two sides were not measured the same way is refused rather than annotated.
 """
 
 import json
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -80,6 +82,127 @@ def verify(
         **request_kwargs,
     )
     return run_verify(request, backends=BackendPair(candidate=candidate, reference=reference))
+
+
+def test_gpu_run_names_only_existing_beside_model_mldrift_caches_without_modifying_them(
+    write_split, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(sys, "platform", "linux")
+    rows = labelled_rows(8)
+    data = write_split(rows)
+    model = tmp_path / "model.litertlm"
+    model.write_bytes(b"model")
+    os.utime(model, (1700000000, 1700000000))
+    caches = [
+        tmp_path / "model.litertlm_1700000000_5_mldrift_weight_cache.bin",
+        tmp_path / "model.litertlm_1700000000_5_mldrift_program_cache.bin",
+        tmp_path / "model.litertlm.vision_encoder_1700000000_5_mldrift_weight_cache.bin",
+    ]
+    # Not this file's: another model's, one whose name only starts with this one's, and
+    # one keyed to an earlier version of this file (another mtime).
+    strangers = [
+        "other.litertlm_1700000000_5_mldrift_weight_cache.bin",
+        "model.litertlm_backup_1700000000_5_mldrift_weight_cache.bin",
+        "model.litertlm_1600000000_5_mldrift_weight_cache.bin",
+        # This file's key, but not a cache LiteRT-LM writes.
+        "model.litertlm_1700000000_5_mldrift_cache_notes.txt",
+        "model.litertlm_1700000000_5_mldrift_foo_cache.bin",
+        # A copy's cache: same mtime and size, another file's name.
+        "model.litertlm.bak_1700000000_5_mldrift_weight_cache.bin",
+    ]
+    for name in strangers:
+        (tmp_path / name).write_bytes(b"x")
+    # A directory with a cache's name is not a cache.
+    cache_named_dir = "model.litertlm.vision_encoder_1700000000_5_mldrift_program_cache.bin"
+    (tmp_path / cache_named_dir).mkdir()
+    for index, cache in enumerate(caches):
+        cache.write_bytes(f"cache-{index}".encode())
+    request = VerifyRequest(
+        model=model,
+        reference="org/reference",
+        data=data,
+        backend="gpu",
+    )
+
+    result = run_verify(
+        request,
+        backends=BackendPair(
+            candidate=FakeBackend(texts=correct_texts(rows)),
+            reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+        ),
+    )
+
+    (notice,) = [text for text in result.manifest["limitations"] if "mldrift" in text]
+    assert all(cache.name in notice for cache in caches)
+    assert "an app or the CLI" in notice
+    assert cache_named_dir not in notice
+    assert "litetune gives its text, picture and tool-path GPU engines a cache directory" in notice
+    assert not [name for name in strangers if name in notice]
+    assert [cache.read_bytes() for cache in caches] == [b"cache-0", b"cache-1", b"cache-2"]
+
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    clean_request = VerifyRequest(
+        model=clean / "model.litertlm",
+        reference="org/reference",
+        data=data,
+        backend="gpu",
+    )
+    clean_result = run_verify(
+        clean_request,
+        backends=BackendPair(
+            candidate=FakeBackend(texts=correct_texts(rows)),
+            reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+        ),
+    )
+
+    assert not [text for text in clean_result.manifest["limitations"] if "mldrift" in text]
+
+    cpu_request = VerifyRequest(
+        model=model,
+        reference="org/reference",
+        data=data,
+        backend="cpu",
+    )
+    cpu_result = run_verify(
+        cpu_request,
+        backends=BackendPair(
+            candidate=FakeBackend(texts=correct_texts(rows)),
+            reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+        ),
+    )
+
+    assert not [text for text in cpu_result.manifest["limitations"] if "mldrift" in text]
+
+    # A directory that cannot be listed ends the scan, not the run.
+    def unlistable(self):
+        raise PermissionError("not listable")
+
+    monkeypatch.setattr(Path, "iterdir", unlistable)
+    hidden = run_verify(
+        request,
+        backends=BackendPair(
+            candidate=FakeBackend(texts=correct_texts(rows)),
+            reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+        ),
+    )
+    monkeypatch.undo()
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert hidden.status is result.status
+    assert not [text for text in hidden.manifest["limitations"] if "mldrift" in text]
+    (could_not,) = [t for t in hidden.manifest["limitations"] if t.startswith("could not look")]
+    assert "not listable" in could_not
+
+    # The cache was shown read by a later run on Linux only; elsewhere nothing is claimed.
+    monkeypatch.setattr(sys, "platform", "darwin")
+    mac_result = run_verify(
+        request,
+        backends=BackendPair(
+            candidate=FakeBackend(texts=correct_texts(rows)),
+            reference=FakeBackend(model="org/reference", texts=correct_texts(rows)),
+        ),
+    )
+    assert not [text for text in mac_result.manifest["limitations"] if "mldrift" in text]
 
 
 # -- the ordinary case ------------------------------------------------------
