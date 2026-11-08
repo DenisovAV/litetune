@@ -12,6 +12,7 @@ eight confident negatives during the measurement work, so each has its own test.
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import types
@@ -28,6 +29,7 @@ from conftest import (
     probe_answer,
 )
 
+import litetune
 from litetune import envs, toolpath
 from litetune.evaluate import (
     BACKEND_OBSERVED,
@@ -5423,3 +5425,43 @@ def test_on_a_hybrid_host_an_intel_adapter_is_not_read_through_nvidia_smi():
     # The vendor is read without regard to case.
     upper = _linux(adapters_of(_L4.replace("vendor=nvidia", "vendor=NVIDIA")), smi=_smi())
     assert gpu_observed("gpu", upper) is True
+
+
+def test_the_picture_header_probe_is_not_named_after_a_standard_module(tmp_path):
+    # Python puts a script's own directory first on sys.path, so a script named
+    # `inspect.py` is what `import inspect` finds -- in 0.8.1 the probe was, and
+    # every CPU picture verify failed importing litert_lm (`inspect.get_annotations`).
+    seen = []
+
+    class ProbeEnv:
+        name = "runtime"
+
+        def provision(self, events=None):
+            return None
+
+        def run(self, argv, timeout=None):
+            seen.append(Path(argv[1]).stem)
+            spec = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            Path(spec["report"]).write_text(json.dumps({"error": None}), encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+    backend = _litertlm(
+        tmp_path,
+        backend_flag="cpu",
+        images=({"path": "a.jpg", "sha256": "0" * 64},),
+        env=ProbeEnv(),
+    )
+    assert backend.picture_backend_problem() is None
+    assert seen and seen[0] not in sys.stdlib_module_names
+
+
+def test_no_script_litetune_writes_and_runs_shadows_a_standard_module():
+    # Every helper script is written into a work directory and run by path, so
+    # its name is the first thing on its own sys.path (see the test above).
+    source = Path(litetune.__file__).parent
+    names = set()
+    for path in source.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        names.update(re.findall(r'/ "([A-Za-z_][A-Za-z0-9_]*)\.py"', text))
+    assert names, "no helper script names found; the pattern no longer matches the code"
+    assert not names & set(sys.stdlib_module_names), names & set(sys.stdlib_module_names)

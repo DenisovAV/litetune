@@ -835,7 +835,7 @@ class LiteRtLmBackend:
             return blocked
         with tempfile.TemporaryDirectory(prefix="litetune-vision-backend-") as tmp:
             work = Path(tmp)
-            script = work / "inspect.py"
+            script = work / "vision_backend.py"
             spec = work / "spec.json"
             report = work / "report.json"
             script.write_text(_VISION_BACKEND_PROBE_SCRIPT, encoding="utf-8")
