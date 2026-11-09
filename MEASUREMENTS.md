@@ -323,10 +323,16 @@ engine rows, `dynamic_wi8_afp32` with a `none` float twin). Every bundle is
 | functiongemma-270m-it, tool path | 0.9125 vs 0.9250, +0.0125 (10); both grammar modes alike on 640 of 640 | the same |
 | gemma-3-270m-it, decision | mode `once`: top option 0.9933, answer 0.9800, mean KL 4.48e-04, twin 4.20e-05 nats | mode `plain`: the same four numbers |
 | Qwen3-0.6B, decision | mode `once`: 0.9933, 0.9867, 1.17e-03, twin 1.49e-04 nats | mode `plain`: the same four numbers |
+| gemma-4-E2B-it tuned on pictures, 300 beans pictures | 0.8867 vs 0.8800, −0.0067 (4) | the same; on the GPU, text and vision, 0.8800, 0.0000 (4) |
 
-Each banking77 and tool-path cell is the candidate's exact match against the reference's,
-then the conversion cost with the count of discordant rows. Every run passed, and every one
-rendered the reference's prompt token ids for all its prompts on both runtimes.
+Each banking77, tool-path and picture cell is the candidate's exact match against the
+reference's, then the conversion cost with the count of discordant rows. Every run passed, and
+every one rendered the reference's prompt token ids for all its prompts on both runtimes.
+The picture row is the seed-0 checkpoint of *Gemma 4 E2B tuned on pictures: beans*, converted
+by each side on another host (an NVIDIA A100-SXM4-40GB, Ubuntu); its 0.18.0 side was verified
+by 0.8.1 with the header probe's script renamed (#123), since 0.8.1's own CPU picture verify
+stops on that probe. On 0.19.1's GPU the runtime picked the A100 through Vulkan for both the
+text model and the vision encoder.
 
 - On 0.19.1 the decision self-check says `not dropped` and picks mode `plain`, which scores
   right after the prefill (LiteRT-LM #3561 is fixed there); on 0.18.0 it picks `once`. The
