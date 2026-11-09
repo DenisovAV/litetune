@@ -298,6 +298,53 @@ September's on both backends, though 4 of 20 GPU rows and 5 of 20 CPU rows retur
 different calls. *First call exact* compares a reply's first call only; comparing every
 call, the `fp32` GPU rows are 13 of 20 exact on 0.18.0 and 14 in September.
 
+### On LiteRT-LM 0.19.1
+
+Measured 2026-11-08 and 2026-11-09 on Linux x86-64: one checkpoint per row, tuned once by the
+change that moves `verify` to litert-lm 0.19.1, then converted and verified twice -- by
+litetune 0.8.1 (export on `litert-torch-nightly` 0.10.0.dev20260926 with litert-lm-builder
+0.18.0, `verify` on litert-lm 0.18.0) and by that change (the same export set, `verify` on
+0.19.1). Every candidate ran on the CPU backend of an `Intel(R) Xeon(R) CPU @ 2.20GHz`, the
+reference on cuda. Banking77: the 600 held-out rows of split `0c7505b2b6f69ab1`, LoRA
+rank 16, alpha 32, one epoch at learning rate 2e-4, batch 8, sequences of 256, `--scorer
+exact-text`. The tool path: FunctionGemma's 640 mobile-actions rows. The decisions: the
+emotion decision of *Every family on emotion* (two epochs for Gemma 3, one for Qwen3, 300
+engine rows, `dynamic_wi8_afp32` with a `none` float twin). Every bundle is
+`dynamic_wi8_afp32`.
+
+| model | 0.18.0 (litetune 0.8.1) | 0.19.1 |
+|---|---|---|
+| gemma-3-270m-it | 0.6567 vs 0.6733, +0.0167 (30) | the same |
+| Qwen2.5-0.5B-Instruct | 0.7683 vs 0.7717, +0.0033 (14) | the same |
+| Qwen3-0.6B | 0.7000 vs 0.7000, 0.0000 (20) | the same |
+| Qwen3.5-0.8B | 0.7867 vs 0.7833, −0.0033 (10) | the same |
+| granite-4.1-3b | 0.7933 vs 0.7917, −0.0017 (9) | the same |
+| MiniCPM5-1B | 0.7183 vs 0.7233, +0.0050 (17) | the same |
+| functiongemma-270m-it, tool path | 0.9125 vs 0.9250, +0.0125 (10); both grammar modes alike on 640 of 640 | the same |
+| gemma-3-270m-it, decision | mode `once`: top option 0.9933, answer 0.9800, mean KL 4.48e-04, twin 4.20e-05 nats | mode `plain`: the same four numbers |
+| Qwen3-0.6B, decision | mode `once`: 0.9933, 0.9867, 1.17e-03, twin 1.49e-04 nats | mode `plain`: the same four numbers |
+
+Each banking77 and tool-path cell is the candidate's exact match against the reference's,
+then the conversion cost with the count of discordant rows. Every run passed, and every one
+rendered the reference's prompt token ids for all its prompts on both runtimes.
+
+- On 0.19.1 the decision self-check says `not dropped` and picks mode `plain`, which scores
+  right after the prefill (LiteRT-LM #3561 is fixed there); on 0.18.0 it picks `once`. The
+  0.18.0 decision bundles carry `--prefill_lengths=8,128` and the 0.19.1 ones
+  `--prefill_lengths=128` only: the same scores, to the digits shown. The decision verify
+  took 137 s against 167 s for Gemma 3 and 415 s against 583 s for Qwen3; every other row
+  took between 0.6 % and 7.3 % less time on 0.19.1, one run each.
+- A first pass exported with `litert-torch-nightly` 0.11.0.dev20261107 and litert-lm-builder
+  0.19.1 instead. Its Qwen3.5 bundle did not load on 0.19.1 (`Failed to allocate tensors`
+  when the engine was created); `Qwen/Qwen3.5-0.8B` as published, exported by that version
+  on an Apple M5 Pro with its default flags, with `--externalize_embedder`, and with and
+  without the exporter's own metadata override, failed the same way on 0.19.1 and answered
+  on `litert-lm-nightly` 0.20.0.dev20261107, while the same model exported by 0.10.0.dev20260926
+  answered on 0.19.1. That version also gives the Qwen and MiniCPM5 families a metadata
+  override fetched from LiteRT-LM's `main` branch at export time, which put another
+  template into a Qwen2.5 bundle than the one handed over. So the export set stays where it
+  was and only the runtime moved.
+
 ## The headline numbers
 
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |

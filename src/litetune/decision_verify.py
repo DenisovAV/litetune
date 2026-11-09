@@ -136,8 +136,9 @@ THIN_OUT_OF_SCOPE = 10
 NO_TWIN = (
     "no --float-twin was given, so the runtime's per-token scores were not compared with the "
     "reference's on a float32 export of this checkpoint. The method the self-check picked was "
-    "measured within 8.2e-4 nats of PyTorch on LiteRT-LM {runtime} on 2026-10-16; convert with "
-    "--recipe none as well and pass that file to check it on this checkpoint"
+    "measured within 4.2e-5 nats of PyTorch on a Gemma 3 checkpoint's float32 export on "
+    "LiteRT-LM {runtime} on 2026-11-08; convert with --recipe none as well and pass that file "
+    "to check it on this checkpoint"
 )
 TEMPERATURE_CARRIED = (
     "the temperature and the threshold were fitted on the reference's calibration scores and "
