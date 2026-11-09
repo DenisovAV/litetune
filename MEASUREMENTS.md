@@ -3254,9 +3254,9 @@ same 40 in reverse order on the same GPU engine:
   activation type, gave 27 replies of 40 unlike the CPU's on 0.19.1 and 35 on
   `litert-lm-nightly` 0.20.0.dev20261106. Reported as google-ai-edge/LiteRT-LM#4460.
 - So decision bundles are exported with the 128-token signature only from the change that
-  adds this paragraph on; a decision bundle converted by litetune 0.8.1 or earlier carries
-  `prefill_8` and needs converting again to run on an Intel Arc GPU. Whether a fine-tuned
-  decision without it agrees with the CPU on the Arc was not measured.
+  adds this paragraph on; a decision bundle converted by litetune 0.8.2 or earlier carries
+  `prefill_8`, and converting it again drops it. Whether a fine-tuned decision without it
+  agrees with the CPU on an Arc GPU was not measured, nor `prefill_8` on the Arc 140V.
 
 ### A GPU cache built on a software adapter
 

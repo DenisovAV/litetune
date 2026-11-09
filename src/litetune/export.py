@@ -82,13 +82,13 @@ WRITTEN_TEMPLATE_FLAGS = (COMPOSED_TEMPLATE_FLAG, CANONICAL_OR_COMPOSED_FLAG)
 # recipe's directory can take the name.
 COMPOSED_TEMPLATE_PREFIX = "_litetune-chat-template-"
 
-# Up to 0.8.1 a decision checkpoint was exported with a second prefill
+# Up to 0.8.2 a decision checkpoint was exported with a second prefill
 # signature of 8 tokens beside the default 128: on LiteRT-LM 0.18.0 option
 # scoring re-prefilled one token per decision (mode `once`), which ran padded to
 # 128 without it -- 142 ms against 23 ms per re-prefill, measured 2026-10-16.
 # On the 0.19 line the #3561 fix leaves nothing to re-prefill (mode `plain`),
-# and a `prefill_8` signature makes Intel Arc GPUs under Direct3D 12 answer
-# wrong (MEASUREMENTS.md, "Why the decision failed on Intel Arc";
+# and with a `prefill_8` signature an Intel Arc B390 under Direct3D 12
+# answered wrong (MEASUREMENTS.md, "Why the decision failed on Intel Arc";
 # google-ai-edge/LiteRT-LM#4460). So only 128 is named: the exporter's own
 # default (`exportable_module_config.py:44`, litert-torch-nightly
 # 0.10.0.dev20260926: `[128]`), kept explicit so a decision bundle keeps the

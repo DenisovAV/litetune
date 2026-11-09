@@ -658,14 +658,15 @@ What each stage does differently for a decision:
 - **tune** checks every row against `decision.json` and records the decision
   beside the checkpoint, where the later stages read it.
 - **convert** names `--prefill_lengths=128`, the exporter's own default, so a
-  decision bundle keeps the signature it was measured with. Up to 0.8.1 it
+  decision bundle keeps the signature it was measured with. Up to 0.8.2 it
   added an 8-token signature because litetune's mode `once` re-prefilled one
   token on LiteRT-LM 0.18.0; on 0.19, with the #3561 fix, mode `plain` needs no
-  re-prefill. A `prefill_8` signature makes Intel Arc GPUs under Direct3D 12
-  answer wrong
+  re-prefill. With a `prefill_8` signature an Intel Arc B390 under Direct3D 12
+  answered wrong
   ([MEASUREMENTS.md](MEASUREMENTS.md#why-the-decision-failed-on-intel-arc),
-  google-ai-edge/LiteRT-LM#4460), so a decision bundle converted by litetune
-  0.8.1 or earlier needs converting again before it runs on one.
+  google-ai-edge/LiteRT-LM#4460). A decision bundle converted by litetune 0.8.2
+  or earlier carries that signature; converting it again drops it. Whether a
+  decision without it agrees with the CPU on an Arc GPU was not measured.
 - **verify** scores every option on every calibration and held-out row with the
   float checkpoint, sixteen rows of a similar length at a time (the most
   padded batch is checked row by row first, and falls back to one row at a
