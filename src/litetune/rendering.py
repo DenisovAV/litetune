@@ -9,8 +9,10 @@ two engines can render the same template differently, and a tokenizer can add
 tokens neither template shows.
 
 So the check compares token ids. For every prompt, a script in `envs.RUNTIME`
-renders it with `Conversation.render_message_to_string` -- in LiteRT-LM v0.18.0
-(as in v0.17.1) that returns `GetSingleTurnText`, the function `SendMessage` renders with --
+renders it with `Conversation.render_message_to_string`. The 0.19.1 binding
+calls `litert_lm_conversation_render_message_to_string`
+(`python/litert_lm/conversation.py`, L593-L607); at LiteRT-LM v0.19.0 that C
+function calls `RenderMessageIntoString` (`c/conversation.cc`, L680-L707),
 and turns the result into ids the way a first-turn prefill does. A template renders
 single-turn only when its text contains `is_appending_to_prefill`
 (`minijinja_template.rs`), and none that litetune packages or fetches does (checked
@@ -113,6 +115,9 @@ _RUNTIME_SCRIPT_HEAD = r'''
 import json
 import sys
 from pathlib import Path
+
+# What a template that would not apply raises with (see where it is caught).
+TEMPLATE_FAILURE = "Failed to apply template: "
 
 
 '''
@@ -237,19 +242,37 @@ def main():
         with engine.create_conversation(**conversation_args) as renderer:
             for index, prompt in enumerate(spec["prompts"]):
                 message = prompt if not pictures else picture_message(prompt, pictures[index])
-                rendered = renderer.render_message_to_string(message)
+                render_error = None
+                try:
+                    rendered = renderer.render_message_to_string(message)
+                except RuntimeError as exc:
+                    # The 0.19.1 binding raises from `get_checked` (`_ffi.py:1415`,
+                    # through `check_status`, L1315-L1344) on any failed status
+                    # (`conversation.py`, L593-L607). Only a template that would
+                    # not apply is this row's `unrendered` mismatch: its status is
+                    # INTERNAL with "Failed to apply template: " (LiteRT-LM v0.19.0
+                    # `runtime/components/prompt_template.cc`, L144-L146). Any
+                    # other failure is the harness's and ends the script.
+                    if TEMPLATE_FAILURE not in str(exc):
+                        raise
+                    rendered = ""
+                    render_error = str(exc)
                 rows.append(
                     {
                         "index": index,
                         "rendered": rendered,
                         "ids": runtime_ids(engine, rendered),
                         "prefill_tokens": None,
+                        **({"render_error": render_error} if render_error is not None else {}),
                     }
                 )
         for row in rows[: spec["prefill_sample"]]:
             if not row["rendered"]:
-                # The binding returns "" when the template fails, and sending
-                # the prompt fails the same way: the comparison reports it as
+                # Through 0.18 the binding returned "" for a failed render;
+                # 0.19.1 raises through `get_checked` (`conversation.py`,
+                # L593-L607), and both become an empty rendering above. Sending
+                # the prompt
+                # fails the same way: the comparison reports it as
                 # unrendered, and the parent does not count it as sent.
                 row["prefill_skipped"] = True
                 continue
@@ -321,7 +344,7 @@ class RenderingMismatch:
     # `ids`: the rendered id lists differ. `prefill`: they agree, and the count
     # the runtime prefilled when the prompt was sent does not. `unrendered`: the
     # runtime's rendering is empty where the reference's is not -- what the
-    # binding returns for the C API's null when the template fails, and also for
+    # binding returned through 0.18 when the template failed (0.19 raises), and also for
     # a template that renders nothing (`conversation.py`,
     # `render_message_to_string`, v0.18.0) -- not a rendering of only the
     # tokens the session adds.
@@ -332,6 +355,7 @@ class RenderingMismatch:
     prefill_tokens: int | None
     runtime_tail: str
     reference_tail: str
+    render_error: str | None = None
     # The reference's rendering holds the prompt's text and the runtime's does
     # not: the shape of a template that reads `content` as a string on a
     # runtime that hands it a list of parts.
@@ -345,10 +369,12 @@ class RenderingMismatch:
                 f"{self.reference_tokens}"
             )
         if self.kind == "unrendered":
-            return (
-                f"prompt {self.index}: the runtime's rendering is empty, which its binding returns "
-                "both when the bundle's template fails and when it renders nothing"
-            )
+            if self.render_error is not None:
+                return (
+                    f"prompt {self.index}: the runtime could not render the prompt: "
+                    f"{self.render_error}"
+                )
+            return f"prompt {self.index}: the runtime's rendering is empty and it reported no error"
         missing = (
             "; the runtime's rendering does not contain the prompt's text"
             if self.prompt_missing
@@ -371,6 +397,7 @@ class RenderingMismatch:
             "prefill_tokens": self.prefill_tokens,
             "runtime_rendered_tail": self.runtime_tail,
             "reference_rendered_tail": self.reference_tail,
+            "render_error": self.render_error,
             "prompt_missing": self.prompt_missing,
         }
 
@@ -428,9 +455,9 @@ class RenderingComparison:
                 observed=self.as_dict(),
             )
         if self.agrees and self.prefill_skipped and not self.prefill_sent:
-            # An empty rendering is what the binding returns both for a failed
-            # template and for one that renders nothing, so a sample that was
-            # skipped whole is a check that did not run, not one that passed.
+            # An empty rendering is either a successful empty result or the
+            # row form used above after the 0.19.1 binding raises, so a sample
+            # that was skipped whole is a check that did not run, not one that passed.
             return Check.unchecked(
                 RENDERING_CHECK,
                 f"identical token ids for all {self.compared} prompts, but none of the "
@@ -560,8 +587,9 @@ def compare_renderings(
             )
         ours_rendered = str(ours.get("rendered", ""))
         theirs_rendered = str(theirs.get("rendered", ""))
+        render_error = ours.get("render_error")
         kind = None
-        if not ours_rendered and theirs_rendered:
+        if render_error is not None or (not ours_rendered and theirs_rendered):
             kind = "unrendered"
         elif runtime_ids != reference_ids:
             kind = "ids"
@@ -580,6 +608,7 @@ def compare_renderings(
                     prefill_tokens=None if sent is None else int(sent),
                     runtime_tail=ours_rendered[-_TAIL:],
                     reference_tail=theirs_rendered[-_TAIL:],
+                    render_error=str(render_error) if render_error is not None else None,
                     prompt_missing=kind == "ids"
                     and bool(text)
                     and text in theirs_rendered

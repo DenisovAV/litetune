@@ -124,12 +124,12 @@ def test_every_release_on_record_is_the_one_it_names(release: Release):
         (envs.EXPORT, "linux_x86_64_glibc_2_27", 12, []),
         (envs.TRAIN, "linux_x86_64_glibc_2_27", 12, []),
         # musl: nothing, not even the runtime's own library.
-        (envs.RUNTIME, "musl_x86_64", 12, ["litert-lm-api==0.18.0"]),
+        (envs.RUNTIME, "musl_x86_64", 12, ["litert-lm-api==0.19.1"]),
         (envs.TRAIN, "musl_x86_64", 12, ["sentencepiece==0.2.0", "torch==2.5.1"]),
         # Apple Silicon: macOS 12 for what carries litert-lm-api, 11 for train.
         (envs.EXPORT, "macosx_arm64", 12, []),
         (envs.TRAIN, "macosx_arm64", 13, ["torch==2.5.1"]),
-        (envs.RUNTIME, "macosx_11_arm64", 12, ["litert-lm-api==0.18.0"]),
+        (envs.RUNTIME, "macosx_11_arm64", 12, ["litert-lm-api==0.19.1"]),
         (envs.TRAIN, "macosx_11_arm64", 12, []),
         (envs.RUNTIME, "macosx_12_arm64", 12, []),
         (envs.EXPORT, "macosx_12_arm64", 12, []),
@@ -139,10 +139,10 @@ def test_every_release_on_record_is_the_one_it_names(release: Release):
         (envs.EXPORT, "win_amd64", 12, ["litert-converter==0.4.0"]),
         (envs.TRAIN, "win_amd64", 13, ["torch==2.5.1"]),
         # Windows on ARM64 and 32-bit Windows: no stage at all.
-        (envs.RUNTIME, "win_arm64", 12, ["litert-lm-api==0.18.0", "numpy==2.0.2"]),
+        (envs.RUNTIME, "win_arm64", 12, ["litert-lm-api==0.19.1", "numpy==2.0.2"]),
         (envs.TRAIN, "win_arm64", 12, ["sentencepiece==0.2.0", "torch==2.5.1"]),
         (envs.TRAIN, "win_arm64", 13, ["torch==2.5.1"]),
-        (envs.RUNTIME, "win32", 12, ["litert-lm-api==0.18.0"]),
+        (envs.RUNTIME, "win32", 12, ["litert-lm-api==0.19.1"]),
         (envs.TRAIN, "win32", 12, ["torch==2.5.1"]),
         (
             envs.EXPORT,
@@ -158,7 +158,7 @@ def test_every_release_on_record_is_the_one_it_names(release: Release):
         (envs.RUNTIME, "linux_aarch64", 12, []),
         (envs.EXPORT, "linux_aarch64", 12, ["litert-converter==0.4.0"]),
         # Intel macOS: neither the runtime's native library nor torch.
-        (envs.RUNTIME, "macosx_x86_64", 12, ["litert-lm-api==0.18.0"]),
+        (envs.RUNTIME, "macosx_x86_64", 12, ["litert-lm-api==0.19.1"]),
         (envs.TRAIN, "macosx_x86_64", 12, ["torch==2.5.1"]),
     ],
 )
@@ -401,3 +401,12 @@ def test_a_marker_is_read_for_the_python_asked_about():
     assert wheels.applies('x==1; python_version >= "3.13"', asked)
     assert not wheels.applies('x==1; python_version < "3.13"', asked)
     assert wheels.applies("x==1", asked), "no marker applies everywhere"
+
+
+def test_the_runtime_brings_the_builder_towers_runs_with():
+    """towers runs in envs.RUNTIME and imports litert-lm-builder from it; it is there
+    only because litert-lm 0.19.1 requires that exact version."""
+    [runtime] = [r for r in envs.RUNTIME.requirements if r.startswith("litert-lm==")]
+    record = next(r for r in PUBLISHED.values() if r.requirement == runtime)
+    version = runtime.split("==", 1)[1]
+    assert f"litert-lm-builder=={version}" in record.requires

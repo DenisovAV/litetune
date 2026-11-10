@@ -298,6 +298,63 @@ September's on both backends, though 4 of 20 GPU rows and 5 of 20 CPU rows retur
 different calls. *First call exact* compares a reply's first call only; comparing every
 call, the `fp32` GPU rows are 13 of 20 exact on 0.18.0 and 14 in September.
 
+### On LiteRT-LM 0.19.1
+
+Measured 2026-11-08 and 2026-11-09 on Linux x86-64: one checkpoint per row, tuned once by the
+change that moves `verify` to litert-lm 0.19.1, then converted and verified twice -- by
+litetune 0.8.1 (export on `litert-torch-nightly` 0.10.0.dev20260926 with litert-lm-builder
+0.18.0, `verify` on litert-lm 0.18.0) and by that change (the same export set, `verify` on
+0.19.1). Every candidate but the picture row's GPU cell ran on the CPU backend; the
+banking77, tool-path and decision candidates on an `Intel(R) Xeon(R) CPU @ 2.20GHz`, every
+reference on cuda. Banking77: the 600 held-out rows of split `0c7505b2b6f69ab1`, LoRA
+rank 16, alpha 32, one epoch at learning rate 2e-4, batch 8, sequences of 256, `--scorer
+exact-text`. The tool path: FunctionGemma's 640 mobile-actions rows. The decisions: the
+emotion decision of *Every family on emotion* (two epochs for Gemma 3, one for Qwen3, 300
+engine rows, `dynamic_wi8_afp32` with a `none` float twin). Every bundle is
+`dynamic_wi8_afp32`.
+
+| model | 0.18.0 (litetune 0.8.1) | 0.19.1 |
+|---|---|---|
+| gemma-3-270m-it | 0.6567 vs 0.6733, +0.0167 (30) | the same |
+| Qwen2.5-0.5B-Instruct | 0.7683 vs 0.7717, +0.0033 (14) | the same |
+| Qwen3-0.6B | 0.7000 vs 0.7000, 0.0000 (20) | the same |
+| Qwen3.5-0.8B | 0.7867 vs 0.7833, −0.0033 (10) | the same |
+| granite-4.1-3b | 0.7933 vs 0.7917, −0.0017 (9) | the same |
+| MiniCPM5-1B | 0.7183 vs 0.7233, +0.0050 (17) | the same |
+| functiongemma-270m-it, tool path | 0.9125 vs 0.9250, +0.0125 (10); both grammar modes alike on 640 of 640 | the same |
+| gemma-3-270m-it, decision | mode `once`: top option 0.9933, answer 0.9800, mean KL 4.48e-04, twin 4.20e-05 nats | mode `plain`: the same four numbers |
+| Qwen3-0.6B, decision | mode `once`: 0.9933, 0.9867, 1.17e-03, twin 1.49e-04 nats | mode `plain`: the same four numbers |
+| gemma-4-E2B-it tuned on pictures, 300 beans pictures | 0.8867 vs 0.8800, −0.0067 (4) | the same; on the GPU, text and vision, 0.8800, 0.0000 (4) |
+
+Each banking77, tool-path and picture cell is the candidate's exact match against the
+reference's, then the conversion cost with the count of discordant rows. Every run passed, and
+every one rendered the reference's prompt token ids for all its prompts on both runtimes.
+The picture row is the seed-0 checkpoint of *Gemma 4 E2B tuned on pictures: beans*, converted
+by each side on another host, with an NVIDIA A100-SXM4-40GB; its 0.18.0 side was verified
+by 0.8.1 with the header probe's script renamed (#123), since 0.8.1's own CPU picture verify
+stops on that probe. On 0.19.1's GPU the runtime named the A100 (Vulkan) as its adapter, and
+the vision encoder was given the GPU.
+
+- On 0.19.1 the decision self-check says `not dropped` and picks mode `plain`, which scores
+  right after the prefill (LiteRT-LM #3561 is fixed there); on 0.18.0 it picks `once`. The
+  0.18.0 decision bundles carry `--prefill_lengths=8,128` and the 0.19.1 ones
+  `--prefill_lengths=128` only: the same scores, to the digits shown. The decision verify
+  took 137 s against 167 s for Gemma 3 and 415 s against 583 s for Qwen3; every banking77 and
+  tool-path verify took between 0.6 % and 7.3 % less time on 0.19.1, one run each.
+- A first pass exported with `litert-torch-nightly` 0.11.0.dev20261107 and litert-lm-builder
+  0.19.1 instead. Its Qwen3.5 bundle did not load on 0.19.1 (`Failed to allocate tensors`
+  when the engine was created). On an Apple M5 Pro, 2026-11-08 to 2026-11-10, `Qwen/Qwen3.5-0.8B`
+  as published, `dynamic_wi8_afp32`, one prompt on the CPU: exported by `litert-torch-nightly`
+  0.11.0.dev20261101 and 0.11.0.dev20261103 with `--externalize_embedder`, and by
+  0.11.0.dev20261107 three ways (`--externalize_embedder` with and without
+  `--litert_lm_llm_metadata_override=none`, and no flags), every bundle failed the same way on
+  0.19.1; on `litert-lm-nightly` 0.20.0.dev20261107 each loaded, the three exported without
+  the exporter's own metadata override answered "Paris" and the two with it returned empty
+  text. Exported by 0.10.0.dev20260926 with builder 0.18.0, it answered "Paris" on both. That version also gives the Qwen and MiniCPM5 families a metadata
+  override fetched from LiteRT-LM's `main` branch at export time, which put another
+  template into a Qwen2.5 bundle than the one handed over. So the export set stays where it
+  was and only the runtime moved.
+
 ## The headline numbers
 
 | | float | `dynamic_wi8_afp32` | `weight_only_wi8_afp32` |
@@ -3179,6 +3236,33 @@ in option scoring and in plain generation:
 - Not run: litert-lm 0.19.0 on the Lunar Lake, Dawn's Vulkan backend on these GPUs (the
   package offers no switch), discrete Arc GPUs, other drivers, other models, and
   flutter_edge_ai's Windows GPU library.
+
+A trigger, found 2026-11-08 on the Panther Lake: the 8-token prefill signature `convert`
+added to every decision bundle. google/gemma-3-270m-it, untuned, exported
+by litert-torch-nightly 0.10.0.dev20260926 (`dynamic_wi8_afp32`) in ways that differ only in
+`--prefill_lengths`; 40 short prompts, the first "What is the capital of France? Answer in one
+word.", each in a new Conversation, greedy, 32 tokens at most, then the same 40 in reverse
+order on the same GPU engine. The command kept for the no-flag row ran litert-lm 0.19.1 with
+the GPU at fp32 activations; the commands for the three `--prefill_lengths` rows were not
+kept:
+
+| export | GPU | replies unlike the CPU's, of 40 | empty GPU replies | forward vs reverse order |
+|---|---|---|---|---|
+| `--prefill_lengths=8` | Arc B390 | 30 | 34 | 1 differs |
+| `--prefill_lengths=8,128` (what decisions used) | Arc B390 | 30 | 33 | 3 differ |
+| `--prefill_lengths=128` | Arc B390 | 17 | 4 | 0 |
+| no flag (the exporter's default, 128) | Arc B390 | 17 | 4 | 0 |
+| `--prefill_lengths=8`, `8,128`, or no flag | Apple M5 Pro (Metal) | 14 each | 4 each | 0 |
+
+- 17 and 14 are this model's ordinary GPU-against-CPU wording differences; with a `prefill_8`
+  signature the Arc answered the first prompt ("Paris") and left most later ones empty. The
+  emotion decision bundle above (`8,128`), run with the same prompts (its activation type
+  not recorded), gave 27 replies of 40 unlike the CPU's on 0.19.1 and 35 on
+  `litert-lm-nightly` 0.20.0.dev20261106. Reported as google-ai-edge/LiteRT-LM#4460.
+- So decision bundles are exported with the 128-token signature only from the change that
+  adds this paragraph on; a decision bundle converted by litetune 0.8.2 or earlier carries
+  `prefill_8`, and converting it again drops it. Whether a fine-tuned decision without it
+  agrees with the CPU on an Arc GPU was not measured, nor `prefill_8` on the Arc 140V.
 
 ### A GPU cache built on a software adapter
 

@@ -82,15 +82,19 @@ WRITTEN_TEMPLATE_FLAGS = (COMPOSED_TEMPLATE_FLAG, CANONICAL_OR_COMPOSED_FLAG)
 # recipe's directory can take the name.
 COMPOSED_TEMPLATE_PREFIX = "_litetune-chat-template-"
 
-# A decision checkpoint is exported with a second prefill signature of 8 tokens
-# beside the default 128. Option scoring re-prefills one token per decision,
-# and without a signature that small it ran padded to 128: 142 ms against 23
-# ms per re-prefill, measured 2026-10-16 on LiteRT-LM 0.18.0, with scores
-# bit-identical to the bundle without it on 540 rows and a file 1.3 % larger.
-# `1,128` re-prefilled faster still but prefilled a 64-token prompt in 869 ms
-# against 204 ms.
+# Up to 0.8.2 a decision checkpoint was exported with a second prefill
+# signature of 8 tokens beside the default 128: on LiteRT-LM 0.18.0 option
+# scoring re-prefilled one token per decision (mode `once`), which ran padded to
+# 128 without it -- 142 ms against 23 ms per re-prefill, measured 2026-10-16.
+# On the 0.19 line the #3561 fix leaves nothing to re-prefill (mode `plain`),
+# and with a `prefill_8` signature an Intel Arc B390 under Direct3D 12
+# answered wrong (MEASUREMENTS.md, "Why the decision failed on Intel Arc";
+# google-ai-edge/LiteRT-LM#4460). So only 128 is named: the exporter's own
+# default (`exportable_module_config.py:44`, litert-torch-nightly
+# 0.10.0.dev20260926: `[128]`), kept explicit so a decision bundle keeps the
+# signature it was measured with if that default moves.
 PREFILL_FLAG = "--prefill_lengths"
-DECISION_PREFILL_LENGTHS = "8,128"
+DECISION_PREFILL_LENGTHS = "128"
 CHAT_TEMPLATE_CHECK = "chat template"
 
 KNOWN_RECIPES = (
@@ -502,9 +506,9 @@ class ExportRequest:
         object.__setattr__(self, "output_dir", Path(self.output_dir))
 
         requested = list(self.extra_flags)
-        # A checkpoint that records a decision is scored option by option, and
-        # gets the small prefill signature that scoring needs unless the caller
-        # set the flag. An unreadable record is not read as "no decision": the
+        # A checkpoint that records a decision gets the exporter's 128-token
+        # default named explicitly unless the caller set the flag. An unreadable
+        # record is not read as "no decision": the
         # plan reports it through the base-model identity, as for any record.
         decision = _recorded_decision(self.model)
         prefill_source: str | None = None
@@ -2543,7 +2547,8 @@ def _vision_carried(
             for section, value in sorted(constraints.items())
             if not isinstance(value, str)
             or not (tokens := [part.strip() for part in value.split(",")])
-            # litert-lm-builder 0.18.0's complete Backend enum. Keep this
+            # litert-lm-builder 0.18.0's complete Backend enum
+            # (`litertlm_builder.py:263-269`). Keep this
             # explicit so reading a bundle never silently accepts a future
             # value the pinned builder has not defined for this release.
             or any(

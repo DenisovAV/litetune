@@ -20,8 +20,8 @@ context. LiteRT-LM's `Conversation` renders the whole history again on every
 message after the first, with the resolved `enable_thinking`, the tools and
 any extra context on both renderings, and requires the new rendering to begin
 with the previous one (`Conversation::GetSingleTurnTextFromFullHistory`,
-`runtime/conversation/conversation.cc` v0.18.0, L257-L324: the preface and its
-tools L259-L261, `enable_thinking` L263-L269, the comparison L316-L321); where
+`runtime/conversation/conversation.cc` v0.19.0, L288-L344: `enable_thinking`
+L294-L300, the history L310-L318, and the comparison L326-L343); where
 it does not, the send fails with INTERNAL, "The new rendered template string
 does not start with the previous rendered template string"
 (google-ai-edge/LiteRT-LM#3443). The first message of a conversation takes the
@@ -106,7 +106,7 @@ LIMITATION_PREFIX = "this bundle answers one message"
 # environment, where litetune itself is not installed. Each setting is the
 # runtime's: `create_env` and `MinijinjaTemplate::apply_impl` in
 # `runtime/components/rust/minijinja_template.rs`, `EditTemplateForMinijinja` in
-# `runtime/components/prompt_template.cc` (LiteRT-LM v0.18.0), and for the
+# `runtime/components/prompt_template.cc` (LiteRT-LM v0.19.0, L41-L75), and for the
 # builtins it relies on, MiniJinja 2.14.0 as LiteRT-LM's Bazel build compiles it
 # (`crate_features` without `loop_controls`, so no `{% break %}`), read in
 # `src/filters.rs`, `src/tests.rs` and `src/value/` of that crate.
@@ -143,8 +143,8 @@ MINIJINJA_EDITS = (
     (r"\.strip\(\)", " | trim"),
     (r"\.strip\((.*?)\)", r" | trim(\1)"),
     (r"\.items\(\)", " | items"),
-    (r"{% generation %}", ""),
-    (r"{% endgeneration %}", ""),
+    (r"\{%\s*-?\s*generation\s*-?\s*%\}", ""),
+    (r"\{%\s*-?\s*endgeneration\s*-?\s*%\}", ""),
 )
 
 

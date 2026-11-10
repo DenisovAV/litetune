@@ -328,6 +328,14 @@ class FakeEngine:
         self.conversations: list[dict] = []
         # Prompts whose template fails: the binding renders them as "".
         self.unrenderable: set[str] = set()
+        # From LiteRT-LM 0.19 the same native failure raises RuntimeError.
+        self.render_raises: set[str] = set()
+        # What a template that would not apply raises with on 0.19.1 (`_ffi.py`
+        # `check_status`; LiteRT-LM v0.19.0 `prompt_template.cc`, L144-L146).
+        self.render_error = (
+            "litert_lm_conversation_render_message_to_string failed with status "
+            "INTERNAL (13): Failed to apply template: undefined value"
+        )
 
     def tokenize(self, text: str) -> list[int]:
         return [ord(c) for c in text]
@@ -384,6 +392,8 @@ def _fake_litert_lm(engine: FakeEngine) -> Any:
 
         def render_message_to_string(self, prompt: str) -> str:
             engine.rendered.append(prompt)
+            if prompt in engine.render_raises:
+                raise RuntimeError(engine.render_error)
             return "" if prompt in engine.unrenderable else f"[{prompt}]"
 
         def send_message(self, prompt: str) -> dict:
@@ -473,6 +483,38 @@ def test_a_prompt_the_template_could_not_render_is_not_sent(tmp_path, monkeypatc
     assert engine.sent == ["a", "ccc"]
     assert written[1]["rendered"] == "" and written[1]["prefill_skipped"] is True
     assert "prefill_skipped" not in written[0]
+
+
+def test_a_render_exception_is_one_unrendered_row_and_later_rows_continue(tmp_path, monkeypatch):
+    """LiteRT-LM 0.19 raises for the failure for which 0.18 returned an empty string."""
+    engine = FakeEngine(bos=2)
+    engine.render_raises = {"bb"}
+
+    written = _run_script(
+        _RUNTIME_SCRIPT,
+        tmp_path,
+        monkeypatch,
+        {"litert_lm": _fake_litert_lm(engine)},
+        {"model": "m.litertlm", "prompts": ["a", "bb", "ccc"], "prefill_sample": 3},
+    )
+
+    assert engine.rendered == ["a", "bb", "ccc"]
+    assert engine.sent == ["a", "ccc"]
+    assert written[1]["rendered"] == "" and written[1]["prefill_skipped"] is True
+    error = engine.render_error
+    assert written[1]["render_error"] == error
+    assert written[2]["rendered"] == "[ccc]"
+
+    runtime = [dict(row) for row in written]
+    for row in runtime:
+        if row["prefill_tokens"] is not None:
+            row["prefill_tokens"] = len(row["ids"])
+    reference = [dict(row) for row in runtime]
+    reference[1] = {"index": 1, "ids": [2, 92], "rendered": "reference"}
+    comparison = compare_renderings(["a", "bb", "ccc"], runtime, reference, prefill_sent=2)
+    assert comparison.mismatches[0].render_error == error
+    assert error in comparison.check().detail
+    assert comparison.as_dict()["first_mismatches"][0]["render_error"] == error
 
 
 TOOLS = [{"type": "function", "function": {"name": "open_app", "description": "d"}}]
@@ -1083,3 +1125,44 @@ def test_verify_says_nothing_of_threads_for_a_rendering_check_that_kept_them(wri
 
     result = _verify(write_split, Default(prefill=2))
     assert not any("one thread" in t for t in result.manifest["limitations"])
+
+
+def test_a_render_failure_that_is_not_the_template_ends_the_script(tmp_path, monkeypatch):
+    """Only a template that would not apply is a row's mismatch; any other failed
+    status is the harness's, not the bundle's."""
+    engine = FakeEngine(bos=2)
+    engine.render_raises = {"bb"}
+    engine.render_error = (
+        "litert_lm_conversation_render_message_to_string failed with status "
+        "INVALID_ARGUMENT (3): Message must be a JSON object."
+    )
+    with pytest.raises(RuntimeError, match="INVALID_ARGUMENT"):
+        _run_script(
+            _RUNTIME_SCRIPT,
+            tmp_path,
+            monkeypatch,
+            {"litert_lm": _fake_litert_lm(engine)},
+            {"model": "m.litertlm", "prompts": ["a", "bb", "ccc"], "prefill_sample": 3},
+        )
+    assert engine.rendered == ["a", "bb"]
+
+
+def test_a_render_error_is_a_mismatch_even_where_the_reference_renders_nothing():
+    """The runtime raised: that row was not rendered, whatever the reference made of it."""
+    ours = rows([[2], [2]], rendered="")
+    ours[1]["render_error"] = "INTERNAL (13): Failed to apply template: undefined value"
+    theirs = rows([[2], [2]], rendered="")
+    comparison = compare_renderings(PROMPTS, ours, theirs, prefill_sent=0)
+
+    assert not comparison.agrees
+    [mismatch] = comparison.mismatches
+    assert mismatch.kind == "unrendered" and mismatch.render_error == ours[1]["render_error"]
+
+
+def test_an_empty_rendering_without_an_error_is_described_as_only_that():
+    ours = rows([[2], [2]], rendered="")
+    theirs = rows([[2, 7], [2, 8]])
+    comparison = compare_renderings(PROMPTS, ours, theirs, prefill_sent=0)
+
+    described = comparison.mismatches[0].describe()
+    assert described == "prompt 0: the runtime's rendering is empty and it reported no error"

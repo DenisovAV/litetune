@@ -711,7 +711,7 @@ def test_backend_reports_which_engine_produced_the_numbers(tmp_path):
     described = _litertlm(tmp_path).describe()
     assert described["engine"] == "litert-lm"
     assert described["backend"] == "cpu"
-    assert "litert-lm==0.18.0" in described["requirements"]
+    assert "litert-lm==0.19.1" in described["requirements"]
 
 
 @pytest.mark.parametrize(("platform", "debian"), [("linux", ["libvulkan1"]), ("win32", [])])

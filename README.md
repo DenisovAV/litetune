@@ -290,6 +290,7 @@ not measured. Off such a CPU nothing changes.
 | 0.7.0 – 0.7.2 | `litert-lm==0.18.0` | unchanged | unchanged; EmbeddingGemma 2 trains in an environment of its own: `torch==2.9.1`, `torchvision==0.24.1`, `transformers==5.19.0`, `sentence-transformers==6.1.0`, `pillow==12.3.0`, `tokenizers==0.23.3`, `huggingface-hub==1.33.0`, `safetensors==0.8.0` |
 | 0.7.3 | `litert-lm==0.18.0` | unchanged; `convert --npu` compiles in environments of its own: an EmbeddingGemma 2 encoder with `ai-edge-litert==2.3.0`, `ai-edge-litert-sdk-qualcomm==2.3.0` (its sdist, sha256-pinned), `litert-lm-builder==0.18.0` and `flatbuffers==25.12.19`; an LLM bundle with the conversion pins plus the same SDK and `flatbuffers` | unchanged |
 | 0.8.0 – 0.8.2 | `litert-lm==0.18.0` | unchanged; a Gemma 4 checkpoint tuned on pictures exports with the conversion pins plus `torchvision==0.29.2` | unchanged; a Gemma 4 checkpoint tuned on pictures trains with the training pins plus `torchvision==0.20.1` and `pillow==12.3.0` |
+| main after 0.8.2 | `litert-lm==0.19.1` | unchanged | unchanged |
 
 To reproduce a published number, install the release that took it: every section
 of MEASUREMENTS.md that `verify` produced on litert-lm 0.16.1 was taken with
@@ -556,7 +557,8 @@ conversation with constrained decoding on (`lib/src/ffi/litert_lm_client.dart`),
 so the grammar-on number is its path; releases before core 1.8.4 render
 FunctionGemma's declarations in Dart and are not served the way it is measured.
 `flutter_gemma_litertlm` 1.8.0 ships LiteRT-LM 0.17.1; `flutter_edge_ai_litertlm`
-1.10.0, its renamed successor, ships 0.18.0, the runtime this litetune measures on.
+1.20.0 runs LiteRT-LM 0.19 (its CHANGELOG; the native tag is `native-v0.19.0-a`).
+This litetune verifies on 0.19.1, the patch release, not that same runtime.
 
 **`verify` picks the path from the model, not from a flag.** With declarations
 and a family whose runtime renders them, it asks the runtime for a structured
@@ -655,8 +657,16 @@ What each stage does differently for a decision:
   (`tests/fixtures/decision-contract-v1.json`).
 - **tune** checks every row against `decision.json` and records the decision
   beside the checkpoint, where the later stages read it.
-- **convert** adds `--prefill_lengths=8,128`: scoring re-prefills one token per
-  decision, which ran padded to 128 tokens without it.
+- **convert** names `--prefill_lengths=128`, the exporter's own default, so a
+  decision bundle keeps the signature it was measured with. Up to 0.8.2 it
+  added an 8-token signature because litetune's mode `once` re-prefilled one
+  token on LiteRT-LM 0.18.0; on 0.19, with the #3561 fix, mode `plain` needs no
+  re-prefill. With a `prefill_8` signature an Intel Arc B390 under Direct3D 12
+  answered wrong
+  ([MEASUREMENTS.md](MEASUREMENTS.md#why-the-decision-failed-on-intel-arc),
+  google-ai-edge/LiteRT-LM#4460). A decision bundle converted by litetune 0.8.2
+  or earlier carries that signature; converting it again drops it. Whether a
+  decision without it agrees with the CPU on an Arc GPU was not measured.
 - **verify** scores every option on every calibration and held-out row with the
   float checkpoint, sixteen rows of a similar length at a time (the most
   padded batch is checked row by row first, and falls back to one row at a
@@ -666,9 +676,9 @@ What each stage does differently for a decision:
   another prompt than the reference, a runtime whose answers agree with the
   reference's on fewer than 95 % of rows, a float twin whose per-token scores
   differ by more than 1e-3 nats, and a threshold that answers no in-scope row.
-  LiteRT-LM 0.18.0 scores a prompt without its second-to-last token right after
-  a prefill; a self-check finds out whether the runtime does, and scores
-  accordingly.
+  A self-check still distinguishes the old #3561 behavior: on LiteRT-LM 0.19.1
+  it says `not dropped` and selects mode `plain`; on 0.18.0 it says `dropped`
+  and selects the compatibility mode `once`.
 - **bundle** writes the decision and its calibration into the `.litertlm` as a
   `litetune.decision` section when verify passed or was inconclusive. With any
   other status it bundles the file without the section, taking out one an
@@ -727,8 +737,9 @@ What has and has not been measured:
   gave other answers than its CPU path on 40 prompts, in plain generation too, on
   litert-lm 0.18.0 on both and 0.19.0 on the B390
   ([MEASUREMENTS.md](MEASUREMENTS.md#why-the-decision-failed-on-intel-arc)). It is measured against
-  the float reference on LiteRT-LM 0.18.0 and on one unreleased nightly with the #3561
-  fix only. On a Mac CPU with SME2 it scores on one thread
+  the float reference on LiteRT-LM 0.18.0, on one unreleased nightly with the #3561
+  fix, and in mode `plain` on 0.19.1 only (MEASUREMENTS.md, "On LiteRT-LM
+  0.19.1"). On a Mac CPU with SME2 it scores on one thread
   ([Which runtime each version measures on](#which-runtime-each-version-measures-on)). On another runtime, `verify` needs `--float-twin` to say more than
   "could not check". One phone, a Galaxy S24, scored three bundles on its CPU
   and GPU with a port of verify's runtime scoring: SST-5's agreed with the
@@ -1134,8 +1145,8 @@ litetune towers --model gemma-4-E2B-it.litertlm --drop vision --drop audio \
 ```
 
 A section belongs to a tower by its `section_type` (a TFLite graph or its
-weights) together with a `model_type` from litert-lm-builder 0.18.0's own list
-for that tower; every other section is kept. The new file is read back before it
+weights) together with a `model_type` litetune assigns to that tower, from the
+names litert-lm-builder 0.19.1's `get_all_tflite_model_types()` lists; every other section is kept. The new file is read back before it
 is written to `--output`: every section, the metadata included, byte for byte
 against the section it came from. A file its own header does not fit -- cut
 short, or naming sections outside it or overlapping -- what the builder cannot
@@ -1479,7 +1490,8 @@ incompatible dependencies and cannot share an interpreter.
 ## Results
 
 Every converted-model figure in these tables was taken on litert-lm 0.16.1, the
-runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, and 0.4.0 – 0.7.2 pin 0.18.0.
+runtime litetune 0.1.x pins; 0.2.0 – 0.3.0 pin 0.17.1, 0.4.0 – 0.8.2 pin 0.18.0,
+and main after 0.8.2 pins 0.19.1.
 [MEASUREMENTS.md](MEASUREMENTS.md#which-runtime-a-number-was-taken-on) has the
 0.17.1 re-measurements beside the originals where there are any, and the same
 again on 0.18.0.

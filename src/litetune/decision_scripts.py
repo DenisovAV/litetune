@@ -39,15 +39,14 @@ has what batching changed in time and in the scores.
 session API on the CPU or the GPU, as the flutter_edge_ai design of
 2026-10-16 has its decider do. It renders with
 `Conversation.render_message_to_string`, prefills the prompt, saves a
-checkpoint, and per option scores and rewinds. LiteRT-LM 0.18.0 scores right
-after a prefill without the prompt's second-to-last token (#3561): mode `once`
-prefills the last token again, once per decision, which gives the reference's
-scores on 0.18.0; mode `plain` does not, which is right on an engine with the
-fix and wrong on 0.18.0. The self-check picks between them: two prompts that
-differ only in their second-to-last token score identically on 0.18.0 and
-differently with the fix. Measured 2026-10-16: 0.0 in all 42 comparisons on
-0.18.0, at least 0.135 on a nightly with the fix; each mode within 8.2e-4 nats
-of PyTorch on a float32 bundle, and wrong on the other engine. Those
+checkpoint, and per option scores and rewinds. LiteRT-LM 0.19.1 includes the
+#3561 fix, so its self-check says `not dropped` and selects mode `plain`.
+Mode `once` remains for an older runtime whose self-check says `dropped`:
+0.18.0 scored right after a prefill without the prompt's second-to-last token,
+and prefilling the last token again once per decision restored its scores.
+Measured 2026-10-16: 0.0 in all 42 comparisons on 0.18.0, at least 0.135 on a
+nightly with the fix; each mode within 8.2e-4 nats of PyTorch on a float32
+bundle, and wrong on the other engine. Those
 measurements were Gemma 3's; the self-check's pair is rendered by the bundle's
 own template, which on Gemma 3 is the pair measured.
 
@@ -625,9 +624,13 @@ def main():
 
     def render(engine, prompt):
         with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
-            rendered = conv.render_message_to_string(prompt)
-        # 0.18.0 returns "" when the render fails in C, and "" tokenises to no
-        # ids, which every check below would pass.
+            try:
+                rendered = conv.render_message_to_string(prompt)
+            except RuntimeError as exc:
+                # The 0.19.1 binding raises from `get_checked` (`_ffi.py:1415`,
+                # through `check_status`, L1315-L1344; `conversation.py`, L593-L607).
+                raise RuntimeError(f"the runtime could not render the prompt: {exc}") from exc
+        # An empty successful rendering tokenises to no ids, which every check below would pass.
         if not rendered:
             raise RuntimeError("the runtime rendered the prompt as empty text")
         # As prefill reads the text; the session puts `session_prefix` first.
@@ -691,6 +694,8 @@ def main():
                 c_call(s, "litert_lm_session_rewind_to_checkpoint", b"p")
         return out, (time.perf_counter() - t0) * 1000
 
+    selfcheck_render_error = [None]
+
     def selfcheck_pair(engine):
         """Two prompts of one length that differ only in their second-to-last token, or None.
 
@@ -704,7 +709,13 @@ def main():
         dropped.
         """
         with engine.create_conversation(sampler_config=greedy, max_output_tokens=1) as conv:
-            a = conv.render_message_to_string(SELFCHECK_MESSAGE)
+            try:
+                a = conv.render_message_to_string(SELFCHECK_MESSAGE)
+            except RuntimeError as exc:
+                # The 0.18 binding returned "" for this render failure; it is
+                # the `len(ia) < 2` branch below that returns None.
+                a = ""
+                selfcheck_render_error[0] = str(exc)
         ia = list(engine.tokenize(a)) if a else []
         if len(ia) < 2:
             return None
@@ -798,6 +809,7 @@ def main():
                 "not_finite": len(diffs) - len(finite),
                 "prompt_lengths": checked,
                 "pair": list(pair) if pair else None,
+                "render_error": selfcheck_render_error[0],
             }
             if verdict == "not finite":
                 report["error"] = (
@@ -810,6 +822,8 @@ def main():
                 return 3
             if verdict not in ("dropped", "not dropped"):
                 report["error"] = f"the self-check could not tell the engine apart: {verdict}"
+                if selfcheck_render_error[0] is not None:
+                    report["error"] += f": {selfcheck_render_error[0]}"
                 write_report()
                 return 3
             mode = "once" if verdict == "dropped" else "plain"

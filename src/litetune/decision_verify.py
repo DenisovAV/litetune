@@ -103,8 +103,10 @@ PROBE_ROWS = 4
 AGREEMENT_FLOOR = 0.95
 TWIN_TOLERANCE = 1e-3
 # The runtime the method was measured correct on, against PyTorch, on a float32
-# bundle (2026-10-16). On another, only a float twin shows it still is.
-MEASURED_RUNTIME = "0.18.0"
+# bundle: mode `once` on 0.18.0 (2026-10-16), mode `plain` on 0.19.1
+# (MEASUREMENTS.md, "On LiteRT-LM 0.19.1"). On another, only a float twin shows
+# it still is.
+MEASURED_RUNTIME = "0.19.1"
 
 # Seconds: a start-up allowance, then a budget per row. At 151 options the
 # runtime took 7.2 s a decision on a server CPU; a phone-class CPU is slower.
@@ -134,8 +136,9 @@ THIN_OUT_OF_SCOPE = 10
 NO_TWIN = (
     "no --float-twin was given, so the runtime's per-token scores were not compared with the "
     "reference's on a float32 export of this checkpoint. The method the self-check picked was "
-    "measured within 8.2e-4 nats of PyTorch on LiteRT-LM {runtime} on 2026-10-16; convert with "
-    "--recipe none as well and pass that file to check it on this checkpoint"
+    "measured within 4.2e-5 nats of PyTorch on a Gemma 3 checkpoint's float32 export on "
+    'LiteRT-LM {runtime} (MEASUREMENTS.md, "On LiteRT-LM 0.19.1"); convert with --recipe none '
+    "as well and pass that file to check it on this checkpoint"
 )
 TEMPERATURE_CARRIED = (
     "the temperature and the threshold were fitted on the reference's calibration scores and "
@@ -937,10 +940,10 @@ def verify_decision(
             "Creating an Engine took 1.17 s for a gemma-3-270m bundle on LiteRT-LM 0.18.0 "
             "(2026-10-16); this family's load time is not measured"
         )
-    # The method -- a rewind that resets only the step while the re-prefilled
-    # cell stays (decision_scripts.ENGINE_SCRIPT, mode `once`) -- was measured
-    # against PyTorch on Gemma 3's caches only, on 2026-10-16. On another family
-    # nothing has shown it holds, and a float twin is what shows it.
+    # The rewind method was measured against PyTorch on Gemma 3's caches:
+    # mode `once` on 0.18.0 (2026-10-16), mode `plain` on 0.19.1
+    # (MEASUREMENTS.md, "On LiteRT-LM 0.19.1"). On another family only its own
+    # float twin shows it holds.
     if job.family != DECISION_FAMILY:
         if job.float_twin is None:
             return refuse(
@@ -1456,14 +1459,17 @@ def verify_decision(
             else None
         ),
     }
+    # Mode `once` re-prefills the prompt's last token; `plain` scores right after
+    # the prefill (`decision_scripts`, `decide`).
+    reprefill = ", the re-prefill of mode 'once'" if mode == "once" else ""
     fields["cost"] = {
         "measures": (
-            "per decision: the session's prefill, the re-prefill of mode 'once', and every "
-            "option's scoring; not rendering or tokenising the prompt"
+            f"per decision: the session's prefill{reprefill}, and every option's scoring; "
+            "not rendering or tokenising the prompt"
             if method == METHOD_REWIND
             else "per decision, for every option: an Engine load, a session, the prompt's "
-            "prefill, the re-prefill of mode 'once' and the option's scoring; not rendering "
-            "or tokenising the prompt"
+            f"prefill{reprefill} and the option's scoring; not rendering or tokenising the "
+            "prompt"
         ),
         "method": method,
         "ms_per_decision_median": statistics.median(ms),
@@ -1503,14 +1509,14 @@ def verify_decision(
     # -- the float twin -----------------------------------------------------------------
     runtime_version = (eng.report.get("runtime") or {}).get("litert-lm")
     if job.float_twin is None:
-        if runtime_version == MEASURED_RUNTIME and mode == "once":
+        if runtime_version == MEASURED_RUNTIME and mode == "plain":
             state.limitations.append(NO_TWIN.format(runtime=MEASURED_RUNTIME))
         elif runtime_version == MEASURED_RUNTIME:
             state.add(
                 Check.unchecked(
                     TWIN_CHECK,
                     f"the self-check picked mode {mode!r} on litert-lm {MEASURED_RUNTIME}, where "
-                    "the measured method is 'once', and no --float-twin was given to show which "
+                    "the measured method is 'plain', and no --float-twin was given to show which "
                     "is right on this build",
                 ),
                 events,

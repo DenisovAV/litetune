@@ -1,4 +1,4 @@
-"""MiniJinja as LiteRT-LM v0.18.0 renders with it, for the tests.
+"""MiniJinja as LiteRT-LM v0.19.0 renders with it, for the tests.
 
 MiniJinja 2.14.0 (`Cargo.toml`, `=2.14.0`, the version pinned in this
 project's dev extras), with the settings, functions and filters `create_env`
@@ -17,7 +17,8 @@ import re
 import time
 from typing import Any
 
-# What LiteRT-LM v0.18.0 does to a template before rendering it, in order:
+# What LiteRT-LM v0.19.0 does to a template before rendering it, in order
+# (`runtime/components/prompt_template.cc` at v0.19.0, L41-L75):
 # `EditTemplateForMinijinja` rewrites Python method calls MiniJinja lacks into
 # filters and tests, with RE2's non-greedy `.*?`, which Python's `re` reads the
 # same way.
@@ -36,15 +37,15 @@ MINIJINJA_EDITS = (
     (r"\.strip\(\)", " | trim"),
     (r"\.strip\((.*?)\)", r" | trim(\1)"),
     (r"\.items\(\)", " | items"),
-    (r"{% generation %}", ""),
-    (r"{% endgeneration %}", ""),
+    (r"\{%\s*-?\s*generation\s*-?\s*%\}", ""),
+    (r"\{%\s*-?\s*endgeneration\s*-?\s*%\}", ""),
 )
 
 
 def minijinja_render(
     source: str, messages: list[dict], add_generation_prompt: bool = True, **context: Any
 ) -> str:
-    """Render as LiteRT-LM v0.18.0 does; `context` is what `extra_context` adds.
+    """Render as LiteRT-LM v0.19.0 does; `context` is what `extra_context` adds.
 
     Not its `none` test, which the runtime makes true only for an undefined
     value: the Python binding hands a test `None` for both undefined and null,

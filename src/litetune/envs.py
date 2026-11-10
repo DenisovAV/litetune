@@ -3738,12 +3738,12 @@ def _macos_cpu_detail(probe: DeviceProbe) -> str:
 RUNTIME = StageEnv(
     name="runtime",
     requirements=(
-        # 0.18.0, the runtime flutter_edge_ai_litertlm 1.10.0 ships (its
-        # CHANGELOG: "LiteRT-LM v0.18.0 (`native-v0.18.0-a`)"). Runtimes are not
+        # 0.19.1, the patch release on the line flutter_edge_ai_litertlm 1.20.0
+        # runs (`native-v0.19.0-a`). Runtimes are not
         # assumed to reproduce each other's answers -- 0.17.1 did not reproduce
         # 0.16.1's (MEASUREMENTS.md, "Which runtime a number was taken on") --
         # so every number records the one it ran on.
-        "litert-lm==0.18.0",
+        "litert-lm==0.19.1",
         "numpy==2.0.2",  # last of the 2.0 line; `<2.1` is a bound, not a pin
     ),
     # litert-lm dlopen()s a native library that links vulkan unconditionally,
@@ -3752,6 +3752,10 @@ RUNTIME = StageEnv(
     system_requirements=("libvulkan1",),
 )
 
+# Keep conversion on the 0.10/0.18 line while RUNTIME moves to 0.19.1: a
+# Qwen3.5 bundle exported by litert-torch-nightly 0.11.0.dev20261107 does not
+# load on litert-lm 0.19.1 (it loads on litert-lm-nightly 0.20.0.dev20261107), while bundles
+# exported by this set load on 0.19.1 (MEASUREMENTS.md, "On LiteRT-LM 0.19.1").
 EXPORT = StageEnv(
     name="export",
     requirements=(

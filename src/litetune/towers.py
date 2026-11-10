@@ -12,8 +12,8 @@ only sends text ships the difference for nothing.
 **Sections are chosen by type, from an allowlist, and nothing else.** A section
 belongs to a tower when its `section_type` is `TFLiteModel` or `TFLiteWeights` (a
 graph and its externalized weights) *and* its `model_type` is one this module
-names for that tower -- values from litert-lm-builder 0.18.0's `TfLiteModelType`
-(`litertlm_builder.py:211-232`); the script refuses a builder whose list differs
+names for that tower -- values from litert-lm-builder 0.19.1's
+`get_all_tflite_model_types()`; the script refuses a builder whose list differs
 from that one in either direction. A `section_type` alone would match the text
 model too. Any other section is kept.
 
@@ -67,8 +67,8 @@ field the builder's proto does not declare (Google's E2B metadata carries one,
 `gemma4` field 13). Not checked: other strings in the metadata, the template
 included.
 
-**It runs in the runtime environment**, not the export one: `litert-lm==0.18.0`
-requires `litert-lm-builder==0.18.0`, so `envs.RUNTIME` already carries the
+**It runs in the runtime environment**, not the export one: `litert-lm==0.19.1`
+requires `litert-lm-builder==0.19.1`, so `envs.RUNTIME` already carries the
 builder, and the export environment would add a converter this never calls. The
 scratch directory beside the output holds, at its fullest, the unpacked bundle
 and the result for a drop -- about the bundle's size plus the result's -- and the
@@ -100,14 +100,23 @@ logger = logging.getLogger(__name__)
 
 TOWERS_SCHEMA = "litetune.towers/1"
 
-# `TfLiteModelType` in litert-lm-builder 0.18.0 (`litertlm_builder.py:211-232`),
-# without its `tf_lite_` prefix, which `unpack` leaves off and older bundles keep.
-# The script refuses a builder whose list is not exactly this one.
+# `get_all_tflite_model_types()` in litert-lm-builder 0.19.1, which returns the
+# TF-free names across its per-capability proto enums. The script refuses a
+# builder whose list is not exactly this one.
 BUILDER_TYPES: tuple[str, ...] = (
-    "prefill_decode", "embedder", "per_layer_embedder", "aux",
-    "audio_frontend", "audio_encoder_hw", "audio_adapter", "end_of_audio",
-    "vision_encoder", "vision_adapter", "end_of_vision",
-    "artisan_text_decoder", "mtp_drafter", "mtp_aux", "text_encoder",
+    "acoustic", "artisan_text_decoder", "audio_adapter", "audio_encoder",
+    "audio_encoder_hw", "audio_frontend", "audio_vocoder", "aux", "codec_decoder",
+    "codec_embedding", "diffusion_transformer_double_block_0",
+    "diffusion_transformer_double_block_1", "diffusion_transformer_final",
+    "diffusion_transformer_initial", "diffusion_transformer_single_block_0",
+    "diffusion_transformer_single_block_1", "diffusion_transformer_single_block_2",
+    "diffusion_transformer_single_block_3", "embedder", "encoder_decoder",
+    "end_of_audio", "end_of_vision", "image_decoder", "image_denoiser",
+    "image_encoder", "llm_backbone", "mtp_aux", "mtp_drafter", "mtp_embedding",
+    "per_layer_embedder", "prefill_decode", "talker", "text_decoder", "text_embedder",
+    "text_embedding", "text_encoder", "text_encoder_0", "text_encoder_1",
+    "text_encoder_2", "text_projection", "tts_decoder", "tts_projector",
+    "vision_adapter", "vision_encoder", "vocoder",
 )  # fmt: skip
 
 TOWER_SECTIONS: dict[str, tuple[str, ...]] = {
@@ -230,6 +239,13 @@ def load(path):
 
 def model_type(section):
     return str(section.get("model_type", "")).lower().removeprefix("tf_lite_")
+
+
+def require_model_type(kind, where):
+    """Refuse a TF-free model type the 0.19 builder cannot write back."""
+    value = str(kind).lower().removeprefix("tf_lite_")
+    if value not in lb.get_all_tflite_model_types():
+        raise Refused(f"{where} has model_type {kind!r}, which litert-lm-builder cannot write back")
 
 
 def toml_string(text):
@@ -360,11 +376,7 @@ def spans(path, where):
             keys += [o.Items(j).Key() for j in range(o.ItemsLength())]
             kind = litertlm_peek.get_model_type(o)
             if kind is not None:
-                try:
-                    lb.TfLiteModelType.get_enum_from_tf_free_value(kind)
-                except ValueError:
-                    raise Refused(f"{where}: section {i} has model_type {kind!r}, which "
-                                  "litert-lm-builder cannot write back") from None
+                require_model_type(kind, f"{where}: section {i}")
         bad = [k for k in keys if k is None or not ITEM_KEY.fullmatch(k.decode("utf-8", "replace"))]
         if bad:
             raise Refused(f"{where}: its header has the item key {bad[0]!r}")
@@ -445,13 +457,9 @@ def unpacked(path, directory, where, places):
         )
     for s in listed:
         if s.get("section_type") in GRAPH_TYPES:
-            try:
-                lb.TfLiteModelType.get_enum_from_tf_free_value(str(s.get("model_type", "")))
-            except ValueError:
-                raise Refused(
-                    f"{where} has a {s['section_type']} section of model_type "
-                    f"{s.get('model_type')!r}, which litert-lm-builder cannot write back"
-                ) from None
+            require_model_type(
+                s.get("model_type", ""), f"{where} has a {s['section_type']} section of"
+            )
     for s, place in zip(listed, places, strict=True):
         if s.get("section_type") == "LlmMetadata":
             raw = Path(directory) / RAW_META
@@ -1121,20 +1129,20 @@ def main(spec):
     work = Path(spec["work"])
     builder = importlib.metadata.version("litert-lm-builder")
     try:
-        # The type lists were read from builder 0.18.0. A builder without one of
+        # The type lists were read from builder 0.19.1. A builder without one of
         # its types would leave part of a tower behind; one with a type it lacks
         # may have one these lists do not name.
-        known = {m.value.lower().removeprefix("tf_lite_") for m in lb.TfLiteModelType}
+        known = set(lb.get_all_tflite_model_types())
         expected = set(spec["builder_types"])
         differences = []
         if expected - known:
             differences.append("has no model type " + ", ".join(sorted(expected - known)))
         if known - expected:
-            differences.append("has model types 0.18.0 does not: "
+            differences.append("has model types 0.19.1 does not: "
                                + ", ".join(sorted(known - expected)))
         if differences:
             raise Refused(f"this litert-lm-builder ({builder}) " + " and ".join(differences)
-                          + "; the tower lists were read from 0.18.0's")
+                          + "; the tower lists were read from 0.19.1's")
         result = (add if spec["mode"] == "add" else drop)(spec, work)
     except Refused as exc:
         result = report(reason=str(exc))

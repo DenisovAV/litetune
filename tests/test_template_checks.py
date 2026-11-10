@@ -162,6 +162,18 @@ def test_the_renderer_rewrites_as_the_runtime_does():
     assert _script("renderer")["MINIJINJA_EDITS"] == MINIJINJA_EDITS
 
 
+def test_generation_blocks_with_runtime_whitespace_are_removed_before_rendering():
+    source = (
+        "0{%- generation -%}1{%- endgeneration -%}2"
+        "{% generation %}3{% endgeneration %}4"
+        "{% - generation - %}5{% - endgeneration - %}6"
+        "{% generation - %}7{% endgeneration - %}8"
+    )
+
+    assert _render(source, [], True) == {"text": "012345678"}
+    assert minijinja_render_native(source, [], True) == "012345678"
+
+
 # Each name the renderer vouches for, with what it does to values that are not
 # strings -- booleans, none, numbers, lists, maps, undefined -- where Jinja2,
 # left to itself, coerces as Python prints and MiniJinja as Rust does. Every

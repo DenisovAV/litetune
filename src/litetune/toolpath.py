@@ -15,13 +15,14 @@ that, and each of them is the reason for a piece of this module:
 writes a call the runtime cannot read is a model that fails for an application.
 The transformers reference produces text and nothing else, and `verify` reads
 it with `metrics.runtime_calls`, which follows the runtime's reading of a reply.
-The runtime's Python binding reports every failed reply as one
-`RuntimeError("litert_lm_conversation_send_message failed")` (`conversation.py`,
-v0.17.1 and v0.18.0) and writes the reason to its log, so the script reads the log around
-each reply to record the reason with the row.
+In 0.19.1 the binding calls `create_checked` from `conversation.py:416-423`, so
+`_ffi.py:1315-1344` raises `RuntimeError("litert_lm_conversation_send_message
+failed with status <NAME> (<n>): <last error>")`: the reason is in the exception
+as well as the native log. The last error may carry the model's response, so the
+script classifies the log around each reply and never stores that exception text.
 
 **Constrained decoding is a choice the caller makes, and both are measured.**
-LiteRT-LM v0.17.1 and v0.18.0 leave it off unless the caller enables it
+LiteRT-LM v0.17.1 through v0.19.1 leave it off unless the caller enables it
 (`ConstrainedDecodingConfig(enable=True)`; the binding sets nothing otherwise),
 so the unconstrained number is what an application gets by default. With it on
 the runtime holds the model to the declared grammar -- which can carry a model
@@ -112,10 +113,12 @@ from pathlib import Path
     + RUNTIME_ENGINE_SOURCE
     + r'''
 
-# The binding's one signal that the runtime gave no reply (`conversation.py`,
-# litert-lm 0.17.1 and 0.18.0). Anything else `send_message` raises is not an answer from
-# the model -- an API change, memory, a closed conversation -- and ends the run
-# as a harness failure rather than being scored, in either decoding mode.
+# The substring in 0.19.1's status-bearing exception when the runtime gave no
+# reply (`conversation.py:416-423`, `_ffi.py:1315-1344`). The last error is in
+# that exception too, but may carry the model's response, so it is not stored.
+# Anything else `send_message` raises is not an answer from the model -- an API
+# change, memory, a closed conversation -- and ends the run as a harness failure
+# rather than being scored, in either decoding mode.
 NO_REPLY = "send_message failed"
 
 # absl's line prefix: severity, date, time, thread, file:line].
@@ -140,7 +143,7 @@ def tokenizer_sections(path):
 
     Read for the grammar: LiteRT-LM builds its constraint only from a
     SentencePiece tokenizer, and where there is none v0.16.1 refused the
-    conversation while v0.17.1 and v0.18.0 log a warning and decode unconstrained
+    conversation while v0.17.1 through v0.19.1 log a warning and decode unconstrained
     (`gemma3_data_processor.cc`, `function_gemma_data_processor.cc`). Raises
     when the header cannot be read.
     """
@@ -231,10 +234,11 @@ def calls_of(reply):
 def logged(action, log_path, row, mark):
     """Run `action` with file descriptor 2 appended to `log_path`.
 
-    Returns (reply, no-reply exception, what the runtime logged). The binding
-    raises one generic `RuntimeError` for any failed reply and the runtime
-    writes the reason to file descriptor 2, so the descriptor itself is
-    redirected -- `sys.stderr` is not where native code writes. Into a file the
+    Returns (reply, no-reply exception, what the runtime logged). LiteRT-LM
+    0.19.1 includes the last error in its exception (`conversation.py:416-423`,
+    `_ffi.py:1315-1344`), but that text may include the model's response and is
+    not stored. The descriptor is redirected because `sys.stderr` is not where
+    native code writes. Into a file the
     parent can read, not a temporary one: if native code aborts mid-call, the
     reason it wrote would otherwise vanish with the process. The reply's lines
     sit between its two marks, so the parent can tell them from the others.
@@ -269,8 +273,10 @@ def reason_of(log, quote=True):
 
     A parse failure's message carries the model's code block and full response
     (`parser_utils.cc`), and that must not travel into a manifest a bundle
-    ships, so a parse failure is its kind alone. The two kinds are told apart
-    by the runtime's own sentences, both in `liblitert-lm` 0.18.0 as in 0.17.1
+    ships, so a parse failure is its kind alone. In 0.19.1 the exception carries
+    the same last error (`_ffi.py:1315-1344`), so this deliberately classifies
+    the captured log instead. The two kinds are told apart by the runtime's own
+    sentences, in `liblitert-lm` 0.17.1 through 0.19.1
     (`parser_utils.cc`, `tasks.cc`). Any other reason is the runtime's last
     error line, or its last line -- only where `quote` says the runtime is
     the version those sentences were read from: on another, a parse failure
@@ -718,7 +724,7 @@ def _refuse_a_mode_with_unread_reasons(rows: list[ToolPathRow]) -> None:
 # constrained decoding is off unless the caller enables it -- and whose log
 # sentences `reason_of` reads a missing reply's kind from. `verify` says when a
 # run used another.
-GRAMMAR_OFF_BY_DEFAULT_IN = "0.18.0"
+GRAMMAR_OFF_BY_DEFAULT_IN = "0.19.1"
 
 DISAGREEING_MODES = (
     "the two decoding modes did not agree: {constrained:.4f} with the runtime's grammar on and "
