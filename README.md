@@ -557,7 +557,7 @@ conversation with constrained decoding on (`lib/src/ffi/litert_lm_client.dart`),
 so the grammar-on number is its path; releases before core 1.8.4 render
 FunctionGemma's declarations in Dart and are not served the way it is measured.
 `flutter_gemma_litertlm` 1.8.0 ships LiteRT-LM 0.17.1; `flutter_edge_ai_litertlm`
-1.20.0 runs LiteRT-LM 0.19.0 (`native-v0.19.0-a`, in that package's CHANGELOG).
+1.20.0 runs LiteRT-LM 0.19 (its CHANGELOG; the native tag is `native-v0.19.0-a`).
 This litetune verifies on 0.19.1, the patch release, not that same runtime.
 
 **`verify` picks the path from the model, not from a flag.** With declarations
@@ -1145,9 +1145,8 @@ litetune towers --model gemma-4-E2B-it.litertlm --drop vision --drop audio \
 ```
 
 A section belongs to a tower by its `section_type` (a TFLite graph or its
-weights) together with a `model_type` from litert-lm-builder 0.19.1's
-`get_all_tflite_model_types()` list
-for that tower; every other section is kept. The new file is read back before it
+weights) together with a `model_type` litetune assigns to that tower, from the
+names litert-lm-builder 0.19.1's `get_all_tflite_model_types()` lists; every other section is kept. The new file is read back before it
 is written to `--output`: every section, the metadata included, byte for byte
 against the section it came from. A file its own header does not fit -- cut
 short, or naming sections outside it or overlapping -- what the builder cannot

@@ -401,3 +401,12 @@ def test_a_marker_is_read_for_the_python_asked_about():
     assert wheels.applies('x==1; python_version >= "3.13"', asked)
     assert not wheels.applies('x==1; python_version < "3.13"', asked)
     assert wheels.applies("x==1", asked), "no marker applies everywhere"
+
+
+def test_the_runtime_brings_the_builder_towers_runs_with():
+    """towers runs in envs.RUNTIME and imports litert-lm-builder from it; it is there
+    only because litert-lm 0.19.1 requires that exact version."""
+    [runtime] = [r for r in envs.RUNTIME.requirements if r.startswith("litert-lm==")]
+    record = next(r for r in PUBLISHED.values() if r.requirement == runtime)
+    version = runtime.split("==", 1)[1]
+    assert f"litert-lm-builder=={version}" in record.requires

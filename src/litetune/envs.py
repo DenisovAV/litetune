@@ -3754,7 +3754,7 @@ RUNTIME = StageEnv(
 
 # Keep conversion on the 0.10/0.18 line while RUNTIME moves to 0.19.1: a
 # Qwen3.5 bundle exported by litert-torch-nightly 0.11.0.dev20261107 does not
-# load on litert-lm 0.19.1 (it does on 0.20.0.dev20261107), while bundles
+# load on litert-lm 0.19.1 (it loads on litert-lm-nightly 0.20.0.dev20261107), while bundles
 # exported by this set load on 0.19.1 (MEASUREMENTS.md, "On LiteRT-LM 0.19.1").
 EXPORT = StageEnv(
     name="export",

@@ -116,6 +116,9 @@ import json
 import sys
 from pathlib import Path
 
+# What a template that would not apply raises with (see where it is caught).
+TEMPLATE_FAILURE = "Failed to apply template: "
+
 
 '''
 
@@ -243,11 +246,15 @@ def main():
                 try:
                     rendered = renderer.render_message_to_string(message)
                 except RuntimeError as exc:
-                    # The 0.19.1 binding checks this call through `get_checked`
-                    # (`conversation.py`, L593-L607; `_ffi.py`, L1315-L1344).
-                    # Keep a template failure as this row's `unrendered`
-                    # mismatch instead of ending the script, and keep the
-                    # native reason with it.
+                    # The 0.19.1 binding raises from `get_checked` (`_ffi.py:1415`,
+                    # through `check_status`, L1315-L1344) on any failed status
+                    # (`conversation.py`, L593-L607). Only a template that would
+                    # not apply is this row's `unrendered` mismatch: its status is
+                    # INTERNAL with "Failed to apply template: " (LiteRT-LM v0.19.0
+                    # `runtime/components/prompt_template.cc`, L144-L146). Any
+                    # other failure is the harness's and ends the script.
+                    if TEMPLATE_FAILURE not in str(exc):
+                        raise
                     rendered = ""
                     render_error = str(exc)
                 rows.append(
@@ -367,7 +374,7 @@ class RenderingMismatch:
                     f"prompt {self.index}: the runtime could not render the prompt: "
                     f"{self.render_error}"
                 )
-            return f"prompt {self.index}: the runtime successfully rendered empty text"
+            return f"prompt {self.index}: the runtime's rendering is empty and it reported no error"
         missing = (
             "; the runtime's rendering does not contain the prompt's text"
             if self.prompt_missing

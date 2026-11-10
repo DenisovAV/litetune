@@ -137,8 +137,8 @@ NO_TWIN = (
     "no --float-twin was given, so the runtime's per-token scores were not compared with the "
     "reference's on a float32 export of this checkpoint. The method the self-check picked was "
     "measured within 4.2e-5 nats of PyTorch on a Gemma 3 checkpoint's float32 export on "
-    "LiteRT-LM {runtime} on 2026-11-08; convert with --recipe none as well and pass that file "
-    "to check it on this checkpoint"
+    'LiteRT-LM {runtime} (MEASUREMENTS.md, "On LiteRT-LM 0.19.1"); convert with --recipe none '
+    "as well and pass that file to check it on this checkpoint"
 )
 TEMPERATURE_CARRIED = (
     "the temperature and the threshold were fitted on the reference's calibration scores and "
@@ -1459,14 +1459,17 @@ def verify_decision(
             else None
         ),
     }
+    # Mode `once` re-prefills the prompt's last token; `plain` scores right after
+    # the prefill (`decision_scripts`, `decide`).
+    reprefill = ", the re-prefill of mode 'once'" if mode == "once" else ""
     fields["cost"] = {
         "measures": (
-            "per decision: the session's prefill, the re-prefill of mode 'once', and every "
-            "option's scoring; not rendering or tokenising the prompt"
+            f"per decision: the session's prefill{reprefill}, and every option's scoring; "
+            "not rendering or tokenising the prompt"
             if method == METHOD_REWIND
             else "per decision, for every option: an Engine load, a session, the prompt's "
-            "prefill, the re-prefill of mode 'once' and the option's scoring; not rendering "
-            "or tokenising the prompt"
+            f"prefill{reprefill} and the option's scoring; not rendering or tokenising the "
+            "prompt"
         ),
         "method": method,
         "ms_per_decision_median": statistics.median(ms),

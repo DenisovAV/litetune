@@ -27,6 +27,7 @@ from litetune.decision_section import payload_bytes
 from litetune.decision_verify import (
     AGREEMENT_CHECK,
     CALIBRATION_CHECK,
+    MEASURED_RUNTIME,
     MPS_ROW_BATCH,
     PROBE_ROWS,
     PROMPT_CHECK,
@@ -1043,6 +1044,8 @@ def test_a_family_that_needs_an_engine_per_prompt_is_scored_on_fresh_engines(spl
     assert fields["decision"]["section"]["payload"]["method"] == "fresh_engine"
     assert fields["cost"]["method"] == "fresh_engine"
     assert "for every option: an Engine load" in fields["cost"]["measures"]
+    # Mode `plain` (the fake's) re-prefills nothing, so the cost does not say it does.
+    assert "re-prefill" not in fields["cost"]["measures"]
     said = [t for t in fields["limitations"] if "state survives a rewind" in t]
     assert len(said) == 1 and "an Engine load per option per decision" in said[0]
 
@@ -1476,7 +1479,7 @@ class _Conversation:
         if raises == "1" or raises == prompt:
             raise RuntimeError(
                 "litert_lm_conversation_render_message_to_string failed with status "
-                "INTERNAL (13): failed to apply template"
+                "INTERNAL (13): Failed to apply template: undefined value"
             )
         before, after = _TEMPLATES[os.environ.get("FAKE_TEMPLATE", "gemma")]
         return before + prompt + after
@@ -1970,6 +1973,7 @@ def test_once_on_the_measured_runtime_without_a_twin_is_not_called_correct(split
 
     assert status == "inconclusive"
     assert "the measured method is 'plain'" in check(fields, TWIN_CHECK)["detail"]
+    assert "the re-prefill of mode 'once'" in fields["cost"]["measures"]
 
 
 def test_the_reference_checks_its_longest_row_against_the_uncached_scores(split, tmp_path):
@@ -2735,7 +2739,7 @@ def test_a_render_exception_is_no_comparisons_and_a_harness_failure(tmp_path):
     assert report["selfcheck"]["pair"] is None and rows == []
     assert report["selfcheck"]["render_error"] == (
         "litert_lm_conversation_render_message_to_string failed with status "
-        "INTERNAL (13): failed to apply template"
+        "INTERNAL (13): Failed to apply template: undefined value"
     )
     assert report["selfcheck"]["render_error"] in report["error"]
     assert "Traceback" not in proc.stderr
@@ -2757,7 +2761,7 @@ def test_a_row_render_exception_keeps_its_reason_and_later_rows_score(tmp_path):
     assert rows[1]["error"] == (
         "the runtime could not render the prompt: "
         "litert_lm_conversation_render_message_to_string failed with status "
-        "INTERNAL (13): failed to apply template"
+        "INTERNAL (13): Failed to apply template: undefined value"
     )
     assert "token_scores" in rows[0]
     assert "token_scores" in rows[2]
@@ -4178,3 +4182,9 @@ def test_each_runs_unbound_reason_is_kept_and_the_runs_reason_names_it(
     assert notes[0] is None and "nvidia-smi lists 2 GPUs" in notes[1]
     assert any(t.startswith("run 2: the runtime selected NVIDIA L4") for t in fields["limitations"])
     assert engine["backend_observed"] is False and engine["gpu_evidence"] is None
+
+
+def test_the_measured_runtime_is_the_one_verify_pins():
+    """The twin limitation and check name MEASURED_RUNTIME as the runtime the method
+    was measured on; verify must run that runtime for those words to hold."""
+    assert f"litert-lm=={MEASURED_RUNTIME}" in envs.RUNTIME.requirements

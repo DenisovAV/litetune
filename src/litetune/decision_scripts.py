@@ -627,8 +627,8 @@ def main():
             try:
                 rendered = conv.render_message_to_string(prompt)
             except RuntimeError as exc:
-                # The 0.19.1 binding raises through `get_checked`
-                # (`conversation.py`, L593-L607; `_ffi.py`, L1315-L1344).
+                # The 0.19.1 binding raises from `get_checked` (`_ffi.py:1415`,
+                # through `check_status`, L1315-L1344; `conversation.py`, L593-L607).
                 raise RuntimeError(f"the runtime could not render the prompt: {exc}") from exc
         # An empty successful rendering tokenises to no ids, which every check below would pass.
         if not rendered:
