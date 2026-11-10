@@ -3,6 +3,11 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.9.0 — 2026-11-10
+- Running a decision bundle on an Intel Arc GPU? Convert it again: up to 0.8.2 decision bundles carry a `prefill_8` signature on which an Arc B390 answered wrong (#125).
+- `verify` runs on LiteRT-LM 0.19.1; conversion keeps 0.8.2's export set, and every family measured gave 0.18.0's numbers (#125).
+- Decisions score right after the prefill on 0.19.1 (mode `plain`), and `convert` names `--prefill_lengths=128` only (#125).
+
 ## 0.8.2 — 2026-11-08
 - `verify` of a Gemma 4 picture bundle on the CPU, the default backend, ended `failed_harness` in 0.8.1; it runs again (#123).
 
