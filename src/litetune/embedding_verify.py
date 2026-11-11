@@ -9,7 +9,8 @@ the measurement this path rests on measured it
 (MEASUREMENTS.md, "EmbeddingGemma 2: many labels"):
 
 - **the reference**, the fine-tune in float32 through sentence-transformers on
-  the CPU, prompt `PROMPT_NAME`, normalised (`REFERENCE_SCRIPT`, in
+  the device tune would use (the environment's probe, or `LITETUNE_DEVICE`;
+  TF32 off on CUDA), prompt `PROMPT_NAME`, normalised (`REFERENCE_SCRIPT`, in
   `envs.EMBED_TRAIN`);
 - **the candidate**, the `.litertlm`, through LiteRT-LM's `EmbeddingEngine` on
   the CPU backend, `DECIDER_PREFIX` + the text, normalised (`ENGINE_SCRIPT`, in
@@ -275,10 +276,9 @@ SIDE_BY_SIDE = (
     "the candidate and Google's file were embedded at the same time, each on its own {threads}; "
     "each file's time per input was measured with the other running"
 )
-REFERENCE_ON_CPU = (
-    "the reference ran on the CPU in float32 through sentence-transformers, whatever "
-    "LITETUNE_DEVICE says"
-)
+DEVICE_WORDS = {"cpu": "the CPU", "cuda": "CUDA (TF32 off)", "mps": "MPS"}
+# {device}: "the CPU", or "CUDA (TF32 off)" / "MPS", from the reference's report.
+REFERENCE_ON = "the reference ran on {device} in float32 through sentence-transformers"
 
 # -- a checkpoint tuned on images ------------------------------------------------
 SCORER_MEANS_IMAGES = (
@@ -300,8 +300,8 @@ IMAGE_GPU_MEASURED = (
     "on one Mac (MEASUREMENTS.md, \"The same int8 file on a Mac's CPU and GPU, and on "
     'Windows"); not with the vision encoder on a Windows or Linux GPU. ' + GPU_PRECISION
 )
-IMAGE_REFERENCE_ON_CPU = (
-    "the reference ran on the CPU in float32 through transformers, whatever LITETUNE_DEVICE says: "
+IMAGE_REFERENCE_ON = (
+    "the reference ran on {device} in float32 through transformers: "
     "the checkpoint with its vision tower and its own processor, each image the processor's "
     "input at a budget of at most {vision_tokens} soft tokens, the mean over every token, "
     "L2-normalised"
@@ -405,7 +405,7 @@ class EmbeddingVerify:
 # ---------------------------------------------------------------------------
 
 REFERENCE_SCRIPT = r'''
-"""Embed texts with a fine-tuned EmbeddingGemma 2: sentence-transformers, float32, CPU.
+"""Embed texts with a fine-tuned EmbeddingGemma 2: sentence-transformers, float32, spec["device"].
 
 Reads JSON {model, prompt_name, prefix, texts, threads, batch_size, out, report}
 from argv[1]. Writes the L2-normalised vectors, float32, one row per text, to
@@ -428,6 +428,19 @@ import time
 from pathlib import Path
 
 REFUSED_EXIT = 3
+# Pictures per language-model pass on an accelerator; the CPU takes one at a time.
+REFERENCE_IMAGE_BATCH = 32
+
+
+def reference_device(torch, given):
+    """The device verify resolved (the probe, or LITETUNE_DEVICE); without an
+    answer, CUDA if any, else the CPU. Float32 throughout: TF32 is turned off on
+    CUDA, where torch would otherwise round matrix products to it."""
+    device = given or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    return device
 
 
 def unusable_rows(np, v):
@@ -458,10 +471,11 @@ def main():
     from sentence_transformers import SentenceTransformer
 
     torch.set_num_threads(spec["threads"])
+    device = reference_device(torch, spec.get("device"))
     started = time.time()
     st = SentenceTransformer(
         spec["model"],
-        device="cpu",
+        device=device,
         model_kwargs={"dtype": torch.float32},
         config_kwargs={"vision_config": None, "audio_config": None},
     )
@@ -494,7 +508,7 @@ def main():
         "rows": int(v.shape[0]),
         "dim": int(v.shape[1]),
         "seconds": round(time.time() - started, 1),
-        "device": "cpu",
+        "device": device,
         "dtype": "float32",
         "threads": torch.get_num_threads(),
         "max_seq_length": limit,
@@ -675,7 +689,8 @@ def picture_bytes(path, expected):
 
 IMAGE_REFERENCE_SCRIPT = (
     r'''
-"""Embed images with an EmbeddingGemma 2 checkpoint tuned on images: transformers, float32, CPU.
+"""Embed images with an EmbeddingGemma 2 checkpoint tuned on images: transformers, float32,
+on spec["device"] (`reference_device`).
 
 Reads JSON {model, processor, images, image_sha256, image_text, vision_tokens,
 threads, out, report} from argv[1]. The model is loaded from `model` with its
@@ -701,6 +716,19 @@ import time
 from pathlib import Path
 
 REFUSED_EXIT = 3
+# Pictures per language-model pass on an accelerator; the CPU takes one at a time.
+REFERENCE_IMAGE_BATCH = 32
+
+
+def reference_device(torch, given):
+    """The device verify resolved (the probe, or LITETUNE_DEVICE); without an
+    answer, CUDA if any, else the CPU. Float32 throughout: TF32 is turned off on
+    CUDA, where torch would otherwise round matrix products to it."""
+    device = given or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    return device
 
 
 def unusable_rows(np, v):
@@ -724,16 +752,36 @@ def main():
 
     strict_pillow(Image)
     torch.set_num_threads(spec["threads"])
+    device = reference_device(torch, spec.get("device"))
     started = time.time()
     config = AutoConfig.from_pretrained(spec["model"])
     config.audio_config = None
-    model = AutoModel.from_pretrained(spec["model"], config=config, dtype=torch.float32).eval()
+    model = AutoModel.from_pretrained(spec["model"], config=config, dtype=torch.float32)
+    model = model.to(device).eval()
     processor = AutoProcessor.from_pretrained(spec["processor"])
     images = json.loads(Path(spec["images"]).read_text(encoding="utf-8"))
     if (problem := digests_problem(images, spec["image_sha256"])) is not None:
         report.write_text(json.dumps({"error": problem}), encoding="utf-8")
         return REFUSED_EXIT
     rows, soft, tokens = [], [], []
+    # On the CPU one picture at a time, as every earlier measurement ran; on an
+    # accelerator `batch` pictures at once, padded and masked out of the mean.
+    batch = 1 if device == "cpu" else REFERENCE_IMAGE_BATCH
+    pending = []
+
+    def flush():
+        width = max(e.shape[1] for e in pending)
+        embeds = torch.zeros(len(pending), width, pending[0].shape[2], device=device)
+        mask = torch.zeros(len(pending), width, dtype=torch.long, device=device)
+        for i, e in enumerate(pending):
+            embeds[i, : e.shape[1]] = e[0]
+            mask[i, : e.shape[1]] = 1
+        state = model.language_model(
+            inputs_embeds=embeds, attention_mask=mask, return_dict=True
+        ).last_hidden_state
+        rows.extend(masked_mean(state, mask).cpu().numpy().astype(np.float64))
+        pending.clear()
+
     with torch.no_grad():
         for path, expected in zip(images, spec["image_sha256"]):
             data, problem = picture_bytes(path, expected)
@@ -742,15 +790,15 @@ def main():
                 return REFUSED_EXIT
             picture = picture_of(Image, ImageOps, data, False)
             embeds, n = image_input(
-                torch, model, processor, picture, spec["image_text"], spec["vision_tokens"], "cpu"
+                torch, model, processor, picture, spec["image_text"], spec["vision_tokens"], device
             )
-            mask = torch.ones(embeds.shape[:2], dtype=torch.long)
-            state = model.language_model(
-                inputs_embeds=embeds, attention_mask=mask, return_dict=True
-            ).last_hidden_state
-            rows.append(masked_mean(state, mask)[0].numpy().astype(np.float64))
+            pending.append(embeds)
             soft.append(n)
             tokens.append(int(embeds.shape[1]))
+            if len(pending) == batch:
+                flush()
+        if pending:
+            flush()
     raw = np.stack(rows) if rows else np.zeros((0, 0))
     bad = unusable_rows(np, raw)
     if len(bad):
@@ -764,7 +812,7 @@ def main():
         "rows": int(v.shape[0]),
         "dim": int(v.shape[1]),
         "seconds": round(time.time() - started, 1),
-        "device": "cpu",
+        "device": device,
         "dtype": "float32",
         "threads": torch.get_num_threads(),
         "vision_tokens": spec["vision_tokens"],
@@ -2363,6 +2411,16 @@ def verify_embedding(
             )
             return None
 
+        # The reference's device as tune's: the environment's own torch, or
+        # LITETUNE_DEVICE; the script asks torch itself when neither answers.
+        try:
+            setting = devices.device_setting(os.environ)
+        except devices.DeviceSettingError as exc:
+            return refuse(REFERENCE_CHECK, str(exc))
+        probe = devices.apply_device_setting(
+            envs.resolve_device(job.train_env, events=events), setting
+        )
+        fields["embedding"]["reference_device_probe"] = probe.as_dict()
         events.note(f"embedding {len(inputs)} {kind}: reference", env=job.train_env.name)
         if images:
             # The check before the rows refuses early; this one ties the files
@@ -2386,6 +2444,7 @@ def verify_embedding(
                 "model": job.reference,
                 "processor": str(processor_dir),
                 "image_text": IMAGE_TOKEN_TEXT,
+                "device": probe.device,
                 "out": str(work / "reference.npy"),
             }
         else:
@@ -2394,6 +2453,7 @@ def verify_embedding(
                 "model": job.reference,
                 "prompt_name": record.prompt_name,
                 "batch_size": REFERENCE_BATCH,
+                "device": probe.device,
                 "out": str(work / "reference.npy"),
             }
         reference_run = run_script(
@@ -2422,6 +2482,8 @@ def verify_embedding(
             fields["embedding"]["soft_tokens"] = compared.as_dict()
         if (problem := accept("reference", REFERENCE_CHECK, reference_run)) is not None:
             return refuse(REFERENCE_CHECK, problem)
+        reference_on = str(reference_run.report.get("device"))
+        fields["embedding"]["reference_device"] = reference_on
 
         names = " and ".join(name for name, _ in engine_sides)
         how = ", side by side" if parallel else ""
@@ -2615,9 +2677,10 @@ def verify_embedding(
         state.limitation(SIDE_BY_SIDE.format(threads=_threads_text(engine_threads)))
     state.limitation(FITTED_ON_EXAMPLES.format(ks=" and ".join(f"k={k}" for k in KS), draws=DRAWS))
     state.limitation(
-        IMAGE_REFERENCE_ON_CPU.format(vision_tokens=record.vision_tokens)
-        if images
-        else REFERENCE_ON_CPU
+        (IMAGE_REFERENCE_ON if images else REFERENCE_ON).format(
+            device=DEVICE_WORDS.get(reference_on, reference_on),
+            vision_tokens=record.vision_tokens,
+        )
     )
     state.limitation(LINEAR_NOT_GATED)
     state.limitation(IMAGE_DESCRIPTIONS_UNUSED if images else DESCRIPTIONS_UNUSED)

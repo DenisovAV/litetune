@@ -53,6 +53,7 @@ from litetune.embedding_verify import (
     EVAL_SCRIPT,
     GATE_CHECK,
     GATED_K,
+    IMAGE_REFERENCE_SCRIPT,
     KS,
     MAX_INPUT_TOKENS,
     RECORD_CHECK,
@@ -543,7 +544,7 @@ def test_the_engine_script_uses_the_measured_engine_call():
 def test_the_reference_script_encodes_as_emb_s5_does():
     assert 'prompt_name=spec["prompt_name"]' in REFERENCE_SCRIPT
     assert "normalize_embeddings=True" in REFERENCE_SCRIPT
-    assert 'device="cpu"' in REFERENCE_SCRIPT
+    assert "device=device" in REFERENCE_SCRIPT
     assert '"dtype": torch.float32' in REFERENCE_SCRIPT
 
 
@@ -751,10 +752,12 @@ def _reference_main(
     torch.float32 = "float32"
     torch.set_num_threads = lambda n: None
     torch.get_num_threads = lambda: 2
+    torch.cuda = types.SimpleNamespace(is_available=lambda: False)
 
     class SentenceTransformer:
         def __init__(self, model, device=None, model_kwargs=None, config_kwargs=None):
             seen["model"] = model
+            seen["device"] = device
             self.prompts = {PROMPT_NAME: prompt}
             self.max_seq_length = max_seq
 
@@ -990,6 +993,9 @@ class FakeEmbedEnvs:
     repeat: str | None = None
     # Each script's source as written to run, by script stem or engine side.
     sources: dict[str, str] = field(default_factory=dict)
+    # What the environment's device probe answers for the reference.
+    device: str | None = "cpu"
+    probes: list[str] = field(default_factory=list)
     # The image reference's processor directory as it was when the script ran:
     # each processor file's bare sha256, by name.
     processor_seen: dict[str, str] | None = None
@@ -1021,6 +1027,7 @@ class FakeEmbedEnvs:
         report: dict[str, Any] = {"rows": len(texts) + (name in self.rows_off), "dim": 6}
         if name == "reference":
             report["max_seq_length"] = 128
+            report["device"] = spec["device"] or "cpu"
             if "images" in spec:
                 report["vision_tokens"] = spec["vision_tokens"]
                 report["soft_tokens_per_row"] = [self.soft_tokens.get(t, 63) for t in texts]
@@ -1147,8 +1154,14 @@ def fake(monkeypatch, tmp_path, ev) -> FakeEmbedEnvs:
     def run(self, args, timeout: int = 3600, **kwargs):
         return instance(self, args, timeout, **kwargs)
 
+    def resolve_device(env, timeout: int = 0, events=None) -> envs.DeviceProbe:
+        instance.probes.append(env.name)
+        return envs.DeviceProbe(device=instance.device, detail=f"fake probe: {instance.device}")
+
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
     monkeypatch.setattr(envs.StageEnv, "run", run)
+    monkeypatch.setattr(envs, "resolve_device", resolve_device)
+    monkeypatch.delenv("LITETUNE_DEVICE", raising=False)
     monkeypatch.setattr(embedding_export, "GOOGLE_SHA256", hashlib.sha256(GOOGLE_BYTES).hexdigest())
     monkeypatch.setattr(
         embedding_export, "VISION_SHA256", hashlib.sha256(VISION_STAND_IN).hexdigest()
@@ -2992,6 +3005,62 @@ def test_a_reference_that_reports_no_count_per_picture_is_refused(fake, tmp_path
     assert failed["name"] == REFERENCE_CHECK and "not one count per picture" in failed["detail"]
 
 
+@pytest.mark.parametrize("images", [False, True])
+@pytest.mark.parametrize(
+    ("probed", "setting", "ran_on", "said"),
+    [
+        ("cuda", None, "cuda", "CUDA (TF32 off)"),
+        ("mps", None, "mps", "MPS"),
+        ("cuda", "cpu", "cpu", "the CPU"),
+        (None, None, "cpu", "the CPU"),
+    ],
+)
+def test_the_reference_runs_on_the_device_tune_would_use(
+    fake, tmp_path, monkeypatch, images, probed, setting, ran_on, said
+):
+    # As tune: the training environment's own probe, or LITETUNE_DEVICE; with
+    # neither, the script asks torch (here: no CUDA, so the CPU).
+    fake.device = probed
+    if setting is not None:
+        monkeypatch.setenv("LITETUNE_DEVICE", setting)
+    s = _image_setup(tmp_path, fake) if images else _setup(tmp_path)
+    result = _verify(s)
+    assert fake.probes == [envs.EMBED_TRAIN.name]
+    assert fake.specs["reference"]["device"] == (None if probed is None else ran_on)
+    assert result.manifest["embedding"]["reference_device"] == ran_on
+    assert any(
+        text.startswith(f"the reference ran on {said} in float32")
+        for text in result.manifest["limitations"]
+    )
+
+
+def test_an_unknown_litetune_device_is_refused_before_the_reference_runs(
+    fake, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LITETUNE_DEVICE", "gpu")
+    (failed,) = _failed(_verify(_setup(tmp_path)).manifest)
+    assert failed["name"] == REFERENCE_CHECK and "LITETUNE_DEVICE" in failed["detail"]
+    assert "reference" not in fake.specs
+
+
+def test_the_reference_scripts_turn_tf32_off_on_cuda():
+    for script in (REFERENCE_SCRIPT, IMAGE_REFERENCE_SCRIPT):
+        ns: dict[str, Any] = {"__name__": "reference_script"}
+        exec(compile(script, "reference.py", "exec"), ns)
+        backends = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(matmul=types.SimpleNamespace(allow_tf32=True)),
+            cudnn=types.SimpleNamespace(allow_tf32=True),
+        )
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: True), backends=backends
+        )
+        assert ns["reference_device"](torch, None) == "cuda"
+        assert not backends.cuda.matmul.allow_tf32 and not backends.cudnn.allow_tf32
+        assert ns["reference_device"](torch, "cpu") == "cpu"
+    # The CPU embeds one picture per pass, as every measurement before batching did.
+    assert 'batch = 1 if device == "cpu" else REFERENCE_IMAGE_BATCH' in IMAGE_REFERENCE_SCRIPT
+
+
 def test_a_picture_in_both_splits_is_refused_before_any_run(fake, tmp_path):
     s = _image_setup(tmp_path, fake)
     train_rows = s.train.read_text(encoding="utf-8").splitlines()
@@ -3836,10 +3905,15 @@ def _image_reference_main(tmp_path, monkeypatch, images, digests, loads=None):
         def eval(self):
             return self
 
+        def to(self, device):
+            assert device == "cpu", device
+            return self
+
     torch: Any = types.ModuleType("torch")
     torch.set_num_threads = lambda n: None
     torch.float32 = "float32"
     torch.no_grad = NoGrad
+    torch.cuda = types.SimpleNamespace(is_available=lambda: False)
     transformers: Any = types.ModuleType("transformers")
     transformers.AutoConfig = loader(
         "AutoConfig", lambda: types.SimpleNamespace(audio_config=object())
