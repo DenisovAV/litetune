@@ -35,7 +35,7 @@ from typing import Any
 
 import pytest
 from conftest import mark_provisioned
-from test_towers import FAKE_BUILDER, FAKE_FORMAT, FAKE_PEEK
+from test_towers import BUILDER_018_TYPES, FAKE_BUILDER_018, FAKE_FORMAT, FAKE_PEEK
 
 from litetune import embedding_convert, envs
 from litetune.embedding_convert import (
@@ -44,7 +44,6 @@ from litetune.embedding_convert import (
     GraftResult,
     graft,
 )
-from litetune.towers import BUILDER_TYPES
 
 np: Any = pytest.importorskip("numpy")
 
@@ -529,13 +528,13 @@ class FakeToolchain:
         package = shim / "litert_lm_builder"
         package.mkdir(parents=True, exist_ok=True)
         (package / "__init__.py").write_text("")
-        builder = FAKE_BUILDER
+        builder = FAKE_BUILDER_018
         if self.pack_alters_encoder:
             anchor = 's.get("model_type") == "prefill_decode"'
             assert builder.count(anchor) == 1
             builder = builder.replace(anchor, 's.get("model_type") == "text_encoder"')
         settings = (
-            f"KNOWN_TYPES = {list(BUILDER_TYPES)!r}\nPACK_FAILS = False\n"
+            f"KNOWN_TYPES = {list(BUILDER_018_TYPES)!r}\nPACK_FAILS = False\n"
             f"PACK_ALTERS_VALUE = False\nPACK_ALTERS_BYTES = {self.pack_alters_encoder}\n"
             "SHRINK_INPUT = None\n"
         )
@@ -1140,3 +1139,11 @@ def test_the_read_back_refuses_a_norm_buffer_that_differs_from_what_was_written(
     w.graph[pos] ^= 1
     with pytest.raises(SCRIPT["Refused"], match="norm buffer 1 reads back with other bytes"):
         w.read_back(bytes(w.graph), {1: value})
+
+
+def test_the_graft_fake_builder_is_the_one_the_export_environment_pins():
+    # The graft runs towers_script under envs.EXPORT; FAKE_BUILDER_018 stands in
+    # for that builder. 0.9.0 called a 0.19-only function there and every
+    # EmbeddingGemma 2 convert failed, because the fake had 0.19's API.
+    assert "litert-lm-builder==0.18.0" in envs.EXPORT.requirements
+    assert "get_all_tflite_model_types" not in FAKE_BUILDER_018

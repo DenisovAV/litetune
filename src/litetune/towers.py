@@ -241,10 +241,20 @@ def model_type(section):
     return str(section.get("model_type", "")).lower().removeprefix("tf_lite_")
 
 
+def builder_model_types():
+    """The TF-free model types this builder can write back. 0.19 lists them
+    (`get_all_tflite_model_types`); 0.18.0, which `envs.EXPORT` pins and the
+    EmbeddingGemma 2 grafts run this script under, has only `TfLiteModelType`,
+    whose `get_enum_from_tf_free_value` accepts exactly these values."""
+    if hasattr(lb, "get_all_tflite_model_types"):
+        return set(lb.get_all_tflite_model_types())
+    return {m.value.lower().removeprefix("tf_lite_") for m in lb.TfLiteModelType}
+
+
 def require_model_type(kind, where):
-    """Refuse a TF-free model type the 0.19 builder cannot write back."""
+    """Refuse a TF-free model type the builder cannot write back."""
     value = str(kind).lower().removeprefix("tf_lite_")
-    if value not in lb.get_all_tflite_model_types():
+    if value not in builder_model_types():
         raise Refused(f"{where} has model_type {kind!r}, which litert-lm-builder cannot write back")
 
 

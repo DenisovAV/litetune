@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 from conftest import mark_provisioned
-from test_towers import FAKE_BUILDER, FAKE_FORMAT, FAKE_PEEK
+from test_towers import BUILDER_018_TYPES, FAKE_BUILDER_018, FAKE_FORMAT, FAKE_PEEK
 
 from litetune import embedding_vision, envs
 from litetune.embedding_convert import EmbeddingConvertError
@@ -45,7 +45,7 @@ from litetune.embedding_tune import (
     write_embedding_record,
 )
 from litetune.embedding_vision import _SPLICE_SCRIPT, SpliceResult, splice, splice_npu
-from litetune.towers import _TOWERS_SCRIPT, BUILDER_TYPES
+from litetune.towers import _TOWERS_SCRIPT
 
 # tomli below Python 3.11, as the builder itself; by name, so that mypy, checking
 # for 3.10, needs stubs for neither.
@@ -176,13 +176,13 @@ def install_shim(
     package = shim / "litert_lm_builder"
     package.mkdir(parents=True, exist_ok=True)
     (package / "__init__.py").write_text("")
-    builder = FAKE_BUILDER
+    builder = FAKE_BUILDER_018
     if alters_bytes_of is not None:
         anchor = 's.get("model_type") == "prefill_decode"'
         assert builder.count(anchor) == 1
         builder = builder.replace(anchor, f's.get("model_type") == "{alters_bytes_of}"')
     settings = (
-        f"KNOWN_TYPES = {list(BUILDER_TYPES)!r}\nPACK_FAILS = False\n"
+        f"KNOWN_TYPES = {list(BUILDER_018_TYPES)!r}\nPACK_FAILS = False\n"
         f"PACK_ALTERS_VALUE = {alters_value}\nPACK_ALTERS_BYTES = {alters_bytes_of is not None}\n"
         "SHRINK_INPUT = None\n"
     )
