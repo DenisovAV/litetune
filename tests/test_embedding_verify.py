@@ -2631,7 +2631,8 @@ def _failed(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return [c for c in manifest["checks"] if c["outcome"] == "failed"]
 
 
-def test_a_multitask_record_without_groups_selects_and_verifies(fake, tmp_path):
+@pytest.mark.parametrize("listed", ["every task", "the other task only"])
+def test_a_multitask_record_without_groups_selects_and_verifies(fake, tmp_path, listed):
     selected = _decision()
     other = Decision(
         "choice",
@@ -2675,10 +2676,17 @@ def test_a_multitask_record_without_groups_selects_and_verifies(fake, tmp_path):
     report = json.loads(report_path.read_text(encoding="utf-8"))
     report["checkpoint"]["decision_sha256"] = None
     report["checkpoint"]["tasks"] = [
-        {"name": task.name, "decision_sha256": task.decision_sha256} for task in tasks
+        {"name": task.name, "decision_sha256": task.decision_sha256}
+        for task in (tasks if listed == "every task" else tasks[:1])
     ]
     report_path.write_text(json.dumps(report), encoding="utf-8")
     result = _verify(setup)
+    if listed != "every task":
+        (failed,) = _failed(result.manifest)
+        assert failed["name"] == RECORD_CHECK
+        assert "does not list the selected task's decision" in failed["detail"]
+        assert fake.runs == []
+        return
     assert result.status is Status.PASSED, result.manifest["checks"]
     assert result.manifest["embedding"]["decision_sha256"] == selected.digest()
 
@@ -2994,6 +3002,20 @@ def test_a_picture_in_both_splits_is_refused_before_any_run(fake, tmp_path):
     assert failed["name"] == ROWS_CHECK
     assert "1 picture(s) are in both the training split" in failed["detail"]
     assert _image_digests(s.train)[0] in failed["detail"]
+    assert fake.runs == []
+
+
+def test_a_group_in_both_splits_is_refused_before_any_run(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    for path, index in ((s.train, 0), (s.heldout, 0)):
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        rows[index]["group"] = "run-7"
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    result = _verify(s)
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert "1 supplied group(s) are in both the training split" in failed["detail"]
+    assert "'run-7'" in failed["detail"]
     assert fake.runs == []
 
 

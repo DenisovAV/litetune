@@ -253,9 +253,9 @@ def test_the_rows_of_one_picture_are_never_in_two_splits(tmp_path, seed):
 
 
 def test_explicit_groups_are_kept_together_and_reported(tmp_path):
-    rows = _image_rows(tmp_path, per_option=6)
+    rows = _image_rows(tmp_path, per_option=24)
     for i, row in enumerate(rows):
-        row["group"] = f"run-{i // 3}"
+        row["group"] = f"run-{i // 2}"
     result = prepare(_request(tmp_path, data=_rows_file(tmp_path, rows, "groups.jsonl")))
     assert (
         result.train is not None and result.calibration is not None and result.heldout is not None
@@ -266,7 +266,7 @@ def test_explicit_groups_are_kept_together_and_reported(tmp_path):
             assert row["group"] not in split_of or split_of[row["group"]] == split
             split_of[row["group"]] = split
     report = json.loads((tmp_path / "split" / "prepare.json").read_text())
-    assert report["source"]["groups"] == {"used": True, "count": 6}
+    assert report["source"]["groups"] == {"used": True, "count": 36}
 
 
 def test_picture_identity_joins_two_explicit_groups(tmp_path):

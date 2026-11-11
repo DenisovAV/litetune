@@ -949,9 +949,12 @@ a rows file is all image rows or all text rows:
 {"image": "leaves/0002.png", "label": "healthy"}
 ```
 
-An optional string `group` keeps related rows in one split. Picture identity
-still groups identical bytes, so a duplicate picture shared by two named groups
-joins those groups:
+An optional string `group`, on image or text rows, keeps related rows in one
+split. Picture identity still groups identical bytes, so a duplicate picture
+shared by two named groups joins those groups. A group's split is drawn from its
+name and `--seed` alone, not from the rest of the file, so rows files prepared
+with one seed put a group they share on the same side; the sizes come out near
+the fractions asked for rather than exact:
 
 ```
 {"image": "frames/001.png", "label": "left", "group": "run-17"}
@@ -970,9 +973,11 @@ litetune verify --model artifacts/int8/model.litertlm --reference tuned/model \
                 --data data/heldout.jsonl --with-base --json > manifest.json
 ```
 
-Several image questions can share one text-tower fine-tune. Each task names the
-split and the `decision.json` beside that split (the layout `prepare` writes);
-mirroring belongs to that task alone:
+Several image questions can share one text-tower fine-tune. Prepare each
+question's rows on its own, with the same `--seed`. Each task names the split
+and the `decision.json` beside that split (the layout `prepare` writes); an
+optional `heldout` defaults to `heldout.jsonl` there, paths are relative to
+`tasks.json`, and mirroring belongs to that task alone:
 
 ```json
 {"tasks": [
@@ -989,11 +994,15 @@ litetune tune --model google/embeddinggemma-2 --tasks tasks.json \
 ```
 
 The run uses one head and class weights per task, shuffles all tasks' training
-items together, and caches a shared picture input once. To verify one task,
-pass its held-out file; `verify` selects the recorded task by the
-`decision.json` beside that file. Across all tasks, a picture or supplied
-`group` cannot occur in training rows of one task and held-out rows of another;
-`verify` refuses the same leakage against the training pictures and groups recorded by `tune`.
+items together, and caches a shared picture input once. `--data`, `--heldout`,
+`--decision`, `--mirror` and `--mirror-swap` are refused beside `--tasks`, and
+so are two tasks with one name or one decision. To verify one task, pass its
+held-out file; `verify` selects the recorded task by the `decision.json` beside
+that file, and refuses a training split other than the one the task was tuned
+on. Across all tasks, a picture or supplied `group` cannot occur in training
+rows of one task and held-out rows of another; `verify` refuses the same
+leakage against the training pictures and groups recorded by `tune`. litetune
+has not yet measured a tune of several questions.
 
 `questions.json` is a `choice` question without a `none_option`, as for text.
 `--context-length` and `--tokenizer` are refused for image rows: there is no

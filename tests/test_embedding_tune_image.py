@@ -307,6 +307,38 @@ def test_an_image_run_writes_an_image_record_beside_the_checkpoint(toolchain, sp
     assert record.soft_tokens == on_disk["soft_tokens"]
 
 
+def test_a_group_in_both_splits_is_refused_before_training(toolchain, split, tmp_path):
+    for path in (split.train, split.heldout):
+        rows = _records(path)
+        rows[0]["group"] = "run-7"
+        _write(path, rows)
+    with pytest.raises(EmbeddingTuneError, match=r"1 supplied group\(s\) are in both.*'run-7'"):
+        run_embedding_tune(_request(split, tmp_path))
+    assert toolchain.calls == []
+
+
+def test_a_multitask_run_whose_script_reports_another_budget_is_a_failure(toolchain, tmp_path):
+    zones = _split(tmp_path / "zones", ids=("near", "far"), train=8)
+    steer = _split(tmp_path / "steer", ids=("left", "right"), train=8)
+    tasks = _tasks_file(
+        tmp_path,
+        [
+            {"name": "zones", "data": str(zones.train), "decision": str(zones.decision)},
+            {"name": "steer", "data": str(steer.train), "decision": str(steer.decision)},
+        ],
+    )
+    toolchain.metrics_overrides = {"vision_tokens": 140}
+    result = run_embedding_tune(
+        EmbeddingTuneRequest(output_dir=tmp_path / "tuned", tasks=tasks, vision_tokens=70)
+    )
+    assert result.outcome is Outcome.FAILED
+    assert _check(result, TRAINING_CHECK).detail == (
+        "the training script reports a budget of 140 vision tokens, not the 70 of the spec it "
+        "was given"
+    )
+    assert not (tmp_path / "tuned" / "model" / "litetune.json").exists()
+
+
 def test_a_multitask_run_records_each_head_and_uses_one_joint_spec(toolchain, tmp_path):
     zones = _split(tmp_path / "zones", ids=("near", "far"), train=8)
     steer = _split(tmp_path / "steer", ids=("left", "right", "straight"), train=9)
@@ -401,6 +433,32 @@ def test_a_multitask_record_round_trips_with_one_or_several_tasks(toolchain, tmp
     assert EmbeddingRecord.from_dict(data, "record").as_dict() == data
     data["tasks"] = data["tasks"][:1]
     assert len(EmbeddingRecord.from_dict(data, "record").tasks) == 1
+
+
+@pytest.mark.parametrize(
+    ("repeated", "message"),
+    [("name", "'tasks' repeats a name"), ("decision_sha256", "'tasks' repeats a decision sha256")],
+)
+def test_a_multitask_record_refuses_a_repeated_task_on_read(toolchain, tmp_path, repeated, message):
+    first = _split(tmp_path / "first", ids=("a", "b"), train=8)
+    second = _split(tmp_path / "second", ids=("x", "y"), train=8)
+    tasks = _tasks_file(
+        tmp_path,
+        [
+            {"name": "first", "data": str(first.train), "decision": str(first.decision)},
+            {"name": "second", "data": str(second.train), "decision": str(second.decision)},
+        ],
+    )
+    result = run_embedding_tune(
+        EmbeddingTuneRequest(output_dir=tmp_path / "tuned", tasks=tasks, vision_tokens=70)
+    )
+    assert result.record is not None
+    data = result.record.as_dict()
+    copied = ("name",) if repeated == "name" else ("decision", "decision_sha256", "labels")
+    for key in copied:
+        data["tasks"][1][key] = data["tasks"][0][key]
+    with pytest.raises(ValueError, match=message):
+        EmbeddingRecord.from_dict(data, "record")
 
 
 @pytest.mark.parametrize("groups", [[], ["later", "earlier"], ["same", "same"], ["ok", 7]])
@@ -511,6 +569,61 @@ def test_tune_trains_on_the_split_prepare_wrote(toolchain, tmp_path):
     for row in given:
         assert Path(row["image"]).parent == (tmp_path / "split" / "images").resolve()
         assert hashlib.sha256(Path(row["image"]).read_bytes()).hexdigest() == row["sha256"]
+
+
+def test_tasks_accept_questions_prepared_apart_over_shared_groups(toolchain, tmp_path):
+    from test_embedding_prepare_images import FakeImageInspector, _fake_image
+
+    from litetune.prepare import PrepareRequest, prepare
+
+    # Two questions about the same runs, prepared from two rows files: a run
+    # held out for one question must be held out for the other, or the joint
+    # tune refuses the pair.
+    tasks = []
+    for name, ids, width in (("zones", ("a", "b"), 8), ("steer", ("left", "right"), 40)):
+        root = tmp_path / name
+        rows = []
+        for i in range(48):
+            option = ids[i % 2]
+            _fake_image(root / "raw" / f"{i}.png", width=width + i, height=4)
+            rows.append({"image": f"raw/{i}.png", "label": option, "group": f"run-{i // 2}"})
+        data = root / "rows.jsonl"
+        data.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        questions = root / "questions.json"
+        questions.write_text(_decision(ids).canonical_text(), encoding="utf-8")
+        prepared = prepare(
+            PrepareRequest(
+                data=data,
+                output_dir=root / "split",
+                context_length=None,
+                base_model=EMBEDDING_MODEL,
+                questions=questions,
+                images=FakeImageInspector(),
+            )
+        )
+        assert prepared.train is not None and prepared.heldout is not None
+        tasks.append(
+            {
+                "name": name,
+                "data": str(prepared.train.path),
+                "decision": str(root / "split" / "decision.json"),
+            }
+        )
+    side = [
+        {
+            row["group"]: split
+            for split in ("train", "calibration", "heldout")
+            for row in _records(tmp_path / name / "split" / f"{split}.jsonl")
+        }
+        for name in ("zones", "steer")
+    ]
+    assert side[0] == side[1]
+    result = run_embedding_tune(
+        EmbeddingTuneRequest(
+            output_dir=tmp_path / "run", tasks=_tasks_file(tmp_path, tasks), vision_tokens=70
+        )
+    )
+    assert result.ok, result.checks.as_dict()
 
 
 def test_the_image_script_is_run_with_the_image_spec(toolchain, split, tmp_path):
@@ -1684,13 +1797,55 @@ def test_multitask_items_keep_weights_and_mirroring_per_task(multitask_script):
         Vectors(),
         selected,
         20,
-        len(selected),
     )
     assert loss.value == 4.0, "(sum of each task's CE sums) / the mixed batch size"
     assert calls == [
         (("zones", [0, 2], 20), ([1, 1], "fake-device"), [2.0, 2 / 3], "sum"),
         (("steer", [1, 3], 20), ([0, 1], "fake-device"), [1.0, 1.0], "sum"),
     ]
+
+
+def test_multitask_heads_weights_and_predictions_follow_each_task(multitask_script):
+    class Linear:
+        def __init__(self, dim, k):
+            self.shape = (dim, k)
+
+    class Torch:
+        float32 = "float32"
+        nn = type("nn", (), {"ModuleList": list, "Linear": Linear})
+
+        @staticmethod
+        def tensor(values, dtype, device):
+            return (values, dtype, device)
+
+    tasks = [{"labels": ["far", "near"]}, {"labels": ["left", "right", "straight"]}]
+    heads = multitask_script["multitask_heads"](Torch(), tasks, 768)
+    assert [head.shape for head in heads] == [(768, 2), (768, 3)]
+
+    runs = [(None, None, None, {"weights": [2.0, 0.5]}), (None, None, None, {"weights": [1.0]})]
+    assert multitask_script["multitask_weight_tensors"](Torch(), runs, "cuda") == [
+        ([2.0, 0.5], "float32", "cuda"),
+        ([1.0], "float32", "cuda"),
+    ]
+
+    class Scores:
+        def __init__(self, picks):
+            self.picks = picks
+
+        def argmax(self, dim):
+            assert dim == -1
+            return self
+
+        def tolist(self):
+            return self.picks
+
+    def head(picks):
+        return lambda vectors: Scores(picks[: len(vectors)])
+
+    predict = multitask_script["multitask_predict"]
+    two_heads = [head([1, 0]), head([2, 0])]
+    assert predict(two_heads, 0, tasks[0]["labels"], ["v1", "v2"]) == ["near", "far"]
+    assert predict(two_heads, 1, tasks[1]["labels"], ["v1", "v2"]) == ["straight", "left"]
 
 
 def test_the_swap_map_is_symmetric_and_refuses_a_repeated_label(script):

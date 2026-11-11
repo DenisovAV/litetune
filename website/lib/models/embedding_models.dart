@@ -40,10 +40,11 @@ class EmbeddingModels extends StatelessComponent {
         "270M parameters: the text tower of Google's EmbeddingGemma 2. An app "
         "uses it through flutter_edge_ai's EmbeddingModel.createDecider, which "
         'embeds the input and answers with the option whose examples have the '
-        'nearest centroid. litetune fine-tunes the tower on one decision and '
+        'nearest centroid. litetune fine-tunes the tower on a decision and '
         "writes the result into Google's own .litertlm file, so the app loads "
         'one file and nothing ships beside it. It can also be fine-tuned on '
-        "pictures and written into Google's text-vision file.",
+        'pictures, several decisions in one tune, and written into '
+        "Google's text-vision file.",
     hubId: 'google/embeddinggemma-2',
     revision: '914f7f89',
     anchor: _section,

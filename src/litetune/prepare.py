@@ -1567,6 +1567,66 @@ def split_grouped(
     )
 
 
+def _group_key(row: Row) -> str:
+    """What places a split group when groups are supplied: the row's own, not its file's."""
+    if row.group is not None:
+        return f"group:{row.group}"
+    if row.image is not None:
+        return f"picture:{row.image.sha256}"
+    return f"row:{row.prompt}\x00{row.completion}"
+
+
+def split_grouped_by_key(
+    rows: Sequence[Row], groups: Sequence[str], seed: int, heldout: int, calibration: int
+) -> tuple[list[Row], list[Row], list[Row]] | None:
+    """(training, calibration, held-out) rows, each split group placed by its key and the seed.
+
+    `split_grouped` permutes the groups by the file's content, so a group two
+    rows files share lands on either side in each. Here a group's place depends
+    on its key alone -- the smallest supplied `group` among its rows, else the
+    smallest picture digest, else the row itself (`_group_key`) -- so every
+    rows file prepared with one seed puts a shared group in the same split,
+    which `tune --tasks` requires. A group whose key draws below
+    `heldout / len(rows)` is held out, below `(heldout + calibration) /
+    len(rows)` set aside, otherwise trained on, so the sizes are near what was
+    asked rather than exact. An empty requested split takes the group that drew
+    lowest, and training keeps the group that drew highest. `None` when there
+    are fewer than two groups.
+    """
+    key_of: dict[str, str] = {}
+    for row, group in zip(rows, groups, strict=True):
+        key = _group_key(row)
+        if group not in key_of or key < key_of[group]:
+            key_of[group] = key
+    if len(key_of) < 2:
+        return None
+
+    def draw(group: str) -> float:
+        payload = f"{key_of[group]}:{seed}".encode()
+        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") / 2**64
+
+    order = sorted(key_of, key=lambda group: (draw(group), key_of[group]))
+    held_below = heldout / len(rows)
+    aside_below = (heldout + calibration) / len(rows)
+    held = {group for group in order if draw(group) < held_below}
+    aside = {group for group in order if held_below <= draw(group) < aside_below}
+    if heldout and not held:
+        held.add(order[0])
+        aside.discard(order[0])
+    if calibration and not aside:
+        spare = [group for group in order[:-1] if group not in held]
+        if spare:
+            aside.add(spare[0])
+    held.discard(order[-1])
+    aside.discard(order[-1])
+    placed = held | aside
+    return (
+        [row for row, group in zip(rows, groups, strict=True) if group not in placed],
+        [row for row, group in zip(rows, groups, strict=True) if group in aside],
+        [row for row, group in zip(rows, groups, strict=True) if group in held],
+    )
+
+
 def row_split_groups(rows: Sequence[Row], *, pictures: bool) -> list[str]:
     """One transitive split-group id per row.
 
@@ -2338,8 +2398,10 @@ class PrepareResult:
                 "path": str(self.request.data),
                 "content_sha256": self.content_sha256,
                 "rows": self.n_rows,
-                # The split is a function of these two and nothing else, which
-                # is what makes it reproducible from the report alone.
+                # Without supplied groups the split is a function of these two
+                # and nothing else, which makes it reproducible from the report
+                # alone; with them, of each group's key and the request's seed
+                # (`split_grouped_by_key`).
                 "split_seed": split_seed(self.content_sha256, self.request.seed),
                 "groups": {"used": self.groups_used, "count": self.groups_count},
             },
@@ -2590,6 +2652,8 @@ def _split_pictures(
     heldout: int,
     calibration: int,
     asked: int | None = None,
+    *,
+    by_key: bool = False,
 ) -> tuple[tuple[list[Row], list[Row]] | None, list[Row]]:
     """An image split's (training, held-out) rows and its calibration rows, by picture.
 
@@ -2597,10 +2661,15 @@ def _split_pictures(
     is both trained on and scored. `None` for the halves when the rows hold
     fewer than two pictures. A held-out or calibration split of another size
     than asked -- `asked`, the caller's --heldout-size, else `heldout` -- is one
-    limitation, with the sizes the groups gave.
+    limitation, with the sizes the groups gave. `by_key` -- rows that supply
+    groups -- places each group by its key (`split_grouped_by_key`).
     """
     groups = row_split_groups(rows, pictures=True)
-    grouped = split_grouped(rows, groups, content_sha256, seed, heldout, calibration)
+    grouped = (
+        split_grouped_by_key(rows, groups, seed, heldout, calibration)
+        if by_key
+        else split_grouped(rows, groups, content_sha256, seed, heldout, calibration)
+    )
     if grouped is None:
         return None, []
     train, aside, held = grouped
@@ -2908,16 +2977,18 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         # same bytes go to one side, so no held-out row asks about a picture the
         # model was trained on.
         halves, _ = _split_pictures(
-            result, rows, content_sha256, request.seed, heldout_n, 0, request.heldout_size
-        )
-    elif explicit_groups and image_stats is None and heldout_n >= 1:
-        grouped_rows = split_grouped(
+            result,
             rows,
-            row_split_groups(rows, pictures=False),
             content_sha256,
             request.seed,
             heldout_n,
             0,
+            request.heldout_size,
+            by_key=explicit_groups,
+        )
+    elif explicit_groups and image_stats is None and heldout_n >= 1:
+        grouped_rows = split_grouped_by_key(
+            rows, row_split_groups(rows, pictures=False), request.seed, heldout_n, 0
         )
         halves = (grouped_rows[0], grouped_rows[2]) if grouped_rows is not None else None
         if decision is None and grouped_rows is not None:
@@ -2963,15 +3034,11 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 heldout_n,
                 calibration_n,
                 request.heldout_size,
+                by_key=explicit_groups,
             )
         else:
-            grouped_rows = split_grouped(
-                rows,
-                row_split_groups(rows, pictures=False),
-                content_sha256,
-                request.seed,
-                heldout_n,
-                calibration_n,
+            grouped_rows = split_grouped_by_key(
+                rows, row_split_groups(rows, pictures=False), request.seed, heldout_n, calibration_n
             )
             if grouped_rows is None:
                 halves = None
@@ -3086,11 +3153,11 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         split_check = Check.passed(
             SPLIT_CHECK,
             f"{result.train.n} training{aside} and {result.heldout.n} held-out examples, split "
-            f"by content {_bare_digest(content_sha256)[:16]} and seed {request.seed}"
             + (
-                f", keeping {result.groups_count} supplied groups together"
+                f"by the keys of {result.groups_count} supplied groups and seed {request.seed}, "
+                "so another rows file prepared with this seed puts a shared group on the same side"
                 if result.groups_used
-                else ""
+                else f"by content {_bare_digest(content_sha256)[:16]} and seed {request.seed}"
             ),
             observed={
                 "train": result.train.as_dict(),

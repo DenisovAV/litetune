@@ -42,6 +42,8 @@ from litetune.prepare import (
     read_rows,
     refuse_undeclared_tools,
     render_call,
+    row_split_groups,
+    split_grouped_by_key,
     split_rows,
     split_seed,
 )
@@ -1834,11 +1836,11 @@ def test_supplied_text_groups_never_split_and_report_changed_heldout_size(write_
 def test_supplied_text_groups_never_split_with_calibration_and_report_sizes(
     write_jsonl, request_for, questions
 ):
-    records = decision_rows(n_per_option=4)
+    records = decision_rows(n_per_option=12)
     for i, record in enumerate(records):
-        record["group"] = f"g{i // 3}"
+        record["group"] = f"g{i // 2}"
     result = prepare(
-        request_for(write_jsonl(records), questions=questions(), heldout_size=2, calibration_size=2)
+        request_for(write_jsonl(records), questions=questions(), heldout_size=7, calibration_size=7)
     )
     split_of = {}
     for split in (result.train, result.calibration, result.heldout):
@@ -1847,9 +1849,57 @@ def test_supplied_text_groups_never_split_with_calibration_and_report_sizes(
             group = records[row["source_line"] - 1]["group"]
             assert split_of.setdefault(group, split.path.name) == split.path.name
     assert any(
-        "same supplied group" in text and "where 2 and 2 were asked" in text
+        "same supplied group" in text and "where 7 and 7 were asked" in text
         for text in result.limitations
     )
+
+
+def test_supplied_text_groups_land_on_one_side_in_every_rows_file(
+    tmp_path, write_jsonl, request_for, questions
+):
+    # Two rows files about the same groups, with different content: each shared
+    # group is placed by its name and the seed, not by the file it is in.
+    side = []
+    for name, extra in (("first", ""), ("second", " again")):
+        records = decision_rows(n_per_option=12)
+        for i, record in enumerate(records):
+            record["prompt"] += extra
+            record["group"] = f"g{i // 2}"
+        result = prepare(
+            request_for(
+                write_jsonl(records, f"{name}.jsonl"),
+                questions=questions(),
+                output_dir=tmp_path / name,
+            )
+        )
+        side.append(
+            {
+                records[row["source_line"] - 1]["group"]: split.path.name
+                for split in (result.train, result.calibration, result.heldout)
+                for row in split_records(split)
+            }
+        )
+    assert side[0] == side[1]
+    assert set(side[0].values()) == {"train.jsonl", "calibration.jsonl", "heldout.jsonl"}
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_a_key_split_of_two_groups_holds_one_out_and_trains_on_the_other(seed):
+    rows = [Row(i + 1, f"p{i}", "c", None, group=f"g{i % 2}") for i in range(4)]
+    groups = row_split_groups(rows, pictures=False)
+    # Asked for one held-out row of four: whatever the draws, each side gets a group.
+    train, calibration, held = split_grouped_by_key(rows, groups, seed, 1, 0)
+    assert calibration == []
+    assert len({row.group for row in train}) == 1 and len({row.group for row in held}) == 1
+    assert {row.group for row in train} != {row.group for row in held}
+    # Asked for nearly everything: training still keeps a group.
+    train, calibration, held = split_grouped_by_key(rows, groups, seed, 3, 0)
+    assert train and held
+
+
+def test_a_key_split_of_one_group_is_none():
+    rows = [Row(i + 1, f"p{i}", "c", None, group="only") for i in range(3)]
+    assert split_grouped_by_key(rows, row_split_groups(rows, pictures=False), 0, 1, 1) is None
 
 
 def test_a_calibration_fraction_is_a_share_of_every_row(write_jsonl, request_for, questions):

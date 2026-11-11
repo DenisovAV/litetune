@@ -127,6 +127,7 @@ from litetune.embedding_tune import (
     EmbeddingTuneError,
     LabelledImage,
     LabelledText,
+    groups_in_both,
     pictures_in_both,
     processor_digests,
     read_image_split,
@@ -2165,6 +2166,14 @@ def verify_embedding(
                     f"{len(both)} picture(s) are in both the training split {job.train_path} and "
                     f"the held-out split {job.heldout} (sha256 {', '.join(both[:3])}); the "
                     "decider would be scored on pictures it was fitted on. Split them with prepare",
+                )
+            if shared := groups_in_both(train_images, heldout_images):
+                return refuse(
+                    ROWS_CHECK,
+                    f"{len(shared)} supplied group(s) are in both the training split "
+                    f"{job.train_path} and the held-out split {job.heldout} "
+                    f"({', '.join(map(repr, shared[:3]))}); the decider would be scored on rows "
+                    "kept with the ones it was fitted on. Split them with prepare",
                 )
             if multitask and (
                 leaked := sorted(

@@ -582,7 +582,9 @@ def _add_prepare(sub) -> None:
             f"{EMBEDDING_MODEL} a row may instead be an image row, "
             '{"image": <a PNG or JPEG file, relative to --data or absolute>, "label": <option '
             "id>}; the file is checked and copied into the split, and a rows file is all image "
-            "rows or all text rows"
+            'rows or all text rows. Any row may carry "group": <string>; the rows of a group stay '
+            "in one split, and a group is placed by its name and --seed alone, so rows files "
+            "prepared with one seed agree on where a shared group goes"
         ),
     )
     prep.add_argument(
@@ -608,7 +610,8 @@ def _add_tune(sub) -> None:
             f"evidence: a run that scored nine times worse than its base finished cleanly with a "
             f"lower loss. --model {EMBEDDING_MODEL} trains an embedding model for a choice "
             "--decision instead, with none of the LLM flags: on text rows with its measured "
-            "recipe, on image rows with a recipe litetune has measured on one dataset. "
+            "recipe, on image rows with a recipe litetune has measured on one dataset; "
+            "--tasks trains several image decisions into one fine-tune, one head each. "
             f"{STAGE_EXIT_CODE_HELP}"
         ),
     )
@@ -619,9 +622,11 @@ def _add_tune(sub) -> None:
         "--tasks",
         type=Path,
         help=(
-            f"only with --model {EMBEDDING_MODEL}: a JSON list of image tasks sharing one "
-            "fine-tune; each task names data, decision and optional heldout, mirror and "
-            "mirror_swap"
+            f"only with --model {EMBEDDING_MODEL} and image rows: a JSON object "
+            '{"tasks": [{"name", "data", "decision", optional "heldout", "mirror", '
+            '"mirror_swap"}, ...]} of decisions trained into one fine-tune, one head each; '
+            "paths are relative to the file, heldout defaults to heldout.jsonl beside data, "
+            "and --data, --decision, --heldout, --mirror and --mirror-swap are refused with it"
         ),
     )
     tune.add_argument(

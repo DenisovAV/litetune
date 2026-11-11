@@ -47,6 +47,14 @@ grafts from, with the processor; the record says `modality: "image"` with the
 vision-token budget, the soft tokens each picture took, the mirror, and the
 sha256 of each processor file saved, which `verify` holds the reference to.
 
+**Several image decisions.** `--tasks tasks.json` names several image splits,
+each with its own `decision.json`, mirror and swaps (`_check_tasks`, each task
+checked as a single-question run would be). One fine-tune of the text tower
+trains one head per task on the shared pool, each with its own class weights,
+all tasks' items shuffled together (`_MULTITASK_IMAGE_MAIN`). The record lists
+the tasks under `tasks` (`EmbeddingTaskRecord`), and `verify` picks one by the
+`decision.json` beside the held-out split it is given.
+
 The training runs in `envs.EMBED_TRAIN` as a generated script; this process
 imports neither torch nor sentence-transformers.
 """
@@ -211,8 +219,9 @@ RECIPE = Recipe()
 class ImageRecipe:
     """The image recipe, as the script is given it: that of unpublished runs on game
     frames, which trained two heads at once, one per task, for 2 epochs (one run
-    3); here one decision is one head. litetune has measured it on one dataset
-    (MEASUREMENTS.md, "EmbeddingGemma 2 on images: beans").
+    3); here each decision is one head, and `--tasks` trains several at once.
+    litetune has measured it on one dataset with one decision (MEASUREMENTS.md,
+    "EmbeddingGemma 2 on images: beans").
 
     A Linear(768, K) head -- weights and bias on the L2-normalised mean pool of
     every token, not a cosine head -- its logits times `logit_scale`,
@@ -300,6 +309,11 @@ IMAGE_RECIPE_UNMEASURED = (
     "float32 fine-tune against 0.8233 on Google's file. It comes from unpublished runs on game "
     "frames. Whether it helps on other pictures is not known; `litetune verify` measures this "
     "checkpoint's decider"
+)
+IMAGE_MULTITASK_UNMEASURED = (
+    "litetune has not measured a tune of several image decisions at once (--tasks): the "
+    "measurement above trained one. `litetune verify` measures each task's decider on its own "
+    "held-out split"
 )
 IMAGE_MIRROR_ASSUMES_SYMMETRY = (
     "--mirror trained on a horizontally flipped copy of every training image{swapped}. That "
@@ -1146,9 +1160,30 @@ def multitask_items(task_runs):
     ]
 
 
-def multitask_loss(torch, task_runs, heads, weight_tensors, vectors, selected, scale, batch_size):
+def multitask_heads(torch, tasks, embedding_dim):
+    # One Linear(embedding_dim, K) per task, K its own option count, in task order.
+    return torch.nn.ModuleList(
+        [torch.nn.Linear(embedding_dim, len(task["labels"])) for task in tasks]
+    )
+
+
+def multitask_weight_tensors(torch, task_runs, device):
+    # Each task's class weights, in task order: multitask_loss indexes them by task.
+    return [
+        torch.tensor(run["weights"], dtype=torch.float32, device=device)
+        for _, _, _, run in task_runs
+    ]
+
+
+def multitask_predict(heads, task_index, labels, vectors):
+    # The task's own head over pooled vectors, read back as that task's labels.
+    return [labels[q] for q in heads[task_index](vectors).argmax(-1).tolist()]
+
+
+def multitask_loss(torch, task_runs, heads, weight_tensors, vectors, selected, scale):
     # Each task sees only its own rows, head and class weights. CE sums within
     # each task; division by the whole mixed batch gives one batch mean.
+    batch_size = len(selected)
     loss = 0
     for task_index in range(len(task_runs)):
         positions = [i for i, (t, _) in enumerate(selected) if t == task_index]
@@ -1272,13 +1307,8 @@ def main():
         return torch.nn.functional.normalize(masked_mean(state, mask), dim=-1)
 
     torch.manual_seed(recipe["seed"])
-    heads = torch.nn.ModuleList(
-        [torch.nn.Linear(recipe["embedding_dim"], len(task["labels"])) for task in spec["tasks"]]
-    ).to(device)
-    weight_tensors = [
-        torch.tensor(run["weights"], dtype=torch.float32, device=device)
-        for _, _, _, run in task_runs
-    ]
+    heads = multitask_heads(torch, spec["tasks"], recipe["embedding_dim"]).to(device)
+    weight_tensors = multitask_weight_tensors(torch, task_runs, device)
     combined = multitask_items([run for _, _, _, run in task_runs])
     lm_params = [p for p in lm.parameters() if p.requires_grad]
     optimiser = torch.optim.AdamW(
@@ -1313,7 +1343,6 @@ def main():
                 vectors,
                 selected,
                 recipe["logit_scale"],
-                len(chosen),
             )
             optimiser.zero_grad()
             loss.backward()
@@ -1344,8 +1373,8 @@ def main():
         with torch.no_grad():
             for i in range(0, len(chosen_items), recipe["eval_batch_size"]):
                 part = chosen_items[i : i + recipe["eval_batch_size"]]
-                scores = heads[task_index](pooled(*batch([item[:2] for item in part])))
-                predicted += [labels[q] for q in scores.argmax(-1).tolist()]
+                vectors = pooled(*batch([item[:2] for item in part]))
+                predicted += multitask_predict(heads, task_index, labels, vectors)
         return predicted
 
     task_metrics = []
@@ -1598,6 +1627,31 @@ def read_image_split(path: Path, decision: Decision, what: str) -> list[Labelled
 def pictures_in_both(train: Sequence[LabelledImage], heldout: Sequence[LabelledImage]) -> list[str]:
     """The digests of the pictures both splits hold, sorted: none in a split `prepare` wrote."""
     return sorted({row.sha256 for row in train} & {row.sha256 for row in heldout})
+
+
+def groups_in_both(train: Sequence[LabelledImage], heldout: Sequence[LabelledImage]) -> list[str]:
+    """The supplied groups both splits hold, sorted: none in a split `prepare` wrote."""
+    return sorted(
+        {row.group for row in train if row.group is not None}
+        & {row.group for row in heldout if row.group is not None}
+    )
+
+
+def refuse_shared_rows(
+    train: Sequence[LabelledImage], heldout: Sequence[LabelledImage], where: str
+) -> None:
+    """Raise when a picture or a supplied group is in both splits: the held-out
+    accuracy would score what the model was trained on."""
+    if both := pictures_in_both(train, heldout):
+        raise EmbeddingTuneError(
+            f"{where}: {len(both)} picture(s) are in both training and held-out "
+            f"(sha256 {', '.join(both[:3])})"
+        )
+    if shared := groups_in_both(train, heldout):
+        raise EmbeddingTuneError(
+            f"{where}: {len(shared)} supplied group(s) are in both training and held-out "
+            f"({', '.join(map(repr, shared[:3]))})"
+        )
 
 
 def resolve_swaps(given: Sequence[str], ids: Sequence[str]) -> tuple[tuple[str, str], ...]:
@@ -2043,8 +2097,8 @@ class EmbeddingRecord:
     # saved beside the checkpoint. `verify` prepares the pictures with the
     # reference's processor and refuses one whose files are not these.
     processor_sha256: Mapping[str, str] | None = None
-    # Present only for a multi-task image tune. A one-task record keeps the
-    # original top-level question fields and omits this key.
+    # Present only for a `--tasks` image tune. A single-question record keeps
+    # the top-level question fields and omits this key.
     tasks: tuple[EmbeddingTaskRecord, ...] = ()
 
     def __post_init__(self) -> None:
@@ -2490,7 +2544,7 @@ class _CheckedTask:
 
 
 def _check_tasks(request: EmbeddingTuneRequest) -> tuple[_CheckedTask, ...]:
-    """Read and validate every task exactly through the single-question checker."""
+    """Read every task and check it with the single-question checker, then across tasks."""
     assert request.tasks is not None
     try:
         raw = json.loads(request.tasks.read_text(encoding="utf-8"))
@@ -2571,14 +2625,7 @@ def _check_tasks(request: EmbeddingTuneRequest) -> tuple[_CheckedTask, ...]:
             mirror=mirror,
             mirror_swap=(),
         )
-        checked = _check_request(single)
-        task_train = [row for row in checked.train if isinstance(row, LabelledImage)]
-        task_heldout = [row for row in checked.heldout if isinstance(row, LabelledImage)]
-        if both := pictures_in_both(task_train, task_heldout):
-            raise EmbeddingTuneError(
-                f"{where}: {len(both)} picture(s) are in both training and held-out "
-                f"(sha256 {', '.join(both[:3])})"
-            )
+        checked = _check_request(single, where)
         checked = replace(
             checked,
             swaps=resolve_swap_pairs(raw_swaps, checked.decision.ids, where),
@@ -2655,8 +2702,11 @@ def _refuse_heldout_modality(request: EmbeddingTuneRequest, modality: str) -> No
         )
 
 
-def _check_request(request: EmbeddingTuneRequest) -> _Checked:
-    """The decision, both splits' rows and the labels. Raises `EmbeddingTuneError`."""
+def _check_request(request: EmbeddingTuneRequest, where: str | None = None) -> _Checked:
+    """The decision, both splits' rows and the labels. Raises `EmbeddingTuneError`.
+
+    `where` names the task in a refusal of a picture or group in both splits.
+    """
     assert request.decision is not None and request.data is not None and request.heldout is not None
     try:
         decision, _ = read_questions(request.decision)
@@ -2690,6 +2740,7 @@ def _check_request(request: EmbeddingTuneRequest) -> _Checked:
     swaps = resolve_swaps(request.mirror_swap, decision.ids)
     images = read_image_split(request.data, decision, "training")
     held = read_image_split(request.heldout, decision, "held-out")
+    refuse_shared_rows(images, held, where or str(request.data))
     return _Checked(decision, modality, images, held, labels_for(decision, images), swaps)
 
 
@@ -2799,6 +2850,7 @@ def run_embedding_tune(
     if image:
         result.limitation(IMAGE_RECIPE_UNMEASURED)
         if checked_tasks:
+            result.limitation(IMAGE_MULTITASK_UNMEASURED)
             mirrored_tasks = checked_tasks
         else:
             assert (
@@ -3360,6 +3412,18 @@ def run_embedding_tune(
                 f"mirrored items {record.mirror}, swaps {[list(p) for p in record.mirror_swap]}, "
                 f"not the {request.vision_tokens}, {request.mirror}, "
                 f"{[list(p) for p in checked.swaps]} of the spec it was given",
+            ),
+            attempted=True,
+        )
+    if checked_tasks and record.vision_tokens != request.vision_tokens:
+        # The per-task mirror settings are compared above; the budget is shared.
+        return _finish(
+            result,
+            events,
+            Check.failed(
+                TRAINING_CHECK,
+                f"the training script reports a budget of {record.vision_tokens} vision tokens, "
+                f"not the {request.vision_tokens} of the spec it was given",
             ),
             attempted=True,
         )
