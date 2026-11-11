@@ -128,6 +128,16 @@ def _check_decision(
         asked, _ = read_questions(path)
     except DecisionError as exc:
         return Check.failed(DECISION_CHECK, str(exc), observed=where), None
+    if asked.mirror is not None:
+        return (
+            Check.failed(
+                DECISION_CHECK,
+                f"{path} declares 'mirror', mirrored training copies of pictures, which only "
+                "google/embeddinggemma-2's image tune makes; this run would train without them",
+                observed=where,
+            ),
+            None,
+        )
     if request.declarations is not None:
         return (
             Check.failed(

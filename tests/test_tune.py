@@ -5228,6 +5228,22 @@ def test_a_decision_split_is_checked_and_its_decision_handed_to_the_script(
     assert "decision_sha256" not in report["request"]
 
 
+def test_a_decision_with_a_mirror_is_refused_by_an_llm_tune(tmp_path, request_for, trainer):
+    data, decision = _decision_split(tmp_path)
+    written = json.loads(decision.read_text(encoding="utf-8"))
+    decision.write_text(json.dumps({**written, "mirror": [["joy", "anger"]]}), encoding="utf-8")
+
+    result = run_tune(
+        request_for(
+            model=GEMMA_270M, data=data, decision=decision, prompt_mode=PromptMode.RUNTIME_RENDERED
+        )
+    )
+
+    check = next(c for c in result.checks.checks if c.name == "decision")
+    assert check.outcome is Outcome.FAILED and "declares 'mirror'" in check.detail
+    assert trainer.configs == []
+
+
 def test_without_a_decision_the_script_is_handed_none(request_for, trainer):
     run_tune(request_for())
 

@@ -1116,8 +1116,9 @@ What has and has not been measured
   and vision encoder given the CPU, and later through verify with both given the
   Mac's GPU. It was also measured on the Mac's and Windows' CPUs, and its SM8750
   file on a Galaxy S25 Ultra's NPU.
-- Not measured: 140 vision tokens, mirrored copies, and the app's CPU path through
-  flutter_edge_ai on the spliced file.
+- Not measured here: 140 vision tokens, mirrored copies (one several-question
+  run used them, in [MEASUREMENTS.md](MEASUREMENTS.md#embeddinggemma-2-on-images-several-questions)),
+  and the app's CPU path through flutter_edge_ai on the spliced file.
 
 ### A generation bundle for a Qualcomm NPU: `convert --npu`
 
