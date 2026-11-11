@@ -52,7 +52,6 @@ from litetune.embedding_tune import (
     EmbeddingTuneError,
     EmbeddingTuneRequest,
     read_embedding_record,
-    resolve_swaps,
     run_embedding_tune,
     summarise,
     write_embedding_record,
@@ -192,8 +191,12 @@ def toolchain(monkeypatch, tmp_path) -> FakeImageToolchain:
 # ---------------------------------------------------------------------------
 
 
-def _decision(ids: tuple[str, ...] = OPTIONS) -> Decision:
-    return Decision("choice", "Where does the road go?", tuple(Option(o) for o in ids))
+def _decision(
+    ids: tuple[str, ...] = OPTIONS, mirror: tuple[tuple[str, str], ...] | None = None
+) -> Decision:
+    return Decision(
+        "choice", "Where does the road go?", tuple(Option(o) for o in ids), None, mirror
+    )
 
 
 @dataclass
@@ -235,11 +238,16 @@ def _write(path: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
-def _split(tmp_path: Path, ids: tuple[str, ...] = OPTIONS, train: int = 12) -> Split:
+def _split(
+    tmp_path: Path,
+    ids: tuple[str, ...] = OPTIONS,
+    train: int = 12,
+    mirror: tuple[tuple[str, str], ...] | None = None,
+) -> Split:
     root = tmp_path / "split"
     root.mkdir(parents=True, exist_ok=True)
     decision = root / "decision.json"
-    decision.write_text(_decision(ids).canonical_text(), encoding="utf-8")
+    decision.write_text(_decision(ids, mirror).canonical_text(), encoding="utf-8")
     return Split(
         root,
         _write(root / "train.jsonl", _rows(root, train, 0, ids)),
@@ -341,18 +349,19 @@ def test_a_multitask_run_whose_script_reports_another_budget_is_a_failure(toolch
 
 def test_a_multitask_run_records_each_head_and_uses_one_joint_spec(toolchain, tmp_path):
     zones = _split(tmp_path / "zones", ids=("near", "far"), train=8)
-    steer = _split(tmp_path / "steer", ids=("left", "right", "straight"), train=9)
+    steer = _split(
+        tmp_path / "steer",
+        ids=("left", "right", "straight"),
+        train=9,
+        mirror=(("left", "right"),),
+    )
+    # The mirror is steer's question's, read from its decision.json; the task file
+    # names the split and the decision only.
     tasks = _tasks_file(
         tmp_path,
         [
             {"name": "zones", "data": str(zones.train), "decision": str(zones.decision)},
-            {
-                "name": "steer",
-                "data": str(steer.train),
-                "decision": str(steer.decision),
-                "mirror": True,
-                "mirror_swap": [["left", "right"]],
-            },
+            {"name": "steer", "data": str(steer.train), "decision": str(steer.decision)},
         ],
     )
     result = run_embedding_tune(
@@ -674,28 +683,32 @@ def test_the_script_is_given_each_rows_file_digest_and_label(toolchain, split, t
     assert len(_records(Path(spec["heldout_rows"]))) == 6
 
 
-def test_mirror_and_its_swaps_reach_the_script_and_the_record(toolchain, split, tmp_path):
-    result = run_embedding_tune(_request(split, tmp_path, mirror=True, mirror_swap=("left:right",)))
+def test_the_questions_mirror_reaches_the_script_and_the_record(toolchain, tmp_path):
+    split = _split(tmp_path, mirror=(("left", "right"),))
+    result = run_embedding_tune(_request(split, tmp_path))
 
     assert result.ok, result.checks.as_dict()
     (spec,) = toolchain.specs
     assert (spec["mirror"], spec["mirror_swap"]) == (True, [["left", "right"]])
     assert result.record is not None
     assert (result.record.mirror, result.record.mirror_swap) == (True, (("left", "right"),))
-    texts = [t for t in result.limitations if t.startswith("--mirror")]
+    texts = [t for t in result.limitations if t.startswith("the question's mirror")]
     assert len(texts) == 1
     assert "left and right" in texts[0] and "mirrored scene means what the original" in texts[0]
 
 
-def test_mirror_without_swaps_notes_the_symmetry_it_assumes(toolchain, split, tmp_path):
-    result = run_embedding_tune(_request(split, tmp_path, mirror=True))
-    (text,) = [t for t in result.limitations if t.startswith("--mirror")]
+def test_mirror_without_swaps_notes_the_symmetry_it_assumes(toolchain, tmp_path):
+    split = _split(tmp_path, mirror=())
+    result = run_embedding_tune(_request(split, tmp_path))
+    (spec,) = toolchain.specs
+    assert (spec["mirror"], spec["mirror_swap"]) == (True, [])
+    (text,) = [t for t in result.limitations if t.startswith("the question's mirror")]
     assert "exchanged" not in text
 
 
 def test_no_mirror_no_mirror_limitation(toolchain, split, tmp_path):
     result = run_embedding_tune(_request(split, tmp_path))
-    assert not [t for t in result.limitations if "--mirror" in t]
+    assert not [t for t in result.limitations if "mirror" in t]
 
 
 def test_an_image_run_says_its_recipe_has_one_litetune_measurement(toolchain, split, tmp_path):
@@ -725,10 +738,9 @@ def test_a_run_on_a_device_the_image_runs_used_makes_no_device_note(
     assert IMAGE_RECIPE_UNMEASURED in result.limitations
 
 
-def test_the_report_and_the_summary_name_the_images_and_the_vision_tokens(
-    toolchain, split, tmp_path
-):
-    result = run_embedding_tune(_request(split, tmp_path, mirror=True))
+def test_the_report_and_the_summary_name_the_images_and_the_vision_tokens(toolchain, tmp_path):
+    split = _split(tmp_path, mirror=())
+    result = run_embedding_tune(_request(split, tmp_path))
     report = json.loads(write_report(result).read_text())
     assert report["modality"] == "image" and report["vision_tokens"] == 70
     assert report["request"]["modality"] == "image"
@@ -780,11 +792,10 @@ def test_metrics_that_say_another_input_than_given_are_a_failure(
     assert not (tmp_path / "tuned" / "model" / "litetune.json").exists()
 
 
-def test_metrics_that_drop_the_swap_of_a_mirrored_run_are_a_failure_naming_it(
-    toolchain, split, tmp_path
-):
+def test_metrics_that_drop_the_swap_of_a_mirrored_run_are_a_failure_naming_it(toolchain, tmp_path):
+    split = _split(tmp_path, mirror=(("left", "right"),))
     toolchain.metrics_overrides = {"mirror_swap": []}
-    result = run_embedding_tune(_request(split, tmp_path, mirror=True, mirror_swap=("left:right",)))
+    result = run_embedding_tune(_request(split, tmp_path))
     assert result.outcome is Outcome.FAILED
     check = _check(result, TRAINING_CHECK)
     assert check.outcome is Outcome.FAILED
@@ -969,42 +980,9 @@ def test_an_empty_image_heldout_split_is_refused(toolchain, split, tmp_path):
     _refused(toolchain, _request(split, tmp_path), r"held-out split .* does not exist")
 
 
-@pytest.mark.parametrize(
-    ("swaps", "pattern"),
-    [
-        (("left:reverse",), r"left:reverse: not two of the decision's option ids"),
-        (("left:left",), r"left:left: an option swapped with itself"),
-        (("left:right", "right:straight"), r"right:straight: 'right' is already in another pair"),
-        (("left:right", "right:left"), r"already in another pair"),
-    ],
-)
-def test_a_swap_that_is_not_a_pair_of_option_ids_is_refused(
-    toolchain, split, tmp_path, swaps, pattern
-):
-    _refused(toolchain, _request(split, tmp_path, mirror=True, mirror_swap=swaps), pattern)
-
-
-def test_a_swap_is_split_at_the_one_colon_with_ids_on_both_sides():
-    ids = ("lane:left", "lane:right", "a")
-    assert resolve_swaps(["lane:left:lane:right"], ids) == (("lane:left", "lane:right"),)
-    assert resolve_swaps([], ids) == ()
-    with pytest.raises(EmbeddingTuneError, match="reads as 2 different pairs"):
-        resolve_swaps(["a:b:c"], ("a", "b:c", "a:b", "c"))
-
-
 # ---------------------------------------------------------------------------
 # The request
 # ---------------------------------------------------------------------------
-
-
-def test_a_swap_without_mirror_is_refused(split, tmp_path):
-    with pytest.raises(EmbeddingTuneError, match="--mirror-swap without --mirror"):
-        _request(split, tmp_path, mirror_swap=("left:right",))
-
-
-def test_a_swap_without_a_colon_is_refused(split, tmp_path):
-    with pytest.raises(EmbeddingTuneError, match="write it as A:B"):
-        _request(split, tmp_path, mirror=True, mirror_swap=("left",))
 
 
 @pytest.mark.parametrize("value", [0, 69, 100, 280, True])
@@ -1035,20 +1013,21 @@ def _text_split(tmp_path: Path) -> Split:
     )
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "named"),
-    [
-        ({"vision_tokens": 70}, "--vision-tokens"),
-        ({"vision_tokens": None, "mirror": True}, "--mirror"),
-        (
-            {"vision_tokens": 140, "mirror": True, "mirror_swap": ("left:right",)},
-            "--vision-tokens, --mirror, --mirror-swap",
-        ),
-    ],
-)
-def test_image_flags_on_a_text_split_are_refused_by_name(toolchain, tmp_path, kwargs, named):
+def test_image_flags_on_a_text_split_are_refused_by_name(toolchain, tmp_path):
     s = _text_split(tmp_path)
-    _refused(toolchain, _request(s, tmp_path, **kwargs), rf"^{named}: .* is a text split")
+    _refused(
+        toolchain, _request(s, tmp_path, vision_tokens=70), r"^--vision-tokens: .* is a text split"
+    )
+
+
+def test_a_text_splits_decision_with_a_mirror_is_refused(toolchain, tmp_path):
+    s = _text_split(tmp_path)
+    s.decision.write_text(_decision(mirror=(("left", "right"),)).canonical_text(), encoding="utf-8")
+    _refused(
+        toolchain,
+        _request(s, tmp_path, vision_tokens=None),
+        r"declares 'mirror', and .* is a text split",
+    )
 
 
 def test_a_heldout_row_with_a_prompt_and_an_image_beside_text_training_is_refused(
@@ -1394,16 +1373,9 @@ def _argv(split: Split, tmp_path: Path, *extra: str, model: str = EMBEDDING_MODE
     ]
 
 
-def test_a_whole_image_run_through_the_command_line(toolchain, split, tmp_path, capsys):
-    argv = _argv(
-        split,
-        tmp_path,
-        "--vision-tokens",
-        "70",
-        "--mirror",
-        "--mirror-swap",
-        "left:right",
-    )
+def test_a_whole_image_run_through_the_command_line(toolchain, tmp_path, capsys):
+    split = _split(tmp_path, mirror=(("left", "right"),))
+    argv = _argv(split, tmp_path, "--vision-tokens", "70")
     assert main(argv) == 0
     record = read_embedding_record(tmp_path / "run" / "model")
     assert record is not None and record.is_image
@@ -1423,8 +1395,6 @@ def test_a_whole_image_run_through_the_command_line(toolchain, split, tmp_path, 
         ("--data", "rows.jsonl"),
         ("--heldout", "heldout.jsonl"),
         ("--decision", "decision.json"),
-        ("--mirror",),
-        ("--mirror-swap", "left:right"),
     ],
 )
 def test_tasks_refuses_single_question_flags(toolchain, tmp_path, capsys, extra):
@@ -1573,36 +1543,32 @@ def test_request_refuses_tasks_with_single_question_paths(tmp_path, field):
 
 
 @pytest.mark.parametrize(
-    "task",
-    [
-        {"name": "x", "data": "x", "decision": "d", "mirror": "yes"},
-        {"name": "x", "data": "x", "decision": "d", "mirror_swap": [["a", "b"]]},
-        {"name": "x", "data": "x", "decision": "d", "mirror_swap": ["a:b"]},
-    ],
+    "extra",
+    [{"mirror": True}, {"mirror_swap": [["a", "b"]]}, {"heldout": "heldout.jsonl"}],
 )
-def test_tasks_json_refuses_invalid_mirror_fields(tmp_path, task):
-    tasks = _tasks_file(tmp_path, [task])
-    with pytest.raises(EmbeddingTuneError, match="mirror"):
+def test_a_task_carries_only_its_name_data_and_decision(tmp_path, extra):
+    # The mirror is the question's (decision.json), and the held-out split is
+    # the one prepare wrote beside the data.
+    tasks = _tasks_file(tmp_path, [{"name": "x", "data": "x", "decision": "d", **extra}])
+    with pytest.raises(EmbeddingTuneError, match=f"unknown keys \\['{next(iter(extra))}'\\]"):
         run_embedding_tune(
             EmbeddingTuneRequest(output_dir=tmp_path / "run", tasks=tasks, vision_tokens=70)
         )
 
 
-def test_the_swap_flag_repeats(toolchain, tmp_path):
-    s = _split(tmp_path, ids=("left", "right", "up", "down"))
-    argv = _argv(
-        s,
-        tmp_path,
-        "--vision-tokens",
-        "140",
-        "--mirror",
-        "--mirror-swap",
-        "left:right",
-        "--mirror-swap",
-        "up:down",
+def test_several_mirror_pairs_reach_the_script(toolchain, tmp_path):
+    s = _split(
+        tmp_path, ids=("left", "right", "up", "down"), mirror=(("left", "right"), ("up", "down"))
     )
-    assert main(argv) == 0
+    assert main(_argv(s, tmp_path, "--vision-tokens", "140")) == 0
     assert toolchain.specs[0]["mirror_swap"] == [["left", "right"], ["up", "down"]]
+
+
+@pytest.mark.parametrize("flag", [["--mirror"], ["--mirror-swap", "left:right"]])
+def test_the_090_mirror_flags_are_gone(toolchain, split, tmp_path, capsys, flag):
+    assert main(_argv(split, tmp_path, "--vision-tokens", "70", *flag)) == 4
+    assert f"unrecognized arguments: {flag[0]}" in capsys.readouterr().err
+    assert toolchain.calls == []
 
 
 def test_an_image_split_without_vision_tokens_exits_could_not_check(
@@ -1611,12 +1577,6 @@ def test_an_image_split_without_vision_tokens_exits_could_not_check(
     assert main(_argv(split, tmp_path)) == 4
     assert "visionTokensPerImage" in capsys.readouterr().err
     assert toolchain.calls == []
-
-
-def test_a_swap_without_mirror_exits_could_not_check(toolchain, split, tmp_path, capsys):
-    argv = _argv(split, tmp_path, "--vision-tokens", "70", "--mirror-swap", "left:right")
-    assert main(argv) == 4
-    assert "--mirror-swap without --mirror" in capsys.readouterr().err
 
 
 def test_vision_tokens_outside_the_choices_are_refused_by_argparse(split, tmp_path, capsys):
@@ -1634,10 +1594,7 @@ def test_a_windows_path_in_an_image_row_is_refused_on_every_host(toolchain, spli
     _refused(toolchain, _request(split, tmp_path), r"train\.jsonl:1: .*not inside the split")
 
 
-@pytest.mark.parametrize(
-    "extra",
-    [["--vision-tokens", "70"], ["--mirror"], ["--mirror", "--mirror-swap", "a:b"]],
-)
+@pytest.mark.parametrize("extra", [["--vision-tokens", "70"]])
 def test_image_flags_are_refused_for_an_llm(toolchain, split, tmp_path, capsys, extra):
     assert main(_argv(split, tmp_path, *extra, model="google/gemma-3-270m-it")) == 4
     err = capsys.readouterr().err

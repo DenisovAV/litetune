@@ -40,15 +40,16 @@ with its vision tower and no audio tower, the vision tower, `embed_vision`
 and the token embeddings frozen, each picture's input computed once at a
 budget of at most `--vision-tokens` soft tokens and cached in the output
 directory, and a Linear(768, K) head -- weights and bias, not a cosine head --
-on the L2-normalised mean pool, its logits times 20. `--mirror` adds a flipped
-copy of every training picture, `--mirror-swap` exchanges two labels on the
+on the L2-normalised mean pool, its logits times 20. A question with a
+`mirror` (`Decision.mirror`, written by prepare into decision.json) adds a
+flipped copy of every training picture, its pairs' labels exchanged on the
 copies. The full HF checkpoint is saved, as one `model.safetensors` convert
 grafts from, with the processor; the record says `modality: "image"` with the
 vision-token budget, the soft tokens each picture took, the mirror, and the
 sha256 of each processor file saved, which `verify` holds the reference to.
 
 **Several image decisions.** `--tasks tasks.json` names several image splits,
-each with its own `decision.json`, mirror and swaps (`_check_tasks`, each task
+each with its own `decision.json` and so its own mirror (`_check_tasks`, each task
 checked as a single-question run would be). One fine-tune of the text tower
 trains one head per task on the shared pool, each with its own class weights,
 all tasks' items shuffled together (`_MULTITASK_IMAGE_MAIN`). The record lists
@@ -317,12 +318,14 @@ IMAGE_RECIPE_UNMEASURED = (
     "checkpoint's decider"
 )
 IMAGE_MULTITASK_UNMEASURED = (
-    "litetune has not measured a tune of several image decisions at once (--tasks): the "
-    "measurement above trained one. `litetune verify` measures each task's decider on its own "
+    "a tune of several image decisions at once (--tasks) has one litetune measurement, on one "
+    "game's frames, with linear probes and not with verify (MEASUREMENTS.md, \"EmbeddingGemma 2 "
+    "on images: several questions\"). `litetune verify` measures each task's decider on its own "
     "held-out split"
 )
 IMAGE_MIRROR_ASSUMES_SYMMETRY = (
-    "--mirror trained on a horizontally flipped copy of every training image{swapped}. That "
+    "the question's mirror trained on a horizontally flipped copy of every training "
+    "image{swapped}. That "
     "assumes a mirrored scene means what the original means: a picture with text, a HUD, or "
     "light from one side is not its own mirror image, and the model was taught pictures the "
     "application never shows it"
@@ -1660,68 +1663,6 @@ def refuse_shared_rows(
         )
 
 
-def resolve_swaps(given: Sequence[str], ids: Sequence[str]) -> tuple[tuple[str, str], ...]:
-    """`--mirror-swap A:B` as id pairs. An id may hold a colon, so the split is the one
-    colon with an option id on both sides; none, or more than one, is refused, as is
-    a pair of one id or an id that is in two pairs."""
-    known = set(ids)
-    pairs: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for text in given:
-        cuts = [
-            (text[:i], text[i + 1 :])
-            for i, char in enumerate(text)
-            if char == ":" and text[:i] in known and text[i + 1 :] in known
-        ]
-        if not cuts:
-            raise EmbeddingTuneError(
-                f"--mirror-swap {text}: not two of the decision's option ids around a colon "
-                f"(its ids: {', '.join(sorted(known)[:12])})"
-            )
-        if len(cuts) > 1:
-            raise EmbeddingTuneError(
-                f"--mirror-swap {text}: reads as {len(cuts)} different pairs of option ids"
-            )
-        a, b = cuts[0]
-        if a == b:
-            raise EmbeddingTuneError(f"--mirror-swap {text}: an option swapped with itself")
-        for label in (a, b):
-            if label in seen:
-                raise EmbeddingTuneError(
-                    f"--mirror-swap {text}: {label!r} is already in another pair; each option "
-                    "has one mirror"
-                )
-            seen.add(label)
-        pairs.append((a, b))
-    return tuple(pairs)
-
-
-def resolve_swap_pairs(
-    given: Sequence[Sequence[str]], ids: Sequence[str], where: str
-) -> tuple[tuple[str, str], ...]:
-    """Task-file mirror pairs, whose two ids are already separate JSON strings."""
-    known = set(ids)
-    pairs: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for raw in given:
-        a, b = raw
-        if a not in known or b not in known:
-            unknown = a if a not in known else b
-            raise EmbeddingTuneError(
-                f"{where}: mirror_swap names {unknown!r}, not one of the decision's option ids"
-            )
-        if a == b:
-            raise EmbeddingTuneError(f"{where}: mirror_swap swaps {a!r} with itself")
-        for label in (a, b):
-            if label in seen:
-                raise EmbeddingTuneError(
-                    f"{where}: mirror_swap names {label!r} twice; each option has one mirror"
-                )
-            seen.add(label)
-        pairs.append((a, b))
-    return tuple(pairs)
-
-
 def labels_for(decision: Decision, train: Sequence[_Labelled]) -> tuple[str, ...]:
     """The decision's ids, sorted, once every one of them has a training row."""
     labels = tuple(sorted(decision.ids))
@@ -1764,12 +1705,9 @@ class EmbeddingTuneRequest:
     timeout_s: int = DEFAULT_TIMEOUT_S
     env: envs.StageEnv = envs.EMBED_TRAIN
     auto_provision: bool = True
-    # Image splits only (`--vision-tokens`, `--mirror`, `--mirror-swap`); a text
-    # split given any of them is refused once its rows are read.
+    # Image splits only; a text split given it is refused once its rows are read.
+    # Mirrored copies are the question's (`Decision.mirror`), not the run's.
     vision_tokens: int | None = None
-    mirror: bool = False
-    # As given, `A:B`; resolved against the decision's ids (`resolve_swaps`).
-    mirror_swap: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # `True == 1` is not in VISION_TOKENS either.
@@ -1778,7 +1716,6 @@ class EmbeddingTuneRequest:
                 f"--vision-tokens {self.vision_tokens}: the image recipe takes one of "
                 f"{', '.join(map(str, VISION_TOKENS))}"
             )
-        object.__setattr__(self, "mirror_swap", tuple(self.mirror_swap))
         if self.tasks is None and (
             self.data is None or self.heldout is None or self.decision is None
         ):
@@ -1787,16 +1724,6 @@ class EmbeddingTuneRequest:
             self.data is not None or self.heldout is not None or self.decision is not None
         ):
             raise EmbeddingTuneError("--tasks cannot be mixed with --data, --heldout or --decision")
-        if self.mirror_swap and not self.mirror:
-            raise EmbeddingTuneError(
-                "--mirror-swap without --mirror: the swap exchanges labels on the mirrored "
-                "copies, and there are none without --mirror"
-            )
-        for text in self.mirror_swap:
-            if ":" not in text:
-                raise EmbeddingTuneError(
-                    f"--mirror-swap {text}: write it as A:B, two option ids around a colon"
-                )
         if not is_embedding_model(self.model):
             raise EmbeddingTuneError(
                 f"the embedding recipe trains {EMBEDDING_MODEL} only, not {self.model!r}: it was "
@@ -1861,6 +1788,7 @@ class EmbeddingTuneRequest:
         self,
         *,
         labels: Sequence[str],
+        mirror: bool,
         swaps: Sequence[tuple[str, str]],
         train_rows: Path,
         heldout_rows: Path,
@@ -1877,7 +1805,7 @@ class EmbeddingTuneRequest:
             "prefix": IMAGE_PREFIX,
             "image_text": IMAGE_TOKEN_TEXT,
             "vision_tokens": self.vision_tokens,
-            "mirror": self.mirror,
+            "mirror": mirror,
             "mirror_swap": [list(pair) for pair in swaps],
             "labels": list(labels),
             "train_rows": str(train_rows),
@@ -1945,8 +1873,6 @@ class EmbeddingTuneRequest:
             out |= {
                 "modality": modality,
                 "vision_tokens": self.vision_tokens,
-                "mirror": self.mirror,
-                "mirror_swap": list(self.mirror_swap),
             }
         return out
 
@@ -2540,6 +2466,9 @@ class _Checked:
     train: Sequence[LabelledText | LabelledImage]
     heldout: Sequence[LabelledText | LabelledImage]
     labels: tuple[str, ...]
+    # The decision's `mirror`: whether the training pictures get mirrored copies,
+    # and which options exchange on them.
+    mirror: bool = False
     swaps: tuple[tuple[str, str], ...] = ()
 
 
@@ -2570,7 +2499,7 @@ def _check_tasks(request: EmbeddingTuneRequest) -> tuple[_CheckedTask, ...]:
     out: list[_CheckedTask] = []
     names: set[str] = set()
     digests: set[str] = set()
-    allowed = {"name", "data", "heldout", "decision", "mirror", "mirror_swap"}
+    allowed = {"name", "data", "decision"}
     for i, item in enumerate(raw["tasks"]):
         where = f"{request.tasks}: tasks[{i}]"
         if not isinstance(item, dict):
@@ -2586,43 +2515,19 @@ def _check_tasks(request: EmbeddingTuneRequest) -> tuple[_CheckedTask, ...]:
         for key in ("data", "decision"):
             if not isinstance(item[key], str) or not item[key]:
                 raise EmbeddingTuneError(f"{where}: {key!r} must be a non-empty path string")
-        if "heldout" in item and (not isinstance(item["heldout"], str) or not item["heldout"]):
-            raise EmbeddingTuneError(f"{where}: 'heldout' must be a non-empty path string")
-        mirror = item.get("mirror", False)
-        if not isinstance(mirror, bool):
-            raise EmbeddingTuneError(f"{where}: 'mirror' must be true or false")
-        raw_swaps = item.get("mirror_swap", [])
-        if not isinstance(raw_swaps, list) or not all(
-            isinstance(pair, list)
-            and len(pair) == 2
-            and all(isinstance(label, str) for label in pair)
-            for pair in raw_swaps
-        ):
-            raise EmbeddingTuneError(f"{where}: 'mirror_swap' must be a list of string pairs")
-        if raw_swaps and not mirror:
-            raise EmbeddingTuneError(f"{where}: mirror_swap needs mirror true")
         data = root / item["data"] if not Path(item["data"]).is_absolute() else Path(item["data"])
         decision_path = (
             root / item["decision"]
             if not Path(item["decision"]).is_absolute()
             else Path(item["decision"])
         )
-        held_value = item.get("heldout")
-        heldout = (
-            (root / held_value if not Path(held_value).is_absolute() else Path(held_value))
-            if held_value is not None
-            else data.parent / "heldout.jsonl"
-        )
+        # Where prepare writes it, and where verify finds the decision beside it.
+        heldout = data.parent / "heldout.jsonl"
         expected_decision = data.parent / "decision.json"
         if decision_path.resolve() != expected_decision.resolve():
             raise EmbeddingTuneError(
                 f"{where}: 'decision' must be {expected_decision}, beside the task's data file; "
                 "verify reads that path beside the held-out split"
-            )
-        if heldout.parent.resolve() != data.parent.resolve():
-            raise EmbeddingTuneError(
-                f"{where}: 'heldout' must be beside the task's data file and decision.json; "
-                "verify selects the task from the decision beside that held-out split"
             )
         if split_modality(data, "training") != "image":
             raise EmbeddingTuneError(f"{where}: --tasks accepts image rows only; {data} is text")
@@ -2632,14 +2537,8 @@ def _check_tasks(request: EmbeddingTuneRequest) -> tuple[_CheckedTask, ...]:
             heldout=heldout,
             decision=decision_path,
             tasks=None,
-            mirror=mirror,
-            mirror_swap=(),
         )
         checked = _check_request(single, where)
-        checked = replace(
-            checked,
-            swaps=resolve_swap_pairs(raw_swaps, checked.decision.ids, where),
-        )
         digest = checked.decision.digest()
         if digest in digests:
             raise EmbeddingTuneError(
@@ -2647,7 +2546,9 @@ def _check_tasks(request: EmbeddingTuneRequest) -> tuple[_CheckedTask, ...]:
             )
         names.add(item["name"])
         digests.add(digest)
-        out.append(_CheckedTask(item["name"], data, heldout, decision_path, checked, mirror))
+        out.append(
+            _CheckedTask(item["name"], data, heldout, decision_path, checked, checked.mirror)
+        )
     training_pictures = {
         row.sha256 for task in out for row in task.checked.train if isinstance(row, LabelledImage)
     }
@@ -2681,13 +2582,7 @@ def _check_tasks(request: EmbeddingTuneRequest) -> tuple[_CheckedTask, ...]:
 
 def _refuse_image_flags_for_text(request: EmbeddingTuneRequest) -> None:
     given = [
-        flag
-        for flag, value in (
-            ("--vision-tokens", request.vision_tokens is not None),
-            ("--mirror", request.mirror),
-            ("--mirror-swap", bool(request.mirror_swap)),
-        )
-        if value
+        flag for flag, value in (("--vision-tokens", request.vision_tokens is not None),) if value
     ]
     if given:
         raise EmbeddingTuneError(
@@ -2733,6 +2628,11 @@ def _check_request(request: EmbeddingTuneRequest, where: str | None = None) -> _
     modality = split_modality(request.data, "training")
     if modality == "text":
         _refuse_image_flags_for_text(request)
+        if decision.mirror is not None:
+            raise EmbeddingTuneError(
+                f"{request.decision} declares 'mirror', and {request.data} is a text split: a "
+                "mirrored copy is a picture's"
+            )
         _refuse_heldout_modality(request, modality)
         train = _read_split(request.data, decision, "training")
         heldout = _read_split(request.heldout, decision, "held-out")
@@ -2747,11 +2647,18 @@ def _check_request(request: EmbeddingTuneRequest, where: str | None = None) -> _
             "differently at another"
         )
     _refuse_heldout_modality(request, modality)
-    swaps = resolve_swaps(request.mirror_swap, decision.ids)
     images = read_image_split(request.data, decision, "training")
     held = read_image_split(request.heldout, decision, "held-out")
     refuse_shared_rows(images, held, where or str(request.data))
-    return _Checked(decision, modality, images, held, labels_for(decision, images), swaps)
+    return _Checked(
+        decision,
+        modality,
+        images,
+        held,
+        labels_for(decision, images),
+        mirror=decision.mirror is not None,
+        swaps=decision.mirror or (),
+    )
 
 
 def _write_rows(path: Path, rows: Sequence[LabelledText | LabelledImage]) -> None:
@@ -2870,7 +2777,7 @@ def run_embedding_tune(
             )
             mirrored_tasks = (
                 _CheckedTask(
-                    "", request.data, request.heldout, request.decision, checked, request.mirror
+                    "", request.data, request.heldout, request.decision, checked, checked.mirror
                 ),
             )
         for task in mirrored_tasks:
@@ -3043,6 +2950,7 @@ def run_embedding_tune(
     if image and not checked_tasks:
         spec = request.image_spec(
             labels=labels,
+            mirror=checked.mirror,
             swaps=checked.swaps,
             train_rows=train_rows,
             heldout_rows=heldout_rows,
@@ -3411,7 +3319,7 @@ def run_embedding_tune(
         and (record.vision_tokens, record.mirror, record.mirror_swap)
         != (
             request.vision_tokens,
-            request.mirror,
+            checked.mirror,
             checked.swaps,
         )
     ):
@@ -3422,7 +3330,7 @@ def run_embedding_tune(
                 TRAINING_CHECK,
                 f"the training script reports a budget of {record.vision_tokens} vision tokens, "
                 f"mirrored items {record.mirror}, swaps {[list(p) for p in record.mirror_swap]}, "
-                f"not the {request.vision_tokens}, {request.mirror}, "
+                f"not the {request.vision_tokens}, {checked.mirror}, "
                 f"{[list(p) for p in checked.swaps]} of the spec it was given",
             ),
             attempted=True,
@@ -3500,7 +3408,7 @@ def summarise(result: EmbeddingTuneResult) -> list[str]:
         described = f"on images at most {request.vision_tokens} vision tokens per image"
         if request.tasks is not None:
             described += ", multiple tasks"
-        elif request.mirror:
+        elif result.trained_decision is not None and result.trained_decision.mirror is not None:
             described += ", mirrored"
         lines = [
             f"outcome: {result.outcome.value}",

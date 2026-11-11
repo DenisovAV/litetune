@@ -973,18 +973,33 @@ litetune verify --model artifacts/int8/model.litertlm --reference tuned/model \
                 --data data/heldout.jsonl --with-base --json > manifest.json
 ```
 
+A question about pictures whose mirror image means the same -- no text, no
+HUD, no light from one side -- can say so with `mirror`: every training picture
+is also trained as its horizontal mirror, and the two options of each pair are
+exchanged on the copy. `"mirror": []` flips without exchanging; without
+`mirror` there are no copies. Each id must be one of the question's options,
+in at most one pair. Held-out pictures are never mirrored:
+
+```json
+{"type": "choice", "question": "Which way does the path turn?",
+ "options": [{"id": "left"}, {"id": "right"}, {"id": "straight"}],
+ "mirror": [["left", "right"]]}
+```
+
+`prepare` checks it, refuses it on text rows, and writes it into
+`decision.json`, where `tune` reads it.
+
 Several image questions can share one text-tower fine-tune. Prepare each
-question's rows on its own, with the same `--seed`. Each task names the split
-and the `decision.json` beside that split (the layout `prepare` writes); an
-optional `heldout` defaults to `heldout.jsonl` there, paths are relative to
-`tasks.json`, and mirroring belongs to that task alone:
+question's rows on its own, with the same `--seed`. Each task names the
+training split and the `decision.json` beside it, as `prepare` wrote them, with
+paths relative to `tasks.json`; the held-out split is the `heldout.jsonl` there,
+and each question's `mirror` comes from its `decision.json`:
 
 ```json
 {"tasks": [
-  {"name": "zones", "data": "zones/train.jsonl", "decision": "zones/decision.json"},
-  {"name": "near", "data": "near/train.jsonl", "decision": "near/decision.json"},
-  {"name": "steer", "data": "steer/train.jsonl", "decision": "steer/decision.json",
-   "mirror": true, "mirror_swap": [["left", "right"]]}
+  {"name": "zones", "data": "zones/data/train.jsonl", "decision": "zones/data/decision.json"},
+  {"name": "near", "data": "near/data/train.jsonl", "decision": "near/data/decision.json"},
+  {"name": "steer", "data": "steer/data/train.jsonl", "decision": "steer/data/decision.json"}
 ]}
 ```
 
@@ -995,15 +1010,15 @@ litetune tune --model google/embeddinggemma-2 --tasks tasks.json \
 
 The run uses one head and class weights per task, shuffles all tasks' training
 items together, caches a shared picture input once, and trains three epochs
-where one question trains two. `--data`, `--heldout`,
-`--decision`, `--mirror` and `--mirror-swap` are refused beside `--tasks`, and
-so are two tasks with one name or one decision. To verify one task, pass its
+where one question trains two. `--data`, `--heldout` and `--decision` are
+refused beside `--tasks`, and so are two tasks with one name or one decision. To verify one task, pass its
 held-out file; `verify` selects the recorded task by the `decision.json` beside
 that file, and refuses a training split other than the one the task was tuned
 on. Across all tasks, a picture or supplied `group` cannot occur in training
 rows of one task and held-out rows of another; `verify` refuses the same
-leakage against the training pictures and groups recorded by `tune`. litetune
-has not yet measured a tune of several questions.
+leakage against the training pictures and groups recorded by `tune`. A tune of
+several questions has one measurement, with linear probes on one game's frames
+([MEASUREMENTS.md](MEASUREMENTS.md#embeddinggemma-2-on-images-several-questions)).
 
 `questions.json` is a `choice` question without a `none_option`, as for text.
 `--context-length` and `--tokenizer` are refused for image rows: there is no
@@ -1023,11 +1038,7 @@ text to measure.
   embeddings are frozen, and each picture's input is computed once and cached
   under the output directory (`embed_image_inputs`); the rest of the text tower
   is trained, in float32, with a throwaway classification head on the mean
-  pool. `--mirror` also
-  trains on a horizontally flipped copy of every training picture, for pictures
-  whose mirror image means the same (no text, no HUD); `--mirror-swap A:B`,
-  repeatable, labels the flipped copy of an A picture B and the other way
-  round. The recipe comes from unpublished runs on one task family -- game
+  pool, with the question's `mirror` copies when it has one. The recipe comes from unpublished runs on one task family -- game
   frames -- on Apple's GPU and on CUDA; litetune has measured it once, below.
 - **convert** writes `artifacts/int8/model.litertlm`: Google's
   `embeddinggemma-2-text-vision-440m.litertlm` (checked by its sha256, revision
@@ -1105,7 +1116,7 @@ What has and has not been measured
   and vision encoder given the CPU, and later through verify with both given the
   Mac's GPU. It was also measured on the Mac's and Windows' CPUs, and its SM8750
   file on a Galaxy S25 Ultra's NPU.
-- Not measured: 140 vision tokens, `--mirror`, and the app's CPU path through
+- Not measured: 140 vision tokens, mirrored copies, and the app's CPU path through
   flutter_edge_ai on the spliced file.
 
 ### A generation bundle for a Qualcomm NPU: `convert --npu`

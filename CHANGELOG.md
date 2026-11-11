@@ -3,6 +3,12 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
+## 0.9.1
+- `convert` of an EmbeddingGemma 2 checkpoint failed in 0.9.0; it converts again (#127).
+- `tune --tasks` trains several image questions into one EmbeddingGemma 2 fine-tune, and `prepare` rows take a `group` (#128).
+- Mirrored training copies are the question's: `"mirror"` in questions.json; the 0.9.0 `--mirror` and `--mirror-swap` flags are gone (#128).
+- Embedding `verify` runs its float reference on CUDA or MPS when there is one, as `tune` does (#128).
+
 ## 0.9.0 — 2026-11-10
 - Running a decision bundle on an Intel Arc GPU? Convert it again: up to 0.8.2 decision bundles carry a `prefill_8` signature on which an Arc B390 answered wrong (#125).
 - `verify` runs on LiteRT-LM 0.19.1; conversion keeps 0.8.2's export set, and every family measured gave 0.18.0's numbers (#125).

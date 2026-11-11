@@ -134,7 +134,9 @@ CONTROL_TEXT = tuple(
 
 # The keys a decision has: in `--questions`, in `decision.json`, in the checkpoint's
 # record, and first in the bundle's section, which adds how the options were scored.
-CONTRACT_KEYS = frozenset({"contract_version", "type", "question", "options", "none_option"})
+CONTRACT_KEYS = frozenset(
+    {"contract_version", "type", "question", "options", "none_option", "mirror"}
+)
 _KEYS = CONTRACT_KEYS
 
 
@@ -235,6 +237,12 @@ class Decision:
     question: str
     options: tuple[Option, ...]
     none_option: str | None = None
+    # A choice question about pictures only (`prepare` refuses it on text): `None`,
+    # no mirrored copies; otherwise every training picture also trains as its
+    # horizontal mirror, the options in a pair exchanged on the copy -- `()`
+    # flips without exchanging. Absent from `as_dict` when `None`, so a decision
+    # without it keeps the text and digest it had before the field existed.
+    mirror: tuple[tuple[str, str], ...] | None = None
 
     @property
     def listed(self) -> tuple[Option, ...]:
@@ -274,13 +282,16 @@ class Decision:
         return label
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "contract_version": CONTRACT_VERSION,
             "type": self.type,
             "question": self.question,
             "options": [option.as_dict() for option in self.options],
             "none_option": self.none_option,
         }
+        if self.mirror is not None:
+            out["mirror"] = [list(pair) for pair in self.mirror]
+        return out
 
     def canonical_text(self) -> str:
         """What `decision.json` holds. `read_questions` reads it back to this decision."""
@@ -319,6 +330,44 @@ def _options(raw: object, kind: str, where: str) -> tuple[Option, ...]:
             description = _line_text(description, "the description", at)
         options.append(Option(option_id, description))
     return tuple(options)
+
+
+def _mirror(
+    raw: object, kind: str, options: tuple[Option, ...], where: str
+) -> tuple[tuple[str, str], ...]:
+    """`mirror`: a list of option-id pairs, each option in at most one, none with itself."""
+    if kind != "choice":
+        raise DecisionError(
+            f"{where}: a {kind} question has no mirror. Mirrored training copies are for a "
+            "choice question about pictures"
+        )
+    if not isinstance(raw, list) or not all(
+        isinstance(pair, list) and len(pair) == 2 and all(isinstance(i, str) for i in pair)
+        for pair in raw
+    ):
+        raise DecisionError(
+            f'{where}: \'mirror\' must be a list of option-id pairs, e.g. [["left", "right"]], '
+            f"or [] to flip without exchanging; got {json.dumps(raw)}"
+        )
+    ids = [option.id for option in options]
+    seen: set[str] = set()
+    for a, b in raw:
+        for option_id in (a, b):
+            if option_id not in ids:
+                raise DecisionError(
+                    f"{where}: mirror names {option_id!r}, which is not one of the options "
+                    f"({_listing(ids)})"
+                )
+        if a == b:
+            raise DecisionError(f"{where}: mirror pairs {a!r} with itself")
+        for option_id in (a, b):
+            if option_id in seen:
+                raise DecisionError(
+                    f"{where}: mirror names {option_id!r} in two pairs; an option has one mirror "
+                    "image"
+                )
+            seen.add(option_id)
+    return tuple((a, b) for a, b in raw)
 
 
 def decision_from(obj: object, where: str) -> Decision:
@@ -384,7 +433,8 @@ def decision_from(obj: object, where: str) -> Decision:
                     "legend the answer returns"
                 )
 
-    decision = Decision(kind, question, options, none_option)
+    mirror = _mirror(obj["mirror"], kind, options, where) if "mirror" in obj else None
+    decision = Decision(kind, question, options, none_option, mirror)
     ids = decision.ids
     repeated = sorted({i for i in ids if ids.count(i) > 1})
     if repeated:

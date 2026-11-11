@@ -582,7 +582,10 @@ def _add_prepare(sub) -> None:
             f"{EMBEDDING_MODEL} a row may instead be an image row, "
             '{"image": <a PNG or JPEG file, relative to --data or absolute>, "label": <option '
             "id>}; the file is checked and copied into the split, and a rows file is all image "
-            'rows or all text rows. Any row may carry "group": <string>; the rows of a group stay '
+            'rows or all text rows. A choice question about pictures may add "mirror": '
+            '[["left", "right"]] to train each picture\'s horizontal mirror too, the paired '
+            'options exchanged on the copy ([] flips without exchanging); no "mirror", no copies. '
+            'Any row may carry "group": <string>; the rows of a group stay '
             "in one split, and a group is placed by its name and --seed alone, so rows files "
             "prepared with one seed agree on where a shared group goes"
         ),
@@ -623,10 +626,10 @@ def _add_tune(sub) -> None:
         type=Path,
         help=(
             f"only with --model {EMBEDDING_MODEL} and image rows: a JSON object "
-            '{"tasks": [{"name", "data", "decision", optional "heldout", "mirror", '
-            '"mirror_swap"}, ...]} of decisions trained into one fine-tune, one head each; '
-            "paths are relative to the file, heldout defaults to heldout.jsonl beside data, "
-            "and --data, --decision, --heldout, --mirror and --mirror-swap are refused with it"
+            '{"tasks": [{"name": ..., "data": ..., "decision": ...}, ...]} of decisions trained '
+            "into one fine-tune, one head each; data is a train.jsonl prepare wrote, decision the "
+            "decision.json beside it, paths relative to the file. Each question's mirror comes "
+            "from its decision.json. --data, --decision and --heldout are refused with it"
         ),
     )
     tune.add_argument(
@@ -647,23 +650,6 @@ def _add_tune(sub) -> None:
             "processor keeps the aspect ratio, so an image may take fewer). Give the runtime the "
             f"same budget in the application, flutter_edge_ai's "
             f"{VISION_TOKENS_SETTING.format(n='N')}, whose default is {APP_VISION_TOKENS}"
-        ),
-    )
-    tune.add_argument(
-        "--mirror",
-        action="store_true",
-        help=(
-            "image splits only: also train on a horizontally flipped copy of every training "
-            "image. Only for pictures whose mirror image means the same (no text, no HUD)"
-        ),
-    )
-    tune.add_argument(
-        "--mirror-swap",
-        action="append",
-        metavar="A:B",
-        help=(
-            "with --mirror: the flipped copy of an image labelled A is labelled B and the other "
-            "way round (left:right). Repeatable; both must be option ids of the decision"
         ),
     )
     # The LLM-only flags below default to None, not to their values, so that the
@@ -1606,13 +1592,7 @@ def _tune(args: argparse.Namespace) -> int:
     if args.data is None:
         raise TuneError("--data is required unless --tasks is used with the embedding model")
     image_flags = [
-        flag
-        for flag, value in (
-            ("--vision-tokens", args.vision_tokens is not None),
-            ("--mirror", args.mirror),
-            ("--mirror-swap", bool(args.mirror_swap)),
-        )
-        if value
+        flag for flag, value in (("--vision-tokens", args.vision_tokens is not None),) if value
     ]
     if image_flags:
         raise TuneError(
@@ -1717,8 +1697,6 @@ def _tune_embedding(args: argparse.Namespace) -> int:
                 ("--data", args.data is not None),
                 ("--heldout", args.heldout is not None),
                 ("--decision", args.decision is not None),
-                ("--mirror", args.mirror),
-                ("--mirror-swap", bool(args.mirror_swap)),
             )
             if value
         ]
@@ -1751,8 +1729,6 @@ def _tune_embedding(args: argparse.Namespace) -> int:
         timeout_s=args.timeout_s,
         auto_provision=not args.no_provision,
         vision_tokens=args.vision_tokens,
-        mirror=args.mirror,
-        mirror_swap=tuple(args.mirror_swap or ()),
     )
     result = run_embedding_tune(request, events=events)
     report = write_embedding_report(result)

@@ -358,6 +358,12 @@ def embedding_decision_refusal(decision: Decision) -> str | None:
     return None
 
 
+MIRROR_NEEDS_PICTURES = (
+    "the question declares 'mirror', which trains each picture's horizontal mirror as well, and "
+    "these rows are not pictures for --base-model {model}: a mirrored copy of text means "
+    "nothing. Drop 'mirror' from the question"
+)
+
 NO_SCOREABILITY_FOR_DECISIONS = (
     "decision rows are measured by scoring each option's log-probability, not by exact match on "
     "an argument, so there are no arguments to profile"
@@ -2844,6 +2850,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             )
         if embedding and (refusal := embedding_decision_refusal(asked)) is not None:
             raise PrepareError(refusal)
+        if asked.mirror is not None and not image_mode:
+            raise PrepareError(MIRROR_NEEDS_PICTURES.format(model=EMBEDDING_MODEL))
         if image_mode:
             # After every refusal the rows file alone can give: opening the
             # images provisions an environment.

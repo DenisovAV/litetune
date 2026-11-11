@@ -25,6 +25,7 @@ from conftest import mark_provisioned
 from litetune import envs
 from litetune.checks import Outcome
 from litetune.cli import main
+from litetune.decisions import read_questions
 from litetune.embedding_tune import EMBEDDING_MODEL
 from litetune.images import (
     IMAGE_CHECK_SCRIPT,
@@ -821,6 +822,37 @@ TEXT_SPLIT_SHA256 = {
 
 def _text_rows() -> list[dict[str, Any]]:
     return [{"prompt": f"photo {i} of a {o}", "label": o} for o in OPTIONS for i in range(12)]
+
+
+def test_a_questions_mirror_is_written_into_decision_json_and_moves_no_row(tmp_path):
+    prepare(_request(tmp_path))
+    plain = {n: (tmp_path / "split" / f"{n}.jsonl").read_bytes() for n in ("train", "heldout")}
+    prepare(
+        _request(
+            tmp_path,
+            questions=_questions(tmp_path, "mirrored.json", mirror=[["cat", "dog"]]),
+            output_dir=tmp_path / "mirrored",
+        )
+    )
+    written = json.loads((tmp_path / "mirrored" / "decision.json").read_text())
+    assert written["mirror"] == [["cat", "dog"]]
+    decision, _ = read_questions(tmp_path / "mirrored" / "decision.json")
+    assert decision.mirror == (("cat", "dog"),)
+    # Mirrored copies are made by tune; the split itself is the one without.
+    for name, data in plain.items():
+        assert (tmp_path / "mirrored" / f"{name}.jsonl").read_bytes() == data
+
+
+def test_a_mirror_on_a_text_split_is_refused(tmp_path):
+    with pytest.raises(PrepareError, match="declares 'mirror'.* not pictures"):
+        prepare(
+            _request(
+                tmp_path,
+                data=_rows_file(tmp_path, _text_rows(), "text.jsonl"),
+                questions=_questions(tmp_path, "mirrored.json", mirror=[]),
+                context_length=1024,
+            )
+        )
 
 
 def test_a_text_split_is_byte_identical_to_before(tmp_path):
