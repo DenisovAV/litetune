@@ -1578,8 +1578,9 @@ def _group_key(row: Row) -> str:
 
 def split_grouped_by_key(
     rows: Sequence[Row], groups: Sequence[str], seed: int, heldout: int, calibration: int
-) -> tuple[list[Row], list[Row], list[Row]] | None:
-    """(training, calibration, held-out) rows, each split group placed by its key and the seed.
+) -> tuple[list[Row], list[Row], list[Row], list[str]] | None:
+    """(training, calibration, held-out) rows, each split group placed by its key and the seed,
+    and the keys of the groups placed otherwise.
 
     `split_grouped` permutes the groups by the file's content, so a group two
     rows files share lands on either side in each. Here a group's place depends
@@ -1589,9 +1590,11 @@ def split_grouped_by_key(
     which `tune --tasks` requires. A group whose key draws below
     `heldout / len(rows)` is held out, below `(heldout + calibration) /
     len(rows)` set aside, otherwise trained on, so the sizes are near what was
-    asked rather than exact. An empty requested split takes the group that drew
-    lowest, and training keeps the group that drew highest. `None` when there
-    are fewer than two groups.
+    asked rather than exact. Training keeps the group that drew highest, and an
+    empty requested split takes the lowest-drawing group another split can
+    spare; those groups are placed by the other groups of this file, not by
+    their key alone, so they are returned for the caller to say so. `None` when
+    there are fewer than two groups.
     """
     key_of: dict[str, str] = {}
     for row, group in zip(rows, groups, strict=True):
@@ -1610,20 +1613,38 @@ def split_grouped_by_key(
     aside_below = (heldout + calibration) / len(rows)
     held = {group for group in order if draw(group) < held_below}
     aside = {group for group in order if held_below <= draw(group) < aside_below}
-    if heldout and not held:
-        held.add(order[0])
-        aside.discard(order[0])
-    if calibration and not aside:
-        spare = [group for group in order[:-1] if group not in held]
-        if spare:
-            aside.add(spare[0])
+    natural = {group: "held" if group in held else "aside" if group in aside else "train"
+               for group in order}  # fmt: skip
     held.discard(order[-1])
     aside.discard(order[-1])
+
+    def spare(*sources: set[str]) -> str | None:
+        # The lowest-drawing group, other than training's last, whose split keeps one.
+        for group in order[:-1]:
+            if group not in held | aside:
+                return group
+            for source in sources:
+                if group in source and len(source) > 1:
+                    return group
+        return None
+
+    if heldout and not held and (filler := spare(aside)) is not None:
+        aside.discard(filler)
+        held.add(filler)
+    if calibration and not aside and (filler := spare(held)) is not None:
+        held.discard(filler)
+        aside.add(filler)
     placed = held | aside
+    moved = sorted(
+        key_of[group]
+        for group in order
+        if natural[group] != ("held" if group in held else "aside" if group in aside else "train")
+    )
     return (
         [row for row, group in zip(rows, groups, strict=True) if group not in placed],
         [row for row, group in zip(rows, groups, strict=True) if group in aside],
         [row for row, group in zip(rows, groups, strict=True) if group in held],
+        moved,
     )
 
 
@@ -2672,7 +2693,9 @@ def _split_pictures(
     )
     if grouped is None:
         return None, []
-    train, aside, held = grouped
+    train, aside, held, *moved = grouped
+    if moved:
+        _note_moved_groups(result, moved[0])
     wanted = heldout if asked is None else asked
     if (len(held), len(aside)) != (wanted, calibration):
         result.limitation(
@@ -2683,6 +2706,16 @@ def _split_pictures(
             f"were asked. Every interval on this split is computed at n={len(held)}"
         )
     return (train, held), aside
+
+
+def _note_moved_groups(result: PrepareResult, moved: Sequence[str]) -> None:
+    """Say which groups `split_grouped_by_key` placed to fill a split rather than by key."""
+    if moved:
+        result.limitation(
+            f"{len(moved)} split group(s) were placed so that no requested split is empty, not "
+            f"by their key ({', '.join(map(repr, moved[:3]))}); a rows file prepared apart that "
+            "shares them may put them on another side, which `tune --tasks` refuses"
+        )
 
 
 def _note_supplied_group_sizes(
@@ -2992,6 +3025,7 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         )
         halves = (grouped_rows[0], grouped_rows[2]) if grouped_rows is not None else None
         if decision is None and grouped_rows is not None:
+            _note_moved_groups(result, grouped_rows[3])
             _note_supplied_group_sizes(
                 result,
                 rows,
@@ -3043,8 +3077,9 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             if grouped_rows is None:
                 halves = None
             else:
-                train_part, calibration_rows, heldout_part = grouped_rows
+                train_part, calibration_rows, heldout_part, moved = grouped_rows
                 halves = (train_part, heldout_part)
+                _note_moved_groups(result, moved)
                 _note_supplied_group_sizes(
                     result,
                     rows,
