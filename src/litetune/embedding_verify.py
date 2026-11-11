@@ -97,6 +97,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1380,8 +1381,11 @@ def run_script(
     work: Path,
     name: str,
     timeout: int,
+    child_env: Mapping[str, str] | None = None,
 ) -> ScriptRun:
-    """Write `source` and `spec` under `work`, run it in `env`, read back its report."""
+    """Write `source` and `spec` under `work`, run it in `env`, read back its report.
+
+    `child_env` is added to the child's environment: the MPS memory policy."""
     if name in SHADOWABLE_MODULES:
         # The script's directory is first on its own sys.path, so it would be
         # what `import <name>` finds.
@@ -1391,7 +1395,7 @@ def run_script(
     script.write_text(source, encoding="utf-8")
     spec_path.write_text(json.dumps({**spec, "report": str(report)}), encoding="utf-8")
     try:
-        proc = env.run(["python", str(script), str(spec_path)], timeout=timeout)
+        proc = env.run(["python", str(script), str(spec_path)], timeout=timeout, env=child_env)
     except subprocess.TimeoutExpired:
         run.failure = f"no result after {timeout} s (timeout)"
         return run
@@ -2411,16 +2415,22 @@ def verify_embedding(
             )
             return None
 
-        # The reference's device as tune's: the environment's own torch, or
-        # LITETUNE_DEVICE; the script asks torch itself when neither answers.
+        # The reference's device as the decision reference's (`place_reference`):
+        # the environment's own torch, or LITETUNE_DEVICE; on MPS with its memory
+        # policy; the script asks torch itself when neither answers.
+        from litetune.decision_verify import mps_ending, place_reference
+
         try:
             setting = devices.device_setting(os.environ)
         except devices.DeviceSettingError as exc:
             return refuse(REFERENCE_CHECK, str(exc))
-        probe = devices.apply_device_setting(
-            envs.resolve_device(job.train_env, events=events), setting
+        placed = place_reference(
+            types.SimpleNamespace(train_env=job.train_env, device=setting), events
         )
-        fields["embedding"]["reference_device_probe"] = probe.as_dict()
+        for text in placed.limitations:
+            state.limitation(text)
+        fields["embedding"]["reference_device_probe"] = placed.probe.as_dict()
+        reference_device = None if placed.device == "auto" else placed.device
         events.note(f"embedding {len(inputs)} {kind}: reference", env=job.train_env.name)
         if images:
             # The check before the rows refuses early; this one ties the files
@@ -2444,7 +2454,7 @@ def verify_embedding(
                 "model": job.reference,
                 "processor": str(processor_dir),
                 "image_text": IMAGE_TOKEN_TEXT,
-                "device": probe.device,
+                "device": reference_device,
                 "out": str(work / "reference.npy"),
             }
         else:
@@ -2453,7 +2463,7 @@ def verify_embedding(
                 "model": job.reference,
                 "prompt_name": record.prompt_name,
                 "batch_size": REFERENCE_BATCH,
-                "device": probe.device,
+                "device": reference_device,
                 "out": str(work / "reference.npy"),
             }
         reference_run = run_script(
@@ -2463,7 +2473,34 @@ def verify_embedding(
             work,
             "reference",
             budget,
+            child_env=placed.memory.child_env if placed.memory is not None else None,
         )
+        if placed.memory is not None and (ending := mps_ending(reference_run.failure)):
+            # As the decision reference: a Mac short of memory for this model, or
+            # a torch without an operation it needs, still gets a reference, on
+            # the CPU and more slowly.
+            advice = (
+                devices.mps_oom_advice(placed.memory)
+                if ending == "out of memory"
+                else "torch's MPS backend could not run an operation the reference needs"
+            )
+            fields["embedding"]["reference_on_mps"] = {
+                "failure": reference_run.failure,
+                "ending": ending,
+            }
+            state.limitation(
+                f"the float reference stopped on MPS ({ending}: {advice}) and was run again on "
+                "the CPU"
+            )
+            events.note(f"the reference stopped on MPS ({ending}); running it on the CPU")
+            reference_run = run_script(
+                job.train_env,
+                IMAGE_REFERENCE_SCRIPT if images else REFERENCE_SCRIPT,
+                {**reference_spec, "device": "cpu"},
+                work,
+                "reference",
+                budget,
+            )
         # An image has no tokens to cut: the processor's input is the image at
         # its budget of vision tokens on both sides; what that made of each
         # picture is held to what tune recorded instead.

@@ -1045,7 +1045,9 @@ text to measure.
   `verify` refuses it; one such file has run, on a Galaxy S25 Ultra's NPU
   (SM8750), measured in [MEASUREMENTS.md](MEASUREMENTS.md).
 - **verify** embeds every picture with the float32 fine-tune (transformers, on
-  the CPU, with the checkpoint's own processor at the tuned budget) and with
+  the device `tune` would use -- CUDA or MPS when there is one, the CPU with
+  `LITETUNE_DEVICE=cpu` -- with the checkpoint's own processor at the tuned
+  budget) and with
   the file (LiteRT-LM's `EmbeddingEngine`, each picture given as its bytes),
   and with `--with-base` with Google's 440m file. With `--backend gpu`, on
   macOS, Windows and Linux as for text, litetune gives the GPU backend to both

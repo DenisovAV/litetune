@@ -10,6 +10,7 @@ writes a stand-in for Google's file.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -996,6 +997,10 @@ class FakeEmbedEnvs:
     # What the environment's device probe answers for the reference.
     device: str | None = "cpu"
     probes: list[str] = field(default_factory=list)
+    # The reference stops as torch does when MPS runs out of memory.
+    mps_out_of_memory: bool = False
+    # Each reference run's spec device and the environment variables it was given.
+    reference_runs: list[tuple[str | None, dict[str, str] | None]] = field(default_factory=list)
     # The image reference's processor directory as it was when the script ran:
     # each processor file's bare sha256, by name.
     processor_seen: dict[str, str] | None = None
@@ -1027,7 +1032,8 @@ class FakeEmbedEnvs:
         report: dict[str, Any] = {"rows": len(texts) + (name in self.rows_off), "dim": 6}
         if name == "reference":
             report["max_seq_length"] = 128
-            report["device"] = spec["device"] or "cpu"
+            # With no device given, the script asks torch: CUDA when the probe saw it.
+            report["device"] = spec["device"] or ("cuda" if self.device == "cuda" else "cpu")
             if "images" in spec:
                 report["vision_tokens"] = spec["vision_tokens"]
                 report["soft_tokens_per_row"] = [self.soft_tokens.get(t, 63) for t in texts]
@@ -1052,7 +1058,15 @@ class FakeEmbedEnvs:
         Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
         return 0
 
-    def __call__(self, env, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
+    def __call__(self, stage, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
+        env = stage
+        if Path(args[1]).stem == "reference":
+            spec_seen = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+            self.reference_runs.append((spec_seen["device"], kwargs.get("env")))
+            if self.mps_out_of_memory and spec_seen["device"] == "mps":
+                return subprocess.CompletedProcess(
+                    args, 1, "", "RuntimeError: MPS backend out of memory (MPS allocated: 9 GB)"
+                )
         name = Path(args[1]).stem
         spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
         self.timeouts[name] = timeout
@@ -1156,7 +1170,12 @@ def fake(monkeypatch, tmp_path, ev) -> FakeEmbedEnvs:
 
     def resolve_device(env, timeout: int = 0, events=None) -> envs.DeviceProbe:
         instance.probes.append(env.name)
-        return envs.DeviceProbe(device=instance.device, detail=f"fake probe: {instance.device}")
+        probe = envs.DeviceProbe(device=instance.device, detail=f"fake probe: {instance.device}")
+        if instance.device == "mps":
+            probe = dataclasses.replace(
+                probe, mps_recommended_max_memory=16 * 2**30, os="Darwin", machine="arm64"
+            )
+        return probe
 
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
     monkeypatch.setattr(envs.StageEnv, "run", run)
@@ -3026,12 +3045,34 @@ def test_the_reference_runs_on_the_device_tune_would_use(
     s = _image_setup(tmp_path, fake) if images else _setup(tmp_path)
     result = _verify(s)
     assert fake.probes == [envs.EMBED_TRAIN.name]
-    assert fake.specs["reference"]["device"] == (None if probed is None else ran_on)
+    # CUDA, and no answer, leave the choice to the script's own torch.
+    told = None if probed is None or ran_on == "cuda" else ran_on
+    assert fake.specs["reference"]["device"] == told
+    if probed is None:
+        assert any("chose its device itself" in t for t in result.manifest["limitations"])
     assert result.manifest["embedding"]["reference_device"] == ran_on
     assert any(
         text.startswith(f"the reference ran on {said} in float32")
         for text in result.manifest["limitations"]
     )
+
+
+def test_the_reference_on_mps_gets_the_memory_policy_and_the_cpu_when_it_runs_out(fake, tmp_path):
+    fake.device, fake.mps_out_of_memory = "mps", True
+    result = _verify(_image_setup(tmp_path, fake))
+    (on_mps, mps_env), (again, cpu_env) = fake.reference_runs
+    assert (on_mps, again) == ("mps", "cpu")
+    # The policy decision verify gives its reference: watermarks, no silent CPU fallback.
+    assert mps_env is not None and mps_env["PYTORCH_ENABLE_MPS_FALLBACK"] == "0"
+    assert "PYTORCH_MPS_HIGH_WATERMARK_RATIO" in mps_env
+    assert cpu_env is None
+    assert result.manifest["embedding"]["reference_device"] == "cpu"
+    assert result.manifest["embedding"]["reference_on_mps"]["ending"] == "out of memory"
+    assert any(
+        "stopped on MPS (out of memory" in text and "run again on the CPU" in text
+        for text in result.manifest["limitations"]
+    )
+    assert result.status is not Status.FAILED_HARNESS
 
 
 def test_an_unknown_litetune_device_is_refused_before_the_reference_runs(
