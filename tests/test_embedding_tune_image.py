@@ -1322,6 +1322,8 @@ def test_a_cached_input_reads_back_with_its_soft_tokens(script, tmp_path):
         ("tokens", "shape (4, 3), not (9, 3)"),
         ("soft", "4 soft tokens of 4"),
         ("garbage", "unreadable"),
+        ("empty", "unreadable: EOFError"),
+        ("empty meta", "unreadable"),
     ],
 )
 def test_a_cached_input_that_cannot_be_used_says_why(script, tmp_path, damage, said):
@@ -1337,6 +1339,10 @@ def test_a_cached_input_that_cannot_be_used_says_why(script, tmp_path, damage, s
         meta.write_text(json.dumps({"soft_tokens": 2, "tokens": 9}), encoding="utf-8")
     if damage == "garbage":
         (tmp_path / "ab-original.npy").write_bytes(b"not numpy")
+    if damage == "empty":
+        (tmp_path / "ab-original.npy").write_bytes(b"")
+    if damage == "empty meta":
+        meta.write_bytes(b"")
     hidden = 5 if damage == "hidden" else 3
     dtype = "float32" if damage == "dtype" else "float16"
     found = script["cached_input"](np, tmp_path, "ab", False, hidden, dtype)

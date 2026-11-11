@@ -797,14 +797,19 @@ def store_input(np, cache, sha256, flipped, array, soft):
     """Write one picture's input and its soft-token count, each file whole or not at all."""
     target = Path(cache) / cache_name(sha256, flipped)
     partial = target.with_name(target.name + ".partial")
+    # Flushed before the rename: a VM stopped without warning (a preempted spot
+    # A100, 2026-11-11) otherwise kept the renamed file with no bytes in it.
     with open(partial, "wb") as handle:
         np.save(handle, array)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(partial, target)
     meta = _cache_meta(cache, sha256, flipped)
     meta_partial = meta.with_name(meta.name + ".partial")
-    meta_partial.write_text(
-        json.dumps({"soft_tokens": soft, "tokens": int(array.shape[0])}), encoding="utf-8"
-    )
+    with open(meta_partial, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"soft_tokens": soft, "tokens": int(array.shape[0])}))
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(meta_partial, meta)
 
 
@@ -818,7 +823,8 @@ def cached_input(np, cache, sha256, flipped, hidden, dtype):
     try:
         array = np.load(target)
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, EOFError) as exc:
+        # EOFError: numpy's word for a file with no bytes in it.
         return f"unreadable: {type(exc).__name__}: {exc}"
     soft = meta.get("soft_tokens") if isinstance(meta, dict) else None
     tokens = meta.get("tokens") if isinstance(meta, dict) else None
