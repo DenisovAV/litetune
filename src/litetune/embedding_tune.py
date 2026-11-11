@@ -797,8 +797,8 @@ def store_input(np, cache, sha256, flipped, array, soft):
     """Write one picture's input and its soft-token count, each file whole or not at all."""
     target = Path(cache) / cache_name(sha256, flipped)
     partial = target.with_name(target.name + ".partial")
-    # Flushed before the rename: a VM stopped without warning (a preempted spot
-    # A100, 2026-11-11) otherwise kept the renamed file with no bytes in it.
+    # Flushed before the rename: a machine powered off mid-run (2026-11-11)
+    # otherwise kept the renamed file with no bytes in it.
     with open(partial, "wb") as handle:
         np.save(handle, array)
         handle.flush()
