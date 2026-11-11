@@ -390,6 +390,10 @@ def test_a_multitask_run_records_each_head_and_uses_one_joint_spec(toolchain, tm
     assert Path(toolchain.calls[1][1]).name == MULTITASK_IMAGE_SCRIPT_NAME
     spec = toolchain.specs[0]
     assert [task["name"] for task in spec["tasks"]] == ["zones", "steer"]
+    # Several questions train three epochs; one question keeps the two beans measured.
+    assert spec["recipe"] == {**IMAGE_RECIPE.as_dict(), "epochs": 3}
+    assert result.record.recipe == spec["recipe"]
+    assert result.as_dict()["request"]["recipe"]["epochs"] == 3
     assert spec["tasks"][0]["mirror"] is False
     assert spec["tasks"][1]["mirror_swap"] == [["left", "right"]]
     assert spec["cache_dir"] == str(tmp_path / "tuned" / IMAGE_CACHE_DIR)

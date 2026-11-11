@@ -994,7 +994,8 @@ litetune tune --model google/embeddinggemma-2 --tasks tasks.json \
 ```
 
 The run uses one head and class weights per task, shuffles all tasks' training
-items together, and caches a shared picture input once. `--data`, `--heldout`,
+items together, caches a shared picture input once, and trains three epochs
+where one question trains two. `--data`, `--heldout`,
 `--decision`, `--mirror` and `--mirror-swap` are refused beside `--tasks`, and
 so are two tasks with one name or one decision. To verify one task, pass its
 held-out file; `verify` selects the recorded task by the `decision.json` beside

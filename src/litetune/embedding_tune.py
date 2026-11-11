@@ -219,7 +219,8 @@ RECIPE = Recipe()
 class ImageRecipe:
     """The image recipe, as the script is given it: that of unpublished runs on game
     frames, which trained two heads at once, one per task, for 2 epochs (one run
-    3); here each decision is one head, and `--tasks` trains several at once.
+    3); here each decision is one head, and `--tasks` trains several at once,
+    for three epochs (`MULTITASK_IMAGE_RECIPE`).
     litetune has measured it on one dataset with one decision (MEASUREMENTS.md,
     "EmbeddingGemma 2 on images: beans").
 
@@ -271,6 +272,11 @@ class ImageRecipe:
 
 
 IMAGE_RECIPE = ImageRecipe()
+# `--tasks`: three epochs. On three questions about one game's frames, two
+# epochs from the base probed below the hand-made fine-tune the recipe comes
+# from, on two of the three, and three epochs matched it (MEASUREMENTS.md,
+# "EmbeddingGemma 2 on images: several questions").
+MULTITASK_IMAGE_RECIPE = replace(IMAGE_RECIPE, epochs=3)
 
 # The text the processor is given for one image; it expands it into the image's
 # soft tokens between its begin and end markers.
@@ -1904,7 +1910,7 @@ class EmbeddingTuneRequest:
             "image_text": IMAGE_TOKEN_TEXT,
             "vision_tokens": self.vision_tokens,
             "tasks": [dict(task) for task in tasks],
-            "recipe": IMAGE_RECIPE.as_dict(),
+            "recipe": MULTITASK_IMAGE_RECIPE.as_dict(),
             "device": device,
             "model_dir": str(self.model_dir),
             "metrics_out": str(metrics_out),
@@ -1924,7 +1930,11 @@ class EmbeddingTuneRequest:
             "tasks": str(self.tasks) if self.tasks is not None else None,
             "output_dir": str(self.output_dir),
             "timeout_s": self.timeout_s,
-            "recipe": (IMAGE_RECIPE if modality == "image" else RECIPE).as_dict(),
+            "recipe": (
+                (MULTITASK_IMAGE_RECIPE if self.tasks is not None else IMAGE_RECIPE)
+                if modality == "image"
+                else RECIPE
+            ).as_dict(),
             "environment": {
                 "name": self.env.name,
                 "identity": self.env.identity,
@@ -3323,7 +3333,9 @@ def run_embedding_tune(
         "seconds": record_metrics.get("train_seconds"),
         "device": record_metrics.get("device"),
         "dtype": record_metrics.get("dtype"),
-        "recipe": (IMAGE_RECIPE if image else RECIPE).as_dict(),
+        "recipe": (
+            (MULTITASK_IMAGE_RECIPE if checked_tasks else IMAGE_RECIPE) if image else RECIPE
+        ).as_dict(),
     }
     single_record = (
         {}
