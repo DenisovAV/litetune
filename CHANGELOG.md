@@ -3,7 +3,7 @@
 Newest first. Full notes for each release are on
 [GitHub](https://github.com/DenisovAV/litetune/releases).
 
-## 0.9.1
+## 0.9.1 — 2026-11-11
 - `convert` of an EmbeddingGemma 2 checkpoint failed in 0.9.0; it converts again (#127).
 - `tune --tasks` trains several image questions into one EmbeddingGemma 2 fine-tune, and `prepare` rows take a `group` (#128).
 - Mirrored training copies are the question's: `"mirror"` in questions.json; the 0.9.0 `--mirror` and `--mirror-swap` flags are gone (#128).
