@@ -949,6 +949,14 @@ a rows file is all image rows or all text rows:
 {"image": "leaves/0002.png", "label": "healthy"}
 ```
 
+An optional string `group` keeps related rows in one split. Picture identity
+still groups identical bytes, so a duplicate picture shared by two named groups
+joins those groups:
+
+```
+{"image": "frames/001.png", "label": "left", "group": "run-17"}
+```
+
 ```bash
 litetune prepare --data rows.jsonl --questions questions.json --output-dir data \
                  --base-model google/embeddinggemma-2
@@ -961,6 +969,28 @@ litetune convert --model tuned/model --output-dir artifacts            # int8 fo
 litetune verify --model artifacts/int8/model.litertlm --reference tuned/model \
                 --data data/heldout.jsonl --with-base --json > manifest.json
 ```
+
+Several image questions can share one text-tower fine-tune. Each task names the
+split and decision produced for it; mirroring belongs to that task alone:
+
+```json
+{"tasks": [
+  {"name": "zones", "data": "zones/train.jsonl", "decision": "zones/decision.json"},
+  {"name": "near", "data": "near/train.jsonl", "decision": "near/decision.json"},
+  {"name": "steer", "data": "steer/train.jsonl", "decision": "steer/decision.json",
+   "mirror": true, "mirror_swap": [["left", "right"]]}
+]}
+```
+
+```bash
+litetune tune --model google/embeddinggemma-2 --tasks tasks.json \
+              --vision-tokens 70 --output-dir tuned
+```
+
+The run uses one head and class weights per task, shuffles all tasks' training
+items together, and caches a shared picture input once. To verify one task,
+pass its held-out file; `verify` selects the recorded task by the
+`decision.json` beside that file.
 
 `questions.json` is a `choice` question without a `none_option`, as for text.
 `--context-length` and `--tokenizer` are refused for image rows: there is no

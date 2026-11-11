@@ -29,6 +29,7 @@ from litetune.checks import Outcome
 from litetune.cli import main
 from litetune.decisions import Decision, Option
 from litetune.embedding_tune import (
+    _EMBED_IMAGE_MULTITASK_SCRIPT,
     _EMBED_IMAGE_SCRIPT,
     _EMBED_TRAIN_SCRIPT,
     BASE_CHECKPOINT_FILE,
@@ -43,6 +44,7 @@ from litetune.embedding_tune import (
     IMAGE_RECIPE_UNMEASURED,
     IMAGE_SCRIPT_NAME,
     IMAGE_TOKEN_TEXT,
+    MULTITASK_IMAGE_SCRIPT_NAME,
     PROCESSOR_FILES,
     PROMPT_NAME,
     RECIPE,
@@ -107,20 +109,39 @@ class FakeImageToolchain:
         for name in PROCESSOR_FILES:
             if name not in self.skip_files:
                 (model_dir / name).write_text(_processor_text(name), encoding="utf-8")
-        train = Path(spec["train_rows"]).read_text(encoding="utf-8").splitlines()
-        heldout = Path(spec["heldout_rows"]).read_text(encoding="utf-8").splitlines()
-        pictures = sorted({json.loads(line)["sha256"] for line in train + heldout})
-        items = len(train) * (2 if spec["mirror"] else 1)
+        if "tasks" in spec:
+            task_metrics = []
+            pictures_set: set[str] = set()
+            items = 0
+            for task in spec["tasks"]:
+                train = Path(task["train_rows"]).read_text(encoding="utf-8").splitlines()
+                heldout = Path(task["heldout_rows"]).read_text(encoding="utf-8").splitlines()
+                pictures_set.update(json.loads(line)["sha256"] for line in train + heldout)
+                task_items = len(train) * (2 if task["mirror"] else 1)
+                items += task_items
+                task_metrics.append(
+                    {
+                        "name": task["name"],
+                        "labels": task["labels"],
+                        "rows": {"train": len(train), "heldout": len(heldout)},
+                        "training_items": task_items,
+                        "mirror": task["mirror"],
+                        "mirror_swap": task["mirror_swap"],
+                        "head_train_accuracy": 1.0,
+                        "head_heldout_accuracy": 0.5,
+                    }
+                )
+            pictures = sorted(pictures_set)
+        else:
+            train = Path(spec["train_rows"]).read_text(encoding="utf-8").splitlines()
+            heldout = Path(spec["heldout_rows"]).read_text(encoding="utf-8").splitlines()
+            pictures = sorted({json.loads(line)["sha256"] for line in train + heldout})
+            items = len(train) * (2 if spec["mirror"] else 1)
         steps = spec["recipe"]["epochs"] * -(-items // spec["recipe"]["batch_size"])
         metrics = {
             "base_model": spec["model"],
             "base_model_revision": spec["revision"],
             "prefix": spec["prefix"],
-            "labels": spec["labels"],
-            "rows": {"train": len(train), "heldout": len(heldout)},
-            "training_items": items,
-            "mirror": spec["mirror"],
-            "mirror_swap": spec["mirror_swap"],
             "vision_tokens": spec["vision_tokens"],
             "soft_tokens_per_image": {sha: self.soft_tokens for sha in pictures},
             "steps_done": steps,
@@ -132,6 +153,20 @@ class FakeImageToolchain:
             "head_heldout_accuracy": 0.5,
             "mps_environment": None,
         }
+        if "tasks" in spec:
+            metrics["tasks"] = task_metrics
+        else:
+            metrics.update(
+                {
+                    "labels": spec["labels"],
+                    "rows": {"train": len(train), "heldout": len(heldout)},
+                    "training_items": items,
+                    "mirror": spec["mirror"],
+                    "mirror_swap": spec["mirror_swap"],
+                    "head_train_accuracy": 1.0,
+                    "head_heldout_accuracy": 0.5,
+                }
+            )
         metrics.update(self.metrics_overrides)
         Path(spec["metrics_out"]).write_text(json.dumps(metrics), encoding="utf-8")
         return subprocess.CompletedProcess(args, self.returncode, "", self.stderr)
@@ -201,7 +236,7 @@ def _write(path: Path, rows: list[dict[str, Any]]) -> Path:
 
 def _split(tmp_path: Path, ids: tuple[str, ...] = OPTIONS, train: int = 12) -> Split:
     root = tmp_path / "split"
-    root.mkdir(exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     decision = root / "decision.json"
     decision.write_text(_decision(ids).canonical_text(), encoding="utf-8")
     return Split(
@@ -227,6 +262,12 @@ def _request(split: Split, tmp_path: Path, **kwargs: Any) -> EmbeddingTuneReques
     }
     params.update(kwargs)
     return EmbeddingTuneRequest(**params)
+
+
+def _tasks_file(tmp_path: Path, tasks: list[dict[str, Any]]) -> Path:
+    path = tmp_path / "tasks.json"
+    path.write_text(json.dumps({"tasks": tasks}), encoding="utf-8")
+    return path
 
 
 def _check(result, name):
@@ -265,6 +306,77 @@ def test_an_image_run_writes_an_image_record_beside_the_checkpoint(toolchain, sp
     pictures = {r["image_sha256"] for r in _records(split.train) + _records(split.heldout)}
     assert on_disk["soft_tokens"] == dict.fromkeys(sorted(pictures), 63)
     assert record.soft_tokens == on_disk["soft_tokens"]
+
+
+def test_a_multitask_run_records_each_head_and_uses_one_joint_spec(toolchain, tmp_path):
+    zones = _split(tmp_path / "zones", ids=("near", "far"), train=8)
+    steer = _split(tmp_path / "steer", ids=("left", "right", "straight"), train=9)
+    tasks = _tasks_file(
+        tmp_path,
+        [
+            {"name": "zones", "data": str(zones.train), "decision": str(zones.decision)},
+            {
+                "name": "steer",
+                "data": str(steer.train),
+                "decision": str(steer.decision),
+                "mirror": True,
+                "mirror_swap": [["left", "right"]],
+            },
+        ],
+    )
+    result = run_embedding_tune(
+        EmbeddingTuneRequest(output_dir=tmp_path / "tuned", tasks=tasks, vision_tokens=70)
+    )
+    assert result.ok, result.checks.as_dict()
+    assert result.record is not None
+    assert [task.name for task in result.record.tasks] == ["zones", "steer"]
+    assert [(task.mirror, task.mirror_swap) for task in result.record.tasks] == [
+        (False, ()),
+        (True, (("left", "right"),)),
+    ]
+    assert [task.head_heldout_accuracy for task in result.record.tasks] == [0.5, 0.5]
+    on_disk = json.loads((tmp_path / "tuned" / "model" / "litetune.json").read_text())
+    for single_field in (
+        "labels",
+        "rows",
+        "head_heldout_accuracy",
+        "decision",
+        "decision_sha256",
+        "train_sha256",
+        "mirror",
+        "mirror_swap",
+    ):
+        assert single_field not in on_disk
+    assert toolchain.scripts == [_EMBED_IMAGE_MULTITASK_SCRIPT]
+    assert Path(toolchain.calls[1][1]).name == MULTITASK_IMAGE_SCRIPT_NAME
+    spec = toolchain.specs[0]
+    assert [task["name"] for task in spec["tasks"]] == ["zones", "steer"]
+    assert spec["tasks"][0]["mirror"] is False
+    assert spec["tasks"][1]["mirror_swap"] == [["left", "right"]]
+    shared = {row["sha256"] for task in spec["tasks"] for row in _records(Path(task["train_rows"]))}
+    assert set(result.record.soft_tokens or {}) >= shared
+    metrics = json.loads((tmp_path / "tuned" / "embed_metrics.json").read_text())
+    assert [task["head_heldout_accuracy"] for task in metrics["tasks"]] == [0.5, 0.5]
+
+
+def test_a_multitask_record_round_trips_with_one_or_several_tasks(toolchain, tmp_path):
+    first = _split(tmp_path / "first", ids=("a", "b"), train=8)
+    second = _split(tmp_path / "second", ids=("x", "y"), train=8)
+    tasks = _tasks_file(
+        tmp_path,
+        [
+            {"name": "first", "data": str(first.train), "decision": str(first.decision)},
+            {"name": "second", "data": str(second.train), "decision": str(second.decision)},
+        ],
+    )
+    result = run_embedding_tune(
+        EmbeddingTuneRequest(output_dir=tmp_path / "tuned", tasks=tasks, vision_tokens=70)
+    )
+    assert result.record is not None
+    data = result.record.as_dict()
+    assert EmbeddingRecord.from_dict(data, "record").as_dict() == data
+    data["tasks"] = data["tasks"][:1]
+    assert len(EmbeddingRecord.from_dict(data, "record").tasks) == 1
 
 
 def test_the_record_holds_the_sha256_of_each_processor_file_saved(toolchain, split, tmp_path):
@@ -1034,6 +1146,90 @@ def test_a_whole_image_run_through_the_command_line(toolchain, split, tmp_path, 
     assert "on images at most 70 vision tokens per image" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("--data", "rows.jsonl"),
+        ("--heldout", "heldout.jsonl"),
+        ("--decision", "decision.json"),
+        ("--mirror",),
+        ("--mirror-swap", "left:right"),
+    ],
+)
+def test_tasks_refuses_single_question_flags(toolchain, tmp_path, capsys, extra):
+    tasks = _tasks_file(tmp_path, [])
+    argv = [
+        "tune",
+        "--model",
+        EMBEDDING_MODEL,
+        "--tasks",
+        str(tasks),
+        "--vision-tokens",
+        "70",
+        "--output-dir",
+        str(tmp_path / "run"),
+        *extra,
+    ]
+    assert main(argv) == 4
+    assert "--tasks cannot be mixed" in capsys.readouterr().err
+    assert toolchain.calls == []
+
+
+def test_tasks_refuses_text_rows(toolchain, tmp_path):
+    decision = _decision(("left", "right"))
+    root = tmp_path / "text"
+    root.mkdir()
+    decision_path = root / "decision.json"
+    decision_path.write_text(decision.canonical_text(), encoding="utf-8")
+    for name in ("train", "heldout"):
+        rows = [
+            {"prompt": decision.render(f"state {i}"), "completion": label}
+            for i, label in enumerate(("left", "right", "left", "right"))
+        ]
+        _write(root / f"{name}.jsonl", rows)
+    tasks = _tasks_file(
+        tmp_path,
+        [{"name": "text", "data": str(root / "train.jsonl"), "decision": str(decision_path)}],
+    )
+    with pytest.raises(EmbeddingTuneError, match="accepts image rows only"):
+        run_embedding_tune(
+            EmbeddingTuneRequest(output_dir=tmp_path / "run", tasks=tasks, vision_tokens=70)
+        )
+    assert toolchain.calls == []
+
+
+def test_tasks_refuses_a_picture_in_both_splits(toolchain, tmp_path):
+    split = _split(tmp_path, ids=("left", "right"), train=8)
+    heldout = _records(split.heldout)
+    heldout[0] = _records(split.train)[0]
+    _write(split.heldout, heldout)
+    tasks = _tasks_file(
+        tmp_path,
+        [{"name": "overlap", "data": str(split.train), "decision": str(split.decision)}],
+    )
+    with pytest.raises(EmbeddingTuneError, match="both training and held-out"):
+        run_embedding_tune(
+            EmbeddingTuneRequest(output_dir=tmp_path / "run", tasks=tasks, vision_tokens=70)
+        )
+    assert toolchain.calls == []
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        {"name": "x", "data": "x", "decision": "d", "mirror": "yes"},
+        {"name": "x", "data": "x", "decision": "d", "mirror_swap": [["a", "b"]]},
+        {"name": "x", "data": "x", "decision": "d", "mirror_swap": ["a:b"]},
+    ],
+)
+def test_tasks_json_refuses_invalid_mirror_fields(tmp_path, task):
+    tasks = _tasks_file(tmp_path, [task])
+    with pytest.raises(EmbeddingTuneError, match="mirror"):
+        run_embedding_tune(
+            EmbeddingTuneRequest(output_dir=tmp_path / "run", tasks=tasks, vision_tokens=70)
+        )
+
+
 def test_the_swap_flag_repeats(toolchain, tmp_path):
     s = _split(tmp_path, ids=("left", "right", "up", "down"))
     argv = _argv(
@@ -1101,6 +1297,58 @@ def script() -> dict[str, Any]:
     namespace: dict[str, Any] = {"__name__": "embed_image_train_script"}
     exec(compile(_EMBED_IMAGE_SCRIPT, IMAGE_SCRIPT_NAME, "exec"), namespace)
     return namespace
+
+
+@pytest.fixture
+def multitask_script() -> dict[str, Any]:
+    namespace: dict[str, Any] = {"__name__": "embed_image_multitask_train_script"}
+    exec(compile(_EMBED_IMAGE_MULTITASK_SCRIPT, MULTITASK_IMAGE_SCRIPT_NAME, "exec"), namespace)
+    return namespace
+
+
+def test_multitask_items_keep_weights_and_mirroring_per_task(multitask_script):
+    run_items = multitask_script["run_items"]
+    zones = run_items(
+        [
+            {"sha256": "z1", "image": "z1", "label": "near"},
+            {"sha256": "z2", "image": "z2", "label": "near"},
+            {"sha256": "z3", "image": "z3", "label": "near"},
+            {"sha256": "z4", "image": "z4", "label": "far"},
+        ],
+        [],
+        ["far", "near"],
+        False,
+        [],
+    )
+    steer = run_items(
+        [
+            {"sha256": "s1", "image": "s1", "label": "left"},
+            {"sha256": "s2", "image": "s2", "label": "right"},
+        ],
+        [],
+        ["left", "right"],
+        True,
+        [["left", "right"]],
+    )
+    assert zones["weights"] == [2.0, 2 / 3]
+    assert zones["items"] == [
+        ("z1", False, "near"),
+        ("z2", False, "near"),
+        ("z3", False, "near"),
+        ("z4", False, "far"),
+    ]
+    assert steer["weights"] == [1.0, 1.0]
+    assert steer["items"][2:] == [("s1", True, "right"), ("s2", True, "left")]
+    assert multitask_script["multitask_items"]([zones, steer]) == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (1, 3),
+    ]
 
 
 def test_the_swap_map_is_symmetric_and_refuses_a_repeated_label(script):

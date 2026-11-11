@@ -27,9 +27,13 @@ from litetune.embedding_tune import (
     DECIDER_PREFIX,
     EMBEDDING_MODEL,
     EMBEDDING_REVISION,
+    IMAGE_PREFIX,
+    IMAGE_RECIPE,
+    PROCESSOR_FILES,
     PROMPT_NAME,
     RECIPE,
     EmbeddingRecord,
+    EmbeddingTaskRecord,
     write_embedding_record,
 )
 from litetune.export import ExportRequest
@@ -55,7 +59,7 @@ def _embedding_checkpoint(root: Path) -> Path:
             device="cpu",
             dtype="float32",
             head_heldout_accuracy=0.5,
-            recipe=RECIPE.as_dict(),
+            recipe=IMAGE_RECIPE.as_dict(),
             decision=DECISION.as_dict(),
             decision_sha256=DECISION.digest(),
         ),
@@ -69,6 +73,7 @@ def seen(monkeypatch) -> dict[str, Any]:
 
     def embedding(request, record, events=None):
         captured["embedding"] = request
+        captured["record"] = record
         raise EmbeddingExportError("stop here")
 
     def llm(request, events=None):
@@ -99,6 +104,44 @@ def test_an_embedding_convert_uses_the_grafts_timeout_when_none_is_given(seen, t
 def test_an_embedding_convert_takes_the_timeout_it_is_given(seen, tmp_path):
     _convert(_embedding_checkpoint(tmp_path), tmp_path / "out", "--timeout-s", "77")
     assert seen["embedding"].timeout_s == 77
+
+
+def test_convert_accepts_a_multitask_image_record_unchanged(seen, tmp_path):
+    model = tmp_path / "multi" / "model"
+    model.mkdir(parents=True)
+    task = EmbeddingTaskRecord(
+        name="zones",
+        decision=DECISION.as_dict(),
+        decision_sha256=DECISION.digest(),
+        labels=("a", "b"),
+        rows={"train": 20, "heldout": 6},
+        train_sha256="sha256:" + "a" * 64,
+        head_heldout_accuracy=0.5,
+        mirror=False,
+        mirror_swap=(),
+    )
+    write_embedding_record(
+        model,
+        EmbeddingRecord(
+            base_model=EMBEDDING_MODEL,
+            base_model_revision=EMBEDDING_REVISION,
+            prompt_name="",
+            prefix=IMAGE_PREFIX,
+            steps_done=6,
+            steps_planned=6,
+            seconds=1.0,
+            device="cpu",
+            dtype="float32",
+            recipe=RECIPE.as_dict(),
+            modality="image",
+            vision_tokens=70,
+            soft_tokens={"b" * 64: 63},
+            processor_sha256=dict.fromkeys(PROCESSOR_FILES, "c" * 64),
+            tasks=(task,),
+        ),
+    )
+    _convert(model, tmp_path / "out")
+    assert seen["record"].tasks == (task,)
 
 
 def test_an_llm_convert_keeps_the_exports_timeout_default(seen, tmp_path):

@@ -613,8 +613,17 @@ def _add_tune(sub) -> None:
         ),
     )
     tune.add_argument("--model", required=True, help="HF id or path of the base checkpoint")
-    tune.add_argument("--data", required=True, type=Path, help="training JSONL")
+    tune.add_argument("--data", type=Path, help="training JSONL")
     tune.add_argument("--output-dir", required=True, type=Path)
+    tune.add_argument(
+        "--tasks",
+        type=Path,
+        help=(
+            f"only with --model {EMBEDDING_MODEL}: a JSON list of image tasks sharing one "
+            "fine-tune; each task names data, decision and optional heldout, mirror and "
+            "mirror_swap"
+        ),
+    )
     tune.add_argument(
         "--heldout",
         type=Path,
@@ -1587,6 +1596,10 @@ def _tune(args: argparse.Namespace) -> int:
         return _tune_embedding(args)
     if args.heldout is not None:
         raise TuneError(f"--heldout is read only with --model {EMBEDDING_MODEL}")
+    if args.tasks is not None:
+        raise TuneError(f"--tasks is read only with --model {EMBEDDING_MODEL}")
+    if args.data is None:
+        raise TuneError("--data is required unless --tasks is used with the embedding model")
     image_flags = [
         flag
         for flag, value in (
@@ -1692,7 +1705,25 @@ def _tune_embedding(args: argparse.Namespace) -> int:
             f"--dtype {args.dtype}: the embedding recipe trains in float32 on every device; "
             "float16 is documented to give NaN embeddings and bfloat16 was not measured"
         )
-    if args.decision is None:
+    if args.tasks is not None:
+        mixed = [
+            flag
+            for flag, value in (
+                ("--data", args.data is not None),
+                ("--heldout", args.heldout is not None),
+                ("--decision", args.decision is not None),
+                ("--mirror", args.mirror),
+                ("--mirror-swap", bool(args.mirror_swap)),
+            )
+            if value
+        ]
+        if mixed:
+            raise EmbeddingTuneError(f"--tasks cannot be mixed with {', '.join(mixed)}")
+    elif args.data is None:
+        raise EmbeddingTuneError(
+            f"--model {EMBEDDING_MODEL} needs --data, or --tasks for image rows"
+        )
+    elif args.decision is None:
         raise EmbeddingTuneError(
             f"--model {EMBEDDING_MODEL} needs --decision, the decision.json prepare wrote beside "
             "the split: its options are the labels the model is trained to separate"
@@ -1704,8 +1735,11 @@ def _tune_embedding(args: argparse.Namespace) -> int:
         )
     events = _stream()
     request = EmbeddingTuneRequest(
+        tasks=args.tasks,
         data=args.data,
-        heldout=args.heldout if args.heldout is not None else args.data.parent / "heldout.jsonl",
+        heldout=(args.heldout if args.heldout is not None else args.data.parent / "heldout.jsonl")
+        if args.data is not None
+        else None,
         decision=args.decision,
         output_dir=args.output_dir,
         revision=args.revision,

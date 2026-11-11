@@ -252,6 +252,47 @@ def test_the_rows_of_one_picture_are_never_in_two_splits(tmp_path, seed):
     assert result.train.n + result.heldout.n + result.calibration.n == len(rows)
 
 
+def test_explicit_groups_are_kept_together_and_reported(tmp_path):
+    rows = _image_rows(tmp_path, per_option=6)
+    for i, row in enumerate(rows):
+        row["group"] = f"run-{i // 3}"
+    result = prepare(_request(tmp_path, data=_rows_file(tmp_path, rows, "groups.jsonl")))
+    assert (
+        result.train is not None and result.calibration is not None and result.heldout is not None
+    )
+    split_of: dict[str, str] = {}
+    for split in ("train", "calibration", "heldout"):
+        for row in _records(tmp_path / "split" / f"{split}.jsonl"):
+            assert row["group"] not in split_of or split_of[row["group"]] == split
+            split_of[row["group"]] = split
+    report = json.loads((tmp_path / "split" / "prepare.json").read_text())
+    assert report["source"]["groups"] == {"used": True, "count": 6}
+
+
+def test_picture_identity_joins_two_explicit_groups(tmp_path):
+    rows = _image_rows(tmp_path, per_option=6)
+    rows[0]["group"] = "first"
+    duplicate = dict(rows[0], group="second")
+    rows.append(duplicate)
+    rows[1]["group"] = "second"
+    result = prepare(_request(tmp_path, data=_rows_file(tmp_path, rows, "bridge.jsonl")))
+    assert result.train is not None
+    located: dict[str, str] = {}
+    for split in ("train", "calibration", "heldout"):
+        for row in _records(tmp_path / "split" / f"{split}.jsonl"):
+            if row.get("group") in {"first", "second"}:
+                located[row["group"]] = split
+    assert located["first"] == located["second"]
+
+
+@pytest.mark.parametrize("value", [None, 7, True, ["run"]])
+def test_a_non_string_group_is_refused(tmp_path, value):
+    rows = _image_rows(tmp_path)
+    rows[0]["group"] = value
+    with pytest.raises(PrepareError, match="'group' must be a string"):
+        prepare(_request(tmp_path, data=_rows_file(tmp_path, rows, "bad-group.jsonl")))
+
+
 def test_without_repeated_pictures_the_split_is_the_row_split(tmp_path):
     from litetune.prepare import Row, split_calibration, split_grouped, split_rows
 

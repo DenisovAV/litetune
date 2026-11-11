@@ -571,6 +571,9 @@ class Row:
     # Whether `image` is shown with the `prompt` rather than in place of it: a
     # Gemma 4 row (`llm_images`), whose record keeps both.
     image_with_prompt: bool = False
+    # An optional caller-supplied split group. Rows with the same value are
+    # kept together; `None` preserves the split behaviour from before groups.
+    group: str | None = None
 
     @property
     def tool(self) -> str:
@@ -585,6 +588,7 @@ class Row:
         return "<unlabelled>"
 
     def as_record(self) -> dict[str, Any]:
+        grouped = {"group": self.group} if self.group is not None else {}
         if self.image is not None and self.image_with_prompt:
             return {
                 "prompt": self.prompt,
@@ -593,6 +597,7 @@ class Row:
                 "completion": self.completion,
                 "target": self.target if isinstance(self.target, str) else None,
                 "source_line": self.lineno,
+                **grouped,
             }
         if self.image is not None:
             # The digest travels in the row so that `content_sha256` of the
@@ -603,6 +608,7 @@ class Row:
                 "completion": self.completion,
                 "target": self.target,
                 "source_line": self.lineno,
+                **grouped,
             }
         return {
             "prompt": self.prompt,
@@ -612,7 +618,16 @@ class Row:
             # came from. A row identified only by its position in a shuffled
             # split is a row nobody can go and look at.
             "source_line": self.lineno,
+            **grouped,
         }
+
+
+def _row_group(path: Path, lineno: int, obj: Mapping[str, Any]) -> str | None:
+    """The optional split group on a source row, refusing every non-string value."""
+    value = obj.get("group")
+    if "group" in obj and not isinstance(value, str):
+        raise PrepareError(f"{path}:{lineno}: 'group' must be a string; got {json.dumps(value)}")
+    return value
 
 
 def refuse_calls_without_declarations(rows: Sequence[Row], base_model: str) -> None:
@@ -813,6 +828,7 @@ def _rows_from(
                 completion=completion,
                 target=target,
                 rendered=rendered,
+                group=_row_group(path, lineno, obj),
             )
         )
     if not rows:
@@ -881,6 +897,7 @@ def read_decision_rows(
                     completion=answer,
                     target=answer,
                     rendered=True,
+                    group=_row_group(path, lineno, obj),
                 )
             )
     except DecisionError as exc:
@@ -1006,14 +1023,14 @@ def _image_path(data: Path, value: str) -> Path:
 
 def read_image_rows(
     path: Path, objects: Sequence[tuple[int, dict[str, Any]]], questions: Path | None
-) -> tuple[Decision, str | None, list[tuple[int, Path, str]]]:
+) -> tuple[Decision, str | None, list[tuple[int, Path, str, str | None]]]:
     """Image decision rows: the decision, its digest, and per row its line, file and answer.
 
     A row is `{"image": <path>, "label": <option id>}`, the path relative to the
     rows file's directory or absolute. Labels are read as a text decision row's
     are. The files are only located here; `image_rows` opens them.
     """
-    located: list[tuple[int, Path]] = []
+    located: list[tuple[int, Path, str | None]] = []
     for lineno, obj in objects:
         where = f"{path}:{lineno}"
         given = [key for key in ("completion", "target") if key in obj]
@@ -1037,7 +1054,7 @@ def read_image_rows(
             raise PrepareError(
                 f"{where}: the image {value!r} is not a regular file (read as {file})"
             )
-        located.append((lineno, file))
+        located.append((lineno, file, _row_group(path, lineno, obj)))
     try:
         decision, digest = _decision_for(objects, questions)
         answers = [decision.answer_for(obj["label"], f"{path}:{lineno}") for lineno, obj in objects]
@@ -1046,7 +1063,10 @@ def read_image_rows(
     return (
         decision,
         digest,
-        [(lineno, file, answer) for (lineno, file), answer in zip(located, answers, strict=True)],
+        [
+            (lineno, file, answer, group)
+            for (lineno, file, group), answer in zip(located, answers, strict=True)
+        ],
     )
 
 
@@ -1159,7 +1179,7 @@ def _image_stats(rows: Sequence[Row], duplicates: int, checker: dict[str, Any]) 
 
 
 def image_rows(
-    path: Path, located: Sequence[tuple[int, Path, str]], inspector: ImageInspector
+    path: Path, located: Sequence[tuple[int, Path, str, str | None]], inspector: ImageInspector
 ) -> tuple[list[Row], ImageStats]:
     """Open every image of `located`, refuse what cannot be trained, and make the rows.
 
@@ -1167,12 +1187,12 @@ def image_rows(
     given two different labels. The same bytes with the same label is a row
     like any other, counted in `ImageStats.duplicate_rows`.
     """
-    files = sorted({file for _, file, _ in located})
+    files = sorted({file for _, file, _, _ in located})
     by_file, checker, decoder = _inspected(files, inspector)
     first: dict[str, tuple[int, str]] = {}
     duplicates = 0
     rows: list[Row] = []
-    for lineno, file, answer in located:
+    for lineno, file, answer, group in located:
         where = f"{path}:{lineno}"
         image = _checked_image(where, file, by_file[file], decoder)
         seen = first.get(image.sha256)
@@ -1194,6 +1214,7 @@ def image_rows(
                 target=answer,
                 rendered=True,
                 image=image,
+                group=group,
             )
         )
     return rows, _image_stats(rows, duplicates, checker)
@@ -1544,6 +1565,41 @@ def split_grouped(
         [row for i, row in enumerate(rows) if i in aside],
         [row for i, row in enumerate(rows) if i in held],
     )
+
+
+def row_split_groups(rows: Sequence[Row], *, pictures: bool) -> list[str]:
+    """One transitive split-group id per row.
+
+    Explicit `group` values join rows. In an image split, identical picture
+    digests join rows too, including rows whose named groups differ. Rows joined
+    by either relation therefore stay in the same component.
+    """
+    parent = list(range(len(rows)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        left, right = find(a), find(b)
+        if left != right:
+            parent[right] = left
+
+    first: dict[tuple[str, str], int] = {}
+    for i, row in enumerate(rows):
+        keys: list[tuple[str, str]] = []
+        if row.group is not None:
+            keys.append(("group", row.group))
+        if pictures and row.image is not None:
+            keys.append(("picture", row.image.sha256))
+        for key in keys:
+            if key in first:
+                union(i, first[key])
+            else:
+                first[key] = i
+    return [str(find(i)) for i in range(len(rows))]
 
 
 # ---------------------------------------------------------------------------
@@ -2227,6 +2283,9 @@ class PrepareResult:
     decision: DecisionProfile | None = None
     # Image decision splits only: what the images are.
     images: ImageStats | None = None
+    # Caller-supplied split groups, before picture identity joins them.
+    groups_used: bool = False
+    groups_count: int = 0
     skipped: list[SkippedCheck] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
     report_path: Path | None = None
@@ -2282,6 +2341,7 @@ class PrepareResult:
                 # The split is a function of these two and nothing else, which
                 # is what makes it reproducible from the report alone.
                 "split_seed": split_seed(self.content_sha256, self.request.seed),
+                "groups": {"used": self.groups_used, "count": self.groups_count},
             },
             "train": self.train.as_dict() if self.train else None,
             "heldout": self.heldout.as_dict() if self.heldout else None,
@@ -2539,15 +2599,16 @@ def _split_pictures(
     than asked -- `asked`, the caller's --heldout-size, else `heldout` -- is one
     limitation, with the sizes the groups gave.
     """
-    pictures = [row.image.sha256 if row.image is not None else "" for row in rows]
-    grouped = split_grouped(rows, pictures, content_sha256, seed, heldout, calibration)
+    groups = row_split_groups(rows, pictures=True)
+    grouped = split_grouped(rows, groups, content_sha256, seed, heldout, calibration)
     if grouped is None:
         return None, []
     train, aside, held = grouped
     wanted = heldout if asked is None else asked
     if (len(held), len(aside)) != (wanted, calibration):
         result.limitation(
-            f"rows that give the same picture are kept in one split, and {len(rows)} rows are "
+            f"rows in the same group or giving the same picture are kept in one split, and "
+            f"{len(rows)} rows are "
             f"available, so {len(held)} rows were held out, {len(aside)} set aside for "
             f"calibration and {len(train)} kept for training, where {wanted} and {calibration} "
             f"were asked. Every interval on this split is computed at n={len(held)}"
@@ -2727,6 +2788,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         declarations_sha256=declarations_sha256,
         decision=decision,
         images=image_stats,
+        groups_used=any(row.group is not None for row in rows),
+        groups_count=len({row.group for row in rows if row.group is not None}),
     )
     if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
         result.limitation(ASSUMED_WIRE_FORMAT)
@@ -2808,7 +2871,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     heldout_n = heldout_size_for(len(rows), request.heldout_fraction, request.heldout_size)
     # Rows split by picture report their sizes once, after the grouping
     # (`_split_pictures`), which may move them again.
-    grouped = llm_images or image_stats is not None
+    explicit_groups = result.groups_used
+    grouped = llm_images or image_stats is not None or explicit_groups
     if request.heldout_size is not None and heldout_n != request.heldout_size and not grouped:
         # Silently handing back 99 when 500 was asked for is the shape of every
         # failure in this codebase's history: the caller reads their own number
@@ -2826,6 +2890,16 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         halves, _ = _split_pictures(
             result, rows, content_sha256, request.seed, heldout_n, 0, request.heldout_size
         )
+    elif explicit_groups and image_stats is None and heldout_n >= 1:
+        grouped_rows = split_grouped(
+            rows,
+            row_split_groups(rows, pictures=False),
+            content_sha256,
+            request.seed,
+            heldout_n,
+            0,
+        )
+        halves = (grouped_rows[0], grouped_rows[2]) if grouped_rows is not None else None
     else:
         halves = (
             split_rows(rows, content_sha256, request.seed, heldout_n) if heldout_n >= 1 else None
@@ -2845,12 +2919,12 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 f"{len(rows) - heldout_n} rows are left after the held-out split, so "
                 f"{calibration_n} were set aside"
             )
-        if image_stats is None:
+        if image_stats is None and not explicit_groups:
             train_part, calibration_rows = split_calibration(
                 rows, content_sha256, request.seed, heldout_n, calibration_n
             )
             halves = (train_part, halves[1])
-        else:
+        elif image_stats is not None:
             halves, calibration_rows = _split_pictures(
                 result,
                 rows,
@@ -2860,6 +2934,20 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 calibration_n,
                 request.heldout_size,
             )
+        else:
+            grouped_rows = split_grouped(
+                rows,
+                row_split_groups(rows, pictures=False),
+                content_sha256,
+                request.seed,
+                heldout_n,
+                calibration_n,
+            )
+            if grouped_rows is None:
+                halves = None
+            else:
+                train_part, calibration_rows, heldout_part = grouped_rows
+                halves = (train_part, heldout_part)
     if decision is not None and halves is not None:
         decision.train = _count_by_option(decision.decision, halves[0])
         decision.calibration = _count_by_option(decision.decision, calibration_rows)
@@ -2959,12 +3047,18 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         split_check = Check.passed(
             SPLIT_CHECK,
             f"{result.train.n} training{aside} and {result.heldout.n} held-out examples, split "
-            f"by content {_bare_digest(content_sha256)[:16]} and seed {request.seed}",
+            f"by content {_bare_digest(content_sha256)[:16]} and seed {request.seed}"
+            + (
+                f", keeping {result.groups_count} supplied groups together"
+                if result.groups_used
+                else ""
+            ),
             observed={
                 "train": result.train.as_dict(),
                 "calibration": result.calibration.as_dict() if result.calibration else None,
                 "heldout": result.heldout.as_dict(),
                 "split_seed": split_seed(content_sha256, request.seed),
+                "groups": {"used": result.groups_used, "count": result.groups_count},
             },
         )
         result.checks.add(split_check)

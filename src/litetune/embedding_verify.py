@@ -97,13 +97,13 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from litetune import devices, envs
 from litetune.checks import Check, CheckSet, Outcome
-from litetune.decisions import Decision, DecisionError, decision_from
+from litetune.decisions import Decision, DecisionError, decision_from, read_questions
 from litetune.embedding_export import (
     EMBEDDING_CONVERT_SCHEMA,
     GOOGLE_HUB_FILE,
@@ -1952,6 +1952,35 @@ def verify_embedding(
         )
     if not 0.0 <= threshold < 1.0:
         return refuse(GATE_CHECK, f"--max-conversion-cost {threshold} is not in [0, 1)")
+    if record.tasks:
+        decision_path = Path(job.heldout).parent / "decision.json"
+        try:
+            _, digest = read_questions(decision_path)
+        except DecisionError as exc:
+            return refuse(
+                RECORD_CHECK,
+                f"the multi-task reference selects a task from {decision_path}: {exc}",
+            )
+        matches = [task for task in record.tasks if task.decision_sha256 == digest]
+        if not matches:
+            return refuse(
+                RECORD_CHECK,
+                f"the decision beside --data hashes to {digest}, which matches none of the "
+                f"{len(record.tasks)} tasks in the reference",
+            )
+        task = matches[0]
+        record = replace(
+            record,
+            labels=task.labels,
+            rows=task.rows,
+            head_heldout_accuracy=task.head_heldout_accuracy,
+            decision=task.decision,
+            decision_sha256=task.decision_sha256,
+            train_sha256=task.train_sha256,
+            mirror=task.mirror,
+            mirror_swap=task.mirror_swap,
+            tasks=(),
+        )
     try:
         decision = decision_from(record.decision, "the reference's litetune.json")
     except DecisionError as exc:

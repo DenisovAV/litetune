@@ -38,6 +38,7 @@ from litetune.embedding_tune import (
     PROMPT_NAME,
     RECIPE,
     EmbeddingRecord,
+    EmbeddingTaskRecord,
     LabelledText,
     write_embedding_record,
 )
@@ -2585,6 +2586,15 @@ def _image_setup(
         },
     }
     fields.update(record or {})
+    if fields.get("tasks"):
+        for key in (
+            "labels",
+            "rows",
+            "head_heldout_accuracy",
+            "decision",
+            "decision_sha256",
+        ):
+            fields.pop(key)
     write_embedding_record(reference, EmbeddingRecord(**fields))
     model = tmp_path / "out" / "int8" / "model.litertlm"
     model.parent.mkdir(parents=True)
@@ -2619,6 +2629,69 @@ def _image_digests(path: Path) -> list[str]:
 
 def _failed(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return [c for c in manifest["checks"] if c["outcome"] == "failed"]
+
+
+def test_a_multitask_image_reference_selects_by_the_decision_beside_data(fake, tmp_path):
+    selected = _decision()
+    other = Decision(
+        "choice",
+        "Another question?",
+        tuple(Option(option) for option in OPTIONS),
+    )
+    tasks = (
+        EmbeddingTaskRecord(
+            "other",
+            other.as_dict(),
+            other.digest(),
+            tuple(sorted(OPTIONS)),
+            {"train": 36, "heldout": 18},
+            "sha256:" + "1" * 64,
+            0.1,
+            False,
+            (),
+        ),
+        EmbeddingTaskRecord(
+            "selected",
+            selected.as_dict(),
+            selected.digest(),
+            tuple(sorted(OPTIONS)),
+            {"train": 36, "heldout": 18},
+            "sha256:" + "2" * 64,
+            0.9,
+            False,
+            (),
+        ),
+    )
+    setup = _image_setup(tmp_path, fake, record={"tasks": tasks})
+    (setup.heldout.parent / "decision.json").write_text(selected.canonical_text(), encoding="utf-8")
+    result = _verify(setup)
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    assert result.manifest["embedding"]["decision_sha256"] == selected.digest()
+
+
+def test_a_multitask_image_reference_refuses_an_untrained_decision(fake, tmp_path):
+    trained = _decision()
+    task = EmbeddingTaskRecord(
+        "trained",
+        trained.as_dict(),
+        trained.digest(),
+        tuple(sorted(OPTIONS)),
+        {"train": 36, "heldout": 18},
+        "sha256:" + "1" * 64,
+        0.9,
+        False,
+        (),
+    )
+    setup = _image_setup(tmp_path, fake, record={"tasks": (task,)})
+    unknown = Decision(
+        "choice",
+        "Question this checkpoint did not train?",
+        tuple(Option(option) for option in OPTIONS),
+    )
+    (setup.heldout.parent / "decision.json").write_text(unknown.canonical_text(), encoding="utf-8")
+    result = _verify(setup)
+    assert result.status is Status.FAILED_HARNESS
+    assert "matches none" in _checks(result.manifest)[RECORD_CHECK]["detail"]
 
 
 def test_an_image_checkpoint_embeds_its_images_on_both_sides_and_passes(fake, tmp_path):

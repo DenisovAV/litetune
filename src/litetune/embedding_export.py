@@ -511,8 +511,20 @@ class EmbeddingExportResult:
                 "sha256": self.checkpoint_sha256,
                 "base_model": self.record.base_model,
                 "base_model_revision": self.record.base_model_revision,
-                "labels": len(self.record.labels),
-                "decision_sha256": self.record.decision_sha256,
+                "labels": len(self.record.labels) if not self.record.tasks else None,
+                "decision_sha256": (self.record.decision_sha256 if not self.record.tasks else None),
+                "tasks": (
+                    [
+                        {
+                            "name": task.name,
+                            "labels": len(task.labels),
+                            "decision_sha256": task.decision_sha256,
+                        }
+                        for task in self.record.tasks
+                    ]
+                    if self.record.tasks
+                    else None
+                ),
             },
             "request": self.request.as_dict(),
             "checks": self.checks.as_dict(),
