@@ -2810,8 +2810,8 @@ paired differences are against the CPU on the same machine (`metrics.paired_diff
 ## EmbeddingGemma 2 on images: several questions
 
 Measured 2026-11-11, once: three questions about one game's frames trained into one
-fine-tune with `tune --tasks`, at litetune commit `152c5aa` (unreleased), and the same run
-at two epochs, at `cd2c4bc`. The frames are screenshots of the Dash sample game and are not
+fine-tune with `tune --tasks`, on revisions of this release before it was merged (their
+commits are not public), at three epochs and at two. The frames are screenshots of the Dash sample game and are not
 published, so this run cannot be repeated from the repository; it is here because the
 three-epoch recipe for `--tasks` rests on it.
 
@@ -2825,8 +2825,11 @@ splits:
 | near | jump, run | 15,383 | 222 | 6,655 | 1,041 | 7,687 |
 | steer | left, right, straight | 6,243 | 348 | 2,157 | 700 | 3,386 |
 
-steer's question has `"mirror": [["left", "right"]]`: 2,157 training pictures and 2,157
-mirrored copies. No picture is in two questions.
+steer was mirrored with left and right exchanged: 2,157 training pictures and 2,157
+mirrored copies. That run gave the mirror as `mirror` and `mirror_swap` keys of steer's
+`tasks.json` entry, which this release replaced with `"mirror": [["left", "right"]]` in the
+question; on these three splits both give byte-identical training items. No picture is in
+two questions.
 
 **tune** `--tasks` at `--vision-tokens 70` on one NVIDIA A100-SXM4-40GB, torch 2.9.1,
 transformers 5.19.0: every picture took 56 to 60 soft tokens. Two epochs: 3,026 steps in

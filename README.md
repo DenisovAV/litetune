@@ -954,7 +954,11 @@ split. Picture identity still groups identical bytes, so a duplicate picture
 shared by two named groups joins those groups. A group's split is drawn from its
 name and `--seed` alone, not from the rest of the file, so rows files prepared
 with one seed put a group they share on the same side; the sizes come out near
-the fractions asked for rather than exact:
+the fractions asked for rather than exact. Two cases depend on the rest of the
+file: a split that would otherwise be empty takes a group from another, which
+`prepare` names among its limitations, and groups joined by a shared picture
+are placed together by the smallest name among them. `tune --tasks` refuses a
+pair of files that put one group on two sides:
 
 ```
 {"image": "frames/001.png", "label": "left", "group": "run-17"}

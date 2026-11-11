@@ -587,7 +587,8 @@ def _add_prepare(sub) -> None:
             'options exchanged on the copy ([] flips without exchanging); no "mirror", no copies. '
             'Any row may carry "group": <string>; the rows of a group stay '
             "in one split, and a group is placed by its name and --seed alone, so rows files "
-            "prepared with one seed agree on where a shared group goes"
+            "prepared with one seed agree on where a shared group goes, except a group the report "
+            "names as placed to fill an empty split"
         ),
     )
     prep.add_argument(

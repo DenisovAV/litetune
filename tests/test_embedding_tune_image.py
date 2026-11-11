@@ -279,6 +279,12 @@ def _tasks_file(tmp_path: Path, tasks: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _companion(tmp_path: Path) -> dict[str, str]:
+    """A second, valid question: --tasks trains two or more."""
+    other = _split(tmp_path / "companion", ids=("p", "q"), train=8)
+    return {"name": "companion", "data": str(other.train), "decision": str(other.decision)}
+
+
 def _check(result, name):
     return next(c for c in result.checks.checks if c.name == name)
 
@@ -479,7 +485,10 @@ def test_a_multitask_record_validates_recorded_training_groups(toolchain, tmp_pa
     split = _split(tmp_path / "split", ids=("a", "b"), train=8)
     tasks = _tasks_file(
         tmp_path,
-        [{"name": "task", "data": str(split.train), "decision": str(split.decision)}],
+        [
+            {"name": "task", "data": str(split.train), "decision": str(split.decision)},
+            _companion(tmp_path),
+        ],
     )
     result = run_embedding_tune(
         EmbeddingTuneRequest(output_dir=tmp_path / "tuned", tasks=tasks, vision_tokens=70)
@@ -1430,7 +1439,10 @@ def test_tasks_refuses_text_rows(toolchain, tmp_path):
         _write(root / f"{name}.jsonl", rows)
     tasks = _tasks_file(
         tmp_path,
-        [{"name": "text", "data": str(root / "train.jsonl"), "decision": str(decision_path)}],
+        [
+            {"name": "text", "data": str(root / "train.jsonl"), "decision": str(decision_path)},
+            _companion(tmp_path),
+        ],
     )
     with pytest.raises(EmbeddingTuneError, match="accepts image rows only"):
         run_embedding_tune(
@@ -1446,7 +1458,10 @@ def test_tasks_refuses_a_picture_in_both_splits(toolchain, tmp_path):
     _write(split.heldout, heldout)
     tasks = _tasks_file(
         tmp_path,
-        [{"name": "overlap", "data": str(split.train), "decision": str(split.decision)}],
+        [
+            {"name": "overlap", "data": str(split.train), "decision": str(split.decision)},
+            _companion(tmp_path),
+        ],
     )
     with pytest.raises(EmbeddingTuneError, match="both training and held-out"):
         run_embedding_tune(
@@ -1520,7 +1535,10 @@ def test_tasks_require_unique_names_decisions_and_the_prepared_decision_path(too
             "decision sha256 .* is repeated",
         ),
         (
-            [{"name": "one", "data": str(first.train), "decision": str(second.decision)}],
+            [
+                {"name": "one", "data": str(first.train), "decision": str(second.decision)},
+                {"name": "two", "data": str(second.train), "decision": str(second.decision)},
+            ],
             "decision.*must be .*first/split/decision.json",
         ),
     ):
@@ -1549,11 +1567,24 @@ def test_request_refuses_tasks_with_single_question_paths(tmp_path, field):
 def test_a_task_carries_only_its_name_data_and_decision(tmp_path, extra):
     # The mirror is the question's (decision.json), and the held-out split is
     # the one prepare wrote beside the data.
-    tasks = _tasks_file(tmp_path, [{"name": "x", "data": "x", "decision": "d", **extra}])
+    tasks = _tasks_file(
+        tmp_path, [{"name": "x", "data": "x", "decision": "d", **extra}, _companion(tmp_path)]
+    )
     with pytest.raises(EmbeddingTuneError, match=f"unknown keys \\['{next(iter(extra))}'\\]"):
         run_embedding_tune(
             EmbeddingTuneRequest(output_dir=tmp_path / "run", tasks=tasks, vision_tokens=70)
         )
+
+
+@pytest.mark.parametrize("count", [0, 1])
+def test_tasks_with_fewer_than_two_questions_are_refused(toolchain, tmp_path, count):
+    # One question trains with --data and --decision, at the recipe measured for one.
+    tasks = _tasks_file(tmp_path, [_companion(tmp_path)][:count])
+    with pytest.raises(EmbeddingTuneError, match=f"names {count} question.*--data and --decision"):
+        run_embedding_tune(
+            EmbeddingTuneRequest(output_dir=tmp_path / "run", tasks=tasks, vision_tokens=70)
+        )
+    assert toolchain.calls == []
 
 
 def test_several_mirror_pairs_reach_the_script(toolchain, tmp_path):

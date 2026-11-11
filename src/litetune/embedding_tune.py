@@ -2493,8 +2493,12 @@ def _check_tasks(request: EmbeddingTuneRequest) -> tuple[_CheckedTask, ...]:
         raise EmbeddingTuneError(
             f"{request.tasks}: expected an object containing only a 'tasks' list"
         )
-    if not raw["tasks"]:
-        raise EmbeddingTuneError(f"{request.tasks}: 'tasks' is empty")
+    if len(raw["tasks"]) < 2:
+        raise EmbeddingTuneError(
+            f"{request.tasks}: 'tasks' names {len(raw['tasks'])} question(s); --tasks trains two "
+            "or more into one fine-tune. Train one with --data and --decision, the recipe "
+            "measured for one question"
+        )
     root = request.tasks.parent
     out: list[_CheckedTask] = []
     names: set[str] = set()
