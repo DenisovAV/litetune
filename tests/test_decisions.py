@@ -344,3 +344,68 @@ def test_every_familys_control_text_is_refused_in_a_state_and_an_option(marker):
     with pytest.raises(DecisionError, match="control token"):
         decision_from({"question": "Q?", "options": [{"id": f"a{marker}"}, {"id": "b"}]}, "q")
     assert state_problem(f"before {marker} after") is not None
+
+
+# ---------------------------------------------------------------------------
+# mirror: a choice question about pictures
+# ---------------------------------------------------------------------------
+
+STEER = {
+    "type": "choice",
+    "question": "Where should Dash steer?",
+    "options": [{"id": "left"}, {"id": "straight"}, {"id": "right"}],
+}
+
+
+@pytest.mark.parametrize(
+    ("given", "pairs"), [([["left", "right"]], (("left", "right"),)), ([], ())]
+)
+def test_a_mirror_is_read_and_written_back(given, pairs):
+    decision = decision_from({**STEER, "mirror": given}, "q")
+    assert decision.mirror == pairs
+    assert json.loads(decision.canonical_text())["mirror"] == given
+    assert decision_from(json.loads(decision.canonical_text()), "d") == decision
+
+
+def test_no_mirror_leaves_the_decision_text_and_digest_as_they_were():
+    decision = decision_from(STEER, "q")
+    assert decision.mirror is None
+    assert "mirror" not in decision.as_dict()
+    before = Decision("choice", STEER["question"], tuple(Option(o["id"]) for o in STEER["options"]))
+    assert decision.digest() == before.digest()
+    assert decision_from({**STEER, "mirror": []}, "q").digest() != decision.digest()
+
+
+@pytest.mark.parametrize(
+    ("mirror", "said"),
+    [
+        ("left:right", "must be a list of option-id pairs"),
+        ([["left"]], "must be a list of option-id pairs"),
+        ([["left", "right", "straight"]], "must be a list of option-id pairs"),
+        ([["left", 1]], "must be a list of option-id pairs"),
+        ([["left", "reverse"]], "mirror names 'reverse', which is not one of the options"),
+        ([["left", "left"]], "mirror pairs 'left' with itself"),
+        ([["left", "right"], ["right", "straight"]], "mirror names 'right' in two pairs"),
+        ([["left", "right"], ["right", "left"]], "in two pairs"),
+    ],
+)
+def test_a_mirror_that_is_not_pairs_of_distinct_options_is_refused(mirror, said):
+    with pytest.raises(DecisionError, match=said):
+        decision_from({**STEER, "mirror": mirror}, "q")
+
+
+def test_a_mirror_names_options_not_the_none_option():
+    with pytest.raises(DecisionError, match="'other', which is not one of the options"):
+        decision_from({**STEER, "none_option": "other", "mirror": [["left", "other"]]}, "q")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        {"type": "noul", "question": "Is it on the road?"},
+        {"type": "score", "question": "How steep?", "options": ["flat", "steep"]},
+    ],
+)
+def test_only_a_choice_question_has_a_mirror(question):
+    with pytest.raises(DecisionError, match="has no mirror"):
+        decision_from({**question, "mirror": []}, "q")

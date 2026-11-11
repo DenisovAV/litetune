@@ -54,6 +54,7 @@ from litetune.embedding_tune import (
     PROMPT_NAME,
     RECIPE,
     EmbeddingRecord,
+    EmbeddingTaskRecord,
     read_embedding_record,
     write_embedding_record,
 )
@@ -688,6 +689,49 @@ def test_an_image_report_ties_to_the_spliced_file(hub, grafter, splicer, tmp_pat
     assert (facts.modality, facts.vision_tokens, facts.weights) == ("image", 140, "int8")
     assert facts.checkpoint_sha256 == report["checkpoint"]["sha256"]
     assert facts.decision_sha256 == _decision().digest()
+
+
+def test_a_multitask_image_report_records_every_decision_digest(hub, grafter, splicer, tmp_path):
+    other = Decision("choice", "Other?", (Option("x"), Option("y")))
+    tasks = tuple(
+        EmbeddingTaskRecord(
+            name,
+            decision.as_dict(),
+            decision.digest(),
+            tuple(sorted(decision.ids)),
+            {"train": 20, "heldout": 4},
+            "sha256:" + digit * 64,
+            0.5,
+            False,
+            (),
+            (digit * 64,),
+        )
+        for name, decision, digit in (("first", _decision(), "1"), ("other", other, "2"))
+    )
+    model = _image_checkpoint(
+        tmp_path,
+        labels=(),
+        rows={},
+        head_heldout_accuracy=0.0,
+        decision={},
+        decision_sha256="",
+        tasks=tasks,
+    )
+    out = tmp_path / "out"
+    assert _convert(model, out) == 0
+    report = _report(out, "int8")
+    assert report["checkpoint"]["decision_sha256"] is None
+    assert [task["decision_sha256"] for task in report["checkpoint"]["tasks"]] == [
+        _decision().digest(),
+        other.digest(),
+    ]
+    from litetune.embedding_verify import convert_facts
+
+    facts, _ = convert_facts(out / "int8" / ARTIFACT_NAME)
+    assert facts is not None and facts.decision_sha256s == (
+        _decision().digest(),
+        other.digest(),
+    )
 
 
 @pytest.mark.parametrize(

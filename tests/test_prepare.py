@@ -42,6 +42,8 @@ from litetune.prepare import (
     read_rows,
     refuse_undeclared_tools,
     render_call,
+    row_split_groups,
+    split_grouped_by_key,
     split_rows,
     split_seed,
 )
@@ -1813,6 +1815,128 @@ def test_a_calibration_size_is_honoured_or_the_shortfall_said(write_jsonl, reque
     assert sum(short.decision.calibration.values()) == 47
     assert sum(short.decision.train.values()) == 1
     assert any("calibration split of 100 was requested" in text for text in short.limitations)
+
+
+def test_supplied_text_groups_never_split_and_report_changed_heldout_size(write_jsonl, request_for):
+    records = rows(12)
+    for i, record in enumerate(records):
+        record["group"] = f"g{i // 3}"
+    result = prepare(request_for(write_jsonl(records), heldout_size=2))
+    split_of = {}
+    for split in (result.train, result.heldout):
+        for row in split_records(split):
+            group = records[row["source_line"] - 1]["group"]
+            assert split_of.setdefault(group, split.path.name) == split.path.name
+    assert any(
+        "same supplied group" in text and "3 rows were held out" in text and "where 2 and 0" in text
+        for text in result.limitations
+    )
+
+
+def test_supplied_text_groups_never_split_with_calibration_and_report_sizes(
+    write_jsonl, request_for, questions
+):
+    records = decision_rows(n_per_option=12)
+    for i, record in enumerate(records):
+        record["group"] = f"g{i // 2}"
+    result = prepare(
+        request_for(write_jsonl(records), questions=questions(), heldout_size=7, calibration_size=7)
+    )
+    split_of = {}
+    for split in (result.train, result.calibration, result.heldout):
+        assert split is not None
+        for row in split_records(split):
+            group = records[row["source_line"] - 1]["group"]
+            assert split_of.setdefault(group, split.path.name) == split.path.name
+    assert any(
+        "same supplied group" in text and "where 7 and 7 were asked" in text
+        for text in result.limitations
+    )
+
+
+def test_supplied_text_groups_land_on_one_side_in_every_rows_file(
+    tmp_path, write_jsonl, request_for, questions
+):
+    # Two rows files about the same groups, with different content: each shared
+    # group is placed by its name and the seed, not by the file it is in.
+    side = []
+    for name, extra in (("first", ""), ("second", " again")):
+        records = decision_rows(n_per_option=12)
+        for i, record in enumerate(records):
+            record["prompt"] += extra
+            record["group"] = f"g{i // 2}"
+        result = prepare(
+            request_for(
+                write_jsonl(records, f"{name}.jsonl"),
+                questions=questions(),
+                output_dir=tmp_path / name,
+            )
+        )
+        side.append(
+            {
+                records[row["source_line"] - 1]["group"]: split.path.name
+                for split in (result.train, result.calibration, result.heldout)
+                for row in split_records(split)
+            }
+        )
+    assert side[0] == side[1]
+    assert set(side[0].values()) == {"train.jsonl", "calibration.jsonl", "heldout.jsonl"}
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_a_key_split_of_two_groups_holds_one_out_and_trains_on_the_other(seed):
+    rows = [Row(i + 1, f"p{i}", "c", None, group=f"g{i % 2}") for i in range(4)]
+    groups = row_split_groups(rows, pictures=False)
+    # Asked for one held-out row of four: whatever the draws, each side gets a group.
+    train, calibration, held, _ = split_grouped_by_key(rows, groups, seed, 1, 0)
+    assert calibration == []
+    assert len({row.group for row in train}) == 1 and len({row.group for row in held}) == 1
+    assert {row.group for row in train} != {row.group for row in held}
+    # Asked for nearly everything: training still keeps a group.
+    train, calibration, held, _ = split_grouped_by_key(rows, groups, seed, 3, 0)
+    assert train and held
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_a_key_split_of_three_groups_fills_every_split_and_names_what_it_moved(seed):
+    # 7/7/6 rows: whatever the draws, three groups fill three splits.
+    rows = [Row(i + 1, f"p{i}", "c", None, group="abc"[min(i // 7, 2)]) for i in range(20)]
+    groups = row_split_groups(rows, pictures=False)
+    train, calibration, held, moved = split_grouped_by_key(rows, groups, seed, 4, 2)
+    sides = [{row.group for row in part} for part in (train, calibration, held)]
+    assert [len(side) for side in sides] == [1, 1, 1]
+    keys = {f"group:{group}" for group in "abc"}
+    assert set(moved) <= keys
+    # A group not moved sits where its own draw puts it: below 4/20 held out,
+    # below 6/20 set aside, otherwise trained on.
+    for side, part in zip(sides, ("train", "calibration", "held"), strict=True):
+        for group in side - {key.removeprefix("group:") for key in moved}:
+            payload = f"group:{group}:{seed}".encode()
+            draw = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") / 2**64
+            expected = "held" if draw < 4 / 20 else "calibration" if draw < 6 / 20 else "train"
+            assert part == expected
+
+
+@pytest.mark.parametrize("with_decision", [False, True])
+def test_a_group_placed_to_fill_a_split_is_a_limitation(
+    write_jsonl, request_for, questions, with_decision
+):
+    records = decision_rows(n_per_option=4) if with_decision else rows(12)
+    for i, record in enumerate(records):
+        record["group"] = f"g{i // 4}"
+    # One row held out (and one set aside): the groups seldom draw that low, so
+    # one is moved to fill the split.
+    extra = {"questions": questions(), "calibration_size": 1} if with_decision else {}
+    result = prepare(request_for(write_jsonl(records), heldout_size=1, **extra))
+    assert any(
+        "placed so that no requested split is empty" in text and "'group:g" in text
+        for text in result.limitations
+    )
+
+
+def test_a_key_split_of_one_group_is_none():
+    rows = [Row(i + 1, f"p{i}", "c", None, group="only") for i in range(3)]
+    assert split_grouped_by_key(rows, row_split_groups(rows, pictures=False), 0, 1, 1) is None
 
 
 def test_a_calibration_fraction_is_a_share_of_every_row(write_jsonl, request_for, questions):

@@ -9,7 +9,8 @@ the measurement this path rests on measured it
 (MEASUREMENTS.md, "EmbeddingGemma 2: many labels"):
 
 - **the reference**, the fine-tune in float32 through sentence-transformers on
-  the CPU, prompt `PROMPT_NAME`, normalised (`REFERENCE_SCRIPT`, in
+  the device tune would use (the environment's probe, or `LITETUNE_DEVICE`;
+  TF32 off on CUDA), prompt `PROMPT_NAME`, normalised (`REFERENCE_SCRIPT`, in
   `envs.EMBED_TRAIN`);
 - **the candidate**, the `.litertlm`, through LiteRT-LM's `EmbeddingEngine` on
   the CPU backend, `DECIDER_PREFIX` + the text, normalised (`ENGINE_SCRIPT`, in
@@ -96,14 +97,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from litetune import devices, envs
 from litetune.checks import Check, CheckSet, Outcome
-from litetune.decisions import Decision, DecisionError, decision_from
+from litetune.decisions import Decision, DecisionError, decision_from, read_questions
 from litetune.embedding_export import (
     EMBEDDING_CONVERT_SCHEMA,
     GOOGLE_HUB_FILE,
@@ -127,6 +129,7 @@ from litetune.embedding_tune import (
     EmbeddingTuneError,
     LabelledImage,
     LabelledText,
+    groups_in_both,
     pictures_in_both,
     processor_digests,
     read_image_split,
@@ -274,10 +277,9 @@ SIDE_BY_SIDE = (
     "the candidate and Google's file were embedded at the same time, each on its own {threads}; "
     "each file's time per input was measured with the other running"
 )
-REFERENCE_ON_CPU = (
-    "the reference ran on the CPU in float32 through sentence-transformers, whatever "
-    "LITETUNE_DEVICE says"
-)
+DEVICE_WORDS = {"cpu": "the CPU", "cuda": "CUDA (TF32 off)", "mps": "MPS"}
+# {device}: "the CPU", or "CUDA (TF32 off)" / "MPS", from the reference's report.
+REFERENCE_ON = "the reference ran on {device} in float32 through sentence-transformers"
 
 # -- a checkpoint tuned on images ------------------------------------------------
 SCORER_MEANS_IMAGES = (
@@ -299,8 +301,8 @@ IMAGE_GPU_MEASURED = (
     "on one Mac (MEASUREMENTS.md, \"The same int8 file on a Mac's CPU and GPU, and on "
     'Windows"); not with the vision encoder on a Windows or Linux GPU. ' + GPU_PRECISION
 )
-IMAGE_REFERENCE_ON_CPU = (
-    "the reference ran on the CPU in float32 through transformers, whatever LITETUNE_DEVICE says: "
+IMAGE_REFERENCE_ON = (
+    "the reference ran on {device} in float32 through transformers: "
     "the checkpoint with its vision tower and its own processor, each image the processor's "
     "input at a budget of at most {vision_tokens} soft tokens, the mean over every token, "
     "L2-normalised"
@@ -404,7 +406,7 @@ class EmbeddingVerify:
 # ---------------------------------------------------------------------------
 
 REFERENCE_SCRIPT = r'''
-"""Embed texts with a fine-tuned EmbeddingGemma 2: sentence-transformers, float32, CPU.
+"""Embed texts with a fine-tuned EmbeddingGemma 2: sentence-transformers, float32, spec["device"].
 
 Reads JSON {model, prompt_name, prefix, texts, threads, batch_size, out, report}
 from argv[1]. Writes the L2-normalised vectors, float32, one row per text, to
@@ -427,6 +429,19 @@ import time
 from pathlib import Path
 
 REFUSED_EXIT = 3
+# Pictures per language-model pass on an accelerator; the CPU takes one at a time.
+REFERENCE_IMAGE_BATCH = 32
+
+
+def reference_device(torch, given):
+    """The device verify resolved (the probe, or LITETUNE_DEVICE); without an
+    answer, CUDA if any, else the CPU. Float32 throughout: TF32 is turned off on
+    CUDA, where torch would otherwise round matrix products to it."""
+    device = given or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    return device
 
 
 def unusable_rows(np, v):
@@ -457,10 +472,11 @@ def main():
     from sentence_transformers import SentenceTransformer
 
     torch.set_num_threads(spec["threads"])
+    device = reference_device(torch, spec.get("device"))
     started = time.time()
     st = SentenceTransformer(
         spec["model"],
-        device="cpu",
+        device=device,
         model_kwargs={"dtype": torch.float32},
         config_kwargs={"vision_config": None, "audio_config": None},
     )
@@ -493,7 +509,7 @@ def main():
         "rows": int(v.shape[0]),
         "dim": int(v.shape[1]),
         "seconds": round(time.time() - started, 1),
-        "device": "cpu",
+        "device": device,
         "dtype": "float32",
         "threads": torch.get_num_threads(),
         "max_seq_length": limit,
@@ -674,7 +690,8 @@ def picture_bytes(path, expected):
 
 IMAGE_REFERENCE_SCRIPT = (
     r'''
-"""Embed images with an EmbeddingGemma 2 checkpoint tuned on images: transformers, float32, CPU.
+"""Embed images with an EmbeddingGemma 2 checkpoint tuned on images: transformers, float32,
+on spec["device"] (`reference_device`).
 
 Reads JSON {model, processor, images, image_sha256, image_text, vision_tokens,
 threads, out, report} from argv[1]. The model is loaded from `model` with its
@@ -700,6 +717,19 @@ import time
 from pathlib import Path
 
 REFUSED_EXIT = 3
+# Pictures per language-model pass on an accelerator; the CPU takes one at a time.
+REFERENCE_IMAGE_BATCH = 32
+
+
+def reference_device(torch, given):
+    """The device verify resolved (the probe, or LITETUNE_DEVICE); without an
+    answer, CUDA if any, else the CPU. Float32 throughout: TF32 is turned off on
+    CUDA, where torch would otherwise round matrix products to it."""
+    device = given or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    return device
 
 
 def unusable_rows(np, v):
@@ -723,16 +753,36 @@ def main():
 
     strict_pillow(Image)
     torch.set_num_threads(spec["threads"])
+    device = reference_device(torch, spec.get("device"))
     started = time.time()
     config = AutoConfig.from_pretrained(spec["model"])
     config.audio_config = None
-    model = AutoModel.from_pretrained(spec["model"], config=config, dtype=torch.float32).eval()
+    model = AutoModel.from_pretrained(spec["model"], config=config, dtype=torch.float32)
+    model = model.to(device).eval()
     processor = AutoProcessor.from_pretrained(spec["processor"])
     images = json.loads(Path(spec["images"]).read_text(encoding="utf-8"))
     if (problem := digests_problem(images, spec["image_sha256"])) is not None:
         report.write_text(json.dumps({"error": problem}), encoding="utf-8")
         return REFUSED_EXIT
     rows, soft, tokens = [], [], []
+    # On the CPU one picture at a time, as every earlier measurement ran; on an
+    # accelerator `batch` pictures at once, padded and masked out of the mean.
+    batch = 1 if device == "cpu" else REFERENCE_IMAGE_BATCH
+    pending = []
+
+    def flush():
+        width = max(e.shape[1] for e in pending)
+        embeds = torch.zeros(len(pending), width, pending[0].shape[2], device=device)
+        mask = torch.zeros(len(pending), width, dtype=torch.long, device=device)
+        for i, e in enumerate(pending):
+            embeds[i, : e.shape[1]] = e[0]
+            mask[i, : e.shape[1]] = 1
+        state = model.language_model(
+            inputs_embeds=embeds, attention_mask=mask, return_dict=True
+        ).last_hidden_state
+        rows.extend(masked_mean(state, mask).cpu().numpy().astype(np.float64))
+        pending.clear()
+
     with torch.no_grad():
         for path, expected in zip(images, spec["image_sha256"]):
             data, problem = picture_bytes(path, expected)
@@ -741,15 +791,15 @@ def main():
                 return REFUSED_EXIT
             picture = picture_of(Image, ImageOps, data, False)
             embeds, n = image_input(
-                torch, model, processor, picture, spec["image_text"], spec["vision_tokens"], "cpu"
+                torch, model, processor, picture, spec["image_text"], spec["vision_tokens"], device
             )
-            mask = torch.ones(embeds.shape[:2], dtype=torch.long)
-            state = model.language_model(
-                inputs_embeds=embeds, attention_mask=mask, return_dict=True
-            ).last_hidden_state
-            rows.append(masked_mean(state, mask)[0].numpy().astype(np.float64))
+            pending.append(embeds)
             soft.append(n)
             tokens.append(int(embeds.shape[1]))
+            if len(pending) == batch:
+                flush()
+        if pending:
+            flush()
     raw = np.stack(rows) if rows else np.zeros((0, 0))
     bad = unusable_rows(np, raw)
     if len(bad):
@@ -763,7 +813,7 @@ def main():
         "rows": int(v.shape[0]),
         "dim": int(v.shape[1]),
         "seconds": round(time.time() - started, 1),
-        "device": "cpu",
+        "device": device,
         "dtype": "float32",
         "threads": torch.get_num_threads(),
         "vision_tokens": spec["vision_tokens"],
@@ -1331,8 +1381,11 @@ def run_script(
     work: Path,
     name: str,
     timeout: int,
+    child_env: Mapping[str, str] | None = None,
 ) -> ScriptRun:
-    """Write `source` and `spec` under `work`, run it in `env`, read back its report."""
+    """Write `source` and `spec` under `work`, run it in `env`, read back its report.
+
+    `child_env` is added to the child's environment: the MPS memory policy."""
     if name in SHADOWABLE_MODULES:
         # The script's directory is first on its own sys.path, so it would be
         # what `import <name>` finds.
@@ -1342,7 +1395,7 @@ def run_script(
     script.write_text(source, encoding="utf-8")
     spec_path.write_text(json.dumps({**spec, "report": str(report)}), encoding="utf-8")
     try:
-        proc = env.run(["python", str(script), str(spec_path)], timeout=timeout)
+        proc = env.run(["python", str(script), str(spec_path)], timeout=timeout, env=child_env)
     except subprocess.TimeoutExpired:
         run.failure = f"no result after {timeout} s (timeout)"
         return run
@@ -1630,6 +1683,7 @@ class ConvertFacts:
     # `storage.hash_file` of the tuned checkpoint's model.safetensors.
     checkpoint_sha256: str | None
     decision_sha256: str | None
+    decision_sha256s: tuple[str, ...] = ()
     # "text" or "image"; "text" for a report written before image checkpoints.
     modality: str = "text"
     # An image report's vision tokens per image; `None` where it records none.
@@ -1668,6 +1722,16 @@ def convert_facts(model: Path) -> tuple[ConvertFacts | None, str]:
     if written.get("sha256") != hash_file(model):
         return None, f"{report_path} describes another file than {model}"
     checkpoint = _mapping(report.get("checkpoint"))
+    raw_tasks = checkpoint.get("tasks")
+    task_digests = (
+        tuple(
+            task["decision_sha256"]
+            for task in raw_tasks
+            if isinstance(task, dict) and isinstance(task.get("decision_sha256"), str)
+        )
+        if isinstance(raw_tasks, list)
+        else ()
+    )
 
     def text(value: object) -> str | None:
         return value if isinstance(value, str) else None
@@ -1679,6 +1743,7 @@ def convert_facts(model: Path) -> tuple[ConvertFacts | None, str]:
             weights=text(graft.get("weights")),
             checkpoint_sha256=text(checkpoint.get("sha256")),
             decision_sha256=text(checkpoint.get("decision_sha256")),
+            decision_sha256s=task_digests,
             modality=modality,
             vision_tokens=(
                 tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else None
@@ -1952,6 +2017,43 @@ def verify_embedding(
         )
     if not 0.0 <= threshold < 1.0:
         return refuse(GATE_CHECK, f"--max-conversion-cost {threshold} is not in [0, 1)")
+    multitask = bool(record.tasks)
+    multitask_training_pictures = {
+        digest for task in record.tasks for digest in task.train_pictures_sha256
+    }
+    multitask_training_groups = {
+        group for task in record.tasks for group in (task.train_groups or ())
+    }
+    if record.tasks:
+        decision_path = Path(job.heldout).parent / "decision.json"
+        try:
+            selected_decision, _ = read_questions(decision_path)
+        except DecisionError as exc:
+            return refuse(
+                RECORD_CHECK,
+                f"the multi-task reference selects a task from {decision_path}: {exc}",
+            )
+        digest = selected_decision.digest()
+        matches = [task for task in record.tasks if task.decision_sha256 == digest]
+        if not matches:
+            return refuse(
+                RECORD_CHECK,
+                f"the decision beside --data hashes to {digest}, which matches none of the "
+                f"{len(record.tasks)} tasks in the reference",
+            )
+        task = matches[0]
+        record = replace(
+            record,
+            labels=task.labels,
+            rows=task.rows,
+            head_heldout_accuracy=task.head_heldout_accuracy,
+            decision=task.decision,
+            decision_sha256=task.decision_sha256,
+            train_sha256=task.train_sha256,
+            mirror=task.mirror,
+            mirror_swap=task.mirror_swap,
+            tasks=(),
+        )
     try:
         decision = decision_from(record.decision, "the reference's litetune.json")
     except DecisionError as exc:
@@ -2005,7 +2107,17 @@ def verify_embedding(
                 "the reference's, so the file's record would not describe this measurement; "
                 "convert the reference again",
             )
-        if facts.decision_sha256 is not None and facts.decision_sha256 != record.decision_sha256:
+        if multitask and record.decision_sha256 not in facts.decision_sha256s:
+            return refuse(
+                RECORD_CHECK,
+                f"{weights_source} does not list the selected task's decision "
+                f"{record.decision_sha256} among the decisions converted from the checkpoint",
+            )
+        if (
+            not multitask
+            and facts.decision_sha256 is not None
+            and facts.decision_sha256 != record.decision_sha256
+        ):
             return refuse(
                 RECORD_CHECK,
                 f"{weights_source} says the file was converted from a checkpoint of decision "
@@ -2026,7 +2138,7 @@ def verify_embedding(
                 f"{facts.checkpoint_sha256}; {safetensors} is {found}: the file was not "
                 "converted from this reference",
             )
-        if facts.decision_sha256 is None:
+        if not multitask and facts.decision_sha256 is None:
             state.limitation(NOT_TIED.format(reason=f"{weights_source} records no decision sha256"))
     state.add(
         Check.passed(
@@ -2107,6 +2219,36 @@ def verify_embedding(
                     f"the held-out split {job.heldout} (sha256 {', '.join(both[:3])}); the "
                     "decider would be scored on pictures it was fitted on. Split them with prepare",
                 )
+            if shared := groups_in_both(train_images, heldout_images):
+                return refuse(
+                    ROWS_CHECK,
+                    f"{len(shared)} supplied group(s) are in both the training split "
+                    f"{job.train_path} and the held-out split {job.heldout} "
+                    f"({', '.join(map(repr, shared[:3]))}); the decider would be scored on rows "
+                    "kept with the ones it was fitted on. Split them with prepare",
+                )
+            if multitask and (
+                leaked := sorted(
+                    {row.sha256 for row in heldout_images} & multitask_training_pictures
+                )
+            ):
+                return refuse(
+                    ROWS_CHECK,
+                    f"{len(leaked)} held-out picture(s) of the selected task were training "
+                    f"pictures of a task in the checkpoint (sha256 {', '.join(leaked[:3])})",
+                )
+            if multitask and (
+                leaked_groups := sorted(
+                    {row.group for row in heldout_images if row.group is not None}
+                    & multitask_training_groups
+                )
+            ):
+                return refuse(
+                    ROWS_CHECK,
+                    f"{len(leaked_groups)} held-out supplied group(s) of the selected task were "
+                    f"training groups of a task in the checkpoint "
+                    f"({', '.join(map(repr, leaked_groups[:3]))})",
+                )
             train, heldout = train_images, heldout_images
         else:
             train = _read_states(job.train_path, decision, "training")
@@ -2129,10 +2271,13 @@ def verify_embedding(
             f"same content ({train_sha256}); the decider would be measured on its own examples",
         )
     if record.train_sha256 is not None and record.train_sha256 != train_sha256:
-        state.limitation(
+        detail = (
             f"the training split here is {train_sha256}; the one tune read was "
             f"{record.train_sha256}"
         )
+        if multitask:
+            return refuse(ROWS_CHECK, detail)
+        state.limitation(detail)
     index = {label: i for i, label in enumerate(labels)}
     fields["data"] = {
         "train": {"path": str(job.train_path), "rows": len(train), "sha256": train_sha256},
@@ -2270,6 +2415,22 @@ def verify_embedding(
             )
             return None
 
+        # The reference's device as the decision reference's (`place_reference`):
+        # the environment's own torch, or LITETUNE_DEVICE; on MPS with its memory
+        # policy; the script asks torch itself when neither answers.
+        from litetune.decision_verify import mps_ending, place_reference
+
+        try:
+            setting = devices.device_setting(os.environ)
+        except devices.DeviceSettingError as exc:
+            return refuse(REFERENCE_CHECK, str(exc))
+        placed = place_reference(
+            types.SimpleNamespace(train_env=job.train_env, device=setting), events
+        )
+        for text in placed.limitations:
+            state.limitation(text)
+        fields["embedding"]["reference_device_probe"] = placed.probe.as_dict()
+        reference_device = None if placed.device == "auto" else placed.device
         events.note(f"embedding {len(inputs)} {kind}: reference", env=job.train_env.name)
         if images:
             # The check before the rows refuses early; this one ties the files
@@ -2293,6 +2454,7 @@ def verify_embedding(
                 "model": job.reference,
                 "processor": str(processor_dir),
                 "image_text": IMAGE_TOKEN_TEXT,
+                "device": reference_device,
                 "out": str(work / "reference.npy"),
             }
         else:
@@ -2301,6 +2463,7 @@ def verify_embedding(
                 "model": job.reference,
                 "prompt_name": record.prompt_name,
                 "batch_size": REFERENCE_BATCH,
+                "device": reference_device,
                 "out": str(work / "reference.npy"),
             }
         reference_run = run_script(
@@ -2310,7 +2473,34 @@ def verify_embedding(
             work,
             "reference",
             budget,
+            child_env=placed.memory.child_env if placed.memory is not None else None,
         )
+        if placed.memory is not None and (ending := mps_ending(reference_run.failure)):
+            # As the decision reference: a Mac short of memory for this model, or
+            # a torch without an operation it needs, still gets a reference, on
+            # the CPU and more slowly.
+            advice = (
+                devices.mps_oom_advice(placed.memory)
+                if ending == "out of memory"
+                else "torch's MPS backend could not run an operation the reference needs"
+            )
+            fields["embedding"]["reference_on_mps"] = {
+                "failure": reference_run.failure,
+                "ending": ending,
+            }
+            state.limitation(
+                f"the float reference stopped on MPS ({ending}: {advice}) and was run again on "
+                "the CPU"
+            )
+            events.note(f"the reference stopped on MPS ({ending}); running it on the CPU")
+            reference_run = run_script(
+                job.train_env,
+                IMAGE_REFERENCE_SCRIPT if images else REFERENCE_SCRIPT,
+                {**reference_spec, "device": "cpu"},
+                work,
+                "reference",
+                budget,
+            )
         # An image has no tokens to cut: the processor's input is the image at
         # its budget of vision tokens on both sides; what that made of each
         # picture is held to what tune recorded instead.
@@ -2329,6 +2519,8 @@ def verify_embedding(
             fields["embedding"]["soft_tokens"] = compared.as_dict()
         if (problem := accept("reference", REFERENCE_CHECK, reference_run)) is not None:
             return refuse(REFERENCE_CHECK, problem)
+        reference_on = str(reference_run.report.get("device"))
+        fields["embedding"]["reference_device"] = reference_on
 
         names = " and ".join(name for name, _ in engine_sides)
         how = ", side by side" if parallel else ""
@@ -2522,9 +2714,10 @@ def verify_embedding(
         state.limitation(SIDE_BY_SIDE.format(threads=_threads_text(engine_threads)))
     state.limitation(FITTED_ON_EXAMPLES.format(ks=" and ".join(f"k={k}" for k in KS), draws=DRAWS))
     state.limitation(
-        IMAGE_REFERENCE_ON_CPU.format(vision_tokens=record.vision_tokens)
-        if images
-        else REFERENCE_ON_CPU
+        (IMAGE_REFERENCE_ON if images else REFERENCE_ON).format(
+            device=DEVICE_WORDS.get(reference_on, reference_on),
+            vision_tokens=record.vision_tokens,
+        )
     )
     state.limitation(LINEAR_NOT_GATED)
     state.limitation(IMAGE_DESCRIPTIONS_UNUSED if images else DESCRIPTIONS_UNUSED)

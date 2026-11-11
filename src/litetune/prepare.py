@@ -358,6 +358,12 @@ def embedding_decision_refusal(decision: Decision) -> str | None:
     return None
 
 
+MIRROR_NEEDS_PICTURES = (
+    "the question declares 'mirror', which trains each picture's horizontal mirror as well, and "
+    "these rows are not pictures for --base-model {model}: a mirrored copy of text means "
+    "nothing. Drop 'mirror' from the question"
+)
+
 NO_SCOREABILITY_FOR_DECISIONS = (
     "decision rows are measured by scoring each option's log-probability, not by exact match on "
     "an argument, so there are no arguments to profile"
@@ -571,6 +577,9 @@ class Row:
     # Whether `image` is shown with the `prompt` rather than in place of it: a
     # Gemma 4 row (`llm_images`), whose record keeps both.
     image_with_prompt: bool = False
+    # An optional caller-supplied split group. Rows with the same value are
+    # kept together; `None` preserves the split behaviour from before groups.
+    group: str | None = None
 
     @property
     def tool(self) -> str:
@@ -585,6 +594,7 @@ class Row:
         return "<unlabelled>"
 
     def as_record(self) -> dict[str, Any]:
+        grouped = {"group": self.group} if self.group is not None else {}
         if self.image is not None and self.image_with_prompt:
             return {
                 "prompt": self.prompt,
@@ -593,6 +603,7 @@ class Row:
                 "completion": self.completion,
                 "target": self.target if isinstance(self.target, str) else None,
                 "source_line": self.lineno,
+                **grouped,
             }
         if self.image is not None:
             # The digest travels in the row so that `content_sha256` of the
@@ -603,6 +614,7 @@ class Row:
                 "completion": self.completion,
                 "target": self.target,
                 "source_line": self.lineno,
+                **grouped,
             }
         return {
             "prompt": self.prompt,
@@ -612,7 +624,16 @@ class Row:
             # came from. A row identified only by its position in a shuffled
             # split is a row nobody can go and look at.
             "source_line": self.lineno,
+            **grouped,
         }
+
+
+def _row_group(path: Path, lineno: int, obj: Mapping[str, Any]) -> str | None:
+    """The optional split group on a source row, refusing every non-string value."""
+    value = obj.get("group")
+    if "group" in obj and not isinstance(value, str):
+        raise PrepareError(f"{path}:{lineno}: 'group' must be a string; got {json.dumps(value)}")
+    return value
 
 
 def refuse_calls_without_declarations(rows: Sequence[Row], base_model: str) -> None:
@@ -813,6 +834,7 @@ def _rows_from(
                 completion=completion,
                 target=target,
                 rendered=rendered,
+                group=_row_group(path, lineno, obj),
             )
         )
     if not rows:
@@ -881,6 +903,7 @@ def read_decision_rows(
                     completion=answer,
                     target=answer,
                     rendered=True,
+                    group=_row_group(path, lineno, obj),
                 )
             )
     except DecisionError as exc:
@@ -1006,14 +1029,14 @@ def _image_path(data: Path, value: str) -> Path:
 
 def read_image_rows(
     path: Path, objects: Sequence[tuple[int, dict[str, Any]]], questions: Path | None
-) -> tuple[Decision, str | None, list[tuple[int, Path, str]]]:
+) -> tuple[Decision, str | None, list[tuple[int, Path, str, str | None]]]:
     """Image decision rows: the decision, its digest, and per row its line, file and answer.
 
     A row is `{"image": <path>, "label": <option id>}`, the path relative to the
     rows file's directory or absolute. Labels are read as a text decision row's
     are. The files are only located here; `image_rows` opens them.
     """
-    located: list[tuple[int, Path]] = []
+    located: list[tuple[int, Path, str | None]] = []
     for lineno, obj in objects:
         where = f"{path}:{lineno}"
         given = [key for key in ("completion", "target") if key in obj]
@@ -1037,7 +1060,7 @@ def read_image_rows(
             raise PrepareError(
                 f"{where}: the image {value!r} is not a regular file (read as {file})"
             )
-        located.append((lineno, file))
+        located.append((lineno, file, _row_group(path, lineno, obj)))
     try:
         decision, digest = _decision_for(objects, questions)
         answers = [decision.answer_for(obj["label"], f"{path}:{lineno}") for lineno, obj in objects]
@@ -1046,7 +1069,10 @@ def read_image_rows(
     return (
         decision,
         digest,
-        [(lineno, file, answer) for (lineno, file), answer in zip(located, answers, strict=True)],
+        [
+            (lineno, file, answer, group)
+            for (lineno, file, group), answer in zip(located, answers, strict=True)
+        ],
     )
 
 
@@ -1159,7 +1185,7 @@ def _image_stats(rows: Sequence[Row], duplicates: int, checker: dict[str, Any]) 
 
 
 def image_rows(
-    path: Path, located: Sequence[tuple[int, Path, str]], inspector: ImageInspector
+    path: Path, located: Sequence[tuple[int, Path, str, str | None]], inspector: ImageInspector
 ) -> tuple[list[Row], ImageStats]:
     """Open every image of `located`, refuse what cannot be trained, and make the rows.
 
@@ -1167,12 +1193,12 @@ def image_rows(
     given two different labels. The same bytes with the same label is a row
     like any other, counted in `ImageStats.duplicate_rows`.
     """
-    files = sorted({file for _, file, _ in located})
+    files = sorted({file for _, file, _, _ in located})
     by_file, checker, decoder = _inspected(files, inspector)
     first: dict[str, tuple[int, str]] = {}
     duplicates = 0
     rows: list[Row] = []
-    for lineno, file, answer in located:
+    for lineno, file, answer, group in located:
         where = f"{path}:{lineno}"
         image = _checked_image(where, file, by_file[file], decoder)
         seen = first.get(image.sha256)
@@ -1194,6 +1220,7 @@ def image_rows(
                 target=answer,
                 rendered=True,
                 image=image,
+                group=group,
             )
         )
     return rows, _image_stats(rows, duplicates, checker)
@@ -1544,6 +1571,122 @@ def split_grouped(
         [row for i, row in enumerate(rows) if i in aside],
         [row for i, row in enumerate(rows) if i in held],
     )
+
+
+def _group_key(row: Row) -> str:
+    """What places a split group when groups are supplied: the row's own, not its file's."""
+    if row.group is not None:
+        return f"group:{row.group}"
+    if row.image is not None:
+        return f"picture:{row.image.sha256}"
+    return f"row:{row.prompt}\x00{row.completion}"
+
+
+def split_grouped_by_key(
+    rows: Sequence[Row], groups: Sequence[str], seed: int, heldout: int, calibration: int
+) -> tuple[list[Row], list[Row], list[Row], list[str]] | None:
+    """(training, calibration, held-out) rows, each split group placed by its key and the seed,
+    and the keys of the groups placed otherwise.
+
+    `split_grouped` permutes the groups by the file's content, so a group two
+    rows files share lands on either side in each. Here a group's place depends
+    on its key alone -- the smallest supplied `group` among its rows, else the
+    smallest picture digest, else the row itself (`_group_key`) -- so every
+    rows file prepared with one seed puts a shared group in the same split,
+    which `tune --tasks` requires. A group whose key draws below
+    `heldout / len(rows)` is held out, below `(heldout + calibration) /
+    len(rows)` set aside, otherwise trained on, so the sizes are near what was
+    asked rather than exact. Training keeps the group that drew highest, and an
+    empty requested split takes the lowest-drawing group another split can
+    spare; those groups are placed by the other groups of this file, not by
+    their key alone, so they are returned for the caller to say so. `None` when
+    there are fewer than two groups.
+    """
+    key_of: dict[str, str] = {}
+    for row, group in zip(rows, groups, strict=True):
+        key = _group_key(row)
+        if group not in key_of or key < key_of[group]:
+            key_of[group] = key
+    if len(key_of) < 2:
+        return None
+
+    def draw(group: str) -> float:
+        payload = f"{key_of[group]}:{seed}".encode()
+        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") / 2**64
+
+    order = sorted(key_of, key=lambda group: (draw(group), key_of[group]))
+    held_below = heldout / len(rows)
+    aside_below = (heldout + calibration) / len(rows)
+    held = {group for group in order if draw(group) < held_below}
+    aside = {group for group in order if held_below <= draw(group) < aside_below}
+    natural = {group: "held" if group in held else "aside" if group in aside else "train"
+               for group in order}  # fmt: skip
+    held.discard(order[-1])
+    aside.discard(order[-1])
+
+    def spare(*sources: set[str]) -> str | None:
+        # The lowest-drawing group, other than training's last, whose split keeps one.
+        for group in order[:-1]:
+            if group not in held | aside:
+                return group
+            for source in sources:
+                if group in source and len(source) > 1:
+                    return group
+        return None
+
+    if heldout and not held and (filler := spare(aside)) is not None:
+        aside.discard(filler)
+        held.add(filler)
+    if calibration and not aside and (filler := spare(held)) is not None:
+        held.discard(filler)
+        aside.add(filler)
+    placed = held | aside
+    moved = sorted(
+        key_of[group]
+        for group in order
+        if natural[group] != ("held" if group in held else "aside" if group in aside else "train")
+    )
+    return (
+        [row for row, group in zip(rows, groups, strict=True) if group not in placed],
+        [row for row, group in zip(rows, groups, strict=True) if group in aside],
+        [row for row, group in zip(rows, groups, strict=True) if group in held],
+        moved,
+    )
+
+
+def row_split_groups(rows: Sequence[Row], *, pictures: bool) -> list[str]:
+    """One transitive split-group id per row.
+
+    Explicit `group` values join rows. In an image split, identical picture
+    digests join rows too, including rows whose named groups differ. Rows joined
+    by either relation therefore stay in the same component.
+    """
+    parent = list(range(len(rows)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        left, right = find(a), find(b)
+        if left != right:
+            parent[right] = left
+
+    first: dict[tuple[str, str], int] = {}
+    for i, row in enumerate(rows):
+        keys: list[tuple[str, str]] = []
+        if row.group is not None:
+            keys.append(("group", row.group))
+        if pictures and row.image is not None:
+            keys.append(("picture", row.image.sha256))
+        for key in keys:
+            if key in first:
+                union(i, first[key])
+            else:
+                first[key] = i
+    return [str(find(i)) for i in range(len(rows))]
 
 
 # ---------------------------------------------------------------------------
@@ -2227,6 +2370,9 @@ class PrepareResult:
     decision: DecisionProfile | None = None
     # Image decision splits only: what the images are.
     images: ImageStats | None = None
+    # Caller-supplied split groups, before picture identity joins them.
+    groups_used: bool = False
+    groups_count: int = 0
     skipped: list[SkippedCheck] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
     report_path: Path | None = None
@@ -2279,9 +2425,12 @@ class PrepareResult:
                 "path": str(self.request.data),
                 "content_sha256": self.content_sha256,
                 "rows": self.n_rows,
-                # The split is a function of these two and nothing else, which
-                # is what makes it reproducible from the report alone.
+                # Without supplied groups the split is a function of these two
+                # and nothing else, which makes it reproducible from the report
+                # alone; with them, of each group's key and the request's seed
+                # (`split_grouped_by_key`).
                 "split_seed": split_seed(self.content_sha256, self.request.seed),
+                "groups": {"used": self.groups_used, "count": self.groups_count},
             },
             "train": self.train.as_dict() if self.train else None,
             "heldout": self.heldout.as_dict() if self.heldout else None,
@@ -2530,6 +2679,8 @@ def _split_pictures(
     heldout: int,
     calibration: int,
     asked: int | None = None,
+    *,
+    by_key: bool = False,
 ) -> tuple[tuple[list[Row], list[Row]] | None, list[Row]]:
     """An image split's (training, held-out) rows and its calibration rows, by picture.
 
@@ -2537,22 +2688,60 @@ def _split_pictures(
     is both trained on and scored. `None` for the halves when the rows hold
     fewer than two pictures. A held-out or calibration split of another size
     than asked -- `asked`, the caller's --heldout-size, else `heldout` -- is one
-    limitation, with the sizes the groups gave.
+    limitation, with the sizes the groups gave. `by_key` -- rows that supply
+    groups -- places each group by its key (`split_grouped_by_key`).
     """
-    pictures = [row.image.sha256 if row.image is not None else "" for row in rows]
-    grouped = split_grouped(rows, pictures, content_sha256, seed, heldout, calibration)
+    groups = row_split_groups(rows, pictures=True)
+    grouped = (
+        split_grouped_by_key(rows, groups, seed, heldout, calibration)
+        if by_key
+        else split_grouped(rows, groups, content_sha256, seed, heldout, calibration)
+    )
     if grouped is None:
         return None, []
-    train, aside, held = grouped
+    train, aside, held, *moved = grouped
+    if moved:
+        _note_moved_groups(result, moved[0])
     wanted = heldout if asked is None else asked
     if (len(held), len(aside)) != (wanted, calibration):
         result.limitation(
-            f"rows that give the same picture are kept in one split, and {len(rows)} rows are "
+            f"rows in the same group or giving the same picture are kept in one split, and "
+            f"{len(rows)} rows are "
             f"available, so {len(held)} rows were held out, {len(aside)} set aside for "
             f"calibration and {len(train)} kept for training, where {wanted} and {calibration} "
             f"were asked. Every interval on this split is computed at n={len(held)}"
         )
     return (train, held), aside
+
+
+def _note_moved_groups(result: PrepareResult, moved: Sequence[str]) -> None:
+    """Say which groups `split_grouped_by_key` placed to fill a split rather than by key."""
+    if moved:
+        result.limitation(
+            f"{len(moved)} split group(s) were placed so that no requested split is empty, not "
+            f"by their key ({', '.join(map(repr, moved[:3]))}); a rows file prepared apart that "
+            "shares them may put them on another side, which `tune --tasks` refuses"
+        )
+
+
+def _note_supplied_group_sizes(
+    result: PrepareResult,
+    rows: Sequence[Row],
+    train: Sequence[Row],
+    calibration: Sequence[Row],
+    heldout: Sequence[Row],
+    asked_heldout: int,
+    asked_calibration: int,
+) -> None:
+    """Say when explicit text groups make either requested split another size."""
+    if (len(heldout), len(calibration)) != (asked_heldout, asked_calibration):
+        result.limitation(
+            f"rows in the same supplied group are kept in one split, and {len(rows)} rows are "
+            f"available, so {len(heldout)} rows were held out, {len(calibration)} set aside for "
+            f"calibration and {len(train)} kept for training, where {asked_heldout} and "
+            f"{asked_calibration} were asked. Every interval on this split is computed at "
+            f"n={len(heldout)}"
+        )
 
 
 def _context_length_for(request: PrepareRequest, image_mode: bool) -> int | None:
@@ -2661,6 +2850,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             )
         if embedding and (refusal := embedding_decision_refusal(asked)) is not None:
             raise PrepareError(refusal)
+        if asked.mirror is not None and not image_mode:
+            raise PrepareError(MIRROR_NEEDS_PICTURES.format(model=EMBEDDING_MODEL))
         if image_mode:
             # After every refusal the rows file alone can give: opening the
             # images provisions an environment.
@@ -2727,6 +2918,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         declarations_sha256=declarations_sha256,
         decision=decision,
         images=image_stats,
+        groups_used=any(row.group is not None for row in rows),
+        groups_count=len({row.group for row in rows if row.group is not None}),
     )
     if wire is None and any(isinstance(row.target, ToolCall) for row in rows):
         result.limitation(ASSUMED_WIRE_FORMAT)
@@ -2808,7 +3001,8 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
     heldout_n = heldout_size_for(len(rows), request.heldout_fraction, request.heldout_size)
     # Rows split by picture report their sizes once, after the grouping
     # (`_split_pictures`), which may move them again.
-    grouped = llm_images or image_stats is not None
+    explicit_groups = result.groups_used
+    grouped = llm_images or image_stats is not None or explicit_groups
     if request.heldout_size is not None and heldout_n != request.heldout_size and not grouped:
         # Silently handing back 99 when 500 was asked for is the shape of every
         # failure in this codebase's history: the caller reads their own number
@@ -2824,8 +3018,31 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         # same bytes go to one side, so no held-out row asks about a picture the
         # model was trained on.
         halves, _ = _split_pictures(
-            result, rows, content_sha256, request.seed, heldout_n, 0, request.heldout_size
+            result,
+            rows,
+            content_sha256,
+            request.seed,
+            heldout_n,
+            0,
+            request.heldout_size,
+            by_key=explicit_groups,
         )
+    elif explicit_groups and image_stats is None and heldout_n >= 1:
+        grouped_rows = split_grouped_by_key(
+            rows, row_split_groups(rows, pictures=False), request.seed, heldout_n, 0
+        )
+        halves = (grouped_rows[0], grouped_rows[2]) if grouped_rows is not None else None
+        if decision is None and grouped_rows is not None:
+            _note_moved_groups(result, grouped_rows[3])
+            _note_supplied_group_sizes(
+                result,
+                rows,
+                grouped_rows[0],
+                grouped_rows[1],
+                grouped_rows[2],
+                request.heldout_size if request.heldout_size is not None else heldout_n,
+                0,
+            )
     else:
         halves = (
             split_rows(rows, content_sha256, request.seed, heldout_n) if heldout_n >= 1 else None
@@ -2845,12 +3062,12 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 f"{len(rows) - heldout_n} rows are left after the held-out split, so "
                 f"{calibration_n} were set aside"
             )
-        if image_stats is None:
+        if image_stats is None and not explicit_groups:
             train_part, calibration_rows = split_calibration(
                 rows, content_sha256, request.seed, heldout_n, calibration_n
             )
             halves = (train_part, halves[1])
-        else:
+        elif image_stats is not None:
             halves, calibration_rows = _split_pictures(
                 result,
                 rows,
@@ -2859,7 +3076,27 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
                 heldout_n,
                 calibration_n,
                 request.heldout_size,
+                by_key=explicit_groups,
             )
+        else:
+            grouped_rows = split_grouped_by_key(
+                rows, row_split_groups(rows, pictures=False), request.seed, heldout_n, calibration_n
+            )
+            if grouped_rows is None:
+                halves = None
+            else:
+                train_part, calibration_rows, heldout_part, moved = grouped_rows
+                halves = (train_part, heldout_part)
+                _note_moved_groups(result, moved)
+                _note_supplied_group_sizes(
+                    result,
+                    rows,
+                    train_part,
+                    calibration_rows,
+                    heldout_part,
+                    request.heldout_size if request.heldout_size is not None else heldout_n,
+                    calibration_n,
+                )
     if decision is not None and halves is not None:
         decision.train = _count_by_option(decision.decision, halves[0])
         decision.calibration = _count_by_option(decision.decision, calibration_rows)
@@ -2959,12 +3196,18 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
         split_check = Check.passed(
             SPLIT_CHECK,
             f"{result.train.n} training{aside} and {result.heldout.n} held-out examples, split "
-            f"by content {_bare_digest(content_sha256)[:16]} and seed {request.seed}",
+            + (
+                f"by the keys of {result.groups_count} supplied groups and seed {request.seed}, "
+                "so another rows file prepared with this seed puts a shared group on the same side"
+                if result.groups_used
+                else f"by content {_bare_digest(content_sha256)[:16]} and seed {request.seed}"
+            ),
             observed={
                 "train": result.train.as_dict(),
                 "calibration": result.calibration.as_dict() if result.calibration else None,
                 "heldout": result.heldout.as_dict(),
                 "split_seed": split_seed(content_sha256, request.seed),
+                "groups": {"used": result.groups_used, "count": result.groups_count},
             },
         )
         result.checks.add(split_check)

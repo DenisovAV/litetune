@@ -25,6 +25,7 @@ from conftest import mark_provisioned
 from litetune import envs
 from litetune.checks import Outcome
 from litetune.cli import main
+from litetune.decisions import read_questions
 from litetune.embedding_tune import EMBEDDING_MODEL
 from litetune.images import (
     IMAGE_CHECK_SCRIPT,
@@ -250,6 +251,47 @@ def test_the_rows_of_one_picture_are_never_in_two_splits(tmp_path, seed):
     assert not halves["train"] & halves["calibration"]
     assert not halves["calibration"] & halves["heldout"]
     assert result.train.n + result.heldout.n + result.calibration.n == len(rows)
+
+
+def test_explicit_groups_are_kept_together_and_reported(tmp_path):
+    rows = _image_rows(tmp_path, per_option=24)
+    for i, row in enumerate(rows):
+        row["group"] = f"run-{i // 2}"
+    result = prepare(_request(tmp_path, data=_rows_file(tmp_path, rows, "groups.jsonl")))
+    assert (
+        result.train is not None and result.calibration is not None and result.heldout is not None
+    )
+    split_of: dict[str, str] = {}
+    for split in ("train", "calibration", "heldout"):
+        for row in _records(tmp_path / "split" / f"{split}.jsonl"):
+            assert row["group"] not in split_of or split_of[row["group"]] == split
+            split_of[row["group"]] = split
+    report = json.loads((tmp_path / "split" / "prepare.json").read_text())
+    assert report["source"]["groups"] == {"used": True, "count": 36}
+
+
+def test_picture_identity_joins_two_explicit_groups(tmp_path):
+    rows = _image_rows(tmp_path, per_option=6)
+    rows[0]["group"] = "first"
+    duplicate = dict(rows[0], group="second")
+    rows.append(duplicate)
+    rows[1]["group"] = "second"
+    result = prepare(_request(tmp_path, data=_rows_file(tmp_path, rows, "bridge.jsonl")))
+    assert result.train is not None
+    located: dict[str, str] = {}
+    for split in ("train", "calibration", "heldout"):
+        for row in _records(tmp_path / "split" / f"{split}.jsonl"):
+            if row.get("group") in {"first", "second"}:
+                located[row["group"]] = split
+    assert located["first"] == located["second"]
+
+
+@pytest.mark.parametrize("value", [None, 7, True, ["run"]])
+def test_a_non_string_group_is_refused(tmp_path, value):
+    rows = _image_rows(tmp_path)
+    rows[0]["group"] = value
+    with pytest.raises(PrepareError, match="'group' must be a string"):
+        prepare(_request(tmp_path, data=_rows_file(tmp_path, rows, "bad-group.jsonl")))
 
 
 def test_without_repeated_pictures_the_split_is_the_row_split(tmp_path):
@@ -780,6 +822,37 @@ TEXT_SPLIT_SHA256 = {
 
 def _text_rows() -> list[dict[str, Any]]:
     return [{"prompt": f"photo {i} of a {o}", "label": o} for o in OPTIONS for i in range(12)]
+
+
+def test_a_questions_mirror_is_written_into_decision_json_and_moves_no_row(tmp_path):
+    prepare(_request(tmp_path))
+    plain = {n: (tmp_path / "split" / f"{n}.jsonl").read_bytes() for n in ("train", "heldout")}
+    prepare(
+        _request(
+            tmp_path,
+            questions=_questions(tmp_path, "mirrored.json", mirror=[["cat", "dog"]]),
+            output_dir=tmp_path / "mirrored",
+        )
+    )
+    written = json.loads((tmp_path / "mirrored" / "decision.json").read_text())
+    assert written["mirror"] == [["cat", "dog"]]
+    decision, _ = read_questions(tmp_path / "mirrored" / "decision.json")
+    assert decision.mirror == (("cat", "dog"),)
+    # Mirrored copies are made by tune; the split itself is the one without.
+    for name, data in plain.items():
+        assert (tmp_path / "mirrored" / f"{name}.jsonl").read_bytes() == data
+
+
+def test_a_mirror_on_a_text_split_is_refused(tmp_path):
+    with pytest.raises(PrepareError, match="declares 'mirror'.* not pictures"):
+        prepare(
+            _request(
+                tmp_path,
+                data=_rows_file(tmp_path, _text_rows(), "text.jsonl"),
+                questions=_questions(tmp_path, "mirrored.json", mirror=[]),
+                context_length=1024,
+            )
+        )
 
 
 def test_a_text_split_is_byte_identical_to_before(tmp_path):

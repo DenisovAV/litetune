@@ -10,6 +10,7 @@ writes a stand-in for Google's file.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -38,6 +39,7 @@ from litetune.embedding_tune import (
     PROMPT_NAME,
     RECIPE,
     EmbeddingRecord,
+    EmbeddingTaskRecord,
     LabelledText,
     write_embedding_record,
 )
@@ -52,6 +54,7 @@ from litetune.embedding_verify import (
     EVAL_SCRIPT,
     GATE_CHECK,
     GATED_K,
+    IMAGE_REFERENCE_SCRIPT,
     KS,
     MAX_INPUT_TOKENS,
     RECORD_CHECK,
@@ -542,7 +545,7 @@ def test_the_engine_script_uses_the_measured_engine_call():
 def test_the_reference_script_encodes_as_emb_s5_does():
     assert 'prompt_name=spec["prompt_name"]' in REFERENCE_SCRIPT
     assert "normalize_embeddings=True" in REFERENCE_SCRIPT
-    assert 'device="cpu"' in REFERENCE_SCRIPT
+    assert "device=device" in REFERENCE_SCRIPT
     assert '"dtype": torch.float32' in REFERENCE_SCRIPT
 
 
@@ -750,10 +753,12 @@ def _reference_main(
     torch.float32 = "float32"
     torch.set_num_threads = lambda n: None
     torch.get_num_threads = lambda: 2
+    torch.cuda = types.SimpleNamespace(is_available=lambda: False)
 
     class SentenceTransformer:
         def __init__(self, model, device=None, model_kwargs=None, config_kwargs=None):
             seen["model"] = model
+            seen["device"] = device
             self.prompts = {PROMPT_NAME: prompt}
             self.max_seq_length = max_seq
 
@@ -989,6 +994,13 @@ class FakeEmbedEnvs:
     repeat: str | None = None
     # Each script's source as written to run, by script stem or engine side.
     sources: dict[str, str] = field(default_factory=dict)
+    # What the environment's device probe answers for the reference.
+    device: str | None = "cpu"
+    probes: list[str] = field(default_factory=list)
+    # The reference stops as torch does when MPS runs out of memory.
+    mps_out_of_memory: bool = False
+    # Each reference run's spec device and the environment variables it was given.
+    reference_runs: list[tuple[str | None, dict[str, str] | None]] = field(default_factory=list)
     # The image reference's processor directory as it was when the script ran:
     # each processor file's bare sha256, by name.
     processor_seen: dict[str, str] | None = None
@@ -1020,6 +1032,8 @@ class FakeEmbedEnvs:
         report: dict[str, Any] = {"rows": len(texts) + (name in self.rows_off), "dim": 6}
         if name == "reference":
             report["max_seq_length"] = 128
+            # With no device given, the script asks torch: CUDA when the probe saw it.
+            report["device"] = spec["device"] or ("cuda" if self.device == "cuda" else "cpu")
             if "images" in spec:
                 report["vision_tokens"] = spec["vision_tokens"]
                 report["soft_tokens_per_row"] = [self.soft_tokens.get(t, 63) for t in texts]
@@ -1044,7 +1058,15 @@ class FakeEmbedEnvs:
         Path(spec["report"]).write_text(json.dumps(report), encoding="utf-8")
         return 0
 
-    def __call__(self, env, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
+    def __call__(self, stage, args, timeout: int = 3600, **kwargs) -> subprocess.CompletedProcess:
+        env = stage
+        if Path(args[1]).stem == "reference":
+            spec_seen = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+            self.reference_runs.append((spec_seen["device"], kwargs.get("env")))
+            if self.mps_out_of_memory and spec_seen["device"] == "mps":
+                return subprocess.CompletedProcess(
+                    args, 1, "", "RuntimeError: MPS backend out of memory (MPS allocated: 9 GB)"
+                )
         name = Path(args[1]).stem
         spec = json.loads(Path(args[2]).read_text(encoding="utf-8"))
         self.timeouts[name] = timeout
@@ -1146,8 +1168,19 @@ def fake(monkeypatch, tmp_path, ev) -> FakeEmbedEnvs:
     def run(self, args, timeout: int = 3600, **kwargs):
         return instance(self, args, timeout, **kwargs)
 
+    def resolve_device(env, timeout: int = 0, events=None) -> envs.DeviceProbe:
+        instance.probes.append(env.name)
+        probe = envs.DeviceProbe(device=instance.device, detail=f"fake probe: {instance.device}")
+        if instance.device == "mps":
+            probe = dataclasses.replace(
+                probe, mps_recommended_max_memory=16 * 2**30, os="Darwin", machine="arm64"
+            )
+        return probe
+
     monkeypatch.setattr(envs.StageEnv, "provision", fake_provision)
     monkeypatch.setattr(envs.StageEnv, "run", run)
+    monkeypatch.setattr(envs, "resolve_device", resolve_device)
+    monkeypatch.delenv("LITETUNE_DEVICE", raising=False)
     monkeypatch.setattr(embedding_export, "GOOGLE_SHA256", hashlib.sha256(GOOGLE_BYTES).hexdigest())
     monkeypatch.setattr(
         embedding_export, "VISION_SHA256", hashlib.sha256(VISION_STAND_IN).hexdigest()
@@ -2585,6 +2618,15 @@ def _image_setup(
         },
     }
     fields.update(record or {})
+    if fields.get("tasks"):
+        for key in (
+            "labels",
+            "rows",
+            "head_heldout_accuracy",
+            "decision",
+            "decision_sha256",
+        ):
+            fields.pop(key)
     write_embedding_record(reference, EmbeddingRecord(**fields))
     model = tmp_path / "out" / "int8" / "model.litertlm"
     model.parent.mkdir(parents=True)
@@ -2619,6 +2661,197 @@ def _image_digests(path: Path) -> list[str]:
 
 def _failed(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return [c for c in manifest["checks"] if c["outcome"] == "failed"]
+
+
+@pytest.mark.parametrize("listed", ["every task", "the other task only"])
+def test_a_multitask_record_without_groups_selects_and_verifies(fake, tmp_path, listed):
+    selected = _decision()
+    other = Decision(
+        "choice",
+        "Another question?",
+        tuple(Option(option) for option in OPTIONS),
+    )
+    tasks = (
+        EmbeddingTaskRecord(
+            "other",
+            other.as_dict(),
+            other.digest(),
+            tuple(sorted(OPTIONS)),
+            {"train": 36, "heldout": 18},
+            "sha256:" + "1" * 64,
+            0.1,
+            False,
+            (),
+        ),
+        EmbeddingTaskRecord(
+            "selected",
+            selected.as_dict(),
+            selected.digest(),
+            tuple(sorted(OPTIONS)),
+            {"train": 36, "heldout": 18},
+            "sha256:" + "2" * 64,
+            0.9,
+            False,
+            (),
+        ),
+    )
+    setup = _image_setup(tmp_path, fake, record={"tasks": tasks})
+    (setup.heldout.parent / "decision.json").write_text(
+        selected.canonical_text() + " \n", encoding="utf-8"
+    )
+    report_path = setup.model.parent / REPORT_NAME
+    record_path = setup.reference / "litetune.json"
+    recorded = json.loads(record_path.read_text(encoding="utf-8"))
+    assert all("train_groups" not in task for task in recorded["tasks"])
+    recorded["tasks"][1]["train_sha256"] = hash_file(setup.train)
+    record_path.write_text(json.dumps(recorded), encoding="utf-8")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["checkpoint"]["decision_sha256"] = None
+    report["checkpoint"]["tasks"] = [
+        {"name": task.name, "decision_sha256": task.decision_sha256}
+        for task in (tasks if listed == "every task" else tasks[:1])
+    ]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    result = _verify(setup)
+    if listed != "every task":
+        (failed,) = _failed(result.manifest)
+        assert failed["name"] == RECORD_CHECK
+        assert "does not list the selected task's decision" in failed["detail"]
+        assert fake.runs == []
+        return
+    assert result.status is Status.PASSED, result.manifest["checks"]
+    assert result.manifest["embedding"]["decision_sha256"] == selected.digest()
+
+
+def test_a_multitask_reference_refuses_cross_task_training_picture_leakage(fake, tmp_path):
+    selected = _decision()
+    heldout_digest = ""
+    task = EmbeddingTaskRecord(
+        "selected",
+        selected.as_dict(),
+        selected.digest(),
+        tuple(sorted(OPTIONS)),
+        {"train": 36, "heldout": 18},
+        "sha256:" + "1" * 64,
+        0.9,
+        False,
+        (),
+    )
+    setup = _image_setup(tmp_path, fake, record={"tasks": (task,)})
+    (setup.heldout.parent / "decision.json").write_text(selected.canonical_text(), encoding="utf-8")
+    heldout_digest = _image_digests(setup.heldout)[0]
+    record = json.loads((setup.reference / "litetune.json").read_text(encoding="utf-8"))
+    record["tasks"][0]["train_pictures_sha256"] = [heldout_digest]
+    (setup.reference / "litetune.json").write_text(json.dumps(record), encoding="utf-8")
+    report_path = setup.model.parent / REPORT_NAME
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["checkpoint"]["decision_sha256"] = None
+    report["checkpoint"]["tasks"] = [{"name": "selected", "decision_sha256": selected.digest()}]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    result = _verify(setup)
+    assert result.status is Status.FAILED_HARNESS
+    assert ROWS_CHECK in _checks(result.manifest), result.manifest["checks"]
+    detail = _checks(result.manifest)[ROWS_CHECK]["detail"]
+    assert heldout_digest in detail and "training pictures of a task" in detail
+
+
+def test_a_multitask_reference_refuses_cross_task_training_group_leakage(fake, tmp_path):
+    selected = _decision()
+    other = Decision("choice", "Another question?", tuple(Option(option) for option in OPTIONS))
+    tasks = (
+        EmbeddingTaskRecord(
+            "other",
+            other.as_dict(),
+            other.digest(),
+            tuple(sorted(OPTIONS)),
+            {"train": 36, "heldout": 18},
+            "sha256:" + "1" * 64,
+            0.1,
+            False,
+            (),
+            train_groups=("shared-run",),
+        ),
+        EmbeddingTaskRecord(
+            "selected",
+            selected.as_dict(),
+            selected.digest(),
+            tuple(sorted(OPTIONS)),
+            {"train": 36, "heldout": 18},
+            "sha256:" + "2" * 64,
+            0.9,
+            False,
+            (),
+        ),
+    )
+    setup = _image_setup(tmp_path, fake, record={"tasks": tasks})
+    (setup.heldout.parent / "decision.json").write_text(selected.canonical_text(), encoding="utf-8")
+    heldout = [json.loads(line) for line in setup.heldout.read_text().splitlines()]
+    heldout[0]["group"] = "shared-run"
+    setup.heldout.write_text("".join(json.dumps(row) + "\n" for row in heldout))
+    report_path = setup.model.parent / REPORT_NAME
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["checkpoint"]["decision_sha256"] = None
+    report["checkpoint"]["tasks"] = [
+        {"name": task.name, "decision_sha256": task.decision_sha256} for task in tasks
+    ]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    result = _verify(setup)
+
+    assert result.status is Status.FAILED_HARNESS
+    detail = _checks(result.manifest)[ROWS_CHECK]["detail"]
+    assert "shared-run" in detail and "training groups of a task" in detail
+
+
+def test_a_multitask_reference_refuses_a_different_selected_training_split(fake, tmp_path):
+    selected = _decision()
+    task = EmbeddingTaskRecord(
+        "selected",
+        selected.as_dict(),
+        selected.digest(),
+        tuple(sorted(OPTIONS)),
+        {"train": 36, "heldout": 18},
+        "sha256:" + "1" * 64,
+        0.9,
+        False,
+        (),
+    )
+    setup = _image_setup(tmp_path, fake, record={"tasks": (task,)})
+    (setup.heldout.parent / "decision.json").write_text(selected.canonical_text(), encoding="utf-8")
+    report_path = setup.model.parent / REPORT_NAME
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["checkpoint"]["decision_sha256"] = None
+    report["checkpoint"]["tasks"] = [{"name": "selected", "decision_sha256": selected.digest()}]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    result = _verify(setup)
+    assert result.status is Status.FAILED_HARNESS
+    detail = _checks(result.manifest)[ROWS_CHECK]["detail"]
+    assert hash_file(setup.train) in detail and task.train_sha256 in detail
+
+
+def test_a_multitask_image_reference_refuses_an_untrained_decision(fake, tmp_path):
+    trained = _decision()
+    task = EmbeddingTaskRecord(
+        "trained",
+        trained.as_dict(),
+        trained.digest(),
+        tuple(sorted(OPTIONS)),
+        {"train": 36, "heldout": 18},
+        "sha256:" + "1" * 64,
+        0.9,
+        False,
+        (),
+    )
+    setup = _image_setup(tmp_path, fake, record={"tasks": (task,)})
+    unknown = Decision(
+        "choice",
+        "Question this checkpoint did not train?",
+        tuple(Option(option) for option in OPTIONS),
+    )
+    (setup.heldout.parent / "decision.json").write_text(unknown.canonical_text(), encoding="utf-8")
+    result = _verify(setup)
+    assert result.status is Status.FAILED_HARNESS
+    assert "matches none" in _checks(result.manifest)[RECORD_CHECK]["detail"]
 
 
 def test_an_image_checkpoint_embeds_its_images_on_both_sides_and_passes(fake, tmp_path):
@@ -2791,6 +3024,84 @@ def test_a_reference_that_reports_no_count_per_picture_is_refused(fake, tmp_path
     assert failed["name"] == REFERENCE_CHECK and "not one count per picture" in failed["detail"]
 
 
+@pytest.mark.parametrize("images", [False, True])
+@pytest.mark.parametrize(
+    ("probed", "setting", "ran_on", "said"),
+    [
+        ("cuda", None, "cuda", "CUDA (TF32 off)"),
+        ("mps", None, "mps", "MPS"),
+        ("cuda", "cpu", "cpu", "the CPU"),
+        (None, None, "cpu", "the CPU"),
+    ],
+)
+def test_the_reference_runs_on_the_device_tune_would_use(
+    fake, tmp_path, monkeypatch, images, probed, setting, ran_on, said
+):
+    # As tune: the training environment's own probe, or LITETUNE_DEVICE; with
+    # neither, the script asks torch (here: no CUDA, so the CPU).
+    fake.device = probed
+    if setting is not None:
+        monkeypatch.setenv("LITETUNE_DEVICE", setting)
+    s = _image_setup(tmp_path, fake) if images else _setup(tmp_path)
+    result = _verify(s)
+    assert fake.probes == [envs.EMBED_TRAIN.name]
+    # CUDA, and no answer, leave the choice to the script's own torch.
+    told = None if probed is None or ran_on == "cuda" else ran_on
+    assert fake.specs["reference"]["device"] == told
+    if probed is None:
+        assert any("chose its device itself" in t for t in result.manifest["limitations"])
+    assert result.manifest["embedding"]["reference_device"] == ran_on
+    assert any(
+        text.startswith(f"the reference ran on {said} in float32")
+        for text in result.manifest["limitations"]
+    )
+
+
+def test_the_reference_on_mps_gets_the_memory_policy_and_the_cpu_when_it_runs_out(fake, tmp_path):
+    fake.device, fake.mps_out_of_memory = "mps", True
+    result = _verify(_image_setup(tmp_path, fake))
+    (on_mps, mps_env), (again, cpu_env) = fake.reference_runs
+    assert (on_mps, again) == ("mps", "cpu")
+    # The policy decision verify gives its reference: watermarks, no silent CPU fallback.
+    assert mps_env is not None and mps_env["PYTORCH_ENABLE_MPS_FALLBACK"] == "0"
+    assert "PYTORCH_MPS_HIGH_WATERMARK_RATIO" in mps_env
+    assert cpu_env is None
+    assert result.manifest["embedding"]["reference_device"] == "cpu"
+    assert result.manifest["embedding"]["reference_on_mps"]["ending"] == "out of memory"
+    assert any(
+        "stopped on MPS (out of memory" in text and "run again on the CPU" in text
+        for text in result.manifest["limitations"]
+    )
+    assert result.status is not Status.FAILED_HARNESS
+
+
+def test_an_unknown_litetune_device_is_refused_before_the_reference_runs(
+    fake, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LITETUNE_DEVICE", "gpu")
+    (failed,) = _failed(_verify(_setup(tmp_path)).manifest)
+    assert failed["name"] == REFERENCE_CHECK and "LITETUNE_DEVICE" in failed["detail"]
+    assert "reference" not in fake.specs
+
+
+def test_the_reference_scripts_turn_tf32_off_on_cuda():
+    for script in (REFERENCE_SCRIPT, IMAGE_REFERENCE_SCRIPT):
+        ns: dict[str, Any] = {"__name__": "reference_script"}
+        exec(compile(script, "reference.py", "exec"), ns)
+        backends = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(matmul=types.SimpleNamespace(allow_tf32=True)),
+            cudnn=types.SimpleNamespace(allow_tf32=True),
+        )
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: True), backends=backends
+        )
+        assert ns["reference_device"](torch, None) == "cuda"
+        assert not backends.cuda.matmul.allow_tf32 and not backends.cudnn.allow_tf32
+        assert ns["reference_device"](torch, "cpu") == "cpu"
+    # The CPU embeds one picture per pass, as every measurement before batching did.
+    assert 'batch = 1 if device == "cpu" else REFERENCE_IMAGE_BATCH' in IMAGE_REFERENCE_SCRIPT
+
+
 def test_a_picture_in_both_splits_is_refused_before_any_run(fake, tmp_path):
     s = _image_setup(tmp_path, fake)
     train_rows = s.train.read_text(encoding="utf-8").splitlines()
@@ -2801,6 +3112,20 @@ def test_a_picture_in_both_splits_is_refused_before_any_run(fake, tmp_path):
     assert failed["name"] == ROWS_CHECK
     assert "1 picture(s) are in both the training split" in failed["detail"]
     assert _image_digests(s.train)[0] in failed["detail"]
+    assert fake.runs == []
+
+
+def test_a_group_in_both_splits_is_refused_before_any_run(fake, tmp_path):
+    s = _image_setup(tmp_path, fake)
+    for path, index in ((s.train, 0), (s.heldout, 0)):
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        rows[index]["group"] = "run-7"
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    result = _verify(s)
+    (failed,) = _failed(result.manifest)
+    assert failed["name"] == ROWS_CHECK
+    assert "1 supplied group(s) are in both the training split" in failed["detail"]
+    assert "'run-7'" in failed["detail"]
     assert fake.runs == []
 
 
@@ -3621,10 +3946,15 @@ def _image_reference_main(tmp_path, monkeypatch, images, digests, loads=None):
         def eval(self):
             return self
 
+        def to(self, device):
+            assert device == "cpu", device
+            return self
+
     torch: Any = types.ModuleType("torch")
     torch.set_num_threads = lambda n: None
     torch.float32 = "float32"
     torch.no_grad = NoGrad
+    torch.cuda = types.SimpleNamespace(is_available=lambda: False)
     transformers: Any = types.ModuleType("transformers")
     transformers.AutoConfig = loader(
         "AutoConfig", lambda: types.SimpleNamespace(audio_config=object())

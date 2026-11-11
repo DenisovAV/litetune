@@ -2598,7 +2598,7 @@ and test archives pooled, 1,295 JPEG leaf photos, every one 500×500, in three o
 `prepare --heldout-size 300` split them into 865 training, 130 calibration (which the
 embedding path does not read) and 300 held-out rows (99, 99 and 102 per option).
 
-**tune** `--vision-tokens 70`, without `--mirror`, on one CUDA device: 110 steps (two
+**tune** `--vision-tokens 70`, without mirrored copies, on one CUDA device: 110 steps (two
 epochs) in 19.8 s, after 49.5 s computing the 1,165 pictures' inputs; 106 s for the stage.
 Every picture took 64 soft tokens. The discarded head scored 0.92 on the held-out rows;
 that is the head's, not the decider's. **convert** passed both times: int8 523,173,888 bytes,
@@ -2646,7 +2646,7 @@ The 10-shot draws, the same five for every side, and the paired differences on t
   481.7 ms and Google's 486.7 ms. The reference took 922.5 s (int8 run) and 941.8 s (int4
   run) for the 1,165 pictures. The reference's and Google's accuracies were the same in both
   verify runs, draw for draw.
-- Not measured: 140 vision tokens, `--mirror`, and the spliced file through flutter_edge_ai
+- Not measured: 140 vision tokens, mirrored copies, and the spliced file through flutter_edge_ai
   on any device.
 
 ### The same int8 file on a Mac's CPU and GPU, and on Windows
@@ -2806,6 +2806,63 @@ paired differences are against the CPU on the same machine (`metrics.paired_diff
   against 298.6 on the NPU.
 - Not measured: Google's PTL file on Lunar Lake, peak memory, and any of these files through
   flutter_edge_ai.
+
+## EmbeddingGemma 2 on images: several questions
+
+Measured 2026-11-11, once: three questions about one game's frames trained into one
+fine-tune with `tune --tasks`, on revisions of this release before it was merged (their
+commits are not public), at three epochs and at two. The frames are screenshots of the Dash sample game and are not
+published, so this run cannot be repeated from the repository; it is here because the
+three-epoch recipe for `--tasks` rests on it.
+
+**The rows.** Three questions, each prepared on its own with `--heldout-fraction 0.5` and
+seed 0, each row carrying the `group` of the run it was recorded in, so no run is in two
+splits:
+
+| Question | Options | Rows | Groups | Train | Calibration | Held-out |
+|---|---|---|---|---|---|---|
+| zones | trail, grass, rock, jump | 28,722 | 277 | 13,235 | 2,302 | 13,185 |
+| near | jump, run | 15,383 | 222 | 6,655 | 1,041 | 7,687 |
+| steer | left, right, straight | 6,243 | 348 | 2,157 | 700 | 3,386 |
+
+steer was mirrored with left and right exchanged: 2,157 training pictures and 2,157
+mirrored copies. That run gave the mirror as `mirror` and `mirror_swap` keys of steer's
+`tasks.json` entry, which this release replaced with `"mirror": [["left", "right"]]` in the
+question; on these three splits both give byte-identical training items. No picture is in
+two questions.
+
+**tune** `--tasks` at `--vision-tokens 70` on one NVIDIA A100-SXM4-40GB, torch 2.9.1,
+transformers 5.19.0: every picture took 56 to 60 soft tokens. Two epochs: 3,026 steps in
+524 s. Three epochs: 4,539 steps in 830 s through `tune` (the inputs cached by an earlier run
+were computed again), and the same 4,539 steps in 1,306 s run as the training script alone
+from the same spec at three epochs; the two three-epoch checkpoints are byte-identical
+(`model.safetensors` sha256 `4a712194…b203`). The discarded heads on the held-out rows
+(the heads', not a decider's): zones 0.8865 / 0.9224, near 0.9351 / 0.9573, steer 0.7877 /
+0.8193 at two / three epochs.
+
+**The probes.** Each question's pictures through the float32 checkpoint (transformers, on
+CUDA, the mean over every token, L2-normalised), then linear probes fitted on the
+embeddings, against the base model and against the hand-made fine-tune the recipe was
+taken from (three heads trained outside litetune, three epochs, continuing an earlier
+fine-tune of the same frames, its split drawn from another hash of the same groups).
+Because the two fine-tunes split the frames differently, a probe was fitted only on frames
+both trained on and scored only on frames neither trained on: zones 6,124 fitted / 8,195
+scored, near 3,187 / 4,791, steer 989 / 1,871 (of them 104 left, 190 right):
+
+| | base | hand-made | litetune, 2 epochs | litetune, 3 epochs |
+|---|---|---|---|---|
+| zones, softmax regression accuracy | 0.708 | 0.926 | 0.909 | 0.931 |
+| zones, 10-shot centroid accuracy | 0.546 | 0.926 | 0.899 | 0.926 |
+| zones, recall of `trail` | 0.093 | 0.840 | 0.716 | 0.789 |
+| near, `jump` recall at 2% of `run` frames called `jump` | 0.466 | 0.830 | 0.765 | 0.838 |
+| near, 10-shot centroid accuracy | 0.715 | 0.958 | 0.943 | 0.961 |
+| steer, left against right, class-balanced regression | 0.446 | 0.816 | 0.820 | 0.827 |
+| steer, 10-shot centroid accuracy | 0.549 | 0.893 | 0.872 | 0.900 |
+
+At two epochs litetune's checkpoint probed below the hand-made one on zones and near; at
+three it matched or passed it on every row but `trail`'s recall. That is why `--tasks`
+trains three epochs and one question keeps two. One run, one game, one seed; `verify` of
+the converted files is not part of this section.
 
 ## LLMs on a Qualcomm NPU
 
