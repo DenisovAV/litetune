@@ -239,8 +239,12 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-def get_all_tflite_model_types():
+def _known_types():
     return sorted(KNOWN_TYPES)
+
+
+def get_all_tflite_model_types():
+    return _known_types()
 
 
 def unpack(litertlm_path, output_dir, jinja_prompt_template_path=None):
@@ -306,7 +310,7 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
     contents = []
     for s in doc.get("section", []):
         if s.get("section_type") in ("TFLiteModel", "TFLiteWeights"):
-            if s["model_type"].lower().removeprefix("tf_lite_") not in get_all_tflite_model_types():
+            if s["model_type"].lower().removeprefix("tf_lite_") not in _known_types():
                 raise ValueError("Unknown TfLiteModelType: " + s["model_type"])
         path = Path(s["data_path"])
         data = (path if path.is_absolute() else toml_path.parent / path).read_bytes()
@@ -327,6 +331,29 @@ def pack(toml_path, output_path, jinja_prompt_template_path=None):
     return str(output_path)
 """
 )
+
+# litert-lm-builder 0.18.0, which `envs.EXPORT` pins and the EmbeddingGemma 2
+# grafts run under: no `get_all_tflite_model_types`, only the `TfLiteModelType`
+# enum of `tf_lite_`-prefixed values. `pack` checks the same list either way.
+FAKE_BUILDER_018 = FAKE_BUILDER.replace(
+    """def get_all_tflite_model_types():
+    return _known_types()
+""",
+    """import enum
+
+TfLiteModelType = enum.Enum(
+    "TfLiteModelType", {t.upper(): "tf_lite_" + t for t in KNOWN_TYPES}
+)
+""",
+)
+assert FAKE_BUILDER_018 != FAKE_BUILDER
+# `TfLiteModelType` in litert-lm-builder 0.18.0, without its `tf_lite_` prefix.
+BUILDER_018_TYPES: tuple[str, ...] = (
+    "artisan_text_decoder", "audio_adapter", "audio_encoder_hw", "audio_frontend", "aux",
+    "embedder", "end_of_audio", "end_of_vision", "mtp_aux", "mtp_drafter",
+    "per_layer_embedder", "prefill_decode", "text_encoder", "vision_adapter", "vision_encoder",
+)  # fmt: skip
+
 
 FAKE_PEEK = (
     FAKE_FORMAT
