@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -1134,7 +1135,10 @@ def test_single_question_text_record_keeps_its_golden_bytes(tmp_path):
   "vision_tokens": null
 }
 """
-    assert write_embedding_record(tmp_path, record).read_bytes() == expected.encode()
+    # 0.9.0's bytes on this OS: write_text ends each line with os.linesep.
+    assert write_embedding_record(tmp_path, record).read_bytes() == (
+        expected.replace("\n", os.linesep).encode()
+    )
 
 
 def test_single_question_image_record_keeps_its_golden_bytes(tmp_path):
@@ -1198,7 +1202,10 @@ def test_single_question_image_record_keeps_its_golden_bytes(tmp_path):
   }
 }
 """
-    assert write_embedding_record(tmp_path, record).read_bytes() == expected.encode()
+    # 0.9.0's bytes on this OS: write_text ends each line with os.linesep.
+    assert write_embedding_record(tmp_path, record).read_bytes() == (
+        expected.replace("\n", os.linesep).encode()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1539,7 +1546,7 @@ def test_tasks_require_unique_names_decisions_and_the_prepared_decision_path(too
                 {"name": "one", "data": str(first.train), "decision": str(second.decision)},
                 {"name": "two", "data": str(second.train), "decision": str(second.decision)},
             ],
-            "decision.*must be .*first/split/decision.json",
+            r"decision.*must be .*first[/\\]split[/\\]decision\.json",
         ),
     ):
         with pytest.raises(EmbeddingTuneError, match=message):
