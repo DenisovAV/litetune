@@ -2616,6 +2616,26 @@ def _split_pictures(
     return (train, held), aside
 
 
+def _note_supplied_group_sizes(
+    result: PrepareResult,
+    rows: Sequence[Row],
+    train: Sequence[Row],
+    calibration: Sequence[Row],
+    heldout: Sequence[Row],
+    asked_heldout: int,
+    asked_calibration: int,
+) -> None:
+    """Say when explicit text groups make either requested split another size."""
+    if (len(heldout), len(calibration)) != (asked_heldout, asked_calibration):
+        result.limitation(
+            f"rows in the same supplied group are kept in one split, and {len(rows)} rows are "
+            f"available, so {len(heldout)} rows were held out, {len(calibration)} set aside for "
+            f"calibration and {len(train)} kept for training, where {asked_heldout} and "
+            f"{asked_calibration} were asked. Every interval on this split is computed at "
+            f"n={len(heldout)}"
+        )
+
+
 def _context_length_for(request: PrepareRequest, image_mode: bool) -> int | None:
     """The window text rows are measured against; `None` for image rows, which
     refuse a window and a tokenizer rather than report ones never applied."""
@@ -2900,6 +2920,16 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             0,
         )
         halves = (grouped_rows[0], grouped_rows[2]) if grouped_rows is not None else None
+        if decision is None and grouped_rows is not None:
+            _note_supplied_group_sizes(
+                result,
+                rows,
+                grouped_rows[0],
+                grouped_rows[1],
+                grouped_rows[2],
+                request.heldout_size if request.heldout_size is not None else heldout_n,
+                0,
+            )
     else:
         halves = (
             split_rows(rows, content_sha256, request.seed, heldout_n) if heldout_n >= 1 else None
@@ -2948,6 +2978,15 @@ def prepare(request: PrepareRequest, events: EventStream | None = None) -> Prepa
             else:
                 train_part, calibration_rows, heldout_part = grouped_rows
                 halves = (train_part, heldout_part)
+                _note_supplied_group_sizes(
+                    result,
+                    rows,
+                    train_part,
+                    calibration_rows,
+                    heldout_part,
+                    request.heldout_size if request.heldout_size is not None else heldout_n,
+                    calibration_n,
+                )
     if decision is not None and halves is not None:
         decision.train = _count_by_option(decision.decision, halves[0])
         decision.calibration = _count_by_option(decision.decision, calibration_rows)

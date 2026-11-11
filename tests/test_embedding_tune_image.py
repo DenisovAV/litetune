@@ -58,6 +58,7 @@ from litetune.embedding_tune import (
     write_embedding_record,
     write_report,
 )
+from litetune.storage import hash_file
 from litetune.tune import TRAINING_CHECK
 
 OPTIONS = ("left", "right", "straight")
@@ -284,8 +285,6 @@ def _records(path: Path) -> list[dict[str, Any]]:
 
 
 def test_an_image_run_writes_an_image_record_beside_the_checkpoint(toolchain, split, tmp_path):
-    from litetune.storage import hash_file
-
     result = run_embedding_tune(_request(split, tmp_path))
 
     assert result.outcome is Outcome.PASSED, result.checks.as_dict()
@@ -335,6 +334,14 @@ def test_a_multitask_run_records_each_head_and_uses_one_joint_spec(toolchain, tm
         (True, (("left", "right"),)),
     ]
     assert [task.head_heldout_accuracy for task in result.record.tasks] == [0.5, 0.5]
+    assert [task.train_sha256 for task in result.record.tasks] == [
+        hash_file(zones.train),
+        hash_file(steer.train),
+    ]
+    assert [set(task.train_pictures_sha256) for task in result.record.tasks] == [
+        {row["image_sha256"] for row in _records(zones.train)},
+        {row["image_sha256"] for row in _records(steer.train)},
+    ]
     on_disk = json.loads((tmp_path / "tuned" / "model" / "litetune.json").read_text())
     for single_field in (
         "labels",
@@ -353,10 +360,21 @@ def test_a_multitask_run_records_each_head_and_uses_one_joint_spec(toolchain, tm
     assert [task["name"] for task in spec["tasks"]] == ["zones", "steer"]
     assert spec["tasks"][0]["mirror"] is False
     assert spec["tasks"][1]["mirror_swap"] == [["left", "right"]]
+    assert spec["cache_dir"] == str(tmp_path / "tuned" / IMAGE_CACHE_DIR)
     shared = {row["sha256"] for task in spec["tasks"] for row in _records(Path(task["train_rows"]))}
     assert set(result.record.soft_tokens or {}) >= shared
     metrics = json.loads((tmp_path / "tuned" / "embed_metrics.json").read_text())
     assert [task["head_heldout_accuracy"] for task in metrics["tasks"]] == [0.5, 0.5]
+    report = result.as_dict()
+    assert [report[key] for key in ("decision", "decision_sha256", "labels", "rows")] == [
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert [task["name"] for task in report["tasks"]] == ["zones", "steer"]
+    summary = summarise(result)[1]
+    assert "zones=2 options" in summary and "steer=3 options" in summary
 
 
 def test_a_multitask_record_round_trips_with_one_or_several_tasks(toolchain, tmp_path):
@@ -942,6 +960,119 @@ def test_a_text_record_is_written_without_the_image_fields_it_never_had(tmp_path
     assert read_embedding_record(tmp_path) == record
 
 
+def test_single_question_text_record_keeps_its_golden_bytes(tmp_path):
+    record = EmbeddingRecord(
+        base_model="m",
+        base_model_revision="r",
+        prompt_name="p",
+        prefix="x",
+        labels=("a", "b"),
+        rows={"train": 2, "heldout": 1},
+        steps_done=1,
+        steps_planned=1,
+        seconds=1.0,
+        device="cpu",
+        dtype="float32",
+        head_heldout_accuracy=0.5,
+        recipe={},
+        decision={},
+        decision_sha256="sha256:" + "0" * 64,
+    )
+    expected = """{
+  "direction": "embedding",
+  "base_model": "m",
+  "base_model_revision": "r",
+  "prompt_name": "p",
+  "prefix": "x",
+  "labels": [
+    "a",
+    "b"
+  ],
+  "rows": {
+    "train": 2,
+    "heldout": 1
+  },
+  "steps_done": 1,
+  "steps_planned": 1,
+  "seconds": 1.0,
+  "device": "cpu",
+  "dtype": "float32",
+  "head_heldout_accuracy": 0.5,
+  "recipe": {},
+  "decision": {},
+  "decision_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "train_sha256": null,
+  "modality": "text",
+  "vision_tokens": null
+}
+"""
+    assert write_embedding_record(tmp_path, record).read_bytes() == expected.encode()
+
+
+def test_single_question_image_record_keeps_its_golden_bytes(tmp_path):
+    record = EmbeddingRecord(
+        base_model="m",
+        base_model_revision="r",
+        prompt_name="",
+        prefix="",
+        labels=("a", "b"),
+        rows={"train": 2, "heldout": 1},
+        steps_done=1,
+        steps_planned=1,
+        seconds=1.0,
+        device="cpu",
+        dtype="float32",
+        head_heldout_accuracy=0.5,
+        recipe={},
+        decision={},
+        decision_sha256="sha256:" + "0" * 64,
+        modality="image",
+        vision_tokens=70,
+        soft_tokens={"a" * 64: 63},
+        processor_sha256=dict.fromkeys(PROCESSOR_FILES, "b" * 64),
+    )
+    expected = """{
+  "direction": "embedding",
+  "base_model": "m",
+  "base_model_revision": "r",
+  "prompt_name": "",
+  "prefix": "",
+  "labels": [
+    "a",
+    "b"
+  ],
+  "rows": {
+    "train": 2,
+    "heldout": 1
+  },
+  "steps_done": 1,
+  "steps_planned": 1,
+  "seconds": 1.0,
+  "device": "cpu",
+  "dtype": "float32",
+  "head_heldout_accuracy": 0.5,
+  "recipe": {},
+  "decision": {},
+  "decision_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "train_sha256": null,
+  "modality": "image",
+  "vision_tokens": 70,
+  "mirror": false,
+  "mirror_swap": [],
+  "soft_tokens": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": 63
+  },
+  "processor_sha256": {
+    "chat_template.jinja": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "processor_config.json": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "tokenizer.json": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "tokenizer_config.json": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}
+"""
+    assert write_embedding_record(tmp_path, record).read_bytes() == expected.encode()
+
+
 # ---------------------------------------------------------------------------
 # The record
 # ---------------------------------------------------------------------------
@@ -1214,6 +1345,93 @@ def test_tasks_refuses_a_picture_in_both_splits(toolchain, tmp_path):
     assert toolchain.calls == []
 
 
+@pytest.mark.parametrize("leak", ["picture", "group"])
+def test_tasks_refuses_cross_task_training_heldout_leakage(toolchain, tmp_path, leak):
+    first = _split(tmp_path / "first", ids=("a", "b"), train=8)
+    second = _split(tmp_path / "second", ids=("x", "y"), train=8)
+    first_train = _records(first.train)
+    second_train = _records(second.train)
+    # The fixture normally gives equal numbered pictures equal bytes across
+    # roots. Make this task independent so the injected picture is cross-task
+    # leakage only, not also overlap inside the second task.
+    for i, row in enumerate(second_train):
+        data = f"second-task-{i}".encode()
+        digest = hashlib.sha256(data).hexdigest()
+        relative = f"images/{digest}.png"
+        (second.train.parent / relative).write_bytes(data)
+        row["image"], row["image_sha256"] = relative, digest
+    _write(second.train, second_train)
+    second_heldout = _records(second.heldout)
+    if leak == "picture":
+        source = first_train[0]
+        target = second_heldout[0]
+        target["image"] = source["image"]
+        target["image_sha256"] = source["image_sha256"]
+        # The path is relative to another split; copy the same bytes there.
+        source_file = first.train.parent / source["image"]
+        target_file = second.heldout.parent / target["image"]
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        target_file.write_bytes(source_file.read_bytes())
+    else:
+        first_train[0]["group"] = "run-7"
+        second_heldout[0]["group"] = "run-7"
+        _write(first.train, first_train)
+    _write(second.heldout, second_heldout)
+    tasks = _tasks_file(
+        tmp_path,
+        [
+            {"name": "first", "data": str(first.train), "decision": str(first.decision)},
+            {"name": "second", "data": str(second.train), "decision": str(second.decision)},
+        ],
+    )
+    with pytest.raises(EmbeddingTuneError, match=f"{leak}.*training.*held-out"):
+        run_embedding_tune(
+            EmbeddingTuneRequest(output_dir=tmp_path / "run", tasks=tasks, vision_tokens=70)
+        )
+    assert toolchain.calls == []
+
+
+def test_tasks_require_unique_names_decisions_and_the_prepared_decision_path(toolchain, tmp_path):
+    first = _split(tmp_path / "first", ids=("a", "b"), train=8)
+    second = _split(tmp_path / "second", ids=("x", "y"), train=8)
+    for tasks, message in (
+        (
+            [
+                {"name": "same", "data": str(first.train), "decision": str(first.decision)},
+                {"name": "same", "data": str(second.train), "decision": str(second.decision)},
+            ],
+            "task name 'same' is repeated",
+        ),
+        (
+            [
+                {"name": "one", "data": str(first.train), "decision": str(first.decision)},
+                {"name": "two", "data": str(first.train), "decision": str(first.decision)},
+            ],
+            "decision sha256 .* is repeated",
+        ),
+        (
+            [{"name": "one", "data": str(first.train), "decision": str(second.decision)}],
+            "decision.*must be .*first/split/decision.json",
+        ),
+    ):
+        with pytest.raises(EmbeddingTuneError, match=message):
+            run_embedding_tune(
+                EmbeddingTuneRequest(
+                    output_dir=tmp_path / "run",
+                    tasks=_tasks_file(tmp_path, tasks),
+                    vision_tokens=70,
+                )
+            )
+    assert toolchain.calls == []
+
+
+@pytest.mark.parametrize("field", ["data", "heldout", "decision"])
+def test_request_refuses_tasks_with_single_question_paths(tmp_path, field):
+    kwargs = {field: tmp_path / field}
+    with pytest.raises(EmbeddingTuneError, match="--tasks cannot be mixed"):
+        EmbeddingTuneRequest(output_dir=tmp_path / "run", tasks=tmp_path / "tasks.json", **kwargs)
+
+
 @pytest.mark.parametrize(
     "task",
     [
@@ -1308,23 +1526,25 @@ def multitask_script() -> dict[str, Any]:
 
 def test_multitask_items_keep_weights_and_mirroring_per_task(multitask_script):
     run_items = multitask_script["run_items"]
+    zone_rows = [
+        {"sha256": "z1", "image": "z1", "label": "near"},
+        {"sha256": "z2", "image": "z2", "label": "near"},
+        {"sha256": "z3", "image": "z3", "label": "near"},
+        {"sha256": "z4", "image": "z4", "label": "far"},
+    ]
     zones = run_items(
-        [
-            {"sha256": "z1", "image": "z1", "label": "near"},
-            {"sha256": "z2", "image": "z2", "label": "near"},
-            {"sha256": "z3", "image": "z3", "label": "near"},
-            {"sha256": "z4", "image": "z4", "label": "far"},
-        ],
+        zone_rows,
         [],
         ["far", "near"],
         False,
         [],
     )
+    steer_rows = [
+        {"sha256": "s1", "image": "s1", "label": "left"},
+        {"sha256": "s2", "image": "s2", "label": "right"},
+    ]
     steer = run_items(
-        [
-            {"sha256": "s1", "image": "s1", "label": "left"},
-            {"sha256": "s2", "image": "s2", "label": "right"},
-        ],
+        steer_rows,
         [],
         ["left", "right"],
         True,
@@ -1348,6 +1568,105 @@ def test_multitask_items_keep_weights_and_mirroring_per_task(multitask_script):
         (1, 1),
         (1, 2),
         (1, 3),
+    ]
+    task_specs = [
+        {
+            "train_rows": "zones-train",
+            "heldout_rows": "zones-heldout",
+            "labels": ["far", "near"],
+            "mirror": False,
+            "mirror_swap": [],
+        },
+        {
+            "train_rows": "steer-train",
+            "heldout_rows": "steer-heldout",
+            "labels": ["left", "right"],
+            "mirror": True,
+            "mirror_swap": [["left", "right"]],
+        },
+    ]
+    rows_by_name = {
+        "zones-train": zone_rows,
+        "zones-heldout": [],
+        "steer-train": steer_rows,
+        "steer-heldout": [],
+    }
+    multitask_script["read_jsonl"] = rows_by_name.__getitem__
+    built, paths, wanted = multitask_script["multitask_runs"](task_specs)
+    assert [run for _, _, _, run in built] == [zones, steer]
+    assert paths == {"z1": "z1", "z2": "z2", "z3": "z3", "z4": "z4", "s1": "s1", "s2": "s2"}
+    assert wanted == {
+        *((f"z{i}", False) for i in range(1, 5)),
+        ("s1", False),
+        ("s2", False),
+        ("s1", True),
+        ("s2", True),
+    }
+
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def __add__(self, other):
+            return Value((other.value if isinstance(other, Value) else other) + self.value)
+
+        __radd__ = __add__
+
+        def __truediv__(self, divisor):
+            return Value(self.value / divisor)
+
+    class Vectors:
+        device = "fake-device"
+
+        def __getitem__(self, positions):
+            return positions
+
+    calls = []
+
+    class Functional:
+        @staticmethod
+        def cross_entropy(logits, gold, *, weight, reduction):
+            calls.append((logits, gold, weight, reduction))
+            return Value(10 if logits[0] == "zones" else 6)
+
+    class Torch:
+        class nn:
+            functional = Functional()
+
+        @staticmethod
+        def tensor(values, device):
+            return (values, device)
+
+    class Head:
+        def __init__(self, name):
+            self.name = name
+
+        def __call__(self, positions):
+            return Scaled((self.name, positions))
+
+    class Scaled(tuple):
+        def __new__(cls, value):
+            return super().__new__(cls, value)
+
+        def __mul__(self, scale):
+            return (self[0], self[1], scale)
+
+    selected = [(0, 1), (1, 3), (0, 0), (1, 2)]
+    task_runs = [(None, None, None, zones), (None, None, None, steer)]
+    loss = multitask_script["multitask_loss"](
+        Torch(),
+        task_runs,
+        [Head("zones"), Head("steer")],
+        [[2.0, 2 / 3], [1.0, 1.0]],
+        Vectors(),
+        selected,
+        20,
+        len(selected),
+    )
+    assert loss.value == 4.0, "(sum of each task's CE sums) / the mixed batch size"
+    assert calls == [
+        (("zones", [0, 2], 20), ([1, 1], "fake-device"), [2.0, 2 / 3], "sum"),
+        (("steer", [1, 3], 20), ([0, 1], "fake-device"), [1.0, 1.0], "sum"),
     ]
 
 

@@ -971,7 +971,8 @@ litetune verify --model artifacts/int8/model.litertlm --reference tuned/model \
 ```
 
 Several image questions can share one text-tower fine-tune. Each task names the
-split and decision produced for it; mirroring belongs to that task alone:
+split and the `decision.json` beside that split (the layout `prepare` writes);
+mirroring belongs to that task alone:
 
 ```json
 {"tasks": [
@@ -990,7 +991,8 @@ litetune tune --model google/embeddinggemma-2 --tasks tasks.json \
 The run uses one head and class weights per task, shuffles all tasks' training
 items together, and caches a shared picture input once. To verify one task,
 pass its held-out file; `verify` selects the recorded task by the
-`decision.json` beside that file.
+`decision.json` beside that file. Across all tasks, a picture or supplied
+`group` cannot occur in training rows of one task and held-out rows of another.
 
 `questions.json` is a `choice` question without a `none_option`, as for text.
 `--context-length` and `--tokenizer` are refused for image rows: there is no

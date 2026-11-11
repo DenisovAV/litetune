@@ -2663,10 +2663,81 @@ def test_a_multitask_image_reference_selects_by_the_decision_beside_data(fake, t
         ),
     )
     setup = _image_setup(tmp_path, fake, record={"tasks": tasks})
-    (setup.heldout.parent / "decision.json").write_text(selected.canonical_text(), encoding="utf-8")
+    (setup.heldout.parent / "decision.json").write_text(
+        selected.canonical_text() + " \n", encoding="utf-8"
+    )
+    report_path = setup.model.parent / REPORT_NAME
+    record_path = setup.reference / "litetune.json"
+    recorded = json.loads(record_path.read_text(encoding="utf-8"))
+    recorded["tasks"][1]["train_sha256"] = hash_file(setup.train)
+    record_path.write_text(json.dumps(recorded), encoding="utf-8")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["checkpoint"]["decision_sha256"] = None
+    report["checkpoint"]["tasks"] = [
+        {"name": task.name, "decision_sha256": task.decision_sha256} for task in tasks
+    ]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
     result = _verify(setup)
     assert result.status is Status.PASSED, result.manifest["checks"]
     assert result.manifest["embedding"]["decision_sha256"] == selected.digest()
+
+
+def test_a_multitask_reference_refuses_cross_task_training_picture_leakage(fake, tmp_path):
+    selected = _decision()
+    heldout_digest = ""
+    task = EmbeddingTaskRecord(
+        "selected",
+        selected.as_dict(),
+        selected.digest(),
+        tuple(sorted(OPTIONS)),
+        {"train": 36, "heldout": 18},
+        "sha256:" + "1" * 64,
+        0.9,
+        False,
+        (),
+    )
+    setup = _image_setup(tmp_path, fake, record={"tasks": (task,)})
+    (setup.heldout.parent / "decision.json").write_text(selected.canonical_text(), encoding="utf-8")
+    heldout_digest = _image_digests(setup.heldout)[0]
+    record = json.loads((setup.reference / "litetune.json").read_text(encoding="utf-8"))
+    record["tasks"][0]["train_pictures_sha256"] = [heldout_digest]
+    (setup.reference / "litetune.json").write_text(json.dumps(record), encoding="utf-8")
+    report_path = setup.model.parent / REPORT_NAME
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["checkpoint"]["decision_sha256"] = None
+    report["checkpoint"]["tasks"] = [{"name": "selected", "decision_sha256": selected.digest()}]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    result = _verify(setup)
+    assert result.status is Status.FAILED_HARNESS
+    assert ROWS_CHECK in _checks(result.manifest), result.manifest["checks"]
+    detail = _checks(result.manifest)[ROWS_CHECK]["detail"]
+    assert heldout_digest in detail and "training pictures of a task" in detail
+
+
+def test_a_multitask_reference_refuses_a_different_selected_training_split(fake, tmp_path):
+    selected = _decision()
+    task = EmbeddingTaskRecord(
+        "selected",
+        selected.as_dict(),
+        selected.digest(),
+        tuple(sorted(OPTIONS)),
+        {"train": 36, "heldout": 18},
+        "sha256:" + "1" * 64,
+        0.9,
+        False,
+        (),
+    )
+    setup = _image_setup(tmp_path, fake, record={"tasks": (task,)})
+    (setup.heldout.parent / "decision.json").write_text(selected.canonical_text(), encoding="utf-8")
+    report_path = setup.model.parent / REPORT_NAME
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["checkpoint"]["decision_sha256"] = None
+    report["checkpoint"]["tasks"] = [{"name": "selected", "decision_sha256": selected.digest()}]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    result = _verify(setup)
+    assert result.status is Status.FAILED_HARNESS
+    detail = _checks(result.manifest)[ROWS_CHECK]["detail"]
+    assert hash_file(setup.train) in detail and task.train_sha256 in detail
 
 
 def test_a_multitask_image_reference_refuses_an_untrained_decision(fake, tmp_path):

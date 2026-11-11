@@ -1630,6 +1630,7 @@ class ConvertFacts:
     # `storage.hash_file` of the tuned checkpoint's model.safetensors.
     checkpoint_sha256: str | None
     decision_sha256: str | None
+    decision_sha256s: tuple[str, ...] = ()
     # "text" or "image"; "text" for a report written before image checkpoints.
     modality: str = "text"
     # An image report's vision tokens per image; `None` where it records none.
@@ -1668,6 +1669,16 @@ def convert_facts(model: Path) -> tuple[ConvertFacts | None, str]:
     if written.get("sha256") != hash_file(model):
         return None, f"{report_path} describes another file than {model}"
     checkpoint = _mapping(report.get("checkpoint"))
+    raw_tasks = checkpoint.get("tasks")
+    task_digests = (
+        tuple(
+            task["decision_sha256"]
+            for task in raw_tasks
+            if isinstance(task, dict) and isinstance(task.get("decision_sha256"), str)
+        )
+        if isinstance(raw_tasks, list)
+        else ()
+    )
 
     def text(value: object) -> str | None:
         return value if isinstance(value, str) else None
@@ -1679,6 +1690,7 @@ def convert_facts(model: Path) -> tuple[ConvertFacts | None, str]:
             weights=text(graft.get("weights")),
             checkpoint_sha256=text(checkpoint.get("sha256")),
             decision_sha256=text(checkpoint.get("decision_sha256")),
+            decision_sha256s=task_digests,
             modality=modality,
             vision_tokens=(
                 tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else None
@@ -1952,15 +1964,20 @@ def verify_embedding(
         )
     if not 0.0 <= threshold < 1.0:
         return refuse(GATE_CHECK, f"--max-conversion-cost {threshold} is not in [0, 1)")
+    multitask = bool(record.tasks)
+    multitask_training_pictures = {
+        digest for task in record.tasks for digest in task.train_pictures_sha256
+    }
     if record.tasks:
         decision_path = Path(job.heldout).parent / "decision.json"
         try:
-            _, digest = read_questions(decision_path)
+            selected_decision, _ = read_questions(decision_path)
         except DecisionError as exc:
             return refuse(
                 RECORD_CHECK,
                 f"the multi-task reference selects a task from {decision_path}: {exc}",
             )
+        digest = selected_decision.digest()
         matches = [task for task in record.tasks if task.decision_sha256 == digest]
         if not matches:
             return refuse(
@@ -2034,7 +2051,17 @@ def verify_embedding(
                 "the reference's, so the file's record would not describe this measurement; "
                 "convert the reference again",
             )
-        if facts.decision_sha256 is not None and facts.decision_sha256 != record.decision_sha256:
+        if multitask and record.decision_sha256 not in facts.decision_sha256s:
+            return refuse(
+                RECORD_CHECK,
+                f"{weights_source} does not list the selected task's decision "
+                f"{record.decision_sha256} among the decisions converted from the checkpoint",
+            )
+        if (
+            not multitask
+            and facts.decision_sha256 is not None
+            and facts.decision_sha256 != record.decision_sha256
+        ):
             return refuse(
                 RECORD_CHECK,
                 f"{weights_source} says the file was converted from a checkpoint of decision "
@@ -2055,7 +2082,7 @@ def verify_embedding(
                 f"{facts.checkpoint_sha256}; {safetensors} is {found}: the file was not "
                 "converted from this reference",
             )
-        if facts.decision_sha256 is None:
+        if not multitask and facts.decision_sha256 is None:
             state.limitation(NOT_TIED.format(reason=f"{weights_source} records no decision sha256"))
     state.add(
         Check.passed(
@@ -2136,6 +2163,16 @@ def verify_embedding(
                     f"the held-out split {job.heldout} (sha256 {', '.join(both[:3])}); the "
                     "decider would be scored on pictures it was fitted on. Split them with prepare",
                 )
+            if multitask and (
+                leaked := sorted(
+                    {row.sha256 for row in heldout_images} & multitask_training_pictures
+                )
+            ):
+                return refuse(
+                    ROWS_CHECK,
+                    f"{len(leaked)} held-out picture(s) of the selected task were training "
+                    f"pictures of a task in the checkpoint (sha256 {', '.join(leaked[:3])})",
+                )
             train, heldout = train_images, heldout_images
         else:
             train = _read_states(job.train_path, decision, "training")
@@ -2158,10 +2195,13 @@ def verify_embedding(
             f"same content ({train_sha256}); the decider would be measured on its own examples",
         )
     if record.train_sha256 is not None and record.train_sha256 != train_sha256:
-        state.limitation(
+        detail = (
             f"the training split here is {train_sha256}; the one tune read was "
             f"{record.train_sha256}"
         )
+        if multitask:
+            return refuse(ROWS_CHECK, detail)
+        state.limitation(detail)
     index = {label: i for i, label in enumerate(labels)}
     fields["data"] = {
         "train": {"path": str(job.train_path), "rows": len(train), "sha256": train_sha256},

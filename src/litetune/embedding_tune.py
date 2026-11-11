@@ -1146,6 +1146,39 @@ def multitask_items(task_runs):
     ]
 
 
+def multitask_loss(torch, task_runs, heads, weight_tensors, vectors, selected, scale, batch_size):
+    # Each task sees only its own rows, head and class weights. CE sums within
+    # each task; division by the whole mixed batch gives one batch mean.
+    loss = 0
+    for task_index in range(len(task_runs)):
+        positions = [i for i, (t, _) in enumerate(selected) if t == task_index]
+        if not positions:
+            continue
+        local = [selected[i][1] for i in positions]
+        targets = task_runs[task_index][3]["targets"]
+        gold = torch.tensor([targets[j] for j in local], device=vectors.device)
+        logits = heads[task_index](vectors[positions]) * scale
+        loss = loss + torch.nn.functional.cross_entropy(
+            logits, gold, weight=weight_tensors[task_index], reduction="sum"
+        ) / batch_size
+    return loss
+
+
+def multitask_runs(tasks):
+    task_runs, paths, wanted = [], {}, set()
+    for task in tasks:
+        rows = read_jsonl(task["train_rows"])
+        heldout = read_jsonl(task["heldout_rows"])
+        run = run_items(
+            rows, heldout, task["labels"], task["mirror"], task["mirror_swap"]
+        )
+        for sha, path in run["paths"].items():
+            paths.setdefault(sha, path)
+        wanted.update(run["inputs"])
+        task_runs.append((task, rows, heldout, run))
+    return task_runs, paths, wanted
+
+
 def main():
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     out = spec["metrics_out"]
@@ -1192,17 +1225,7 @@ def main():
     for package in ("torch", "transformers", "sentence-transformers", "pillow", "numpy"):
         versions[package] = importlib.metadata.version(package)
 
-    task_runs, paths, wanted = [], {}, set()
-    for task in spec["tasks"]:
-        rows = read_jsonl(task["train_rows"])
-        heldout = read_jsonl(task["heldout_rows"])
-        run = run_items(
-            rows, heldout, task["labels"], task["mirror"], task["mirror_swap"]
-        )
-        for sha, path in run["paths"].items():
-            paths.setdefault(sha, path)
-        wanted.update(run["inputs"])
-        task_runs.append((task, rows, heldout, run))
+    task_runs, paths, wanted = multitask_runs(spec["tasks"])
 
     dtype = recipe["cache_dtype"]
     script_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -1282,21 +1305,16 @@ def main():
                     f"the pool is {vectors.shape[-1]}-dimensional, the recipe's head takes "
                     f"{recipe['embedding_dim']}"
                 )
-            loss = 0
-            for task_index in range(len(task_runs)):
-                positions = [i for i, (t, _) in enumerate(selected) if t == task_index]
-                if not positions:
-                    continue
-                local = [selected[i][1] for i in positions]
-                targets = task_runs[task_index][3]["targets"]
-                gold = torch.tensor([targets[j] for j in local], device=device)
-                logits = heads[task_index](vectors[positions]) * recipe["logit_scale"]
-                loss = loss + torch.nn.functional.cross_entropy(
-                    logits,
-                    gold,
-                    weight=weight_tensors[task_index],
-                    reduction="sum",
-                ) / len(chosen)
+            loss = multitask_loss(
+                torch,
+                task_runs,
+                heads,
+                weight_tensors,
+                vectors,
+                selected,
+                recipe["logit_scale"],
+                len(chosen),
+            )
             optimiser.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(lm_params, recipe["grad_clip"])
@@ -1461,9 +1479,13 @@ class LabelledImage:
     path: Path
     sha256: str
     label: str
+    group: str | None = None
 
     def as_dict(self) -> dict[str, str]:
-        return {"image": str(self.path), "sha256": self.sha256, "label": self.label}
+        out = {"image": str(self.path), "sha256": self.sha256, "label": self.label}
+        if self.group is not None:
+            out["group"] = self.group
+        return out
 
 
 class _Labelled(Protocol):
@@ -1564,7 +1586,10 @@ def read_image_split(path: Path, decision: Decision, what: str) -> list[Labelled
             raise EmbeddingTuneError(
                 f"{where}: the completion {completion!r} is not one of the decision's options"
             )
-        out.append(LabelledImage(file, expected, completion))
+        group = obj.get("group")
+        if "group" in obj and not isinstance(group, str):
+            raise EmbeddingTuneError(f"{where}: 'group' must be a string")
+        out.append(LabelledImage(file, expected, completion, group))
     if not out:
         raise EmbeddingTuneError(f"the {what} split {path} has no rows")
     return out
@@ -1875,6 +1900,7 @@ class EmbeddingTaskRecord:
     head_heldout_accuracy: float
     mirror: bool
     mirror_swap: tuple[tuple[str, str], ...]
+    train_pictures_sha256: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1884,6 +1910,7 @@ class EmbeddingTaskRecord:
             "labels": list(self.labels),
             "rows": dict(self.rows),
             "train_sha256": self.train_sha256,
+            "train_pictures_sha256": list(self.train_pictures_sha256),
             "head_heldout_accuracy": self.head_heldout_accuracy,
             "mirror": self.mirror,
             "mirror_swap": [list(pair) for pair in self.mirror_swap],
@@ -1900,6 +1927,7 @@ class EmbeddingTaskRecord:
             "labels": list,
             "rows": dict,
             "train_sha256": str,
+            "train_pictures_sha256": list,
             "head_heldout_accuracy": (int, float),
             "mirror": bool,
             "mirror_swap": list,
@@ -1929,6 +1957,16 @@ class EmbeddingTaskRecord:
             raise ValueError(f"{where}: 'decision_sha256' is not a storage sha256")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", data["train_sha256"]):
             raise ValueError(f"{where}: 'train_sha256' is not a storage sha256")
+        train_pictures = data["train_pictures_sha256"]
+        if (
+            not all(
+                isinstance(digest, str) and _SHA256_HEX.fullmatch(digest)
+                for digest in train_pictures
+            )
+            or len(set(train_pictures)) != len(train_pictures)
+            or train_pictures != sorted(train_pictures)
+        ):
+            raise ValueError(f"{where}: 'train_pictures_sha256' must hold sorted distinct sha256s")
         try:
             decision = decision_from(dict(data["decision"]), where)
         except DecisionError:
@@ -1944,6 +1982,7 @@ class EmbeddingTaskRecord:
             labels=tuple(labels),
             rows=dict(rows),
             train_sha256=data["train_sha256"],
+            train_pictures_sha256=tuple(train_pictures),
             head_heldout_accuracy=float(data["head_heldout_accuracy"]),
             mirror=data["mirror"],
             mirror_swap=swaps,
@@ -2319,6 +2358,7 @@ class EmbeddingTuneResult:
     labels: tuple[str, ...] = ()
     rows: dict[str, int] = field(default_factory=dict)
     trained_decision: Decision | None = None
+    tasks: list[dict[str, Any]] = field(default_factory=list)
     record: EmbeddingRecord | None = None
     metrics: dict[str, Any] | None = None
     model_dir: Path | None = None
@@ -2361,8 +2401,8 @@ class EmbeddingTuneResult:
             "decision_sha256": (
                 self.trained_decision.digest() if self.trained_decision is not None else None
             ),
-            "labels": list(self.labels),
-            "rows": dict(self.rows),
+            "labels": None if self.tasks else list(self.labels),
+            "rows": None if self.tasks else dict(self.rows),
             "record": self.record.as_dict() if self.record is not None else None,
             "device": self.device,
             "device_probe": self.device_probe.as_dict() if self.device_probe else None,
@@ -2378,6 +2418,8 @@ class EmbeddingTuneResult:
             "stdout_tail": self.stdout_tail,
             "limitations": list(self.limitations),
         }
+        if self.tasks:
+            out["tasks"] = list(self.tasks)
         # A text run's report is the one written before images existed.
         if self.modality == "image":
             out["modality"] = self.modality
@@ -2493,6 +2535,17 @@ def _check_tasks(request: EmbeddingTuneRequest) -> tuple[_CheckedTask, ...]:
             if held_value is not None
             else data.parent / "heldout.jsonl"
         )
+        expected_decision = data.parent / "decision.json"
+        if decision_path.resolve() != expected_decision.resolve():
+            raise EmbeddingTuneError(
+                f"{where}: 'decision' must be {expected_decision}, beside the task's data file; "
+                "verify reads that path beside the held-out split"
+            )
+        if heldout.parent.resolve() != data.parent.resolve():
+            raise EmbeddingTuneError(
+                f"{where}: 'heldout' must be beside the task's data file and decision.json; "
+                "verify selects the task from the decision beside that held-out split"
+            )
         if split_modality(data, "training") != "image":
             raise EmbeddingTuneError(f"{where}: --tasks accepts image rows only; {data} is text")
         single = replace(
@@ -2524,6 +2577,34 @@ def _check_tasks(request: EmbeddingTuneRequest) -> tuple[_CheckedTask, ...]:
         names.add(item["name"])
         digests.add(digest)
         out.append(_CheckedTask(item["name"], data, heldout, decision_path, checked, mirror))
+    training_pictures = {
+        row.sha256 for task in out for row in task.checked.train if isinstance(row, LabelledImage)
+    }
+    heldout_pictures = {
+        row.sha256 for task in out for row in task.checked.heldout if isinstance(row, LabelledImage)
+    }
+    if leaked := sorted(training_pictures & heldout_pictures):
+        raise EmbeddingTuneError(
+            f"{request.tasks}: {len(leaked)} picture(s) are training pictures of one task and "
+            f"held-out pictures of another (sha256 {', '.join(leaked[:3])})"
+        )
+    training_groups = {
+        row.group
+        for task in out
+        for row in task.checked.train
+        if isinstance(row, LabelledImage) and row.group is not None
+    }
+    heldout_groups = {
+        row.group
+        for task in out
+        for row in task.checked.heldout
+        if isinstance(row, LabelledImage) and row.group is not None
+    }
+    if leaked_groups := sorted(training_groups & heldout_groups):
+        raise EmbeddingTuneError(
+            f"{request.tasks}: {len(leaked_groups)} supplied group(s) are in training rows of one "
+            f"task and held-out rows of another ({', '.join(map(repr, leaked_groups[:3]))})"
+        )
     return tuple(out)
 
 
@@ -2682,9 +2763,24 @@ def run_embedding_tune(
         checks=CheckSet(name=f"train:{request.model}:{DIRECTION}"),
         modality=checked.modality,
     )
-    result.trained_decision = decision
-    result.labels = labels
-    result.rows = {"train": len(train), "heldout": len(heldout)}
+    if checked_tasks:
+        result.tasks = [
+            {
+                "name": task.name,
+                "decision": task.checked.decision.as_dict(),
+                "decision_sha256": task.checked.decision.digest(),
+                "labels": list(task.checked.labels),
+                "rows": {
+                    "train": len(task.checked.train),
+                    "heldout": len(task.checked.heldout),
+                },
+            }
+            for task in checked_tasks
+        ]
+    else:
+        result.trained_decision = decision
+        result.labels = labels
+        result.rows = {"train": len(train), "heldout": len(heldout)}
     result.limitation(NOT_VERIFIED)
     if image:
         result.limitation(IMAGE_RECIPE_UNMEASURED)
@@ -3094,6 +3190,9 @@ def run_embedding_tune(
                     "labels": metrics.get("labels"),
                     "rows": metrics.get("rows"),
                     "train_sha256": hash_file(task.data),
+                    "train_pictures_sha256": sorted(
+                        {row.sha256 for row in task.checked.train if isinstance(row, LabelledImage)}
+                    ),
                     "head_heldout_accuracy": metrics.get("head_heldout_accuracy"),
                     "mirror": metrics.get("mirror"),
                     "mirror_swap": metrics.get("mirror_swap"),
@@ -3303,7 +3402,12 @@ def summarise(result: EmbeddingTuneResult) -> list[str]:
         lines = [
             f"outcome: {result.outcome.value}",
             f"  embedding fine-tune of {request.model} at {request.pinned_revision[:12]}, "
-            f"{len(result.labels)} options, {described}; the app must give the runtime the "
+            + (
+                ", ".join(f"{task['name']}={len(task['labels'])} options" for task in result.tasks)
+                if result.tasks
+                else f"{len(result.labels)} options"
+            )
+            + f", {described}; the app must give the runtime the "
             f"same budget ({VISION_TOKENS_SETTING.format(n=request.vision_tokens)}; "
             f"{APP_VISION_TOKENS} when it sets none)",
         ]

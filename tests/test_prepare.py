@@ -1815,6 +1815,43 @@ def test_a_calibration_size_is_honoured_or_the_shortfall_said(write_jsonl, reque
     assert any("calibration split of 100 was requested" in text for text in short.limitations)
 
 
+def test_supplied_text_groups_never_split_and_report_changed_heldout_size(write_jsonl, request_for):
+    records = rows(12)
+    for i, record in enumerate(records):
+        record["group"] = f"g{i // 3}"
+    result = prepare(request_for(write_jsonl(records), heldout_size=2))
+    split_of = {}
+    for split in (result.train, result.heldout):
+        for row in split_records(split):
+            group = records[row["source_line"] - 1]["group"]
+            assert split_of.setdefault(group, split.path.name) == split.path.name
+    assert any(
+        "same supplied group" in text and "3 rows were held out" in text and "where 2 and 0" in text
+        for text in result.limitations
+    )
+
+
+def test_supplied_text_groups_never_split_with_calibration_and_report_sizes(
+    write_jsonl, request_for, questions
+):
+    records = decision_rows(n_per_option=4)
+    for i, record in enumerate(records):
+        record["group"] = f"g{i // 3}"
+    result = prepare(
+        request_for(write_jsonl(records), questions=questions(), heldout_size=2, calibration_size=2)
+    )
+    split_of = {}
+    for split in (result.train, result.calibration, result.heldout):
+        assert split is not None
+        for row in split_records(split):
+            group = records[row["source_line"] - 1]["group"]
+            assert split_of.setdefault(group, split.path.name) == split.path.name
+    assert any(
+        "same supplied group" in text and "where 2 and 2 were asked" in text
+        for text in result.limitations
+    )
+
+
 def test_a_calibration_fraction_is_a_share_of_every_row(write_jsonl, request_for, questions):
     data = write_jsonl(decision_rows(n_per_option=20))
 
