@@ -1901,9 +1901,10 @@ class EmbeddingTaskRecord:
     mirror: bool
     mirror_swap: tuple[tuple[str, str], ...]
     train_pictures_sha256: tuple[str, ...] = ()
+    train_groups: tuple[str, ...] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "name": self.name,
             "decision": dict(self.decision),
             "decision_sha256": self.decision_sha256,
@@ -1915,6 +1916,9 @@ class EmbeddingTaskRecord:
             "mirror": self.mirror,
             "mirror_swap": [list(pair) for pair in self.mirror_swap],
         }
+        if self.train_groups is not None:
+            out["train_groups"] = list(self.train_groups)
+        return out
 
     @classmethod
     def from_dict(cls, data: object, where: str) -> EmbeddingTaskRecord:
@@ -1967,6 +1971,15 @@ class EmbeddingTaskRecord:
             or train_pictures != sorted(train_pictures)
         ):
             raise ValueError(f"{where}: 'train_pictures_sha256' must hold sorted distinct sha256s")
+        train_groups = data.get("train_groups")
+        if "train_groups" in data and (
+            not isinstance(train_groups, list)
+            or not train_groups
+            or not all(isinstance(group, str) for group in train_groups)
+            or len(set(train_groups)) != len(train_groups)
+            or train_groups != sorted(train_groups)
+        ):
+            raise ValueError(f"{where}: 'train_groups' must hold sorted distinct strings")
         try:
             decision = decision_from(dict(data["decision"]), where)
         except DecisionError:
@@ -1983,6 +1996,7 @@ class EmbeddingTaskRecord:
             rows=dict(rows),
             train_sha256=data["train_sha256"],
             train_pictures_sha256=tuple(train_pictures),
+            train_groups=tuple(train_groups) if isinstance(train_groups, list) else None,
             head_heldout_accuracy=float(data["head_heldout_accuracy"]),
             mirror=data["mirror"],
             mirror_swap=swaps,
@@ -3192,6 +3206,19 @@ def run_embedding_tune(
                     "train_sha256": hash_file(task.data),
                     "train_pictures_sha256": sorted(
                         {row.sha256 for row in task.checked.train if isinstance(row, LabelledImage)}
+                    ),
+                    **(
+                        {"train_groups": groups}
+                        if (
+                            groups := sorted(
+                                {
+                                    row.group
+                                    for row in task.checked.train
+                                    if isinstance(row, LabelledImage) and row.group is not None
+                                }
+                            )
+                        )
+                        else {}
                     ),
                     "head_heldout_accuracy": metrics.get("head_heldout_accuracy"),
                     "mirror": metrics.get("mirror"),

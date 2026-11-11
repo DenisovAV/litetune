@@ -1968,6 +1968,9 @@ def verify_embedding(
     multitask_training_pictures = {
         digest for task in record.tasks for digest in task.train_pictures_sha256
     }
+    multitask_training_groups = {
+        group for task in record.tasks for group in (task.train_groups or ())
+    }
     if record.tasks:
         decision_path = Path(job.heldout).parent / "decision.json"
         try:
@@ -2172,6 +2175,18 @@ def verify_embedding(
                     ROWS_CHECK,
                     f"{len(leaked)} held-out picture(s) of the selected task were training "
                     f"pictures of a task in the checkpoint (sha256 {', '.join(leaked[:3])})",
+                )
+            if multitask and (
+                leaked_groups := sorted(
+                    {row.group for row in heldout_images if row.group is not None}
+                    & multitask_training_groups
+                )
+            ):
+                return refuse(
+                    ROWS_CHECK,
+                    f"{len(leaked_groups)} held-out supplied group(s) of the selected task were "
+                    f"training groups of a task in the checkpoint "
+                    f"({', '.join(map(repr, leaked_groups[:3]))})",
                 )
             train, heldout = train_images, heldout_images
         else:

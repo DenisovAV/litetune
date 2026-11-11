@@ -2631,7 +2631,7 @@ def _failed(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return [c for c in manifest["checks"] if c["outcome"] == "failed"]
 
 
-def test_a_multitask_image_reference_selects_by_the_decision_beside_data(fake, tmp_path):
+def test_a_multitask_record_without_groups_selects_and_verifies(fake, tmp_path):
     selected = _decision()
     other = Decision(
         "choice",
@@ -2669,6 +2669,7 @@ def test_a_multitask_image_reference_selects_by_the_decision_beside_data(fake, t
     report_path = setup.model.parent / REPORT_NAME
     record_path = setup.reference / "litetune.json"
     recorded = json.loads(record_path.read_text(encoding="utf-8"))
+    assert all("train_groups" not in task for task in recorded["tasks"])
     recorded["tasks"][1]["train_sha256"] = hash_file(setup.train)
     record_path.write_text(json.dumps(recorded), encoding="utf-8")
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -2712,6 +2713,54 @@ def test_a_multitask_reference_refuses_cross_task_training_picture_leakage(fake,
     assert ROWS_CHECK in _checks(result.manifest), result.manifest["checks"]
     detail = _checks(result.manifest)[ROWS_CHECK]["detail"]
     assert heldout_digest in detail and "training pictures of a task" in detail
+
+
+def test_a_multitask_reference_refuses_cross_task_training_group_leakage(fake, tmp_path):
+    selected = _decision()
+    other = Decision("choice", "Another question?", tuple(Option(option) for option in OPTIONS))
+    tasks = (
+        EmbeddingTaskRecord(
+            "other",
+            other.as_dict(),
+            other.digest(),
+            tuple(sorted(OPTIONS)),
+            {"train": 36, "heldout": 18},
+            "sha256:" + "1" * 64,
+            0.1,
+            False,
+            (),
+            train_groups=("shared-run",),
+        ),
+        EmbeddingTaskRecord(
+            "selected",
+            selected.as_dict(),
+            selected.digest(),
+            tuple(sorted(OPTIONS)),
+            {"train": 36, "heldout": 18},
+            "sha256:" + "2" * 64,
+            0.9,
+            False,
+            (),
+        ),
+    )
+    setup = _image_setup(tmp_path, fake, record={"tasks": tasks})
+    (setup.heldout.parent / "decision.json").write_text(selected.canonical_text(), encoding="utf-8")
+    heldout = [json.loads(line) for line in setup.heldout.read_text().splitlines()]
+    heldout[0]["group"] = "shared-run"
+    setup.heldout.write_text("".join(json.dumps(row) + "\n" for row in heldout))
+    report_path = setup.model.parent / REPORT_NAME
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["checkpoint"]["decision_sha256"] = None
+    report["checkpoint"]["tasks"] = [
+        {"name": task.name, "decision_sha256": task.decision_sha256} for task in tasks
+    ]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    result = _verify(setup)
+
+    assert result.status is Status.FAILED_HARNESS
+    detail = _checks(result.manifest)[ROWS_CHECK]["detail"]
+    assert "shared-run" in detail and "training groups of a task" in detail
 
 
 def test_a_multitask_reference_refuses_a_different_selected_training_split(fake, tmp_path):

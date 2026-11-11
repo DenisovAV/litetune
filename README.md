@@ -992,7 +992,8 @@ The run uses one head and class weights per task, shuffles all tasks' training
 items together, and caches a shared picture input once. To verify one task,
 pass its held-out file; `verify` selects the recorded task by the
 `decision.json` beside that file. Across all tasks, a picture or supplied
-`group` cannot occur in training rows of one task and held-out rows of another.
+`group` cannot occur in training rows of one task and held-out rows of another;
+`verify` refuses the same leakage against the training pictures and groups recorded by `tune`.
 
 `questions.json` is a `choice` question without a `none_option`, as for text.
 `--context-length` and `--tokenizer` are refused for image rows: there is no

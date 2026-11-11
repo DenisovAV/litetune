@@ -380,6 +380,10 @@ def test_a_multitask_run_records_each_head_and_uses_one_joint_spec(toolchain, tm
 def test_a_multitask_record_round_trips_with_one_or_several_tasks(toolchain, tmp_path):
     first = _split(tmp_path / "first", ids=("a", "b"), train=8)
     second = _split(tmp_path / "second", ids=("x", "y"), train=8)
+    first_train = _records(first.train)
+    for i, row in enumerate(first_train):
+        row["group"] = f"run-{i % 2}"
+    _write(first.train, first_train)
     tasks = _tasks_file(
         tmp_path,
         [
@@ -392,9 +396,28 @@ def test_a_multitask_record_round_trips_with_one_or_several_tasks(toolchain, tmp
     )
     assert result.record is not None
     data = result.record.as_dict()
+    assert data["tasks"][0]["train_groups"] == ["run-0", "run-1"]
+    assert "train_groups" not in data["tasks"][1]
     assert EmbeddingRecord.from_dict(data, "record").as_dict() == data
     data["tasks"] = data["tasks"][:1]
     assert len(EmbeddingRecord.from_dict(data, "record").tasks) == 1
+
+
+@pytest.mark.parametrize("groups", [[], ["later", "earlier"], ["same", "same"], ["ok", 7]])
+def test_a_multitask_record_validates_recorded_training_groups(toolchain, tmp_path, groups):
+    split = _split(tmp_path / "split", ids=("a", "b"), train=8)
+    tasks = _tasks_file(
+        tmp_path,
+        [{"name": "task", "data": str(split.train), "decision": str(split.decision)}],
+    )
+    result = run_embedding_tune(
+        EmbeddingTuneRequest(output_dir=tmp_path / "tuned", tasks=tasks, vision_tokens=70)
+    )
+    assert result.record is not None
+    data = result.record.as_dict()
+    data["tasks"][0]["train_groups"] = groups
+    with pytest.raises(ValueError, match="'train_groups' must hold sorted distinct strings"):
+        EmbeddingRecord.from_dict(data, "record")
 
 
 def test_the_record_holds_the_sha256_of_each_processor_file_saved(toolchain, split, tmp_path):
