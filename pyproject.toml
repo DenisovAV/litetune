@@ -24,12 +24,44 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Sasha Denisov", email = "denisov.shureg@gmail.com" }]
-keywords = ["lora", "fine-tuning", "on-device", "litertlm", "quantization", "evaluation"]
+keywords = [
+    "lora",
+    "fine-tuning",
+    "on-device",
+    "litertlm",
+    "litert",
+    "litert-lm",
+    "quantization",
+    "evaluation",
+    "gemma",
+    "functiongemma",
+    "embeddinggemma",
+    "qwen",
+    "tflite",
+    "android",
+    "flutter",
+    "npu",
+    "edge-ai",
+]
+# The Python versions are the ones every stage provisions on (README, Install:
+# "Python 3.10-3.12"); 3.13 installs and runs `prepare` and `bundle`, but not
+# `convert` or `verify` -- see `requires-python` above. No license classifier:
+# `license` is an SPDX expression, which PEP 639 says replaces them.
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: Console",
     "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
 ]
 
 # Deliberately thin. The heavy toolchains -- torch/transformers for training,
@@ -55,7 +87,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/DenisovAV/litetune"
+Homepage = "https://litetune.dev"
+Documentation = "https://github.com/DenisovAV/litetune#readme"
+Changelog = "https://litetune.dev/changelog"
 Repository = "https://github.com/DenisovAV/litetune"
 Issues = "https://github.com/DenisovAV/litetune/issues"
 

@@ -150,9 +150,9 @@ if [ "$tagged_version" != "$VERSION" ]; then
   echo "!!  the commit tagged for $VERSION says ${tagged_version:-nothing readable} in its own _version.py." >&2
   exit 1
 fi
-if [ -n "$(git status --porcelain -- . ../CHANGELOG.md ../src/litetune/_version.py)" ]; then
+if [ -n "$(git status --porcelain -- . ../CHANGELOG.md ../README.md ../src/litetune/_version.py)" ]; then
   echo "!!  uncommitted changes to the site's inputs; commit or stash them first:" >&2
-  git status --short -- . ../CHANGELOG.md ../src/litetune/_version.py >&2
+  git status --short -- . ../CHANGELOG.md ../README.md ../src/litetune/_version.py >&2
   exit 1
 fi
 

@@ -77,10 +77,16 @@ class Formats extends StatelessComponent {
       ' — fewer have been measured end to end than export; which, and how, is '
       'on ';
 
+  /// The families `convert` exports. `/llms.txt` lists the same line.
+  static const models =
+      'Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3 0.6B/1.7B, '
+      'Qwen2.5 0.5B/1.5B Instruct, Qwen3.5, MiniCPM5 1B, Granite 4.1 3B, '
+      'FunctionGemma, and EmbeddingGemma 2 as a decider';
+
   @override
   Component build(BuildContext context) {
     return section(classes: 'row', [
-      div(classes: 'label', [Component.text('Supported formats')]),
+      h2(classes: 'label', [Component.text('Supported formats')]),
       div(classes: 'defs', [
         _row('Output', [
           span(classes: 'mono', [Component.text('.litertlm')]),
@@ -100,11 +106,7 @@ class Formats extends StatelessComponent {
           span(classes: 'qualifier', [Component.text(accelerationQualifier)]),
         ]),
         _row('Models', [
-          Component.text(
-            'Gemma 3 (text), Gemma 4 E2B/E4B, Qwen3 0.6B/1.7B, '
-            'Qwen2.5 0.5B/1.5B Instruct, Qwen3.5, MiniCPM5 1B, Granite 4.1 3B, '
-            'FunctionGemma, and EmbeddingGemma 2 as a decider',
-          ),
+          Component.text(models),
           span(classes: 'qualifier', [
             Component.text(measuredQualifier),
             a(href: '/models', [Component.text('the models page')]),

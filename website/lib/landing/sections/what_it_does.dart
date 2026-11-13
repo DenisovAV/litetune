@@ -8,7 +8,7 @@ import '../../theme/brand.dart';
 /// They are listed rather than shown as a terminal transcript: a transcript
 /// implies a copy-pasteable happy path, and each of these takes flags that
 /// depend on the model and the task. The README is where the full invocations
-/// belong.
+/// belong; `QuickStart` below quotes the first four from it, flags and all.
 class WhatItDoes extends StatelessComponent {
   const WhatItDoes({super.key});
 
@@ -18,19 +18,22 @@ class WhatItDoes extends StatelessComponent {
   static const convertDescription =
       'turns the result into a file LiteRT-LM can load';
 
+  /// The five stages and what each does, in order. `/llms.txt` lists the
+  /// same pairs.
+  static const steps = [
+    ('prepare', prepareDescription),
+    ('tune', 'fine-tunes it, with the settings the export step will need'),
+    ('convert', convertDescription),
+    ('verify', 'compares that file with the model it came from'),
+    ('bundle', 'packages it together with what the comparison found'),
+  ];
+
   @override
   Component build(BuildContext context) {
     return section(classes: 'row', [
-      div(classes: 'label', [Component.text('What it does')]),
+      h2(classes: 'label', [Component.text('What it does')]),
       div(classes: 'defs', [
-        _step('prepare', prepareDescription),
-        _step(
-          'tune',
-          'fine-tunes it, with the settings the export step will need',
-        ),
-        _step('convert', convertDescription),
-        _step('verify', 'compares that file with the model it came from'),
-        _step('bundle', 'packages it together with what the comparison found'),
+        for (final (command, gloss) in steps) _step(command, gloss),
       ]),
     ]);
   }

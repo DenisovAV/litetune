@@ -68,7 +68,10 @@ for page in models models/embeddings; do
   fi
 done
 
-for artefact in main.client.dart.js favicon.svg; do
+# Then the social card, which every page's head names, and the two text files
+# for language models (lib/llms_txt.dart): nothing on a page shows any of the
+# three missing.
+for artefact in main.client.dart.js favicon.svg images/og-image.png llms.txt llms-full.txt; do
   [ -s "$BUILD_DIR/$artefact" ] || fail "$artefact is missing or empty"
 done
 

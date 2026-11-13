@@ -20,7 +20,7 @@ class RuntimesStrip extends StatelessComponent {
   @override
   Component build(BuildContext context) {
     return div(classes: 'runtimes', [
-      div(classes: 'label', [Component.text('Supported runtimes')]),
+      h2(classes: 'label', [Component.text('Supported runtimes')]),
       div(classes: 'runtimes-list', [
         div(classes: 'runtime', [
           div(classes: 'runtime-name', [Component.text('LiteRT-LM')]),

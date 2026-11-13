@@ -10,6 +10,8 @@ import 'package:litetune_website/changelog/changelog_page.dart'
 import 'package:litetune_website/landing/sections/formats.dart' as _formats;
 import 'package:litetune_website/landing/sections/hero.dart' as _hero;
 import 'package:litetune_website/landing/sections/nav_bar.dart' as _nav_bar;
+import 'package:litetune_website/landing/sections/quick_start.dart'
+    as _quick_start;
 import 'package:litetune_website/landing/sections/runtimes.dart' as _runtimes;
 import 'package:litetune_website/landing/sections/site_footer.dart'
     as _site_footer;
@@ -49,6 +51,7 @@ ServerOptions get defaultServerOptions => ServerOptions(
     ..._formats.Formats.styles,
     ..._hero.Hero.styles,
     ..._nav_bar.NavBar.styles,
+    ..._quick_start.QuickStart.styles,
     ..._runtimes.RuntimesStrip.styles,
     ..._site_footer.SiteFooter.styles,
     ..._what_it_does.WhatItDoes.styles,

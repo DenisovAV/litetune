@@ -23,9 +23,10 @@ permissions:
   contents: read
 
 on:
-  # The three files outside `website/` are read by the build: the nav shows the
-  # version from `_version.py`, `/changelog` is `CHANGELOG.md` rendered, and
-  # `/measurements` is `MEASUREMENTS.md` rendered. A path missing from these
+  # The four files outside `website/` are read by the build: the nav shows the
+  # version from `_version.py`, `/changelog` is `CHANGELOG.md` rendered,
+  # `/measurements` is `MEASUREMENTS.md` rendered, and `/llms-full.txt` is
+  # `README.md` and `MEASUREMENTS.md` together. A path missing from these
   # lists is a page that goes stale without anything saying so -- the file
   # changes, nothing rebuilds, and the site keeps serving the old one.
   pull_request:
@@ -34,6 +35,7 @@ on:
       - '.github/workflows/site.yml'
       - 'CHANGELOG.md'
       - 'MEASUREMENTS.md'
+      - 'README.md'
       - 'src/litetune/_version.py'
   push:
     branches: [main]
@@ -42,6 +44,7 @@ on:
       - '.github/workflows/site.yml'
       - 'CHANGELOG.md'
       - 'MEASUREMENTS.md'
+      - 'README.md'
       - 'src/litetune/_version.py'
   # The deploy that puts a new version on the site. A push to `main` cannot be
   # that deploy: the version is bumped on `main` before the release exists, and

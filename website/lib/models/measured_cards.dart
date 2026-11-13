@@ -114,7 +114,7 @@ class MeasuredCards extends StatelessComponent {
       classes: 'measured',
       attributes: const {'id': closeTarget},
       [
-        div(classes: 'measured-label', [Component.text(label)]),
+        h2(classes: 'measured-label', [Component.text(label)]),
         div(classes: 'measured-cards', [for (final run in runs) _card(run)]),
         if (note.isNotEmpty) p(classes: 'measured-note', note),
         for (final run in runs) _modal(run),
@@ -237,10 +237,12 @@ class MeasuredCards extends StatelessComponent {
   // disclosure that wants neither.
   @css
   static List<StyleRule> get styles => [
+    // The page's `<h2>`, drawn as the plain line it was as a `<div>`.
     css('.measured-label').styles(
       color: Brand.muted,
       fontSize: 0.9.rem,
-      margin: Margin.only(bottom: 0.75.rem),
+      fontWeight: FontWeight.w400,
+      margin: Margin.only(top: Unit.zero, bottom: 0.75.rem),
     ),
     css('.measured-cards').styles(
       display: Display.grid,
