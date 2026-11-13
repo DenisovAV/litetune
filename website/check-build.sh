@@ -78,7 +78,7 @@ done
 # The IndexNow key (web/<key>.txt, holding its own name): Bing reads it back
 # from the site before it accepts a submission signed with that key, so a
 # build without it makes every submission fail.
-keys=$(find "$BUILD_DIR" -maxdepth 1 -regex '.*/[0-9a-f]\{32\}\.txt')
+keys=$(ls "$BUILD_DIR" | grep -E '^[0-9a-f]{32}\.txt$' | sed "s|^|${BUILD_DIR}/|" || true)
 [ "$(printf '%s\n' "$keys" | grep -c .)" -eq 1 ] || fail "expected one IndexNow key file, found: ${keys:-none}"
 [ "$(cat "$keys")" = "$(basename "$keys" .txt)" ] || fail "$keys does not hold its own name"
 

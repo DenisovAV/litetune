@@ -12,7 +12,7 @@ set -euo pipefail
 HOST="litetune.dev"
 WEB_DIR="$(cd "$(dirname "$0")/../web" && pwd)"
 
-key_file=$(find "$WEB_DIR" -maxdepth 1 -regex '.*/[0-9a-f]\{32\}\.txt')
+key_file=$(ls "$WEB_DIR" | grep -E '^[0-9a-f]{32}\.txt$' | sed "s|^|${WEB_DIR}/|" || true)
 [ "$(printf '%s\n' "$key_file" | grep -c .)" -eq 1 ] \
   || { echo "expected one key file in $WEB_DIR, found: ${key_file:-none}" >&2; exit 1; }
 key=$(basename "$key_file" .txt)
