@@ -1,7 +1,10 @@
 # litetune
 
-**Fine-tune a small model, convert it for LiteRT-LM on native devices, and
-compare the result with the model it came from.**
+[litetune.dev](https://litetune.dev) · [Measurements](https://litetune.dev/measurements) · [Models](https://litetune.dev/models)
+
+**Full or LoRA fine-tuning of small models such as Gemma and Qwen, conversion
+to `.litertlm` for LiteRT-LM on native devices, and a comparison of the result
+with the model it came from.**
 
 Getting from a Hugging Face checkpoint to a model that works inside your app is
 a long road — LoRA, merge, export to `.litertlm`, bundle metadata — and a
