@@ -75,6 +75,13 @@ for artefact in main.client.dart.js favicon.svg images/og-image.png llms.txt llm
   [ -s "$BUILD_DIR/$artefact" ] || fail "$artefact is missing or empty"
 done
 
+# The IndexNow key (web/<key>.txt, holding its own name): Bing reads it back
+# from the site before it accepts a submission signed with that key, so a
+# build without it makes every submission fail.
+keys=$(ls "$BUILD_DIR" | grep -E '^[0-9a-f]{32}\.txt$' | sed "s|^|${BUILD_DIR}/|" || true)
+[ "$(printf '%s\n' "$keys" | grep -c .)" -eq 1 ] || fail "expected one IndexNow key file, found: ${keys:-none}"
+[ "$(cat "$keys")" = "$(basename "$keys" .txt)" ] || fail "$keys does not hold its own name"
+
 # The sitemap is the one output nothing on the page would reveal missing, and
 # it is conditional: `build_command.dart:366` writes it only when
 # --sitemap-domain was passed. Both callers pass it, so its absence means the

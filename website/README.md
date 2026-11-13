@@ -28,6 +28,7 @@ the check will reject.
 | `lib/main.server.dart` | The only entrypoint that matters — renders one `Document` at `/` |
 | `lib/seo.dart` | Open Graph / Twitter / canonical / JSON-LD head tags, and each page's title and description |
 | `lib/llms_txt.dart` | `/llms.txt` and `/llms-full.txt`, built from what the pages render and from README.md and MEASUREMENTS.md |
+| `web/<32 hex>.txt` | The IndexNow key: holds its own name; Bing fetches it to accept a submission (`tool/indexnow.sh`) |
 | `tool/og_image.py` | Draws `web/images/og-image.png`, the link-preview card; run it by hand and commit the PNG |
 | `lib/theme/brand.dart` | Design tokens as CSS custom properties, dark by default |
 | `lib/landing/landing_page.dart` | Composes the sections |
