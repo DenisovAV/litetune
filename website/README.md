@@ -26,7 +26,9 @@ the check will reject.
 | Path | What it holds |
 |---|---|
 | `lib/main.server.dart` | The only entrypoint that matters — renders one `Document` at `/` |
-| `lib/seo.dart` | Open Graph / Twitter / canonical / JSON-LD head tags |
+| `lib/seo.dart` | Open Graph / Twitter / canonical / JSON-LD head tags, and each page's title and description |
+| `lib/llms_txt.dart` | `/llms.txt` and `/llms-full.txt`, built from what the pages render and from README.md and MEASUREMENTS.md |
+| `tool/og_image.py` | Draws `web/images/og-image.png`, the link-preview card; run it by hand and commit the PNG |
 | `lib/theme/brand.dart` | Design tokens as CSS custom properties, dark by default |
 | `lib/landing/landing_page.dart` | Composes the sections |
 | `lib/landing/sections/` | One file per section |

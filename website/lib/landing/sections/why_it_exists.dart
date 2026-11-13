@@ -35,7 +35,7 @@ class WhyItExists extends StatelessComponent {
   @override
   Component build(BuildContext context) {
     return section(classes: 'row', [
-      div(classes: 'label', [Component.text('Why it exists')]),
+      h2(classes: 'label', [Component.text('Why it exists')]),
       div(classes: 'why-body', [
         p(classes: 'prose', [
           Component.text(

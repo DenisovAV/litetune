@@ -76,3 +76,10 @@ final String changelogMarkdown = File(
 final String measurementsMarkdown = File(
   '${_root.path}/MEASUREMENTS.md',
 ).readAsStringSync();
+
+/// `README.md` at the repository root, as written. `/llms-full.txt` is this
+/// file and [measurementsMarkdown], so the text an assistant reads there is
+/// the text GitHub and PyPI show.
+final String readmeMarkdown = File(
+  '${_root.path}/README.md',
+).readAsStringSync();

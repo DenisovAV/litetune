@@ -37,24 +37,23 @@ class Hero extends StatelessComponent {
       'Apache-2.0 · Python 3.10–3.12 · full pipeline on Linux x86_64 and '
       'Apple Silicon macOS · Windows except convert · alpha';
 
+  /// The two ways to install it. `/llms.txt` lists the same commands.
+  static const installCommands = [
+    'pip install litetune',
+    'brew install DenisovAV/tap/litetune',
+  ];
+
   @override
   Component build(BuildContext context) {
     return section(classes: 'hero', [
       h1(classes: 'hero-h1', [Component.text(description)]),
       const RuntimesStrip(),
       div(classes: 'hero-install-row', [
-        div(classes: 'install', [
-          span(classes: 'install-prompt', [Component.text(r'$')]),
-          span(classes: 'install-cmd', [
-            Component.text('pip install litetune'),
+        for (final command in installCommands)
+          div(classes: 'install', [
+            span(classes: 'install-prompt', [Component.text(r'$')]),
+            span(classes: 'install-cmd', [Component.text(command)]),
           ]),
-        ]),
-        div(classes: 'install', [
-          span(classes: 'install-prompt', [Component.text(r'$')]),
-          span(classes: 'install-cmd', [
-            Component.text('brew install DenisovAV/tap/litetune'),
-          ]),
-        ]),
       ]),
       p(classes: 'hero-meta', [Component.text(compatibility)]),
     ]);

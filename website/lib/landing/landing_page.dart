@@ -5,6 +5,7 @@ import '../theme/brand.dart';
 import 'sections/formats.dart';
 import 'sections/hero.dart';
 import 'sections/nav_bar.dart';
+import 'sections/quick_start.dart';
 import 'sections/site_footer.dart';
 import 'sections/what_it_does.dart';
 import 'sections/where_to_run.dart';
@@ -28,6 +29,7 @@ class LandingPage extends StatelessComponent {
         const Formats(),
         const WhereToRun(),
         const WhatItDoes(),
+        const QuickStart(),
       ]),
       div(classes: 'content', [const SiteFooter()]),
     ]);
@@ -55,7 +57,9 @@ class LandingPage extends StatelessComponent {
     ),
     // Shared two-column section: a small uppercase label, then the content.
     // `.row` and `.label` are used by several sections; their look is defined
-    // once here rather than repeated in each.
+    // once here rather than repeated in each. The label is each section's
+    // `<h2>`, so the margin and weight a heading brings by default are reset
+    // here and it keeps the look it had as a `<div>`.
     css('.row').styles(
       display: Display.flex,
       gap: Gap.all(5.5.rem),
@@ -71,6 +75,8 @@ class LandingPage extends StatelessComponent {
       width: 11.rem,
       flex: const Flex(shrink: 0),
       lineHeight: 1.6.em,
+      fontWeight: FontWeight.w400,
+      margin: Margin.zero,
     ),
     // Below the breakpoint the label stops being a gutter and becomes a
     // heading above its content — at phone width a fixed 11rem column would

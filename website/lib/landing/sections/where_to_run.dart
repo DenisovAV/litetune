@@ -12,6 +12,10 @@ import '../../theme/brand.dart';
 class WhereToRun extends StatelessComponent {
   const WhereToRun({super.key});
 
+  /// flutter_gemma's site. fluttergemma.dev, which this used to link,
+  /// answers with a 301 to this address.
+  static const flutterGemmaUrl = 'https://flutteredge.ai';
+
   static const galleryNote =
       "Google's Android, iOS and macOS app for running local models on the "
       'device. Import the file to try it without writing an app first.';
@@ -19,10 +23,10 @@ class WhereToRun extends StatelessComponent {
   @override
   Component build(BuildContext context) {
     return section(classes: 'row', [
-      div(classes: 'label', [Component.text('Where to run it')]),
+      h2(classes: 'label', [Component.text('Where to run it')]),
       div(classes: 'cards', [
         _card(
-          href: 'https://fluttergemma.dev',
+          href: flutterGemmaUrl,
           name: 'flutter_gemma',
           note:
               'A Flutter plugin that runs .litertlm through the LiteRT-LM C '
